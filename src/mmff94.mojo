@@ -1,0 +1,1448 @@
+# SmallField: MMFF94 Force Field Implementation
+# Merged from: bond_stretch.mojo, angle_bend.mojo, torsion.mojo, vdw.mojo, electrostatic.mojo, total.mojo
+# Updated for Mojo 0.25.7
+
+from math import sqrt, cos, sin, acos, atan2, pow, abs
+from memory import alloc
+
+
+# =============================================================================
+# MMFF94 Constants
+# =============================================================================
+
+# Mathematical constants
+alias PI: Float32 = 3.14159265358979323846
+alias DEG_TO_RAD: Float32 = 0.017453292519943295
+alias RAD_TO_DEG: Float32 = 57.29577951308232
+
+# Bond stretching
+alias MMFF_BOND_PREFACTOR: Float32 = 143.9325  # mdyn*A/rad^2 -> kcal/mol
+alias MMFF_CUBIC_STRETCH: Float32 = -2.0       # A^-1
+
+# Angle bending
+alias MMFF_ANGLE_PREFACTOR: Float32 = 0.043844  # mdyn*A/rad^2 -> kcal/mol
+alias MMFF_ANGLE_SEXTIC: Float32 = -0.007       # rad^-1
+
+# Electrostatics
+alias MMFF_ELEC_CONSTANT: Float32 = 332.0716  # kcal*A/mol/e^2
+alias MMFF_ELEC_BUFFER: Float32 = 0.05        # Angstroms - prevents singularity
+
+# Default parameters
+alias DEFAULT_DIELECTRIC: Float32 = 1.0
+alias DEFAULT_1_4_VDW_SCALE: Float32 = 0.75
+alias DEFAULT_1_4_ELEC_SCALE: Float32 = 0.75
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+fn compute_distance(
+    x1: Float32, y1: Float32, z1: Float32,
+    x2: Float32, y2: Float32, z2: Float32
+) -> Float32:
+    """Compute Euclidean distance between two points."""
+    var dx = x2 - x1
+    var dy = y2 - y1
+    var dz = z2 - z1
+    return sqrt(dx * dx + dy * dy + dz * dz)
+
+
+# =============================================================================
+# Bond Stretching
+# E_bond = 0.5 * 143.9325 * kb * dr^2 * (1 + cs*dr + 7/12*cs^2*dr^2)
+# =============================================================================
+
+fn bond_energy_single(
+    r: Float32,      # Current bond length
+    r0: Float32,     # Equilibrium bond length
+    kb: Float32      # Force constant
+) -> Float32:
+    """
+    MMFF94 bond stretching energy for a single bond.
+
+    E = 0.5 * 143.9325 * kb * dr^2 * (1 + cs*dr + 7/12*cs^2*dr^2)
+
+    where:
+        dr = r - r0
+        cs = -2.0 (cubic stretch constant)
+    """
+    var dr = r - r0
+    var dr2 = dr * dr
+    var cs = MMFF_CUBIC_STRETCH
+    var cs2 = cs * cs
+
+    # Quartic bond stretch potential
+    var energy = Float32(0.5) * MMFF_BOND_PREFACTOR * kb * dr2 * (
+        Float32(1.0) + cs * dr + Float32(7.0 / 12.0) * cs2 * dr2
+    )
+    return energy
+
+
+fn bond_energy_and_gradient(
+    r: Float32,
+    r0: Float32,
+    kb: Float32
+) -> Tuple[Float32, Float32]:
+    """
+    Compute bond energy and its gradient dE/dr.
+
+    dE/dr = 143.9325 * kb * dr * (1 + 1.5*cs*dr + 7/3*cs^2*dr^2)
+    """
+    var dr = r - r0
+    var dr2 = dr * dr
+    var cs = MMFF_CUBIC_STRETCH
+    var cs2 = cs * cs
+
+    var energy = Float32(0.5) * MMFF_BOND_PREFACTOR * kb * dr2 * (
+        Float32(1.0) + cs * dr + Float32(7.0 / 12.0) * cs2 * dr2
+    )
+
+    var gradient = MMFF_BOND_PREFACTOR * kb * dr * (
+        Float32(1.0) + Float32(1.5) * cs * dr + Float32(7.0 / 3.0) * cs2 * dr2
+    )
+
+    return (energy, gradient)
+
+
+fn compute_bond_forces(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Gradients (output)
+    grad_x: type_of(alloc[Float32](1)),
+    grad_y: type_of(alloc[Float32](1)),
+    grad_z: type_of(alloc[Float32](1)),
+    # Bond topology
+    bond_i: type_of(alloc[Int32](1)),
+    bond_j: type_of(alloc[Int32](1)),
+    # Bond parameters
+    bond_kb: type_of(alloc[Float32](1)),
+    bond_r0: type_of(alloc[Float32](1)),
+    # Range
+    bond_start: Int,
+    bond_end: Int
+) -> Float32:
+    """
+    Compute bond stretching energy and accumulate forces.
+
+    Returns total bond energy for the given range.
+    Accumulates gradients into grad_x, grad_y, grad_z.
+    """
+    var total_energy: Float32 = 0.0
+
+    for b in range(bond_start, bond_end):
+        var i = Int(bond_i[b])
+        var j = Int(bond_j[b])
+
+        # Get positions
+        var x1 = x[i]
+        var y1 = y[i]
+        var z1 = z[i]
+        var x2 = x[j]
+        var y2 = y[j]
+        var z2 = z[j]
+
+        # Compute distance
+        var dx = x2 - x1
+        var dy = y2 - y1
+        var dz = z2 - z1
+        var r = sqrt(dx * dx + dy * dy + dz * dz)
+
+        # Avoid division by zero
+        if r < Float32(1e-8):
+            continue
+
+        # Compute energy and gradient
+        var result = bond_energy_and_gradient(r, bond_r0[b], bond_kb[b])
+        var energy = result[0]
+        var dE_dr = result[1]
+
+        total_energy += energy
+
+        # Convert dE/dr to dE/d(xyz) using chain rule
+        # dE/dx = dE/dr * dr/dx = dE/dr * (x2-x1)/r
+        var inv_r = Float32(1.0) / r
+        var fx = dE_dr * dx * inv_r
+        var fy = dE_dr * dy * inv_r
+        var fz = dE_dr * dz * inv_r
+
+        # Accumulate gradients (opposite signs for i and j)
+        grad_x[i] = grad_x[i] - fx
+        grad_y[i] = grad_y[i] - fy
+        grad_z[i] = grad_z[i] - fz
+        grad_x[j] = grad_x[j] + fx
+        grad_y[j] = grad_y[j] + fy
+        grad_z[j] = grad_z[j] + fz
+
+    return total_energy
+
+
+fn compute_total_bond_energy(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Bond topology
+    bond_i: type_of(alloc[Int32](1)),
+    bond_j: type_of(alloc[Int32](1)),
+    # Bond parameters
+    bond_kb: type_of(alloc[Float32](1)),
+    bond_r0: type_of(alloc[Float32](1)),
+    # Number of bonds
+    num_bonds: Int
+) -> Float32:
+    """
+    Compute total bond stretching energy (no gradients).
+
+    Optimized for energy-only evaluation.
+    """
+    var total_energy: Float32 = 0.0
+
+    for b in range(num_bonds):
+        var i = Int(bond_i[b])
+        var j = Int(bond_j[b])
+
+        # Get positions
+        var x1 = x[i]
+        var y1 = y[i]
+        var z1 = z[i]
+        var x2 = x[j]
+        var y2 = y[j]
+        var z2 = z[j]
+
+        # Compute distance and energy
+        var r = compute_distance(x1, y1, z1, x2, y2, z2)
+        var energy = bond_energy_single(r, bond_r0[b], bond_kb[b])
+        total_energy += energy
+
+    return total_energy
+
+
+fn compute_total_bond_energy_kahan(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Bond topology
+    bond_i: type_of(alloc[Int32](1)),
+    bond_j: type_of(alloc[Int32](1)),
+    # Bond parameters
+    bond_kb: type_of(alloc[Float32](1)),
+    bond_r0: type_of(alloc[Float32](1)),
+    # Number of bonds
+    num_bonds: Int
+) -> Float32:
+    """
+    Compute total bond stretching energy with Kahan summation.
+
+    More accurate accumulation for many bonds to prevent FP32 drift.
+    """
+    var total_energy: Float32 = 0.0
+    var compensation: Float32 = 0.0
+
+    for b in range(num_bonds):
+        var i = Int(bond_i[b])
+        var j = Int(bond_j[b])
+
+        # Get positions
+        var x1 = x[i]
+        var y1 = y[i]
+        var z1 = z[i]
+        var x2 = x[j]
+        var y2 = y[j]
+        var z2 = z[j]
+
+        # Compute distance and energy
+        var r = compute_distance(x1, y1, z1, x2, y2, z2)
+        var energy = bond_energy_single(r, bond_r0[b], bond_kb[b])
+
+        # Kahan summation
+        var y_val = energy - compensation
+        var t = total_energy + y_val
+        compensation = (t - total_energy) - y_val
+        total_energy = t
+
+    return total_energy
+
+
+# =============================================================================
+# Angle Bending
+# E_angle = 0.043844 * ka * dtheta^2 * (1 - 0.007*dtheta)
+# =============================================================================
+
+fn compute_angle(
+    x1: Float32, y1: Float32, z1: Float32,  # Atom i
+    x2: Float32, y2: Float32, z2: Float32,  # Atom j (central)
+    x3: Float32, y3: Float32, z3: Float32   # Atom k
+) -> Float32:
+    """
+    Compute angle i-j-k in radians.
+
+    Returns the angle at central atom j.
+    """
+    # Vectors from central atom j to i and k
+    var v1x = x1 - x2
+    var v1y = y1 - y2
+    var v1z = z1 - z2
+
+    var v2x = x3 - x2
+    var v2y = y3 - y2
+    var v2z = z3 - z2
+
+    # Magnitudes
+    var r1 = sqrt(v1x * v1x + v1y * v1y + v1z * v1z)
+    var r2 = sqrt(v2x * v2x + v2y * v2y + v2z * v2z)
+
+    if r1 < Float32(1e-8) or r2 < Float32(1e-8):
+        return Float32(0.0)
+
+    # Dot product and cosine
+    var dot = v1x * v2x + v1y * v2y + v1z * v2z
+    var cos_theta = dot / (r1 * r2)
+
+    # Clamp to [-1, 1] to avoid acos domain errors
+    if cos_theta > Float32(1.0):
+        cos_theta = Float32(1.0)
+    elif cos_theta < Float32(-1.0):
+        cos_theta = Float32(-1.0)
+
+    return acos(cos_theta)
+
+
+fn angle_energy_single(
+    theta: Float32,    # Current angle in radians
+    theta0: Float32,   # Equilibrium angle in radians
+    ka: Float32        # Force constant
+) -> Float32:
+    """
+    MMFF94 angle bending energy for a single angle.
+
+    E = 0.043844 * ka * dtheta^2 * (1 - 0.007*dtheta)
+
+    where:
+        dtheta = theta - theta0 (in degrees for the cubic term)
+    """
+    var dtheta_rad = theta - theta0
+    var dtheta_deg = dtheta_rad * RAD_TO_DEG  # Convert to degrees for sextic term
+    var dtheta_deg2 = dtheta_deg * dtheta_deg
+
+    # MMFF uses degrees in the polynomial but radians^2 in the main term
+    var energy = MMFF_ANGLE_PREFACTOR * ka * dtheta_deg2 * (
+        Float32(1.0) + MMFF_ANGLE_SEXTIC * dtheta_deg
+    )
+    return energy
+
+
+fn angle_energy_and_gradient(
+    theta: Float32,
+    theta0: Float32,
+    ka: Float32
+) -> Tuple[Float32, Float32]:
+    """
+    Compute angle energy and its gradient dE/dtheta.
+
+    dE/dtheta = 0.043844 * ka * 2*dtheta * (1 - 0.007*dtheta) +
+                0.043844 * ka * dtheta^2 * (-0.007)
+              = 0.043844 * ka * dtheta * (2 - 0.021*dtheta)
+
+    Returns (energy, dE/d_theta_deg) - gradient w.r.t degrees.
+    """
+    var dtheta_rad = theta - theta0
+    var dtheta_deg = dtheta_rad * RAD_TO_DEG
+    var dtheta_deg2 = dtheta_deg * dtheta_deg
+
+    var energy = MMFF_ANGLE_PREFACTOR * ka * dtheta_deg2 * (
+        Float32(1.0) + MMFF_ANGLE_SEXTIC * dtheta_deg
+    )
+
+    # Gradient w.r.t. theta in degrees
+    var gradient_deg = MMFF_ANGLE_PREFACTOR * ka * dtheta_deg * (
+        Float32(2.0) + Float32(3.0) * MMFF_ANGLE_SEXTIC * dtheta_deg
+    )
+
+    # Convert to gradient w.r.t. theta in radians
+    var gradient_rad = gradient_deg * RAD_TO_DEG
+
+    return (energy, gradient_rad)
+
+
+fn compute_angle_forces(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Gradients (output)
+    grad_x: type_of(alloc[Float32](1)),
+    grad_y: type_of(alloc[Float32](1)),
+    grad_z: type_of(alloc[Float32](1)),
+    # Angle topology
+    angle_i: type_of(alloc[Int32](1)),
+    angle_j: type_of(alloc[Int32](1)),
+    angle_k: type_of(alloc[Int32](1)),
+    # Angle parameters
+    angle_ka: type_of(alloc[Float32](1)),
+    angle_theta0: type_of(alloc[Float32](1)),
+    # Range
+    angle_start: Int,
+    angle_end: Int
+) -> Float32:
+    """
+    Compute angle bending energy and accumulate forces.
+
+    Returns total angle energy for the given range.
+    Accumulates gradients into grad_x, grad_y, grad_z.
+    """
+    var total_energy: Float32 = 0.0
+
+    for a in range(angle_start, angle_end):
+        var i = Int(angle_i[a])
+        var j = Int(angle_j[a])  # Central atom
+        var k = Int(angle_k[a])
+
+        # Get positions
+        var x1 = x[i]
+        var y1 = y[i]
+        var z1 = z[i]
+        var x2 = x[j]
+        var y2 = y[j]
+        var z2 = z[j]
+        var x3 = x[k]
+        var y3 = y[k]
+        var z3 = z[k]
+
+        # Vectors from central atom
+        var v1x = x1 - x2
+        var v1y = y1 - y2
+        var v1z = z1 - z2
+        var v2x = x3 - x2
+        var v2y = y3 - y2
+        var v2z = z3 - z2
+
+        var r1 = sqrt(v1x * v1x + v1y * v1y + v1z * v1z)
+        var r2 = sqrt(v2x * v2x + v2y * v2y + v2z * v2z)
+
+        if r1 < Float32(1e-8) or r2 < Float32(1e-8):
+            continue
+
+        # Compute angle
+        var dot = v1x * v2x + v1y * v2y + v1z * v2z
+        var cos_theta = dot / (r1 * r2)
+        if cos_theta > Float32(1.0):
+            cos_theta = Float32(1.0)
+        elif cos_theta < Float32(-1.0):
+            cos_theta = Float32(-1.0)
+
+        var theta = acos(cos_theta)
+        var sin_theta = sin(theta)
+
+        # Avoid singularity at linear angles
+        if sin_theta < Float32(1e-8):
+            sin_theta = Float32(1e-8)
+
+        # Compute energy and gradient
+        var result = angle_energy_and_gradient(theta, angle_theta0[a], angle_ka[a])
+        var energy = result[0]
+        var dE_dtheta = result[1]
+
+        total_energy += energy
+
+        # Compute dtheta/d(xyz) using chain rule
+        # d(cos(theta))/d(xyz) then convert to dtheta
+        var inv_r1 = Float32(1.0) / r1
+        var inv_r2 = Float32(1.0) / r2
+        var inv_sin = Float32(1.0) / sin_theta
+
+        # Normalize vectors
+        var u1x = v1x * inv_r1
+        var u1y = v1y * inv_r1
+        var u1z = v1z * inv_r1
+        var u2x = v2x * inv_r2
+        var u2y = v2y * inv_r2
+        var u2z = v2z * inv_r2
+
+        # dtheta/d(atom_i) = -1/(r1*sin_theta) * (u2 - cos_theta*u1)
+        var factor_i = -dE_dtheta * inv_r1 * inv_sin
+        var fix = factor_i * (u2x - cos_theta * u1x)
+        var fiy = factor_i * (u2y - cos_theta * u1y)
+        var fiz = factor_i * (u2z - cos_theta * u1z)
+
+        # dtheta/d(atom_k) = -1/(r2*sin_theta) * (u1 - cos_theta*u2)
+        var factor_k = -dE_dtheta * inv_r2 * inv_sin
+        var fkx = factor_k * (u1x - cos_theta * u2x)
+        var fky = factor_k * (u1y - cos_theta * u2y)
+        var fkz = factor_k * (u1z - cos_theta * u2z)
+
+        # Force on central atom j = -(force_i + force_k)
+        var fjx = -(fix + fkx)
+        var fjy = -(fiy + fky)
+        var fjz = -(fiz + fkz)
+
+        # Accumulate gradients
+        grad_x[i] = grad_x[i] + fix
+        grad_y[i] = grad_y[i] + fiy
+        grad_z[i] = grad_z[i] + fiz
+        grad_x[j] = grad_x[j] + fjx
+        grad_y[j] = grad_y[j] + fjy
+        grad_z[j] = grad_z[j] + fjz
+        grad_x[k] = grad_x[k] + fkx
+        grad_y[k] = grad_y[k] + fky
+        grad_z[k] = grad_z[k] + fkz
+
+    return total_energy
+
+
+fn compute_total_angle_energy(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Angle topology
+    angle_i: type_of(alloc[Int32](1)),
+    angle_j: type_of(alloc[Int32](1)),
+    angle_k: type_of(alloc[Int32](1)),
+    # Angle parameters
+    angle_ka: type_of(alloc[Float32](1)),
+    angle_theta0: type_of(alloc[Float32](1)),
+    # Number of angles
+    num_angles: Int
+) -> Float32:
+    """
+    Compute total angle bending energy (no gradients).
+    """
+    var total_energy: Float32 = 0.0
+
+    for a in range(num_angles):
+        var i = Int(angle_i[a])
+        var j = Int(angle_j[a])
+        var k = Int(angle_k[a])
+
+        # Compute angle
+        var theta = compute_angle(
+            x[i], y[i], z[i],
+            x[j], y[j], z[j],
+            x[k], y[k], z[k]
+        )
+
+        var energy = angle_energy_single(theta, angle_theta0[a], angle_ka[a])
+        total_energy += energy
+
+    return total_energy
+
+
+# =============================================================================
+# Torsion
+# E_torsion = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
+# =============================================================================
+
+fn compute_torsion_angle(
+    x1: Float32, y1: Float32, z1: Float32,  # Atom i
+    x2: Float32, y2: Float32, z2: Float32,  # Atom j
+    x3: Float32, y3: Float32, z3: Float32,  # Atom k
+    x4: Float32, y4: Float32, z4: Float32   # Atom l
+) -> Float32:
+    """
+    Compute torsion angle i-j-k-l in radians.
+
+    Uses the standard IUPAC definition with atan2.
+    """
+    # Bond vectors
+    var b1x = x2 - x1
+    var b1y = y2 - y1
+    var b1z = z2 - z1
+
+    var b2x = x3 - x2
+    var b2y = y3 - y2
+    var b2z = z3 - z2
+
+    var b3x = x4 - x3
+    var b3y = y4 - y3
+    var b3z = z4 - z3
+
+    # Normal vectors to the planes
+    # n1 = b1 x b2
+    var n1x = b1y * b2z - b1z * b2y
+    var n1y = b1z * b2x - b1x * b2z
+    var n1z = b1x * b2y - b1y * b2x
+
+    # n2 = b2 x b3
+    var n2x = b2y * b3z - b2z * b3y
+    var n2y = b2z * b3x - b2x * b3z
+    var n2z = b2x * b3y - b2y * b3x
+
+    # m1 = n1 x b2/|b2|
+    var b2_len = sqrt(b2x * b2x + b2y * b2y + b2z * b2z)
+    if b2_len < Float32(1e-8):
+        return Float32(0.0)
+
+    var b2_inv = Float32(1.0) / b2_len
+    var m1x = n1y * b2z * b2_inv - n1z * b2y * b2_inv
+    var m1y = n1z * b2x * b2_inv - n1x * b2z * b2_inv
+    var m1z = n1x * b2y * b2_inv - n1y * b2x * b2_inv
+
+    # x = n1 . n2
+    var x_val = n1x * n2x + n1y * n2y + n1z * n2z
+    # y = m1 . n2
+    var y_val = m1x * n2x + m1y * n2y + m1z * n2z
+
+    return atan2(y_val, x_val)
+
+
+fn torsion_energy_single(
+    phi: Float32,     # Current torsion angle in radians
+    v1: Float32,      # Fourier coefficient for cos(phi)
+    v2: Float32,      # Fourier coefficient for cos(2*phi)
+    v3: Float32       # Fourier coefficient for cos(3*phi)
+) -> Float32:
+    """
+    MMFF94 torsion energy for a single torsion.
+
+    E = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
+    """
+    var cos_phi = cos(phi)
+    var cos_2phi = cos(Float32(2.0) * phi)
+    var cos_3phi = cos(Float32(3.0) * phi)
+
+    var energy = Float32(0.5) * (
+        v1 * (Float32(1.0) + cos_phi) +
+        v2 * (Float32(1.0) - cos_2phi) +
+        v3 * (Float32(1.0) + cos_3phi)
+    )
+    return energy
+
+
+fn torsion_energy_and_gradient(
+    phi: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32
+) -> Tuple[Float32, Float32]:
+    """
+    Compute torsion energy and its gradient dE/dphi.
+
+    dE/dphi = 0.5 * (-V1*sin(phi) + 2*V2*sin(2*phi) - 3*V3*sin(3*phi))
+    """
+    var cos_phi = cos(phi)
+    var cos_2phi = cos(Float32(2.0) * phi)
+    var cos_3phi = cos(Float32(3.0) * phi)
+    var sin_phi = sin(phi)
+    var sin_2phi = sin(Float32(2.0) * phi)
+    var sin_3phi = sin(Float32(3.0) * phi)
+
+    var energy = Float32(0.5) * (
+        v1 * (Float32(1.0) + cos_phi) +
+        v2 * (Float32(1.0) - cos_2phi) +
+        v3 * (Float32(1.0) + cos_3phi)
+    )
+
+    var gradient = Float32(0.5) * (
+        -v1 * sin_phi +
+        Float32(2.0) * v2 * sin_2phi -
+        Float32(3.0) * v3 * sin_3phi
+    )
+
+    return (energy, gradient)
+
+
+fn compute_torsion_forces(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Gradients (output)
+    grad_x: type_of(alloc[Float32](1)),
+    grad_y: type_of(alloc[Float32](1)),
+    grad_z: type_of(alloc[Float32](1)),
+    # Torsion topology
+    torsion_i: type_of(alloc[Int32](1)),
+    torsion_j: type_of(alloc[Int32](1)),
+    torsion_k: type_of(alloc[Int32](1)),
+    torsion_l: type_of(alloc[Int32](1)),
+    # Torsion parameters
+    torsion_v1: type_of(alloc[Float32](1)),
+    torsion_v2: type_of(alloc[Float32](1)),
+    torsion_v3: type_of(alloc[Float32](1)),
+    # Range
+    torsion_start: Int,
+    torsion_end: Int
+) -> Float32:
+    """
+    Compute torsion energy and accumulate forces.
+
+    Uses the standard formulation for torsion derivatives.
+    """
+    var total_energy: Float32 = 0.0
+
+    for t in range(torsion_start, torsion_end):
+        var i = Int(torsion_i[t])
+        var j = Int(torsion_j[t])
+        var k = Int(torsion_k[t])
+        var l = Int(torsion_l[t])
+
+        # Get positions
+        var x1 = x[i]
+        var y1 = y[i]
+        var z1 = z[i]
+        var x2 = x[j]
+        var y2 = y[j]
+        var z2 = z[j]
+        var x3 = x[k]
+        var y3 = y[k]
+        var z3 = z[k]
+        var x4 = x[l]
+        var y4 = y[l]
+        var z4 = z[l]
+
+        # Bond vectors
+        var b1x = x2 - x1
+        var b1y = y2 - y1
+        var b1z = z2 - z1
+
+        var b2x = x3 - x2
+        var b2y = y3 - y2
+        var b2z = z3 - z2
+
+        var b3x = x4 - x3
+        var b3y = y4 - y3
+        var b3z = z4 - z3
+
+        # Cross products for plane normals
+        var n1x = b1y * b2z - b1z * b2y
+        var n1y = b1z * b2x - b1x * b2z
+        var n1z = b1x * b2y - b1y * b2x
+
+        var n2x = b2y * b3z - b2z * b3y
+        var n2y = b2z * b3x - b2x * b3z
+        var n2z = b2x * b3y - b2y * b3x
+
+        # Magnitudes
+        var n1_sq = n1x * n1x + n1y * n1y + n1z * n1z
+        var n2_sq = n2x * n2x + n2y * n2y + n2z * n2z
+        var b2_sq = b2x * b2x + b2y * b2y + b2z * b2z
+
+        if n1_sq < Float32(1e-10) or n2_sq < Float32(1e-10) or b2_sq < Float32(1e-10):
+            continue
+
+        var b2_len = sqrt(b2_sq)
+
+        # Compute torsion angle
+        var m1x = n1y * b2z / b2_len - n1z * b2y / b2_len
+        var m1y = n1z * b2x / b2_len - n1x * b2z / b2_len
+        var m1z = n1x * b2y / b2_len - n1y * b2x / b2_len
+
+        var x_val = n1x * n2x + n1y * n2y + n1z * n2z
+        var y_val = m1x * n2x + m1y * n2y + m1z * n2z
+        var phi = atan2(y_val, x_val)
+
+        # Compute energy and gradient
+        var result = torsion_energy_and_gradient(
+            phi, torsion_v1[t], torsion_v2[t], torsion_v3[t]
+        )
+        var energy = result[0]
+        var dE_dphi = result[1]
+
+        total_energy += energy
+
+        # Compute forces using standard torsion gradient formulas
+        # dphi/dr_i = (b2_len / n1_sq) * n1
+        # dphi/dr_l = -(b2_len / n2_sq) * n2
+        # dphi/dr_j and dphi/dr_k involve both planes
+
+        var factor_i = dE_dphi * b2_len / n1_sq
+        var factor_l = -dE_dphi * b2_len / n2_sq
+
+        # Force on atom i
+        var fix = factor_i * n1x
+        var fiy = factor_i * n1y
+        var fiz = factor_i * n1z
+
+        # Force on atom l
+        var flx = factor_l * n2x
+        var fly = factor_l * n2y
+        var flz = factor_l * n2z
+
+        # Projections for j and k
+        var b1_dot_b2 = b1x * b2x + b1y * b2y + b1z * b2z
+        var b3_dot_b2 = b3x * b2x + b3y * b2y + b3z * b2z
+
+        var factor_j_from_i = -b1_dot_b2 / b2_sq - Float32(1.0)
+        var factor_j_from_l = b3_dot_b2 / b2_sq
+
+        var fjx = factor_j_from_i * fix + factor_j_from_l * flx
+        var fjy = factor_j_from_i * fiy + factor_j_from_l * fly
+        var fjz = factor_j_from_i * fiz + factor_j_from_l * flz
+
+        var factor_k_from_i = b1_dot_b2 / b2_sq
+        var factor_k_from_l = -b3_dot_b2 / b2_sq - Float32(1.0)
+
+        var fkx = factor_k_from_i * fix + factor_k_from_l * flx
+        var fky = factor_k_from_i * fiy + factor_k_from_l * fly
+        var fkz = factor_k_from_i * fiz + factor_k_from_l * flz
+
+        # Accumulate gradients
+        grad_x[i] = grad_x[i] + fix
+        grad_y[i] = grad_y[i] + fiy
+        grad_z[i] = grad_z[i] + fiz
+        grad_x[j] = grad_x[j] + fjx
+        grad_y[j] = grad_y[j] + fjy
+        grad_z[j] = grad_z[j] + fjz
+        grad_x[k] = grad_x[k] + fkx
+        grad_y[k] = grad_y[k] + fky
+        grad_z[k] = grad_z[k] + fkz
+        grad_x[l] = grad_x[l] + flx
+        grad_y[l] = grad_y[l] + fly
+        grad_z[l] = grad_z[l] + flz
+
+    return total_energy
+
+
+fn compute_total_torsion_energy(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Torsion topology
+    torsion_i: type_of(alloc[Int32](1)),
+    torsion_j: type_of(alloc[Int32](1)),
+    torsion_k: type_of(alloc[Int32](1)),
+    torsion_l: type_of(alloc[Int32](1)),
+    # Torsion parameters
+    torsion_v1: type_of(alloc[Float32](1)),
+    torsion_v2: type_of(alloc[Float32](1)),
+    torsion_v3: type_of(alloc[Float32](1)),
+    # Number of torsions
+    num_torsions: Int
+) -> Float32:
+    """
+    Compute total torsion energy (no gradients).
+    """
+    var total_energy: Float32 = 0.0
+
+    for t in range(num_torsions):
+        var i = Int(torsion_i[t])
+        var j = Int(torsion_j[t])
+        var k = Int(torsion_k[t])
+        var l = Int(torsion_l[t])
+
+        var phi = compute_torsion_angle(
+            x[i], y[i], z[i],
+            x[j], y[j], z[j],
+            x[k], y[k], z[k],
+            x[l], y[l], z[l]
+        )
+
+        var energy = torsion_energy_single(
+            phi, torsion_v1[t], torsion_v2[t], torsion_v3[t]
+        )
+        total_energy += energy
+
+    return total_energy
+
+
+# =============================================================================
+# Van der Waals
+# Buffered 14-7 potential: E_vdw = epsilon * (1.07*R*/(r+0.07*R*))^7 * (1.12*R*^7/(r^7+0.12*R*^7) - 2)
+# =============================================================================
+
+fn vdw_energy_single(
+    r: Float32,        # Current distance
+    epsilon: Float32,  # Well depth (kcal/mol)
+    r_star: Float32    # Equilibrium distance (Angstroms)
+) -> Float32:
+    """
+    MMFF94 buffered 14-7 van der Waals energy.
+
+    E = epsilon * (1.07*R*/(r+0.07*R*))^7 * (1.12*R*^7/(r^7+0.12*R*^7) - 2)
+
+    This form prevents singularities at r=0 and has correct asymptotic behavior.
+    """
+    # Constants
+    alias DELTA: Float32 = 0.07
+    alias GAMMA: Float32 = 0.12
+
+    var r_star_7 = pow(r_star, Float32(7.0))
+
+    # Repulsive term: (1.07*R*/(r+0.07*R*))^7
+    var denom_rep = r + DELTA * r_star
+    var ratio_rep = (Float32(1.0) + DELTA) * r_star / denom_rep
+    var rep_term = pow(ratio_rep, Float32(7.0))
+
+    # Attractive term: 1.12*R*^7/(r^7+0.12*R*^7) - 2
+    var r_7 = pow(r, Float32(7.0))
+    var denom_att = r_7 + GAMMA * r_star_7
+    var att_term = (Float32(1.0) + GAMMA) * r_star_7 / denom_att - Float32(2.0)
+
+    return epsilon * rep_term * att_term
+
+
+fn vdw_energy_and_gradient(
+    r: Float32,
+    epsilon: Float32,
+    r_star: Float32
+) -> Tuple[Float32, Float32]:
+    """
+    Compute vdW energy and its gradient dE/dr.
+    """
+    alias DELTA: Float32 = 0.07
+    alias GAMMA: Float32 = 0.12
+
+    var r_star_7 = pow(r_star, Float32(7.0))
+    var r_6 = pow(r, Float32(6.0))
+    var r_7 = r * r_6
+
+    # Repulsive components
+    var denom_rep = r + DELTA * r_star
+    var ratio_rep = (Float32(1.0) + DELTA) * r_star / denom_rep
+    var rep_term = pow(ratio_rep, Float32(7.0))
+
+    # Attractive components
+    var denom_att = r_7 + GAMMA * r_star_7
+    var att_ratio = (Float32(1.0) + GAMMA) * r_star_7 / denom_att
+    var att_term = att_ratio - Float32(2.0)
+
+    var energy = epsilon * rep_term * att_term
+
+    # Derivatives
+    # d(rep_term)/dr = -7 * rep_term / denom_rep
+    var d_rep = -Float32(7.0) * rep_term / denom_rep
+
+    # d(att_ratio)/dr = -7 * att_ratio * r^6 / denom_att
+    var d_att = -Float32(7.0) * att_ratio * r_6 / denom_att
+
+    # Chain rule
+    var gradient = epsilon * (d_rep * att_term + rep_term * d_att)
+
+    return (energy, gradient)
+
+
+fn compute_vdw_forces(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Gradients (output)
+    grad_x: type_of(alloc[Float32](1)),
+    grad_y: type_of(alloc[Float32](1)),
+    grad_z: type_of(alloc[Float32](1)),
+    # Nonbonded pair indices
+    nb_i: type_of(alloc[Int32](1)),
+    nb_j: type_of(alloc[Int32](1)),
+    nb_is_1_4: type_of(alloc[Int32](1)),
+    # vdW parameters
+    nb_epsilon: type_of(alloc[Float32](1)),
+    nb_r_star: type_of(alloc[Float32](1)),
+    # Range
+    nb_start: Int,
+    nb_end: Int,
+    # Scale factor for 1-4 interactions
+    scale_1_4: Float32
+) -> Float32:
+    """
+    Compute vdW energy and accumulate forces.
+
+    1-4 interactions are scaled by scale_1_4 (typically 0.75).
+    """
+    var total_energy: Float32 = 0.0
+
+    for p in range(nb_start, nb_end):
+        var i = Int(nb_i[p])
+        var j = Int(nb_j[p])
+
+        # Get positions
+        var x1 = x[i]
+        var y1 = y[i]
+        var z1 = z[i]
+        var x2 = x[j]
+        var y2 = y[j]
+        var z2 = z[j]
+
+        # Compute distance
+        var dx = x2 - x1
+        var dy = y2 - y1
+        var dz = z2 - z1
+        var r = sqrt(dx * dx + dy * dy + dz * dz)
+
+        if r < Float32(0.1):  # Avoid very close contacts
+            continue
+
+        # Apply 1-4 scaling
+        var scale = Float32(1.0)
+        if nb_is_1_4[p] != 0:
+            scale = scale_1_4
+
+        # Compute energy and gradient
+        var result = vdw_energy_and_gradient(r, nb_epsilon[p], nb_r_star[p])
+        var energy = result[0] * scale
+        var dE_dr = result[1] * scale
+
+        total_energy += energy
+
+        # Convert to Cartesian forces
+        var inv_r = Float32(1.0) / r
+        var fx = dE_dr * dx * inv_r
+        var fy = dE_dr * dy * inv_r
+        var fz = dE_dr * dz * inv_r
+
+        # Accumulate gradients
+        grad_x[i] = grad_x[i] - fx
+        grad_y[i] = grad_y[i] - fy
+        grad_z[i] = grad_z[i] - fz
+        grad_x[j] = grad_x[j] + fx
+        grad_y[j] = grad_y[j] + fy
+        grad_z[j] = grad_z[j] + fz
+
+    return total_energy
+
+
+fn compute_total_vdw_energy(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Nonbonded pair indices
+    nb_i: type_of(alloc[Int32](1)),
+    nb_j: type_of(alloc[Int32](1)),
+    nb_is_1_4: type_of(alloc[Int32](1)),
+    # vdW parameters
+    nb_epsilon: type_of(alloc[Float32](1)),
+    nb_r_star: type_of(alloc[Float32](1)),
+    # Number of pairs
+    num_pairs: Int,
+    # Scale factor for 1-4 interactions
+    scale_1_4: Float32
+) -> Float32:
+    """
+    Compute total vdW energy (no gradients).
+    """
+    var total_energy: Float32 = 0.0
+
+    for p in range(num_pairs):
+        var i = Int(nb_i[p])
+        var j = Int(nb_j[p])
+
+        var dx = x[j] - x[i]
+        var dy = y[j] - y[i]
+        var dz = z[j] - z[i]
+        var r = sqrt(dx * dx + dy * dy + dz * dz)
+
+        if r < Float32(0.1):
+            continue
+
+        var scale = Float32(1.0)
+        if nb_is_1_4[p] != 0:
+            scale = scale_1_4
+
+        var energy = vdw_energy_single(r, nb_epsilon[p], nb_r_star[p])
+        total_energy += energy * scale
+
+    return total_energy
+
+
+# =============================================================================
+# Electrostatics
+# E_elec = 332.0716 * qi * qj / (D * (r + delta))
+# =============================================================================
+
+fn electrostatic_energy_single(
+    r: Float32,       # Distance
+    qi: Float32,      # Charge on atom i
+    qj: Float32,      # Charge on atom j
+    dielectric: Float32  # Dielectric constant (1.0 for vacuum, r for distance-dependent)
+) -> Float32:
+    """
+    MMFF94 electrostatic energy.
+
+    E = 332.0716 * qi * qj / (D * (r + 0.05))
+
+    The buffer of 0.05 A prevents singularities at short distances.
+    """
+    var r_eff = r + MMFF_ELEC_BUFFER
+    return MMFF_ELEC_CONSTANT * qi * qj / (dielectric * r_eff)
+
+
+fn electrostatic_energy_and_gradient(
+    r: Float32,
+    qi: Float32,
+    qj: Float32,
+    dielectric: Float32,
+    use_distance_dielectric: Bool
+) -> Tuple[Float32, Float32]:
+    """
+    Compute electrostatic energy and its gradient dE/dr.
+
+    If use_distance_dielectric=True, D=r and:
+        E = 332.0716 * qi * qj / (r * (r + 0.05))
+        dE/dr = -332.0716 * qi * qj * (2r + 0.05) / (r^2 * (r + 0.05)^2)
+
+    If use_distance_dielectric=False, D=dielectric (constant) and:
+        E = 332.0716 * qi * qj / (D * (r + 0.05))
+        dE/dr = -332.0716 * qi * qj / (D * (r + 0.05)^2)
+    """
+    var r_eff = r + MMFF_ELEC_BUFFER
+    var qq = qi * qj
+
+    if use_distance_dielectric:
+        # Distance-dependent dielectric: D = r
+        var energy = MMFF_ELEC_CONSTANT * qq / (r * r_eff)
+
+        # Gradient: d/dr [1/(r*(r+d))] = -(2r+d)/(r^2*(r+d)^2)
+        var gradient = -MMFF_ELEC_CONSTANT * qq * (Float32(2.0) * r + MMFF_ELEC_BUFFER) / (
+            r * r * r_eff * r_eff
+        )
+        return (energy, gradient)
+    else:
+        # Constant dielectric
+        var energy = MMFF_ELEC_CONSTANT * qq / (dielectric * r_eff)
+
+        # Gradient: d/dr [1/(r+d)] = -1/(r+d)^2
+        var gradient = -MMFF_ELEC_CONSTANT * qq / (dielectric * r_eff * r_eff)
+        return (energy, gradient)
+
+
+fn compute_electrostatic_forces(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Gradients (output)
+    grad_x: type_of(alloc[Float32](1)),
+    grad_y: type_of(alloc[Float32](1)),
+    grad_z: type_of(alloc[Float32](1)),
+    # Charges
+    charge: type_of(alloc[Float32](1)),
+    # Nonbonded pair indices
+    nb_i: type_of(alloc[Int32](1)),
+    nb_j: type_of(alloc[Int32](1)),
+    nb_is_1_4: type_of(alloc[Int32](1)),
+    # Range
+    nb_start: Int,
+    nb_end: Int,
+    # Options
+    dielectric: Float32,
+    use_distance_dielectric: Bool,
+    scale_1_4: Float32
+) -> Float32:
+    """
+    Compute electrostatic energy and accumulate forces.
+
+    1-4 interactions are scaled by scale_1_4 (typically 0.75).
+    """
+    var total_energy: Float32 = 0.0
+
+    for p in range(nb_start, nb_end):
+        var i = Int(nb_i[p])
+        var j = Int(nb_j[p])
+
+        var qi = charge[i]
+        var qj = charge[j]
+
+        # Skip if either charge is zero
+        if qi == Float32(0.0) or qj == Float32(0.0):
+            continue
+
+        # Get positions
+        var x1 = x[i]
+        var y1 = y[i]
+        var z1 = z[i]
+        var x2 = x[j]
+        var y2 = y[j]
+        var z2 = z[j]
+
+        # Compute distance
+        var dx = x2 - x1
+        var dy = y2 - y1
+        var dz = z2 - z1
+        var r = sqrt(dx * dx + dy * dy + dz * dz)
+
+        if r < Float32(0.1):  # Avoid very close contacts
+            continue
+
+        # Apply 1-4 scaling
+        var scale = Float32(1.0)
+        if nb_is_1_4[p] != 0:
+            scale = scale_1_4
+
+        # Compute energy and gradient
+        var result = electrostatic_energy_and_gradient(
+            r, qi, qj, dielectric, use_distance_dielectric
+        )
+        var energy = result[0] * scale
+        var dE_dr = result[1] * scale
+
+        total_energy += energy
+
+        # Convert to Cartesian forces
+        var inv_r = Float32(1.0) / r
+        var fx = dE_dr * dx * inv_r
+        var fy = dE_dr * dy * inv_r
+        var fz = dE_dr * dz * inv_r
+
+        # Accumulate gradients
+        grad_x[i] = grad_x[i] - fx
+        grad_y[i] = grad_y[i] - fy
+        grad_z[i] = grad_z[i] - fz
+        grad_x[j] = grad_x[j] + fx
+        grad_y[j] = grad_y[j] + fy
+        grad_z[j] = grad_z[j] + fz
+
+    return total_energy
+
+
+fn compute_total_electrostatic_energy(
+    # Positions
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    # Charges
+    charge: type_of(alloc[Float32](1)),
+    # Nonbonded pair indices
+    nb_i: type_of(alloc[Int32](1)),
+    nb_j: type_of(alloc[Int32](1)),
+    nb_is_1_4: type_of(alloc[Int32](1)),
+    # Number of pairs
+    num_pairs: Int,
+    # Options
+    dielectric: Float32,
+    use_distance_dielectric: Bool,
+    scale_1_4: Float32
+) -> Float32:
+    """
+    Compute total electrostatic energy (no gradients).
+    """
+    var total_energy: Float32 = 0.0
+
+    for p in range(num_pairs):
+        var i = Int(nb_i[p])
+        var j = Int(nb_j[p])
+
+        var qi = charge[i]
+        var qj = charge[j]
+
+        if qi == Float32(0.0) or qj == Float32(0.0):
+            continue
+
+        var dx = x[j] - x[i]
+        var dy = y[j] - y[i]
+        var dz = z[j] - z[i]
+        var r = sqrt(dx * dx + dy * dy + dz * dz)
+
+        if r < Float32(0.1):
+            continue
+
+        var scale = Float32(1.0)
+        if nb_is_1_4[p] != 0:
+            scale = scale_1_4
+
+        var energy: Float32 = 0.0
+        if use_distance_dielectric:
+            energy = MMFF_ELEC_CONSTANT * qi * qj / (r * (r + MMFF_ELEC_BUFFER))
+        else:
+            energy = MMFF_ELEC_CONSTANT * qi * qj / (dielectric * (r + MMFF_ELEC_BUFFER))
+
+        total_energy += energy * scale
+
+    return total_energy
+
+
+# =============================================================================
+# Total Energy & Options
+# =============================================================================
+
+struct MMFF94Options(Copyable, Movable):
+    """Configuration options for MMFF94 calculations."""
+    var dielectric: Float32
+    var use_distance_dielectric: Bool
+    var vdw_1_4_scale: Float32
+    var elec_1_4_scale: Float32
+    var compute_bonds: Bool
+    var compute_angles: Bool
+    var compute_torsions: Bool
+    var compute_vdw: Bool
+    var compute_elec: Bool
+
+    fn __init__(out self):
+        """Default MMFF94 options."""
+        self.dielectric = DEFAULT_DIELECTRIC
+        self.use_distance_dielectric = True
+        self.vdw_1_4_scale = DEFAULT_1_4_VDW_SCALE
+        self.elec_1_4_scale = DEFAULT_1_4_ELEC_SCALE
+        self.compute_bonds = True
+        self.compute_angles = True
+        self.compute_torsions = True
+        self.compute_vdw = True
+        self.compute_elec = True
+
+    fn __copyinit__(out self, other: Self):
+        self.dielectric = other.dielectric
+        self.use_distance_dielectric = other.use_distance_dielectric
+        self.vdw_1_4_scale = other.vdw_1_4_scale
+        self.elec_1_4_scale = other.elec_1_4_scale
+        self.compute_bonds = other.compute_bonds
+        self.compute_angles = other.compute_angles
+        self.compute_torsions = other.compute_torsions
+        self.compute_vdw = other.compute_vdw
+        self.compute_elec = other.compute_elec
+
+    fn __moveinit__(out self, deinit other: Self):
+        self.dielectric = other.dielectric
+        self.use_distance_dielectric = other.use_distance_dielectric
+        self.vdw_1_4_scale = other.vdw_1_4_scale
+        self.elec_1_4_scale = other.elec_1_4_scale
+        self.compute_bonds = other.compute_bonds
+        self.compute_angles = other.compute_angles
+        self.compute_torsions = other.compute_torsions
+        self.compute_vdw = other.compute_vdw
+        self.compute_elec = other.compute_elec
+
+
+struct EnergyComponents(Copyable, Movable):
+    """Breakdown of energy components."""
+    var bond: Float32
+    var angle: Float32
+    var torsion: Float32
+    var vdw: Float32
+    var elec: Float32
+    var total: Float32
+
+    fn __init__(out self):
+        self.bond = 0.0
+        self.angle = 0.0
+        self.torsion = 0.0
+        self.vdw = 0.0
+        self.elec = 0.0
+        self.total = 0.0
+
+    fn __copyinit__(out self, other: Self):
+        self.bond = other.bond
+        self.angle = other.angle
+        self.torsion = other.torsion
+        self.vdw = other.vdw
+        self.elec = other.elec
+        self.total = other.total
+
+    fn __moveinit__(out self, deinit other: Self):
+        self.bond = other.bond
+        self.angle = other.angle
+        self.torsion = other.torsion
+        self.vdw = other.vdw
+        self.elec = other.elec
+        self.total = other.total
+
+    fn sum(mut self):
+        """Compute total from components."""
+        self.total = self.bond + self.angle + self.torsion + self.vdw + self.elec
+
+
+fn compute_mmff94_energy(
+    # Atom data
+    x: type_of(alloc[Float32](1)),
+    y: type_of(alloc[Float32](1)),
+    z: type_of(alloc[Float32](1)),
+    charge: type_of(alloc[Float32](1)),
+    num_atoms: Int,
+    # Bond data
+    bond_i: type_of(alloc[Int32](1)),
+    bond_j: type_of(alloc[Int32](1)),
+    bond_kb: type_of(alloc[Float32](1)),
+    bond_r0: type_of(alloc[Float32](1)),
+    num_bonds: Int,
+    # Angle data
+    angle_i: type_of(alloc[Int32](1)),
+    angle_j: type_of(alloc[Int32](1)),
+    angle_k: type_of(alloc[Int32](1)),
+    angle_ka: type_of(alloc[Float32](1)),
+    angle_theta0: type_of(alloc[Float32](1)),
+    num_angles: Int,
+    # Torsion data
+    torsion_i: type_of(alloc[Int32](1)),
+    torsion_j: type_of(alloc[Int32](1)),
+    torsion_k: type_of(alloc[Int32](1)),
+    torsion_l: type_of(alloc[Int32](1)),
+    torsion_v1: type_of(alloc[Float32](1)),
+    torsion_v2: type_of(alloc[Float32](1)),
+    torsion_v3: type_of(alloc[Float32](1)),
+    num_torsions: Int,
+    # Nonbonded data
+    nb_i: type_of(alloc[Int32](1)),
+    nb_j: type_of(alloc[Int32](1)),
+    nb_is_1_4: type_of(alloc[Int32](1)),
+    nb_epsilon: type_of(alloc[Float32](1)),
+    nb_r_star: type_of(alloc[Float32](1)),
+    num_nb_pairs: Int,
+    # Options
+    opts: MMFF94Options
+) -> EnergyComponents:
+    """
+    Compute total MMFF94 energy with component breakdown.
+    """
+    var result = EnergyComponents()
+
+    if opts.compute_bonds:
+        result.bond = compute_total_bond_energy(
+            x, y, z, bond_i, bond_j, bond_kb, bond_r0, num_bonds
+        )
+
+    if opts.compute_angles:
+        result.angle = compute_total_angle_energy(
+            x, y, z, angle_i, angle_j, angle_k, angle_ka, angle_theta0, num_angles
+        )
+
+    if opts.compute_torsions:
+        result.torsion = compute_total_torsion_energy(
+            x, y, z, torsion_i, torsion_j, torsion_k, torsion_l,
+            torsion_v1, torsion_v2, torsion_v3, num_torsions
+        )
+
+    if opts.compute_vdw:
+        result.vdw = compute_total_vdw_energy(
+            x, y, z, nb_i, nb_j, nb_is_1_4, nb_epsilon, nb_r_star,
+            num_nb_pairs, opts.vdw_1_4_scale
+        )
+
+    if opts.compute_elec:
+        result.elec = compute_total_electrostatic_energy(
+            x, y, z, charge, nb_i, nb_j, nb_is_1_4, num_nb_pairs,
+            opts.dielectric, opts.use_distance_dielectric, opts.elec_1_4_scale
+        )
+
+    result.sum()
+    return result
+
+
+fn gradient_rms(
+    grad_x: type_of(alloc[Float32](1)),
+    grad_y: type_of(alloc[Float32](1)),
+    grad_z: type_of(alloc[Float32](1)),
+    num_atoms: Int
+) -> Float32:
+    """Compute RMS gradient for convergence checking."""
+    var sum_sq: Float32 = 0.0
+    for i in range(num_atoms):
+        sum_sq += grad_x[i] * grad_x[i]
+        sum_sq += grad_y[i] * grad_y[i]
+        sum_sq += grad_z[i] * grad_z[i]
+
+    return sqrt(sum_sq / Float32(3 * num_atoms))
+
+
+fn gradient_max(
+    grad_x: type_of(alloc[Float32](1)),
+    grad_y: type_of(alloc[Float32](1)),
+    grad_z: type_of(alloc[Float32](1)),
+    num_atoms: Int
+) -> Float32:
+    """Find maximum gradient component magnitude."""
+    var max_grad: Float32 = 0.0
+    for i in range(num_atoms):
+        var gx = abs(grad_x[i])
+        var gy = abs(grad_y[i])
+        var gz = abs(grad_z[i])
+        if gx > max_grad:
+            max_grad = gx
+        if gy > max_grad:
+            max_grad = gy
+        if gz > max_grad:
+            max_grad = gz
+
+    return max_grad
