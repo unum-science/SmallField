@@ -3,12 +3,7 @@
 # Updated for Mojo 0.25.7
 
 from math import sqrt, cos
-from memory import alloc
-
-
-# ============================================================================
-# CONSTANTS
-# ============================================================================
+from memory import UnsafePointer
 
 # Bond length estimates by bond order
 alias BOND_LENGTH_SINGLE: Float32 = 1.5     # A (typical C-C)
@@ -30,10 +25,6 @@ alias LCG_C: Int = 1013904223
 alias LCG_M: Int = 2147483647
 
 
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-
 fn get_pair_index(i: Int, j: Int, n: Int) -> Int:
     """
     Get linear index for pair (i, j) in upper triangular storage.
@@ -49,10 +40,6 @@ fn get_pair_index(i: Int, j: Int, n: Int) -> Int:
     return a * n - a * (a + 1) // 2 + b - a - 1
 
 
-# ============================================================================
-# DISTANCE BOUNDS
-# ============================================================================
-
 struct DistanceBounds(Copyable, Movable):
     """
     Symmetric matrix storing lower and upper distance bounds.
@@ -60,8 +47,8 @@ struct DistanceBounds(Copyable, Movable):
     Uses flat storage with row-major upper triangle for efficiency.
     Access pattern: bounds[i,j] where i < j.
     """
-    var lower: type_of(alloc[Float32](1))  # Lower bounds matrix
-    var upper: type_of(alloc[Float32](1))  # Upper bounds matrix
+    var lower: UnsafePointer[Float32]
+    var upper: UnsafePointer[Float32]
     var num_atoms: Int
     var matrix_size: Int  # n*(n-1)/2 elements
 
@@ -70,8 +57,8 @@ struct DistanceBounds(Copyable, Movable):
         self.num_atoms = num_atoms
         self.matrix_size = num_atoms * (num_atoms - 1) // 2
 
-        self.lower = alloc[Float32](self.matrix_size)
-        self.upper = alloc[Float32](self.matrix_size)
+        self.lower = UnsafePointer[Float32].alloc(self.matrix_size)
+        self.upper = UnsafePointer[Float32].alloc(self.matrix_size)
 
         # Initialize to infinity bounds
         for i in range(self.matrix_size):
@@ -82,8 +69,8 @@ struct DistanceBounds(Copyable, Movable):
         self.num_atoms = other.num_atoms
         self.matrix_size = other.matrix_size
 
-        self.lower = alloc[Float32](self.matrix_size)
-        self.upper = alloc[Float32](self.matrix_size)
+        self.lower = UnsafePointer[Float32].alloc(self.matrix_size)
+        self.upper = UnsafePointer[Float32].alloc(self.matrix_size)
 
         for i in range(self.matrix_size):
             self.lower[i] = other.lower[i]
@@ -137,18 +124,18 @@ struct DistanceBounds(Copyable, Movable):
 fn initialize_bounds_from_topology(
     mut bounds: DistanceBounds,
     # Bond topology
-    bond_i: type_of(alloc[Int32](1)),
-    bond_j: type_of(alloc[Int32](1)),
-    bond_length: type_of(alloc[Float32](1)),  # Rest lengths
+    bond_i: UnsafePointer[Int32],
+    bond_j: UnsafePointer[Int32],
+    bond_length: UnsafePointer[Float32],
     num_bonds: Int,
     # Angle topology
-    angle_i: type_of(alloc[Int32](1)),
-    angle_j: type_of(alloc[Int32](1)),
-    angle_k: type_of(alloc[Int32](1)),
-    angle_theta0: type_of(alloc[Float32](1)),  # Rest angles in radians
+    angle_i: UnsafePointer[Int32],
+    angle_j: UnsafePointer[Int32],
+    angle_k: UnsafePointer[Int32],
+    angle_theta0: UnsafePointer[Float32],
     num_angles: Int,
     # VdW radii for all atoms
-    vdw_radii: type_of(alloc[Float32](1)),
+    vdw_radii: UnsafePointer[Float32],
     num_atoms: Int
 ):
     """
@@ -210,7 +197,7 @@ fn initialize_bounds_from_topology(
 
 fn sample_distance_matrix(
     bounds: DistanceBounds,
-    mut distances: type_of(alloc[Float32](1)),
+    mut distances: UnsafePointer[Float32],
     seed: Int
 ):
     """
@@ -235,13 +222,9 @@ fn sample_distance_matrix(
             distances[idx] = dist
 
 
-# ============================================================================
-# TRIANGLE INEQUALITY SMOOTHING
-# ============================================================================
-
 fn smooth_bounds_triangle(
-    lower: type_of(alloc[Float32](1)),
-    upper: type_of(alloc[Float32](1)),
+    lower: UnsafePointer[Float32],
+    upper: UnsafePointer[Float32],
     num_atoms: Int
 ):
     """
@@ -294,8 +277,8 @@ fn smooth_bounds_triangle(
 
 
 fn check_bounds_validity(
-    lower: type_of(alloc[Float32](1)),
-    upper: type_of(alloc[Float32](1)),
+    lower: UnsafePointer[Float32],
+    upper: UnsafePointer[Float32],
     num_atoms: Int
 ) -> Bool:
     """
@@ -312,8 +295,8 @@ fn check_bounds_validity(
 
 
 fn smooth_bounds_fast(
-    lower: type_of(alloc[Float32](1)),
-    upper: type_of(alloc[Float32](1)),
+    lower: UnsafePointer[Float32],
+    upper: UnsafePointer[Float32],
     num_atoms: Int,
     max_passes: Int
 ):
@@ -378,13 +361,9 @@ fn smooth_bounds_fast(
                         lower[idx_ij] = new_lower
 
 
-# ============================================================================
-# MDS EMBEDDING
-# ============================================================================
-
 fn distance_to_gram_matrix(
-    distances: type_of(alloc[Float32](1)),
-    mut gram: type_of(alloc[Float32](1)),
+    distances: UnsafePointer[Float32],
+    mut gram: UnsafePointer[Float32],
     num_atoms: Int
 ):
     """
@@ -400,7 +379,7 @@ fn distance_to_gram_matrix(
     var n = num_atoms
 
     # Compute row averages of D^2
-    var row_avg = alloc[Float32](n)
+    var row_avg = UnsafePointer[Float32].alloc(n)
     var total_sum: Float32 = 0.0
 
     for i in range(n):
@@ -432,10 +411,10 @@ fn distance_to_gram_matrix(
 
 
 fn power_iteration_3d(
-    gram: type_of(alloc[Float32](1)),
-    mut x: type_of(alloc[Float32](1)),
-    mut y: type_of(alloc[Float32](1)),
-    mut z: type_of(alloc[Float32](1)),
+    gram: UnsafePointer[Float32],
+    mut x: UnsafePointer[Float32],
+    mut y: UnsafePointer[Float32],
+    mut z: UnsafePointer[Float32],
     num_atoms: Int,
     max_iterations: Int,
     tolerance: Float32
@@ -449,10 +428,10 @@ fn power_iteration_3d(
     var n = num_atoms
 
     # Allocate work vectors
-    var v1 = alloc[Float32](n)
-    var v2 = alloc[Float32](n)
-    var v3 = alloc[Float32](n)
-    var temp = alloc[Float32](n)
+    var v1 = UnsafePointer[Float32].alloc(n)
+    var v2 = UnsafePointer[Float32].alloc(n)
+    var v3 = UnsafePointer[Float32].alloc(n)
+    var temp = UnsafePointer[Float32].alloc(n)
 
     # Initialize with random vectors
     var seed = 42
@@ -502,9 +481,9 @@ fn power_iteration_3d(
 
 
 fn power_iterate(
-    gram: type_of(alloc[Float32](1)),
-    mut v: type_of(alloc[Float32](1)),
-    mut temp: type_of(alloc[Float32](1)),
+    gram: UnsafePointer[Float32],
+    mut v: UnsafePointer[Float32],
+    mut temp: UnsafePointer[Float32],
     n: Int,
     max_iterations: Int,
     tolerance: Float32
@@ -554,8 +533,8 @@ fn power_iterate(
 
 
 fn deflate_matrix(
-    mut gram: type_of(alloc[Float32](1)),
-    v: type_of(alloc[Float32](1)),
+    mut gram: UnsafePointer[Float32],
+    v: UnsafePointer[Float32],
     eigenvalue: Float32,
     n: Int
 ):
@@ -568,8 +547,8 @@ fn deflate_matrix(
 
 
 fn orthogonalize(
-    mut v: type_of(alloc[Float32](1)),
-    u: type_of(alloc[Float32](1)),
+    mut v: UnsafePointer[Float32],
+    u: UnsafePointer[Float32],
     n: Int
 ):
     """
@@ -587,7 +566,7 @@ fn orthogonalize(
             v[i] = v[i] - scale * u[i]
 
 
-fn normalize(mut v: type_of(alloc[Float32](1)), n: Int):
+fn normalize(mut v: UnsafePointer[Float32], n: Int):
     """Normalize vector to unit length."""
     var norm: Float32 = 0.0
     for i in range(n):
@@ -601,10 +580,10 @@ fn normalize(mut v: type_of(alloc[Float32](1)), n: Int):
 
 
 fn embed_from_distances(
-    distances: type_of(alloc[Float32](1)),
-    mut x: type_of(alloc[Float32](1)),
-    mut y: type_of(alloc[Float32](1)),
-    mut z: type_of(alloc[Float32](1)),
+    distances: UnsafePointer[Float32],
+    mut x: UnsafePointer[Float32],
+    mut y: UnsafePointer[Float32],
+    mut z: UnsafePointer[Float32],
     num_atoms: Int
 ):
     """
@@ -615,7 +594,7 @@ fn embed_from_distances(
     var n = num_atoms
 
     # Allocate Gram matrix
-    var gram = alloc[Float32](n * n)
+    var gram = UnsafePointer[Float32].alloc(n * n)
 
     # Convert distances to Gram matrix
     distance_to_gram_matrix(distances, gram, n)
@@ -643,16 +622,12 @@ fn embed_from_distances(
     gram.free()
 
 
-# ============================================================================
-# COORDINATE REFINEMENT
-# ============================================================================
-
 fn compute_distance_violations(
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
-    lower: type_of(alloc[Float32](1)),
-    upper: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Float32],
+    y: UnsafePointer[Float32],
+    z: UnsafePointer[Float32],
+    lower: UnsafePointer[Float32],
+    upper: UnsafePointer[Float32],
     num_atoms: Int
 ) -> Float32:
     """
@@ -683,11 +658,11 @@ fn compute_distance_violations(
 
 
 fn refine_coordinates(
-    mut x: type_of(alloc[Float32](1)),
-    mut y: type_of(alloc[Float32](1)),
-    mut z: type_of(alloc[Float32](1)),
-    lower: type_of(alloc[Float32](1)),
-    upper: type_of(alloc[Float32](1)),
+    mut x: UnsafePointer[Float32],
+    mut y: UnsafePointer[Float32],
+    mut z: UnsafePointer[Float32],
+    lower: UnsafePointer[Float32],
+    upper: UnsafePointer[Float32],
     num_atoms: Int,
     max_iterations: Int,
     tolerance: Float32
@@ -700,9 +675,9 @@ fn refine_coordinates(
     var n = num_atoms
 
     # Allocate gradients
-    var grad_x = alloc[Float32](n)
-    var grad_y = alloc[Float32](n)
-    var grad_z = alloc[Float32](n)
+    var grad_x = UnsafePointer[Float32].alloc(n)
+    var grad_y = UnsafePointer[Float32].alloc(n)
+    var grad_z = UnsafePointer[Float32].alloc(n)
 
     var step_size: Float32 = 0.1
 
@@ -775,12 +750,12 @@ fn refine_coordinates(
 
 
 fn chirality_check(
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
-    chiral_centers: type_of(alloc[Int32](1)),
-    chiral_neighbors: type_of(alloc[Int32](1)),  # 4 neighbors per center
-    expected_sign: type_of(alloc[Int32](1)),     # +1 or -1
+    x: UnsafePointer[Float32],
+    y: UnsafePointer[Float32],
+    z: UnsafePointer[Float32],
+    chiral_centers: UnsafePointer[Int32],
+    chiral_neighbors: UnsafePointer[Int32],
+    expected_sign: UnsafePointer[Int32],
     num_chiral: Int
 ) -> Bool:
     """
@@ -824,9 +799,9 @@ fn chirality_check(
 
 
 fn invert_coordinates(
-    mut x: type_of(alloc[Float32](1)),
-    mut y: type_of(alloc[Float32](1)),
-    mut z: type_of(alloc[Float32](1)),
+    mut x: UnsafePointer[Float32],
+    mut y: UnsafePointer[Float32],
+    mut z: UnsafePointer[Float32],
     num_atoms: Int
 ):
     """
@@ -839,9 +814,9 @@ fn invert_coordinates(
 
 
 fn random_perturbation(
-    mut x: type_of(alloc[Float32](1)),
-    mut y: type_of(alloc[Float32](1)),
-    mut z: type_of(alloc[Float32](1)),
+    mut x: UnsafePointer[Float32],
+    mut y: UnsafePointer[Float32],
+    mut z: UnsafePointer[Float32],
     num_atoms: Int,
     magnitude: Float32,
     seed: Int

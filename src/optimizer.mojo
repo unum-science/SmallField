@@ -3,12 +3,8 @@
 # Updated for Mojo 0.25.7
 
 from math import sqrt
-from memory import alloc
+from memory import UnsafePointer
 
-
-# ============================================================================
-# CONSTANTS
-# ============================================================================
 
 # L-BFGS parameters
 alias DEFAULT_HISTORY_SIZE: Int = 8
@@ -24,9 +20,7 @@ alias DEFAULT_MIN_STEP: Float32 = 1e-10
 alias DEFAULT_MAX_LINE_SEARCH_ITERS: Int = 20
 
 
-# ============================================================================
-# KAHAN SUMMATION
-# ============================================================================
+# Kahan summation
 
 struct KahanAccumulator(Copyable, Movable):
     """
@@ -71,7 +65,7 @@ struct KahanAccumulator(Copyable, Movable):
         self.compensation = 0.0
 
 
-fn kahan_sum(values: type_of(alloc[Float32](1)), n: Int) -> Float32:
+fn kahan_sum(values: UnsafePointer[Float32], n: Int) -> Float32:
     """
     Compute sum of array using Kahan summation.
     """
@@ -88,8 +82,8 @@ fn kahan_sum(values: type_of(alloc[Float32](1)), n: Int) -> Float32:
 
 
 fn kahan_dot_product(
-    a: type_of(alloc[Float32](1)),
-    b: type_of(alloc[Float32](1)),
+    a: UnsafePointer[Float32],
+    b: UnsafePointer[Float32],
     n: Int
 ) -> Float32:
     """
@@ -109,7 +103,7 @@ fn kahan_dot_product(
 
 
 fn kahan_norm_squared(
-    values: type_of(alloc[Float32](1)),
+    values: UnsafePointer[Float32],
     n: Int
 ) -> Float32:
     """
@@ -128,7 +122,7 @@ fn kahan_norm_squared(
     return sum
 
 
-fn neumaier_sum(values: type_of(alloc[Float32](1)), n: Int) -> Float32:
+fn neumaier_sum(values: UnsafePointer[Float32], n: Int) -> Float32:
     """
     Neumaier's improved Kahan summation.
 
@@ -154,9 +148,7 @@ fn neumaier_sum(values: type_of(alloc[Float32](1)), n: Int) -> Float32:
     return sum + compensation
 
 
-# ============================================================================
-# LINE SEARCH
-# ============================================================================
+# Line search
 
 struct LineSearchResult(Copyable, Movable):
     """Result of line search."""
@@ -185,12 +177,12 @@ struct LineSearchResult(Copyable, Movable):
 
 
 fn directional_derivative(
-    gradient: type_of(alloc[Float32](1)),
-    direction: type_of(alloc[Float32](1)),
+    gradient: UnsafePointer[Float32],
+    direction: UnsafePointer[Float32],
     n: Int
 ) -> Float32:
     """
-    Compute directional derivative: g^T * d
+    Compute directional derivative: g^T * d.
     """
     var dot: Float32 = 0.0
     for i in range(n):
@@ -199,10 +191,10 @@ fn directional_derivative(
 
 
 fn backtracking_line_search(
-    x_current: type_of(alloc[Float32](1)),
-    mut x_trial: type_of(alloc[Float32](1)),
-    direction: type_of(alloc[Float32](1)),
-    gradient: type_of(alloc[Float32](1)),
+    x_current: UnsafePointer[Float32],
+    x_trial: UnsafePointer[Float32],
+    direction: UnsafePointer[Float32],
+    gradient: UnsafePointer[Float32],
     current_energy: Float32,
     n: Int,
     # Energy function callback would be here in full implementation
@@ -230,12 +222,9 @@ fn backtracking_line_search(
     if dg >= Float32(0.0):
         # Not a descent direction
         result.success = False
-        return result
+        return result^
 
     var step = initial_step
-
-    # Armijo threshold
-    var threshold = c1 * dg
 
     # Set initial trial position
     for i in range(n):
@@ -245,17 +234,17 @@ fn backtracking_line_search(
     result.success = True  # Caller will evaluate
     result.iterations = 0
 
-    return result
+    return result^
 
 
 fn update_trial_position(
-    x_current: type_of(alloc[Float32](1)),
-    mut x_trial: type_of(alloc[Float32](1)),
-    direction: type_of(alloc[Float32](1)),
+    x_current: UnsafePointer[Float32],
+    x_trial: UnsafePointer[Float32],
+    direction: UnsafePointer[Float32],
     step: Float32,
     n: Int
 ):
-    """Update trial position: x_trial = x_current + step * direction"""
+    """Update trial position: x_trial = x_current + step * direction."""
     for i in range(n):
         x_trial[i] = x_current[i] + step * direction[i]
 
@@ -338,9 +327,7 @@ fn cubic_interpolation(
     return alpha_new
 
 
-# ============================================================================
-# L-BFGS OPTIMIZER
-# ============================================================================
+# L-BFGS optimizer
 
 struct LBFGSState(Copyable, Movable):
     """
@@ -355,23 +342,23 @@ struct LBFGSState(Copyable, Movable):
     var history_count: Int  # How many history entries are filled
 
     # Circular buffer for s = x_{k+1} - x_k
-    var s: type_of(alloc[Float32](1))  # [history_size * num_vars]
+    var s: UnsafePointer[Float32]  # [history_size * num_vars]
 
     # Circular buffer for y = g_{k+1} - g_k
-    var y: type_of(alloc[Float32](1))  # [history_size * num_vars]
+    var y: UnsafePointer[Float32]  # [history_size * num_vars]
 
     # rho = 1 / (y^T * s)
-    var rho: type_of(alloc[Float32](1))  # [history_size]
+    var rho: UnsafePointer[Float32]  # [history_size]
 
     # alpha for two-loop recursion (temporary)
-    var alpha: type_of(alloc[Float32](1))  # [history_size]
+    var alpha: UnsafePointer[Float32]  # [history_size]
 
     # Previous position and gradient
-    var prev_x: type_of(alloc[Float32](1))
-    var prev_g: type_of(alloc[Float32](1))
+    var prev_x: UnsafePointer[Float32]
+    var prev_g: UnsafePointer[Float32]
 
     # Search direction
-    var direction: type_of(alloc[Float32](1))
+    var direction: UnsafePointer[Float32]
 
     fn __init__(out self, num_atoms: Int, history_size: Int):
         """Initialize L-BFGS state."""
@@ -382,13 +369,13 @@ struct LBFGSState(Copyable, Movable):
 
         var buffer_size = history_size * self.num_vars
 
-        self.s = alloc[Float32](buffer_size)
-        self.y = alloc[Float32](buffer_size)
-        self.rho = alloc[Float32](history_size)
-        self.alpha = alloc[Float32](history_size)
-        self.prev_x = alloc[Float32](self.num_vars)
-        self.prev_g = alloc[Float32](self.num_vars)
-        self.direction = alloc[Float32](self.num_vars)
+        self.s = UnsafePointer[Float32].alloc(buffer_size)
+        self.y = UnsafePointer[Float32].alloc(buffer_size)
+        self.rho = UnsafePointer[Float32].alloc(history_size)
+        self.alpha = UnsafePointer[Float32].alloc(history_size)
+        self.prev_x = UnsafePointer[Float32].alloc(self.num_vars)
+        self.prev_g = UnsafePointer[Float32].alloc(self.num_vars)
+        self.direction = UnsafePointer[Float32].alloc(self.num_vars)
 
         # Initialize to zero
         for i in range(buffer_size):
@@ -412,13 +399,13 @@ struct LBFGSState(Copyable, Movable):
 
         var buffer_size = self.history_size * self.num_vars
 
-        self.s = alloc[Float32](buffer_size)
-        self.y = alloc[Float32](buffer_size)
-        self.rho = alloc[Float32](self.history_size)
-        self.alpha = alloc[Float32](self.history_size)
-        self.prev_x = alloc[Float32](self.num_vars)
-        self.prev_g = alloc[Float32](self.num_vars)
-        self.direction = alloc[Float32](self.num_vars)
+        self.s = UnsafePointer[Float32].alloc(buffer_size)
+        self.y = UnsafePointer[Float32].alloc(buffer_size)
+        self.rho = UnsafePointer[Float32].alloc(self.history_size)
+        self.alpha = UnsafePointer[Float32].alloc(self.history_size)
+        self.prev_x = UnsafePointer[Float32].alloc(self.num_vars)
+        self.prev_g = UnsafePointer[Float32].alloc(self.num_vars)
+        self.direction = UnsafePointer[Float32].alloc(self.num_vars)
 
         for i in range(buffer_size):
             self.s[i] = other.s[i]
@@ -459,7 +446,7 @@ struct LBFGSState(Copyable, Movable):
 
 fn lbfgs_two_loop(
     mut state: LBFGSState,
-    gradient: type_of(alloc[Float32](1))
+    gradient: UnsafePointer[Float32]
 ):
     """
     L-BFGS two-loop recursion to compute search direction.
@@ -535,8 +522,8 @@ fn lbfgs_two_loop(
 
 fn lbfgs_update_history(
     mut state: LBFGSState,
-    x_new: type_of(alloc[Float32](1)),
-    g_new: type_of(alloc[Float32](1))
+    x_new: UnsafePointer[Float32],
+    g_new: UnsafePointer[Float32]
 ):
     """
     Update L-BFGS history with new position and gradient.
@@ -569,15 +556,13 @@ fn lbfgs_update_history(
         state.history_count += 1
 
 
-# ============================================================================
-# COORDINATE UTILITIES
-# ============================================================================
+# Coordinate utilities
 
 fn flatten_coordinates(
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
-    mut flat: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Float32],
+    y: UnsafePointer[Float32],
+    z: UnsafePointer[Float32],
+    flat: UnsafePointer[Float32],
     num_atoms: Int
 ):
     """Flatten xyz coordinates to 1D array."""
@@ -588,10 +573,10 @@ fn flatten_coordinates(
 
 
 fn unflatten_coordinates(
-    flat: type_of(alloc[Float32](1)),
-    mut x: type_of(alloc[Float32](1)),
-    mut y: type_of(alloc[Float32](1)),
-    mut z: type_of(alloc[Float32](1)),
+    flat: UnsafePointer[Float32],
+    x: UnsafePointer[Float32],
+    y: UnsafePointer[Float32],
+    z: UnsafePointer[Float32],
     num_atoms: Int
 ):
     """Unflatten 1D array to xyz coordinates."""
@@ -602,10 +587,10 @@ fn unflatten_coordinates(
 
 
 fn flatten_gradients(
-    grad_x: type_of(alloc[Float32](1)),
-    grad_y: type_of(alloc[Float32](1)),
-    grad_z: type_of(alloc[Float32](1)),
-    mut flat: type_of(alloc[Float32](1)),
+    grad_x: UnsafePointer[Float32],
+    grad_y: UnsafePointer[Float32],
+    grad_z: UnsafePointer[Float32],
+    flat: UnsafePointer[Float32],
     num_atoms: Int
 ):
     """Flatten xyz gradients to 1D array."""
@@ -615,7 +600,7 @@ fn flatten_gradients(
         flat[3 * i + 2] = grad_z[i]
 
 
-fn gradient_norm(gradient: type_of(alloc[Float32](1)), n: Int) -> Float32:
+fn gradient_norm(gradient: UnsafePointer[Float32], n: Int) -> Float32:
     """Compute L2 norm of gradient."""
     var sum_sq: Float32 = 0.0
     for i in range(n):
@@ -623,7 +608,7 @@ fn gradient_norm(gradient: type_of(alloc[Float32](1)), n: Int) -> Float32:
     return sqrt(sum_sq)
 
 
-fn gradient_rms_from_flat(gradient: type_of(alloc[Float32](1)), n: Int) -> Float32:
+fn gradient_rms_from_flat(gradient: UnsafePointer[Float32], n: Int) -> Float32:
     """Compute RMS gradient."""
     var sum_sq: Float32 = 0.0
     for i in range(n):

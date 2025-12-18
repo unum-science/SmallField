@@ -3,32 +3,31 @@
 # Merged from: atom.mojo, bond.mojo, angle.mojo, torsion.mojo, molecule.mojo
 # Updated for Mojo 0.25.7
 
-from memory import alloc
+from memory import UnsafePointer, alloc
 
-
-# =============================================================================
 # Constants
-# =============================================================================
-
-alias ALIGNMENT: Int = 128  # 128-byte alignment for GPU warp transactions
-alias SIMD_WIDTH: Int = 8   # For AVX-512 with Float32
+alias ALIGNMENT: Int = 128
+alias SIMD_WIDTH: Int = 8
 
 # Compile-time size classes for fixed-size molecule batches
-alias SIZE_64: Int = 64      # Tiny fragments
-alias SIZE_128: Int = 128    # Small molecules (median ~50 atoms with H)
-alias SIZE_256: Int = 256    # Medium molecules
-alias SIZE_512: Int = 512    # Large molecules
-alias SIZE_1024: Int = 1024  # Very large molecules
+# All are multiples of 64 for AVX-512 alignment
+alias SIZE_64: Int = 64       # Tiny fragments
+alias SIZE_128: Int = 128     # Small molecules
+alias SIZE_192: Int = 192     # Medium-small (3×64)
+alias SIZE_256: Int = 256     # Medium molecules
+alias SIZE_320: Int = 320     # Medium-large (5×64)
+alias SIZE_512: Int = 512     # Large molecules
+alias SIZE_1024: Int = 1024   # Very large molecules
 
+# Storage type aliases for mixed precision
+alias StorageF16 = DType.float16
+alias StorageBF16 = DType.bfloat16
+alias StorageF32 = DType.float32
 
-# =============================================================================
-# Utility Functions
-# =============================================================================
-
+# Utility functions
 fn align_capacity(n: Int) -> Int:
     """Round up capacity to nearest multiple of 32 for alignment."""
     return ((n + 31) // 32) * 32
-
 
 fn select_size_class(num_atoms: Int) -> Int:
     """Select smallest size bucket that fits the given atom count."""
@@ -36,52 +35,41 @@ fn select_size_class(num_atoms: Int) -> Int:
         return SIZE_64
     if num_atoms <= 128:
         return SIZE_128
+    if num_atoms <= 192:
+        return SIZE_192
     if num_atoms <= 256:
         return SIZE_256
+    if num_atoms <= 320:
+        return SIZE_320
     if num_atoms <= 512:
         return SIZE_512
     return SIZE_1024
 
-
-# =============================================================================
 # AtomBuffers
-# =============================================================================
-
-struct AtomBuffers(Copyable, Movable):
+struct AtomBuffers[StorageType: DType = DType.float32](Copyable, Movable):
     """
     SoA storage for atom positions and gradients.
 
-    Memory layout optimized for:
-    - GPU coalesced access (128-byte aligned)
-    - CPU SIMD (AVX-512 friendly)
-    - Batched molecule processing (CSR indexing)
+    Memory layout optimized for GPU coalesced access and CPU SIMD.
+    Positions can be FP16 or FP32, gradients always FP32 for stability.
     """
-    # Positions (FP32 storage)
-    var x: type_of(alloc[Float32](1))
-    var y: type_of(alloc[Float32](1))
-    var z: type_of(alloc[Float32](1))
+    var x: UnsafePointer[Scalar[StorageType]]
+    var y: UnsafePointer[Scalar[StorageType]]
+    var z: UnsafePointer[Scalar[StorageType]]
 
-    # Gradients (FP32 for accumulation stability)
-    var grad_x: type_of(alloc[Float32](1))
-    var grad_y: type_of(alloc[Float32](1))
-    var grad_z: type_of(alloc[Float32](1))
+    var grad_x: UnsafePointer[Float32]
+    var grad_y: UnsafePointer[Float32]
+    var grad_z: UnsafePointer[Float32]
 
-    # Atom types for MMFF94 parameters
-    var atom_type: type_of(alloc[Int32](1))
+    var atom_type: UnsafePointer[Int32]
+    var charge: UnsafePointer[Scalar[StorageType]]
+    var atom_starts: UnsafePointer[Int32]
 
-    # Partial charges
-    var charge: type_of(alloc[Float32](1))
-
-    # CSR indexing for batch access
-    var atom_starts: type_of(alloc[Int32](1))  # [num_molecules + 1]
-
-    # Sizes
     var capacity: Int
     var num_atoms: Int
     var num_molecules: Int
 
     fn __init__(out self, max_atoms: Int, max_molecules: Int):
-        """Allocate buffers with aligned capacity."""
         var cap = align_capacity(max_atoms)
         var mol_cap = align_capacity(max_molecules + 1)
 
@@ -89,24 +77,18 @@ struct AtomBuffers(Copyable, Movable):
         self.num_atoms = 0
         self.num_molecules = 0
 
-        # Allocate position buffers
-        self.x = alloc[Float32](cap)
-        self.y = alloc[Float32](cap)
-        self.z = alloc[Float32](cap)
+        self.x = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.y = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.z = UnsafePointer[Scalar[StorageType]].alloc(cap)
 
-        # Allocate gradient buffers
-        self.grad_x = alloc[Float32](cap)
-        self.grad_y = alloc[Float32](cap)
-        self.grad_z = alloc[Float32](cap)
+        self.grad_x = UnsafePointer[Float32].alloc(cap)
+        self.grad_y = UnsafePointer[Float32].alloc(cap)
+        self.grad_z = UnsafePointer[Float32].alloc(cap)
 
-        # Allocate type and charge buffers
-        self.atom_type = alloc[Int32](cap)
-        self.charge = alloc[Float32](cap)
+        self.atom_type = UnsafePointer[Int32].alloc(cap)
+        self.charge = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.atom_starts = UnsafePointer[Int32].alloc(mol_cap)
 
-        # Allocate CSR index
-        self.atom_starts = alloc[Int32](mol_cap)
-
-        # Initialize to zero
         for i in range(cap):
             self.x[i] = 0.0
             self.y[i] = 0.0
@@ -128,15 +110,15 @@ struct AtomBuffers(Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.x = alloc[Float32](cap)
-        self.y = alloc[Float32](cap)
-        self.z = alloc[Float32](cap)
-        self.grad_x = alloc[Float32](cap)
-        self.grad_y = alloc[Float32](cap)
-        self.grad_z = alloc[Float32](cap)
-        self.atom_type = alloc[Int32](cap)
-        self.charge = alloc[Float32](cap)
-        self.atom_starts = alloc[Int32](mol_cap)
+        self.x = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.y = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.z = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.grad_x = UnsafePointer[Float32].alloc(cap)
+        self.grad_y = UnsafePointer[Float32].alloc(cap)
+        self.grad_z = UnsafePointer[Float32].alloc(cap)
+        self.atom_type = UnsafePointer[Int32].alloc(cap)
+        self.charge = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.atom_starts = UnsafePointer[Int32].alloc(mol_cap)
 
         for i in range(cap):
             self.x[i] = other.x[i]
@@ -166,7 +148,6 @@ struct AtomBuffers(Copyable, Movable):
         self.atom_starts = other.atom_starts
 
     fn free(self):
-        """Release all allocated memory."""
         self.x.free()
         self.y.free()
         self.z.free()
@@ -178,7 +159,6 @@ struct AtomBuffers(Copyable, Movable):
         self.atom_starts.free()
 
     fn zero_gradients(self):
-        """Reset all gradients to zero."""
         for i in range(self.num_atoms):
             self.grad_x[i] = 0.0
             self.grad_y[i] = 0.0
@@ -187,11 +167,10 @@ struct AtomBuffers(Copyable, Movable):
     fn set_atom(
         self,
         idx: Int,
-        px: Float32, py: Float32, pz: Float32,
+        px: Scalar[StorageType], py: Scalar[StorageType], pz: Scalar[StorageType],
         atype: Int32,
-        q: Float32
+        q: Scalar[StorageType]
     ):
-        """Set atom data at index."""
         self.x[idx] = px
         self.y[idx] = py
         self.z[idx] = pz
@@ -199,49 +178,56 @@ struct AtomBuffers(Copyable, Movable):
         self.charge[idx] = q
 
     fn get_molecule_atom_range(self, mol_idx: Int) -> Tuple[Int, Int]:
-        """Get atom index range for a molecule: [start, end)."""
         var start = Int(self.atom_starts[mol_idx])
         var end = Int(self.atom_starts[mol_idx + 1])
         return (start, end)
 
     fn get_num_atoms_in_molecule(self, mol_idx: Int) -> Int:
-        """Get number of atoms in a specific molecule."""
         return Int(self.atom_starts[mol_idx + 1]) - Int(self.atom_starts[mol_idx])
 
+    fn load_position_f32(self, idx: Int) -> Tuple[Float32, Float32, Float32]:
+        """Load position as Float32, converting from storage type if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (
+                Float32(self.x[idx]),
+                Float32(self.y[idx]),
+                Float32(self.z[idx])
+            )
+        else:
+            return (
+                self.x[idx].cast[DType.float32](),
+                self.y[idx].cast[DType.float32](),
+                self.z[idx].cast[DType.float32]()
+            )
 
-# =============================================================================
+    fn load_charge_f32(self, idx: Int) -> Float32:
+        """Load charge as Float32, converting from storage type if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return Float32(self.charge[idx])
+        else:
+            return self.charge[idx].cast[DType.float32]()
+
 # BondBuffers
-# =============================================================================
-
-struct BondBuffers(Copyable, Movable):
+struct BondBuffers[StorageType: DType = DType.float32](Copyable, Movable):
     """
     SoA storage for bond topology and MMFF94 bond stretch parameters.
-
-    Uses CSR-like indexing for efficient batch processing:
-    - bond_starts[mol] to bond_starts[mol+1] gives bond range for molecule
-    - Atom indices are local to the batch (offset by atom_starts)
+    Uses CSR-like indexing for efficient batch processing.
     """
-    # Bond topology (atom indices)
-    var atom_i: type_of(alloc[Int32](1))
-    var atom_j: type_of(alloc[Int32](1))
+    var atom_i: UnsafePointer[Int32]
+    var atom_j: UnsafePointer[Int32]
 
-    # MMFF94 bond stretch parameters
-    var force_constant: type_of(alloc[Float32](1))  # kb (mdyn/A)
-    var rest_length: type_of(alloc[Float32](1))     # r0 (Angstroms)
+    var force_constant: UnsafePointer[Scalar[StorageType]]
+    var rest_length: UnsafePointer[Scalar[StorageType]]
+    var bond_type: UnsafePointer[Int32]
+    var bond_starts: UnsafePointer[Int32]
 
-    # Bond type for MMFF94 (0-5)
-    var bond_type: type_of(alloc[Int32](1))
-
-    # CSR indexing for batch access
-    var bond_starts: type_of(alloc[Int32](1))  # [num_molecules + 1]
-
-    # Sizes
     var capacity: Int
     var num_bonds: Int
     var num_molecules: Int
 
     fn __init__(out self, max_bonds: Int, max_molecules: Int):
-        """Allocate buffers with aligned capacity."""
         var cap = align_capacity(max_bonds)
         var mol_cap = align_capacity(max_molecules + 1)
 
@@ -249,19 +235,13 @@ struct BondBuffers(Copyable, Movable):
         self.num_bonds = 0
         self.num_molecules = 0
 
-        # Allocate topology buffers
-        self.atom_i = alloc[Int32](cap)
-        self.atom_j = alloc[Int32](cap)
+        self.atom_i = UnsafePointer[Int32].alloc(cap)
+        self.atom_j = UnsafePointer[Int32].alloc(cap)
+        self.force_constant = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.rest_length = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.bond_type = UnsafePointer[Int32].alloc(cap)
+        self.bond_starts = UnsafePointer[Int32].alloc(mol_cap)
 
-        # Allocate parameter buffers
-        self.force_constant = alloc[Float32](cap)
-        self.rest_length = alloc[Float32](cap)
-        self.bond_type = alloc[Int32](cap)
-
-        # Allocate CSR index
-        self.bond_starts = alloc[Int32](mol_cap)
-
-        # Initialize to zero
         for i in range(cap):
             self.atom_i[i] = 0
             self.atom_j[i] = 0
@@ -280,12 +260,12 @@ struct BondBuffers(Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.atom_i = alloc[Int32](cap)
-        self.atom_j = alloc[Int32](cap)
-        self.force_constant = alloc[Float32](cap)
-        self.rest_length = alloc[Float32](cap)
-        self.bond_type = alloc[Int32](cap)
-        self.bond_starts = alloc[Int32](mol_cap)
+        self.atom_i = UnsafePointer[Int32].alloc(cap)
+        self.atom_j = UnsafePointer[Int32].alloc(cap)
+        self.force_constant = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.rest_length = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.bond_type = UnsafePointer[Int32].alloc(cap)
+        self.bond_starts = UnsafePointer[Int32].alloc(mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = other.atom_i[i]
@@ -309,7 +289,6 @@ struct BondBuffers(Copyable, Movable):
         self.bond_starts = other.bond_starts
 
     fn free(self):
-        """Release all allocated memory."""
         self.atom_i.free()
         self.atom_j.free()
         self.force_constant.free()
@@ -321,10 +300,9 @@ struct BondBuffers(Copyable, Movable):
         self,
         idx: Int,
         i: Int32, j: Int32,
-        kb: Float32, r0: Float32,
+        kb: Scalar[StorageType], r0: Scalar[StorageType],
         btype: Int32
     ):
-        """Set bond data at index."""
         self.atom_i[idx] = i
         self.atom_j[idx] = j
         self.force_constant[idx] = kb
@@ -332,49 +310,44 @@ struct BondBuffers(Copyable, Movable):
         self.bond_type[idx] = btype
 
     fn get_molecule_bond_range(self, mol_idx: Int) -> Tuple[Int, Int]:
-        """Get bond index range for a molecule: [start, end)."""
         var start = Int(self.bond_starts[mol_idx])
         var end = Int(self.bond_starts[mol_idx + 1])
         return (start, end)
 
     fn get_num_bonds_in_molecule(self, mol_idx: Int) -> Int:
-        """Get number of bonds in a specific molecule."""
         return Int(self.bond_starts[mol_idx + 1]) - Int(self.bond_starts[mol_idx])
 
+    fn load_params_f32(self, idx: Int) -> Tuple[Float32, Float32]:
+        """Load bond parameters as Float32, converting if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (Float32(self.force_constant[idx]), Float32(self.rest_length[idx]))
+        else:
+            return (
+                self.force_constant[idx].cast[DType.float32](),
+                self.rest_length[idx].cast[DType.float32]()
+            )
 
-# =============================================================================
 # AngleBuffers
-# =============================================================================
-
-struct AngleBuffers(Copyable, Movable):
+struct AngleBuffers[StorageType: DType = DType.float32](Copyable, Movable):
     """
     SoA storage for angle topology and MMFF94 angle bend parameters.
-
     Angle i-j-k where j is the central atom.
-    Uses CSR-like indexing for efficient batch processing.
     """
-    # Angle topology (atom indices)
-    var atom_i: type_of(alloc[Int32](1))  # First atom
-    var atom_j: type_of(alloc[Int32](1))  # Central atom
-    var atom_k: type_of(alloc[Int32](1))  # Third atom
+    var atom_i: UnsafePointer[Int32]
+    var atom_j: UnsafePointer[Int32]
+    var atom_k: UnsafePointer[Int32]
 
-    # MMFF94 angle bend parameters
-    var force_constant: type_of(alloc[Float32](1))  # ka (mdyn*A/rad^2)
-    var rest_angle: type_of(alloc[Float32](1))      # theta0 (radians)
+    var force_constant: UnsafePointer[Scalar[StorageType]]
+    var rest_angle: UnsafePointer[Scalar[StorageType]]
+    var is_linear: UnsafePointer[Int32]
+    var angle_starts: UnsafePointer[Int32]
 
-    # Linear angle flag (for 180-degree angles)
-    var is_linear: type_of(alloc[Int32](1))
-
-    # CSR indexing for batch access
-    var angle_starts: type_of(alloc[Int32](1))  # [num_molecules + 1]
-
-    # Sizes
     var capacity: Int
     var num_angles: Int
     var num_molecules: Int
 
     fn __init__(out self, max_angles: Int, max_molecules: Int):
-        """Allocate buffers with aligned capacity."""
         var cap = align_capacity(max_angles)
         var mol_cap = align_capacity(max_molecules + 1)
 
@@ -382,20 +355,14 @@ struct AngleBuffers(Copyable, Movable):
         self.num_angles = 0
         self.num_molecules = 0
 
-        # Allocate topology buffers
-        self.atom_i = alloc[Int32](cap)
-        self.atom_j = alloc[Int32](cap)
-        self.atom_k = alloc[Int32](cap)
+        self.atom_i = UnsafePointer[Int32].alloc(cap)
+        self.atom_j = UnsafePointer[Int32].alloc(cap)
+        self.atom_k = UnsafePointer[Int32].alloc(cap)
+        self.force_constant = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.rest_angle = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.is_linear = UnsafePointer[Int32].alloc(cap)
+        self.angle_starts = UnsafePointer[Int32].alloc(mol_cap)
 
-        # Allocate parameter buffers
-        self.force_constant = alloc[Float32](cap)
-        self.rest_angle = alloc[Float32](cap)
-        self.is_linear = alloc[Int32](cap)
-
-        # Allocate CSR index
-        self.angle_starts = alloc[Int32](mol_cap)
-
-        # Initialize to zero
         for i in range(cap):
             self.atom_i[i] = 0
             self.atom_j[i] = 0
@@ -415,13 +382,13 @@ struct AngleBuffers(Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.atom_i = alloc[Int32](cap)
-        self.atom_j = alloc[Int32](cap)
-        self.atom_k = alloc[Int32](cap)
-        self.force_constant = alloc[Float32](cap)
-        self.rest_angle = alloc[Float32](cap)
-        self.is_linear = alloc[Int32](cap)
-        self.angle_starts = alloc[Int32](mol_cap)
+        self.atom_i = UnsafePointer[Int32].alloc(cap)
+        self.atom_j = UnsafePointer[Int32].alloc(cap)
+        self.atom_k = UnsafePointer[Int32].alloc(cap)
+        self.force_constant = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.rest_angle = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.is_linear = UnsafePointer[Int32].alloc(cap)
+        self.angle_starts = UnsafePointer[Int32].alloc(mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = other.atom_i[i]
@@ -447,7 +414,6 @@ struct AngleBuffers(Copyable, Movable):
         self.angle_starts = other.angle_starts
 
     fn free(self):
-        """Release all allocated memory."""
         self.atom_i.free()
         self.atom_j.free()
         self.atom_k.free()
@@ -460,10 +426,9 @@ struct AngleBuffers(Copyable, Movable):
         self,
         idx: Int,
         i: Int32, j: Int32, k: Int32,
-        ka: Float32, theta0: Float32,
+        ka: Scalar[StorageType], theta0: Scalar[StorageType],
         linear: Int32
     ):
-        """Set angle data at index."""
         self.atom_i[idx] = i
         self.atom_j[idx] = j
         self.atom_k[idx] = k
@@ -472,54 +437,47 @@ struct AngleBuffers(Copyable, Movable):
         self.is_linear[idx] = linear
 
     fn get_molecule_angle_range(self, mol_idx: Int) -> Tuple[Int, Int]:
-        """Get angle index range for a molecule: [start, end)."""
         var start = Int(self.angle_starts[mol_idx])
         var end = Int(self.angle_starts[mol_idx + 1])
         return (start, end)
 
     fn get_num_angles_in_molecule(self, mol_idx: Int) -> Int:
-        """Get number of angles in a specific molecule."""
         return Int(self.angle_starts[mol_idx + 1]) - Int(self.angle_starts[mol_idx])
 
+    fn load_params_f32(self, idx: Int) -> Tuple[Float32, Float32]:
+        """Load angle parameters as Float32, converting if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (Float32(self.force_constant[idx]), Float32(self.rest_angle[idx]))
+        else:
+            return (
+                self.force_constant[idx].cast[DType.float32](),
+                self.rest_angle[idx].cast[DType.float32]()
+            )
 
-# =============================================================================
 # TorsionBuffers
-# =============================================================================
-
-struct TorsionBuffers(Copyable, Movable):
+struct TorsionBuffers[StorageType: DType = DType.float32](Copyable, Movable):
     """
     SoA storage for torsion topology and MMFF94 torsion parameters.
-
     Torsion i-j-k-l where j-k is the central bond.
-    Uses CSR-like indexing for efficient batch processing.
-
-    MMFF94 torsion energy:
     E = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
     """
-    # Torsion topology (atom indices)
-    var atom_i: type_of(alloc[Int32](1))
-    var atom_j: type_of(alloc[Int32](1))
-    var atom_k: type_of(alloc[Int32](1))
-    var atom_l: type_of(alloc[Int32](1))
+    var atom_i: UnsafePointer[Int32]
+    var atom_j: UnsafePointer[Int32]
+    var atom_k: UnsafePointer[Int32]
+    var atom_l: UnsafePointer[Int32]
 
-    # MMFF94 torsion parameters (Fourier coefficients)
-    var v1: type_of(alloc[Float32](1))  # kcal/mol
-    var v2: type_of(alloc[Float32](1))  # kcal/mol
-    var v3: type_of(alloc[Float32](1))  # kcal/mol
+    var v1: UnsafePointer[Scalar[StorageType]]
+    var v2: UnsafePointer[Scalar[StorageType]]
+    var v3: UnsafePointer[Scalar[StorageType]]
+    var torsion_type: UnsafePointer[Int32]
+    var torsion_starts: UnsafePointer[Int32]
 
-    # Torsion type
-    var torsion_type: type_of(alloc[Int32](1))
-
-    # CSR indexing for batch access
-    var torsion_starts: type_of(alloc[Int32](1))  # [num_molecules + 1]
-
-    # Sizes
     var capacity: Int
     var num_torsions: Int
     var num_molecules: Int
 
     fn __init__(out self, max_torsions: Int, max_molecules: Int):
-        """Allocate buffers with aligned capacity."""
         var cap = align_capacity(max_torsions)
         var mol_cap = align_capacity(max_molecules + 1)
 
@@ -527,22 +485,16 @@ struct TorsionBuffers(Copyable, Movable):
         self.num_torsions = 0
         self.num_molecules = 0
 
-        # Allocate topology buffers
-        self.atom_i = alloc[Int32](cap)
-        self.atom_j = alloc[Int32](cap)
-        self.atom_k = alloc[Int32](cap)
-        self.atom_l = alloc[Int32](cap)
+        self.atom_i = UnsafePointer[Int32].alloc(cap)
+        self.atom_j = UnsafePointer[Int32].alloc(cap)
+        self.atom_k = UnsafePointer[Int32].alloc(cap)
+        self.atom_l = UnsafePointer[Int32].alloc(cap)
+        self.v1 = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.v2 = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.v3 = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.torsion_type = UnsafePointer[Int32].alloc(cap)
+        self.torsion_starts = UnsafePointer[Int32].alloc(mol_cap)
 
-        # Allocate parameter buffers
-        self.v1 = alloc[Float32](cap)
-        self.v2 = alloc[Float32](cap)
-        self.v3 = alloc[Float32](cap)
-        self.torsion_type = alloc[Int32](cap)
-
-        # Allocate CSR index
-        self.torsion_starts = alloc[Int32](mol_cap)
-
-        # Initialize to zero
         for i in range(cap):
             self.atom_i[i] = 0
             self.atom_j[i] = 0
@@ -564,15 +516,15 @@ struct TorsionBuffers(Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.atom_i = alloc[Int32](cap)
-        self.atom_j = alloc[Int32](cap)
-        self.atom_k = alloc[Int32](cap)
-        self.atom_l = alloc[Int32](cap)
-        self.v1 = alloc[Float32](cap)
-        self.v2 = alloc[Float32](cap)
-        self.v3 = alloc[Float32](cap)
-        self.torsion_type = alloc[Int32](cap)
-        self.torsion_starts = alloc[Int32](mol_cap)
+        self.atom_i = UnsafePointer[Int32].alloc(cap)
+        self.atom_j = UnsafePointer[Int32].alloc(cap)
+        self.atom_k = UnsafePointer[Int32].alloc(cap)
+        self.atom_l = UnsafePointer[Int32].alloc(cap)
+        self.v1 = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.v2 = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.v3 = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.torsion_type = UnsafePointer[Int32].alloc(cap)
+        self.torsion_starts = UnsafePointer[Int32].alloc(mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = other.atom_i[i]
@@ -602,7 +554,6 @@ struct TorsionBuffers(Copyable, Movable):
         self.torsion_starts = other.torsion_starts
 
     fn free(self):
-        """Release all allocated memory."""
         self.atom_i.free()
         self.atom_j.free()
         self.atom_k.free()
@@ -617,10 +568,9 @@ struct TorsionBuffers(Copyable, Movable):
         self,
         idx: Int,
         i: Int32, j: Int32, k: Int32, l: Int32,
-        v1_val: Float32, v2_val: Float32, v3_val: Float32,
+        v1_val: Scalar[StorageType], v2_val: Scalar[StorageType], v3_val: Scalar[StorageType],
         ttype: Int32
     ):
-        """Set torsion data at index."""
         self.atom_i[idx] = i
         self.atom_j[idx] = j
         self.atom_k[idx] = k
@@ -631,36 +581,38 @@ struct TorsionBuffers(Copyable, Movable):
         self.torsion_type[idx] = ttype
 
     fn get_molecule_torsion_range(self, mol_idx: Int) -> Tuple[Int, Int]:
-        """Get torsion index range for a molecule: [start, end)."""
         var start = Int(self.torsion_starts[mol_idx])
         var end = Int(self.torsion_starts[mol_idx + 1])
         return (start, end)
 
     fn get_num_torsions_in_molecule(self, mol_idx: Int) -> Int:
-        """Get number of torsions in a specific molecule."""
         return Int(self.torsion_starts[mol_idx + 1]) - Int(self.torsion_starts[mol_idx])
 
+    fn load_params_f32(self, idx: Int) -> Tuple[Float32, Float32, Float32]:
+        """Load torsion parameters as Float32, converting if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (Float32(self.v1[idx]), Float32(self.v2[idx]), Float32(self.v3[idx]))
+        else:
+            return (
+                self.v1[idx].cast[DType.float32](),
+                self.v2[idx].cast[DType.float32](),
+                self.v3[idx].cast[DType.float32]()
+            )
 
-# =============================================================================
 # NonbondedPairs
-# =============================================================================
-
-struct NonbondedPairs(Copyable, Movable):
+struct NonbondedPairs[StorageType: DType = DType.float32](Copyable, Movable):
     """
     Storage for van der Waals and electrostatic interaction pairs.
-    Excludes 1-2 (bonded) and 1-3 (angle) pairs.
-    Includes 1-4 pairs with scaling factors.
+    Excludes 1-2 (bonded) and 1-3 (angle) pairs, includes 1-4 with scaling.
     """
-    var atom_i: type_of(alloc[Int32](1))
-    var atom_j: type_of(alloc[Int32](1))
-    var is_1_4: type_of(alloc[Int32](1))  # 1 if 1-4 pair, 0 otherwise
+    var atom_i: UnsafePointer[Int32]
+    var atom_j: UnsafePointer[Int32]
+    var is_1_4: UnsafePointer[Int32]
 
-    # vdW parameters (combined for pair)
-    var epsilon: type_of(alloc[Float32](1))  # kcal/mol
-    var r_star: type_of(alloc[Float32](1))   # Angstroms
-
-    # CSR indexing
-    var pair_starts: type_of(alloc[Int32](1))
+    var epsilon: UnsafePointer[Scalar[StorageType]]
+    var r_star: UnsafePointer[Scalar[StorageType]]
+    var pair_starts: UnsafePointer[Int32]
 
     var capacity: Int
     var num_pairs: Int
@@ -674,12 +626,12 @@ struct NonbondedPairs(Copyable, Movable):
         self.num_pairs = 0
         self.num_molecules = 0
 
-        self.atom_i = alloc[Int32](cap)
-        self.atom_j = alloc[Int32](cap)
-        self.is_1_4 = alloc[Int32](cap)
-        self.epsilon = alloc[Float32](cap)
-        self.r_star = alloc[Float32](cap)
-        self.pair_starts = alloc[Int32](mol_cap)
+        self.atom_i = UnsafePointer[Int32].alloc(cap)
+        self.atom_j = UnsafePointer[Int32].alloc(cap)
+        self.is_1_4 = UnsafePointer[Int32].alloc(cap)
+        self.epsilon = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.r_star = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.pair_starts = UnsafePointer[Int32].alloc(mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = 0
@@ -699,12 +651,12 @@ struct NonbondedPairs(Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.atom_i = alloc[Int32](cap)
-        self.atom_j = alloc[Int32](cap)
-        self.is_1_4 = alloc[Int32](cap)
-        self.epsilon = alloc[Float32](cap)
-        self.r_star = alloc[Float32](cap)
-        self.pair_starts = alloc[Int32](mol_cap)
+        self.atom_i = UnsafePointer[Int32].alloc(cap)
+        self.atom_j = UnsafePointer[Int32].alloc(cap)
+        self.is_1_4 = UnsafePointer[Int32].alloc(cap)
+        self.epsilon = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.r_star = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.pair_starts = UnsafePointer[Int32].alloc(mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = other.atom_i[i]
@@ -735,63 +687,63 @@ struct NonbondedPairs(Copyable, Movable):
         self.r_star.free()
         self.pair_starts.free()
 
+    fn load_params_f32(self, idx: Int) -> Tuple[Float32, Float32]:
+        """Load vdW parameters as Float32, converting if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (Float32(self.epsilon[idx]), Float32(self.r_star[idx]))
+        else:
+            return (
+                self.epsilon[idx].cast[DType.float32](),
+                self.r_star[idx].cast[DType.float32]()
+            )
 
-# =============================================================================
 # MoleculeBatch
-# =============================================================================
-
-struct MoleculeBatch(Copyable, Movable):
+struct MoleculeBatch[StorageType: DType = DType.float32](Copyable, Movable):
     """
     Container for a batch of molecules with all MMFF94 force field data.
-
-    All data is stored in SoA format with CSR-like indexing for
-    efficient GPU coalescing and CPU SIMD processing.
+    All data is stored in SoA format with CSR-like indexing.
+    Positions/parameters use StorageType, gradients always Float32.
     """
-    # Positions and gradients
-    var x: type_of(alloc[Float32](1))
-    var y: type_of(alloc[Float32](1))
-    var z: type_of(alloc[Float32](1))
-    var grad_x: type_of(alloc[Float32](1))
-    var grad_y: type_of(alloc[Float32](1))
-    var grad_z: type_of(alloc[Float32](1))
-    var atom_type: type_of(alloc[Int32](1))
-    var charge: type_of(alloc[Float32](1))
-    var atom_starts: type_of(alloc[Int32](1))
+    var x: UnsafePointer[Scalar[StorageType]]
+    var y: UnsafePointer[Scalar[StorageType]]
+    var z: UnsafePointer[Scalar[StorageType]]
+    var grad_x: UnsafePointer[Float32]
+    var grad_y: UnsafePointer[Float32]
+    var grad_z: UnsafePointer[Float32]
+    var atom_type: UnsafePointer[Int32]
+    var charge: UnsafePointer[Scalar[StorageType]]
+    var atom_starts: UnsafePointer[Int32]
 
-    # Bonds
-    var bond_i: type_of(alloc[Int32](1))
-    var bond_j: type_of(alloc[Int32](1))
-    var bond_kb: type_of(alloc[Float32](1))
-    var bond_r0: type_of(alloc[Float32](1))
-    var bond_starts: type_of(alloc[Int32](1))
+    var bond_i: UnsafePointer[Int32]
+    var bond_j: UnsafePointer[Int32]
+    var bond_kb: UnsafePointer[Scalar[StorageType]]
+    var bond_r0: UnsafePointer[Scalar[StorageType]]
+    var bond_starts: UnsafePointer[Int32]
 
-    # Angles
-    var angle_i: type_of(alloc[Int32](1))
-    var angle_j: type_of(alloc[Int32](1))
-    var angle_k: type_of(alloc[Int32](1))
-    var angle_ka: type_of(alloc[Float32](1))
-    var angle_theta0: type_of(alloc[Float32](1))
-    var angle_starts: type_of(alloc[Int32](1))
+    var angle_i: UnsafePointer[Int32]
+    var angle_j: UnsafePointer[Int32]
+    var angle_k: UnsafePointer[Int32]
+    var angle_ka: UnsafePointer[Scalar[StorageType]]
+    var angle_theta0: UnsafePointer[Scalar[StorageType]]
+    var angle_starts: UnsafePointer[Int32]
 
-    # Torsions
-    var torsion_i: type_of(alloc[Int32](1))
-    var torsion_j: type_of(alloc[Int32](1))
-    var torsion_k: type_of(alloc[Int32](1))
-    var torsion_l: type_of(alloc[Int32](1))
-    var torsion_v1: type_of(alloc[Float32](1))
-    var torsion_v2: type_of(alloc[Float32](1))
-    var torsion_v3: type_of(alloc[Float32](1))
-    var torsion_starts: type_of(alloc[Int32](1))
+    var torsion_i: UnsafePointer[Int32]
+    var torsion_j: UnsafePointer[Int32]
+    var torsion_k: UnsafePointer[Int32]
+    var torsion_l: UnsafePointer[Int32]
+    var torsion_v1: UnsafePointer[Scalar[StorageType]]
+    var torsion_v2: UnsafePointer[Scalar[StorageType]]
+    var torsion_v3: UnsafePointer[Scalar[StorageType]]
+    var torsion_starts: UnsafePointer[Int32]
 
-    # Nonbonded pairs
-    var nb_i: type_of(alloc[Int32](1))
-    var nb_j: type_of(alloc[Int32](1))
-    var nb_is_1_4: type_of(alloc[Int32](1))
-    var nb_epsilon: type_of(alloc[Float32](1))
-    var nb_r_star: type_of(alloc[Float32](1))
-    var nb_starts: type_of(alloc[Int32](1))
+    var nb_i: UnsafePointer[Int32]
+    var nb_j: UnsafePointer[Int32]
+    var nb_is_1_4: UnsafePointer[Int32]
+    var nb_epsilon: UnsafePointer[Scalar[StorageType]]
+    var nb_r_star: UnsafePointer[Scalar[StorageType]]
+    var nb_starts: UnsafePointer[Int32]
 
-    # Capacities
     var atom_capacity: Int
     var bond_capacity: Int
     var angle_capacity: Int
@@ -799,7 +751,6 @@ struct MoleculeBatch(Copyable, Movable):
     var nb_capacity: Int
     var mol_capacity: Int
 
-    # Current counts
     var num_atoms: Int
     var num_bonds: Int
     var num_angles: Int
@@ -816,7 +767,6 @@ struct MoleculeBatch(Copyable, Movable):
         max_nb_pairs: Int,
         max_molecules: Int
     ):
-        """Allocate all buffers with aligned capacity."""
         self.atom_capacity = align_capacity(max_atoms)
         self.bond_capacity = align_capacity(max_bonds)
         self.angle_capacity = align_capacity(max_angles)
@@ -831,51 +781,45 @@ struct MoleculeBatch(Copyable, Movable):
         self.num_nb_pairs = 0
         self.num_molecules = 0
 
-        # Allocate atom buffers
-        self.x = alloc[Float32](self.atom_capacity)
-        self.y = alloc[Float32](self.atom_capacity)
-        self.z = alloc[Float32](self.atom_capacity)
-        self.grad_x = alloc[Float32](self.atom_capacity)
-        self.grad_y = alloc[Float32](self.atom_capacity)
-        self.grad_z = alloc[Float32](self.atom_capacity)
-        self.atom_type = alloc[Int32](self.atom_capacity)
-        self.charge = alloc[Float32](self.atom_capacity)
-        self.atom_starts = alloc[Int32](self.mol_capacity)
+        self.x = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
+        self.y = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
+        self.z = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
+        self.grad_x = UnsafePointer[Float32].alloc(self.atom_capacity)
+        self.grad_y = UnsafePointer[Float32].alloc(self.atom_capacity)
+        self.grad_z = UnsafePointer[Float32].alloc(self.atom_capacity)
+        self.atom_type = UnsafePointer[Int32].alloc(self.atom_capacity)
+        self.charge = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
+        self.atom_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        # Allocate bond buffers
-        self.bond_i = alloc[Int32](self.bond_capacity)
-        self.bond_j = alloc[Int32](self.bond_capacity)
-        self.bond_kb = alloc[Float32](self.bond_capacity)
-        self.bond_r0 = alloc[Float32](self.bond_capacity)
-        self.bond_starts = alloc[Int32](self.mol_capacity)
+        self.bond_i = UnsafePointer[Int32].alloc(self.bond_capacity)
+        self.bond_j = UnsafePointer[Int32].alloc(self.bond_capacity)
+        self.bond_kb = UnsafePointer[Scalar[StorageType]].alloc(self.bond_capacity)
+        self.bond_r0 = UnsafePointer[Scalar[StorageType]].alloc(self.bond_capacity)
+        self.bond_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        # Allocate angle buffers
-        self.angle_i = alloc[Int32](self.angle_capacity)
-        self.angle_j = alloc[Int32](self.angle_capacity)
-        self.angle_k = alloc[Int32](self.angle_capacity)
-        self.angle_ka = alloc[Float32](self.angle_capacity)
-        self.angle_theta0 = alloc[Float32](self.angle_capacity)
-        self.angle_starts = alloc[Int32](self.mol_capacity)
+        self.angle_i = UnsafePointer[Int32].alloc(self.angle_capacity)
+        self.angle_j = UnsafePointer[Int32].alloc(self.angle_capacity)
+        self.angle_k = UnsafePointer[Int32].alloc(self.angle_capacity)
+        self.angle_ka = UnsafePointer[Scalar[StorageType]].alloc(self.angle_capacity)
+        self.angle_theta0 = UnsafePointer[Scalar[StorageType]].alloc(self.angle_capacity)
+        self.angle_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        # Allocate torsion buffers
-        self.torsion_i = alloc[Int32](self.torsion_capacity)
-        self.torsion_j = alloc[Int32](self.torsion_capacity)
-        self.torsion_k = alloc[Int32](self.torsion_capacity)
-        self.torsion_l = alloc[Int32](self.torsion_capacity)
-        self.torsion_v1 = alloc[Float32](self.torsion_capacity)
-        self.torsion_v2 = alloc[Float32](self.torsion_capacity)
-        self.torsion_v3 = alloc[Float32](self.torsion_capacity)
-        self.torsion_starts = alloc[Int32](self.mol_capacity)
+        self.torsion_i = UnsafePointer[Int32].alloc(self.torsion_capacity)
+        self.torsion_j = UnsafePointer[Int32].alloc(self.torsion_capacity)
+        self.torsion_k = UnsafePointer[Int32].alloc(self.torsion_capacity)
+        self.torsion_l = UnsafePointer[Int32].alloc(self.torsion_capacity)
+        self.torsion_v1 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
+        self.torsion_v2 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
+        self.torsion_v3 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
+        self.torsion_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        # Allocate nonbonded buffers
-        self.nb_i = alloc[Int32](self.nb_capacity)
-        self.nb_j = alloc[Int32](self.nb_capacity)
-        self.nb_is_1_4 = alloc[Int32](self.nb_capacity)
-        self.nb_epsilon = alloc[Float32](self.nb_capacity)
-        self.nb_r_star = alloc[Float32](self.nb_capacity)
-        self.nb_starts = alloc[Int32](self.mol_capacity)
+        self.nb_i = UnsafePointer[Int32].alloc(self.nb_capacity)
+        self.nb_j = UnsafePointer[Int32].alloc(self.nb_capacity)
+        self.nb_is_1_4 = UnsafePointer[Int32].alloc(self.nb_capacity)
+        self.nb_epsilon = UnsafePointer[Scalar[StorageType]].alloc(self.nb_capacity)
+        self.nb_r_star = UnsafePointer[Scalar[StorageType]].alloc(self.nb_capacity)
+        self.nb_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        # Initialize CSR starts to 0
         for i in range(self.mol_capacity):
             self.atom_starts[i] = 0
             self.bond_starts[i] = 0
@@ -898,47 +842,45 @@ struct MoleculeBatch(Copyable, Movable):
         self.num_nb_pairs = other.num_nb_pairs
         self.num_molecules = other.num_molecules
 
-        # Allocate and copy all buffers
-        self.x = alloc[Float32](self.atom_capacity)
-        self.y = alloc[Float32](self.atom_capacity)
-        self.z = alloc[Float32](self.atom_capacity)
-        self.grad_x = alloc[Float32](self.atom_capacity)
-        self.grad_y = alloc[Float32](self.atom_capacity)
-        self.grad_z = alloc[Float32](self.atom_capacity)
-        self.atom_type = alloc[Int32](self.atom_capacity)
-        self.charge = alloc[Float32](self.atom_capacity)
-        self.atom_starts = alloc[Int32](self.mol_capacity)
+        self.x = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
+        self.y = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
+        self.z = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
+        self.grad_x = UnsafePointer[Float32].alloc(self.atom_capacity)
+        self.grad_y = UnsafePointer[Float32].alloc(self.atom_capacity)
+        self.grad_z = UnsafePointer[Float32].alloc(self.atom_capacity)
+        self.atom_type = UnsafePointer[Int32].alloc(self.atom_capacity)
+        self.charge = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
+        self.atom_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        self.bond_i = alloc[Int32](self.bond_capacity)
-        self.bond_j = alloc[Int32](self.bond_capacity)
-        self.bond_kb = alloc[Float32](self.bond_capacity)
-        self.bond_r0 = alloc[Float32](self.bond_capacity)
-        self.bond_starts = alloc[Int32](self.mol_capacity)
+        self.bond_i = UnsafePointer[Int32].alloc(self.bond_capacity)
+        self.bond_j = UnsafePointer[Int32].alloc(self.bond_capacity)
+        self.bond_kb = UnsafePointer[Scalar[StorageType]].alloc(self.bond_capacity)
+        self.bond_r0 = UnsafePointer[Scalar[StorageType]].alloc(self.bond_capacity)
+        self.bond_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        self.angle_i = alloc[Int32](self.angle_capacity)
-        self.angle_j = alloc[Int32](self.angle_capacity)
-        self.angle_k = alloc[Int32](self.angle_capacity)
-        self.angle_ka = alloc[Float32](self.angle_capacity)
-        self.angle_theta0 = alloc[Float32](self.angle_capacity)
-        self.angle_starts = alloc[Int32](self.mol_capacity)
+        self.angle_i = UnsafePointer[Int32].alloc(self.angle_capacity)
+        self.angle_j = UnsafePointer[Int32].alloc(self.angle_capacity)
+        self.angle_k = UnsafePointer[Int32].alloc(self.angle_capacity)
+        self.angle_ka = UnsafePointer[Scalar[StorageType]].alloc(self.angle_capacity)
+        self.angle_theta0 = UnsafePointer[Scalar[StorageType]].alloc(self.angle_capacity)
+        self.angle_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        self.torsion_i = alloc[Int32](self.torsion_capacity)
-        self.torsion_j = alloc[Int32](self.torsion_capacity)
-        self.torsion_k = alloc[Int32](self.torsion_capacity)
-        self.torsion_l = alloc[Int32](self.torsion_capacity)
-        self.torsion_v1 = alloc[Float32](self.torsion_capacity)
-        self.torsion_v2 = alloc[Float32](self.torsion_capacity)
-        self.torsion_v3 = alloc[Float32](self.torsion_capacity)
-        self.torsion_starts = alloc[Int32](self.mol_capacity)
+        self.torsion_i = UnsafePointer[Int32].alloc(self.torsion_capacity)
+        self.torsion_j = UnsafePointer[Int32].alloc(self.torsion_capacity)
+        self.torsion_k = UnsafePointer[Int32].alloc(self.torsion_capacity)
+        self.torsion_l = UnsafePointer[Int32].alloc(self.torsion_capacity)
+        self.torsion_v1 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
+        self.torsion_v2 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
+        self.torsion_v3 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
+        self.torsion_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        self.nb_i = alloc[Int32](self.nb_capacity)
-        self.nb_j = alloc[Int32](self.nb_capacity)
-        self.nb_is_1_4 = alloc[Int32](self.nb_capacity)
-        self.nb_epsilon = alloc[Float32](self.nb_capacity)
-        self.nb_r_star = alloc[Float32](self.nb_capacity)
-        self.nb_starts = alloc[Int32](self.mol_capacity)
+        self.nb_i = UnsafePointer[Int32].alloc(self.nb_capacity)
+        self.nb_j = UnsafePointer[Int32].alloc(self.nb_capacity)
+        self.nb_is_1_4 = UnsafePointer[Int32].alloc(self.nb_capacity)
+        self.nb_epsilon = UnsafePointer[Scalar[StorageType]].alloc(self.nb_capacity)
+        self.nb_r_star = UnsafePointer[Scalar[StorageType]].alloc(self.nb_capacity)
+        self.nb_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
 
-        # Copy data
         for i in range(self.atom_capacity):
             self.x[i] = other.x[i]
             self.y[i] = other.y[i]
@@ -1040,7 +982,6 @@ struct MoleculeBatch(Copyable, Movable):
         self.nb_starts = other.nb_starts
 
     fn free(self):
-        """Release all allocated memory."""
         self.x.free()
         self.y.free()
         self.z.free()
@@ -1081,17 +1022,84 @@ struct MoleculeBatch(Copyable, Movable):
         self.nb_starts.free()
 
     fn zero_gradients(self):
-        """Reset all gradients to zero."""
         for i in range(self.num_atoms):
             self.grad_x[i] = 0.0
             self.grad_y[i] = 0.0
             self.grad_z[i] = 0.0
 
     fn clear(mut self):
-        """Reset batch to empty state."""
         self.num_atoms = 0
         self.num_bonds = 0
         self.num_angles = 0
         self.num_torsions = 0
         self.num_nb_pairs = 0
         self.num_molecules = 0
+
+    fn load_position_f32(self, idx: Int) -> Tuple[Float32, Float32, Float32]:
+        """Load position as Float32, converting from storage type if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (Float32(self.x[idx]), Float32(self.y[idx]), Float32(self.z[idx]))
+        else:
+            return (
+                self.x[idx].cast[DType.float32](),
+                self.y[idx].cast[DType.float32](),
+                self.z[idx].cast[DType.float32]()
+            )
+
+    fn load_charge_f32(self, idx: Int) -> Float32:
+        """Load charge as Float32, converting from storage type if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return Float32(self.charge[idx])
+        else:
+            return self.charge[idx].cast[DType.float32]()
+
+    fn load_bond_params_f32(self, idx: Int) -> Tuple[Float32, Float32]:
+        """Load bond parameters as Float32, converting if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (Float32(self.bond_kb[idx]), Float32(self.bond_r0[idx]))
+        else:
+            return (
+                self.bond_kb[idx].cast[DType.float32](),
+                self.bond_r0[idx].cast[DType.float32]()
+            )
+
+    fn load_angle_params_f32(self, idx: Int) -> Tuple[Float32, Float32]:
+        """Load angle parameters as Float32, converting if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (Float32(self.angle_ka[idx]), Float32(self.angle_theta0[idx]))
+        else:
+            return (
+                self.angle_ka[idx].cast[DType.float32](),
+                self.angle_theta0[idx].cast[DType.float32]()
+            )
+
+    fn load_torsion_params_f32(self, idx: Int) -> Tuple[Float32, Float32, Float32]:
+        """Load torsion parameters as Float32, converting if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (
+                Float32(self.torsion_v1[idx]),
+                Float32(self.torsion_v2[idx]),
+                Float32(self.torsion_v3[idx])
+            )
+        else:
+            return (
+                self.torsion_v1[idx].cast[DType.float32](),
+                self.torsion_v2[idx].cast[DType.float32](),
+                self.torsion_v3[idx].cast[DType.float32]()
+            )
+
+    fn load_nb_params_f32(self, idx: Int) -> Tuple[Float32, Float32]:
+        """Load nonbonded parameters as Float32, converting if needed."""
+        @parameter
+        if StorageType == DType.float16:
+            return (Float32(self.nb_epsilon[idx]), Float32(self.nb_r_star[idx]))
+        else:
+            return (
+                self.nb_epsilon[idx].cast[DType.float32](),
+                self.nb_r_star[idx].cast[DType.float32]()
+            )

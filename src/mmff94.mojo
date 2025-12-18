@@ -2,13 +2,14 @@
 # Merged from: bond_stretch.mojo, angle_bend.mojo, torsion.mojo, vdw.mojo, electrostatic.mojo, total.mojo
 # Updated for Mojo 0.25.7
 
-from math import sqrt, cos, sin, acos, atan2, pow, abs
-from memory import alloc
+from math import sqrt, cos, sin, acos, atan2
+from memory import UnsafePointer
 
-
-# =============================================================================
-# MMFF94 Constants
-# =============================================================================
+fn abs_f32(x: Float32) -> Float32:
+    """Absolute value for Float32."""
+    if x < Float32(0.0):
+        return -x
+    return x
 
 # Mathematical constants
 alias PI: Float32 = 3.14159265358979323846
@@ -32,11 +33,7 @@ alias DEFAULT_DIELECTRIC: Float32 = 1.0
 alias DEFAULT_1_4_VDW_SCALE: Float32 = 0.75
 alias DEFAULT_1_4_ELEC_SCALE: Float32 = 0.75
 
-
-# =============================================================================
-# Utility Functions
-# =============================================================================
-
+# Utility functions
 fn compute_distance(
     x1: Float32, y1: Float32, z1: Float32,
     x2: Float32, y2: Float32, z2: Float32
@@ -47,12 +44,8 @@ fn compute_distance(
     var dz = z2 - z1
     return sqrt(dx * dx + dy * dy + dz * dz)
 
-
-# =============================================================================
-# Bond Stretching
+# Bond stretching
 # E_bond = 0.5 * 143.9325 * kb * dr^2 * (1 + cs*dr + 7/12*cs^2*dr^2)
-# =============================================================================
-
 fn bond_energy_single(
     r: Float32,      # Current bond length
     r0: Float32,     # Equilibrium bond length
@@ -72,12 +65,10 @@ fn bond_energy_single(
     var cs = MMFF_CUBIC_STRETCH
     var cs2 = cs * cs
 
-    # Quartic bond stretch potential
     var energy = Float32(0.5) * MMFF_BOND_PREFACTOR * kb * dr2 * (
         Float32(1.0) + cs * dr + Float32(7.0 / 12.0) * cs2 * dr2
     )
     return energy
-
 
 fn bond_energy_and_gradient(
     r: Float32,
@@ -104,22 +95,23 @@ fn bond_energy_and_gradient(
 
     return (energy, gradient)
 
-
-fn compute_bond_forces(
+fn compute_bond_forces[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Gradients (output)
-    grad_x: type_of(alloc[Float32](1)),
-    grad_y: type_of(alloc[Float32](1)),
-    grad_z: type_of(alloc[Float32](1)),
+    mut grad_x: UnsafePointer[Scalar[StorageType]],
+    mut grad_y: UnsafePointer[Scalar[StorageType]],
+    mut grad_z: UnsafePointer[Scalar[StorageType]],
     # Bond topology
-    bond_i: type_of(alloc[Int32](1)),
-    bond_j: type_of(alloc[Int32](1)),
+    bond_i: UnsafePointer[Int32],
+    bond_j: UnsafePointer[Int32],
     # Bond parameters
-    bond_kb: type_of(alloc[Float32](1)),
-    bond_r0: type_of(alloc[Float32](1)),
+    bond_kb: UnsafePointer[Scalar[StorageType]],
+    bond_r0: UnsafePointer[Scalar[StorageType]],
     # Range
     bond_start: Int,
     bond_end: Int
@@ -136,13 +128,13 @@ fn compute_bond_forces(
         var i = Int(bond_i[b])
         var j = Int(bond_j[b])
 
-        # Get positions
-        var x1 = x[i]
-        var y1 = y[i]
-        var z1 = z[i]
-        var x2 = x[j]
-        var y2 = y[j]
-        var z2 = z[j]
+        # Get positions and convert to Float32
+        var x1 = Float32(x[i])
+        var y1 = Float32(y[i])
+        var z1 = Float32(z[i])
+        var x2 = Float32(x[j])
+        var y2 = Float32(y[j])
+        var z2 = Float32(z[j])
 
         # Compute distance
         var dx = x2 - x1
@@ -150,46 +142,47 @@ fn compute_bond_forces(
         var dz = z2 - z1
         var r = sqrt(dx * dx + dy * dy + dz * dz)
 
-        # Avoid division by zero
         if r < Float32(1e-8):
             continue
 
         # Compute energy and gradient
-        var result = bond_energy_and_gradient(r, bond_r0[b], bond_kb[b])
+        var r0 = Float32(bond_r0[b])
+        var kb = Float32(bond_kb[b])
+        var result = bond_energy_and_gradient(r, r0, kb)
         var energy = result[0]
         var dE_dr = result[1]
 
         total_energy += energy
 
         # Convert dE/dr to dE/d(xyz) using chain rule
-        # dE/dx = dE/dr * dr/dx = dE/dr * (x2-x1)/r
         var inv_r = Float32(1.0) / r
         var fx = dE_dr * dx * inv_r
         var fy = dE_dr * dy * inv_r
         var fz = dE_dr * dz * inv_r
 
-        # Accumulate gradients (opposite signs for i and j)
-        grad_x[i] = grad_x[i] - fx
-        grad_y[i] = grad_y[i] - fy
-        grad_z[i] = grad_z[i] - fz
-        grad_x[j] = grad_x[j] + fx
-        grad_y[j] = grad_y[j] + fy
-        grad_z[j] = grad_z[j] + fz
+        # Accumulate gradients
+        grad_x[i] = grad_x[i] - Scalar[StorageType](fx)
+        grad_y[i] = grad_y[i] - Scalar[StorageType](fy)
+        grad_z[i] = grad_z[i] - Scalar[StorageType](fz)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](fx)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](fy)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](fz)
 
     return total_energy
 
-
-fn compute_total_bond_energy(
+fn compute_total_bond_energy[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Bond topology
-    bond_i: type_of(alloc[Int32](1)),
-    bond_j: type_of(alloc[Int32](1)),
+    bond_i: UnsafePointer[Int32],
+    bond_j: UnsafePointer[Int32],
     # Bond parameters
-    bond_kb: type_of(alloc[Float32](1)),
-    bond_r0: type_of(alloc[Float32](1)),
+    bond_kb: UnsafePointer[Scalar[StorageType]],
+    bond_r0: UnsafePointer[Scalar[StorageType]],
     # Number of bonds
     num_bonds: Int
 ) -> Float32:
@@ -204,33 +197,34 @@ fn compute_total_bond_energy(
         var i = Int(bond_i[b])
         var j = Int(bond_j[b])
 
-        # Get positions
-        var x1 = x[i]
-        var y1 = y[i]
-        var z1 = z[i]
-        var x2 = x[j]
-        var y2 = y[j]
-        var z2 = z[j]
+        # Get positions and convert to Float32
+        var x1 = Float32(x[i])
+        var y1 = Float32(y[i])
+        var z1 = Float32(z[i])
+        var x2 = Float32(x[j])
+        var y2 = Float32(y[j])
+        var z2 = Float32(z[j])
 
         # Compute distance and energy
         var r = compute_distance(x1, y1, z1, x2, y2, z2)
-        var energy = bond_energy_single(r, bond_r0[b], bond_kb[b])
+        var energy = bond_energy_single(r, Float32(bond_r0[b]), Float32(bond_kb[b]))
         total_energy += energy
 
     return total_energy
 
-
-fn compute_total_bond_energy_kahan(
+fn compute_total_bond_energy_kahan[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Bond topology
-    bond_i: type_of(alloc[Int32](1)),
-    bond_j: type_of(alloc[Int32](1)),
+    bond_i: UnsafePointer[Int32],
+    bond_j: UnsafePointer[Int32],
     # Bond parameters
-    bond_kb: type_of(alloc[Float32](1)),
-    bond_r0: type_of(alloc[Float32](1)),
+    bond_kb: UnsafePointer[Scalar[StorageType]],
+    bond_r0: UnsafePointer[Scalar[StorageType]],
     # Number of bonds
     num_bonds: Int
 ) -> Float32:
@@ -246,17 +240,17 @@ fn compute_total_bond_energy_kahan(
         var i = Int(bond_i[b])
         var j = Int(bond_j[b])
 
-        # Get positions
-        var x1 = x[i]
-        var y1 = y[i]
-        var z1 = z[i]
-        var x2 = x[j]
-        var y2 = y[j]
-        var z2 = z[j]
+        # Get positions and convert to Float32
+        var x1 = Float32(x[i])
+        var y1 = Float32(y[i])
+        var z1 = Float32(z[i])
+        var x2 = Float32(x[j])
+        var y2 = Float32(y[j])
+        var z2 = Float32(z[j])
 
         # Compute distance and energy
         var r = compute_distance(x1, y1, z1, x2, y2, z2)
-        var energy = bond_energy_single(r, bond_r0[b], bond_kb[b])
+        var energy = bond_energy_single(r, Float32(bond_r0[b]), Float32(bond_kb[b]))
 
         # Kahan summation
         var y_val = energy - compensation
@@ -266,12 +260,8 @@ fn compute_total_bond_energy_kahan(
 
     return total_energy
 
-
-# =============================================================================
-# Angle Bending
+# Angle bending
 # E_angle = 0.043844 * ka * dtheta^2 * (1 - 0.007*dtheta)
-# =============================================================================
-
 fn compute_angle(
     x1: Float32, y1: Float32, z1: Float32,  # Atom i
     x2: Float32, y2: Float32, z2: Float32,  # Atom j (central)
@@ -310,7 +300,6 @@ fn compute_angle(
 
     return acos(cos_theta)
 
-
 fn angle_energy_single(
     theta: Float32,    # Current angle in radians
     theta0: Float32,   # Equilibrium angle in radians
@@ -325,15 +314,13 @@ fn angle_energy_single(
         dtheta = theta - theta0 (in degrees for the cubic term)
     """
     var dtheta_rad = theta - theta0
-    var dtheta_deg = dtheta_rad * RAD_TO_DEG  # Convert to degrees for sextic term
+    var dtheta_deg = dtheta_rad * RAD_TO_DEG
     var dtheta_deg2 = dtheta_deg * dtheta_deg
 
-    # MMFF uses degrees in the polynomial but radians^2 in the main term
     var energy = MMFF_ANGLE_PREFACTOR * ka * dtheta_deg2 * (
         Float32(1.0) + MMFF_ANGLE_SEXTIC * dtheta_deg
     )
     return energy
-
 
 fn angle_energy_and_gradient(
     theta: Float32,
@@ -367,23 +354,24 @@ fn angle_energy_and_gradient(
 
     return (energy, gradient_rad)
 
-
-fn compute_angle_forces(
+fn compute_angle_forces[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Gradients (output)
-    grad_x: type_of(alloc[Float32](1)),
-    grad_y: type_of(alloc[Float32](1)),
-    grad_z: type_of(alloc[Float32](1)),
+    mut grad_x: UnsafePointer[Scalar[StorageType]],
+    mut grad_y: UnsafePointer[Scalar[StorageType]],
+    mut grad_z: UnsafePointer[Scalar[StorageType]],
     # Angle topology
-    angle_i: type_of(alloc[Int32](1)),
-    angle_j: type_of(alloc[Int32](1)),
-    angle_k: type_of(alloc[Int32](1)),
+    angle_i: UnsafePointer[Int32],
+    angle_j: UnsafePointer[Int32],
+    angle_k: UnsafePointer[Int32],
     # Angle parameters
-    angle_ka: type_of(alloc[Float32](1)),
-    angle_theta0: type_of(alloc[Float32](1)),
+    angle_ka: UnsafePointer[Scalar[StorageType]],
+    angle_theta0: UnsafePointer[Scalar[StorageType]],
     # Range
     angle_start: Int,
     angle_end: Int
@@ -401,16 +389,16 @@ fn compute_angle_forces(
         var j = Int(angle_j[a])  # Central atom
         var k = Int(angle_k[a])
 
-        # Get positions
-        var x1 = x[i]
-        var y1 = y[i]
-        var z1 = z[i]
-        var x2 = x[j]
-        var y2 = y[j]
-        var z2 = z[j]
-        var x3 = x[k]
-        var y3 = y[k]
-        var z3 = z[k]
+        # Get positions and convert to Float32
+        var x1 = Float32(x[i])
+        var y1 = Float32(y[i])
+        var z1 = Float32(z[i])
+        var x2 = Float32(x[j])
+        var y2 = Float32(y[j])
+        var z2 = Float32(z[j])
+        var x3 = Float32(x[k])
+        var y3 = Float32(y[k])
+        var z3 = Float32(z[k])
 
         # Vectors from central atom
         var v1x = x1 - x2
@@ -442,14 +430,13 @@ fn compute_angle_forces(
             sin_theta = Float32(1e-8)
 
         # Compute energy and gradient
-        var result = angle_energy_and_gradient(theta, angle_theta0[a], angle_ka[a])
+        var result = angle_energy_and_gradient(theta, Float32(angle_theta0[a]), Float32(angle_ka[a]))
         var energy = result[0]
         var dE_dtheta = result[1]
 
         total_energy += energy
 
         # Compute dtheta/d(xyz) using chain rule
-        # d(cos(theta))/d(xyz) then convert to dtheta
         var inv_r1 = Float32(1.0) / r1
         var inv_r2 = Float32(1.0) / r2
         var inv_sin = Float32(1.0) / sin_theta
@@ -480,31 +467,32 @@ fn compute_angle_forces(
         var fjz = -(fiz + fkz)
 
         # Accumulate gradients
-        grad_x[i] = grad_x[i] + fix
-        grad_y[i] = grad_y[i] + fiy
-        grad_z[i] = grad_z[i] + fiz
-        grad_x[j] = grad_x[j] + fjx
-        grad_y[j] = grad_y[j] + fjy
-        grad_z[j] = grad_z[j] + fjz
-        grad_x[k] = grad_x[k] + fkx
-        grad_y[k] = grad_y[k] + fky
-        grad_z[k] = grad_z[k] + fkz
+        grad_x[i] = grad_x[i] + Scalar[StorageType](fix)
+        grad_y[i] = grad_y[i] + Scalar[StorageType](fiy)
+        grad_z[i] = grad_z[i] + Scalar[StorageType](fiz)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](fjx)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](fjy)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](fjz)
+        grad_x[k] = grad_x[k] + Scalar[StorageType](fkx)
+        grad_y[k] = grad_y[k] + Scalar[StorageType](fky)
+        grad_z[k] = grad_z[k] + Scalar[StorageType](fkz)
 
     return total_energy
 
-
-fn compute_total_angle_energy(
+fn compute_total_angle_energy[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Angle topology
-    angle_i: type_of(alloc[Int32](1)),
-    angle_j: type_of(alloc[Int32](1)),
-    angle_k: type_of(alloc[Int32](1)),
+    angle_i: UnsafePointer[Int32],
+    angle_j: UnsafePointer[Int32],
+    angle_k: UnsafePointer[Int32],
     # Angle parameters
-    angle_ka: type_of(alloc[Float32](1)),
-    angle_theta0: type_of(alloc[Float32](1)),
+    angle_ka: UnsafePointer[Scalar[StorageType]],
+    angle_theta0: UnsafePointer[Scalar[StorageType]],
     # Number of angles
     num_angles: Int
 ) -> Float32:
@@ -520,22 +508,18 @@ fn compute_total_angle_energy(
 
         # Compute angle
         var theta = compute_angle(
-            x[i], y[i], z[i],
-            x[j], y[j], z[j],
-            x[k], y[k], z[k]
+            Float32(x[i]), Float32(y[i]), Float32(z[i]),
+            Float32(x[j]), Float32(y[j]), Float32(z[j]),
+            Float32(x[k]), Float32(y[k]), Float32(z[k])
         )
 
-        var energy = angle_energy_single(theta, angle_theta0[a], angle_ka[a])
+        var energy = angle_energy_single(theta, Float32(angle_theta0[a]), Float32(angle_ka[a]))
         total_energy += energy
 
     return total_energy
 
-
-# =============================================================================
 # Torsion
 # E_torsion = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
-# =============================================================================
-
 fn compute_torsion_angle(
     x1: Float32, y1: Float32, z1: Float32,  # Atom i
     x2: Float32, y2: Float32, z2: Float32,  # Atom j
@@ -588,7 +572,6 @@ fn compute_torsion_angle(
 
     return atan2(y_val, x_val)
 
-
 fn torsion_energy_single(
     phi: Float32,     # Current torsion angle in radians
     v1: Float32,      # Fourier coefficient for cos(phi)
@@ -610,7 +593,6 @@ fn torsion_energy_single(
         v3 * (Float32(1.0) + cos_3phi)
     )
     return energy
-
 
 fn torsion_energy_and_gradient(
     phi: Float32,
@@ -644,25 +626,26 @@ fn torsion_energy_and_gradient(
 
     return (energy, gradient)
 
-
-fn compute_torsion_forces(
+fn compute_torsion_forces[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Gradients (output)
-    grad_x: type_of(alloc[Float32](1)),
-    grad_y: type_of(alloc[Float32](1)),
-    grad_z: type_of(alloc[Float32](1)),
+    mut grad_x: UnsafePointer[Scalar[StorageType]],
+    mut grad_y: UnsafePointer[Scalar[StorageType]],
+    mut grad_z: UnsafePointer[Scalar[StorageType]],
     # Torsion topology
-    torsion_i: type_of(alloc[Int32](1)),
-    torsion_j: type_of(alloc[Int32](1)),
-    torsion_k: type_of(alloc[Int32](1)),
-    torsion_l: type_of(alloc[Int32](1)),
+    torsion_i: UnsafePointer[Int32],
+    torsion_j: UnsafePointer[Int32],
+    torsion_k: UnsafePointer[Int32],
+    torsion_l: UnsafePointer[Int32],
     # Torsion parameters
-    torsion_v1: type_of(alloc[Float32](1)),
-    torsion_v2: type_of(alloc[Float32](1)),
-    torsion_v3: type_of(alloc[Float32](1)),
+    torsion_v1: UnsafePointer[Scalar[StorageType]],
+    torsion_v2: UnsafePointer[Scalar[StorageType]],
+    torsion_v3: UnsafePointer[Scalar[StorageType]],
     # Range
     torsion_start: Int,
     torsion_end: Int
@@ -680,19 +663,19 @@ fn compute_torsion_forces(
         var k = Int(torsion_k[t])
         var l = Int(torsion_l[t])
 
-        # Get positions
-        var x1 = x[i]
-        var y1 = y[i]
-        var z1 = z[i]
-        var x2 = x[j]
-        var y2 = y[j]
-        var z2 = z[j]
-        var x3 = x[k]
-        var y3 = y[k]
-        var z3 = z[k]
-        var x4 = x[l]
-        var y4 = y[l]
-        var z4 = z[l]
+        # Get positions and convert to Float32
+        var x1 = Float32(x[i])
+        var y1 = Float32(y[i])
+        var z1 = Float32(z[i])
+        var x2 = Float32(x[j])
+        var y2 = Float32(y[j])
+        var z2 = Float32(z[j])
+        var x3 = Float32(x[k])
+        var y3 = Float32(y[k])
+        var z3 = Float32(z[k])
+        var x4 = Float32(x[l])
+        var y4 = Float32(y[l])
+        var z4 = Float32(z[l])
 
         # Bond vectors
         var b1x = x2 - x1
@@ -737,7 +720,7 @@ fn compute_torsion_forces(
 
         # Compute energy and gradient
         var result = torsion_energy_and_gradient(
-            phi, torsion_v1[t], torsion_v2[t], torsion_v3[t]
+            phi, Float32(torsion_v1[t]), Float32(torsion_v2[t]), Float32(torsion_v3[t])
         )
         var energy = result[0]
         var dE_dphi = result[1]
@@ -745,10 +728,6 @@ fn compute_torsion_forces(
         total_energy += energy
 
         # Compute forces using standard torsion gradient formulas
-        # dphi/dr_i = (b2_len / n1_sq) * n1
-        # dphi/dr_l = -(b2_len / n2_sq) * n2
-        # dphi/dr_j and dphi/dr_k involve both planes
-
         var factor_i = dE_dphi * b2_len / n1_sq
         var factor_l = -dE_dphi * b2_len / n2_sq
 
@@ -781,36 +760,37 @@ fn compute_torsion_forces(
         var fkz = factor_k_from_i * fiz + factor_k_from_l * flz
 
         # Accumulate gradients
-        grad_x[i] = grad_x[i] + fix
-        grad_y[i] = grad_y[i] + fiy
-        grad_z[i] = grad_z[i] + fiz
-        grad_x[j] = grad_x[j] + fjx
-        grad_y[j] = grad_y[j] + fjy
-        grad_z[j] = grad_z[j] + fjz
-        grad_x[k] = grad_x[k] + fkx
-        grad_y[k] = grad_y[k] + fky
-        grad_z[k] = grad_z[k] + fkz
-        grad_x[l] = grad_x[l] + flx
-        grad_y[l] = grad_y[l] + fly
-        grad_z[l] = grad_z[l] + flz
+        grad_x[i] = grad_x[i] + Scalar[StorageType](fix)
+        grad_y[i] = grad_y[i] + Scalar[StorageType](fiy)
+        grad_z[i] = grad_z[i] + Scalar[StorageType](fiz)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](fjx)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](fjy)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](fjz)
+        grad_x[k] = grad_x[k] + Scalar[StorageType](fkx)
+        grad_y[k] = grad_y[k] + Scalar[StorageType](fky)
+        grad_z[k] = grad_z[k] + Scalar[StorageType](fkz)
+        grad_x[l] = grad_x[l] + Scalar[StorageType](flx)
+        grad_y[l] = grad_y[l] + Scalar[StorageType](fly)
+        grad_z[l] = grad_z[l] + Scalar[StorageType](flz)
 
     return total_energy
 
-
-fn compute_total_torsion_energy(
+fn compute_total_torsion_energy[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Torsion topology
-    torsion_i: type_of(alloc[Int32](1)),
-    torsion_j: type_of(alloc[Int32](1)),
-    torsion_k: type_of(alloc[Int32](1)),
-    torsion_l: type_of(alloc[Int32](1)),
+    torsion_i: UnsafePointer[Int32],
+    torsion_j: UnsafePointer[Int32],
+    torsion_k: UnsafePointer[Int32],
+    torsion_l: UnsafePointer[Int32],
     # Torsion parameters
-    torsion_v1: type_of(alloc[Float32](1)),
-    torsion_v2: type_of(alloc[Float32](1)),
-    torsion_v3: type_of(alloc[Float32](1)),
+    torsion_v1: UnsafePointer[Scalar[StorageType]],
+    torsion_v2: UnsafePointer[Scalar[StorageType]],
+    torsion_v3: UnsafePointer[Scalar[StorageType]],
     # Number of torsions
     num_torsions: Int
 ) -> Float32:
@@ -826,25 +806,21 @@ fn compute_total_torsion_energy(
         var l = Int(torsion_l[t])
 
         var phi = compute_torsion_angle(
-            x[i], y[i], z[i],
-            x[j], y[j], z[j],
-            x[k], y[k], z[k],
-            x[l], y[l], z[l]
+            Float32(x[i]), Float32(y[i]), Float32(z[i]),
+            Float32(x[j]), Float32(y[j]), Float32(z[j]),
+            Float32(x[k]), Float32(y[k]), Float32(z[k]),
+            Float32(x[l]), Float32(y[l]), Float32(z[l])
         )
 
         var energy = torsion_energy_single(
-            phi, torsion_v1[t], torsion_v2[t], torsion_v3[t]
+            phi, Float32(torsion_v1[t]), Float32(torsion_v2[t]), Float32(torsion_v3[t])
         )
         total_energy += energy
 
     return total_energy
 
-
-# =============================================================================
 # Van der Waals
 # Buffered 14-7 potential: E_vdw = epsilon * (1.07*R*/(r+0.07*R*))^7 * (1.12*R*^7/(r^7+0.12*R*^7) - 2)
-# =============================================================================
-
 fn vdw_energy_single(
     r: Float32,        # Current distance
     epsilon: Float32,  # Well depth (kcal/mol)
@@ -857,24 +833,22 @@ fn vdw_energy_single(
 
     This form prevents singularities at r=0 and has correct asymptotic behavior.
     """
-    # Constants
     alias DELTA: Float32 = 0.07
     alias GAMMA: Float32 = 0.12
 
-    var r_star_7 = pow(r_star, Float32(7.0))
+    var r_star_7 = r_star ** 7
 
     # Repulsive term: (1.07*R*/(r+0.07*R*))^7
     var denom_rep = r + DELTA * r_star
     var ratio_rep = (Float32(1.0) + DELTA) * r_star / denom_rep
-    var rep_term = pow(ratio_rep, Float32(7.0))
+    var rep_term = ratio_rep ** 7
 
     # Attractive term: 1.12*R*^7/(r^7+0.12*R*^7) - 2
-    var r_7 = pow(r, Float32(7.0))
+    var r_7 = r ** 7
     var denom_att = r_7 + GAMMA * r_star_7
     var att_term = (Float32(1.0) + GAMMA) * r_star_7 / denom_att - Float32(2.0)
 
     return epsilon * rep_term * att_term
-
 
 fn vdw_energy_and_gradient(
     r: Float32,
@@ -887,14 +861,14 @@ fn vdw_energy_and_gradient(
     alias DELTA: Float32 = 0.07
     alias GAMMA: Float32 = 0.12
 
-    var r_star_7 = pow(r_star, Float32(7.0))
-    var r_6 = pow(r, Float32(6.0))
+    var r_star_7 = r_star ** 7
+    var r_6 = r ** 6
     var r_7 = r * r_6
 
     # Repulsive components
     var denom_rep = r + DELTA * r_star
     var ratio_rep = (Float32(1.0) + DELTA) * r_star / denom_rep
-    var rep_term = pow(ratio_rep, Float32(7.0))
+    var rep_term = ratio_rep ** 7
 
     # Attractive components
     var denom_att = r_7 + GAMMA * r_star_7
@@ -915,23 +889,24 @@ fn vdw_energy_and_gradient(
 
     return (energy, gradient)
 
-
-fn compute_vdw_forces(
+fn compute_vdw_forces[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Gradients (output)
-    grad_x: type_of(alloc[Float32](1)),
-    grad_y: type_of(alloc[Float32](1)),
-    grad_z: type_of(alloc[Float32](1)),
+    mut grad_x: UnsafePointer[Scalar[StorageType]],
+    mut grad_y: UnsafePointer[Scalar[StorageType]],
+    mut grad_z: UnsafePointer[Scalar[StorageType]],
     # Nonbonded pair indices
-    nb_i: type_of(alloc[Int32](1)),
-    nb_j: type_of(alloc[Int32](1)),
-    nb_is_1_4: type_of(alloc[Int32](1)),
+    nb_i: UnsafePointer[Int32],
+    nb_j: UnsafePointer[Int32],
+    nb_is_1_4: UnsafePointer[Int32],
     # vdW parameters
-    nb_epsilon: type_of(alloc[Float32](1)),
-    nb_r_star: type_of(alloc[Float32](1)),
+    nb_epsilon: UnsafePointer[Scalar[StorageType]],
+    nb_r_star: UnsafePointer[Scalar[StorageType]],
     # Range
     nb_start: Int,
     nb_end: Int,
@@ -949,13 +924,13 @@ fn compute_vdw_forces(
         var i = Int(nb_i[p])
         var j = Int(nb_j[p])
 
-        # Get positions
-        var x1 = x[i]
-        var y1 = y[i]
-        var z1 = z[i]
-        var x2 = x[j]
-        var y2 = y[j]
-        var z2 = z[j]
+        # Get positions and convert to Float32
+        var x1 = Float32(x[i])
+        var y1 = Float32(y[i])
+        var z1 = Float32(z[i])
+        var x2 = Float32(x[j])
+        var y2 = Float32(y[j])
+        var z2 = Float32(z[j])
 
         # Compute distance
         var dx = x2 - x1
@@ -963,7 +938,7 @@ fn compute_vdw_forces(
         var dz = z2 - z1
         var r = sqrt(dx * dx + dy * dy + dz * dz)
 
-        if r < Float32(0.1):  # Avoid very close contacts
+        if r < Float32(0.1):
             continue
 
         # Apply 1-4 scaling
@@ -972,7 +947,7 @@ fn compute_vdw_forces(
             scale = scale_1_4
 
         # Compute energy and gradient
-        var result = vdw_energy_and_gradient(r, nb_epsilon[p], nb_r_star[p])
+        var result = vdw_energy_and_gradient(r, Float32(nb_epsilon[p]), Float32(nb_r_star[p]))
         var energy = result[0] * scale
         var dE_dr = result[1] * scale
 
@@ -985,28 +960,29 @@ fn compute_vdw_forces(
         var fz = dE_dr * dz * inv_r
 
         # Accumulate gradients
-        grad_x[i] = grad_x[i] - fx
-        grad_y[i] = grad_y[i] - fy
-        grad_z[i] = grad_z[i] - fz
-        grad_x[j] = grad_x[j] + fx
-        grad_y[j] = grad_y[j] + fy
-        grad_z[j] = grad_z[j] + fz
+        grad_x[i] = grad_x[i] - Scalar[StorageType](fx)
+        grad_y[i] = grad_y[i] - Scalar[StorageType](fy)
+        grad_z[i] = grad_z[i] - Scalar[StorageType](fz)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](fx)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](fy)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](fz)
 
     return total_energy
 
-
-fn compute_total_vdw_energy(
+fn compute_total_vdw_energy[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Nonbonded pair indices
-    nb_i: type_of(alloc[Int32](1)),
-    nb_j: type_of(alloc[Int32](1)),
-    nb_is_1_4: type_of(alloc[Int32](1)),
+    nb_i: UnsafePointer[Int32],
+    nb_j: UnsafePointer[Int32],
+    nb_is_1_4: UnsafePointer[Int32],
     # vdW parameters
-    nb_epsilon: type_of(alloc[Float32](1)),
-    nb_r_star: type_of(alloc[Float32](1)),
+    nb_epsilon: UnsafePointer[Scalar[StorageType]],
+    nb_r_star: UnsafePointer[Scalar[StorageType]],
     # Number of pairs
     num_pairs: Int,
     # Scale factor for 1-4 interactions
@@ -1021,9 +997,9 @@ fn compute_total_vdw_energy(
         var i = Int(nb_i[p])
         var j = Int(nb_j[p])
 
-        var dx = x[j] - x[i]
-        var dy = y[j] - y[i]
-        var dz = z[j] - z[i]
+        var dx = Float32(x[j]) - Float32(x[i])
+        var dy = Float32(y[j]) - Float32(y[i])
+        var dz = Float32(z[j]) - Float32(z[i])
         var r = sqrt(dx * dx + dy * dy + dz * dz)
 
         if r < Float32(0.1):
@@ -1033,17 +1009,13 @@ fn compute_total_vdw_energy(
         if nb_is_1_4[p] != 0:
             scale = scale_1_4
 
-        var energy = vdw_energy_single(r, nb_epsilon[p], nb_r_star[p])
+        var energy = vdw_energy_single(r, Float32(nb_epsilon[p]), Float32(nb_r_star[p]))
         total_energy += energy * scale
 
     return total_energy
 
-
-# =============================================================================
 # Electrostatics
 # E_elec = 332.0716 * qi * qj / (D * (r + delta))
-# =============================================================================
-
 fn electrostatic_energy_single(
     r: Float32,       # Distance
     qi: Float32,      # Charge on atom i
@@ -1059,7 +1031,6 @@ fn electrostatic_energy_single(
     """
     var r_eff = r + MMFF_ELEC_BUFFER
     return MMFF_ELEC_CONSTANT * qi * qj / (dielectric * r_eff)
-
 
 fn electrostatic_energy_and_gradient(
     r: Float32,
@@ -1099,22 +1070,23 @@ fn electrostatic_energy_and_gradient(
         var gradient = -MMFF_ELEC_CONSTANT * qq / (dielectric * r_eff * r_eff)
         return (energy, gradient)
 
-
-fn compute_electrostatic_forces(
+fn compute_electrostatic_forces[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Gradients (output)
-    grad_x: type_of(alloc[Float32](1)),
-    grad_y: type_of(alloc[Float32](1)),
-    grad_z: type_of(alloc[Float32](1)),
+    mut grad_x: UnsafePointer[Scalar[StorageType]],
+    mut grad_y: UnsafePointer[Scalar[StorageType]],
+    mut grad_z: UnsafePointer[Scalar[StorageType]],
     # Charges
-    charge: type_of(alloc[Float32](1)),
+    charge: UnsafePointer[Scalar[StorageType]],
     # Nonbonded pair indices
-    nb_i: type_of(alloc[Int32](1)),
-    nb_j: type_of(alloc[Int32](1)),
-    nb_is_1_4: type_of(alloc[Int32](1)),
+    nb_i: UnsafePointer[Int32],
+    nb_j: UnsafePointer[Int32],
+    nb_is_1_4: UnsafePointer[Int32],
     # Range
     nb_start: Int,
     nb_end: Int,
@@ -1134,20 +1106,20 @@ fn compute_electrostatic_forces(
         var i = Int(nb_i[p])
         var j = Int(nb_j[p])
 
-        var qi = charge[i]
-        var qj = charge[j]
+        var qi = Float32(charge[i])
+        var qj = Float32(charge[j])
 
         # Skip if either charge is zero
         if qi == Float32(0.0) or qj == Float32(0.0):
             continue
 
-        # Get positions
-        var x1 = x[i]
-        var y1 = y[i]
-        var z1 = z[i]
-        var x2 = x[j]
-        var y2 = y[j]
-        var z2 = z[j]
+        # Get positions and convert to Float32
+        var x1 = Float32(x[i])
+        var y1 = Float32(y[i])
+        var z1 = Float32(z[i])
+        var x2 = Float32(x[j])
+        var y2 = Float32(y[j])
+        var z2 = Float32(z[j])
 
         # Compute distance
         var dx = x2 - x1
@@ -1155,7 +1127,7 @@ fn compute_electrostatic_forces(
         var dz = z2 - z1
         var r = sqrt(dx * dx + dy * dy + dz * dz)
 
-        if r < Float32(0.1):  # Avoid very close contacts
+        if r < Float32(0.1):
             continue
 
         # Apply 1-4 scaling
@@ -1179,27 +1151,28 @@ fn compute_electrostatic_forces(
         var fz = dE_dr * dz * inv_r
 
         # Accumulate gradients
-        grad_x[i] = grad_x[i] - fx
-        grad_y[i] = grad_y[i] - fy
-        grad_z[i] = grad_z[i] - fz
-        grad_x[j] = grad_x[j] + fx
-        grad_y[j] = grad_y[j] + fy
-        grad_z[j] = grad_z[j] + fz
+        grad_x[i] = grad_x[i] - Scalar[StorageType](fx)
+        grad_y[i] = grad_y[i] - Scalar[StorageType](fy)
+        grad_z[i] = grad_z[i] - Scalar[StorageType](fz)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](fx)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](fy)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](fz)
 
     return total_energy
 
-
-fn compute_total_electrostatic_energy(
+fn compute_total_electrostatic_energy[
+    StorageType: DType
+](
     # Positions
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
     # Charges
-    charge: type_of(alloc[Float32](1)),
+    charge: UnsafePointer[Scalar[StorageType]],
     # Nonbonded pair indices
-    nb_i: type_of(alloc[Int32](1)),
-    nb_j: type_of(alloc[Int32](1)),
-    nb_is_1_4: type_of(alloc[Int32](1)),
+    nb_i: UnsafePointer[Int32],
+    nb_j: UnsafePointer[Int32],
+    nb_is_1_4: UnsafePointer[Int32],
     # Number of pairs
     num_pairs: Int,
     # Options
@@ -1216,15 +1189,15 @@ fn compute_total_electrostatic_energy(
         var i = Int(nb_i[p])
         var j = Int(nb_j[p])
 
-        var qi = charge[i]
-        var qj = charge[j]
+        var qi = Float32(charge[i])
+        var qj = Float32(charge[j])
 
         if qi == Float32(0.0) or qj == Float32(0.0):
             continue
 
-        var dx = x[j] - x[i]
-        var dy = y[j] - y[i]
-        var dz = z[j] - z[i]
+        var dx = Float32(x[j]) - Float32(x[i])
+        var dy = Float32(y[j]) - Float32(y[i])
+        var dz = Float32(z[j]) - Float32(z[i])
         var r = sqrt(dx * dx + dy * dy + dz * dz)
 
         if r < Float32(0.1):
@@ -1244,11 +1217,7 @@ fn compute_total_electrostatic_energy(
 
     return total_energy
 
-
-# =============================================================================
-# Total Energy & Options
-# =============================================================================
-
+# Total energy and options
 struct MMFF94Options(Copyable, Movable):
     """Configuration options for MMFF94 calculations."""
     var dielectric: Float32
@@ -1295,7 +1264,6 @@ struct MMFF94Options(Copyable, Movable):
         self.compute_vdw = other.compute_vdw
         self.compute_elec = other.compute_elec
 
-
 struct EnergyComponents(Copyable, Movable):
     """Breakdown of energy components."""
     var bond: Float32
@@ -1333,42 +1301,43 @@ struct EnergyComponents(Copyable, Movable):
         """Compute total from components."""
         self.total = self.bond + self.angle + self.torsion + self.vdw + self.elec
 
-
-fn compute_mmff94_energy(
+fn compute_mmff94_energy[
+    StorageType: DType
+](
     # Atom data
-    x: type_of(alloc[Float32](1)),
-    y: type_of(alloc[Float32](1)),
-    z: type_of(alloc[Float32](1)),
-    charge: type_of(alloc[Float32](1)),
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
+    charge: UnsafePointer[Scalar[StorageType]],
     num_atoms: Int,
     # Bond data
-    bond_i: type_of(alloc[Int32](1)),
-    bond_j: type_of(alloc[Int32](1)),
-    bond_kb: type_of(alloc[Float32](1)),
-    bond_r0: type_of(alloc[Float32](1)),
+    bond_i: UnsafePointer[Int32],
+    bond_j: UnsafePointer[Int32],
+    bond_kb: UnsafePointer[Scalar[StorageType]],
+    bond_r0: UnsafePointer[Scalar[StorageType]],
     num_bonds: Int,
     # Angle data
-    angle_i: type_of(alloc[Int32](1)),
-    angle_j: type_of(alloc[Int32](1)),
-    angle_k: type_of(alloc[Int32](1)),
-    angle_ka: type_of(alloc[Float32](1)),
-    angle_theta0: type_of(alloc[Float32](1)),
+    angle_i: UnsafePointer[Int32],
+    angle_j: UnsafePointer[Int32],
+    angle_k: UnsafePointer[Int32],
+    angle_ka: UnsafePointer[Scalar[StorageType]],
+    angle_theta0: UnsafePointer[Scalar[StorageType]],
     num_angles: Int,
     # Torsion data
-    torsion_i: type_of(alloc[Int32](1)),
-    torsion_j: type_of(alloc[Int32](1)),
-    torsion_k: type_of(alloc[Int32](1)),
-    torsion_l: type_of(alloc[Int32](1)),
-    torsion_v1: type_of(alloc[Float32](1)),
-    torsion_v2: type_of(alloc[Float32](1)),
-    torsion_v3: type_of(alloc[Float32](1)),
+    torsion_i: UnsafePointer[Int32],
+    torsion_j: UnsafePointer[Int32],
+    torsion_k: UnsafePointer[Int32],
+    torsion_l: UnsafePointer[Int32],
+    torsion_v1: UnsafePointer[Scalar[StorageType]],
+    torsion_v2: UnsafePointer[Scalar[StorageType]],
+    torsion_v3: UnsafePointer[Scalar[StorageType]],
     num_torsions: Int,
     # Nonbonded data
-    nb_i: type_of(alloc[Int32](1)),
-    nb_j: type_of(alloc[Int32](1)),
-    nb_is_1_4: type_of(alloc[Int32](1)),
-    nb_epsilon: type_of(alloc[Float32](1)),
-    nb_r_star: type_of(alloc[Float32](1)),
+    nb_i: UnsafePointer[Int32],
+    nb_j: UnsafePointer[Int32],
+    nb_is_1_4: UnsafePointer[Int32],
+    nb_epsilon: UnsafePointer[Scalar[StorageType]],
+    nb_r_star: UnsafePointer[Scalar[StorageType]],
     num_nb_pairs: Int,
     # Options
     opts: MMFF94Options
@@ -1407,37 +1376,42 @@ fn compute_mmff94_energy(
         )
 
     result.sum()
-    return result
+    return result^
 
-
-fn gradient_rms(
-    grad_x: type_of(alloc[Float32](1)),
-    grad_y: type_of(alloc[Float32](1)),
-    grad_z: type_of(alloc[Float32](1)),
+fn gradient_rms[
+    StorageType: DType
+](
+    mut grad_x: UnsafePointer[Scalar[StorageType]],
+    mut grad_y: UnsafePointer[Scalar[StorageType]],
+    mut grad_z: UnsafePointer[Scalar[StorageType]],
     num_atoms: Int
 ) -> Float32:
     """Compute RMS gradient for convergence checking."""
     var sum_sq: Float32 = 0.0
     for i in range(num_atoms):
-        sum_sq += grad_x[i] * grad_x[i]
-        sum_sq += grad_y[i] * grad_y[i]
-        sum_sq += grad_z[i] * grad_z[i]
+        var gx = Float32(grad_x[i])
+        var gy = Float32(grad_y[i])
+        var gz = Float32(grad_z[i])
+        sum_sq += gx * gx
+        sum_sq += gy * gy
+        sum_sq += gz * gz
 
     return sqrt(sum_sq / Float32(3 * num_atoms))
 
-
-fn gradient_max(
-    grad_x: type_of(alloc[Float32](1)),
-    grad_y: type_of(alloc[Float32](1)),
-    grad_z: type_of(alloc[Float32](1)),
+fn gradient_max[
+    StorageType: DType
+](
+    mut grad_x: UnsafePointer[Scalar[StorageType]],
+    mut grad_y: UnsafePointer[Scalar[StorageType]],
+    mut grad_z: UnsafePointer[Scalar[StorageType]],
     num_atoms: Int
 ) -> Float32:
     """Find maximum gradient component magnitude."""
     var max_grad: Float32 = 0.0
     for i in range(num_atoms):
-        var gx = abs(grad_x[i])
-        var gy = abs(grad_y[i])
-        var gz = abs(grad_z[i])
+        var gx = abs_f32(Float32(grad_x[i]))
+        var gy = abs_f32(Float32(grad_y[i]))
+        var gz = abs_f32(Float32(grad_z[i]))
         if gx > max_grad:
             max_grad = gx
         if gy > max_grad:
