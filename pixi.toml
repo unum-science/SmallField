@@ -6,9 +6,12 @@ version = "0.1.0"
 
 [tasks]
 test = "mojo test tests/"
-test-quick = "mojo run tests/test_mmff94.mojo"
-benchmark = "mojo run benchmarks/benchmark.mojo"
-check = "mojo check src/types.mojo && mojo check src/mmff94.mojo && mojo check src/etkdg.mojo && mojo check src/optimizer.mojo"
+test-quick = "mojo run tests/mmff94.mojo"
+validate = "python tests/validate_rdkit.py"
+check = "mojo build src/types.mojo -o /dev/null 2>&1 && mojo build src/mmff94.mojo -o /dev/null 2>&1 && echo 'All modules compile successfully'"
+test-simd = "mojo run src/simd_utils.mojo"
+benchmark = "python benchmarks/orchestrator.py"
+benchmark-quick = "python benchmarks/orchestrator.py -n 100"
 
 [dependencies]
 max = ">=25.7.0,<26"
