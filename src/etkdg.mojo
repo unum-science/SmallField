@@ -147,33 +147,33 @@ fn initialize_bounds_from_topology(
     - 1,4+ bounds (non-bonded): sum of vdW radii as lower bound
     """
     # Set 1,2 bounds from bond lengths
-    for b in range(num_bonds):
-        var i = Int(bond_i[b])
-        var j = Int(bond_j[b])
-        var r0 = bond_length[b]
+    for bond_idx in range(num_bonds):
+        var i = Int(bond_i[bond_idx])
+        var j = Int(bond_j[bond_idx])
+        var r0 = bond_length[bond_idx]
 
         # Tight bounds around equilibrium
         bounds.set_bounds(i, j, r0 - Float32(0.1), r0 + Float32(0.1))
 
     # Set 1,3 bounds from angles using law of cosines
-    for a in range(num_angles):
-        var i = Int(angle_i[a])
-        var j = Int(angle_j[a])  # Central atom
-        var k = Int(angle_k[a])
-        var theta0 = angle_theta0[a]
+    for angle_idx in range(num_angles):
+        var i = Int(angle_i[angle_idx])
+        var j = Int(angle_j[angle_idx])  # Central atom
+        var k = Int(angle_k[angle_idx])
+        var theta0 = angle_theta0[angle_idx]
 
         # Need bond lengths i-j and j-k
         var r_ij: Float32 = BOND_LENGTH_SINGLE
         var r_jk: Float32 = BOND_LENGTH_SINGLE
 
         # Find actual bond lengths from bond list
-        for b in range(num_bonds):
-            var bi = Int(bond_i[b])
-            var bj = Int(bond_j[b])
+        for bond_idx in range(num_bonds):
+            var bi = Int(bond_i[bond_idx])
+            var bj = Int(bond_j[bond_idx])
             if (bi == i and bj == j) or (bi == j and bj == i):
-                r_ij = bond_length[b]
+                r_ij = bond_length[bond_idx]
             if (bi == j and bj == k) or (bi == k and bj == j):
-                r_jk = bond_length[b]
+                r_jk = bond_length[bond_idx]
 
         # Law of cosines: d_ik^2 = r_ij^2 + r_jk^2 - 2*r_ij*r_jk*cos(theta)
         var cos_theta = cos(theta0)
@@ -764,12 +764,12 @@ fn chirality_check(
     For each chiral center, computes signed volume of tetrahedron
     formed by the four neighbors.
     """
-    for c in range(num_chiral):
-        var center = Int(chiral_centers[c])
-        var n0 = Int(chiral_neighbors[c * 4 + 0])
-        var n1 = Int(chiral_neighbors[c * 4 + 1])
-        var n2 = Int(chiral_neighbors[c * 4 + 2])
-        var n3 = Int(chiral_neighbors[c * 4 + 3])
+    for chiral_idx in range(num_chiral):
+        var center = Int(chiral_centers[chiral_idx])
+        var n0 = Int(chiral_neighbors[chiral_idx * 4 + 0])
+        var n1 = Int(chiral_neighbors[chiral_idx * 4 + 1])
+        var n2 = Int(chiral_neighbors[chiral_idx * 4 + 2])
+        var n3 = Int(chiral_neighbors[chiral_idx * 4 + 3])
 
         # Vectors from n0 to n1, n2, n3
         var v1x = x[n1] - x[n0]
@@ -792,7 +792,7 @@ fn chirality_check(
         var volume = v1x * cross_x + v1y * cross_y + v1z * cross_z
 
         var sign = 1 if volume > Float32(0.0) else -1
-        if sign != Int(expected_sign[c]):
+        if sign != Int(expected_sign[chiral_idx]):
             return False
 
     return True

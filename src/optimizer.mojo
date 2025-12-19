@@ -468,19 +468,19 @@ fn lbfgs_two_loop(
         return
 
     # First loop: from most recent to oldest
-    for i in range(m - 1, -1, -1):
-        var idx = i % state.history_size
+    for hist_idx in range(m - 1, -1, -1):
+        var idx = hist_idx % state.history_size
         var offset = idx * n
 
         # alpha_i = rho_i * s_i^T * q
         var dot: Float32 = 0.0
-        for j in range(n):
-            dot += state.s[offset + j] * state.direction[j]
+        for var_idx in range(n):
+            dot += state.s[offset + var_idx] * state.direction[var_idx]
         state.alpha[idx] = state.rho[idx] * dot
 
         # q = q - alpha_i * y_i
-        for j in range(n):
-            state.direction[j] = state.direction[j] - state.alpha[idx] * state.y[offset + j]
+        for var_idx in range(n):
+            state.direction[var_idx] = state.direction[var_idx] - state.alpha[idx] * state.y[offset + var_idx]
 
     # Compute initial Hessian approximation: gamma * I
     # gamma = s^T * y / (y^T * y) from most recent update
@@ -489,35 +489,35 @@ fn lbfgs_two_loop(
 
     var sy: Float32 = 0.0
     var yy: Float32 = 0.0
-    for j in range(n):
-        sy += state.s[latest_offset + j] * state.y[latest_offset + j]
-        yy += state.y[latest_offset + j] * state.y[latest_offset + j]
+    for var_idx in range(n):
+        sy += state.s[latest_offset + var_idx] * state.y[latest_offset + var_idx]
+        yy += state.y[latest_offset + var_idx] * state.y[latest_offset + var_idx]
 
     var gamma = sy / yy if yy > Float32(1e-10) else Float32(1.0)
 
     # r = gamma * q
-    for j in range(n):
-        state.direction[j] = gamma * state.direction[j]
+    for var_idx in range(n):
+        state.direction[var_idx] = gamma * state.direction[var_idx]
 
     # Second loop: from oldest to most recent
-    for i in range(m):
-        var idx = i % state.history_size
+    for hist_idx in range(m):
+        var idx = hist_idx % state.history_size
         var offset = idx * n
 
         # beta = rho_i * y_i^T * r
         var dot: Float32 = 0.0
-        for j in range(n):
-            dot += state.y[offset + j] * state.direction[j]
+        for var_idx in range(n):
+            dot += state.y[offset + var_idx] * state.direction[var_idx]
         var beta = state.rho[idx] * dot
 
         # r = r + (alpha_i - beta) * s_i
         var diff = state.alpha[idx] - beta
-        for j in range(n):
-            state.direction[j] = state.direction[j] + diff * state.s[offset + j]
+        for var_idx in range(n):
+            state.direction[var_idx] = state.direction[var_idx] + diff * state.s[offset + var_idx]
 
     # Negate to get descent direction
-    for j in range(n):
-        state.direction[j] = -state.direction[j]
+    for var_idx in range(n):
+        state.direction[var_idx] = -state.direction[var_idx]
 
 
 fn lbfgs_update_history(

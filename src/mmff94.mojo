@@ -148,9 +148,9 @@ fn compute_bond_forces[
     """
     var total_energy: Float32 = 0.0
 
-    for b in range(bond_start, bond_end):
-        var i = Int(bond_i[b])
-        var j = Int(bond_j[b])
+    for bond_idx in range(bond_start, bond_end):
+        var i = Int(bond_i[bond_idx])
+        var j = Int(bond_j[bond_idx])
 
         # Get positions and convert to Float32
         var x1 = Float32(x[i])
@@ -170,27 +170,27 @@ fn compute_bond_forces[
             continue
 
         # Compute energy and gradient
-        var r0 = Float32(bond_r0[b])
-        var kb = Float32(bond_kb[b])
+        var r0 = Float32(bond_r0[bond_idx])
+        var kb = Float32(bond_kb[bond_idx])
         var result = bond_energy_and_gradient(r, r0, kb)
         var energy = result[0]
-        var dE_dr = result[1]
+        var grad_r = result[1]
 
         total_energy += energy
 
         # Convert dE/dr to dE/d(xyz) using chain rule
         var inv_r = Float32(1.0) / r
-        var fx = dE_dr * dx * inv_r
-        var fy = dE_dr * dy * inv_r
-        var fz = dE_dr * dz * inv_r
+        var force_x = grad_r * dx * inv_r
+        var force_y = grad_r * dy * inv_r
+        var force_z = grad_r * dz * inv_r
 
         # Accumulate gradients using store()
-        grad_x[i] = grad_x[i] - Scalar[StorageType](fx)
-        grad_y[i] = grad_y[i] - Scalar[StorageType](fy)
-        grad_z[i] = grad_z[i] - Scalar[StorageType](fz)
-        grad_x[j] = grad_x[j] + Scalar[StorageType](fx)
-        grad_y[j] = grad_y[j] + Scalar[StorageType](fy)
-        grad_z[j] = grad_z[j] + Scalar[StorageType](fz)
+        grad_x[i] = grad_x[i] - Scalar[StorageType](force_x)
+        grad_y[i] = grad_y[i] - Scalar[StorageType](force_y)
+        grad_z[i] = grad_z[i] - Scalar[StorageType](force_z)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](force_x)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](force_y)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](force_z)
 
     return total_energy
 
@@ -217,9 +217,9 @@ fn compute_total_bond_energy[
     """
     var total_energy: Float32 = 0.0
 
-    for b in range(num_bonds):
-        var i = Int(bond_i[b])
-        var j = Int(bond_j[b])
+    for bond_idx in range(num_bonds):
+        var i = Int(bond_i[bond_idx])
+        var j = Int(bond_j[bond_idx])
 
         # Get positions and convert to Float32
         var x1 = Float32(x[i])
@@ -231,7 +231,7 @@ fn compute_total_bond_energy[
 
         # Compute distance and energy
         var r = compute_distance(x1, y1, z1, x2, y2, z2)
-        var energy = bond_energy_single(r, Float32(bond_r0[b]), Float32(bond_kb[b]))
+        var energy = bond_energy_single(r, Float32(bond_r0[bond_idx]), Float32(bond_kb[bond_idx]))
         total_energy += energy
 
     return total_energy
@@ -260,9 +260,9 @@ fn compute_total_bond_energy_kahan[
     var total_energy: Float32 = 0.0
     var compensation: Float32 = 0.0
 
-    for b in range(num_bonds):
-        var i = Int(bond_i[b])
-        var j = Int(bond_j[b])
+    for bond_idx in range(num_bonds):
+        var i = Int(bond_i[bond_idx])
+        var j = Int(bond_j[bond_idx])
 
         # Get positions and convert to Float32
         var x1 = Float32(x[i])
@@ -274,7 +274,7 @@ fn compute_total_bond_energy_kahan[
 
         # Compute distance and energy
         var r = compute_distance(x1, y1, z1, x2, y2, z2)
-        var energy = bond_energy_single(r, Float32(bond_r0[b]), Float32(bond_kb[b]))
+        var energy = bond_energy_single(r, Float32(bond_r0[bond_idx]), Float32(bond_kb[bond_idx]))
 
         # Kahan summation
         var y_val = energy - compensation
@@ -418,10 +418,10 @@ fn compute_angle_forces[
     """
     var total_energy: Float32 = 0.0
 
-    for a in range(angle_start, angle_end):
-        var i = Int(angle_i[a])
-        var j = Int(angle_j[a])  # Central atom
-        var k = Int(angle_k[a])
+    for angle_idx in range(angle_start, angle_end):
+        var i = Int(angle_i[angle_idx])
+        var j = Int(angle_j[angle_idx])  # Central atom
+        var k = Int(angle_k[angle_idx])
 
         # Get positions and convert to Float32
         var x1 = Float32(x[i])
@@ -464,9 +464,9 @@ fn compute_angle_forces[
             sin_theta = Float32(1e-8)
 
         # Compute energy and gradient
-        var result = angle_energy_and_gradient(theta, Float32(angle_theta0[a]), Float32(angle_ka[a]))
+        var result = angle_energy_and_gradient(theta, Float32(angle_theta0[angle_idx]), Float32(angle_ka[angle_idx]))
         var energy = result[0]
-        var dE_dtheta = result[1]
+        var grad_theta = result[1]
 
         total_energy += energy
 
@@ -476,40 +476,40 @@ fn compute_angle_forces[
         var inv_sin = Float32(1.0) / sin_theta
 
         # Normalize vectors
-        var u1x = v1x * inv_r1
-        var u1y = v1y * inv_r1
-        var u1z = v1z * inv_r1
-        var u2x = v2x * inv_r2
-        var u2y = v2y * inv_r2
-        var u2z = v2z * inv_r2
+        var unit1_x = v1x * inv_r1
+        var unit1_y = v1y * inv_r1
+        var unit1_z = v1z * inv_r1
+        var unit2_x = v2x * inv_r2
+        var unit2_y = v2y * inv_r2
+        var unit2_z = v2z * inv_r2
 
         # dtheta/d(atom_i) = -1/(r1*sin_theta) * (u2 - cos_theta*u1)
-        var factor_i = -dE_dtheta * inv_r1 * inv_sin
-        var fix = factor_i * (u2x - cos_theta * u1x)
-        var fiy = factor_i * (u2y - cos_theta * u1y)
-        var fiz = factor_i * (u2z - cos_theta * u1z)
+        var factor_i = -grad_theta * inv_r1 * inv_sin
+        var force_i_x = factor_i * (unit2_x - cos_theta * unit1_x)
+        var force_i_y = factor_i * (unit2_y - cos_theta * unit1_y)
+        var force_i_z = factor_i * (unit2_z - cos_theta * unit1_z)
 
         # dtheta/d(atom_k) = -1/(r2*sin_theta) * (u1 - cos_theta*u2)
-        var factor_k = -dE_dtheta * inv_r2 * inv_sin
-        var fkx = factor_k * (u1x - cos_theta * u2x)
-        var fky = factor_k * (u1y - cos_theta * u2y)
-        var fkz = factor_k * (u1z - cos_theta * u2z)
+        var factor_k = -grad_theta * inv_r2 * inv_sin
+        var force_k_x = factor_k * (unit1_x - cos_theta * unit2_x)
+        var force_k_y = factor_k * (unit1_y - cos_theta * unit2_y)
+        var force_k_z = factor_k * (unit1_z - cos_theta * unit2_z)
 
         # Force on central atom j = -(force_i + force_k)
-        var fjx = -(fix + fkx)
-        var fjy = -(fiy + fky)
-        var fjz = -(fiz + fkz)
+        var force_j_x = -(force_i_x + force_k_x)
+        var force_j_y = -(force_i_y + force_k_y)
+        var force_j_z = -(force_i_z + force_k_z)
 
         # Accumulate gradients using store()
-        grad_x[i] = grad_x[i] + Scalar[StorageType](fix)
-        grad_y[i] = grad_y[i] + Scalar[StorageType](fiy)
-        grad_z[i] = grad_z[i] + Scalar[StorageType](fiz)
-        grad_x[j] = grad_x[j] + Scalar[StorageType](fjx)
-        grad_y[j] = grad_y[j] + Scalar[StorageType](fjy)
-        grad_z[j] = grad_z[j] + Scalar[StorageType](fjz)
-        grad_x[k] = grad_x[k] + Scalar[StorageType](fkx)
-        grad_y[k] = grad_y[k] + Scalar[StorageType](fky)
-        grad_z[k] = grad_z[k] + Scalar[StorageType](fkz)
+        grad_x[i] = grad_x[i] + Scalar[StorageType](force_i_x)
+        grad_y[i] = grad_y[i] + Scalar[StorageType](force_i_y)
+        grad_z[i] = grad_z[i] + Scalar[StorageType](force_i_z)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](force_j_x)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](force_j_y)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](force_j_z)
+        grad_x[k] = grad_x[k] + Scalar[StorageType](force_k_x)
+        grad_y[k] = grad_y[k] + Scalar[StorageType](force_k_y)
+        grad_z[k] = grad_z[k] + Scalar[StorageType](force_k_z)
 
     return total_energy
 
@@ -535,10 +535,10 @@ fn compute_total_angle_energy[
     """
     var total_energy: Float32 = 0.0
 
-    for a in range(num_angles):
-        var i = Int(angle_i[a])
-        var j = Int(angle_j[a])
-        var k = Int(angle_k[a])
+    for angle_idx in range(num_angles):
+        var i = Int(angle_i[angle_idx])
+        var j = Int(angle_j[angle_idx])
+        var k = Int(angle_k[angle_idx])
 
         # Compute angle
         var theta = compute_angle(
@@ -547,7 +547,7 @@ fn compute_total_angle_energy[
             Float32(x[k]), Float32(y[k]), Float32(z[k])
         )
 
-        var energy = angle_energy_single(theta, Float32(angle_theta0[a]), Float32(angle_ka[a]))
+        var energy = angle_energy_single(theta, Float32(angle_theta0[angle_idx]), Float32(angle_ka[angle_idx]))
         total_energy += energy
 
     return total_energy
@@ -599,10 +599,10 @@ fn compute_total_stretch_bend_energy[
     """
     var total_energy: Float32 = 0.0
 
-    for s in range(num_stbn):
-        var i = Int(stbn_i[s])
-        var j = Int(stbn_j[s])  # Central atom
-        var k = Int(stbn_k[s])
+    for stbn_idx in range(num_stbn):
+        var i = Int(stbn_i[stbn_idx])
+        var j = Int(stbn_j[stbn_idx])  # Central atom
+        var k = Int(stbn_k[stbn_idx])
 
         # Compute current bond lengths
         var dx_ij = Float32(x[j]) - Float32(x[i])
@@ -624,14 +624,14 @@ fn compute_total_stretch_bend_energy[
         var theta_deg = theta * RAD_TO_DEG
 
         # Compute deviations
-        var dr1 = r_ij - Float32(stbn_r0_ij[s])
-        var dr2 = r_jk - Float32(stbn_r0_jk[s])
-        var dtheta_deg = theta_deg - Float32(stbn_theta0[s])
+        var dr1 = r_ij - Float32(stbn_r0_ij[stbn_idx])
+        var dr2 = r_jk - Float32(stbn_r0_jk[stbn_idx])
+        var dtheta_deg = theta_deg - Float32(stbn_theta0[stbn_idx])
 
         # Compute stretch-bend energy
         var energy = stretch_bend_energy_single(
             dr1, dr2, dtheta_deg,
-            Float32(stbn_kba_ijk[s]), Float32(stbn_kba_kji[s])
+            Float32(stbn_kba_ijk[stbn_idx]), Float32(stbn_kba_kji[stbn_idx])
         )
         total_energy += energy
 
@@ -666,51 +666,51 @@ fn compute_oop_chi(
     chi is the angle between the j-l vector and the plane defined by i-j-k.
     """
     # Vectors from central atom j
-    var rJI_x = x_i - x_j
-    var rJI_y = y_i - y_j
-    var rJI_z = z_i - z_j
+    var vec_ji_x = x_i - x_j
+    var vec_ji_y = y_i - y_j
+    var vec_ji_z = z_i - z_j
 
-    var rJK_x = x_k - x_j
-    var rJK_y = y_k - y_j
-    var rJK_z = z_k - z_j
+    var vec_jk_x = x_k - x_j
+    var vec_jk_y = y_k - y_j
+    var vec_jk_z = z_k - z_j
 
-    var rJL_x = x_l - x_j
-    var rJL_y = y_l - y_j
-    var rJL_z = z_l - z_j
+    var vec_jl_x = x_l - x_j
+    var vec_jl_y = y_l - y_j
+    var vec_jl_z = z_l - z_j
 
     # Normalize vectors
-    var dJI = sqrt(rJI_x * rJI_x + rJI_y * rJI_y + rJI_z * rJI_z)
-    var dJK = sqrt(rJK_x * rJK_x + rJK_y * rJK_y + rJK_z * rJK_z)
-    var dJL = sqrt(rJL_x * rJL_x + rJL_y * rJL_y + rJL_z * rJL_z)
+    var dist_ji = sqrt(vec_ji_x * vec_ji_x + vec_ji_y * vec_ji_y + vec_ji_z * vec_ji_z)
+    var dist_jk = sqrt(vec_jk_x * vec_jk_x + vec_jk_y * vec_jk_y + vec_jk_z * vec_jk_z)
+    var dist_jl = sqrt(vec_jl_x * vec_jl_x + vec_jl_y * vec_jl_y + vec_jl_z * vec_jl_z)
 
-    if dJI < Float32(1e-8) or dJK < Float32(1e-8) or dJL < Float32(1e-8):
+    if dist_ji < Float32(1e-8) or dist_jk < Float32(1e-8) or dist_jl < Float32(1e-8):
         return Float32(0.0)
 
-    rJI_x /= dJI
-    rJI_y /= dJI
-    rJI_z /= dJI
-    rJK_x /= dJK
-    rJK_y /= dJK
-    rJK_z /= dJK
-    rJL_x /= dJL
-    rJL_y /= dJL
-    rJL_z /= dJL
+    vec_ji_x /= dist_ji
+    vec_ji_y /= dist_ji
+    vec_ji_z /= dist_ji
+    vec_jk_x /= dist_jk
+    vec_jk_y /= dist_jk
+    vec_jk_z /= dist_jk
+    vec_jl_x /= dist_jl
+    vec_jl_y /= dist_jl
+    vec_jl_z /= dist_jl
 
-    # Normal to the i-j-k plane (rJI x rJK)
-    var n_x = rJI_y * rJK_z - rJI_z * rJK_y
-    var n_y = rJI_z * rJK_x - rJI_x * rJK_z
-    var n_z = rJI_x * rJK_y - rJI_y * rJK_x
+    # Normal to the i-j-k plane (vec_ji x vec_jk)
+    var normal_x = vec_ji_y * vec_jk_z - vec_ji_z * vec_jk_y
+    var normal_y = vec_ji_z * vec_jk_x - vec_ji_x * vec_jk_z
+    var normal_z = vec_ji_x * vec_jk_y - vec_ji_y * vec_jk_x
 
-    var n_len = sqrt(n_x * n_x + n_y * n_y + n_z * n_z)
-    if n_len < Float32(1e-8):
+    var normal_len = sqrt(normal_x * normal_x + normal_y * normal_y + normal_z * normal_z)
+    if normal_len < Float32(1e-8):
         return Float32(0.0)
 
-    n_x /= n_len
-    n_y /= n_len
-    n_z /= n_len
+    normal_x /= normal_len
+    normal_y /= normal_len
+    normal_z /= normal_len
 
-    # sin(chi) = rJL dot n
-    var sin_chi = rJL_x * n_x + rJL_y * n_y + rJL_z * n_z
+    # sin(chi) = vec_jl dot normal
+    var sin_chi = vec_jl_x * normal_x + vec_jl_y * normal_y + vec_jl_z * normal_z
 
     # Clamp to [-1, 1]
     if sin_chi > Float32(1.0):
@@ -746,11 +746,11 @@ fn compute_total_oop_energy[
     """
     var total_energy: Float32 = 0.0
 
-    for o in range(num_oop):
-        var i = Int(oop_i[o])
-        var j = Int(oop_j[o])  # Central atom
-        var k = Int(oop_k[o])
-        var l = Int(oop_l[o])  # Out-of-plane atom
+    for oop_idx in range(num_oop):
+        var i = Int(oop_i[oop_idx])
+        var j = Int(oop_j[oop_idx])  # Central atom
+        var k = Int(oop_k[oop_idx])
+        var l = Int(oop_l[oop_idx])  # Out-of-plane atom
 
         var chi_deg = compute_oop_chi(
             Float32(x[i]), Float32(y[i]), Float32(z[i]),
@@ -759,7 +759,7 @@ fn compute_total_oop_energy[
             Float32(x[l]), Float32(y[l]), Float32(z[l])
         )
 
-        var energy = oop_energy_single(chi_deg, Float32(oop_koop[o]))
+        var energy = oop_energy_single(chi_deg, Float32(oop_koop[oop_idx]))
         total_energy += energy
 
     return total_energy
@@ -778,45 +778,45 @@ fn compute_torsion_angle(
     Uses the standard IUPAC definition with atan2.
     """
     # Bond vectors
-    var b1x = x2 - x1
-    var b1y = y2 - y1
-    var b1z = z2 - z1
+    var bond1_x = x2 - x1
+    var bond1_y = y2 - y1
+    var bond1_z = z2 - z1
 
-    var b2x = x3 - x2
-    var b2y = y3 - y2
-    var b2z = z3 - z2
+    var bond2_x = x3 - x2
+    var bond2_y = y3 - y2
+    var bond2_z = z3 - z2
 
-    var b3x = x4 - x3
-    var b3y = y4 - y3
-    var b3z = z4 - z3
+    var bond3_x = x4 - x3
+    var bond3_y = y4 - y3
+    var bond3_z = z4 - z3
 
     # Normal vectors to the planes
     # n1 = b1 x b2
-    var n1x = b1y * b2z - b1z * b2y
-    var n1y = b1z * b2x - b1x * b2z
-    var n1z = b1x * b2y - b1y * b2x
+    var normal1_x = bond1_y * bond2_z - bond1_z * bond2_y
+    var normal1_y = bond1_z * bond2_x - bond1_x * bond2_z
+    var normal1_z = bond1_x * bond2_y - bond1_y * bond2_x
 
     # n2 = b2 x b3
-    var n2x = b2y * b3z - b2z * b3y
-    var n2y = b2z * b3x - b2x * b3z
-    var n2z = b2x * b3y - b2y * b3x
+    var normal2_x = bond2_y * bond3_z - bond2_z * bond3_y
+    var normal2_y = bond2_z * bond3_x - bond2_x * bond3_z
+    var normal2_z = bond2_x * bond3_y - bond2_y * bond3_x
 
     # m1 = n1 x b2/|b2|
-    var b2_len = sqrt(b2x * b2x + b2y * b2y + b2z * b2z)
+    var b2_len = sqrt(bond2_x * bond2_x + bond2_y * bond2_y + bond2_z * bond2_z)
     if b2_len < Float32(1e-8):
         return Float32(0.0)
 
     var b2_inv = Float32(1.0) / b2_len
-    var m1x = n1y * b2z * b2_inv - n1z * b2y * b2_inv
-    var m1y = n1z * b2x * b2_inv - n1x * b2z * b2_inv
-    var m1z = n1x * b2y * b2_inv - n1y * b2x * b2_inv
+    var perp1_x = normal1_y * bond2_z * b2_inv - normal1_z * bond2_y * b2_inv
+    var perp1_y = normal1_z * bond2_x * b2_inv - normal1_x * bond2_z * b2_inv
+    var perp1_z = normal1_x * bond2_y * b2_inv - normal1_y * bond2_x * b2_inv
 
     # x = n1 . n2
-    var x_val = n1x * n2x + n1y * n2y + n1z * n2z
+    var dot_x = normal1_x * normal2_x + normal1_y * normal2_y + normal1_z * normal2_z
     # y = m1 . n2
-    var y_val = m1x * n2x + m1y * n2y + m1z * n2z
+    var dot_y = perp1_x * normal2_x + perp1_y * normal2_y + perp1_z * normal2_z
 
-    return atan2(y_val, x_val)
+    return atan2(dot_y, dot_x)
 
 fn torsion_energy_single(
     phi: Float32,     # Current torsion angle in radians
@@ -903,11 +903,11 @@ fn compute_torsion_forces[
     """
     var total_energy: Float32 = 0.0
 
-    for t in range(torsion_start, torsion_end):
-        var i = Int(torsion_i[t])
-        var j = Int(torsion_j[t])
-        var k = Int(torsion_k[t])
-        var l = Int(torsion_l[t])
+    for torsion_idx in range(torsion_start, torsion_end):
+        var i = Int(torsion_i[torsion_idx])
+        var j = Int(torsion_j[torsion_idx])
+        var k = Int(torsion_k[torsion_idx])
+        var l = Int(torsion_l[torsion_idx])
 
         # Get positions and convert to Float32
         var x1 = Float32(x[i])
@@ -924,31 +924,31 @@ fn compute_torsion_forces[
         var z4 = Float32(z[l])
 
         # Bond vectors
-        var b1x = x2 - x1
-        var b1y = y2 - y1
-        var b1z = z2 - z1
+        var bond1_x = x2 - x1
+        var bond1_y = y2 - y1
+        var bond1_z = z2 - z1
 
-        var b2x = x3 - x2
-        var b2y = y3 - y2
-        var b2z = z3 - z2
+        var bond2_x = x3 - x2
+        var bond2_y = y3 - y2
+        var bond2_z = z3 - z2
 
-        var b3x = x4 - x3
-        var b3y = y4 - y3
-        var b3z = z4 - z3
+        var bond3_x = x4 - x3
+        var bond3_y = y4 - y3
+        var bond3_z = z4 - z3
 
         # Cross products for plane normals
-        var n1x = b1y * b2z - b1z * b2y
-        var n1y = b1z * b2x - b1x * b2z
-        var n1z = b1x * b2y - b1y * b2x
+        var normal1_x = bond1_y * bond2_z - bond1_z * bond2_y
+        var normal1_y = bond1_z * bond2_x - bond1_x * bond2_z
+        var normal1_z = bond1_x * bond2_y - bond1_y * bond2_x
 
-        var n2x = b2y * b3z - b2z * b3y
-        var n2y = b2z * b3x - b2x * b3z
-        var n2z = b2x * b3y - b2y * b3x
+        var normal2_x = bond2_y * bond3_z - bond2_z * bond3_y
+        var normal2_y = bond2_z * bond3_x - bond2_x * bond3_z
+        var normal2_z = bond2_x * bond3_y - bond2_y * bond3_x
 
         # Magnitudes
-        var n1_sq = n1x * n1x + n1y * n1y + n1z * n1z
-        var n2_sq = n2x * n2x + n2y * n2y + n2z * n2z
-        var b2_sq = b2x * b2x + b2y * b2y + b2z * b2z
+        var n1_sq = normal1_x * normal1_x + normal1_y * normal1_y + normal1_z * normal1_z
+        var n2_sq = normal2_x * normal2_x + normal2_y * normal2_y + normal2_z * normal2_z
+        var b2_sq = bond2_x * bond2_x + bond2_y * bond2_y + bond2_z * bond2_z
 
         if n1_sq < Float32(1e-10) or n2_sq < Float32(1e-10) or b2_sq < Float32(1e-10):
             continue
@@ -956,68 +956,68 @@ fn compute_torsion_forces[
         var b2_len = sqrt(b2_sq)
 
         # Compute torsion angle
-        var m1x = n1y * b2z / b2_len - n1z * b2y / b2_len
-        var m1y = n1z * b2x / b2_len - n1x * b2z / b2_len
-        var m1z = n1x * b2y / b2_len - n1y * b2x / b2_len
+        var perp1_x = normal1_y * bond2_z / b2_len - normal1_z * bond2_y / b2_len
+        var perp1_y = normal1_z * bond2_x / b2_len - normal1_x * bond2_z / b2_len
+        var perp1_z = normal1_x * bond2_y / b2_len - normal1_y * bond2_x / b2_len
 
-        var x_val = n1x * n2x + n1y * n2y + n1z * n2z
-        var y_val = m1x * n2x + m1y * n2y + m1z * n2z
-        var phi = atan2(y_val, x_val)
+        var dot_x = normal1_x * normal2_x + normal1_y * normal2_y + normal1_z * normal2_z
+        var dot_y = perp1_x * normal2_x + perp1_y * normal2_y + perp1_z * normal2_z
+        var phi = atan2(dot_y, dot_x)
 
         # Compute energy and gradient
         var result = torsion_energy_and_gradient(
-            phi, Float32(torsion_v1[t]), Float32(torsion_v2[t]), Float32(torsion_v3[t])
+            phi, Float32(torsion_v1[torsion_idx]), Float32(torsion_v2[torsion_idx]), Float32(torsion_v3[torsion_idx])
         )
         var energy = result[0]
-        var dE_dphi = result[1]
+        var grad_phi = result[1]
 
         total_energy += energy
 
         # Compute forces using standard torsion gradient formulas
-        var factor_i = dE_dphi * b2_len / n1_sq
-        var factor_l = -dE_dphi * b2_len / n2_sq
+        var factor_i = grad_phi * b2_len / n1_sq
+        var factor_l = -grad_phi * b2_len / n2_sq
 
         # Force on atom i
-        var fix = factor_i * n1x
-        var fiy = factor_i * n1y
-        var fiz = factor_i * n1z
+        var force_i_x = factor_i * normal1_x
+        var force_i_y = factor_i * normal1_y
+        var force_i_z = factor_i * normal1_z
 
         # Force on atom l
-        var flx = factor_l * n2x
-        var fly = factor_l * n2y
-        var flz = factor_l * n2z
+        var force_l_x = factor_l * normal2_x
+        var force_l_y = factor_l * normal2_y
+        var force_l_z = factor_l * normal2_z
 
         # Projections for j and k
-        var b1_dot_b2 = b1x * b2x + b1y * b2y + b1z * b2z
-        var b3_dot_b2 = b3x * b2x + b3y * b2y + b3z * b2z
+        var b1_dot_b2 = bond1_x * bond2_x + bond1_y * bond2_y + bond1_z * bond2_z
+        var b3_dot_b2 = bond3_x * bond2_x + bond3_y * bond2_y + bond3_z * bond2_z
 
         var factor_j_from_i = -b1_dot_b2 / b2_sq - Float32(1.0)
         var factor_j_from_l = b3_dot_b2 / b2_sq
 
-        var fjx = factor_j_from_i * fix + factor_j_from_l * flx
-        var fjy = factor_j_from_i * fiy + factor_j_from_l * fly
-        var fjz = factor_j_from_i * fiz + factor_j_from_l * flz
+        var force_j_x = factor_j_from_i * force_i_x + factor_j_from_l * force_l_x
+        var force_j_y = factor_j_from_i * force_i_y + factor_j_from_l * force_l_y
+        var force_j_z = factor_j_from_i * force_i_z + factor_j_from_l * force_l_z
 
         var factor_k_from_i = b1_dot_b2 / b2_sq
         var factor_k_from_l = -b3_dot_b2 / b2_sq - Float32(1.0)
 
-        var fkx = factor_k_from_i * fix + factor_k_from_l * flx
-        var fky = factor_k_from_i * fiy + factor_k_from_l * fly
-        var fkz = factor_k_from_i * fiz + factor_k_from_l * flz
+        var force_k_x = factor_k_from_i * force_i_x + factor_k_from_l * force_l_x
+        var force_k_y = factor_k_from_i * force_i_y + factor_k_from_l * force_l_y
+        var force_k_z = factor_k_from_i * force_i_z + factor_k_from_l * force_l_z
 
         # Accumulate gradients using store()
-        grad_x[i] = grad_x[i] + Scalar[StorageType](fix)
-        grad_y[i] = grad_y[i] + Scalar[StorageType](fiy)
-        grad_z[i] = grad_z[i] + Scalar[StorageType](fiz)
-        grad_x[j] = grad_x[j] + Scalar[StorageType](fjx)
-        grad_y[j] = grad_y[j] + Scalar[StorageType](fjy)
-        grad_z[j] = grad_z[j] + Scalar[StorageType](fjz)
-        grad_x[k] = grad_x[k] + Scalar[StorageType](fkx)
-        grad_y[k] = grad_y[k] + Scalar[StorageType](fky)
-        grad_z[k] = grad_z[k] + Scalar[StorageType](fkz)
-        grad_x[l] = grad_x[l] + Scalar[StorageType](flx)
-        grad_y[l] = grad_y[l] + Scalar[StorageType](fly)
-        grad_z[l] = grad_z[l] + Scalar[StorageType](flz)
+        grad_x[i] = grad_x[i] + Scalar[StorageType](force_i_x)
+        grad_y[i] = grad_y[i] + Scalar[StorageType](force_i_y)
+        grad_z[i] = grad_z[i] + Scalar[StorageType](force_i_z)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](force_j_x)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](force_j_y)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](force_j_z)
+        grad_x[k] = grad_x[k] + Scalar[StorageType](force_k_x)
+        grad_y[k] = grad_y[k] + Scalar[StorageType](force_k_y)
+        grad_z[k] = grad_z[k] + Scalar[StorageType](force_k_z)
+        grad_x[l] = grad_x[l] + Scalar[StorageType](force_l_x)
+        grad_y[l] = grad_y[l] + Scalar[StorageType](force_l_y)
+        grad_z[l] = grad_z[l] + Scalar[StorageType](force_l_z)
 
     return total_energy
 
@@ -1045,11 +1045,11 @@ fn compute_total_torsion_energy[
     """
     var total_energy: Float32 = 0.0
 
-    for t in range(num_torsions):
-        var i = Int(torsion_i[t])
-        var j = Int(torsion_j[t])
-        var k = Int(torsion_k[t])
-        var l = Int(torsion_l[t])
+    for torsion_idx in range(num_torsions):
+        var i = Int(torsion_i[torsion_idx])
+        var j = Int(torsion_j[torsion_idx])
+        var k = Int(torsion_k[torsion_idx])
+        var l = Int(torsion_l[torsion_idx])
 
         var phi = compute_torsion_angle(
             Float32(x[i]), Float32(y[i]), Float32(z[i]),
@@ -1059,7 +1059,7 @@ fn compute_total_torsion_energy[
         )
 
         var energy = torsion_energy_single(
-            phi, Float32(torsion_v1[t]), Float32(torsion_v2[t]), Float32(torsion_v3[t])
+            phi, Float32(torsion_v1[torsion_idx]), Float32(torsion_v2[torsion_idx]), Float32(torsion_v3[torsion_idx])
         )
         total_energy += energy
 
@@ -1180,9 +1180,9 @@ fn compute_vdw_forces[
     """
     var total_energy: Float32 = 0.0
 
-    for p in range(nb_start, nb_end):
-        var i = Int(nb_i[p])
-        var j = Int(nb_j[p])
+    for pair_idx in range(nb_start, nb_end):
+        var i = Int(nb_i[pair_idx])
+        var j = Int(nb_j[pair_idx])
 
         # Get positions and convert to Float32
         var x1 = Float32(x[i])
@@ -1202,25 +1202,25 @@ fn compute_vdw_forces[
             continue
 
         # Compute energy and gradient (no 1-4 scaling for vdW)
-        var result = vdw_energy_and_gradient(r, Float32(nb_epsilon[p]), Float32(nb_r_star[p]))
+        var result = vdw_energy_and_gradient(r, Float32(nb_epsilon[pair_idx]), Float32(nb_r_star[pair_idx]))
         var energy = result[0]
-        var dE_dr = result[1]
+        var grad_r = result[1]
 
         total_energy += energy
 
         # Convert to Cartesian forces
         var inv_r = Float32(1.0) / r
-        var fx = dE_dr * dx * inv_r
-        var fy = dE_dr * dy * inv_r
-        var fz = dE_dr * dz * inv_r
+        var force_x = grad_r * dx * inv_r
+        var force_y = grad_r * dy * inv_r
+        var force_z = grad_r * dz * inv_r
 
         # Accumulate gradients using store()
-        grad_x[i] = grad_x[i] - Scalar[StorageType](fx)
-        grad_y[i] = grad_y[i] - Scalar[StorageType](fy)
-        grad_z[i] = grad_z[i] - Scalar[StorageType](fz)
-        grad_x[j] = grad_x[j] + Scalar[StorageType](fx)
-        grad_y[j] = grad_y[j] + Scalar[StorageType](fy)
-        grad_z[j] = grad_z[j] + Scalar[StorageType](fz)
+        grad_x[i] = grad_x[i] - Scalar[StorageType](force_x)
+        grad_y[i] = grad_y[i] - Scalar[StorageType](force_y)
+        grad_z[i] = grad_z[i] - Scalar[StorageType](force_z)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](force_x)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](force_y)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](force_z)
 
     return total_energy
 
@@ -1248,9 +1248,9 @@ fn compute_total_vdw_energy[
     """
     var total_energy: Float32 = 0.0
 
-    for p in range(num_pairs):
-        var i = Int(nb_i[p])
-        var j = Int(nb_j[p])
+    for pair_idx in range(num_pairs):
+        var i = Int(nb_i[pair_idx])
+        var j = Int(nb_j[pair_idx])
 
         var dx = Float32(x[j]) - Float32(x[i])
         var dy = Float32(y[j]) - Float32(y[i])
@@ -1260,7 +1260,7 @@ fn compute_total_vdw_energy[
         if r < Float32(0.1):
             continue
 
-        var energy = vdw_energy_single(r, Float32(nb_epsilon[p]), Float32(nb_r_star[p]))
+        var energy = vdw_energy_single(r, Float32(nb_epsilon[pair_idx]), Float32(nb_r_star[pair_idx]))
         total_energy += energy
 
     return total_energy
@@ -1353,9 +1353,9 @@ fn compute_electrostatic_forces[
     """
     var total_energy: Float32 = 0.0
 
-    for p in range(nb_start, nb_end):
-        var i = Int(nb_i[p])
-        var j = Int(nb_j[p])
+    for pair_idx in range(nb_start, nb_end):
+        var i = Int(nb_i[pair_idx])
+        var j = Int(nb_j[pair_idx])
 
         var qi = Float32(charge[i])
         var qj = Float32(charge[j])
@@ -1383,7 +1383,7 @@ fn compute_electrostatic_forces[
 
         # Apply 1-4 scaling
         var scale = Float32(1.0)
-        if nb_is_1_4[p] != 0:
+        if nb_is_1_4[pair_idx] != 0:
             scale = scale_1_4
 
         # Compute energy and gradient
@@ -1391,23 +1391,23 @@ fn compute_electrostatic_forces[
             r, qi, qj, dielectric, use_distance_dielectric
         )
         var energy = result[0] * scale
-        var dE_dr = result[1] * scale
+        var grad_r = result[1] * scale
 
         total_energy += energy
 
         # Convert to Cartesian forces
         var inv_r = Float32(1.0) / r
-        var fx = dE_dr * dx * inv_r
-        var fy = dE_dr * dy * inv_r
-        var fz = dE_dr * dz * inv_r
+        var force_x = grad_r * dx * inv_r
+        var force_y = grad_r * dy * inv_r
+        var force_z = grad_r * dz * inv_r
 
         # Accumulate gradients using store()
-        grad_x[i] = grad_x[i] - Scalar[StorageType](fx)
-        grad_y[i] = grad_y[i] - Scalar[StorageType](fy)
-        grad_z[i] = grad_z[i] - Scalar[StorageType](fz)
-        grad_x[j] = grad_x[j] + Scalar[StorageType](fx)
-        grad_y[j] = grad_y[j] + Scalar[StorageType](fy)
-        grad_z[j] = grad_z[j] + Scalar[StorageType](fz)
+        grad_x[i] = grad_x[i] - Scalar[StorageType](force_x)
+        grad_y[i] = grad_y[i] - Scalar[StorageType](force_y)
+        grad_z[i] = grad_z[i] - Scalar[StorageType](force_z)
+        grad_x[j] = grad_x[j] + Scalar[StorageType](force_x)
+        grad_y[j] = grad_y[j] + Scalar[StorageType](force_y)
+        grad_z[j] = grad_z[j] + Scalar[StorageType](force_z)
 
     return total_energy
 
@@ -1436,9 +1436,9 @@ fn compute_total_electrostatic_energy[
     """
     var total_energy: Float32 = 0.0
 
-    for p in range(num_pairs):
-        var i = Int(nb_i[p])
-        var j = Int(nb_j[p])
+    for pair_idx in range(num_pairs):
+        var i = Int(nb_i[pair_idx])
+        var j = Int(nb_j[pair_idx])
 
         var qi = Float32(charge[i])
         var qj = Float32(charge[j])
@@ -1455,7 +1455,7 @@ fn compute_total_electrostatic_energy[
             continue
 
         var scale = Float32(1.0)
-        if nb_is_1_4[p] != 0:
+        if nb_is_1_4[pair_idx] != 0:
             scale = scale_1_4
 
         var energy: Float32 = 0.0
