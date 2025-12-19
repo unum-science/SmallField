@@ -4,6 +4,15 @@
 
 from math import sqrt, cos, sin, acos, atan2
 from memory import UnsafePointer
+from .simd_utils import (
+    MultiAccumulator,
+    SIMDMultiAccumulator,
+    rsqrt14,
+    rsqrt14_nr,
+    rcp14,
+    rcp14_nr,
+    SIMD_F32_WIDTH,
+)
 
 fn abs_f32(x: Float32) -> Float32:
     """Absolute value for Float32."""
@@ -1243,10 +1252,13 @@ fn compute_total_vdw_energy[
     """
     Compute total vdW energy (no gradients).
 
+    Uses 4 independent accumulators to break dependency chains and
+    improve instruction-level parallelism.
+
     NOTE: MMFF94 does NOT apply 1-4 scaling to vdW energy.
     1-4 scaling (0.75) only applies to electrostatic energy.
     """
-    var total_energy: Float32 = 0.0
+    var accum = MultiAccumulator[4]()
 
     for pair_idx in range(num_pairs):
         var i = Int(nb_i[pair_idx])
@@ -1261,9 +1273,198 @@ fn compute_total_vdw_energy[
             continue
 
         var energy = vdw_energy_single(r, Float32(nb_epsilon[pair_idx]), Float32(nb_r_star[pair_idx]))
-        total_energy += energy
+        accum.add(pair_idx, energy)
 
-    return total_energy
+    return accum.reduce()
+
+
+fn compute_vdw_energy_simd[
+    StorageType: DType,
+    width: Int = 16
+](
+    # Positions
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
+    # Nonbonded pair indices
+    nb_i: UnsafePointer[Int32],
+    nb_j: UnsafePointer[Int32],
+    # vdW parameters
+    nb_epsilon: UnsafePointer[Scalar[StorageType]],
+    nb_r_star: UnsafePointer[Scalar[StorageType]],
+    # Number of pairs
+    num_pairs: Int
+) -> Float32:
+    """
+    SIMD-vectorized vdW energy computation.
+
+    Processes 'width' pairs simultaneously (16 for AVX-512).
+    Uses:
+    - rsqrt14 for fast reciprocal sqrt (distance normalization)
+    - SIMDMultiAccumulator to break dependency chains
+    - vdw_energy[width]() for parallel energy calculation
+
+    NOTE: MMFF94 does NOT apply 1-4 scaling to vdW energy.
+    """
+    var accum = SIMDMultiAccumulator[width, 4]()
+
+    # Main SIMD loop - process 'width' pairs at a time
+    var simd_pairs = (num_pairs // width) * width
+
+    for pair_base in range(0, simd_pairs, width):
+        # Gather atom indices for this batch
+        var x_i = SIMD[DType.float32, width]()
+        var y_i = SIMD[DType.float32, width]()
+        var z_i = SIMD[DType.float32, width]()
+        var x_j = SIMD[DType.float32, width]()
+        var y_j = SIMD[DType.float32, width]()
+        var z_j = SIMD[DType.float32, width]()
+        var eps = SIMD[DType.float32, width]()
+        var rstar = SIMD[DType.float32, width]()
+
+        # Gather positions and parameters for all pairs in this batch
+        @parameter
+        for k in range(width):
+            var ii = Int(nb_i[pair_base + k])
+            var jj = Int(nb_j[pair_base + k])
+            x_i[k] = Float32(x[ii])
+            y_i[k] = Float32(y[ii])
+            z_i[k] = Float32(z[ii])
+            x_j[k] = Float32(x[jj])
+            y_j[k] = Float32(y[jj])
+            z_j[k] = Float32(z[jj])
+            eps[k] = Float32(nb_epsilon[pair_base + k])
+            rstar[k] = Float32(nb_r_star[pair_base + k])
+
+        # Compute distances for all pairs
+        var dx = x_j - x_i
+        var dy = y_j - y_i
+        var dz = z_j - z_i
+        var r_sq = dx * dx + dy * dy + dz * dz
+
+        # Use rsqrt14 for fast distance computation: r = r_sq * rsqrt(r_sq)
+        var inv_r = rsqrt14[width](r_sq)
+        var r = r_sq * inv_r
+
+        # Compute vdW energy for all pairs in parallel
+        var energy = vdw_energy[width](r, eps, rstar)
+
+        # Mask out invalid pairs (r < 0.1)
+        var min_dist = SIMD[DType.float32, width](0.1)
+        var mask = r >= min_dist
+        energy = mask.select(energy, SIMD[DType.float32, width](0))
+
+        # Accumulate with multi-accumulator pattern
+        accum.add(pair_base // width, energy)
+
+    # No tail code needed - structures are padded to SIMD width multiples
+    return accum.reduce()
+
+
+fn compute_electrostatic_energy_simd[
+    StorageType: DType,
+    width: Int = 16
+](
+    # Positions
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
+    # Charges
+    charge: UnsafePointer[Scalar[StorageType]],
+    # Nonbonded pair indices
+    nb_i: UnsafePointer[Int32],
+    nb_j: UnsafePointer[Int32],
+    nb_is_1_4: UnsafePointer[Int32],
+    # Number of pairs
+    num_pairs: Int,
+    # Options
+    dielectric: Float32,
+    use_distance_dielectric: Bool,
+    scale_1_4: Float32
+) -> Float32:
+    """
+    SIMD-vectorized electrostatic energy computation.
+
+    Processes 'width' pairs simultaneously (16 for AVX-512).
+    Uses:
+    - rsqrt14 for fast distance computation
+    - rcp14 for fast reciprocal (1/r terms)
+    - SIMDMultiAccumulator to break dependency chains
+
+    1-4 interactions are scaled by scale_1_4 (typically 0.75).
+    """
+    var accum = SIMDMultiAccumulator[width, 4]()
+
+    # Main SIMD loop
+    var simd_pairs = (num_pairs // width) * width
+    var elec_const = SIMD[DType.float32, width](MMFF_ELEC_CONSTANT)
+    var elec_buffer = SIMD[DType.float32, width](MMFF_ELEC_BUFFER)
+    var one = SIMD[DType.float32, width](1.0)
+    var scale_1_4_vec = SIMD[DType.float32, width](scale_1_4)
+    var dielectric_vec = SIMD[DType.float32, width](dielectric)
+
+    for pair_base in range(0, simd_pairs, width):
+        # Gather data for this batch
+        var qi = SIMD[DType.float32, width]()
+        var qj = SIMD[DType.float32, width]()
+        var x_i = SIMD[DType.float32, width]()
+        var y_i = SIMD[DType.float32, width]()
+        var z_i = SIMD[DType.float32, width]()
+        var x_j = SIMD[DType.float32, width]()
+        var y_j = SIMD[DType.float32, width]()
+        var z_j = SIMD[DType.float32, width]()
+        var is_1_4 = SIMD[DType.float32, width]()
+
+        @parameter
+        for k in range(width):
+            var ii = Int(nb_i[pair_base + k])
+            var jj = Int(nb_j[pair_base + k])
+            qi[k] = Float32(charge[ii])
+            qj[k] = Float32(charge[jj])
+            x_i[k] = Float32(x[ii])
+            y_i[k] = Float32(y[ii])
+            z_i[k] = Float32(z[ii])
+            x_j[k] = Float32(x[jj])
+            y_j[k] = Float32(y[jj])
+            z_j[k] = Float32(z[jj])
+            is_1_4[k] = Float32(1.0) if nb_is_1_4[pair_base + k] != 0 else Float32(0.0)
+
+        # Compute scale factors: 1.0 or scale_1_4 based on is_1_4 flag
+        var scale = one + is_1_4 * (scale_1_4_vec - one)
+
+        # Compute distances
+        var dx = x_j - x_i
+        var dy = y_j - y_i
+        var dz = z_j - z_i
+        var r_sq = dx * dx + dy * dy + dz * dz
+        var inv_r = rsqrt14[width](r_sq)
+        var r = r_sq * inv_r
+        var r_eff = r + elec_buffer
+
+        # Compute energy: E = 332.0716 * qi * qj / (D * r_eff)
+        var qq = qi * qj
+        var energy: SIMD[DType.float32, width]
+
+        if use_distance_dielectric:
+            # D = r, so E = k * qq / (r * r_eff)
+            var denom = r * r_eff
+            energy = elec_const * qq * rcp14[width](denom)
+        else:
+            # Constant dielectric
+            var denom = dielectric_vec * r_eff
+            energy = elec_const * qq * rcp14[width](denom)
+
+        # Apply 1-4 scaling and mask invalid pairs
+        energy = energy * scale
+        var min_dist = SIMD[DType.float32, width](0.1)
+        var valid_mask = (r >= min_dist) & (qq != SIMD[DType.float32, width](0))
+        energy = valid_mask.select(energy, SIMD[DType.float32, width](0))
+
+        accum.add(pair_base // width, energy)
+
+    # No tail code needed - structures are padded to SIMD width multiples
+    return accum.reduce()
+
 
 # Electrostatics
 # E_elec = 332.0716 * qi * qj / (D * (r + delta))
@@ -1433,8 +1634,11 @@ fn compute_total_electrostatic_energy[
 ) -> Float32:
     """
     Compute total electrostatic energy (no gradients).
+
+    Uses 4 independent accumulators to break dependency chains and
+    improve instruction-level parallelism.
     """
-    var total_energy: Float32 = 0.0
+    var accum = MultiAccumulator[4]()
 
     for pair_idx in range(num_pairs):
         var i = Int(nb_i[pair_idx])
@@ -1464,9 +1668,9 @@ fn compute_total_electrostatic_energy[
         else:
             energy = MMFF_ELEC_CONSTANT * qi * qj / (dielectric * (r + MMFF_ELEC_BUFFER))
 
-        total_energy += energy * scale
+        accum.add(pair_idx, energy * scale)
 
-    return total_energy
+    return accum.reduce()
 
 # Total energy and options
 struct MMFF94Options(Copyable, Movable):

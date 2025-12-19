@@ -155,7 +155,7 @@ def compile_runner(runner_dir: Path, temp_dir: str) -> Optional[Path]:
 
     try:
         result = subprocess.run(
-            ["mojo", "build", str(runner_path), "-o", str(compiled_path)],
+            ["mojo", "build", "-O3", str(runner_path), "-o", str(compiled_path)],
             capture_output=True,
             text=True,
             timeout=120,  # 2 minute timeout for compilation

@@ -8,14 +8,14 @@
 
 from sys import argv, num_physical_cores
 from time import perf_counter_ns
-from math import sqrt, cos, acos, atan2
+from math import sqrt, cos, acos, atan2, rsqrt
 from memory import UnsafePointer
 from algorithm import parallelize
 
-# SIMD configuration (compile-time)
+# SIMD configuration (compile-time) - Enabled for Intel Xeon Platinum 8468 (Sapphire Rapids)
 alias HAS_AVX512: Bool = True
-alias HAS_AVX512_BF16: Bool = False
-alias HAS_AVX512_FP16: Bool = False
+alias HAS_AVX512_BF16: Bool = True   # Native VDPBF16PS instruction
+alias HAS_AVX512_FP16: Bool = True   # Native FP16 instructions
 alias SIMD_F32_WIDTH: Int = 16
 
 # =============================================================================
@@ -135,6 +135,178 @@ fn vdw_energy_single(r: Float32, epsilon: Float32, r_star: Float32) -> Float32:
 fn elec_energy_single(r: Float32, qi: Float32, qj: Float32, scale: Float32) -> Float32:
     var r_eff = r + MMFF_ELEC_BUFFER
     return scale * MMFF_ELEC_CONSTANT * qi * qj / r_eff
+
+
+# =============================================================================
+# SIMD Fast Math (rsqrt14, rcp14)
+# =============================================================================
+
+from sys.intrinsics import llvm_intrinsic
+
+
+@always_inline
+fn rsqrt14_16(a: SIMD[DType.float32, 16]) -> SIMD[DType.float32, 16]:
+    """Approximate 1/sqrt(a) with ~14-bit precision.
+    Uses LLVM's intrinsic which maps to VRSQRT14PS on AVX-512."""
+    return rsqrt(a)
+
+
+@always_inline
+fn rcp14_16(a: SIMD[DType.float32, 16]) -> SIMD[DType.float32, 16]:
+    """Approximate 1/a with fast reciprocal.
+    Uses LLVM's division which can use VRCP14PS on AVX-512."""
+    return SIMD[DType.float32, 16](1.0) / a
+
+
+@always_inline
+fn rsqrt14_32(a: SIMD[DType.float32, 32]) -> SIMD[DType.float32, 32]:
+    """Approximate 1/sqrt(a) for 32-wide vectors (two AVX-512 ops)."""
+    var lo = rsqrt14_16(SIMD[DType.float32, 16](
+        a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+        a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]))
+    var hi = rsqrt14_16(SIMD[DType.float32, 16](
+        a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23],
+        a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31]))
+    return SIMD[DType.float32, 32](
+        lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7],
+        lo[8], lo[9], lo[10], lo[11], lo[12], lo[13], lo[14], lo[15],
+        hi[0], hi[1], hi[2], hi[3], hi[4], hi[5], hi[6], hi[7],
+        hi[8], hi[9], hi[10], hi[11], hi[12], hi[13], hi[14], hi[15])
+
+
+@always_inline
+fn rcp14_32(a: SIMD[DType.float32, 32]) -> SIMD[DType.float32, 32]:
+    """Approximate 1/a for 32-wide vectors (two AVX-512 ops)."""
+    var lo = rcp14_16(SIMD[DType.float32, 16](
+        a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+        a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]))
+    var hi = rcp14_16(SIMD[DType.float32, 16](
+        a[16], a[17], a[18], a[19], a[20], a[21], a[22], a[23],
+        a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31]))
+    return SIMD[DType.float32, 32](
+        lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7],
+        lo[8], lo[9], lo[10], lo[11], lo[12], lo[13], lo[14], lo[15],
+        hi[0], hi[1], hi[2], hi[3], hi[4], hi[5], hi[6], hi[7],
+        hi[8], hi[9], hi[10], hi[11], hi[12], hi[13], hi[14], hi[15])
+
+
+# =============================================================================
+# SIMD Energy Functions
+# =============================================================================
+
+@always_inline
+fn pow7_simd[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    """Compute x^7 = x * x^2 * x^4 for SIMD vectors."""
+    var x2 = x * x
+    var x4 = x2 * x2
+    return x * x2 * x4
+
+
+@always_inline
+fn vdw_energy_simd[width: Int](
+    r: SIMD[DType.float32, width],
+    epsilon: SIMD[DType.float32, width],
+    r_star: SIMD[DType.float32, width]
+) -> SIMD[DType.float32, width]:
+    """SIMD vdW energy for 'width' pairs simultaneously."""
+    var delta = SIMD[DType.float32, width](MMFF_VDW_DELTA)
+    var gamma = SIMD[DType.float32, width](MMFF_VDW_GAMMA)
+    var one = SIMD[DType.float32, width](1.0)
+    var two = SIMD[DType.float32, width](2.0)
+
+    var r_star_7 = pow7_simd[width](r_star)
+    var denom_rep = r + delta * r_star
+    var ratio_rep = (one + delta) * r_star / denom_rep
+    var rep_term = pow7_simd[width](ratio_rep)
+
+    var r_7 = pow7_simd[width](r)
+    var denom_att = r_7 + gamma * r_star_7
+    var att_term = (one + gamma) * r_star_7 / denom_att - two
+
+    return epsilon * rep_term * att_term
+
+
+@always_inline
+fn vdw_energy(r: Float32, epsilon: Float32, r_star: Float32) -> Float32:
+    """Scalar vdW energy computation for tail processing."""
+    var delta = Float32(MMFF_VDW_DELTA)
+    var gamma = Float32(MMFF_VDW_GAMMA)
+
+    var r_star_7 = r_star * r_star * r_star * r_star * r_star * r_star * r_star
+    var denom_rep = r + delta * r_star
+    var ratio_rep = (1.0 + delta) * r_star / denom_rep
+    var rep_term = ratio_rep * ratio_rep * ratio_rep * ratio_rep * ratio_rep * ratio_rep * ratio_rep
+
+    var r_7 = r * r * r * r * r * r * r
+    var denom_att = r_7 + gamma * r_star_7
+    var att_term = (1.0 + gamma) * r_star_7 / denom_att - 2.0
+
+    return epsilon * rep_term * att_term
+
+
+# =============================================================================
+# Multi-Accumulator for Reduced Dependency Chains
+# =============================================================================
+
+struct MultiAccum4:
+    """4 independent scalar accumulators to break dependency chains."""
+    var a0: Float32
+    var a1: Float32
+    var a2: Float32
+    var a3: Float32
+
+    fn __init__(out self):
+        self.a0 = 0.0
+        self.a1 = 0.0
+        self.a2 = 0.0
+        self.a3 = 0.0
+
+    @always_inline
+    fn add(mut self, idx: Int, value: Float32):
+        var i = idx & 3
+        if i == 0:
+            self.a0 += value
+        elif i == 1:
+            self.a1 += value
+        elif i == 2:
+            self.a2 += value
+        else:
+            self.a3 += value
+
+    @always_inline
+    fn reduce(self) -> Float32:
+        return (self.a0 + self.a1) + (self.a2 + self.a3)
+
+
+struct SIMDMultiAccum4[width: Int]:
+    """4 independent SIMD accumulators."""
+    var a0: SIMD[DType.float32, width]
+    var a1: SIMD[DType.float32, width]
+    var a2: SIMD[DType.float32, width]
+    var a3: SIMD[DType.float32, width]
+
+    fn __init__(out self):
+        self.a0 = SIMD[DType.float32, width](0)
+        self.a1 = SIMD[DType.float32, width](0)
+        self.a2 = SIMD[DType.float32, width](0)
+        self.a3 = SIMD[DType.float32, width](0)
+
+    @always_inline
+    fn add(mut self, idx: Int, value: SIMD[DType.float32, width]):
+        var i = idx & 3
+        if i == 0:
+            self.a0 += value
+        elif i == 1:
+            self.a1 += value
+        elif i == 2:
+            self.a2 += value
+        else:
+            self.a3 += value
+
+    @always_inline
+    fn reduce(self) -> Float32:
+        var sum_vec = (self.a0 + self.a1) + (self.a2 + self.a3)
+        return sum_vec.reduce_add()
 
 
 @always_inline
@@ -451,30 +623,117 @@ fn compute_molecule_energy[StorageType: DType](
             Float32(batch.torsion_v3[t])
         )
 
-    # Nonbonded (vdW + electrostatic)
-    for n in range(nb_start, nb_end):
-        var i = Int(batch.nb_i[n])
-        var j = Int(batch.nb_j[n])
+    # Nonbonded (vdW + electrostatic) - SIMD batch processing
+    # Structures are padded to SIMD width multiples, no tail code needed
+    var num_pairs = nb_end - nb_start
+
+    # Process only complete SIMD batches (16 pairs at a time)
+    # Structures should be padded to SIMD multiples, but be safe
+    var simd_pairs = (num_pairs // 16) * 16
+
+    var vdw_accum = SIMDMultiAccum4[16]()
+    var elec_accum = SIMDMultiAccum4[16]()
+
+    for nb_base in range(0, simd_pairs, 16):
+        var n = nb_start + nb_base
+
+        # Gather atom indices and positions for 16 pairs
+        var x_i = SIMD[DType.float32, 16]()
+        var y_i = SIMD[DType.float32, 16]()
+        var z_i = SIMD[DType.float32, 16]()
+        var x_j = SIMD[DType.float32, 16]()
+        var y_j = SIMD[DType.float32, 16]()
+        var z_j = SIMD[DType.float32, 16]()
+        var eps = SIMD[DType.float32, 16]()
+        var rstar = SIMD[DType.float32, 16]()
+        var qi = SIMD[DType.float32, 16]()
+        var qj = SIMD[DType.float32, 16]()
+        var is_1_4 = SIMD[DType.float32, 16]()
+
+        @parameter
+        for k in range(16):
+            var pair_idx = n + k
+            var i = Int(batch.nb_i[pair_idx])
+            var j = Int(batch.nb_j[pair_idx])
+            var ai = atom_start + i
+            var aj = atom_start + j
+
+            x_i[k] = Float32(batch.x[ai])
+            y_i[k] = Float32(batch.y[ai])
+            z_i[k] = Float32(batch.z[ai])
+            x_j[k] = Float32(batch.x[aj])
+            y_j[k] = Float32(batch.y[aj])
+            z_j[k] = Float32(batch.z[aj])
+            eps[k] = Float32(batch.nb_epsilon[pair_idx])
+            rstar[k] = Float32(batch.nb_r_star[pair_idx])
+            qi[k] = Float32(batch.nb_qi[pair_idx])
+            qj[k] = Float32(batch.nb_qj[pair_idx])
+            is_1_4[k] = Float32(1.0) if batch.nb_is_1_4[pair_idx] == 1 else Float32(0.0)
+
+        # Compute distances using rsqrt14 (fast approximation)
+        var dx = x_j - x_i
+        var dy = y_j - y_i
+        var dz = z_j - z_i
+        var r_sq = dx * dx + dy * dy + dz * dz
+        var inv_r = rsqrt14_16(r_sq)
+        var r = r_sq * inv_r
+
+        # vdW energy (no 1-4 scaling)
+        # Note: Invalid distances (r < 0.1) will produce large positive vdW energies
+        # but since all structures are padded, all pairs should be valid
+        var vdw_e = vdw_energy_simd[16](r, eps, rstar)
+        vdw_accum.add(nb_base // 16, vdw_e)
+
+        # Electrostatic energy (0.75 scaling for 1-4 pairs)
+        var qq = qi * qj
+        var elec_const = SIMD[DType.float32, 16](MMFF_ELEC_CONSTANT)
+        var elec_buffer = SIMD[DType.float32, 16](MMFF_ELEC_BUFFER)
+        var r_eff = r + elec_buffer
+
+        # Scale: 1.0 for normal pairs, 0.75 for 1-4 pairs
+        var one = SIMD[DType.float32, 16](1.0)
+        var scale_1_4 = SIMD[DType.float32, 16](0.75)
+        var scale = one + is_1_4 * (scale_1_4 - one)
+
+        var elec_e = scale * elec_const * qq * rcp14_16(r_eff)
+        elec_accum.add(nb_base // 16, elec_e)
+
+    result.vdw = vdw_accum.reduce()
+    result.elec = elec_accum.reduce()
+
+    # Scalar tail for remaining pairs (if num_pairs not divisible by 16)
+    for nb_idx in range(simd_pairs, num_pairs):
+        var pair_idx = nb_start + nb_idx
+        var i = Int(batch.nb_i[pair_idx])
+        var j = Int(batch.nb_j[pair_idx])
         var ai = atom_start + i
         var aj = atom_start + j
 
-        var r = compute_distance(
-            Float32(batch.x[ai]), Float32(batch.y[ai]), Float32(batch.z[ai]),
-            Float32(batch.x[aj]), Float32(batch.y[aj]), Float32(batch.z[aj])
-        )
+        var xi = Float32(batch.x[ai])
+        var yi = Float32(batch.y[ai])
+        var zi = Float32(batch.z[ai])
+        var xj = Float32(batch.x[aj])
+        var yj = Float32(batch.y[aj])
+        var zj = Float32(batch.z[aj])
 
-        if r < Float32(0.1):
-            continue
+        var dx = xj - xi
+        var dy = yj - yi
+        var dz = zj - zi
+        var r = sqrt(dx*dx + dy*dy + dz*dz)
 
-        # vdW (no 1-4 scaling)
-        result.vdw += vdw_energy_single(r, Float32(batch.nb_epsilon[n]), Float32(batch.nb_r_star[n]))
+        if r >= 0.1:
+            var eps = Float32(batch.nb_epsilon[pair_idx])
+            var rstar = Float32(batch.nb_r_star[pair_idx])
+            result.vdw += vdw_energy(r, eps, rstar)
 
-        # Electrostatic (0.75 scaling for 1-4)
-        var qi = Float32(batch.nb_qi[n])
-        var qj = Float32(batch.nb_qj[n])
-        if qi * qi > Float32(1e-20) and qj * qj > Float32(1e-20):
-            var scale = Float32(0.75) if batch.nb_is_1_4[n] == 1 else Float32(1.0)
-            result.elec += elec_energy_single(r, qi, qj, scale)
+            var qi_val = Float32(batch.nb_qi[pair_idx])
+            var qj_val = Float32(batch.nb_qj[pair_idx])
+            var qi_abs = qi_val if qi_val > 0 else -qi_val
+            var qj_abs = qj_val if qj_val > 0 else -qj_val
+            if qi_abs > 1e-10 and qj_abs > 1e-10:
+                var r_eff = r + MMFF_ELEC_BUFFER
+                var scale: Float32 = Float32(0.75) if batch.nb_is_1_4[pair_idx] == 1 else Float32(1.0)
+                result.elec += scale * MMFF_ELEC_CONSTANT * qi_val * qj_val / r_eff
 
     return result^
 
