@@ -53,17 +53,17 @@ struct AtomBuffers[StorageType: DType = DType.float32](Copyable, Movable):
     Memory layout optimized for GPU coalesced access and CPU SIMD.
     Positions can be FP16 or FP32, gradients always FP32 for stability.
     """
-    var x: UnsafePointer[Scalar[StorageType]]
-    var y: UnsafePointer[Scalar[StorageType]]
-    var z: UnsafePointer[Scalar[StorageType]]
+    var x: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var y: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var z: UnsafePointer[Scalar[StorageType], MutOrigin.external]
 
-    var grad_x: UnsafePointer[Float32]
-    var grad_y: UnsafePointer[Float32]
-    var grad_z: UnsafePointer[Float32]
+    var grad_x: UnsafePointer[Float32, MutOrigin.external]
+    var grad_y: UnsafePointer[Float32, MutOrigin.external]
+    var grad_z: UnsafePointer[Float32, MutOrigin.external]
 
-    var atom_type: UnsafePointer[Int32]
-    var charge: UnsafePointer[Scalar[StorageType]]
-    var atom_starts: UnsafePointer[Int32]
+    var atom_type: UnsafePointer[Int32, MutOrigin.external]
+    var charge: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var atom_starts: UnsafePointer[Int32, MutOrigin.external]
 
     var capacity: Int
     var num_atoms: Int
@@ -77,17 +77,17 @@ struct AtomBuffers[StorageType: DType = DType.float32](Copyable, Movable):
         self.num_atoms = 0
         self.num_molecules = 0
 
-        self.x = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.y = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.z = UnsafePointer[Scalar[StorageType]].alloc(cap)
+        self.x = alloc[Scalar[StorageType]](cap)
+        self.y = alloc[Scalar[StorageType]](cap)
+        self.z = alloc[Scalar[StorageType]](cap)
 
-        self.grad_x = UnsafePointer[Float32].alloc(cap)
-        self.grad_y = UnsafePointer[Float32].alloc(cap)
-        self.grad_z = UnsafePointer[Float32].alloc(cap)
+        self.grad_x = alloc[Float32](cap)
+        self.grad_y = alloc[Float32](cap)
+        self.grad_z = alloc[Float32](cap)
 
-        self.atom_type = UnsafePointer[Int32].alloc(cap)
-        self.charge = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.atom_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.atom_type = alloc[Int32](cap)
+        self.charge = alloc[Scalar[StorageType]](cap)
+        self.atom_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.x[i] = 0.0
@@ -110,15 +110,15 @@ struct AtomBuffers[StorageType: DType = DType.float32](Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.x = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.y = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.z = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.grad_x = UnsafePointer[Float32].alloc(cap)
-        self.grad_y = UnsafePointer[Float32].alloc(cap)
-        self.grad_z = UnsafePointer[Float32].alloc(cap)
-        self.atom_type = UnsafePointer[Int32].alloc(cap)
-        self.charge = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.atom_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.x = alloc[Scalar[StorageType]](cap)
+        self.y = alloc[Scalar[StorageType]](cap)
+        self.z = alloc[Scalar[StorageType]](cap)
+        self.grad_x = alloc[Float32](cap)
+        self.grad_y = alloc[Float32](cap)
+        self.grad_z = alloc[Float32](cap)
+        self.atom_type = alloc[Int32](cap)
+        self.charge = alloc[Scalar[StorageType]](cap)
+        self.atom_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.x[i] = other.x[i]
@@ -215,13 +215,13 @@ struct BondBuffers[StorageType: DType = DType.float32](Copyable, Movable):
     SoA storage for bond topology and MMFF94 bond stretch parameters.
     Uses CSR-like indexing for efficient batch processing.
     """
-    var atom_i: UnsafePointer[Int32]
-    var atom_j: UnsafePointer[Int32]
+    var atom_i: UnsafePointer[Int32, MutOrigin.external]
+    var atom_j: UnsafePointer[Int32, MutOrigin.external]
 
-    var force_constant: UnsafePointer[Scalar[StorageType]]
-    var rest_length: UnsafePointer[Scalar[StorageType]]
-    var bond_type: UnsafePointer[Int32]
-    var bond_starts: UnsafePointer[Int32]
+    var force_constant: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var rest_length: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var bond_type: UnsafePointer[Int32, MutOrigin.external]
+    var bond_starts: UnsafePointer[Int32, MutOrigin.external]
 
     var capacity: Int
     var num_bonds: Int
@@ -235,12 +235,12 @@ struct BondBuffers[StorageType: DType = DType.float32](Copyable, Movable):
         self.num_bonds = 0
         self.num_molecules = 0
 
-        self.atom_i = UnsafePointer[Int32].alloc(cap)
-        self.atom_j = UnsafePointer[Int32].alloc(cap)
-        self.force_constant = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.rest_length = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.bond_type = UnsafePointer[Int32].alloc(cap)
-        self.bond_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.atom_i = alloc[Int32](cap)
+        self.atom_j = alloc[Int32](cap)
+        self.force_constant = alloc[Scalar[StorageType]](cap)
+        self.rest_length = alloc[Scalar[StorageType]](cap)
+        self.bond_type = alloc[Int32](cap)
+        self.bond_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = 0
@@ -260,12 +260,12 @@ struct BondBuffers[StorageType: DType = DType.float32](Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.atom_i = UnsafePointer[Int32].alloc(cap)
-        self.atom_j = UnsafePointer[Int32].alloc(cap)
-        self.force_constant = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.rest_length = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.bond_type = UnsafePointer[Int32].alloc(cap)
-        self.bond_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.atom_i = alloc[Int32](cap)
+        self.atom_j = alloc[Int32](cap)
+        self.force_constant = alloc[Scalar[StorageType]](cap)
+        self.rest_length = alloc[Scalar[StorageType]](cap)
+        self.bond_type = alloc[Int32](cap)
+        self.bond_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = other.atom_i[i]
@@ -334,14 +334,14 @@ struct AngleBuffers[StorageType: DType = DType.float32](Copyable, Movable):
     SoA storage for angle topology and MMFF94 angle bend parameters.
     Angle i-j-k where j is the central atom.
     """
-    var atom_i: UnsafePointer[Int32]
-    var atom_j: UnsafePointer[Int32]
-    var atom_k: UnsafePointer[Int32]
+    var atom_i: UnsafePointer[Int32, MutOrigin.external]
+    var atom_j: UnsafePointer[Int32, MutOrigin.external]
+    var atom_k: UnsafePointer[Int32, MutOrigin.external]
 
-    var force_constant: UnsafePointer[Scalar[StorageType]]
-    var rest_angle: UnsafePointer[Scalar[StorageType]]
-    var is_linear: UnsafePointer[Int32]
-    var angle_starts: UnsafePointer[Int32]
+    var force_constant: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var rest_angle: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var is_linear: UnsafePointer[Int32, MutOrigin.external]
+    var angle_starts: UnsafePointer[Int32, MutOrigin.external]
 
     var capacity: Int
     var num_angles: Int
@@ -355,13 +355,13 @@ struct AngleBuffers[StorageType: DType = DType.float32](Copyable, Movable):
         self.num_angles = 0
         self.num_molecules = 0
 
-        self.atom_i = UnsafePointer[Int32].alloc(cap)
-        self.atom_j = UnsafePointer[Int32].alloc(cap)
-        self.atom_k = UnsafePointer[Int32].alloc(cap)
-        self.force_constant = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.rest_angle = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.is_linear = UnsafePointer[Int32].alloc(cap)
-        self.angle_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.atom_i = alloc[Int32](cap)
+        self.atom_j = alloc[Int32](cap)
+        self.atom_k = alloc[Int32](cap)
+        self.force_constant = alloc[Scalar[StorageType]](cap)
+        self.rest_angle = alloc[Scalar[StorageType]](cap)
+        self.is_linear = alloc[Int32](cap)
+        self.angle_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = 0
@@ -382,13 +382,13 @@ struct AngleBuffers[StorageType: DType = DType.float32](Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.atom_i = UnsafePointer[Int32].alloc(cap)
-        self.atom_j = UnsafePointer[Int32].alloc(cap)
-        self.atom_k = UnsafePointer[Int32].alloc(cap)
-        self.force_constant = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.rest_angle = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.is_linear = UnsafePointer[Int32].alloc(cap)
-        self.angle_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.atom_i = alloc[Int32](cap)
+        self.atom_j = alloc[Int32](cap)
+        self.atom_k = alloc[Int32](cap)
+        self.force_constant = alloc[Scalar[StorageType]](cap)
+        self.rest_angle = alloc[Scalar[StorageType]](cap)
+        self.is_linear = alloc[Int32](cap)
+        self.angle_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = other.atom_i[i]
@@ -462,16 +462,16 @@ struct TorsionBuffers[StorageType: DType = DType.float32](Copyable, Movable):
     Torsion i-j-k-l where j-k is the central bond.
     E = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
     """
-    var atom_i: UnsafePointer[Int32]
-    var atom_j: UnsafePointer[Int32]
-    var atom_k: UnsafePointer[Int32]
-    var atom_l: UnsafePointer[Int32]
+    var atom_i: UnsafePointer[Int32, MutOrigin.external]
+    var atom_j: UnsafePointer[Int32, MutOrigin.external]
+    var atom_k: UnsafePointer[Int32, MutOrigin.external]
+    var atom_l: UnsafePointer[Int32, MutOrigin.external]
 
-    var v1: UnsafePointer[Scalar[StorageType]]
-    var v2: UnsafePointer[Scalar[StorageType]]
-    var v3: UnsafePointer[Scalar[StorageType]]
-    var torsion_type: UnsafePointer[Int32]
-    var torsion_starts: UnsafePointer[Int32]
+    var v1: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var v2: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var v3: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var torsion_type: UnsafePointer[Int32, MutOrigin.external]
+    var torsion_starts: UnsafePointer[Int32, MutOrigin.external]
 
     var capacity: Int
     var num_torsions: Int
@@ -485,15 +485,15 @@ struct TorsionBuffers[StorageType: DType = DType.float32](Copyable, Movable):
         self.num_torsions = 0
         self.num_molecules = 0
 
-        self.atom_i = UnsafePointer[Int32].alloc(cap)
-        self.atom_j = UnsafePointer[Int32].alloc(cap)
-        self.atom_k = UnsafePointer[Int32].alloc(cap)
-        self.atom_l = UnsafePointer[Int32].alloc(cap)
-        self.v1 = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.v2 = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.v3 = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.torsion_type = UnsafePointer[Int32].alloc(cap)
-        self.torsion_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.atom_i = alloc[Int32](cap)
+        self.atom_j = alloc[Int32](cap)
+        self.atom_k = alloc[Int32](cap)
+        self.atom_l = alloc[Int32](cap)
+        self.v1 = alloc[Scalar[StorageType]](cap)
+        self.v2 = alloc[Scalar[StorageType]](cap)
+        self.v3 = alloc[Scalar[StorageType]](cap)
+        self.torsion_type = alloc[Int32](cap)
+        self.torsion_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = 0
@@ -516,15 +516,15 @@ struct TorsionBuffers[StorageType: DType = DType.float32](Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.atom_i = UnsafePointer[Int32].alloc(cap)
-        self.atom_j = UnsafePointer[Int32].alloc(cap)
-        self.atom_k = UnsafePointer[Int32].alloc(cap)
-        self.atom_l = UnsafePointer[Int32].alloc(cap)
-        self.v1 = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.v2 = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.v3 = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.torsion_type = UnsafePointer[Int32].alloc(cap)
-        self.torsion_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.atom_i = alloc[Int32](cap)
+        self.atom_j = alloc[Int32](cap)
+        self.atom_k = alloc[Int32](cap)
+        self.atom_l = alloc[Int32](cap)
+        self.v1 = alloc[Scalar[StorageType]](cap)
+        self.v2 = alloc[Scalar[StorageType]](cap)
+        self.v3 = alloc[Scalar[StorageType]](cap)
+        self.torsion_type = alloc[Int32](cap)
+        self.torsion_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = other.atom_i[i]
@@ -606,13 +606,13 @@ struct NonbondedPairs[StorageType: DType = DType.float32](Copyable, Movable):
     Storage for van der Waals and electrostatic interaction pairs.
     Excludes 1-2 (bonded) and 1-3 (angle) pairs, includes 1-4 with scaling.
     """
-    var atom_i: UnsafePointer[Int32]
-    var atom_j: UnsafePointer[Int32]
-    var is_1_4: UnsafePointer[Int32]
+    var atom_i: UnsafePointer[Int32, MutOrigin.external]
+    var atom_j: UnsafePointer[Int32, MutOrigin.external]
+    var is_1_4: UnsafePointer[Int32, MutOrigin.external]
 
-    var epsilon: UnsafePointer[Scalar[StorageType]]
-    var r_star: UnsafePointer[Scalar[StorageType]]
-    var pair_starts: UnsafePointer[Int32]
+    var epsilon: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var r_star: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var pair_starts: UnsafePointer[Int32, MutOrigin.external]
 
     var capacity: Int
     var num_pairs: Int
@@ -626,12 +626,12 @@ struct NonbondedPairs[StorageType: DType = DType.float32](Copyable, Movable):
         self.num_pairs = 0
         self.num_molecules = 0
 
-        self.atom_i = UnsafePointer[Int32].alloc(cap)
-        self.atom_j = UnsafePointer[Int32].alloc(cap)
-        self.is_1_4 = UnsafePointer[Int32].alloc(cap)
-        self.epsilon = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.r_star = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.pair_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.atom_i = alloc[Int32](cap)
+        self.atom_j = alloc[Int32](cap)
+        self.is_1_4 = alloc[Int32](cap)
+        self.epsilon = alloc[Scalar[StorageType]](cap)
+        self.r_star = alloc[Scalar[StorageType]](cap)
+        self.pair_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = 0
@@ -651,12 +651,12 @@ struct NonbondedPairs[StorageType: DType = DType.float32](Copyable, Movable):
         var cap = other.capacity
         var mol_cap = align_capacity(other.num_molecules + 1)
 
-        self.atom_i = UnsafePointer[Int32].alloc(cap)
-        self.atom_j = UnsafePointer[Int32].alloc(cap)
-        self.is_1_4 = UnsafePointer[Int32].alloc(cap)
-        self.epsilon = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.r_star = UnsafePointer[Scalar[StorageType]].alloc(cap)
-        self.pair_starts = UnsafePointer[Int32].alloc(mol_cap)
+        self.atom_i = alloc[Int32](cap)
+        self.atom_j = alloc[Int32](cap)
+        self.is_1_4 = alloc[Int32](cap)
+        self.epsilon = alloc[Scalar[StorageType]](cap)
+        self.r_star = alloc[Scalar[StorageType]](cap)
+        self.pair_starts = alloc[Int32](mol_cap)
 
         for i in range(cap):
             self.atom_i[i] = other.atom_i[i]
@@ -705,44 +705,44 @@ struct MoleculeBatch[StorageType: DType = DType.float32](Copyable, Movable):
     All data is stored in SoA format with CSR-like indexing.
     Positions/parameters use StorageType, gradients always Float32.
     """
-    var x: UnsafePointer[Scalar[StorageType]]
-    var y: UnsafePointer[Scalar[StorageType]]
-    var z: UnsafePointer[Scalar[StorageType]]
-    var grad_x: UnsafePointer[Float32]
-    var grad_y: UnsafePointer[Float32]
-    var grad_z: UnsafePointer[Float32]
-    var atom_type: UnsafePointer[Int32]
-    var charge: UnsafePointer[Scalar[StorageType]]
-    var atom_starts: UnsafePointer[Int32]
+    var x: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var y: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var z: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var grad_x: UnsafePointer[Float32, MutOrigin.external]
+    var grad_y: UnsafePointer[Float32, MutOrigin.external]
+    var grad_z: UnsafePointer[Float32, MutOrigin.external]
+    var atom_type: UnsafePointer[Int32, MutOrigin.external]
+    var charge: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var atom_starts: UnsafePointer[Int32, MutOrigin.external]
 
-    var bond_i: UnsafePointer[Int32]
-    var bond_j: UnsafePointer[Int32]
-    var bond_kb: UnsafePointer[Scalar[StorageType]]
-    var bond_r0: UnsafePointer[Scalar[StorageType]]
-    var bond_starts: UnsafePointer[Int32]
+    var bond_i: UnsafePointer[Int32, MutOrigin.external]
+    var bond_j: UnsafePointer[Int32, MutOrigin.external]
+    var bond_kb: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var bond_r0: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var bond_starts: UnsafePointer[Int32, MutOrigin.external]
 
-    var angle_i: UnsafePointer[Int32]
-    var angle_j: UnsafePointer[Int32]
-    var angle_k: UnsafePointer[Int32]
-    var angle_ka: UnsafePointer[Scalar[StorageType]]
-    var angle_theta0: UnsafePointer[Scalar[StorageType]]
-    var angle_starts: UnsafePointer[Int32]
+    var angle_i: UnsafePointer[Int32, MutOrigin.external]
+    var angle_j: UnsafePointer[Int32, MutOrigin.external]
+    var angle_k: UnsafePointer[Int32, MutOrigin.external]
+    var angle_ka: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var angle_theta0: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var angle_starts: UnsafePointer[Int32, MutOrigin.external]
 
-    var torsion_i: UnsafePointer[Int32]
-    var torsion_j: UnsafePointer[Int32]
-    var torsion_k: UnsafePointer[Int32]
-    var torsion_l: UnsafePointer[Int32]
-    var torsion_v1: UnsafePointer[Scalar[StorageType]]
-    var torsion_v2: UnsafePointer[Scalar[StorageType]]
-    var torsion_v3: UnsafePointer[Scalar[StorageType]]
-    var torsion_starts: UnsafePointer[Int32]
+    var torsion_i: UnsafePointer[Int32, MutOrigin.external]
+    var torsion_j: UnsafePointer[Int32, MutOrigin.external]
+    var torsion_k: UnsafePointer[Int32, MutOrigin.external]
+    var torsion_l: UnsafePointer[Int32, MutOrigin.external]
+    var torsion_v1: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var torsion_v2: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var torsion_v3: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var torsion_starts: UnsafePointer[Int32, MutOrigin.external]
 
-    var nb_i: UnsafePointer[Int32]
-    var nb_j: UnsafePointer[Int32]
-    var nb_is_1_4: UnsafePointer[Int32]
-    var nb_epsilon: UnsafePointer[Scalar[StorageType]]
-    var nb_r_star: UnsafePointer[Scalar[StorageType]]
-    var nb_starts: UnsafePointer[Int32]
+    var nb_i: UnsafePointer[Int32, MutOrigin.external]
+    var nb_j: UnsafePointer[Int32, MutOrigin.external]
+    var nb_is_1_4: UnsafePointer[Int32, MutOrigin.external]
+    var nb_epsilon: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var nb_r_star: UnsafePointer[Scalar[StorageType], MutOrigin.external]
+    var nb_starts: UnsafePointer[Int32, MutOrigin.external]
 
     var atom_capacity: Int
     var bond_capacity: Int
@@ -781,44 +781,44 @@ struct MoleculeBatch[StorageType: DType = DType.float32](Copyable, Movable):
         self.num_nb_pairs = 0
         self.num_molecules = 0
 
-        self.x = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
-        self.y = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
-        self.z = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
-        self.grad_x = UnsafePointer[Float32].alloc(self.atom_capacity)
-        self.grad_y = UnsafePointer[Float32].alloc(self.atom_capacity)
-        self.grad_z = UnsafePointer[Float32].alloc(self.atom_capacity)
-        self.atom_type = UnsafePointer[Int32].alloc(self.atom_capacity)
-        self.charge = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
-        self.atom_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.x = alloc[Scalar[StorageType]](self.atom_capacity)
+        self.y = alloc[Scalar[StorageType]](self.atom_capacity)
+        self.z = alloc[Scalar[StorageType]](self.atom_capacity)
+        self.grad_x = alloc[Float32](self.atom_capacity)
+        self.grad_y = alloc[Float32](self.atom_capacity)
+        self.grad_z = alloc[Float32](self.atom_capacity)
+        self.atom_type = alloc[Int32](self.atom_capacity)
+        self.charge = alloc[Scalar[StorageType]](self.atom_capacity)
+        self.atom_starts = alloc[Int32](self.mol_capacity)
 
-        self.bond_i = UnsafePointer[Int32].alloc(self.bond_capacity)
-        self.bond_j = UnsafePointer[Int32].alloc(self.bond_capacity)
-        self.bond_kb = UnsafePointer[Scalar[StorageType]].alloc(self.bond_capacity)
-        self.bond_r0 = UnsafePointer[Scalar[StorageType]].alloc(self.bond_capacity)
-        self.bond_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.bond_i = alloc[Int32](self.bond_capacity)
+        self.bond_j = alloc[Int32](self.bond_capacity)
+        self.bond_kb = alloc[Scalar[StorageType]](self.bond_capacity)
+        self.bond_r0 = alloc[Scalar[StorageType]](self.bond_capacity)
+        self.bond_starts = alloc[Int32](self.mol_capacity)
 
-        self.angle_i = UnsafePointer[Int32].alloc(self.angle_capacity)
-        self.angle_j = UnsafePointer[Int32].alloc(self.angle_capacity)
-        self.angle_k = UnsafePointer[Int32].alloc(self.angle_capacity)
-        self.angle_ka = UnsafePointer[Scalar[StorageType]].alloc(self.angle_capacity)
-        self.angle_theta0 = UnsafePointer[Scalar[StorageType]].alloc(self.angle_capacity)
-        self.angle_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.angle_i = alloc[Int32](self.angle_capacity)
+        self.angle_j = alloc[Int32](self.angle_capacity)
+        self.angle_k = alloc[Int32](self.angle_capacity)
+        self.angle_ka = alloc[Scalar[StorageType]](self.angle_capacity)
+        self.angle_theta0 = alloc[Scalar[StorageType]](self.angle_capacity)
+        self.angle_starts = alloc[Int32](self.mol_capacity)
 
-        self.torsion_i = UnsafePointer[Int32].alloc(self.torsion_capacity)
-        self.torsion_j = UnsafePointer[Int32].alloc(self.torsion_capacity)
-        self.torsion_k = UnsafePointer[Int32].alloc(self.torsion_capacity)
-        self.torsion_l = UnsafePointer[Int32].alloc(self.torsion_capacity)
-        self.torsion_v1 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
-        self.torsion_v2 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
-        self.torsion_v3 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
-        self.torsion_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.torsion_i = alloc[Int32](self.torsion_capacity)
+        self.torsion_j = alloc[Int32](self.torsion_capacity)
+        self.torsion_k = alloc[Int32](self.torsion_capacity)
+        self.torsion_l = alloc[Int32](self.torsion_capacity)
+        self.torsion_v1 = alloc[Scalar[StorageType]](self.torsion_capacity)
+        self.torsion_v2 = alloc[Scalar[StorageType]](self.torsion_capacity)
+        self.torsion_v3 = alloc[Scalar[StorageType]](self.torsion_capacity)
+        self.torsion_starts = alloc[Int32](self.mol_capacity)
 
-        self.nb_i = UnsafePointer[Int32].alloc(self.nb_capacity)
-        self.nb_j = UnsafePointer[Int32].alloc(self.nb_capacity)
-        self.nb_is_1_4 = UnsafePointer[Int32].alloc(self.nb_capacity)
-        self.nb_epsilon = UnsafePointer[Scalar[StorageType]].alloc(self.nb_capacity)
-        self.nb_r_star = UnsafePointer[Scalar[StorageType]].alloc(self.nb_capacity)
-        self.nb_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.nb_i = alloc[Int32](self.nb_capacity)
+        self.nb_j = alloc[Int32](self.nb_capacity)
+        self.nb_is_1_4 = alloc[Int32](self.nb_capacity)
+        self.nb_epsilon = alloc[Scalar[StorageType]](self.nb_capacity)
+        self.nb_r_star = alloc[Scalar[StorageType]](self.nb_capacity)
+        self.nb_starts = alloc[Int32](self.mol_capacity)
 
         for i in range(self.mol_capacity):
             self.atom_starts[i] = 0
@@ -842,44 +842,44 @@ struct MoleculeBatch[StorageType: DType = DType.float32](Copyable, Movable):
         self.num_nb_pairs = other.num_nb_pairs
         self.num_molecules = other.num_molecules
 
-        self.x = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
-        self.y = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
-        self.z = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
-        self.grad_x = UnsafePointer[Float32].alloc(self.atom_capacity)
-        self.grad_y = UnsafePointer[Float32].alloc(self.atom_capacity)
-        self.grad_z = UnsafePointer[Float32].alloc(self.atom_capacity)
-        self.atom_type = UnsafePointer[Int32].alloc(self.atom_capacity)
-        self.charge = UnsafePointer[Scalar[StorageType]].alloc(self.atom_capacity)
-        self.atom_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.x = alloc[Scalar[StorageType]](self.atom_capacity)
+        self.y = alloc[Scalar[StorageType]](self.atom_capacity)
+        self.z = alloc[Scalar[StorageType]](self.atom_capacity)
+        self.grad_x = alloc[Float32](self.atom_capacity)
+        self.grad_y = alloc[Float32](self.atom_capacity)
+        self.grad_z = alloc[Float32](self.atom_capacity)
+        self.atom_type = alloc[Int32](self.atom_capacity)
+        self.charge = alloc[Scalar[StorageType]](self.atom_capacity)
+        self.atom_starts = alloc[Int32](self.mol_capacity)
 
-        self.bond_i = UnsafePointer[Int32].alloc(self.bond_capacity)
-        self.bond_j = UnsafePointer[Int32].alloc(self.bond_capacity)
-        self.bond_kb = UnsafePointer[Scalar[StorageType]].alloc(self.bond_capacity)
-        self.bond_r0 = UnsafePointer[Scalar[StorageType]].alloc(self.bond_capacity)
-        self.bond_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.bond_i = alloc[Int32](self.bond_capacity)
+        self.bond_j = alloc[Int32](self.bond_capacity)
+        self.bond_kb = alloc[Scalar[StorageType]](self.bond_capacity)
+        self.bond_r0 = alloc[Scalar[StorageType]](self.bond_capacity)
+        self.bond_starts = alloc[Int32](self.mol_capacity)
 
-        self.angle_i = UnsafePointer[Int32].alloc(self.angle_capacity)
-        self.angle_j = UnsafePointer[Int32].alloc(self.angle_capacity)
-        self.angle_k = UnsafePointer[Int32].alloc(self.angle_capacity)
-        self.angle_ka = UnsafePointer[Scalar[StorageType]].alloc(self.angle_capacity)
-        self.angle_theta0 = UnsafePointer[Scalar[StorageType]].alloc(self.angle_capacity)
-        self.angle_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.angle_i = alloc[Int32](self.angle_capacity)
+        self.angle_j = alloc[Int32](self.angle_capacity)
+        self.angle_k = alloc[Int32](self.angle_capacity)
+        self.angle_ka = alloc[Scalar[StorageType]](self.angle_capacity)
+        self.angle_theta0 = alloc[Scalar[StorageType]](self.angle_capacity)
+        self.angle_starts = alloc[Int32](self.mol_capacity)
 
-        self.torsion_i = UnsafePointer[Int32].alloc(self.torsion_capacity)
-        self.torsion_j = UnsafePointer[Int32].alloc(self.torsion_capacity)
-        self.torsion_k = UnsafePointer[Int32].alloc(self.torsion_capacity)
-        self.torsion_l = UnsafePointer[Int32].alloc(self.torsion_capacity)
-        self.torsion_v1 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
-        self.torsion_v2 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
-        self.torsion_v3 = UnsafePointer[Scalar[StorageType]].alloc(self.torsion_capacity)
-        self.torsion_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.torsion_i = alloc[Int32](self.torsion_capacity)
+        self.torsion_j = alloc[Int32](self.torsion_capacity)
+        self.torsion_k = alloc[Int32](self.torsion_capacity)
+        self.torsion_l = alloc[Int32](self.torsion_capacity)
+        self.torsion_v1 = alloc[Scalar[StorageType]](self.torsion_capacity)
+        self.torsion_v2 = alloc[Scalar[StorageType]](self.torsion_capacity)
+        self.torsion_v3 = alloc[Scalar[StorageType]](self.torsion_capacity)
+        self.torsion_starts = alloc[Int32](self.mol_capacity)
 
-        self.nb_i = UnsafePointer[Int32].alloc(self.nb_capacity)
-        self.nb_j = UnsafePointer[Int32].alloc(self.nb_capacity)
-        self.nb_is_1_4 = UnsafePointer[Int32].alloc(self.nb_capacity)
-        self.nb_epsilon = UnsafePointer[Scalar[StorageType]].alloc(self.nb_capacity)
-        self.nb_r_star = UnsafePointer[Scalar[StorageType]].alloc(self.nb_capacity)
-        self.nb_starts = UnsafePointer[Int32].alloc(self.mol_capacity)
+        self.nb_i = alloc[Int32](self.nb_capacity)
+        self.nb_j = alloc[Int32](self.nb_capacity)
+        self.nb_is_1_4 = alloc[Int32](self.nb_capacity)
+        self.nb_epsilon = alloc[Scalar[StorageType]](self.nb_capacity)
+        self.nb_r_star = alloc[Scalar[StorageType]](self.nb_capacity)
+        self.nb_starts = alloc[Int32](self.mol_capacity)
 
         for i in range(self.atom_capacity):
             self.x[i] = other.x[i]

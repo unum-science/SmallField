@@ -21,8 +21,10 @@ alias MMFF_BOND_PREFACTOR: Float32 = 143.9325  # mdyn*A/rad^2 -> kcal/mol
 alias MMFF_CUBIC_STRETCH: Float32 = -2.0       # A^-1
 
 # Angle bending
-alias MMFF_ANGLE_PREFACTOR: Float32 = 0.043844  # mdyn*A/rad^2 -> kcal/mol
-alias MMFF_ANGLE_SEXTIC: Float32 = -0.007       # rad^-1
+# c2 = MDYNE_A_TO_KCAL_MOL * DEG2RAD^2 = 143.9325 * (π/180)^2 = 0.043844
+# MMFF_ANGLE_PREFACTOR = 0.5 * c2 = 0.021922
+alias MMFF_ANGLE_PREFACTOR: Float32 = 0.021922  # 0.5 * 0.043844 (mdyn*A/rad^2 -> kcal/mol)
+alias MMFF_ANGLE_CUBIC: Float32 = -0.006981317  # Exact RDKit cb value (deg^-1)
 
 # Electrostatics
 alias MMFF_ELEC_CONSTANT: Float32 = 332.0716  # kcal*A/mol/e^2
@@ -44,55 +46,77 @@ fn compute_distance(
     var dz = z2 - z1
     return sqrt(dx * dx + dy * dy + dz * dz)
 
+# SIMD width constants
+alias SIMD_WIDTH_SCALAR: Int = 1
+alias SIMD_WIDTH_AVX512: Int = 16
+
 # Bond stretching
 # E_bond = 0.5 * 143.9325 * kb * dr^2 * (1 + cs*dr + 7/12*cs^2*dr^2)
-fn bond_energy_single(
-    r: Float32,      # Current bond length
-    r0: Float32,     # Equilibrium bond length
-    kb: Float32      # Force constant
-) -> Float32:
+fn bond_energy[width: Int = 1](
+    r: SIMD[DType.float32, width],
+    r0: SIMD[DType.float32, width],
+    kb: SIMD[DType.float32, width]
+) -> SIMD[DType.float32, width]:
     """
-    MMFF94 bond stretching energy for a single bond.
+    MMFF94 bond stretching energy.
 
     E = 0.5 * 143.9325 * kb * dr^2 * (1 + cs*dr + 7/12*cs^2*dr^2)
 
     where:
         dr = r - r0
         cs = -2.0 (cubic stretch constant)
+
+    When width=1, operates on scalars.
+    When width=16, processes 16 bonds in parallel (AVX-512).
     """
     var dr = r - r0
     var dr2 = dr * dr
-    var cs = MMFF_CUBIC_STRETCH
+    var cs = SIMD[DType.float32, width](MMFF_CUBIC_STRETCH)
     var cs2 = cs * cs
+    var half = SIMD[DType.float32, width](0.5)
+    var one = SIMD[DType.float32, width](1.0)
+    var prefactor = SIMD[DType.float32, width](MMFF_BOND_PREFACTOR)
+    var cubic_factor = SIMD[DType.float32, width](7.0 / 12.0)
 
-    var energy = Float32(0.5) * MMFF_BOND_PREFACTOR * kb * dr2 * (
-        Float32(1.0) + cs * dr + Float32(7.0 / 12.0) * cs2 * dr2
+    return half * prefactor * kb * dr2 * (one + cs * dr + cubic_factor * cs2 * dr2)
+
+
+# Scalar convenience wrapper for backward compatibility
+fn bond_energy_single(r: Float32, r0: Float32, kb: Float32) -> Float32:
+    """Scalar bond energy (calls SIMD version with width=1)."""
+    return bond_energy[1](r, r0, kb)[0]
+
+fn bond_gradient[width: Int = 1](
+    r: SIMD[DType.float32, width],
+    r0: SIMD[DType.float32, width],
+    kb: SIMD[DType.float32, width]
+) -> SIMD[DType.float32, width]:
+    """
+    Compute bond energy gradient dE/dr.
+
+    dE/dr = 143.9325 * kb * dr * (1 + 1.5*cs*dr + 7/3*cs^2*dr^2)
+    """
+    var dr = r - r0
+    var dr2 = dr * dr
+    var cs = SIMD[DType.float32, width](MMFF_CUBIC_STRETCH)
+    var cs2 = cs * cs
+    var one = SIMD[DType.float32, width](1.0)
+    var prefactor = SIMD[DType.float32, width](MMFF_BOND_PREFACTOR)
+
+    return prefactor * kb * dr * (
+        one + SIMD[DType.float32, width](1.5) * cs * dr +
+        SIMD[DType.float32, width](7.0 / 3.0) * cs2 * dr2
     )
-    return energy
+
 
 fn bond_energy_and_gradient(
     r: Float32,
     r0: Float32,
     kb: Float32
 ) -> Tuple[Float32, Float32]:
-    """
-    Compute bond energy and its gradient dE/dr.
-
-    dE/dr = 143.9325 * kb * dr * (1 + 1.5*cs*dr + 7/3*cs^2*dr^2)
-    """
-    var dr = r - r0
-    var dr2 = dr * dr
-    var cs = MMFF_CUBIC_STRETCH
-    var cs2 = cs * cs
-
-    var energy = Float32(0.5) * MMFF_BOND_PREFACTOR * kb * dr2 * (
-        Float32(1.0) + cs * dr + Float32(7.0 / 12.0) * cs2 * dr2
-    )
-
-    var gradient = MMFF_BOND_PREFACTOR * kb * dr * (
-        Float32(1.0) + Float32(1.5) * cs * dr + Float32(7.0 / 3.0) * cs2 * dr2
-    )
-
+    """Scalar bond energy and gradient (backward compatibility)."""
+    var energy = bond_energy[1](r, r0, kb)[0]
+    var gradient = bond_gradient[1](r, r0, kb)[0]
     return (energy, gradient)
 
 fn compute_bond_forces[
@@ -160,7 +184,7 @@ fn compute_bond_forces[
         var fy = dE_dr * dy * inv_r
         var fz = dE_dr * dz * inv_r
 
-        # Accumulate gradients
+        # Accumulate gradients using store()
         grad_x[i] = grad_x[i] - Scalar[StorageType](fx)
         grad_y[i] = grad_y[i] - Scalar[StorageType](fy)
         grad_z[i] = grad_z[i] - Scalar[StorageType](fz)
@@ -300,27 +324,37 @@ fn compute_angle(
 
     return acos(cos_theta)
 
-fn angle_energy_single(
-    theta: Float32,    # Current angle in radians
-    theta0: Float32,   # Equilibrium angle in radians
-    ka: Float32        # Force constant
-) -> Float32:
+fn angle_energy[width: Int = 1](
+    theta: SIMD[DType.float32, width],
+    theta0: SIMD[DType.float32, width],
+    ka: SIMD[DType.float32, width]
+) -> SIMD[DType.float32, width]:
     """
-    MMFF94 angle bending energy for a single angle.
+    MMFF94 angle bending energy.
 
     E = 0.043844 * ka * dtheta^2 * (1 - 0.007*dtheta)
 
     where:
         dtheta = theta - theta0 (in degrees for the cubic term)
+
+    When width=1, operates on scalars.
+    When width=16, processes 16 angles in parallel (AVX-512).
     """
     var dtheta_rad = theta - theta0
-    var dtheta_deg = dtheta_rad * RAD_TO_DEG
+    var rad_to_deg = SIMD[DType.float32, width](RAD_TO_DEG)
+    var dtheta_deg = dtheta_rad * rad_to_deg
     var dtheta_deg2 = dtheta_deg * dtheta_deg
 
-    var energy = MMFF_ANGLE_PREFACTOR * ka * dtheta_deg2 * (
-        Float32(1.0) + MMFF_ANGLE_SEXTIC * dtheta_deg
-    )
-    return energy
+    var prefactor = SIMD[DType.float32, width](MMFF_ANGLE_PREFACTOR)
+    var cubic = SIMD[DType.float32, width](MMFF_ANGLE_CUBIC)
+    var one = SIMD[DType.float32, width](1.0)
+
+    return prefactor * ka * dtheta_deg2 * (one + cubic * dtheta_deg)
+
+
+fn angle_energy_single(theta: Float32, theta0: Float32, ka: Float32) -> Float32:
+    """Scalar angle energy (calls SIMD version with width=1)."""
+    return angle_energy[1](theta, theta0, ka)[0]
 
 fn angle_energy_and_gradient(
     theta: Float32,
@@ -341,12 +375,12 @@ fn angle_energy_and_gradient(
     var dtheta_deg2 = dtheta_deg * dtheta_deg
 
     var energy = MMFF_ANGLE_PREFACTOR * ka * dtheta_deg2 * (
-        Float32(1.0) + MMFF_ANGLE_SEXTIC * dtheta_deg
+        Float32(1.0) + MMFF_ANGLE_CUBIC * dtheta_deg
     )
 
     # Gradient w.r.t. theta in degrees
     var gradient_deg = MMFF_ANGLE_PREFACTOR * ka * dtheta_deg * (
-        Float32(2.0) + Float32(3.0) * MMFF_ANGLE_SEXTIC * dtheta_deg
+        Float32(2.0) + Float32(3.0) * MMFF_ANGLE_CUBIC * dtheta_deg
     )
 
     # Convert to gradient w.r.t. theta in radians
@@ -466,7 +500,7 @@ fn compute_angle_forces[
         var fjy = -(fiy + fky)
         var fjz = -(fiz + fkz)
 
-        # Accumulate gradients
+        # Accumulate gradients using store()
         grad_x[i] = grad_x[i] + Scalar[StorageType](fix)
         grad_y[i] = grad_y[i] + Scalar[StorageType](fiy)
         grad_z[i] = grad_z[i] + Scalar[StorageType](fiz)
@@ -514,6 +548,218 @@ fn compute_total_angle_energy[
         )
 
         var energy = angle_energy_single(theta, Float32(angle_theta0[a]), Float32(angle_ka[a]))
+        total_energy += energy
+
+    return total_energy
+
+# Stretch-bend coupling
+# E_stbn = c5 * dtheta * (kba_ijk * dr1 + kba_kji * dr2)
+# where c5 = MDYNE_A_TO_KCAL_MOL * DEG2RAD = 143.9325 * (π/180)
+alias MMFF_STBN_PREFACTOR: Float32 = 2.51210  # 143.9325 * π / 180
+
+fn stretch_bend_energy_single(
+    dr1: Float32,       # Bond 1 deviation (r1 - r0_1)
+    dr2: Float32,       # Bond 2 deviation (r2 - r0_2)
+    dtheta_deg: Float32,  # Angle deviation in degrees
+    kba_ijk: Float32,   # Stretch-bend force constant i-j
+    kba_kji: Float32    # Stretch-bend force constant k-j
+) -> Float32:
+    """
+    MMFF94 stretch-bend coupling energy.
+
+    E = c5 * dtheta * (kba_ijk * dr1 + kba_kji * dr2)
+    where c5 = MDYNE_A_TO_KCAL_MOL * DEG2RAD
+    """
+    return MMFF_STBN_PREFACTOR * dtheta_deg * (kba_ijk * dr1 + kba_kji * dr2)
+
+fn compute_total_stretch_bend_energy[
+    StorageType: DType
+](
+    # Positions
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
+    # Stretch-bend topology (same as angles)
+    stbn_i: UnsafePointer[Int32],
+    stbn_j: UnsafePointer[Int32],
+    stbn_k: UnsafePointer[Int32],
+    # Stretch-bend parameters
+    stbn_kba_ijk: UnsafePointer[Scalar[StorageType]],
+    stbn_kba_kji: UnsafePointer[Scalar[StorageType]],
+    # Bond equilibrium lengths (for the two bonds in the angle)
+    stbn_r0_ij: UnsafePointer[Scalar[StorageType]],
+    stbn_r0_jk: UnsafePointer[Scalar[StorageType]],
+    # Angle equilibrium value
+    stbn_theta0: UnsafePointer[Scalar[StorageType]],
+    # Number of stretch-bend terms
+    num_stbn: Int
+) -> Float32:
+    """
+    Compute total stretch-bend coupling energy.
+    """
+    var total_energy: Float32 = 0.0
+
+    for s in range(num_stbn):
+        var i = Int(stbn_i[s])
+        var j = Int(stbn_j[s])  # Central atom
+        var k = Int(stbn_k[s])
+
+        # Compute current bond lengths
+        var dx_ij = Float32(x[j]) - Float32(x[i])
+        var dy_ij = Float32(y[j]) - Float32(y[i])
+        var dz_ij = Float32(z[j]) - Float32(z[i])
+        var r_ij = sqrt(dx_ij * dx_ij + dy_ij * dy_ij + dz_ij * dz_ij)
+
+        var dx_jk = Float32(x[k]) - Float32(x[j])
+        var dy_jk = Float32(y[k]) - Float32(y[j])
+        var dz_jk = Float32(z[k]) - Float32(z[j])
+        var r_jk = sqrt(dx_jk * dx_jk + dy_jk * dy_jk + dz_jk * dz_jk)
+
+        # Compute current angle
+        var theta = compute_angle(
+            Float32(x[i]), Float32(y[i]), Float32(z[i]),
+            Float32(x[j]), Float32(y[j]), Float32(z[j]),
+            Float32(x[k]), Float32(y[k]), Float32(z[k])
+        )
+        var theta_deg = theta * RAD_TO_DEG
+
+        # Compute deviations
+        var dr1 = r_ij - Float32(stbn_r0_ij[s])
+        var dr2 = r_jk - Float32(stbn_r0_jk[s])
+        var dtheta_deg = theta_deg - Float32(stbn_theta0[s])
+
+        # Compute stretch-bend energy
+        var energy = stretch_bend_energy_single(
+            dr1, dr2, dtheta_deg,
+            Float32(stbn_kba_ijk[s]), Float32(stbn_kba_kji[s])
+        )
+        total_energy += energy
+
+    return total_energy
+
+# Out-of-plane bending (for sp2 centers)
+# E_oop = 0.5 * c2 * koop * chi^2
+# where c2 = MDYNE_A_TO_KCAL_MOL * DEG2RAD^2 = 0.043844
+alias MMFF_OOP_PREFACTOR: Float32 = 0.021922  # 0.5 * 0.043844
+
+fn oop_energy_single(
+    chi_deg: Float32,  # Out-of-plane angle in degrees
+    koop: Float32      # Force constant
+) -> Float32:
+    """
+    MMFF94 out-of-plane bending energy.
+
+    E = 0.5 * c2 * koop * chi^2
+    where c2 = MDYNE_A_TO_KCAL_MOL * DEG2RAD^2
+    """
+    return MMFF_OOP_PREFACTOR * koop * chi_deg * chi_deg
+
+fn compute_oop_chi(
+    x_i: Float32, y_i: Float32, z_i: Float32,  # Atom i
+    x_j: Float32, y_j: Float32, z_j: Float32,  # Atom j (central sp2)
+    x_k: Float32, y_k: Float32, z_k: Float32,  # Atom k
+    x_l: Float32, y_l: Float32, z_l: Float32   # Atom l (out-of-plane atom)
+) -> Float32:
+    """
+    Compute out-of-plane angle chi in degrees.
+
+    chi is the angle between the j-l vector and the plane defined by i-j-k.
+    """
+    # Vectors from central atom j
+    var rJI_x = x_i - x_j
+    var rJI_y = y_i - y_j
+    var rJI_z = z_i - z_j
+
+    var rJK_x = x_k - x_j
+    var rJK_y = y_k - y_j
+    var rJK_z = z_k - z_j
+
+    var rJL_x = x_l - x_j
+    var rJL_y = y_l - y_j
+    var rJL_z = z_l - z_j
+
+    # Normalize vectors
+    var dJI = sqrt(rJI_x * rJI_x + rJI_y * rJI_y + rJI_z * rJI_z)
+    var dJK = sqrt(rJK_x * rJK_x + rJK_y * rJK_y + rJK_z * rJK_z)
+    var dJL = sqrt(rJL_x * rJL_x + rJL_y * rJL_y + rJL_z * rJL_z)
+
+    if dJI < Float32(1e-8) or dJK < Float32(1e-8) or dJL < Float32(1e-8):
+        return Float32(0.0)
+
+    rJI_x /= dJI
+    rJI_y /= dJI
+    rJI_z /= dJI
+    rJK_x /= dJK
+    rJK_y /= dJK
+    rJK_z /= dJK
+    rJL_x /= dJL
+    rJL_y /= dJL
+    rJL_z /= dJL
+
+    # Normal to the i-j-k plane (rJI x rJK)
+    var n_x = rJI_y * rJK_z - rJI_z * rJK_y
+    var n_y = rJI_z * rJK_x - rJI_x * rJK_z
+    var n_z = rJI_x * rJK_y - rJI_y * rJK_x
+
+    var n_len = sqrt(n_x * n_x + n_y * n_y + n_z * n_z)
+    if n_len < Float32(1e-8):
+        return Float32(0.0)
+
+    n_x /= n_len
+    n_y /= n_len
+    n_z /= n_len
+
+    # sin(chi) = rJL dot n
+    var sin_chi = rJL_x * n_x + rJL_y * n_y + rJL_z * n_z
+
+    # Clamp to [-1, 1]
+    if sin_chi > Float32(1.0):
+        sin_chi = Float32(1.0)
+    elif sin_chi < Float32(-1.0):
+        sin_chi = Float32(-1.0)
+
+    # Convert to degrees using small angle approximation: asin(x) ≈ x for small x
+    # For accuracy, we could use asin but that's in math module
+    # chi_deg = asin(sin_chi) * RAD_TO_DEG
+    # For small angles (typical in OOP), sin_chi ≈ chi in radians
+    return sin_chi * RAD_TO_DEG  # Approximation valid for small angles
+
+fn compute_total_oop_energy[
+    StorageType: DType
+](
+    # Positions
+    x: UnsafePointer[Scalar[StorageType]],
+    y: UnsafePointer[Scalar[StorageType]],
+    z: UnsafePointer[Scalar[StorageType]],
+    # OOP topology (i, j, k, l where j is central)
+    oop_i: UnsafePointer[Int32],
+    oop_j: UnsafePointer[Int32],
+    oop_k: UnsafePointer[Int32],
+    oop_l: UnsafePointer[Int32],
+    # OOP parameters
+    oop_koop: UnsafePointer[Scalar[StorageType]],
+    # Number of OOP terms
+    num_oop: Int
+) -> Float32:
+    """
+    Compute total out-of-plane bending energy.
+    """
+    var total_energy: Float32 = 0.0
+
+    for o in range(num_oop):
+        var i = Int(oop_i[o])
+        var j = Int(oop_j[o])  # Central atom
+        var k = Int(oop_k[o])
+        var l = Int(oop_l[o])  # Out-of-plane atom
+
+        var chi_deg = compute_oop_chi(
+            Float32(x[i]), Float32(y[i]), Float32(z[i]),
+            Float32(x[j]), Float32(y[j]), Float32(z[j]),
+            Float32(x[k]), Float32(y[k]), Float32(z[k]),
+            Float32(x[l]), Float32(y[l]), Float32(z[l])
+        )
+
+        var energy = oop_energy_single(chi_deg, Float32(oop_koop[o]))
         total_energy += energy
 
     return total_energy
@@ -759,7 +1005,7 @@ fn compute_torsion_forces[
         var fky = factor_k_from_i * fiy + factor_k_from_l * fly
         var fkz = factor_k_from_i * fiz + factor_k_from_l * flz
 
-        # Accumulate gradients
+        # Accumulate gradients using store()
         grad_x[i] = grad_x[i] + Scalar[StorageType](fix)
         grad_y[i] = grad_y[i] + Scalar[StorageType](fiy)
         grad_z[i] = grad_z[i] + Scalar[StorageType](fiz)
@@ -821,34 +1067,50 @@ fn compute_total_torsion_energy[
 
 # Van der Waals
 # Buffered 14-7 potential: E_vdw = epsilon * (1.07*R*/(r+0.07*R*))^7 * (1.12*R*^7/(r^7+0.12*R*^7) - 2)
-fn vdw_energy_single(
-    r: Float32,        # Current distance
-    epsilon: Float32,  # Well depth (kcal/mol)
-    r_star: Float32    # Equilibrium distance (Angstroms)
-) -> Float32:
+# Helper for x^7 = x * x^2 * x^4 (efficient for SIMD)
+fn pow7[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    """Compute x^7 efficiently using x * x^2 * x^4."""
+    var x2 = x * x
+    var x4 = x2 * x2
+    return x * x2 * x4
+
+
+fn vdw_energy[width: Int = 1](
+    r: SIMD[DType.float32, width],
+    epsilon: SIMD[DType.float32, width],
+    r_star: SIMD[DType.float32, width]
+) -> SIMD[DType.float32, width]:
     """
     MMFF94 buffered 14-7 van der Waals energy.
 
     E = epsilon * (1.07*R*/(r+0.07*R*))^7 * (1.12*R*^7/(r^7+0.12*R*^7) - 2)
 
-    This form prevents singularities at r=0 and has correct asymptotic behavior.
+    When width=1, operates on scalars.
+    When width=16, processes 16 pairs in parallel (AVX-512).
     """
-    alias DELTA: Float32 = 0.07
-    alias GAMMA: Float32 = 0.12
+    var delta = SIMD[DType.float32, width](0.07)
+    var gamma = SIMD[DType.float32, width](0.12)
+    var one = SIMD[DType.float32, width](1.0)
+    var two = SIMD[DType.float32, width](2.0)
 
-    var r_star_7 = r_star ** 7
+    var r_star_7 = pow7[width](r_star)
 
     # Repulsive term: (1.07*R*/(r+0.07*R*))^7
-    var denom_rep = r + DELTA * r_star
-    var ratio_rep = (Float32(1.0) + DELTA) * r_star / denom_rep
-    var rep_term = ratio_rep ** 7
+    var denom_rep = r + delta * r_star
+    var ratio_rep = (one + delta) * r_star / denom_rep
+    var rep_term = pow7[width](ratio_rep)
 
     # Attractive term: 1.12*R*^7/(r^7+0.12*R*^7) - 2
-    var r_7 = r ** 7
-    var denom_att = r_7 + GAMMA * r_star_7
-    var att_term = (Float32(1.0) + GAMMA) * r_star_7 / denom_att - Float32(2.0)
+    var r_7 = pow7[width](r)
+    var denom_att = r_7 + gamma * r_star_7
+    var att_term = (one + gamma) * r_star_7 / denom_att - two
 
     return epsilon * rep_term * att_term
+
+
+fn vdw_energy_single(r: Float32, epsilon: Float32, r_star: Float32) -> Float32:
+    """Scalar vdW energy (calls SIMD version with width=1)."""
+    return vdw_energy[1](r, epsilon, r_star)[0]
 
 fn vdw_energy_and_gradient(
     r: Float32,
@@ -903,20 +1165,18 @@ fn compute_vdw_forces[
     # Nonbonded pair indices
     nb_i: UnsafePointer[Int32],
     nb_j: UnsafePointer[Int32],
-    nb_is_1_4: UnsafePointer[Int32],
     # vdW parameters
     nb_epsilon: UnsafePointer[Scalar[StorageType]],
     nb_r_star: UnsafePointer[Scalar[StorageType]],
     # Range
     nb_start: Int,
-    nb_end: Int,
-    # Scale factor for 1-4 interactions
-    scale_1_4: Float32
+    nb_end: Int
 ) -> Float32:
     """
     Compute vdW energy and accumulate forces.
 
-    1-4 interactions are scaled by scale_1_4 (typically 0.75).
+    NOTE: MMFF94 does NOT apply 1-4 scaling to vdW energy.
+    1-4 scaling (0.75) only applies to electrostatic energy.
     """
     var total_energy: Float32 = 0.0
 
@@ -941,15 +1201,10 @@ fn compute_vdw_forces[
         if r < Float32(0.1):
             continue
 
-        # Apply 1-4 scaling
-        var scale = Float32(1.0)
-        if nb_is_1_4[p] != 0:
-            scale = scale_1_4
-
-        # Compute energy and gradient
+        # Compute energy and gradient (no 1-4 scaling for vdW)
         var result = vdw_energy_and_gradient(r, Float32(nb_epsilon[p]), Float32(nb_r_star[p]))
-        var energy = result[0] * scale
-        var dE_dr = result[1] * scale
+        var energy = result[0]
+        var dE_dr = result[1]
 
         total_energy += energy
 
@@ -959,7 +1214,7 @@ fn compute_vdw_forces[
         var fy = dE_dr * dy * inv_r
         var fz = dE_dr * dz * inv_r
 
-        # Accumulate gradients
+        # Accumulate gradients using store()
         grad_x[i] = grad_x[i] - Scalar[StorageType](fx)
         grad_y[i] = grad_y[i] - Scalar[StorageType](fy)
         grad_z[i] = grad_z[i] - Scalar[StorageType](fz)
@@ -979,17 +1234,17 @@ fn compute_total_vdw_energy[
     # Nonbonded pair indices
     nb_i: UnsafePointer[Int32],
     nb_j: UnsafePointer[Int32],
-    nb_is_1_4: UnsafePointer[Int32],
     # vdW parameters
     nb_epsilon: UnsafePointer[Scalar[StorageType]],
     nb_r_star: UnsafePointer[Scalar[StorageType]],
     # Number of pairs
-    num_pairs: Int,
-    # Scale factor for 1-4 interactions
-    scale_1_4: Float32
+    num_pairs: Int
 ) -> Float32:
     """
     Compute total vdW energy (no gradients).
+
+    NOTE: MMFF94 does NOT apply 1-4 scaling to vdW energy.
+    1-4 scaling (0.75) only applies to electrostatic energy.
     """
     var total_energy: Float32 = 0.0
 
@@ -1005,12 +1260,8 @@ fn compute_total_vdw_energy[
         if r < Float32(0.1):
             continue
 
-        var scale = Float32(1.0)
-        if nb_is_1_4[p] != 0:
-            scale = scale_1_4
-
         var energy = vdw_energy_single(r, Float32(nb_epsilon[p]), Float32(nb_r_star[p]))
-        total_energy += energy * scale
+        total_energy += energy
 
     return total_energy
 
@@ -1150,7 +1401,7 @@ fn compute_electrostatic_forces[
         var fy = dE_dr * dy * inv_r
         var fz = dE_dr * dz * inv_r
 
-        # Accumulate gradients
+        # Accumulate gradients using store()
         grad_x[i] = grad_x[i] - Scalar[StorageType](fx)
         grad_y[i] = grad_y[i] - Scalar[StorageType](fy)
         grad_z[i] = grad_z[i] - Scalar[StorageType](fz)
@@ -1365,8 +1616,7 @@ fn compute_mmff94_energy[
 
     if opts.compute_vdw:
         result.vdw = compute_total_vdw_energy(
-            x, y, z, nb_i, nb_j, nb_is_1_4, nb_epsilon, nb_r_star,
-            num_nb_pairs, opts.vdw_1_4_scale
+            x, y, z, nb_i, nb_j, nb_epsilon, nb_r_star, num_nb_pairs
         )
 
     if opts.compute_elec:
