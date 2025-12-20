@@ -48,13 +48,31 @@ class BenchmarkResult:
     kernel: str
     vdw_energies: List[float]
     elec_energies: List[float]
-    elapsed_sec: float
+    elapsed_times: List[float]  # Multiple iterations for statistics
     num_molecules: int
 
     @property
+    def elapsed_sec(self) -> float:
+        """Mean elapsed time across iterations."""
+        return np.mean(self.elapsed_times) if self.elapsed_times else 0.0
+
+    @property
+    def elapsed_std(self) -> float:
+        """Standard deviation of elapsed times."""
+        return np.std(self.elapsed_times) if len(self.elapsed_times) > 1 else 0.0
+
+    @property
     def throughput(self) -> float:
-        """Molecules per second."""
+        """Mean molecules per second."""
         return self.num_molecules / max(self.elapsed_sec, 1e-9)
+
+    @property
+    def throughput_std(self) -> float:
+        """Standard deviation of throughput."""
+        if not self.elapsed_times or len(self.elapsed_times) < 2:
+            return 0.0
+        throughputs = [self.num_molecules / max(t, 1e-9) for t in self.elapsed_times]
+        return np.std(throughputs)
 
 
 def benchmark_rdkit(molecules: List[MoleculeData], iterations: int = 3) -> float:
@@ -216,47 +234,59 @@ def prepare_batch_data(molecules: List[MoleculeData]) -> Dict:
     }
 
 
-def run_kernel_benchmark(batch_data: Dict, kernel: str) -> Optional[BenchmarkResult]:
+def run_kernel_benchmark(
+    batch_data: Dict,
+    kernel: str,
+    warmup: int = 2,
+    iterations: int = 5,
+) -> Optional[BenchmarkResult]:
     """
     Run Mojo kernel benchmark via direct Python binding (batched).
 
     Args:
         batch_data: Pre-prepared batch data from prepare_batch_data()
-        kernel: Kernel name (skylake, simd, genoa, turin)
+        kernel: Kernel name (simd, simd_f64, skylake, genoa, turin, h100, h100_cpu)
+        warmup: Number of warmup iterations (not timed)
+        iterations: Number of measurement iterations
 
     Returns: BenchmarkResult or None on failure
     """
     try:
-        # Reset output arrays to zero
-        batch_data["vdw_out"].fill(0.0)
-        batch_data["elec_out"].fill(0.0)
+        # Common arguments for compute_batch
+        def run_batch():
+            batch_data["vdw_out"].fill(0.0)
+            batch_data["elec_out"].fill(0.0)
+            smallfield.compute_batch(
+                batch_data["num_molecules"],
+                batch_data["total_atoms"],
+                batch_data["total_pairs"],
+                kernel,
+                batch_data["coords"],
+                batch_data["pair_idx"],
+                batch_data["vdw_params"],
+                batch_data["charges"],
+                batch_data["is_1_4"],
+                batch_data["offsets"],
+                batch_data["vdw_out"],
+                batch_data["elec_out"],
+            )
 
-        # Time the batch call with new grouped matrix API
-        # Args: n_mol, n_atoms, n_pairs, kernel,
-        #       coords, pair_idx, vdw_params, charges, is_1_4, offsets,
-        #       vdw_out, elec_out
-        start = time.perf_counter()
-        smallfield.compute_batch(
-            batch_data["num_molecules"],
-            batch_data["total_atoms"],
-            batch_data["total_pairs"],
-            kernel,
-            batch_data["coords"],
-            batch_data["pair_idx"],
-            batch_data["vdw_params"],
-            batch_data["charges"],
-            batch_data["is_1_4"],
-            batch_data["offsets"],
-            batch_data["vdw_out"],
-            batch_data["elec_out"],
-        )
-        elapsed = time.perf_counter() - start
+        # Warmup iterations (not timed)
+        for _ in range(warmup):
+            run_batch()
+
+        # Measurement iterations
+        elapsed_times = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            run_batch()
+            elapsed_times.append(time.perf_counter() - start)
 
         return BenchmarkResult(
             kernel=kernel,
             vdw_energies=list(batch_data["vdw_out"]),
             elec_energies=list(batch_data["elec_out"]),
-            elapsed_sec=elapsed,
+            elapsed_times=elapsed_times,
             num_molecules=batch_data["num_molecules"],
         )
 
@@ -295,15 +325,15 @@ def generate_report(
     lines.append("")
 
     # Per-kernel results
-    lines.append("-" * 80)
+    lines.append("-" * 90)
     lines.append(
-        f"{'Kernel':<12} {'Throughput':>14} {'Speedup':>10} {'vdW RMSE':>12} {'Elec RMSE':>12}"
+        f"{'Kernel':<12} {'Throughput (mean±std)':>24} {'Speedup':>10} {'vdW RMSE':>12} {'Elec RMSE':>12}"
     )
-    lines.append("-" * 80)
+    lines.append("-" * 90)
 
-    for kernel in ["simd", "skylake", "genoa", "turin", "h100"]:
+    for kernel in ["simd", "simd_f64", "skylake", "genoa", "turin", "h100"]:
         if kernel not in results:
-            lines.append(f"{kernel:<12} {'FAILED':>14}")
+            lines.append(f"{kernel:<12} {'FAILED':>24}")
             continue
 
         result = results[kernel]
@@ -323,8 +353,10 @@ def generate_report(
 
         speedup = result.throughput / rdkit_throughput if rdkit_throughput > 0 else 0.0
 
+        # Format throughput with std
+        throughput_str = f"{result.throughput:,.0f} ± {result.throughput_std:,.0f}/s"
         lines.append(
-            f"{kernel:<12} {result.throughput:>11,.0f}/s {speedup:>9.1f}x {vdw_rmse:>12.4f} {elec_rmse:>12.4f}"
+            f"{kernel:<12} {throughput_str:>24} {speedup:>9.1f}x {vdw_rmse:>12.4f} {elec_rmse:>12.4f}"
         )
 
     lines.append("-" * 80)
@@ -337,11 +369,14 @@ def main(
     n_samples: int = 1000,
     smiles_path: str = DEFAULT_SMILES_PATH,
     skip_rdkit: bool = False,
+    warmup: int = 2,
+    iterations: int = 5,
 ):
     """Run the complete unified benchmark."""
 
     print("=" * 80, flush=True)
     print("SmallField Unified Benchmark (Batched API)", flush=True)
+    print(f"Warmup: {warmup}, Iterations: {iterations}", flush=True)
     print("=" * 80, flush=True)
     print(flush=True)
 
@@ -373,16 +408,20 @@ def main(
     print()
 
     # Step 5: Run Mojo kernel benchmarks via batched binding
-    print("Step 5: Running Mojo kernels (batched)...")
+    print(
+        f"Step 5: Running Mojo kernels (batched, {warmup} warmup + {iterations} iters)..."
+    )
     results: Dict[str, BenchmarkResult] = {}
 
-    for kernel in ["simd", "skylake", "genoa", "turin", "h100"]:
+    for kernel in ["simd", "simd_f64", "skylake", "genoa", "turin", "h100"]:
         print(f"  Running {kernel}...", end=" ", flush=True)
-        result = run_kernel_benchmark(batch_data, kernel)
+        result = run_kernel_benchmark(
+            batch_data, kernel, warmup=warmup, iterations=iterations
+        )
         if result:
             results[kernel] = result
             print(
-                f"{result.throughput:,.0f} mol/sec ({result.elapsed_sec*1000:.1f} ms)"
+                f"{result.throughput:,.0f} ± {result.throughput_std:,.0f} mol/sec ({result.elapsed_sec*1000:.2f} ± {result.elapsed_std*1000:.2f} ms)"
             )
         else:
             print("FAILED")
@@ -424,10 +463,24 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip RDKit benchmark and use estimated throughput",
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        help="Number of warmup iterations (default: 2)",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=5,
+        help="Number of measurement iterations (default: 5)",
+    )
 
     args = parser.parse_args()
     main(
         n_samples=args.num_samples,
         smiles_path=args.smiles_path,
         skip_rdkit=args.skip_rdkit,
+        warmup=args.warmup,
+        iterations=args.iterations,
     )
