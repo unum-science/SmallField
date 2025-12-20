@@ -27,12 +27,13 @@ namespace smallfield {
 
 #pragma region Constants
 
-constexpr std::size_t warp_size = 32;
+constexpr std::uint32_t warp_size = 32;
 constexpr unsigned int full_mask = 0xFFFFFFFF;
 
 constexpr float const coulomb_const_f32 = 332.0716f;
 constexpr float const delta_f32 = 0.05f;
 constexpr float const scale_1_4_f32 = 0.75f;
+constexpr float const scale_1_4_diff_f32 = scale_1_4_f32 - 1.0f; // For branchless scaling
 
 #pragma endregion
 
@@ -63,19 +64,20 @@ __device__ __forceinline__ half h_fma_(half a, half b, half c) { return __hfma(a
 #pragma region Warp Reduction
 
 /**
- * Butterfly reduction: sum across all 32 warp lanes using XOR shuffle.
- * After reduction, ALL lanes have the total sum.
+ * Warp reduction using butterfly XOR shuffles.
+ * Uses 5 shuffle operations to reduce 32 lanes.
+ * Result is available in all lanes.
  *
- * Uses 5 shuffle operations (log2(32) = 5).
+ * Note: __reduce_add_sync only supports integer types on sm_80+.
+ * For float reduction, we use the shuffle-based approach.
  */
 __device__ __forceinline__ float warp_reduce_sum_f32_(float val) {
-    float sum = val;
-    sum += __shfl_xor_sync(full_mask, sum, 16);
-    sum += __shfl_xor_sync(full_mask, sum, 8);
-    sum += __shfl_xor_sync(full_mask, sum, 4);
-    sum += __shfl_xor_sync(full_mask, sum, 2);
-    sum += __shfl_xor_sync(full_mask, sum, 1);
-    return sum;
+    val += __shfl_xor_sync(full_mask, val, 16);
+    val += __shfl_xor_sync(full_mask, val, 8);
+    val += __shfl_xor_sync(full_mask, val, 4);
+    val += __shfl_xor_sync(full_mask, val, 2);
+    val += __shfl_xor_sync(full_mask, val, 1);
+    return val;
 }
 
 #pragma endregion
@@ -126,11 +128,7 @@ __device__ __forceinline__ float compute_distance_f32_(float const xi, float con
  *
  * Computation in FP16, final multiply in FP32 for accumulation precision.
  */
-__device__ __forceinline__ float compute_vdw_energy_f16_(
-    half const r,
-    half const epsilon,
-    half const r_star
-) {
+__device__ __forceinline__ float compute_vdw_energy_f16_(half const r, half const epsilon, half const r_star) {
     half const r_safe = __hgt(r, __float2half(0.001f)) ? r : __float2half(0.001f);
 
     half const inv_rstar = h_rcp_(r_star);
@@ -197,40 +195,37 @@ __device__ __forceinline__ float compute_vdw_energy_f32_(float const r, float co
  * E = 332.0716 * qi * qj / (r + 0.05)
  *
  * For 1-4 interactions: scale by 0.75.
+ * Uses branchless scaling: scale = 1.0 + is_1_4 * (0.75 - 1.0)
  */
 __device__ __forceinline__ float compute_elec_energy_f16_(half const r, half const qi, half const qj,
-                                                          bool const is_1_4) {
+                                                          std::int32_t const is_1_4) {
     half const coulomb_const = __float2half(332.0716f);
     half const delta = __float2half(0.05f);
-    half const scale_1_4 = __float2half(0.75f);
 
     half const r_buffered = __hadd(r, delta);
     half const inv_r = h_rcp_(r_buffered);
 
     half e = __hmul(__hmul(__hmul(coulomb_const, qi), qj), inv_r);
 
-    if (is_1_4) {
-        e = __hmul(e, scale_1_4);
-    }
-
-    return __half2float(e);
+    // Branchless 1-4 scaling: scale = 1.0 + is_1_4 * (0.75 - 1.0)
+    float const scale = 1.0f + static_cast<float>(is_1_4) * scale_1_4_diff_f32;
+    return __half2float(e) * scale;
 }
 
 /**
  * MMFF94 Buffered Coulomb electrostatic energy (FP32 compute and accumulation).
+ * Uses branchless scaling: scale = 1.0 + is_1_4 * (0.75 - 1.0)
  */
 __device__ __forceinline__ float compute_elec_energy_f32_(float const r, float const qi, float const qj,
-                                                          bool const is_1_4) {
+                                                          std::int32_t const is_1_4) {
     float const r_buffered = r + delta_f32;
     float const inv_r = __frcp_rn(r_buffered);
 
     float e = coulomb_const_f32 * qi * qj * inv_r;
 
-    if (is_1_4) {
-        e *= scale_1_4_f32;
-    }
-
-    return e;
+    // Branchless 1-4 scaling
+    float const scale = 1.0f + static_cast<float>(is_1_4) * scale_1_4_diff_f32;
+    return e * scale;
 }
 
 #pragma endregion
@@ -249,20 +244,19 @@ __global__ void mmff94_vdw_energy_kernel_f16(half const* coord_x, half const* co
                                              std::int32_t const* nb_i, std::int32_t const* nb_j, half const* nb_epsilon,
                                              half const* nb_r_star, std::int32_t const* mol_nb_start,
                                              std::int32_t const* mol_nb_end, float* out_vdw,
-                                             std::int32_t const n_molecules) {
-    std::size_t const mol_idx = blockIdx.x;
-    std::size_t const lane = threadIdx.x;
+                                             std::uint32_t const n_molecules) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
 
-    if (mol_idx >= static_cast<std::size_t>(n_molecules)) {
+    if (mol_idx >= n_molecules) {
         return;
     }
 
-    std::int32_t const nb_start = mol_nb_start[mol_idx];
-    std::int32_t const nb_end = mol_nb_end[mol_idx];
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
     float vdw_accum = 0.0f;
 
-    for (std::size_t pair_idx = static_cast<std::size_t>(nb_start) + lane; pair_idx < static_cast<std::size_t>(nb_end);
-         pair_idx += warp_size) {
+    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
         std::int32_t const i = nb_i[pair_idx];
         std::int32_t const j = nb_j[pair_idx];
 
@@ -295,20 +289,19 @@ __global__ void mmff94_vdw_energy_kernel_f32(float const* coord_x, float const* 
                                              std::int32_t const* nb_i, std::int32_t const* nb_j,
                                              float const* nb_epsilon, float const* nb_r_star,
                                              std::int32_t const* mol_nb_start, std::int32_t const* mol_nb_end,
-                                             float* out_vdw, std::int32_t const n_molecules) {
-    std::size_t const mol_idx = blockIdx.x;
-    std::size_t const lane = threadIdx.x;
+                                             float* out_vdw, std::uint32_t const n_molecules) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
 
-    if (mol_idx >= static_cast<std::size_t>(n_molecules)) {
+    if (mol_idx >= n_molecules) {
         return;
     }
 
-    std::int32_t const nb_start = mol_nb_start[mol_idx];
-    std::int32_t const nb_end = mol_nb_end[mol_idx];
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
     float vdw_accum = 0.0f;
 
-    for (std::size_t pair_idx = static_cast<std::size_t>(nb_start) + lane; pair_idx < static_cast<std::size_t>(nb_end);
-         pair_idx += warp_size) {
+    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
         std::int32_t const i = nb_i[pair_idx];
         std::int32_t const j = nb_j[pair_idx];
 
@@ -345,20 +338,19 @@ __global__ void mmff94_elec_energy_kernel_f16(half const* coord_x, half const* c
                                               std::int32_t const* nb_i, std::int32_t const* nb_j, half const* nb_qi,
                                               half const* nb_qj, std::int32_t const* nb_is_1_4,
                                               std::int32_t const* mol_nb_start, std::int32_t const* mol_nb_end,
-                                              float* out_elec, std::int32_t const n_molecules) {
-    std::size_t const mol_idx = blockIdx.x;
-    std::size_t const lane = threadIdx.x;
+                                              float* out_elec, std::uint32_t const n_molecules) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
 
-    if (mol_idx >= static_cast<std::size_t>(n_molecules)) {
+    if (mol_idx >= n_molecules) {
         return;
     }
 
-    std::int32_t const nb_start = mol_nb_start[mol_idx];
-    std::int32_t const nb_end = mol_nb_end[mol_idx];
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
     float elec_accum = 0.0f;
 
-    for (std::size_t pair_idx = static_cast<std::size_t>(nb_start) + lane; pair_idx < static_cast<std::size_t>(nb_end);
-         pair_idx += warp_size) {
+    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
         std::int32_t const i = nb_i[pair_idx];
         std::int32_t const j = nb_j[pair_idx];
 
@@ -373,7 +365,7 @@ __global__ void mmff94_elec_energy_kernel_f16(half const* coord_x, half const* c
 
         half const qi = nb_qi[pair_idx];
         half const qj = nb_qj[pair_idx];
-        bool const is_1_4 = (nb_is_1_4[pair_idx] != 0);
+        std::int32_t const is_1_4 = nb_is_1_4[pair_idx]; // Branchless: use int directly
 
         elec_accum += compute_elec_energy_f16_(r, qi, qj, is_1_4);
     }
@@ -392,20 +384,19 @@ __global__ void mmff94_elec_energy_kernel_f32(float const* coord_x, float const*
                                               std::int32_t const* nb_i, std::int32_t const* nb_j, float const* nb_qi,
                                               float const* nb_qj, std::int32_t const* nb_is_1_4,
                                               std::int32_t const* mol_nb_start, std::int32_t const* mol_nb_end,
-                                              float* out_elec, std::int32_t const n_molecules) {
-    std::size_t const mol_idx = blockIdx.x;
-    std::size_t const lane = threadIdx.x;
+                                              float* out_elec, std::uint32_t const n_molecules) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
 
-    if (mol_idx >= static_cast<std::size_t>(n_molecules)) {
+    if (mol_idx >= n_molecules) {
         return;
     }
 
-    std::int32_t const nb_start = mol_nb_start[mol_idx];
-    std::int32_t const nb_end = mol_nb_end[mol_idx];
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
     float elec_accum = 0.0f;
 
-    for (std::size_t pair_idx = static_cast<std::size_t>(nb_start) + lane; pair_idx < static_cast<std::size_t>(nb_end);
-         pair_idx += warp_size) {
+    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
         std::int32_t const i = nb_i[pair_idx];
         std::int32_t const j = nb_j[pair_idx];
 
@@ -420,7 +411,7 @@ __global__ void mmff94_elec_energy_kernel_f32(float const* coord_x, float const*
 
         float const qi = nb_qi[pair_idx];
         float const qj = nb_qj[pair_idx];
-        bool const is_1_4 = (nb_is_1_4[pair_idx] != 0);
+        std::int32_t const is_1_4 = nb_is_1_4[pair_idx]; // Branchless: use int directly
 
         elec_accum += compute_elec_energy_f32_(r, qi, qj, is_1_4);
     }
