@@ -127,10 +127,14 @@ class BuildExt(build_ext):
         except ImportError:
             pass
 
+        # Pass AVX-512 flags to host compiler via -Xcompiler
+        host_flags = "-fPIC,-mavx512f,-mavx512bw,-mavx512dq,-mavx512vl"
+        if enable_openmp:
+            host_flags += ",-fopenmp"
         cmd = (
             f"nvcc -c {source} -o {output_file} -std=c++17 "
             f"-gencode=arch=compute_{arch_code},code=sm_{arch_code} "
-            f"-Xcompiler -fPIC {include_dirs} -O3 -g"
+            f"-Xcompiler {host_flags} {include_dirs} -O3 -g"
         )
         if os.system(cmd) != 0:
             raise RuntimeError(f"nvcc compilation of {source} failed")
