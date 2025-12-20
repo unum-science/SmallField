@@ -6,6 +6,15 @@ SmallField is a high-performance library for generating 3D conformers of small m
 It implements [Merck Molecular Force Field](https://en.wikipedia.org/wiki/Merck_molecular_force_field) optimization (MMFF94) via the [Limited-memory Broyden–Fletcher–Goldfarb–Shanno algorithm](https://en.wikipedia.org/wiki/Limited-memory_BFGS) (L-BFGS), comparing both throughput and accuracy against [RDKit](https://github.com/rdkit/rdkit)'s baseline.
 It works around the fact that most modern CPUs and GPUs lack `f64` FMA units or Tensor Cores, focusing on `f16` and `bf16` representations with `f32` accumulation instead.
 All of its core data-structures are padded proportionally to SIMD and SIMT widths to maximize hardware utilization and avoid code duplication for loop tails.
+It calculates all 7 energy terms:
+
+1. VdW (van der Waals) computed for $O(n²)$ all atom pairs
+2. Electrostatic computed for $O(n²)$ all atom pairs
+3. Bond stretching computed for $O(n)$ bonds
+4. Angle bending computed for $O(n)$ angles
+5. Torsion computed for $O(n)$ torsions
+6. Stretch-bend coupling computed for $O(n)$ stretch-bend terms
+7. Out-of-plane bending computed for $O(n)$ out-of-plane terms
 
 ## Backends
 
