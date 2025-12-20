@@ -33,6 +33,7 @@ RAD_TO_DEG = 180.0 / np.pi
 @dataclass
 class EnergyComponents:
     """Per-term MMFF94 energy breakdown."""
+
     bond: float = 0.0
     angle: float = 0.0
     torsion: float = 0.0
@@ -49,14 +50,22 @@ def bond_energy(r: float, r0: float, kb: float) -> float:
     dr = r - r0
     dr2 = dr * dr
     cs = MMFF_CUBIC_STRETCH
-    return 0.5 * MMFF_BOND_PREFACTOR * kb * dr2 * (1.0 + cs * dr + (7.0 / 12.0) * cs * cs * dr2)
+    return (
+        0.5
+        * MMFF_BOND_PREFACTOR
+        * kb
+        * dr2
+        * (1.0 + cs * dr + (7.0 / 12.0) * cs * cs * dr2)
+    )
 
 
 def angle_energy(theta_rad: float, theta0_rad: float, ka: float) -> float:
     """MMFF94 angle bending energy."""
     dtheta_deg = (theta_rad - theta0_rad) * RAD_TO_DEG
     dtheta_deg2 = dtheta_deg * dtheta_deg
-    return MMFF_ANGLE_PREFACTOR * ka * dtheta_deg2 * (1.0 + MMFF_ANGLE_CUBIC * dtheta_deg)
+    return (
+        MMFF_ANGLE_PREFACTOR * ka * dtheta_deg2 * (1.0 + MMFF_ANGLE_CUBIC * dtheta_deg)
+    )
 
 
 def torsion_energy(phi_rad: float, v1: float, v2: float, v3: float) -> float:
@@ -65,9 +74,7 @@ def torsion_energy(phi_rad: float, v1: float, v2: float, v3: float) -> float:
     cos_2phi = np.cos(2.0 * phi_rad)
     cos_3phi = np.cos(3.0 * phi_rad)
     return MMFF_TORSION_PREFACTOR * (
-        v1 * (1.0 + cos_phi) +
-        v2 * (1.0 - cos_2phi) +
-        v3 * (1.0 + cos_3phi)
+        v1 * (1.0 + cos_phi) + v2 * (1.0 - cos_2phi) + v3 * (1.0 + cos_3phi)
     )
 
 
@@ -201,7 +208,9 @@ def compute_energy_f64(mol: MoleculeData) -> EnergyComponents:
     return result
 
 
-def compute_baseline(molecules: List[MoleculeData], verbose: bool = True) -> List[EnergyComponents]:
+def compute_baseline(
+    molecules: List[MoleculeData], verbose: bool = True
+) -> List[EnergyComponents]:
     """
     Compute f64 baseline for all molecules.
 

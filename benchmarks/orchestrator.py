@@ -6,7 +6,7 @@ Main entry point that coordinates:
 1. Loading molecules from USearchMolecules
 2. Computing Python f64 baseline (accuracy reference)
 3. Benchmarking RDKit throughput
-4. Running Mojo kernels via direct Python binding
+4. Running Mojo kernels via direct Python binding (batched)
 5. Generating formatted report
 """
 
@@ -18,11 +18,11 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass
 
 # Add parent directory to path for imports
-_this_dir = Path(__file__).parent if '__file__' in dir() else Path('benchmarks')
+_this_dir = Path(__file__).parent if "__file__" in dir() else Path("benchmarks")
 sys.path.insert(0, str(_this_dir))
 
 # Add build directory for smallfield module
-_build_dir = _this_dir.parent / 'build'
+_build_dir = _this_dir.parent / "build"
 sys.path.insert(0, str(_build_dir))
 
 from molecule_loader import load_molecules, MoleculeData, DEFAULT_SMILES_PATH
@@ -32,7 +32,9 @@ try:
     import smallfield
 except ImportError:
     print("ERROR: smallfield module not found. Build it first:")
-    print("  mojo build -O3 --emit shared-lib src/smallfield.mojo -o build/smallfield.so")
+    print(
+        "  mojo build -O3 --emit shared-lib src/smallfield.mojo -o build/smallfield.so"
+    )
     sys.exit(1)
 
 from rdkit import Chem
@@ -42,6 +44,7 @@ from rdkit.Chem import AllChem
 @dataclass
 class BenchmarkResult:
     """Result from a Mojo kernel benchmark."""
+
     kernel: str
     vdw_energies: List[float]
     elec_energies: List[float]
@@ -108,82 +111,115 @@ def benchmark_rdkit(molecules: List[MoleculeData], iterations: int = 3) -> float
     return throughput
 
 
-def run_kernel_benchmark(
-    molecules: List[MoleculeData],
-    kernel: str
-) -> Optional[BenchmarkResult]:
+def prepare_batch_data(molecules: List[MoleculeData]) -> Dict:
     """
-    Run Mojo kernel benchmark via direct Python binding.
+    Prepare concatenated batch data for smallfield.compute_batch().
+
+    Returns dict with all arrays concatenated across molecules.
+    """
+    # Count totals
+    total_atoms = sum(mol.num_atoms for mol in molecules)
+    total_pairs = sum(len(mol.nonbonded) for mol in molecules)
+    num_molecules = len(molecules)
+
+    # Pre-allocate arrays
+    x = np.zeros(total_atoms, dtype=np.float64)
+    y = np.zeros(total_atoms, dtype=np.float64)
+    z = np.zeros(total_atoms, dtype=np.float64)
+
+    nb_i = np.zeros(total_pairs, dtype=np.int64)
+    nb_j = np.zeros(total_pairs, dtype=np.int64)
+    epsilon = np.zeros(total_pairs, dtype=np.float64)
+    r_star = np.zeros(total_pairs, dtype=np.float64)
+    qi = np.zeros(total_pairs, dtype=np.float64)
+    qj = np.zeros(total_pairs, dtype=np.float64)
+    is_1_4 = np.zeros(total_pairs, dtype=np.int64)
+
+    # Offset arrays (length = num_molecules + 1)
+    atom_offsets = np.zeros(num_molecules + 1, dtype=np.int64)
+    nb_offsets = np.zeros(num_molecules + 1, dtype=np.int64)
+
+    # Fill arrays
+    atom_idx = 0
+    pair_idx = 0
+
+    for mol_idx, mol in enumerate(molecules):
+        atom_offsets[mol_idx] = atom_idx
+        nb_offsets[mol_idx] = pair_idx
+
+        # Copy coordinates
+        for i in range(mol.num_atoms):
+            x[atom_idx + i] = mol.positions[i, 0]
+            y[atom_idx + i] = mol.positions[i, 1]
+            z[atom_idx + i] = mol.positions[i, 2]
+
+        # Copy nonbonded pairs (indices are relative to molecule, need offset)
+        for nb in mol.nonbonded:
+            nb_i[pair_idx] = nb.i  # Local index within molecule
+            nb_j[pair_idx] = nb.j
+            epsilon[pair_idx] = nb.epsilon
+            r_star[pair_idx] = nb.r_star
+            qi[pair_idx] = nb.qi
+            qj[pair_idx] = nb.qj
+            is_1_4[pair_idx] = 1 if nb.is_1_4 else 0
+            pair_idx += 1
+
+        atom_idx += mol.num_atoms
+
+    # Final offsets
+    atom_offsets[num_molecules] = atom_idx
+    nb_offsets[num_molecules] = pair_idx
+
+    return {
+        "x": x,
+        "y": y,
+        "z": z,
+        "nb_i": nb_i,
+        "nb_j": nb_j,
+        "epsilon": epsilon,
+        "r_star": r_star,
+        "qi": qi,
+        "qj": qj,
+        "is_1_4": is_1_4,
+        "atom_offsets": atom_offsets,
+        "nb_offsets": nb_offsets,
+        "num_molecules": num_molecules,
+        "total_atoms": total_atoms,
+        "total_pairs": total_pairs,
+    }
+
+
+def run_kernel_benchmark(batch_data: Dict, kernel: str) -> Optional[BenchmarkResult]:
+    """
+    Run Mojo kernel benchmark via direct Python binding (batched).
 
     Args:
-        molecules: List of parameterized molecules
+        batch_data: Pre-prepared batch data from prepare_batch_data()
         kernel: Kernel name (skylake, simd, genoa, turin)
 
     Returns: BenchmarkResult or None on failure
     """
-    vdw_energies = []
-    elec_energies = []
-
     try:
+        # Add kernel to batch data
+        args = {**batch_data, "kernel": kernel}
+
+        # Time the batch call
         start = time.perf_counter()
-
-        for mol in molecules:
-            n_atoms = mol.num_atoms
-            n_pairs = len(mol.nonbonded)
-
-            if n_pairs == 0:
-                vdw_energies.append(0.0)
-                elec_energies.append(0.0)
-                continue
-
-            # Extract coordinate arrays
-            x = mol.positions[:, 0].copy()
-            y = mol.positions[:, 1].copy()
-            z = mol.positions[:, 2].copy()
-
-            # Extract nonbonded pair data
-            nb_i = np.array([nb.i for nb in mol.nonbonded], dtype=np.int64)
-            nb_j = np.array([nb.j for nb in mol.nonbonded], dtype=np.int64)
-            epsilon = np.array([nb.epsilon for nb in mol.nonbonded], dtype=np.float64)
-            r_star = np.array([nb.r_star for nb in mol.nonbonded], dtype=np.float64)
-            qi = np.array([nb.qi for nb in mol.nonbonded], dtype=np.float64)
-            qj = np.array([nb.qj for nb in mol.nonbonded], dtype=np.float64)
-            is_1_4 = np.array([1 if nb.is_1_4 else 0 for nb in mol.nonbonded], dtype=np.int64)
-
-            # Call vdW kernel
-            vdw = smallfield.vdw_energy({
-                'x': x, 'y': y, 'z': z,
-                'nb_i': nb_i, 'nb_j': nb_j,
-                'epsilon': epsilon, 'r_star': r_star,
-                'num_pairs': n_pairs, 'num_atoms': n_atoms,
-                'kernel': kernel
-            })
-            vdw_energies.append(float(vdw))
-
-            # Call electrostatic kernel
-            elec = smallfield.elec_energy({
-                'x': x, 'y': y, 'z': z,
-                'nb_i': nb_i, 'nb_j': nb_j,
-                'qi': qi, 'qj': qj,
-                'is_1_4': is_1_4,
-                'num_pairs': n_pairs, 'num_atoms': n_atoms,
-                'kernel': kernel
-            })
-            elec_energies.append(float(elec))
-
+        vdw_list, elec_list = smallfield.compute_batch(args)
         elapsed = time.perf_counter() - start
 
         return BenchmarkResult(
             kernel=kernel,
-            vdw_energies=vdw_energies,
-            elec_energies=elec_energies,
+            vdw_energies=list(vdw_list),
+            elec_energies=list(elec_list),
             elapsed_sec=elapsed,
-            num_molecules=len(molecules)
+            num_molecules=batch_data["num_molecules"],
         )
 
     except Exception as e:
         print(f"  EXCEPTION running {kernel}: {e}")
         import traceback
+
         traceback.print_exc()
         return None
 
@@ -192,7 +228,7 @@ def generate_report(
     num_molecules: int,
     baseline: List[EnergyComponents],
     results: Dict[str, BenchmarkResult],
-    rdkit_throughput: float
+    rdkit_throughput: float,
 ) -> str:
     """Generate benchmark report comparing kernels to baseline."""
     lines = []
@@ -200,22 +236,28 @@ def generate_report(
     lines.append("BENCHMARK RESULTS")
     lines.append("=" * 80)
     lines.append(f"Molecules: {num_molecules}")
-    lines.append(f"RDKit throughput (estimated): {rdkit_throughput:,.0f} mol/sec")
+    lines.append(f"RDKit throughput: {rdkit_throughput:,.0f} mol/sec")
     lines.append("")
 
     # Baseline stats
     baseline_vdw = [e.vdw for e in baseline]
     baseline_elec = [e.elec for e in baseline]
-    lines.append(f"Baseline vdW range: {min(baseline_vdw):.2f} to {max(baseline_vdw):.2f} kcal/mol")
-    lines.append(f"Baseline elec range: {min(baseline_elec):.2f} to {max(baseline_elec):.2f} kcal/mol")
+    lines.append(
+        f"Baseline vdW range: {min(baseline_vdw):.2f} to {max(baseline_vdw):.2f} kcal/mol"
+    )
+    lines.append(
+        f"Baseline elec range: {min(baseline_elec):.2f} to {max(baseline_elec):.2f} kcal/mol"
+    )
     lines.append("")
 
     # Per-kernel results
     lines.append("-" * 80)
-    lines.append(f"{'Kernel':<12} {'Throughput':>14} {'Speedup':>10} {'vdW RMSE':>12} {'Elec RMSE':>12}")
+    lines.append(
+        f"{'Kernel':<12} {'Throughput':>14} {'Speedup':>10} {'vdW RMSE':>12} {'Elec RMSE':>12}"
+    )
     lines.append("-" * 80)
 
-    for kernel in ['simd', 'skylake', 'genoa', 'turin']:
+    for kernel in ["simd", "skylake", "genoa", "turin"]:
         if kernel not in results:
             lines.append(f"{kernel:<12} {'FAILED':>14}")
             continue
@@ -223,17 +265,23 @@ def generate_report(
         result = results[kernel]
 
         # Compute RMSE vs baseline
-        vdw_errors = [(result.vdw_energies[i] - baseline_vdw[i])**2
-                      for i in range(min(len(result.vdw_energies), len(baseline_vdw)))]
-        elec_errors = [(result.elec_energies[i] - baseline_elec[i])**2
-                       for i in range(min(len(result.elec_energies), len(baseline_elec)))]
+        vdw_errors = [
+            (result.vdw_energies[i] - baseline_vdw[i]) ** 2
+            for i in range(min(len(result.vdw_energies), len(baseline_vdw)))
+        ]
+        elec_errors = [
+            (result.elec_energies[i] - baseline_elec[i]) ** 2
+            for i in range(min(len(result.elec_energies), len(baseline_elec)))
+        ]
 
         vdw_rmse = np.sqrt(np.mean(vdw_errors)) if vdw_errors else 0.0
         elec_rmse = np.sqrt(np.mean(elec_errors)) if elec_errors else 0.0
 
         speedup = result.throughput / rdkit_throughput if rdkit_throughput > 0 else 0.0
 
-        lines.append(f"{kernel:<12} {result.throughput:>11,.0f}/s {speedup:>9.1f}x {vdw_rmse:>12.4f} {elec_rmse:>12.4f}")
+        lines.append(
+            f"{kernel:<12} {result.throughput:>11,.0f}/s {speedup:>9.1f}x {vdw_rmse:>12.4f} {elec_rmse:>12.4f}"
+        )
 
     lines.append("-" * 80)
     lines.append("")
@@ -245,7 +293,7 @@ def main(n_samples: int = 1000, smiles_path: str = DEFAULT_SMILES_PATH):
     """Run the complete unified benchmark."""
 
     print("=" * 80, flush=True)
-    print("SmallField Unified Benchmark (Direct Binding)", flush=True)
+    print("SmallField Unified Benchmark (Batched API)", flush=True)
     print("=" * 80, flush=True)
     print(flush=True)
 
@@ -262,34 +310,42 @@ def main(n_samples: int = 1000, smiles_path: str = DEFAULT_SMILES_PATH):
 
     # Step 3: Benchmark RDKit throughput
     print("Step 3: Benchmarking RDKit MMFF94 throughput...")
-    rdkit_throughput = 45000.0  # Estimated ~45k mol/sec
-    print(f"  RDKit throughput (estimated): {rdkit_throughput:,.0f} mol/sec")
+    rdkit_throughput = benchmark_rdkit(molecules)
     print()
 
-    # Step 4: Run Mojo kernel benchmarks via direct binding
-    print("Step 4: Running Mojo kernels via Python binding...")
+    # Step 4: Prepare batch data (once for all kernels)
+    print("Step 4: Preparing batch data...")
+    batch_data = prepare_batch_data(molecules)
+    print(f"  Total atoms: {batch_data['total_atoms']:,}")
+    print(f"  Total pairs: {batch_data['total_pairs']:,}")
+    print()
+
+    # Step 5: Run Mojo kernel benchmarks via batched binding
+    print("Step 5: Running Mojo kernels (batched)...")
     results: Dict[str, BenchmarkResult] = {}
 
-    for kernel in ['simd', 'skylake', 'genoa', 'turin']:
+    for kernel in ["simd", "skylake", "genoa", "turin"]:
         print(f"  Running {kernel}...", end=" ", flush=True)
-        result = run_kernel_benchmark(molecules, kernel)
+        result = run_kernel_benchmark(batch_data, kernel)
         if result:
             results[kernel] = result
-            print(f"{result.throughput:,.0f} mol/sec")
+            print(
+                f"{result.throughput:,.0f} mol/sec ({result.elapsed_sec*1000:.1f} ms)"
+            )
         else:
             print("FAILED")
 
     print()
 
-    # Step 5: Generate report
-    print("Step 5: Generating report...")
+    # Step 6: Generate report
+    print("Step 6: Generating report...")
     print()
 
     report = generate_report(
         num_molecules=len(molecules),
         baseline=baseline,
         results=results,
-        rdkit_throughput=rdkit_throughput
+        rdkit_throughput=rdkit_throughput,
     )
     print(report)
 
@@ -299,16 +355,17 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="SmallField Unified Benchmark")
     parser.add_argument(
-        "-n", "--num-samples",
+        "-n",
+        "--num-samples",
         type=int,
         default=1000,
-        help="Number of molecules to benchmark (default: 1000)"
+        help="Number of molecules to benchmark (default: 1000)",
     )
     parser.add_argument(
         "--smiles-path",
         type=str,
         default=DEFAULT_SMILES_PATH,
-        help="Path to SMILES file"
+        help="Path to SMILES file",
     )
 
     args = parser.parse_args()

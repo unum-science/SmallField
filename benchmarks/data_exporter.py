@@ -188,10 +188,10 @@ def export_binary(molecules: List[MoleculeData], output_path: str) -> dict:
             nb_qj[nb_off + nb_idx] = nb.qj
 
     # Write binary file
-    with open(output_path, 'wb') as f:
+    with open(output_path, "wb") as f:
         # Header (64 bytes)
         header = struct.pack(
-            '<IIIIIIII',  # 8 x u32 = 32 bytes
+            "<IIIIIIII",  # 8 x u32 = 32 bytes
             MAGIC,
             VERSION,
             num_molecules,
@@ -199,10 +199,10 @@ def export_binary(molecules: List[MoleculeData], output_path: str) -> dict:
             num_bonds_total,
             num_angles_total,
             num_torsions_total,
-            num_nb_total
+            num_nb_total,
         )
         f.write(header)
-        f.write(b'\x00' * 32)  # Padding to 64 bytes
+        f.write(b"\x00" * 32)  # Padding to 64 bytes
 
         # Offset arrays
         f.write(atom_starts.tobytes())
@@ -251,14 +251,14 @@ def export_binary(molecules: List[MoleculeData], output_path: str) -> dict:
     file_size = Path(output_path).stat().st_size
 
     return {
-        'num_molecules': num_molecules,
-        'num_atoms': num_atoms_total,
-        'num_bonds': num_bonds_total,
-        'num_angles': num_angles_total,
-        'num_torsions': num_torsions_total,
-        'num_nb': num_nb_total,
-        'file_size_bytes': file_size,
-        'file_size_mb': file_size / (1024 * 1024)
+        "num_molecules": num_molecules,
+        "num_atoms": num_atoms_total,
+        "num_bonds": num_bonds_total,
+        "num_angles": num_angles_total,
+        "num_torsions": num_torsions_total,
+        "num_nb": num_nb_total,
+        "file_size_bytes": file_size,
+        "file_size_mb": file_size / (1024 * 1024),
     }
 
 
@@ -269,7 +269,7 @@ if __name__ == "__main__":
     # Quick test
     molecules = load_molecules(DEFAULT_SMILES_PATH, n_samples=100)
 
-    with tempfile.NamedTemporaryFile(suffix='.bin', delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
         output_path = f.name
 
     stats = export_binary(molecules, output_path)

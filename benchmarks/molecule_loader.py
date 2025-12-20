@@ -19,6 +19,7 @@ from rdkit.Chem import AllChem
 @dataclass
 class BondData:
     """MMFF94 bond parameters."""
+
     i: int
     j: int
     kb: float  # Force constant (mdyn/A)
@@ -28,6 +29,7 @@ class BondData:
 @dataclass
 class AngleData:
     """MMFF94 angle parameters."""
+
     i: int
     j: int  # Central atom
     k: int
@@ -38,6 +40,7 @@ class AngleData:
 @dataclass
 class TorsionData:
     """MMFF94 torsion parameters."""
+
     i: int
     j: int
     k: int
@@ -50,6 +53,7 @@ class TorsionData:
 @dataclass
 class NonbondedPair:
     """MMFF94 nonbonded pair (vdW + electrostatic)."""
+
     i: int
     j: int
     is_1_4: bool  # True if 1-4 interaction (electrostatic scaling)
@@ -62,6 +66,7 @@ class NonbondedPair:
 @dataclass
 class MoleculeData:
     """Complete MMFF94 parameterized molecule."""
+
     smiles: str
     num_atoms: int
     positions: np.ndarray  # Shape (num_atoms, 3), dtype float64
@@ -80,7 +85,7 @@ def load_smiles_file(path: str, max_read: int = 20000) -> List[str]:
             parts = line.strip().split()
             if parts:
                 # Take first component (before any '.')
-                smi = parts[0].split('.')[0]
+                smi = parts[0].split(".")[0]
                 if smi and 5 <= len(smi) <= 80:
                     smiles_list.append(smi)
             if len(smiles_list) >= max_read:
@@ -126,17 +131,22 @@ def parameterize_molecule(smiles: str, seed: int = 42) -> Optional[MoleculeData]
 
     # Extract positions
     conf = mol.GetConformer()
-    positions = np.array([
-        [conf.GetAtomPosition(i).x,
-         conf.GetAtomPosition(i).y,
-         conf.GetAtomPosition(i).z]
-        for i in range(num_atoms)
-    ], dtype=np.float64)
+    positions = np.array(
+        [
+            [
+                conf.GetAtomPosition(i).x,
+                conf.GetAtomPosition(i).y,
+                conf.GetAtomPosition(i).z,
+            ]
+            for i in range(num_atoms)
+        ],
+        dtype=np.float64,
+    )
 
     # Extract charges
-    charges = np.array([
-        mmff.GetMMFFPartialCharge(i) for i in range(num_atoms)
-    ], dtype=np.float64)
+    charges = np.array(
+        [mmff.GetMMFFPartialCharge(i) for i in range(num_atoms)], dtype=np.float64
+    )
 
     # Extract bond parameters
     bonds = []
@@ -154,7 +164,7 @@ def parameterize_molecule(smiles: str, seed: int = 42) -> Optional[MoleculeData]
         j = atom.GetIdx()
         neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
         for idx1, i in enumerate(neighbors):
-            for k in neighbors[idx1 + 1:]:
+            for k in neighbors[idx1 + 1 :]:
                 key = (min(i, k), j, max(i, k))
                 if key not in angles_seen:
                     angles_seen.add(key)
@@ -162,14 +172,20 @@ def parameterize_molecule(smiles: str, seed: int = 42) -> Optional[MoleculeData]
                     if params:
                         _, ka, theta0_deg = params
                         theta0_rad = theta0_deg * np.pi / 180.0
-                        angles.append(AngleData(i=i, j=j, k=k, ka=ka, theta0=theta0_rad))
+                        angles.append(
+                            AngleData(i=i, j=j, k=k, ka=ka, theta0=theta0_rad)
+                        )
 
     # Extract torsion parameters
     torsions = []
     for bond in mol.GetBonds():
         j, k = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        neighbors_j = [n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != k]
-        neighbors_k = [n.GetIdx() for n in mol.GetAtomWithIdx(k).GetNeighbors() if n.GetIdx() != j]
+        neighbors_j = [
+            n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != k
+        ]
+        neighbors_k = [
+            n.GetIdx() for n in mol.GetAtomWithIdx(k).GetNeighbors() if n.GetIdx() != j
+        ]
 
         for i in neighbors_j:
             for l in neighbors_k:
@@ -177,7 +193,9 @@ def parameterize_molecule(smiles: str, seed: int = 42) -> Optional[MoleculeData]
                     params = mmff.GetMMFFTorsionParams(mol, i, j, k, l)
                     if params:
                         _, v1, v2, v3 = params
-                        torsions.append(TorsionData(i=i, j=j, k=k, l=l, v1=v1, v2=v2, v3=v3))
+                        torsions.append(
+                            TorsionData(i=i, j=j, k=k, l=l, v1=v1, v2=v2, v3=v3)
+                        )
 
     # Build exclusion sets for nonbonded
     bonded_1_2 = {i: set() for i in range(num_atoms)}
@@ -214,14 +232,17 @@ def parameterize_molecule(smiles: str, seed: int = 42) -> Optional[MoleculeData]
                 r_star, epsilon = vdw_params[0], vdw_params[1]
                 is_1_4 = j in bonded_1_4[i]
 
-                nonbonded.append(NonbondedPair(
-                    i=i, j=j,
-                    is_1_4=is_1_4,
-                    epsilon=epsilon,
-                    r_star=r_star,
-                    qi=charges[i],
-                    qj=charges[j]
-                ))
+                nonbonded.append(
+                    NonbondedPair(
+                        i=i,
+                        j=j,
+                        is_1_4=is_1_4,
+                        epsilon=epsilon,
+                        r_star=r_star,
+                        qi=charges[i],
+                        qj=charges[j],
+                    )
+                )
 
     return MoleculeData(
         smiles=smiles,
@@ -231,15 +252,12 @@ def parameterize_molecule(smiles: str, seed: int = 42) -> Optional[MoleculeData]
         bonds=bonds,
         angles=angles,
         torsions=torsions,
-        nonbonded=nonbonded
+        nonbonded=nonbonded,
     )
 
 
 def load_molecules(
-    smiles_path: str,
-    n_samples: int = 1000,
-    seed: int = 42,
-    verbose: bool = True
+    smiles_path: str, n_samples: int = 1000, seed: int = 42, verbose: bool = True
 ) -> List[MoleculeData]:
     """
     Load and parameterize molecules from USearchMolecules SMILES file.
@@ -289,8 +307,12 @@ def load_molecules(
         bond_counts = [len(m.bonds) for m in molecules]
         nb_counts = [len(m.nonbonded) for m in molecules]
 
-        print(f"  Atom counts: min={min(atom_counts)}, max={max(atom_counts)}, avg={np.mean(atom_counts):.1f}")
-        print(f"  Bonds per mol: min={min(bond_counts)}, max={max(bond_counts)}, avg={np.mean(bond_counts):.1f}")
+        print(
+            f"  Atom counts: min={min(atom_counts)}, max={max(atom_counts)}, avg={np.mean(atom_counts):.1f}"
+        )
+        print(
+            f"  Bonds per mol: min={min(bond_counts)}, max={max(bond_counts)}, avg={np.mean(bond_counts):.1f}"
+        )
         print(f"  NB pairs per mol: avg={np.mean(nb_counts):.1f}")
 
     return molecules

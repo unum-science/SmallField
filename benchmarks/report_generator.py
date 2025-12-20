@@ -15,6 +15,7 @@ from baseline_compute import EnergyComponents
 @dataclass
 class BenchmarkResult:
     """Results from a single storage type benchmark."""
+
     storage_type: str
     energies: List[EnergyComponents]
     elapsed_ns: int
@@ -27,9 +28,9 @@ class BenchmarkResult:
         return self.num_molecules / (self.elapsed_ns / 1e9)
 
 
-def compute_rmse_percent(baseline: List[EnergyComponents],
-                         test: List[EnergyComponents],
-                         term: str) -> float:
+def compute_rmse_percent(
+    baseline: List[EnergyComponents], test: List[EnergyComponents], term: str
+) -> float:
     """Compute RMSE as percentage of mean baseline value."""
     baseline_values = np.array([getattr(e, term) for e in baseline])
     test_values = np.array([getattr(e, term) for e in test])
@@ -44,18 +45,18 @@ def compute_rmse_percent(baseline: List[EnergyComponents],
     return (rmse / mean_abs_baseline) * 100
 
 
-def compute_mae(baseline: List[EnergyComponents],
-                test: List[EnergyComponents],
-                term: str) -> float:
+def compute_mae(
+    baseline: List[EnergyComponents], test: List[EnergyComponents], term: str
+) -> float:
     """Compute Mean Absolute Error in kcal/mol."""
     baseline_values = np.array([getattr(e, term) for e in baseline])
     test_values = np.array([getattr(e, term) for e in test])
     return np.mean(np.abs(test_values - baseline_values))
 
 
-def compute_max_error(baseline: List[EnergyComponents],
-                      test: List[EnergyComponents],
-                      term: str) -> float:
+def compute_max_error(
+    baseline: List[EnergyComponents], test: List[EnergyComponents], term: str
+) -> float:
     """Compute maximum absolute error in kcal/mol."""
     baseline_values = np.array([getattr(e, term) for e in baseline])
     test_values = np.array([getattr(e, term) for e in test])
@@ -66,7 +67,7 @@ def generate_report(
     num_molecules: int,
     baseline: List[EnergyComponents],
     results: Dict[str, BenchmarkResult],
-    rdkit_throughput: float
+    rdkit_throughput: float,
 ) -> str:
     """
     Generate formatted benchmark report.
@@ -80,8 +81,8 @@ def generate_report(
     Returns:
         Formatted report string
     """
-    terms = ['bond', 'angle', 'torsion', 'vdw', 'elec', 'total']
-    storage_types = ['f32', 'bf16', 'f16']
+    terms = ["bond", "angle", "torsion", "vdw", "elec", "total"]
+    storage_types = ["f32", "bf16", "f16"]
 
     lines = []
 
@@ -89,7 +90,9 @@ def generate_report(
     lines.append("=" * 80)
     lines.append("SmallField Unified Benchmark")
     lines.append("=" * 80)
-    lines.append(f"Dataset: {num_molecules} molecules | Baseline: Python f64 | Reference: RDKit MMFF94")
+    lines.append(
+        f"Dataset: {num_molecules} molecules | Baseline: Python f64 | Reference: RDKit MMFF94"
+    )
     lines.append("")
 
     # SIMD info from first result
@@ -162,7 +165,9 @@ def generate_report(
             continue
         throughput = results[stype].throughput
         speedup = throughput / rdkit_throughput if rdkit_throughput > 0 else 0
-        lines.append(f"{'SmallField ' + stype:<30} {throughput:>15,.0f} {speedup:>14.2f}x")
+        lines.append(
+            f"{'SmallField ' + stype:<30} {throughput:>15,.0f} {speedup:>14.2f}x"
+        )
 
     lines.append("")
     lines.append("=" * 80)
@@ -170,7 +175,9 @@ def generate_report(
     return "\n".join(lines)
 
 
-def parse_mojo_output(output: str) -> Tuple[List[EnergyComponents], int, int, Dict[str, str]]:
+def parse_mojo_output(
+    output: str,
+) -> Tuple[List[EnergyComponents], int, int, Dict[str, str]]:
     """
     Parse output from Mojo runner.
 
@@ -182,19 +189,19 @@ def parse_mojo_output(output: str) -> Tuple[List[EnergyComponents], int, int, Di
     num_molecules = 0
     simd_info = {}
 
-    for line in output.strip().split('\n'):
+    for line in output.strip().split("\n"):
         line = line.strip()
 
-        if line.startswith('#'):
+        if line.startswith("#"):
             # Parse SIMD info comments
-            if ':' in line:
+            if ":" in line:
                 key_val = line[1:].strip()
-                if ':' in key_val:
-                    key, val = key_val.split(':', 1)
+                if ":" in key_val:
+                    key, val = key_val.split(":", 1)
                     simd_info[key.strip()] = val.strip()
             continue
 
-        if line.startswith('TIMING'):
+        if line.startswith("TIMING"):
             parts = line.split()
             if len(parts) >= 3:
                 elapsed_ns = int(parts[1])
@@ -210,7 +217,7 @@ def parse_mojo_output(output: str) -> Tuple[List[EnergyComponents], int, int, Di
                     angle=float(parts[2]),
                     torsion=float(parts[3]),
                     vdw=float(parts[4]),
-                    elec=float(parts[5])
+                    elec=float(parts[5]),
                 )
                 energies.append(energy)
             except (ValueError, IndexError):
@@ -238,15 +245,15 @@ if __name__ == "__main__":
 
     # Simulate f16 results (more error)
     f16_energies = [
-        EnergyComponents(
-            bond=1.005, angle=2.01, torsion=0.51, vdw=-1.01, elec=0.31
-        )
+        EnergyComponents(bond=1.005, angle=2.01, torsion=0.51, vdw=-1.01, elec=0.31)
         for _ in range(100)
     ]
 
     results = {
-        'f32': BenchmarkResult('f32', f32_energies, 1_000_000, 100, {'AVX-512': 'True'}),
-        'f16': BenchmarkResult('f16', f16_energies, 900_000, 100, {'AVX-512': 'True'}),
+        "f32": BenchmarkResult(
+            "f32", f32_energies, 1_000_000, 100, {"AVX-512": "True"}
+        ),
+        "f16": BenchmarkResult("f16", f16_energies, 900_000, 100, {"AVX-512": "True"}),
     }
 
     report = generate_report(100, baseline, results, 40000)
