@@ -3,21 +3,22 @@
 > Hardware-accelerated Small Molecule conformer generation on CPUs and GPUs.
 
 SmallField is a high-performance library for generating 3D conformers of small molecules using mixed precision numerics.
+It implements [Merck Molecular Force Field](https://en.wikipedia.org/wiki/Merck_molecular_force_field) optimization (MMFF94) via the [Limited-memory Broyden–Fletcher–Goldfarb–Shanno algorithm](https://en.wikipedia.org/wiki/Limited-memory_BFGS) (L-BFGS), comparing both throughput and accuracy against [RDKit](https://github.com/rdkit/rdkit)'s baseline.
 It works around the fact that most modern CPUs and GPUs lack `f64` FMA units or Tensor Cores, focusing on `f16` and `bf16` representations with `f32` accumulation instead.
-It implements ETKDG and MMFF force field based optimization, comparing against RDKit's implementations.
 All of its core data-structures are padded proportionally to SIMD and SIMT widths to maximize hardware utilization and avoid code duplication for loop tails.
 
-## CPU Backends
+## Backends
 
-- __Serial__: Templated f32/f64 with 4/8-way accumulators (auto-vectorizable)
-- __AVX-512 F32__: Skylake-X and newer (rsqrt14, rcp14, FMA)
-- __AVX-512 F16__: Intel SPR, AMD Turin (vcvtph2ps/vcvtps2ph)
-- __AVX-512 BF16__: AMD Genoa (vdpbf16ps)
+CPUs:
 
-## GPU Backends
+- __Serial__: Templated C++ kernels for `f32` and `f64` arithmetic
+- __Skylake__: AVX-512 kernels for `f32` arithmetic leveraging `rsqrt14`, `rcp14`, and FMA units
+- __Turin__: AVX-512 kernels for `f16` coordinates leveraging `f32` for accumulation
 
-- __CUDA F16__: NVIDIA H100 (warp reductions, tensor cores)
-- __CUDA F32__: NVIDIA H100 (warp reductions)
+GPUs:
+
+- __CUDA F32__: NVIDIA H100 kernels using warp reductions
+- __CUDA F16__: NVIDIA H100 kernels for `half2` coordinates and Tensor Cores
 
 ## Installation
 
@@ -39,11 +40,41 @@ pytest test.py -s -x
 ## Usage
 
 ```python
-import smallfield
+import smallfield as sf
+import numpy as np
 
-# Compute MMFF94 energy
-energy = smallfield.compute_energy(mol, backend=smallfield.Backend.AVX512_F32)
+# Check available backends
+print(f"Skylake AVX-512: {sf.has_skylake()}")
+print(f"CUDA: {sf.has_cuda()}")
 
-# Optimize conformer
-optimized_mol = smallfield.optimize_conformer(mol, max_iters=200)
+# Create context with pre-allocated buffers
+ctx = sf.Context(
+    total_atoms=10000,      # Max atoms (rounded up for SIMD)
+    total_pairs=1000000,    # Max VdW pairs
+    max_molecules=1000      # Max molecules in batch
+)
+
+# Compute VdW energy for single molecule
+energy = ctx.vdw_skylake(
+    coords_x, coords_y, coords_z,  # f64 coordinate arrays
+    pair_i, pair_j,                 # i32 atom pair indices
+    epsilon, r_star                 # f64 VdW parameters
+)
+
+# Compute VdW energy for batch of molecules
+batch_energy = ctx.vdw_batch_skylake(
+    coords_x, coords_y, coords_z,
+    pair_i, pair_j, epsilon, r_star,
+    mol_start, mol_end,             # i32 pair index ranges per molecule
+    n_molecules
+)
+```
+
+## Benchmarking
+
+SmallField includes comprehensive benchmarking tools to compare performance across all implementations.
+To run the benchmark on a 1000 randomly sampled molecules for 100 iterations:
+
+```bash
+uv run --with rdkit python bench.py --n-molecules 1000 --iterations 100 --smiles-dir /path/to/smiles/
 ```

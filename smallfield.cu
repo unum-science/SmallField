@@ -437,6 +437,19 @@ class context_t {
         }
     }
 
+#if defined(__CUDACC__)
+    /**
+     * @brief Copy f64 array to buffer as CUDA half.
+     */
+    void copy_f64_to_f16_(py::array_t<double> const& src, half* dst, std::uint32_t count) {
+        auto const buf = src.request();
+        double const* src_ptr = static_cast<double const*>(buf.ptr);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            dst[i] = __float2half(static_cast<float>(src_ptr[i]));
+        }
+    }
+#endif
+
     /**
      * @brief Copy f64 array to buffer as fp16.
      */
@@ -700,8 +713,54 @@ class context_t {
                                py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j,
                                py::array_t<double> pair_epsilon, py::array_t<double> pair_r_star, int max_iterations = 200,
                                double gradient_threshold = 1e-4) {
-        // Placeholder implementation - will be completed with actual L-BFGS integration
-        throw std::runtime_error("optimize_serial not yet implemented - requires L-BFGS integration");
+        auto buf_x = coords_x.request();
+        auto buf_y = coords_y.request();
+        auto buf_z = coords_z.request();
+        auto buf_i = pair_atom_i.request();
+        auto buf_j = pair_atom_j.request();
+        auto buf_eps = pair_epsilon.request();
+        auto buf_rstar = pair_r_star.request();
+
+        std::size_t const n_atoms = static_cast<std::size_t>(buf_x.size);
+        std::size_t const n_pairs = static_cast<std::size_t>(buf_i.size);
+
+        // Get mutable pointers to coordinates (will be modified in-place)
+        double* cx = static_cast<double*>(buf_x.ptr);
+        double* cy = static_cast<double*>(buf_y.ptr);
+        double* cz = static_cast<double*>(buf_z.ptr);
+
+        // Allocate L-BFGS state
+        constexpr std::size_t m = 10;
+        lbfgs_state_t<double> state;
+        state.n_atoms = n_atoms;
+        state.m = m;
+        state.k = 0;
+
+        std::size_t const n_coords = 3 * n_atoms;
+        aligned_buffer<double> workspace(m * n_coords * 2 + m * 2 + n_coords * 5);
+        double* ptr = workspace.data();
+        state.s_history = ptr; ptr += m * n_coords;
+        state.y_history = ptr; ptr += m * n_coords;
+        state.alpha = ptr; ptr += m;
+        state.rho = ptr; ptr += m;
+        state.q = ptr; ptr += n_coords;
+        state.grad = ptr; ptr += n_coords;
+        state.grad_prev = ptr; ptr += n_coords;
+        state.direction = ptr; ptr += n_coords;
+        state.coord_backup = ptr;
+
+        // Run L-BFGS (VdW only, no electrostatics)
+        auto result = lbfgs_optimize<double>(
+            cx, cy, cz,
+            static_cast<std::int32_t const*>(buf_i.ptr),
+            static_cast<std::int32_t const*>(buf_j.ptr),
+            static_cast<double const*>(buf_eps.ptr),
+            static_cast<double const*>(buf_rstar.ptr),
+            n_pairs,
+            nullptr, nullptr, nullptr, nullptr, nullptr, 0,  // No electrostatics
+            max_iterations, gradient_threshold, state);
+
+        return py::make_tuple(result.final_energy, result.iterations, result.status == 0, result.rms_gradient);
     }
 
     /**
@@ -713,8 +772,89 @@ class context_t {
                                 py::array_t<double> pair_epsilon, py::array_t<double> pair_r_star, int max_iterations = 200,
                                 double gradient_threshold = 1e-4) {
 #if defined(__AVX512F__)
-        // Placeholder implementation - will be completed with actual L-BFGS integration
-        throw std::runtime_error("optimize_skylake not yet implemented - requires L-BFGS integration");
+        auto buf_x = coords_x.request();
+        auto buf_y = coords_y.request();
+        auto buf_z = coords_z.request();
+        auto buf_i = pair_atom_i.request();
+        auto buf_j = pair_atom_j.request();
+        auto buf_eps = pair_epsilon.request();
+        auto buf_rstar = pair_r_star.request();
+
+        std::size_t const n_atoms = static_cast<std::size_t>(buf_x.size);
+        std::size_t const n_pairs = static_cast<std::size_t>(buf_i.size);
+
+        // Pad to SIMD width (16 floats)
+        std::size_t const n_atoms_padded = (n_atoms + 15) & ~15ULL;
+        std::size_t const n_coords = 3 * n_atoms_padded;
+
+        // Allocate padded float arrays for coordinates
+        aligned_buffer<float> coords(n_atoms_padded * 3);
+        float* cx = coords.data();
+        float* cy = cx + n_atoms_padded;
+        float* cz = cy + n_atoms_padded;
+
+        // Copy and convert input coordinates
+        double const* dx = static_cast<double const*>(buf_x.ptr);
+        double const* dy = static_cast<double const*>(buf_y.ptr);
+        double const* dz = static_cast<double const*>(buf_z.ptr);
+        for (std::size_t i = 0; i < n_atoms; ++i) {
+            cx[i] = static_cast<float>(dx[i]);
+            cy[i] = static_cast<float>(dy[i]);
+            cz[i] = static_cast<float>(dz[i]);
+        }
+        for (std::size_t i = n_atoms; i < n_atoms_padded; ++i) {
+            cx[i] = cy[i] = cz[i] = 0.0f;
+        }
+
+        // Copy parameters as f32
+        aligned_buffer<float> eps_f32(n_pairs);
+        aligned_buffer<float> rstar_f32(n_pairs);
+        double const* eps_d = static_cast<double const*>(buf_eps.ptr);
+        double const* rstar_d = static_cast<double const*>(buf_rstar.ptr);
+        for (std::size_t i = 0; i < n_pairs; ++i) {
+            eps_f32[i] = static_cast<float>(eps_d[i]);
+            rstar_f32[i] = static_cast<float>(rstar_d[i]);
+        }
+
+        // Allocate L-BFGS state
+        constexpr std::size_t m = 10;
+        lbfgs_state_t<float> state;
+        state.n_atoms = n_atoms_padded;
+        state.m = m;
+        state.k = 0;
+
+        aligned_buffer<float> workspace(m * n_coords * 2 + m * 2 + n_coords * 5);
+        float* ptr = workspace.data();
+        state.s_history = ptr; ptr += m * n_coords;
+        state.y_history = ptr; ptr += m * n_coords;
+        state.alpha = ptr; ptr += m;
+        state.rho = ptr; ptr += m;
+        state.q = ptr; ptr += n_coords;
+        state.grad = ptr; ptr += n_coords;
+        state.grad_prev = ptr; ptr += n_coords;
+        state.direction = ptr; ptr += n_coords;
+        state.coord_backup = ptr;
+
+        // Run L-BFGS (VdW only)
+        auto result = lbfgs_optimize_skylake(
+            cx, cy, cz,
+            static_cast<std::int32_t const*>(buf_i.ptr),
+            static_cast<std::int32_t const*>(buf_j.ptr),
+            eps_f32.data(), rstar_f32.data(), n_pairs,
+            nullptr, nullptr, nullptr, nullptr, nullptr, 0,  // No electrostatics
+            max_iterations, static_cast<float>(gradient_threshold), state);
+
+        // Copy optimized coordinates back
+        double* out_x = static_cast<double*>(buf_x.ptr);
+        double* out_y = static_cast<double*>(buf_y.ptr);
+        double* out_z = static_cast<double*>(buf_z.ptr);
+        for (std::size_t i = 0; i < n_atoms; ++i) {
+            out_x[i] = static_cast<double>(cx[i]);
+            out_y[i] = static_cast<double>(cy[i]);
+            out_z[i] = static_cast<double>(cz[i]);
+        }
+
+        return py::make_tuple(result.final_energy, result.iterations, result.status == 0, result.rms_gradient);
 #else
         throw std::runtime_error("AVX-512 F32 support not available");
 #endif
@@ -730,8 +870,110 @@ class context_t {
                                  py::array_t<std::int32_t> mol_pair_start, py::array_t<std::int32_t> mol_pair_end,
                                  std::uint32_t n_molecules, int max_iterations = 200, double gradient_threshold = 1e-4) {
 #if defined(__CUDACC__)
-        // Placeholder implementation - will be completed with actual L-BFGS integration
-        throw std::runtime_error("optimize_cuda_f32 not yet implemented - requires L-BFGS integration");
+        auto buf_x = coords_x.request();
+        auto buf_y = coords_y.request();
+        auto buf_z = coords_z.request();
+        auto buf_i = pair_atom_i.request();
+        auto buf_j = pair_atom_j.request();
+        auto buf_eps = pair_epsilon.request();
+        auto buf_rstar = pair_r_star.request();
+        auto buf_ps = mol_pair_start.request();
+        auto buf_pe = mol_pair_end.request();
+
+        std::uint32_t const n_atoms = static_cast<std::uint32_t>(buf_x.size);
+        std::uint32_t const n_pairs = static_cast<std::uint32_t>(buf_i.size);
+
+        // Copy coordinates to f32 unified memory buffers
+        copy_f64_to_f32_(coords_x, coords_.x_data<float>(), n_atoms);
+        copy_f64_to_f32_(coords_y, coords_.y_data<float>(), n_atoms);
+        copy_f64_to_f32_(coords_z, coords_.z_data<float>(), n_atoms);
+        copy_f64_to_f32_(pair_epsilon, pairs_.param1_data<float>(), n_pairs);
+        copy_f64_to_f32_(pair_r_star, pairs_.param2_data<float>(), n_pairs);
+
+        std::memcpy(pairs_.i_data(), buf_i.ptr, n_pairs * sizeof(std::int32_t));
+        std::memcpy(pairs_.j_data(), buf_j.ptr, n_pairs * sizeof(std::int32_t));
+        std::memcpy(batch_.start_data(), buf_ps.ptr, n_molecules * sizeof(std::int32_t));
+        std::memcpy(batch_.end_data(), buf_pe.ptr, n_molecules * sizeof(std::int32_t));
+
+        // Create atom ranges from pair data (compute min/max atom index per molecule)
+        aligned_buffer<std::int32_t> mol_atom_start_buf(n_molecules);
+        aligned_buffer<std::int32_t> mol_atom_end_buf(n_molecules);
+        std::int32_t const* ps = static_cast<std::int32_t const*>(buf_ps.ptr);
+        std::int32_t const* pe = static_cast<std::int32_t const*>(buf_pe.ptr);
+        std::int32_t const* pi = static_cast<std::int32_t const*>(buf_i.ptr);
+        std::int32_t const* pj = static_cast<std::int32_t const*>(buf_j.ptr);
+
+        for (std::uint32_t m = 0; m < n_molecules; ++m) {
+            std::int32_t min_atom = INT32_MAX, max_atom = INT32_MIN;
+            for (std::int32_t p = ps[m]; p < pe[m]; ++p) {
+                min_atom = std::min(min_atom, std::min(pi[p], pj[p]));
+                max_atom = std::max(max_atom, std::max(pi[p], pj[p]));
+            }
+            mol_atom_start_buf[m] = min_atom;
+            mol_atom_end_buf[m] = max_atom + 1;
+        }
+
+        // Create zero buffers for electrostatic params (VdW only)
+        aligned_buffer<float> zeros_f32(n_pairs);
+        aligned_buffer<std::int32_t> zeros_i32(n_pairs);
+        std::memset(zeros_f32.data(), 0, n_pairs * sizeof(float));
+        std::memset(zeros_i32.data(), 0, n_pairs * sizeof(std::int32_t));
+
+        // Allocate output buffers
+        aligned_buffer<std::int32_t> out_status(n_molecules);
+        aligned_buffer<std::int32_t> out_iters(n_molecules);
+        aligned_buffer<float> out_energy(n_molecules);
+        aligned_buffer<float> out_rms(n_molecules);
+
+        // Compute workspace size and shared memory
+        std::uint32_t max_atoms_per_mol = 0;
+        for (std::uint32_t m = 0; m < n_molecules; ++m) {
+            std::uint32_t na = mol_atom_end_buf[m] - mol_atom_start_buf[m];
+            max_atoms_per_mol = std::max(max_atoms_per_mol, na);
+        }
+        constexpr std::uint32_t memory_depth = 10;
+        // Inline formula: memory_depth * n_atoms * 3 * 2 + memory_depth * 2 + n_atoms * 3
+        std::size_t shared_mem = max_atoms_per_mol * 3 * 2 * sizeof(float); // gradient + search_dir
+
+        // Launch kernel
+        mmff94_lbfgs_optimize_kernel_f32<<<n_molecules, warp_size, shared_mem>>>(
+            coords_.x_data<float>(), coords_.y_data<float>(), coords_.z_data<float>(),
+            pairs_.i_data(), pairs_.j_data(),
+            pairs_.param1_data<float>(), pairs_.param2_data<float>(),
+            zeros_f32.data(), zeros_f32.data(), zeros_i32.data(),  // No electrostatics
+            mol_atom_start_buf.data(), mol_atom_end_buf.data(),
+            batch_.start_data(), batch_.end_data(),
+            reinterpret_cast<float*>(lbfgs_workspace_.data()),
+            out_status.data(), out_iters.data(), out_energy.data(), out_rms.data(),
+            n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth);
+
+        cudaDeviceSynchronize();
+
+        // Copy coordinates back
+        double* dx = static_cast<double*>(buf_x.ptr);
+        double* dy = static_cast<double*>(buf_y.ptr);
+        double* dz = static_cast<double*>(buf_z.ptr);
+        float const* fx = coords_.x_data<float>();
+        float const* fy = coords_.y_data<float>();
+        float const* fz = coords_.z_data<float>();
+        for (std::uint32_t i = 0; i < n_atoms; ++i) {
+            dx[i] = static_cast<double>(fx[i]);
+            dy[i] = static_cast<double>(fy[i]);
+            dz[i] = static_cast<double>(fz[i]);
+        }
+
+        // Aggregate results (sum energies, use first molecule's status for simplicity)
+        double total_energy = 0.0;
+        int total_iters = 0;
+        double total_rms = 0.0;
+        for (std::uint32_t m = 0; m < n_molecules; ++m) {
+            total_energy += static_cast<double>(out_energy[m]);
+            total_iters = std::max(total_iters, static_cast<int>(out_iters[m]));
+            total_rms += static_cast<double>(out_rms[m]);
+        }
+        total_rms /= n_molecules;
+
+        return py::make_tuple(total_energy, total_iters, out_status[0] == 0, total_rms);
 #else
         throw std::runtime_error("CUDA support not available");
 #endif
@@ -747,8 +989,111 @@ class context_t {
                                  py::array_t<std::int32_t> mol_pair_start, py::array_t<std::int32_t> mol_pair_end,
                                  std::uint32_t n_molecules, int max_iterations = 200, double gradient_threshold = 1e-4) {
 #if defined(__CUDACC__)
-        // Placeholder implementation - will be completed with actual L-BFGS integration
-        throw std::runtime_error("optimize_cuda_f16 not yet implemented - requires L-BFGS integration");
+        auto buf_x = coords_x.request();
+        auto buf_y = coords_y.request();
+        auto buf_z = coords_z.request();
+        auto buf_i = pair_atom_i.request();
+        auto buf_j = pair_atom_j.request();
+        auto buf_eps = pair_epsilon.request();
+        auto buf_rstar = pair_r_star.request();
+        auto buf_ps = mol_pair_start.request();
+        auto buf_pe = mol_pair_end.request();
+
+        std::uint32_t const n_atoms = static_cast<std::uint32_t>(buf_x.size);
+        std::uint32_t const n_pairs = static_cast<std::uint32_t>(buf_i.size);
+
+        // Copy coordinates to f16 unified memory buffers
+        copy_f64_to_f16_(coords_x, coords_.x_data<half>(), n_atoms);
+        copy_f64_to_f16_(coords_y, coords_.y_data<half>(), n_atoms);
+        copy_f64_to_f16_(coords_z, coords_.z_data<half>(), n_atoms);
+        copy_f64_to_f16_(pair_epsilon, pairs_.param1_data<half>(), n_pairs);
+        copy_f64_to_f16_(pair_r_star, pairs_.param2_data<half>(), n_pairs);
+
+        std::memcpy(pairs_.i_data(), buf_i.ptr, n_pairs * sizeof(std::int32_t));
+        std::memcpy(pairs_.j_data(), buf_j.ptr, n_pairs * sizeof(std::int32_t));
+        std::memcpy(batch_.start_data(), buf_ps.ptr, n_molecules * sizeof(std::int32_t));
+        std::memcpy(batch_.end_data(), buf_pe.ptr, n_molecules * sizeof(std::int32_t));
+
+        // Create atom ranges from pair data
+        aligned_buffer<std::int32_t> mol_atom_start_buf(n_molecules);
+        aligned_buffer<std::int32_t> mol_atom_end_buf(n_molecules);
+        std::int32_t const* ps = static_cast<std::int32_t const*>(buf_ps.ptr);
+        std::int32_t const* pe = static_cast<std::int32_t const*>(buf_pe.ptr);
+        std::int32_t const* pi = static_cast<std::int32_t const*>(buf_i.ptr);
+        std::int32_t const* pj = static_cast<std::int32_t const*>(buf_j.ptr);
+
+        for (std::uint32_t m = 0; m < n_molecules; ++m) {
+            std::int32_t min_atom = INT32_MAX, max_atom = INT32_MIN;
+            for (std::int32_t p = ps[m]; p < pe[m]; ++p) {
+                min_atom = std::min(min_atom, std::min(pi[p], pj[p]));
+                max_atom = std::max(max_atom, std::max(pi[p], pj[p]));
+            }
+            mol_atom_start_buf[m] = min_atom;
+            mol_atom_end_buf[m] = max_atom + 1;
+        }
+
+        // Create zero buffers for electrostatic params (VdW only)
+        aligned_buffer<half> zeros_f16(n_pairs);
+        aligned_buffer<std::int32_t> zeros_i32(n_pairs);
+        for (std::uint32_t i = 0; i < n_pairs; ++i) {
+            zeros_f16[i] = __float2half(0.0f);
+        }
+        std::memset(zeros_i32.data(), 0, n_pairs * sizeof(std::int32_t));
+
+        // Allocate output buffers
+        aligned_buffer<std::int32_t> out_status(n_molecules);
+        aligned_buffer<std::int32_t> out_iters(n_molecules);
+        aligned_buffer<float> out_energy(n_molecules);
+        aligned_buffer<float> out_rms(n_molecules);
+
+        // Compute workspace size
+        std::uint32_t max_atoms_per_mol = 0;
+        for (std::uint32_t m = 0; m < n_molecules; ++m) {
+            std::uint32_t na = mol_atom_end_buf[m] - mol_atom_start_buf[m];
+            max_atoms_per_mol = std::max(max_atoms_per_mol, na);
+        }
+        constexpr std::uint32_t memory_depth = 10;
+        std::size_t shared_mem = max_atoms_per_mol * 3 * 2 * sizeof(float); // gradient + search_dir
+
+        // Launch kernel
+        mmff94_lbfgs_optimize_kernel_f16<<<n_molecules, warp_size, shared_mem>>>(
+            coords_.x_data<half>(), coords_.y_data<half>(), coords_.z_data<half>(),
+            pairs_.i_data(), pairs_.j_data(),
+            pairs_.param1_data<half>(), pairs_.param2_data<half>(),
+            zeros_f16.data(), zeros_f16.data(), zeros_i32.data(),  // No electrostatics
+            mol_atom_start_buf.data(), mol_atom_end_buf.data(),
+            batch_.start_data(), batch_.end_data(),
+            reinterpret_cast<float*>(lbfgs_workspace_.data()),
+            out_status.data(), out_iters.data(), out_energy.data(), out_rms.data(),
+            n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth);
+
+        cudaDeviceSynchronize();
+
+        // Copy coordinates back (f16 -> f64)
+        double* dx = static_cast<double*>(buf_x.ptr);
+        double* dy = static_cast<double*>(buf_y.ptr);
+        double* dz = static_cast<double*>(buf_z.ptr);
+        half const* hx = coords_.x_data<half>();
+        half const* hy = coords_.y_data<half>();
+        half const* hz = coords_.z_data<half>();
+        for (std::uint32_t i = 0; i < n_atoms; ++i) {
+            dx[i] = static_cast<double>(__half2float(hx[i]));
+            dy[i] = static_cast<double>(__half2float(hy[i]));
+            dz[i] = static_cast<double>(__half2float(hz[i]));
+        }
+
+        // Aggregate results
+        double total_energy = 0.0;
+        int total_iters = 0;
+        double total_rms = 0.0;
+        for (std::uint32_t m = 0; m < n_molecules; ++m) {
+            total_energy += static_cast<double>(out_energy[m]);
+            total_iters = std::max(total_iters, static_cast<int>(out_iters[m]));
+            total_rms += static_cast<double>(out_rms[m]);
+        }
+        total_rms /= n_molecules;
+
+        return py::make_tuple(total_energy, total_iters, out_status[0] == 0, total_rms);
 #else
         throw std::runtime_error("CUDA support not available");
 #endif
