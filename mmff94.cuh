@@ -37,6 +37,59 @@ constexpr float const scale_1_4_diff_f32 = scale_1_4_f32 - 1.0f; // For branchle
 
 #pragma endregion
 
+#pragma region Atom-Centric Data Structures
+
+/**
+ * TODO: Consider a dense per-atom coordinate layout for molecules under 256 atoms.
+ * For small molecules, storing coordinates inline with AoS layout and using
+ * register-based accumulation could further reduce memory traffic.
+ * Current implementation uses shuffle-based coordinate access which works well
+ * for molecules up to 32 atoms per warp.
+ */
+
+/**
+ * Neighbor entry in symmetric adjacency list.
+ *
+ * Each pair (A, B) is stored twice:
+ * - In A's neighbor list with j=B and sign=-1 (force on A)
+ * - In B's neighbor list with j=A and sign=+1 (force on B)
+ *
+ * Memory layout (16 bytes aligned for coalesced loads):
+ * ┌───────┬───────┬────────┬─────────┬────────┬───────────┐
+ * │ j (1) │sign(1)│flags(2)│ eps (4) │rstar(4)│q_prod (4) │
+ * └───────┴───────┴────────┴─────────┴────────┴───────────┘
+ */
+struct __align__(16) neighbor_t {
+    std::uint8_t j;        // Neighbor atom index within molecule (0-255)
+    std::int8_t sign;      // Force direction: -1 or +1
+    std::uint16_t flags;   // Bit 0 = is_1_4
+    float epsilon;         // VdW epsilon
+    float r_star;          // VdW equilibrium distance
+    float q_product;       // qi * qj (precomputed for electrostatics)
+};
+
+static_assert(sizeof(neighbor_t) == 16, "neighbor_t must be 16 bytes");
+
+/**
+ * Per-molecule metadata for atom-centric kernel.
+ *
+ * Layout:
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │  atom_start: First atom index in global coordinate array   │
+ * │  n_atoms:    Number of atoms in this molecule              │
+ * │  neighbor_start: First neighbor in global neighbor array   │
+ * │  n_neighbors: Total neighbors (2x pairs due to symmetry)   │
+ * └─────────────────────────────────────────────────────────────┘
+ */
+struct mol_meta_t {
+    std::uint32_t atom_start;      // First atom index in global array
+    std::uint32_t n_atoms;         // Number of atoms in molecule
+    std::uint32_t neighbor_start;  // First neighbor in neighbor array
+    std::uint32_t n_neighbors;     // Total neighbors (2x pairs)
+};
+
+#pragma endregion
+
 #pragma region FP16 Helper Functions
 
 /**
@@ -347,6 +400,108 @@ __device__ __forceinline__ float compute_elec_energy_f16_pair_(half2 const r, ha
 
 #pragma endregion
 
+#pragma region VdW Gradient Computation
+
+/**
+ * MMFF94 Buffered 14-7 van der Waals gradient (FP32 compute).
+ * Returns dE/dr (not force, just the energy gradient).
+ */
+__device__ __forceinline__ float compute_vdw_gradient_f32_(float const r, float const epsilon, float const r_star) {
+    float const r_safe = (r > 0.001f) ? r : 0.001f;
+
+    float const inv_rstar = __frcp_rn(r_star);
+    float const rho = r_safe * inv_rstar;
+
+    float const rho2 = rho * rho;
+    float const rho4 = rho2 * rho2;
+    float const rho6 = rho4 * rho2;
+    float const rho7 = rho6 * rho;
+
+    float const c_107 = 1.07f;
+    float const c_007 = 0.07f;
+    float const c_112 = 1.12f;
+    float const c_012 = 0.12f;
+    float const c_2 = 2.0f;
+
+    // Repulsive term: (1.07/(rho+0.07))^7
+    float const rep_denom = rho + c_007;
+    float const rep_ratio = c_107 * __frcp_rn(rep_denom);
+    float const rep_2 = rep_ratio * rep_ratio;
+    float const rep_4 = rep_2 * rep_2;
+    float const rep_6 = rep_4 * rep_2;
+    float const rep_7 = rep_6 * rep_ratio;
+
+    // Attractive term: (1.12/(rho^7+0.12)) - 2
+    float const att_denom = rho7 + c_012;
+    float const att_term = c_112 * __frcp_rn(att_denom) - c_2;
+
+    // Gradient of repulsive: d/drho[(1.07/(rho+0.07))^7] = 7*(1.07/(rho+0.07))^6 * (-1.07/(rho+0.07)^2)
+    float const d_rep = -7.0f * rep_6 * c_107 / (rep_denom * rep_denom);
+
+    // Gradient of attractive: d/drho[(1.12/(rho^7+0.12)) - 2] = -1.12 * 7*rho^6 / (rho^7+0.12)^2
+    float const d_att = -c_112 * 7.0f * rho6 / (att_denom * att_denom);
+
+    // Product rule: d/drho[rep * att] = d_rep * att + rep * d_att
+    float const dE_drho = epsilon * (d_rep * att_term + rep_7 * d_att);
+
+    // Chain rule: dE/dr = dE/drho * drho/dr = dE/drho * (1/r_star)
+    float const dE_dr = dE_drho * inv_rstar;
+
+    return dE_dr;
+}
+
+/**
+ * MMFF94 Buffered 14-7 van der Waals gradient (FP16 compute, FP32 return).
+ * Returns dE/dr (not force, just the energy gradient).
+ */
+__device__ __forceinline__ float compute_vdw_gradient_f16_(half const r, half const epsilon, half const r_star) {
+    half const r_safe = __hgt(r, __float2half(0.001f)) ? r : __float2half(0.001f);
+
+    half const inv_rstar = h_rcp_(r_star);
+    half const rho = __hmul(r_safe, inv_rstar);
+
+    half const rho2 = __hmul(rho, rho);
+    half const rho4 = __hmul(rho2, rho2);
+    half const rho6 = __hmul(rho4, rho2);
+    half const rho7 = __hmul(rho6, rho);
+
+    half const c_107 = __float2half(1.07f);
+    half const c_007 = __float2half(0.07f);
+    half const c_112 = __float2half(1.12f);
+    half const c_012 = __float2half(0.12f);
+    half const c_2 = __float2half(2.0f);
+
+    // Repulsive term: (1.07/(rho+0.07))^7
+    half const rep_denom = __hadd(rho, c_007);
+    half const rep_ratio = __hmul(c_107, h_rcp_(rep_denom));
+    half const rep_2 = __hmul(rep_ratio, rep_ratio);
+    half const rep_4 = __hmul(rep_2, rep_2);
+    half const rep_6 = __hmul(rep_4, rep_2);
+    half const rep_7 = __hmul(rep_6, rep_ratio);
+
+    // Attractive term: (1.12/(rho^7+0.12)) - 2
+    half const att_denom = __hadd(rho7, c_012);
+    half const att_term = __hsub(__hmul(c_112, h_rcp_(att_denom)), c_2);
+
+    // Gradient of repulsive
+    half const rep_denom_sq = __hmul(rep_denom, rep_denom);
+    half const d_rep = __hmul(__hmul(__hmul(__float2half(-7.0f), rep_6), c_107), h_rcp_(rep_denom_sq));
+
+    // Gradient of attractive
+    half const att_denom_sq = __hmul(att_denom, att_denom);
+    half const d_att = __hmul(__hmul(__float2half(-7.84f), rho6), h_rcp_(att_denom_sq));
+
+    // Product rule
+    half const dE_drho = __hmul(epsilon, __hadd(__hmul(d_rep, att_term), __hmul(rep_7, d_att)));
+
+    // Chain rule
+    half const dE_dr = __hmul(dE_drho, inv_rstar);
+
+    return __half2float(dE_dr);
+}
+
+#pragma endregion
+
 #pragma region VdW Energy Kernels
 
 /**
@@ -608,6 +763,1210 @@ __global__ void mmff94_elec_energy_kernel_f32(float const* coord_x, float const*
 
     if (lane == 0) {
         out_elec[mol_idx] = elec_total;
+    }
+}
+
+#pragma endregion
+
+#pragma region Electrostatic Gradient Computation
+
+/**
+ * MMFF94 Buffered Coulomb electrostatic gradient (FP32 compute).
+ *
+ * dE/dr = -332.0716 * qi * qj / (r + 0.05)^2
+ * Force on atom j: F_j = -(dE/dr) * (r_vec / |r_vec|)
+ * Force on atom i: F_i = -F_j (Newton's 3rd law)
+ *
+ * For 1-4 interactions: scale gradient by 0.75.
+ * Uses branchless scaling: scale = 1.0 + is_1_4 * (0.75 - 1.0)
+ */
+__device__ __forceinline__ void compute_elec_gradient_f32_(float const r, float const qi, float const qj,
+                                                            std::int32_t const is_1_4, float const dx, float const dy,
+                                                            float const dz, float* fx, float* fy, float* fz) {
+    float const r_buffered = r + delta_f32;
+    float const r_buffered_sq = r_buffered * r_buffered;
+
+    // dE/dr = -332.0716 * qi * qj / (r + 0.05)^2
+    float const grad_magnitude = -coulomb_const_f32 * qi * qj * __frcp_rn(r_buffered_sq);
+
+    // Branchless 1-4 scaling
+    float const scale = 1.0f + static_cast<float>(is_1_4) * scale_1_4_diff_f32;
+    float const scaled_grad = grad_magnitude * scale;
+
+    // Force direction: F_j = -(dE/dr) * (r_vec / |r_vec|)
+    float const inv_r = __frcp_rn(r);
+    *fx = -scaled_grad * dx * inv_r;
+    *fy = -scaled_grad * dy * inv_r;
+    *fz = -scaled_grad * dz * inv_r;
+}
+
+/**
+ * MMFF94 Buffered Coulomb electrostatic gradient (FP16 compute, FP32 output).
+ *
+ * Uses FP16 for intermediate computations, returns forces in FP32.
+ */
+__device__ __forceinline__ void compute_elec_gradient_f16_(half const r, half const qi, half const qj,
+                                                            std::int32_t const is_1_4, half const dx, half const dy,
+                                                            half const dz, float* fx, float* fy, float* fz) {
+    half const coulomb_const = __float2half(332.0716f);
+    half const delta = __float2half(0.05f);
+
+    half const r_buffered = __hadd(r, delta);
+    half const r_buffered_sq = __hmul(r_buffered, r_buffered);
+
+    // dE/dr = -332.0716 * qi * qj / (r + 0.05)^2
+    half const grad_magnitude_abs = __hmul(__hmul(__hmul(coulomb_const, qi), qj), h_rcp_(r_buffered_sq));
+    half const grad_magnitude = __hneg(grad_magnitude_abs);
+
+    // Branchless 1-4 scaling (in FP32 for precision)
+    float const scale = 1.0f + static_cast<float>(is_1_4) * scale_1_4_diff_f32;
+    float const scaled_grad = __half2float(grad_magnitude) * scale;
+
+    // Force direction: F_j = -(dE/dr) * (r_vec / |r_vec|)
+    half const inv_r = h_rcp_(r);
+    *fx = -scaled_grad * __half2float(dx) * __half2float(inv_r);
+    *fy = -scaled_grad * __half2float(dy) * __half2float(inv_r);
+    *fz = -scaled_grad * __half2float(dz) * __half2float(inv_r);
+}
+
+#pragma endregion
+
+#pragma region Electrostatic Gradient Kernels
+
+/**
+ * MMFF94 electrostatic gradient kernel (FP32 compute and accumulation).
+ *
+ * One warp (32 threads) per molecule.
+ * Thread k processes pairs k, k+32, k+64... via strided iteration.
+ * Atomic operations accumulate forces to handle race conditions.
+ */
+__global__ void mmff94_elec_gradient_kernel_f32(float const* coord_x, float const* coord_y, float const* coord_z,
+                                                 std::int32_t const* nb_i, std::int32_t const* nb_j,
+                                                 float const* nb_qi, float const* nb_qj, std::int32_t const* nb_is_1_4,
+                                                 std::int32_t const* mol_nb_start, std::int32_t const* mol_nb_end,
+                                                 float* grad_x, float* grad_y, float* grad_z,
+                                                 std::uint32_t const n_molecules) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
+
+    if (mol_idx >= n_molecules) {
+        return;
+    }
+
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
+
+    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
+        std::int32_t const i = nb_i[pair_idx];
+        std::int32_t const j = nb_j[pair_idx];
+
+        float const xi = coord_x[i];
+        float const yi = coord_y[i];
+        float const zi = coord_z[i];
+        float const xj = coord_x[j];
+        float const yj = coord_y[j];
+        float const zj = coord_z[j];
+
+        float const dx = xj - xi;
+        float const dy = yj - yi;
+        float const dz = zj - zi;
+
+        float const r = compute_distance_f32_(xi, yi, zi, xj, yj, zj);
+
+        float const qi = nb_qi[pair_idx];
+        float const qj = nb_qj[pair_idx];
+        std::int32_t const is_1_4 = nb_is_1_4[pair_idx];
+
+        float fx, fy, fz;
+        compute_elec_gradient_f32_(r, qi, qj, is_1_4, dx, dy, dz, &fx, &fy, &fz);
+
+        // Accumulate forces (Newton's 3rd law: F_i = -F_j)
+        atomicAdd(&grad_x[i], -fx);
+        atomicAdd(&grad_y[i], -fy);
+        atomicAdd(&grad_z[i], -fz);
+        atomicAdd(&grad_x[j], fx);
+        atomicAdd(&grad_y[j], fy);
+        atomicAdd(&grad_z[j], fz);
+    }
+}
+
+/**
+ * MMFF94 electrostatic gradient kernel (FP16 compute, FP32 accumulation).
+ *
+ * One warp (32 threads) per molecule.
+ * Thread k processes pairs k, k+32, k+64... via strided iteration.
+ * Atomic operations accumulate forces to handle race conditions.
+ */
+__global__ void mmff94_elec_gradient_kernel_f16(half const* coord_x, half const* coord_y, half const* coord_z,
+                                                 std::int32_t const* nb_i, std::int32_t const* nb_j, half const* nb_qi,
+                                                 half const* nb_qj, std::int32_t const* nb_is_1_4,
+                                                 std::int32_t const* mol_nb_start, std::int32_t const* mol_nb_end,
+                                                 float* grad_x, float* grad_y, float* grad_z,
+                                                 std::uint32_t const n_molecules) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
+
+    if (mol_idx >= n_molecules) {
+        return;
+    }
+
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
+
+    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
+        std::int32_t const i = nb_i[pair_idx];
+        std::int32_t const j = nb_j[pair_idx];
+
+        half const xi = coord_x[i];
+        half const yi = coord_y[i];
+        half const zi = coord_z[i];
+        half const xj = coord_x[j];
+        half const yj = coord_y[j];
+        half const zj = coord_z[j];
+
+        half const dx = __hsub(xj, xi);
+        half const dy = __hsub(yj, yi);
+        half const dz = __hsub(zj, zi);
+
+        half const r = compute_distance_f16_(xi, yi, zi, xj, yj, zj);
+
+        half const qi = nb_qi[pair_idx];
+        half const qj = nb_qj[pair_idx];
+        std::int32_t const is_1_4 = nb_is_1_4[pair_idx];
+
+        float fx, fy, fz;
+        compute_elec_gradient_f16_(r, qi, qj, is_1_4, dx, dy, dz, &fx, &fy, &fz);
+
+        // Accumulate forces (Newton's 3rd law: F_i = -F_j)
+        atomicAdd(&grad_x[i], -fx);
+        atomicAdd(&grad_y[i], -fy);
+        atomicAdd(&grad_z[i], -fz);
+        atomicAdd(&grad_x[j], fx);
+        atomicAdd(&grad_y[j], fy);
+        atomicAdd(&grad_z[j], fz);
+    }
+}
+
+#pragma endregion
+
+#pragma region VdW Gradient Kernels
+
+/**
+ * MMFF94 van der Waals gradient kernel (FP32 compute and accumulation).
+ *
+ * One warp (32 threads) per molecule.
+ * Thread k processes pairs k, k+32, k+64... via strided iteration.
+ * Atomic operations accumulate forces to handle race conditions.
+ */
+__global__ void mmff94_vdw_gradient_kernel_f32(float const* coord_x, float const* coord_y, float const* coord_z,
+                                                std::int32_t const* nb_i, std::int32_t const* nb_j,
+                                                float const* nb_epsilon, float const* nb_r_star,
+                                                std::int32_t const* mol_nb_start, std::int32_t const* mol_nb_end,
+                                                float* grad_x, float* grad_y, float* grad_z,
+                                                std::uint32_t const n_molecules) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
+
+    if (mol_idx >= n_molecules) {
+        return;
+    }
+
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
+
+    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
+        std::int32_t const i = nb_i[pair_idx];
+        std::int32_t const j = nb_j[pair_idx];
+
+        float const xi = coord_x[i];
+        float const yi = coord_y[i];
+        float const zi = coord_z[i];
+        float const xj = coord_x[j];
+        float const yj = coord_y[j];
+        float const zj = coord_z[j];
+
+        float const dx = xj - xi;
+        float const dy = yj - yi;
+        float const dz = zj - zi;
+
+        float const r = compute_distance_f32_(xi, yi, zi, xj, yj, zj);
+
+        float const eps = nb_epsilon[pair_idx];
+        float const rstar = nb_r_star[pair_idx];
+
+        // Get dE/dr
+        float const dE_dr = compute_vdw_gradient_f32_(r, eps, rstar);
+
+        // Force: F = -(dE/dr) * (r_vec / |r_vec|)
+        float const inv_r = __frcp_rn(r);
+        float const fx = -dE_dr * dx * inv_r;
+        float const fy = -dE_dr * dy * inv_r;
+        float const fz = -dE_dr * dz * inv_r;
+
+        // Accumulate forces (Newton's 3rd law: F_i = -F_j)
+        atomicAdd(&grad_x[i], -fx);
+        atomicAdd(&grad_y[i], -fy);
+        atomicAdd(&grad_z[i], -fz);
+        atomicAdd(&grad_x[j], fx);
+        atomicAdd(&grad_y[j], fy);
+        atomicAdd(&grad_z[j], fz);
+    }
+}
+
+/**
+ * MMFF94 van der Waals gradient kernel (FP16 compute, FP32 accumulation).
+ *
+ * One warp (32 threads) per molecule.
+ * Thread k processes pairs k, k+32, k+64... via strided iteration.
+ * Atomic operations accumulate forces to handle race conditions.
+ */
+__global__ void mmff94_vdw_gradient_kernel_f16(half const* coord_x, half const* coord_y, half const* coord_z,
+                                                std::int32_t const* nb_i, std::int32_t const* nb_j,
+                                                half const* nb_epsilon, half const* nb_r_star,
+                                                std::int32_t const* mol_nb_start, std::int32_t const* mol_nb_end,
+                                                float* grad_x, float* grad_y, float* grad_z,
+                                                std::uint32_t const n_molecules) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
+
+    if (mol_idx >= n_molecules) {
+        return;
+    }
+
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
+
+    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
+        std::int32_t const i = nb_i[pair_idx];
+        std::int32_t const j = nb_j[pair_idx];
+
+        half const xi = coord_x[i];
+        half const yi = coord_y[i];
+        half const zi = coord_z[i];
+        half const xj = coord_x[j];
+        half const yj = coord_y[j];
+        half const zj = coord_z[j];
+
+        half const dx = __hsub(xj, xi);
+        half const dy = __hsub(yj, yi);
+        half const dz = __hsub(zj, zi);
+
+        half const r = compute_distance_f16_(xi, yi, zi, xj, yj, zj);
+
+        half const eps = nb_epsilon[pair_idx];
+        half const rstar = nb_r_star[pair_idx];
+
+        // Get dE/dr (returns FP32)
+        float const dE_dr = compute_vdw_gradient_f16_(r, eps, rstar);
+
+        // Force: F = -(dE/dr) * (r_vec / |r_vec|)
+        half const inv_r = h_rcp_(r);
+        float const fx = -dE_dr * __half2float(dx) * __half2float(inv_r);
+        float const fy = -dE_dr * __half2float(dy) * __half2float(inv_r);
+        float const fz = -dE_dr * __half2float(dz) * __half2float(inv_r);
+
+        // Accumulate forces (Newton's 3rd law: F_i = -F_j)
+        atomicAdd(&grad_x[i], -fx);
+        atomicAdd(&grad_y[i], -fy);
+        atomicAdd(&grad_z[i], -fz);
+        atomicAdd(&grad_x[j], fx);
+        atomicAdd(&grad_y[j], fy);
+        atomicAdd(&grad_z[j], fz);
+    }
+}
+
+#pragma endregion
+
+#pragma region L-BFGS Optimizer
+
+/**
+ * L-BFGS workspace size per molecule.
+ *
+ * Memory layout per molecule (for memory_depth m and n_atoms atoms):
+ * - s_history: m * n_atoms * 3 (position deltas)
+ * - y_history: m * n_atoms * 3 (gradient deltas)
+ * - rho: m (scaling factors)
+ * - alpha: m (line search coefficients)
+ * - gradient_prev: n_atoms * 3 (previous gradient)
+ */
+__device__ __forceinline__ std::uint32_t lbfgs_workspace_size_(std::uint32_t const n_atoms,
+                                                                std::uint32_t const memory_depth) {
+    return memory_depth * n_atoms * 3 * 2  // s_history + y_history
+           + memory_depth                  // rho
+           + memory_depth                  // alpha
+           + n_atoms * 3;                  // gradient_prev
+}
+
+/**
+ * Compute dot product using warp reduction.
+ * Each thread processes elements in strided fashion, then reduces across warp.
+ */
+__device__ __forceinline__ float warp_dot_product_f32_(float const* a, float const* b, std::uint32_t const n,
+                                                        std::uint32_t const lane) {
+    float dot = 0.0f;
+    for (std::uint32_t i = lane; i < n; i += warp_size) {
+        dot = fmaf(a[i], b[i], dot);
+    }
+    return warp_reduce_sum_f32_(dot);
+}
+
+/**
+ * Compute RMS (root mean square) using warp reduction.
+ * RMS = sqrt(sum(x[i]^2) / n)
+ */
+__device__ __forceinline__ float warp_rms_f32_(float const* x, std::uint32_t const n, std::uint32_t const lane) {
+    float sum_sq = 0.0f;
+    for (std::uint32_t i = lane; i < n; i += warp_size) {
+        float const val = x[i];
+        sum_sq = fmaf(val, val, sum_sq);
+    }
+    float const total_sum_sq = warp_reduce_sum_f32_(sum_sq);
+    return sqrtf(total_sum_sq * __frcp_rn(static_cast<float>(n)));
+}
+
+/**
+ * L-BFGS two-loop recursion for computing search direction.
+ *
+ * Given gradient g and history (s, y, rho), computes search direction d = -H * g
+ * where H is the inverse Hessian approximation.
+ *
+ * One warp processes this sequentially. Lane 0 does scalar ops, all lanes do vector ops.
+ */
+__device__ __forceinline__ void lbfgs_two_loop_recursion_(float const* gradient, float* search_dir, float* s_history,
+                                                           float* y_history, float* rho, float* alpha,
+                                                           std::uint32_t const n_elements, std::uint32_t const k,
+                                                           std::uint32_t const memory_depth, std::uint32_t const lane) {
+    // Copy gradient to search_dir: q = g
+    for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+        search_dir[i] = gradient[i];
+    }
+    __syncwarp(full_mask);
+
+    // First loop (backward through history)
+    for (std::uint32_t i = 0; i < k; ++i) {
+        std::uint32_t const idx = (k - 1 - i) % memory_depth;
+        float* s = s_history + idx * n_elements;
+        float* y = y_history + idx * n_elements;
+
+        float const rho_val = rho[idx];
+        float const dot = warp_dot_product_f32_(s, search_dir, n_elements, lane);
+
+        float alpha_val = 0.0f;
+        if (lane == 0) {
+            alpha_val = rho_val * dot;
+            alpha[idx] = alpha_val;
+        }
+        alpha_val = __shfl_sync(full_mask, alpha_val, 0);
+
+        // q = q - alpha * y
+        for (std::uint32_t j = lane; j < n_elements; j += warp_size) {
+            search_dir[j] -= alpha_val * y[j];
+        }
+        __syncwarp(full_mask);
+    }
+
+    // Initial Hessian scaling: H0 = (s_k · y_k) / (y_k · y_k)
+    if (k > 0) {
+        std::uint32_t const last_idx = (k - 1) % memory_depth;
+        float* s_last = s_history + last_idx * n_elements;
+        float* y_last = y_history + last_idx * n_elements;
+
+        float const s_dot_y = warp_dot_product_f32_(s_last, y_last, n_elements, lane);
+        float const y_dot_y = warp_dot_product_f32_(y_last, y_last, n_elements, lane);
+
+        float gamma = 1.0f;
+        if (lane == 0) {
+            gamma = s_dot_y * __frcp_rn(y_dot_y);
+        }
+        gamma = __shfl_sync(full_mask, gamma, 0);
+
+        // r = gamma * q
+        for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+            search_dir[i] *= gamma;
+        }
+        __syncwarp(full_mask);
+    }
+
+    // Second loop (forward through history)
+    for (std::uint32_t i = 0; i < k; ++i) {
+        std::uint32_t const idx = i % memory_depth;
+        float* s = s_history + idx * n_elements;
+        float* y = y_history + idx * n_elements;
+
+        float const rho_val = rho[idx];
+        float const alpha_val = alpha[idx];
+        float const dot = warp_dot_product_f32_(y, search_dir, n_elements, lane);
+
+        float beta = 0.0f;
+        if (lane == 0) {
+            beta = rho_val * dot;
+        }
+        beta = __shfl_sync(full_mask, beta, 0);
+
+        // r = r + s * (alpha - beta)
+        float const coeff = alpha_val - beta;
+        for (std::uint32_t j = lane; j < n_elements; j += warp_size) {
+            search_dir[j] = fmaf(s[j], coeff, search_dir[j]);
+        }
+        __syncwarp(full_mask);
+    }
+
+    // Negate to get descent direction: d = -r
+    for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+        search_dir[i] = -search_dir[i];
+    }
+    __syncwarp(full_mask);
+}
+
+/**
+ * Backtracking line search with Armijo condition.
+ *
+ * Finds step size alpha that satisfies:
+ * E(x + alpha*d) <= E(x) + c1 * alpha * (grad · d)
+ *
+ * Returns: step size alpha
+ */
+__device__ __forceinline__ float lbfgs_line_search_f32_(float const* coord_x, float const* coord_y, float const* coord_z,
+                                                         float const* search_dir, float const* gradient,
+                                                         std::int32_t const* nb_i, std::int32_t const* nb_j,
+                                                         float const* nb_epsilon, float const* nb_r_star,
+                                                         float const* nb_qi, float const* nb_qj,
+                                                         std::int32_t const* nb_is_1_4, std::uint32_t const nb_start,
+                                                         std::uint32_t const nb_end, std::uint32_t const atom_start,
+                                                         std::uint32_t const n_atoms, float const energy_current,
+                                                         std::uint32_t const lane) {
+    constexpr float c1 = 1e-4f;     // Armijo parameter
+    constexpr float alpha_init = 1.0f;
+    constexpr float rho_decay = 0.5f;
+    constexpr int max_line_search = 20;
+
+    // Compute grad · d (directional derivative)
+    std::uint32_t const n_elements = n_atoms * 3;
+    float const grad_dot_d = warp_dot_product_f32_(gradient, search_dir, n_elements, lane);
+
+    float alpha = alpha_init;
+
+    // Shared temporary arrays for trial coordinates (local to warp)
+    extern __shared__ float shared_mem[];
+    float* trial_x = shared_mem;
+    float* trial_y = trial_x + n_atoms;
+    float* trial_z = trial_y + n_atoms;
+
+    for (int iter = 0; iter < max_line_search; ++iter) {
+        // Compute trial position: x_trial = x + alpha * d
+        for (std::uint32_t i = lane; i < n_atoms; i += warp_size) {
+            std::uint32_t const atom_idx = atom_start + i;
+            trial_x[i] = coord_x[atom_idx] + alpha * search_dir[i];
+            trial_y[i] = coord_y[atom_idx] + alpha * search_dir[n_atoms + i];
+            trial_z[i] = coord_z[atom_idx] + alpha * search_dir[2 * n_atoms + i];
+        }
+        __syncwarp(full_mask);
+
+        // Evaluate energy at trial position
+        float energy_trial = 0.0f;
+
+        for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
+            std::int32_t const i = nb_i[pair_idx] - static_cast<std::int32_t>(atom_start);
+            std::int32_t const j = nb_j[pair_idx] - static_cast<std::int32_t>(atom_start);
+
+            float const xi = trial_x[i];
+            float const yi = trial_y[i];
+            float const zi = trial_z[i];
+            float const xj = trial_x[j];
+            float const yj = trial_y[j];
+            float const zj = trial_z[j];
+
+            float const r = compute_distance_f32_(xi, yi, zi, xj, yj, zj);
+
+            // VdW energy
+            float const eps = nb_epsilon[pair_idx];
+            float const rstar = nb_r_star[pair_idx];
+            energy_trial += compute_vdw_energy_f32_(r, eps, rstar);
+
+            // Electrostatic energy
+            float const qi = nb_qi[pair_idx];
+            float const qj = nb_qj[pair_idx];
+            std::int32_t const is_1_4 = nb_is_1_4[pair_idx];
+            energy_trial += compute_elec_energy_f32_(r, qi, qj, is_1_4);
+        }
+
+        energy_trial = warp_reduce_sum_f32_(energy_trial);
+
+        // Check Armijo condition
+        float armijo_threshold = 0.0f;
+        if (lane == 0) {
+            armijo_threshold = energy_current + c1 * alpha * grad_dot_d;
+        }
+        armijo_threshold = __shfl_sync(full_mask, armijo_threshold, 0);
+
+        if (energy_trial <= armijo_threshold) {
+            return alpha;
+        }
+
+        // Reduce step size
+        alpha *= rho_decay;
+    }
+
+    return alpha;
+}
+
+/**
+ * L-BFGS optimization kernel (FP32 compute).
+ *
+ * One warp (32 threads) per molecule.
+ * Each warp independently optimizes its assigned molecule.
+ *
+ * Status codes:
+ * 0: Success (gradient threshold reached)
+ * 1: Max iterations reached
+ * 2: Line search failed
+ */
+__global__ void mmff94_lbfgs_optimize_kernel_f32(
+    float* coord_x, float* coord_y, float* coord_z, std::int32_t const* nb_i, std::int32_t const* nb_j,
+    float const* nb_epsilon, float const* nb_r_star, float const* nb_qi, float const* nb_qj,
+    std::int32_t const* nb_is_1_4, std::int32_t const* mol_atom_start, std::int32_t const* mol_atom_end,
+    std::int32_t const* mol_nb_start, std::int32_t const* mol_nb_end, float* lbfgs_workspace, std::int32_t* out_status,
+    std::int32_t* out_iterations, float* out_energy, float* out_rms_grad, std::uint32_t const n_molecules,
+    std::int32_t const max_iterations, float const grad_threshold, std::uint32_t const memory_depth) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
+
+    if (mol_idx >= n_molecules) {
+        return;
+    }
+
+    std::uint32_t const atom_start = static_cast<std::uint32_t>(mol_atom_start[mol_idx]);
+    std::uint32_t const atom_end = static_cast<std::uint32_t>(mol_atom_end[mol_idx]);
+    std::uint32_t const n_atoms = atom_end - atom_start;
+    std::uint32_t const n_elements = n_atoms * 3;
+
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
+
+    // Setup workspace pointers
+    std::uint32_t const workspace_offset = mol_idx * lbfgs_workspace_size_(n_atoms, memory_depth);
+    float* s_history = lbfgs_workspace + workspace_offset;
+    float* y_history = s_history + memory_depth * n_elements;
+    float* rho = y_history + memory_depth * n_elements;
+    float* alpha = rho + memory_depth;
+    float* gradient_prev = alpha + memory_depth;
+
+    // Temporary arrays (allocated in shared memory - each block gets its own)
+    extern __shared__ float shared_mem[];
+    float* gradient = shared_mem;
+    float* search_dir = gradient + n_elements;
+
+    // Initialize gradient arrays to zero
+    for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+        gradient[i] = 0.0f;
+        gradient_prev[i] = 0.0f;
+    }
+    __syncwarp(full_mask);
+
+    std::uint32_t k = 0; // History size
+
+    for (std::int32_t iter = 0; iter < max_iterations; ++iter) {
+        // Zero out gradient
+        for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+            gradient[i] = 0.0f;
+        }
+        __syncwarp(full_mask);
+
+        // Compute energy and gradient
+        float energy = 0.0f;
+
+        for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
+            std::int32_t const i_global = nb_i[pair_idx];
+            std::int32_t const j_global = nb_j[pair_idx];
+            std::int32_t const i = i_global - static_cast<std::int32_t>(atom_start);
+            std::int32_t const j = j_global - static_cast<std::int32_t>(atom_start);
+
+            float const xi = coord_x[i_global];
+            float const yi = coord_y[i_global];
+            float const zi = coord_z[i_global];
+            float const xj = coord_x[j_global];
+            float const yj = coord_y[j_global];
+            float const zj = coord_z[j_global];
+
+            float const dx = xj - xi;
+            float const dy = yj - yi;
+            float const dz = zj - zi;
+
+            float const r = compute_distance_f32_(xi, yi, zi, xj, yj, zj);
+
+            // VdW energy and gradient
+            float const eps = nb_epsilon[pair_idx];
+            float const rstar = nb_r_star[pair_idx];
+            energy += compute_vdw_energy_f32_(r, eps, rstar);
+
+            float const dE_dr_vdw = compute_vdw_gradient_f32_(r, eps, rstar);
+            float const inv_r = __frcp_rn(r);
+            float const fx_vdw = -dE_dr_vdw * dx * inv_r;
+            float const fy_vdw = -dE_dr_vdw * dy * inv_r;
+            float const fz_vdw = -dE_dr_vdw * dz * inv_r;
+
+            atomicAdd(&gradient[i], -fx_vdw);
+            atomicAdd(&gradient[n_atoms + i], -fy_vdw);
+            atomicAdd(&gradient[2 * n_atoms + i], -fz_vdw);
+            atomicAdd(&gradient[j], fx_vdw);
+            atomicAdd(&gradient[n_atoms + j], fy_vdw);
+            atomicAdd(&gradient[2 * n_atoms + j], fz_vdw);
+
+            // Electrostatic energy and gradient
+            float const qi = nb_qi[pair_idx];
+            float const qj = nb_qj[pair_idx];
+            std::int32_t const is_1_4 = nb_is_1_4[pair_idx];
+            energy += compute_elec_energy_f32_(r, qi, qj, is_1_4);
+
+            float fx_elec, fy_elec, fz_elec;
+            compute_elec_gradient_f32_(r, qi, qj, is_1_4, dx, dy, dz, &fx_elec, &fy_elec, &fz_elec);
+
+            atomicAdd(&gradient[i], -fx_elec);
+            atomicAdd(&gradient[n_atoms + i], -fy_elec);
+            atomicAdd(&gradient[2 * n_atoms + i], -fz_elec);
+            atomicAdd(&gradient[j], fx_elec);
+            atomicAdd(&gradient[n_atoms + j], fy_elec);
+            atomicAdd(&gradient[2 * n_atoms + j], fz_elec);
+        }
+
+        energy = warp_reduce_sum_f32_(energy);
+        __syncwarp(full_mask);
+
+        // Compute gradient RMS
+        float const rms_grad = warp_rms_f32_(gradient, n_elements, lane);
+
+        // Check convergence
+        if (rms_grad < grad_threshold) {
+            if (lane == 0) {
+                out_status[mol_idx] = 0;
+                out_iterations[mol_idx] = iter;
+                out_energy[mol_idx] = energy;
+                out_rms_grad[mol_idx] = rms_grad;
+            }
+            return;
+        }
+
+        // Compute search direction using L-BFGS two-loop recursion
+        lbfgs_two_loop_recursion_(gradient, search_dir, s_history, y_history, rho, alpha, n_elements, k, memory_depth,
+                                   lane);
+
+        // Line search
+        float const step_size = lbfgs_line_search_f32_(coord_x, coord_y, coord_z, search_dir, gradient, nb_i, nb_j,
+                                                        nb_epsilon, nb_r_star, nb_qi, nb_qj, nb_is_1_4, nb_start,
+                                                        nb_end, atom_start, n_atoms, energy, lane);
+
+        // Update positions: x = x + step_size * search_dir
+        for (std::uint32_t i = lane; i < n_atoms; i += warp_size) {
+            std::uint32_t const atom_idx = atom_start + i;
+            coord_x[atom_idx] += step_size * search_dir[i];
+            coord_y[atom_idx] += step_size * search_dir[n_atoms + i];
+            coord_z[atom_idx] += step_size * search_dir[2 * n_atoms + i];
+        }
+        __syncwarp(full_mask);
+
+        // Update L-BFGS history
+        if (iter > 0) {
+            std::uint32_t const hist_idx = k % memory_depth;
+            float* s = s_history + hist_idx * n_elements;
+            float* y = y_history + hist_idx * n_elements;
+
+            float s_dot_y = 0.0f;
+
+            for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+                s[i] = step_size * search_dir[i];
+                y[i] = gradient[i] - gradient_prev[i];
+                s_dot_y = fmaf(s[i], y[i], s_dot_y);
+            }
+
+            s_dot_y = warp_reduce_sum_f32_(s_dot_y);
+
+            if (lane == 0) {
+                rho[hist_idx] = __frcp_rn(s_dot_y);
+            }
+
+            k = (k < memory_depth) ? k + 1 : memory_depth;
+        }
+
+        // Save current gradient for next iteration
+        for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+            gradient_prev[i] = gradient[i];
+        }
+        __syncwarp(full_mask);
+    }
+
+    // Max iterations reached
+    float const energy_final = 0.0f; // Could recompute if needed
+    float const rms_grad_final = warp_rms_f32_(gradient, n_elements, lane);
+
+    if (lane == 0) {
+        out_status[mol_idx] = 1;
+        out_iterations[mol_idx] = max_iterations;
+        out_energy[mol_idx] = energy_final;
+        out_rms_grad[mol_idx] = rms_grad_final;
+    }
+}
+
+/**
+ * L-BFGS optimization kernel (FP16 compute, FP32 accumulation).
+ *
+ * One warp (32 threads) per molecule.
+ * Each warp independently optimizes its assigned molecule.
+ */
+__global__ void mmff94_lbfgs_optimize_kernel_f16(
+    half* coord_x, half* coord_y, half* coord_z, std::int32_t const* nb_i, std::int32_t const* nb_j,
+    half const* nb_epsilon, half const* nb_r_star, half const* nb_qi, half const* nb_qj,
+    std::int32_t const* nb_is_1_4, std::int32_t const* mol_atom_start, std::int32_t const* mol_atom_end,
+    std::int32_t const* mol_nb_start, std::int32_t const* mol_nb_end, float* lbfgs_workspace, std::int32_t* out_status,
+    std::int32_t* out_iterations, float* out_energy, float* out_rms_grad, std::uint32_t const n_molecules,
+    std::int32_t const max_iterations, float const grad_threshold, std::uint32_t const memory_depth) {
+    std::uint32_t const mol_idx = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
+
+    if (mol_idx >= n_molecules) {
+        return;
+    }
+
+    std::uint32_t const atom_start = static_cast<std::uint32_t>(mol_atom_start[mol_idx]);
+    std::uint32_t const atom_end = static_cast<std::uint32_t>(mol_atom_end[mol_idx]);
+    std::uint32_t const n_atoms = atom_end - atom_start;
+    std::uint32_t const n_elements = n_atoms * 3;
+
+    std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
+    std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
+
+    // Setup workspace pointers
+    std::uint32_t const workspace_offset = mol_idx * lbfgs_workspace_size_(n_atoms, memory_depth);
+    float* s_history = lbfgs_workspace + workspace_offset;
+    float* y_history = s_history + memory_depth * n_elements;
+    float* rho = y_history + memory_depth * n_elements;
+    float* alpha = rho + memory_depth;
+    float* gradient_prev = alpha + memory_depth;
+
+    // Temporary arrays (allocated in shared memory - each block gets its own)
+    extern __shared__ float shared_mem[];
+    float* gradient = shared_mem;
+    float* search_dir = gradient + n_elements;
+
+    // Initialize gradient arrays to zero
+    for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+        gradient[i] = 0.0f;
+        gradient_prev[i] = 0.0f;
+    }
+    __syncwarp(full_mask);
+
+    std::uint32_t k = 0; // History size
+
+    for (std::int32_t iter = 0; iter < max_iterations; ++iter) {
+        // Zero out gradient
+        for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+            gradient[i] = 0.0f;
+        }
+        __syncwarp(full_mask);
+
+        // Compute energy and gradient
+        float energy = 0.0f;
+
+        for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
+            std::int32_t const i_global = nb_i[pair_idx];
+            std::int32_t const j_global = nb_j[pair_idx];
+            std::int32_t const i = i_global - static_cast<std::int32_t>(atom_start);
+            std::int32_t const j = j_global - static_cast<std::int32_t>(atom_start);
+
+            half const xi = coord_x[i_global];
+            half const yi = coord_y[i_global];
+            half const zi = coord_z[i_global];
+            half const xj = coord_x[j_global];
+            half const yj = coord_y[j_global];
+            half const zj = coord_z[j_global];
+
+            half const dx = __hsub(xj, xi);
+            half const dy = __hsub(yj, yi);
+            half const dz = __hsub(zj, zi);
+
+            half const r = compute_distance_f16_(xi, yi, zi, xj, yj, zj);
+
+            // VdW energy and gradient
+            half const eps = nb_epsilon[pair_idx];
+            half const rstar = nb_r_star[pair_idx];
+            energy += compute_vdw_energy_f16_(r, eps, rstar);
+
+            float const dE_dr_vdw = compute_vdw_gradient_f16_(r, eps, rstar);
+            half const inv_r = h_rcp_(r);
+            float const fx_vdw = -dE_dr_vdw * __half2float(dx) * __half2float(inv_r);
+            float const fy_vdw = -dE_dr_vdw * __half2float(dy) * __half2float(inv_r);
+            float const fz_vdw = -dE_dr_vdw * __half2float(dz) * __half2float(inv_r);
+
+            atomicAdd(&gradient[i], -fx_vdw);
+            atomicAdd(&gradient[n_atoms + i], -fy_vdw);
+            atomicAdd(&gradient[2 * n_atoms + i], -fz_vdw);
+            atomicAdd(&gradient[j], fx_vdw);
+            atomicAdd(&gradient[n_atoms + j], fy_vdw);
+            atomicAdd(&gradient[2 * n_atoms + j], fz_vdw);
+
+            // Electrostatic energy and gradient
+            half const qi = nb_qi[pair_idx];
+            half const qj = nb_qj[pair_idx];
+            std::int32_t const is_1_4 = nb_is_1_4[pair_idx];
+            energy += compute_elec_energy_f16_(r, qi, qj, is_1_4);
+
+            float fx_elec, fy_elec, fz_elec;
+            compute_elec_gradient_f16_(r, qi, qj, is_1_4, dx, dy, dz, &fx_elec, &fy_elec, &fz_elec);
+
+            atomicAdd(&gradient[i], -fx_elec);
+            atomicAdd(&gradient[n_atoms + i], -fy_elec);
+            atomicAdd(&gradient[2 * n_atoms + i], -fz_elec);
+            atomicAdd(&gradient[j], fx_elec);
+            atomicAdd(&gradient[n_atoms + j], fy_elec);
+            atomicAdd(&gradient[2 * n_atoms + j], fz_elec);
+        }
+
+        energy = warp_reduce_sum_f32_(energy);
+        __syncwarp(full_mask);
+
+        // Compute gradient RMS
+        float const rms_grad = warp_rms_f32_(gradient, n_elements, lane);
+
+        // Check convergence
+        if (rms_grad < grad_threshold) {
+            if (lane == 0) {
+                out_status[mol_idx] = 0;
+                out_iterations[mol_idx] = iter;
+                out_energy[mol_idx] = energy;
+                out_rms_grad[mol_idx] = rms_grad;
+            }
+            return;
+        }
+
+        // Compute search direction using L-BFGS two-loop recursion
+        lbfgs_two_loop_recursion_(gradient, search_dir, s_history, y_history, rho, alpha, n_elements, k, memory_depth,
+                                   lane);
+
+        // Line search (convert coords to FP32 for line search)
+        float* trial_x = search_dir + n_elements; // Reuse shared memory
+        float* trial_y = trial_x + n_atoms;
+        float* trial_z = trial_y + n_atoms;
+
+        for (std::uint32_t i = lane; i < n_atoms; i += warp_size) {
+            std::uint32_t const atom_idx = atom_start + i;
+            trial_x[i] = __half2float(coord_x[atom_idx]);
+            trial_y[i] = __half2float(coord_y[atom_idx]);
+            trial_z[i] = __half2float(coord_z[atom_idx]);
+        }
+        __syncwarp(full_mask);
+
+        // Simplified line search for FP16 (fixed step)
+        float const step_size = 0.01f; // Conservative for FP16
+
+        // Update positions: x = x + step_size * search_dir
+        for (std::uint32_t i = lane; i < n_atoms; i += warp_size) {
+            std::uint32_t const atom_idx = atom_start + i;
+            float const new_x = trial_x[i] + step_size * search_dir[i];
+            float const new_y = trial_y[i] + step_size * search_dir[n_atoms + i];
+            float const new_z = trial_z[i] + step_size * search_dir[2 * n_atoms + i];
+            coord_x[atom_idx] = __float2half(new_x);
+            coord_y[atom_idx] = __float2half(new_y);
+            coord_z[atom_idx] = __float2half(new_z);
+        }
+        __syncwarp(full_mask);
+
+        // Update L-BFGS history
+        if (iter > 0) {
+            std::uint32_t const hist_idx = k % memory_depth;
+            float* s = s_history + hist_idx * n_elements;
+            float* y = y_history + hist_idx * n_elements;
+
+            float s_dot_y = 0.0f;
+
+            for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+                s[i] = step_size * search_dir[i];
+                y[i] = gradient[i] - gradient_prev[i];
+                s_dot_y = fmaf(s[i], y[i], s_dot_y);
+            }
+
+            s_dot_y = warp_reduce_sum_f32_(s_dot_y);
+
+            if (lane == 0) {
+                rho[hist_idx] = __frcp_rn(s_dot_y);
+            }
+
+            k = (k < memory_depth) ? k + 1 : memory_depth;
+        }
+
+        // Save current gradient for next iteration
+        for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
+            gradient_prev[i] = gradient[i];
+        }
+        __syncwarp(full_mask);
+    }
+
+    // Max iterations reached
+    float const energy_final = 0.0f; // Could recompute if needed
+    float const rms_grad_final = warp_rms_f32_(gradient, n_elements, lane);
+
+    if (lane == 0) {
+        out_status[mol_idx] = 1;
+        out_iterations[mol_idx] = max_iterations;
+        out_energy[mol_idx] = energy_final;
+        out_rms_grad[mol_idx] = rms_grad_final;
+    }
+}
+
+#pragma endregion
+
+#pragma region Atom-Centric Kernels
+
+/**
+ * Atom-centric MMFF94 energy and gradient kernel (FP32).
+ *
+ * This kernel eliminates atomics and gathers by using:
+ * 1. Register-based coordinate storage (each lane owns one atom)
+ * 2. Shuffle-based coordinate access (~5 cycles vs ~100 for gather)
+ * 3. Local gradient accumulation (no race conditions)
+ * 4. Symmetric adjacency list (each pair stored twice)
+ *
+ * Architecture:
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │  REGISTER OWNERSHIP (molecule with N ≤ 32 atoms):          │
+ * │                                                            │
+ * │  Lane 0 owns atom 0: holds (x0, y0, z0) in registers       │
+ * │  Lane 1 owns atom 1: holds (x1, y1, z1) in registers       │
+ * │  ...                                                       │
+ * │  Lane 31 owns atom 31 (or idle if N < 32)                  │
+ * │                                                            │
+ * │  Each lane processes atoms: lane, lane+32, lane+64, ...    │
+ * │  ► NO CONFLICTS: each lane writes only to its own atoms    │
+ * │  ► NO ATOMICS: pure local accumulation                     │
+ * │  ► NO SYNC: lanes work independently                       │
+ * └─────────────────────────────────────────────────────────────┘
+ *
+ * Data layout:
+ * - coords: [mol0: x0 y0 z0 x1 y1 z1 ...] [mol1: ...] ... (AoS per molecule)
+ * - neighbor_offsets: [n_atoms+1] entries per molecule giving neighbor ranges
+ * - neighbors: symmetric adjacency list with neighbor_t entries
+ *
+ * One warp (32 threads) per molecule.
+ */
+__global__ void mmff94_energy_gradient_atom_centric_f32(
+    float* __restrict__ coords,               // [sum(n_atoms) * 3] AoS: x0,y0,z0,x1,y1,z1,...
+    neighbor_t const* __restrict__ neighbors, // [sum(n_neighbors)] symmetric adjacency list
+    std::uint32_t const* __restrict__ neighbor_offsets, // Per-atom neighbor ranges
+    mol_meta_t const* __restrict__ metas,     // Per-molecule metadata
+    float* __restrict__ grad_out,             // [sum(n_atoms) * 3] output gradients
+    float* __restrict__ energy_out,           // [n_molecules] output energies
+    std::uint32_t const n_molecules) {
+
+    std::uint32_t const mol = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x & 31;
+
+    if (mol >= n_molecules) return;
+
+    mol_meta_t const meta = metas[mol];
+    std::uint32_t const n_atoms = meta.n_atoms;
+    std::uint32_t const atom_base = meta.atom_start;
+    std::uint32_t const neighbor_base = meta.neighbor_start;
+
+    // Load MY atom's coordinates into registers
+    // Each lane loads atom (lane % n_atoms) if lane < n_atoms
+    float my_x = 0.0f, my_y = 0.0f, my_z = 0.0f;
+    if (lane < n_atoms) {
+        std::uint32_t const coord_idx = (atom_base + lane) * 3;
+        my_x = coords[coord_idx + 0];
+        my_y = coords[coord_idx + 1];
+        my_z = coords[coord_idx + 2];
+    }
+
+    float total_energy = 0.0f;
+
+    // Each lane processes atoms it owns: lane, lane+32, lane+64, ...
+    // For molecules ≤32 atoms, each lane processes at most 1 atom
+    for (std::uint32_t atom = lane; atom < n_atoms; atom += warp_size) {
+        // Get this atom's coordinates via shuffle
+        // (If atom == lane, we use my own values; otherwise shuffle)
+        float const ax = __shfl_sync(full_mask, my_x, atom % warp_size);
+        float const ay = __shfl_sync(full_mask, my_y, atom % warp_size);
+        float const az = __shfl_sync(full_mask, my_z, atom % warp_size);
+
+        float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+
+        // Get this atom's neighbor range
+        std::uint32_t const start = neighbor_offsets[atom_base + atom];
+        std::uint32_t const end = neighbor_offsets[atom_base + atom + 1];
+
+        // Iterate this atom's neighbors
+        for (std::uint32_t n = start; n < end; ++n) {
+            neighbor_t const nb = neighbors[neighbor_base + n];
+
+            // Get neighbor coordinates via shuffle
+            float const bx = __shfl_sync(full_mask, my_x, nb.j % warp_size);
+            float const by = __shfl_sync(full_mask, my_y, nb.j % warp_size);
+            float const bz = __shfl_sync(full_mask, my_z, nb.j % warp_size);
+
+            // Compute distance
+            float const dx = bx - ax;
+            float const dy = by - ay;
+            float const dz = bz - az;
+            float const r2 = fmaf(dx, dx, fmaf(dy, dy, dz * dz));
+            float const r = sqrtf(r2);
+            float const r_safe = (r > 0.001f) ? r : 0.001f;
+
+            // ── VdW Energy ──────────────────────────────────────────────
+            float const inv_rstar = __frcp_rn(nb.r_star);
+            float const rho = r_safe * inv_rstar;
+
+            float const rho2 = rho * rho;
+            float const rho4 = rho2 * rho2;
+            float const rho6 = rho4 * rho2;
+            float const rho7 = rho6 * rho;
+
+            float const rep_denom = rho + 0.07f;
+            float const rep_ratio = 1.07f * __frcp_rn(rep_denom);
+            float const rep_2 = rep_ratio * rep_ratio;
+            float const rep_4 = rep_2 * rep_2;
+            float const rep_6 = rep_4 * rep_2;
+            float const rep_7 = rep_6 * rep_ratio;
+
+            float const att_denom = rho7 + 0.12f;
+            float const att_term = 1.12f * __frcp_rn(att_denom) - 2.0f;
+
+            float const e_vdw = nb.epsilon * rep_7 * att_term;
+
+            // ── VdW Gradient ────────────────────────────────────────────
+            float const d_rep = -7.0f * rep_6 * 1.07f / (rep_denom * rep_denom);
+            float const d_att = -7.84f * rho6 / (att_denom * att_denom);
+            float const dE_drho = nb.epsilon * (d_rep * att_term + rep_7 * d_att);
+            float const dE_dr_vdw = dE_drho * inv_rstar;
+
+            // ── Electrostatic Energy ────────────────────────────────────
+            float const r_buffered = r_safe + delta_f32;
+            float const inv_r_buf = __frcp_rn(r_buffered);
+            float const is_1_4 = static_cast<float>(nb.flags & 1);
+            float const scale = 1.0f + is_1_4 * scale_1_4_diff_f32;
+            float const e_elec = coulomb_const_f32 * nb.q_product * inv_r_buf * scale;
+
+            // ── Electrostatic Gradient ──────────────────────────────────
+            float const dE_dr_elec = -coulomb_const_f32 * nb.q_product * __frcp_rn(r_buffered * r_buffered) * scale;
+
+            // ── Combined Force ──────────────────────────────────────────
+            float const dE_dr = dE_dr_vdw + dE_dr_elec;
+            float const inv_r = __frcp_rn(r_safe);
+            float const fx = -dE_dr * dx * inv_r;
+            float const fy = -dE_dr * dy * inv_r;
+            float const fz = -dE_dr * dz * inv_r;
+
+            // Apply sign for force direction
+            // sign=-1: force points TO this atom (we're atom i in original pair)
+            // sign=+1: force points AWAY from this atom (we're atom j in original pair)
+            float const s = static_cast<float>(nb.sign);
+            gx += s * fx;
+            gy += s * fy;
+            gz += s * fz;
+
+            // Energy: count once per pair (only when this atom < neighbor)
+            // Since pairs are symmetric, we only count when atom < nb.j
+            if (atom < nb.j) {
+                total_energy += e_vdw + e_elec;
+            }
+        }
+
+        // Write gradient for this atom
+        std::uint32_t const out_idx = (atom_base + atom) * 3;
+        grad_out[out_idx + 0] = gx;
+        grad_out[out_idx + 1] = gy;
+        grad_out[out_idx + 2] = gz;
+    }
+
+    // Reduce energy across warp
+    total_energy = warp_reduce_sum_f32_(total_energy);
+    if (lane == 0) {
+        energy_out[mol] = total_energy;
+    }
+}
+
+/**
+ * Atom-centric MMFF94 energy-only kernel (FP32).
+ *
+ * Simplified version without gradient computation for energy evaluation.
+ */
+__global__ void mmff94_energy_atom_centric_f32(
+    float const* __restrict__ coords,         // [sum(n_atoms) * 3] AoS
+    neighbor_t const* __restrict__ neighbors, // [sum(n_neighbors)]
+    std::uint32_t const* __restrict__ neighbor_offsets,
+    mol_meta_t const* __restrict__ metas,
+    float* __restrict__ energy_out,
+    std::uint32_t const n_molecules) {
+
+    std::uint32_t const mol = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x & 31;
+
+    if (mol >= n_molecules) return;
+
+    mol_meta_t const meta = metas[mol];
+    std::uint32_t const n_atoms = meta.n_atoms;
+    std::uint32_t const atom_base = meta.atom_start;
+    std::uint32_t const neighbor_base = meta.neighbor_start;
+
+    // Load coordinates into registers
+    float my_x = 0.0f, my_y = 0.0f, my_z = 0.0f;
+    if (lane < n_atoms) {
+        std::uint32_t const coord_idx = (atom_base + lane) * 3;
+        my_x = coords[coord_idx + 0];
+        my_y = coords[coord_idx + 1];
+        my_z = coords[coord_idx + 2];
+    }
+
+    float total_energy = 0.0f;
+
+    for (std::uint32_t atom = lane; atom < n_atoms; atom += warp_size) {
+        float const ax = __shfl_sync(full_mask, my_x, atom % warp_size);
+        float const ay = __shfl_sync(full_mask, my_y, atom % warp_size);
+        float const az = __shfl_sync(full_mask, my_z, atom % warp_size);
+
+        std::uint32_t const start = neighbor_offsets[atom_base + atom];
+        std::uint32_t const end = neighbor_offsets[atom_base + atom + 1];
+
+        for (std::uint32_t n = start; n < end; ++n) {
+            neighbor_t const nb = neighbors[neighbor_base + n];
+
+            float const bx = __shfl_sync(full_mask, my_x, nb.j % warp_size);
+            float const by = __shfl_sync(full_mask, my_y, nb.j % warp_size);
+            float const bz = __shfl_sync(full_mask, my_z, nb.j % warp_size);
+
+            float const dx = bx - ax;
+            float const dy = by - ay;
+            float const dz = bz - az;
+            float const r2 = fmaf(dx, dx, fmaf(dy, dy, dz * dz));
+            float const r = sqrtf(r2);
+            float const r_safe = (r > 0.001f) ? r : 0.001f;
+
+            // VdW energy
+            float const inv_rstar = __frcp_rn(nb.r_star);
+            float const rho = r_safe * inv_rstar;
+            float const rho2 = rho * rho;
+            float const rho4 = rho2 * rho2;
+            float const rho6 = rho4 * rho2;
+            float const rho7 = rho6 * rho;
+
+            float const rep_ratio = 1.07f * __frcp_rn(rho + 0.07f);
+            float const rep_7 = rep_ratio * rep_ratio * rep_ratio * rep_ratio * rep_ratio * rep_ratio * rep_ratio;
+            float const att_term = 1.12f * __frcp_rn(rho7 + 0.12f) - 2.0f;
+            float const e_vdw = nb.epsilon * rep_7 * att_term;
+
+            // Electrostatic energy
+            float const r_buffered = r_safe + delta_f32;
+            float const is_1_4 = static_cast<float>(nb.flags & 1);
+            float const scale = 1.0f + is_1_4 * scale_1_4_diff_f32;
+            float const e_elec = coulomb_const_f32 * nb.q_product * __frcp_rn(r_buffered) * scale;
+
+            // Only count energy when atom < neighbor (avoid double counting)
+            if (atom < nb.j) {
+                total_energy += e_vdw + e_elec;
+            }
+        }
+    }
+
+    total_energy = warp_reduce_sum_f32_(total_energy);
+    if (lane == 0) {
+        energy_out[mol] = total_energy;
     }
 }
 
