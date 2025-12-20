@@ -61,6 +61,30 @@ __device__ __forceinline__ half h_fma_(half a, half b, half c) { return __hfma(a
 
 #pragma endregion
 
+#pragma region FP16 half2 Packed Helper Functions
+
+/**
+ * Fast reciprocal square root for half2 (packed FP16).
+ */
+__device__ __forceinline__ half2 h2_rsqrt_(half2 x) { return h2rsqrt(x); }
+
+/**
+ * Fast reciprocal for half2 (packed FP16).
+ */
+__device__ __forceinline__ half2 h2_rcp_(half2 x) { return h2rcp(x); }
+
+/**
+ * FP16 square root for half2 (packed FP16).
+ */
+__device__ __forceinline__ half2 h2_sqrt_(half2 x) { return h2sqrt(x); }
+
+/**
+ * Fused multiply-add for half2: a*b + c.
+ */
+__device__ __forceinline__ half2 h2_fma_(half2 a, half2 b, half2 c) { return __hfma2(a, b, c); }
+
+#pragma endregion
+
 #pragma region Warp Reduction
 
 /**
@@ -115,6 +139,26 @@ __device__ __forceinline__ float compute_distance_f32_(float const xi, float con
     r2 = fmaf(dz, dz, r2);
 
     return sqrtf(r2);
+}
+
+/**
+ * Paired Euclidean distance computation using half2.
+ * Computes distances for two pairs simultaneously.
+ *
+ * Input: Two sets of coordinates packed as half2.
+ * Output: Two distances packed as half2.
+ */
+__device__ __forceinline__ half2 compute_distance_f16_pair_(half2 const xi, half2 const yi, half2 const zi,
+                                                            half2 const xj, half2 const yj, half2 const zj) {
+    half2 const dx = __hsub2(xi, xj);
+    half2 const dy = __hsub2(yi, yj);
+    half2 const dz = __hsub2(zi, zj);
+
+    half2 r2 = __hmul2(dx, dx);
+    r2 = h2_fma_(dy, dy, r2);
+    r2 = h2_fma_(dz, dz, r2);
+
+    return h2_sqrt_(r2);
 }
 
 #pragma endregion
@@ -185,6 +229,50 @@ __device__ __forceinline__ float compute_vdw_energy_f32_(float const r, float co
     return epsilon * t1_7 * t2;
 }
 
+/**
+ * MMFF94 Buffered 14-7 van der Waals energy using half2 packed operations.
+ * Processes 2 pairs simultaneously for 2x throughput.
+ *
+ * Returns: Two energies packed as float (low + high).
+ *
+ * Note: Computation in FP16 with packed half2, final conversion to FP32 for accumulation.
+ */
+__device__ __forceinline__ float compute_vdw_energy_f16_pair_(half2 const r, half2 const epsilon, half2 const r_star) {
+    // Safety clamp: r >= 0.001
+    half2 const safety = __float2half2_rn(0.001f);
+    half2 const r_safe = __hmul2(__hgt2(r, safety), r) + __hmul2(__hle2(r, safety), safety);
+
+    half2 const inv_rstar = h2_rcp_(r_star);
+    half2 const rho = __hmul2(r_safe, inv_rstar);
+
+    half2 const rho2 = __hmul2(rho, rho);
+    half2 const rho4 = __hmul2(rho2, rho2);
+    half2 const rho6 = __hmul2(rho4, rho2);
+    half2 const rho7 = __hmul2(rho6, rho);
+
+    half2 const c_107 = __float2half2_rn(1.07f);
+    half2 const c_007 = __float2half2_rn(0.07f);
+    half2 const t1 = __hmul2(c_107, h2_rcp_(__hadd2(rho, c_007)));
+    half2 const t1_2 = __hmul2(t1, t1);
+    half2 const t1_4 = __hmul2(t1_2, t1_2);
+    half2 const t1_6 = __hmul2(t1_4, t1_2);
+    half2 const t1_7 = __hmul2(t1_6, t1);
+
+    half2 const c_112 = __float2half2_rn(1.12f);
+    half2 const c_012 = __float2half2_rn(0.12f);
+    half2 const c_2 = __float2half2_rn(2.0f);
+    half2 const t2 = __hsub2(__hmul2(c_112, h2_rcp_(__hadd2(rho7, c_012))), c_2);
+
+    // Final energy: epsilon * t1_7 * t2 (per pair)
+    half2 const e_pair = __hmul2(__hmul2(epsilon, t1_7), t2);
+
+    // Convert both halves to FP32 and return sum
+    float const e_low = __half2float(__low2half(e_pair));
+    float const e_high = __half2float(__high2half(e_pair));
+
+    return e_low + e_high;
+}
+
 #pragma endregion
 
 #pragma region Electrostatic Energy Computation
@@ -228,15 +316,46 @@ __device__ __forceinline__ float compute_elec_energy_f32_(float const r, float c
     return e * scale;
 }
 
+/**
+ * MMFF94 Buffered Coulomb electrostatic energy using half2 packed operations.
+ * Processes 2 pairs simultaneously for 2x throughput.
+ *
+ * Returns: Two energies (with 1-4 scaling applied) as float (low + high).
+ *
+ * Note: Computation in FP16 with packed half2, 1-4 scaling in FP32.
+ */
+__device__ __forceinline__ float compute_elec_energy_f16_pair_(half2 const r, half2 const qi, half2 const qj,
+                                                               std::int32_t const is_1_4_low,
+                                                               std::int32_t const is_1_4_high) {
+    half2 const coulomb_const = __float2half2_rn(332.0716f);
+    half2 const delta = __float2half2_rn(0.05f);
+
+    half2 const r_buffered = __hadd2(r, delta);
+    half2 const inv_r = h2_rcp_(r_buffered);
+
+    half2 const e = __hmul2(__hmul2(__hmul2(coulomb_const, qi), qj), inv_r);
+
+    // Extract and apply 1-4 scaling in FP32
+    float const e_low = __half2float(__low2half(e));
+    float const e_high = __half2float(__high2half(e));
+
+    float const scale_low = 1.0f + static_cast<float>(is_1_4_low) * scale_1_4_diff_f32;
+    float const scale_high = 1.0f + static_cast<float>(is_1_4_high) * scale_1_4_diff_f32;
+
+    return e_low * scale_low + e_high * scale_high;
+}
+
 #pragma endregion
 
 #pragma region VdW Energy Kernels
 
 /**
- * MMFF94 van der Waals energy kernel (FP16 compute, FP32 accumulation).
+ * MMFF94 van der Waals energy kernel (FP16 compute with half2 packed operations, FP32 accumulation).
  *
  * One warp (32 threads) per molecule.
  * Thread k processes pairs k, k+32, k+64... via strided iteration.
+ * Uses half2 to process 2 pairs at once when possible (2x stride).
+ * Falls back to single half for odd remaining pairs.
  * Warp reduction sums energies across lanes.
  * Lane 0 writes final result.
  */
@@ -254,9 +373,39 @@ __global__ void mmff94_vdw_energy_kernel_f16(half const* coord_x, half const* co
 
     std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
     std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
+    std::uint32_t const n_pairs = nb_end - nb_start;
     float vdw_accum = 0.0f;
 
-    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
+    // Process pairs in groups of 2 using half2 (2x warp_size stride)
+    std::uint32_t const stride_2x = warp_size * 2;
+    for (std::uint32_t pair_idx = nb_start + lane * 2; pair_idx + 1 < nb_end; pair_idx += stride_2x) {
+        // Load pair 0
+        std::int32_t const i0 = nb_i[pair_idx];
+        std::int32_t const j0 = nb_j[pair_idx];
+
+        // Load pair 1
+        std::int32_t const i1 = nb_i[pair_idx + 1];
+        std::int32_t const j1 = nb_j[pair_idx + 1];
+
+        // Pack coordinates as half2
+        half2 const xi = make_half2(coord_x[i0], coord_x[i1]);
+        half2 const yi = make_half2(coord_y[i0], coord_y[i1]);
+        half2 const zi = make_half2(coord_z[i0], coord_z[i1]);
+        half2 const xj = make_half2(coord_x[j0], coord_x[j1]);
+        half2 const yj = make_half2(coord_y[j0], coord_y[j1]);
+        half2 const zj = make_half2(coord_z[j0], coord_z[j1]);
+
+        half2 const r = compute_distance_f16_pair_(xi, yi, zi, xj, yj, zj);
+
+        half2 const eps = make_half2(nb_epsilon[pair_idx], nb_epsilon[pair_idx + 1]);
+        half2 const rstar = make_half2(nb_r_star[pair_idx], nb_r_star[pair_idx + 1]);
+
+        vdw_accum += compute_vdw_energy_f16_pair_(r, eps, rstar);
+    }
+
+    // Handle remaining single pair if n_pairs is odd
+    if ((n_pairs & 1) && (lane == 0)) {
+        std::uint32_t const pair_idx = nb_end - 1;
         std::int32_t const i = nb_i[pair_idx];
         std::int32_t const j = nb_j[pair_idx];
 
@@ -332,7 +481,14 @@ __global__ void mmff94_vdw_energy_kernel_f32(float const* coord_x, float const* 
 #pragma region Electrostatic Energy Kernels
 
 /**
- * MMFF94 electrostatic energy kernel (FP16 compute, FP32 accumulation).
+ * MMFF94 electrostatic energy kernel (FP16 compute with half2 packed operations, FP32 accumulation).
+ *
+ * One warp (32 threads) per molecule.
+ * Thread k processes pairs k, k+32, k+64... via strided iteration.
+ * Uses half2 to process 2 pairs at once when possible (2x stride).
+ * Falls back to single half for odd remaining pairs.
+ * Warp reduction sums energies across lanes.
+ * Lane 0 writes final result.
  */
 __global__ void mmff94_elec_energy_kernel_f16(half const* coord_x, half const* coord_y, half const* coord_z,
                                               std::int32_t const* nb_i, std::int32_t const* nb_j, half const* nb_qi,
@@ -348,9 +504,41 @@ __global__ void mmff94_elec_energy_kernel_f16(half const* coord_x, half const* c
 
     std::uint32_t const nb_start = static_cast<std::uint32_t>(mol_nb_start[mol_idx]);
     std::uint32_t const nb_end = static_cast<std::uint32_t>(mol_nb_end[mol_idx]);
+    std::uint32_t const n_pairs = nb_end - nb_start;
     float elec_accum = 0.0f;
 
-    for (std::uint32_t pair_idx = nb_start + lane; pair_idx < nb_end; pair_idx += warp_size) {
+    // Process pairs in groups of 2 using half2 (2x warp_size stride)
+    std::uint32_t const stride_2x = warp_size * 2;
+    for (std::uint32_t pair_idx = nb_start + lane * 2; pair_idx + 1 < nb_end; pair_idx += stride_2x) {
+        // Load pair 0
+        std::int32_t const i0 = nb_i[pair_idx];
+        std::int32_t const j0 = nb_j[pair_idx];
+
+        // Load pair 1
+        std::int32_t const i1 = nb_i[pair_idx + 1];
+        std::int32_t const j1 = nb_j[pair_idx + 1];
+
+        // Pack coordinates as half2
+        half2 const xi = make_half2(coord_x[i0], coord_x[i1]);
+        half2 const yi = make_half2(coord_y[i0], coord_y[i1]);
+        half2 const zi = make_half2(coord_z[i0], coord_z[i1]);
+        half2 const xj = make_half2(coord_x[j0], coord_x[j1]);
+        half2 const yj = make_half2(coord_y[j0], coord_y[j1]);
+        half2 const zj = make_half2(coord_z[j0], coord_z[j1]);
+
+        half2 const r = compute_distance_f16_pair_(xi, yi, zi, xj, yj, zj);
+
+        half2 const qi = make_half2(nb_qi[pair_idx], nb_qi[pair_idx + 1]);
+        half2 const qj = make_half2(nb_qj[pair_idx], nb_qj[pair_idx + 1]);
+        std::int32_t const is_1_4_low = nb_is_1_4[pair_idx];
+        std::int32_t const is_1_4_high = nb_is_1_4[pair_idx + 1];
+
+        elec_accum += compute_elec_energy_f16_pair_(r, qi, qj, is_1_4_low, is_1_4_high);
+    }
+
+    // Handle remaining single pair if n_pairs is odd
+    if ((n_pairs & 1) && (lane == 0)) {
+        std::uint32_t const pair_idx = nb_end - 1;
         std::int32_t const i = nb_i[pair_idx];
         std::int32_t const j = nb_j[pair_idx];
 
