@@ -1,5 +1,8 @@
 """
-SmallField: Python wrapper for Mojo MMFF94 implementation.
+@file smallfield.py
+@brief Python wrapper for SmallField MMFF94 force field implementation.
+@author Ash Vardanian
+@date 2025-12-20
 
 This module provides a Python interface to the SmallField force field
 implementation, allowing it to work with RDKit molecules.
@@ -9,20 +12,23 @@ import subprocess
 import tempfile
 import os
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any, Union
 import numpy as np
 
 try:
     from rdkit import Chem
     from rdkit.Chem import AllChem
+
     RDKIT_AVAILABLE = True
+    Mol = Chem.Mol
 except ImportError:
     RDKIT_AVAILABLE = False
+    Mol = Any
 
 
 # MMFF94 Constants (matching Mojo implementation)
 MMFF_BOND_PREFACTOR = 143.9325  # mdyn*A/rad^2 -> kcal/mol
-MMFF_CUBIC_STRETCH = -2.0       # A^-1
+MMFF_CUBIC_STRETCH = -2.0  # A^-1
 
 
 def bond_energy_single(r: float, r0: float, kb: float) -> float:
@@ -43,7 +49,13 @@ def bond_energy_single(r: float, r0: float, kb: float) -> float:
     dr2 = dr * dr
     cs = MMFF_CUBIC_STRETCH
     cs2 = cs * cs
-    return 0.5 * MMFF_BOND_PREFACTOR * kb * dr2 * (1.0 + cs * dr + (7.0 / 12.0) * cs2 * dr2)
+    return (
+        0.5
+        * MMFF_BOND_PREFACTOR
+        * kb
+        * dr2
+        * (1.0 + cs * dr + (7.0 / 12.0) * cs2 * dr2)
+    )
 
 
 def compute_mmff_bond_energy(mol, conf_id: int = -1) -> Tuple[float, List[float]]:
@@ -81,7 +93,7 @@ def compute_mmff_bond_energy(mol, conf_id: int = -1) -> Tuple[float, List[float]
         dx = pos_j.x - pos_i.x
         dy = pos_j.y - pos_i.y
         dz = pos_j.z - pos_i.z
-        r = np.sqrt(dx*dx + dy*dy + dz*dz)
+        r = np.sqrt(dx * dx + dy * dy + dz * dz)
 
         # Get MMFF parameters
         stretch_params = mmff_props.GetMMFFBondStretchParams(mol, i, j)
@@ -124,16 +136,16 @@ def compare_with_rdkit(mol, conf_id: int = -1) -> dict:
     smallfield_bond_energy, _ = compute_mmff_bond_energy(mol, conf_id)
 
     return {
-        'rdkit_total_energy': rdkit_total_energy,
-        'smallfield_bond_energy': smallfield_bond_energy,
-        'note': 'RDKit total includes all MMFF terms; SmallField is bond-only'
+        "rdkit_total_energy": rdkit_total_energy,
+        "smallfield_bond_energy": smallfield_bond_energy,
+        "note": "RDKit total includes all MMFF terms; SmallField is bond-only",
     }
 
 
 def is_mojo_available() -> bool:
     """Check if Mojo runtime is available."""
     try:
-        result = subprocess.run(['mojo', '--version'], capture_output=True, text=True)
+        result = subprocess.run(["mojo", "--version"], capture_output=True, text=True)
         return result.returncode == 0
     except FileNotFoundError:
         return False
@@ -217,15 +229,15 @@ def process_molecule(smiles: str, num_conformers: int = 10) -> Optional[dict]:
             bond_energy = compute_mmff_bond_energy(mol, conf_id)[0]
             energies.append(bond_energy)
         except Exception as e:
-            energies.append(float('inf'))
+            energies.append(float("inf"))
 
     return {
-        'smiles': smiles,
-        'num_atoms': mol.GetNumAtoms(),
-        'num_bonds': mol.GetNumBonds(),
-        'num_conformers': len(conf_ids),
-        'bond_energies': energies,
-        'min_energy': min(energies) if energies else None
+        "smiles": smiles,
+        "num_atoms": mol.GetNumAtoms(),
+        "num_bonds": mol.GetNumBonds(),
+        "num_conformers": len(conf_ids),
+        "bond_energies": energies,
+        "min_energy": min(energies) if energies else None,
     }
 
 
@@ -257,5 +269,7 @@ if __name__ == "__main__":
     comparison = compare_with_rdkit(mol)
     print(f"\nComparison with RDKit:")
     print(f"  RDKit total MMFF energy: {comparison['rdkit_total_energy']:.4f} kcal/mol")
-    print(f"  SmallField bond energy:  {comparison['smallfield_bond_energy']:.4f} kcal/mol")
+    print(
+        f"  SmallField bond energy:  {comparison['smallfield_bond_energy']:.4f} kcal/mol"
+    )
     print(f"  Note: {comparison['note']}")

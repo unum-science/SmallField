@@ -11,12 +11,16 @@ Usage:
 """
 
 import argparse
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+
+# Get CPU core count for theoretical multi-core throughput
+CPU_CORES = os.cpu_count() or 1
 
 try:
     from rdkit import Chem
@@ -121,6 +125,297 @@ class MoleculeData:
             pair_j=pair_j,
             epsilon=epsilon,
             r_star=r_star,
+        )
+
+
+@dataclass
+class MMFF94MolData:
+    """Full MMFF94 force field parameters for a molecule."""
+
+    mol: Chem.Mol
+    n_atoms: int
+    coords_x: np.ndarray
+    coords_y: np.ndarray
+    coords_z: np.ndarray
+    # VdW pairs
+    vdw_pair_i: np.ndarray
+    vdw_pair_j: np.ndarray
+    vdw_epsilon: np.ndarray
+    vdw_r_star: np.ndarray
+    # Electrostatic pairs
+    elec_pair_i: np.ndarray
+    elec_pair_j: np.ndarray
+    elec_charge_i: np.ndarray
+    elec_charge_j: np.ndarray
+    elec_is_1_4: np.ndarray
+    # Bonds
+    bond_atom_i: np.ndarray
+    bond_atom_j: np.ndarray
+    bond_kb: np.ndarray
+    bond_r0: np.ndarray
+    # Angles
+    angle_atom_i: np.ndarray
+    angle_atom_j: np.ndarray
+    angle_atom_k: np.ndarray
+    angle_ka: np.ndarray
+    angle_theta0: np.ndarray
+    # Torsions
+    torsion_atom_i: np.ndarray
+    torsion_atom_j: np.ndarray
+    torsion_atom_k: np.ndarray
+    torsion_atom_l: np.ndarray
+    torsion_v1: np.ndarray
+    torsion_v2: np.ndarray
+    torsion_v3: np.ndarray
+    # Stretch-bend
+    stbn_atom_i: np.ndarray
+    stbn_atom_j: np.ndarray
+    stbn_atom_k: np.ndarray
+    stbn_kba_ijk: np.ndarray
+    stbn_kba_kji: np.ndarray
+    stbn_r0_ij: np.ndarray
+    stbn_r0_kj: np.ndarray
+    stbn_theta0: np.ndarray
+    # Out-of-plane
+    oop_atom_i: np.ndarray
+    oop_atom_j: np.ndarray
+    oop_atom_k: np.ndarray
+    oop_atom_l: np.ndarray
+    oop_koop: np.ndarray
+
+    @classmethod
+    def from_mol(cls, mol: Chem.Mol) -> "MMFF94MolData":
+        """Extract all MMFF94 parameters from RDKit Mol object."""
+        n_atoms = mol.GetNumAtoms()
+        conf = mol.GetConformer(-1)
+
+        coords_x = np.array(
+            [conf.GetAtomPosition(i).x for i in range(n_atoms)], dtype=np.float64
+        )
+        coords_y = np.array(
+            [conf.GetAtomPosition(i).y for i in range(n_atoms)], dtype=np.float64
+        )
+        coords_z = np.array(
+            [conf.GetAtomPosition(i).z for i in range(n_atoms)], dtype=np.float64
+        )
+
+        mmff_props = AllChem.MMFFGetMoleculeProperties(mol)
+        if mmff_props is None:
+            raise ValueError("Could not get MMFF properties")
+
+        # Build exclusion sets:
+        # - 1-2 pairs (bonded): excluded from VdW/elec
+        # - 1-3 pairs (share an angle): excluded from VdW/elec
+        # - 1-4 pairs (share a torsion): included with scaling
+        excluded_pairs = set()  # 1-2 and 1-3 pairs
+        is_1_4_pair = set()  # 1-4 pairs
+
+        # 1-2 pairs (directly bonded)
+        for bond in mol.GetBonds():
+            i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            excluded_pairs.add((min(i, j), max(i, j)))
+
+        # 1-3 pairs (share an angle - neighbors of neighbors)
+        for atom in mol.GetAtoms():
+            j = atom.GetIdx()
+            neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
+            for idx_i in range(len(neighbors)):
+                for idx_k in range(idx_i + 1, len(neighbors)):
+                    i, k = neighbors[idx_i], neighbors[idx_k]
+                    excluded_pairs.add((min(i, k), max(i, k)))
+
+        # 1-4 pairs (share a torsion - atoms at ends of torsions)
+        for bond in mol.GetBonds():
+            j, k = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            j_neighbors = [
+                n.GetIdx()
+                for n in mol.GetAtomWithIdx(j).GetNeighbors()
+                if n.GetIdx() != k
+            ]
+            k_neighbors = [
+                n.GetIdx()
+                for n in mol.GetAtomWithIdx(k).GetNeighbors()
+                if n.GetIdx() != j
+            ]
+            for i in j_neighbors:
+                for l in k_neighbors:
+                    if i != l:  # Avoid same atom
+                        pair = (min(i, l), max(i, l))
+                        if pair not in excluded_pairs:
+                            is_1_4_pair.add(pair)
+
+        # VdW pairs (exclude 1-2 and 1-3 pairs)
+        vdw_i, vdw_j, vdw_eps, vdw_rs = [], [], [], []
+        for i in range(n_atoms):
+            for j in range(i + 1, n_atoms):
+                pair = (i, j)
+                if pair in excluded_pairs:
+                    continue
+                params = mmff_props.GetMMFFVdWParams(i, j)
+                if params:
+                    vdw_i.append(i)
+                    vdw_j.append(j)
+                    vdw_eps.append(params[1])
+                    vdw_rs.append(params[0])
+
+        # Electrostatic pairs (exclude 1-2 and 1-3 pairs, mark 1-4 for scaling)
+        elec_i, elec_j, elec_qi, elec_qj, elec_14 = [], [], [], [], []
+        for i in range(n_atoms):
+            qi = mmff_props.GetMMFFPartialCharge(i)
+            for j in range(i + 1, n_atoms):
+                pair = (i, j)
+                if pair in excluded_pairs:
+                    continue
+                qj = mmff_props.GetMMFFPartialCharge(j)
+                elec_i.append(i)
+                elec_j.append(j)
+                elec_qi.append(qi)
+                elec_qj.append(qj)
+                elec_14.append(1 if pair in is_1_4_pair else 0)
+
+        # Bonds
+        bond_i, bond_j, bond_kb_list, bond_r0_list = [], [], [], []
+        bond_params_cache = {}
+        for bond in mol.GetBonds():
+            i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            params = mmff_props.GetMMFFBondStretchParams(mol, i, j)
+            if params:
+                bond_i.append(i)
+                bond_j.append(j)
+                bond_kb_list.append(params[1])
+                bond_r0_list.append(params[2])
+                bond_params_cache[(i, j)] = params[2]
+                bond_params_cache[(j, i)] = params[2]
+
+        # Angles
+        ang_i, ang_j, ang_k, ang_ka_list, ang_theta0_list = [], [], [], [], []
+        angle_params_cache = {}
+        for atom in mol.GetAtoms():
+            j = atom.GetIdx()
+            neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
+            for idx_i in range(len(neighbors)):
+                for idx_k in range(idx_i + 1, len(neighbors)):
+                    i, k = neighbors[idx_i], neighbors[idx_k]
+                    params = mmff_props.GetMMFFAngleBendParams(mol, i, j, k)
+                    if params:
+                        ang_i.append(i)
+                        ang_j.append(j)
+                        ang_k.append(k)
+                        ang_ka_list.append(params[1])
+                        ang_theta0_list.append(params[2])
+                        angle_params_cache[(i, j, k)] = params[2]
+                        angle_params_cache[(k, j, i)] = params[2]
+
+        # Torsions
+        tor_i, tor_j, tor_k, tor_l = [], [], [], []
+        tor_v1, tor_v2, tor_v3 = [], [], []
+        for bond in mol.GetBonds():
+            j, k = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+            j_neighbors = [
+                n.GetIdx()
+                for n in mol.GetAtomWithIdx(j).GetNeighbors()
+                if n.GetIdx() != k
+            ]
+            k_neighbors = [
+                n.GetIdx()
+                for n in mol.GetAtomWithIdx(k).GetNeighbors()
+                if n.GetIdx() != j
+            ]
+            for i in j_neighbors:
+                for l in k_neighbors:
+                    params = mmff_props.GetMMFFTorsionParams(mol, i, j, k, l)
+                    if params:
+                        tor_i.append(i)
+                        tor_j.append(j)
+                        tor_k.append(k)
+                        tor_l.append(l)
+                        tor_v1.append(params[1])
+                        tor_v2.append(params[2])
+                        tor_v3.append(params[3])
+
+        # Stretch-bend
+        stbn_i, stbn_j, stbn_k = [], [], []
+        stbn_kij, stbn_kji, stbn_rij, stbn_rkj, stbn_t0 = [], [], [], [], []
+        for atom in mol.GetAtoms():
+            j = atom.GetIdx()
+            neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
+            for idx_i in range(len(neighbors)):
+                for idx_k in range(idx_i + 1, len(neighbors)):
+                    i, k = neighbors[idx_i], neighbors[idx_k]
+                    params = mmff_props.GetMMFFStretchBendParams(mol, i, j, k)
+                    if params:
+                        r0_ij = bond_params_cache.get((i, j), 1.5)
+                        r0_kj = bond_params_cache.get((k, j), 1.5)
+                        theta0 = angle_params_cache.get((i, j, k), 109.5)
+                        stbn_i.append(i)
+                        stbn_j.append(j)
+                        stbn_k.append(k)
+                        stbn_kij.append(params[1])
+                        stbn_kji.append(params[2])
+                        stbn_rij.append(r0_ij)
+                        stbn_rkj.append(r0_kj)
+                        stbn_t0.append(theta0)
+
+        # Out-of-plane bending (sp2 centers)
+        oop_i, oop_j, oop_k, oop_l, oop_ko = [], [], [], [], []
+        for atom in mol.GetAtoms():
+            if atom.GetHybridization() == Chem.HybridizationType.SP2:
+                j = atom.GetIdx()
+                neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
+                if len(neighbors) == 3:
+                    i, k, l = neighbors
+                    params = mmff_props.GetMMFFOopBendParams(mol, i, j, k, l)
+                    if params:
+                        oop_i.append(i)
+                        oop_j.append(j)
+                        oop_k.append(k)
+                        oop_l.append(l)
+                        oop_ko.append(params)
+
+        return cls(
+            mol=mol,
+            n_atoms=n_atoms,
+            coords_x=coords_x,
+            coords_y=coords_y,
+            coords_z=coords_z,
+            vdw_pair_i=np.array(vdw_i, dtype=np.int32),
+            vdw_pair_j=np.array(vdw_j, dtype=np.int32),
+            vdw_epsilon=np.array(vdw_eps, dtype=np.float64),
+            vdw_r_star=np.array(vdw_rs, dtype=np.float64),
+            elec_pair_i=np.array(elec_i, dtype=np.int32),
+            elec_pair_j=np.array(elec_j, dtype=np.int32),
+            elec_charge_i=np.array(elec_qi, dtype=np.float64),
+            elec_charge_j=np.array(elec_qj, dtype=np.float64),
+            elec_is_1_4=np.array(elec_14, dtype=np.int32),
+            bond_atom_i=np.array(bond_i, dtype=np.int32),
+            bond_atom_j=np.array(bond_j, dtype=np.int32),
+            bond_kb=np.array(bond_kb_list, dtype=np.float64),
+            bond_r0=np.array(bond_r0_list, dtype=np.float64),
+            angle_atom_i=np.array(ang_i, dtype=np.int32),
+            angle_atom_j=np.array(ang_j, dtype=np.int32),
+            angle_atom_k=np.array(ang_k, dtype=np.int32),
+            angle_ka=np.array(ang_ka_list, dtype=np.float64),
+            angle_theta0=np.array(ang_theta0_list, dtype=np.float64),
+            torsion_atom_i=np.array(tor_i, dtype=np.int32),
+            torsion_atom_j=np.array(tor_j, dtype=np.int32),
+            torsion_atom_k=np.array(tor_k, dtype=np.int32),
+            torsion_atom_l=np.array(tor_l, dtype=np.int32),
+            torsion_v1=np.array(tor_v1, dtype=np.float64),
+            torsion_v2=np.array(tor_v2, dtype=np.float64),
+            torsion_v3=np.array(tor_v3, dtype=np.float64),
+            stbn_atom_i=np.array(stbn_i, dtype=np.int32),
+            stbn_atom_j=np.array(stbn_j, dtype=np.int32),
+            stbn_atom_k=np.array(stbn_k, dtype=np.int32),
+            stbn_kba_ijk=np.array(stbn_kij, dtype=np.float64),
+            stbn_kba_kji=np.array(stbn_kji, dtype=np.float64),
+            stbn_r0_ij=np.array(stbn_rij, dtype=np.float64),
+            stbn_r0_kj=np.array(stbn_rkj, dtype=np.float64),
+            stbn_theta0=np.array(stbn_t0, dtype=np.float64),
+            oop_atom_i=np.array(oop_i, dtype=np.int32),
+            oop_atom_j=np.array(oop_j, dtype=np.int32),
+            oop_atom_k=np.array(oop_k, dtype=np.int32),
+            oop_atom_l=np.array(oop_l, dtype=np.int32),
+            oop_koop=np.array(oop_ko, dtype=np.float64),
         )
 
 
@@ -260,7 +555,7 @@ def optimize_rdkit(
     coords_z_list = []
 
     # Warmup
-    for m in mol_data_list[:min(10, n_molecules)]:
+    for m in mol_data_list[: min(10, n_molecules)]:
         mol_copy = Chem.Mol(m.mol)
         ff = AllChem.MMFFGetMoleculeForceField(
             mol_copy, AllChem.MMFFGetMoleculeProperties(mol_copy)
@@ -307,14 +602,12 @@ def optimize_rdkit(
 
 
 def optimize_serial_f64(
-    mol_data_list: List[MoleculeData], max_iterations: int, grad_threshold: float
+    mol_data_list: List[MMFF94MolData], max_iterations: int, grad_threshold: float
 ) -> Optional[BenchmarkResult]:
-    """Optimize molecules using SmallField serial F64."""
+    """Optimize molecules using SmallField serial F64 with full MMFF94."""
     n_molecules = len(mol_data_list)
-
-    # Get max sizes for context
     max_atoms = max(m.n_atoms for m in mol_data_list)
-    max_pairs = max(len(m.pair_i) for m in mol_data_list)
+    max_pairs = max(len(m.vdw_pair_i) for m in mol_data_list)
 
     ctx = smallfield.Context(max_atoms, max_pairs, 1)
 
@@ -324,12 +617,53 @@ def optimize_serial_f64(
     coords_z_list = []
 
     # Warmup
-    for m in mol_data_list[:min(5, n_molecules)]:
+    for m in mol_data_list[: min(5, n_molecules)]:
         cx, cy, cz = m.coords_x.copy(), m.coords_y.copy(), m.coords_z.copy()
         try:
-            ctx.optimize_serial(
-                cx, cy, cz, m.pair_i, m.pair_j, m.epsilon, m.r_star,
-                max_iterations, grad_threshold
+            ctx.optimize_serial_f64(
+                cx,
+                cy,
+                cz,
+                m.vdw_pair_i,
+                m.vdw_pair_j,
+                m.vdw_epsilon,
+                m.vdw_r_star,
+                m.elec_pair_i,
+                m.elec_pair_j,
+                m.elec_charge_i,
+                m.elec_charge_j,
+                m.elec_is_1_4,
+                m.bond_atom_i,
+                m.bond_atom_j,
+                m.bond_kb,
+                m.bond_r0,
+                m.angle_atom_i,
+                m.angle_atom_j,
+                m.angle_atom_k,
+                m.angle_ka,
+                m.angle_theta0,
+                m.torsion_atom_i,
+                m.torsion_atom_j,
+                m.torsion_atom_k,
+                m.torsion_atom_l,
+                m.torsion_v1,
+                m.torsion_v2,
+                m.torsion_v3,
+                m.stbn_atom_i,
+                m.stbn_atom_j,
+                m.stbn_atom_k,
+                m.stbn_kba_ijk,
+                m.stbn_kba_kji,
+                m.stbn_r0_ij,
+                m.stbn_r0_kj,
+                m.stbn_theta0,
+                m.oop_atom_i,
+                m.oop_atom_j,
+                m.oop_atom_k,
+                m.oop_atom_l,
+                m.oop_koop,
+                max_iterations,
+                grad_threshold,
             )
         except Exception:
             pass
@@ -337,16 +671,54 @@ def optimize_serial_f64(
     start = time.perf_counter()
 
     for i, m in enumerate(mol_data_list):
-        cx = m.coords_x.copy()
-        cy = m.coords_y.copy()
-        cz = m.coords_z.copy()
-
+        cx, cy, cz = m.coords_x.copy(), m.coords_y.copy(), m.coords_z.copy()
         try:
-            result = ctx.optimize_serial(
-                cx, cy, cz, m.pair_i, m.pair_j, m.epsilon, m.r_star,
-                max_iterations, grad_threshold
+            result = ctx.optimize_serial_f64(
+                cx,
+                cy,
+                cz,
+                m.vdw_pair_i,
+                m.vdw_pair_j,
+                m.vdw_epsilon,
+                m.vdw_r_star,
+                m.elec_pair_i,
+                m.elec_pair_j,
+                m.elec_charge_i,
+                m.elec_charge_j,
+                m.elec_is_1_4,
+                m.bond_atom_i,
+                m.bond_atom_j,
+                m.bond_kb,
+                m.bond_r0,
+                m.angle_atom_i,
+                m.angle_atom_j,
+                m.angle_atom_k,
+                m.angle_ka,
+                m.angle_theta0,
+                m.torsion_atom_i,
+                m.torsion_atom_j,
+                m.torsion_atom_k,
+                m.torsion_atom_l,
+                m.torsion_v1,
+                m.torsion_v2,
+                m.torsion_v3,
+                m.stbn_atom_i,
+                m.stbn_atom_j,
+                m.stbn_atom_k,
+                m.stbn_kba_ijk,
+                m.stbn_kba_kji,
+                m.stbn_r0_ij,
+                m.stbn_r0_kj,
+                m.stbn_theta0,
+                m.oop_atom_i,
+                m.oop_atom_j,
+                m.oop_atom_k,
+                m.oop_atom_l,
+                m.oop_koop,
+                max_iterations,
+                grad_threshold,
             )
-            energies[i] = result[0]  # final_energy
+            energies[i] = result[0]
             coords_x_list.append(cx)
             coords_y_list.append(cy)
             coords_z_list.append(cz)
@@ -363,6 +735,149 @@ def optimize_serial_f64(
 
     return BenchmarkResult(
         backend="Serial F64",
+        time_ms=time_ms,
+        mol_per_sec=mol_per_sec,
+        energies=energies,
+        coords_x=coords_x_list,
+        coords_y=coords_y_list,
+        coords_z=coords_z_list,
+    )
+
+
+def optimize_serial_f32(
+    mol_data_list: List[MMFF94MolData], max_iterations: int, grad_threshold: float
+) -> Optional[BenchmarkResult]:
+    """Optimize molecules using SmallField serial F32 with full MMFF94."""
+    n_molecules = len(mol_data_list)
+    max_atoms = max(m.n_atoms for m in mol_data_list)
+    max_pairs = max(len(m.vdw_pair_i) for m in mol_data_list)
+
+    ctx = smallfield.Context(max_atoms, max_pairs, 1)
+
+    energies = np.zeros(n_molecules, dtype=np.float64)
+    coords_x_list = []
+    coords_y_list = []
+    coords_z_list = []
+
+    # Warmup
+    for m in mol_data_list[: min(5, n_molecules)]:
+        cx, cy, cz = m.coords_x.copy(), m.coords_y.copy(), m.coords_z.copy()
+        try:
+            ctx.optimize_serial_f32(
+                cx,
+                cy,
+                cz,
+                m.vdw_pair_i,
+                m.vdw_pair_j,
+                m.vdw_epsilon,
+                m.vdw_r_star,
+                m.elec_pair_i,
+                m.elec_pair_j,
+                m.elec_charge_i,
+                m.elec_charge_j,
+                m.elec_is_1_4,
+                m.bond_atom_i,
+                m.bond_atom_j,
+                m.bond_kb,
+                m.bond_r0,
+                m.angle_atom_i,
+                m.angle_atom_j,
+                m.angle_atom_k,
+                m.angle_ka,
+                m.angle_theta0,
+                m.torsion_atom_i,
+                m.torsion_atom_j,
+                m.torsion_atom_k,
+                m.torsion_atom_l,
+                m.torsion_v1,
+                m.torsion_v2,
+                m.torsion_v3,
+                m.stbn_atom_i,
+                m.stbn_atom_j,
+                m.stbn_atom_k,
+                m.stbn_kba_ijk,
+                m.stbn_kba_kji,
+                m.stbn_r0_ij,
+                m.stbn_r0_kj,
+                m.stbn_theta0,
+                m.oop_atom_i,
+                m.oop_atom_j,
+                m.oop_atom_k,
+                m.oop_atom_l,
+                m.oop_koop,
+                max_iterations,
+                grad_threshold,
+            )
+        except Exception:
+            pass
+
+    start = time.perf_counter()
+
+    for i, m in enumerate(mol_data_list):
+        cx, cy, cz = m.coords_x.copy(), m.coords_y.copy(), m.coords_z.copy()
+        try:
+            result = ctx.optimize_serial_f32(
+                cx,
+                cy,
+                cz,
+                m.vdw_pair_i,
+                m.vdw_pair_j,
+                m.vdw_epsilon,
+                m.vdw_r_star,
+                m.elec_pair_i,
+                m.elec_pair_j,
+                m.elec_charge_i,
+                m.elec_charge_j,
+                m.elec_is_1_4,
+                m.bond_atom_i,
+                m.bond_atom_j,
+                m.bond_kb,
+                m.bond_r0,
+                m.angle_atom_i,
+                m.angle_atom_j,
+                m.angle_atom_k,
+                m.angle_ka,
+                m.angle_theta0,
+                m.torsion_atom_i,
+                m.torsion_atom_j,
+                m.torsion_atom_k,
+                m.torsion_atom_l,
+                m.torsion_v1,
+                m.torsion_v2,
+                m.torsion_v3,
+                m.stbn_atom_i,
+                m.stbn_atom_j,
+                m.stbn_atom_k,
+                m.stbn_kba_ijk,
+                m.stbn_kba_kji,
+                m.stbn_r0_ij,
+                m.stbn_r0_kj,
+                m.stbn_theta0,
+                m.oop_atom_i,
+                m.oop_atom_j,
+                m.oop_atom_k,
+                m.oop_atom_l,
+                m.oop_koop,
+                max_iterations,
+                grad_threshold,
+            )
+            energies[i] = result[0]
+            coords_x_list.append(cx)
+            coords_y_list.append(cy)
+            coords_z_list.append(cz)
+        except Exception as e:
+            print(f"Serial F32 failed for molecule {i}: {e}")
+            energies[i] = float("nan")
+            coords_x_list.append(m.coords_x.copy())
+            coords_y_list.append(m.coords_y.copy())
+            coords_z_list.append(m.coords_z.copy())
+
+    end = time.perf_counter()
+    time_ms = (end - start) * 1000
+    mol_per_sec = n_molecules / (time_ms / 1000)
+
+    return BenchmarkResult(
+        backend="Serial F32",
         time_ms=time_ms,
         mol_per_sec=mol_per_sec,
         energies=energies,
@@ -391,12 +906,19 @@ def optimize_skylake(
     coords_z_list = []
 
     # Warmup
-    for m in mol_data_list[:min(5, n_molecules)]:
+    for m in mol_data_list[: min(5, n_molecules)]:
         cx, cy, cz = m.coords_x.copy(), m.coords_y.copy(), m.coords_z.copy()
         try:
             ctx.optimize_skylake(
-                cx, cy, cz, m.pair_i, m.pair_j, m.epsilon, m.r_star,
-                max_iterations, grad_threshold
+                cx,
+                cy,
+                cz,
+                m.pair_i,
+                m.pair_j,
+                m.epsilon,
+                m.r_star,
+                max_iterations,
+                grad_threshold,
             )
         except Exception:
             pass
@@ -410,8 +932,15 @@ def optimize_skylake(
 
         try:
             result = ctx.optimize_skylake(
-                cx, cy, cz, m.pair_i, m.pair_j, m.epsilon, m.r_star,
-                max_iterations, grad_threshold
+                cx,
+                cy,
+                cz,
+                m.pair_i,
+                m.pair_j,
+                m.epsilon,
+                m.r_star,
+                max_iterations,
+                grad_threshold,
             )
             energies[i] = result[0]
             coords_x_list.append(cx)
@@ -442,62 +971,152 @@ def optimize_skylake(
 def optimize_cuda_f32(
     mol_data_list: List[MoleculeData], max_iterations: int, grad_threshold: float
 ) -> Optional[BenchmarkResult]:
-    """Optimize molecules using SmallField CUDA F32."""
+    """Optimize molecules using SmallField CUDA F32 (batched)."""
     if not smallfield.has_cuda():
         return None
 
     n_molecules = len(mol_data_list)
-    max_atoms = max(m.n_atoms for m in mol_data_list)
-    max_pairs = max(len(m.pair_i) for m in mol_data_list)
 
-    ctx = smallfield.Context(max_atoms, max_pairs, 1)
+    # Build batched arrays for all molecules
+    total_atoms = sum(m.n_atoms for m in mol_data_list)
+    total_pairs = sum(len(m.pair_i) for m in mol_data_list)
 
+    # Concatenated coordinate arrays
+    all_coords_x = np.zeros(total_atoms, dtype=np.float64)
+    all_coords_y = np.zeros(total_atoms, dtype=np.float64)
+    all_coords_z = np.zeros(total_atoms, dtype=np.float64)
+
+    # Concatenated pair arrays
+    all_pair_i = np.zeros(total_pairs, dtype=np.int32)
+    all_pair_j = np.zeros(total_pairs, dtype=np.int32)
+    all_epsilon = np.zeros(total_pairs, dtype=np.float64)
+    all_r_star = np.zeros(total_pairs, dtype=np.float64)
+
+    # Per-molecule pair ranges
+    mol_pair_start = np.zeros(n_molecules, dtype=np.int32)
+    mol_pair_end = np.zeros(n_molecules, dtype=np.int32)
+
+    # Track atom offsets for index adjustment
+    mol_atom_start = np.zeros(n_molecules, dtype=np.int32)
+
+    atom_offset = 0
+    pair_offset = 0
+
+    for i, m in enumerate(mol_data_list):
+        n_atoms = m.n_atoms
+        n_pairs = len(m.pair_i)
+
+        mol_atom_start[i] = atom_offset
+        mol_pair_start[i] = pair_offset
+        mol_pair_end[i] = pair_offset + m.n_pairs  # Use actual pairs, not padded
+
+        # Copy coordinates
+        all_coords_x[atom_offset : atom_offset + n_atoms] = m.coords_x[:n_atoms]
+        all_coords_y[atom_offset : atom_offset + n_atoms] = m.coords_y[:n_atoms]
+        all_coords_z[atom_offset : atom_offset + n_atoms] = m.coords_z[:n_atoms]
+
+        # Copy pairs with adjusted indices (add atom offset)
+        all_pair_i[pair_offset : pair_offset + n_pairs] = (
+            m.pair_i[:n_pairs] + atom_offset
+        )
+        all_pair_j[pair_offset : pair_offset + n_pairs] = (
+            m.pair_j[:n_pairs] + atom_offset
+        )
+        all_epsilon[pair_offset : pair_offset + n_pairs] = m.epsilon[:n_pairs]
+        all_r_star[pair_offset : pair_offset + n_pairs] = m.r_star[:n_pairs]
+
+        atom_offset += n_atoms
+        pair_offset += n_pairs
+
+    ctx = smallfield.Context(total_atoms, total_pairs, n_molecules)
+
+    # Warmup with small batch
+    try:
+        warmup_coords_x = all_coords_x.copy()
+        warmup_coords_y = all_coords_y.copy()
+        warmup_coords_z = all_coords_z.copy()
+        ctx.optimize_cuda_f32(
+            warmup_coords_x,
+            warmup_coords_y,
+            warmup_coords_z,
+            all_pair_i,
+            all_pair_j,
+            all_epsilon,
+            all_r_star,
+            mol_pair_start[: min(5, n_molecules)],
+            mol_pair_end[: min(5, n_molecules)],
+            min(5, n_molecules),
+            max_iterations,
+            grad_threshold,
+        )
+    except Exception:
+        pass
+
+    # Timed batch run
+    batch_coords_x = all_coords_x.copy()
+    batch_coords_y = all_coords_y.copy()
+    batch_coords_z = all_coords_z.copy()
+
+    start = time.perf_counter()
+
+    try:
+        result = ctx.optimize_cuda_f32(
+            batch_coords_x,
+            batch_coords_y,
+            batch_coords_z,
+            all_pair_i,
+            all_pair_j,
+            all_epsilon,
+            all_r_star,
+            mol_pair_start,
+            mol_pair_end,
+            n_molecules,
+            max_iterations,
+            grad_threshold,
+        )
+    except Exception as e:
+        print(f"CUDA F32 batch optimization failed: {e}")
+        return None
+
+    end = time.perf_counter()
+    time_ms = (end - start) * 1000
+    mol_per_sec = n_molecules / (time_ms / 1000)
+
+    # Extract per-molecule results
     energies = np.zeros(n_molecules, dtype=np.float64)
     coords_x_list = []
     coords_y_list = []
     coords_z_list = []
 
-    # Warmup
-    for m in mol_data_list[:min(5, n_molecules)]:
-        cx, cy, cz = m.coords_x.copy(), m.coords_y.copy(), m.coords_z.copy()
-        mol_pair_start = np.array([0], dtype=np.int32)
-        mol_pair_end = np.array([m.n_pairs], dtype=np.int32)
-        try:
-            ctx.optimize_cuda_f32(
-                cx, cy, cz, m.pair_i, m.pair_j, m.epsilon, m.r_star,
-                mol_pair_start, mol_pair_end, 1, max_iterations, grad_threshold
-            )
-        except Exception:
-            pass
-
-    start = time.perf_counter()
-
+    # result[0] is the energy of the first molecule (or batch energy)
+    # For now, extract individual energies by computing VdW for each molecule
     for i, m in enumerate(mol_data_list):
-        cx = m.coords_x.copy()
-        cy = m.coords_y.copy()
-        cz = m.coords_z.copy()
-        mol_pair_start = np.array([0], dtype=np.int32)
-        mol_pair_end = np.array([m.n_pairs], dtype=np.int32)
+        n_atoms = m.n_atoms
+        a_start = mol_atom_start[i]
 
-        try:
-            result = ctx.optimize_cuda_f32(
-                cx, cy, cz, m.pair_i, m.pair_j, m.epsilon, m.r_star,
-                mol_pair_start, mol_pair_end, 1, max_iterations, grad_threshold
+        coords_x_list.append(batch_coords_x[a_start : a_start + n_atoms].copy())
+        coords_y_list.append(batch_coords_y[a_start : a_start + n_atoms].copy())
+        coords_z_list.append(batch_coords_z[a_start : a_start + n_atoms].copy())
+
+        # Compute final VdW energy for this molecule
+        p_start = mol_pair_start[i]
+        p_end = mol_pair_end[i]
+        energy = 0.0
+        for p in range(p_start, p_end):
+            ii = all_pair_i[p] - a_start
+            jj = all_pair_j[p] - a_start
+            dx = batch_coords_x[a_start + ii] - batch_coords_x[a_start + jj]
+            dy = batch_coords_y[a_start + ii] - batch_coords_y[a_start + jj]
+            dz = batch_coords_z[a_start + ii] - batch_coords_z[a_start + jj]
+            r = np.sqrt(dx * dx + dy * dy + dz * dz)
+            rho = r / all_r_star[p]
+            rho7 = rho**7
+            energy += (
+                all_epsilon[p]
+                * (1.07 / (rho + 0.07)) ** 7
+                * ((1.12 / (rho7 + 0.12)) - 2)
             )
-            energies[i] = result[0]
-            coords_x_list.append(cx)
-            coords_y_list.append(cy)
-            coords_z_list.append(cz)
-        except Exception as e:
-            print(f"CUDA F32 failed for molecule {i}: {e}")
-            energies[i] = float("nan")
-            coords_x_list.append(m.coords_x.copy())
-            coords_y_list.append(m.coords_y.copy())
-            coords_z_list.append(m.coords_z.copy())
-
-    end = time.perf_counter()
-    time_ms = (end - start) * 1000
-    mol_per_sec = n_molecules / (time_ms / 1000)
+        energies[i] = energy
 
     return BenchmarkResult(
         backend="CUDA F32",
@@ -513,62 +1132,140 @@ def optimize_cuda_f32(
 def optimize_cuda_f16(
     mol_data_list: List[MoleculeData], max_iterations: int, grad_threshold: float
 ) -> Optional[BenchmarkResult]:
-    """Optimize molecules using SmallField CUDA F16."""
+    """Optimize molecules using SmallField CUDA F16 (batched)."""
     if not smallfield.has_cuda():
         return None
 
     n_molecules = len(mol_data_list)
-    max_atoms = max(m.n_atoms for m in mol_data_list)
-    max_pairs = max(len(m.pair_i) for m in mol_data_list)
 
-    ctx = smallfield.Context(max_atoms, max_pairs, 1)
+    # Build batched arrays for all molecules (same as F32)
+    total_atoms = sum(m.n_atoms for m in mol_data_list)
+    total_pairs = sum(len(m.pair_i) for m in mol_data_list)
 
+    all_coords_x = np.zeros(total_atoms, dtype=np.float64)
+    all_coords_y = np.zeros(total_atoms, dtype=np.float64)
+    all_coords_z = np.zeros(total_atoms, dtype=np.float64)
+    all_pair_i = np.zeros(total_pairs, dtype=np.int32)
+    all_pair_j = np.zeros(total_pairs, dtype=np.int32)
+    all_epsilon = np.zeros(total_pairs, dtype=np.float64)
+    all_r_star = np.zeros(total_pairs, dtype=np.float64)
+    mol_pair_start = np.zeros(n_molecules, dtype=np.int32)
+    mol_pair_end = np.zeros(n_molecules, dtype=np.int32)
+    mol_atom_start = np.zeros(n_molecules, dtype=np.int32)
+
+    atom_offset = 0
+    pair_offset = 0
+
+    for i, m in enumerate(mol_data_list):
+        n_atoms = m.n_atoms
+        n_pairs = len(m.pair_i)
+
+        mol_atom_start[i] = atom_offset
+        mol_pair_start[i] = pair_offset
+        mol_pair_end[i] = pair_offset + m.n_pairs
+
+        all_coords_x[atom_offset : atom_offset + n_atoms] = m.coords_x[:n_atoms]
+        all_coords_y[atom_offset : atom_offset + n_atoms] = m.coords_y[:n_atoms]
+        all_coords_z[atom_offset : atom_offset + n_atoms] = m.coords_z[:n_atoms]
+
+        all_pair_i[pair_offset : pair_offset + n_pairs] = (
+            m.pair_i[:n_pairs] + atom_offset
+        )
+        all_pair_j[pair_offset : pair_offset + n_pairs] = (
+            m.pair_j[:n_pairs] + atom_offset
+        )
+        all_epsilon[pair_offset : pair_offset + n_pairs] = m.epsilon[:n_pairs]
+        all_r_star[pair_offset : pair_offset + n_pairs] = m.r_star[:n_pairs]
+
+        atom_offset += n_atoms
+        pair_offset += n_pairs
+
+    ctx = smallfield.Context(total_atoms, total_pairs, n_molecules)
+
+    # Warmup
+    try:
+        warmup_coords_x = all_coords_x.copy()
+        warmup_coords_y = all_coords_y.copy()
+        warmup_coords_z = all_coords_z.copy()
+        ctx.optimize_cuda_f16(
+            warmup_coords_x,
+            warmup_coords_y,
+            warmup_coords_z,
+            all_pair_i,
+            all_pair_j,
+            all_epsilon,
+            all_r_star,
+            mol_pair_start[: min(5, n_molecules)],
+            mol_pair_end[: min(5, n_molecules)],
+            min(5, n_molecules),
+            max_iterations,
+            grad_threshold,
+        )
+    except Exception:
+        pass
+
+    batch_coords_x = all_coords_x.copy()
+    batch_coords_y = all_coords_y.copy()
+    batch_coords_z = all_coords_z.copy()
+
+    start = time.perf_counter()
+
+    try:
+        result = ctx.optimize_cuda_f16(
+            batch_coords_x,
+            batch_coords_y,
+            batch_coords_z,
+            all_pair_i,
+            all_pair_j,
+            all_epsilon,
+            all_r_star,
+            mol_pair_start,
+            mol_pair_end,
+            n_molecules,
+            max_iterations,
+            grad_threshold,
+        )
+    except Exception as e:
+        print(f"CUDA F16 batch optimization failed: {e}")
+        return None
+
+    end = time.perf_counter()
+    time_ms = (end - start) * 1000
+    mol_per_sec = n_molecules / (time_ms / 1000)
+
+    # Extract per-molecule results
     energies = np.zeros(n_molecules, dtype=np.float64)
     coords_x_list = []
     coords_y_list = []
     coords_z_list = []
 
-    # Warmup
-    for m in mol_data_list[:min(5, n_molecules)]:
-        cx, cy, cz = m.coords_x.copy(), m.coords_y.copy(), m.coords_z.copy()
-        mol_pair_start = np.array([0], dtype=np.int32)
-        mol_pair_end = np.array([m.n_pairs], dtype=np.int32)
-        try:
-            ctx.optimize_cuda_f16(
-                cx, cy, cz, m.pair_i, m.pair_j, m.epsilon, m.r_star,
-                mol_pair_start, mol_pair_end, 1, max_iterations, grad_threshold
-            )
-        except Exception:
-            pass
-
-    start = time.perf_counter()
-
     for i, m in enumerate(mol_data_list):
-        cx = m.coords_x.copy()
-        cy = m.coords_y.copy()
-        cz = m.coords_z.copy()
-        mol_pair_start = np.array([0], dtype=np.int32)
-        mol_pair_end = np.array([m.n_pairs], dtype=np.int32)
+        n_atoms = m.n_atoms
+        a_start = mol_atom_start[i]
 
-        try:
-            result = ctx.optimize_cuda_f16(
-                cx, cy, cz, m.pair_i, m.pair_j, m.epsilon, m.r_star,
-                mol_pair_start, mol_pair_end, 1, max_iterations, grad_threshold
+        coords_x_list.append(batch_coords_x[a_start : a_start + n_atoms].copy())
+        coords_y_list.append(batch_coords_y[a_start : a_start + n_atoms].copy())
+        coords_z_list.append(batch_coords_z[a_start : a_start + n_atoms].copy())
+
+        # Compute final VdW energy
+        p_start = mol_pair_start[i]
+        p_end = mol_pair_end[i]
+        energy = 0.0
+        for p in range(p_start, p_end):
+            ii = all_pair_i[p] - a_start
+            jj = all_pair_j[p] - a_start
+            dx = batch_coords_x[a_start + ii] - batch_coords_x[a_start + jj]
+            dy = batch_coords_y[a_start + ii] - batch_coords_y[a_start + jj]
+            dz = batch_coords_z[a_start + ii] - batch_coords_z[a_start + jj]
+            r = np.sqrt(dx * dx + dy * dy + dz * dz)
+            rho = r / all_r_star[p]
+            rho7 = rho**7
+            energy += (
+                all_epsilon[p]
+                * (1.07 / (rho + 0.07)) ** 7
+                * ((1.12 / (rho7 + 0.12)) - 2)
             )
-            energies[i] = result[0]
-            coords_x_list.append(cx)
-            coords_y_list.append(cy)
-            coords_z_list.append(cz)
-        except Exception as e:
-            print(f"CUDA F16 failed for molecule {i}: {e}")
-            energies[i] = float("nan")
-            coords_x_list.append(m.coords_x.copy())
-            coords_y_list.append(m.coords_y.copy())
-            coords_z_list.append(m.coords_z.copy())
-
-    end = time.perf_counter()
-    time_ms = (end - start) * 1000
-    mol_per_sec = n_molecules / (time_ms / 1000)
+        energies[i] = energy
 
     return BenchmarkResult(
         backend="CUDA F16",
@@ -661,6 +1358,17 @@ def run_benchmark(
         print("No molecules loaded. Exiting.")
         return
 
+    # Create MMFF94 data for serial optimizers (full force field)
+    print("Extracting full MMFF94 parameters for serial optimizers...")
+    mmff94_mol_data_list: List[MMFF94MolData] = []
+    for m in mol_data_list:
+        try:
+            mmff94_data = MMFF94MolData.from_mol(m.mol)
+            mmff94_mol_data_list.append(mmff94_data)
+        except Exception as e:
+            print(f"  Warning: Failed to extract MMFF94 params: {e}")
+    print(f"  Extracted MMFF94 params for {len(mmff94_mol_data_list)} molecules")
+
     print(f"\nOptimization parameters:")
     print(f"  Max iterations:      {max_iterations}")
     print(f"  Gradient threshold:  {grad_threshold}")
@@ -687,10 +1395,12 @@ def run_benchmark(
     results["RDKit (baseline)"] = rdkit_result
     print(f"done ({rdkit_result.time_ms:.1f} ms)")
 
-    # Serial F64
-    print("  Serial F64...", end=" ", flush=True)
+    # Serial F64 (uses full MMFF94)
+    print("  Serial F64 (MMFF94)...", end=" ", flush=True)
     try:
-        serial_result = optimize_serial_f64(mol_data_list, max_iterations, grad_threshold)
+        serial_result = optimize_serial_f64(
+            mmff94_mol_data_list, max_iterations, grad_threshold
+        )
         if serial_result:
             results["Serial F64"] = serial_result
             print(f"done ({serial_result.time_ms:.1f} ms)")
@@ -699,8 +1409,22 @@ def run_benchmark(
     except Exception as e:
         print(f"failed: {e}")
 
-    # Skylake
-    print("  Skylake AVX-512 F32...", end=" ", flush=True)
+    # Serial F32 (uses full MMFF94)
+    print("  Serial F32 (MMFF94)...", end=" ", flush=True)
+    try:
+        serial_f32_result = optimize_serial_f32(
+            mmff94_mol_data_list, max_iterations, grad_threshold
+        )
+        if serial_f32_result:
+            results["Serial F32"] = serial_f32_result
+            print(f"done ({serial_f32_result.time_ms:.1f} ms)")
+        else:
+            print("N/A")
+    except Exception as e:
+        print(f"failed: {e}")
+
+    # Skylake (VdW-only for now, pending kernel update)
+    print("  Skylake AVX-512 F32 (VdW)...", end=" ", flush=True)
     try:
         skylake_result = optimize_skylake(mol_data_list, max_iterations, grad_threshold)
         if skylake_result:
@@ -711,46 +1435,37 @@ def run_benchmark(
     except Exception as e:
         print(f"failed: {e}")
 
-    # CUDA F32
-    print("  CUDA F32...", end=" ", flush=True)
-    try:
-        cuda_f32_result = optimize_cuda_f32(mol_data_list, max_iterations, grad_threshold)
-        if cuda_f32_result:
-            results["CUDA F32"] = cuda_f32_result
-            print(f"done ({cuda_f32_result.time_ms:.1f} ms)")
-        else:
-            print("N/A")
-    except Exception as e:
-        print(f"failed: {e}")
+    # CUDA F32 - disabled for kernel rewrite
+    print("  CUDA F32... disabled (kernel rewrite pending)")
 
-    # CUDA F16 - temporarily disabled due to crash
-    print("  CUDA F16... skipped (needs debugging)")
-    # try:
-    #     cuda_f16_result = optimize_cuda_f16(mol_data_list, max_iterations, grad_threshold)
-    #     if cuda_f16_result:
-    #         results["CUDA F16"] = cuda_f16_result
-    #         print(f"done ({cuda_f16_result.time_ms:.1f} ms)")
-    #     else:
-    #         print("N/A")
-    # except Exception as e:
-    #     print(f"failed: {e}")
+    # CUDA F16 - disabled for kernel rewrite
+    print("  CUDA F16... disabled (kernel rewrite pending)")
 
     print()
 
     # Throughput table
     print("-" * 100)
-    print("THROUGHPUT")
+    print(f"THROUGHPUT  (CPU cores: {CPU_CORES})")
     print("-" * 100)
-    print(f"{'Backend':<30} {'Time (ms)':>15} {'Mol/sec':>15} {'Speedup':>15}")
+    print(f"{'Backend':<35} {'Time (ms)':>15} {'Mol/sec':>15} {'Speedup':>15}")
     print("-" * 100)
 
-    rdkit_time = results["RDKit (baseline)"].time_ms
+    rdkit_result = results["RDKit (baseline)"]
+    rdkit_time = rdkit_result.time_ms
+    rdkit_mol_per_sec = rdkit_result.mol_per_sec
 
     for name, result in results.items():
         speedup = rdkit_time / result.time_ms if result.time_ms > 0 else 0
         print(
-            f"{name:<30} {result.time_ms:>15.2f} {result.mol_per_sec:>15.0f} {speedup:>14.1f}x"
+            f"{name:<35} {result.time_ms:>15.2f} {result.mol_per_sec:>15.0f} {speedup:>14.1f}x"
         )
+
+    # Add theoretical multi-core RDKit throughput
+    theoretical_mol_per_sec = rdkit_mol_per_sec * CPU_CORES
+    theoretical_time = rdkit_time / CPU_CORES
+    print(
+        f"{'RDKit (theoretical ' + str(CPU_CORES) + ' cores)':<35} {theoretical_time:>15.2f} {theoretical_mol_per_sec:>15.0f} {'1.0x (upper bound)':>15}"
+    )
 
     print("-" * 100)
     print()
@@ -776,7 +1491,9 @@ def run_benchmark(
         print("-" * 100)
         print("ACCURACY vs Serial F64")
         print("-" * 100)
-        print(f"{'Backend':<30} {'Energy MAE':>15} {'Energy Max':>15} {'Coord RMSD':>15}")
+        print(
+            f"{'Backend':<30} {'Energy MAE':>15} {'Energy Max':>15} {'Coord RMSD':>15}"
+        )
         print("-" * 100)
 
         serial_metrics = compute_accuracy_metrics(results, "Serial F64")

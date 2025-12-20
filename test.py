@@ -224,7 +224,7 @@ def test_serial_vdw_f64(ethanol_mol):
         epsilon = np.pad(epsilon, (0, padding), mode="constant", constant_values=0)
         r0 = np.pad(r0, (0, padding), mode="constant", constant_values=1.0)
 
-    energy = smallfield.compute_vdw_energy_serial(
+    energy = smallfield.compute_vdw_energy_serial_f64(
         coords_x, coords_y, coords_z, pair_i, pair_j, epsilon, r0
     )
 
@@ -246,7 +246,7 @@ def test_serial_vdw_f32(ethanol_mol):
         epsilon = np.pad(epsilon, (0, padding), mode="constant", constant_values=0)
         r0 = np.pad(r0, (0, padding), mode="constant", constant_values=1.0)
 
-    energy_f32 = smallfield.compute_vdw_energy_serial(
+    energy_f32 = smallfield.compute_vdw_energy_serial_f32(
         coords_x, coords_y, coords_z, pair_i, pair_j, epsilon, r0
     )
 
@@ -266,7 +266,7 @@ def test_serial_vdw_f32(ethanol_mol):
         )
         r0_f64 = np.pad(r0_f64, (0, padding), mode="constant", constant_values=1.0)
 
-    energy_f64 = smallfield.compute_vdw_energy_serial(
+    energy_f64 = smallfield.compute_vdw_energy_serial_f64(
         coords_x_f64,
         coords_y_f64,
         coords_z_f64,
@@ -294,12 +294,12 @@ def test_avx512_vdw(ethanol_mol):
         epsilon = np.pad(epsilon, (0, padding), mode="constant", constant_values=0)
         r0 = np.pad(r0, (0, padding), mode="constant", constant_values=1.0)
 
-    energy_avx512 = smallfield.compute_vdw_energy_avx512(
+    energy_avx512 = smallfield.compute_vdw_energy_skylake_f32(
         coords_x, coords_y, coords_z, pair_i, pair_j, epsilon, r0
     )
 
     # Compare with serial version
-    energy_serial = smallfield.compute_vdw_energy_serial(
+    energy_serial = smallfield.compute_vdw_energy_serial_f64(
         coords_x.astype(np.float64),
         coords_y.astype(np.float64),
         coords_z.astype(np.float64),
@@ -330,101 +330,49 @@ def test_electrostatic_serial(ethanol_mol):
         charge_j = np.pad(charge_j, (0, padding), mode="constant", constant_values=0)
         is_1_4 = np.pad(is_1_4, (0, padding), mode="constant", constant_values=0)
 
-    energy = smallfield.compute_electrostatic_energy_serial(
+    energy = smallfield.compute_electrostatic_energy_serial_f64(
         coords_x, coords_y, coords_z, pair_i, pair_j, charge_i, charge_j, is_1_4
     )
 
     assert isinstance(energy, (float, np.floating))
 
 
-def test_high_level_api(ethanol_mol):
-    """Test high-level convenience API."""
+def test_skylake_electrostatic(ethanol_mol):
+    """Test AVX-512 electrostatic energy computation."""
     coords_x, coords_y, coords_z = extract_coordinates(ethanol_mol, dtype=np.float32)
-    pair_i, pair_j, epsilon, r0 = extract_vdw_pairs(ethanol_mol, dtype=np.float32)
+    pair_i, pair_j, _, _ = extract_vdw_pairs(ethanol_mol, dtype=np.float32)
     _, _, charge_i, charge_j, is_1_4 = extract_electrostatic_pairs(
         ethanol_mol, dtype=np.float32
     )
 
-    # Pad arrays
+    # Pad arrays to multiple of 16 for AVX-512
     n_pairs = len(pair_i)
     padding = (16 - n_pairs % 16) % 16
     if padding > 0:
         pair_i = np.pad(pair_i, (0, padding), mode="edge")
         pair_j = np.pad(pair_j, (0, padding), mode="edge")
-        epsilon = np.pad(epsilon, (0, padding), mode="constant", constant_values=0)
-        r0 = np.pad(r0, (0, padding), mode="constant", constant_values=1.0)
         charge_i = np.pad(charge_i, (0, padding), mode="constant", constant_values=0)
         charge_j = np.pad(charge_j, (0, padding), mode="constant", constant_values=0)
         is_1_4 = np.pad(is_1_4, (0, padding), mode="constant", constant_values=0)
 
-    # Test automatic backend selection
-    vdw_energy = smallfield.compute_vdw_energy(
-        coords_x, coords_y, coords_z, pair_i, pair_j, epsilon, r0, backend="auto"
-    )
-
-    elec_energy = smallfield.compute_electrostatic_energy(
-        coords_x,
-        coords_y,
-        coords_z,
-        pair_i,
-        pair_j,
-        charge_i,
-        charge_j,
-        is_1_4,
-        backend="auto",
-    )
-
-    total, vdw, elec = smallfield.compute_total_energy(
-        coords_x,
-        coords_y,
-        coords_z,
-        pair_i,
-        pair_j,
-        epsilon,
-        r0,
-        charge_i,
-        charge_j,
-        is_1_4,
-        backend="auto",
-    )
-
-    assert total == vdw + elec
-    assert vdw == vdw_energy
-    assert elec == elec_energy
-
-
-@pytest.mark.skipif(not smallfield.has_cuda(), reason="CUDA not available")
-def test_cuda_vdw(ethanol_mol):
-    """Test CUDA VdW energy computation."""
-    coords_x, coords_y, coords_z = extract_coordinates(ethanol_mol, dtype=np.float32)
-    pair_i, pair_j, epsilon, r0 = extract_vdw_pairs(ethanol_mol, dtype=np.float32)
-
-    # Pad arrays
-    n_pairs = len(pair_i)
-    padding = (16 - n_pairs % 16) % 16
-    if padding > 0:
-        pair_i = np.pad(pair_i, (0, padding), mode="edge")
-        pair_j = np.pad(pair_j, (0, padding), mode="edge")
-        epsilon = np.pad(epsilon, (0, padding), mode="constant", constant_values=0)
-        r0 = np.pad(r0, (0, padding), mode="constant", constant_values=1.0)
-
-    energy_cuda = smallfield.compute_vdw_energy_cuda(
-        coords_x, coords_y, coords_z, pair_i, pair_j, epsilon, r0
+    energy_skylake = smallfield.compute_electrostatic_energy_skylake_f32(
+        coords_x, coords_y, coords_z, pair_i, pair_j, charge_i, charge_j, is_1_4
     )
 
     # Compare with serial version
-    energy_serial = smallfield.compute_vdw_energy_serial(
+    energy_serial = smallfield.compute_electrostatic_energy_serial_f64(
         coords_x.astype(np.float64),
         coords_y.astype(np.float64),
         coords_z.astype(np.float64),
         pair_i,
         pair_j,
-        epsilon.astype(np.float64),
-        r0.astype(np.float64),
+        charge_i.astype(np.float64),
+        charge_j.astype(np.float64),
+        is_1_4,
     )
 
-    # CUDA uses FP16/FP32, so tolerance is higher
-    np.testing.assert_allclose(energy_cuda, energy_serial, rtol=1e-2)
+    # AVX-512 uses fast approximations, so tolerance is higher
+    np.testing.assert_allclose(energy_skylake, energy_serial, rtol=1e-3)
 
 
 if __name__ == "__main__":
