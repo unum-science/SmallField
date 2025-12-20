@@ -10,10 +10,40 @@ Supported backends:
 - AVX-512 CPU (Skylake F32, Genoa BF16, Turin FP16)
 - CUDA GPU (f16, f32) - H100 and newer
 
-Usage:
-    uv run python -c "import smallfield; print(smallfield.has_cuda())"
+Usage with Context (recommended for repeated calculations):
+    >>> import smallfield
+    >>> import numpy as np
+    >>>
+    >>> # Create a context with pre-allocated buffers
+    >>> ctx = smallfield.Context(
+    ...     total_atoms=1000,
+    ...     total_pairs=5000,
+    ...     max_molecules=10
+    ... )
+    >>>
+    >>> # Prepare data (f64 arrays - conversion happens internally)
+    >>> coords_x = np.array([0.0, 1.0, 2.0], dtype=np.float64)
+    >>> coords_y = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    >>> coords_z = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    >>> pair_i = np.array([0, 1], dtype=np.int32)
+    >>> pair_j = np.array([1, 2], dtype=np.int32)
+    >>> epsilon = np.array([0.1, 0.1], dtype=np.float64)
+    >>> r0 = np.array([1.5, 1.5], dtype=np.float64)
+    >>>
+    >>> # Compute energy using different backends
+    >>> energy_f32 = ctx.compute_vdw_energy_serial_f32(
+    ...     coords_x, coords_y, coords_z,
+    ...     pair_i, pair_j, epsilon, r0
+    ... )
+    >>>
+    >>> # For CUDA:
+    >>> # energy_cuda = ctx.compute_vdw_energy_cuda_f32(
+    >>> #     coords_x, coords_y, coords_z,
+    >>> #     nb_i, nb_j, epsilon, r_star,
+    >>> #     mol_nb_start, mol_nb_end, n_molecules
+    >>> # )
 
-Example:
+Usage without Context (one-off calculations):
     >>> import smallfield
     >>> import numpy as np
     >>>
@@ -110,6 +140,13 @@ try:
     except AttributeError:
         pass
 
+    # SmallFieldContext class
+    Context: Optional[type] = None
+    try:
+        Context = _smallfield.Context
+    except AttributeError:
+        pass
+
 except ImportError as e:
     raise ImportError(
         "Failed to import _smallfield extension module. "
@@ -162,4 +199,6 @@ __all__ = [
     "compute_vdw_energy_cuda_f32",
     "compute_electrostatic_energy_cuda_f16",
     "compute_electrostatic_energy_cuda_f32",
+    # Context class
+    "Context",
 ]
