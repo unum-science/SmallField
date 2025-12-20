@@ -5,7 +5,8 @@
 # - simd: Generic SIMD f32 (ARM NEON, AVX2)
 # - genoa: AVX-512 bf16 storage (AMD Genoa, Intel Cooper Lake+)
 # - turin: AVX-512 f16 storage (AMD Turin, Intel Sapphire Rapids+)
-# - h100: FP16 precision (H100 GPU algorithm, CPU fallback)
+# - h100: FP16 GPU kernel (H100 with warp reduction)
+# - h100_cpu: FP16 precision CPU fallback
 #
 # Python API (batch-only, zero-copy via numpy buffer protocol):
 #   compute_batch(n_mol, n_atoms, n_pairs, kernel,
@@ -44,6 +45,7 @@ from mmff94_turin import (
 from mmff94_h100 import (
     compute_vdw_energy_h100,
     compute_electrostatic_energy_h100,
+    compute_batch_gpu,
 )
 
 
@@ -210,6 +212,51 @@ fn compute_batch_impl(
         buf_qi.free()
         buf_qj.free()
 
+    elif kern == "simd_f64":
+        # Full f64 precision SIMD kernel (baseline accuracy reference)
+        var buf_x = alloc[Float64](alloc_atoms)
+        var buf_y = alloc[Float64](alloc_atoms)
+        var buf_z = alloc[Float64](alloc_atoms)
+        var buf_eps = alloc[Float64](alloc_pairs)
+        var buf_rstar = alloc[Float64](alloc_pairs)
+        var buf_qi = alloc[Float64](alloc_pairs)
+        var buf_qj = alloc[Float64](alloc_pairs)
+
+        # Direct copy from numpy (no conversion needed - already f64)
+        for i in range(n_atoms):
+            buf_x[i] = coords_ptr[i * 3]
+            buf_y[i] = coords_ptr[i * 3 + 1]
+            buf_z[i] = coords_ptr[i * 3 + 2]
+        for i in range(n_pairs):
+            buf_eps[i] = vdw_params_ptr[i * 2]
+            buf_rstar[i] = vdw_params_ptr[i * 2 + 1]
+            buf_qi[i] = charges_ptr[i * 2]
+            buf_qj[i] = charges_ptr[i * 2 + 1]
+
+        for mol_idx in range(n_mol):
+            var atom_start = Int(offsets_ptr[mol_idx * 2])
+            var nb_start = Int(offsets_ptr[mol_idx * 2 + 1])
+            var nb_end = Int(offsets_ptr[(mol_idx + 1) * 2 + 1])
+            var vdw = compute_vdw_energy_simd[DType.float64, 4](
+                buf_x, buf_y, buf_z, buf_ni, buf_nj,
+                buf_eps, buf_rstar, atom_start, nb_start, nb_end
+            )
+            var elec = compute_electrostatic_energy_simd[DType.float64, 4](
+                buf_x, buf_y, buf_z, buf_ni, buf_nj,
+                buf_qi, buf_qj, buf_14, atom_start, nb_start, nb_end
+            )
+            # Results are already f64
+            vdw_out_ptr[mol_idx] = Float64(vdw)
+            elec_out_ptr[mol_idx] = Float64(elec)
+
+        buf_x.free()
+        buf_y.free()
+        buf_z.free()
+        buf_eps.free()
+        buf_rstar.free()
+        buf_qi.free()
+        buf_qj.free()
+
     elif kern == "genoa":
         var buf_x = alloc[BFloat16](alloc_atoms)
         var buf_y = alloc[BFloat16](alloc_atoms)
@@ -300,8 +347,8 @@ fn compute_batch_impl(
         buf_qi.free()
         buf_qj.free()
 
-    elif kern == "h100":
-        # H100 GPU kernel (CPU fallback for now - uses FP16 precision)
+    elif kern == "h100_cpu":
+        # H100 algorithm CPU fallback (uses FP16 precision)
         var buf_x = alloc[Float16](alloc_atoms)
         var buf_y = alloc[Float16](alloc_atoms)
         var buf_z = alloc[Float16](alloc_atoms)
@@ -345,6 +392,67 @@ fn compute_batch_impl(
         buf_rstar.free()
         buf_qi.free()
         buf_qj.free()
+
+    elif kern == "h100":
+        # H100 GPU kernel - warp-parallel FP16 with reduction
+        var buf_x = alloc[Float16](alloc_atoms)
+        var buf_y = alloc[Float16](alloc_atoms)
+        var buf_z = alloc[Float16](alloc_atoms)
+        var buf_eps = alloc[Float16](alloc_pairs)
+        var buf_rstar = alloc[Float16](alloc_pairs)
+        var buf_qi = alloc[Float16](alloc_pairs)
+        var buf_qj = alloc[Float16](alloc_pairs)
+        var buf_nb_start = alloc[Int32](n_mol)
+        var buf_nb_end = alloc[Int32](n_mol)
+        var buf_vdw_out = alloc[Float32](n_mol)
+        var buf_elec_out = alloc[Float32](n_mol)
+
+        # Convert f64 -> f16 from grouped matrices
+        for i in range(n_atoms):
+            buf_x[i] = Float16(coords_ptr[i * 3])
+            buf_y[i] = Float16(coords_ptr[i * 3 + 1])
+            buf_z[i] = Float16(coords_ptr[i * 3 + 2])
+        for i in range(n_pairs):
+            buf_eps[i] = Float16(vdw_params_ptr[i * 2])
+            buf_rstar[i] = Float16(vdw_params_ptr[i * 2 + 1])
+            buf_qi[i] = Float16(charges_ptr[i * 2])
+            buf_qj[i] = Float16(charges_ptr[i * 2 + 1])
+
+        # Compute nb_start and nb_end for each molecule
+        for mol_idx in range(n_mol):
+            var nb_start = Int(offsets_ptr[mol_idx * 2 + 1])
+            var nb_end = Int(offsets_ptr[(mol_idx + 1) * 2 + 1])
+            buf_nb_start[mol_idx] = Int32(nb_start)
+            buf_nb_end[mol_idx] = Int32(nb_end)
+
+        # Launch GPU kernel batch
+        compute_batch_gpu(
+            n_mol, n_atoms, n_pairs,
+            buf_x, buf_y, buf_z,
+            buf_ni, buf_nj,
+            buf_eps, buf_rstar,
+            buf_qi, buf_qj,
+            buf_14,
+            buf_nb_start, buf_nb_end,
+            buf_vdw_out, buf_elec_out
+        )
+
+        # Copy results to output arrays
+        for mol_idx in range(n_mol):
+            vdw_out_ptr[mol_idx] = Float64(buf_vdw_out[mol_idx])
+            elec_out_ptr[mol_idx] = Float64(buf_elec_out[mol_idx])
+
+        buf_x.free()
+        buf_y.free()
+        buf_z.free()
+        buf_eps.free()
+        buf_rstar.free()
+        buf_qi.free()
+        buf_qj.free()
+        buf_nb_start.free()
+        buf_nb_end.free()
+        buf_vdw_out.free()
+        buf_elec_out.free()
 
     else:
         # Default to skylake
