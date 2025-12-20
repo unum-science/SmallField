@@ -45,13 +45,15 @@ class BuildExt(build_ext):
                         "-fPIC",
                         "-std=c++17",
                         "-fdiagnostics-color=always",
-                    ],
+                    ]
+                    + ext.extra_compile_args,
+                    include_dirs=ext.include_dirs,
                 )
                 objects.extend(obj)
 
         # Link all object files
         self.compiler.link_shared_object(
-            objects + [os.path.join(self.build_temp, "starter_kit.o")],
+            objects + [os.path.join(self.build_temp, "smallfield.o")],
             self.get_ext_fullpath(ext.name),
             libraries=ext.libraries,
             library_dirs=ext.library_dirs,
@@ -61,7 +63,7 @@ class BuildExt(build_ext):
         )
 
     def build_gcc_extension(self, ext):
-        # Check if compiling on macOS
+        # Fallback for compiling on macOS or without CUDA
         objects = []
         for source in ext.sources:
             if source.endswith(".cu"):
@@ -74,6 +76,7 @@ class BuildExt(build_ext):
                         "-std=c++17",
                         "-fdiagnostics-color=always",
                     ]
+                    + ext.extra_compile_args
                     + (["-fopenmp"] if enable_openmp else []),
                     include_dirs=ext.include_dirs,
                 )
@@ -86,6 +89,7 @@ class BuildExt(build_ext):
                         "-std=c++17",
                         "-fdiagnostics-color=always",
                     ]
+                    + ext.extra_compile_args
                     + (["-fopenmp"] if enable_openmp else []),
                     include_dirs=ext.include_dirs,
                 )
@@ -109,7 +113,7 @@ class BuildExt(build_ext):
         os.makedirs(output_dir, exist_ok=True)
         include_dirs = self.compiler.include_dirs + ext.include_dirs
         include_dirs = " ".join(f"-I{dir}" for dir in include_dirs)
-        output_file = os.path.join(output_dir, "starter_kit.o")
+        output_file = os.path.join(output_dir, "smallfield.o")
 
         # Let's try inferring the compute capability from the GPU
         arch_code = "90"
@@ -145,15 +149,13 @@ python_lib_name = os.path.basename(python_lib_dir).replace(".so", "")
 
 ext_modules = [
     Extension(
-        "starter_kit",
-        ["starter_kit.cu"],
+        "_smallfield",
+        ["smallfield.cu"],
         include_dirs=[
             pybind11.get_include(),
             np.get_include(),
             get_python_inc(),
-            "cccl/cub/",
-            "cccl/libcudacxx/include",
-            "cccl/thrust/",
+            "ForkUnion/include",
             "/usr/local/cuda/include/",
             "/usr/include/cuda/",
         ],
@@ -163,11 +165,18 @@ ext_modules = [
             "/usr/lib/wsl/lib",
             python_lib_dir,
         ],
-        #
         libraries=[python_lib_name.replace(".a", "")]
-        + (["cudart", "cuda", "cublas"] if enable_cuda else [])
+        + (["cudart", "cuda"] if enable_cuda else [])
         + (["gomp"] if enable_openmp else []),
-        #
+        extra_compile_args=[
+            "-std=c++17",
+            "-fPIC",
+            "-mavx512f",
+            "-mavx512bw",
+            "-mavx512dq",
+            "-mavx512vl",
+        ]
+        + (["-fopenmp"] if enable_openmp else []),
         extra_link_args=[f"-Wl,-rpath,{python_lib_dir}"]
         + (["-fopenmp"] if enable_openmp else []),
         language="c++",
@@ -175,15 +184,20 @@ ext_modules = [
 ]
 
 setup(
-    name="PyBindToGPUs",
+    name="smallfield",
     version=__version__,
     author="Ash Vardanian",
     author_email="1983160+ashvardanian@users.noreply.github.com",
-    url="https://github.com/ashvardanian/PyBindToGPUs",
-    description="Starter Kit project for CUDA- and OpenMP-accelerated Python projects.",
+    url="https://github.com/unum-science/SmallField",
+    description="Fast MMFF94 force field implementation with CPU (AVX-512) and GPU (CUDA) support.",
     long_description=long_description,
     ext_modules=ext_modules,
-    extras_require={"test": "pytest"},
+    packages=["smallfield"],
+    extras_require={
+        "test": ["pytest", "pytest-benchmark", "rdkit"],
+        "cpu": ["pytest", "pytest-benchmark", "rdkit"],
+        "gpu": ["pytest", "pytest-benchmark", "rdkit", "cupy-cuda12x"],
+    },
     cmdclass={"build_ext": BuildExt},
     zip_safe=False,
     python_requires=">=3.7",
