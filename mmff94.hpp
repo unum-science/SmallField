@@ -323,8 +323,9 @@ inline float compute_electrostatic_energy_skylake(float const* coord_x, float co
 
 /** Convert 16 BF16 values to F32. */
 inline __m512 bf16_to_f32_(std::uint16_t const* bf16_data) {
+    // Load raw bytes as __m256i, then reinterpret as __m256bh for cvtpbh
     __m256i const bf16_vec = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(bf16_data));
-    return _mm512_cvtpbh_ps(bf16_vec);
+    return _mm512_cvtpbh_ps(*reinterpret_cast<__m256bh const*>(&bf16_vec));
 }
 
 /**
@@ -470,15 +471,25 @@ inline float compute_vdw_energy_turin(_Float16 const* coord_x, _Float16 const* c
         __m512h const dist_h = _mm512_mul_ph(dist_sq_h, inv_dist_h);
 
         // Widen to F32 for pow7 computation (split 32 -> 2x16)
-        __m512 const dist_lo = _mm512_cvtph_ps(_mm512_castph512_ph256(dist_h));
-        __m512 const dist_hi = _mm512_cvtph_ps(_mm512_extractf32x8_ps(_mm512_castph_ps(dist_h), 1));
+        // Cast through integer types for compatibility with _mm512_cvtph_ps
+        __m512i const dist_i = _mm512_castph_si512(dist_h);
+        __m256i const dist_lo_i = _mm512_castsi512_si256(dist_i);
+        __m256i const dist_hi_i = _mm512_extracti64x4_epi64(dist_i, 1);
+        __m512 const dist_lo = _mm512_cvtph_ps(dist_lo_i);
+        __m512 const dist_hi = _mm512_cvtph_ps(dist_hi_i);
 
         __m512h const eps_h = _mm512_loadu_ph(eps_f16);
         __m512h const eq_dist_h = _mm512_loadu_ph(eq_dist_f16);
-        __m512 const eps_lo = _mm512_cvtph_ps(_mm512_castph512_ph256(eps_h));
-        __m512 const eps_hi = _mm512_cvtph_ps(_mm512_extractf32x8_ps(_mm512_castph_ps(eps_h), 1));
-        __m512 const eq_dist_lo = _mm512_cvtph_ps(_mm512_castph512_ph256(eq_dist_h));
-        __m512 const eq_dist_hi = _mm512_cvtph_ps(_mm512_extractf32x8_ps(_mm512_castph_ps(eq_dist_h), 1));
+        __m512i const eps_i = _mm512_castph_si512(eps_h);
+        __m512i const eq_dist_i = _mm512_castph_si512(eq_dist_h);
+        __m256i const eps_lo_i = _mm512_castsi512_si256(eps_i);
+        __m256i const eps_hi_i = _mm512_extracti64x4_epi64(eps_i, 1);
+        __m256i const eq_dist_lo_i = _mm512_castsi512_si256(eq_dist_i);
+        __m256i const eq_dist_hi_i = _mm512_extracti64x4_epi64(eq_dist_i, 1);
+        __m512 const eps_lo = _mm512_cvtph_ps(eps_lo_i);
+        __m512 const eps_hi = _mm512_cvtph_ps(eps_hi_i);
+        __m512 const eq_dist_lo = _mm512_cvtph_ps(eq_dist_lo_i);
+        __m512 const eq_dist_hi = _mm512_cvtph_ps(eq_dist_hi_i);
 
         // Compute energy for lower half
         __m512 const eq_dist_7_lo = pow7_(eq_dist_lo);
