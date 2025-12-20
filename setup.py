@@ -128,7 +128,9 @@ class BuildExt(build_ext):
             pass
 
         # Pass AVX-512 flags to host compiler via -Xcompiler
-        host_flags = "-fPIC,-mavx512f,-mavx512bw,-mavx512dq,-mavx512vl"
+        host_flags = (
+            "-fPIC,-mavx512f,-mavx512bw,-mavx512dq,-mavx512vl,-mavx512bf16,-mavx512fp16"
+        )
         if enable_openmp:
             host_flags += ",-fopenmp"
         cmd = (
@@ -179,6 +181,8 @@ ext_modules = [
             "-mavx512bw",
             "-mavx512dq",
             "-mavx512vl",
+            "-mavx512bf16",  # Sapphire Rapids / Genoa BF16
+            "-mavx512fp16",  # Sapphire Rapids / Turin FP16
         ]
         + (["-fopenmp"] if enable_openmp else []),
         extra_link_args=[f"-Wl,-rpath,{python_lib_dir}"]
