@@ -1944,13 +1944,10 @@ inline void compute_vdw_gradient_skylake(float const* coord_x, float const* coor
         __m512 const dE_dr =
             _mm512_mul_ps(eps, _mm512_fmadd_ps(d_repulsive, att_term, _mm512_mul_ps(rep_term, d_attractive)));
 
-        // Force magnitude: F = -dE/dr
-        __m512 const force_mag = _mm512_sub_ps(_mm512_setzero_ps(), dE_dr);
-
-        // Force components: F_vec = force_mag * (r_vec / |r_vec|)
-        __m512 const fx = _mm512_mul_ps(_mm512_mul_ps(force_mag, dx), inv_dist);
-        __m512 const fy = _mm512_mul_ps(_mm512_mul_ps(force_mag, dy), inv_dist);
-        __m512 const fz = _mm512_mul_ps(_mm512_mul_ps(force_mag, dz), inv_dist);
+        // Gradient components: dE/dx = dE/dr * dx/r
+        __m512 const fx = _mm512_mul_ps(_mm512_mul_ps(dE_dr, dx), inv_dist);
+        __m512 const fy = _mm512_mul_ps(_mm512_mul_ps(dE_dr, dy), inv_dist);
+        __m512 const fz = _mm512_mul_ps(_mm512_mul_ps(dE_dr, dz), inv_dist);
 
         // Accumulate forces via scalar loop (scatter is slow)
         alignas(64) float fx_arr[16], fy_arr[16], fz_arr[16];
@@ -2094,22 +2091,17 @@ inline void compute_electrostatic_gradient_skylake(float const* coord_x, float c
         __m512 const effective_dist_sq = _mm512_mul_ps(effective_dist, effective_dist);
         __m512 const grad_magnitude =
             _mm512_mul_ps(_mm512_mul_ps(coulomb_vec, charge_product), _mm512_rcp14_ps(effective_dist_sq));
-        __m512 const grad_magnitude_neg = _mm512_sub_ps(_mm512_setzero_ps(), grad_magnitude);
 
         // Branchless 1-4 scaling
         __m512 const scale = _mm512_fmadd_ps(is_1_4, scale_diff_vec, one_vec);
-        __m512 const scaled_grad = _mm512_mul_ps(grad_magnitude_neg, scale);
+        __m512 const scaled_grad = _mm512_mul_ps(grad_magnitude, scale);
 
-        // Force direction: F_j = -(dE/dr) * (r_vec / |r_vec|)
+        // Gradient components: dE/dx = dE/dr * dx/r
         __m512 const fx = _mm512_mul_ps(_mm512_mul_ps(scaled_grad, dx), inv_dist);
         __m512 const fy = _mm512_mul_ps(_mm512_mul_ps(scaled_grad, dy), inv_dist);
         __m512 const fz = _mm512_mul_ps(_mm512_mul_ps(scaled_grad, dz), inv_dist);
 
-        __m512 const fx_neg = _mm512_sub_ps(_mm512_setzero_ps(), fx);
-        __m512 const fy_neg = _mm512_sub_ps(_mm512_setzero_ps(), fy);
-        __m512 const fz_neg = _mm512_sub_ps(_mm512_setzero_ps(), fz);
-
-        // Accumulate forces (Newton's 3rd law: F_i = -F_j)
+        // Accumulate gradients (Newton's 3rd law: grad_i = -grad_j)
         // Note: Using serial accumulation to avoid race conditions
         alignas(64) std::int32_t atom_i_arr[16];
         alignas(64) std::int32_t atom_j_arr[16];
@@ -2117,21 +2109,14 @@ inline void compute_electrostatic_gradient_skylake(float const* coord_x, float c
 
         _mm512_store_si512(atom_i_arr, idx_i);
         _mm512_store_si512(atom_j_arr, idx_j);
-        _mm512_store_ps(fx_arr, fx_neg);
-        _mm512_store_ps(fy_arr, fy_neg);
-        _mm512_store_ps(fz_arr, fz_neg);
-
-        for (std::size_t k = 0; k < 16; ++k) {
-            grad_x[atom_i_arr[k]] += fx_arr[k];
-            grad_y[atom_i_arr[k]] += fy_arr[k];
-            grad_z[atom_i_arr[k]] += fz_arr[k];
-        }
-
         _mm512_store_ps(fx_arr, fx);
         _mm512_store_ps(fy_arr, fy);
         _mm512_store_ps(fz_arr, fz);
 
         for (std::size_t k = 0; k < 16; ++k) {
+            grad_x[atom_i_arr[k]] -= fx_arr[k];
+            grad_y[atom_i_arr[k]] -= fy_arr[k];
+            grad_z[atom_i_arr[k]] -= fz_arr[k];
             grad_x[atom_j_arr[k]] += fx_arr[k];
             grad_y[atom_j_arr[k]] += fy_arr[k];
             grad_z[atom_j_arr[k]] += fz_arr[k];
@@ -2485,11 +2470,10 @@ inline void compute_vdw_gradient_skylake_fast(float const* coord_x, float const*
         __m512 const dE_dr =
             _mm512_mul_ps(eps, _mm512_fmadd_ps(d_repulsive, att_term, _mm512_mul_ps(rep_term, d_attractive)));
 
-        __m512 const force_mag = _mm512_sub_ps(_mm512_setzero_ps(), dE_dr);
-
-        __m512 const fx = _mm512_mul_ps(_mm512_mul_ps(force_mag, dx), inv_dist);
-        __m512 const fy = _mm512_mul_ps(_mm512_mul_ps(force_mag, dy), inv_dist);
-        __m512 const fz = _mm512_mul_ps(_mm512_mul_ps(force_mag, dz), inv_dist);
+        // Gradient components: dE/dx = dE/dr * dx/r
+        __m512 const fx = _mm512_mul_ps(_mm512_mul_ps(dE_dr, dx), inv_dist);
+        __m512 const fy = _mm512_mul_ps(_mm512_mul_ps(dE_dr, dy), inv_dist);
+        __m512 const fz = _mm512_mul_ps(_mm512_mul_ps(dE_dr, dz), inv_dist);
 
         // Accumulate via scalar loop
         alignas(64) float fx_arr[16], fy_arr[16], fz_arr[16];
