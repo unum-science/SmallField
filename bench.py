@@ -230,9 +230,11 @@ def benchmark_batch_cuda_f32(
     if not smallfield.has_cuda():
         return None
 
+    ctx = smallfield.Context(batch.total_atoms, batch.total_pairs, batch.n_molecules)
+
     # Warmup
     for _ in range(10):
-        smallfield.compute_vdw_energy_cuda_f32(
+        ctx.vdw_cuda_f32(
             batch.coords_x_f64,
             batch.coords_y_f64,
             batch.coords_z_f64,
@@ -247,7 +249,7 @@ def benchmark_batch_cuda_f32(
 
     start = time.perf_counter()
     for _ in range(n_iterations):
-        energy = smallfield.compute_vdw_energy_cuda_f32(
+        energy = ctx.vdw_cuda_f32(
             batch.coords_x_f64,
             batch.coords_y_f64,
             batch.coords_z_f64,
@@ -271,9 +273,11 @@ def benchmark_batch_cuda_f16(
     if not smallfield.has_cuda():
         return None
 
+    ctx = smallfield.Context(batch.total_atoms, batch.total_pairs, batch.n_molecules)
+
     # Warmup
     for _ in range(10):
-        smallfield.compute_vdw_energy_cuda_f16(
+        ctx.vdw_cuda_f16(
             batch.coords_x_f64,
             batch.coords_y_f64,
             batch.coords_z_f64,
@@ -288,7 +292,7 @@ def benchmark_batch_cuda_f16(
 
     start = time.perf_counter()
     for _ in range(n_iterations):
-        energy = smallfield.compute_vdw_energy_cuda_f16(
+        energy = ctx.vdw_cuda_f16(
             batch.coords_x_f64,
             batch.coords_y_f64,
             batch.coords_z_f64,
@@ -303,6 +307,34 @@ def benchmark_batch_cuda_f16(
     end = time.perf_counter()
 
     return energy, (end - start) / n_iterations * 1000
+
+
+def benchmark_rdkit_baseline(
+    mol_data_list: List[MoleculeData], n_iterations: int
+) -> Optional[Tuple[float, float]]:
+    """Benchmark RDKit MMFF94 VdW energy calculation (baseline)."""
+    # Warmup
+    for _ in range(min(10, n_iterations)):
+        total_energy = 0.0
+        for m in mol_data_list:
+            ff = AllChem.MMFFGetMoleculeForceField(
+                m.mol, AllChem.MMFFGetMoleculeProperties(m.mol)
+            )
+            if ff is not None:
+                total_energy += ff.CalcEnergy()
+
+    start = time.perf_counter()
+    for _ in range(n_iterations):
+        total_energy = 0.0
+        for m in mol_data_list:
+            ff = AllChem.MMFFGetMoleculeForceField(
+                m.mol, AllChem.MMFFGetMoleculeProperties(m.mol)
+            )
+            if ff is not None:
+                total_energy += ff.CalcEnergy()
+    end = time.perf_counter()
+
+    return total_energy, (end - start) / n_iterations * 1000
 
 
 def benchmark_batch_skylake(
@@ -316,7 +348,7 @@ def benchmark_batch_skylake(
 
     # Warmup
     for _ in range(10):
-        ctx.compute_vdw_energy_skylake_batch(
+        ctx.vdw_batch_skylake(
             batch.coords_x_f64,
             batch.coords_y_f64,
             batch.coords_z_f64,
@@ -331,7 +363,7 @@ def benchmark_batch_skylake(
 
     start = time.perf_counter()
     for _ in range(n_iterations):
-        energy = ctx.compute_vdw_energy_skylake_batch(
+        energy = ctx.vdw_batch_skylake(
             batch.coords_x_f64,
             batch.coords_y_f64,
             batch.coords_z_f64,
@@ -348,7 +380,7 @@ def benchmark_batch_skylake(
     return energy, (end - start) / n_iterations * 1000
 
 
-def run_benchmark(n_molecules: int, n_iterations: int):
+def run_benchmark(n_molecules: int, n_iterations: int, smiles_dir: Path):
     """Run the batch benchmark."""
     print("=" * 100)
     print("SmallField MMFF94 Batch Benchmark")
@@ -362,7 +394,7 @@ def run_benchmark(n_molecules: int, n_iterations: int):
     print()
 
     # Load molecules
-    mol_data_list = load_molecules_from_usearch(n_molecules)
+    mol_data_list = load_molecules(n_molecules, smiles_dir)
     if not mol_data_list:
         print("No molecules loaded. Exiting.")
         return
@@ -431,6 +463,12 @@ if __name__ == "__main__":
         default=100,
         help="Benchmark iterations (default: 100)",
     )
+    parser.add_argument(
+        "--smiles-dir",
+        type=Path,
+        default=DEFAULT_SMILES_PATH,
+        help=f"Path to SMILES directory (default: {DEFAULT_SMILES_PATH})",
+    )
     args = parser.parse_args()
 
-    run_benchmark(args.n_molecules, args.iterations)
+    run_benchmark(args.n_molecules, args.iterations, args.smiles_dir)
