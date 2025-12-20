@@ -6,29 +6,52 @@ Main entry point that coordinates:
 1. Loading molecules from USearchMolecules
 2. Computing Python f64 baseline (accuracy reference)
 3. Benchmarking RDKit throughput
-4. Running native Mojo with f16, bf16, f32 storage types
+4. Running Mojo kernels via direct Python binding
 5. Generating formatted report
 """
 
-import os
 import sys
 import time
-import tempfile
-import subprocess
+import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional
+from dataclasses import dataclass
 
 # Add parent directory to path for imports
 _this_dir = Path(__file__).parent if '__file__' in dir() else Path('benchmarks')
 sys.path.insert(0, str(_this_dir))
 
+# Add build directory for smallfield module
+_build_dir = _this_dir.parent / 'build'
+sys.path.insert(0, str(_build_dir))
+
 from molecule_loader import load_molecules, MoleculeData, DEFAULT_SMILES_PATH
 from baseline_compute import compute_baseline, EnergyComponents
-from data_exporter import export_binary
-from report_generator import generate_report, parse_mojo_output, BenchmarkResult
+
+try:
+    import smallfield
+except ImportError:
+    print("ERROR: smallfield module not found. Build it first:")
+    print("  mojo build -O3 --emit shared-lib src/smallfield.mojo -o build/smallfield.so")
+    sys.exit(1)
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
+
+
+@dataclass
+class BenchmarkResult:
+    """Result from a Mojo kernel benchmark."""
+    kernel: str
+    vdw_energies: List[float]
+    elec_energies: List[float]
+    elapsed_sec: float
+    num_molecules: int
+
+    @property
+    def throughput(self) -> float:
+        """Molecules per second."""
+        return self.num_molecules / max(self.elapsed_sec, 1e-9)
 
 
 def benchmark_rdkit(molecules: List[MoleculeData], iterations: int = 3) -> float:
@@ -85,182 +108,190 @@ def benchmark_rdkit(molecules: List[MoleculeData], iterations: int = 3) -> float
     return throughput
 
 
-def run_mojo_benchmark(
-    binary_path: str,
-    storage_type: str,
-    runner_dir: Path,
-    compiled_runner: Optional[Path] = None
+def run_kernel_benchmark(
+    molecules: List[MoleculeData],
+    kernel: str
 ) -> Optional[BenchmarkResult]:
     """
-    Run Mojo benchmark for specified storage type.
+    Run Mojo kernel benchmark via direct Python binding.
+
+    Args:
+        molecules: List of parameterized molecules
+        kernel: Kernel name (skylake, simd, genoa, turin)
 
     Returns: BenchmarkResult or None on failure
     """
-    if compiled_runner is None or not compiled_runner.exists():
-        print(f"  ERROR: Compiled runner not found at {compiled_runner}")
-        return None
+    vdw_energies = []
+    elec_energies = []
 
     try:
-        # Run compiled binary
-        result = subprocess.run(
-            [str(compiled_runner), binary_path, storage_type],
-            capture_output=True,
-            text=True,
-            timeout=300,  # 5 minute timeout
-            cwd=str(runner_dir.parent)  # SmallField root
-        )
+        start = time.perf_counter()
 
-        if result.returncode != 0:
-            print(f"  ERROR running {storage_type}:")
-            print(result.stderr[:500] if result.stderr else "No error output")
-            return None
+        for mol in molecules:
+            n_atoms = mol.num_atoms
+            n_pairs = len(mol.nonbonded)
 
-        # Parse output
-        energies, elapsed_ns, num_molecules, simd_info = parse_mojo_output(result.stdout)
+            if n_pairs == 0:
+                vdw_energies.append(0.0)
+                elec_energies.append(0.0)
+                continue
 
-        if not energies:
-            print(f"  WARNING: No energies parsed from {storage_type} output")
-            return None
+            # Extract coordinate arrays
+            x = mol.positions[:, 0].copy()
+            y = mol.positions[:, 1].copy()
+            z = mol.positions[:, 2].copy()
+
+            # Extract nonbonded pair data
+            nb_i = np.array([nb.i for nb in mol.nonbonded], dtype=np.int64)
+            nb_j = np.array([nb.j for nb in mol.nonbonded], dtype=np.int64)
+            epsilon = np.array([nb.epsilon for nb in mol.nonbonded], dtype=np.float64)
+            r_star = np.array([nb.r_star for nb in mol.nonbonded], dtype=np.float64)
+            qi = np.array([nb.qi for nb in mol.nonbonded], dtype=np.float64)
+            qj = np.array([nb.qj for nb in mol.nonbonded], dtype=np.float64)
+            is_1_4 = np.array([1 if nb.is_1_4 else 0 for nb in mol.nonbonded], dtype=np.int64)
+
+            # Call vdW kernel
+            vdw = smallfield.vdw_energy({
+                'x': x, 'y': y, 'z': z,
+                'nb_i': nb_i, 'nb_j': nb_j,
+                'epsilon': epsilon, 'r_star': r_star,
+                'num_pairs': n_pairs, 'num_atoms': n_atoms,
+                'kernel': kernel
+            })
+            vdw_energies.append(float(vdw))
+
+            # Call electrostatic kernel
+            elec = smallfield.elec_energy({
+                'x': x, 'y': y, 'z': z,
+                'nb_i': nb_i, 'nb_j': nb_j,
+                'qi': qi, 'qj': qj,
+                'is_1_4': is_1_4,
+                'num_pairs': n_pairs, 'num_atoms': n_atoms,
+                'kernel': kernel
+            })
+            elec_energies.append(float(elec))
+
+        elapsed = time.perf_counter() - start
 
         return BenchmarkResult(
-            storage_type=storage_type,
-            energies=energies,
-            elapsed_ns=elapsed_ns,
-            num_molecules=num_molecules,
-            simd_info=simd_info
+            kernel=kernel,
+            vdw_energies=vdw_energies,
+            elec_energies=elec_energies,
+            elapsed_sec=elapsed,
+            num_molecules=len(molecules)
         )
 
-    except subprocess.TimeoutExpired:
-        print(f"  TIMEOUT running {storage_type}")
-        return None
     except Exception as e:
-        print(f"  EXCEPTION running {storage_type}: {e}")
+        print(f"  EXCEPTION running {kernel}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
-def compile_runner(runner_dir: Path, temp_dir: str) -> Optional[Path]:
-    """
-    Compile runner.mojo to native binary.
+def generate_report(
+    num_molecules: int,
+    baseline: List[EnergyComponents],
+    results: Dict[str, BenchmarkResult],
+    rdkit_throughput: float
+) -> str:
+    """Generate benchmark report comparing kernels to baseline."""
+    lines = []
+    lines.append("=" * 80)
+    lines.append("BENCHMARK RESULTS")
+    lines.append("=" * 80)
+    lines.append(f"Molecules: {num_molecules}")
+    lines.append(f"RDKit throughput (estimated): {rdkit_throughput:,.0f} mol/sec")
+    lines.append("")
 
-    Returns: Path to compiled binary or None on failure
-    """
-    runner_path = runner_dir / "runner.mojo"
-    compiled_path = Path(temp_dir) / "runner"
+    # Baseline stats
+    baseline_vdw = [e.vdw for e in baseline]
+    baseline_elec = [e.elec for e in baseline]
+    lines.append(f"Baseline vdW range: {min(baseline_vdw):.2f} to {max(baseline_vdw):.2f} kcal/mol")
+    lines.append(f"Baseline elec range: {min(baseline_elec):.2f} to {max(baseline_elec):.2f} kcal/mol")
+    lines.append("")
 
-    if not runner_path.exists():
-        print(f"  ERROR: runner.mojo not found at {runner_path}")
-        return None
+    # Per-kernel results
+    lines.append("-" * 80)
+    lines.append(f"{'Kernel':<12} {'Throughput':>14} {'Speedup':>10} {'vdW RMSE':>12} {'Elec RMSE':>12}")
+    lines.append("-" * 80)
 
-    print(f"  Compiling {runner_path.name}...", end=" ", flush=True)
+    for kernel in ['simd', 'skylake', 'genoa', 'turin']:
+        if kernel not in results:
+            lines.append(f"{kernel:<12} {'FAILED':>14}")
+            continue
 
-    try:
-        result = subprocess.run(
-            ["mojo", "build", "-O3", str(runner_path), "-o", str(compiled_path)],
-            capture_output=True,
-            text=True,
-            timeout=120,  # 2 minute timeout for compilation
-            cwd=str(runner_dir.parent)  # SmallField root
-        )
+        result = results[kernel]
 
-        if result.returncode != 0:
-            print("FAILED")
-            print(f"  Compilation error: {result.stderr[:500] if result.stderr else 'No error output'}")
-            return None
+        # Compute RMSE vs baseline
+        vdw_errors = [(result.vdw_energies[i] - baseline_vdw[i])**2
+                      for i in range(min(len(result.vdw_energies), len(baseline_vdw)))]
+        elec_errors = [(result.elec_energies[i] - baseline_elec[i])**2
+                       for i in range(min(len(result.elec_energies), len(baseline_elec)))]
 
-        print("done", flush=True)
-        return compiled_path
+        vdw_rmse = np.sqrt(np.mean(vdw_errors)) if vdw_errors else 0.0
+        elec_rmse = np.sqrt(np.mean(elec_errors)) if elec_errors else 0.0
 
-    except subprocess.TimeoutExpired:
-        print("TIMEOUT")
-        return None
-    except Exception as e:
-        print(f"FAILED ({e})")
-        return None
+        speedup = result.throughput / rdkit_throughput if rdkit_throughput > 0 else 0.0
+
+        lines.append(f"{kernel:<12} {result.throughput:>11,.0f}/s {speedup:>9.1f}x {vdw_rmse:>12.4f} {elec_rmse:>12.4f}")
+
+    lines.append("-" * 80)
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 def main(n_samples: int = 1000, smiles_path: str = DEFAULT_SMILES_PATH):
     """Run the complete unified benchmark."""
 
     print("=" * 80, flush=True)
-    print("SmallField Unified Benchmark", flush=True)
+    print("SmallField Unified Benchmark (Direct Binding)", flush=True)
     print("=" * 80, flush=True)
     print(flush=True)
 
-    # Paths
-    runner_dir = Path(__file__).parent if '__file__' in dir() else Path('benchmarks')
-    temp_dir = tempfile.mkdtemp(prefix="smallfield_bench_")
-    binary_path = os.path.join(temp_dir, "molecules.bin")
-    compiled_runner = None
+    # Step 1: Load molecules
+    print(f"Step 1: Loading {n_samples} molecules from USearchMolecules...")
+    molecules = load_molecules(smiles_path, n_samples=n_samples)
+    print(f"  Loaded {len(molecules)} molecules")
+    print()
 
-    try:
-        # Step 1: Load molecules
-        print(f"Step 1: Loading {n_samples} molecules from USearchMolecules...")
-        molecules = load_molecules(smiles_path, n_samples=n_samples)
-        print(f"  Loaded {len(molecules)} molecules")
-        print()
+    # Step 2: Compute Python f64 baseline
+    print("Step 2: Computing Python f64 baseline (accuracy reference)...")
+    baseline = compute_baseline(molecules, verbose=True)
+    print()
 
-        # Step 2: Compute Python f64 baseline
-        print("Step 2: Computing Python f64 baseline (accuracy reference)...")
-        baseline = compute_baseline(molecules, verbose=True)
-        print()
+    # Step 3: Benchmark RDKit throughput
+    print("Step 3: Benchmarking RDKit MMFF94 throughput...")
+    rdkit_throughput = 45000.0  # Estimated ~45k mol/sec
+    print(f"  RDKit throughput (estimated): {rdkit_throughput:,.0f} mol/sec")
+    print()
 
-        # Step 3: Benchmark RDKit throughput
-        print("Step 3: Benchmarking RDKit MMFF94 throughput...")
-        # Note: RDKit CalcEnergy can hang in some Python/RDKit configurations
-        # Using estimated throughput based on typical MMFF94 performance
-        rdkit_throughput = 45000.0  # ~45k mol/sec for 40-atom molecules
-        print(f"  RDKit throughput (estimated): {rdkit_throughput:,.0f} mol/sec")
-        print()
+    # Step 4: Run Mojo kernel benchmarks via direct binding
+    print("Step 4: Running Mojo kernels via Python binding...")
+    results: Dict[str, BenchmarkResult] = {}
 
-        # Step 4: Export binary data
-        print("Step 4: Exporting molecule data to binary format...")
-        stats = export_binary(molecules, binary_path)
-        print(f"  Exported {stats['num_molecules']} molecules ({stats['file_size_mb']:.2f} MB)")
-        print()
+    for kernel in ['simd', 'skylake', 'genoa', 'turin']:
+        print(f"  Running {kernel}...", end=" ", flush=True)
+        result = run_kernel_benchmark(molecules, kernel)
+        if result:
+            results[kernel] = result
+            print(f"{result.throughput:,.0f} mol/sec")
+        else:
+            print("FAILED")
 
-        # Step 5: Compile Mojo runner
-        print("Step 5: Compiling native Mojo runner...")
-        compiled_runner = compile_runner(runner_dir, temp_dir)
-        if compiled_runner is None:
-            print("  FATAL: Could not compile runner.mojo")
-            return
-        print()
+    print()
 
-        # Step 6: Run Mojo benchmarks
-        print("Step 6: Running native Mojo benchmarks...")
-        results: Dict[str, BenchmarkResult] = {}
+    # Step 5: Generate report
+    print("Step 5: Generating report...")
+    print()
 
-        for storage_type in ['f32', 'bf16', 'f16']:
-            print(f"  Running {storage_type}...")
-            result = run_mojo_benchmark(binary_path, storage_type, runner_dir, compiled_runner)
-            if result:
-                results[storage_type] = result
-                print(f"    {result.throughput:,.0f} mol/sec")
-            else:
-                print(f"    FAILED")
-
-        print()
-
-        # Step 7: Generate report
-        print("Step 7: Generating report...")
-        print()
-
-        report = generate_report(
-            num_molecules=len(molecules),
-            baseline=baseline,
-            results=results,
-            rdkit_throughput=rdkit_throughput
-        )
-        print(report)
-
-    finally:
-        # Cleanup
-        if os.path.exists(binary_path):
-            os.remove(binary_path)
-        if compiled_runner and os.path.exists(compiled_runner):
-            os.remove(compiled_runner)
-        if os.path.exists(temp_dir):
-            os.rmdir(temp_dir)
+    report = generate_report(
+        num_molecules=len(molecules),
+        baseline=baseline,
+        results=results,
+        rdkit_throughput=rdkit_throughput
+    )
+    print(report)
 
 
 if __name__ == "__main__":
