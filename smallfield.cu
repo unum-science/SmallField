@@ -226,10 +226,10 @@ struct batch_buffers_t {
  * atom-centric kernel that eliminates atomics and gathers.
  */
 struct atom_centric_buffers_t {
-    aligned_buffer<std::uint8_t> neighbors;        // neighbor_t array
+    aligned_buffer<std::uint8_t> neighbors;         // neighbor_t array
     aligned_buffer<std::uint32_t> neighbor_offsets; // Per-atom neighbor ranges
-    aligned_buffer<std::uint8_t> metas;            // mol_meta_t array
-    aligned_buffer<float> coords_aos;              // AoS coordinates: x0,y0,z0,x1,y1,z1,...
+    aligned_buffer<std::uint8_t> metas;             // mol_meta_t array
+    aligned_buffer<float> coords_aos;               // AoS coordinates: x0,y0,z0,x1,y1,z1,...
 
     std::size_t capacity_neighbors_ = 0;
     std::size_t capacity_atoms_ = 0;
@@ -280,16 +280,13 @@ struct atom_centric_buffers_t {
  * @param coords_z Z coordinates (SoA)
  * @param bufs Output buffers
  */
-inline void build_symmetric_adjacency_list_(
-    std::int32_t const* pair_i, std::int32_t const* pair_j,
-    float const* epsilon, float const* r_star,
-    float const* qi, float const* qj,
-    std::int32_t const* is_1_4,
-    std::int32_t const* mol_pair_start, std::int32_t const* mol_pair_end,
-    std::int32_t const* mol_atom_start, std::int32_t const* mol_atom_end,
-    std::uint32_t n_molecules,
-    float const* coords_x, float const* coords_y, float const* coords_z,
-    atom_centric_buffers_t& bufs) {
+inline void build_symmetric_adjacency_list_(std::int32_t const* pair_i, std::int32_t const* pair_j,
+                                            float const* epsilon, float const* r_star, float const* qi, float const* qj,
+                                            std::int32_t const* is_1_4, std::int32_t const* mol_pair_start,
+                                            std::int32_t const* mol_pair_end, std::int32_t const* mol_atom_start,
+                                            std::int32_t const* mol_atom_end, std::uint32_t n_molecules,
+                                            float const* coords_x, float const* coords_y, float const* coords_z,
+                                            atom_centric_buffers_t& bufs) {
 
     neighbor_t* neighbors = bufs.neighbors_data();
     std::uint32_t* offsets = bufs.offsets_data();
@@ -706,28 +703,93 @@ class context_t {
     }
 
     /**
-     * @brief Optimize geometry using serial F64 L-BFGS.
+     * @brief Optimize geometry using serial F64 L-BFGS with full MMFF94 force field.
      * @return tuple: (final_energy, iterations, converged, rms_gradient)
      */
-    py::tuple optimize_serial(py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
-                               py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j,
-                               py::array_t<double> pair_epsilon, py::array_t<double> pair_r_star, int max_iterations = 200,
-                               double gradient_threshold = 1e-4) {
+    py::tuple optimize_serial_f64(
+        py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
+        py::array_t<std::int32_t> vdw_pair_i, py::array_t<std::int32_t> vdw_pair_j, py::array_t<double> vdw_epsilon,
+        py::array_t<double> vdw_r_star, py::array_t<std::int32_t> elec_pair_i, py::array_t<std::int32_t> elec_pair_j,
+        py::array_t<double> elec_charge_i, py::array_t<double> elec_charge_j, py::array_t<std::int32_t> elec_is_1_4,
+        py::array_t<std::int32_t> bond_atom_i, py::array_t<std::int32_t> bond_atom_j, py::array_t<double> bond_kb,
+        py::array_t<double> bond_r0, py::array_t<std::int32_t> angle_atom_i, py::array_t<std::int32_t> angle_atom_j,
+        py::array_t<std::int32_t> angle_atom_k, py::array_t<double> angle_ka, py::array_t<double> angle_theta0,
+        py::array_t<std::int32_t> torsion_atom_i, py::array_t<std::int32_t> torsion_atom_j,
+        py::array_t<std::int32_t> torsion_atom_k, py::array_t<std::int32_t> torsion_atom_l,
+        py::array_t<double> torsion_v1, py::array_t<double> torsion_v2, py::array_t<double> torsion_v3,
+        py::array_t<std::int32_t> stbn_atom_i, py::array_t<std::int32_t> stbn_atom_j,
+        py::array_t<std::int32_t> stbn_atom_k, py::array_t<double> stbn_kba_ijk, py::array_t<double> stbn_kba_kji,
+        py::array_t<double> stbn_r0_ij, py::array_t<double> stbn_r0_kj, py::array_t<double> stbn_theta0,
+        py::array_t<std::int32_t> oop_atom_i, py::array_t<std::int32_t> oop_atom_j,
+        py::array_t<std::int32_t> oop_atom_k, py::array_t<std::int32_t> oop_atom_l, py::array_t<double> oop_koop,
+        int max_iterations = 200, double gradient_threshold = 1e-4) {
+
         auto buf_x = coords_x.request();
-        auto buf_y = coords_y.request();
-        auto buf_z = coords_z.request();
-        auto buf_i = pair_atom_i.request();
-        auto buf_j = pair_atom_j.request();
-        auto buf_eps = pair_epsilon.request();
-        auto buf_rstar = pair_r_star.request();
-
         std::size_t const n_atoms = static_cast<std::size_t>(buf_x.size);
-        std::size_t const n_pairs = static_cast<std::size_t>(buf_i.size);
-
-        // Get mutable pointers to coordinates (will be modified in-place)
         double* cx = static_cast<double*>(buf_x.ptr);
-        double* cy = static_cast<double*>(buf_y.ptr);
-        double* cz = static_cast<double*>(buf_z.ptr);
+        double* cy = static_cast<double*>(coords_y.request().ptr);
+        double* cz = static_cast<double*>(coords_z.request().ptr);
+
+        // Build MMFF94 params struct
+        mmff94_params_t<double> params{};
+        auto vdw_i = vdw_pair_i.request();
+        params.vdw_pair_i = static_cast<std::int32_t const*>(vdw_i.ptr);
+        params.vdw_pair_j = static_cast<std::int32_t const*>(vdw_pair_j.request().ptr);
+        params.vdw_epsilon = static_cast<double const*>(vdw_epsilon.request().ptr);
+        params.vdw_r_star = static_cast<double const*>(vdw_r_star.request().ptr);
+        params.vdw_count = static_cast<std::size_t>(vdw_i.size);
+
+        auto elec_i = elec_pair_i.request();
+        params.elec_pair_i = static_cast<std::int32_t const*>(elec_i.ptr);
+        params.elec_pair_j = static_cast<std::int32_t const*>(elec_pair_j.request().ptr);
+        params.elec_charge_i = static_cast<double const*>(elec_charge_i.request().ptr);
+        params.elec_charge_j = static_cast<double const*>(elec_charge_j.request().ptr);
+        params.elec_is_1_4 = static_cast<std::int32_t const*>(elec_is_1_4.request().ptr);
+        params.elec_count = static_cast<std::size_t>(elec_i.size);
+
+        auto bond_i = bond_atom_i.request();
+        params.bond_atom_i = static_cast<std::int32_t const*>(bond_i.ptr);
+        params.bond_atom_j = static_cast<std::int32_t const*>(bond_atom_j.request().ptr);
+        params.bond_kb = static_cast<double const*>(bond_kb.request().ptr);
+        params.bond_r0 = static_cast<double const*>(bond_r0.request().ptr);
+        params.bond_count = static_cast<std::size_t>(bond_i.size);
+
+        auto ang_i = angle_atom_i.request();
+        params.angle_atom_i = static_cast<std::int32_t const*>(ang_i.ptr);
+        params.angle_atom_j = static_cast<std::int32_t const*>(angle_atom_j.request().ptr);
+        params.angle_atom_k = static_cast<std::int32_t const*>(angle_atom_k.request().ptr);
+        params.angle_ka = static_cast<double const*>(angle_ka.request().ptr);
+        params.angle_theta0 = static_cast<double const*>(angle_theta0.request().ptr);
+        params.angle_count = static_cast<std::size_t>(ang_i.size);
+
+        auto tor_i = torsion_atom_i.request();
+        params.torsion_atom_i = static_cast<std::int32_t const*>(tor_i.ptr);
+        params.torsion_atom_j = static_cast<std::int32_t const*>(torsion_atom_j.request().ptr);
+        params.torsion_atom_k = static_cast<std::int32_t const*>(torsion_atom_k.request().ptr);
+        params.torsion_atom_l = static_cast<std::int32_t const*>(torsion_atom_l.request().ptr);
+        params.torsion_v1 = static_cast<double const*>(torsion_v1.request().ptr);
+        params.torsion_v2 = static_cast<double const*>(torsion_v2.request().ptr);
+        params.torsion_v3 = static_cast<double const*>(torsion_v3.request().ptr);
+        params.torsion_count = static_cast<std::size_t>(tor_i.size);
+
+        auto stbn_i = stbn_atom_i.request();
+        params.stbn_atom_i = static_cast<std::int32_t const*>(stbn_i.ptr);
+        params.stbn_atom_j = static_cast<std::int32_t const*>(stbn_atom_j.request().ptr);
+        params.stbn_atom_k = static_cast<std::int32_t const*>(stbn_atom_k.request().ptr);
+        params.stbn_kba_ijk = static_cast<double const*>(stbn_kba_ijk.request().ptr);
+        params.stbn_kba_kji = static_cast<double const*>(stbn_kba_kji.request().ptr);
+        params.stbn_r0_ij = static_cast<double const*>(stbn_r0_ij.request().ptr);
+        params.stbn_r0_kj = static_cast<double const*>(stbn_r0_kj.request().ptr);
+        params.stbn_theta0 = static_cast<double const*>(stbn_theta0.request().ptr);
+        params.stbn_count = static_cast<std::size_t>(stbn_i.size);
+
+        auto oop_i = oop_atom_i.request();
+        params.oop_atom_i = static_cast<std::int32_t const*>(oop_i.ptr);
+        params.oop_atom_j = static_cast<std::int32_t const*>(oop_atom_j.request().ptr);
+        params.oop_atom_k = static_cast<std::int32_t const*>(oop_atom_k.request().ptr);
+        params.oop_atom_l = static_cast<std::int32_t const*>(oop_atom_l.request().ptr);
+        params.oop_koop = static_cast<double const*>(oop_koop.request().ptr);
+        params.oop_count = static_cast<std::size_t>(oop_i.size);
 
         // Allocate L-BFGS state
         constexpr std::size_t m = 10;
@@ -739,26 +801,371 @@ class context_t {
         std::size_t const n_coords = 3 * n_atoms;
         aligned_buffer<double> workspace(m * n_coords * 2 + m * 2 + n_coords * 5);
         double* ptr = workspace.data();
-        state.s_history = ptr; ptr += m * n_coords;
-        state.y_history = ptr; ptr += m * n_coords;
-        state.alpha = ptr; ptr += m;
-        state.rho = ptr; ptr += m;
-        state.q = ptr; ptr += n_coords;
-        state.grad = ptr; ptr += n_coords;
-        state.grad_prev = ptr; ptr += n_coords;
-        state.direction = ptr; ptr += n_coords;
+        state.s_history = ptr;
+        ptr += m * n_coords;
+        state.y_history = ptr;
+        ptr += m * n_coords;
+        state.alpha = ptr;
+        ptr += m;
+        state.rho = ptr;
+        ptr += m;
+        state.q = ptr;
+        ptr += n_coords;
+        state.grad = ptr;
+        ptr += n_coords;
+        state.grad_prev = ptr;
+        ptr += n_coords;
+        state.direction = ptr;
+        ptr += n_coords;
         state.coord_backup = ptr;
 
-        // Run L-BFGS (VdW only, no electrostatics)
-        auto result = lbfgs_optimize<double>(
-            cx, cy, cz,
-            static_cast<std::int32_t const*>(buf_i.ptr),
-            static_cast<std::int32_t const*>(buf_j.ptr),
-            static_cast<double const*>(buf_eps.ptr),
-            static_cast<double const*>(buf_rstar.ptr),
-            n_pairs,
-            nullptr, nullptr, nullptr, nullptr, nullptr, 0,  // No electrostatics
-            max_iterations, gradient_threshold, state);
+        auto result = lbfgs_optimize_mmff94<double>(cx, cy, cz, params, max_iterations, gradient_threshold, state);
+        return py::make_tuple(result.final_energy, result.iterations, result.status == 0, result.rms_gradient);
+    }
+
+    /**
+     * @brief Compute energy and gradient for debugging.
+     * @return tuple: (energy, grad_x, grad_y, grad_z)
+     */
+    py::tuple compute_energy_gradient_f64(
+        py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
+        py::array_t<std::int32_t> vdw_pair_i, py::array_t<std::int32_t> vdw_pair_j, py::array_t<double> vdw_epsilon,
+        py::array_t<double> vdw_r_star, py::array_t<std::int32_t> elec_pair_i, py::array_t<std::int32_t> elec_pair_j,
+        py::array_t<double> elec_charge_i, py::array_t<double> elec_charge_j, py::array_t<std::int32_t> elec_is_1_4,
+        py::array_t<std::int32_t> bond_atom_i, py::array_t<std::int32_t> bond_atom_j, py::array_t<double> bond_kb,
+        py::array_t<double> bond_r0, py::array_t<std::int32_t> angle_atom_i, py::array_t<std::int32_t> angle_atom_j,
+        py::array_t<std::int32_t> angle_atom_k, py::array_t<double> angle_ka, py::array_t<double> angle_theta0,
+        py::array_t<std::int32_t> torsion_atom_i, py::array_t<std::int32_t> torsion_atom_j,
+        py::array_t<std::int32_t> torsion_atom_k, py::array_t<std::int32_t> torsion_atom_l,
+        py::array_t<double> torsion_v1, py::array_t<double> torsion_v2, py::array_t<double> torsion_v3,
+        py::array_t<std::int32_t> stbn_atom_i, py::array_t<std::int32_t> stbn_atom_j,
+        py::array_t<std::int32_t> stbn_atom_k, py::array_t<double> stbn_kba_ijk, py::array_t<double> stbn_kba_kji,
+        py::array_t<double> stbn_r0_ij, py::array_t<double> stbn_r0_kj, py::array_t<double> stbn_theta0,
+        py::array_t<std::int32_t> oop_atom_i, py::array_t<std::int32_t> oop_atom_j,
+        py::array_t<std::int32_t> oop_atom_k, py::array_t<std::int32_t> oop_atom_l, py::array_t<double> oop_koop) {
+
+        auto buf_x = coords_x.request();
+        std::size_t const n_atoms = static_cast<std::size_t>(buf_x.size);
+
+        double* cx = static_cast<double*>(buf_x.ptr);
+        double* cy = static_cast<double*>(coords_y.request().ptr);
+        double* cz = static_cast<double*>(coords_z.request().ptr);
+
+        // Fill params struct
+        mmff94_params_t<double> params{};
+
+        auto vdw_i = vdw_pair_i.request();
+        params.vdw_pair_i = static_cast<std::int32_t const*>(vdw_i.ptr);
+        params.vdw_pair_j = static_cast<std::int32_t const*>(vdw_pair_j.request().ptr);
+        params.vdw_epsilon = static_cast<double const*>(vdw_epsilon.request().ptr);
+        params.vdw_r_star = static_cast<double const*>(vdw_r_star.request().ptr);
+        params.vdw_count = static_cast<std::size_t>(vdw_i.size);
+
+        auto elec_i = elec_pair_i.request();
+        params.elec_pair_i = static_cast<std::int32_t const*>(elec_i.ptr);
+        params.elec_pair_j = static_cast<std::int32_t const*>(elec_pair_j.request().ptr);
+        params.elec_charge_i = static_cast<double const*>(elec_charge_i.request().ptr);
+        params.elec_charge_j = static_cast<double const*>(elec_charge_j.request().ptr);
+        params.elec_is_1_4 = static_cast<std::int32_t const*>(elec_is_1_4.request().ptr);
+        params.elec_count = static_cast<std::size_t>(elec_i.size);
+
+        auto bond_i = bond_atom_i.request();
+        params.bond_atom_i = static_cast<std::int32_t const*>(bond_i.ptr);
+        params.bond_atom_j = static_cast<std::int32_t const*>(bond_atom_j.request().ptr);
+        params.bond_kb = static_cast<double const*>(bond_kb.request().ptr);
+        params.bond_r0 = static_cast<double const*>(bond_r0.request().ptr);
+        params.bond_count = static_cast<std::size_t>(bond_i.size);
+
+        auto ang_i = angle_atom_i.request();
+        params.angle_atom_i = static_cast<std::int32_t const*>(ang_i.ptr);
+        params.angle_atom_j = static_cast<std::int32_t const*>(angle_atom_j.request().ptr);
+        params.angle_atom_k = static_cast<std::int32_t const*>(angle_atom_k.request().ptr);
+        params.angle_ka = static_cast<double const*>(angle_ka.request().ptr);
+        params.angle_theta0 = static_cast<double const*>(angle_theta0.request().ptr);
+        params.angle_count = static_cast<std::size_t>(ang_i.size);
+
+        auto tor_i = torsion_atom_i.request();
+        params.torsion_atom_i = static_cast<std::int32_t const*>(tor_i.ptr);
+        params.torsion_atom_j = static_cast<std::int32_t const*>(torsion_atom_j.request().ptr);
+        params.torsion_atom_k = static_cast<std::int32_t const*>(torsion_atom_k.request().ptr);
+        params.torsion_atom_l = static_cast<std::int32_t const*>(torsion_atom_l.request().ptr);
+        params.torsion_v1 = static_cast<double const*>(torsion_v1.request().ptr);
+        params.torsion_v2 = static_cast<double const*>(torsion_v2.request().ptr);
+        params.torsion_v3 = static_cast<double const*>(torsion_v3.request().ptr);
+        params.torsion_count = static_cast<std::size_t>(tor_i.size);
+
+        auto stbn_i = stbn_atom_i.request();
+        params.stbn_atom_i = static_cast<std::int32_t const*>(stbn_i.ptr);
+        params.stbn_atom_j = static_cast<std::int32_t const*>(stbn_atom_j.request().ptr);
+        params.stbn_atom_k = static_cast<std::int32_t const*>(stbn_atom_k.request().ptr);
+        params.stbn_kba_ijk = static_cast<double const*>(stbn_kba_ijk.request().ptr);
+        params.stbn_kba_kji = static_cast<double const*>(stbn_kba_kji.request().ptr);
+        params.stbn_r0_ij = static_cast<double const*>(stbn_r0_ij.request().ptr);
+        params.stbn_r0_kj = static_cast<double const*>(stbn_r0_kj.request().ptr);
+        params.stbn_theta0 = static_cast<double const*>(stbn_theta0.request().ptr);
+        params.stbn_count = static_cast<std::size_t>(stbn_i.size);
+
+        auto oop_i = oop_atom_i.request();
+        params.oop_atom_i = static_cast<std::int32_t const*>(oop_i.ptr);
+        params.oop_atom_j = static_cast<std::int32_t const*>(oop_atom_j.request().ptr);
+        params.oop_atom_k = static_cast<std::int32_t const*>(oop_atom_k.request().ptr);
+        params.oop_atom_l = static_cast<std::int32_t const*>(oop_atom_l.request().ptr);
+        params.oop_koop = static_cast<double const*>(oop_koop.request().ptr);
+        params.oop_count = static_cast<std::size_t>(oop_i.size);
+
+        // Compute energy
+        double energy = 0.0;
+        if (params.vdw_count > 0) {
+            energy += compute_vdw_energy(cx, cy, cz, params.vdw_pair_i, params.vdw_pair_j, params.vdw_epsilon,
+                                         params.vdw_r_star, 0, params.vdw_count);
+        }
+        if (params.elec_count > 0) {
+            energy +=
+                compute_electrostatic_energy(cx, cy, cz, params.elec_pair_i, params.elec_pair_j, params.elec_charge_i,
+                                             params.elec_charge_j, params.elec_is_1_4, 0, params.elec_count);
+        }
+        if (params.bond_count > 0) {
+            energy += compute_bond_energy(cx, cy, cz, params.bond_atom_i, params.bond_atom_j, params.bond_kb,
+                                          params.bond_r0, 0, params.bond_count);
+        }
+        if (params.angle_count > 0) {
+            energy += compute_angle_energy(cx, cy, cz, params.angle_atom_i, params.angle_atom_j, params.angle_atom_k,
+                                           params.angle_ka, params.angle_theta0, 0, params.angle_count);
+        }
+        if (params.torsion_count > 0) {
+            energy += compute_torsion_energy(cx, cy, cz, params.torsion_atom_i, params.torsion_atom_j,
+                                             params.torsion_atom_k, params.torsion_atom_l, params.torsion_v1,
+                                             params.torsion_v2, params.torsion_v3, 0, params.torsion_count);
+        }
+        if (params.stbn_count > 0) {
+            energy += compute_stretch_bend_energy(
+                cx, cy, cz, params.stbn_atom_i, params.stbn_atom_j, params.stbn_atom_k, params.stbn_kba_ijk,
+                params.stbn_kba_kji, params.stbn_r0_ij, params.stbn_r0_kj, params.stbn_theta0, 0, params.stbn_count);
+        }
+        if (params.oop_count > 0) {
+            energy += compute_oop_energy(cx, cy, cz, params.oop_atom_i, params.oop_atom_j, params.oop_atom_k,
+                                         params.oop_atom_l, params.oop_koop, 0, params.oop_count);
+        }
+
+        // Compute gradient
+        std::vector<double> grad_x(n_atoms, 0.0), grad_y(n_atoms, 0.0), grad_z(n_atoms, 0.0);
+
+        if (params.vdw_count > 0) {
+            compute_vdw_gradient(cx, cy, cz, params.vdw_pair_i, params.vdw_pair_j, params.vdw_epsilon,
+                                 params.vdw_r_star, 0, params.vdw_count, grad_x.data(), grad_y.data(), grad_z.data());
+        }
+        if (params.elec_count > 0) {
+            compute_electrostatic_gradient(cx, cy, cz, params.elec_pair_i, params.elec_pair_j, params.elec_charge_i,
+                                           params.elec_charge_j, params.elec_is_1_4, 0, params.elec_count,
+                                           0.75, // 1-4 scaling factor
+                                           grad_x.data(), grad_y.data(), grad_z.data());
+        }
+        if (params.bond_count > 0) {
+            compute_bond_gradient(cx, cy, cz, params.bond_atom_i, params.bond_atom_j, params.bond_kb, params.bond_r0, 0,
+                                  params.bond_count, grad_x.data(), grad_y.data(), grad_z.data());
+        }
+        if (params.angle_count > 0) {
+            compute_angle_gradient(cx, cy, cz, params.angle_atom_i, params.angle_atom_j, params.angle_atom_k,
+                                   params.angle_ka, params.angle_theta0, 0, params.angle_count, grad_x.data(),
+                                   grad_y.data(), grad_z.data());
+        }
+        if (params.torsion_count > 0) {
+            compute_torsion_gradient(cx, cy, cz, params.torsion_atom_i, params.torsion_atom_j, params.torsion_atom_k,
+                                     params.torsion_atom_l, params.torsion_v1, params.torsion_v2, params.torsion_v3, 0,
+                                     params.torsion_count, grad_x.data(), grad_y.data(), grad_z.data());
+        }
+        if (params.stbn_count > 0) {
+            compute_stretch_bend_gradient(cx, cy, cz, params.stbn_atom_i, params.stbn_atom_j, params.stbn_atom_k,
+                                          params.stbn_kba_ijk, params.stbn_kba_kji, params.stbn_r0_ij,
+                                          params.stbn_r0_kj, params.stbn_theta0, 0, params.stbn_count, grad_x.data(),
+                                          grad_y.data(), grad_z.data());
+        }
+        if (params.oop_count > 0) {
+            compute_oop_gradient(cx, cy, cz, params.oop_atom_i, params.oop_atom_j, params.oop_atom_k, params.oop_atom_l,
+                                 params.oop_koop, 0, params.oop_count, grad_x.data(), grad_y.data(), grad_z.data());
+        }
+
+        // Convert to numpy arrays
+        py::array_t<double> gx_np(n_atoms), gy_np(n_atoms), gz_np(n_atoms);
+        auto gx_ptr = static_cast<double*>(gx_np.request().ptr);
+        auto gy_ptr = static_cast<double*>(gy_np.request().ptr);
+        auto gz_ptr = static_cast<double*>(gz_np.request().ptr);
+        std::copy(grad_x.begin(), grad_x.end(), gx_ptr);
+        std::copy(grad_y.begin(), grad_y.end(), gy_ptr);
+        std::copy(grad_z.begin(), grad_z.end(), gz_ptr);
+
+        return py::make_tuple(energy, gx_np, gy_np, gz_np);
+    }
+
+    /**
+     * @brief Optimize geometry using serial F32 L-BFGS with full MMFF94 force field.
+     * @return tuple: (final_energy, iterations, converged, rms_gradient)
+     */
+    py::tuple optimize_serial_f32(
+        py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
+        py::array_t<std::int32_t> vdw_pair_i, py::array_t<std::int32_t> vdw_pair_j, py::array_t<double> vdw_epsilon,
+        py::array_t<double> vdw_r_star, py::array_t<std::int32_t> elec_pair_i, py::array_t<std::int32_t> elec_pair_j,
+        py::array_t<double> elec_charge_i, py::array_t<double> elec_charge_j, py::array_t<std::int32_t> elec_is_1_4,
+        py::array_t<std::int32_t> bond_atom_i, py::array_t<std::int32_t> bond_atom_j, py::array_t<double> bond_kb,
+        py::array_t<double> bond_r0, py::array_t<std::int32_t> angle_atom_i, py::array_t<std::int32_t> angle_atom_j,
+        py::array_t<std::int32_t> angle_atom_k, py::array_t<double> angle_ka, py::array_t<double> angle_theta0,
+        py::array_t<std::int32_t> torsion_atom_i, py::array_t<std::int32_t> torsion_atom_j,
+        py::array_t<std::int32_t> torsion_atom_k, py::array_t<std::int32_t> torsion_atom_l,
+        py::array_t<double> torsion_v1, py::array_t<double> torsion_v2, py::array_t<double> torsion_v3,
+        py::array_t<std::int32_t> stbn_atom_i, py::array_t<std::int32_t> stbn_atom_j,
+        py::array_t<std::int32_t> stbn_atom_k, py::array_t<double> stbn_kba_ijk, py::array_t<double> stbn_kba_kji,
+        py::array_t<double> stbn_r0_ij, py::array_t<double> stbn_r0_kj, py::array_t<double> stbn_theta0,
+        py::array_t<std::int32_t> oop_atom_i, py::array_t<std::int32_t> oop_atom_j,
+        py::array_t<std::int32_t> oop_atom_k, py::array_t<std::int32_t> oop_atom_l, py::array_t<double> oop_koop,
+        int max_iterations = 200, double gradient_threshold = 1e-4) {
+
+        auto buf_x = coords_x.request();
+        auto buf_y = coords_y.request();
+        auto buf_z = coords_z.request();
+        std::size_t const n_atoms = static_cast<std::size_t>(buf_x.size);
+
+        // Convert coordinates to float
+        aligned_buffer<float> cx_f32(n_atoms), cy_f32(n_atoms), cz_f32(n_atoms);
+        double const* dx = static_cast<double const*>(buf_x.ptr);
+        double const* dy = static_cast<double const*>(buf_y.ptr);
+        double const* dz = static_cast<double const*>(buf_z.ptr);
+        for (std::size_t i = 0; i < n_atoms; ++i) {
+            cx_f32[i] = static_cast<float>(dx[i]);
+            cy_f32[i] = static_cast<float>(dy[i]);
+            cz_f32[i] = static_cast<float>(dz[i]);
+        }
+
+        // Helper to convert double array to float
+        auto to_float = [](py::array_t<double> arr) {
+            auto buf = arr.request();
+            std::size_t n = static_cast<std::size_t>(buf.size);
+            aligned_buffer<float> result(n);
+            double const* src = static_cast<double const*>(buf.ptr);
+            for (std::size_t i = 0; i < n; ++i)
+                result[i] = static_cast<float>(src[i]);
+            return result;
+        };
+
+        // Convert all parameters to float
+        auto vdw_eps_f32 = to_float(vdw_epsilon);
+        auto vdw_rs_f32 = to_float(vdw_r_star);
+        auto elec_qi_f32 = to_float(elec_charge_i);
+        auto elec_qj_f32 = to_float(elec_charge_j);
+        auto bond_kb_f32 = to_float(bond_kb);
+        auto bond_r0_f32 = to_float(bond_r0);
+        auto angle_ka_f32 = to_float(angle_ka);
+        auto angle_theta0_f32 = to_float(angle_theta0);
+        auto torsion_v1_f32 = to_float(torsion_v1);
+        auto torsion_v2_f32 = to_float(torsion_v2);
+        auto torsion_v3_f32 = to_float(torsion_v3);
+        auto stbn_kij_f32 = to_float(stbn_kba_ijk);
+        auto stbn_kji_f32 = to_float(stbn_kba_kji);
+        auto stbn_rij_f32 = to_float(stbn_r0_ij);
+        auto stbn_rkj_f32 = to_float(stbn_r0_kj);
+        auto stbn_t0_f32 = to_float(stbn_theta0);
+        auto oop_ko_f32 = to_float(oop_koop);
+
+        // Build MMFF94 params struct
+        mmff94_params_t<float> params{};
+        auto vdw_i = vdw_pair_i.request();
+        params.vdw_pair_i = static_cast<std::int32_t const*>(vdw_i.ptr);
+        params.vdw_pair_j = static_cast<std::int32_t const*>(vdw_pair_j.request().ptr);
+        params.vdw_epsilon = vdw_eps_f32.data();
+        params.vdw_r_star = vdw_rs_f32.data();
+        params.vdw_count = static_cast<std::size_t>(vdw_i.size);
+
+        auto elec_i = elec_pair_i.request();
+        params.elec_pair_i = static_cast<std::int32_t const*>(elec_i.ptr);
+        params.elec_pair_j = static_cast<std::int32_t const*>(elec_pair_j.request().ptr);
+        params.elec_charge_i = elec_qi_f32.data();
+        params.elec_charge_j = elec_qj_f32.data();
+        params.elec_is_1_4 = static_cast<std::int32_t const*>(elec_is_1_4.request().ptr);
+        params.elec_count = static_cast<std::size_t>(elec_i.size);
+
+        auto bond_i = bond_atom_i.request();
+        params.bond_atom_i = static_cast<std::int32_t const*>(bond_i.ptr);
+        params.bond_atom_j = static_cast<std::int32_t const*>(bond_atom_j.request().ptr);
+        params.bond_kb = bond_kb_f32.data();
+        params.bond_r0 = bond_r0_f32.data();
+        params.bond_count = static_cast<std::size_t>(bond_i.size);
+
+        auto ang_i = angle_atom_i.request();
+        params.angle_atom_i = static_cast<std::int32_t const*>(ang_i.ptr);
+        params.angle_atom_j = static_cast<std::int32_t const*>(angle_atom_j.request().ptr);
+        params.angle_atom_k = static_cast<std::int32_t const*>(angle_atom_k.request().ptr);
+        params.angle_ka = angle_ka_f32.data();
+        params.angle_theta0 = angle_theta0_f32.data();
+        params.angle_count = static_cast<std::size_t>(ang_i.size);
+
+        auto tor_i = torsion_atom_i.request();
+        params.torsion_atom_i = static_cast<std::int32_t const*>(tor_i.ptr);
+        params.torsion_atom_j = static_cast<std::int32_t const*>(torsion_atom_j.request().ptr);
+        params.torsion_atom_k = static_cast<std::int32_t const*>(torsion_atom_k.request().ptr);
+        params.torsion_atom_l = static_cast<std::int32_t const*>(torsion_atom_l.request().ptr);
+        params.torsion_v1 = torsion_v1_f32.data();
+        params.torsion_v2 = torsion_v2_f32.data();
+        params.torsion_v3 = torsion_v3_f32.data();
+        params.torsion_count = static_cast<std::size_t>(tor_i.size);
+
+        auto stbn_i = stbn_atom_i.request();
+        params.stbn_atom_i = static_cast<std::int32_t const*>(stbn_i.ptr);
+        params.stbn_atom_j = static_cast<std::int32_t const*>(stbn_atom_j.request().ptr);
+        params.stbn_atom_k = static_cast<std::int32_t const*>(stbn_atom_k.request().ptr);
+        params.stbn_kba_ijk = stbn_kij_f32.data();
+        params.stbn_kba_kji = stbn_kji_f32.data();
+        params.stbn_r0_ij = stbn_rij_f32.data();
+        params.stbn_r0_kj = stbn_rkj_f32.data();
+        params.stbn_theta0 = stbn_t0_f32.data();
+        params.stbn_count = static_cast<std::size_t>(stbn_i.size);
+
+        auto oop_i = oop_atom_i.request();
+        params.oop_atom_i = static_cast<std::int32_t const*>(oop_i.ptr);
+        params.oop_atom_j = static_cast<std::int32_t const*>(oop_atom_j.request().ptr);
+        params.oop_atom_k = static_cast<std::int32_t const*>(oop_atom_k.request().ptr);
+        params.oop_atom_l = static_cast<std::int32_t const*>(oop_atom_l.request().ptr);
+        params.oop_koop = oop_ko_f32.data();
+        params.oop_count = static_cast<std::size_t>(oop_i.size);
+
+        // Allocate L-BFGS state
+        constexpr std::size_t m = 10;
+        lbfgs_state_t<float> state;
+        state.n_atoms = n_atoms;
+        state.m = m;
+        state.k = 0;
+
+        std::size_t const n_coords = 3 * n_atoms;
+        aligned_buffer<float> workspace(m * n_coords * 2 + m * 2 + n_coords * 5);
+        float* ptr = workspace.data();
+        state.s_history = ptr;
+        ptr += m * n_coords;
+        state.y_history = ptr;
+        ptr += m * n_coords;
+        state.alpha = ptr;
+        ptr += m;
+        state.rho = ptr;
+        ptr += m;
+        state.q = ptr;
+        ptr += n_coords;
+        state.grad = ptr;
+        ptr += n_coords;
+        state.grad_prev = ptr;
+        ptr += n_coords;
+        state.direction = ptr;
+        ptr += n_coords;
+        state.coord_backup = ptr;
+
+        auto result = lbfgs_optimize_mmff94<float>(cx_f32.data(), cy_f32.data(), cz_f32.data(), params, max_iterations,
+                                                   static_cast<float>(gradient_threshold), state);
+
+        // Copy back optimized coordinates to double arrays
+        double* ox = static_cast<double*>(buf_x.ptr);
+        double* oy = static_cast<double*>(buf_y.ptr);
+        double* oz = static_cast<double*>(buf_z.ptr);
+        for (std::size_t i = 0; i < n_atoms; ++i) {
+            ox[i] = static_cast<double>(cx_f32[i]);
+            oy[i] = static_cast<double>(cy_f32[i]);
+            oz[i] = static_cast<double>(cz_f32[i]);
+        }
 
         return py::make_tuple(result.final_energy, result.iterations, result.status == 0, result.rms_gradient);
     }
@@ -768,9 +1175,9 @@ class context_t {
      * @return tuple: (final_energy, iterations, converged, rms_gradient)
      */
     py::tuple optimize_skylake(py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
-                                py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j,
-                                py::array_t<double> pair_epsilon, py::array_t<double> pair_r_star, int max_iterations = 200,
-                                double gradient_threshold = 1e-4) {
+                               py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j,
+                               py::array_t<double> pair_epsilon, py::array_t<double> pair_r_star,
+                               int max_iterations = 200, double gradient_threshold = 1e-4) {
 #if defined(__AVX512F__)
         auto buf_x = coords_x.request();
         auto buf_y = coords_y.request();
@@ -816,6 +1223,16 @@ class context_t {
             rstar_f32[i] = static_cast<float>(rstar_d[i]);
         }
 
+        // Precompute VdW constants (eliminates redundant pow7 and multiplications)
+        aligned_buffer<float> vdw_precomputed_storage(n_pairs * 5);
+        vdw_precomputed_t<float> vdw_pre;
+        vdw_pre.eq_dist_7 = vdw_precomputed_storage.data();
+        vdw_pre.delta_eq_dist = vdw_pre.eq_dist_7 + n_pairs;
+        vdw_pre.one_plus_delta_eq_dist = vdw_pre.delta_eq_dist + n_pairs;
+        vdw_pre.gamma_eq_dist_7 = vdw_pre.one_plus_delta_eq_dist + n_pairs;
+        vdw_pre.one_plus_gamma_eq_dist_7 = vdw_pre.gamma_eq_dist_7 + n_pairs;
+        precompute_vdw_constants(rstar_f32.data(), n_pairs, vdw_pre);
+
         // Allocate L-BFGS state
         constexpr std::size_t m = 10;
         lbfgs_state_t<float> state;
@@ -825,23 +1242,28 @@ class context_t {
 
         aligned_buffer<float> workspace(m * n_coords * 2 + m * 2 + n_coords * 5);
         float* ptr = workspace.data();
-        state.s_history = ptr; ptr += m * n_coords;
-        state.y_history = ptr; ptr += m * n_coords;
-        state.alpha = ptr; ptr += m;
-        state.rho = ptr; ptr += m;
-        state.q = ptr; ptr += n_coords;
-        state.grad = ptr; ptr += n_coords;
-        state.grad_prev = ptr; ptr += n_coords;
-        state.direction = ptr; ptr += n_coords;
+        state.s_history = ptr;
+        ptr += m * n_coords;
+        state.y_history = ptr;
+        ptr += m * n_coords;
+        state.alpha = ptr;
+        ptr += m;
+        state.rho = ptr;
+        ptr += m;
+        state.q = ptr;
+        ptr += n_coords;
+        state.grad = ptr;
+        ptr += n_coords;
+        state.grad_prev = ptr;
+        ptr += n_coords;
+        state.direction = ptr;
+        ptr += n_coords;
         state.coord_backup = ptr;
 
-        // Run L-BFGS (VdW only)
-        auto result = lbfgs_optimize_skylake(
-            cx, cy, cz,
-            static_cast<std::int32_t const*>(buf_i.ptr),
-            static_cast<std::int32_t const*>(buf_j.ptr),
-            eps_f32.data(), rstar_f32.data(), n_pairs,
-            nullptr, nullptr, nullptr, nullptr, nullptr, 0,  // No electrostatics
+        // Run L-BFGS with precomputed constants (fast path)
+        auto result = lbfgs_optimize_skylake_fast(
+            cx, cy, cz, static_cast<std::int32_t const*>(buf_i.ptr), static_cast<std::int32_t const*>(buf_j.ptr),
+            eps_f32.data(), vdw_pre, n_pairs, nullptr, nullptr, nullptr, nullptr, nullptr, 0, // No electrostatics
             max_iterations, static_cast<float>(gradient_threshold), state);
 
         // Copy optimized coordinates back
@@ -864,11 +1286,12 @@ class context_t {
      * @brief Optimize geometry using CUDA F32 batch L-BFGS.
      * @return tuple: (final_energy, iterations, converged, rms_gradient)
      */
-    py::tuple optimize_cuda_f32(py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
-                                 py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j,
-                                 py::array_t<double> pair_epsilon, py::array_t<double> pair_r_star,
-                                 py::array_t<std::int32_t> mol_pair_start, py::array_t<std::int32_t> mol_pair_end,
-                                 std::uint32_t n_molecules, int max_iterations = 200, double gradient_threshold = 1e-4) {
+    py::tuple optimize_cuda_f32(py::array_t<double> coords_x, py::array_t<double> coords_y,
+                                py::array_t<double> coords_z, py::array_t<std::int32_t> pair_atom_i,
+                                py::array_t<std::int32_t> pair_atom_j, py::array_t<double> pair_epsilon,
+                                py::array_t<double> pair_r_star, py::array_t<std::int32_t> mol_pair_start,
+                                py::array_t<std::int32_t> mol_pair_end, std::uint32_t n_molecules,
+                                int max_iterations = 200, double gradient_threshold = 1e-4) {
 #if defined(__CUDACC__)
         auto buf_x = coords_x.request();
         auto buf_y = coords_y.request();
@@ -933,19 +1356,17 @@ class context_t {
         }
         constexpr std::uint32_t memory_depth = 10;
         // Inline formula: memory_depth * n_atoms * 3 * 2 + memory_depth * 2 + n_atoms * 3
-        std::size_t shared_mem = max_atoms_per_mol * 3 * 2 * sizeof(float); // gradient + search_dir
+        std::size_t shared_mem = max_atoms_per_mol * 3 * 3 * sizeof(float); // gradient + search_dir + trial_coords
 
         // Launch kernel
         mmff94_lbfgs_optimize_kernel_f32<<<n_molecules, warp_size, shared_mem>>>(
-            coords_.x_data<float>(), coords_.y_data<float>(), coords_.z_data<float>(),
-            pairs_.i_data(), pairs_.j_data(),
-            pairs_.param1_data<float>(), pairs_.param2_data<float>(),
-            zeros_f32.data(), zeros_f32.data(), zeros_i32.data(),  // No electrostatics
-            mol_atom_start_buf.data(), mol_atom_end_buf.data(),
-            batch_.start_data(), batch_.end_data(),
-            reinterpret_cast<float*>(lbfgs_workspace_.data()),
-            out_status.data(), out_iters.data(), out_energy.data(), out_rms.data(),
-            n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth);
+            coords_.x_data<float>(), coords_.y_data<float>(), coords_.z_data<float>(), pairs_.i_data(), pairs_.j_data(),
+            pairs_.param1_data<float>(), pairs_.param2_data<float>(), zeros_f32.data(), zeros_f32.data(),
+            zeros_i32.data(), // No electrostatics
+            mol_atom_start_buf.data(), mol_atom_end_buf.data(), batch_.start_data(), batch_.end_data(),
+            reinterpret_cast<float*>(lbfgs_workspace_.data()), out_status.data(), out_iters.data(), out_energy.data(),
+            out_rms.data(), n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth,
+            max_atoms_per_mol);
 
         cudaDeviceSynchronize();
 
@@ -983,11 +1404,12 @@ class context_t {
      * @brief Optimize geometry using CUDA F16 batch L-BFGS.
      * @return tuple: (final_energy, iterations, converged, rms_gradient)
      */
-    py::tuple optimize_cuda_f16(py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
-                                 py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j,
-                                 py::array_t<double> pair_epsilon, py::array_t<double> pair_r_star,
-                                 py::array_t<std::int32_t> mol_pair_start, py::array_t<std::int32_t> mol_pair_end,
-                                 std::uint32_t n_molecules, int max_iterations = 200, double gradient_threshold = 1e-4) {
+    py::tuple optimize_cuda_f16(py::array_t<double> coords_x, py::array_t<double> coords_y,
+                                py::array_t<double> coords_z, py::array_t<std::int32_t> pair_atom_i,
+                                py::array_t<std::int32_t> pair_atom_j, py::array_t<double> pair_epsilon,
+                                py::array_t<double> pair_r_star, py::array_t<std::int32_t> mol_pair_start,
+                                py::array_t<std::int32_t> mol_pair_end, std::uint32_t n_molecules,
+                                int max_iterations = 200, double gradient_threshold = 1e-4) {
 #if defined(__CUDACC__)
         auto buf_x = coords_x.request();
         auto buf_y = coords_y.request();
@@ -1057,15 +1479,13 @@ class context_t {
 
         // Launch kernel
         mmff94_lbfgs_optimize_kernel_f16<<<n_molecules, warp_size, shared_mem>>>(
-            coords_.x_data<half>(), coords_.y_data<half>(), coords_.z_data<half>(),
-            pairs_.i_data(), pairs_.j_data(),
-            pairs_.param1_data<half>(), pairs_.param2_data<half>(),
-            zeros_f16.data(), zeros_f16.data(), zeros_i32.data(),  // No electrostatics
-            mol_atom_start_buf.data(), mol_atom_end_buf.data(),
-            batch_.start_data(), batch_.end_data(),
-            reinterpret_cast<float*>(lbfgs_workspace_.data()),
-            out_status.data(), out_iters.data(), out_energy.data(), out_rms.data(),
-            n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth);
+            coords_.x_data<half>(), coords_.y_data<half>(), coords_.z_data<half>(), pairs_.i_data(), pairs_.j_data(),
+            pairs_.param1_data<half>(), pairs_.param2_data<half>(), zeros_f16.data(), zeros_f16.data(),
+            zeros_i32.data(), // No electrostatics
+            mol_atom_start_buf.data(), mol_atom_end_buf.data(), batch_.start_data(), batch_.end_data(),
+            reinterpret_cast<float*>(lbfgs_workspace_.data()), out_status.data(), out_iters.data(), out_energy.data(),
+            out_rms.data(), n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth,
+            max_atoms_per_mol);
 
         cudaDeviceSynchronize();
 
@@ -1114,13 +1534,11 @@ class context_t {
      */
     py::tuple energy_gradient_atom_centric_cuda_f32(
         py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
-        py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j,
-        py::array_t<double> pair_epsilon, py::array_t<double> pair_r_star,
-        py::array_t<double> pair_qi, py::array_t<double> pair_qj,
-        py::array_t<std::int32_t> pair_is_1_4,
-        py::array_t<std::int32_t> mol_pair_start, py::array_t<std::int32_t> mol_pair_end,
-        py::array_t<std::int32_t> mol_atom_start, py::array_t<std::int32_t> mol_atom_end,
-        std::uint32_t n_molecules) {
+        py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j, py::array_t<double> pair_epsilon,
+        py::array_t<double> pair_r_star, py::array_t<double> pair_qi, py::array_t<double> pair_qj,
+        py::array_t<std::int32_t> pair_is_1_4, py::array_t<std::int32_t> mol_pair_start,
+        py::array_t<std::int32_t> mol_pair_end, py::array_t<std::int32_t> mol_atom_start,
+        py::array_t<std::int32_t> mol_atom_end, std::uint32_t n_molecules) {
 #if defined(__CUDACC__)
         std::uint32_t const num_atoms = static_cast<std::uint32_t>(coords_x.size());
         std::uint32_t const num_pairs = static_cast<std::uint32_t>(pair_atom_i.size());
@@ -1167,29 +1585,18 @@ class context_t {
 
         // Build symmetric adjacency list
         build_symmetric_adjacency_list_(
-            pairs_.i_data(), pairs_.j_data(),
-            pairs_.param1_data<float>(), pairs_.param2_data<float>(),
-            qi_buf.data(), qj_buf.data(),
-            pairs_.is_1_4_data(),
-            batch_.start_data(), batch_.end_data(),
-            static_cast<std::int32_t const*>(buf_atom_start.ptr),
-            static_cast<std::int32_t const*>(buf_atom_end.ptr),
-            n_molecules,
-            coords_.x_data<float>(), coords_.y_data<float>(), coords_.z_data<float>(),
-            atom_centric_bufs_);
+            pairs_.i_data(), pairs_.j_data(), pairs_.param1_data<float>(), pairs_.param2_data<float>(), qi_buf.data(),
+            qj_buf.data(), pairs_.is_1_4_data(), batch_.start_data(), batch_.end_data(),
+            static_cast<std::int32_t const*>(buf_atom_start.ptr), static_cast<std::int32_t const*>(buf_atom_end.ptr),
+            n_molecules, coords_.x_data<float>(), coords_.y_data<float>(), coords_.z_data<float>(), atom_centric_bufs_);
 
         // Allocate output gradient buffer
         aligned_buffer<float> grad_out(num_atoms * 3);
 
         // Launch atom-centric kernel
         mmff94_energy_gradient_atom_centric_f32<<<n_molecules, warp_size>>>(
-            atom_centric_bufs_.coords_data(),
-            atom_centric_bufs_.neighbors_data(),
-            atom_centric_bufs_.offsets_data(),
-            atom_centric_bufs_.metas_data(),
-            grad_out.data(),
-            batch_.energy_data(),
-            n_molecules);
+            atom_centric_bufs_.coords_data(), atom_centric_bufs_.neighbors_data(), atom_centric_bufs_.offsets_data(),
+            atom_centric_bufs_.metas_data(), grad_out.data(), batch_.energy_data(), n_molecules);
 
         cudaDeviceSynchronize();
 
@@ -1977,12 +2384,47 @@ PYBIND11_MODULE(_smallfield, m) {
              py::arg("coords_x"), py::arg("coords_y"), py::arg("coords_z"), py::arg("pair_atom_i"),
              py::arg("pair_atom_j"), py::arg("pair_epsilon"), py::arg("pair_r_star"), py::arg("mol_pair_start"),
              py::arg("mol_pair_end"), py::arg("n_molecules"))
-        // Optimization methods
-        .def("optimize_serial", &smallfield::context_t::optimize_serial,
-             "Optimize geometry using serial F64 L-BFGS. Returns (final_energy, iterations, converged, rms_gradient).",
-             py::arg("coords_x"), py::arg("coords_y"), py::arg("coords_z"), py::arg("pair_atom_i"),
-             py::arg("pair_atom_j"), py::arg("pair_epsilon"), py::arg("pair_r_star"), py::arg("max_iterations") = 200,
-             py::arg("gradient_threshold") = 1e-4)
+        // Optimization methods (full MMFF94 force field)
+        .def("optimize_serial_f64", &smallfield::context_t::optimize_serial_f64,
+             "Optimize geometry using serial F64 L-BFGS with full MMFF94 force field. "
+             "Returns (final_energy, iterations, converged, rms_gradient).",
+             py::arg("coords_x"), py::arg("coords_y"), py::arg("coords_z"), py::arg("vdw_pair_i"),
+             py::arg("vdw_pair_j"), py::arg("vdw_epsilon"), py::arg("vdw_r_star"), py::arg("elec_pair_i"),
+             py::arg("elec_pair_j"), py::arg("elec_charge_i"), py::arg("elec_charge_j"), py::arg("elec_is_1_4"),
+             py::arg("bond_atom_i"), py::arg("bond_atom_j"), py::arg("bond_kb"), py::arg("bond_r0"),
+             py::arg("angle_atom_i"), py::arg("angle_atom_j"), py::arg("angle_atom_k"), py::arg("angle_ka"),
+             py::arg("angle_theta0"), py::arg("torsion_atom_i"), py::arg("torsion_atom_j"), py::arg("torsion_atom_k"),
+             py::arg("torsion_atom_l"), py::arg("torsion_v1"), py::arg("torsion_v2"), py::arg("torsion_v3"),
+             py::arg("stbn_atom_i"), py::arg("stbn_atom_j"), py::arg("stbn_atom_k"), py::arg("stbn_kba_ijk"),
+             py::arg("stbn_kba_kji"), py::arg("stbn_r0_ij"), py::arg("stbn_r0_kj"), py::arg("stbn_theta0"),
+             py::arg("oop_atom_i"), py::arg("oop_atom_j"), py::arg("oop_atom_k"), py::arg("oop_atom_l"),
+             py::arg("oop_koop"), py::arg("max_iterations") = 200, py::arg("gradient_threshold") = 1e-4)
+        .def("compute_energy_gradient_f64", &smallfield::context_t::compute_energy_gradient_f64,
+             "Compute MMFF94 energy and gradient. Returns (energy, grad_x, grad_y, grad_z).", py::arg("coords_x"),
+             py::arg("coords_y"), py::arg("coords_z"), py::arg("vdw_pair_i"), py::arg("vdw_pair_j"),
+             py::arg("vdw_epsilon"), py::arg("vdw_r_star"), py::arg("elec_pair_i"), py::arg("elec_pair_j"),
+             py::arg("elec_charge_i"), py::arg("elec_charge_j"), py::arg("elec_is_1_4"), py::arg("bond_atom_i"),
+             py::arg("bond_atom_j"), py::arg("bond_kb"), py::arg("bond_r0"), py::arg("angle_atom_i"),
+             py::arg("angle_atom_j"), py::arg("angle_atom_k"), py::arg("angle_ka"), py::arg("angle_theta0"),
+             py::arg("torsion_atom_i"), py::arg("torsion_atom_j"), py::arg("torsion_atom_k"), py::arg("torsion_atom_l"),
+             py::arg("torsion_v1"), py::arg("torsion_v2"), py::arg("torsion_v3"), py::arg("stbn_atom_i"),
+             py::arg("stbn_atom_j"), py::arg("stbn_atom_k"), py::arg("stbn_kba_ijk"), py::arg("stbn_kba_kji"),
+             py::arg("stbn_r0_ij"), py::arg("stbn_r0_kj"), py::arg("stbn_theta0"), py::arg("oop_atom_i"),
+             py::arg("oop_atom_j"), py::arg("oop_atom_k"), py::arg("oop_atom_l"), py::arg("oop_koop"))
+        .def("optimize_serial_f32", &smallfield::context_t::optimize_serial_f32,
+             "Optimize geometry using serial F32 L-BFGS with full MMFF94 force field. "
+             "Returns (final_energy, iterations, converged, rms_gradient).",
+             py::arg("coords_x"), py::arg("coords_y"), py::arg("coords_z"), py::arg("vdw_pair_i"),
+             py::arg("vdw_pair_j"), py::arg("vdw_epsilon"), py::arg("vdw_r_star"), py::arg("elec_pair_i"),
+             py::arg("elec_pair_j"), py::arg("elec_charge_i"), py::arg("elec_charge_j"), py::arg("elec_is_1_4"),
+             py::arg("bond_atom_i"), py::arg("bond_atom_j"), py::arg("bond_kb"), py::arg("bond_r0"),
+             py::arg("angle_atom_i"), py::arg("angle_atom_j"), py::arg("angle_atom_k"), py::arg("angle_ka"),
+             py::arg("angle_theta0"), py::arg("torsion_atom_i"), py::arg("torsion_atom_j"), py::arg("torsion_atom_k"),
+             py::arg("torsion_atom_l"), py::arg("torsion_v1"), py::arg("torsion_v2"), py::arg("torsion_v3"),
+             py::arg("stbn_atom_i"), py::arg("stbn_atom_j"), py::arg("stbn_atom_k"), py::arg("stbn_kba_ijk"),
+             py::arg("stbn_kba_kji"), py::arg("stbn_r0_ij"), py::arg("stbn_r0_kj"), py::arg("stbn_theta0"),
+             py::arg("oop_atom_i"), py::arg("oop_atom_j"), py::arg("oop_atom_k"), py::arg("oop_atom_l"),
+             py::arg("oop_koop"), py::arg("max_iterations") = 200, py::arg("gradient_threshold") = 1e-4)
         .def("optimize_skylake", &smallfield::context_t::optimize_skylake,
              "Optimize geometry using Skylake AVX-512 F32 L-BFGS. Returns (final_energy, iterations, converged, "
              "rms_gradient).",
@@ -2008,13 +2450,10 @@ PYBIND11_MODULE(_smallfield, m) {
              "Compute energy and gradient using atom-centric CUDA F32 kernel. "
              "Eliminates atomics and gathers via register-based coordinate storage "
              "and symmetric adjacency list. Returns (total_energy, grad_x, grad_y, grad_z).",
-             py::arg("coords_x"), py::arg("coords_y"), py::arg("coords_z"),
-             py::arg("pair_atom_i"), py::arg("pair_atom_j"),
-             py::arg("pair_epsilon"), py::arg("pair_r_star"),
-             py::arg("pair_qi"), py::arg("pair_qj"), py::arg("pair_is_1_4"),
-             py::arg("mol_pair_start"), py::arg("mol_pair_end"),
-             py::arg("mol_atom_start"), py::arg("mol_atom_end"),
-             py::arg("n_molecules"));
+             py::arg("coords_x"), py::arg("coords_y"), py::arg("coords_z"), py::arg("pair_atom_i"),
+             py::arg("pair_atom_j"), py::arg("pair_epsilon"), py::arg("pair_r_star"), py::arg("pair_qi"),
+             py::arg("pair_qj"), py::arg("pair_is_1_4"), py::arg("mol_pair_start"), py::arg("mol_pair_end"),
+             py::arg("mol_atom_start"), py::arg("mol_atom_end"), py::arg("n_molecules"));
 }
 
 #pragma endregion
