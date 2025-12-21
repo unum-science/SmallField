@@ -1,20 +1,20 @@
 /**
- * @file smallfield.cu
- * @brief Python bindings for SmallField MMFF94 force field calculations
- * @author Ash Vardanian
- * @date 2024
- *
- * Provides CPU (serial, AVX-512) and GPU (CUDA) implementations for:
- * - Van der Waals energy (buffered 14-7 potential)
- * - Electrostatic energy (Coulomb with buffer)
- *
- * Bindings use pybind11 for clean Python interface.
- *
- * Module name: _smallfield
- * Namespace: smallfield
- * Internal functions end with underscore (_)
- * Uses std::size_t for positive indexes
- * East Const style
+ *  @file smallfield.cu
+ *  @brief Python bindings for SmallField MMFF94 force field calculations
+ *  @author Ash Vardanian
+ *  @date 2024
+ *  
+ *  Provides CPU (serial, AVX-512) and GPU (CUDA) implementations for:
+ *  - Van der Waals energy (buffered 14-7 potential)
+ *  - Electrostatic energy (Coulomb with buffer)
+ *  
+ *  Bindings use pybind11 for clean Python interface.
+ *  
+ *  Module name: _smallfield
+ *  Namespace: smallfield
+ *  Internal functions end with underscore (_)
+ *  Uses std::size_t for positive indexes
+ *  East Const style
  */
 
 #include <pybind11/numpy.h>
@@ -44,9 +44,9 @@ namespace smallfield {
 #pragma region Allocators and Aligned Buffers
 
 /**
- * @brief CPU memory allocator using std::aligned_alloc.
- *
- * Allocates 64-byte aligned memory for AVX-512 SIMD operations.
+ *  @brief CPU memory allocator using std::aligned_alloc.
+ *  
+ *  Allocates 64-byte aligned memory for AVX-512 SIMD operations.
  */
 struct cpu_allocator_t {
     static void* allocate(std::size_t bytes, std::size_t alignment) {
@@ -59,9 +59,9 @@ struct cpu_allocator_t {
 
 #if defined(__CUDACC__)
 /**
- * @brief CUDA unified memory allocator using cudaMallocManaged.
- *
- * Memory is accessible from both CPU and GPU with automatic migration.
+ *  @brief CUDA unified memory allocator using cudaMallocManaged.
+ *  
+ *  Memory is accessible from both CPU and GPU with automatic migration.
  */
 struct cuda_allocator_t {
     static void* allocate(std::size_t bytes, std::size_t /*alignment*/) {
@@ -80,14 +80,14 @@ using default_allocator_t = cpu_allocator_t;
 #endif
 
 /**
- * @brief Aligned buffer with allocator policy.
- *
- * @tparam scalar_type_ Element type
- * @tparam allocator_type_ Allocator type (cpu_allocator_t or cuda_allocator_t)
- * @tparam alignment_ Memory alignment in bytes (default 64 for AVX-512)
- *
- * Properly aligns heap data (not just the object) for SIMD operations.
- * Non-copyable, movable.
+ *  @brief Aligned buffer with allocator policy.
+ *  
+ *  @tparam scalar_type_ Element type
+ *  @tparam allocator_type_ Allocator type (cpu_allocator_t or cuda_allocator_t)
+ *  @tparam alignment_ Memory alignment in bytes (default 64 for AVX-512)
+ *  
+ *  Properly aligns heap data (not just the object) for SIMD operations.
+ *  Non-copyable, movable.
  */
 template <typename scalar_type_, typename allocator_type_ = default_allocator_t, std::size_t alignment_ = 64>
 struct aligned_buffer {
@@ -143,9 +143,9 @@ struct aligned_buffer {
 #pragma region Structured Buffer Types
 
 /**
- * @brief Coordinate buffers for a batch of atoms (x, y, z).
- *
- * Uses byte storage that can be cast to any scalar type.
+ *  @brief Coordinate buffers for a batch of atoms (x, y, z).
+ *  
+ *  Uses byte storage that can be cast to any scalar type.
  */
 struct coord_buffers_t {
     aligned_buffer<std::uint8_t> x, y, z;
@@ -167,9 +167,9 @@ struct coord_buffers_t {
 };
 
 /**
- * @brief Non-bonded pair buffers for VdW/electrostatic calculations.
- *
- * Uses byte storage for params that can be cast to any scalar type.
+ *  @brief Non-bonded pair buffers for VdW/electrostatic calculations.
+ *  
+ *  Uses byte storage for params that can be cast to any scalar type.
  */
 struct pair_buffers_t {
     aligned_buffer<std::int32_t> atom_i, atom_j;
@@ -197,7 +197,7 @@ struct pair_buffers_t {
 };
 
 /**
- * @brief Batch indexing buffers for per-molecule processing.
+ *  @brief Batch indexing buffers for per-molecule processing.
  */
 struct batch_buffers_t {
     aligned_buffer<std::int32_t> mol_start, mol_end;
@@ -220,10 +220,10 @@ struct batch_buffers_t {
 
 #if defined(__CUDACC__)
 /**
- * @brief Buffers for atom-centric kernel data layout.
- *
- * Converts pair-based layout to symmetric adjacency list for the
- * atom-centric kernel that eliminates atomics and gathers.
+ *  @brief Buffers for atom-centric kernel data layout.
+ *  
+ *  Converts pair-based layout to symmetric adjacency list for the
+ *  atom-centric kernel that eliminates atomics and gathers.
  */
 struct atom_centric_buffers_t {
     aligned_buffer<std::uint8_t> neighbors;         // neighbor_t array
@@ -253,32 +253,32 @@ struct atom_centric_buffers_t {
 };
 
 /**
- * @brief Build symmetric adjacency list from pair arrays.
- *
- * Converts (pair_i, pair_j, epsilon, r_star, qi, qj, is_1_4) pairs
- * into a symmetric adjacency list where each pair is stored twice:
- * - Once in atom i's neighbor list (with sign = -1)
- * - Once in atom j's neighbor list (with sign = +1)
- *
- * This enables the atom-centric kernel to process each atom independently
- * without atomic operations or cross-lane communication for gradients.
- *
- * @param pair_i Atom i indices for each pair
- * @param pair_j Atom j indices for each pair
- * @param epsilon VdW epsilon for each pair
- * @param r_star VdW equilibrium distance for each pair
- * @param qi Charge of atom i for each pair
- * @param qj Charge of atom j for each pair
- * @param is_1_4 1-4 interaction flag for each pair
- * @param mol_pair_start Start index in pairs for each molecule
- * @param mol_pair_end End index in pairs for each molecule
- * @param mol_atom_start Start index in atoms for each molecule
- * @param mol_atom_end End index in atoms for each molecule
- * @param n_molecules Number of molecules
- * @param coords_x X coordinates (SoA)
- * @param coords_y Y coordinates (SoA)
- * @param coords_z Z coordinates (SoA)
- * @param bufs Output buffers
+ *  @brief Build symmetric adjacency list from pair arrays.
+ *  
+ *  Converts (pair_i, pair_j, epsilon, r_star, qi, qj, is_1_4) pairs
+ *  into a symmetric adjacency list where each pair is stored twice:
+ *  - Once in atom i's neighbor list (with sign = -1)
+ *  - Once in atom j's neighbor list (with sign = +1)
+ *  
+ *  This enables the atom-centric kernel to process each atom independently
+ *  without atomic operations or cross-lane communication for gradients.
+ *  
+ *  @param pair_i Atom i indices for each pair
+ *  @param pair_j Atom j indices for each pair
+ *  @param epsilon VdW epsilon for each pair
+ *  @param r_star VdW equilibrium distance for each pair
+ *  @param qi Charge of atom i for each pair
+ *  @param qj Charge of atom j for each pair
+ *  @param is_1_4 1-4 interaction flag for each pair
+ *  @param mol_pair_start Start index in pairs for each molecule
+ *  @param mol_pair_end End index in pairs for each molecule
+ *  @param mol_atom_start Start index in atoms for each molecule
+ *  @param mol_atom_end End index in atoms for each molecule
+ *  @param n_molecules Number of molecules
+ *  @param coords_x X coordinates (SoA)
+ *  @param coords_y Y coordinates (SoA)
+ *  @param coords_z Z coordinates (SoA)
+ *  @param bufs Output buffers
  */
 inline void build_symmetric_adjacency_list_(std::int32_t const* pair_i, std::int32_t const* pair_j,
                                             float const* epsilon, float const* r_star, float const* qi, float const* qj,
@@ -377,14 +377,14 @@ inline void build_symmetric_adjacency_list_(std::int32_t const* pair_i, std::int
 #pragma region context_t Class
 
 /**
- * @brief Context for SmallField MMFF94 force field calculations.
- *
- * Pre-allocates buffers with total capacity limits.
- * Uses default_allocator_t which is CUDA unified memory when compiling with nvcc,
- * or CPU aligned memory otherwise.
- *
- * Python API receives and returns f64 (double) arrays.
- * All internal conversion to f32/f16/bf16 happens inside the native library.
+ *  @brief Context for SmallField MMFF94 force field calculations.
+ *  
+ *  Pre-allocates buffers with total capacity limits.
+ *  Uses default_allocator_t which is CUDA unified memory when compiling with nvcc,
+ *  or CPU aligned memory otherwise.
+ *  
+ *  Python API receives and returns f64 (double) arrays.
+ *  All internal conversion to f32/f16/bf16 happens inside the native library.
  */
 class context_t {
   private:
@@ -402,7 +402,7 @@ class context_t {
 
     // L-BFGS workspace for optimization
     // Workspace per molecule: m*(6*n_atoms + 2) floats where m=10 (memory parameter)
-    aligned_buffer<std::uint8_t> lbfgs_workspace_;
+    aligned_buffer<std::uint8_t> lbfgs_workspace_bytes_;
 
 #if defined(__CUDACC__)
     // Atom-centric kernel buffers (symmetric adjacency list)
@@ -410,7 +410,7 @@ class context_t {
 #endif
 
     /**
-     * @brief Copy f64 array to buffer as f32.
+     *  @brief Copy f64 array to buffer as f32.
      */
     void copy_f64_to_f32_(py::array_t<double> const& src, float* dst, std::uint32_t count) {
         auto const buf = src.request();
@@ -421,7 +421,7 @@ class context_t {
     }
 
     /**
-     * @brief Copy f64 array to buffer as bf16.
+     *  @brief Copy f64 array to buffer as bf16.
      */
     void copy_f64_to_bf16_(py::array_t<double> const& src, std::uint16_t* dst, std::uint32_t count) {
         auto const buf = src.request();
@@ -436,7 +436,7 @@ class context_t {
 
 #if defined(__CUDACC__)
     /**
-     * @brief Copy f64 array to buffer as CUDA half.
+     *  @brief Copy f64 array to buffer as CUDA half.
      */
     void copy_f64_to_f16_(py::array_t<double> const& src, half* dst, std::uint32_t count) {
         auto const buf = src.request();
@@ -448,7 +448,7 @@ class context_t {
 #endif
 
     /**
-     * @brief Copy f64 array to buffer as fp16.
+     *  @brief Copy f64 array to buffer as fp16.
      */
     void copy_f64_to_fp16_(py::array_t<double> const& src, std::uint16_t* dst, std::uint32_t count) {
         auto const buf = src.request();
@@ -508,7 +508,7 @@ class context_t {
         std::uint32_t const m = 10; // L-BFGS memory parameter
         std::size_t const floats_per_mol = 6 * m * atoms_per_mol + 2 * m + 15 * atoms_per_mol;
         std::size_t const workspace_bytes = max_molecules * floats_per_mol * sizeof(float);
-        lbfgs_workspace_.allocate(workspace_bytes);
+        lbfgs_workspace_bytes_.allocate(workspace_bytes);
 
 #if defined(__CUDACC__)
         // Allocate atom-centric buffers (2x pairs for symmetric adjacency list)
@@ -528,7 +528,7 @@ class context_t {
     std::uint32_t capacity_molecules() const { return capacity_molecules_; }
 
     /**
-     * @brief VdW batch using Skylake AVX-512 with ForkUnion parallelization.
+     *  @brief VdW batch using Skylake AVX-512 with ForkUnion parallelization.
      */
     double vdw_skylake(py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
                        py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j,
@@ -585,10 +585,10 @@ class context_t {
     }
 
     /**
-     * @brief VdW energy using CUDA F32 kernel.
-     *
-     * Uses CUDA unified memory - data written to buffers is automatically
-     * migrated to GPU when kernel runs, results readable after sync.
+     *  @brief VdW energy using CUDA F32 kernel.
+     *  
+     *  Uses CUDA unified memory - data written to buffers is automatically
+     *  migrated to GPU when kernel runs, results readable after sync.
      */
     double vdw_cuda_f32(py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
                         py::array_t<std::int32_t> nb_i, py::array_t<std::int32_t> nb_j, py::array_t<double> nb_epsilon,
@@ -642,9 +642,9 @@ class context_t {
     }
 
     /**
-     * @brief VdW energy using CUDA F16 kernel.
-     *
-     * Uses CUDA unified memory with F16 buffers for reduced bandwidth.
+     *  @brief VdW energy using CUDA F16 kernel.
+     *  
+     *  Uses CUDA unified memory with F16 buffers for reduced bandwidth.
      */
     double vdw_cuda_f16(py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
                         py::array_t<std::int32_t> nb_i, py::array_t<std::int32_t> nb_j, py::array_t<double> nb_epsilon,
@@ -703,8 +703,8 @@ class context_t {
     }
 
     /**
-     * @brief Optimize geometry using serial F64 L-BFGS with full MMFF94 force field.
-     * @return tuple: (final_energy, iterations, converged, rms_gradient)
+     *  @brief Optimize geometry using serial F64 L-BFGS with full MMFF94 force field.
+     *  @return tuple: (final_energy, iterations, converged, rms_gradient)
      */
     py::tuple optimize_serial_f64(
         py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
@@ -731,7 +731,7 @@ class context_t {
         double* cz = static_cast<double*>(coords_z.request().ptr);
 
         // Build MMFF94 params struct
-        mmff94_params_t<double> params{};
+        mmff94_params_f64_t params{};
         auto vdw_i = vdw_pair_i.request();
         params.vdw_pair_i = static_cast<std::int32_t const*>(vdw_i.ptr);
         params.vdw_pair_j = static_cast<std::int32_t const*>(vdw_pair_j.request().ptr);
@@ -793,7 +793,7 @@ class context_t {
 
         // Allocate L-BFGS state
         constexpr std::size_t m = 10;
-        lbfgs_state_t<double> state;
+        lbfgs_state_f64_t state;
         state.n_atoms = n_atoms;
         state.m = m;
         state.k = 0;
@@ -824,8 +824,8 @@ class context_t {
     }
 
     /**
-     * @brief Optimize geometry using serial F32 L-BFGS with full MMFF94 force field.
-     * @return tuple: (final_energy, iterations, converged, rms_gradient)
+     *  @brief Optimize geometry using serial F32 L-BFGS with full MMFF94 force field.
+     *  @return tuple: (final_energy, iterations, converged, rms_gradient)
      */
     py::tuple optimize_serial_f32(
         py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
@@ -892,7 +892,7 @@ class context_t {
         auto oop_ko_f32 = to_float(oop_koop);
 
         // Build MMFF94 params struct
-        mmff94_params_t<float> params{};
+        mmff94_params_f32_t params{};
         auto vdw_i = vdw_pair_i.request();
         params.vdw_pair_i = static_cast<std::int32_t const*>(vdw_i.ptr);
         params.vdw_pair_j = static_cast<std::int32_t const*>(vdw_pair_j.request().ptr);
@@ -954,7 +954,7 @@ class context_t {
 
         // Allocate L-BFGS state
         constexpr std::size_t m = 10;
-        lbfgs_state_t<float> state;
+        lbfgs_state_f32_t state;
         state.n_atoms = n_atoms;
         state.m = m;
         state.k = 0;
@@ -997,8 +997,8 @@ class context_t {
     }
 
     /**
-     * @brief Optimize geometry using Skylake AVX-512 F32 L-BFGS.
-     * @return tuple: (final_energy, iterations, converged, rms_gradient)
+     *  @brief Optimize geometry using Skylake AVX-512 F32 L-BFGS.
+     *  @return tuple: (final_energy, iterations, converged, rms_gradient)
      */
     py::tuple optimize_skylake(py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
                                py::array_t<std::int32_t> pair_atom_i, py::array_t<std::int32_t> pair_atom_j,
@@ -1051,7 +1051,7 @@ class context_t {
 
         // Precompute VdW constants (eliminates redundant pow7 and multiplications)
         aligned_buffer<float> vdw_precomputed_storage(n_pairs * 5);
-        vdw_precomputed_t<float> vdw_pre;
+        vdw_precomputed_f32_t vdw_pre;
         vdw_pre.eq_dist_7 = vdw_precomputed_storage.data();
         vdw_pre.delta_eq_dist = vdw_pre.eq_dist_7 + n_pairs;
         vdw_pre.one_plus_delta_eq_dist = vdw_pre.delta_eq_dist + n_pairs;
@@ -1061,7 +1061,7 @@ class context_t {
 
         // Allocate L-BFGS state
         constexpr std::size_t m = 10;
-        lbfgs_state_t<float> state;
+        lbfgs_state_f32_t state;
         state.n_atoms = n_atoms_padded;
         state.m = m;
         state.k = 0;
@@ -1109,8 +1109,8 @@ class context_t {
     }
 
     /**
-     * @brief Optimize geometry using CUDA F32 batch L-BFGS.
-     * @return tuple: (final_energy, iterations, converged, rms_gradient)
+     *  @brief Optimize geometry using CUDA F32 batch L-BFGS.
+     *  @return tuple: (final_energy, iterations, converged, rms_gradient)
      */
     py::tuple optimize_cuda_f32(py::array_t<double> coords_x, py::array_t<double> coords_y,
                                 py::array_t<double> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1190,7 +1190,8 @@ class context_t {
             pairs_.param1_data<float>(), pairs_.param2_data<float>(), zeros_f32.data(), zeros_f32.data(),
             zeros_i32.data(), // No electrostatics
             mol_atom_start_buf.data(), mol_atom_end_buf.data(), batch_.start_data(), batch_.end_data(),
-            reinterpret_cast<float*>(lbfgs_workspace_.data()), out_status.data(), out_iters.data(), out_energy.data(),
+            reinterpret_cast<float*>(lbfgs_workspace_bytes_.data()), out_status.data(), out_iters.data(),
+            out_energy.data(),
             out_rms.data(), n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth,
             max_atoms_per_mol);
 
@@ -1227,8 +1228,8 @@ class context_t {
     }
 
     /**
-     * @brief Optimize geometry using CUDA F16 batch L-BFGS.
-     * @return tuple: (final_energy, iterations, converged, rms_gradient)
+     *  @brief Optimize geometry using CUDA F16 batch L-BFGS.
+     *  @return tuple: (final_energy, iterations, converged, rms_gradient)
      */
     py::tuple optimize_cuda_f16(py::array_t<double> coords_x, py::array_t<double> coords_y,
                                 py::array_t<double> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1309,7 +1310,8 @@ class context_t {
             pairs_.param1_data<half>(), pairs_.param2_data<half>(), zeros_f16.data(), zeros_f16.data(),
             zeros_i32.data(), // No electrostatics
             mol_atom_start_buf.data(), mol_atom_end_buf.data(), batch_.start_data(), batch_.end_data(),
-            reinterpret_cast<float*>(lbfgs_workspace_.data()), out_status.data(), out_iters.data(), out_energy.data(),
+            reinterpret_cast<float*>(lbfgs_workspace_bytes_.data()), out_status.data(), out_iters.data(),
+            out_energy.data(),
             out_rms.data(), n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth,
             max_atoms_per_mol);
 
@@ -1346,17 +1348,17 @@ class context_t {
     }
 
     /**
-     * @brief Compute energy and gradient using atom-centric CUDA F32 kernel.
-     *
-     * This kernel eliminates atomics and gathers by using:
-     * - Register-based coordinate storage
-     * - Shuffle-based coordinate access
-     * - Symmetric adjacency list (pairs stored twice)
-     * - Local gradient accumulation
-     *
-     * Requires additional charge arrays for electrostatics.
-     *
-     * @return tuple: (total_energy, gradient_x, gradient_y, gradient_z)
+     *  @brief Compute energy and gradient using atom-centric CUDA F32 kernel.
+     *  
+     *  This kernel eliminates atomics and gathers by using:
+     *  - Register-based coordinate storage
+     *  - Shuffle-based coordinate access
+     *  - Symmetric adjacency list (pairs stored twice)
+     *  - Local gradient accumulation
+     *  
+     *  Requires additional charge arrays for electrostatics.
+     *  
+     *  @return tuple: (total_energy, gradient_x, gradient_y, gradient_z)
      */
     py::tuple energy_gradient_atom_centric_cuda_f32(
         py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
@@ -1459,7 +1461,7 @@ class context_t {
 #pragma region Internal Helpers
 
 /**
- * @brief Check if CUDA support is available at compile time.
+ *  @brief Check if CUDA support is available at compile time.
  */
 inline bool supports_cuda_() noexcept {
 #if defined(__CUDACC__)
@@ -1470,7 +1472,7 @@ inline bool supports_cuda_() noexcept {
 }
 
 /**
- * @brief Check if AVX-512 F32 support is available at compile time.
+ *  @brief Check if AVX-512 F32 support is available at compile time.
  */
 inline bool supports_avx512_f32_() noexcept {
 #if defined(__AVX512F__)
@@ -1481,7 +1483,7 @@ inline bool supports_avx512_f32_() noexcept {
 }
 
 /**
- * @brief Check if AVX-512 BF16 support is available at compile time.
+ *  @brief Check if AVX-512 BF16 support is available at compile time.
  */
 inline bool supports_avx512_bf16_() noexcept {
 #if defined(__AVX512BF16__)
@@ -1492,7 +1494,7 @@ inline bool supports_avx512_bf16_() noexcept {
 }
 
 /**
- * @brief Check if AVX-512 FP16 support is available at compile time.
+ *  @brief Check if AVX-512 FP16 support is available at compile time.
  */
 inline bool supports_avx512_fp16_() noexcept {
 #if defined(__AVX512FP16__)
@@ -1507,7 +1509,7 @@ inline bool supports_avx512_fp16_() noexcept {
 #pragma region Serial CPU Kernels
 
 /**
- * @brief Compute van der Waals energy using serial CPU kernel (F32).
+ *  @brief Compute van der Waals energy using serial CPU kernel (F32).
  */
 float compute_vdw_energy_serial_f32_(py::array_t<float> coords_x, py::array_t<float> coords_y,
                                      py::array_t<float> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1531,7 +1533,7 @@ float compute_vdw_energy_serial_f32_(py::array_t<float> coords_x, py::array_t<fl
 }
 
 /**
- * @brief Compute van der Waals energy using serial CPU kernel (F64).
+ *  @brief Compute van der Waals energy using serial CPU kernel (F64).
  */
 double compute_vdw_energy_serial_f64_(py::array_t<double> coords_x, py::array_t<double> coords_y,
                                       py::array_t<double> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1555,7 +1557,7 @@ double compute_vdw_energy_serial_f64_(py::array_t<double> coords_x, py::array_t<
 }
 
 /**
- * @brief Compute electrostatic energy using serial CPU kernel (F32).
+ *  @brief Compute electrostatic energy using serial CPU kernel (F32).
  */
 float compute_electrostatic_energy_serial_f32_(py::array_t<float> coords_x, py::array_t<float> coords_y,
                                                py::array_t<float> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1582,7 +1584,7 @@ float compute_electrostatic_energy_serial_f32_(py::array_t<float> coords_x, py::
 }
 
 /**
- * @brief Compute electrostatic energy using serial CPU kernel (F64).
+ *  @brief Compute electrostatic energy using serial CPU kernel (F64).
  */
 double compute_electrostatic_energy_serial_f64_(py::array_t<double> coords_x, py::array_t<double> coords_y,
                                                 py::array_t<double> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1615,7 +1617,7 @@ double compute_electrostatic_energy_serial_f64_(py::array_t<double> coords_x, py
 #if defined(__AVX512F__)
 
 /**
- * @brief Compute van der Waals energy using AVX-512 F32 (Skylake).
+ *  @brief Compute van der Waals energy using AVX-512 F32 (Skylake).
  */
 float compute_vdw_energy_skylake_f32_(py::array_t<float> coords_x, py::array_t<float> coords_y,
                                       py::array_t<float> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1639,7 +1641,7 @@ float compute_vdw_energy_skylake_f32_(py::array_t<float> coords_x, py::array_t<f
 }
 
 /**
- * @brief Compute electrostatic energy using AVX-512 F32 (Skylake).
+ *  @brief Compute electrostatic energy using AVX-512 F32 (Skylake).
  */
 float compute_electrostatic_energy_skylake_f32_(py::array_t<float> coords_x, py::array_t<float> coords_y,
                                                 py::array_t<float> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1674,7 +1676,7 @@ float compute_electrostatic_energy_skylake_f32_(py::array_t<float> coords_x, py:
 #if defined(__AVX512BF16__)
 
 /**
- * @brief Compute van der Waals energy using AVX-512 BF16 (Genoa).
+ *  @brief Compute van der Waals energy using AVX-512 BF16 (Genoa).
  */
 float compute_vdw_energy_genoa_bf16_(py::array_t<std::uint16_t> coords_x, py::array_t<std::uint16_t> coords_y,
                                      py::array_t<std::uint16_t> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1706,10 +1708,10 @@ float compute_vdw_energy_genoa_bf16_(py::array_t<std::uint16_t> coords_x, py::ar
 #if defined(__AVX512FP16__)
 
 /**
- * @brief Compute van der Waals energy using AVX-512 FP16 (Turin).
- *
- * Uses std::uint16_t for Python binding compatibility (NumPy doesn't know _Float16).
- * IEEE 754 FP16 and _Float16 have identical binary representation.
+ *  @brief Compute van der Waals energy using AVX-512 FP16 (Turin).
+ *  
+ *  Uses std::uint16_t for Python binding compatibility (NumPy doesn't know _Float16).
+ *  IEEE 754 FP16 and _Float16 have identical binary representation.
  */
 float compute_vdw_energy_turin_fp16_(py::array_t<std::uint16_t> coords_x, py::array_t<std::uint16_t> coords_y,
                                      py::array_t<std::uint16_t> coords_z, py::array_t<std::int32_t> pair_atom_i,
@@ -1742,7 +1744,7 @@ float compute_vdw_energy_turin_fp16_(py::array_t<std::uint16_t> coords_x, py::ar
 #if defined(__CUDACC__)
 
 /**
- * @brief Compute van der Waals energy using CUDA F16.
+ *  @brief Compute van der Waals energy using CUDA F16.
  */
 float compute_vdw_energy_cuda_f16_(py::array_t<std::uint16_t> coords_x, py::array_t<std::uint16_t> coords_y,
                                    py::array_t<std::uint16_t> coords_z, py::array_t<std::int32_t> nb_i,
@@ -1827,7 +1829,7 @@ float compute_vdw_energy_cuda_f16_(py::array_t<std::uint16_t> coords_x, py::arra
 }
 
 /**
- * @brief Compute van der Waals energy using CUDA F32.
+ *  @brief Compute van der Waals energy using CUDA F32.
  */
 float compute_vdw_energy_cuda_f32_(py::array_t<float> coords_x, py::array_t<float> coords_y,
                                    py::array_t<float> coords_z, py::array_t<std::int32_t> nb_i,
@@ -1912,7 +1914,7 @@ float compute_vdw_energy_cuda_f32_(py::array_t<float> coords_x, py::array_t<floa
 }
 
 /**
- * @brief Compute electrostatic energy using CUDA F16.
+ *  @brief Compute electrostatic energy using CUDA F16.
  */
 float compute_electrostatic_energy_cuda_f16_(py::array_t<std::uint16_t> coords_x, py::array_t<std::uint16_t> coords_y,
                                              py::array_t<std::uint16_t> coords_z, py::array_t<std::int32_t> nb_i,
@@ -2003,7 +2005,7 @@ float compute_electrostatic_energy_cuda_f16_(py::array_t<std::uint16_t> coords_x
 }
 
 /**
- * @brief Compute electrostatic energy using CUDA F32.
+ *  @brief Compute electrostatic energy using CUDA F32.
  */
 float compute_electrostatic_energy_cuda_f32_(py::array_t<float> coords_x, py::array_t<float> coords_y,
                                              py::array_t<float> coords_z, py::array_t<std::int32_t> nb_i,

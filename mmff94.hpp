@@ -1,18 +1,18 @@
 /**
- * @file mmff94.hpp
- * @brief MMFF94 force field energy kernels for CPU (serial and AVX-512)
- * @author Ash Vardanian
+ *  @file mmff94.hpp
+ *  @brief MMFF94 force field energy kernels for CPU (serial and AVX-512)
+ *  @author Ash Vardanian
  *
- * Implements van der Waals (buffered 14-7) and electrostatic energy calculations.
- * All data structures are padded to SIMD width, so no tail handling is needed.
+ *  Implements van der Waals (buffered 14-7) and electrostatic energy calculations.
+ *  All data structures are padded to SIMD width, so no tail handling is needed.
  *
- * Supported backends:
- * - Serial templated (f32/f64)
- * - Skylake: AVX-512 F32
- * - Genoa: AVX-512 BF16
- * - Turin: AVX-512 FP16
+ *  Supported backends:
+ *  - Serial templated (f32/f64)
+ *  - Skylake: AVX-512 F32
+ *  - Genoa: AVX-512 BF16
+ *  - Turin: AVX-512 FP16
  *
- * Usage:
+ *  Usage:
  *     uv run pytest --benchmark-enable bench.py
  */
 
@@ -30,146 +30,142 @@
 namespace smallfield {
 
 #pragma region Constants
-
-// =============================================================================
 // Van der Waals Constants
-// =============================================================================
-
-/** Van der Waals delta parameter for buffered 14-7 potential. */
+/**  Van der Waals delta parameter for buffered 14-7 potential. */
 float constexpr vdw_delta = 0.07f;
 
-/** Van der Waals gamma parameter for buffered 14-7 potential. */
+/**  Van der Waals gamma parameter for buffered 14-7 potential. */
 float constexpr vdw_gamma = 0.12f;
-
-// =============================================================================
 // Electrostatic Constants
-// =============================================================================
-
-/** Electrostatic conversion constant (kcal*A/mol/e^2). */
+/**  Electrostatic conversion constant (kcal*A/mol/e^2). */
 float constexpr elec_constant = 332.0716f;
 
-/** Electrostatic buffer to prevent singularities (Angstroms). */
+/**  Electrostatic buffer to prevent singularities (Angstroms). */
 float constexpr elec_buffer = 0.05f;
 
-/** Default 1-4 scaling factor for electrostatic interactions. */
+/**  Default 1-4 scaling factor for electrostatic interactions. */
 float constexpr scale_1_4_default = 0.75f;
-
-// =============================================================================
 // Bond Stretching Constants (Quartic Potential)
-// =============================================================================
-
-/** Bond prefactor: converts mdyn*A to kcal/mol. */
+/**  Bond prefactor: converts mdyn*A to kcal/mol. */
 float constexpr bond_prefactor = 143.9325f;
 
-/** Cubic stretch constant (A^-1). */
+/**  Cubic stretch constant (A^-1). */
 float constexpr bond_cubic_stretch = -2.0f;
-
-// =============================================================================
 // Angle Bending Constants (Cubic Polynomial)
-// =============================================================================
-
-/** Angle prefactor: 143.9325 * (pi/180)^2 = 0.043844 (mdyn*A/rad^2 -> kcal/mol/deg^2). */
+/**  Angle prefactor: 143.9325 * (pi/180)^2 = 0.043844 (mdyn*A/rad^2 -> kcal/mol/deg^2). */
 float constexpr angle_prefactor = 0.043844f;
 
-/** Cubic bend constant (deg^-1). */
+/**  Cubic bend constant (deg^-1). */
 float constexpr angle_cubic_bend = -0.006981317f;
-
-// =============================================================================
 // Torsion Constants (Cosine Series)
-// =============================================================================
-
-/** Torsion prefactor. */
+/**  Torsion prefactor. */
 float constexpr torsion_prefactor = 0.5f;
-
-// =============================================================================
 // Stretch-Bend Coupling Constants
-// =============================================================================
-
-/** Stretch-bend prefactor: 143.9325 * (pi/180) = 2.51210 */
+/**  Stretch-bend prefactor: 143.9325 * (pi/180) = 2.51210 */
 float constexpr stretch_bend_prefactor = 2.51210f;
-
-// =============================================================================
 // Out-of-Plane Bending Constants
-// =============================================================================
-
-/** OOP prefactor (same as angle prefactor). */
+/**  OOP prefactor (same as angle prefactor). */
 float constexpr oop_prefactor = 0.043844f;
-
-// =============================================================================
 // Numerical Constants
-// =============================================================================
-
-/** Minimum distance squared to avoid numerical instabilities. */
+/**  Minimum distance squared to avoid numerical instabilities. */
 float constexpr min_distance_squared = 0.01f;
 
-/** Pi constant. */
+/**  Pi constant. */
 double constexpr pi = 3.14159265358979323846;
 
-/** Degrees to radians conversion. */
+/**  Degrees to radians conversion. */
 double constexpr deg_to_rad = pi / 180.0;
 
-/** Radians to degrees conversion. */
+/**  Radians to degrees conversion. */
 double constexpr rad_to_deg = 180.0 / pi;
 
 #pragma endregion
 
 #pragma region Helpers
 
-/** Compute x^7 efficiently as x * x^2 * x^4. */
-template <typename scalar_t> inline scalar_t pow7_(scalar_t x) {
+/**  Compute x^7 efficiently as x * x^2 * x^4. */
+template <typename scalar_type_> inline scalar_type_ pow7_(scalar_type_ x) {
+    using scalar_t = scalar_type_;
+
     scalar_t const x2 = x * x;
     scalar_t const x4 = x2 * x2;
     return x * x2 * x4;
 }
 
-/** Clamp value to [lo, hi] range. */
-template <typename scalar_t> inline scalar_t clamp_(scalar_t x, scalar_t lo, scalar_t hi) {
-    return x < lo ? lo : (x > hi ? hi : x);
+/**  Clamp value to [lo, hi] range. */
+template <typename scalar_type_> inline scalar_type_ clamp_(scalar_type_ x, scalar_type_ lo, scalar_type_ hi) {
+    using scalar_t = scalar_type_;
+
+    scalar_t const value = x < lo ? lo : (x > hi ? hi : x);
+    return value;
 }
 
-template <typename scalar_t> struct vec3_t {
-    scalar_t x;
-    scalar_t y;
-    scalar_t z;
+template <typename scalar_type_> struct vec3 {
+    scalar_type_ x;
+    scalar_type_ y;
+    scalar_type_ z;
 };
 
-template <typename scalar_t> inline vec3_t<scalar_t> make_vec3_(scalar_t x, scalar_t y, scalar_t z) {
-    return {x, y, z};
+template <typename scalar_type_> inline vec3<scalar_type_> make_vec3_(scalar_type_ x, scalar_type_ y, scalar_type_ z) {
+    using scalar_t = scalar_type_;
+
+    return vec3<scalar_t>{x, y, z};
 }
 
-template <typename scalar_t> inline vec3_t<scalar_t> sub_(vec3_t<scalar_t> const& a, vec3_t<scalar_t> const& b) {
-    return {a.x - b.x, a.y - b.y, a.z - b.z};
+template <typename scalar_type_>
+inline vec3<scalar_type_> sub_(vec3<scalar_type_> const& a, vec3<scalar_type_> const& b) {
+    using scalar_t = scalar_type_;
+
+    return vec3<scalar_t>{a.x - b.x, a.y - b.y, a.z - b.z};
 }
 
-template <typename scalar_t> inline vec3_t<scalar_t> add_(vec3_t<scalar_t> const& a, vec3_t<scalar_t> const& b) {
-    return {a.x + b.x, a.y + b.y, a.z + b.z};
+template <typename scalar_type_>
+inline vec3<scalar_type_> add_(vec3<scalar_type_> const& a, vec3<scalar_type_> const& b) {
+    using scalar_t = scalar_type_;
+
+    return vec3<scalar_t>{a.x + b.x, a.y + b.y, a.z + b.z};
 }
 
-template <typename scalar_t> inline vec3_t<scalar_t> scale_(vec3_t<scalar_t> const& a, scalar_t s) {
-    return {a.x * s, a.y * s, a.z * s};
+template <typename scalar_type_> inline vec3<scalar_type_> scale_(vec3<scalar_type_> const& a, scalar_type_ s) {
+    using scalar_t = scalar_type_;
+
+    return vec3<scalar_t>{a.x * s, a.y * s, a.z * s};
 }
 
-template <typename scalar_t> inline scalar_t dot_(vec3_t<scalar_t> const& a, vec3_t<scalar_t> const& b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
+template <typename scalar_type_> inline scalar_type_ dot_(vec3<scalar_type_> const& a, vec3<scalar_type_> const& b) {
+    using scalar_t = scalar_type_;
+
+    scalar_t const value = a.x * b.x + a.y * b.y + a.z * b.z;
+    return value;
 }
 
-template <typename scalar_t> inline vec3_t<scalar_t> cross_(vec3_t<scalar_t> const& a, vec3_t<scalar_t> const& b) {
-    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+template <typename scalar_type_>
+inline vec3<scalar_type_> cross_(vec3<scalar_type_> const& a, vec3<scalar_type_> const& b) {
+    using scalar_t = scalar_type_;
+
+    return vec3<scalar_t>{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
 }
 
-template <typename scalar_t> inline scalar_t norm_(vec3_t<scalar_t> const& a) { return std::sqrt(dot_(a, a)); }
+template <typename scalar_type_> inline scalar_type_ norm_(vec3<scalar_type_> const& a) {
+    using scalar_t = scalar_type_;
+
+    scalar_t const value = std::sqrt(dot_(a, a));
+    return value;
+}
 
 #pragma endregion
 
 #pragma region L-BFGS Data Structures
 
 /**
- * @brief State container for L-BFGS optimizer.
+ *  @brief State container for L-BFGS optimizer.
  *
- * Stores history vectors (s, y), working buffers, and iteration state.
- * Memory layout: all arrays are flat and contiguous for cache efficiency.
+ *  Stores history vectors (s, y), working buffers, and iteration state.
+ *  Memory layout: all arrays are flat and contiguous for cache efficiency.
  */
-template <typename scalar_t> struct lbfgs_state_t {
+template <typename scalar_type_> struct lbfgs_state {
+    using scalar_t = scalar_type_;
+
     scalar_t* s_history;    // [m * 3 * n_atoms] position differences
     scalar_t* y_history;    // [m * 3 * n_atoms] gradient differences
     scalar_t* alpha;        // [m] two-loop recursion coefficients
@@ -184,8 +180,11 @@ template <typename scalar_t> struct lbfgs_state_t {
     std::size_t k;          // iteration count
 };
 
+using lbfgs_state_f32_t = lbfgs_state<float>;
+using lbfgs_state_f64_t = lbfgs_state<double>;
+
 /**
- * @brief Result of optimization run.
+ *  @brief Result of optimization run.
  */
 struct optimize_result_t {
     int status;          // 0=converged, 1=max_iter, -1=error
@@ -199,28 +198,33 @@ struct optimize_result_t {
 #pragma region Precomputed VdW Pair Constants
 
 /**
- * @brief Precomputed VdW pair constants for eliminating redundant calculations.
+ *  @brief Precomputed VdW pair constants for eliminating redundant calculations.
  *
- * These values are constant for each pair and can be computed once at setup.
- * Eliminates ~8 multiplications per 16 pairs in every energy/gradient call.
+ *  These values are constant for each pair and can be computed once at setup.
+ *  Eliminates ~8 multiplications per 16 pairs in every energy/gradient call.
  */
-template <typename scalar_t> struct vdw_precomputed_t {
-    scalar_t* eq_dist_7;                // pow7(equilibrium_distance)
-    scalar_t* delta_eq_dist;            // delta * equilibrium_distance
-    scalar_t* one_plus_delta_eq_dist;   // (1 + delta) * equilibrium_distance
-    scalar_t* gamma_eq_dist_7;          // gamma * eq_dist_7
-    scalar_t* one_plus_gamma_eq_dist_7; // (1 + gamma) * eq_dist_7
+template <typename scalar_type_> struct vdw_precomputed {
+    scalar_type_* eq_dist_7;                // pow7(equilibrium_distance)
+    scalar_type_* delta_eq_dist;            // delta * equilibrium_distance
+    scalar_type_* one_plus_delta_eq_dist;   // (1 + delta) * equilibrium_distance
+    scalar_type_* gamma_eq_dist_7;          // gamma * eq_dist_7
+    scalar_type_* one_plus_gamma_eq_dist_7; // (1 + gamma) * eq_dist_7
 };
 
+using vdw_precomputed_f32_t = vdw_precomputed<float>;
+using vdw_precomputed_f64_t = vdw_precomputed<double>;
+
 /**
- * @brief Precompute VdW pair constants from epsilon and equilibrium distance arrays.
+ *  @brief Precompute VdW pair constants from epsilon and equilibrium distance arrays.
  *
- * Call once at setup before optimization. The output arrays must be pre-allocated
- * with size >= n_pairs.
+ *  Call once at setup before optimization. The output arrays must be pre-allocated
+ *  with size >= n_pairs.
  */
-template <typename scalar_t>
-void precompute_vdw_constants(scalar_t const* pair_equilibrium_distance, std::size_t n_pairs,
-                              vdw_precomputed_t<scalar_t>& out) {
+template <typename scalar_type_>
+void precompute_vdw_constants(scalar_type_ const* pair_equilibrium_distance, std::size_t n_pairs,
+                              vdw_precomputed<scalar_type_>& out) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr delta = static_cast<scalar_t>(vdw_delta);
     scalar_t constexpr gamma = static_cast<scalar_t>(vdw_gamma);
     scalar_t constexpr one_plus_delta = static_cast<scalar_t>(1.0 + vdw_delta);
@@ -243,40 +247,40 @@ void precompute_vdw_constants(scalar_t const* pair_equilibrium_distance, std::si
 #pragma region MMFF94 Force Field Parameters
 
 /**
- * @brief All MMFF94 force field parameters for a molecule.
+ *  @brief All MMFF94 force field parameters for a molecule.
  *
- * Contains arrays for all energy terms: VdW, electrostatic, bond, angle,
- * torsion, stretch-bend, and out-of-plane bending.
+ *  Contains arrays for all energy terms: VdW, electrostatic, bond, angle,
+ *  torsion, stretch-bend, and out-of-plane bending.
  */
-template <typename scalar_t> struct mmff94_params_t {
+template <typename scalar_type_> struct mmff94_params {
     // VdW pairs (buffered 14-7)
     std::int32_t const* vdw_pair_i;
     std::int32_t const* vdw_pair_j;
-    scalar_t const* vdw_epsilon;
-    scalar_t const* vdw_r_star;
+    scalar_type_ const* vdw_epsilon;
+    scalar_type_ const* vdw_r_star;
     std::size_t vdw_count;
 
     // Electrostatic pairs
     std::int32_t const* elec_pair_i;
     std::int32_t const* elec_pair_j;
-    scalar_t const* elec_charge_i;
-    scalar_t const* elec_charge_j;
+    scalar_type_ const* elec_charge_i;
+    scalar_type_ const* elec_charge_j;
     std::int32_t const* elec_is_1_4;
     std::size_t elec_count;
 
     // Bonds (quartic stretching)
     std::int32_t const* bond_atom_i;
     std::int32_t const* bond_atom_j;
-    scalar_t const* bond_kb;
-    scalar_t const* bond_r0;
+    scalar_type_ const* bond_kb;
+    scalar_type_ const* bond_r0;
     std::size_t bond_count;
 
     // Angles (cubic bending)
     std::int32_t const* angle_atom_i;
     std::int32_t const* angle_atom_j;
     std::int32_t const* angle_atom_k;
-    scalar_t const* angle_ka;
-    scalar_t const* angle_theta0;
+    scalar_type_ const* angle_ka;
+    scalar_type_ const* angle_theta0;
     std::size_t angle_count;
 
     // Torsions (3-term Fourier)
@@ -284,20 +288,20 @@ template <typename scalar_t> struct mmff94_params_t {
     std::int32_t const* torsion_atom_j;
     std::int32_t const* torsion_atom_k;
     std::int32_t const* torsion_atom_l;
-    scalar_t const* torsion_v1;
-    scalar_t const* torsion_v2;
-    scalar_t const* torsion_v3;
+    scalar_type_ const* torsion_v1;
+    scalar_type_ const* torsion_v2;
+    scalar_type_ const* torsion_v3;
     std::size_t torsion_count;
 
     // Stretch-bend coupling
     std::int32_t const* stbn_atom_i;
     std::int32_t const* stbn_atom_j;
     std::int32_t const* stbn_atom_k;
-    scalar_t const* stbn_kba_ijk;
-    scalar_t const* stbn_kba_kji;
-    scalar_t const* stbn_r0_ij;
-    scalar_t const* stbn_r0_kj;
-    scalar_t const* stbn_theta0;
+    scalar_type_ const* stbn_kba_ijk;
+    scalar_type_ const* stbn_kba_kji;
+    scalar_type_ const* stbn_r0_ij;
+    scalar_type_ const* stbn_r0_kj;
+    scalar_type_ const* stbn_theta0;
     std::size_t stbn_count;
 
     // Out-of-plane bending (Wilson angle)
@@ -305,23 +309,28 @@ template <typename scalar_t> struct mmff94_params_t {
     std::int32_t const* oop_atom_j;
     std::int32_t const* oop_atom_k;
     std::int32_t const* oop_atom_l;
-    scalar_t const* oop_koop;
+    scalar_type_ const* oop_koop;
     std::size_t oop_count;
 };
+
+using mmff94_params_f32_t = mmff94_params<float>;
+using mmff94_params_f64_t = mmff94_params<double>;
 
 #pragma endregion
 
 #pragma region Serial Kernels
 
 /**
- * Compute van der Waals energy using MMFF94 buffered 14-7 potential.
- * Data is assumed to be padded to SIMD width (no tail handling).
+ *  Compute van der Waals energy using MMFF94 buffered 14-7 potential.
+ *  Data is assumed to be padded to SIMD width (no tail handling).
  */
-template <typename scalar_t>
-scalar_t compute_vdw_energy(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                            std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
-                            scalar_t const* pair_epsilon, scalar_t const* pair_equilibrium_distance,
-                            std::size_t pair_start, std::size_t pair_count) {
+template <typename scalar_type_>
+scalar_type_ compute_vdw_energy(scalar_type_ const* coord_x, scalar_type_ const* coord_y, scalar_type_ const* coord_z,
+                                std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
+                                scalar_type_ const* pair_epsilon, scalar_type_ const* pair_equilibrium_distance,
+                                std::size_t pair_start, std::size_t pair_count) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr delta = static_cast<scalar_t>(vdw_delta);
     scalar_t constexpr gamma = static_cast<scalar_t>(vdw_gamma);
     scalar_t constexpr one_plus_delta = static_cast<scalar_t>(1.0 + vdw_delta);
@@ -361,15 +370,17 @@ scalar_t compute_vdw_energy(scalar_t const* coord_x, scalar_t const* coord_y, sc
 }
 
 /**
- * Compute van der Waals gradient using MMFF94 buffered 14-7 potential.
- * Accumulates forces into grad_x, grad_y, grad_z (caller must zero arrays first).
+ *  Compute van der Waals gradient using MMFF94 buffered 14-7 potential.
+ *  Accumulates forces into grad_x, grad_y, grad_z (caller must zero arrays first).
  */
-template <typename scalar_t>
-void compute_vdw_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
+template <typename scalar_type_>
+void compute_vdw_gradient(scalar_type_ const* coord_x, scalar_type_ const* coord_y, scalar_type_ const* coord_z,
                           std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
-                          scalar_t const* pair_epsilon, scalar_t const* pair_equilibrium_distance,
-                          std::size_t pair_start, std::size_t pair_count, scalar_t* grad_x, scalar_t* grad_y,
-                          scalar_t* grad_z) {
+                          scalar_type_ const* pair_epsilon, scalar_type_ const* pair_equilibrium_distance,
+                          std::size_t pair_start, std::size_t pair_count, scalar_type_* grad_x, scalar_type_* grad_y,
+                          scalar_type_* grad_z) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr delta = static_cast<scalar_t>(vdw_delta);
     scalar_t constexpr gamma = static_cast<scalar_t>(vdw_gamma);
     scalar_t constexpr one_plus_delta = static_cast<scalar_t>(1.0 + vdw_delta);
@@ -434,15 +445,18 @@ void compute_vdw_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scal
 }
 
 /**
- * Compute electrostatic energy using MMFF94 Coulomb potential with buffer.
- * Data is assumed to be padded to SIMD width (no tail handling).
+ *  Compute electrostatic energy using MMFF94 Coulomb potential with buffer.
+ *  Data is assumed to be padded to SIMD width (no tail handling).
  */
-template <typename scalar_t>
-scalar_t compute_electrostatic_energy(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                                      std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
-                                      scalar_t const* pair_charge_i, scalar_t const* pair_charge_j,
-                                      std::int32_t const* pair_is_1_4, std::size_t pair_start, std::size_t pair_count,
-                                      scalar_t scaling_1_4 = static_cast<scalar_t>(scale_1_4_default)) {
+template <typename scalar_type_>
+scalar_type_ compute_electrostatic_energy(scalar_type_ const* coord_x, scalar_type_ const* coord_y,
+                                          scalar_type_ const* coord_z, std::int32_t const* pair_atom_i,
+                                          std::int32_t const* pair_atom_j, scalar_type_ const* pair_charge_i,
+                                          scalar_type_ const* pair_charge_j, std::int32_t const* pair_is_1_4,
+                                          std::size_t pair_start, std::size_t pair_count,
+                                          scalar_type_ scaling_1_4 = static_cast<scalar_type_>(scale_1_4_default)) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr coulomb = static_cast<scalar_t>(elec_constant);
     scalar_t constexpr buffer = static_cast<scalar_t>(elec_buffer);
     scalar_t constexpr one = static_cast<scalar_t>(1.0);
@@ -481,16 +495,19 @@ scalar_t compute_electrostatic_energy(scalar_t const* coord_x, scalar_t const* c
 }
 
 /**
- * Compute electrostatic gradient using MMFF94 Coulomb potential with buffer.
- * Accumulates forces into grad_x/y/z arrays (does not zero them).
- * Data is assumed to be padded to SIMD width (no tail handling).
+ *  Compute electrostatic gradient using MMFF94 Coulomb potential with buffer.
+ *  Accumulates forces into grad_x/y/z arrays (does not zero them).
+ *  Data is assumed to be padded to SIMD width (no tail handling).
  */
-template <typename scalar_t>
-void compute_electrostatic_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                                    std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
-                                    scalar_t const* pair_charge_i, scalar_t const* pair_charge_j,
-                                    std::int32_t const* pair_is_1_4, std::size_t pair_start, std::size_t pair_count,
-                                    scalar_t scaling_1_4, scalar_t* grad_x, scalar_t* grad_y, scalar_t* grad_z) {
+template <typename scalar_type_>
+void compute_electrostatic_gradient(scalar_type_ const* coord_x, scalar_type_ const* coord_y,
+                                    scalar_type_ const* coord_z, std::int32_t const* pair_atom_i,
+                                    std::int32_t const* pair_atom_j, scalar_type_ const* pair_charge_i,
+                                    scalar_type_ const* pair_charge_j, std::int32_t const* pair_is_1_4,
+                                    std::size_t pair_start, std::size_t pair_count, scalar_type_ scaling_1_4,
+                                    scalar_type_* grad_x, scalar_type_* grad_y, scalar_type_* grad_z) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr coulomb = static_cast<scalar_t>(elec_constant);
     scalar_t constexpr buffer = static_cast<scalar_t>(elec_buffer);
     scalar_t constexpr one = static_cast<scalar_t>(1.0);
@@ -539,19 +556,18 @@ void compute_electrostatic_gradient(scalar_t const* coord_x, scalar_t const* coo
         grad_z[j] += dE_dz;
     }
 }
-
-// =============================================================================
 // Bond Stretching Energy and Gradient (Quartic Potential)
-// =============================================================================
-
 /**
- * Compute bond stretching energy using MMFF94 quartic potential.
- * E = 0.5 * 143.9325 * kb * dr^2 * (1 + cs*dr + 7/12*cs^2*dr^2)
+ *  Compute bond stretching energy using MMFF94 quartic potential.
+ *  E = 0.5 * 143.9325 * kb * dr^2 * (1 + cs*dr + 7/12*cs^2*dr^2)
  */
-template <typename scalar_t>
-scalar_t compute_bond_energy(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                             std::int32_t const* bond_atom_i, std::int32_t const* bond_atom_j, scalar_t const* bond_kb,
-                             scalar_t const* bond_r0, std::size_t bond_start, std::size_t bond_count) {
+template <typename scalar_type_>
+scalar_type_ compute_bond_energy(scalar_type_ const* coord_x, scalar_type_ const* coord_y, scalar_type_ const* coord_z,
+                                 std::int32_t const* bond_atom_i, std::int32_t const* bond_atom_j,
+                                 scalar_type_ const* bond_kb, scalar_type_ const* bond_r0, std::size_t bond_start,
+                                 std::size_t bond_count) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr prefactor = static_cast<scalar_t>(bond_prefactor);
     scalar_t constexpr cs = static_cast<scalar_t>(bond_cubic_stretch);
     scalar_t constexpr cs2 = cs * cs;
@@ -583,14 +599,16 @@ scalar_t compute_bond_energy(scalar_t const* coord_x, scalar_t const* coord_y, s
 }
 
 /**
- * Compute bond stretching gradient using MMFF94 quartic potential.
- * dE/dr = 143.9325 * kb * dr * (1 + 1.5*cs*dr + 7/6*cs^2*dr^2)
+ *  Compute bond stretching gradient using MMFF94 quartic potential.
+ *  dE/dr = 143.9325 * kb * dr * (1 + 1.5*cs*dr + 7/6*cs^2*dr^2)
  */
-template <typename scalar_t>
-void compute_bond_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                           std::int32_t const* bond_atom_i, std::int32_t const* bond_atom_j, scalar_t const* bond_kb,
-                           scalar_t const* bond_r0, std::size_t bond_start, std::size_t bond_count, scalar_t* grad_x,
-                           scalar_t* grad_y, scalar_t* grad_z) {
+template <typename scalar_type_>
+void compute_bond_gradient(scalar_type_ const* coord_x, scalar_type_ const* coord_y, scalar_type_ const* coord_z,
+                           std::int32_t const* bond_atom_i, std::int32_t const* bond_atom_j,
+                           scalar_type_ const* bond_kb, scalar_type_ const* bond_r0, std::size_t bond_start,
+                           std::size_t bond_count, scalar_type_* grad_x, scalar_type_* grad_y, scalar_type_* grad_z) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr prefactor = static_cast<scalar_t>(bond_prefactor);
     scalar_t constexpr cs = static_cast<scalar_t>(bond_cubic_stretch);
     scalar_t constexpr cs2 = cs * cs;
@@ -612,7 +630,8 @@ void compute_bond_gradient(scalar_t const* coord_x, scalar_t const* coord_y, sca
         scalar_t const dr = r - r0;
 
         // dE/dr = 143.9325 * kb * dr * (1 + 1.5*cs*dr + 7/6*cs^2*dr^2)
-        scalar_t const term = static_cast<scalar_t>(1.0) + one_point_five * cs * dr + seven_sixths * cs2 * dr * dr;
+        scalar_t const term =
+            static_cast<scalar_t>(1.0) + one_point_five * cs * dr + seven_sixths * cs2 * dr * dr;
         scalar_t const dE_dr = prefactor * kb * dr * term;
 
         // Convert to force: F = -dE/dr * (r_vec / |r_vec|)
@@ -630,21 +649,19 @@ void compute_bond_gradient(scalar_t const* coord_x, scalar_t const* coord_y, sca
         grad_z[j] += fz;
     }
 }
-
-// =============================================================================
 // Angle Bending Energy and Gradient (Cubic Polynomial)
-// =============================================================================
-
 /**
- * Compute angle bending energy using MMFF94 cubic polynomial.
- * E = 0.5 * 0.043844 * ka * dtheta^2 * (1 + cb*dtheta)
- * where dtheta is in degrees.
+ *  Compute angle bending energy using MMFF94 cubic polynomial.
+ *  E = 0.5 * 0.043844 * ka * dtheta^2 * (1 + cb*dtheta)
+ *  where dtheta is in degrees.
  */
-template <typename scalar_t>
-scalar_t compute_angle_energy(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                              std::int32_t const* angle_atom_i, std::int32_t const* angle_atom_j,
-                              std::int32_t const* angle_atom_k, scalar_t const* angle_ka, scalar_t const* angle_theta0,
-                              std::size_t angle_start, std::size_t angle_count) {
+template <typename scalar_type_>
+scalar_type_ compute_angle_energy(scalar_type_ const* coord_x, scalar_type_ const* coord_y, scalar_type_ const* coord_z,
+                                  std::int32_t const* angle_atom_i, std::int32_t const* angle_atom_j,
+                                  std::int32_t const* angle_atom_k, scalar_type_ const* angle_ka,
+                                  scalar_type_ const* angle_theta0, std::size_t angle_start, std::size_t angle_count) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr prefactor = static_cast<scalar_t>(angle_prefactor);
     scalar_t constexpr cb = static_cast<scalar_t>(angle_cubic_bend);
     scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
@@ -689,40 +706,43 @@ scalar_t compute_angle_energy(scalar_t const* coord_x, scalar_t const* coord_y, 
 }
 
 /**
- * Compute angle bending gradient using MMFF94 cubic polynomial.
- * Uses chain rule: dE/dx = dE/dtheta * dtheta/dx
+ *  Compute angle bending gradient using MMFF94 cubic polynomial.
+ *  Uses chain rule: dE/dx = dE/dtheta * dtheta/dx
  */
-template <typename scalar_t>
-void compute_angle_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
+template <typename scalar_type_>
+void compute_angle_gradient(scalar_type_ const* coord_x, scalar_type_ const* coord_y, scalar_type_ const* coord_z,
                             std::int32_t const* angle_atom_i, std::int32_t const* angle_atom_j,
-                            std::int32_t const* angle_atom_k, scalar_t const* angle_ka, scalar_t const* angle_theta0,
-                            std::size_t angle_start, std::size_t angle_count, scalar_t* grad_x, scalar_t* grad_y,
-                            scalar_t* grad_z) {
+                            std::int32_t const* angle_atom_k, scalar_type_ const* angle_ka,
+                            scalar_type_ const* angle_theta0, std::size_t angle_start, std::size_t angle_count,
+                            scalar_type_* grad_x, scalar_type_* grad_y, scalar_type_* grad_z) {
+    using scalar_t = scalar_type_;
+
     std::size_t const angle_end = angle_start + angle_count;
     for (std::size_t idx = angle_start; idx < angle_end; ++idx) {
         std::int32_t const i = angle_atom_i[idx];
         std::int32_t const j = angle_atom_j[idx]; // central atom
         std::int32_t const k = angle_atom_k[idx];
 
-        vec3_t<scalar_t> const p1 = make_vec3_(coord_x[i], coord_y[i], coord_z[i]);
-        vec3_t<scalar_t> const p2 = make_vec3_(coord_x[j], coord_y[j], coord_z[j]);
-        vec3_t<scalar_t> const p3 = make_vec3_(coord_x[k], coord_y[k], coord_z[k]);
+        vec3<scalar_t> const p1 = make_vec3_(coord_x[i], coord_y[i], coord_z[i]);
+        vec3<scalar_t> const p2 = make_vec3_(coord_x[j], coord_y[j], coord_z[j]);
+        vec3<scalar_t> const p3 = make_vec3_(coord_x[k], coord_y[k], coord_z[k]);
 
-        vec3_t<scalar_t> const r12 = sub_(p1, p2);
-        vec3_t<scalar_t> const r32 = sub_(p3, p2);
+        vec3<scalar_t> const r12 = sub_(p1, p2);
+        vec3<scalar_t> const r32 = sub_(p3, p2);
         scalar_t const dist1 = norm_(r12);
         scalar_t const dist2 = norm_(r32);
         if (dist1 < static_cast<scalar_t>(1e-8) || dist2 < static_cast<scalar_t>(1e-8)) {
             continue;
         }
 
-        vec3_t<scalar_t> const p12 = scale_(r12, static_cast<scalar_t>(1.0) / dist1);
-        vec3_t<scalar_t> const p32 = scale_(r32, static_cast<scalar_t>(1.0) / dist2);
-        scalar_t const cos_theta = clamp_(dot_(p12, p32), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
+        vec3<scalar_t> const p12 = scale_(r12, static_cast<scalar_t>(1.0) / dist1);
+        vec3<scalar_t> const p32 = scale_(r32, static_cast<scalar_t>(1.0) / dist2);
+        scalar_t const cos_theta =
+            clamp_(dot_(p12, p32), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
         scalar_t const sin_theta_sq = static_cast<scalar_t>(1.0) - cos_theta * cos_theta;
-        scalar_t const sin_theta =
-            std::max((sin_theta_sq > static_cast<scalar_t>(0.0) ? std::sqrt(sin_theta_sq) : static_cast<scalar_t>(0.0)),
-                     static_cast<scalar_t>(1e-8));
+        scalar_t const sin_theta = std::max(
+            (sin_theta_sq > static_cast<scalar_t>(0.0) ? std::sqrt(sin_theta_sq) : static_cast<scalar_t>(0.0)),
+            static_cast<scalar_t>(1e-8));
 
         scalar_t constexpr cb = static_cast<scalar_t>(angle_cubic_bend);
         scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
@@ -733,7 +753,8 @@ void compute_angle_gradient(scalar_t const* coord_x, scalar_t const* coord_y, sc
 
         // dE/dTheta in degrees (matches RDKit form).
         scalar_t const dE_dtheta =
-            to_deg * c2 * ka * angle_term * (static_cast<scalar_t>(1.0) + static_cast<scalar_t>(1.5) * cb * angle_term);
+            to_deg * c2 * ka * angle_term *
+            (static_cast<scalar_t>(1.0) + static_cast<scalar_t>(1.5) * cb * angle_term);
 
         scalar_t const dCos_dS1 = static_cast<scalar_t>(1.0) / dist1 * (p32.x - cos_theta * p12.x);
         scalar_t const dCos_dS2 = static_cast<scalar_t>(1.0) / dist1 * (p32.y - cos_theta * p12.y);
@@ -754,21 +775,20 @@ void compute_angle_gradient(scalar_t const* coord_x, scalar_t const* coord_y, sc
         grad_z[k] += dE_dtheta * dCos_dS6 * inv_sin;
     }
 }
-
-// =============================================================================
 // Torsion Energy and Gradient (Cosine Series)
-// =============================================================================
-
 /**
- * Compute torsion energy using MMFF94 3-term cosine series.
- * E = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
+ *  Compute torsion energy using MMFF94 3-term cosine series.
+ *  E = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
  */
-template <typename scalar_t>
-scalar_t compute_torsion_energy(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                                std::int32_t const* torsion_atom_i, std::int32_t const* torsion_atom_j,
-                                std::int32_t const* torsion_atom_k, std::int32_t const* torsion_atom_l,
-                                scalar_t const* torsion_v1, scalar_t const* torsion_v2, scalar_t const* torsion_v3,
-                                std::size_t torsion_start, std::size_t torsion_count) {
+template <typename scalar_type_>
+scalar_type_ compute_torsion_energy(scalar_type_ const* coord_x, scalar_type_ const* coord_y,
+                                    scalar_type_ const* coord_z, std::int32_t const* torsion_atom_i,
+                                    std::int32_t const* torsion_atom_j, std::int32_t const* torsion_atom_k,
+                                    std::int32_t const* torsion_atom_l, scalar_type_ const* torsion_v1,
+                                    scalar_type_ const* torsion_v2, scalar_type_ const* torsion_v3,
+                                    std::size_t torsion_start, std::size_t torsion_count) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr prefactor = static_cast<scalar_t>(torsion_prefactor);
 
     scalar_t accum = 0;
@@ -823,29 +843,32 @@ scalar_t compute_torsion_energy(scalar_t const* coord_x, scalar_t const* coord_y
         scalar_t const v3 = torsion_v3[idx];
 
         // E = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
-        scalar_t const cos_2phi = static_cast<scalar_t>(2.0) * cos_phi * cos_phi - static_cast<scalar_t>(1.0);
+        scalar_t const cos_2phi =
+            static_cast<scalar_t>(2.0) * cos_phi * cos_phi - static_cast<scalar_t>(1.0);
         scalar_t const cos_3phi =
             cos_phi * (static_cast<scalar_t>(4.0) * cos_phi * cos_phi - static_cast<scalar_t>(3.0));
 
-        accum +=
-            prefactor * (v1 * (static_cast<scalar_t>(1.0) + cos_phi) + v2 * (static_cast<scalar_t>(1.0) - cos_2phi) +
-                         v3 * (static_cast<scalar_t>(1.0) + cos_3phi));
+        accum += prefactor *
+                 (v1 * (static_cast<scalar_t>(1.0) + cos_phi) + v2 * (static_cast<scalar_t>(1.0) - cos_2phi) +
+                  v3 * (static_cast<scalar_t>(1.0) + cos_3phi));
     }
 
     return accum;
 }
 
 /**
- * Compute torsion gradient using MMFF94 3-term cosine series.
- * dE/dphi = 0.5 * (-V1*sin(phi) + 2*V2*sin(2*phi) - 3*V3*sin(3*phi))
+ *  Compute torsion gradient using MMFF94 3-term cosine series.
+ *  dE/dphi = 0.5 * (-V1*sin(phi) + 2*V2*sin(2*phi) - 3*V3*sin(3*phi))
  */
-template <typename scalar_t>
-void compute_torsion_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
+template <typename scalar_type_>
+void compute_torsion_gradient(scalar_type_ const* coord_x, scalar_type_ const* coord_y, scalar_type_ const* coord_z,
                               std::int32_t const* torsion_atom_i, std::int32_t const* torsion_atom_j,
                               std::int32_t const* torsion_atom_k, std::int32_t const* torsion_atom_l,
-                              scalar_t const* torsion_v1, scalar_t const* torsion_v2, scalar_t const* torsion_v3,
-                              std::size_t torsion_start, std::size_t torsion_count, scalar_t* grad_x, scalar_t* grad_y,
-                              scalar_t* grad_z) {
+                              scalar_type_ const* torsion_v1, scalar_type_ const* torsion_v2,
+                              scalar_type_ const* torsion_v3, std::size_t torsion_start, std::size_t torsion_count,
+                              scalar_type_* grad_x, scalar_type_* grad_y, scalar_type_* grad_z) {
+    using scalar_t = scalar_type_;
+
     std::size_t const torsion_end = torsion_start + torsion_count;
     for (std::size_t idx = torsion_start; idx < torsion_end; ++idx) {
         std::int32_t const i = torsion_atom_i[idx];
@@ -853,13 +876,13 @@ void compute_torsion_gradient(scalar_t const* coord_x, scalar_t const* coord_y, 
         std::int32_t const k = torsion_atom_k[idx];
         std::int32_t const l = torsion_atom_l[idx];
 
-        vec3_t<scalar_t> const p1 = make_vec3_(coord_x[i], coord_y[i], coord_z[i]);
-        vec3_t<scalar_t> const p2 = make_vec3_(coord_x[j], coord_y[j], coord_z[j]);
-        vec3_t<scalar_t> const p3 = make_vec3_(coord_x[k], coord_y[k], coord_z[k]);
-        vec3_t<scalar_t> const p4 = make_vec3_(coord_x[l], coord_y[l], coord_z[l]);
+        vec3<scalar_t> const p1 = make_vec3_(coord_x[i], coord_y[i], coord_z[i]);
+        vec3<scalar_t> const p2 = make_vec3_(coord_x[j], coord_y[j], coord_z[j]);
+        vec3<scalar_t> const p3 = make_vec3_(coord_x[k], coord_y[k], coord_z[k]);
+        vec3<scalar_t> const p4 = make_vec3_(coord_x[l], coord_y[l], coord_z[l]);
 
-        vec3_t<scalar_t> r[4];
-        vec3_t<scalar_t> t[2];
+        vec3<scalar_t> r[4];
+        vec3<scalar_t> t[2];
         scalar_t d[2];
         r[0] = sub_(p1, p2);
         r[1] = sub_(p3, p2);
@@ -873,7 +896,8 @@ void compute_torsion_gradient(scalar_t const* coord_x, scalar_t const* coord_y, 
         d[1] = std::max(norm_(t[1]), static_cast<scalar_t>(1e-5));
         t[1] = scale_(t[1], static_cast<scalar_t>(1.0) / d[1]);
 
-        scalar_t const cos_phi = clamp_(dot_(t[0], t[1]), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
+        scalar_t const cos_phi =
+            clamp_(dot_(t[0], t[1]), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
         scalar_t const sin_phi_sq = static_cast<scalar_t>(1.0) - cos_phi * cos_phi;
         scalar_t const sin_phi =
             (sin_phi_sq > static_cast<scalar_t>(0.0)) ? std::sqrt(sin_phi_sq) : static_cast<scalar_t>(0.0);
@@ -887,10 +911,11 @@ void compute_torsion_gradient(scalar_t const* coord_x, scalar_t const* coord_y, 
         scalar_t const sin_3phi =
             static_cast<scalar_t>(3.0) * sin_phi - static_cast<scalar_t>(4.0) * sin_phi * sin_phi * sin_phi;
         scalar_t const dE_dphi =
-            static_cast<scalar_t>(0.5) *
-            (-v1 * sin_phi + static_cast<scalar_t>(2.0) * v2 * sin_2phi - static_cast<scalar_t>(3.0) * v3 * sin_3phi);
+            static_cast<scalar_t>(0.5) * (-v1 * sin_phi + static_cast<scalar_t>(2.0) * v2 * sin_2phi -
+                                              static_cast<scalar_t>(3.0) * v3 * sin_3phi);
 
-        if (std::abs(cos_phi) < static_cast<scalar_t>(1e-8) && std::abs(sin_phi) < static_cast<scalar_t>(1e-8)) {
+        if (std::abs(cos_phi) < static_cast<scalar_t>(1e-8) &&
+            std::abs(sin_phi) < static_cast<scalar_t>(1e-8)) {
             continue;
         }
 
@@ -929,22 +954,21 @@ void compute_torsion_gradient(scalar_t const* coord_x, scalar_t const* coord_y, 
         grad_z[l] += sin_term * (dCos_dT[3] * r[2].y - dCos_dT[4] * r[2].x);
     }
 }
-
-// =============================================================================
 // Stretch-Bend Coupling Energy and Gradient
-// =============================================================================
-
 /**
- * Compute stretch-bend coupling energy.
- * E = 2.51210 * (kba_ijk * dr_ij + kba_kji * dr_kj) * dtheta
+ *  Compute stretch-bend coupling energy.
+ *  E = 2.51210 * (kba_ijk * dr_ij + kba_kji * dr_kj) * dtheta
  */
-template <typename scalar_t>
-scalar_t compute_stretch_bend_energy(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                                     std::int32_t const* stbn_atom_i, std::int32_t const* stbn_atom_j,
-                                     std::int32_t const* stbn_atom_k, scalar_t const* stbn_kba_ijk,
-                                     scalar_t const* stbn_kba_kji, scalar_t const* stbn_r0_ij,
-                                     scalar_t const* stbn_r0_kj, scalar_t const* stbn_theta0, std::size_t stbn_start,
-                                     std::size_t stbn_count) {
+template <typename scalar_type_>
+scalar_type_ compute_stretch_bend_energy(scalar_type_ const* coord_x, scalar_type_ const* coord_y,
+                                         scalar_type_ const* coord_z, std::int32_t const* stbn_atom_i,
+                                         std::int32_t const* stbn_atom_j, std::int32_t const* stbn_atom_k,
+                                         scalar_type_ const* stbn_kba_ijk, scalar_type_ const* stbn_kba_kji,
+                                         scalar_type_ const* stbn_r0_ij, scalar_type_ const* stbn_r0_kj,
+                                         scalar_type_ const* stbn_theta0, std::size_t stbn_start,
+                                         std::size_t stbn_count) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr prefactor = static_cast<scalar_t>(stretch_bend_prefactor);
     scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
 
@@ -968,7 +992,8 @@ scalar_t compute_stretch_bend_energy(scalar_t const* coord_x, scalar_t const* co
         scalar_t const r_kj = std::sqrt(rjk_x * rjk_x + rjk_y * rjk_y + rjk_z * rjk_z);
 
         scalar_t const dot = rji_x * rjk_x + rji_y * rjk_y + rji_z * rjk_z;
-        scalar_t const cos_theta = clamp_(dot / (r_ij * r_kj), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
+        scalar_t const cos_theta =
+            clamp_(dot / (r_ij * r_kj), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
         scalar_t const theta_deg = std::acos(cos_theta) * to_deg;
 
         scalar_t const dr_ij = r_ij - stbn_r0_ij[idx];
@@ -983,41 +1008,45 @@ scalar_t compute_stretch_bend_energy(scalar_t const* coord_x, scalar_t const* co
 }
 
 /**
- * Compute stretch-bend coupling gradient.
- * Cross-term coupling between bond stretches and angle bend.
+ *  Compute stretch-bend coupling gradient.
+ *  Cross-term coupling between bond stretches and angle bend.
  */
-template <typename scalar_t>
-void compute_stretch_bend_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                                   std::int32_t const* stbn_atom_i, std::int32_t const* stbn_atom_j,
-                                   std::int32_t const* stbn_atom_k, scalar_t const* stbn_kba_ijk,
-                                   scalar_t const* stbn_kba_kji, scalar_t const* stbn_r0_ij, scalar_t const* stbn_r0_kj,
-                                   scalar_t const* stbn_theta0, std::size_t stbn_start, std::size_t stbn_count,
-                                   scalar_t* grad_x, scalar_t* grad_y, scalar_t* grad_z) {
+template <typename scalar_type_>
+void compute_stretch_bend_gradient(scalar_type_ const* coord_x, scalar_type_ const* coord_y,
+                                   scalar_type_ const* coord_z, std::int32_t const* stbn_atom_i,
+                                   std::int32_t const* stbn_atom_j, std::int32_t const* stbn_atom_k,
+                                   scalar_type_ const* stbn_kba_ijk, scalar_type_ const* stbn_kba_kji,
+                                   scalar_type_ const* stbn_r0_ij, scalar_type_ const* stbn_r0_kj,
+                                   scalar_type_ const* stbn_theta0, std::size_t stbn_start, std::size_t stbn_count,
+                                   scalar_type_* grad_x, scalar_type_* grad_y, scalar_type_* grad_z) {
+    using scalar_t = scalar_type_;
+
     std::size_t const stbn_end = stbn_start + stbn_count;
     for (std::size_t idx = stbn_start; idx < stbn_end; ++idx) {
         std::int32_t const i = stbn_atom_i[idx];
         std::int32_t const j = stbn_atom_j[idx];
         std::int32_t const k = stbn_atom_k[idx];
 
-        vec3_t<scalar_t> const p1 = make_vec3_(coord_x[i], coord_y[i], coord_z[i]);
-        vec3_t<scalar_t> const p2 = make_vec3_(coord_x[j], coord_y[j], coord_z[j]);
-        vec3_t<scalar_t> const p3 = make_vec3_(coord_x[k], coord_y[k], coord_z[k]);
+        vec3<scalar_t> const p1 = make_vec3_(coord_x[i], coord_y[i], coord_z[i]);
+        vec3<scalar_t> const p2 = make_vec3_(coord_x[j], coord_y[j], coord_z[j]);
+        vec3<scalar_t> const p3 = make_vec3_(coord_x[k], coord_y[k], coord_z[k]);
 
-        vec3_t<scalar_t> const r12 = sub_(p1, p2);
-        vec3_t<scalar_t> const r32 = sub_(p3, p2);
+        vec3<scalar_t> const r12 = sub_(p1, p2);
+        vec3<scalar_t> const r32 = sub_(p3, p2);
         scalar_t const dist1 = norm_(r12);
         scalar_t const dist2 = norm_(r32);
         if (dist1 < static_cast<scalar_t>(1e-8) || dist2 < static_cast<scalar_t>(1e-8)) {
             continue;
         }
 
-        vec3_t<scalar_t> const p12 = scale_(r12, static_cast<scalar_t>(1.0) / dist1);
-        vec3_t<scalar_t> const p32 = scale_(r32, static_cast<scalar_t>(1.0) / dist2);
-        scalar_t const cos_theta = clamp_(dot_(p12, p32), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
+        vec3<scalar_t> const p12 = scale_(r12, static_cast<scalar_t>(1.0) / dist1);
+        vec3<scalar_t> const p32 = scale_(r32, static_cast<scalar_t>(1.0) / dist2);
+        scalar_t const cos_theta =
+            clamp_(dot_(p12, p32), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
         scalar_t const sin_theta_sq = static_cast<scalar_t>(1.0) - cos_theta * cos_theta;
-        scalar_t const sin_theta =
-            std::max((sin_theta_sq > static_cast<scalar_t>(0.0) ? std::sqrt(sin_theta_sq) : static_cast<scalar_t>(0.0)),
-                     static_cast<scalar_t>(1e-8));
+        scalar_t const sin_theta = std::max(
+            (sin_theta_sq > static_cast<scalar_t>(0.0) ? std::sqrt(sin_theta_sq) : static_cast<scalar_t>(0.0)),
+            static_cast<scalar_t>(1e-8));
 
         scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
         scalar_t constexpr c5 = static_cast<scalar_t>(stretch_bend_prefactor);
@@ -1050,22 +1079,20 @@ void compute_stretch_bend_gradient(scalar_t const* coord_x, scalar_t const* coor
         grad_z[k] += c5 * (p32.z * stbn_kba_kji[idx] * angle_term + dCos_dS6 * dTheta_dCos * dist_term);
     }
 }
-
-// =============================================================================
 // Out-of-Plane Bending Energy and Gradient (Wilson Angle)
-// =============================================================================
-
 /**
- * Compute out-of-plane bending energy for sp2 centers.
- * E = 0.5 * 0.043844 * koop * chi^2
- * where chi is the Wilson out-of-plane angle in degrees.
- * Atom j is the central sp2 atom with neighbors i, k, l.
+ *  Compute out-of-plane bending energy for sp2 centers.
+ *  E = 0.5 * 0.043844 * koop * chi^2
+ *  where chi is the Wilson out-of-plane angle in degrees.
+ *  Atom j is the central sp2 atom with neighbors i, k, l.
  */
-template <typename scalar_t>
-scalar_t compute_oop_energy(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
-                            std::int32_t const* oop_atom_i, std::int32_t const* oop_atom_j,
-                            std::int32_t const* oop_atom_k, std::int32_t const* oop_atom_l, scalar_t const* oop_koop,
-                            std::size_t oop_start, std::size_t oop_count) {
+template <typename scalar_type_>
+scalar_type_ compute_oop_energy(scalar_type_ const* coord_x, scalar_type_ const* coord_y, scalar_type_ const* coord_z,
+                                std::int32_t const* oop_atom_i, std::int32_t const* oop_atom_j,
+                                std::int32_t const* oop_atom_k, std::int32_t const* oop_atom_l,
+                                scalar_type_ const* oop_koop, std::size_t oop_start, std::size_t oop_count) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr prefactor = static_cast<scalar_t>(oop_prefactor);
     scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
 
@@ -1116,14 +1143,16 @@ scalar_t compute_oop_energy(scalar_t const* coord_x, scalar_t const* coord_y, sc
 }
 
 /**
- * Compute out-of-plane bending gradient for sp2 centers.
+ *  Compute out-of-plane bending gradient for sp2 centers.
  */
-template <typename scalar_t>
-void compute_oop_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scalar_t const* coord_z,
+template <typename scalar_type_>
+void compute_oop_gradient(scalar_type_ const* coord_x, scalar_type_ const* coord_y, scalar_type_ const* coord_z,
                           std::int32_t const* oop_atom_i, std::int32_t const* oop_atom_j,
-                          std::int32_t const* oop_atom_k, std::int32_t const* oop_atom_l, scalar_t const* oop_koop,
-                          std::size_t oop_start, std::size_t oop_count, scalar_t* grad_x, scalar_t* grad_y,
-                          scalar_t* grad_z) {
+                          std::int32_t const* oop_atom_k, std::int32_t const* oop_atom_l, scalar_type_ const* oop_koop,
+                          std::size_t oop_start, std::size_t oop_count, scalar_type_* grad_x, scalar_type_* grad_y,
+                          scalar_type_* grad_z) {
+    using scalar_t = scalar_type_;
+
     std::size_t const oop_end = oop_start + oop_count;
     for (std::size_t idx = oop_start; idx < oop_end; ++idx) {
         std::int32_t const i = oop_atom_i[idx];
@@ -1131,9 +1160,9 @@ void compute_oop_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scal
         std::int32_t const k = oop_atom_k[idx];
         std::int32_t const l = oop_atom_l[idx];
 
-        vec3_t<scalar_t> rji = make_vec3_(coord_x[i] - coord_x[j], coord_y[i] - coord_y[j], coord_z[i] - coord_z[j]);
-        vec3_t<scalar_t> rjk = make_vec3_(coord_x[k] - coord_x[j], coord_y[k] - coord_y[j], coord_z[k] - coord_z[j]);
-        vec3_t<scalar_t> rjl = make_vec3_(coord_x[l] - coord_x[j], coord_y[l] - coord_y[j], coord_z[l] - coord_z[j]);
+        vec3<scalar_t> rji = make_vec3_(coord_x[i] - coord_x[j], coord_y[i] - coord_y[j], coord_z[i] - coord_z[j]);
+        vec3<scalar_t> rjk = make_vec3_(coord_x[k] - coord_x[j], coord_y[k] - coord_y[j], coord_z[k] - coord_z[j]);
+        vec3<scalar_t> rjl = make_vec3_(coord_x[l] - coord_x[j], coord_y[l] - coord_y[j], coord_z[l] - coord_z[j]);
 
         scalar_t const dji = norm_(rji);
         scalar_t const djk = norm_(rjk);
@@ -1147,39 +1176,41 @@ void compute_oop_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scal
         rjk = scale_(rjk, static_cast<scalar_t>(1.0) / djk);
         rjl = scale_(rjl, static_cast<scalar_t>(1.0) / djl);
 
-        vec3_t<scalar_t> n = cross_(scale_(rji, static_cast<scalar_t>(-1.0)), rjk);
+        vec3<scalar_t> n = cross_(scale_(rji, static_cast<scalar_t>(-1.0)), rjk);
         scalar_t const n_len = std::max(norm_(n), static_cast<scalar_t>(1e-8));
         n = scale_(n, static_cast<scalar_t>(1.0) / n_len);
 
         scalar_t const c2 = static_cast<scalar_t>(oop_prefactor);
         scalar_t const to_deg = static_cast<scalar_t>(rad_to_deg);
-        scalar_t const sin_chi = clamp_(dot_(rjl, n), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
+        scalar_t const sin_chi =
+            clamp_(dot_(rjl, n), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
         scalar_t const cos_chi_sq = static_cast<scalar_t>(1.0) - sin_chi * sin_chi;
-        scalar_t const cos_chi =
-            std::max((cos_chi_sq > static_cast<scalar_t>(0.0) ? std::sqrt(cos_chi_sq) : static_cast<scalar_t>(0.0)),
-                     static_cast<scalar_t>(1e-8));
+        scalar_t const cos_chi = std::max(
+            (cos_chi_sq > static_cast<scalar_t>(0.0) ? std::sqrt(cos_chi_sq) : static_cast<scalar_t>(0.0)),
+            static_cast<scalar_t>(1e-8));
         scalar_t const chi = to_deg * std::asin(sin_chi);
-        scalar_t const cos_theta = clamp_(dot_(rji, rjk), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
+        scalar_t const cos_theta =
+            clamp_(dot_(rji, rjk), static_cast<scalar_t>(-1.0), static_cast<scalar_t>(1.0));
         scalar_t const sin_theta_sq =
             std::max(static_cast<scalar_t>(1.0) - cos_theta * cos_theta, static_cast<scalar_t>(1e-8));
-        scalar_t const sin_theta =
-            std::max((sin_theta_sq > static_cast<scalar_t>(0.0) ? std::sqrt(sin_theta_sq) : static_cast<scalar_t>(0.0)),
-                     static_cast<scalar_t>(1e-8));
+        scalar_t const sin_theta = std::max(
+            (sin_theta_sq > static_cast<scalar_t>(0.0) ? std::sqrt(sin_theta_sq) : static_cast<scalar_t>(0.0)),
+            static_cast<scalar_t>(1e-8));
 
         scalar_t const dE_dchi = to_deg * c2 * oop_koop[idx] * chi;
-        vec3_t<scalar_t> const t1 = cross_(rjl, rjk);
-        vec3_t<scalar_t> const t2 = cross_(rji, rjl);
-        vec3_t<scalar_t> const t3 = cross_(rjk, rji);
+        vec3<scalar_t> const t1 = cross_(rjl, rjk);
+        vec3<scalar_t> const t2 = cross_(rji, rjl);
+        vec3<scalar_t> const t3 = cross_(rjk, rji);
         scalar_t const term1 = cos_chi * sin_theta;
         scalar_t const term2 = sin_chi / (cos_chi * sin_theta_sq);
 
-        vec3_t<scalar_t> const tg1 = scale_(
+        vec3<scalar_t> const tg1 = scale_(
             sub_(scale_(t1, static_cast<scalar_t>(1.0) / term1), scale_(sub_(rji, scale_(rjk, cos_theta)), term2)),
             static_cast<scalar_t>(1.0) / dji);
-        vec3_t<scalar_t> const tg3 = scale_(
+        vec3<scalar_t> const tg3 = scale_(
             sub_(scale_(t2, static_cast<scalar_t>(1.0) / term1), scale_(sub_(rjk, scale_(rji, cos_theta)), term2)),
             static_cast<scalar_t>(1.0) / djk);
-        vec3_t<scalar_t> const tg4 =
+        vec3<scalar_t> const tg4 =
             scale_(sub_(scale_(t3, static_cast<scalar_t>(1.0) / term1), scale_(rjl, sin_chi / cos_chi)),
                    static_cast<scalar_t>(1.0) / djl);
 
@@ -1199,49 +1230,52 @@ void compute_oop_gradient(scalar_t const* coord_x, scalar_t const* coord_y, scal
 }
 
 /**
- * @brief L-BFGS optimizer for MMFF94 force field.
+ *  @brief L-BFGS optimizer for MMFF94 force field.
  *
- * Minimizes energy using Limited-memory BFGS with two-loop recursion.
- * Combines VdW and electrostatic gradients for total force calculation.
+ *  Minimizes energy using Limited-memory BFGS with two-loop recursion.
+ *  Combines VdW and electrostatic gradients for total force calculation.
  *
- * @param coord_x X coordinates (will be modified)
- * @param coord_y Y coordinates (will be modified)
- * @param coord_z Z coordinates (will be modified)
- * @param vdw_pair_i VdW pair first atom indices
- * @param vdw_pair_j VdW pair second atom indices
- * @param vdw_epsilon Well depth parameters
- * @param vdw_r_star Equilibrium distances
- * @param vdw_pair_count Number of VdW pairs
- * @param elec_pair_i Electrostatic pair first atom indices
- * @param elec_pair_j Electrostatic pair second atom indices
- * @param elec_charge_i First atom charges
- * @param elec_charge_j Second atom charges
- * @param elec_is_1_4 1-4 interaction flags
- * @param elec_pair_count Number of electrostatic pairs
- * @param max_iterations Maximum optimization iterations
- * @param grad_threshold RMS gradient convergence threshold
- * @param state L-BFGS state (pre-allocated)
- * @return Optimization result with status and final metrics
+ *  @param coord_x X coordinates (will be modified)
+ *  @param coord_y Y coordinates (will be modified)
+ *  @param coord_z Z coordinates (will be modified)
+ *  @param vdw_pair_i VdW pair first atom indices
+ *  @param vdw_pair_j VdW pair second atom indices
+ *  @param vdw_epsilon Well depth parameters
+ *  @param vdw_r_star Equilibrium distances
+ *  @param vdw_pair_count Number of VdW pairs
+ *  @param elec_pair_i Electrostatic pair first atom indices
+ *  @param elec_pair_j Electrostatic pair second atom indices
+ *  @param elec_charge_i First atom charges
+ *  @param elec_charge_j Second atom charges
+ *  @param elec_is_1_4 1-4 interaction flags
+ *  @param elec_pair_count Number of electrostatic pairs
+ *  @param max_iterations Maximum optimization iterations
+ *  @param grad_threshold RMS gradient convergence threshold
+ *  @param state L-BFGS state (pre-allocated)
+ *  @return Optimization result with status and final metrics
  */
-template <typename scalar_t>
-optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t* coord_z,
-                                 std::int32_t const* vdw_pair_i, std::int32_t const* vdw_pair_j,
-                                 scalar_t const* vdw_epsilon, scalar_t const* vdw_r_star, std::size_t vdw_pair_count,
-                                 std::int32_t const* elec_pair_i, std::int32_t const* elec_pair_j,
-                                 scalar_t const* elec_charge_i, scalar_t const* elec_charge_j,
-                                 std::int32_t const* elec_is_1_4, std::size_t elec_pair_count, int max_iterations,
-                                 scalar_t grad_threshold, lbfgs_state_t<scalar_t>& state) {
+template <typename scalar_type_>
+optimize_result_t
+lbfgs_optimize(scalar_type_* coord_x, scalar_type_* coord_y, scalar_type_* coord_z, std::int32_t const* vdw_pair_i,
+               std::int32_t const* vdw_pair_j, scalar_type_ const* vdw_epsilon, scalar_type_ const* vdw_r_star,
+               std::size_t vdw_pair_count, std::int32_t const* elec_pair_i, std::int32_t const* elec_pair_j,
+               scalar_type_ const* elec_charge_i, scalar_type_ const* elec_charge_j, std::int32_t const* elec_is_1_4,
+               std::size_t elec_pair_count, int max_iterations, scalar_type_ grad_threshold,
+               lbfgs_state<scalar_type_>& state) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr zero = static_cast<scalar_t>(0.0);
     scalar_t constexpr one = static_cast<scalar_t>(1.0);
-    scalar_t constexpr alpha_init = static_cast<scalar_t>(1.0); // Initial step size (L-BFGS direction is pre-scaled)
-    scalar_t constexpr c1 = static_cast<scalar_t>(1e-4);        // Armijo condition constant
-    scalar_t constexpr rho_ls = static_cast<scalar_t>(0.5);     // Line search backtrack factor
+    scalar_t constexpr alpha_init =
+        static_cast<scalar_t>(1.0);                          // Initial step size (L-BFGS direction is pre-scaled)
+    scalar_t constexpr c1 = static_cast<scalar_t>(1e-4); // Armijo condition constant
+    scalar_t constexpr rho_ls = static_cast<scalar_t>(0.5); // Line search backtrack factor
 
     std::size_t const n_coords = 3 * state.n_atoms;
     optimize_result_t result{-1, 0, 0.0, 0.0};
 
     // Helper: compute RMS gradient
-    auto compute_rms_gradient_ = [&]() -> scalar_t {
+    auto rms_gradient_fn = [&]() -> scalar_t {
         scalar_t sum_sq = zero;
         for (std::size_t i = 0; i < n_coords; ++i) {
             sum_sq += state.grad[i] * state.grad[i];
@@ -1250,9 +1284,9 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
     };
 
     // Helper: compute total energy
-    auto compute_total_energy_ = [&]() -> scalar_t {
+    auto total_energy_fn = [&]() -> scalar_t {
         scalar_t vdw_energy = compute_vdw_energy(coord_x, coord_y, coord_z, vdw_pair_i, vdw_pair_j, vdw_epsilon,
-                                                 vdw_r_star, 0, vdw_pair_count);
+                                                     vdw_r_star, 0, vdw_pair_count);
         scalar_t elec_energy =
             compute_electrostatic_energy(coord_x, coord_y, coord_z, elec_pair_i, elec_pair_j, elec_charge_i,
                                          elec_charge_j, elec_is_1_4, 0, elec_pair_count);
@@ -1260,7 +1294,7 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
     };
 
     // Helper: compute total gradient (zeros arrays first)
-    auto compute_total_gradient_ = [&]() -> void {
+    auto total_gradient_fn = [&]() -> void {
         for (std::size_t i = 0; i < state.n_atoms; ++i) {
             state.grad[i] = zero;
             state.grad[state.n_atoms + i] = zero;
@@ -1270,12 +1304,12 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
                              vdw_pair_count, state.grad, state.grad + state.n_atoms, state.grad + 2 * state.n_atoms);
         compute_electrostatic_gradient(coord_x, coord_y, coord_z, elec_pair_i, elec_pair_j, elec_charge_i,
                                        elec_charge_j, elec_is_1_4, 0, elec_pair_count,
-                                       static_cast<scalar_t>(scale_1_4_default), state.grad, state.grad + state.n_atoms,
-                                       state.grad + 2 * state.n_atoms);
+                                       static_cast<scalar_t>(scale_1_4_default), state.grad,
+                                       state.grad + state.n_atoms, state.grad + 2 * state.n_atoms);
     };
 
     // Helper: dot product
-    auto dot_product_ = [](scalar_t const* a, scalar_t const* b, std::size_t n) -> scalar_t {
+    auto dot_product_fn = [](scalar_t const* a, scalar_t const* b, std::size_t n) -> scalar_t {
         scalar_t sum = static_cast<scalar_t>(0.0);
         for (std::size_t i = 0; i < n; ++i) {
             sum += a[i] * b[i];
@@ -1284,14 +1318,14 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
     };
 
     // Initialize gradient
-    compute_total_gradient_();
-    scalar_t rms_grad = compute_rms_gradient_();
+    total_gradient_fn();
+    scalar_t rms_grad = rms_gradient_fn();
 
     // Check initial convergence
     if (rms_grad < grad_threshold) {
         result.status = 0;
         result.iterations = 0;
-        result.final_energy = static_cast<double>(compute_total_energy_());
+        result.final_energy = static_cast<double>(total_energy_fn());
         result.rms_gradient = static_cast<double>(rms_grad);
         return result;
     }
@@ -1311,7 +1345,7 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
             scalar_t const* s_i = state.s_history + idx * n_coords;
             scalar_t const* y_i = state.y_history + idx * n_coords;
 
-            state.alpha[idx] = state.rho[idx] * dot_product_(s_i, state.q, n_coords);
+            state.alpha[idx] = state.rho[idx] * dot_product_fn(s_i, state.q, n_coords);
             for (std::size_t j = 0; j < n_coords; ++j) {
                 state.q[j] -= state.alpha[idx] * y_i[j];
             }
@@ -1323,8 +1357,8 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
             std::size_t const newest = (state.k - 1) % state.m;
             scalar_t const* s_newest = state.s_history + newest * n_coords;
             scalar_t const* y_newest = state.y_history + newest * n_coords;
-            scalar_t const s_dot_y = dot_product_(s_newest, y_newest, n_coords);
-            scalar_t const y_dot_y = dot_product_(y_newest, y_newest, n_coords);
+            scalar_t const s_dot_y = dot_product_fn(s_newest, y_newest, n_coords);
+            scalar_t const y_dot_y = dot_product_fn(y_newest, y_newest, n_coords);
             gamma = s_dot_y / y_dot_y;
         }
 
@@ -1338,7 +1372,7 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
             scalar_t const* s_i = state.s_history + idx * n_coords;
             scalar_t const* y_i = state.y_history + idx * n_coords;
 
-            scalar_t const beta = state.rho[idx] * dot_product_(y_i, state.direction, n_coords);
+            scalar_t const beta = state.rho[idx] * dot_product_fn(y_i, state.direction, n_coords);
             for (std::size_t j = 0; j < n_coords; ++j) {
                 state.direction[j] += s_i[j] * (state.alpha[idx] - beta);
             }
@@ -1350,8 +1384,8 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
         }
 
         // Backtracking line search
-        scalar_t const energy_old = compute_total_energy_();
-        scalar_t grad_dot_dir = dot_product_(state.grad, state.direction, n_coords);
+        scalar_t const energy_old = total_energy_fn();
+        scalar_t grad_dot_dir = dot_product_fn(state.grad, state.direction, n_coords);
 
         // If direction is not descent, reset history and use steepest descent
         if (grad_dot_dir >= zero) {
@@ -1361,7 +1395,7 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
             for (std::size_t i = 0; i < n_coords; ++i) {
                 state.direction[i] = -state.grad[i];
             }
-            grad_dot_dir = dot_product_(state.grad, state.direction, n_coords);
+            grad_dot_dir = dot_product_fn(state.grad, state.direction, n_coords);
             // If still not descent (shouldn't happen unless gradient is zero), exit
             if (grad_dot_dir >= zero) {
                 result.status = 0; // Converged (gradient is zero or nearly zero)
@@ -1393,7 +1427,7 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
                 coord_y[i] = backup_y[i] + alpha * state.direction[state.n_atoms + i];
                 coord_z[i] = backup_z[i] + alpha * state.direction[2 * state.n_atoms + i];
             }
-            energy_new = compute_total_energy_();
+            energy_new = total_energy_fn();
             if (energy_new <= energy_old + c1 * alpha * grad_dot_dir)
                 break;
             alpha *= rho_ls;
@@ -1417,8 +1451,8 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
         }
 
         // Compute new gradient
-        compute_total_gradient_();
-        rms_grad = compute_rms_gradient_();
+        total_gradient_fn();
+        rms_grad = rms_gradient_fn();
 
         // Update history
         std::size_t const hist_idx = state.k % state.m;
@@ -1433,7 +1467,7 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
         }
 
         // Compute rho = 1/(y·s) - only update history if curvature condition satisfied
-        scalar_t const y_dot_s = dot_product_(y_k, s_k, n_coords);
+        scalar_t const y_dot_s = dot_product_fn(y_k, s_k, n_coords);
         if (y_dot_s > static_cast<scalar_t>(1e-10)) {
             state.rho[hist_idx] = one / y_dot_s;
             state.k++;
@@ -1451,30 +1485,32 @@ optimize_result_t lbfgs_optimize(scalar_t* coord_x, scalar_t* coord_y, scalar_t*
 
     // Max iterations reached
     result.status = 1;
-    result.final_energy = static_cast<double>(compute_total_energy_());
+    result.final_energy = static_cast<double>(total_energy_fn());
     result.rms_gradient = static_cast<double>(rms_grad);
     return result;
 }
 
 /**
- * @brief L-BFGS optimization using complete MMFF94 force field.
+ *  @brief L-BFGS optimization using complete MMFF94 force field.
  *
- * Includes all energy terms: VdW, electrostatic, bond stretching, angle bending,
- * torsion, stretch-bend coupling, and out-of-plane bending.
+ *  Includes all energy terms: VdW, electrostatic, bond stretching, angle bending,
+ *  torsion, stretch-bend coupling, and out-of-plane bending.
  *
- * @param coord_x X coordinates (modified in-place)
- * @param coord_y Y coordinates (modified in-place)
- * @param coord_z Z coordinates (modified in-place)
- * @param params MMFF94 force field parameters
- * @param max_iterations Maximum optimization iterations
- * @param grad_threshold RMS gradient convergence threshold
- * @param state L-BFGS state (pre-allocated)
- * @return Optimization result with status and final metrics
+ *  @param coord_x X coordinates (modified in-place)
+ *  @param coord_y Y coordinates (modified in-place)
+ *  @param coord_z Z coordinates (modified in-place)
+ *  @param params MMFF94 force field parameters
+ *  @param max_iterations Maximum optimization iterations
+ *  @param grad_threshold RMS gradient convergence threshold
+ *  @param state L-BFGS state (pre-allocated)
+ *  @return Optimization result with status and final metrics
  */
-template <typename scalar_t>
-optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, scalar_t* coord_z,
-                                        mmff94_params_t<scalar_t> const& params, int max_iterations,
-                                        scalar_t grad_threshold, lbfgs_state_t<scalar_t>& state) {
+template <typename scalar_type_>
+optimize_result_t lbfgs_optimize_mmff94(scalar_type_* coord_x, scalar_type_* coord_y, scalar_type_* coord_z,
+                                        mmff94_params<scalar_type_> const& params, int max_iterations,
+                                        scalar_type_ grad_threshold, lbfgs_state<scalar_type_>& state) {
+    using scalar_t = scalar_type_;
+
     scalar_t constexpr zero = static_cast<scalar_t>(0.0);
     scalar_t constexpr one = static_cast<scalar_t>(1.0);
     scalar_t constexpr alpha_init = static_cast<scalar_t>(1.0); // L-BFGS direction is pre-scaled
@@ -1484,7 +1520,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
     std::size_t const n_coords = 3 * state.n_atoms;
     optimize_result_t result{-1, 0, 0.0, 0.0};
 
-    auto compute_rms_gradient_ = [&]() -> scalar_t {
+    auto rms_gradient_fn = [&]() -> scalar_t {
         scalar_t sum_sq = zero;
         for (std::size_t i = 0; i < n_coords; ++i) {
             sum_sq += state.grad[i] * state.grad[i];
@@ -1492,7 +1528,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
         return std::sqrt(sum_sq / static_cast<scalar_t>(n_coords));
     };
 
-    auto compute_total_energy_ = [&]() -> scalar_t {
+    auto total_energy_fn = [&]() -> scalar_t {
         scalar_t energy = zero;
 
         // VdW
@@ -1545,7 +1581,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
         return energy;
     };
 
-    auto compute_total_gradient_ = [&]() -> void {
+    auto total_gradient_fn = [&]() -> void {
         scalar_t* grad_x = state.grad;
         scalar_t* grad_y = state.grad + state.n_atoms;
         scalar_t* grad_z = state.grad + 2 * state.n_atoms;
@@ -1567,8 +1603,8 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
         if (params.elec_count > 0) {
             compute_electrostatic_gradient(coord_x, coord_y, coord_z, params.elec_pair_i, params.elec_pair_j,
                                            params.elec_charge_i, params.elec_charge_j, params.elec_is_1_4, 0,
-                                           params.elec_count, static_cast<scalar_t>(scale_1_4_default), grad_x, grad_y,
-                                           grad_z);
+                                           params.elec_count, static_cast<scalar_t>(scale_1_4_default), grad_x,
+                                           grad_y, grad_z);
         }
 
         // Bond stretching
@@ -1606,7 +1642,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
         }
     };
 
-    auto dot_product_ = [](scalar_t const* a, scalar_t const* b, std::size_t n) -> scalar_t {
+    auto dot_product_fn = [](scalar_t const* a, scalar_t const* b, std::size_t n) -> scalar_t {
         scalar_t sum = static_cast<scalar_t>(0.0);
         for (std::size_t i = 0; i < n; ++i) {
             sum += a[i] * b[i];
@@ -1615,14 +1651,14 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
     };
 
     // Initialize gradient
-    compute_total_gradient_();
-    scalar_t rms_grad = compute_rms_gradient_();
+    total_gradient_fn();
+    scalar_t rms_grad = rms_gradient_fn();
 
     // Check initial convergence
     if (rms_grad < grad_threshold) {
         result.status = 0;
         result.iterations = 0;
-        result.final_energy = static_cast<double>(compute_total_energy_());
+        result.final_energy = static_cast<double>(total_energy_fn());
         result.rms_gradient = static_cast<double>(rms_grad);
         return result;
     }
@@ -1641,7 +1677,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
             std::size_t const idx = (state.k - 1 - i) % state.m;
             scalar_t const* s_i = state.s_history + idx * n_coords;
             scalar_t const* y_i = state.y_history + idx * n_coords;
-            state.alpha[idx] = state.rho[idx] * dot_product_(s_i, state.q, n_coords);
+            state.alpha[idx] = state.rho[idx] * dot_product_fn(s_i, state.q, n_coords);
             for (std::size_t j = 0; j < n_coords; ++j) {
                 state.q[j] -= state.alpha[idx] * y_i[j];
             }
@@ -1653,7 +1689,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
             std::size_t const newest = (state.k - 1) % state.m;
             scalar_t const* s_newest = state.s_history + newest * n_coords;
             scalar_t const* y_newest = state.y_history + newest * n_coords;
-            gamma = dot_product_(s_newest, y_newest, n_coords) / dot_product_(y_newest, y_newest, n_coords);
+            gamma = dot_product_fn(s_newest, y_newest, n_coords) / dot_product_fn(y_newest, y_newest, n_coords);
         }
 
         for (std::size_t i = 0; i < n_coords; ++i) {
@@ -1665,7 +1701,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
             std::size_t const idx = (state.k - i) % state.m;
             scalar_t const* s_i = state.s_history + idx * n_coords;
             scalar_t const* y_i = state.y_history + idx * n_coords;
-            scalar_t const beta = state.rho[idx] * dot_product_(y_i, state.direction, n_coords);
+            scalar_t const beta = state.rho[idx] * dot_product_fn(y_i, state.direction, n_coords);
             for (std::size_t j = 0; j < n_coords; ++j) {
                 state.direction[j] += s_i[j] * (state.alpha[idx] - beta);
             }
@@ -1677,8 +1713,8 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
         }
 
         // Backtracking line search
-        scalar_t const energy_old = compute_total_energy_();
-        scalar_t grad_dot_dir = dot_product_(state.grad, state.direction, n_coords);
+        scalar_t const energy_old = total_energy_fn();
+        scalar_t grad_dot_dir = dot_product_fn(state.grad, state.direction, n_coords);
 
         // If direction is not descent, reset history and use steepest descent
         if (grad_dot_dir >= zero) {
@@ -1686,7 +1722,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
             for (std::size_t i = 0; i < n_coords; ++i) {
                 state.direction[i] = -state.grad[i];
             }
-            grad_dot_dir = dot_product_(state.grad, state.direction, n_coords);
+            grad_dot_dir = dot_product_fn(state.grad, state.direction, n_coords);
             if (grad_dot_dir >= zero) {
                 result.status = 0; // Converged
                 result.iterations = iter;
@@ -1717,7 +1753,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
                 coord_y[i] = backup_y[i] + alpha * state.direction[state.n_atoms + i];
                 coord_z[i] = backup_z[i] + alpha * state.direction[2 * state.n_atoms + i];
             }
-            energy_new = compute_total_energy_();
+            energy_new = total_energy_fn();
             if (energy_new <= energy_old + c1 * alpha * grad_dot_dir)
                 break;
             alpha *= rho_ls;
@@ -1740,8 +1776,8 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
         }
 
         // Compute new gradient
-        compute_total_gradient_();
-        rms_grad = compute_rms_gradient_();
+        total_gradient_fn();
+        rms_grad = rms_gradient_fn();
 
         // Update history (only if curvature condition y·s > 0 is satisfied)
         std::size_t const hist_idx = state.k % state.m;
@@ -1753,7 +1789,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
             y_k[i] = state.grad[i] - state.grad_prev[i];
         }
 
-        scalar_t const ys = dot_product_(y_k, s_k, n_coords);
+        scalar_t const ys = dot_product_fn(y_k, s_k, n_coords);
         if (ys > static_cast<scalar_t>(1e-10)) {
             // Curvature condition satisfied - update history
             state.rho[hist_idx] = one / ys;
@@ -1771,7 +1807,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
     }
 
     result.status = 1;
-    result.final_energy = static_cast<double>(compute_total_energy_());
+    result.final_energy = static_cast<double>(total_energy_fn());
     result.rms_gradient = static_cast<double>(rms_grad);
     return result;
 }
@@ -1782,7 +1818,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_t* coord_x, scalar_t* coord_y, sc
 
 #if defined(__AVX512F__)
 
-/** Compute x^7 for 16 floats using AVX-512. */
+/**  Compute x^7 for 16 floats using AVX-512. */
 inline __m512 pow7_(__m512 x) {
     __m512 const x2 = _mm512_mul_ps(x, x);
     __m512 const x4 = _mm512_mul_ps(x2, x2);
@@ -1790,21 +1826,21 @@ inline __m512 pow7_(__m512 x) {
 }
 
 /**
- * @brief Compute van der Waals energy using AVX-512 with 16-way parallelism.
+ *  @brief Compute van der Waals energy using AVX-512 with 16-way parallelism.
  *
- * Uses fast reciprocal (rcp14) and reciprocal sqrt (rsqrt14) approximations.
- * Data must be padded to multiple of 16 pairs.
+ *  Uses fast reciprocal (rcp14) and reciprocal sqrt (rsqrt14) approximations.
+ *  Data must be padded to multiple of 16 pairs.
  *
- * @param coord_x X coordinates of all atoms
- * @param coord_y Y coordinates of all atoms
- * @param coord_z Z coordinates of all atoms
- * @param pair_atom_i First atom index for each pair
- * @param pair_atom_j Second atom index for each pair
- * @param pair_epsilon Well depth parameter for each pair
- * @param pair_equilibrium_distance Equilibrium distance for each pair
- * @param pair_start Starting pair index
- * @param pair_count Number of pairs (must be multiple of 16)
- * @return Total van der Waals energy in kcal/mol
+ *  @param coord_x X coordinates of all atoms
+ *  @param coord_y Y coordinates of all atoms
+ *  @param coord_z Z coordinates of all atoms
+ *  @param pair_atom_i First atom index for each pair
+ *  @param pair_atom_j Second atom index for each pair
+ *  @param pair_epsilon Well depth parameter for each pair
+ *  @param pair_equilibrium_distance Equilibrium distance for each pair
+ *  @param pair_start Starting pair index
+ *  @param pair_count Number of pairs (must be multiple of 16)
+ *  @return Total van der Waals energy in kcal/mol
  */
 inline float compute_vdw_energy_skylake(float const* coord_x, float const* coord_y, float const* coord_z,
                                         std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
@@ -1869,10 +1905,10 @@ inline float compute_vdw_energy_skylake(float const* coord_x, float const* coord
 }
 
 /**
- * @brief Compute van der Waals gradient using AVX-512 with 16-way parallelism.
+ *  @brief Compute van der Waals gradient using AVX-512 with 16-way parallelism.
  *
- * Accumulates forces into grad arrays using scatter operations.
- * Data must be padded to multiple of 16 pairs.
+ *  Accumulates forces into grad arrays using scatter operations.
+ *  Data must be padded to multiple of 16 pairs.
  */
 inline void compute_vdw_gradient_skylake(float const* coord_x, float const* coord_y, float const* coord_z,
                                          std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
@@ -1972,10 +2008,10 @@ inline void compute_vdw_gradient_skylake(float const* coord_x, float const* coor
 }
 
 /**
- * @brief Compute electrostatic energy using AVX-512 with 16-way parallelism.
+ *  @brief Compute electrostatic energy using AVX-512 with 16-way parallelism.
  *
- * Uses branchless 1-4 scaling via arithmetic operations.
- * Data must be padded to multiple of 16 pairs.
+ *  Uses branchless 1-4 scaling via arithmetic operations.
+ *  Data must be padded to multiple of 16 pairs.
  */
 inline float compute_electrostatic_energy_skylake(float const* coord_x, float const* coord_y, float const* coord_z,
                                                   std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
@@ -2036,10 +2072,10 @@ inline float compute_electrostatic_energy_skylake(float const* coord_x, float co
 }
 
 /**
- * @brief Compute electrostatic gradient using AVX-512 with 16-way parallelism.
+ *  @brief Compute electrostatic gradient using AVX-512 with 16-way parallelism.
  *
- * Accumulates forces into grad_x/y/z arrays using scatter operations.
- * Data must be padded to multiple of 16 pairs.
+ *  Accumulates forces into grad_x/y/z arrays using scatter operations.
+ *  Data must be padded to multiple of 16 pairs.
  */
 inline void compute_electrostatic_gradient_skylake(float const* coord_x, float const* coord_y, float const* coord_z,
                                                    std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
@@ -2125,10 +2161,10 @@ inline void compute_electrostatic_gradient_skylake(float const* coord_x, float c
 }
 
 /**
- * @brief L-BFGS optimizer using AVX-512 for vectorized operations.
+ *  @brief L-BFGS optimizer using AVX-512 for vectorized operations.
  *
- * Vectorizes dot products and array operations for improved performance.
- * Falls back to serial gradient computation for force accumulation.
+ *  Vectorizes dot products and array operations for improved performance.
+ *  Falls back to serial gradient computation for force accumulation.
  */
 inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, float* coord_z,
                                                 std::int32_t const* vdw_pair_i, std::int32_t const* vdw_pair_j,
@@ -2137,7 +2173,7 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
                                                 std::int32_t const* elec_pair_j, float const* elec_charge_i,
                                                 float const* elec_charge_j, std::int32_t const* elec_is_1_4,
                                                 std::size_t elec_pair_count, int max_iterations, float grad_threshold,
-                                                lbfgs_state_t<float>& state) {
+                                                lbfgs_state_f32_t& state) {
     // All arrays are padded to SIMD width (16 floats) - no tail handling needed
     std::size_t const n_atoms = state.n_atoms;
     std::size_t const n_coords = 3 * n_atoms;
@@ -2151,7 +2187,7 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
     float* backup_z = state.coord_backup + 2 * n_atoms;
 
     // Vectorized dot product (no tail - arrays are padded)
-    auto dot_ = [](float const* a, float const* b, std::size_t chunks) -> float {
+    auto dot_fn = [](float const* a, float const* b, std::size_t chunks) -> float {
         __m512 acc = _mm512_setzero_ps();
         for (std::size_t i = 0; i < chunks; ++i)
             acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i * 16), _mm512_loadu_ps(b + i * 16), acc);
@@ -2159,12 +2195,12 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
     };
 
     // RMS gradient magnitude
-    auto rms_grad_ = [&]() -> float {
-        return std::sqrt(dot_(state.grad, state.grad, coord_chunks) / static_cast<float>(n_coords));
+    auto rms_grad_fn = [&]() -> float {
+        return std::sqrt(dot_fn(state.grad, state.grad, coord_chunks) / static_cast<float>(n_coords));
     };
 
     // Total energy (data is padded - call AVX-512 kernels directly)
-    auto energy_ = [&]() -> float {
+    auto energy_fn = [&]() -> float {
         return compute_vdw_energy_skylake(coord_x, coord_y, coord_z, vdw_pair_i, vdw_pair_j, vdw_epsilon, vdw_r_star, 0,
                                           vdw_pair_count) +
                compute_electrostatic_energy_skylake(coord_x, coord_y, coord_z, elec_pair_i, elec_pair_j, elec_charge_i,
@@ -2172,7 +2208,7 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
     };
 
     // Compute gradient (zeros then accumulates)
-    auto gradient_ = [&]() -> void {
+    auto gradient_fn = [&]() -> void {
         __m512 const zero = _mm512_setzero_ps();
         for (std::size_t i = 0; i < atom_chunks; ++i) {
             _mm512_storeu_ps(state.grad + i * 16, zero);
@@ -2187,12 +2223,12 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
     };
 
     // Initialize
-    gradient_();
-    float rms = rms_grad_();
+    gradient_fn();
+    float rms = rms_grad_fn();
     if (rms < grad_threshold) {
         result.status = 0;
         result.iterations = 0;
-        result.final_energy = static_cast<double>(energy_());
+        result.final_energy = static_cast<double>(energy_fn());
         result.rms_gradient = static_cast<double>(rms);
         return result;
     }
@@ -2208,7 +2244,7 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
             std::size_t const idx = (state.k - 1 - h) % state.m;
             float const* s = state.s_history + idx * n_coords;
             float const* y = state.y_history + idx * n_coords;
-            state.alpha[idx] = state.rho[idx] * dot_(s, state.q, coord_chunks);
+            state.alpha[idx] = state.rho[idx] * dot_fn(s, state.q, coord_chunks);
             __m512 const a = _mm512_set1_ps(state.alpha[idx]);
             for (std::size_t i = 0; i < coord_chunks; ++i)
                 _mm512_storeu_ps(state.q + i * 16,
@@ -2221,7 +2257,7 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
             std::size_t const idx = (state.k - 1) % state.m;
             float const* s = state.s_history + idx * n_coords;
             float const* y = state.y_history + idx * n_coords;
-            gamma = dot_(s, y, coord_chunks) / dot_(y, y, coord_chunks);
+            gamma = dot_fn(s, y, coord_chunks) / dot_fn(y, y, coord_chunks);
         }
         __m512 const g = _mm512_set1_ps(gamma);
         for (std::size_t i = 0; i < coord_chunks; ++i)
@@ -2232,7 +2268,7 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
             std::size_t const idx = (state.k - h) % state.m;
             float const* s = state.s_history + idx * n_coords;
             float const* y = state.y_history + idx * n_coords;
-            float const beta = state.rho[idx] * dot_(y, state.direction, coord_chunks);
+            float const beta = state.rho[idx] * dot_fn(y, state.direction, coord_chunks);
             __m512 const diff = _mm512_set1_ps(state.alpha[idx] - beta);
             for (std::size_t i = 0; i < coord_chunks; ++i)
                 _mm512_storeu_ps(state.direction + i * 16, _mm512_fmadd_ps(_mm512_loadu_ps(s + i * 16), diff,
@@ -2245,8 +2281,8 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
             _mm512_storeu_ps(state.direction + i * 16, _mm512_sub_ps(zero, _mm512_loadu_ps(state.direction + i * 16)));
 
         // Line search
-        float const e_old = energy_();
-        float g_dot_d = dot_(state.grad, state.direction, coord_chunks);
+        float const e_old = energy_fn();
+        float g_dot_d = dot_fn(state.grad, state.direction, coord_chunks);
 
         // If direction is not descent, reset history and use steepest descent
         if (g_dot_d >= 0.0f) {
@@ -2254,7 +2290,7 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
             // direction = -gradient
             for (std::size_t i = 0; i < coord_chunks; ++i)
                 _mm512_storeu_ps(state.direction + i * 16, _mm512_sub_ps(zero, _mm512_loadu_ps(state.grad + i * 16)));
-            g_dot_d = dot_(state.grad, state.direction, coord_chunks);
+            g_dot_d = dot_fn(state.grad, state.direction, coord_chunks);
             if (g_dot_d >= 0.0f) {
                 result.status = 0; // Converged
                 result.iterations = iter;
@@ -2286,7 +2322,7 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
                                  _mm512_fmadd_ps(av, _mm512_loadu_ps(state.direction + 2 * n_atoms + i * 16),
                                                  _mm512_loadu_ps(backup_z + i * 16)));
             }
-            e_new = energy_();
+            e_new = energy_fn();
             if (e_new <= e_old + 1e-4f * alpha * g_dot_d)
                 break;
             alpha *= 0.5f;
@@ -2303,8 +2339,8 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
         // Save gradient, compute new gradient
         for (std::size_t i = 0; i < coord_chunks; ++i)
             _mm512_storeu_ps(state.grad_prev + i * 16, _mm512_loadu_ps(state.grad + i * 16));
-        gradient_();
-        rms = rms_grad_();
+        gradient_fn();
+        rms = rms_grad_fn();
 
         // Update history
         std::size_t const hist_idx = state.k % state.m;
@@ -2316,7 +2352,7 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
             _mm512_storeu_ps(y_k + i * 16, _mm512_sub_ps(_mm512_loadu_ps(state.grad + i * 16),
                                                          _mm512_loadu_ps(state.grad_prev + i * 16)));
         }
-        state.rho[hist_idx] = 1.0f / dot_(y_k, s_k, coord_chunks);
+        state.rho[hist_idx] = 1.0f / dot_fn(y_k, s_k, coord_chunks);
         state.k++;
         result.iterations = iter + 1;
 
@@ -2329,20 +2365,20 @@ inline optimize_result_t lbfgs_optimize_skylake(float* coord_x, float* coord_y, 
     }
 
     result.status = 1;
-    result.final_energy = static_cast<double>(energy_());
+    result.final_energy = static_cast<double>(energy_fn());
     result.rms_gradient = static_cast<double>(rms);
     return result;
 }
 
 /**
- * @brief Compute VdW energy using precomputed constants (fast path).
+ *  @brief Compute VdW energy using precomputed constants (fast path).
  *
- * Eliminates redundant pow7 and constant multiplications by using
- * pre-calculated values. ~2x fewer FLOPs than compute_vdw_energy_skylake.
+ *  Eliminates redundant pow7 and constant multiplications by using
+ *  pre-calculated values. ~2x fewer FLOPs than compute_vdw_energy_skylake.
  */
 inline float compute_vdw_energy_skylake_fast(float const* coord_x, float const* coord_y, float const* coord_z,
                                              std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
-                                             float const* pair_epsilon, vdw_precomputed_t<float> const& pre,
+                                             float const* pair_epsilon, vdw_precomputed_f32_t const& pre,
                                              std::size_t pair_start, std::size_t pair_count) {
     __m512 const two_vec = _mm512_set1_ps(2.0f);
     __m512 accum = _mm512_setzero_ps();
@@ -2402,11 +2438,11 @@ inline float compute_vdw_energy_skylake_fast(float const* coord_x, float const* 
 }
 
 /**
- * @brief Compute VdW gradient using precomputed constants (fast path).
+ *  @brief Compute VdW gradient using precomputed constants (fast path).
  */
 inline void compute_vdw_gradient_skylake_fast(float const* coord_x, float const* coord_y, float const* coord_z,
                                               std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,
-                                              float const* pair_epsilon, vdw_precomputed_t<float> const& pre,
+                                              float const* pair_epsilon, vdw_precomputed_f32_t const& pre,
                                               std::size_t pair_start, std::size_t pair_count, float* grad_x,
                                               float* grad_y, float* grad_z) {
     __m512 const two_vec = _mm512_set1_ps(2.0f);
@@ -2498,19 +2534,19 @@ inline void compute_vdw_gradient_skylake_fast(float const* coord_x, float const*
 }
 
 /**
- * @brief L-BFGS optimizer using precomputed VdW constants (fast path).
+ *  @brief L-BFGS optimizer using precomputed VdW constants (fast path).
  *
- * Same algorithm as lbfgs_optimize_skylake but uses precomputed constants
- * to eliminate redundant calculations in energy/gradient evaluations.
+ *  Same algorithm as lbfgs_optimize_skylake but uses precomputed constants
+ *  to eliminate redundant calculations in energy/gradient evaluations.
  */
 inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coord_y, float* coord_z,
                                                      std::int32_t const* vdw_pair_i, std::int32_t const* vdw_pair_j,
-                                                     float const* vdw_epsilon, vdw_precomputed_t<float> const& vdw_pre,
+                                                     float const* vdw_epsilon, vdw_precomputed_f32_t const& vdw_pre,
                                                      std::size_t vdw_pair_count, std::int32_t const* elec_pair_i,
                                                      std::int32_t const* elec_pair_j, float const* elec_charge_i,
                                                      float const* elec_charge_j, std::int32_t const* elec_is_1_4,
                                                      std::size_t elec_pair_count, int max_iterations,
-                                                     float grad_threshold, lbfgs_state_t<float>& state) {
+                                                     float grad_threshold, lbfgs_state_f32_t& state) {
     std::size_t const n_atoms = state.n_atoms;
     std::size_t const n_coords = 3 * n_atoms;
     std::size_t const atom_chunks = n_atoms / 16;
@@ -2521,19 +2557,19 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
     float* backup_y = state.coord_backup + n_atoms;
     float* backup_z = state.coord_backup + 2 * n_atoms;
 
-    auto dot_ = [](float const* a, float const* b, std::size_t chunks) -> float {
+    auto dot_fn = [](float const* a, float const* b, std::size_t chunks) -> float {
         __m512 acc = _mm512_setzero_ps();
         for (std::size_t i = 0; i < chunks; ++i)
             acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i * 16), _mm512_loadu_ps(b + i * 16), acc);
         return _mm512_reduce_add_ps(acc);
     };
 
-    auto rms_grad_ = [&]() -> float {
-        return std::sqrt(dot_(state.grad, state.grad, coord_chunks) / static_cast<float>(n_coords));
+    auto rms_grad_fn = [&]() -> float {
+        return std::sqrt(dot_fn(state.grad, state.grad, coord_chunks) / static_cast<float>(n_coords));
     };
 
     // Fast energy using precomputed constants
-    auto energy_ = [&]() -> float {
+    auto energy_fn = [&]() -> float {
         float vdw = compute_vdw_energy_skylake_fast(coord_x, coord_y, coord_z, vdw_pair_i, vdw_pair_j, vdw_epsilon,
                                                     vdw_pre, 0, vdw_pair_count);
         if (elec_pair_count > 0) {
@@ -2544,7 +2580,7 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
     };
 
     // Fast gradient using precomputed constants
-    auto gradient_ = [&]() -> void {
+    auto gradient_fn = [&]() -> void {
         __m512 const zero = _mm512_setzero_ps();
         for (std::size_t i = 0; i < atom_chunks; ++i) {
             _mm512_storeu_ps(state.grad + i * 16, zero);
@@ -2561,12 +2597,12 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
     };
 
     // Initialize
-    gradient_();
-    float rms = rms_grad_();
+    gradient_fn();
+    float rms = rms_grad_fn();
     if (rms < grad_threshold) {
         result.status = 0;
         result.iterations = 0;
-        result.final_energy = static_cast<double>(energy_());
+        result.final_energy = static_cast<double>(energy_fn());
         result.rms_gradient = static_cast<double>(rms);
         return result;
     }
@@ -2580,7 +2616,7 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
             std::size_t const idx = (state.k - 1 - h) % state.m;
             float const* s = state.s_history + idx * n_coords;
             float const* y = state.y_history + idx * n_coords;
-            state.alpha[idx] = state.rho[idx] * dot_(s, state.q, coord_chunks);
+            state.alpha[idx] = state.rho[idx] * dot_fn(s, state.q, coord_chunks);
             __m512 const a = _mm512_set1_ps(state.alpha[idx]);
             for (std::size_t i = 0; i < coord_chunks; ++i)
                 _mm512_storeu_ps(state.q + i * 16,
@@ -2592,7 +2628,7 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
             std::size_t const idx = (state.k - 1) % state.m;
             float const* s = state.s_history + idx * n_coords;
             float const* y = state.y_history + idx * n_coords;
-            gamma = dot_(s, y, coord_chunks) / dot_(y, y, coord_chunks);
+            gamma = dot_fn(s, y, coord_chunks) / dot_fn(y, y, coord_chunks);
         }
         __m512 const g = _mm512_set1_ps(gamma);
         for (std::size_t i = 0; i < coord_chunks; ++i)
@@ -2602,7 +2638,7 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
             std::size_t const idx = (state.k - h) % state.m;
             float const* s = state.s_history + idx * n_coords;
             float const* y = state.y_history + idx * n_coords;
-            float const beta = state.rho[idx] * dot_(y, state.direction, coord_chunks);
+            float const beta = state.rho[idx] * dot_fn(y, state.direction, coord_chunks);
             __m512 const diff = _mm512_set1_ps(state.alpha[idx] - beta);
             for (std::size_t i = 0; i < coord_chunks; ++i)
                 _mm512_storeu_ps(state.direction + i * 16, _mm512_fmadd_ps(_mm512_loadu_ps(s + i * 16), diff,
@@ -2613,15 +2649,15 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
         for (std::size_t i = 0; i < coord_chunks; ++i)
             _mm512_storeu_ps(state.direction + i * 16, _mm512_sub_ps(zero, _mm512_loadu_ps(state.direction + i * 16)));
 
-        float const e_old = energy_();
-        float g_dot_d = dot_(state.grad, state.direction, coord_chunks);
+        float const e_old = energy_fn();
+        float g_dot_d = dot_fn(state.grad, state.direction, coord_chunks);
 
         // If direction is not descent, reset history and use steepest descent
         if (g_dot_d >= 0.0f) {
             state.k = 0;
             for (std::size_t i = 0; i < coord_chunks; ++i)
                 _mm512_storeu_ps(state.direction + i * 16, _mm512_sub_ps(zero, _mm512_loadu_ps(state.grad + i * 16)));
-            g_dot_d = dot_(state.grad, state.direction, coord_chunks);
+            g_dot_d = dot_fn(state.grad, state.direction, coord_chunks);
             if (g_dot_d >= 0.0f) {
                 result.status = 0; // Converged
                 result.iterations = iter;
@@ -2652,7 +2688,7 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
                                  _mm512_fmadd_ps(av, _mm512_loadu_ps(state.direction + 2 * n_atoms + i * 16),
                                                  _mm512_loadu_ps(backup_z + i * 16)));
             }
-            e_new = energy_();
+            e_new = energy_fn();
             if (e_new <= e_old + 1e-4f * alpha * g_dot_d)
                 break;
             alpha *= 0.5f;
@@ -2668,8 +2704,8 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
 
         for (std::size_t i = 0; i < coord_chunks; ++i)
             _mm512_storeu_ps(state.grad_prev + i * 16, _mm512_loadu_ps(state.grad + i * 16));
-        gradient_();
-        rms = rms_grad_();
+        gradient_fn();
+        rms = rms_grad_fn();
 
         std::size_t const hist_idx = state.k % state.m;
         float* s_k = state.s_history + hist_idx * n_coords;
@@ -2680,7 +2716,7 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
             _mm512_storeu_ps(y_k + i * 16, _mm512_sub_ps(_mm512_loadu_ps(state.grad + i * 16),
                                                          _mm512_loadu_ps(state.grad_prev + i * 16)));
         }
-        state.rho[hist_idx] = 1.0f / dot_(y_k, s_k, coord_chunks);
+        state.rho[hist_idx] = 1.0f / dot_fn(y_k, s_k, coord_chunks);
         state.k++;
         result.iterations = iter + 1;
 
@@ -2693,7 +2729,7 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
     }
 
     result.status = 1;
-    result.final_energy = static_cast<double>(energy_());
+    result.final_energy = static_cast<double>(energy_fn());
     result.rms_gradient = static_cast<double>(rms);
     return result;
 }
@@ -2706,7 +2742,7 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
 
 #if defined(__AVX512BF16__)
 
-/** Convert 16 BF16 values to F32. */
+/**  Convert 16 BF16 values to F32. */
 inline __m512 bf16_to_f32_(std::uint16_t const* bf16_data) {
     // Load raw bytes as __m256i, then reinterpret as __m256bh for cvtpbh
     __m256i const bf16_vec = _mm256_loadu_si256(reinterpret_cast<__m256i const*>(bf16_data));
@@ -2714,9 +2750,9 @@ inline __m512 bf16_to_f32_(std::uint16_t const* bf16_data) {
 }
 
 /**
- * @brief Compute van der Waals energy with BF16 storage and F32 compute.
+ *  @brief Compute van der Waals energy with BF16 storage and F32 compute.
  *
- * Saves 2x memory bandwidth while maintaining F32 compute precision.
+ *  Saves 2x memory bandwidth while maintaining F32 compute precision.
  */
 inline float compute_vdw_energy_genoa(std::uint16_t const* coord_x, std::uint16_t const* coord_y,
                                       std::uint16_t const* coord_z, std::int32_t const* pair_atom_i,
@@ -2799,9 +2835,9 @@ inline float compute_vdw_energy_genoa(std::uint16_t const* coord_x, std::uint16_
 #if defined(__AVX512FP16__)
 
 /**
- * @brief Compute van der Waals energy with FP16 storage and mixed precision.
+ *  @brief Compute van der Waals energy with FP16 storage and mixed precision.
  *
- * Distances computed in native FP16 (32-wide), then widened to F32 for pow7.
+ *  Distances computed in native FP16 (32-wide), then widened to F32 for pow7.
  */
 inline float compute_vdw_energy_turin(_Float16 const* coord_x, _Float16 const* coord_y, _Float16 const* coord_z,
                                       std::int32_t const* pair_atom_i, std::int32_t const* pair_atom_j,

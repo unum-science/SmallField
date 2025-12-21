@@ -22,6 +22,15 @@ import numpy as np
 # Get CPU core count for theoretical multi-core throughput
 CPU_CORES = os.cpu_count() or 1
 
+def get_omp_threads() -> int:
+    """Get OpenMP thread count (used by RDKit)."""
+    # Check environment variable first
+    omp_threads = os.environ.get("OMP_NUM_THREADS")
+    if omp_threads:
+        return int(omp_threads)
+    # Default to CPU count if not set
+    return CPU_CORES
+
 try:
     from rdkit import Chem
     from rdkit.Chem import AllChem
@@ -443,6 +452,7 @@ class BenchmarkResult:
     coords_x: List[np.ndarray] = field(default_factory=list)
     coords_y: List[np.ndarray] = field(default_factory=list)
     coords_z: List[np.ndarray] = field(default_factory=list)
+    iter_counts: List[int] = field(default_factory=list)
 
 
 def load_smiles_from_file(file_path: Path, n_molecules: int) -> List[str]:
@@ -670,6 +680,7 @@ def optimize_serial_f64(
 
     start = time.perf_counter()
 
+    iter_counts = []
     for i, m in enumerate(mol_data_list):
         cx, cy, cz = m.coords_x.copy(), m.coords_y.copy(), m.coords_z.copy()
         try:
@@ -719,12 +730,14 @@ def optimize_serial_f64(
                 grad_threshold,
             )
             energies[i] = result[0]
+            iter_counts.append(result[1])
             coords_x_list.append(cx)
             coords_y_list.append(cy)
             coords_z_list.append(cz)
         except Exception as e:
             print(f"Serial F64 failed for molecule {i}: {e}")
             energies[i] = float("nan")
+            iter_counts.append(max_iterations)
             coords_x_list.append(m.coords_x.copy())
             coords_y_list.append(m.coords_y.copy())
             coords_z_list.append(m.coords_z.copy())
@@ -741,6 +754,7 @@ def optimize_serial_f64(
         coords_x=coords_x_list,
         coords_y=coords_y_list,
         coords_z=coords_z_list,
+        iter_counts=iter_counts,
     )
 
 
@@ -1346,6 +1360,15 @@ def run_benchmark(
     print("=" * 100)
     print()
 
+    # Thread configuration
+    omp_threads = get_omp_threads()
+    print("Thread Configuration:")
+    print(f"  CPU cores available:    {CPU_CORES}")
+    print(f"  OMP_NUM_THREADS:        {os.environ.get('OMP_NUM_THREADS', 'not set')}")
+    print(f"  RDKit threads (OMP):    {omp_threads}")
+    print(f"  SmallField Serial:      1 (single-threaded)")
+    print()
+
     # Print capabilities
     print("Capabilities:")
     print(f"  Skylake (AVX-512 F32):  {'Yes' if smallfield.has_skylake() else 'No'}")
@@ -1470,6 +1493,20 @@ def run_benchmark(
     print("-" * 100)
     print()
 
+    # Iteration statistics for SmallField
+    for name, result in results.items():
+        if result.iter_counts:
+            iters = np.array(result.iter_counts)
+            hit_max = np.sum(iters >= max_iterations)
+            print(f"Iteration stats ({name}):")
+            print(f"  Mean: {np.mean(iters):.1f}, Median: {np.median(iters):.0f}, Max: {np.max(iters)}")
+            print(f"  Hit max ({max_iterations}): {hit_max}/{len(iters)} ({100*hit_max/len(iters):.1f}%)")
+            # Check for diverged molecules (energy > 1000 kcal/mol or very negative)
+            diverged = np.sum((result.energies > 1000) | (result.energies < -1000))
+            if diverged > 0:
+                print(f"  Diverged (|E| > 1000): {diverged}/{len(result.energies)}")
+            print()
+
     # Accuracy vs RDKit
     print("-" * 100)
     print("ACCURACY vs RDKit")
@@ -1525,8 +1562,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--grad-threshold",
         type=float,
-        default=1e-4,
-        help="Gradient convergence threshold (default: 1e-4)",
+        default=0.1,
+        help="Gradient convergence threshold (default: 0.1)",
     )
     parser.add_argument(
         "--smiles-dir",
