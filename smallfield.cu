@@ -3,13 +3,13 @@
  *  @brief Python bindings for SmallField MMFF94 force field calculations
  *  @author Ash Vardanian
  *  @date 2024
- *  
+ *
  *  Provides CPU (serial, AVX-512) and GPU (CUDA) implementations for:
  *  - Van der Waals energy (buffered 14-7 potential)
  *  - Electrostatic energy (Coulomb with buffer)
- *  
+ *
  *  Bindings use pybind11 for clean Python interface.
- *  
+ *
  *  Module name: _smallfield
  *  Namespace: smallfield
  *  Internal functions end with underscore (_)
@@ -45,7 +45,7 @@ namespace smallfield {
 
 /**
  *  @brief CPU memory allocator using std::aligned_alloc.
- *  
+ *
  *  Allocates 64-byte aligned memory for AVX-512 SIMD operations.
  */
 struct cpu_allocator_t {
@@ -60,7 +60,7 @@ struct cpu_allocator_t {
 #if defined(__CUDACC__)
 /**
  *  @brief CUDA unified memory allocator using cudaMallocManaged.
- *  
+ *
  *  Memory is accessible from both CPU and GPU with automatic migration.
  */
 struct cuda_allocator_t {
@@ -81,11 +81,11 @@ using default_allocator_t = cpu_allocator_t;
 
 /**
  *  @brief Aligned buffer with allocator policy.
- *  
+ *
  *  @tparam scalar_type_ Element type
  *  @tparam allocator_type_ Allocator type (cpu_allocator_t or cuda_allocator_t)
  *  @tparam alignment_ Memory alignment in bytes (default 64 for AVX-512)
- *  
+ *
  *  Properly aligns heap data (not just the object) for SIMD operations.
  *  Non-copyable, movable.
  */
@@ -144,7 +144,7 @@ struct aligned_buffer {
 
 /**
  *  @brief Coordinate buffers for a batch of atoms (x, y, z).
- *  
+ *
  *  Uses byte storage that can be cast to any scalar type.
  */
 struct coord_buffers_t {
@@ -168,7 +168,7 @@ struct coord_buffers_t {
 
 /**
  *  @brief Non-bonded pair buffers for VdW/electrostatic calculations.
- *  
+ *
  *  Uses byte storage for params that can be cast to any scalar type.
  */
 struct pair_buffers_t {
@@ -221,7 +221,7 @@ struct batch_buffers_t {
 #if defined(__CUDACC__)
 /**
  *  @brief Buffers for atom-centric kernel data layout.
- *  
+ *
  *  Converts pair-based layout to symmetric adjacency list for the
  *  atom-centric kernel that eliminates atomics and gathers.
  */
@@ -254,15 +254,15 @@ struct atom_centric_buffers_t {
 
 /**
  *  @brief Build symmetric adjacency list from pair arrays.
- *  
+ *
  *  Converts (pair_i, pair_j, epsilon, r_star, qi, qj, is_1_4) pairs
  *  into a symmetric adjacency list where each pair is stored twice:
  *  - Once in atom i's neighbor list (with sign = -1)
  *  - Once in atom j's neighbor list (with sign = +1)
- *  
+ *
  *  This enables the atom-centric kernel to process each atom independently
  *  without atomic operations or cross-lane communication for gradients.
- *  
+ *
  *  @param pair_i Atom i indices for each pair
  *  @param pair_j Atom j indices for each pair
  *  @param epsilon VdW epsilon for each pair
@@ -378,11 +378,11 @@ inline void build_symmetric_adjacency_list_(std::int32_t const* pair_i, std::int
 
 /**
  *  @brief Context for SmallField MMFF94 force field calculations.
- *  
+ *
  *  Pre-allocates buffers with total capacity limits.
  *  Uses default_allocator_t which is CUDA unified memory when compiling with nvcc,
  *  or CPU aligned memory otherwise.
- *  
+ *
  *  Python API receives and returns f64 (double) arrays.
  *  All internal conversion to f32/f16/bf16 happens inside the native library.
  */
@@ -480,11 +480,13 @@ class context_t {
     static constexpr std::uint32_t simd_align(std::uint32_t n) { return (n + 31) & ~31u; }
 
   public:
-    context_t(std::uint32_t total_atoms, std::uint32_t total_pairs, std::uint32_t max_molecules)
+    context_t(std::uint32_t total_atoms, std::uint32_t total_pairs, std::uint32_t max_molecules,
+              std::uint32_t num_threads = 0)
         : capacity_atoms_(simd_align(total_atoms)), capacity_pairs_(simd_align(total_pairs)),
           capacity_molecules_(max_molecules) {
 
-        pool_.try_spawn(std::thread::hardware_concurrency());
+        std::uint32_t const threads = (num_threads == 0) ? std::thread::hardware_concurrency() : num_threads;
+        pool_.try_spawn(threads);
 
         // Allocate with max scalar size (4 bytes for float), rounded up for SIMD
         coords_.allocate(capacity_atoms_, 4);
@@ -526,6 +528,7 @@ class context_t {
     std::uint32_t capacity_atoms() const { return capacity_atoms_; }
     std::uint32_t capacity_pairs() const { return capacity_pairs_; }
     std::uint32_t capacity_molecules() const { return capacity_molecules_; }
+    std::uint32_t num_threads() const { return static_cast<std::uint32_t>(pool_.threads_count()); }
 
     /**
      *  @brief VdW batch using Skylake AVX-512 with ForkUnion parallelization.
@@ -586,7 +589,7 @@ class context_t {
 
     /**
      *  @brief VdW energy using CUDA F32 kernel.
-     *  
+     *
      *  Uses CUDA unified memory - data written to buffers is automatically
      *  migrated to GPU when kernel runs, results readable after sync.
      */
@@ -643,7 +646,7 @@ class context_t {
 
     /**
      *  @brief VdW energy using CUDA F16 kernel.
-     *  
+     *
      *  Uses CUDA unified memory with F16 buffers for reduced bandwidth.
      */
     double vdw_cuda_f16(py::array_t<double> coords_x, py::array_t<double> coords_y, py::array_t<double> coords_z,
@@ -1191,9 +1194,8 @@ class context_t {
             zeros_i32.data(), // No electrostatics
             mol_atom_start_buf.data(), mol_atom_end_buf.data(), batch_.start_data(), batch_.end_data(),
             reinterpret_cast<float*>(lbfgs_workspace_bytes_.data()), out_status.data(), out_iters.data(),
-            out_energy.data(),
-            out_rms.data(), n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth,
-            max_atoms_per_mol);
+            out_energy.data(), out_rms.data(), n_molecules, max_iterations, static_cast<float>(gradient_threshold),
+            memory_depth, max_atoms_per_mol);
 
         cudaDeviceSynchronize();
 
@@ -1311,9 +1313,8 @@ class context_t {
             zeros_i32.data(), // No electrostatics
             mol_atom_start_buf.data(), mol_atom_end_buf.data(), batch_.start_data(), batch_.end_data(),
             reinterpret_cast<float*>(lbfgs_workspace_bytes_.data()), out_status.data(), out_iters.data(),
-            out_energy.data(),
-            out_rms.data(), n_molecules, max_iterations, static_cast<float>(gradient_threshold), memory_depth,
-            max_atoms_per_mol);
+            out_energy.data(), out_rms.data(), n_molecules, max_iterations, static_cast<float>(gradient_threshold),
+            memory_depth, max_atoms_per_mol);
 
         cudaDeviceSynchronize();
 
@@ -1349,15 +1350,15 @@ class context_t {
 
     /**
      *  @brief Compute energy and gradient using atom-centric CUDA F32 kernel.
-     *  
+     *
      *  This kernel eliminates atomics and gathers by using:
      *  - Register-based coordinate storage
      *  - Shuffle-based coordinate access
      *  - Symmetric adjacency list (pairs stored twice)
      *  - Local gradient accumulation
-     *  
+     *
      *  Requires additional charge arrays for electrostatics.
-     *  
+     *
      *  @return tuple: (total_energy, gradient_x, gradient_y, gradient_z)
      */
     py::tuple energy_gradient_atom_centric_cuda_f32(
@@ -1709,7 +1710,7 @@ float compute_vdw_energy_genoa_bf16_(py::array_t<std::uint16_t> coords_x, py::ar
 
 /**
  *  @brief Compute van der Waals energy using AVX-512 FP16 (Turin).
- *  
+ *
  *  Uses std::uint16_t for Python binding compatibility (NumPy doesn't know _Float16).
  *  IEEE 754 FP16 and _Float16 have identical binary representation.
  */
@@ -2193,11 +2194,14 @@ PYBIND11_MODULE(_smallfield, m) {
 
     // context_t class
     py::class_<smallfield::context_t>(m, "Context", "Pre-allocated context for SmallField MMFF94 force field")
-        .def(py::init<std::uint32_t, std::uint32_t, std::uint32_t>(), py::arg("total_atoms"), py::arg("total_pairs"),
-             py::arg("max_molecules"), "Create a new context with pre-allocated buffers (rounded up for SIMD).")
+        .def(py::init<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>(), py::arg("total_atoms"),
+             py::arg("total_pairs"), py::arg("max_molecules"), py::arg("num_threads") = 0,
+             "Create a new context with pre-allocated buffers (rounded up for SIMD). "
+             "num_threads=0 uses all available cores.")
         .def_property_readonly("capacity_atoms", &smallfield::context_t::capacity_atoms)
         .def_property_readonly("capacity_pairs", &smallfield::context_t::capacity_pairs)
         .def_property_readonly("capacity_molecules", &smallfield::context_t::capacity_molecules)
+        .def_property_readonly("num_threads", &smallfield::context_t::num_threads)
         // Batch VdW energy methods
         .def("vdw_skylake", &smallfield::context_t::vdw_skylake,
              "VdW batch energy using Skylake AVX-512 F32 with ForkUnion parallelization.", py::arg("coords_x"),
