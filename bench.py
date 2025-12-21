@@ -22,6 +22,7 @@ import numpy as np
 # Get CPU core count for theoretical multi-core throughput
 CPU_CORES = os.cpu_count() or 1
 
+
 def get_omp_threads() -> int:
     """Get OpenMP thread count (used by RDKit)."""
     # Check environment variable first
@@ -30,6 +31,7 @@ def get_omp_threads() -> int:
         return int(omp_threads)
     # Default to CPU count if not set
     return CPU_CORES
+
 
 try:
     from rdkit import Chem
@@ -1352,9 +1354,14 @@ def compute_accuracy_metrics(
 
 
 def run_benchmark(
-    n_molecules: int, max_iterations: int, grad_threshold: float, smiles_dir: Path
+    n_molecules: int,
+    fixed_iters: int,
+    target_grad: float,
+    max_iters: int,
+    num_threads: int,
+    smiles_dir: Path,
 ):
-    """Run the geometry optimization benchmark."""
+    """Run the geometry optimization benchmark with dual metrics."""
     print("=" * 100)
     print("SmallField MMFF94 Geometry Optimization Benchmark")
     print("=" * 100)
@@ -1362,11 +1369,12 @@ def run_benchmark(
 
     # Thread configuration
     omp_threads = get_omp_threads()
+    sf_threads = num_threads if num_threads > 0 else CPU_CORES
     print("Thread Configuration:")
     print(f"  CPU cores available:    {CPU_CORES}")
     print(f"  OMP_NUM_THREADS:        {os.environ.get('OMP_NUM_THREADS', 'not set')}")
     print(f"  RDKit threads (OMP):    {omp_threads}")
-    print(f"  SmallField Serial:      1 (single-threaded)")
+    print(f"  SmallField threads:     {sf_threads}")
     print()
 
     # Print capabilities
@@ -1392,9 +1400,9 @@ def run_benchmark(
             print(f"  Warning: Failed to extract MMFF94 params: {e}")
     print(f"  Extracted MMFF94 params for {len(mmff94_mol_data_list)} molecules")
 
-    print(f"\nOptimization parameters:")
-    print(f"  Max iterations:      {max_iterations}")
-    print(f"  Gradient threshold:  {grad_threshold}")
+    print(f"\nBenchmark parameters:")
+    print(f"  Iterations-bound:    {fixed_iters} fixed iterations")
+    print(f"  Accuracy-bound:      target grad={target_grad}, max iters={max_iters}")
     print()
 
     total_atoms = sum(m.n_atoms for m in mol_data_list)
@@ -1406,141 +1414,166 @@ def run_benchmark(
     print(f"  Total pairs: {total_pairs:,}")
     print()
 
-    # Run all backends
-    results: Dict[str, BenchmarkResult] = {}
-
-    print("Running optimizations...")
+    # ==========================================================================
+    # ITERATIONS-BOUND TEST (fixed iterations, measure per-iteration speed)
+    # ==========================================================================
+    print("=" * 100)
+    print(f"ITERATIONS-BOUND TEST ({fixed_iters} fixed iterations)")
+    print("=" * 100)
     print()
 
-    # RDKit baseline
+    results_fixed: Dict[str, BenchmarkResult] = {}
+
+    # RDKit baseline (fixed iterations)
     print("  RDKit (baseline)...", end=" ", flush=True)
-    rdkit_result = optimize_rdkit(mol_data_list, max_iterations)
-    results["RDKit (baseline)"] = rdkit_result
-    print(f"done ({rdkit_result.time_ms:.1f} ms)")
+    rdkit_fixed = optimize_rdkit(mol_data_list, fixed_iters)
+    results_fixed["RDKit"] = rdkit_fixed
+    print(f"done ({rdkit_fixed.time_ms:.1f} ms)")
 
-    # Serial F64 (uses full MMFF94)
-    print("  Serial F64 (MMFF94)...", end=" ", flush=True)
+    # Serial F64 (fixed iterations, threshold=0 to disable early exit)
+    print("  Serial F64...", end=" ", flush=True)
     try:
-        serial_result = optimize_serial_f64(
-            mmff94_mol_data_list, max_iterations, grad_threshold
-        )
-        if serial_result:
-            results["Serial F64"] = serial_result
-            print(f"done ({serial_result.time_ms:.1f} ms)")
+        serial_fixed = optimize_serial_f64(mmff94_mol_data_list, fixed_iters, 0.0)
+        if serial_fixed:
+            results_fixed["Serial F64"] = serial_fixed
+            print(f"done ({serial_fixed.time_ms:.1f} ms)")
         else:
             print("N/A")
     except Exception as e:
         print(f"failed: {e}")
 
-    # Serial F32 (uses full MMFF94)
-    print("  Serial F32 (MMFF94)...", end=" ", flush=True)
+    # Serial F32 (fixed iterations)
+    print("  Serial F32...", end=" ", flush=True)
     try:
-        serial_f32_result = optimize_serial_f32(
-            mmff94_mol_data_list, max_iterations, grad_threshold
-        )
-        if serial_f32_result:
-            results["Serial F32"] = serial_f32_result
-            print(f"done ({serial_f32_result.time_ms:.1f} ms)")
+        serial_f32_fixed = optimize_serial_f32(mmff94_mol_data_list, fixed_iters, 0.0)
+        if serial_f32_fixed:
+            results_fixed["Serial F32"] = serial_f32_fixed
+            print(f"done ({serial_f32_fixed.time_ms:.1f} ms)")
         else:
             print("N/A")
     except Exception as e:
         print(f"failed: {e}")
-
-    # Skylake (VdW-only for now, pending kernel update)
-    print("  Skylake AVX-512 F32 (VdW)...", end=" ", flush=True)
-    try:
-        skylake_result = optimize_skylake(mol_data_list, max_iterations, grad_threshold)
-        if skylake_result:
-            results["Skylake AVX-512 F32"] = skylake_result
-            print(f"done ({skylake_result.time_ms:.1f} ms)")
-        else:
-            print("N/A")
-    except Exception as e:
-        print(f"failed: {e}")
-
-    # CUDA F32 - disabled for kernel rewrite
-    print("  CUDA F32... disabled (kernel rewrite pending)")
-
-    # CUDA F16 - disabled for kernel rewrite
-    print("  CUDA F16... disabled (kernel rewrite pending)")
 
     print()
 
-    # Throughput table
+    # Iterations-bound results table
     print("-" * 100)
-    print(f"THROUGHPUT  (CPU cores: {CPU_CORES})")
-    print("-" * 100)
-    print(f"{'Backend':<35} {'Time (ms)':>15} {'Mol/sec':>15} {'Speedup':>15}")
+    print(
+        f"{'Backend':<25} {'Time (ms)':>12} {'ms/mol':>10} {'ms/iter':>10} {'Speedup':>12}"
+    )
     print("-" * 100)
 
-    rdkit_result = results["RDKit (baseline)"]
-    rdkit_time = rdkit_result.time_ms
-    rdkit_mol_per_sec = rdkit_result.mol_per_sec
+    rdkit_time = rdkit_fixed.time_ms
+    n_mols = len(mol_data_list)
+    rdkit_ms_per_mol = rdkit_time / n_mols
+    rdkit_ms_per_iter = rdkit_time / (n_mols * fixed_iters)
 
-    for name, result in results.items():
+    for name, result in results_fixed.items():
+        ms_per_mol = result.time_ms / n_mols
+        ms_per_iter = result.time_ms / (n_mols * fixed_iters)
         speedup = rdkit_time / result.time_ms if result.time_ms > 0 else 0
         print(
-            f"{name:<35} {result.time_ms:>15.2f} {result.mol_per_sec:>15.0f} {speedup:>14.1f}x"
+            f"{name:<25} {result.time_ms:>12.1f} {ms_per_mol:>10.3f} {ms_per_iter:>10.4f} {speedup:>11.2f}x"
         )
 
-    # Add theoretical multi-core RDKit throughput
-    theoretical_mol_per_sec = rdkit_mol_per_sec * CPU_CORES
-    theoretical_time = rdkit_time / CPU_CORES
+    print("-" * 100)
+    print()
+
+    # ==========================================================================
+    # ACCURACY-BOUND TEST (converge to threshold, measure convergence speed)
+    # ==========================================================================
+    print("=" * 100)
+    print(f"ACCURACY-BOUND TEST (target grad={target_grad}, max iters={max_iters})")
+    print("=" * 100)
+    print()
+
+    results_accuracy: Dict[str, BenchmarkResult] = {}
+
+    # RDKit baseline (accuracy)
+    print("  RDKit (baseline)...", end=" ", flush=True)
+    rdkit_accuracy = optimize_rdkit(mol_data_list, max_iters)
+    results_accuracy["RDKit"] = rdkit_accuracy
+    print(f"done ({rdkit_accuracy.time_ms:.1f} ms)")
+
+    # Serial F64 (accuracy)
+    print("  Serial F64...", end=" ", flush=True)
+    try:
+        serial_accuracy = optimize_serial_f64(
+            mmff94_mol_data_list, max_iters, target_grad
+        )
+        if serial_accuracy:
+            results_accuracy["Serial F64"] = serial_accuracy
+            print(f"done ({serial_accuracy.time_ms:.1f} ms)")
+        else:
+            print("N/A")
+    except Exception as e:
+        print(f"failed: {e}")
+
+    # Serial F32 (accuracy)
+    print("  Serial F32...", end=" ", flush=True)
+    try:
+        serial_f32_accuracy = optimize_serial_f32(
+            mmff94_mol_data_list, max_iters, target_grad
+        )
+        if serial_f32_accuracy:
+            results_accuracy["Serial F32"] = serial_f32_accuracy
+            print(f"done ({serial_f32_accuracy.time_ms:.1f} ms)")
+        else:
+            print("N/A")
+    except Exception as e:
+        print(f"failed: {e}")
+
+    print()
+
+    # Accuracy-bound results table
+    print("-" * 100)
     print(
-        f"{'RDKit (theoretical ' + str(CPU_CORES) + ' cores)':<35} {theoretical_time:>15.2f} {theoretical_mol_per_sec:>15.0f} {'1.0x (upper bound)':>15}"
+        f"{'Backend':<25} {'Time (ms)':>12} {'Avg Iters':>10} {'Converged':>12} {'Speedup':>12}"
     )
-
     print("-" * 100)
-    print()
 
-    # Iteration statistics for SmallField
-    for name, result in results.items():
+    rdkit_time_acc = rdkit_accuracy.time_ms
+
+    for name, result in results_accuracy.items():
         if result.iter_counts:
-            iters = np.array(result.iter_counts)
-            hit_max = np.sum(iters >= max_iterations)
-            print(f"Iteration stats ({name}):")
-            print(f"  Mean: {np.mean(iters):.1f}, Median: {np.median(iters):.0f}, Max: {np.max(iters)}")
-            print(f"  Hit max ({max_iterations}): {hit_max}/{len(iters)} ({100*hit_max/len(iters):.1f}%)")
-            # Check for diverged molecules (energy > 1000 kcal/mol or very negative)
-            diverged = np.sum((result.energies > 1000) | (result.energies < -1000))
-            if diverged > 0:
-                print(f"  Diverged (|E| > 1000): {diverged}/{len(result.energies)}")
-            print()
-
-    # Accuracy vs RDKit
-    print("-" * 100)
-    print("ACCURACY vs RDKit")
-    print("-" * 100)
-    print(f"{'Backend':<30} {'Energy MAE':>15} {'Energy Max':>15} {'Coord RMSD':>15}")
-    print("-" * 100)
-
-    rdkit_metrics = compute_accuracy_metrics(results, "RDKit (baseline)")
-    for name, m in rdkit_metrics.items():
+            avg_iters = np.mean(result.iter_counts)
+            converged = (
+                100
+                * np.sum(np.array(result.iter_counts) < max_iters)
+                / len(result.iter_counts)
+            )
+        else:
+            avg_iters = max_iters
+            converged = 100.0  # RDKit returns 0 on convergence
+        speedup = rdkit_time_acc / result.time_ms if result.time_ms > 0 else 0
         print(
-            f"{name:<30} {m['energy_mae']:>15.6f} {m['energy_max']:>15.6f} {m['coord_rmsd']:>15.6f}"
+            f"{name:<25} {result.time_ms:>12.1f} {avg_iters:>10.1f} {converged:>11.1f}% {speedup:>11.2f}x"
         )
 
     print("-" * 100)
     print()
 
-    # Accuracy vs Serial F64
-    if "Serial F64" in results:
-        print("-" * 100)
-        print("ACCURACY vs Serial F64")
-        print("-" * 100)
-        print(
-            f"{'Backend':<30} {'Energy MAE':>15} {'Energy Max':>15} {'Coord RMSD':>15}"
-        )
-        print("-" * 100)
+    # Energy comparison (accuracy-bound test)
+    print("-" * 100)
+    print("ENERGY COMPARISON (accuracy-bound test)")
+    print("-" * 100)
+    print(f"{'Backend':<25} {'Mean Energy':>15} {'Energy MAE vs RDKit':>20}")
+    print("-" * 100)
 
-        serial_metrics = compute_accuracy_metrics(results, "Serial F64")
-        for name, m in serial_metrics.items():
-            print(
-                f"{name:<30} {m['energy_mae']:>15.6f} {m['energy_max']:>15.6f} {m['coord_rmsd']:>15.6f}"
-            )
+    rdkit_energies = results_accuracy["RDKit"].energies
+    rdkit_mean = np.mean(rdkit_energies)
 
-        print("-" * 100)
-        print()
+    for name, result in results_accuracy.items():
+        mean_e = np.mean(result.energies)
+        if name == "RDKit":
+            mae_str = "-"
+        else:
+            mae = np.mean(np.abs(result.energies - rdkit_energies))
+            mae_str = f"{mae:.4f}"
+        print(f"{name:<25} {mean_e:>15.4f} {mae_str:>20}")
+
+    print("-" * 100)
+    print()
 
 
 if __name__ == "__main__":
@@ -1554,16 +1587,28 @@ if __name__ == "__main__":
         help="Number of molecules (default: 100)",
     )
     parser.add_argument(
-        "--max-iter",
+        "--fixed-iters",
         type=int,
         default=200,
-        help="Max optimization iterations (default: 200)",
+        help="Fixed iterations for iterations-bound test (default: 200)",
     )
     parser.add_argument(
-        "--grad-threshold",
+        "--target-grad",
         type=float,
         default=0.1,
-        help="Gradient convergence threshold (default: 0.1)",
+        help="Target gradient threshold for accuracy-bound test (default: 0.1)",
+    )
+    parser.add_argument(
+        "--max-iters",
+        type=int,
+        default=500,
+        help="Max iterations for accuracy-bound test (default: 500)",
+    )
+    parser.add_argument(
+        "--num-threads",
+        type=int,
+        default=1,
+        help="Number of threads for SmallField (0=all cores, default: 1 for fair comparison)",
     )
     parser.add_argument(
         "--smiles-dir",
@@ -1573,4 +1618,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    run_benchmark(args.n_molecules, args.max_iter, args.grad_threshold, args.smiles_dir)
+    run_benchmark(
+        args.n_molecules,
+        args.fixed_iters,
+        args.target_grad,
+        args.max_iters,
+        args.num_threads,
+        args.smiles_dir,
+    )
