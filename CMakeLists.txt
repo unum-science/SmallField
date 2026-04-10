@@ -88,8 +88,8 @@ if(NOT RDKit_FOUND)
                     "Pass -DRDKIT_PREFIX=/path/to/conda/env")
 endif()
 
-# ForkUnion (header-only submodule)
-add_subdirectory(ForkUnion)
+# OpenMP for CPU parallelism
+find_package(OpenMP REQUIRED)
 
 # curand library
 find_library(CURAND_LIBRARY curand
@@ -99,5 +99,6 @@ find_library(CURAND_LIBRARY curand
 
 if(RDKit_FOUND)
     enable_testing()
-    add_subdirectory(tests)
+    add_subdirectory(test)
+    add_subdirectory(bench)
 endif()

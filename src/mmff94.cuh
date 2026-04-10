@@ -23,7 +23,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-#include "src/lbfgs_warp.cuh" // warp_size, full_mask, warp_reduce_sum_f32_, L-BFGS primitives
+#include "lbfgs_warp.cuh" // warp_size, full_mask, warp_reduce_sum_f32_, L-BFGS primitives
 
 namespace smallfield {
 

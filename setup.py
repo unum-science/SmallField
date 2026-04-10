@@ -167,12 +167,11 @@ python_lib_name = os.path.basename(python_lib_dir).replace(".so", "")
 ext_modules = [
     Extension(
         "_smallfield",
-        ["smallfield.cu"],
+        ["src/smallfield.cu"],
         include_dirs=[
             pybind11.get_include(),
             np.get_include(),
             get_python_inc(),
-            "ForkUnion/include",
             "src",
             "/usr/local/cuda/include/",
             "/usr/include/cuda/",
@@ -213,6 +212,7 @@ setup(
     long_description=long_description,
     ext_modules=ext_modules,
     packages=["smallfield"],
+    package_dir={"smallfield": "python/smallfield"},
     extras_require={
         "test": ["pytest", "pytest-benchmark", "rdkit"],
         "cpu": ["pytest", "pytest-benchmark", "rdkit"],

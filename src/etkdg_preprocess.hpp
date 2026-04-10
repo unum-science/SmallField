@@ -472,20 +472,36 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
 inline etkdg_prepared_molecule_t prepare_molecule(std::string const& smiles) {
     etkdg_prepared_molecule_t result{};
 
-    std::unique_ptr<RDKit::RWMol> mol(RDKit::SmilesToMol(smiles));
+    std::unique_ptr<RDKit::RWMol> mol;
+    try {
+        mol.reset(RDKit::SmilesToMol(smiles));
+    } catch (...) {
+        return result;
+    }
     if (!mol)
         return result;
 
-    RDKit::MolOps::addHs(*mol);
+    try {
+        RDKit::MolOps::addHs(*mol);
+    } catch (...) {
+        return result;
+    }
     result.num_atoms = mol->getNumAtoms();
+    if (result.num_atoms > 128)
+        return result; // too large for single-warp pipeline
 
     // build raw bounds (no CPU smoothing — GPU handles Floyd-Warshall)
     // chiral signs from graph CW/CCW tags (no EmbedMolecule needed)
-    build_bounds_matrix(*mol, result.bounds_matrix);
-    extract_chiral_centers(*mol, result.chiral_centers);
-    extract_etk_torsions(*mol, result.etk_torsions);
-    extract_distance_constraints(*mol, result.bounds_matrix, result.distance_constraints);
-    extract_mmff94_params(*mol, result);
+    try {
+        build_bounds_matrix(*mol, result.bounds_matrix);
+        extract_chiral_centers(*mol, result.chiral_centers);
+        extract_etk_torsions(*mol, result.etk_torsions);
+        extract_distance_constraints(*mol, result.bounds_matrix, result.distance_constraints);
+        extract_mmff94_params(*mol, result);
+    } catch (...) {
+        result.num_atoms = 0; // mark as failed
+        return result;
+    }
 
     result.metadata.num_atoms = result.num_atoms;
     result.metadata.num_chiral_centers = static_cast<std::uint32_t>(result.chiral_centers.size());

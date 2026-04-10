@@ -1,11 +1,6 @@
 # C++ / CUDA test executables linking against RDKit for cross-validation.
 # Each test is a standalone executable with its own main().
 
-find_package(OpenMP QUIET)
-if(OpenMP_CXX_FOUND)
-    message(STATUS "OpenMP found for tests")
-endif()
-
 # shared test utilities (header-only)
 add_library(test_helpers INTERFACE)
 target_include_directories(test_helpers INTERFACE
@@ -33,16 +28,14 @@ set(RDKIT_LIBS
 # with nvcc, then link them together.
 
 macro(add_mixed_test test_name)
-    # the test has a .cpp (host / RDKit code) and a .cu (CUDA kernels) file
     add_executable(${test_name} ${test_name}.cpp ${test_name}_kernels.cu)
     set_source_files_properties(${test_name}.cpp PROPERTIES LANGUAGE CXX)
     target_link_libraries(${test_name} PRIVATE
         test_helpers
-        fork_union
         ${RDKIT_LIBS}
         ${CURAND_LIBRARY}
         cudart
-        $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
+        OpenMP::OpenMP_CXX)
     target_include_directories(${test_name} PRIVATE
         ${CMAKE_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/src)
@@ -56,6 +49,3 @@ add_mixed_test(test_triangle_smooth)
 add_mixed_test(test_dg_energy)
 add_mixed_test(test_chirality)
 add_mixed_test(test_pipeline)
-add_mixed_test(bench_pipeline)
-add_mixed_test(bench_scaling)
-add_mixed_test(bench_comparison)

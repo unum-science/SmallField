@@ -29,7 +29,8 @@
 #include <utility>
 #include <vector>
 
-#include "fork_union.hpp"
+#include <omp.h>
+
 #include "mmff94.hpp"
 
 #if defined(__CUDACC__)
@@ -38,8 +39,6 @@
 #endif
 
 namespace py = pybind11;
-namespace fu = ashvardanian::fork_union;
-
 namespace smallfield {
 
 #pragma region Allocators and Aligned Buffers
@@ -393,8 +392,7 @@ class context_t {
     std::uint32_t capacity_pairs_;
     std::uint32_t capacity_molecules_;
 
-    // ForkUnion thread pool for CPU parallelism
-    fu::basic_pool_t pool_;
+    std::uint32_t num_threads_;
 
     // Single set of buffers - use max scalar size (4 bytes for float)
     coord_buffers_t coords_;
@@ -486,8 +484,8 @@ class context_t {
         : capacity_atoms_(simd_align(total_atoms)), capacity_pairs_(simd_align(total_pairs)),
           capacity_molecules_(max_molecules) {
 
-        std::uint32_t const threads = (num_threads == 0) ? std::thread::hardware_concurrency() : num_threads;
-        pool_.try_spawn(threads);
+        num_threads_ = (num_threads == 0) ? std::thread::hardware_concurrency() : num_threads;
+        omp_set_num_threads(static_cast<int>(num_threads_));
 
         // Allocate with max scalar size (4 bytes for float), rounded up for SIMD
         coords_.allocate(capacity_atoms_, 4);
@@ -529,7 +527,7 @@ class context_t {
     std::uint32_t capacity_atoms() const { return capacity_atoms_; }
     std::uint32_t capacity_pairs() const { return capacity_pairs_; }
     std::uint32_t capacity_molecules() const { return capacity_molecules_; }
-    std::uint32_t num_threads() const { return static_cast<std::uint32_t>(pool_.threads_count()); }
+    std::uint32_t num_threads() const { return num_threads_; }
 
     /**
      *  @brief VdW batch using Skylake AVX-512 with ForkUnion parallelization.
@@ -570,13 +568,13 @@ class context_t {
         float const* r_star = pairs_.param2_data<float>();
         float* out_energy = batch_.energy_data();
 
-        pool_.for_n(n_molecules, [=](auto prong) noexcept {
-            std::uint32_t const mol = static_cast<std::uint32_t>(prong.task);
+#pragma omp parallel for schedule(dynamic, 1)
+        for (std::uint32_t mol = 0; mol < n_molecules; ++mol) {
             std::int32_t const start = mol_start[mol];
             std::int32_t const end = mol_end[mol];
             std::int32_t const count = end - start;
             out_energy[mol] = compute_vdw_energy_skylake(cx, cy, cz, pair_i, pair_j, eps, r_star, start, count);
-        });
+        }
 
         double total_energy = 0.0;
         for (std::uint32_t i = 0; i < n_molecules; ++i) {
