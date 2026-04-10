@@ -34,6 +34,7 @@ macro(add_mixed_test test_name)
         test_helpers
         ${RDKIT_LIBS}
         ${CURAND_LIBRARY}
+        ${CUSOLVER_LIBRARY}
         cudart
         OpenMP::OpenMP_CXX)
     target_include_directories(${test_name} PRIVATE
@@ -48,4 +49,5 @@ endmacro()
 add_mixed_test(test_triangle_smooth)
 add_mixed_test(test_dg_energy)
 add_mixed_test(test_chirality)
+add_mixed_test(test_mmff_gradient)
 add_mixed_test(test_pipeline)

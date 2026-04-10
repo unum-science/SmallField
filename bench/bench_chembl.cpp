@@ -144,7 +144,6 @@ static void bench_smallfield_gpu(std::vector<std::string> const& smiles, std::ui
     // Time phase 2 GPU upload, execution, and download.
     auto result = gpu_etkdg_mmff_pipeline(
         batch_out.bounds_matrices.data(), static_cast<std::uint32_t>(batch_out.bounds_matrices.size()),
-        batch_out.initial_coordinates.data(), static_cast<std::uint32_t>(batch_out.initial_coordinates.size()),
         batch_out.chiral_centers.empty() ? nullptr : batch_out.chiral_centers.data(),
         static_cast<std::uint32_t>(batch_out.chiral_centers.size()),
         batch_out.etk_torsions.empty() ? nullptr : batch_out.etk_torsions.data(),
@@ -185,7 +184,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const& smiles, std::ui
     std::printf("  Conf/s:      %.1f\n", conf_per_sec);
     std::printf("  Succeeded:   %u / %u conformers\n", result.num_succeeded, total_conf);
 
-    // GPU memory usage estimate
+    // GPU memory usage estimate.
     std::size_t bounds_bytes = batch_out.bounds_matrices.size() * sizeof(float);
     std::size_t params_bytes = batch_out.mmff_nonbonded.size() * sizeof(mmff94_nonbonded_pair_t) +
                                batch_out.mmff_bonds.size() * sizeof(mmff94_bond_t) +
@@ -291,6 +290,7 @@ static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecul
         std::printf("  Per-atom-count breakdown:\n");
         std::printf("    %6s  %6s  %8s  %8s\n", "atoms", "count", "rdkit_P50", "sf_P50");
         std::vector<std::uint32_t> bins = {20, 40, 60, 80, 100, 128};
+        std::vector<double> heavy_bin_rdkit;
         for (std::size_t b = 0; b < bins.size(); ++b) {
             std::uint32_t lo = (b == 0) ? 0 : bins[b - 1];
             std::uint32_t hi = bins[b];
@@ -306,7 +306,17 @@ static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecul
                 std::sort(bin_sf.begin(), bin_sf.end());
                 std::printf("    %3u-%-3u  %5zu  %8.1f  %8.1f\n", lo, hi, bin_rdkit.size(), percentile(bin_rdkit, 50),
                             percentile(bin_sf, 50));
+                if (lo == 100 && hi == 128)
+                    heavy_bin_rdkit = bin_rdkit;
             }
+        }
+
+        if (!heavy_bin_rdkit.empty()) {
+            double const heavy_p50 = percentile(heavy_bin_rdkit, 50);
+            double const heavy_p95 = percentile(heavy_bin_rdkit, 95);
+            bool const passes_gate = heavy_p50 < 180.0 && heavy_p95 < 300.0;
+            std::printf("  Heavy-bin gate (100-128 atoms): P50=%.1f  P95=%.1f  [%s]\n", heavy_p50, heavy_p95,
+                        passes_gate ? "PASS" : "FAIL");
         }
     }
 }

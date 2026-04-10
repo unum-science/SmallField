@@ -183,7 +183,7 @@ ext_modules = [
             python_lib_dir,
         ],
         libraries=[python_lib_name.replace(".a", "")]
-        + (["cudart", "cuda", "curand"] if enable_cuda else [])
+        + (["cudart", "cuda", "curand", "cusolver"] if enable_cuda else [])
         + (["gomp"] if enable_openmp else []),
         extra_compile_args=[
             "-std=c++17",

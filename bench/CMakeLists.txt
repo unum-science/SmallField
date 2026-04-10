@@ -21,6 +21,7 @@ macro(add_mixed_bench bench_name)
     target_link_libraries(${bench_name} PRIVATE
         ${RDKIT_LIBS}
         ${CURAND_LIBRARY}
+        ${CUSOLVER_LIBRARY}
         cudart
         OpenMP::OpenMP_CXX)
     target_include_directories(${bench_name} PRIVATE

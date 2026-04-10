@@ -17,10 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <memory>
-#include <numeric>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,8 +40,7 @@ namespace smallfield {
 /** Complete preprocessed molecule ready for GPU pipeline upload. */
 struct etkdg_prepared_molecule_t {
     std::uint32_t num_atoms;
-    std::vector<float> bounds_matrix;       ///< N x N flat, smoothed
-    std::vector<float> initial_coordinates; ///< 4 x N SoA from SmallField metric embedding
+    std::vector<float> bounds_matrix; ///< N x N flat, unsmoothed
     std::vector<chiral_center_descriptor_t> chiral_centers;
     std::vector<etk_torsion_descriptor_t> etk_torsions;
     std::vector<distance_constraint_t> distance_constraints; ///< 1-2 bond, 1-3 angle
@@ -90,195 +86,6 @@ inline void build_bounds_matrix(RDKit::ROMol const& molecule, std::vector<float>
             bounds[j * num_atoms + i] = static_cast<float>(bounds_mat->getLowerBound(i, j));
         }
     }
-}
-
-/** Read an upper-triangular bound from the flattened matrix. */
-inline float read_upper_bound(std::vector<float> const& bounds, std::uint32_t num_atoms, std::uint32_t atom_a,
-                              std::uint32_t atom_b) {
-    std::uint32_t const row = std::min(atom_a, atom_b);
-    std::uint32_t const col = std::max(atom_a, atom_b);
-    return bounds[row * num_atoms + col];
-}
-
-/** Read a lower-triangular bound from the flattened matrix. */
-inline float read_lower_bound(std::vector<float> const& bounds, std::uint32_t num_atoms, std::uint32_t atom_a,
-                              std::uint32_t atom_b) {
-    std::uint32_t const row = std::max(atom_a, atom_b);
-    std::uint32_t const col = std::min(atom_a, atom_b);
-    return bounds[row * num_atoms + col];
-}
-
-/** CPU reference triangle smoothing matching the GPU bound convention. */
-inline void triangle_smooth_bounds_in_place(std::vector<float>& bounds, std::uint32_t num_atoms) {
-    std::uint32_t const total_pairs = num_atoms * num_atoms;
-    for (std::uint32_t k = 0; k < num_atoms; ++k) {
-        for (std::uint32_t linear_index = 0; linear_index < total_pairs; ++linear_index) {
-            std::uint32_t const i = linear_index / num_atoms;
-            std::uint32_t const j = linear_index % num_atoms;
-            if (i == j || i == k || j == k)
-                continue;
-
-            float const upper_ik = read_upper_bound(bounds, num_atoms, i, k);
-            float const upper_kj = read_upper_bound(bounds, num_atoms, k, j);
-
-            if (i < j) {
-                float const candidate = upper_ik + upper_kj;
-                float& current = bounds[i * num_atoms + j];
-                if (candidate < current)
-                    current = candidate;
-            } else {
-                float const lower_ik = read_lower_bound(bounds, num_atoms, i, k);
-                float const lower_kj = read_lower_bound(bounds, num_atoms, k, j);
-                float const c1 = lower_ik - upper_kj;
-                float const c2 = lower_kj - upper_ik;
-                float& current = bounds[i * num_atoms + j];
-                current = std::max(current, std::max(c1, c2));
-            }
-        }
-    }
-}
-
-/** Symmetric Jacobi eigendecomposition. Eigenvectors are returned column-major in `eigenvectors`. */
-inline bool jacobi_symmetric_eigendecomposition(std::vector<double>& matrix, std::uint32_t num_atoms,
-                                                std::vector<double>& eigenvectors, std::vector<double>& eigenvalues) {
-    if (num_atoms == 0)
-        return false;
-
-    eigenvectors.assign(num_atoms * num_atoms, 0.0);
-    for (std::uint32_t i = 0; i < num_atoms; ++i)
-        eigenvectors[i * num_atoms + i] = 1.0;
-
-    constexpr std::uint32_t max_sweeps = 64;
-    constexpr double tolerance = 1.0e-10;
-
-    for (std::uint32_t sweep = 0; sweep < max_sweeps; ++sweep) {
-        double max_off_diagonal = 0.0;
-        std::uint32_t pivot_p = 0;
-        std::uint32_t pivot_q = 0;
-
-        for (std::uint32_t i = 0; i < num_atoms; ++i) {
-            for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
-                double const value = std::fabs(matrix[i * num_atoms + j]);
-                if (value > max_off_diagonal) {
-                    max_off_diagonal = value;
-                    pivot_p = i;
-                    pivot_q = j;
-                }
-            }
-        }
-
-        if (max_off_diagonal < tolerance)
-            break;
-
-        double const app = matrix[pivot_p * num_atoms + pivot_p];
-        double const aqq = matrix[pivot_q * num_atoms + pivot_q];
-        double const apq = matrix[pivot_p * num_atoms + pivot_q];
-        if (std::fabs(apq) < tolerance)
-            continue;
-
-        double const tau = (aqq - app) / (2.0 * apq);
-        double const t =
-            (tau >= 0.0) ? 1.0 / (tau + std::sqrt(1.0 + tau * tau)) : -1.0 / (-tau + std::sqrt(1.0 + tau * tau));
-        double const c = 1.0 / std::sqrt(1.0 + t * t);
-        double const s = t * c;
-
-        for (std::uint32_t k = 0; k < num_atoms; ++k) {
-            if (k == pivot_p || k == pivot_q)
-                continue;
-            double const aik = matrix[pivot_p * num_atoms + k];
-            double const aqk = matrix[pivot_q * num_atoms + k];
-            double const new_aik = c * aik - s * aqk;
-            double const new_aqk = s * aik + c * aqk;
-            matrix[pivot_p * num_atoms + k] = new_aik;
-            matrix[k * num_atoms + pivot_p] = new_aik;
-            matrix[pivot_q * num_atoms + k] = new_aqk;
-            matrix[k * num_atoms + pivot_q] = new_aqk;
-        }
-
-        matrix[pivot_p * num_atoms + pivot_p] = c * c * app - 2.0 * c * s * apq + s * s * aqq;
-        matrix[pivot_q * num_atoms + pivot_q] = s * s * app + 2.0 * c * s * apq + c * c * aqq;
-        matrix[pivot_p * num_atoms + pivot_q] = 0.0;
-        matrix[pivot_q * num_atoms + pivot_p] = 0.0;
-
-        for (std::uint32_t k = 0; k < num_atoms; ++k) {
-            double const vip = eigenvectors[k * num_atoms + pivot_p];
-            double const viq = eigenvectors[k * num_atoms + pivot_q];
-            eigenvectors[k * num_atoms + pivot_p] = c * vip - s * viq;
-            eigenvectors[k * num_atoms + pivot_q] = s * vip + c * viq;
-        }
-    }
-
-    eigenvalues.resize(num_atoms, 0.0);
-    for (std::uint32_t i = 0; i < num_atoms; ++i)
-        eigenvalues[i] = matrix[i * num_atoms + i];
-    return true;
-}
-
-/** Build a SmallField-owned 4D metric embedding from the smoothed bounds matrix. */
-inline bool build_metric_initial_coordinates(std::vector<float> const& bounds_matrix, std::uint32_t num_atoms,
-                                             std::vector<float>& initial_coordinates) {
-    if (num_atoms == 0)
-        return false;
-
-    std::vector<float> smoothed_bounds = bounds_matrix;
-    triangle_smooth_bounds_in_place(smoothed_bounds, num_atoms);
-
-    std::vector<double> squared_distances(num_atoms * num_atoms, 0.0);
-    for (std::uint32_t i = 0; i < num_atoms; ++i) {
-        for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
-            double const upper = static_cast<double>(smoothed_bounds[i * num_atoms + j]);
-            double const lower = static_cast<double>(smoothed_bounds[j * num_atoms + i]);
-            double const distance = 0.5 * (std::max(lower, 0.0) + std::max(upper, lower));
-            double const squared = distance * distance;
-            squared_distances[i * num_atoms + j] = squared;
-            squared_distances[j * num_atoms + i] = squared;
-        }
-    }
-
-    std::vector<double> row_means(num_atoms, 0.0);
-    double grand_mean = 0.0;
-    for (std::uint32_t i = 0; i < num_atoms; ++i) {
-        double row_sum = 0.0;
-        for (std::uint32_t j = 0; j < num_atoms; ++j)
-            row_sum += squared_distances[i * num_atoms + j];
-        row_means[i] = row_sum / static_cast<double>(num_atoms);
-        grand_mean += row_means[i];
-    }
-    grand_mean /= static_cast<double>(num_atoms);
-
-    std::vector<double> gram_matrix(num_atoms * num_atoms, 0.0);
-    for (std::uint32_t i = 0; i < num_atoms; ++i) {
-        for (std::uint32_t j = 0; j < num_atoms; ++j) {
-            gram_matrix[i * num_atoms + j] =
-                -0.5 * (squared_distances[i * num_atoms + j] - row_means[i] - row_means[j] + grand_mean);
-        }
-    }
-
-    std::vector<double> eigenvectors;
-    std::vector<double> eigenvalues;
-    if (!jacobi_symmetric_eigendecomposition(gram_matrix, num_atoms, eigenvectors, eigenvalues))
-        return false;
-
-    std::vector<std::uint32_t> order(num_atoms);
-    std::iota(order.begin(), order.end(), 0u);
-    std::sort(order.begin(), order.end(),
-              [&](std::uint32_t lhs, std::uint32_t rhs) { return eigenvalues[lhs] > eigenvalues[rhs]; });
-
-    initial_coordinates.assign(4 * num_atoms, 0.0f);
-    constexpr double minimum_eigenvalue = 1.0e-8;
-    for (std::uint32_t dim = 0; dim < 4 && dim < order.size(); ++dim) {
-        std::uint32_t const eigen_index = order[dim];
-        double const eigenvalue = std::max(eigenvalues[eigen_index], 0.0);
-        if (eigenvalue < minimum_eigenvalue)
-            continue;
-        double const scale = std::sqrt(eigenvalue);
-        for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-            initial_coordinates[dim * num_atoms + atom] =
-                static_cast<float>(scale * eigenvectors[atom * num_atoms + eigen_index]);
-        }
-    }
-
-    return true;
 }
 
 /**
@@ -467,7 +274,7 @@ inline void extract_etk_torsions(RDKit::ROMol const& molecule, std::vector<etk_t
             torsion.atom_indices[1] = static_cast<std::uint8_t>(atom_j);
             torsion.atom_indices[2] = static_cast<std::uint8_t>(atom_k);
             torsion.atom_indices[3] = static_cast<std::uint8_t>(atom_l);
-            torsion.fourier_coefficients[2] = 1.0f; // generic V₃ = 1.0
+            torsion.fourier_coefficients[2] = 1.0f; // Generic V₃ = 1.0.
             torsions.push_back(torsion);
         }
     }
@@ -507,7 +314,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
     for (auto const& atom : molecule.atoms()) {
         unsigned int center = atom->getIdx();
         // Collect neighbors by inline iteration without a temporary vector.
-        unsigned int nb_indices[8]; // max 8 neighbors (typical max valence)
+        unsigned int nb_indices[8]; // Max 8 neighbors (typical max valence).
         unsigned int nb_count = 0;
         for (auto const& nb : molecule.atomNeighbors(atom)) {
             if (nb_count < 8)
@@ -539,7 +346,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
     }
 
     // Cache partial charges in a single pass.
-    float charges[256]; // stack-allocated, max 256 atoms
+    float charges[256]; // Stack-allocated, max 256 atoms.
     for (unsigned int i = 0; i < num_atoms && i < 256; ++i)
         charges[i] = static_cast<float>(mmff_props.getMMFFPartialCharge(i));
 
@@ -792,13 +599,12 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const& smiles) {
 
     try {
         build_bounds_matrix(*mol, result.bounds_matrix);
-        build_metric_initial_coordinates(result.bounds_matrix, result.num_atoms, result.initial_coordinates);
         extract_chiral_centers(*mol, result.chiral_centers);
         extract_etk_torsions(*mol, result.etk_torsions);
         extract_distance_constraints(*mol, result.bounds_matrix, result.distance_constraints);
         extract_mmff94_params(*mol, result);
     } catch (...) {
-        result.num_atoms = 0; // mark as failed
+        result.num_atoms = 0; // Mark as failed.
         return result;
     }
 
@@ -813,7 +619,6 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const& smiles) {
     result.metadata.num_mmff_oops = static_cast<std::uint32_t>(result.mmff_oops.size());
     result.metadata.num_mmff_stretchbends = static_cast<std::uint32_t>(result.mmff_stretchbends.size());
     result.metadata.bounds_offset = 0;
-    result.metadata.initial_coordinates_offset = 0;
     result.metadata.chiral_offset = 0;
     result.metadata.torsion_offset = 0;
     result.metadata.constraint_offset = 0;
@@ -831,7 +636,6 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const& smiles) {
 /** Batch of molecules packed into contiguous GPU-ready arrays. */
 struct etkdg_molecule_batch_t {
     std::vector<float> bounds_matrices;                      ///< concatenated Nᵢ x Nᵢ
-    std::vector<float> initial_coordinates;                  ///< concatenated 3 x Nᵢ SoA embeddings
     std::vector<chiral_center_descriptor_t> chiral_centers;  ///< concatenated
     std::vector<etk_torsion_descriptor_t> etk_torsions;      ///< concatenated
     std::vector<distance_constraint_t> distance_constraints; ///< concatenated
@@ -867,13 +671,12 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
 
     // Pre-allocate batch vectors to avoid reallocation during the insert loop.
     {
-        std::size_t total_bounds = 0, total_initial = 0, total_chirals = 0, total_etk = 0, total_dcons = 0;
+        std::size_t total_bounds = 0, total_chirals = 0, total_etk = 0, total_dcons = 0;
         std::size_t total_nb = 0, total_bonds = 0, total_angles = 0, total_torsions = 0;
         std::size_t total_oops = 0, total_stbn = 0;
         std::size_t total_inter = 0, total_off = 0;
         for (auto const& p : prepared) {
             total_bounds += p.bounds_matrix.size();
-            total_initial += p.initial_coordinates.size();
             total_chirals += p.chiral_centers.size();
             total_etk += p.etk_torsions.size();
             total_dcons += p.distance_constraints.size();
@@ -887,7 +690,6 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
             total_off += p.mmff_atom_offsets.size();
         }
         batch.bounds_matrices.reserve(total_bounds);
-        batch.initial_coordinates.reserve(total_initial);
         batch.chiral_centers.reserve(total_chirals);
         batch.etk_torsions.reserve(total_etk);
         batch.distance_constraints.reserve(total_dcons);
@@ -913,7 +715,6 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         // Set offsets before appending to the batched arrays.
         etkdg_molecule_metadata_t meta = prepared[m].metadata;
         meta.bounds_offset = static_cast<std::uint32_t>(batch.bounds_matrices.size());
-        meta.initial_coordinates_offset = static_cast<std::uint32_t>(batch.initial_coordinates.size());
         meta.chiral_offset = static_cast<std::uint32_t>(batch.chiral_centers.size());
         meta.torsion_offset = static_cast<std::uint32_t>(batch.etk_torsions.size());
         meta.constraint_offset = static_cast<std::uint32_t>(batch.distance_constraints.size());
@@ -931,8 +732,6 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         // Append the molecule data.
         batch.bounds_matrices.insert(batch.bounds_matrices.end(), prepared[m].bounds_matrix.begin(),
                                      prepared[m].bounds_matrix.end());
-        batch.initial_coordinates.insert(batch.initial_coordinates.end(), prepared[m].initial_coordinates.begin(),
-                                         prepared[m].initial_coordinates.end());
         batch.chiral_centers.insert(batch.chiral_centers.end(), prepared[m].chiral_centers.begin(),
                                     prepared[m].chiral_centers.end());
         batch.etk_torsions.insert(batch.etk_torsions.end(), prepared[m].etk_torsions.begin(),

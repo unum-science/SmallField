@@ -97,6 +97,12 @@ find_library(CURAND_LIBRARY curand
           ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib64
           /usr/local/cuda/lib64)
 
+# cusolver library
+find_library(CUSOLVER_LIBRARY cusolver
+    HINTS ${CUDAToolkit_LIBRARY_DIR}
+          ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib64
+          /usr/local/cuda/lib64)
+
 if(RDKit_FOUND)
     enable_testing()
     add_subdirectory(test)

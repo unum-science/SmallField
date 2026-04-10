@@ -3,7 +3,7 @@
  * @brief MMFF94 energy and gradient functor for ETKDG pipeline stage 9.
  *
  * Uses per-atom interaction lists for zero-waste iteration.
- * Full analytical gradients for VdW, electrostatic, bond, angle, and torsion terms.
+ * Full analytical gradients for VdW, electrostatic, bond, angle, torsion, OOP, and stretch-bend terms.
  * Compatible with fire_minimize_ (same functor interface).
  *
  * Positions in SoA float: [x₀..xₙ, y₀..yₙ, z₀..zₙ].
@@ -32,6 +32,34 @@ constexpr float mmff_tor_pf = 0.5f;
 constexpr float mmff_stbn_pf = 2.51210f;
 constexpr float mmff_deg2rad = 3.14159265f / 180.0f;
 constexpr float mmff_rad2deg = 180.0f / 3.14159265f;
+
+struct float3_mmff_t {
+    float x;
+    float y;
+    float z;
+};
+
+__device__ __forceinline__ float3_mmff_t make_float3_mmff_(float x, float y, float z) { return {x, y, z}; }
+
+__device__ __forceinline__ float dot_float3_mmff_(float3_mmff_t const& lhs, float3_mmff_t const& rhs) {
+    return fmaf(lhs.x, rhs.x, fmaf(lhs.y, rhs.y, lhs.z * rhs.z));
+}
+
+__device__ __forceinline__ float3_mmff_t cross_float3_mmff_(float3_mmff_t const& lhs, float3_mmff_t const& rhs) {
+    return {lhs.y * rhs.z - lhs.z * rhs.y, lhs.z * rhs.x - lhs.x * rhs.z, lhs.x * rhs.y - lhs.y * rhs.x};
+}
+
+__device__ __forceinline__ float3_mmff_t add_float3_mmff_(float3_mmff_t const& lhs, float3_mmff_t const& rhs) {
+    return {lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z};
+}
+
+__device__ __forceinline__ float3_mmff_t sub_float3_mmff_(float3_mmff_t const& lhs, float3_mmff_t const& rhs) {
+    return {lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z};
+}
+
+__device__ __forceinline__ float3_mmff_t scale_float3_mmff_(float3_mmff_t const& value, float scale) {
+    return {value.x * scale, value.y * scale, value.z * scale};
+}
 
 /** Compute nonbonded (VdW + electrostatic) energy and gradient contribution for one atom. */
 __device__ __forceinline__ void mmff_nonbonded_contribution_(float const* positions, std::uint32_t num_atoms,
@@ -291,72 +319,78 @@ __device__ __forceinline__ void mmff_oop_contribution_(float const* positions, s
                                                        std::uint32_t /*atom*/, mmff94_oop_t const& oop,
                                                        std::uint8_t role, float* energy, float* gx, float* gy,
                                                        float* gz) {
-    float ix = positions[oop.atom_i], iy = positions[num_atoms + oop.atom_i],
-          iz = positions[2 * num_atoms + oop.atom_i];
-    float jx = positions[oop.atom_j], jy = positions[num_atoms + oop.atom_j],
-          jz = positions[2 * num_atoms + oop.atom_j];
-    float kx = positions[oop.atom_k], ky = positions[num_atoms + oop.atom_k],
-          kz = positions[2 * num_atoms + oop.atom_k];
-    float lx = positions[oop.atom_l], ly = positions[num_atoms + oop.atom_l],
-          lz = positions[2 * num_atoms + oop.atom_l];
+    float const ix = positions[oop.atom_i], iy = positions[num_atoms + oop.atom_i],
+                iz = positions[2 * num_atoms + oop.atom_i];
+    float const jx = positions[oop.atom_j], jy = positions[num_atoms + oop.atom_j],
+                jz = positions[2 * num_atoms + oop.atom_j];
+    float const kx = positions[oop.atom_k], ky = positions[num_atoms + oop.atom_k],
+                kz = positions[2 * num_atoms + oop.atom_k];
+    float const lx = positions[oop.atom_l], ly = positions[num_atoms + oop.atom_l],
+                lz = positions[2 * num_atoms + oop.atom_l];
 
     float const base_energy = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
     if (role == 0)
         *energy += base_energy;
 
-    constexpr float epsilon = 1e-4f;
-    float* target_x = nullptr;
-    float* target_y = nullptr;
-    float* target_z = nullptr;
+    float3_mmff_t const atom_i_position = make_float3_mmff_(ix, iy, iz);
+    float3_mmff_t const atom_j_position = make_float3_mmff_(jx, jy, jz);
+    float3_mmff_t const atom_k_position = make_float3_mmff_(kx, ky, kz);
+    float3_mmff_t const atom_l_position = make_float3_mmff_(lx, ly, lz);
+
+    float3_mmff_t const bond_ji = sub_float3_mmff_(atom_i_position, atom_j_position);
+    float3_mmff_t const bond_jk = sub_float3_mmff_(atom_k_position, atom_j_position);
+    float3_mmff_t const bond_jl = sub_float3_mmff_(atom_l_position, atom_j_position);
+    float3_mmff_t const plane_normal = cross_float3_mmff_(bond_jk, bond_jl);
+
+    float const bond_ji_length = sqrtf(fmaxf(dot_float3_mmff_(bond_ji, bond_ji), 1e-12f));
+    float const plane_normal_length = sqrtf(fmaxf(dot_float3_mmff_(plane_normal, plane_normal), 1e-12f));
+    float const inv_bond_ji_length = __frcp_rn(bond_ji_length);
+    float const inv_plane_normal_length = __frcp_rn(plane_normal_length);
+
+    float3_mmff_t const bond_ji_unit = scale_float3_mmff_(bond_ji, inv_bond_ji_length);
+    float3_mmff_t const plane_normal_unit = scale_float3_mmff_(plane_normal, inv_plane_normal_length);
+
+    float const sin_chi = fmaxf(-1.0f, fminf(1.0f, dot_float3_mmff_(bond_ji_unit, plane_normal_unit)));
+    float const chi_deg = asinf(sin_chi) * mmff_rad2deg;
+    float const inv_cos_chi = __frcp_rn(sqrtf(fmaxf(1.0f - sin_chi * sin_chi, 1e-10f)));
+    float const dE_dsin_chi = mmff_angle_pf * oop.force_constant * chi_deg * mmff_rad2deg * inv_cos_chi;
+
+    float3_mmff_t const ds_dji = scale_float3_mmff_(
+        sub_float3_mmff_(plane_normal_unit, scale_float3_mmff_(bond_ji_unit, sin_chi)), inv_bond_ji_length);
+    float3_mmff_t const ds_dn = scale_float3_mmff_(
+        sub_float3_mmff_(bond_ji_unit, scale_float3_mmff_(plane_normal_unit, sin_chi)), inv_plane_normal_length);
+    float3_mmff_t const ds_djk = cross_float3_mmff_(bond_jl, ds_dn);
+    float3_mmff_t const ds_djl = cross_float3_mmff_(ds_dn, bond_jk);
+
+    float3_mmff_t const gradient_i = scale_float3_mmff_(ds_dji, dE_dsin_chi);
+    float3_mmff_t const gradient_k = scale_float3_mmff_(ds_djk, dE_dsin_chi);
+    float3_mmff_t const gradient_l = scale_float3_mmff_(ds_djl, dE_dsin_chi);
+    float3_mmff_t const gradient_j =
+        scale_float3_mmff_(add_float3_mmff_(add_float3_mmff_(ds_dji, ds_djk), ds_djl), -dE_dsin_chi);
+
     switch (role) {
     case 0:
-        target_x = &ix;
-        target_y = &iy;
-        target_z = &iz;
+        *gx += gradient_i.x;
+        *gy += gradient_i.y;
+        *gz += gradient_i.z;
         break;
     case 1:
-        target_x = &jx;
-        target_y = &jy;
-        target_z = &jz;
+        *gx += gradient_j.x;
+        *gy += gradient_j.y;
+        *gz += gradient_j.z;
         break;
     case 2:
-        target_x = &kx;
-        target_y = &ky;
-        target_z = &kz;
+        *gx += gradient_k.x;
+        *gy += gradient_k.y;
+        *gz += gradient_k.z;
         break;
     case 3:
-        target_x = &lx;
-        target_y = &ly;
-        target_z = &lz;
+        *gx += gradient_l.x;
+        *gy += gradient_l.y;
+        *gz += gradient_l.z;
         break;
-    default: return;
+    default: break;
     }
-
-    float original = *target_x;
-    *target_x = original + epsilon;
-    float const epx = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
-    *target_x = original - epsilon;
-    float const emx = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
-    *target_x = original;
-
-    original = *target_y;
-    *target_y = original + epsilon;
-    float const epy = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
-    *target_y = original - epsilon;
-    float const emy = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
-    *target_y = original;
-
-    original = *target_z;
-    *target_z = original + epsilon;
-    float const epz = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
-    *target_z = original - epsilon;
-    float const emz = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
-    *target_z = original;
-
-    float const inv_2eps = 0.5f / epsilon;
-    *gx += (epx - emx) * inv_2eps;
-    *gy += (epy - emy) * inv_2eps;
-    *gz += (epz - emz) * inv_2eps;
 }
 
 /** Stretch-bend coupling energy and gradient. */
@@ -506,22 +540,6 @@ struct mmff94_energy_functor_t {
                 gradient[num_atoms + atom] = gy;
                 gradient[2 * num_atoms + atom] = gz;
             }
-        }
-
-        // remove center-of-mass force (zero mean gradient per dimension)
-        // prevents rigid-body translation during FIRE minimization
-        if (write_gradient && num_atoms > 1) {
-            __syncwarp(full_mask);
-            float const inv_n = __frcp_rn(static_cast<float>(num_atoms));
-            for (std::uint32_t d = 0; d < 3; ++d) {
-                float mean_g = 0.0f;
-                for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
-                    mean_g += gradient[d * num_atoms + i];
-                mean_g = warp_reduce_sum_f32_(mean_g) * inv_n;
-                for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
-                    gradient[d * num_atoms + i] -= mean_g;
-            }
-            __syncwarp(full_mask);
         }
 
         return warp_reduce_sum_f32_(total_energy);

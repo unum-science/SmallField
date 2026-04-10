@@ -11,20 +11,21 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <cuda_runtime.h>
 #include <numeric>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 #include "bench_chembl_kernels.h"
 #include "etkdg_pipeline.cuh"
+#include "metric_embedding_prepass.cuh"
 
 using namespace smallfield;
 
 extern "C" {
 
 gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
-    float const* host_bounds, std::uint32_t bounds_total_floats, float const* host_initial_coordinates,
-    std::uint32_t initial_coordinates_total, chiral_center_descriptor_t const* host_chirals,
+    float const* host_bounds, std::uint32_t bounds_total_floats, chiral_center_descriptor_t const* host_chirals,
     std::uint32_t chirals_total, etk_torsion_descriptor_t const* host_torsions, std::uint32_t torsions_total,
     distance_constraint_t const* host_constraints, std::uint32_t constraints_total,
     mmff94_nonbonded_pair_t const* host_mmff_nb, std::uint32_t mmff_nb_total, mmff94_bond_t const* host_mmff_bonds,
@@ -66,7 +67,6 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     etkdg_molecule_metadata_t* dev_metadata;
 
     cudaMalloc(&dev_bounds, bounds_total_floats * sizeof(float));
-    cudaMalloc(&dev_initial_coordinates, std::max(initial_coordinates_total, 1u) * sizeof(float));
     cudaMalloc(&dev_chirals, std::max(chirals_total, 1u) * sizeof(chiral_center_descriptor_t));
     cudaMalloc(&dev_torsions, std::max(torsions_total, 1u) * sizeof(etk_torsion_descriptor_t));
     cudaMalloc(&dev_constraints, std::max(constraints_total, 1u) * sizeof(distance_constraint_t));
@@ -89,11 +89,13 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaMalloc(&dev_coords_out, total_coords * sizeof(float));
     cudaMalloc(&dev_energies_out, total_conf * sizeof(float));
     cudaMalloc(&dev_status_out, total_conf * sizeof(std::uint8_t));
+    cudaMalloc(&dev_initial_coordinates,
+               static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float));
 
     int num_sms = 0;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
 
-    // CUDA events for timing
+    // CUDA events for timing.
     cudaEvent_t ev_upload_start, ev_upload_end, ev_kernel_start, ev_kernel_end, ev_download_end;
     cudaEventCreate(&ev_upload_start);
     cudaEventCreate(&ev_upload_end);
@@ -104,9 +106,6 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     // Run phase 1 upload because all parameter arrays are shared across waves.
     cudaEventRecord(ev_upload_start);
     cudaMemcpy(dev_bounds, host_bounds, bounds_total_floats * sizeof(float), cudaMemcpyHostToDevice);
-    if (initial_coordinates_total > 0)
-        cudaMemcpy(dev_initial_coordinates, host_initial_coordinates, initial_coordinates_total * sizeof(float),
-                   cudaMemcpyHostToDevice);
     if (chirals_total > 0)
         cudaMemcpy(dev_chirals, host_chirals, chirals_total * sizeof(chiral_center_descriptor_t),
                    cudaMemcpyHostToDevice);
@@ -139,6 +138,10 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
                    cudaMemcpyHostToDevice);
     cudaMemcpy(dev_metadata, sorted_meta.data(), num_molecules * sizeof(etkdg_molecule_metadata_t),
                cudaMemcpyHostToDevice);
+    bool const prepass_ok = build_metric_initial_coordinates_on_gpu(
+        dev_bounds, dev_metadata, sorted_meta.data(), num_molecules, max_atoms_per_molecule, dev_initial_coordinates);
+    if (!prepass_ok)
+        std::fprintf(stderr, "Metric embedding prepass failed.\n");
     cudaEventRecord(ev_upload_end);
 
     // Run phase 2 wave-based kernel dispatch.
@@ -176,12 +179,12 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
         // Launch the kernel for the molecules in the current wave.
         // Write output to sorted slots [wave_start * num_conf, wave_end * num_conf).
         etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
-            dev_bounds, initial_coordinates_total > 0 ? dev_initial_coordinates : nullptr, dev_chirals, dev_torsions,
+            dev_bounds, dev_initial_coordinates + wave_start * max_atoms_per_molecule * 4, dev_chirals, dev_torsions,
             dev_constraints, dev_mmff_nb, dev_mmff_bonds, dev_mmff_angles, dev_mmff_torsions, dev_mmff_oops,
             dev_mmff_stbn, dev_mmff_inter, dev_mmff_offsets, dev_metadata + wave_start,
             dev_coords_out + wave_start * num_conformers * max_atoms_per_molecule * 3,
             dev_energies_out + wave_start * num_conformers, dev_status_out + wave_start * num_conformers, wave_size,
-            num_conformers, max_stereo_attempts, wave_max_atoms, max_atoms_per_molecule, seed);
+            num_conformers, max_stereo_attempts, wave_max_atoms, max_atoms_per_molecule, max_atoms_per_molecule, seed);
 
         total_grid += grid_size;
         max_bpsm = std::max(max_bpsm, static_cast<std::uint32_t>(blocks_per_sm));

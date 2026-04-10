@@ -15,8 +15,7 @@ using namespace smallfield;
 using namespace smallfield::test;
 
 extern "C" void gpu_etkdg_pipeline(
-    float const* host_bounds, std::uint32_t bounds_total_floats, float const* host_initial_coordinates,
-    std::uint32_t initial_coordinates_total, chiral_center_descriptor_t const* host_chirals,
+    float const* host_bounds, std::uint32_t bounds_total_floats, chiral_center_descriptor_t const* host_chirals,
     std::uint32_t chirals_total, etk_torsion_descriptor_t const* host_torsions, std::uint32_t torsions_total,
     distance_constraint_t const* host_constraints, std::uint32_t constraints_total,
     mmff94_nonbonded_pair_t const* host_mmff_nb, std::uint32_t mmff_nb_total, mmff94_bond_t const* host_mmff_bonds,
@@ -66,7 +65,6 @@ int main() {
     // Run the stage 2 through stage 9 GPU pipeline.
     std::printf("  launching GPU pipeline...\n");
     gpu_etkdg_pipeline(batch.bounds_matrices.data(), static_cast<std::uint32_t>(batch.bounds_matrices.size()),
-                       batch.initial_coordinates.data(), static_cast<std::uint32_t>(batch.initial_coordinates.size()),
                        batch.chiral_centers.empty() ? nullptr : batch.chiral_centers.data(),
                        static_cast<std::uint32_t>(batch.chiral_centers.size()),
                        batch.etk_torsions.empty() ? nullptr : batch.etk_torsions.data(),

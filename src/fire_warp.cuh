@@ -35,13 +35,15 @@ namespace smallfield {
  * @param[out] out_final_energy    Final energy (lane 0).
  * @param[out] out_iterations      Iteration count (lane 0).
  * @param[out] out_status          0=converged, 1=max_iterations (lane 0).
+ * @param[out] out_final_rms_gradient  Final RMS gradient (lane 0, optional).
  */
 template <typename EnergyGradientFunctor>
 __device__ __forceinline__ void fire_minimize_(float* positions, float* velocities, float* gradient,
                                                std::uint32_t num_elements, std::int32_t max_iterations,
                                                float gradient_threshold, std::uint32_t lane,
                                                EnergyGradientFunctor&& compute_energy_gradient, float* out_final_energy,
-                                               std::int32_t* out_iterations, std::int32_t* out_status) {
+                                               std::int32_t* out_iterations, std::int32_t* out_status,
+                                               float* out_final_rms_gradient = nullptr) {
     // FIRE parameters (Bitzek et al., PRL 2006)
     constexpr float dt_start = 0.05f;
     constexpr float dt_max = 0.5f;
@@ -54,6 +56,7 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
     float dt = dt_start;
     float alpha = alpha_start;
     int steps_since_reset = 0;
+    float last_rms_gradient = 0.0f;
 
     // zero velocities
     for (std::uint32_t i = lane; i < num_elements; i += warp_size)
@@ -78,11 +81,14 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
         sum_vv = warp_reduce_sum_f32_(sum_vv);
 
         float const rms_gradient = sqrtf(sum_gg * __frcp_rn(static_cast<float>(num_elements)));
+        last_rms_gradient = rms_gradient;
         if (rms_gradient < gradient_threshold) {
             if (lane == 0) {
                 *out_status = 0;
                 *out_iterations = iteration;
                 *out_final_energy = energy;
+                if (out_final_rms_gradient != nullptr)
+                    *out_final_rms_gradient = rms_gradient;
             }
             return;
         }
@@ -129,6 +135,8 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
         *out_status = 1;
         *out_iterations = max_iterations;
         *out_final_energy = final_energy;
+        if (out_final_rms_gradient != nullptr)
+            *out_final_rms_gradient = last_rms_gradient;
     }
 }
 

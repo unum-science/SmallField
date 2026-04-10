@@ -27,7 +27,6 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t num_etk_torsions;
     std::uint32_t num_distance_constraints;
     std::uint32_t bounds_offset;
-    std::uint32_t initial_coordinates_offset;
     std::uint32_t chiral_offset;
     std::uint32_t torsion_offset;
     std::uint32_t constraint_offset;
@@ -44,7 +43,7 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t mmff_oop_offset;
     std::uint32_t mmff_stretchbend_offset;
     std::uint32_t mmff_atom_offsets_start;
-    std::uint32_t padding[2]; ///< pad to 96 bytes (24 uint32_t) for alignment
+    std::uint32_t padding[3]; ///< pad to 96 bytes (24 uint32_t) for alignment
 };
 
 /**

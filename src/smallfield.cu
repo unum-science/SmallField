@@ -5,8 +5,10 @@
  * Provides GPU-accelerated ETKDG + MMFF94 conformer generation via pybind11.
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 #include <utility>
 
 #include <pybind11/numpy.h>
@@ -14,6 +16,7 @@
 
 #if defined(__CUDACC__)
 #include "etkdg_pipeline.cuh"
+#include "metric_embedding_prepass.cuh"
 #endif
 
 namespace py = pybind11;
@@ -77,6 +80,7 @@ class etkdg_context_t {
     aligned_buffer<std::uint8_t> torsions_buffer_;
     aligned_buffer<std::uint8_t> constraints_buffer_;
     aligned_buffer<std::uint8_t> metadata_buffer_;
+    aligned_buffer<float> initial_coordinates_buffer_;
     aligned_buffer<float> coordinates_out_buffer_;
     aligned_buffer<float> energies_out_buffer_;
     aligned_buffer<std::uint8_t> status_out_buffer_;
@@ -95,6 +99,7 @@ class etkdg_context_t {
         torsions_buffer_.allocate(max_molecules * 64 * sizeof(etk_torsion_descriptor_t));
         constraints_buffer_.allocate(max_molecules * 256 * sizeof(distance_constraint_t));
         metadata_buffer_.allocate(max_molecules * sizeof(etkdg_molecule_metadata_t));
+        initial_coordinates_buffer_.allocate(max_molecules * max_atoms * 4);
         coordinates_out_buffer_.allocate(max_total_conformers * max_atoms * 3);
         energies_out_buffer_.allocate(max_total_conformers);
         status_out_buffer_.allocate(max_total_conformers);
@@ -129,6 +134,13 @@ class etkdg_context_t {
             cudaMemcpy(constraints_buffer_.data(), constraints_info.ptr, constraints_info.size, cudaMemcpyHostToDevice);
         cudaMemcpy(metadata_buffer_.data(), metadata_info.ptr, metadata_info.size, cudaMemcpyHostToDevice);
 
+        auto const* host_metadata = reinterpret_cast<etkdg_molecule_metadata_t const*>(metadata_info.ptr);
+        bool const prepass_ok = build_metric_initial_coordinates_on_gpu(
+            bounds_buffer_.data(), reinterpret_cast<etkdg_molecule_metadata_t const*>(metadata_buffer_.data()),
+            host_metadata, num_molecules, max_atoms_, initial_coordinates_buffer_.data());
+        if (!prepass_ok)
+            throw std::runtime_error("Metric embedding prepass failed");
+
         // Compute the grid size from occupancy.
         std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(max_atoms_, 0);
         cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -142,13 +154,14 @@ class etkdg_context_t {
             std::min(num_molecules, static_cast<std::uint32_t>(max_blocks_per_sm * num_sms));
 
         etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
-            bounds_buffer_.data(), nullptr, reinterpret_cast<chiral_center_descriptor_t const*>(chirals_buffer_.data()),
+            bounds_buffer_.data(), initial_coordinates_buffer_.data(),
+            reinterpret_cast<chiral_center_descriptor_t const*>(chirals_buffer_.data()),
             reinterpret_cast<etk_torsion_descriptor_t const*>(torsions_buffer_.data()),
             reinterpret_cast<distance_constraint_t const*>(constraints_buffer_.data()), nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr,
             reinterpret_cast<etkdg_molecule_metadata_t const*>(metadata_buffer_.data()), coordinates_out_buffer_.data(),
             energies_out_buffer_.data(), status_out_buffer_.data(), num_molecules, num_conformers, max_stereo_attempts,
-            max_atoms_, max_atoms_, random_seed);
+            max_atoms_, max_atoms_, max_atoms_, random_seed);
         cudaDeviceSynchronize();
 
         // Copy results back to the host.

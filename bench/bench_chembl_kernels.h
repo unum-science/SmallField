@@ -22,12 +22,12 @@ struct gpu_pipeline_result_t {
 };
 
 extern "C" gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
-    float const* host_bounds, std::uint32_t bounds_total_floats, float const* host_initial_coordinates,
-    std::uint32_t initial_coordinates_total, smallfield::chiral_center_descriptor_t const* host_chirals,
-    std::uint32_t chirals_total, smallfield::etk_torsion_descriptor_t const* host_torsions,
-    std::uint32_t torsions_total, smallfield::distance_constraint_t const* host_constraints,
-    std::uint32_t constraints_total, smallfield::mmff94_nonbonded_pair_t const* host_mmff_nb,
-    std::uint32_t mmff_nb_total, smallfield::mmff94_bond_t const* host_mmff_bonds, std::uint32_t mmff_bonds_total,
+    float const* host_bounds, std::uint32_t bounds_total_floats,
+    smallfield::chiral_center_descriptor_t const* host_chirals, std::uint32_t chirals_total,
+    smallfield::etk_torsion_descriptor_t const* host_torsions, std::uint32_t torsions_total,
+    smallfield::distance_constraint_t const* host_constraints, std::uint32_t constraints_total,
+    smallfield::mmff94_nonbonded_pair_t const* host_mmff_nb, std::uint32_t mmff_nb_total,
+    smallfield::mmff94_bond_t const* host_mmff_bonds, std::uint32_t mmff_bonds_total,
     smallfield::mmff94_angle_t const* host_mmff_angles, std::uint32_t mmff_angles_total,
     smallfield::mmff94_torsion_t const* host_mmff_torsions, std::uint32_t mmff_torsions_total,
     smallfield::mmff94_oop_t const* host_mmff_oops, std::uint32_t mmff_oops_total,
