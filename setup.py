@@ -125,7 +125,18 @@ class BuildExt(build_ext):
             major, minor = device.compute_capability()
             arch_code = f"{major}{minor}"
         except ImportError:
-            pass
+            # Fallback: try nvidia-smi to detect compute capability
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    cap = result.stdout.strip().split("\n")[0].strip()
+                    arch_code = cap.replace(".", "")
+            except Exception:
+                pass
 
         # Pass AVX-512 flags to host compiler via -Xcompiler
         host_flags = (
@@ -162,6 +173,7 @@ ext_modules = [
             np.get_include(),
             get_python_inc(),
             "ForkUnion/include",
+            "src",
             "/usr/local/cuda/include/",
             "/usr/include/cuda/",
         ],
@@ -172,7 +184,7 @@ ext_modules = [
             python_lib_dir,
         ],
         libraries=[python_lib_name.replace(".a", "")]
-        + (["cudart", "cuda"] if enable_cuda else [])
+        + (["cudart", "cuda", "curand"] if enable_cuda else [])
         + (["gomp"] if enable_openmp else []),
         extra_compile_args=[
             "-std=c++17",

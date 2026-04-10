@@ -33,6 +33,7 @@
 #include "mmff94.hpp"
 
 #if defined(__CUDACC__)
+#include "etkdg_pipeline.cuh"
 #include "mmff94.cuh"
 #endif
 
@@ -2100,6 +2101,119 @@ float compute_electrostatic_energy_cuda_f32_(py::array_t<float> coords_x, py::ar
 
 #pragma endregion
 
+#pragma region ETKDG Pipeline Context
+
+#if defined(__CUDACC__)
+
+class etkdg_context_t {
+    aligned_buffer<float, cuda_allocator_t> bounds_buffer_;
+    aligned_buffer<std::uint8_t, cuda_allocator_t> chirals_buffer_;
+    aligned_buffer<std::uint8_t, cuda_allocator_t> torsions_buffer_;
+    aligned_buffer<std::uint8_t, cuda_allocator_t> constraints_buffer_;
+    aligned_buffer<std::uint8_t, cuda_allocator_t> metadata_buffer_;
+    aligned_buffer<float, cuda_allocator_t> coordinates_out_buffer_;
+    aligned_buffer<float, cuda_allocator_t> energies_out_buffer_;
+    aligned_buffer<std::uint8_t, cuda_allocator_t> status_out_buffer_;
+
+    std::uint32_t max_atoms_;
+    std::uint32_t max_molecules_;
+    std::uint32_t max_conformers_;
+
+  public:
+    etkdg_context_t(std::uint32_t max_atoms, std::uint32_t max_molecules, std::uint32_t max_conformers)
+        : max_atoms_(max_atoms), max_molecules_(max_molecules), max_conformers_(max_conformers) {
+
+        std::uint32_t const max_total_conformers = max_molecules * max_conformers;
+        bounds_buffer_.allocate(max_molecules * max_atoms * max_atoms);
+        chirals_buffer_.allocate(max_molecules * 16 * sizeof(chiral_center_descriptor_t));
+        torsions_buffer_.allocate(max_molecules * 64 * sizeof(etk_torsion_descriptor_t));
+        constraints_buffer_.allocate(max_molecules * 256 * sizeof(distance_constraint_t));
+        metadata_buffer_.allocate(max_molecules * sizeof(etkdg_molecule_metadata_t));
+        coordinates_out_buffer_.allocate(max_total_conformers * max_atoms * 3);
+        energies_out_buffer_.allocate(max_total_conformers);
+        status_out_buffer_.allocate(max_total_conformers);
+    }
+
+    std::uint32_t max_atoms() const { return max_atoms_; }
+    std::uint32_t max_molecules() const { return max_molecules_; }
+    std::uint32_t max_conformers() const { return max_conformers_; }
+
+    py::tuple generate_conformers(py::array_t<float> bounds_matrices, py::array_t<std::uint8_t> chiral_centers,
+                                  py::array_t<std::uint8_t> torsion_terms,
+                                  py::array_t<std::uint8_t> distance_constraints,
+                                  py::array_t<std::uint8_t> molecule_metadata, std::uint32_t num_conformers,
+                                  std::uint32_t max_stereo_attempts, std::uint64_t random_seed) {
+
+        auto bounds_info = bounds_matrices.request();
+        auto chirals_info = chiral_centers.request();
+        auto torsions_info = torsion_terms.request();
+        auto constraints_info = distance_constraints.request();
+        auto metadata_info = molecule_metadata.request();
+
+        std::uint32_t const num_molecules =
+            static_cast<std::uint32_t>(metadata_info.size / sizeof(etkdg_molecule_metadata_t));
+
+        // copy input to device buffers
+        float* bounds_ptr = bounds_buffer_.data();
+        cudaMemcpy(bounds_ptr, bounds_info.ptr, bounds_info.size * sizeof(float), cudaMemcpyHostToDevice);
+
+        std::uint8_t* chirals_ptr = chirals_buffer_.data();
+        if (chirals_info.size > 0)
+            cudaMemcpy(chirals_ptr, chirals_info.ptr, chirals_info.size, cudaMemcpyHostToDevice);
+
+        std::uint8_t* torsions_ptr = torsions_buffer_.data();
+        if (torsions_info.size > 0)
+            cudaMemcpy(torsions_ptr, torsions_info.ptr, torsions_info.size, cudaMemcpyHostToDevice);
+
+        std::uint8_t* constraints_ptr = constraints_buffer_.data();
+        if (constraints_info.size > 0)
+            cudaMemcpy(constraints_ptr, constraints_info.ptr, constraints_info.size, cudaMemcpyHostToDevice);
+
+        std::uint8_t* metadata_ptr = metadata_buffer_.data();
+        cudaMemcpy(metadata_ptr, metadata_info.ptr, metadata_info.size, cudaMemcpyHostToDevice);
+
+        float* coords_out_ptr = coordinates_out_buffer_.data();
+        float* energies_out_ptr = energies_out_buffer_.data();
+        std::uint8_t* status_out_ptr = status_out_buffer_.data();
+
+        constexpr std::uint32_t memory_depth = 5;
+        std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(max_atoms_, memory_depth);
+
+        cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(shared_bytes));
+
+        // warp-loop: launch min(num_molecules, 752) warps, each loops with stride
+        std::uint32_t const grid_size = std::min(num_molecules, 752u);
+        etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
+            bounds_ptr, reinterpret_cast<chiral_center_descriptor_t const*>(chirals_ptr),
+            reinterpret_cast<etk_torsion_descriptor_t const*>(torsions_ptr),
+            reinterpret_cast<distance_constraint_t const*>(constraints_ptr),
+            reinterpret_cast<etkdg_molecule_metadata_t const*>(metadata_ptr), coords_out_ptr, energies_out_ptr,
+            status_out_ptr, num_molecules, num_conformers, max_stereo_attempts, max_atoms_, memory_depth, random_seed);
+        cudaDeviceSynchronize();
+
+        // copy results back
+        std::uint32_t const total_conformers = num_molecules * num_conformers;
+        std::uint32_t const total_coords = total_conformers * max_atoms_ * 3;
+
+        auto coords_result = py::array_t<float>(total_coords);
+        auto energies_result = py::array_t<float>(total_conformers);
+        auto status_result = py::array_t<std::uint8_t>(total_conformers);
+
+        cudaMemcpy(coords_result.mutable_data(), coords_out_ptr, total_coords * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(energies_result.mutable_data(), energies_out_ptr, total_conformers * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(status_result.mutable_data(), status_out_ptr, total_conformers * sizeof(std::uint8_t),
+                   cudaMemcpyDeviceToHost);
+
+        return py::make_tuple(coords_result, energies_result, status_result);
+    }
+};
+
+#endif // __CUDACC__
+
+#pragma endregion
+
 } // namespace smallfield
 
 #pragma region Pybind11 Module Definition
@@ -2274,6 +2388,25 @@ PYBIND11_MODULE(_smallfield, m) {
              py::arg("pair_atom_j"), py::arg("pair_epsilon"), py::arg("pair_r_star"), py::arg("pair_qi"),
              py::arg("pair_qj"), py::arg("pair_is_1_4"), py::arg("mol_pair_start"), py::arg("mol_pair_end"),
              py::arg("mol_atom_start"), py::arg("mol_atom_end"), py::arg("n_molecules"));
+
+#if defined(__CUDACC__)
+    // ETKDG conformer generation pipeline context
+    py::class_<smallfield::etkdg_context_t>(
+        m, "EtkdgContext",
+        "GPU ETKDG conformer generation pipeline. "
+        "Runs the full ETKDG algorithm (stages 2-8) on GPU with one warp per molecule.")
+        .def(py::init<std::uint32_t, std::uint32_t, std::uint32_t>(), py::arg("max_atoms"), py::arg("max_molecules"),
+             py::arg("max_conformers"), "Create pipeline context with preallocated GPU buffers.")
+        .def_property_readonly("max_atoms", &smallfield::etkdg_context_t::max_atoms)
+        .def_property_readonly("max_molecules", &smallfield::etkdg_context_t::max_molecules)
+        .def_property_readonly("max_conformers", &smallfield::etkdg_context_t::max_conformers)
+        .def("generate_conformers", &smallfield::etkdg_context_t::generate_conformers,
+             "Run the ETKDG pipeline on preprocessed molecular data. "
+             "Returns (coordinates, energies, status) where status 0 = success.",
+             py::arg("bounds_matrices"), py::arg("chiral_centers"), py::arg("torsion_terms"),
+             py::arg("distance_constraints"), py::arg("molecule_metadata"), py::arg("num_conformers") = 10,
+             py::arg("max_stereo_attempts") = 20, py::arg("random_seed") = 42);
+#endif
 }
 
 #pragma endregion

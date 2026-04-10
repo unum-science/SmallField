@@ -23,12 +23,13 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "src/lbfgs_warp.cuh" // warp_size, full_mask, warp_reduce_sum_f32_, L-BFGS primitives
+
 namespace smallfield {
 
 #pragma region Constants
 
-constexpr std::uint32_t warp_size = 32;
-constexpr unsigned int full_mask = 0xFFFFFFFF;
+// warp_size and full_mask are defined in src/lbfgs_warp.cuh
 
 constexpr float const coulomb_const_f32 = 332.0716f;
 constexpr float const delta_f32 = 0.05f;
@@ -140,22 +141,7 @@ __device__ __forceinline__ half2 h2_fma_(half2 a, half2 b, half2 c) { return __h
 
 #pragma region Warp Reduction
 
-/**
- * Warp reduction using butterfly XOR shuffles.
- * Uses 5 shuffle operations to reduce 32 lanes.
- * Result is available in all lanes.
- *
- * Note: __reduce_add_sync only supports integer types on sm_80+.
- * For float reduction, we use the shuffle-based approach.
- */
-__device__ __forceinline__ float warp_reduce_sum_f32_(float val) {
-    val += __shfl_xor_sync(full_mask, val, 16);
-    val += __shfl_xor_sync(full_mask, val, 8);
-    val += __shfl_xor_sync(full_mask, val, 4);
-    val += __shfl_xor_sync(full_mask, val, 2);
-    val += __shfl_xor_sync(full_mask, val, 1);
-    return val;
-}
+// warp_reduce_sum_f32_ is defined in src/lbfgs_warp.cuh
 
 #pragma endregion
 
@@ -1079,144 +1065,9 @@ __global__ void mmff94_vdw_gradient_kernel_f16(half const* coord_x, half const* 
 
 #pragma region L-BFGS Optimizer
 
-/**
- * L-BFGS workspace size per molecule.
- *
- * Memory layout per molecule (for memory_depth m and n_atoms atoms):
- * - s_history: m * n_atoms * 3 (position deltas)
- * - y_history: m * n_atoms * 3 (gradient deltas)
- * - rho: m (scaling factors)
- * - alpha: m (line search coefficients)
- * - gradient_prev: n_atoms * 3 (previous gradient)
- */
-__device__ __forceinline__ std::uint32_t lbfgs_workspace_size_(std::uint32_t const n_atoms,
-                                                               std::uint32_t const memory_depth) {
-    return memory_depth * n_atoms * 3 * 2 // s_history + y_history
-           + memory_depth                 // rho
-           + memory_depth                 // alpha
-           + n_atoms * 3;                 // gradient_prev
-}
-
-/**
- * Compute dot product using warp reduction.
- * Each thread processes elements in strided fashion, then reduces across warp.
- */
-__device__ __forceinline__ float warp_dot_product_f32_(float const* a, float const* b, std::uint32_t const n,
-                                                       std::uint32_t const lane) {
-    float dot = 0.0f;
-    for (std::uint32_t i = lane; i < n; i += warp_size) {
-        dot = fmaf(a[i], b[i], dot);
-    }
-    return warp_reduce_sum_f32_(dot);
-}
-
-/**
- * Compute RMS (root mean square) using warp reduction.
- * RMS = sqrt(sum(x[i]^2) / n)
- */
-__device__ __forceinline__ float warp_rms_f32_(float const* x, std::uint32_t const n, std::uint32_t const lane) {
-    float sum_sq = 0.0f;
-    for (std::uint32_t i = lane; i < n; i += warp_size) {
-        float const val = x[i];
-        sum_sq = fmaf(val, val, sum_sq);
-    }
-    float const total_sum_sq = warp_reduce_sum_f32_(sum_sq);
-    return sqrtf(total_sum_sq * __frcp_rn(static_cast<float>(n)));
-}
-
-/**
- * L-BFGS two-loop recursion for computing search direction.
- *
- * Given gradient g and history (s, y, rho), computes search direction d = -H * g
- * where H is the inverse Hessian approximation.
- *
- * One warp processes this sequentially. Lane 0 does scalar ops, all lanes do vector ops.
- */
-__device__ __forceinline__ void lbfgs_two_loop_recursion_(float const* gradient, float* search_dir, float* s_history,
-                                                          float* y_history, float* rho, float* alpha,
-                                                          std::uint32_t const n_elements, std::uint32_t const k,
-                                                          std::uint32_t const memory_depth, std::uint32_t const lane) {
-    // Copy gradient to search_dir: q = g
-    for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
-        search_dir[i] = gradient[i];
-    }
-    __syncwarp(full_mask);
-
-    // First loop (backward through history)
-    for (std::uint32_t i = 0; i < k; ++i) {
-        std::uint32_t const idx = (k - 1 - i) % memory_depth;
-        float* s = s_history + idx * n_elements;
-        float* y = y_history + idx * n_elements;
-
-        float const rho_val = rho[idx];
-        float const dot = warp_dot_product_f32_(s, search_dir, n_elements, lane);
-
-        float alpha_val = 0.0f;
-        if (lane == 0) {
-            alpha_val = rho_val * dot;
-            alpha[idx] = alpha_val;
-        }
-        alpha_val = __shfl_sync(full_mask, alpha_val, 0);
-
-        // q = q - alpha * y
-        for (std::uint32_t j = lane; j < n_elements; j += warp_size) {
-            search_dir[j] -= alpha_val * y[j];
-        }
-        __syncwarp(full_mask);
-    }
-
-    // Initial Hessian scaling: H0 = (s_k · y_k) / (y_k · y_k)
-    if (k > 0) {
-        std::uint32_t const last_idx = (k - 1) % memory_depth;
-        float* s_last = s_history + last_idx * n_elements;
-        float* y_last = y_history + last_idx * n_elements;
-
-        float const s_dot_y = warp_dot_product_f32_(s_last, y_last, n_elements, lane);
-        float const y_dot_y = warp_dot_product_f32_(y_last, y_last, n_elements, lane);
-
-        float gamma = 1.0f;
-        if (lane == 0) {
-            gamma = s_dot_y * __frcp_rn(y_dot_y);
-        }
-        gamma = __shfl_sync(full_mask, gamma, 0);
-
-        // r = gamma * q
-        for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
-            search_dir[i] *= gamma;
-        }
-        __syncwarp(full_mask);
-    }
-
-    // Second loop (forward through history)
-    for (std::uint32_t i = 0; i < k; ++i) {
-        std::uint32_t const idx = i % memory_depth;
-        float* s = s_history + idx * n_elements;
-        float* y = y_history + idx * n_elements;
-
-        float const rho_val = rho[idx];
-        float const alpha_val = alpha[idx];
-        float const dot = warp_dot_product_f32_(y, search_dir, n_elements, lane);
-
-        float beta = 0.0f;
-        if (lane == 0) {
-            beta = rho_val * dot;
-        }
-        beta = __shfl_sync(full_mask, beta, 0);
-
-        // r = r + s * (alpha - beta)
-        float const coeff = alpha_val - beta;
-        for (std::uint32_t j = lane; j < n_elements; j += warp_size) {
-            search_dir[j] = fmaf(s[j], coeff, search_dir[j]);
-        }
-        __syncwarp(full_mask);
-    }
-
-    // Negate to get descent direction: d = -r
-    for (std::uint32_t i = lane; i < n_elements; i += warp_size) {
-        search_dir[i] = -search_dir[i];
-    }
-    __syncwarp(full_mask);
-}
+// lbfgs_workspace_size_, warp_dot_product_f32_, warp_rms_f32_,
+// and lbfgs_two_loop_recursion_ are defined in src/lbfgs_warp.cuh.
+// The MMFF94 kernels below call them directly.
 
 /**
  * Backtracking line search with Armijo condition.

@@ -8,6 +8,7 @@ This module provides a Python interface to the SmallField force field
 implementation, allowing it to work with RDKit molecules.
 """
 
+import struct
 import subprocess
 import tempfile
 import os
@@ -273,3 +274,165 @@ if __name__ == "__main__":
         f"  SmallField bond energy:  {comparison['smallfield_bond_energy']:.4f} kcal/mol"
     )
     print(f"  Note: {comparison['note']}")
+
+
+def _prepare_molecule_for_gpu(smiles: str):
+    """Prepare a single molecule for GPU ETKDG pipeline.
+
+    Returns bounds matrix, chiral descriptors, torsion descriptors,
+    distance constraints, and metadata as numpy arrays.
+    Requires RDKit.
+    """
+    if not RDKIT_AVAILABLE:
+        raise ImportError("RDKit is required for ETKDG conformer generation")
+
+    from rdkit.Chem import rdDistGeom
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+    mol = Chem.AddHs(mol)
+    num_atoms = mol.GetNumAtoms()
+
+    # bounds matrix (already smoothed by RDKit)
+    bounds = rdDistGeom.GetMoleculeBoundsMatrix(mol)
+    # RDKit returns upper triangle as upper bounds, lower triangle as lower bounds
+    bounds_flat = bounds.astype(np.float32).flatten()
+
+    # embed to get 3D geometry for chiral sign computation
+    AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+
+    # chiral centers: 8 bytes each (center, 4 neighbors, sign, 2 padding)
+    chirals = []
+    for atom in mol.GetAtoms():
+        tag = atom.GetChiralTag()
+        if tag not in (Chem.ChiralType.CHI_TETRAHEDRAL_CW,
+                       Chem.ChiralType.CHI_TETRAHEDRAL_CCW):
+            continue
+        neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
+        if len(neighbors) < 3:
+            continue
+        # compute signed volume from embedded geometry to get target sign
+        conf = mol.GetConformer()
+        ra = conf.GetAtomPosition(atom.GetIdx())
+        rb = conf.GetAtomPosition(neighbors[0])
+        rc = conf.GetAtomPosition(neighbors[1])
+        rd = conf.GetAtomPosition(neighbors[2])
+        bx, by, bz = rb.x - ra.x, rb.y - ra.y, rb.z - ra.z
+        cx, cy, cz = rc.x - ra.x, rc.y - ra.y, rc.z - ra.z
+        dx, dy, dz = rd.x - ra.x, rd.y - ra.y, rd.z - ra.z
+        volume = bx * (cy*dz - cz*dy) + by * (cz*dx - cx*dz) + bz * (cx*dy - cy*dx)
+        target_sign = 1 if volume > 0 else -1
+
+        descriptor = struct.pack("BBBBBbBB",
+            atom.GetIdx(),
+            neighbors[0] if len(neighbors) > 0 else 0,
+            neighbors[1] if len(neighbors) > 1 else 0,
+            neighbors[2] if len(neighbors) > 2 else 0,
+            neighbors[3] if len(neighbors) > 3 else 0,
+            target_sign, 0, 0)
+        chirals.append(descriptor)
+
+    chirals_bytes = b"".join(chirals)
+
+    # torsion terms: 32 bytes each (4 atom indices, 4 padding, 6 floats)
+    torsions = []
+    for bond in mol.GetBonds():
+        if bond.GetIsAromatic() or bond.GetBondTypeAsDouble() > 1.5:
+            continue
+        j, k = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        i_atom = next((n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors()
+                       if n.GetIdx() != k), None)
+        l_atom = next((n.GetIdx() for n in mol.GetAtomWithIdx(k).GetNeighbors()
+                       if n.GetIdx() != j), None)
+        if i_atom is None or l_atom is None:
+            continue
+        descriptor = struct.pack("BBBBBBBB6f",
+            i_atom, j, k, l_atom, 0, 0, 0, 0,
+            0.0, 0.0, 1.0, 0.0, 0.0, 0.0)  # default V3=1.0
+        torsions.append(descriptor)
+
+    torsions_bytes = b"".join(torsions)
+
+    # distance constraints: 16 bytes each
+    constraints = []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        descriptor = struct.pack("BBBBfff",
+            i, j, 0, 0, 1.425, 1.575, 10.0)  # 1-2 bond, ~1.5A
+        constraints.append(descriptor)
+
+    constraints_bytes = b"".join(constraints)
+
+    # metadata: 32 bytes
+    metadata = struct.pack("IIIIIIII",
+        num_atoms,
+        len(chirals),
+        len(torsions),
+        len(constraints),
+        0,  # bounds_offset (single molecule)
+        0,  # chiral_offset
+        0,  # torsion_offset
+        0)  # constraint_offset
+
+    return {
+        "num_atoms": num_atoms,
+        "bounds": bounds_flat,
+        "chirals": np.frombuffer(chirals_bytes, dtype=np.uint8) if chirals_bytes else np.array([], dtype=np.uint8),
+        "torsions": np.frombuffer(torsions_bytes, dtype=np.uint8) if torsions_bytes else np.array([], dtype=np.uint8),
+        "constraints": np.frombuffer(constraints_bytes, dtype=np.uint8) if constraints_bytes else np.array([], dtype=np.uint8),
+        "metadata": np.frombuffer(metadata, dtype=np.uint8),
+    }
+
+
+def generate_conformers(smiles: str, num_conformers: int = 10,
+                        max_stereo_attempts: int = 20,
+                        seed: int = 42) -> Optional[np.ndarray]:
+    """Generate 3D conformers for a molecule using GPU ETKDG pipeline.
+
+    Args:
+        smiles: SMILES string for the molecule.
+        num_conformers: Number of conformers to generate.
+        max_stereo_attempts: Maximum retry attempts per conformer on stereo failure.
+        seed: Random seed for reproducibility.
+
+    Returns:
+        numpy array of shape (K, N, 3) with 3D coordinates for successful conformers,
+        or None if the GPU pipeline is not available.
+    """
+    import smallfield as sf
+    if sf.EtkdgContext is None:
+        return None
+
+    prepared = _prepare_molecule_for_gpu(smiles)
+    num_atoms = prepared["num_atoms"]
+
+    ctx = sf.EtkdgContext(num_atoms, 1, num_conformers)
+    coords, energies, status = ctx.generate_conformers(
+        prepared["bounds"],
+        prepared["chirals"],
+        prepared["torsions"],
+        prepared["constraints"],
+        prepared["metadata"],
+        num_conformers,
+        max_stereo_attempts,
+        seed)
+
+    # extract successful conformers, convert from SoA to (K, N, 3)
+    coords_array = np.array(coords).reshape(num_conformers, num_atoms * 3)
+    status_array = np.array(status)
+
+    successful = []
+    for k in range(num_conformers):
+        if status_array[k] == 0:
+            soa = coords_array[k]  # [x0..xN, y0..yN, z0..zN]
+            xyz = np.zeros((num_atoms, 3), dtype=np.float32)
+            xyz[:, 0] = soa[0:num_atoms]
+            xyz[:, 1] = soa[num_atoms:2*num_atoms]
+            xyz[:, 2] = soa[2*num_atoms:3*num_atoms]
+            successful.append(xyz)
+
+    if not successful:
+        return None
+
+    return np.stack(successful)
