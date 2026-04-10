@@ -100,8 +100,19 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
         float const energy = compute_energy_gradient(positions, gradient, num_elements, lane);
         __syncwarp(fire_full_mask);
 
-        // convergence check
-        float const rms_gradient = fire_warp_rms_(gradient, num_elements, lane);
+        // fused computation: rms_gradient, power, v_norm, f_norm in a single pass
+        float sum_gg = 0.0f, sum_gv = 0.0f, sum_vv = 0.0f;
+        for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size) {
+            float const g = gradient[i], v = velocities[i];
+            sum_gg = fmaf(g, g, sum_gg);
+            sum_gv = fmaf(g, v, sum_gv);
+            sum_vv = fmaf(v, v, sum_vv);
+        }
+        sum_gg = fire_warp_reduce_sum_(sum_gg);
+        sum_gv = fire_warp_reduce_sum_(sum_gv);
+        sum_vv = fire_warp_reduce_sum_(sum_vv);
+
+        float const rms_gradient = sqrtf(sum_gg * __frcp_rn(static_cast<float>(num_elements)));
         if (rms_gradient < gradient_threshold) {
             if (lane == 0) {
                 *out_status = 0;
@@ -111,17 +122,10 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
             return;
         }
 
-        // P = F · v = -gradient · velocity
-        float const power = -fire_warp_dot_(gradient, velocities, num_elements, lane);
-
-        // broadcast power to all lanes (already done by warp_reduce)
+        float const power = -sum_gv; // P = F·v = -∇E·v
         if (power > 0.0f) {
-            // accelerating: mix velocity toward force direction
-            // |v| and |F| for normalization
-            float const v_norm_sq = fire_warp_dot_(velocities, velocities, num_elements, lane);
-            float const f_norm_sq = fire_warp_dot_(gradient, gradient, num_elements, lane);
-            float const v_norm = sqrtf(fmaxf(v_norm_sq, 1e-20f));
-            float const f_norm = sqrtf(fmaxf(f_norm_sq, 1e-20f));
+            float const v_norm = sqrtf(fmaxf(sum_vv, 1e-20f));
+            float const f_norm = sqrtf(fmaxf(sum_gg, 1e-20f));
             float const v_over_f = v_norm * __frcp_rn(f_norm);
 
             // v = (1-α)·v + α·|v|·F̂  where F = -gradient

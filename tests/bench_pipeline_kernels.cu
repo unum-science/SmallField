@@ -68,7 +68,7 @@ float gpu_etkdg_pipeline_timed(float const* host_bounds, std::uint32_t bounds_to
 
     // warm up
     etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
-        dev_bounds, dev_chirals, dev_torsions, dev_constraints, dev_metadata, dev_coords_out, dev_energies_out,
+        dev_bounds, dev_chirals, dev_torsions, dev_constraints, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, dev_metadata, dev_coords_out, dev_energies_out,
         dev_status_out, num_molecules, num_conformers, max_stereo_attempts, max_atoms_per_molecule, seed);
     cudaDeviceSynchronize();
 
@@ -79,7 +79,7 @@ float gpu_etkdg_pipeline_timed(float const* host_bounds, std::uint32_t bounds_to
 
     cudaEventRecord(start);
     etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
-        dev_bounds, dev_chirals, dev_torsions, dev_constraints, dev_metadata, dev_coords_out, dev_energies_out,
+        dev_bounds, dev_chirals, dev_torsions, dev_constraints, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, dev_metadata, dev_coords_out, dev_energies_out,
         dev_status_out, num_molecules, num_conformers, max_stereo_attempts, max_atoms_per_molecule,
         seed + 1);
     cudaEventRecord(stop);

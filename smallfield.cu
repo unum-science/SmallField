@@ -2192,9 +2192,10 @@ class etkdg_context_t {
         etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
             bounds_ptr, reinterpret_cast<chiral_center_descriptor_t const*>(chirals_ptr),
             reinterpret_cast<etk_torsion_descriptor_t const*>(torsions_ptr),
-            reinterpret_cast<distance_constraint_t const*>(constraints_ptr),
-            reinterpret_cast<etkdg_molecule_metadata_t const*>(metadata_ptr), coords_out_ptr, energies_out_ptr,
-            status_out_ptr, num_molecules, num_conformers, max_stereo_attempts, max_atoms_, random_seed);
+            reinterpret_cast<distance_constraint_t const*>(constraints_ptr), nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, reinterpret_cast<etkdg_molecule_metadata_t const*>(metadata_ptr), coords_out_ptr,
+            energies_out_ptr, status_out_ptr, num_molecules, num_conformers, max_stereo_attempts, max_atoms_,
+            random_seed);
         cudaDeviceSynchronize();
 
         // copy results back

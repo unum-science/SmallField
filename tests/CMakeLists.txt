@@ -1,6 +1,11 @@
 # C++ / CUDA test executables linking against RDKit for cross-validation.
 # Each test is a standalone executable with its own main().
 
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP found for tests")
+endif()
+
 # shared test utilities (header-only)
 add_library(test_helpers INTERFACE)
 target_include_directories(test_helpers INTERFACE
@@ -36,7 +41,8 @@ macro(add_mixed_test test_name)
         fork_union
         ${RDKIT_LIBS}
         ${CURAND_LIBRARY}
-        cudart)
+        cudart
+        $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>)
     target_include_directories(${test_name} PRIVATE
         ${CMAKE_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/src)
@@ -52,3 +58,4 @@ add_mixed_test(test_chirality)
 add_mixed_test(test_pipeline)
 add_mixed_test(bench_pipeline)
 add_mixed_test(bench_scaling)
+add_mixed_test(bench_comparison)
