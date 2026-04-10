@@ -28,6 +28,8 @@ extern "C" gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     smallfield::mmff94_bond_t const* host_mmff_bonds, std::uint32_t mmff_bonds_total,
     smallfield::mmff94_angle_t const* host_mmff_angles, std::uint32_t mmff_angles_total,
     smallfield::mmff94_torsion_t const* host_mmff_torsions, std::uint32_t mmff_torsions_total,
+    smallfield::mmff94_oop_t const* host_mmff_oops, std::uint32_t mmff_oops_total,
+    smallfield::mmff94_stretchbend_t const* host_mmff_stbn, std::uint32_t mmff_stbn_total,
     smallfield::mmff94_atom_interaction_t const* host_mmff_interactions, std::uint32_t mmff_interactions_total,
     smallfield::mmff94_atom_offsets_t const* host_mmff_offsets, std::uint32_t mmff_offsets_total,
     smallfield::etkdg_molecule_metadata_t const* host_metadata, std::uint32_t num_molecules, float* host_coords_out,

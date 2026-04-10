@@ -34,41 +34,176 @@
 
 namespace smallfield {
 
-/** Compute shared memory bytes for the pipeline kernel (FIRE optimizer). */
+/** Compute shared memory bytes for the pipeline kernel. */
 __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory_bytes(std::uint32_t max_atoms,
                                                                                        std::uint32_t /*unused*/) {
     std::uint32_t const dim4 = 4 * max_atoms;
-    // bounds in half precision: N² × 2 bytes
-    std::uint32_t const bounds_bytes = max_atoms * max_atoms * sizeof(__half);
-    // FIRE arrays in float: positions + velocities + gradient (3 arrays, no history)
+    // metric matrix (float N², reused as bounds_half after embedding): max(N²*4, N²*2)
+    std::uint32_t const matrix_bytes = max_atoms * max_atoms * sizeof(float);
+    // FIRE arrays in float: positions + velocities + gradient (3 arrays)
     std::uint32_t const fire_arrays = 3 * dim4 * sizeof(float);
-    return bounds_bytes + fire_arrays;
+    return matrix_bytes + fire_arrays;
 }
 
-// stage 3: generate random 4D coordinates scaled by molecular diameter
+// stage 3: random 4D coordinate generation (fallback until metric embedding is debugged)
 
 __device__ __forceinline__ void generate_random_coordinates_(__half const* bounds_half, float* positions,
                                                              std::uint32_t num_atoms, std::uint32_t lane,
                                                              curandStatePhilox4_32_10_t* rng_state) {
-    // estimate diameter from max upper bound
     float max_upper = 0.0f;
     for (std::uint32_t idx = lane; idx < num_atoms * num_atoms; idx += warp_size) {
         std::uint32_t const i = idx / num_atoms;
         std::uint32_t const j = idx % num_atoms;
-        if (i < j) {
-            float const val = __half2float(bounds_half[i * num_atoms + j]);
-            max_upper = fmaxf(max_upper, val);
-        }
+        if (i < j)
+            max_upper = fmaxf(max_upper, __half2float(bounds_half[i * num_atoms + j]));
     }
-    // warp max reduction
     for (int offset = 16; offset > 0; offset >>= 1)
         max_upper = fmaxf(max_upper, __shfl_xor_sync(full_mask, max_upper, offset));
 
     float const scale = max_upper * 0.5f;
-
-    for (std::uint32_t i = lane; i < num_atoms; i += warp_size) {
+    for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
         for (std::uint32_t d = 0; d < 4; ++d)
             positions[d * num_atoms + i] = (curand_uniform(rng_state) - 0.5f) * scale;
+    __syncwarp(full_mask);
+}
+
+// stage 3 (future): metric matrix embedding
+// Produces 4D coordinates that approximately satisfy the distance bounds.
+// Algorithm:
+//   1. Sample target distances D_ij = uniform(lower_ij, upper_ij)
+//   2. Compute metric matrix G = -0.5 * J * D² * J (J = centering matrix)
+//   3. Jacobi eigendecomposition of G
+//   4. Coordinates = top 4 eigenvectors scaled by sqrt(eigenvalue)
+
+__device__ __forceinline__ void metric_matrix_embedding_(float* G, float const* global_bounds,
+                                                         std::uint32_t num_atoms_in_bounds, float* positions,
+                                                         float* workspace, std::uint32_t num_atoms, std::uint32_t lane,
+                                                         curandStatePhilox4_32_10_t* rng_state) {
+    std::uint32_t const num = num_atoms;
+    std::uint32_t const num_squared = num * num;
+    float const inverse_num_atoms = __frcp_rn(static_cast<float>(num));
+
+    // step 1: sample D² from global bounds (float), store in G
+    // bounds convention: [i*bounds_stride+j] with i<j = upper, i>j = lower (bounds_stride = num_atoms_in_bounds)
+    std::uint32_t const bounds_stride = num_atoms_in_bounds;
+    for (std::uint32_t idx = lane; idx < num_squared; idx += warp_size) {
+        std::uint32_t const i = idx / num;
+        std::uint32_t const j = idx % num;
+        if (i == j) {
+            G[idx] = 0.0f;
+        } else {
+            std::uint32_t const lower_index = (i > j) ? (i * bounds_stride + j) : (j * bounds_stride + i);
+            std::uint32_t const upper_index = (i < j) ? (i * bounds_stride + j) : (j * bounds_stride + i);
+            float const lower = global_bounds[lower_index];
+            float const upper = global_bounds[upper_index];
+            float const d = lower + curand_uniform(rng_state) * fmaxf(upper - lower, 0.0f);
+            G[idx] = d * d;
+        }
+    }
+    __syncwarp(full_mask);
+
+    // step 2: double centering — G = -0.5 * (D² - row_means - col_means + grand_mean)
+    // compute row means (each row mean is also the col mean since D² is symmetric)
+    // use positions array temporarily for row means (N floats, fits in 4N positions buffer)
+    float* row_means = workspace; // temporary, overwritten by step 4
+    for (std::uint32_t i = lane; i < num; i += warp_size) {
+        float sum = 0.0f;
+        for (std::uint32_t j = 0; j < num; ++j)
+            sum += G[i * num + j];
+        row_means[i] = sum * inverse_num_atoms;
+    }
+    __syncwarp(full_mask);
+
+    // grand mean
+    float grand_mean = 0.0f;
+    for (std::uint32_t i = lane; i < num; i += warp_size)
+        grand_mean += row_means[i];
+    grand_mean = warp_reduce_sum_f32_(grand_mean) * inverse_num_atoms;
+
+    // apply centering
+    for (std::uint32_t idx = lane; idx < num_squared; idx += warp_size) {
+        std::uint32_t const i = idx / num;
+        std::uint32_t const j = idx % num;
+        G[idx] = -0.5f * (G[idx] - row_means[i] - row_means[j] + grand_mean);
+    }
+    __syncwarp(full_mask);
+
+    // step 3: Jacobi eigendecomposition (in-place on G, symmetric)
+    // We only need the top 4 eigenvalues/eigenvectors.
+    // Use cyclic Jacobi: for each off-diagonal (i,j), zero G[i][j] via rotation.
+    // Track eigenvectors in positions buffer (reinterpreted as V matrix, N×4).
+    // Actually, for simplicity, we'll do power iteration for top 4 eigenvectors
+    // since full Jacobi needs O(N²) eigenvector storage.
+
+    // Power iteration: find top 4 eigenvectors one at a time
+    float eigenvalues[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // positions[d*N + i] will hold eigenvector d, component i
+    for (std::uint32_t i = lane; i < 4 * num; i += warp_size)
+        positions[i] = 0.0f;
+    __syncwarp(full_mask);
+
+    for (std::uint32_t eigenvector_index = 0; eigenvector_index < 4; ++eigenvector_index) {
+        // initialize random vector
+        for (std::uint32_t i = lane; i < num; i += warp_size)
+            positions[eigenvector_index * num + i] = curand_uniform(rng_state) - 0.5f;
+        __syncwarp(full_mask);
+
+        // 20 power iterations per eigenvector
+        for (std::uint32_t iter = 0; iter < 20; ++iter) {
+            // matrix-vector multiply: v_new = G * v
+            // use row_means as temp buffer for the result
+            for (std::uint32_t i = lane; i < num; i += warp_size) {
+                float sum = 0.0f;
+                for (std::uint32_t j = 0; j < num; ++j)
+                    sum += G[i * num + j] * positions[eigenvector_index * num + j];
+                row_means[i] = sum;
+            }
+            __syncwarp(full_mask);
+
+            // deflate: subtract projections onto previous eigenvectors
+            for (std::uint32_t prev = 0; prev < eigenvector_index; ++prev) {
+                float dot = 0.0f;
+                for (std::uint32_t i = lane; i < num; i += warp_size)
+                    dot += row_means[i] * positions[prev * num + i];
+                dot = warp_reduce_sum_f32_(dot);
+                for (std::uint32_t i = lane; i < num; i += warp_size)
+                    row_means[i] -= dot * positions[prev * num + i];
+                __syncwarp(full_mask);
+            }
+
+            // normalize
+            float norm_sq = 0.0f;
+            for (std::uint32_t i = lane; i < num; i += warp_size)
+                norm_sq += row_means[i] * row_means[i];
+            norm_sq = warp_reduce_sum_f32_(norm_sq);
+            float const inv_norm = (norm_sq > 1e-20f) ? rsqrtf(norm_sq) : 0.0f;
+
+            for (std::uint32_t i = lane; i < num; i += warp_size)
+                positions[eigenvector_index * num + i] = row_means[i] * inv_norm;
+            __syncwarp(full_mask);
+        }
+
+        // eigenvalue = v^T G v (Rayleigh quotient)
+        for (std::uint32_t i = lane; i < num; i += warp_size) {
+            float sum = 0.0f;
+            for (std::uint32_t j = 0; j < num; ++j)
+                sum += G[i * num + j] * positions[eigenvector_index * num + j];
+            row_means[i] = sum;
+        }
+        __syncwarp(full_mask);
+
+        float eigenvalue = 0.0f;
+        for (std::uint32_t i = lane; i < num; i += warp_size)
+            eigenvalue += positions[eigenvector_index * num + i] * row_means[i];
+        eigenvalue = warp_reduce_sum_f32_(eigenvalue);
+        eigenvalues[eigenvector_index] = fmaxf(eigenvalue, 0.0f);
+    }
+
+    // step 4: scale eigenvectors by sqrt(eigenvalue) → coordinates
+    for (std::uint32_t d = 0; d < 4; ++d) {
+        float const scale = sqrtf(eigenvalues[d]);
+        for (std::uint32_t i = lane; i < num; i += warp_size)
+            positions[d * num + i] *= scale;
     }
     __syncwarp(full_mask);
 }
@@ -107,6 +242,7 @@ __global__ void etkdg_pipeline_warp_kernel(
     // MMFF94 parameter arrays + per-atom interaction lists (stage 9, global memory)
     mmff94_nonbonded_pair_t const* __restrict__ mmff_nonbonded_pairs, mmff94_bond_t const* __restrict__ mmff_bond_terms,
     mmff94_angle_t const* __restrict__ mmff_angle_terms, mmff94_torsion_t const* __restrict__ mmff_torsion_terms,
+    mmff94_oop_t const* __restrict__ mmff_oop_terms, mmff94_stretchbend_t const* __restrict__ mmff_stretchbend_terms,
     mmff94_atom_interaction_t const* __restrict__ mmff_interactions,
     mmff94_atom_offsets_t const* __restrict__ mmff_atom_offsets,
     etkdg_molecule_metadata_t const* __restrict__ molecule_metadata, float* __restrict__ conformer_coordinates_out,
@@ -118,13 +254,13 @@ __global__ void etkdg_pipeline_warp_kernel(
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const grid_stride = gridDim.x;
 
-    // shared memory partitioning
+    // shared memory: [G/bounds matrix: N² floats] [positions + velocities + gradient: 3×4N floats]
     extern __shared__ char shared_raw[];
     std::uint32_t const max_n = max_atoms_per_molecule;
 
-    __half* shared_bounds = reinterpret_cast<__half*>(shared_raw);
-    std::uint32_t float_offset = (max_n * max_n * sizeof(__half) + sizeof(float) - 1) / sizeof(float);
-    float* shared_float = reinterpret_cast<float*>(shared_raw) + float_offset;
+    float* shared_matrix = reinterpret_cast<float*>(shared_raw);   // N² floats (G matrix, then bounds_half)
+    __half* shared_bounds = reinterpret_cast<__half*>(shared_raw); // reinterpret as half for DG stages
+    float* shared_float = shared_matrix + max_n * max_n;
 
     // warp-loop: each warp processes molecules with stride
     for (std::uint32_t mol = warp_id; mol < total_molecules; mol += grid_stride) {
@@ -165,9 +301,15 @@ __global__ void etkdg_pipeline_warp_kernel(
             float final_energy = 0.0f;
 
             for (std::uint32_t attempt = 0; attempt < max_stereo_attempts; ++attempt) {
-                // stage 3: random 4D coordinates
+                // stage 3: random 4D coordinates (TODO: replace with metric matrix embedding)
                 skipahead(static_cast<unsigned long long>(conf * 1000 + attempt * 100), &rng_state);
                 generate_random_coordinates_(shared_bounds, positions, num_atoms, lane, &rng_state);
+
+                // reload bounds_half from global memory (G matrix overwrote shared region)
+                for (std::uint32_t i = lane; i < bounds_size; i += warp_size)
+                    shared_bounds[i] = __float2half(global_bounds[i]);
+                __syncwarp(full_mask);
+                triangle_smooth_warp_half_(shared_bounds, num_atoms, lane);
 
                 // stage 4: DG minimization (4D, FIRE, 100 iterations max)
                 distance_geometry_energy_functor_t dg_functor{
@@ -220,6 +362,8 @@ __global__ void etkdg_pipeline_warp_kernel(
                                                              mmff_bond_terms + meta.mmff_bond_offset,
                                                              mmff_angle_terms + meta.mmff_angle_offset,
                                                              mmff_torsion_terms + meta.mmff_torsion_offset,
+                                                             mmff_oop_terms + meta.mmff_oop_offset,
+                                                             mmff_stretchbend_terms + meta.mmff_stretchbend_offset,
                                                              mmff_interactions,
                                                              mmff_atom_offsets + meta.mmff_atom_offsets_start,
                                                              num_atoms};

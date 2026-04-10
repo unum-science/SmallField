@@ -74,7 +74,7 @@ void gpu_etkdg_pipeline(float const* host_bounds, std::uint32_t bounds_total_flo
     std::uint32_t const grid_size = std::min(num_molecules, static_cast<std::uint32_t>(max_blocks_per_sm * num_sms));
     etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
         dev_bounds, dev_chirals, dev_torsions, dev_constraints, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        dev_metadata, dev_coords_out, dev_energies_out, dev_status_out, num_molecules, num_conformers,
+        nullptr, nullptr, dev_metadata, dev_coords_out, dev_energies_out, dev_status_out, num_molecules, num_conformers,
         max_stereo_attempts, max_atoms_per_molecule, max_atoms_per_molecule, seed);
 
     cudaError_t err = cudaDeviceSynchronize();

@@ -28,7 +28,8 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     distance_constraint_t const* host_constraints, std::uint32_t constraints_total,
     mmff94_nonbonded_pair_t const* host_mmff_nb, std::uint32_t mmff_nb_total, mmff94_bond_t const* host_mmff_bonds,
     std::uint32_t mmff_bonds_total, mmff94_angle_t const* host_mmff_angles, std::uint32_t mmff_angles_total,
-    mmff94_torsion_t const* host_mmff_torsions, std::uint32_t mmff_torsions_total,
+    mmff94_torsion_t const* host_mmff_torsions, std::uint32_t mmff_torsions_total, mmff94_oop_t const* host_mmff_oops,
+    std::uint32_t mmff_oops_total, mmff94_stretchbend_t const* host_mmff_stbn, std::uint32_t mmff_stbn_total,
     mmff94_atom_interaction_t const* host_mmff_interactions, std::uint32_t mmff_interactions_total,
     mmff94_atom_offsets_t const* host_mmff_offsets, std::uint32_t mmff_offsets_total,
     etkdg_molecule_metadata_t const* host_metadata, std::uint32_t num_molecules, float* host_coords_out,
@@ -56,6 +57,8 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     mmff94_bond_t* dev_mmff_bonds;
     mmff94_angle_t* dev_mmff_angles;
     mmff94_torsion_t* dev_mmff_torsions;
+    mmff94_oop_t* dev_mmff_oops;
+    mmff94_stretchbend_t* dev_mmff_stbn;
     mmff94_atom_interaction_t* dev_mmff_inter;
     mmff94_atom_offsets_t* dev_mmff_offsets;
     etkdg_molecule_metadata_t* dev_metadata;
@@ -68,6 +71,8 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaMalloc(&dev_mmff_bonds, std::max(mmff_bonds_total, 1u) * sizeof(mmff94_bond_t));
     cudaMalloc(&dev_mmff_angles, std::max(mmff_angles_total, 1u) * sizeof(mmff94_angle_t));
     cudaMalloc(&dev_mmff_torsions, std::max(mmff_torsions_total, 1u) * sizeof(mmff94_torsion_t));
+    cudaMalloc(&dev_mmff_oops, std::max(mmff_oops_total, 1u) * sizeof(mmff94_oop_t));
+    cudaMalloc(&dev_mmff_stbn, std::max(mmff_stbn_total, 1u) * sizeof(mmff94_stretchbend_t));
     cudaMalloc(&dev_mmff_inter, std::max(mmff_interactions_total, 1u) * sizeof(mmff94_atom_interaction_t));
     cudaMalloc(&dev_mmff_offsets, std::max(mmff_offsets_total, 1u) * sizeof(mmff94_atom_offsets_t));
     cudaMalloc(&dev_metadata, num_molecules * sizeof(etkdg_molecule_metadata_t));
@@ -115,6 +120,11 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     if (mmff_torsions_total > 0)
         cudaMemcpy(dev_mmff_torsions, host_mmff_torsions, mmff_torsions_total * sizeof(mmff94_torsion_t),
                    cudaMemcpyHostToDevice);
+    if (mmff_oops_total > 0)
+        cudaMemcpy(dev_mmff_oops, host_mmff_oops, mmff_oops_total * sizeof(mmff94_oop_t), cudaMemcpyHostToDevice);
+    if (mmff_stbn_total > 0)
+        cudaMemcpy(dev_mmff_stbn, host_mmff_stbn, mmff_stbn_total * sizeof(mmff94_stretchbend_t),
+                   cudaMemcpyHostToDevice);
     if (mmff_interactions_total > 0)
         cudaMemcpy(dev_mmff_inter, host_mmff_interactions, mmff_interactions_total * sizeof(mmff94_atom_interaction_t),
                    cudaMemcpyHostToDevice);
@@ -126,8 +136,8 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaEventRecord(ev_upload_end);
 
     // phase 2: wave-based kernel dispatch
-    constexpr std::uint32_t wave_bins[] = {32, 64, 96, 128};
-    constexpr std::uint32_t num_bins = 4;
+    constexpr std::uint32_t wave_bins[] = {16, 32, 48, 64, 80, 96, 112, 128};
+    constexpr std::uint32_t num_bins = 8;
 
     cudaEventRecord(ev_kernel_start);
 
@@ -161,8 +171,8 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
         // output written to sorted slots [wave_start*num_conf .. wave_end*num_conf)
         etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
             dev_bounds, dev_chirals, dev_torsions, dev_constraints, dev_mmff_nb, dev_mmff_bonds, dev_mmff_angles,
-            dev_mmff_torsions, dev_mmff_inter, dev_mmff_offsets, dev_metadata + wave_start,
-            dev_coords_out + wave_start * num_conformers * max_atoms_per_molecule * 3,
+            dev_mmff_torsions, dev_mmff_oops, dev_mmff_stbn, dev_mmff_inter, dev_mmff_offsets,
+            dev_metadata + wave_start, dev_coords_out + wave_start * num_conformers * max_atoms_per_molecule * 3,
             dev_energies_out + wave_start * num_conformers, dev_status_out + wave_start * num_conformers, wave_size,
             num_conformers, max_stereo_attempts, wave_max_atoms, max_atoms_per_molecule, seed);
 
@@ -223,6 +233,8 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaFree(dev_mmff_bonds);
     cudaFree(dev_mmff_angles);
     cudaFree(dev_mmff_torsions);
+    cudaFree(dev_mmff_oops);
+    cudaFree(dev_mmff_stbn);
     cudaFree(dev_mmff_inter);
     cudaFree(dev_mmff_offsets);
     cudaFree(dev_metadata);
