@@ -164,7 +164,7 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
             dev_mmff_torsions, dev_mmff_inter, dev_mmff_offsets, dev_metadata + wave_start,
             dev_coords_out + wave_start * num_conformers * max_atoms_per_molecule * 3,
             dev_energies_out + wave_start * num_conformers, dev_status_out + wave_start * num_conformers, wave_size,
-            num_conformers, max_stereo_attempts, wave_max_atoms, seed);
+            num_conformers, max_stereo_attempts, wave_max_atoms, max_atoms_per_molecule, seed);
 
         total_grid += grid_size;
         max_bpsm = std::max(max_bpsm, static_cast<std::uint32_t>(blocks_per_sm));

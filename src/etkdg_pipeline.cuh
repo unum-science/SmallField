@@ -78,14 +78,15 @@ __device__ __forceinline__ void generate_random_coordinates_(__half const* bound
 __device__ __forceinline__ void write_conformer_output_(float* coordinates_out, float* energies_out,
                                                         std::uint8_t* status_out, float const* positions,
                                                         std::uint32_t mol_index, std::uint32_t conformer_index,
-                                                        std::uint32_t num_atoms, std::uint32_t max_atoms,
+                                                        std::uint32_t num_atoms, std::uint32_t output_stride,
                                                         std::uint32_t num_conformers, float energy, bool succeeded,
                                                         std::uint32_t lane) {
     std::uint32_t const slot = mol_index * num_conformers + conformer_index;
-    std::uint32_t const coord_offset = slot * max_atoms * 3;
-    std::uint32_t const dim3 = 3 * num_atoms;
-    for (std::uint32_t i = lane; i < dim3; i += warp_size)
-        coordinates_out[coord_offset + i] = positions[i];
+    std::uint32_t const coord_offset = slot * output_stride * 3;
+    // positions are SoA with num_atoms stride, output uses output_stride
+    for (std::uint32_t d = 0; d < 3; ++d)
+        for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
+            coordinates_out[coord_offset + d * output_stride + i] = positions[d * num_atoms + i];
     if (lane == 0) {
         energies_out[slot] = energy;
         status_out[slot] = succeeded ? 0 : 1;
@@ -111,7 +112,7 @@ __global__ void etkdg_pipeline_warp_kernel(
     etkdg_molecule_metadata_t const* __restrict__ molecule_metadata, float* __restrict__ conformer_coordinates_out,
     float* __restrict__ conformer_energies_out, std::uint8_t* __restrict__ conformer_status_out,
     std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t max_stereo_attempts,
-    std::uint32_t max_atoms_per_molecule, std::uint64_t random_seed) {
+    std::uint32_t max_atoms_per_molecule, std::uint32_t output_atoms_stride, std::uint64_t random_seed) {
 
     std::uint32_t const warp_id = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
@@ -237,7 +238,7 @@ __global__ void etkdg_pipeline_warp_kernel(
 
             // write output
             write_conformer_output_(conformer_coordinates_out, conformer_energies_out, conformer_status_out, positions,
-                                    mol, conf, num_atoms, max_atoms_per_molecule, num_conformers_per_molecule,
+                                    mol, conf, num_atoms, output_atoms_stride, num_conformers_per_molecule,
                                     final_energy, succeeded, lane);
         }
     }

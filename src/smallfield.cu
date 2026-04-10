@@ -147,7 +147,7 @@ class etkdg_context_t {
             reinterpret_cast<distance_constraint_t const*>(constraints_buffer_.data()), nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, reinterpret_cast<etkdg_molecule_metadata_t const*>(metadata_buffer_.data()),
             coordinates_out_buffer_.data(), energies_out_buffer_.data(), status_out_buffer_.data(), num_molecules,
-            num_conformers, max_stereo_attempts, max_atoms_, random_seed);
+            num_conformers, max_stereo_attempts, max_atoms_, max_atoms_, random_seed);
         cudaDeviceSynchronize();
 
         // copy results back
