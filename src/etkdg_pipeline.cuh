@@ -28,22 +28,20 @@
 #include "dg_forcefield.cuh"
 #include "etk_forcefield.cuh"
 #include "etkdg_types.cuh"
-#include "lbfgs_warp.cuh"
+#include "fire_warp.cuh"
 #include "triangle_smooth.cuh"
 
 namespace smallfield {
 
-/** Compute shared memory bytes for the pipeline kernel. */
+/** Compute shared memory bytes for the pipeline kernel (FIRE optimizer). */
 __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory_bytes(std::uint32_t max_atoms,
-                                                                                       std::uint32_t memory_depth) {
+                                                                                       std::uint32_t /*unused*/) {
     std::uint32_t const dim4 = 4 * max_atoms;
     // bounds in half precision: N² × 2 bytes
     std::uint32_t const bounds_bytes = max_atoms * max_atoms * sizeof(__half);
-    // L-BFGS arrays in float: positions + gradient + direction + trial + grad_prev
-    std::uint32_t const lbfgs_arrays = 5 * dim4 * sizeof(float);
-    // L-BFGS history: (s + y) × m × dim4 + (rho + alpha) × m
-    std::uint32_t const history_bytes = (2 * memory_depth * dim4 + 2 * memory_depth) * sizeof(float);
-    return bounds_bytes + lbfgs_arrays + history_bytes;
+    // FIRE arrays in float: positions + velocities + gradient (3 arrays, no history)
+    std::uint32_t const fire_arrays = 3 * dim4 * sizeof(float);
+    return bounds_bytes + fire_arrays;
 }
 
 // stage 3: generate random 4D coordinates scaled by molecular diameter
@@ -107,7 +105,7 @@ __global__ void etkdg_pipeline_warp_kernel(
     etkdg_molecule_metadata_t const* __restrict__ molecule_metadata, float* __restrict__ conformer_coordinates_out,
     float* __restrict__ conformer_energies_out, std::uint8_t* __restrict__ conformer_status_out,
     std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t max_stereo_attempts,
-    std::uint32_t max_atoms_per_molecule, std::uint32_t memory_depth, std::uint64_t random_seed) {
+    std::uint32_t max_atoms_per_molecule, std::uint64_t random_seed) {
 
     std::uint32_t const warp_id = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
@@ -129,25 +127,20 @@ __global__ void etkdg_pipeline_warp_kernel(
         std::uint32_t const dim4 = 4 * num_atoms;
         std::uint32_t const dim3 = 3 * num_atoms;
 
-        // partition shared float memory for this molecule
+        // FIRE shared memory: positions + velocities + gradient (3 arrays)
         std::uint32_t off = 0;
         float* positions = shared_float + off;
         off += dim4;
+        float* velocities = shared_float + off;
+        off += dim4;
         float* gradient = shared_float + off;
-        off += dim4;
-        float* search_direction = shared_float + off;
-        off += dim4;
-        float* trial_positions = shared_float + off;
-        off += dim4;
-        float* workspace = shared_float + off;
-        // workspace holds: grad_prev + s_history + y_history + rho + alpha
 
         // stage 2: load bounds (float → half) and smooth
         std::uint32_t const bounds_size = num_atoms * num_atoms;
         float const* global_bounds = bounds_matrices + meta.bounds_offset;
         for (std::uint32_t i = lane; i < bounds_size; i += warp_size)
             shared_bounds[i] = __float2half(global_bounds[i]);
-        __syncwarp(full_mask);
+        __syncwarp(fire_full_mask);
 
         triangle_smooth_warp_half_(shared_bounds, num_atoms, lane);
 
@@ -156,7 +149,7 @@ __global__ void etkdg_pipeline_warp_kernel(
         etk_torsion_descriptor_t const* mol_torsions = torsion_terms + meta.torsion_offset;
         distance_constraint_t const* mol_constraints = distance_constraints + meta.constraint_offset;
 
-        // Philox RNG: init once per molecule (cheap, ~100 cycles)
+        // Philox RNG: init once per molecule
         curandStatePhilox4_32_10_t rng_state;
         curand_init(random_seed, mol * 32 + lane, 0, &rng_state);
 
@@ -166,18 +159,18 @@ __global__ void etkdg_pipeline_warp_kernel(
             float final_energy = 0.0f;
 
             for (std::uint32_t attempt = 0; attempt < max_stereo_attempts; ++attempt) {
-                // stage 3: random 4D coordinates (advance RNG, ~free)
+                // stage 3: random 4D coordinates
                 skipahead(static_cast<unsigned long long>(conf * 1000 + attempt * 100), &rng_state);
                 generate_random_coordinates_(shared_bounds, positions, num_atoms, lane, &rng_state);
 
-                // stage 4: DG minimization (4D)
+                // stage 4: DG minimization (4D, FIRE, 100 iterations max)
                 distance_geometry_energy_functor_t dg_functor{
                     shared_bounds, mol_chirals, num_atoms, meta.num_chiral_centers, 4, 1.0f, 1.0f, 100.0f, 0.0f};
 
                 float dg_energy = 0.0f;
                 std::int32_t dg_iterations = 0, dg_status = 0;
-                lbfgs_minimize_(positions, gradient, search_direction, trial_positions, workspace, dim4, memory_depth,
-                                400, 1e-4f, lane, dg_functor, &dg_energy, &dg_iterations, &dg_status);
+                fire_minimize_(positions, velocities, gradient, dim4, 100, 1e-4f, lane, dg_functor, &dg_energy,
+                               &dg_iterations, &dg_status);
 
                 // stage 5: stereochemistry check
                 if (meta.num_chiral_centers > 0) {
@@ -185,23 +178,22 @@ __global__ void etkdg_pipeline_warp_kernel(
                         continue;
                 }
 
-                // stage 6: fourth-dimension crush (warm-start L-BFGS)
+                // stage 6: fourth-dimension crush (50 iterations)
                 dg_functor.fourth_dimension_penalty_weight = 10.0f;
                 float crush_energy = 0.0f;
                 std::int32_t crush_iterations = 0, crush_status = 0;
-                lbfgs_minimize_(positions, gradient, search_direction, trial_positions, workspace, dim4, memory_depth,
-                                200, 1e-4f, lane, dg_functor, &crush_energy, &crush_iterations, &crush_status);
+                fire_minimize_(positions, velocities, gradient, dim4, 50, 1e-4f, lane, dg_functor, &crush_energy,
+                               &crush_iterations, &crush_status);
 
-                // stage 7: ETK torsion refinement (3D)
+                // stage 7: ETK torsion refinement (3D, 100 iterations)
                 if (meta.num_etk_torsions > 0) {
                     etk_torsion_energy_functor_t etk_functor{mol_torsions, mol_constraints, meta.num_etk_torsions,
                                                              meta.num_distance_constraints, num_atoms};
 
                     float etk_energy = 0.0f;
                     std::int32_t etk_iterations = 0, etk_status = 0;
-                    lbfgs_minimize_(positions, gradient, search_direction, trial_positions, workspace, dim3,
-                                    memory_depth, 300, 1e-4f, lane, etk_functor, &etk_energy, &etk_iterations,
-                                    &etk_status);
+                    fire_minimize_(positions, velocities, gradient, dim3, 100, 1e-4f, lane, etk_functor, &etk_energy,
+                                   &etk_iterations, &etk_status);
                     final_energy = etk_energy;
                 } else {
                     final_energy = crush_energy;

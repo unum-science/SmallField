@@ -2176,20 +2176,25 @@ class etkdg_context_t {
         float* energies_out_ptr = energies_out_buffer_.data();
         std::uint8_t* status_out_ptr = status_out_buffer_.data();
 
-        constexpr std::uint32_t memory_depth = 5;
-        std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(max_atoms_, memory_depth);
+        std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(max_atoms_, 0);
 
         cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(shared_bytes));
 
-        // warp-loop: launch min(num_molecules, 752) warps, each loops with stride
-        std::uint32_t const grid_size = std::min(num_molecules, 752u);
+        // compute optimal grid size from occupancy
+        int max_blocks_per_sm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, etkdg_pipeline_warp_kernel, 32, shared_bytes);
+        int num_sms = 0;
+        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+        std::uint32_t const grid_size =
+            std::min(num_molecules, static_cast<std::uint32_t>(max_blocks_per_sm * num_sms));
+
         etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
             bounds_ptr, reinterpret_cast<chiral_center_descriptor_t const*>(chirals_ptr),
             reinterpret_cast<etk_torsion_descriptor_t const*>(torsions_ptr),
             reinterpret_cast<distance_constraint_t const*>(constraints_ptr),
             reinterpret_cast<etkdg_molecule_metadata_t const*>(metadata_ptr), coords_out_ptr, energies_out_ptr,
-            status_out_ptr, num_molecules, num_conformers, max_stereo_attempts, max_atoms_, memory_depth, random_seed);
+            status_out_ptr, num_molecules, num_conformers, max_stereo_attempts, max_atoms_, random_seed);
         cudaDeviceSynchronize();
 
         // copy results back

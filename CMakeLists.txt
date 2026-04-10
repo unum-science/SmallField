@@ -6,9 +6,28 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# detect GPU architecture at build time, fall back to SM 9.0 (H100)
+# detect GPU architecture at build time
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "90")
+    # detect highest GPU compute capability via nvidia-smi
+    execute_process(
+        COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+        OUTPUT_VARIABLE _gpu_caps OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET RESULT_VARIABLE _smi_result)
+    if(_smi_result EQUAL 0 AND _gpu_caps)
+        # take the first line (first GPU)
+        string(REGEX MATCH "[0-9]+\\.[0-9]+" _cap_match "${_gpu_caps}")
+        if(_cap_match)
+            string(REPLACE "." "" _arch_code "${_cap_match}")
+            set(CMAKE_CUDA_ARCHITECTURES "${_arch_code}")
+            message(STATUS "Detected GPU compute capability: ${_cap_match} (SM ${_arch_code})")
+        else()
+            set(CMAKE_CUDA_ARCHITECTURES "90")
+            message(STATUS "Could not parse GPU capability, defaulting to SM 90")
+        endif()
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES "90")
+        message(STATUS "nvidia-smi not found, defaulting to SM 90")
+    endif()
 endif()
 
 # RDKit from conda-forge.

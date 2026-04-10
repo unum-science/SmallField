@@ -21,8 +21,6 @@ float gpu_etkdg_pipeline_timed(float const* host_bounds, std::uint32_t bounds_to
                                std::uint32_t num_conformers, std::uint32_t max_stereo_attempts,
                                std::uint32_t max_atoms_per_molecule, std::uint64_t seed) {
 
-    constexpr std::uint32_t memory_depth = 5;
-
     float* dev_bounds;
     chiral_center_descriptor_t* dev_chirals;
     etk_torsion_descriptor_t* dev_torsions;
@@ -56,15 +54,20 @@ float gpu_etkdg_pipeline_timed(float const* host_bounds, std::uint32_t bounds_to
                    cudaMemcpyHostToDevice);
     cudaMemcpy(dev_metadata, host_metadata, num_molecules * sizeof(etkdg_molecule_metadata_t), cudaMemcpyHostToDevice);
 
-    std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(max_atoms_per_molecule, memory_depth);
+    std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(max_atoms_per_molecule, 0);
     cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
 
-    std::uint32_t const grid_size = std::min(num_molecules, 752u);
+    // compute optimal grid size from occupancy
+    int max_blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, etkdg_pipeline_warp_kernel, 32, shared_bytes);
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    std::uint32_t const grid_size = std::min(num_molecules, static_cast<std::uint32_t>(max_blocks_per_sm * num_sms));
 
     // warm up
     etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
         dev_bounds, dev_chirals, dev_torsions, dev_constraints, dev_metadata, dev_coords_out, dev_energies_out,
-        dev_status_out, num_molecules, num_conformers, max_stereo_attempts, max_atoms_per_molecule, memory_depth, seed);
+        dev_status_out, num_molecules, num_conformers, max_stereo_attempts, max_atoms_per_molecule, seed);
     cudaDeviceSynchronize();
 
     // timed run
@@ -75,8 +78,7 @@ float gpu_etkdg_pipeline_timed(float const* host_bounds, std::uint32_t bounds_to
     cudaEventRecord(start);
     etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
         dev_bounds, dev_chirals, dev_torsions, dev_constraints, dev_metadata, dev_coords_out, dev_energies_out,
-        dev_status_out, num_molecules, num_conformers, max_stereo_attempts, max_atoms_per_molecule, memory_depth,
-        seed + 1);
+        dev_status_out, num_molecules, num_conformers, max_stereo_attempts, max_atoms_per_molecule, seed + 1);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 

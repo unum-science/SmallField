@@ -292,22 +292,30 @@ struct etkdg_molecule_batch_t {
 
 /**
  * Prepare a batch of molecules from SMILES strings.
- * Packs all per-molecule data into concatenated arrays with offset metadata.
+ * Phase 1 (OpenMP parallel): prepare each molecule independently.
+ * Phase 2 (sequential): pack into contiguous GPU-ready arrays.
  */
 inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> const& smiles_list) {
 
     etkdg_molecule_batch_t batch{};
     batch.num_molecules = static_cast<std::uint32_t>(smiles_list.size());
 
+    // phase 1: prepare molecules in parallel (RDKit calls are thread-safe for independent molecules)
+    std::vector<etkdg_prepared_molecule_t> prepared(smiles_list.size());
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (std::size_t i = 0; i < smiles_list.size(); ++i) {
+        prepared[i] = prepare_molecule(smiles_list[i]);
+    }
+
+    // phase 2: pack into contiguous arrays (sequential, fast)
     for (std::uint32_t m = 0; m < batch.num_molecules; ++m) {
-        auto prepared = prepare_molecule(smiles_list[m]);
-        if (prepared.num_atoms == 0)
+        if (prepared[m].num_atoms == 0)
             continue;
 
-        batch.max_atoms_per_molecule = std::max(batch.max_atoms_per_molecule, prepared.num_atoms);
+        batch.max_atoms_per_molecule = std::max(batch.max_atoms_per_molecule, prepared[m].num_atoms);
 
         // set offsets before appending
-        etkdg_molecule_metadata_t meta = prepared.metadata;
+        etkdg_molecule_metadata_t meta = prepared[m].metadata;
         meta.bounds_offset = static_cast<std::uint32_t>(batch.bounds_matrices.size());
         meta.chiral_offset = static_cast<std::uint32_t>(batch.chiral_centers.size());
         meta.torsion_offset = static_cast<std::uint32_t>(batch.etk_torsions.size());
@@ -316,13 +324,14 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         batch.molecule_metadata.push_back(meta);
 
         // append data
-        batch.bounds_matrices.insert(batch.bounds_matrices.end(), prepared.bounds_matrix.begin(),
-                                     prepared.bounds_matrix.end());
-        batch.chiral_centers.insert(batch.chiral_centers.end(), prepared.chiral_centers.begin(),
-                                    prepared.chiral_centers.end());
-        batch.etk_torsions.insert(batch.etk_torsions.end(), prepared.etk_torsions.begin(), prepared.etk_torsions.end());
-        batch.distance_constraints.insert(batch.distance_constraints.end(), prepared.distance_constraints.begin(),
-                                          prepared.distance_constraints.end());
+        batch.bounds_matrices.insert(batch.bounds_matrices.end(), prepared[m].bounds_matrix.begin(),
+                                     prepared[m].bounds_matrix.end());
+        batch.chiral_centers.insert(batch.chiral_centers.end(), prepared[m].chiral_centers.begin(),
+                                    prepared[m].chiral_centers.end());
+        batch.etk_torsions.insert(batch.etk_torsions.end(), prepared[m].etk_torsions.begin(),
+                                  prepared[m].etk_torsions.end());
+        batch.distance_constraints.insert(batch.distance_constraints.end(), prepared[m].distance_constraints.begin(),
+                                          prepared[m].distance_constraints.end());
     }
 
     return batch;

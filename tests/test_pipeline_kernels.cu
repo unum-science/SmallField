@@ -21,8 +21,6 @@ void gpu_etkdg_pipeline(float const* host_bounds, std::uint32_t bounds_total_flo
                         std::uint32_t num_conformers, std::uint32_t max_stereo_attempts,
                         std::uint32_t max_atoms_per_molecule, std::uint64_t seed) {
 
-    constexpr std::uint32_t memory_depth = 5;
-
     // allocate device memory
     float* dev_bounds;
     chiral_center_descriptor_t* dev_chirals;
@@ -59,7 +57,7 @@ void gpu_etkdg_pipeline(float const* host_bounds, std::uint32_t bounds_total_flo
     cudaMemcpy(dev_metadata, host_metadata, num_molecules * sizeof(etkdg_molecule_metadata_t), cudaMemcpyHostToDevice);
 
     // compute shared memory size
-    std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(max_atoms_per_molecule, memory_depth);
+    std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(max_atoms_per_molecule, 0);
     std::printf("  pipeline: %u molecules, %u conformers each, max_atoms=%u, shared_mem=%u bytes\n", num_molecules,
                 num_conformers, max_atoms_per_molecule, shared_bytes);
 
@@ -67,10 +65,16 @@ void gpu_etkdg_pipeline(float const* host_bounds, std::uint32_t bounds_total_flo
     cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
 
     // warp-loop launch: min(num_molecules, 752) warps, each loops with stride
-    std::uint32_t const grid_size = std::min(num_molecules, 752u);
+
+    // compute optimal grid size from occupancy
+    int max_blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, etkdg_pipeline_warp_kernel, 32, shared_bytes);
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    std::uint32_t const grid_size = std::min(num_molecules, static_cast<std::uint32_t>(max_blocks_per_sm * num_sms));
     etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
         dev_bounds, dev_chirals, dev_torsions, dev_constraints, dev_metadata, dev_coords_out, dev_energies_out,
-        dev_status_out, num_molecules, num_conformers, max_stereo_attempts, max_atoms_per_molecule, memory_depth, seed);
+        dev_status_out, num_molecules, num_conformers, max_stereo_attempts, max_atoms_per_molecule, seed);
 
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
