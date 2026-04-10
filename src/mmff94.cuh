@@ -27,26 +27,10 @@
 
 namespace smallfield {
 
-#pragma region Constants
-
-// warp_size and full_mask are defined in src/lbfgs_warp.cuh
-
-constexpr float const coulomb_const_f32 = 332.0716f;
-constexpr float const delta_f32 = 0.05f;
-constexpr float const scale_1_4_f32 = 0.75f;
-constexpr float const scale_1_4_diff_f32 = scale_1_4_f32 - 1.0f; // For branchless scaling
-
-#pragma endregion
-
-#pragma region Atom-Centric Data Structures
-
-/**
- * TODO: Consider a dense per-atom coordinate layout for molecules under 256 atoms.
- * For small molecules, storing coordinates inline with AoS layout and using
- * register-based accumulation could further reduce memory traffic.
- * Current implementation uses shuffle-based coordinate access which works well
- * for molecules up to 32 atoms per warp.
- */
+constexpr float coulomb_const_f32 = 332.0716f;
+constexpr float delta_f32 = 0.05f;
+constexpr float scale_1_4_f32 = 0.75f;
+constexpr float scale_1_4_diff_f32 = scale_1_4_f32 - 1.0f;
 
 /**
  * Neighbor entry in symmetric adjacency list.
@@ -54,13 +38,8 @@ constexpr float const scale_1_4_diff_f32 = scale_1_4_f32 - 1.0f; // For branchle
  * Each pair (A, B) is stored twice:
  * - In A's neighbor list with j=B and sign=-1 (force on A)
  * - In B's neighbor list with j=A and sign=+1 (force on B)
- *
- * Memory layout (16 bytes aligned for coalesced loads):
- * ┌───────┬───────┬────────┬─────────┬────────┬───────────┐
- * │ j (1) │sign(1)│flags(2)│ eps (4) │rstar(4)│q_prod (4) │
- * └───────┴───────┴────────┴─────────┴────────┴───────────┘
  */
-struct __align__(16) neighbor_t {
+struct alignas(16) neighbor_t {
     std::uint8_t j;      // Neighbor atom index within molecule (0-255)
     std::int8_t sign;    // Force direction: -1 or +1
     std::uint16_t flags; // Bit 0 = is_1_4
@@ -71,27 +50,13 @@ struct __align__(16) neighbor_t {
 
 static_assert(sizeof(neighbor_t) == 16, "neighbor_t must be 16 bytes");
 
-/**
- * Per-molecule metadata for atom-centric kernel.
- *
- * Layout:
- * ┌─────────────────────────────────────────────────────────────┐
- * │  atom_start: First atom index in global coordinate array   │
- * │  n_atoms:    Number of atoms in this molecule              │
- * │  neighbor_start: First neighbor in global neighbor array   │
- * │  n_neighbors: Total neighbors (2x pairs due to symmetry)   │
- * └─────────────────────────────────────────────────────────────┘
- */
+/** Per-molecule metadata for atom-centric kernel. */
 struct mol_meta_t {
     std::uint32_t atom_start;     // First atom index in global array
     std::uint32_t n_atoms;        // Number of atoms in molecule
     std::uint32_t neighbor_start; // First neighbor in neighbor array
     std::uint32_t n_neighbors;    // Total neighbors (2x pairs)
 };
-
-#pragma endregion
-
-#pragma region FP16 Helper Functions
 
 /**
  * Fast reciprocal square root for FP16.
@@ -113,10 +78,6 @@ __device__ __forceinline__ half h_sqrt_(half x) { return hsqrt(x); }
  */
 __device__ __forceinline__ half h_fma_(half a, half b, half c) { return __hfma(a, b, c); }
 
-#pragma endregion
-
-#pragma region FP16 half2 Packed Helper Functions
-
 /**
  * Fast reciprocal square root for half2 (packed FP16).
  */
@@ -137,15 +98,6 @@ __device__ __forceinline__ half2 h2_sqrt_(half2 x) { return h2sqrt(x); }
  */
 __device__ __forceinline__ half2 h2_fma_(half2 a, half2 b, half2 c) { return __hfma2(a, b, c); }
 
-#pragma endregion
-
-#pragma region Warp Reduction
-
-// warp_reduce_sum_f32_ is defined in src/lbfgs_warp.cuh
-
-#pragma endregion
-
-#pragma region Distance Computation
 
 /**
  * Euclidean distance in FP16.
@@ -199,10 +151,6 @@ __device__ __forceinline__ half2 compute_distance_f16_pair_(half2 const xi, half
 
     return h2_sqrt_(r2);
 }
-
-#pragma endregion
-
-#pragma region VdW Energy Computation
 
 /**
  * MMFF94 Buffered 14-7 van der Waals energy (FP16 compute, FP32 accumulation).
@@ -312,10 +260,6 @@ __device__ __forceinline__ float compute_vdw_energy_f16_pair_(half2 const r, hal
     return e_low + e_high;
 }
 
-#pragma endregion
-
-#pragma region Electrostatic Energy Computation
-
 /**
  * MMFF94 Buffered Coulomb electrostatic energy (FP16 compute, FP32 accumulation).
  *
@@ -383,10 +327,6 @@ __device__ __forceinline__ float compute_elec_energy_f16_pair_(half2 const r, ha
 
     return e_low * scale_low + e_high * scale_high;
 }
-
-#pragma endregion
-
-#pragma region VdW Gradient Computation
 
 /**
  * MMFF94 Buffered 14-7 van der Waals gradient (FP32 compute).
@@ -485,10 +425,6 @@ __device__ __forceinline__ float compute_vdw_gradient_f16_(half const r, half co
 
     return __half2float(dE_dr);
 }
-
-#pragma endregion
-
-#pragma region VdW Energy Kernels
 
 /**
  * MMFF94 van der Waals energy kernel (FP16 compute with half2 packed operations, FP32 accumulation).
@@ -616,10 +552,6 @@ __global__ void mmff94_vdw_energy_kernel_f32(float const* coord_x, float const* 
         out_vdw[mol_idx] = vdw_total;
     }
 }
-
-#pragma endregion
-
-#pragma region Electrostatic Energy Kernels
 
 /**
  * MMFF94 electrostatic energy kernel (FP16 compute with half2 packed operations, FP32 accumulation).
@@ -752,10 +684,6 @@ __global__ void mmff94_elec_energy_kernel_f32(float const* coord_x, float const*
     }
 }
 
-#pragma endregion
-
-#pragma region Electrostatic Gradient Computation
-
 /**
  * MMFF94 Buffered Coulomb electrostatic gradient (FP32 compute).
  *
@@ -814,10 +742,6 @@ __device__ __forceinline__ void compute_elec_gradient_f16_(half const r, half co
     *fy = -scaled_grad * __half2float(dy) * __half2float(inv_r);
     *fz = -scaled_grad * __half2float(dz) * __half2float(inv_r);
 }
-
-#pragma endregion
-
-#pragma region Electrostatic Gradient Kernels
 
 /**
  * MMFF94 electrostatic gradient kernel (FP32 compute and accumulation).
@@ -932,10 +856,6 @@ __global__ void mmff94_elec_gradient_kernel_f16(half const* coord_x, half const*
         atomicAdd(&grad_z[j], fz);
     }
 }
-
-#pragma endregion
-
-#pragma region VdW Gradient Kernels
 
 /**
  * MMFF94 van der Waals gradient kernel (FP32 compute and accumulation).
@@ -1061,13 +981,6 @@ __global__ void mmff94_vdw_gradient_kernel_f16(half const* coord_x, half const* 
     }
 }
 
-#pragma endregion
-
-#pragma region L-BFGS Optimizer
-
-// lbfgs_workspace_size_, warp_dot_product_f32_, warp_rms_f32_,
-// and lbfgs_two_loop_recursion_ are defined in src/lbfgs_warp.cuh.
-// The MMFF94 kernels below call them directly.
 
 /**
  * Backtracking line search with Armijo condition.
@@ -1568,10 +1481,6 @@ __global__ void mmff94_lbfgs_optimize_kernel_f16(
     }
 }
 
-#pragma endregion
-
-#pragma region Atom-Centric Kernels
-
 /**
  * Atom-centric MMFF94 energy and gradient kernel (FP32).
  *
@@ -1826,8 +1735,6 @@ __global__ void mmff94_energy_atom_centric_f32(float const* __restrict__ coords,
         energy_out[mol] = total_energy;
     }
 }
-
-#pragma endregion
 
 } // namespace smallfield
 

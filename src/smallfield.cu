@@ -14,7 +14,6 @@
  *  Namespace: smallfield
  *  Internal functions end with underscore (_)
  *  Uses std::size_t for positive indexes
- *  East Const style
  */
 
 #include <pybind11/numpy.h>
@@ -40,8 +39,6 @@
 
 namespace py = pybind11;
 namespace smallfield {
-
-#pragma region Allocators and Aligned Buffers
 
 /**
  *  @brief CPU memory allocator using std::aligned_alloc.
@@ -138,10 +135,6 @@ struct aligned_buffer {
     scalar_t const& operator[](std::size_t i) const noexcept { return data_[i]; }
 };
 
-#pragma endregion
-
-#pragma region Structured Buffer Types
-
 /**
  *  @brief Coordinate buffers for a batch of atoms (x, y, z).
  *
@@ -213,10 +206,6 @@ struct batch_buffers_t {
     std::int32_t* end_data() noexcept { return mol_end.data(); }
     float* energy_data() noexcept { return out_energy.data(); }
 };
-
-#pragma endregion
-
-#pragma region Atom-Centric Buffers
 
 #if defined(__CUDACC__)
 /**
@@ -371,10 +360,6 @@ inline void build_symmetric_adjacency_list_(std::int32_t const* pair_i, std::int
     }
 }
 #endif // __CUDACC__
-
-#pragma endregion
-
-#pragma region context_t Class
 
 /**
  *  @brief Context for SmallField MMFF94 force field calculations.
@@ -1456,10 +1441,6 @@ class context_t {
     }
 };
 
-#pragma endregion
-
-#pragma region Internal Helpers
-
 /**
  *  @brief Check if CUDA support is available at compile time.
  */
@@ -1503,10 +1484,6 @@ inline bool supports_avx512_fp16_() noexcept {
     return false;
 #endif
 }
-
-#pragma endregion
-
-#pragma region Serial CPU Kernels
 
 /**
  *  @brief Compute van der Waals energy using serial CPU kernel (F32).
@@ -1610,10 +1587,6 @@ double compute_electrostatic_energy_serial_f64_(py::array_t<double> coords_x, py
         scaling_1_4);
 }
 
-#pragma endregion
-
-#pragma region AVX-512 Skylake F32 Kernels
-
 #if defined(__AVX512F__)
 
 /**
@@ -1669,10 +1642,6 @@ float compute_electrostatic_energy_skylake_f32_(py::array_t<float> coords_x, py:
 
 #endif // __AVX512F__
 
-#pragma endregion
-
-#pragma region AVX-512 Genoa BF16 Kernels
-
 #if defined(__AVX512BF16__)
 
 /**
@@ -1700,10 +1669,6 @@ float compute_vdw_energy_genoa_bf16_(py::array_t<std::uint16_t> coords_x, py::ar
 }
 
 #endif // __AVX512BF16__
-
-#pragma endregion
-
-#pragma region AVX-512 Turin FP16 Kernels
 
 #if defined(__AVX512FP16__)
 
@@ -1736,10 +1701,6 @@ float compute_vdw_energy_turin_fp16_(py::array_t<std::uint16_t> coords_x, py::ar
 }
 
 #endif // __AVX512FP16__
-
-#pragma endregion
-
-#pragma region CUDA GPU Kernels
 
 #if defined(__CUDACC__)
 
@@ -2097,10 +2058,6 @@ float compute_electrostatic_energy_cuda_f32_(py::array_t<float> coords_x, py::ar
 
 #endif // __CUDACC__
 
-#pragma endregion
-
-#pragma region ETKDG Pipeline Context
-
 #if defined(__CUDACC__)
 
 class etkdg_context_t {
@@ -2216,11 +2173,7 @@ class etkdg_context_t {
 
 #endif // __CUDACC__
 
-#pragma endregion
-
 } // namespace smallfield
-
-#pragma region Pybind11 Module Definition
 
 PYBIND11_MODULE(_smallfield, m) {
     m.doc() = "SmallField MMFF94 force field implementation with CPU and GPU support";
@@ -2412,5 +2365,3 @@ PYBIND11_MODULE(_smallfield, m) {
              py::arg("max_stereo_attempts") = 20, py::arg("random_seed") = 42);
 #endif
 }
-
-#pragma endregion

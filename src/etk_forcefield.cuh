@@ -109,17 +109,20 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const* posi
     float const sin_phi_sq = 1.0f - cos_phi * cos_phi;
     float const sin_phi = (sin_phi_sq > 0.0f) ? sqrtf(sin_phi_sq) : 0.0f;
 
-    // __sincosf + Chebyshev recurrence for Fourier series
+    // Chebyshev recurrence for 6-term Fourier series
     float energy = 0.0f;
     float dE_dphi = 0.0f;
+    float d2E_dphi2 = 0.0f;
     float sin_prev = 0.0f, cos_prev = 1.0f;
     float sin_curr = sin_phi, cos_curr = cos_phi;
 
     for (std::uint32_t n = 1; n <= 6; ++n) {
         float const coeff = torsion.fourier_coefficients[n - 1];
         if (coeff != 0.0f) {
+            float const nf = static_cast<float>(n);
             energy += coeff * cos_curr;
-            dE_dphi -= static_cast<float>(n) * coeff * sin_curr;
+            dE_dphi -= nf * coeff * sin_curr;
+            d2E_dphi2 -= nf * nf * coeff * cos_curr;
         }
         // Chebyshev: sin((n+1)φ) = 2cos(φ)sin(nφ) − sin((n−1)φ)
         float const sin_next = 2.0f * cos_phi * sin_curr - sin_prev;
@@ -133,10 +136,11 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const* posi
     if (!write_gradient)
         return energy;
 
-    if (fabsf(cos_phi) < 1e-8f && fabsf(sin_phi) < 1e-8f)
-        return energy;
-
-    float const sin_term = (fabsf(sin_phi) < 1e-8f) ? (-dE_dphi / cos_phi) : (-dE_dphi / sin_phi);
+    // sin_term = -dE_dphi / sin(φ), needed for the chain rule ∂E/∂r = sin_term · ∂cos(φ)/∂r
+    // at φ = 0 or π, sin(φ) → 0 but dE_dphi → 0 too (sin(nφ) = 0 for integer n).
+    // L'Hopital: lim[sin→0] dE_dphi/sin(φ) = d²E/dφ² / cos(φ)
+    float const sin_term =
+        (fabsf(sin_phi) > 1e-6f) ? (-dE_dphi / sin_phi) : (-d2E_dphi2 / fmaxf(fabsf(cos_phi), 1e-10f));
 
     float const dCos_dT[6] = {
         inv_d0 * (t1x - cos_phi * t0x), inv_d0 * (t1y - cos_phi * t0y), inv_d0 * (t1z - cos_phi * t0z),

@@ -146,12 +146,12 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
         }
         __syncwarp(fire_full_mask);
 
-        // velocity Verlet integration with displacement clamping
+        // velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt
         for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size) {
-            velocities[i] -= gradient[i] * dt;
-            float displacement = velocities[i] * dt;
+            float displacement = velocities[i] * dt - 0.5f * gradient[i] * dt * dt;
             displacement = fmaxf(-0.5f, fminf(0.5f, displacement));
             positions[i] += displacement;
+            velocities[i] -= gradient[i] * dt;
         }
         __syncwarp(fire_full_mask);
     }

@@ -33,8 +33,12 @@ using clock_type = std::chrono::high_resolution_clock;
 // GPU kernel wrapper (defined in bench_chembl_kernels.cu)
 extern "C" {
 struct gpu_pipeline_result_t {
+    float upload_time_ms;
     float kernel_time_ms;
+    float download_time_ms;
     std::uint32_t num_succeeded;
+    std::uint32_t grid_size;
+    std::uint32_t blocks_per_sm;
 };
 
 gpu_pipeline_result_t
@@ -181,15 +185,18 @@ static void bench_smallfield_gpu(std::vector<std::string> const& smiles, std::ui
         batch_out.num_molecules, coords_out.data(), energies_out.data(), status_out.data(), num_conformers,
         max_stereo_attempts, batch_out.max_atoms_per_molecule, 42);
 
-    auto t1 = clock_type::now();
-    double const total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    double const mol_per_sec = batch_out.num_molecules / (total_ms / 1000.0);
-    double const conf_per_sec = result.num_succeeded / (total_ms / 1000.0);
+    double const gpu_total_ms = result.upload_time_ms + result.kernel_time_ms + result.download_time_ms;
+    double const e2e_ms = preproc_ms + gpu_total_ms;
+    double const mol_per_sec = batch_out.num_molecules / (e2e_ms / 1000.0);
+    double const conf_per_sec = result.num_succeeded / (e2e_ms / 1000.0);
 
+    std::printf("  GPU: grid=%u (%u blocks/SM)\n", result.grid_size, result.blocks_per_sm);
+    std::printf("  Upload:      %.2f ms\n", result.upload_time_ms);
     std::printf("  Kernel:      %.2f ms\n", result.kernel_time_ms);
-    std::printf("  Total:       %.0f ms (preproc %.0f + kernel %.2f + overhead %.0f)\n", total_ms, preproc_ms,
-                static_cast<double>(result.kernel_time_ms), total_ms - preproc_ms - result.kernel_time_ms);
-    std::printf("  Mol/s:       %.1f (end-to-end)\n", mol_per_sec);
+    std::printf("  Download:    %.2f ms\n", result.download_time_ms);
+    std::printf("  GPU total:   %.2f ms (upload + kernel + download)\n", gpu_total_ms);
+    std::printf("  End-to-end:  %.0f ms (preproc %.0f + GPU %.0f)\n", e2e_ms, preproc_ms, gpu_total_ms);
+    std::printf("  Mol/s:       %.1f\n", mol_per_sec);
     std::printf("  Conf/s:      %.1f\n", conf_per_sec);
     std::printf("  Succeeded:   %u / %u conformers\n", result.num_succeeded, total_conf);
 

@@ -120,7 +120,6 @@ __global__ void etkdg_pipeline_warp_kernel(
     // shared memory partitioning
     extern __shared__ char shared_raw[];
     std::uint32_t const max_n = max_atoms_per_molecule;
-    std::uint32_t const dim4_max = 4 * max_n;
 
     __half* shared_bounds = reinterpret_cast<__half*>(shared_raw);
     std::uint32_t float_offset = (max_n * max_n * sizeof(__half) + sizeof(float) - 1) / sizeof(float);
@@ -226,7 +225,7 @@ __global__ void etkdg_pipeline_warp_kernel(
 
                         float mmff_energy = 0.0f;
                         std::int32_t mmff_iterations = 0, mmff_status = 0;
-                        fire_minimize_(positions, velocities, gradient, dim3, 500, 1e-4f, lane, mmff_functor,
+                        fire_minimize_(positions, velocities, gradient, dim3, 200, 1e-4f, lane, mmff_functor,
                                        &mmff_energy, &mmff_iterations, &mmff_status);
                         final_energy = mmff_energy;
                     }

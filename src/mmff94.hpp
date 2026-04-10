@@ -29,59 +29,48 @@
 
 namespace smallfield {
 
-#pragma region Constants
-// Van der Waals Constants
 /**  Van der Waals delta parameter for buffered 14-7 potential. */
-float constexpr vdw_delta = 0.07f;
+constexpr float vdw_delta = 0.07f;
 
 /**  Van der Waals gamma parameter for buffered 14-7 potential. */
-float constexpr vdw_gamma = 0.12f;
-// Electrostatic Constants
+constexpr float vdw_gamma = 0.12f;
 /**  Electrostatic conversion constant (kcal*A/mol/e^2). */
-float constexpr elec_constant = 332.0716f;
+constexpr float elec_constant = 332.0716f;
 
 /**  Electrostatic buffer to prevent singularities (Angstroms). */
-float constexpr elec_buffer = 0.05f;
+constexpr float elec_buffer = 0.05f;
 
 /**  Default 1-4 scaling factor for electrostatic interactions. */
-float constexpr scale_1_4_default = 0.75f;
-// Bond Stretching Constants (Quartic Potential)
+constexpr float scale_1_4_default = 0.75f;
 /**  Bond prefactor: converts mdyn*A to kcal/mol. */
-float constexpr bond_prefactor = 143.9325f;
+constexpr float bond_prefactor = 143.9325f;
 
 /**  Cubic stretch constant (A^-1). */
-float constexpr bond_cubic_stretch = -2.0f;
-// Angle Bending Constants (Cubic Polynomial)
+constexpr float bond_cubic_stretch = -2.0f;
 /**  Angle prefactor: 143.9325 * (pi/180)^2 = 0.043844 (mdyn*A/rad^2 -> kcal/mol/deg^2). */
-float constexpr angle_prefactor = 0.043844f;
+constexpr float angle_prefactor = 0.043844f;
 
 /**  Cubic bend constant (deg^-1). */
-float constexpr angle_cubic_bend = -0.006981317f;
-// Torsion Constants (Cosine Series)
+constexpr float angle_cubic_bend = -0.007f;
 /**  Torsion prefactor. */
-float constexpr torsion_prefactor = 0.5f;
-// Stretch-Bend Coupling Constants
+constexpr float torsion_prefactor = 0.5f;
 /**  Stretch-bend prefactor: 143.9325 * (pi/180) = 2.51210 */
-float constexpr stretch_bend_prefactor = 2.51210f;
-// Out-of-Plane Bending Constants
+constexpr float stretch_bend_prefactor = 2.51210f;
 /**  OOP prefactor (same as angle prefactor). */
-float constexpr oop_prefactor = 0.043844f;
-// Numerical Constants
+constexpr float oop_prefactor = 0.043844f;
 /**  Minimum distance squared to avoid numerical instabilities. */
-float constexpr min_distance_squared = 0.01f;
+constexpr float min_distance_squared = 0.01f;
 
 /**  Pi constant. */
-double constexpr pi = 3.14159265358979323846;
+constexpr double pi = 3.14159265358979323846;
 
 /**  Degrees to radians conversion. */
-double constexpr deg_to_rad = pi / 180.0;
+constexpr double deg_to_rad = pi / 180.0;
 
 /**  Radians to degrees conversion. */
-double constexpr rad_to_deg = 180.0 / pi;
+constexpr double rad_to_deg = 180.0 / pi;
 
-#pragma endregion
 
-#pragma region Helpers
 
 /**  Compute x^7 efficiently as x * x^2 * x^4. */
 template <typename scalar_type_> inline scalar_type_ pow7_(scalar_type_ x) {
@@ -153,9 +142,7 @@ template <typename scalar_type_> inline scalar_type_ norm_(vec3<scalar_type_> co
     return value;
 }
 
-#pragma endregion
 
-#pragma region L-BFGS Data Structures
 
 /**
  *  @brief State container for L-BFGS optimizer.
@@ -193,9 +180,7 @@ struct optimize_result_t {
     double rms_gradient; // RMS gradient magnitude
 };
 
-#pragma endregion
 
-#pragma region Precomputed VdW Pair Constants
 
 /**
  *  @brief Precomputed VdW pair constants for eliminating redundant calculations.
@@ -225,10 +210,10 @@ void precompute_vdw_constants(scalar_type_ const* pair_equilibrium_distance, std
                               vdw_precomputed<scalar_type_>& out) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr delta = static_cast<scalar_t>(vdw_delta);
-    scalar_t constexpr gamma = static_cast<scalar_t>(vdw_gamma);
-    scalar_t constexpr one_plus_delta = static_cast<scalar_t>(1.0 + vdw_delta);
-    scalar_t constexpr one_plus_gamma = static_cast<scalar_t>(1.0 + vdw_gamma);
+    constexpr scalar_t delta = static_cast<scalar_t>(vdw_delta);
+    constexpr scalar_t gamma = static_cast<scalar_t>(vdw_gamma);
+    constexpr scalar_t one_plus_delta = static_cast<scalar_t>(1.0 + vdw_delta);
+    constexpr scalar_t one_plus_gamma = static_cast<scalar_t>(1.0 + vdw_gamma);
 
     for (std::size_t i = 0; i < n_pairs; ++i) {
         scalar_t const eq_dist = pair_equilibrium_distance[i];
@@ -242,9 +227,7 @@ void precompute_vdw_constants(scalar_type_ const* pair_equilibrium_distance, std
     }
 }
 
-#pragma endregion
 
-#pragma region MMFF94 Force Field Parameters
 
 /**
  *  @brief All MMFF94 force field parameters for a molecule.
@@ -316,9 +299,7 @@ template <typename scalar_type_> struct mmff94_params {
 using mmff94_params_f32_t = mmff94_params<float>;
 using mmff94_params_f64_t = mmff94_params<double>;
 
-#pragma endregion
 
-#pragma region Serial Kernels
 
 /**
  *  Compute van der Waals energy using MMFF94 buffered 14-7 potential.
@@ -331,11 +312,11 @@ scalar_type_ compute_vdw_energy(scalar_type_ const* coord_x, scalar_type_ const*
                                 std::size_t pair_start, std::size_t pair_count) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr delta = static_cast<scalar_t>(vdw_delta);
-    scalar_t constexpr gamma = static_cast<scalar_t>(vdw_gamma);
-    scalar_t constexpr one_plus_delta = static_cast<scalar_t>(1.0 + vdw_delta);
-    scalar_t constexpr one_plus_gamma = static_cast<scalar_t>(1.0 + vdw_gamma);
-    scalar_t constexpr two = static_cast<scalar_t>(2.0);
+    constexpr scalar_t delta = static_cast<scalar_t>(vdw_delta);
+    constexpr scalar_t gamma = static_cast<scalar_t>(vdw_gamma);
+    constexpr scalar_t one_plus_delta = static_cast<scalar_t>(1.0 + vdw_delta);
+    constexpr scalar_t one_plus_gamma = static_cast<scalar_t>(1.0 + vdw_gamma);
+    constexpr scalar_t two = static_cast<scalar_t>(2.0);
 
     scalar_t accum = 0;
 
@@ -381,12 +362,12 @@ void compute_vdw_gradient(scalar_type_ const* coord_x, scalar_type_ const* coord
                           scalar_type_* grad_z) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr delta = static_cast<scalar_t>(vdw_delta);
-    scalar_t constexpr gamma = static_cast<scalar_t>(vdw_gamma);
-    scalar_t constexpr one_plus_delta = static_cast<scalar_t>(1.0 + vdw_delta);
-    scalar_t constexpr one_plus_gamma = static_cast<scalar_t>(1.0 + vdw_gamma);
-    scalar_t constexpr two = static_cast<scalar_t>(2.0);
-    scalar_t constexpr seven = static_cast<scalar_t>(7.0);
+    constexpr scalar_t delta = static_cast<scalar_t>(vdw_delta);
+    constexpr scalar_t gamma = static_cast<scalar_t>(vdw_gamma);
+    constexpr scalar_t one_plus_delta = static_cast<scalar_t>(1.0 + vdw_delta);
+    constexpr scalar_t one_plus_gamma = static_cast<scalar_t>(1.0 + vdw_gamma);
+    constexpr scalar_t two = static_cast<scalar_t>(2.0);
+    constexpr scalar_t seven = static_cast<scalar_t>(7.0);
 
     std::size_t const pair_end = pair_start + pair_count;
     for (std::size_t idx = pair_start; idx < pair_end; ++idx) {
@@ -457,9 +438,9 @@ scalar_type_ compute_electrostatic_energy(scalar_type_ const* coord_x, scalar_ty
                                           scalar_type_ scaling_1_4 = static_cast<scalar_type_>(scale_1_4_default)) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr coulomb = static_cast<scalar_t>(elec_constant);
-    scalar_t constexpr buffer = static_cast<scalar_t>(elec_buffer);
-    scalar_t constexpr one = static_cast<scalar_t>(1.0);
+    constexpr scalar_t coulomb = static_cast<scalar_t>(elec_constant);
+    constexpr scalar_t buffer = static_cast<scalar_t>(elec_buffer);
+    constexpr scalar_t one = static_cast<scalar_t>(1.0);
 
     scalar_t const scale_diff = scaling_1_4 - one;
     scalar_t accum = 0;
@@ -508,9 +489,9 @@ void compute_electrostatic_gradient(scalar_type_ const* coord_x, scalar_type_ co
                                     scalar_type_* grad_x, scalar_type_* grad_y, scalar_type_* grad_z) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr coulomb = static_cast<scalar_t>(elec_constant);
-    scalar_t constexpr buffer = static_cast<scalar_t>(elec_buffer);
-    scalar_t constexpr one = static_cast<scalar_t>(1.0);
+    constexpr scalar_t coulomb = static_cast<scalar_t>(elec_constant);
+    constexpr scalar_t buffer = static_cast<scalar_t>(elec_buffer);
+    constexpr scalar_t one = static_cast<scalar_t>(1.0);
 
     scalar_t const scale_diff = scaling_1_4 - one;
 
@@ -556,7 +537,6 @@ void compute_electrostatic_gradient(scalar_type_ const* coord_x, scalar_type_ co
         grad_z[j] += dE_dz;
     }
 }
-// Bond Stretching Energy and Gradient (Quartic Potential)
 /**
  *  Compute bond stretching energy using MMFF94 quartic potential.
  *  E = 0.5 * 143.9325 * kb * dr^2 * (1 + cs*dr + 7/12*cs^2*dr^2)
@@ -568,10 +548,10 @@ scalar_type_ compute_bond_energy(scalar_type_ const* coord_x, scalar_type_ const
                                  std::size_t bond_count) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr prefactor = static_cast<scalar_t>(bond_prefactor);
-    scalar_t constexpr cs = static_cast<scalar_t>(bond_cubic_stretch);
-    scalar_t constexpr cs2 = cs * cs;
-    scalar_t constexpr seven_twelfths = static_cast<scalar_t>(7.0 / 12.0);
+    constexpr scalar_t prefactor = static_cast<scalar_t>(bond_prefactor);
+    constexpr scalar_t cs = static_cast<scalar_t>(bond_cubic_stretch);
+    constexpr scalar_t cs2 = cs * cs;
+    constexpr scalar_t seven_twelfths = static_cast<scalar_t>(7.0 / 12.0);
 
     scalar_t accum = 0;
 
@@ -609,11 +589,11 @@ void compute_bond_gradient(scalar_type_ const* coord_x, scalar_type_ const* coor
                            std::size_t bond_count, scalar_type_* grad_x, scalar_type_* grad_y, scalar_type_* grad_z) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr prefactor = static_cast<scalar_t>(bond_prefactor);
-    scalar_t constexpr cs = static_cast<scalar_t>(bond_cubic_stretch);
-    scalar_t constexpr cs2 = cs * cs;
-    scalar_t constexpr one_point_five = static_cast<scalar_t>(1.5);
-    scalar_t constexpr seven_sixths = static_cast<scalar_t>(7.0 / 6.0);
+    constexpr scalar_t prefactor = static_cast<scalar_t>(bond_prefactor);
+    constexpr scalar_t cs = static_cast<scalar_t>(bond_cubic_stretch);
+    constexpr scalar_t cs2 = cs * cs;
+    constexpr scalar_t one_point_five = static_cast<scalar_t>(1.5);
+    constexpr scalar_t seven_sixths = static_cast<scalar_t>(7.0 / 6.0);
 
     std::size_t const bond_end = bond_start + bond_count;
     for (std::size_t idx = bond_start; idx < bond_end; ++idx) {
@@ -649,7 +629,6 @@ void compute_bond_gradient(scalar_type_ const* coord_x, scalar_type_ const* coor
         grad_z[j] += fz;
     }
 }
-// Angle Bending Energy and Gradient (Cubic Polynomial)
 /**
  *  Compute angle bending energy using MMFF94 cubic polynomial.
  *  E = 0.5 * 0.043844 * ka * dtheta^2 * (1 + cb*dtheta)
@@ -662,9 +641,9 @@ scalar_type_ compute_angle_energy(scalar_type_ const* coord_x, scalar_type_ cons
                                   scalar_type_ const* angle_theta0, std::size_t angle_start, std::size_t angle_count) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr prefactor = static_cast<scalar_t>(angle_prefactor);
-    scalar_t constexpr cb = static_cast<scalar_t>(angle_cubic_bend);
-    scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
+    constexpr scalar_t prefactor = static_cast<scalar_t>(angle_prefactor);
+    constexpr scalar_t cb = static_cast<scalar_t>(angle_cubic_bend);
+    constexpr scalar_t to_deg = static_cast<scalar_t>(rad_to_deg);
 
     scalar_t accum = 0;
 
@@ -744,9 +723,9 @@ void compute_angle_gradient(scalar_type_ const* coord_x, scalar_type_ const* coo
             (sin_theta_sq > static_cast<scalar_t>(0.0) ? std::sqrt(sin_theta_sq) : static_cast<scalar_t>(0.0)),
             static_cast<scalar_t>(1e-8));
 
-        scalar_t constexpr cb = static_cast<scalar_t>(angle_cubic_bend);
-        scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
-        scalar_t constexpr c2 = static_cast<scalar_t>(angle_prefactor);
+        constexpr scalar_t cb = static_cast<scalar_t>(angle_cubic_bend);
+        constexpr scalar_t to_deg = static_cast<scalar_t>(rad_to_deg);
+        constexpr scalar_t c2 = static_cast<scalar_t>(angle_prefactor);
         scalar_t const theta0 = angle_theta0[idx];
         scalar_t const angle_term = to_deg * std::acos(cos_theta) - theta0;
         scalar_t const ka = angle_ka[idx];
@@ -775,7 +754,6 @@ void compute_angle_gradient(scalar_type_ const* coord_x, scalar_type_ const* coo
         grad_z[k] += dE_dtheta * dCos_dS6 * inv_sin;
     }
 }
-// Torsion Energy and Gradient (Cosine Series)
 /**
  *  Compute torsion energy using MMFF94 3-term cosine series.
  *  E = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
@@ -789,7 +767,7 @@ scalar_type_ compute_torsion_energy(scalar_type_ const* coord_x, scalar_type_ co
                                     std::size_t torsion_start, std::size_t torsion_count) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr prefactor = static_cast<scalar_t>(torsion_prefactor);
+    constexpr scalar_t prefactor = static_cast<scalar_t>(torsion_prefactor);
 
     scalar_t accum = 0;
 
@@ -954,7 +932,6 @@ void compute_torsion_gradient(scalar_type_ const* coord_x, scalar_type_ const* c
         grad_z[l] += sin_term * (dCos_dT[3] * r[2].y - dCos_dT[4] * r[2].x);
     }
 }
-// Stretch-Bend Coupling Energy and Gradient
 /**
  *  Compute stretch-bend coupling energy.
  *  E = 2.51210 * (kba_ijk * dr_ij + kba_kji * dr_kj) * dtheta
@@ -969,8 +946,8 @@ scalar_type_ compute_stretch_bend_energy(scalar_type_ const* coord_x, scalar_typ
                                          std::size_t stbn_count) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr prefactor = static_cast<scalar_t>(stretch_bend_prefactor);
-    scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
+    constexpr scalar_t prefactor = static_cast<scalar_t>(stretch_bend_prefactor);
+    constexpr scalar_t to_deg = static_cast<scalar_t>(rad_to_deg);
 
     scalar_t accum = 0;
 
@@ -1048,8 +1025,8 @@ void compute_stretch_bend_gradient(scalar_type_ const* coord_x, scalar_type_ con
             (sin_theta_sq > static_cast<scalar_t>(0.0) ? std::sqrt(sin_theta_sq) : static_cast<scalar_t>(0.0)),
             static_cast<scalar_t>(1e-8));
 
-        scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
-        scalar_t constexpr c5 = static_cast<scalar_t>(stretch_bend_prefactor);
+        constexpr scalar_t to_deg = static_cast<scalar_t>(rad_to_deg);
+        constexpr scalar_t c5 = static_cast<scalar_t>(stretch_bend_prefactor);
         scalar_t const theta0 = stbn_theta0[idx];
         scalar_t const angle_term = to_deg * std::acos(cos_theta) - theta0; // degrees
         // dist_term is sum of (force_constant * bond_deviation) - NO to_deg factor here!
@@ -1079,7 +1056,6 @@ void compute_stretch_bend_gradient(scalar_type_ const* coord_x, scalar_type_ con
         grad_z[k] += c5 * (p32.z * stbn_kba_kji[idx] * angle_term + dCos_dS6 * dTheta_dCos * dist_term);
     }
 }
-// Out-of-Plane Bending Energy and Gradient (Wilson Angle)
 /**
  *  Compute out-of-plane bending energy for sp2 centers.
  *  E = 0.5 * 0.043844 * koop * chi^2
@@ -1093,8 +1069,8 @@ scalar_type_ compute_oop_energy(scalar_type_ const* coord_x, scalar_type_ const*
                                 scalar_type_ const* oop_koop, std::size_t oop_start, std::size_t oop_count) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr prefactor = static_cast<scalar_t>(oop_prefactor);
-    scalar_t constexpr to_deg = static_cast<scalar_t>(rad_to_deg);
+    constexpr scalar_t prefactor = static_cast<scalar_t>(oop_prefactor);
+    constexpr scalar_t to_deg = static_cast<scalar_t>(rad_to_deg);
 
     scalar_t accum = 0;
 
@@ -1264,12 +1240,12 @@ lbfgs_optimize(scalar_type_* coord_x, scalar_type_* coord_y, scalar_type_* coord
                lbfgs_state<scalar_type_>& state) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr zero = static_cast<scalar_t>(0.0);
-    scalar_t constexpr one = static_cast<scalar_t>(1.0);
-    scalar_t constexpr alpha_init =
+    constexpr scalar_t zero = static_cast<scalar_t>(0.0);
+    constexpr scalar_t one = static_cast<scalar_t>(1.0);
+    constexpr scalar_t alpha_init =
         static_cast<scalar_t>(1.0);                          // Initial step size (L-BFGS direction is pre-scaled)
-    scalar_t constexpr c1 = static_cast<scalar_t>(1e-4); // Armijo condition constant
-    scalar_t constexpr rho_ls = static_cast<scalar_t>(0.5); // Line search backtrack factor
+    constexpr scalar_t c1 = static_cast<scalar_t>(1e-4); // Armijo condition constant
+    constexpr scalar_t rho_ls = static_cast<scalar_t>(0.5); // Line search backtrack factor
 
     std::size_t const n_coords = 3 * state.n_atoms;
     optimize_result_t result{-1, 0, 0.0, 0.0};
@@ -1511,11 +1487,11 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_type_* coord_x, scalar_type_* coo
                                         scalar_type_ grad_threshold, lbfgs_state<scalar_type_>& state) {
     using scalar_t = scalar_type_;
 
-    scalar_t constexpr zero = static_cast<scalar_t>(0.0);
-    scalar_t constexpr one = static_cast<scalar_t>(1.0);
-    scalar_t constexpr alpha_init = static_cast<scalar_t>(1.0); // L-BFGS direction is pre-scaled
-    scalar_t constexpr c1 = static_cast<scalar_t>(1e-4);
-    scalar_t constexpr rho_ls = static_cast<scalar_t>(0.5);
+    constexpr scalar_t zero = static_cast<scalar_t>(0.0);
+    constexpr scalar_t one = static_cast<scalar_t>(1.0);
+    constexpr scalar_t alpha_init = static_cast<scalar_t>(1.0); // L-BFGS direction is pre-scaled
+    constexpr scalar_t c1 = static_cast<scalar_t>(1e-4);
+    constexpr scalar_t rho_ls = static_cast<scalar_t>(0.5);
 
     std::size_t const n_coords = 3 * state.n_atoms;
     optimize_result_t result{-1, 0, 0.0, 0.0};
@@ -1812,9 +1788,7 @@ optimize_result_t lbfgs_optimize_mmff94(scalar_type_* coord_x, scalar_type_* coo
     return result;
 }
 
-#pragma endregion
 
-#pragma region AVX-512 F32 Kernels
 
 #if defined(__AVX512F__)
 
@@ -2736,9 +2710,7 @@ inline optimize_result_t lbfgs_optimize_skylake_fast(float* coord_x, float* coor
 
 #endif // __AVX512F__
 
-#pragma endregion
 
-#pragma region AVX-512 BF16 Kernels
 
 #if defined(__AVX512BF16__)
 
@@ -2828,9 +2800,7 @@ inline float compute_vdw_energy_genoa(std::uint16_t const* coord_x, std::uint16_
 
 #endif // __AVX512BF16__
 
-#pragma endregion
 
-#pragma region AVX-512 FP16 Kernels
 
 #if defined(__AVX512FP16__)
 
@@ -2944,6 +2914,5 @@ inline float compute_vdw_energy_turin(_Float16 const* coord_x, _Float16 const* c
 
 #endif // __AVX512FP16__
 
-#pragma endregion
 
 } // namespace smallfield
