@@ -16,7 +16,7 @@
 
 #if defined(__CUDACC__)
 
-#include "lbfgs_warp.cuh"
+#include "warp_primitives.cuh"
 #include <cuda_fp16.h>
 
 namespace smallfield {

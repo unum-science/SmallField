@@ -145,7 +145,7 @@ __global__ void etkdg_pipeline_warp_kernel(
         float const* global_bounds = bounds_matrices + meta.bounds_offset;
         for (std::uint32_t i = lane; i < bounds_size; i += warp_size)
             shared_bounds[i] = __float2half(global_bounds[i]);
-        __syncwarp(fire_full_mask);
+        __syncwarp(full_mask);
 
         triangle_smooth_warp_half_(shared_bounds, num_atoms, lane);
 

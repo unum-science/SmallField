@@ -7,29 +7,20 @@
  * Reports per-wave timing and overall upload/kernel/download breakdown.
  */
 
+#include "bench_chembl_kernels.h"
+#include "etkdg_pipeline.cuh"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cuda_runtime.h>
 #include <numeric>
 #include <vector>
-
-#include <cuda_runtime.h>
-
-#include "etkdg_pipeline.cuh"
 
 using namespace smallfield;
 
 extern "C" {
-
-struct gpu_pipeline_result_t {
-    float upload_time_ms;
-    float kernel_time_ms;
-    float download_time_ms;
-    std::uint32_t num_succeeded;
-    std::uint32_t grid_size;
-    std::uint32_t blocks_per_sm;
-};
 
 gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     float const* host_bounds, std::uint32_t bounds_total_floats, chiral_center_descriptor_t const* host_chirals,

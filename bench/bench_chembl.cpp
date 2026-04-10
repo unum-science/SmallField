@@ -9,6 +9,7 @@
  *   4. Scaling analysis across batch sizes
  */
 
+#include "bench_chembl_kernels.h"
 #include "etkdg_preprocess.hpp"
 #include "test_helpers.hpp"
 
@@ -29,27 +30,6 @@
 using namespace smallfield;
 using namespace smallfield::test;
 using clock_type = std::chrono::high_resolution_clock;
-
-// GPU kernel wrapper (defined in bench_chembl_kernels.cu)
-extern "C" {
-struct gpu_pipeline_result_t {
-    float upload_time_ms;
-    float kernel_time_ms;
-    float download_time_ms;
-    std::uint32_t num_succeeded;
-    std::uint32_t grid_size;
-    std::uint32_t blocks_per_sm;
-};
-
-gpu_pipeline_result_t
-gpu_etkdg_mmff_pipeline(float const*, std::uint32_t, chiral_center_descriptor_t const*, std::uint32_t,
-                        etk_torsion_descriptor_t const*, std::uint32_t, distance_constraint_t const*, std::uint32_t,
-                        mmff94_nonbonded_pair_t const*, std::uint32_t, mmff94_bond_t const*, std::uint32_t,
-                        mmff94_angle_t const*, std::uint32_t, mmff94_torsion_t const*, std::uint32_t,
-                        mmff94_atom_interaction_t const*, std::uint32_t, mmff94_atom_offsets_t const*, std::uint32_t,
-                        etkdg_molecule_metadata_t const*, std::uint32_t, float*, float*, std::uint8_t*, std::uint32_t,
-                        std::uint32_t, std::uint32_t, std::uint64_t);
-}
 
 // load SMILES from file (one per line)
 static std::vector<std::string> load_smiles(std::string const& path, std::uint32_t max_count = 0) {

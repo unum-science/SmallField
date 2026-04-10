@@ -6,7 +6,7 @@
  * Gradient descent with adaptive momentum. Much lighter than L-BFGS:
  * needs only positions + velocities + gradient (3 arrays, no history).
  *
- * Same functor interface as lbfgs_minimize_:
+ * Functor interface:
  *   float functor(positions, gradient, num_elements, lane)
  *   float functor.energy_only(positions, num_elements, lane)
  */
@@ -15,42 +15,9 @@
 
 #if defined(__CUDACC__)
 
-#include <cstdint>
-#include <cuda_runtime.h>
+#include "warp_primitives.cuh"
 
 namespace smallfield {
-
-constexpr std::uint32_t fire_warp_size = 32;
-constexpr unsigned int fire_full_mask = 0xFFFFFFFF;
-
-/** Warp reduction via butterfly XOR shuffles. All lanes get the result. */
-__device__ __forceinline__ float fire_warp_reduce_sum_(float value) {
-    value += __shfl_xor_sync(fire_full_mask, value, 16);
-    value += __shfl_xor_sync(fire_full_mask, value, 8);
-    value += __shfl_xor_sync(fire_full_mask, value, 4);
-    value += __shfl_xor_sync(fire_full_mask, value, 2);
-    value += __shfl_xor_sync(fire_full_mask, value, 1);
-    return value;
-}
-
-/** Warp dot product. */
-__device__ __forceinline__ float fire_warp_dot_(float const* a, float const* b, std::uint32_t num_elements,
-                                                std::uint32_t lane) {
-    float dot = 0.0f;
-    for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size)
-        dot = fmaf(a[i], b[i], dot);
-    return fire_warp_reduce_sum_(dot);
-}
-
-/** Warp RMS: √(Σxᵢ²/n) */
-__device__ __forceinline__ float fire_warp_rms_(float const* x, std::uint32_t num_elements, std::uint32_t lane) {
-    float sum_sq = 0.0f;
-    for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size) {
-        float const val = x[i];
-        sum_sq = fmaf(val, val, sum_sq);
-    }
-    return sqrtf(fire_warp_reduce_sum_(sum_sq) * __frcp_rn(static_cast<float>(num_elements)));
-}
 
 /**
  * FIRE minimization driver.
@@ -89,26 +56,26 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
     int steps_since_reset = 0;
 
     // zero velocities
-    for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size)
+    for (std::uint32_t i = lane; i < num_elements; i += warp_size)
         velocities[i] = 0.0f;
-    __syncwarp(fire_full_mask);
+    __syncwarp(full_mask);
 
     for (std::int32_t iteration = 0; iteration < max_iterations; ++iteration) {
         // compute energy and gradient (gradient = -force, so force = -gradient)
         float const energy = compute_energy_gradient(positions, gradient, num_elements, lane);
-        __syncwarp(fire_full_mask);
+        __syncwarp(full_mask);
 
         // fused computation: rms_gradient, power, v_norm, f_norm in a single pass
         float sum_gg = 0.0f, sum_gv = 0.0f, sum_vv = 0.0f;
-        for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size) {
+        for (std::uint32_t i = lane; i < num_elements; i += warp_size) {
             float const g = gradient[i], v = velocities[i];
             sum_gg = fmaf(g, g, sum_gg);
             sum_gv = fmaf(g, v, sum_gv);
             sum_vv = fmaf(v, v, sum_vv);
         }
-        sum_gg = fire_warp_reduce_sum_(sum_gg);
-        sum_gv = fire_warp_reduce_sum_(sum_gv);
-        sum_vv = fire_warp_reduce_sum_(sum_vv);
+        sum_gg = warp_reduce_sum_f32_(sum_gg);
+        sum_gv = warp_reduce_sum_f32_(sum_gv);
+        sum_vv = warp_reduce_sum_f32_(sum_vv);
 
         float const rms_gradient = sqrtf(sum_gg * __frcp_rn(static_cast<float>(num_elements)));
         if (rms_gradient < gradient_threshold) {
@@ -127,7 +94,7 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
             float const v_over_f = v_norm * __frcp_rn(f_norm);
 
             // v = (1-α)·v + α·|v|·F̂  where F = -gradient
-            for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size) {
+            for (std::uint32_t i = lane; i < num_elements; i += warp_size) {
                 velocities[i] = (1.0f - alpha) * velocities[i] - alpha * v_over_f * gradient[i];
             }
 
@@ -138,22 +105,22 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
             steps_since_reset++;
         } else {
             // decelerating: reset velocity, shrink step
-            for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size)
+            for (std::uint32_t i = lane; i < num_elements; i += warp_size)
                 velocities[i] = 0.0f;
             dt *= f_dec;
             alpha = alpha_start;
             steps_since_reset = 0;
         }
-        __syncwarp(fire_full_mask);
+        __syncwarp(full_mask);
 
         // velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt
-        for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size) {
+        for (std::uint32_t i = lane; i < num_elements; i += warp_size) {
             float displacement = velocities[i] * dt - 0.5f * gradient[i] * dt * dt;
             displacement = fmaxf(-0.5f, fminf(0.5f, displacement));
             positions[i] += displacement;
             velocities[i] -= gradient[i] * dt;
         }
-        __syncwarp(fire_full_mask);
+        __syncwarp(full_mask);
     }
 
     // max iterations reached — report the last computed energy

@@ -14,7 +14,7 @@
 #if defined(__CUDACC__)
 
 #include "etkdg_types.cuh"
-#include "fire_warp.cuh"
+#include "warp_primitives.cuh"
 
 namespace smallfield {
 
@@ -294,14 +294,14 @@ struct mmff94_energy_functor_t {
                                                std::uint32_t lane, bool write_gradient) const {
 
         if (write_gradient) {
-            for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size)
+            for (std::uint32_t i = lane; i < num_elements; i += warp_size)
                 gradient[i] = 0.0f;
-            __syncwarp(fire_full_mask);
+            __syncwarp(full_mask);
         }
 
         float total_energy = 0.0f;
 
-        for (std::uint32_t atom = lane; atom < num_atoms; atom += fire_warp_size) {
+        for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size) {
             float gx = 0.0f, gy = 0.0f, gz = 0.0f;
 
             std::uint32_t const start = atom_offsets[atom].interaction_start;
@@ -340,20 +340,20 @@ struct mmff94_energy_functor_t {
         // remove center-of-mass force (zero mean gradient per dimension)
         // prevents rigid-body translation during FIRE minimization
         if (write_gradient && num_atoms > 1) {
-            __syncwarp(fire_full_mask);
+            __syncwarp(full_mask);
             float const inv_n = __frcp_rn(static_cast<float>(num_atoms));
             for (std::uint32_t d = 0; d < 3; ++d) {
                 float mean_g = 0.0f;
-                for (std::uint32_t i = lane; i < num_atoms; i += fire_warp_size)
+                for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
                     mean_g += gradient[d * num_atoms + i];
-                mean_g = fire_warp_reduce_sum_(mean_g) * inv_n;
-                for (std::uint32_t i = lane; i < num_atoms; i += fire_warp_size)
+                mean_g = warp_reduce_sum_f32_(mean_g) * inv_n;
+                for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
                     gradient[d * num_atoms + i] -= mean_g;
             }
-            __syncwarp(fire_full_mask);
+            __syncwarp(full_mask);
         }
 
-        return fire_warp_reduce_sum_(total_energy);
+        return warp_reduce_sum_f32_(total_energy);
     }
 };
 

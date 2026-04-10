@@ -107,22 +107,6 @@ inline double rdkit_mmff94_energy(RDKit::RWMol& mol, int conformer_id = -1) {
     return force_field->calcEnergy();
 }
 
-/// Optimize with MMFF94 and return the final energy in kcal/mol.
-inline double rdkit_mmff94_optimize(RDKit::RWMol& mol, int max_iterations = 200, int conformer_id = -1) {
-    std::unique_ptr<RDKit::MMFF::MMFFMolProperties> mmff_properties(new RDKit::MMFF::MMFFMolProperties(mol));
-    if (!mmff_properties || !mmff_properties->isValid()) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    std::unique_ptr<ForceFields::ForceField> force_field(
-        RDKit::MMFF::constructForceField(mol, mmff_properties.get(), 100, conformer_id));
-    if (!force_field) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    force_field->initialize();
-    force_field->minimize(max_iterations);
-    return force_field->calcEnergy();
-}
-
 /// Get the smoothed bounds matrix from RDKit as a flat N x N double array.
 inline std::vector<double> rdkit_bounds_matrix(RDKit::RWMol& mol) {
     std::uint32_t const num_atoms = mol.getNumAtoms();

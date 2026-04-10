@@ -26,7 +26,8 @@ macro(add_mixed_bench bench_name)
     target_include_directories(${bench_name} PRIVATE
         ${CMAKE_SOURCE_DIR}
         ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/test)
+        ${CMAKE_SOURCE_DIR}/test
+        ${CMAKE_CURRENT_SOURCE_DIR})
     set_target_properties(${bench_name} PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         LINKER_LANGUAGE CUDA)

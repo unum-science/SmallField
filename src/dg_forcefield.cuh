@@ -21,7 +21,7 @@
 #if defined(__CUDACC__)
 
 #include "etkdg_types.cuh"
-#include "lbfgs_warp.cuh"
+#include "warp_primitives.cuh"
 #include <cuda_fp16.h>
 
 namespace smallfield {

@@ -18,7 +18,7 @@
 #if defined(__CUDACC__)
 
 #include "etkdg_types.cuh"
-#include "lbfgs_warp.cuh"
+#include "warp_primitives.cuh"
 
 namespace smallfield {
 
@@ -180,7 +180,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const* posi
 /**
  * Atom-centric ETK torsion energy and gradient functor.
  * Each thread owns atoms, iterates all torsions checking participation.
- * No atomicAdd. Compatible with lbfgs_minimize_.
+ * No atomicAdd. Compatible with fire_minimize_.
  */
 struct etk_torsion_energy_functor_t {
     etk_torsion_descriptor_t const* torsion_terms;

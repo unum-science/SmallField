@@ -1,89 +1,122 @@
-# SmallField
+![SmallField conformer generation library](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/SmallField.jpg?raw=true)
 
-> Hardware-accelerated Small Molecule conformer generation on CPUs and GPUs.
+__SmallField__ generates 3D conformers from SMILES strings using [ETKDG](https://doi.org/10.1021/acs.jcim.5b00654) distance geometry with experimental torsion preferences followed by [MMFF94](https://doi.org/10.1006/jcat.1996.0027) force field optimization — entirely on the GPU.
+One CUDA warp processes one molecule, running all pipeline stages in shared memory with no global memory atomics.
+CPU preprocessing uses [RDKit](https://github.com/rdkit/rdkit) for SMILES parsing, bounds matrices, CSD torsion lookup, and MMFF94 parameter extraction.
 
-SmallField is a high-performance library for generating 3D conformers of small molecules using mixed precision numerics.
-It implements [Merck Molecular Force Field](https://en.wikipedia.org/wiki/Merck_molecular_force_field) optimization (MMFF94) via the [Limited-memory Broyden–Fletcher–Goldfarb–Shanno algorithm](https://en.wikipedia.org/wiki/Limited-memory_BFGS) (L-BFGS), comparing both throughput and accuracy against [RDKit](https://github.com/rdkit/rdkit)'s baseline.
-It works around the fact that most modern CPUs and GPUs lack `f64` FMA units or Tensor Cores, focusing on `f16` and `bf16` representations with `f32` accumulation instead.
-All of its core data-structures are padded proportionally to SIMD and SIMT widths to maximize hardware utilization and avoid code duplication for loop tails.
-It calculates all 7 energy terms:
+## Pipeline
 
-1. VdW (van der Waals) computed for $O(n²)$ all atom pairs
-2. Electrostatic computed for $O(n²)$ all atom pairs
-3. Bond stretching computed for $O(n)$ bonds
-4. Angle bending computed for $O(n)$ angles
-5. Torsion computed for $O(n)$ torsions
-6. Stretch-bend coupling computed for $O(n)$ stretch-bend terms
-7. Out-of-plane bending computed for $O(n)$ out-of-plane terms
+__CPU (OpenMP, per-molecule):__ SMILES parse + addHs → bounds matrix → chiral centers → CSD torsion Fourier coefficients → MMFF94 params + per-atom interaction lists.
 
-## Backends
+__GPU (one warp per molecule, shared memory):__
 
-CPUs:
+| #    | Stage              | Method                                                    |
+| :--- | :----------------- | :-------------------------------------------------------- |
+| 2    | Triangle smoothing | Floyd-Warshall on half-precision bounds                   |
+| 3    | Random 4D init     | Philox counter-based RNG                                  |
+| 4    | DG minimize        | FIRE optimizer, 4D, atom-centric                          |
+| 5    | Stereo check       | Chiral volume sign validation                             |
+| 6    | 4th-dim crush      | FIRE with w&#8324; penalty                                |
+| 7    | ETK torsion refine | FIRE, 3D, 6-term Fourier + distance constraints           |
+| 8    | Final validation   | Repeat stereo check                                       |
+| 9    | MMFF94 polish      | FIRE, 3D, full force field (VdW + electrostatic + bonded) |
 
-- __Serial__: Templated C++ kernels for `f32` and `f64` arithmetic
-- __Skylake__: AVX-512 kernels for `f32` arithmetic leveraging `rsqrt14`, `rcp14`, and FMA units
-- __Turin__: AVX-512 kernels for `f16` coordinates leveraging `f32` for accumulation
+## Architecture
 
-GPUs:
+- __Atom-centric:__ each thread owns ceil(N/32) atoms, accumulates gradients in registers via `__shfl_sync`.
+  No `atomicAdd`, no pair index scanning.
+- __Half-precision bounds:__ `__half` storage halves shared memory for the N×N bounds matrix, enabling up to 16 blocks/SM for small molecules.
+- __FIRE optimizer:__ 3 shared arrays (positions + velocities + gradient) vs 15 for L-BFGS.
+  Velocity Verlet integration with displacement clamping.
+- __Wave dispatch:__ molecules sorted by atom count, launched in waves (≤32, ≤64, ≤96, ≤128 atoms).
+  Small molecules get 16 blocks/SM, large get 2.
+- __Per-atom interaction lists:__ two-pass build (count, then fill) during preprocessing.
+  GPU iterates only relevant terms per atom.
 
-- __CUDA F32__: NVIDIA H100 kernels using warp reductions
-- __CUDA F16__: NVIDIA H100 kernels for `half2` coordinates and Tensor Cores
+## Performance
+
+Measured on ChEMBL 8,948 drug-like molecules (≤128 atoms with H), 3 conformers each.
+See [BENCH.md](BENCH.md) for full methodology.
+
+| System         | Hardware                    |     Mol/s | Conformers/s |
+| :------------- | :-------------------------- | --------: | -----------: |
+| __SmallField__ | 1x RTX PRO 6000 Blackwell   | __1,245__ |        3,626 |
+| RDKit CPU      | 2x Xeon 6776P (192 threads) |       627 |        1,717 |
+
+NVIDIA's [nvMolKit](https://docs.nvidia.com/bionemo/) also targets GPU conformer generation but requires the BioNeMo proprietary stack.
+SmallField is open-source, runs on any CUDA 12+ GPU, and uses a single persistent warp-loop kernel.
+
+## Python
+
+```python
+import smallfield
+
+coords = smallfield.generate_conformers("c1ccc(CC(=O)O)cc1", num_conformers=10)
+print(coords.shape)  # (K, N, 3) where K = successful conformers
+```
+
+Requires RDKit for preprocessing - `pip install rdkit`.
+The GPU pipeline context is also available directly:
+
+```python
+ctx = smallfield.EtkdgContext(max_atoms=128, max_molecules=1000, max_conformers=10)
+coords, energies, status = ctx.generate_conformers(
+    bounds_flat, chirals, torsions, constraints, metadata,
+    num_conformers=10, max_stereo_attempts=20, random_seed=42)
+```
+
+## C++ Benchmark
+
+```bash
+cd build
+cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc) bench_chembl
+
+LD_LIBRARY_PATH=/path/to/conda/env/lib:$LD_LIBRARY_PATH \
+    ./bench/bench_chembl --smi /path/to/chembl.smi
+```
+
+Runs both RDKit CPU (OpenMP, `numThreads=1` per molecule) and SmallField GPU with per-stage timing, wave dispatch breakdown, and quality cross-validation against RDKit's MMFF94 energy evaluator.
 
 ## Installation
 
-```bash
-git submodule update --init --recursive     # fetch ForkUnion
-uv pip install -e .[gpu]                    # or `.[cpu]` for non-CUDA devices
-uv run pytest test.py -s -x                 # build and test
-```
-
-Or using a conventional Python environment:
+__Python:__
 
 ```bash
-git submodule update --init --recursive
-pip install -r requirements-gpu.txt         # or requirements-cpu.txt
-pip install -e .
-pytest test.py -s -x
+pip install -e .[gpu] # builds CUDA extension via nvcc
 ```
 
-## Usage
-
-```python
-import smallfield as sf
-import numpy as np
-
-# Check available backends
-print(f"Skylake AVX-512: {sf.has_skylake()}")
-print(f"CUDA: {sf.has_cuda()}")
-
-# Create context with pre-allocated buffers
-ctx = sf.Context(
-    total_atoms=10000,      # Max atoms (rounded up for SIMD)
-    total_pairs=1000000,    # Max VdW pairs
-    max_molecules=1000      # Max molecules in batch
-)
-
-# Compute VdW energy for single molecule
-energy = ctx.vdw_skylake(
-    coords_x, coords_y, coords_z,  # f64 coordinate arrays
-    pair_i, pair_j,                 # i32 atom pair indices
-    epsilon, r_star                 # f64 VdW parameters
-)
-
-# Compute VdW energy for batch of molecules
-batch_energy = ctx.vdw_batch_skylake(
-    coords_x, coords_y, coords_z,
-    pair_i, pair_j, epsilon, r_star,
-    mol_start, mol_end,             # i32 pair index ranges per molecule
-    n_molecules
-)
-```
-
-## Benchmarking
-
-SmallField includes comprehensive benchmarking tools to compare performance across all implementations.
-To run the benchmark on a 1000 randomly sampled molecules for 100 iterations:
+__C++ tests and benchmarks (requires RDKit from conda-forge):__
 
 ```bash
-uv run --with rdkit python bench.py --n-molecules 1000 --iterations 100 --smiles-dir /path/to/smiles/
+micromamba install -c conda-forge rdkit-dev
+cd build && cmake .. -DRDKIT_PREFIX=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+ctest --output-on-failure
 ```
+
+## Project Layout
+
+```
+src/
+  warp_primitives.cuh     warp_size, full_mask, warp_reduce_sum_f32_
+  fire_warp.cuh           FIRE optimizer (warp-level, functor-generic)
+  triangle_smooth.cuh     Floyd-Warshall on half-precision bounds
+  etkdg_types.cuh         GPU data structures (metadata, descriptors, MMFF94 terms)
+  dg_forcefield.cuh       distance geometry energy + gradient (atom-centric)
+  etk_forcefield.cuh      ETK torsion Fourier energy + gradient (atom-centric)
+  mmff94_functor.cuh      MMFF94 energy + gradient (per-atom interaction lists)
+  etkdg_pipeline.cuh      persistent warp-loop kernel (stages 2-9)
+  etkdg_preprocess.hpp    CPU preprocessing (RDKit -> GPU-ready arrays)
+  smallfield.cu           pybind11 bindings
+test/                     C++ tests cross-validated against RDKit
+bench/                    C++ benchmark (RDKit CPU vs SmallField GPU)
+python/smallfield/        Python package
+```
+
+~2,500 lines of CUDA/C++.
+No dependencies beyond CUDA 12+ and RDKit for preprocessing only.
+
+## License
+
+Apache 2.0

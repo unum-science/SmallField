@@ -9,7 +9,6 @@ Methodology and results for comparing CPU (RDKit) and GPU (SmallField) conformer
 | GPU       | 8x NVIDIA RTX PRO 6000 Blackwell Server Edition (188 SMs, SM 12.0, 96 GB each) |
 | CPU       | 2x Intel Xeon 6776P (48 cores / 96 threads each, 192 threads total)            |
 | RAM       | 1.7 TB DDR5                                                                    |
-| PCIe      | Gen 5                                                                          |
 
 Benchmarks use a single GPU unless noted otherwise.
 
@@ -82,24 +81,25 @@ __Quality cross-validation:__
 
 ### GPU kernel (per-molecule, `src/etkdg_pipeline.cuh`)
 
-| #   | Stage                        | Function                                                | File:Line                                  |
-| --- | ---------------------------- | ------------------------------------------------------- | ------------------------------------------ |
-| 2   | Triangle smoothing           | `triangle_smooth_warp_half_`                            | `triangle_smooth.cuh:44`                   |
-| 3   | Random 4D init               | `generate_random_coordinates_`                          | `etkdg_pipeline.cuh:50`                    |
-| 4   | DG minimize (4D FIRE)        | `fire_minimize_` + `distance_geometry_energy_functor_t` | `fire_warp.cuh:73`, `dg_forcefield.cuh:91` |
-| 5   | Stereo check                 | `validate_chirality_`                                   | `dg_forcefield.cuh:65`                     |
-| 6   | 4th-dim crush (FIRE)         | Same as 4 with `fourth_dimension_penalty_weight = 10`   | `etkdg_pipeline.cuh:188`                   |
-| 7   | ETK torsion refine (3D FIRE) | `fire_minimize_` + `etk_torsion_energy_functor_t`       | `etk_forcefield.cuh:181`                   |
-| 8   | Final validation             | Same as 5                                               | `etkdg_pipeline.cuh:210`                   |
-| 9   | MMFF94 polish (3D FIRE)      | `fire_minimize_` + `mmff94_energy_functor_t`            | `mmff94_functor.cuh:273`                   |
+| #   | Stage                             | Function                                                | File:Line                                  |
+| --- | --------------------------------- | ------------------------------------------------------- | ------------------------------------------ |
+| 2   | Triangle smoothing                | `triangle_smooth_warp_half_`                            | `triangle_smooth.cuh:44`                   |
+| 3   | Random 4D init                    | `generate_random_coordinates_`                          | `etkdg_pipeline.cuh:50`                    |
+| 4   | DG minimize (4D FIRE)             | `fire_minimize_` + `distance_geometry_energy_functor_t` | `fire_warp.cuh:40`, `dg_forcefield.cuh:91` |
+| 5   | Stereo check                      | `validate_chirality_`                                   | `dg_forcefield.cuh:65`                     |
+| 6   | 4th-dim crush (FIRE)              | Same as 4 with `fourth_dimension_penalty_weight = 10`   | `etkdg_pipeline.cuh:187`                   |
+| 7   | ETK torsion refine (3D FIRE)      | `fire_minimize_` + `etk_torsion_energy_functor_t`       | `etk_forcefield.cuh:185`                   |
+| 8   | Final validation                  | Same as 5                                               | `etkdg_pipeline.cuh:209`                   |
+| 9   | MMFF94 polish (3D FIRE, 200 iter) | `fire_minimize_` + `mmff94_energy_functor_t`            | `mmff94_functor.cuh:273`                   |
 
 ### Key design choices
 
 - __Atom-centric processing:__ each thread owns ceil(N/32) atoms, accumulates gradients in registers via `__shfl_sync`.
   Eliminates atomicAdd and pair index scanning.
 - __Half-precision bounds:__ `__half` storage halves shared memory for the N x N bounds matrix, enabling 2 blocks/SM at N=128.
-- __FIRE optimizer:__ only 3 arrays (positions + velocities + gradient) vs 15 for L-BFGS.
-  Displacement clamped to +/-0.5 angstrom per step.
+- __FIRE optimizer:__ 3 arrays (positions + velocities + gradient), velocity Verlet integration, displacement clamped to +/-0.5 angstrom per step.
+- __Wave-based dispatch:__ molecules sorted by atom count, launched in 4 waves (<=32, <=64,
+  <=96, <=128 atoms). Small molecules get up to 16 blocks/SM vs 2 for N=128.
 - __Philox RNG:__ ~100 cycles init vs ~1000 for XORWOW.
   Counter-based, stateless.
 
