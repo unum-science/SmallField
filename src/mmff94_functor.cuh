@@ -53,7 +53,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(float const* positi
     float const rep7 = rep_ratio * rep_ratio * rep_ratio * rep_ratio * rep_ratio * rep_ratio * rep_ratio;
     float const att = (1.0f + mmff_vdw_g) * __frcp_rn(rho7 + mmff_vdw_g) - 2.0f;
     float const e_vdw = pair.epsilon * rep7 * att;
-    float const d_rep = -7.0f * rep7 * __frcp_rn(rep_d * (1.0f + mmff_vdw_d));
+    float const d_rep = -7.0f * rep7 * __frcp_rn(rep_d);
     float const d_att = -7.0f * (1.0f + mmff_vdw_g) * rho7 * __frcp_rn(rho * (rho7 + mmff_vdw_g) * (rho7 + mmff_vdw_g));
     float const dE_dr_vdw = pair.epsilon * (d_rep * att + rep7 * d_att) * __frcp_rn(pair.r_star);
 
@@ -68,10 +68,10 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(float const* positi
         *energy += e_vdw + e_elec;
 
     float const dE_dr = dE_dr_vdw + dE_dr_elec;
-    float const sign = (role == 0) ? 1.0f : -1.0f;
-    *gx += sign * dE_dr * dx * inv_r;
-    *gy += sign * dE_dr * dy * inv_r;
-    *gz += sign * dE_dr * dz * inv_r;
+    // gradient: ∂E/∂rᵢ = −dE/dr · dx/r (dx = other − atom)
+    *gx -= dE_dr * dx * inv_r;
+    *gy -= dE_dr * dy * inv_r;
+    *gz -= dE_dr * dz * inv_r;
 }
 
 /** Compute bond stretching energy and gradient for one atom. */
@@ -95,10 +95,10 @@ __device__ __forceinline__ void mmff_bond_contribution_(float const* positions, 
 
     float const dE_dr =
         mmff_bond_pf * bond.force_constant * dr * (1.0f + 1.5f * cs * dr + (7.0f / 6.0f) * cs * cs * dr * dr);
-    float const sign = (role == 0) ? 1.0f : -1.0f;
-    *gx += sign * dE_dr * dx * inv_r;
-    *gy += sign * dE_dr * dy * inv_r;
-    *gz += sign * dE_dr * dz * inv_r;
+    // bond gradient: same sign convention
+    *gx -= dE_dr * dx * inv_r;
+    *gy -= dE_dr * dy * inv_r;
+    *gz -= dE_dr * dz * inv_r;
 }
 
 /** Compute angle bending energy and gradient for one atom. */
@@ -137,32 +137,31 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const* positions,
         *energy +=
             0.5f * mmff_angle_pf * angle.force_constant * dtheta_deg * dtheta_deg * (1.0f + mmff_angle_cb * dtheta_deg);
 
-    // dE/dθ in degrees, then convert: dE/dθ_rad = dE/dθ_deg * (180/π)
-    float const dE_dtheta_deg =
-        mmff_angle_pf * angle.force_constant * dtheta_deg * (1.0f + 1.5f * mmff_angle_cb * dtheta_deg);
+    // dE/dθ matching CPU mmff94.hpp:755: dE_dtheta = rad2deg * c2 * ka * angle_term * (...)
+    // the extra rad2deg converts the derivative to work with the -1/sinθ chain rule
+    float const dE_dtheta =
+        mmff_rad2deg * mmff_angle_pf * angle.force_constant * dtheta_deg * (1.0f + 1.5f * mmff_angle_cb * dtheta_deg);
     float const inv_sin = __frcp_rn(sin_theta);
 
-    // chain rule: ∂E/∂r = (dE/dθ)·(−1/sinθ)·∂cosθ/∂r
-    // for atom_i: ∂cosθ/∂rᵢ = (cosθ·p̂₁₂ − p̂₃₂) / |r₁₂|
-    // for atom_k: ∂cosθ/∂rₖ = (cosθ·p̂₃₂ − p̂₁₂) / |r₃₂|
-    // for atom_j: ∂cosθ/∂rⱼ = −(∂cosθ/∂rᵢ + ∂cosθ/∂rₖ)
-    float const factor = -dE_dtheta_deg * mmff_rad2deg * inv_sin;
+    // ∂E/∂rᵢ = dE_dθ · ∂cosθ/∂rᵢ · (−1/sinθ)
+    // ∂cosθ/∂rᵢ = (p̂₃₂ − cosθ·p̂₁₂) / |r₁₂|   (from CPU mmff94.hpp:759)
+    float const factor = dE_dtheta * (-inv_sin);
 
-    if (role == 0) { // atom_i
-        *gx += factor * (cos_theta * p12_x - p32_x) * inv_rij;
-        *gy += factor * (cos_theta * p12_y - p32_y) * inv_rij;
-        *gz += factor * (cos_theta * p12_z - p32_z) * inv_rij;
-    } else if (role == 2) { // atom_k
-        *gx += factor * (cos_theta * p32_x - p12_x) * inv_rkj;
-        *gy += factor * (cos_theta * p32_y - p12_y) * inv_rkj;
-        *gz += factor * (cos_theta * p32_z - p12_z) * inv_rkj;
+    if (role == 0) { // atom_i: ∂cosθ/∂rᵢ = (p̂₃₂ − cosθ·p̂₁₂) / |r₁₂|
+        *gx += factor * (p32_x - cos_theta * p12_x) * inv_rij;
+        *gy += factor * (p32_y - cos_theta * p12_y) * inv_rij;
+        *gz += factor * (p32_z - cos_theta * p12_z) * inv_rij;
+    } else if (role == 2) { // atom_k: ∂cosθ/∂rₖ = (p̂₁₂ − cosθ·p̂₃₂) / |r₃₂|
+        *gx += factor * (p12_x - cos_theta * p32_x) * inv_rkj;
+        *gy += factor * (p12_y - cos_theta * p32_y) * inv_rkj;
+        *gz += factor * (p12_z - cos_theta * p32_z) * inv_rkj;
     } else { // role == 1, atom_j (center): -(grad_i + grad_k)
-        float const gi_x = factor * (cos_theta * p12_x - p32_x) * inv_rij;
-        float const gi_y = factor * (cos_theta * p12_y - p32_y) * inv_rij;
-        float const gi_z = factor * (cos_theta * p12_z - p32_z) * inv_rij;
-        float const gk_x = factor * (cos_theta * p32_x - p12_x) * inv_rkj;
-        float const gk_y = factor * (cos_theta * p32_y - p12_y) * inv_rkj;
-        float const gk_z = factor * (cos_theta * p32_z - p12_z) * inv_rkj;
+        float const gi_x = factor * (p32_x - cos_theta * p12_x) * inv_rij;
+        float const gi_y = factor * (p32_y - cos_theta * p12_y) * inv_rij;
+        float const gi_z = factor * (p32_z - cos_theta * p12_z) * inv_rij;
+        float const gk_x = factor * (p12_x - cos_theta * p32_x) * inv_rkj;
+        float const gk_y = factor * (p12_y - cos_theta * p32_y) * inv_rkj;
+        float const gk_z = factor * (p12_z - cos_theta * p32_z) * inv_rkj;
         *gx -= gi_x + gk_x;
         *gy -= gi_y + gk_y;
         *gz -= gi_z + gk_z;
@@ -206,17 +205,16 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const* position
     t1z *= id1;
 
     float const cos_phi = fmaxf(-1.0f, fminf(1.0f, t0x * t1x + t0y * t1y + t0z * t1z));
-    float const sin_phi_sq = 1.0f - cos_phi * cos_phi;
-    float const sin_phi = (sin_phi_sq > 0.0f) ? sqrtf(sin_phi_sq) : 0.0f;
 
-    // MMFF94 torsion energy: 0.5*(V1*(1+cos) + V2*(1-cos2) + V3*(1+cos3))
-    float sin_phi_val, cos_phi_val;
-    __sincosf(acosf(cos_phi) * ((t0x * (r2y * t1z - r2z * t1y) + t0y * (r2z * t1x - r2x * t1z) +
-                                 t0z * (r2x * t1y - r2y * t1x)) >= 0.0f
-                                    ? 1.0f
-                                    : -1.0f),
-              &sin_phi_val, &cos_phi_val);
-    // simpler: use cos_phi directly for energy
+    // signed sin(φ) from the triple product (t0 × t1) · r1_hat
+    // r1 = bond j→k (the central bond), same direction as bond_jk
+    float const r1_len = sqrtf(fmaxf(r1x * r1x + r1y * r1y + r1z * r1z, 1e-10f));
+    float const cross_n_x = t0y * t1z - t0z * t1y;
+    float const cross_n_y = t0z * t1x - t0x * t1z;
+    float const cross_n_z = t0x * t1y - t0y * t1x;
+    float const sin_phi = (cross_n_x * r1x + cross_n_y * r1y + cross_n_z * r1z) * __frcp_rn(r1_len);
+
+    // energy (uses cos_phi only, sign-independent)
     float const cos2 = 2.0f * cos_phi * cos_phi - 1.0f;
     float const cos3 = cos_phi * (4.0f * cos_phi * cos_phi - 3.0f);
     float const tor_energy =
@@ -225,14 +223,15 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const* position
     if (role == 0)
         *energy += tor_energy;
 
-    // dE/dφ = 0.5 * (-V1·sin(φ) + 2V2·sin(2φ) - 3V3·sin(3φ))
+    // dE/dφ = 0.5 * (-V1·sin(φ) + 2V2·sin(2φ) - 3V3·sin(3φ)) using SIGNED sin
     float const sin2 = 2.0f * sin_phi * cos_phi;
-    float const sin3 = 3.0f * sin_phi - 4.0f * sin_phi * sin_phi * sin_phi;
+    float const sin3 = sin_phi * (3.0f - 4.0f * sin_phi * sin_phi);
     float const dE_dphi = mmff_tor_pf * (-tor.v1 * sin_phi + 2.0f * tor.v2 * sin2 - 3.0f * tor.v3 * sin3);
 
-    if (fabsf(cos_phi) < 1e-8f && fabsf(sin_phi) < 1e-8f)
+    float const abs_sin = fabsf(sin_phi);
+    if (fabsf(cos_phi) < 1e-8f && abs_sin < 1e-8f)
         return;
-    float const sin_term = (fabsf(sin_phi) < 1e-8f) ? (-dE_dphi / cos_phi) : (-dE_dphi / sin_phi);
+    float const sin_term = (abs_sin < 1e-8f) ? (-dE_dphi / cos_phi) : (-dE_dphi / sin_phi);
 
     float const dc[6] = {
         id0 * (t1x - cos_phi * t0x), id0 * (t1y - cos_phi * t0y), id0 * (t1z - cos_phi * t0z),
@@ -336,6 +335,22 @@ struct mmff94_energy_functor_t {
                 gradient[num_atoms + atom] = gy;
                 gradient[2 * num_atoms + atom] = gz;
             }
+        }
+
+        // remove center-of-mass force (zero mean gradient per dimension)
+        // prevents rigid-body translation during FIRE minimization
+        if (write_gradient && num_atoms > 1) {
+            __syncwarp(fire_full_mask);
+            float const inv_n = __frcp_rn(static_cast<float>(num_atoms));
+            for (std::uint32_t d = 0; d < 3; ++d) {
+                float mean_g = 0.0f;
+                for (std::uint32_t i = lane; i < num_atoms; i += fire_warp_size)
+                    mean_g += gradient[d * num_atoms + i];
+                mean_g = fire_warp_reduce_sum_(mean_g) * inv_n;
+                for (std::uint32_t i = lane; i < num_atoms; i += fire_warp_size)
+                    gradient[d * num_atoms + i] -= mean_g;
+            }
+            __syncwarp(fire_full_mask);
         }
 
         return fire_warp_reduce_sum_(total_energy);

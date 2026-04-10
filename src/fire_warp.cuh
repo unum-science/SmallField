@@ -34,8 +34,8 @@ __device__ __forceinline__ float fire_warp_reduce_sum_(float value) {
 }
 
 /** Warp dot product. */
-__device__ __forceinline__ float fire_warp_dot_(float const* a, float const* b,
-                                                 std::uint32_t num_elements, std::uint32_t lane) {
+__device__ __forceinline__ float fire_warp_dot_(float const* a, float const* b, std::uint32_t num_elements,
+                                                std::uint32_t lane) {
     float dot = 0.0f;
     for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size)
         dot = fmaf(a[i], b[i], dot);
@@ -43,8 +43,7 @@ __device__ __forceinline__ float fire_warp_dot_(float const* a, float const* b,
 }
 
 /** Warp RMS: √(Σxᵢ²/n) */
-__device__ __forceinline__ float fire_warp_rms_(float const* x, std::uint32_t num_elements,
-                                                 std::uint32_t lane) {
+__device__ __forceinline__ float fire_warp_rms_(float const* x, std::uint32_t num_elements, std::uint32_t lane) {
     float sum_sq = 0.0f;
     for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size) {
         float const val = x[i];
@@ -74,12 +73,11 @@ template <typename EnergyGradientFunctor>
 __device__ __forceinline__ void fire_minimize_(float* positions, float* velocities, float* gradient,
                                                std::uint32_t num_elements, std::int32_t max_iterations,
                                                float gradient_threshold, std::uint32_t lane,
-                                               EnergyGradientFunctor&& compute_energy_gradient,
-                                               float* out_final_energy, std::int32_t* out_iterations,
-                                               std::int32_t* out_status) {
+                                               EnergyGradientFunctor&& compute_energy_gradient, float* out_final_energy,
+                                               std::int32_t* out_iterations, std::int32_t* out_status) {
     // FIRE parameters (Bitzek et al., PRL 2006)
-    constexpr float dt_start = 0.1f;
-    constexpr float dt_max = 1.0f;
+    constexpr float dt_start = 0.05f;
+    constexpr float dt_max = 0.5f;
     constexpr float f_inc = 1.1f;
     constexpr float f_dec = 0.5f;
     constexpr float alpha_start = 0.1f;
@@ -148,20 +146,22 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
         }
         __syncwarp(fire_full_mask);
 
-        // velocity Verlet integration: v += F·dt, x += v·dt
-        // (F = -gradient)
+        // velocity Verlet integration with displacement clamping
         for (std::uint32_t i = lane; i < num_elements; i += fire_warp_size) {
             velocities[i] -= gradient[i] * dt;
-            positions[i] += velocities[i] * dt;
+            float displacement = velocities[i] * dt;
+            displacement = fmaxf(-0.5f, fminf(0.5f, displacement));
+            positions[i] += displacement;
         }
         __syncwarp(fire_full_mask);
     }
 
-    // max iterations reached
+    // max iterations reached — report the last computed energy
+    float const final_energy = compute_energy_gradient.energy_only(positions, num_elements, lane);
     if (lane == 0) {
         *out_status = 1;
         *out_iterations = max_iterations;
-        *out_final_energy = 0.0f;
+        *out_final_energy = final_energy;
     }
 }
 

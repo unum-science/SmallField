@@ -104,10 +104,8 @@ __global__ void etkdg_pipeline_warp_kernel(
     etk_torsion_descriptor_t const* __restrict__ torsion_terms,
     distance_constraint_t const* __restrict__ distance_constraints,
     // MMFF94 parameter arrays + per-atom interaction lists (stage 9, global memory)
-    mmff94_nonbonded_pair_t const* __restrict__ mmff_nonbonded_pairs,
-    mmff94_bond_t const* __restrict__ mmff_bond_terms,
-    mmff94_angle_t const* __restrict__ mmff_angle_terms,
-    mmff94_torsion_t const* __restrict__ mmff_torsion_terms,
+    mmff94_nonbonded_pair_t const* __restrict__ mmff_nonbonded_pairs, mmff94_bond_t const* __restrict__ mmff_bond_terms,
+    mmff94_angle_t const* __restrict__ mmff_angle_terms, mmff94_torsion_t const* __restrict__ mmff_torsion_terms,
     mmff94_atom_interaction_t const* __restrict__ mmff_interactions,
     mmff94_atom_offsets_t const* __restrict__ mmff_atom_offsets,
     etkdg_molecule_metadata_t const* __restrict__ molecule_metadata, float* __restrict__ conformer_coordinates_out,
@@ -216,19 +214,20 @@ __global__ void etkdg_pipeline_warp_kernel(
                 if (valid) {
                     // stage 9: MMFF94 polish (3D, FIRE, 100 iterations)
                     if (meta.num_mmff_nonbonded > 0 && mmff_interactions != nullptr) {
-                        mmff94_energy_functor_t mmff_functor{
-                            mmff_nonbonded_pairs + meta.mmff_nonbonded_offset,
-                            mmff_bond_terms + meta.mmff_bond_offset,
-                            mmff_angle_terms + meta.mmff_angle_offset,
-                            mmff_torsion_terms + meta.mmff_torsion_offset,
-                            mmff_interactions,  // per-atom lists (global, offsets relative to molecule)
-                            mmff_atom_offsets,
-                            num_atoms};
+                        // debug: verify stage 9 data (remove after debugging)
+                        // if (lane == 0 && mol == 0 && conf == 0) { ... }
+                        mmff94_energy_functor_t mmff_functor{mmff_nonbonded_pairs + meta.mmff_nonbonded_offset,
+                                                             mmff_bond_terms + meta.mmff_bond_offset,
+                                                             mmff_angle_terms + meta.mmff_angle_offset,
+                                                             mmff_torsion_terms + meta.mmff_torsion_offset,
+                                                             mmff_interactions,
+                                                             mmff_atom_offsets + meta.mmff_atom_offsets_start,
+                                                             num_atoms};
 
                         float mmff_energy = 0.0f;
                         std::int32_t mmff_iterations = 0, mmff_status = 0;
-                        fire_minimize_(positions, velocities, gradient, dim3, 100, 1e-4f, lane,
-                                       mmff_functor, &mmff_energy, &mmff_iterations, &mmff_status);
+                        fire_minimize_(positions, velocities, gradient, dim3, 500, 1e-4f, lane, mmff_functor,
+                                       &mmff_energy, &mmff_iterations, &mmff_status);
                         final_energy = mmff_energy;
                     }
 
