@@ -14,43 +14,48 @@
 
 #pragma once
 
-#include "etkdg_types.cuh"
-
-#include <DistGeom/BoundsMatrix.h>
-#include <DistGeom/TriangleSmooth.h>
-#include <Geometry/point.h>
-#include <GraphMol/DistGeomHelpers/BoundsMatrixBuilder.h>
-#include <GraphMol/DistGeomHelpers/Embedder.h>
-#include <GraphMol/ForceFieldHelpers/CrystalFF/TorsionPreferences.h>
-#include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
-#include <GraphMol/GraphMol.h>
-#include <GraphMol/MolOps.h>
-#include <GraphMol/SmilesParse/SmilesParse.h>
-
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
+
+// clang-format off
+#include <DistGeom/BoundsMatrix.h>
+#include <GraphMol/GraphMol.h>
+#include <GraphMol/Chirality.h>
+#include <GraphMol/DistGeomHelpers/BoundsMatrixBuilder.h>
+#include <GraphMol/ForceFieldHelpers/CrystalFF/TorsionPreferences.h>
+#include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
+#include <GraphMol/MolOps.h>
+#include <GraphMol/SmilesParse/SmilesParse.h>
+// clang-format on
+
+#include "etkdg_types.cuh"
 
 namespace smallfield {
 
 /** Complete preprocessed molecule ready for GPU pipeline upload. */
 struct etkdg_prepared_molecule_t {
     std::uint32_t num_atoms;
-    std::vector<float> bounds_matrix; ///< N x N flat, smoothed
+    std::vector<float> bounds_matrix;       ///< N x N flat, smoothed
+    std::vector<float> initial_coordinates; ///< 4 x N SoA from SmallField metric embedding
     std::vector<chiral_center_descriptor_t> chiral_centers;
     std::vector<etk_torsion_descriptor_t> etk_torsions;
     std::vector<distance_constraint_t> distance_constraints; ///< 1-2 bond, 1-3 angle
-    // MMFF94 force field parameters (stage 9)
+    // MMFF94 force field parameters (stage 9).
     std::vector<mmff94_nonbonded_pair_t> mmff_nonbonded;
     std::vector<mmff94_bond_t> mmff_bonds;
     std::vector<mmff94_angle_t> mmff_angles;
     std::vector<mmff94_torsion_t> mmff_torsions;
     std::vector<mmff94_oop_t> mmff_oops;
     std::vector<mmff94_stretchbend_t> mmff_stretchbends;
-    // per-atom interaction lists (built from the above)
+    // Per-atom interaction lists built from the term arrays above.
     std::vector<mmff94_atom_interaction_t> mmff_interactions;
     std::vector<mmff94_atom_offsets_t> mmff_atom_offsets;
     etkdg_molecule_metadata_t metadata;
@@ -71,14 +76,14 @@ inline void build_bounds_matrix(RDKit::ROMol const& molecule, std::vector<float>
     std::uint32_t const num_atoms = molecule.getNumAtoms();
     bounds.resize(num_atoms * num_atoms, 0.0f);
 
-    // use RDKit's bounds matrix builder
+    // Use RDKit's bounds matrix builder.
     auto* bounds_raw = new DistGeom::BoundsMatrix(num_atoms);
     DistGeom::BoundsMatPtr bounds_mat(bounds_raw);
     RDKit::DGeomHelpers::initBoundsMat(bounds_raw);
     RDKit::DGeomHelpers::setTopolBounds(molecule, bounds_mat);
-    // no CPU smoothing — the GPU kernel handles Floyd-Warshall in shared memory
+    // Do not smooth on the CPU. The GPU kernel handles Floyd-Warshall in shared memory.
 
-    // flatten to our row-major convention
+    // Flatten to the row-major convention used by the GPU path.
     for (std::uint32_t i = 0; i < num_atoms; ++i) {
         for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
             bounds[i * num_atoms + j] = static_cast<float>(bounds_mat->getUpperBound(i, j));
@@ -87,35 +92,244 @@ inline void build_bounds_matrix(RDKit::ROMol const& molecule, std::vector<float>
     }
 }
 
+/** Read an upper-triangular bound from the flattened matrix. */
+inline float read_upper_bound(std::vector<float> const& bounds, std::uint32_t num_atoms, std::uint32_t atom_a,
+                              std::uint32_t atom_b) {
+    std::uint32_t const row = std::min(atom_a, atom_b);
+    std::uint32_t const col = std::max(atom_a, atom_b);
+    return bounds[row * num_atoms + col];
+}
+
+/** Read a lower-triangular bound from the flattened matrix. */
+inline float read_lower_bound(std::vector<float> const& bounds, std::uint32_t num_atoms, std::uint32_t atom_a,
+                              std::uint32_t atom_b) {
+    std::uint32_t const row = std::max(atom_a, atom_b);
+    std::uint32_t const col = std::min(atom_a, atom_b);
+    return bounds[row * num_atoms + col];
+}
+
+/** CPU reference triangle smoothing matching the GPU bound convention. */
+inline void triangle_smooth_bounds_in_place(std::vector<float>& bounds, std::uint32_t num_atoms) {
+    std::uint32_t const total_pairs = num_atoms * num_atoms;
+    for (std::uint32_t k = 0; k < num_atoms; ++k) {
+        for (std::uint32_t linear_index = 0; linear_index < total_pairs; ++linear_index) {
+            std::uint32_t const i = linear_index / num_atoms;
+            std::uint32_t const j = linear_index % num_atoms;
+            if (i == j || i == k || j == k)
+                continue;
+
+            float const upper_ik = read_upper_bound(bounds, num_atoms, i, k);
+            float const upper_kj = read_upper_bound(bounds, num_atoms, k, j);
+
+            if (i < j) {
+                float const candidate = upper_ik + upper_kj;
+                float& current = bounds[i * num_atoms + j];
+                if (candidate < current)
+                    current = candidate;
+            } else {
+                float const lower_ik = read_lower_bound(bounds, num_atoms, i, k);
+                float const lower_kj = read_lower_bound(bounds, num_atoms, k, j);
+                float const c1 = lower_ik - upper_kj;
+                float const c2 = lower_kj - upper_ik;
+                float& current = bounds[i * num_atoms + j];
+                current = std::max(current, std::max(c1, c2));
+            }
+        }
+    }
+}
+
+/** Symmetric Jacobi eigendecomposition. Eigenvectors are returned column-major in `eigenvectors`. */
+inline bool jacobi_symmetric_eigendecomposition(std::vector<double>& matrix, std::uint32_t num_atoms,
+                                                std::vector<double>& eigenvectors, std::vector<double>& eigenvalues) {
+    if (num_atoms == 0)
+        return false;
+
+    eigenvectors.assign(num_atoms * num_atoms, 0.0);
+    for (std::uint32_t i = 0; i < num_atoms; ++i)
+        eigenvectors[i * num_atoms + i] = 1.0;
+
+    constexpr std::uint32_t max_sweeps = 64;
+    constexpr double tolerance = 1.0e-10;
+
+    for (std::uint32_t sweep = 0; sweep < max_sweeps; ++sweep) {
+        double max_off_diagonal = 0.0;
+        std::uint32_t pivot_p = 0;
+        std::uint32_t pivot_q = 0;
+
+        for (std::uint32_t i = 0; i < num_atoms; ++i) {
+            for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
+                double const value = std::fabs(matrix[i * num_atoms + j]);
+                if (value > max_off_diagonal) {
+                    max_off_diagonal = value;
+                    pivot_p = i;
+                    pivot_q = j;
+                }
+            }
+        }
+
+        if (max_off_diagonal < tolerance)
+            break;
+
+        double const app = matrix[pivot_p * num_atoms + pivot_p];
+        double const aqq = matrix[pivot_q * num_atoms + pivot_q];
+        double const apq = matrix[pivot_p * num_atoms + pivot_q];
+        if (std::fabs(apq) < tolerance)
+            continue;
+
+        double const tau = (aqq - app) / (2.0 * apq);
+        double const t =
+            (tau >= 0.0) ? 1.0 / (tau + std::sqrt(1.0 + tau * tau)) : -1.0 / (-tau + std::sqrt(1.0 + tau * tau));
+        double const c = 1.0 / std::sqrt(1.0 + t * t);
+        double const s = t * c;
+
+        for (std::uint32_t k = 0; k < num_atoms; ++k) {
+            if (k == pivot_p || k == pivot_q)
+                continue;
+            double const aik = matrix[pivot_p * num_atoms + k];
+            double const aqk = matrix[pivot_q * num_atoms + k];
+            double const new_aik = c * aik - s * aqk;
+            double const new_aqk = s * aik + c * aqk;
+            matrix[pivot_p * num_atoms + k] = new_aik;
+            matrix[k * num_atoms + pivot_p] = new_aik;
+            matrix[pivot_q * num_atoms + k] = new_aqk;
+            matrix[k * num_atoms + pivot_q] = new_aqk;
+        }
+
+        matrix[pivot_p * num_atoms + pivot_p] = c * c * app - 2.0 * c * s * apq + s * s * aqq;
+        matrix[pivot_q * num_atoms + pivot_q] = s * s * app + 2.0 * c * s * apq + c * c * aqq;
+        matrix[pivot_p * num_atoms + pivot_q] = 0.0;
+        matrix[pivot_q * num_atoms + pivot_p] = 0.0;
+
+        for (std::uint32_t k = 0; k < num_atoms; ++k) {
+            double const vip = eigenvectors[k * num_atoms + pivot_p];
+            double const viq = eigenvectors[k * num_atoms + pivot_q];
+            eigenvectors[k * num_atoms + pivot_p] = c * vip - s * viq;
+            eigenvectors[k * num_atoms + pivot_q] = s * vip + c * viq;
+        }
+    }
+
+    eigenvalues.resize(num_atoms, 0.0);
+    for (std::uint32_t i = 0; i < num_atoms; ++i)
+        eigenvalues[i] = matrix[i * num_atoms + i];
+    return true;
+}
+
+/** Build a SmallField-owned 4D metric embedding from the smoothed bounds matrix. */
+inline bool build_metric_initial_coordinates(std::vector<float> const& bounds_matrix, std::uint32_t num_atoms,
+                                             std::vector<float>& initial_coordinates) {
+    if (num_atoms == 0)
+        return false;
+
+    std::vector<float> smoothed_bounds = bounds_matrix;
+    triangle_smooth_bounds_in_place(smoothed_bounds, num_atoms);
+
+    std::vector<double> squared_distances(num_atoms * num_atoms, 0.0);
+    for (std::uint32_t i = 0; i < num_atoms; ++i) {
+        for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
+            double const upper = static_cast<double>(smoothed_bounds[i * num_atoms + j]);
+            double const lower = static_cast<double>(smoothed_bounds[j * num_atoms + i]);
+            double const distance = 0.5 * (std::max(lower, 0.0) + std::max(upper, lower));
+            double const squared = distance * distance;
+            squared_distances[i * num_atoms + j] = squared;
+            squared_distances[j * num_atoms + i] = squared;
+        }
+    }
+
+    std::vector<double> row_means(num_atoms, 0.0);
+    double grand_mean = 0.0;
+    for (std::uint32_t i = 0; i < num_atoms; ++i) {
+        double row_sum = 0.0;
+        for (std::uint32_t j = 0; j < num_atoms; ++j)
+            row_sum += squared_distances[i * num_atoms + j];
+        row_means[i] = row_sum / static_cast<double>(num_atoms);
+        grand_mean += row_means[i];
+    }
+    grand_mean /= static_cast<double>(num_atoms);
+
+    std::vector<double> gram_matrix(num_atoms * num_atoms, 0.0);
+    for (std::uint32_t i = 0; i < num_atoms; ++i) {
+        for (std::uint32_t j = 0; j < num_atoms; ++j) {
+            gram_matrix[i * num_atoms + j] =
+                -0.5 * (squared_distances[i * num_atoms + j] - row_means[i] - row_means[j] + grand_mean);
+        }
+    }
+
+    std::vector<double> eigenvectors;
+    std::vector<double> eigenvalues;
+    if (!jacobi_symmetric_eigendecomposition(gram_matrix, num_atoms, eigenvectors, eigenvalues))
+        return false;
+
+    std::vector<std::uint32_t> order(num_atoms);
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(),
+              [&](std::uint32_t lhs, std::uint32_t rhs) { return eigenvalues[lhs] > eigenvalues[rhs]; });
+
+    initial_coordinates.assign(4 * num_atoms, 0.0f);
+    constexpr double minimum_eigenvalue = 1.0e-8;
+    for (std::uint32_t dim = 0; dim < 4 && dim < order.size(); ++dim) {
+        std::uint32_t const eigen_index = order[dim];
+        double const eigenvalue = std::max(eigenvalues[eigen_index], 0.0);
+        if (eigenvalue < minimum_eigenvalue)
+            continue;
+        double const scale = std::sqrt(eigenvalue);
+        for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
+            initial_coordinates[dim * num_atoms + atom] =
+                static_cast<float>(scale * eigenvectors[atom * num_atoms + eigen_index]);
+        }
+    }
+
+    return true;
+}
+
 /**
- * Extract chiral centers from molecular graph.
- * Target sign derived from CW/CCW tag without needing 3D coordinates.
+ * Extract graph-only chiral center descriptors.
  *
- * RDKit convention: CHI_TETRAHEDRAL_CW means the signed volume
- * V = (r_b−r_a) · ((r_c−r_a) × (r_d−r_a)) is positive when
- * neighbors are in the connection table order.
+ * Neighbors are sorted by decreasing CIP priority. With that ordering, the GPU
+ * triple product over the top-three ligands has a stable sign convention:
+ *   R -> negative volume, S -> positive volume.
  */
 inline void extract_chiral_centers(RDKit::ROMol const& molecule,
                                    std::vector<chiral_center_descriptor_t>& chiral_centers) {
     chiral_centers.clear();
+    auto& stereo_molecule = const_cast<RDKit::ROMol&>(molecule);
+    RDKit::MolOps::assignStereochemistry(stereo_molecule, true, true, true);
+
+    RDKit::UINT_VECT cip_ranks(molecule.getNumAtoms(), 0);
+    RDKit::Chirality::assignAtomCIPRanks(molecule, cip_ranks);
 
     for (auto const& atom : molecule.atoms()) {
         auto chirality = atom->getChiralTag();
         if (chirality != RDKit::Atom::CHI_TETRAHEDRAL_CW && chirality != RDKit::Atom::CHI_TETRAHEDRAL_CCW)
             continue;
+        if (!atom->hasProp("_CIPCode"))
+            continue;
 
         chiral_center_descriptor_t descriptor{};
         descriptor.center_atom = static_cast<std::uint8_t>(atom->getIdx());
 
-        std::uint32_t neighbor_count = 0;
-        for (auto const& neighbor : molecule.atomNeighbors(atom)) {
-            if (neighbor_count < 4)
-                descriptor.neighbor_atoms[neighbor_count] = static_cast<std::uint8_t>(neighbor->getIdx());
-            ++neighbor_count;
-        }
+        if (atom->getDegree() < 3)
+            continue;
 
-        // graph-based sign: CW → +1, CCW → -1
-        descriptor.target_sign = (chirality == RDKit::Atom::CHI_TETRAHEDRAL_CW) ? 1 : -1;
+        std::vector<std::uint32_t> ordered_neighbors;
+        ordered_neighbors.reserve(4);
+        for (auto const& neighbor : molecule.atomNeighbors(atom)) {
+            ordered_neighbors.push_back(neighbor->getIdx());
+        }
+        std::sort(ordered_neighbors.begin(), ordered_neighbors.end(), [&](std::uint32_t lhs, std::uint32_t rhs) {
+            if (cip_ranks[lhs] != cip_ranks[rhs])
+                return cip_ranks[lhs] > cip_ranks[rhs];
+            return lhs < rhs;
+        });
+        std::uint32_t const neighbor_count = static_cast<std::uint32_t>(ordered_neighbors.size());
+        if (neighbor_count < 3)
+            continue;
+
+        for (std::uint32_t i = 0; i < 4 && i < neighbor_count; ++i)
+            descriptor.neighbor_atoms[i] = static_cast<std::uint8_t>(ordered_neighbors[i]);
+
+        std::string cip_code;
+        atom->getProp("_CIPCode", cip_code);
+        descriptor.target_sign = (cip_code == "S") ? 1 : -1;
 
         chiral_centers.push_back(descriptor);
     }
@@ -188,7 +402,7 @@ inline void extract_distance_constraints(RDKit::ROMol const& molecule, std::vect
 inline void extract_etk_torsions(RDKit::ROMol const& molecule, std::vector<etk_torsion_descriptor_t>& torsions) {
     torsions.clear();
 
-    // get CSD experimental torsion preferences from RDKit
+    // Get CSD experimental torsion preferences from RDKit.
     ForceFields::CrystalFF::CrystalFFDetails crystal_details;
     ForceFields::CrystalFF::getExperimentalTorsions(molecule, crystal_details,
                                                     /*useExpTorsions=*/true,
@@ -197,7 +411,7 @@ inline void extract_etk_torsions(RDKit::ROMol const& molecule, std::vector<etk_t
                                                     /*useBasicKnowledge=*/true,
                                                     /*version=*/2);
 
-    // convert RDKit's torsion data to our descriptor format
+    // Convert RDKit's torsion data to the SmallField descriptor format.
     for (std::size_t t = 0; t < crystal_details.expTorsionAtoms.size(); ++t) {
         auto const& atom_indices = crystal_details.expTorsionAtoms[t];
         if (atom_indices.size() < 4)
@@ -213,7 +427,7 @@ inline void extract_etk_torsions(RDKit::ROMol const& molecule, std::vector<etk_t
         torsion.atom_indices[2] = static_cast<std::uint8_t>(atom_indices[2]);
         torsion.atom_indices[3] = static_cast<std::uint8_t>(atom_indices[3]);
 
-        // combine signs and force constants: Vₙ = signs[n] * forceConstants[n]
+        // Combine signs and force constants: Vn = signs[n] * forceConstants[n].
         for (std::size_t n = 0; n < 6 && n < force_constants.size(); ++n) {
             float sign = (n < signs.size()) ? static_cast<float>(signs[n]) : 1.0f;
             torsion.fourier_coefficients[n] = sign * static_cast<float>(force_constants[n]);
@@ -222,7 +436,7 @@ inline void extract_etk_torsions(RDKit::ROMol const& molecule, std::vector<etk_t
         torsions.push_back(torsion);
     }
 
-    // if no CSD torsions found, fall back to generic 3-fold barriers for rotatable bonds
+    // If no CSD torsions are found, fall back to generic 3-fold barriers for rotatable bonds.
     if (torsions.empty()) {
         for (auto const& bond : molecule.bonds()) {
             if (bond->getIsAromatic() || bond->getBondTypeAsDouble() > 1.5)
@@ -277,22 +491,22 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
 
     std::uint32_t const num_atoms = molecule.getNumAtoms();
 
-    // flat exclusion matrix: excluded[i*N+j] = true for 1-2 and 1-3 pairs
-    // flat 1-4 matrix: is_1_4[i*N+j] = true for atoms exactly 3 bonds apart
+    // Use a flat exclusion matrix for 1-2 and 1-3 pairs.
+    // Use a flat 1-4 matrix for atoms exactly 3 bonds apart.
     std::vector<bool> excluded(num_atoms * num_atoms, false);
     std::vector<bool> is_1_4(num_atoms * num_atoms, false);
 
-    // mark 1-2 bonds as excluded
+    // Mark 1-2 bonds as excluded.
     for (auto const& bond : molecule.bonds()) {
         unsigned int a = bond->getBeginAtomIdx(), b = bond->getEndAtomIdx();
         excluded[a * num_atoms + b] = true;
         excluded[b * num_atoms + a] = true;
     }
 
-    // mark 1-3 pairs as excluded + detect 1-4 pairs from torsion terminals
+    // Mark 1-3 pairs as excluded and detect 1-4 pairs from torsion terminals.
     for (auto const& atom : molecule.atoms()) {
         unsigned int center = atom->getIdx();
-        // collect neighbors by inline iteration (no temp vector)
+        // Collect neighbors by inline iteration without a temporary vector.
         unsigned int nb_indices[8]; // max 8 neighbors (typical max valence)
         unsigned int nb_count = 0;
         for (auto const& nb : molecule.atomNeighbors(atom)) {
@@ -324,12 +538,12 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
         }
     }
 
-    // cache partial charges (single pass)
+    // Cache partial charges in a single pass.
     float charges[256]; // stack-allocated, max 256 atoms
     for (unsigned int i = 0; i < num_atoms && i < 256; ++i)
         charges[i] = static_cast<float>(mmff_props.getMMFFPartialCharge(i));
 
-    // nonbonded pairs: O(N²) with O(1) exclusion/1-4 lookup
+    // Build nonbonded pairs with O(N^2) iteration and O(1) exclusion lookup.
     for (unsigned int i = 0; i < num_atoms; ++i) {
         for (unsigned int j = i + 1; j < num_atoms; ++j) {
             if (excluded[i * num_atoms + j])
@@ -346,7 +560,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
         }
     }
 
-    // bonds
+    // Build bond terms.
     for (auto const& bond : molecule.bonds()) {
         unsigned int i = bond->getBeginAtomIdx(), j = bond->getEndAtomIdx();
         unsigned int bond_type;
@@ -361,7 +575,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
                                      0.0f});
     }
 
-    // angles: iterate atoms as central, pair their neighbors
+    // Build angle terms by iterating atoms as centers and pairing their neighbors.
     for (auto const& atom : molecule.atoms()) {
         unsigned int j = atom->getIdx();
         unsigned int nonbonded[8];
@@ -383,7 +597,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
         }
     }
 
-    // torsions
+    // Build torsion terms.
     for (auto const& bond : molecule.bonds()) {
         unsigned int j = bond->getBeginAtomIdx(), k = bond->getEndAtomIdx();
         for (auto const& nj : molecule.atomNeighbors(molecule.getAtomWithIdx(j))) {
@@ -404,7 +618,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
         }
     }
 
-    // out-of-plane bending: for each sp2 center with 3+ neighbors
+    // Build out-of-plane bending terms for each sp2 center with 3 or more neighbors.
     for (auto const& atom : molecule.atoms()) {
         unsigned int j = atom->getIdx();
         unsigned int neighbor_indices[8];
@@ -416,7 +630,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
             continue;
 
         for (unsigned int a = 0; a < neighbor_count; ++a) {
-            // atom neighbor_indices[a] is the out-of-plane atom; the other two form the plane with j
+            // Treat neighbor_indices[a] as the out-of-plane atom and the other two as the plane atoms.
             unsigned int plane[2];
             unsigned int plane_count = 0;
             for (unsigned int b = 0; b < neighbor_count && plane_count < 2; ++b)
@@ -437,7 +651,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
         }
     }
 
-    // stretch-bend coupling: reuse angle topology
+    // Build stretch-bend terms by reusing angle topology.
     for (auto const& atom : molecule.atoms()) {
         unsigned int j = atom->getIdx();
         unsigned int neighbor_indices[8];
@@ -464,7 +678,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
         }
     }
 
-    // build per-atom interaction lists (two-pass, no vector-of-vectors)
+    // Build per-atom interaction lists in two passes without vector-of-vectors.
     auto const& nonbonded = result.mmff_nonbonded;
     auto const& bonds = result.mmff_bonds;
     auto const& angles = result.mmff_angles;
@@ -472,8 +686,8 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
     auto const& oops = result.mmff_oops;
     auto const& stretchbends = result.mmff_stretchbends;
 
-    // pass 1: count interactions per atom
-    std::vector<std::uint16_t> counts(num_atoms, 0);
+    // Pass 1: Count interactions per atom.
+    std::vector<std::uint32_t> counts(num_atoms, 0);
     for (auto const& p : nonbonded) {
         counts[p.atom_i]++;
         counts[p.atom_j]++;
@@ -505,47 +719,47 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
         counts[s.atom_k]++;
     }
 
-    // compute offsets from counts
+    // Compute offsets from the per-atom counts.
     result.mmff_atom_offsets.resize(num_atoms);
-    std::uint16_t running = 0;
+    std::uint32_t running = 0;
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
         result.mmff_atom_offsets[a] = {running, counts[a]};
         running += counts[a];
     }
 
-    // pass 2: fill interaction entries (using write cursors per atom)
+    // Pass 2: Fill interaction entries by using per-atom write cursors.
     std::uint32_t const total_interactions = running;
     result.mmff_interactions.resize(total_interactions);
-    std::vector<std::uint16_t> cursors(num_atoms);
+    std::vector<std::uint32_t> cursors(num_atoms);
     for (std::uint32_t a = 0; a < num_atoms; ++a)
         cursors[a] = result.mmff_atom_offsets[a].interaction_start;
 
-    for (std::uint16_t t = 0; t < nonbonded.size(); ++t) {
+    for (std::uint32_t t = 0; t < nonbonded.size(); ++t) {
         result.mmff_interactions[cursors[nonbonded[t].atom_i]++] = {t, 0, 0};
         result.mmff_interactions[cursors[nonbonded[t].atom_j]++] = {t, 0, 1};
     }
-    for (std::uint16_t t = 0; t < bonds.size(); ++t) {
+    for (std::uint32_t t = 0; t < bonds.size(); ++t) {
         result.mmff_interactions[cursors[bonds[t].atom_i]++] = {t, 1, 0};
         result.mmff_interactions[cursors[bonds[t].atom_j]++] = {t, 1, 1};
     }
-    for (std::uint16_t t = 0; t < angles.size(); ++t) {
+    for (std::uint32_t t = 0; t < angles.size(); ++t) {
         result.mmff_interactions[cursors[angles[t].atom_i]++] = {t, 2, 0};
         result.mmff_interactions[cursors[angles[t].atom_j]++] = {t, 3, 1};
         result.mmff_interactions[cursors[angles[t].atom_k]++] = {t, 2, 2};
     }
-    for (std::uint16_t t = 0; t < torsions.size(); ++t) {
+    for (std::uint32_t t = 0; t < torsions.size(); ++t) {
         result.mmff_interactions[cursors[torsions[t].atom_i]++] = {t, 4, 0};
         result.mmff_interactions[cursors[torsions[t].atom_j]++] = {t, 4, 1};
         result.mmff_interactions[cursors[torsions[t].atom_k]++] = {t, 4, 2};
         result.mmff_interactions[cursors[torsions[t].atom_l]++] = {t, 4, 3};
     }
-    for (std::uint16_t t = 0; t < oops.size(); ++t) {
+    for (std::uint32_t t = 0; t < oops.size(); ++t) {
         result.mmff_interactions[cursors[oops[t].atom_i]++] = {t, 5, 0};
         result.mmff_interactions[cursors[oops[t].atom_j]++] = {t, 5, 1};
         result.mmff_interactions[cursors[oops[t].atom_k]++] = {t, 5, 2};
         result.mmff_interactions[cursors[oops[t].atom_l]++] = {t, 5, 3};
     }
-    for (std::uint16_t t = 0; t < stretchbends.size(); ++t) {
+    for (std::uint32_t t = 0; t < stretchbends.size(); ++t) {
         result.mmff_interactions[cursors[stretchbends[t].atom_i]++] = {t, 6, 0};
         result.mmff_interactions[cursors[stretchbends[t].atom_j]++] = {t, 6, 1};
         result.mmff_interactions[cursors[stretchbends[t].atom_k]++] = {t, 6, 2};
@@ -574,12 +788,11 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const& smiles) {
     }
     result.num_atoms = mol->getNumAtoms();
     if (result.num_atoms > 128)
-        return result; // too large for single-warp pipeline
+        return result; // Too large for the single-warp pipeline.
 
-    // build raw bounds (no CPU smoothing — GPU handles Floyd-Warshall)
-    // chiral signs from graph CW/CCW tags (no EmbedMolecule needed)
     try {
         build_bounds_matrix(*mol, result.bounds_matrix);
+        build_metric_initial_coordinates(result.bounds_matrix, result.num_atoms, result.initial_coordinates);
         extract_chiral_centers(*mol, result.chiral_centers);
         extract_etk_torsions(*mol, result.etk_torsions);
         extract_distance_constraints(*mol, result.bounds_matrix, result.distance_constraints);
@@ -600,6 +813,7 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const& smiles) {
     result.metadata.num_mmff_oops = static_cast<std::uint32_t>(result.mmff_oops.size());
     result.metadata.num_mmff_stretchbends = static_cast<std::uint32_t>(result.mmff_stretchbends.size());
     result.metadata.bounds_offset = 0;
+    result.metadata.initial_coordinates_offset = 0;
     result.metadata.chiral_offset = 0;
     result.metadata.torsion_offset = 0;
     result.metadata.constraint_offset = 0;
@@ -617,6 +831,7 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const& smiles) {
 /** Batch of molecules packed into contiguous GPU-ready arrays. */
 struct etkdg_molecule_batch_t {
     std::vector<float> bounds_matrices;                      ///< concatenated Nᵢ x Nᵢ
+    std::vector<float> initial_coordinates;                  ///< concatenated 3 x Nᵢ SoA embeddings
     std::vector<chiral_center_descriptor_t> chiral_centers;  ///< concatenated
     std::vector<etk_torsion_descriptor_t> etk_torsions;      ///< concatenated
     std::vector<distance_constraint_t> distance_constraints; ///< concatenated
@@ -630,6 +845,7 @@ struct etkdg_molecule_batch_t {
     std::vector<mmff94_atom_interaction_t> mmff_interactions; ///< per-atom interaction lists
     std::vector<mmff94_atom_offsets_t> mmff_atom_offsets;     ///< per-atom offsets
     std::vector<etkdg_molecule_metadata_t> molecule_metadata; ///< one per molecule
+    std::vector<std::uint32_t> input_indices;                 ///< packed molecule index -> original input index
     std::uint32_t num_molecules = 0;
     std::uint32_t max_atoms_per_molecule = 0;
 };
@@ -642,23 +858,22 @@ struct etkdg_molecule_batch_t {
 inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> const& smiles_list) {
 
     etkdg_molecule_batch_t batch{};
-    batch.num_molecules = static_cast<std::uint32_t>(smiles_list.size());
-
-    // phase 1: prepare molecules in parallel (RDKit calls are thread-safe for independent molecules)
+    // Phase 1: Prepare molecules in parallel. RDKit calls are thread-safe for independent molecules.
     std::vector<etkdg_prepared_molecule_t> prepared(smiles_list.size());
 #pragma omp parallel for schedule(dynamic, 4)
     for (std::size_t i = 0; i < smiles_list.size(); ++i) {
         prepared[i] = prepare_molecule(smiles_list[i]);
     }
 
-    // pre-allocate batch vectors to avoid reallocation during insert loop
+    // Pre-allocate batch vectors to avoid reallocation during the insert loop.
     {
-        std::size_t total_bounds = 0, total_chirals = 0, total_etk = 0, total_dcons = 0;
+        std::size_t total_bounds = 0, total_initial = 0, total_chirals = 0, total_etk = 0, total_dcons = 0;
         std::size_t total_nb = 0, total_bonds = 0, total_angles = 0, total_torsions = 0;
         std::size_t total_oops = 0, total_stbn = 0;
         std::size_t total_inter = 0, total_off = 0;
         for (auto const& p : prepared) {
             total_bounds += p.bounds_matrix.size();
+            total_initial += p.initial_coordinates.size();
             total_chirals += p.chiral_centers.size();
             total_etk += p.etk_torsions.size();
             total_dcons += p.distance_constraints.size();
@@ -672,6 +887,7 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
             total_off += p.mmff_atom_offsets.size();
         }
         batch.bounds_matrices.reserve(total_bounds);
+        batch.initial_coordinates.reserve(total_initial);
         batch.chiral_centers.reserve(total_chirals);
         batch.etk_torsions.reserve(total_etk);
         batch.distance_constraints.reserve(total_dcons);
@@ -684,18 +900,20 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         batch.mmff_interactions.reserve(total_inter);
         batch.mmff_atom_offsets.reserve(total_off);
         batch.molecule_metadata.reserve(prepared.size());
+        batch.input_indices.reserve(prepared.size());
     }
 
-    // phase 2: pack into contiguous arrays (sequential, no reallocations)
-    for (std::uint32_t m = 0; m < batch.num_molecules; ++m) {
+    // Phase 2: Pack into contiguous arrays sequentially without reallocations.
+    for (std::uint32_t m = 0; m < static_cast<std::uint32_t>(prepared.size()); ++m) {
         if (prepared[m].num_atoms == 0)
             continue;
 
         batch.max_atoms_per_molecule = std::max(batch.max_atoms_per_molecule, prepared[m].num_atoms);
 
-        // set offsets before appending
+        // Set offsets before appending to the batched arrays.
         etkdg_molecule_metadata_t meta = prepared[m].metadata;
         meta.bounds_offset = static_cast<std::uint32_t>(batch.bounds_matrices.size());
+        meta.initial_coordinates_offset = static_cast<std::uint32_t>(batch.initial_coordinates.size());
         meta.chiral_offset = static_cast<std::uint32_t>(batch.chiral_centers.size());
         meta.torsion_offset = static_cast<std::uint32_t>(batch.etk_torsions.size());
         meta.constraint_offset = static_cast<std::uint32_t>(batch.distance_constraints.size());
@@ -708,10 +926,13 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         meta.mmff_atom_offsets_start = static_cast<std::uint32_t>(batch.mmff_atom_offsets.size());
 
         batch.molecule_metadata.push_back(meta);
+        batch.input_indices.push_back(m);
 
-        // append data
+        // Append the molecule data.
         batch.bounds_matrices.insert(batch.bounds_matrices.end(), prepared[m].bounds_matrix.begin(),
                                      prepared[m].bounds_matrix.end());
+        batch.initial_coordinates.insert(batch.initial_coordinates.end(), prepared[m].initial_coordinates.begin(),
+                                         prepared[m].initial_coordinates.end());
         batch.chiral_centers.insert(batch.chiral_centers.end(), prepared[m].chiral_centers.begin(),
                                     prepared[m].chiral_centers.end());
         batch.etk_torsions.insert(batch.etk_torsions.end(), prepared[m].etk_torsions.begin(),
@@ -729,8 +950,8 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         batch.mmff_oops.insert(batch.mmff_oops.end(), prepared[m].mmff_oops.begin(), prepared[m].mmff_oops.end());
         batch.mmff_stretchbends.insert(batch.mmff_stretchbends.end(), prepared[m].mmff_stretchbends.begin(),
                                        prepared[m].mmff_stretchbends.end());
-        // adjust per-atom interaction offsets for the batched array position
-        std::uint16_t const interactions_base = static_cast<std::uint16_t>(batch.mmff_interactions.size());
+        // Adjust per-atom interaction offsets for the batched array position.
+        std::uint32_t const interactions_base = static_cast<std::uint32_t>(batch.mmff_interactions.size());
         batch.mmff_interactions.insert(batch.mmff_interactions.end(), prepared[m].mmff_interactions.begin(),
                                        prepared[m].mmff_interactions.end());
         auto adjusted_offsets = prepared[m].mmff_atom_offsets;
@@ -738,6 +959,8 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
             off.interaction_start += interactions_base;
         batch.mmff_atom_offsets.insert(batch.mmff_atom_offsets.end(), adjusted_offsets.begin(), adjusted_offsets.end());
     }
+
+    batch.num_molecules = static_cast<std::uint32_t>(batch.molecule_metadata.size());
 
     return batch;
 }

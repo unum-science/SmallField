@@ -27,6 +27,7 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t num_etk_torsions;
     std::uint32_t num_distance_constraints;
     std::uint32_t bounds_offset;
+    std::uint32_t initial_coordinates_offset;
     std::uint32_t chiral_offset;
     std::uint32_t torsion_offset;
     std::uint32_t constraint_offset;
@@ -43,7 +44,7 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t mmff_oop_offset;
     std::uint32_t mmff_stretchbend_offset;
     std::uint32_t mmff_atom_offsets_start;
-    std::uint32_t padding[3]; ///< pad to 96 bytes (24 uint32_t) for alignment
+    std::uint32_t padding[2]; ///< pad to 96 bytes (24 uint32_t) for alignment
 };
 
 /**
@@ -168,15 +169,15 @@ struct alignas(32) mmff94_stretchbend_t {
  * interaction_type: 0=nonbonded, 1=bond, 2=angle(end), 3=angle(center), 4=torsion, 5=oop, 6=stretch-bend
  */
 struct mmff94_atom_interaction_t {
-    std::uint16_t term_index;      ///< index into the type-specific parameter array
+    std::uint32_t term_index;      ///< index into the type-specific parameter array
     std::uint8_t interaction_type; ///< 0=nb, 1=bond, 2=angle(end), 3=angle(ctr), 4=tor, 5=oop, 6=stbn
     std::uint8_t role;             ///< this atom's role (0=i, 1=j, 2=k, 3=l)
 };
 
-/** Per-atom offset into the interaction list. 4 bytes per atom. */
+/** Per-atom offset into the interaction list. */
 struct mmff94_atom_offsets_t {
-    std::uint16_t interaction_start; ///< first interaction entry for this atom
-    std::uint16_t interaction_count; ///< number of interactions for this atom
+    std::uint32_t interaction_start; ///< first interaction entry for this atom
+    std::uint32_t interaction_count; ///< number of interactions for this atom
 };
 
 /**

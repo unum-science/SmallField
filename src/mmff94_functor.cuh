@@ -267,63 +267,96 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const* position
     *gz += fz;
 }
 
-/** OOP bending energy and gradient. Wilson angle chi between bond j→i and plane j-k-l. */
-__device__ __forceinline__ void mmff_oop_contribution_(float const* positions, std::uint32_t num_atoms,
-                                                       std::uint32_t atom, mmff94_oop_t const& oop, std::uint8_t role,
-                                                       float* energy, float* gx, float* gy, float* gz) {
-    // load positions
-    float const jx = positions[oop.atom_j], jy = positions[num_atoms + oop.atom_j],
-                jz = positions[2 * num_atoms + oop.atom_j];
-    float const rji_x = positions[oop.atom_i] - jx, rji_y = positions[num_atoms + oop.atom_i] - jy,
-                rji_z = positions[2 * num_atoms + oop.atom_i] - jz;
-    float const rjk_x = positions[oop.atom_k] - jx, rjk_y = positions[num_atoms + oop.atom_k] - jy,
-                rjk_z = positions[2 * num_atoms + oop.atom_k] - jz;
-    float const rjl_x = positions[oop.atom_l] - jx, rjl_y = positions[num_atoms + oop.atom_l] - jy,
-                rjl_z = positions[2 * num_atoms + oop.atom_l] - jz;
+/** OOP energy helper for explicit coordinates. */
+__device__ __forceinline__ float mmff_oop_energy_(float ix, float iy, float iz, float jx, float jy, float jz, float kx,
+                                                  float ky, float kz, float lx, float ly, float lz,
+                                                  mmff94_oop_t const& oop) {
+    float const rji_x = ix - jx, rji_y = iy - jy, rji_z = iz - jz;
+    float const rjk_x = kx - jx, rjk_y = ky - jy, rjk_z = kz - jz;
+    float const rjl_x = lx - jx, rjl_y = ly - jy, rjl_z = lz - jz;
 
-    // normal to plane k-j-l
     float const nx = rjk_y * rjl_z - rjk_z * rjl_y;
     float const ny = rjk_z * rjl_x - rjk_x * rjl_z;
     float const nz = rjk_x * rjl_y - rjk_y * rjl_x;
-    float const n_len_sq = nx * nx + ny * ny + nz * nz;
-    float const n_len = sqrtf(fmaxf(n_len_sq, 1e-10f));
-    float const inv_n = __frcp_rn(n_len);
+    float const n_len = sqrtf(fmaxf(nx * nx + ny * ny + nz * nz, 1e-12f));
+    float const rji_len = sqrtf(fmaxf(rji_x * rji_x + rji_y * rji_y + rji_z * rji_z, 1e-12f));
+    float const sin_chi =
+        fmaxf(-1.0f, fminf(1.0f, (rji_x * nx + rji_y * ny + rji_z * nz) * __frcp_rn(rji_len * n_len)));
+    float const chi_deg = asinf(sin_chi) * mmff_rad2deg;
+    return 0.5f * mmff_angle_pf * oop.force_constant * chi_deg * chi_deg;
+}
 
-    // Wilson angle: sin(chi) = (rji . n) / (|rji| * |n|)
-    float const rji_len = sqrtf(fmaxf(rji_x * rji_x + rji_y * rji_y + rji_z * rji_z, 1e-10f));
-    float const dot_rji_n = rji_x * nx + rji_y * ny + rji_z * nz;
-    float const sin_chi = fmaxf(-1.0f, fminf(1.0f, dot_rji_n * __frcp_rn(rji_len * n_len)));
-    float const chi_rad = asinf(sin_chi);
-    float const chi_deg = chi_rad * mmff_rad2deg;
+/** OOP bending energy and gradient. */
+__device__ __forceinline__ void mmff_oop_contribution_(float const* positions, std::uint32_t num_atoms,
+                                                       std::uint32_t /*atom*/, mmff94_oop_t const& oop,
+                                                       std::uint8_t role, float* energy, float* gx, float* gy,
+                                                       float* gz) {
+    float ix = positions[oop.atom_i], iy = positions[num_atoms + oop.atom_i],
+          iz = positions[2 * num_atoms + oop.atom_i];
+    float jx = positions[oop.atom_j], jy = positions[num_atoms + oop.atom_j],
+          jz = positions[2 * num_atoms + oop.atom_j];
+    float kx = positions[oop.atom_k], ky = positions[num_atoms + oop.atom_k],
+          kz = positions[2 * num_atoms + oop.atom_k];
+    float lx = positions[oop.atom_l], ly = positions[num_atoms + oop.atom_l],
+          lz = positions[2 * num_atoms + oop.atom_l];
 
-    // energy (counted once by role 0)
+    float const base_energy = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
     if (role == 0)
-        *energy += 0.5f * mmff_angle_pf * oop.force_constant * chi_deg * chi_deg;
+        *energy += base_energy;
 
-    // gradient: dE/dchi_deg = 0.043844 * koop * chi_deg
-    // dchi_deg/dchi_rad = rad2deg
-    // dchi_rad/d(sin_chi) = 1/cos(chi)
-    float const cos_chi = sqrtf(fmaxf(1.0f - sin_chi * sin_chi, 1e-10f));
-    float const dE = mmff_angle_pf * oop.force_constant * chi_deg * mmff_rad2deg * __frcp_rn(cos_chi);
-    float const inv_rji = __frcp_rn(rji_len);
-    float const inv_rji_n = __frcp_rn(rji_len * n_len);
-
-    // d(sin_chi)/d(rji) = (n - sin_chi * rji_hat * |n|) / (|rji| * |n|)
-    if (role == 0) { // atom i
-        *gx += dE * (nx * inv_rji_n - sin_chi * rji_x * inv_rji * inv_rji);
-        *gy += dE * (ny * inv_rji_n - sin_chi * rji_y * inv_rji * inv_rji);
-        *gz += dE * (nz * inv_rji_n - sin_chi * rji_z * inv_rji * inv_rji);
-    } else if (role == 1) { // atom j (center): -(grad_i + grad_k + grad_l)
-        float const gi_x = dE * (nx * inv_rji_n - sin_chi * rji_x * inv_rji * inv_rji);
-        float const gi_y = dE * (ny * inv_rji_n - sin_chi * rji_y * inv_rji * inv_rji);
-        float const gi_z = dE * (nz * inv_rji_n - sin_chi * rji_z * inv_rji * inv_rji);
-        // simplified: center atom gradient ensures force balance
-        *gx -= gi_x;
-        *gy -= gi_y;
-        *gz -= gi_z;
+    constexpr float epsilon = 1e-4f;
+    float* target_x = nullptr;
+    float* target_y = nullptr;
+    float* target_z = nullptr;
+    switch (role) {
+    case 0:
+        target_x = &ix;
+        target_y = &iy;
+        target_z = &iz;
+        break;
+    case 1:
+        target_x = &jx;
+        target_y = &jy;
+        target_z = &jz;
+        break;
+    case 2:
+        target_x = &kx;
+        target_y = &ky;
+        target_z = &kz;
+        break;
+    case 3:
+        target_x = &lx;
+        target_y = &ly;
+        target_z = &lz;
+        break;
+    default: return;
     }
-    // roles 2,3 (k,l) gradients via normal derivative are complex; approximate via force balance
-    // the energy is small relative to other terms so this is acceptable for now
+
+    float original = *target_x;
+    *target_x = original + epsilon;
+    float const epx = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
+    *target_x = original - epsilon;
+    float const emx = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
+    *target_x = original;
+
+    original = *target_y;
+    *target_y = original + epsilon;
+    float const epy = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
+    *target_y = original - epsilon;
+    float const emy = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
+    *target_y = original;
+
+    original = *target_z;
+    *target_z = original + epsilon;
+    float const epz = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
+    *target_z = original - epsilon;
+    float const emz = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
+    *target_z = original;
+
+    float const inv_2eps = 0.5f / epsilon;
+    *gx += (epx - emx) * inv_2eps;
+    *gy += (epy - emy) * inv_2eps;
+    *gz += (epz - emz) * inv_2eps;
 }
 
 /** Stretch-bend coupling energy and gradient. */

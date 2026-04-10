@@ -48,7 +48,7 @@ def generate_conformers(smiles: str, num_conformers: int = 10,
 
     try:
         from rdkit import Chem
-        from rdkit.Chem import AllChem, rdDistGeom
+        from rdkit.Chem import rdDistGeom
     except ImportError:
         raise ImportError("RDKit is required for ETKDG conformer generation")
 
@@ -63,7 +63,7 @@ def generate_conformers(smiles: str, num_conformers: int = 10,
     bounds = rdDistGeom.GetMoleculeBoundsMatrix(mol)
     bounds_flat = bounds.astype(np.float32).flatten()
 
-    AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+    Chem.AssignStereochemistry(mol, cleanIt=True, force=True, flagPossibleStereoCenters=True)
 
     chirals = []
     for atom in mol.GetAtoms():
@@ -71,21 +71,13 @@ def generate_conformers(smiles: str, num_conformers: int = 10,
         if tag not in (Chem.ChiralType.CHI_TETRAHEDRAL_CW,
                        Chem.ChiralType.CHI_TETRAHEDRAL_CCW):
             continue
+        if not atom.HasProp("_CIPCode"):
+            continue
         neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
         if len(neighbors) < 3:
             continue
-        conf = mol.GetConformer()
-        ra = conf.GetAtomPosition(atom.GetIdx())
-        rb = conf.GetAtomPosition(neighbors[0])
-        rc = conf.GetAtomPosition(neighbors[1])
-        rd = conf.GetAtomPosition(neighbors[2])
-        bv = (rb.x - ra.x, rb.y - ra.y, rb.z - ra.z)
-        cv = (rc.x - ra.x, rc.y - ra.y, rc.z - ra.z)
-        dv = (rd.x - ra.x, rd.y - ra.y, rd.z - ra.z)
-        volume = (bv[0] * (cv[1]*dv[2] - cv[2]*dv[1])
-                + bv[1] * (cv[2]*dv[0] - cv[0]*dv[2])
-                + bv[2] * (cv[0]*dv[1] - cv[1]*dv[0]))
-        target_sign = 1 if volume > 0 else -1
+        neighbors.sort(key=lambda idx: (-int(mol.GetAtomWithIdx(idx).GetProp("_CIPRank")), idx))
+        target_sign = 1 if atom.GetProp("_CIPCode") == "S" else -1
         descriptor = struct.pack("BBBBBbBB",
             atom.GetIdx(),
             neighbors[0], neighbors[1] if len(neighbors) > 1 else 0,

@@ -7,9 +7,6 @@
  * Reports per-wave timing and overall upload/kernel/download breakdown.
  */
 
-#include "bench_chembl_kernels.h"
-#include "etkdg_pipeline.cuh"
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -18,12 +15,16 @@
 #include <numeric>
 #include <vector>
 
+#include "bench_chembl_kernels.h"
+#include "etkdg_pipeline.cuh"
+
 using namespace smallfield;
 
 extern "C" {
 
 gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
-    float const* host_bounds, std::uint32_t bounds_total_floats, chiral_center_descriptor_t const* host_chirals,
+    float const* host_bounds, std::uint32_t bounds_total_floats, float const* host_initial_coordinates,
+    std::uint32_t initial_coordinates_total, chiral_center_descriptor_t const* host_chirals,
     std::uint32_t chirals_total, etk_torsion_descriptor_t const* host_torsions, std::uint32_t torsions_total,
     distance_constraint_t const* host_constraints, std::uint32_t constraints_total,
     mmff94_nonbonded_pair_t const* host_mmff_nb, std::uint32_t mmff_nb_total, mmff94_bond_t const* host_mmff_bonds,
@@ -36,20 +37,21 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     float* host_energies_out, std::uint8_t* host_status_out, std::uint32_t num_conformers,
     std::uint32_t max_stereo_attempts, std::uint32_t max_atoms_per_molecule, std::uint64_t seed) {
 
-    // sort molecules by atom count for wave-based dispatch
+    // Sort molecules by atom count for wave-based dispatch.
     std::vector<std::uint32_t> order(num_molecules);
     std::iota(order.begin(), order.end(), 0u);
     std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
         return host_metadata[a].num_atoms < host_metadata[b].num_atoms;
     });
 
-    // reorder metadata according to sort
+    // Reorder metadata according to the sort order.
     std::vector<etkdg_molecule_metadata_t> sorted_meta(num_molecules);
     for (std::uint32_t i = 0; i < num_molecules; ++i)
         sorted_meta[i] = host_metadata[order[i]];
 
-    // allocate device memory for all input arrays
+    // Allocate device memory for all input arrays.
     float* dev_bounds;
+    float* dev_initial_coordinates;
     chiral_center_descriptor_t* dev_chirals;
     etk_torsion_descriptor_t* dev_torsions;
     distance_constraint_t* dev_constraints;
@@ -64,6 +66,7 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     etkdg_molecule_metadata_t* dev_metadata;
 
     cudaMalloc(&dev_bounds, bounds_total_floats * sizeof(float));
+    cudaMalloc(&dev_initial_coordinates, std::max(initial_coordinates_total, 1u) * sizeof(float));
     cudaMalloc(&dev_chirals, std::max(chirals_total, 1u) * sizeof(chiral_center_descriptor_t));
     cudaMalloc(&dev_torsions, std::max(torsions_total, 1u) * sizeof(etk_torsion_descriptor_t));
     cudaMalloc(&dev_constraints, std::max(constraints_total, 1u) * sizeof(distance_constraint_t));
@@ -77,7 +80,7 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaMalloc(&dev_mmff_offsets, std::max(mmff_offsets_total, 1u) * sizeof(mmff94_atom_offsets_t));
     cudaMalloc(&dev_metadata, num_molecules * sizeof(etkdg_molecule_metadata_t));
 
-    // allocate output buffers (using global max_atoms for output stride)
+    // Allocate output buffers by using the global max_atoms value as the output stride.
     std::uint32_t const total_conf = num_molecules * num_conformers;
     std::uint32_t const total_coords = total_conf * max_atoms_per_molecule * 3;
     float* dev_coords_out;
@@ -98,9 +101,12 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaEventCreate(&ev_kernel_end);
     cudaEventCreate(&ev_download_end);
 
-    // phase 1: upload (all parameter arrays are shared across waves)
+    // Run phase 1 upload because all parameter arrays are shared across waves.
     cudaEventRecord(ev_upload_start);
     cudaMemcpy(dev_bounds, host_bounds, bounds_total_floats * sizeof(float), cudaMemcpyHostToDevice);
+    if (initial_coordinates_total > 0)
+        cudaMemcpy(dev_initial_coordinates, host_initial_coordinates, initial_coordinates_total * sizeof(float),
+                   cudaMemcpyHostToDevice);
     if (chirals_total > 0)
         cudaMemcpy(dev_chirals, host_chirals, chirals_total * sizeof(chiral_center_descriptor_t),
                    cudaMemcpyHostToDevice);
@@ -135,7 +141,7 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
                cudaMemcpyHostToDevice);
     cudaEventRecord(ev_upload_end);
 
-    // phase 2: wave-based kernel dispatch
+    // Run phase 2 wave-based kernel dispatch.
     constexpr std::uint32_t wave_bins[] = {16, 32, 48, 64, 80, 96, 112, 128};
     constexpr std::uint32_t num_bins = 8;
 
@@ -146,7 +152,7 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     std::uint32_t max_bpsm = 0;
 
     for (std::uint32_t bin = 0; bin < num_bins && wave_start < num_molecules; ++bin) {
-        // find end of this wave: all molecules with num_atoms <= wave_bins[bin]
+        // Find the end of the current wave.
         std::uint32_t wave_end = wave_start;
         while (wave_end < num_molecules && sorted_meta[wave_end].num_atoms <= wave_bins[bin])
             ++wave_end;
@@ -167,12 +173,13 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
         std::printf("    wave %u: atoms<=%-3u  mols=%-5u  shared=%-5u  blocks/SM=%-2d  grid=%-5u\n", bin,
                     wave_max_atoms, wave_size, shared_bytes, blocks_per_sm, grid_size);
 
-        // launch kernel for this wave's molecules
-        // output written to sorted slots [wave_start*num_conf .. wave_end*num_conf)
+        // Launch the kernel for the molecules in the current wave.
+        // Write output to sorted slots [wave_start * num_conf, wave_end * num_conf).
         etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
-            dev_bounds, dev_chirals, dev_torsions, dev_constraints, dev_mmff_nb, dev_mmff_bonds, dev_mmff_angles,
-            dev_mmff_torsions, dev_mmff_oops, dev_mmff_stbn, dev_mmff_inter, dev_mmff_offsets,
-            dev_metadata + wave_start, dev_coords_out + wave_start * num_conformers * max_atoms_per_molecule * 3,
+            dev_bounds, initial_coordinates_total > 0 ? dev_initial_coordinates : nullptr, dev_chirals, dev_torsions,
+            dev_constraints, dev_mmff_nb, dev_mmff_bonds, dev_mmff_angles, dev_mmff_torsions, dev_mmff_oops,
+            dev_mmff_stbn, dev_mmff_inter, dev_mmff_offsets, dev_metadata + wave_start,
+            dev_coords_out + wave_start * num_conformers * max_atoms_per_molecule * 3,
             dev_energies_out + wave_start * num_conformers, dev_status_out + wave_start * num_conformers, wave_size,
             num_conformers, max_stereo_attempts, wave_max_atoms, max_atoms_per_molecule, seed);
 
@@ -183,7 +190,7 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
 
     cudaEventRecord(ev_kernel_end);
 
-    // phase 3: download and unsort results
+    // Run phase 3 download and unsort the results.
     std::vector<float> sorted_coords(total_coords);
     std::vector<float> sorted_energies(total_conf);
     std::vector<std::uint8_t> sorted_status(total_conf);
@@ -194,7 +201,7 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaEventRecord(ev_download_end);
     cudaEventSynchronize(ev_download_end);
 
-    // unsort: map sorted index back to original molecule index
+    // Map each sorted index back to the original molecule index.
     std::uint32_t const coord_stride = max_atoms_per_molecule * 3;
     for (std::uint32_t sorted_idx = 0; sorted_idx < num_molecules; ++sorted_idx) {
         std::uint32_t const orig_idx = order[sorted_idx];
@@ -208,7 +215,7 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
         }
     }
 
-    // count successes
+    // Count successes.
     std::uint32_t num_succeeded = 0;
     for (std::uint32_t i = 0; i < total_conf; ++i)
         if (host_status_out[i] == 0)
@@ -219,13 +226,14 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaEventElapsedTime(&kernel_ms, ev_kernel_start, ev_kernel_end);
     cudaEventElapsedTime(&download_ms, ev_kernel_end, ev_download_end);
 
-    // cleanup
+    // Clean up.
     cudaEventDestroy(ev_upload_start);
     cudaEventDestroy(ev_upload_end);
     cudaEventDestroy(ev_kernel_start);
     cudaEventDestroy(ev_kernel_end);
     cudaEventDestroy(ev_download_end);
     cudaFree(dev_bounds);
+    cudaFree(dev_initial_coordinates);
     cudaFree(dev_chirals);
     cudaFree(dev_torsions);
     cudaFree(dev_constraints);

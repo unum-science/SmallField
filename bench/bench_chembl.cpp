@@ -9,29 +9,29 @@
  *   4. Scaling analysis across batch sizes
  */
 
-#include "bench_chembl_kernels.h"
-#include "etkdg_preprocess.hpp"
-#include "test_helpers.hpp"
-
-#include <GraphMol/DistGeomHelpers/Embedder.h>
-#include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <numeric>
-#include <omp.h>
 #include <random>
 #include <string>
 #include <vector>
+
+#include <GraphMol/DistGeomHelpers/Embedder.h>
+#include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
+#include <omp.h>
+
+#include "bench_chembl_kernels.h"
+#include "etkdg_preprocess.hpp"
+#include "test_helpers.hpp"
 
 using namespace smallfield;
 using namespace smallfield::test;
 using clock_type = std::chrono::high_resolution_clock;
 
-// load SMILES from file (one per line)
+// Load SMILES from a file, one per line.
 static std::vector<std::string> load_smiles(std::string const& path, std::uint32_t max_count = 0) {
     std::vector<std::string> result;
     std::ifstream file(path);
@@ -39,7 +39,7 @@ static std::vector<std::string> load_smiles(std::string const& path, std::uint32
     while (std::getline(file, line)) {
         if (line.empty() || line[0] == '#')
             continue;
-        // take first whitespace-delimited token (SMILES may be followed by name)
+        // Take the first whitespace-delimited token because the line may also contain a molecule name.
         auto end = line.find_first_of(" \t");
         if (end != std::string::npos)
             line = line.substr(0, end);
@@ -60,14 +60,14 @@ static double percentile(std::vector<double>& sorted_values, double p) {
     return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac;
 }
 
-// section 1: RDKit CPU benchmark
+// Section 1: RDKit CPU benchmark.
 static void bench_rdkit_cpu(std::vector<std::string> const& smiles, std::uint32_t num_conformers,
                             std::uint32_t max_stereo_attempts) {
     int num_threads = omp_get_max_threads();
     std::uint32_t const n = static_cast<std::uint32_t>(smiles.size());
     std::printf("\n=== System A: RDKit CPU (%d threads) ===\n", num_threads);
 
-    // pre-parse all molecules (untimed)
+    // Pre-parse all molecules outside the timed region.
     std::printf("  Pre-parsing %u molecules...\n", n);
     std::vector<std::unique_ptr<RDKit::RWMol>> mols(n);
     std::uint32_t parse_ok = 0;
@@ -83,7 +83,7 @@ static void bench_rdkit_cpu(std::vector<std::string> const& smiles, std::uint32_
     }
     std::printf("  Parsed: %u / %u\n", parse_ok, n);
 
-    // timed: EmbedMultipleConfs + MMFFOptimize
+    // Time EmbedMultipleConfs followed by MMFFOptimize.
     std::printf("  Running ETKDG + MMFF94 (%u conformers each)...\n", num_conformers);
     auto t0 = clock_type::now();
     std::uint32_t total_conf_ok = 0;
@@ -103,7 +103,7 @@ static void bench_rdkit_cpu(std::vector<std::string> const& smiles, std::uint32_
                 total_conf_ok += static_cast<std::uint32_t>(conf_ids.size());
             }
         } catch (...) {
-            // bad molecule, skip
+            // Skip molecules that fail RDKit processing.
         }
     }
     auto t1 = clock_type::now();
@@ -116,7 +116,7 @@ static void bench_rdkit_cpu(std::vector<std::string> const& smiles, std::uint32_
     std::printf("  Succeeded: %u conformers\n", total_conf_ok);
 }
 
-// section 2: SmallField GPU benchmark
+// Section 2: SmallField GPU benchmark.
 static void bench_smallfield_gpu(std::vector<std::string> const& smiles, std::uint32_t num_conformers,
                                  std::uint32_t max_stereo_attempts, std::vector<float>& coords_out,
                                  std::vector<float>& energies_out, std::vector<std::uint8_t>& status_out,
@@ -124,7 +124,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const& smiles, std::ui
     std::uint32_t const n = static_cast<std::uint32_t>(smiles.size());
     std::printf("\n=== System B: SmallField GPU ===\n");
 
-    // timed phase 1: CPU preprocessing
+    // Time phase 1 CPU preprocessing.
     std::printf("  Preprocessing %u molecules (OpenMP)...\n", n);
     auto t0 = clock_type::now();
     batch_out = prepare_molecule_batch(smiles);
@@ -134,16 +134,17 @@ static void bench_smallfield_gpu(std::vector<std::string> const& smiles, std::ui
                 batch_out.max_atoms_per_molecule);
     std::printf("  Preprocessing: %.0f ms\n", preproc_ms);
 
-    // allocate output
+    // Allocate output buffers.
     std::uint32_t const total_conf = batch_out.num_molecules * num_conformers;
     std::uint32_t const max_coords = total_conf * batch_out.max_atoms_per_molecule * 3;
     coords_out.resize(max_coords);
     energies_out.resize(total_conf);
     status_out.resize(total_conf);
 
-    // timed phase 2: GPU upload + kernel
+    // Time phase 2 GPU upload, execution, and download.
     auto result = gpu_etkdg_mmff_pipeline(
         batch_out.bounds_matrices.data(), static_cast<std::uint32_t>(batch_out.bounds_matrices.size()),
+        batch_out.initial_coordinates.data(), static_cast<std::uint32_t>(batch_out.initial_coordinates.size()),
         batch_out.chiral_centers.empty() ? nullptr : batch_out.chiral_centers.data(),
         static_cast<std::uint32_t>(batch_out.chiral_centers.size()),
         batch_out.etk_torsions.empty() ? nullptr : batch_out.etk_torsions.data(),
@@ -196,14 +197,14 @@ static void bench_smallfield_gpu(std::vector<std::string> const& smiles, std::ui
                 bounds_bytes / 1e6, params_bytes / 1e6);
 }
 
-// section 3: quality cross-validation
+// Section 3: Quality cross-validation.
 static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecule_batch_t const& batch,
                            std::vector<float> const& coords, std::vector<float> const& energies,
                            std::vector<std::uint8_t> const& status, std::uint32_t num_conformers,
                            std::uint32_t max_samples) {
     std::printf("\n=== Quality cross-validation ===\n");
 
-    // build list of (mol_index, conf_index) for succeeded conformers
+    // Build the list of succeeded conformers.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> succeeded;
     for (std::uint32_t m = 0; m < batch.num_molecules; ++m) {
         for (std::uint32_t c = 0; c < num_conformers; ++c) {
@@ -213,7 +214,7 @@ static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecul
         }
     }
 
-    // random sample
+    // Select a random sample.
     std::mt19937 rng(42);
     if (succeeded.size() > max_samples) {
         std::shuffle(succeeded.begin(), succeeded.end(), rng);
@@ -221,7 +222,7 @@ static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecul
     }
     std::printf("  Evaluating %zu conformers via RDKit MMFF94...\n", succeeded.size());
 
-    // parallel cross-validation
+    // Run cross-validation in parallel.
     std::vector<double> rdkit_energies(succeeded.size(), std::numeric_limits<double>::quiet_NaN());
     std::vector<double> sf_energies(succeeded.size());
     std::vector<std::uint32_t> atom_counts(succeeded.size());
@@ -230,7 +231,8 @@ static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecul
     for (std::size_t idx = 0; idx < succeeded.size(); ++idx) {
         auto [m, c] = succeeded[idx];
         try {
-            auto mol = mol_from_smiles(smiles[m]);
+            std::uint32_t const input_index = batch.input_indices[m];
+            auto mol = mol_from_smiles(smiles[input_index]);
             if (!mol)
                 continue;
             bool embedded = embed_molecule(*mol);
@@ -242,7 +244,7 @@ static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecul
             std::uint32_t const slot = m * num_conformers + c;
             std::uint32_t const off = slot * max_n * 3;
 
-            // convert SoA → interleaved
+            // Convert SoA coordinates to interleaved layout.
             std::vector<float> interleaved(na * 3);
             for (std::uint32_t i = 0; i < na; ++i) {
                 interleaved[i * 3 + 0] = coords[off + 0 * max_n + i];
@@ -254,11 +256,11 @@ static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecul
             sf_energies[idx] = static_cast<double>(energies[slot]);
             atom_counts[idx] = na;
         } catch (...) {
-            // skip
+            // Skip failures.
         }
     }
 
-    // analyze
+    // Analyze the resulting energy distributions.
     std::uint32_t finite_count = 0;
     std::vector<double> valid_rdkit, valid_sf;
     for (std::size_t i = 0; i < rdkit_energies.size(); ++i) {
@@ -285,7 +287,7 @@ static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecul
                     percentile(valid_sf, 25), percentile(valid_sf, 50), percentile(valid_sf, 75),
                     percentile(valid_sf, 95));
 
-        // per-atom-count breakdown
+        // Print the per-atom-count breakdown.
         std::printf("  Per-atom-count breakdown:\n");
         std::printf("    %6s  %6s  %8s  %8s\n", "atoms", "count", "rdkit_P50", "sf_P50");
         std::vector<std::uint32_t> bins = {20, 40, 60, 80, 100, 128};
@@ -313,13 +315,13 @@ int main(int argc, char** argv) {
     std::printf("bench_chembl: SmallField GPU vs RDKit CPU\n");
     std::printf("==========================================\n");
 
-    // defaults
+    // Set defaults.
     std::string smi_path = "/tmp/chembl_valid.smi";
     std::uint32_t num_conformers = 3;
     std::uint32_t max_stereo_attempts = 10;
     std::uint32_t quality_samples = 10000;
 
-    // simple arg parsing
+    // Parse the command line.
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--smi" && i + 1 < argc)
@@ -341,7 +343,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // scaling analysis: run at multiple batch sizes
+    // Run the scaling analysis at multiple batch sizes.
     std::vector<std::uint32_t> batch_sizes = {100, 500, 1000, 2000, 5000};
     if (all_smiles.size() > 5000)
         batch_sizes.push_back(static_cast<std::uint32_t>(all_smiles.size()));
@@ -353,16 +355,16 @@ int main(int argc, char** argv) {
         std::vector<std::string> smiles(all_smiles.begin(), all_smiles.begin() + batch_size);
         std::printf("\n\n############## batch_size = %u ##############\n", batch_size);
 
-        // system A: RDKit CPU
+        // Run system A: RDKit CPU.
         bench_rdkit_cpu(smiles, num_conformers, max_stereo_attempts);
 
-        // system B: SmallField GPU
+        // Run system B: SmallField GPU.
         std::vector<float> coords, energies_f;
         std::vector<std::uint8_t> status;
         etkdg_molecule_batch_t batch;
         bench_smallfield_gpu(smiles, num_conformers, max_stereo_attempts, coords, energies_f, status, batch);
 
-        // quality cross-validation (only on full dataset)
+        // Run quality cross-validation only on the full dataset.
         if (batch_size == static_cast<std::uint32_t>(all_smiles.size()) || batch_size == batch_sizes.back()) {
             cross_validate(smiles, batch, coords, energies_f, status, num_conformers, quality_samples);
         }

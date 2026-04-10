@@ -5,12 +5,12 @@
  * Provides GPU-accelerated ETKDG + MMFF94 conformer generation via pybind11.
  */
 
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-
 #include <cstdint>
 #include <cstdlib>
 #include <utility>
+
+#include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
 
 #if defined(__CUDACC__)
 #include "etkdg_pipeline.cuh"
@@ -119,7 +119,7 @@ class etkdg_context_t {
         std::uint32_t const num_molecules =
             static_cast<std::uint32_t>(metadata_info.size / sizeof(etkdg_molecule_metadata_t));
 
-        // copy input to device
+        // Copy input to the device.
         cudaMemcpy(bounds_buffer_.data(), bounds_info.ptr, bounds_info.size * sizeof(float), cudaMemcpyHostToDevice);
         if (chirals_info.size > 0)
             cudaMemcpy(chirals_buffer_.data(), chirals_info.ptr, chirals_info.size, cudaMemcpyHostToDevice);
@@ -129,7 +129,7 @@ class etkdg_context_t {
             cudaMemcpy(constraints_buffer_.data(), constraints_info.ptr, constraints_info.size, cudaMemcpyHostToDevice);
         cudaMemcpy(metadata_buffer_.data(), metadata_info.ptr, metadata_info.size, cudaMemcpyHostToDevice);
 
-        // compute grid size from occupancy
+        // Compute the grid size from occupancy.
         std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(max_atoms_, 0);
         cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(shared_bytes));
@@ -142,7 +142,7 @@ class etkdg_context_t {
             std::min(num_molecules, static_cast<std::uint32_t>(max_blocks_per_sm * num_sms));
 
         etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes>>>(
-            bounds_buffer_.data(), reinterpret_cast<chiral_center_descriptor_t const*>(chirals_buffer_.data()),
+            bounds_buffer_.data(), nullptr, reinterpret_cast<chiral_center_descriptor_t const*>(chirals_buffer_.data()),
             reinterpret_cast<etk_torsion_descriptor_t const*>(torsions_buffer_.data()),
             reinterpret_cast<distance_constraint_t const*>(constraints_buffer_.data()), nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -151,7 +151,7 @@ class etkdg_context_t {
             max_atoms_, max_atoms_, random_seed);
         cudaDeviceSynchronize();
 
-        // copy results back
+        // Copy results back to the host.
         std::uint32_t const total_conformers = num_molecules * num_conformers;
         std::uint32_t const total_coords = total_conformers * max_atoms_ * 3;
 
