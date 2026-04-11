@@ -71,8 +71,9 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(float const* positi
     float const ax = positions[atom], ay = positions[num_atoms + atom], az = positions[2 * num_atoms + atom];
     float const bx = positions[other], by = positions[num_atoms + other], bz = positions[2 * num_atoms + other];
     float const dx = bx - ax, dy = by - ay, dz = bz - az;
-    float const r = sqrtf(fmaxf(fmaf(dx, dx, fmaf(dy, dy, dz * dz)), 1e-8f));
-    float const inv_r = __frcp_rn(r);
+    float const r_sq = fmaxf(fmaf(dx, dx, fmaf(dy, dy, dz * dz)), 1e-8f);
+    float const inv_r = rsqrtf(r_sq);
+    float const r = r_sq * inv_r;
 
     // VdW: buffered 14-7
     float const rho = r * __frcp_rn(pair.r_star);
@@ -113,8 +114,9 @@ __device__ __forceinline__ void mmff_bond_contribution_(float const* positions, 
     float const ax = positions[atom], ay = positions[num_atoms + atom], az = positions[2 * num_atoms + atom];
     float const bx = positions[other], by = positions[num_atoms + other], bz = positions[2 * num_atoms + other];
     float const dx = bx - ax, dy = by - ay, dz = bz - az;
-    float const r = sqrtf(fmaxf(fmaf(dx, dx, fmaf(dy, dy, dz * dz)), 1e-8f));
-    float const inv_r = __frcp_rn(r);
+    float const r_sq = fmaxf(fmaf(dx, dx, fmaf(dy, dy, dz * dz)), 1e-8f);
+    float const inv_r = rsqrtf(r_sq);
+    float const r = r_sq * inv_r;
     float const dr = r - bond.equilibrium_distance;
     float const cs = mmff_bond_cs;
 
@@ -146,10 +148,8 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const* positions,
     // vectors from central atom j
     float const rij_x = ix - jx, rij_y = iy - jy, rij_z = iz - jz;
     float const rkj_x = kx - jx, rkj_y = ky - jy, rkj_z = kz - jz;
-    float const rij_len = sqrtf(fmaxf(fmaf(rij_x, rij_x, fmaf(rij_y, rij_y, rij_z * rij_z)), 1e-8f));
-    float const rkj_len = sqrtf(fmaxf(fmaf(rkj_x, rkj_x, fmaf(rkj_y, rkj_y, rkj_z * rkj_z)), 1e-8f));
-    float const inv_rij = __frcp_rn(rij_len);
-    float const inv_rkj = __frcp_rn(rkj_len);
+    float const inv_rij = rsqrtf(fmaxf(fmaf(rij_x, rij_x, fmaf(rij_y, rij_y, rij_z * rij_z)), 1e-8f));
+    float const inv_rkj = rsqrtf(fmaxf(fmaf(rkj_x, rkj_x, fmaf(rkj_y, rkj_y, rkj_z * rkj_z)), 1e-8f));
 
     // unit vectors
     float const p12_x = rij_x * inv_rij, p12_y = rij_y * inv_rij, p12_z = rij_z * inv_rij;
@@ -220,15 +220,13 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const* position
 
     // normals
     float t0x = r0y * r1z - r0z * r1y, t0y = r0z * r1x - r0x * r1z, t0z = r0x * r1y - r0y * r1x;
-    float const d0 = sqrtf(fmaxf(t0x * t0x + t0y * t0y + t0z * t0z, 1e-10f));
-    float const id0 = __frcp_rn(d0);
+    float const id0 = rsqrtf(fmaxf(t0x * t0x + t0y * t0y + t0z * t0z, 1e-10f));
     t0x *= id0;
     t0y *= id0;
     t0z *= id0;
 
     float t1x = r2y * r3z - r2z * r3y, t1y = r2z * r3x - r2x * r3z, t1z = r2x * r3y - r2y * r3x;
-    float const d1 = sqrtf(fmaxf(t1x * t1x + t1y * t1y + t1z * t1z, 1e-10f));
-    float const id1 = __frcp_rn(d1);
+    float const id1 = rsqrtf(fmaxf(t1x * t1x + t1y * t1y + t1z * t1z, 1e-10f));
     t1x *= id1;
     t1y *= id1;
     t1z *= id1;
@@ -237,11 +235,11 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const* position
 
     // signed sin(φ) from the triple product (t0 × t1) · r1_hat
     // r1 = bond j→k (the central bond), same direction as bond_jk
-    float const r1_len = sqrtf(fmaxf(r1x * r1x + r1y * r1y + r1z * r1z, 1e-10f));
+    float const inv_r1_len = rsqrtf(fmaxf(r1x * r1x + r1y * r1y + r1z * r1z, 1e-10f));
     float const cross_n_x = t0y * t1z - t0z * t1y;
     float const cross_n_y = t0z * t1x - t0x * t1z;
     float const cross_n_z = t0x * t1y - t0y * t1x;
-    float const sin_phi = (cross_n_x * r1x + cross_n_y * r1y + cross_n_z * r1z) * __frcp_rn(r1_len);
+    float const sin_phi = (cross_n_x * r1x + cross_n_y * r1y + cross_n_z * r1z) * inv_r1_len;
 
     // energy (uses cos_phi only, sign-independent)
     float const cos2 = 2.0f * cos_phi * cos_phi - 1.0f;
@@ -306,10 +304,9 @@ __device__ __forceinline__ float mmff_oop_energy_(float ix, float iy, float iz, 
     float const nx = rjk_y * rjl_z - rjk_z * rjl_y;
     float const ny = rjk_z * rjl_x - rjk_x * rjl_z;
     float const nz = rjk_x * rjl_y - rjk_y * rjl_x;
-    float const n_len = sqrtf(fmaxf(nx * nx + ny * ny + nz * nz, 1e-12f));
-    float const rji_len = sqrtf(fmaxf(rji_x * rji_x + rji_y * rji_y + rji_z * rji_z, 1e-12f));
-    float const sin_chi =
-        fmaxf(-1.0f, fminf(1.0f, (rji_x * nx + rji_y * ny + rji_z * nz) * __frcp_rn(rji_len * n_len)));
+    float const inv_n_len = rsqrtf(fmaxf(nx * nx + ny * ny + nz * nz, 1e-12f));
+    float const inv_rji_len = rsqrtf(fmaxf(rji_x * rji_x + rji_y * rji_y + rji_z * rji_z, 1e-12f));
+    float const sin_chi = fmaxf(-1.0f, fminf(1.0f, (rji_x * nx + rji_y * ny + rji_z * nz) * inv_rji_len * inv_n_len));
     float const chi_deg = asinf(sin_chi) * mmff_rad2deg;
     return 0.5f * mmff_angle_pf * oop.force_constant * chi_deg * chi_deg;
 }
@@ -342,17 +339,15 @@ __device__ __forceinline__ void mmff_oop_contribution_(float const* positions, s
     float3_mmff_t const bond_jl = sub_float3_mmff_(atom_l_position, atom_j_position);
     float3_mmff_t const plane_normal = cross_float3_mmff_(bond_jk, bond_jl);
 
-    float const bond_ji_length = sqrtf(fmaxf(dot_float3_mmff_(bond_ji, bond_ji), 1e-12f));
-    float const plane_normal_length = sqrtf(fmaxf(dot_float3_mmff_(plane_normal, plane_normal), 1e-12f));
-    float const inv_bond_ji_length = __frcp_rn(bond_ji_length);
-    float const inv_plane_normal_length = __frcp_rn(plane_normal_length);
+    float const inv_bond_ji_length = rsqrtf(fmaxf(dot_float3_mmff_(bond_ji, bond_ji), 1e-12f));
+    float const inv_plane_normal_length = rsqrtf(fmaxf(dot_float3_mmff_(plane_normal, plane_normal), 1e-12f));
 
     float3_mmff_t const bond_ji_unit = scale_float3_mmff_(bond_ji, inv_bond_ji_length);
     float3_mmff_t const plane_normal_unit = scale_float3_mmff_(plane_normal, inv_plane_normal_length);
 
     float const sin_chi = fmaxf(-1.0f, fminf(1.0f, dot_float3_mmff_(bond_ji_unit, plane_normal_unit)));
     float const chi_deg = asinf(sin_chi) * mmff_rad2deg;
-    float const inv_cos_chi = __frcp_rn(sqrtf(fmaxf(1.0f - sin_chi * sin_chi, 1e-10f)));
+    float const inv_cos_chi = rsqrtf(fmaxf(1.0f - sin_chi * sin_chi, 1e-10f));
     float const dE_dsin_chi = mmff_angle_pf * oop.force_constant * chi_deg * mmff_rad2deg * inv_cos_chi;
 
     float3_mmff_t const ds_dji = scale_float3_mmff_(
@@ -406,10 +401,12 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const* posi
     float const rkj_x = positions[sb.atom_k] - jx, rkj_y = positions[num_atoms + sb.atom_k] - jy,
                 rkj_z = positions[2 * num_atoms + sb.atom_k] - jz;
 
-    float const rij_len = sqrtf(fmaxf(rij_x * rij_x + rij_y * rij_y + rij_z * rij_z, 1e-8f));
-    float const rkj_len = sqrtf(fmaxf(rkj_x * rkj_x + rkj_y * rkj_y + rkj_z * rkj_z, 1e-8f));
-    float const inv_rij = __frcp_rn(rij_len);
-    float const inv_rkj = __frcp_rn(rkj_len);
+    float const rij_len_sq = fmaxf(rij_x * rij_x + rij_y * rij_y + rij_z * rij_z, 1e-8f);
+    float const rkj_len_sq = fmaxf(rkj_x * rkj_x + rkj_y * rkj_y + rkj_z * rkj_z, 1e-8f);
+    float const inv_rij = rsqrtf(rij_len_sq);
+    float const inv_rkj = rsqrtf(rkj_len_sq);
+    float const rij_len = rij_len_sq * inv_rij;
+    float const rkj_len = rkj_len_sq * inv_rkj;
 
     float const cos_theta =
         fmaxf(-1.0f, fminf(1.0f, (rij_x * rkj_x + rij_y * rkj_y + rij_z * rkj_z) * inv_rij * inv_rkj));

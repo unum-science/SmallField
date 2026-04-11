@@ -26,6 +26,8 @@ extern "C" gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     smallfield::chiral_center_descriptor_t const* host_chirals, std::uint32_t chirals_total,
     smallfield::etk_torsion_descriptor_t const* host_torsions, std::uint32_t torsions_total,
     smallfield::distance_constraint_t const* host_constraints, std::uint32_t constraints_total,
+    smallfield::etk_atom_interaction_t const* host_etk_interactions, std::uint32_t etk_interactions_total,
+    smallfield::etk_atom_offsets_t const* host_etk_atom_offsets, std::uint32_t etk_atom_offsets_total,
     smallfield::mmff94_nonbonded_pair_t const* host_mmff_nb, std::uint32_t mmff_nb_total,
     smallfield::mmff94_bond_t const* host_mmff_bonds, std::uint32_t mmff_bonds_total,
     smallfield::mmff94_angle_t const* host_mmff_angles, std::uint32_t mmff_angles_total,

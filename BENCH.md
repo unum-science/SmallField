@@ -77,28 +77,28 @@ All SmallField energy numbers in the quality section are the SmallField pipeline
 
 ### CPU preprocessing (per-molecule, `src/etkdg_preprocess.hpp`)
 
-| #   | Stage                             | Function                           | Line |
-| --- | --------------------------------- | ---------------------------------- | ---- |
-| 0a  | SMILES parse + addHs              | `prepare_molecule`                 | 579  |
-| 0b  | Bounds matrix                     | `build_bounds_matrix`              | 71   |
-| 0c  | Chiral centers                    | `extract_chiral_centers`           | 98   |
-| 0d  | CSD torsions                      | `extract_etk_torsions`             | 209  |
-| 0e  | MMFF94 params + interaction lists | `extract_mmff94_params`            | 288  |
-| 0f  | Batch assembly                    | `prepare_molecule_batch`           | 662  |
+| #   | Stage                             | Function                 | Line |
+| --- | --------------------------------- | ------------------------ | ---- |
+| 0a  | SMILES parse + addHs              | `prepare_molecule`       | 579  |
+| 0b  | Bounds matrix                     | `build_bounds_matrix`    | 71   |
+| 0c  | Chiral centers                    | `extract_chiral_centers` | 98   |
+| 0d  | CSD torsions                      | `extract_etk_torsions`   | 209  |
+| 0e  | MMFF94 params + interaction lists | `extract_mmff94_params`  | 288  |
+| 0f  | Batch assembly                    | `prepare_molecule_batch` | 662  |
 
 ### GPU prepass (`src/metric_embedding_prepass.cuh`)
 
-| #   | Stage                          | Function                              | Line |
-| --- | ------------------------------ | ------------------------------------- | ---- |
-| 1a  | Bounds smoothing + Gram build  | `smooth_and_build_gram_kernel`        | 62   |
+| #   | Stage                            | Function                                  | Line |
+| --- | -------------------------------- | ----------------------------------------- | ---- |
+| 1a  | Bounds smoothing + Gram build    | `smooth_and_build_gram_kernel`            | 62   |
 | 1b  | Batched eigensolve orchestration | `build_metric_initial_coordinates_on_gpu` | 166  |
-| 1c  | 4D coordinate projection       | `project_metric_coordinates_kernel`   | 137  |
+| 1c  | 4D coordinate projection         | `project_metric_coordinates_kernel`       | 137  |
 
 ### GPU kernel (per-molecule, `src/etkdg_pipeline.cuh`)
 
 | #   | Stage                                 | Function                                                | File:Line                                  |
 | --- | ------------------------------------- | ------------------------------------------------------- | ------------------------------------------ |
-| 2   | Load pre-smoothed bounds             | Shared-memory load                                      | `etkdg_pipeline.cuh:151`                   |
+| 2   | Load pre-smoothed bounds              | Shared-memory load                                      | `etkdg_pipeline.cuh:151`                   |
 | 3   | Native metric init + mirrored retries | `initialize_from_metric_coordinates_`                   | `etkdg_pipeline.cuh:50`                    |
 | 4   | DG minimize (4D FIRE)                 | `fire_minimize_` + `distance_geometry_energy_functor_t` | `fire_warp.cuh:40`, `dg_forcefield.cuh:91` |
 | 5   | Stereo check                          | `validate_chirality_`                                   | `dg_forcefield.cuh:65`                     |
@@ -128,25 +128,27 @@ Dataset: 8,948 ChEMBL molecules, 3 conformers each, single GPU.
 
 | Batch | RDKit CPU mol/s | SmallField GPU mol/s | GPU speedup |
 | ----- | --------------- | -------------------- | ----------- |
-| 100   | 15.4            | 23.8                 | 1.5x        |
-| 500   | 72.3            | 85.9                 | 1.2x        |
-| 1,000 | 128.8           | 173.5                | 1.3x        |
-| 2,000 | 202.6           | 299.6                | 1.5x        |
-| 5,000 | 364.6           | 650.1                | 1.8x        |
-| 8,948 | 482.7           | 985.3                | 2.0x        |
+| 100   | 18              | 17                   | 0.9x        |
+| 500   | 88              | 76                   | 0.9x        |
+| 1,000 | 185             | 148                  | 0.8x        |
+| 2,000 | 296             | 275                  | 0.9x        |
+| 5,000 | 561             | 605                  | 1.1x        |
+| 8,948 | 628             | 823                  | 1.3x        |
 
 RDKit CPU uses 192 OpenMP threads with `schedule(dynamic, 1)` and `numThreads=1` per molecule.
-GPU throughput is end-to-end and includes preprocessing, upload, kernel execution, and download.
+GPU throughput is end-to-end (preprocessing + upload + prepass + kernel + download).
+GPU overtakes CPU at ~5,000 molecules; at full dataset the GPU is 1.3x faster.
+For smaller batches the GPU prepass and upload overhead dominate, making it slower than 192 CPU cores.
 
 ### GPU time breakdown (8,948 molecules)
 
 | Phase                      | Time          | %     |
 | -------------------------- | ------------- | ----- |
-| CPU preprocessing (OpenMP) | 1,463 ms      | 16.1% |
-| GPU upload + prepass       | 1,382 ms      | 15.2% |
-| GPU kernel (8 waves)       | 6,231 ms      | 68.6% |
-| GPU download               | 5 ms          | 0.1%  |
-| __Total__                  | __9,082 ms__  |       |
+| CPU preprocessing (OpenMP) | 1,249 ms      | 11.5% |
+| GPU upload + prepass       | 994 ms        | 9.1%  |
+| GPU kernel (8 waves)       | 8,596 ms      | 79.1% |
+| GPU download               | 31 ms         | 0.3%  |
+| __Total__                  | __10,870 ms__ |       |
 
 ### Wave dispatch breakdown
 
@@ -161,21 +163,40 @@ GPU throughput is end-to-end and includes preprocessing, upload, kernel executio
 | 6    | 112       | 310       | 3         | 310   |
 | 7    | 128       | 200       | 2         | 200   |
 
+### Per-wave kernel profiling (nsys, 8,948 molecules)
+
+Profiled with `nsys profile` (CUDA 13.0, Blackwell SM 12.0).
+Pipeline kernel accounts for 97.5% of total GPU time; metric embedding prepass is 2.5%.
+
+| Wave | Atoms | Mols  | Grid  | Kernel ms | ms/mol | us/conf | % of kernel |
+| ---- | ----- | ----- | ----- | --------- | ------ | ------- | ----------- |
+| 0    | 16    | 46    | 46    | 59        | 1.28   | 425     | 0.4%        |
+| 1    | 32    | 1,502 | 1,502 | 465       | 0.31   | 103     | 3.0%        |
+| 2    | 48    | 3,049 | 2,256 | 1,669     | 0.55   | 182     | 10.7%       |
+| 3    | 64    | 2,267 | 1,504 | 2,077     | 0.92   | 305     | 13.4%       |
+| 4    | 80    | 1,023 | 940   | 2,715     | 2.65   | 885     | 17.5%       |
+| 5    | 96    | 551   | 551   | 2,376     | 4.31   | 1,437   | 15.3%       |
+| 6    | 112   | 310   | 310   | 2,865     | 9.24   | 3,081   | 18.4%       |
+| 7    | 128   | 200   | 200   | 3,302     | 16.51  | 5,503   | 21.3%       |
+
+Per-molecule cost scales ~50x from N=32 to N=128.
+Waves 4-7 (atoms > 64) contain only 23% of molecules but consume 72% of kernel time.
+The dominant cost is the O(N²) pairwise MMFF94 interaction computation in stage 9.
+
 ## Quality
 
 Cross-validation uses 10,000 random SmallField conformers evaluated by RDKit's `MMFF::calcEnergy()`.
 
 ### Summary
 
-| Metric                                              | Value                                          |
-| --------------------------------------------------- | ---------------------------------------------- |
-| Kernel success rate (stereo + MMFF path)            | 97.0% (26,040 / 26,844)                        |
-| Finite MMFF94 energy (RDKit cross-val)              | 97.5%                                          |
-| Median RDKit MMFF94 energy of SmallField conformers | 78.5 kcal/mol                                  |
-| Median SmallField final MMFF94 energy               | 78.6 kcal/mol                                  |
-| P95 RDKit MMFF94 energy of SmallField conformers    | 258.8 kcal/mol                                 |
-| P95 SmallField final MMFF94 energy                  | 259.1 kcal/mol                                 |
-| Expected for valid conformers                       | < 200 kcal/mol for most small/medium molecules |
+| Metric                                              | Value                    |
+| --------------------------------------------------- | ------------------------ |
+| Kernel success rate (stereo + MMFF path)            | 96.2% (25,822 / 26,844) |
+| Finite MMFF94 energy (RDKit cross-val)              | 97.4%                    |
+| Median RDKit MMFF94 energy of SmallField conformers | 58.5 kcal/mol            |
+| Median SmallField final MMFF94 energy               | 58.5 kcal/mol            |
+| P5 / P95 RDKit energy                               | -67.2 / 183.1 kcal/mol  |
+| Expected for valid conformers                       | < 200 kcal/mol           |
 
 The catastrophic-energy regime is gone.
 On the corrected SmallField-native path with GPU metric embedding, the typical conformer lands in a chemically reasonable MMFF94 range.
@@ -187,12 +208,12 @@ Median cross-validated energy stays below 200 kcal/mol through the 80-100 atom b
 
 | Atoms   | Count | RDKit P50 (kcal/mol) | SmallField P50 (kcal/mol) |
 | ------- | ----- | -------------------- | ------------------------- |
-| 0-20    | 186   | 9.2                  | 9.2                       |
-| 20-40   | 3,319 | 46.5                 | 46.5                      |
-| 40-60   | 3,749 | 86.2                 | 86.2                      |
-| 60-80   | 1,579 | 120.9                | 120.9                     |
-| 80-100  | 616   | 190.9                | 190.9                     |
-| 100-128 | 306   | 253.2                | 253.1                     |
+| 0-20    | 191   | 0.6                  | 0.6                       |
+| 20-40   | 3,366 | 36.0                 | 36.0                      |
+| 40-60   | 3,737 | 65.1                 | 65.2                      |
+| 60-80   | 1,584 | 83.8                 | 83.8                      |
+| 80-100  | 603   | 121.2                | 121.2                     |
+| 100-128 | 251   | 149.3                | 149.3                     |
 
 ### Diagnosis
 

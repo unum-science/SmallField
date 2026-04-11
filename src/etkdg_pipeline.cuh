@@ -186,7 +186,8 @@ __global__ void etkdg_pipeline_warp_kernel(
     chiral_center_descriptor_t const* __restrict__ chiral_centers,
     etk_torsion_descriptor_t const* __restrict__ torsion_terms,
     distance_constraint_t const* __restrict__ distance_constraints,
-    // MMFF94 parameter arrays + per-atom interaction lists (stage 9, global memory)
+    etk_atom_interaction_t const* __restrict__ etk_interactions,
+    etk_atom_offsets_t const* __restrict__ etk_atom_offsets,
     mmff94_nonbonded_pair_t const* __restrict__ mmff_nonbonded_pairs, mmff94_bond_t const* __restrict__ mmff_bond_terms,
     mmff94_angle_t const* __restrict__ mmff_angle_terms, mmff94_torsion_t const* __restrict__ mmff_torsion_terms,
     mmff94_oop_t const* __restrict__ mmff_oop_terms, mmff94_stretchbend_t const* __restrict__ mmff_stretchbend_terms,
@@ -279,8 +280,11 @@ __global__ void etkdg_pipeline_warp_kernel(
 
                 // Stage 7: Run ETK torsion refinement in 3D with 100 FIRE iterations.
                 if (meta.num_etk_torsions > 0) {
-                    etk_torsion_energy_functor_t etk_functor{mol_torsions, mol_constraints, meta.num_etk_torsions,
-                                                             meta.num_distance_constraints, num_atoms};
+                    etk_torsion_energy_functor_t etk_functor{
+                        mol_torsions, mol_constraints,
+                        etk_interactions,
+                        etk_atom_offsets + meta.etk_atom_offsets_start,
+                        num_atoms};
 
                     float etk_energy = 0.0f;
                     float etk_rms_gradient = 0.0f;

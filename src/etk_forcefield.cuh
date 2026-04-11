@@ -50,9 +50,10 @@ __device__ __forceinline__ float compute_dihedral_angle_(float const* positions,
     float const cross_dot = (n1_y * n2_z - n1_z * n2_y) * bond_jk_x + (n1_z * n2_x - n1_x * n2_z) * bond_jk_y +
                             (n1_x * n2_y - n1_y * n2_x) * bond_jk_z;
 
-    float const jk_len = sqrtf(fmaf(bond_jk_x, bond_jk_x, fmaf(bond_jk_y, bond_jk_y, bond_jk_z * bond_jk_z)));
+    float const inv_jk_len =
+        rsqrtf(fmaxf(fmaf(bond_jk_x, bond_jk_x, fmaf(bond_jk_y, bond_jk_y, bond_jk_z * bond_jk_z)), 1e-10f));
 
-    return atan2f(cross_dot * __frcp_rn(fmaxf(jk_len, 1e-10f)), dot_n);
+    return atan2f(cross_dot * inv_jk_len, dot_n);
 }
 
 /**
@@ -90,8 +91,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const* posi
     float t0x = r0y * r1z - r0z * r1y;
     float t0y = r0z * r1x - r0x * r1z;
     float t0z = r0x * r1y - r0y * r1x;
-    float const d0 = sqrtf(fmaxf(t0x * t0x + t0y * t0y + t0z * t0z, 1e-10f));
-    float const inv_d0 = __frcp_rn(d0);
+    float const inv_d0 = rsqrtf(fmaxf(t0x * t0x + t0y * t0y + t0z * t0z, 1e-10f));
     t0x *= inv_d0;
     t0y *= inv_d0;
     t0z *= inv_d0;
@@ -99,8 +99,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const* posi
     float t1x = r2y * r3z - r2z * r3y;
     float t1y = r2z * r3x - r2x * r3z;
     float t1z = r2x * r3y - r2y * r3x;
-    float const d1 = sqrtf(fmaxf(t1x * t1x + t1y * t1y + t1z * t1z, 1e-10f));
-    float const inv_d1 = __frcp_rn(d1);
+    float const inv_d1 = rsqrtf(fmaxf(t1x * t1x + t1y * t1y + t1z * t1z, 1e-10f));
     t1x *= inv_d1;
     t1y *= inv_d1;
     t1z *= inv_d1;
@@ -185,8 +184,8 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const* posi
 struct etk_torsion_energy_functor_t {
     etk_torsion_descriptor_t const* torsion_terms;
     distance_constraint_t const* distance_constraints;
-    std::uint32_t num_torsion_terms;
-    std::uint32_t num_distance_constraints;
+    etk_atom_interaction_t const* interactions;
+    etk_atom_offsets_t const* atom_offsets;
     std::uint32_t num_atoms;
 
     __device__ __forceinline__ float operator()(float const* positions, float* gradient, std::uint32_t num_elements,
@@ -211,78 +210,66 @@ struct etk_torsion_energy_functor_t {
 
         float total_energy = 0.0f;
 
-        // atom-centric: each thread processes its owned atoms
         for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size) {
-            float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+            float gradient_x = 0.0f, gradient_y = 0.0f, gradient_z = 0.0f;
 
-            // torsion terms: check if this atom participates
-            for (std::uint32_t t = 0; t < num_torsion_terms; ++t) {
-                auto const& torsion = torsion_terms[t];
-                std::uint32_t role = 4; // invalid
-                if (torsion.atom_indices[0] == atom)
-                    role = 0;
-                else if (torsion.atom_indices[1] == atom)
-                    role = 1;
-                else if (torsion.atom_indices[2] == atom)
-                    role = 2;
-                else if (torsion.atom_indices[3] == atom)
-                    role = 3;
-                if (role > 3)
-                    continue;
+            std::uint32_t const interaction_start = atom_offsets[atom].interaction_start;
+            std::uint32_t const interaction_count = atom_offsets[atom].interaction_count;
 
-                float torsion_energy =
-                    compute_torsion_contribution_(positions, num_atoms, torsion, role, &gx, &gy, &gz, write_gradient);
+            for (std::uint32_t index = interaction_start; index < interaction_start + interaction_count; ++index) {
+                auto const& entry = interactions[index];
 
-                // count energy only once per torsion (when we're atom i)
-                if (role == 0)
-                    total_energy += torsion_energy;
-            }
+                if (entry.interaction_type == 0) {
+                    // torsion term
+                    float torsion_energy =
+                        compute_torsion_contribution_(positions, num_atoms, torsion_terms[entry.term_index], entry.role,
+                                                      &gradient_x, &gradient_y, &gradient_z, write_gradient);
+                    if (entry.role == 0)
+                        total_energy += torsion_energy;
+                } else {
+                    // distance constraint
+                    auto const& constraint = distance_constraints[entry.term_index];
+                    std::uint32_t const atom_i = constraint.atom_index_i;
+                    std::uint32_t const atom_j = constraint.atom_index_j;
 
-            // distance constraint terms
-            for (std::uint32_t c = 0; c < num_distance_constraints; ++c) {
-                auto const& constraint = distance_constraints[c];
-                std::uint32_t const ci = constraint.atom_index_i;
-                std::uint32_t const cj = constraint.atom_index_j;
-                if (atom != ci && atom != cj)
-                    continue;
+                    float const delta_x = positions[atom_j] - positions[atom_i];
+                    float const delta_y = positions[num_atoms + atom_j] - positions[num_atoms + atom_i];
+                    float const delta_z = positions[2 * num_atoms + atom_j] - positions[2 * num_atoms + atom_i];
+                    float const distance_squared = fmaf(delta_x, delta_x, fmaf(delta_y, delta_y, delta_z * delta_z));
+                    float const inverse_distance = rsqrtf(fmaxf(distance_squared, 1e-10f));
+                    float const distance = distance_squared * inverse_distance;
 
-                float const dx = positions[cj] - positions[ci];
-                float const dy = positions[num_atoms + cj] - positions[num_atoms + ci];
-                float const dz = positions[2 * num_atoms + cj] - positions[2 * num_atoms + ci];
-                float const dist = sqrtf(fmaf(dx, dx, fmaf(dy, dy, dz * dz)));
-                float const inv_dist = __frcp_rn(fmaxf(dist, 1e-10f));
+                    float const upper_bound = constraint.upper_bound_angstrom;
+                    float const lower_bound = constraint.lower_bound_angstrom;
+                    float const weight = constraint.penalty_weight;
+                    float const direction = (entry.role == 0) ? -1.0f : 1.0f;
 
-                float const upper = constraint.upper_bound_angstrom;
-                float const lower = constraint.lower_bound_angstrom;
-                float const weight = constraint.penalty_weight;
-                float sign = (atom == ci) ? -1.0f : 1.0f;
-
-                if (dist > upper) {
-                    if (atom == ci)
-                        total_energy += weight * (dist - upper) * (dist - upper);
-                    if (write_gradient) {
-                        float const scale = 2.0f * weight * (dist - upper) * inv_dist;
-                        gx += sign * scale * dx;
-                        gy += sign * scale * dy;
-                        gz += sign * scale * dz;
-                    }
-                } else if (dist < lower) {
-                    if (atom == ci)
-                        total_energy += weight * (lower - dist) * (lower - dist);
-                    if (write_gradient) {
-                        float const scale = -2.0f * weight * (lower - dist) * inv_dist;
-                        gx += sign * scale * dx;
-                        gy += sign * scale * dy;
-                        gz += sign * scale * dz;
+                    if (distance > upper_bound) {
+                        if (entry.role == 0)
+                            total_energy += weight * (distance - upper_bound) * (distance - upper_bound);
+                        if (write_gradient) {
+                            float const scale = 2.0f * weight * (distance - upper_bound) * inverse_distance;
+                            gradient_x += direction * scale * delta_x;
+                            gradient_y += direction * scale * delta_y;
+                            gradient_z += direction * scale * delta_z;
+                        }
+                    } else if (distance < lower_bound) {
+                        if (entry.role == 0)
+                            total_energy += weight * (lower_bound - distance) * (lower_bound - distance);
+                        if (write_gradient) {
+                            float const scale = -2.0f * weight * (lower_bound - distance) * inverse_distance;
+                            gradient_x += direction * scale * delta_x;
+                            gradient_y += direction * scale * delta_y;
+                            gradient_z += direction * scale * delta_z;
+                        }
                     }
                 }
             }
 
-            // write gradient for this atom (direct write, no atomicAdd)
             if (write_gradient) {
-                gradient[atom] = gx;
-                gradient[num_atoms + atom] = gy;
-                gradient[2 * num_atoms + atom] = gz;
+                gradient[atom] = gradient_x;
+                gradient[num_atoms + atom] = gradient_y;
+                gradient[2 * num_atoms + atom] = gradient_z;
             }
         }
 

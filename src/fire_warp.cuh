@@ -76,9 +76,12 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
             sum_gv = fmaf(g, v, sum_gv);
             sum_vv = fmaf(v, v, sum_vv);
         }
-        sum_gg = warp_reduce_sum_f32_(sum_gg);
-        sum_gv = warp_reduce_sum_f32_(sum_gv);
-        sum_vv = warp_reduce_sum_f32_(sum_vv);
+        // interleaved warp reduction for instruction-level parallelism
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_gg += __shfl_xor_sync(full_mask, sum_gg, offset);
+            sum_gv += __shfl_xor_sync(full_mask, sum_gv, offset);
+            sum_vv += __shfl_xor_sync(full_mask, sum_vv, offset);
+        }
 
         float const rms_gradient = sqrtf(sum_gg * __frcp_rn(static_cast<float>(num_elements)));
         last_rms_gradient = rms_gradient;
@@ -95,9 +98,9 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
 
         float const power = -sum_gv; // P = F·v = -∇E·v
         if (power > 0.0f) {
+            float const inverse_f_norm = rsqrtf(fmaxf(sum_gg, 1e-20f));
             float const v_norm = sqrtf(fmaxf(sum_vv, 1e-20f));
-            float const f_norm = sqrtf(fmaxf(sum_gg, 1e-20f));
-            float const v_over_f = v_norm * __frcp_rn(f_norm);
+            float const v_over_f = v_norm * inverse_f_norm;
 
             // v = (1-α)·v + α·|v|·F̂  where F = -gradient
             for (std::uint32_t i = lane; i < num_elements; i += warp_size) {
@@ -120,11 +123,12 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
         __syncwarp(full_mask);
 
         // velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt
+        float const half_dt_squared = 0.5f * dt * dt;
         for (std::uint32_t i = lane; i < num_elements; i += warp_size) {
-            float displacement = velocities[i] * dt - 0.5f * gradient[i] * dt * dt;
+            float displacement = fmaf(velocities[i], dt, -gradient[i] * half_dt_squared);
             displacement = fmaxf(-0.5f, fminf(0.5f, displacement));
             positions[i] += displacement;
-            velocities[i] -= gradient[i] * dt;
+            velocities[i] = fmaf(gradient[i], -dt, velocities[i]);
         }
         __syncwarp(full_mask);
     }

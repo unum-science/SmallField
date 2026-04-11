@@ -185,8 +185,8 @@ struct distance_geometry_energy_functor_t {
                         distance_squared = fmaf(dw, dw, distance_squared);
                     }
 
-                    float const distance = sqrtf(fmaxf(distance_squared, 1e-12f));
-                    float const inverse_distance = __frcp_rn(distance);
+                    float const inverse_distance = rsqrtf(fmaxf(distance_squared, 1e-12f));
+                    float const distance = distance_squared * inverse_distance;
 
                     // read bounds (half → float)
                     std::uint32_t const min_idx = (atom < other) ? atom : other;

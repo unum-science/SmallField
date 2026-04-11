@@ -51,9 +51,12 @@ struct etkdg_prepared_molecule_t {
     std::vector<mmff94_torsion_t> mmff_torsions;
     std::vector<mmff94_oop_t> mmff_oops;
     std::vector<mmff94_stretchbend_t> mmff_stretchbends;
-    // Per-atom interaction lists built from the term arrays above.
+    // Per-atom MMFF94 interaction lists built from the term arrays above.
     std::vector<mmff94_atom_interaction_t> mmff_interactions;
     std::vector<mmff94_atom_offsets_t> mmff_atom_offsets;
+    // Per-atom ETK interaction lists (torsions + distance constraints).
+    std::vector<etk_atom_interaction_t> etk_interactions;
+    std::vector<etk_atom_offsets_t> etk_atom_offsets;
     etkdg_molecule_metadata_t metadata;
 };
 
@@ -277,6 +280,51 @@ inline void extract_etk_torsions(RDKit::ROMol const& molecule, std::vector<etk_t
             torsion.fourier_coefficients[2] = 1.0f; // Generic V₃ = 1.0.
             torsions.push_back(torsion);
         }
+    }
+}
+
+/** Build per-atom interaction lists for ETK torsions and distance constraints. */
+inline void build_etk_interaction_lists(etkdg_prepared_molecule_t& result) {
+    std::uint32_t const num_atoms = result.num_atoms;
+    auto const& torsions = result.etk_torsions;
+    auto const& constraints = result.distance_constraints;
+
+    // pass 1: count interactions per atom
+    std::vector<std::uint32_t> counts(num_atoms, 0);
+    for (auto const& torsion : torsions) {
+        counts[torsion.atom_indices[0]]++;
+        counts[torsion.atom_indices[1]]++;
+        counts[torsion.atom_indices[2]]++;
+        counts[torsion.atom_indices[3]]++;
+    }
+    for (auto const& constraint : constraints) {
+        counts[constraint.atom_index_i]++;
+        counts[constraint.atom_index_j]++;
+    }
+
+    // compute offsets
+    result.etk_atom_offsets.resize(num_atoms);
+    std::uint32_t running = 0;
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
+        result.etk_atom_offsets[atom] = {running, counts[atom]};
+        running += counts[atom];
+    }
+
+    // pass 2: fill entries
+    result.etk_interactions.resize(running);
+    std::vector<std::uint32_t> cursors(num_atoms);
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
+        cursors[atom] = result.etk_atom_offsets[atom].interaction_start;
+
+    for (std::uint32_t term = 0; term < torsions.size(); ++term) {
+        result.etk_interactions[cursors[torsions[term].atom_indices[0]]++] = {term, 0, 0};
+        result.etk_interactions[cursors[torsions[term].atom_indices[1]]++] = {term, 0, 1};
+        result.etk_interactions[cursors[torsions[term].atom_indices[2]]++] = {term, 0, 2};
+        result.etk_interactions[cursors[torsions[term].atom_indices[3]]++] = {term, 0, 3};
+    }
+    for (std::uint32_t term = 0; term < constraints.size(); ++term) {
+        result.etk_interactions[cursors[constraints[term].atom_index_i]++] = {term, 1, 0};
+        result.etk_interactions[cursors[constraints[term].atom_index_j]++] = {term, 1, 1};
     }
 }
 
@@ -602,6 +650,7 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const& smiles) {
         extract_chiral_centers(*mol, result.chiral_centers);
         extract_etk_torsions(*mol, result.etk_torsions);
         extract_distance_constraints(*mol, result.bounds_matrix, result.distance_constraints);
+        build_etk_interaction_lists(result);
         extract_mmff94_params(*mol, result);
     } catch (...) {
         result.num_atoms = 0; // Mark as failed.
@@ -629,6 +678,8 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const& smiles) {
     result.metadata.mmff_oop_offset = 0;
     result.metadata.mmff_stretchbend_offset = 0;
     result.metadata.mmff_atom_offsets_start = 0;
+    result.metadata.etk_interaction_offset = 0;
+    result.metadata.etk_atom_offsets_start = 0;
 
     return result;
 }
@@ -646,8 +697,10 @@ struct etkdg_molecule_batch_t {
     std::vector<mmff94_torsion_t> mmff_torsions;              ///< concatenated
     std::vector<mmff94_oop_t> mmff_oops;                      ///< concatenated
     std::vector<mmff94_stretchbend_t> mmff_stretchbends;      ///< concatenated
-    std::vector<mmff94_atom_interaction_t> mmff_interactions; ///< per-atom interaction lists
-    std::vector<mmff94_atom_offsets_t> mmff_atom_offsets;     ///< per-atom offsets
+    std::vector<mmff94_atom_interaction_t> mmff_interactions; ///< per-atom MMFF94 interaction lists
+    std::vector<mmff94_atom_offsets_t> mmff_atom_offsets;     ///< per-atom MMFF94 offsets
+    std::vector<etk_atom_interaction_t> etk_interactions;     ///< per-atom ETK interaction lists
+    std::vector<etk_atom_offsets_t> etk_atom_offsets;         ///< per-atom ETK offsets
     std::vector<etkdg_molecule_metadata_t> molecule_metadata; ///< one per molecule
     std::vector<std::uint32_t> input_indices;                 ///< packed molecule index -> original input index
     std::uint32_t num_molecules = 0;
@@ -674,7 +727,8 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         std::size_t total_bounds = 0, total_chirals = 0, total_etk = 0, total_dcons = 0;
         std::size_t total_nb = 0, total_bonds = 0, total_angles = 0, total_torsions = 0;
         std::size_t total_oops = 0, total_stbn = 0;
-        std::size_t total_inter = 0, total_off = 0;
+        std::size_t total_mmff_inter = 0, total_mmff_off = 0;
+        std::size_t total_etk_inter = 0, total_etk_off = 0;
         for (auto const& p : prepared) {
             total_bounds += p.bounds_matrix.size();
             total_chirals += p.chiral_centers.size();
@@ -686,8 +740,10 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
             total_torsions += p.mmff_torsions.size();
             total_oops += p.mmff_oops.size();
             total_stbn += p.mmff_stretchbends.size();
-            total_inter += p.mmff_interactions.size();
-            total_off += p.mmff_atom_offsets.size();
+            total_mmff_inter += p.mmff_interactions.size();
+            total_mmff_off += p.mmff_atom_offsets.size();
+            total_etk_inter += p.etk_interactions.size();
+            total_etk_off += p.etk_atom_offsets.size();
         }
         batch.bounds_matrices.reserve(total_bounds);
         batch.chiral_centers.reserve(total_chirals);
@@ -699,8 +755,10 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         batch.mmff_torsions.reserve(total_torsions);
         batch.mmff_oops.reserve(total_oops);
         batch.mmff_stretchbends.reserve(total_stbn);
-        batch.mmff_interactions.reserve(total_inter);
-        batch.mmff_atom_offsets.reserve(total_off);
+        batch.mmff_interactions.reserve(total_mmff_inter);
+        batch.mmff_atom_offsets.reserve(total_mmff_off);
+        batch.etk_interactions.reserve(total_etk_inter);
+        batch.etk_atom_offsets.reserve(total_etk_off);
         batch.molecule_metadata.reserve(prepared.size());
         batch.input_indices.reserve(prepared.size());
     }
@@ -725,6 +783,8 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         meta.mmff_oop_offset = static_cast<std::uint32_t>(batch.mmff_oops.size());
         meta.mmff_stretchbend_offset = static_cast<std::uint32_t>(batch.mmff_stretchbends.size());
         meta.mmff_atom_offsets_start = static_cast<std::uint32_t>(batch.mmff_atom_offsets.size());
+        meta.etk_interaction_offset = static_cast<std::uint32_t>(batch.etk_interactions.size());
+        meta.etk_atom_offsets_start = static_cast<std::uint32_t>(batch.etk_atom_offsets.size());
 
         batch.molecule_metadata.push_back(meta);
         batch.input_indices.push_back(m);
@@ -757,6 +817,16 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         for (auto& off : adjusted_offsets)
             off.interaction_start += interactions_base;
         batch.mmff_atom_offsets.insert(batch.mmff_atom_offsets.end(), adjusted_offsets.begin(), adjusted_offsets.end());
+
+        // ETK interaction list: adjust offsets for batched array position
+        std::uint32_t const etk_interactions_base = static_cast<std::uint32_t>(batch.etk_interactions.size());
+        batch.etk_interactions.insert(batch.etk_interactions.end(), prepared[m].etk_interactions.begin(),
+                                      prepared[m].etk_interactions.end());
+        auto etk_adjusted_offsets = prepared[m].etk_atom_offsets;
+        for (auto& off : etk_adjusted_offsets)
+            off.interaction_start += etk_interactions_base;
+        batch.etk_atom_offsets.insert(batch.etk_atom_offsets.end(), etk_adjusted_offsets.begin(),
+                                      etk_adjusted_offsets.end());
     }
 
     batch.num_molecules = static_cast<std::uint32_t>(batch.molecule_metadata.size());
