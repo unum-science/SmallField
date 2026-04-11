@@ -1,6 +1,6 @@
 /**
- * @file test_mmff_gradient.cpp
- * @brief MMFF94 energy and gradient validation for OOP and full-stage terms.
+ *  @file test_mmff_gradient.cpp
+ *  @brief MMFF94 energy and gradient validation for OOP and full-stage terms.
  */
 
 #include <algorithm>
@@ -14,19 +14,21 @@
 using namespace smallfield;
 using namespace smallfield::test;
 
-extern "C" void gpu_mmff_energy(
-    float const* host_positions, std::uint32_t num_atoms, mmff94_nonbonded_pair_t const* host_nonbonded_params,
-    std::uint32_t num_nonbonded_params, mmff94_bond_t const* host_bond_params, std::uint32_t num_bond_params,
-    mmff94_angle_t const* host_angle_params, std::uint32_t num_angle_params,
-    mmff94_torsion_t const* host_torsion_params, std::uint32_t num_torsion_params, mmff94_oop_t const* host_oop_params,
-    std::uint32_t num_oop_params, mmff94_stretchbend_t const* host_stretchbend_params,
-    std::uint32_t num_stretchbend_params, mmff94_atom_interaction_t const* host_interactions,
-    std::uint32_t num_interactions, mmff94_atom_offsets_t const* host_atom_offsets, std::uint32_t num_atom_offsets,
-    float* host_gradient, float* out_energy);
+extern "C" void gpu_mmff_energy(float const *host_positions, std::uint32_t num_atoms,
+                                mmff94_nonbonded_pair_t const *host_nonbonded_params,
+                                std::uint32_t num_nonbonded_params, mmff94_bond_t const *host_bond_params,
+                                std::uint32_t num_bond_params, mmff94_angle_t const *host_angle_params,
+                                std::uint32_t num_angle_params, mmff94_torsion_t const *host_torsion_params,
+                                std::uint32_t num_torsion_params, mmff94_oop_t const *host_oop_params,
+                                std::uint32_t num_oop_params, mmff94_stretchbend_t const *host_stretchbend_params,
+                                std::uint32_t num_stretchbend_params,
+                                mmff94_atom_interaction_t const *host_interactions, std::uint32_t num_interactions,
+                                mmff94_atom_offsets_t const *host_atom_offsets, std::uint32_t num_atom_offsets,
+                                float *host_gradient, float *out_energy);
 
 namespace {
 
-std::vector<float> interleaved_to_soa(std::vector<float> const& interleaved) {
+std::vector<float> interleaved_to_soa(std::vector<float> const &interleaved) {
     std::uint32_t const num_atoms = static_cast<std::uint32_t>(interleaved.size() / 3);
     std::vector<float> soa(3 * num_atoms, 0.0f);
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
@@ -37,8 +39,9 @@ std::vector<float> interleaved_to_soa(std::vector<float> const& interleaved) {
     return soa;
 }
 
-void evaluate_mmff_energy_and_gradient(etkdg_prepared_molecule_t const& prepared, std::vector<float> const& positions_soa,
-                                       float* out_energy, std::vector<float>& gradient_out) {
+void evaluate_mmff_energy_and_gradient(etkdg_prepared_molecule_t const &prepared,
+                                       std::vector<float> const &positions_soa, float *out_energy,
+                                       std::vector<float> &gradient_out) {
     gradient_out.assign(positions_soa.size(), 0.0f);
     gpu_mmff_energy(positions_soa.data(), prepared.num_atoms,
                     prepared.mmff_nonbonded.empty() ? nullptr : prepared.mmff_nonbonded.data(),
@@ -59,15 +62,15 @@ void evaluate_mmff_energy_and_gradient(etkdg_prepared_molecule_t const& prepared
                     static_cast<std::uint32_t>(prepared.mmff_atom_offsets.size()), gradient_out.data(), out_energy);
 }
 
-etkdg_prepared_molecule_t build_single_oop_prepared(etkdg_prepared_molecule_t const& prepared) {
+etkdg_prepared_molecule_t build_single_oop_prepared(etkdg_prepared_molecule_t const &prepared) {
     SF_TEST_ASSERT(!prepared.mmff_oops.empty(), "prepared molecule must contain at least one OOP term");
 
-    etkdg_prepared_molecule_t single{};
+    etkdg_prepared_molecule_t single {};
     single.num_atoms = prepared.num_atoms;
     single.mmff_oops.push_back(prepared.mmff_oops.front());
     single.mmff_atom_offsets.assign(prepared.num_atoms, {});
 
-    mmff94_oop_t const& oop = single.mmff_oops.front();
+    mmff94_oop_t const &oop = single.mmff_oops.front();
     std::uint8_t const atoms[] = {oop.atom_i, oop.atom_j, oop.atom_k, oop.atom_l};
     for (std::uint32_t role = 0; role < 4; ++role) {
         std::uint8_t const atom = atoms[role];
@@ -75,7 +78,7 @@ etkdg_prepared_molecule_t build_single_oop_prepared(etkdg_prepared_molecule_t co
         single.mmff_atom_offsets[atom] = {};
         single.mmff_atom_offsets[atom].oop_start = position;
         single.mmff_atom_offsets[atom].oop_count = 1;
-        single.mmff_interactions.push_back({0, 5, static_cast<std::uint8_t>(role)});
+        single.mmff_interactions.push_back({0, mmff94_out_of_plane_k, static_cast<atom_role_t>(role)});
     }
     return single;
 }
@@ -98,7 +101,7 @@ void test_single_oop_gradient_finite_difference() {
     float analytical_energy = 0.0f;
     evaluate_mmff_energy_and_gradient(prepared, positions, &analytical_energy, analytical_gradient);
 
-    mmff94_oop_t const& oop = prepared.mmff_oops.front();
+    mmff94_oop_t const &oop = prepared.mmff_oops.front();
     std::uint32_t const oop_atoms[] = {oop.atom_i, oop.atom_j, oop.atom_k, oop.atom_l};
     constexpr float epsilon = 1.0e-4f;
 

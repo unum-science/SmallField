@@ -1,6 +1,6 @@
 /**
- * @file warp_primitives.cuh
- * @brief Shared warp-level constants and reduction primitives.
+ *  @file warp_primitives.cuh
+ *  @brief Shared warp-level constants and reduction primitives.
  */
 
 #pragma once

@@ -1,8 +1,8 @@
 /**
- * @file etkdg_pipeline.cuh
- * @brief Persistent warp-loop CUDA kernel for the full ETKDG conformer generation pipeline.
+ *  @file etkdg_pipeline.cuh
+ *  @brief Persistent warp-loop CUDA kernel for the full ETKDG conformer generation pipeline.
  *
- * Stages per molecule:
+ *  Stages per molecule:
  *   2: load pre-smoothed bounds from global memory
  *   3: native metric embedding with mirrored retries
  *   4: distance geometry minimization (4D FIRE, atom-centric)
@@ -12,7 +12,7 @@
  *   8: final validation
  *   9: MMFF94 polish
  *
- * Architecture:
+ *  Architecture:
  *   - warp-loop: gridDim warps, each loops over molecules with stride
  *   - atom-centric: no atomicAdd, no pair index scan
  *   - half-precision bounds: halves shared memory, enables 2 blocks/SM at N=128
@@ -31,6 +31,7 @@
 #include "etkdg_types.cuh"
 #include "fire_warp.cuh"
 #include "mmff94_functor.cuh"
+
 namespace smallfield {
 
 struct refinement_policy_t {
@@ -46,41 +47,41 @@ __host__ __device__ __forceinline__ std::uint32_t align_up_(std::uint32_t value,
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
-__host__ __device__ __forceinline__ std::uint32_t total_mmff_terms_(etkdg_molecule_metadata_t const& meta) {
+__host__ __device__ __forceinline__ std::uint32_t total_mmff_terms_(etkdg_molecule_metadata_t const &meta) {
     return meta.num_mmff_nonbonded + meta.num_mmff_bonds + meta.num_mmff_angles + meta.num_mmff_torsions +
            meta.num_mmff_oops + meta.num_mmff_stretchbends;
 }
 
-__host__ __device__ __forceinline__ bool is_heavy_refinement_case_(etkdg_molecule_metadata_t const& meta) {
+__host__ __device__ __forceinline__ bool is_heavy_refinement_case_(etkdg_molecule_metadata_t const &meta) {
     std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
     std::uint32_t const torsion_complexity = meta.num_etk_torsions + meta.num_mmff_torsions;
     return meta.num_atoms >= 96 || total_mmff_terms >= 900 || torsion_complexity >= 64;
 }
 
-__host__ __device__ __forceinline__ float heavy_mmff_rescue_threshold_(etkdg_molecule_metadata_t const& meta) {
+__host__ __device__ __forceinline__ float heavy_mmff_rescue_threshold_(etkdg_molecule_metadata_t const &meta) {
     return fmaxf(220.0f, 2.0f * static_cast<float>(meta.num_atoms));
 }
 
 __host__ __device__ __forceinline__ refinement_policy_t
-select_refinement_policy_(etkdg_molecule_metadata_t const& meta) {
+select_refinement_policy_(etkdg_molecule_metadata_t const &meta) {
     std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
     std::uint32_t const torsion_complexity = meta.num_etk_torsions + meta.num_mmff_torsions;
 
     if (meta.num_atoms <= 20 && total_mmff_terms <= 96 && torsion_complexity <= 12)
         return {60, 0, 1.5e-4f, 120, 0, 1.5e-4f};
 
-    if (is_heavy_refinement_case_(meta))
-        return {160, 80, 7.5e-5f, 320, 160, 5.0e-5f};
+    if (is_heavy_refinement_case_(meta)) return {160, 80, 7.5e-5f, 320, 160, 5.0e-5f};
 
     return {100, 40, 1.0e-4f, 200, 80, 1.0e-4f};
 }
 
 template <typename EnergyGradientFunctor>
-__device__ __forceinline__ void
-run_fire_stage_(float* positions, float* velocities, float* gradient, std::uint32_t num_elements,
-                std::int32_t initial_iterations, std::int32_t continuation_iterations, float gradient_threshold,
-                std::uint32_t lane, EnergyGradientFunctor&& compute_energy_gradient, float* out_final_energy,
-                std::int32_t* out_iterations, std::int32_t* out_status, float* out_final_rms_gradient) {
+__device__ __forceinline__ void run_fire_stage_(float *positions, float *velocities, float *gradient,
+                                                std::uint32_t num_elements, std::int32_t initial_iterations,
+                                                std::int32_t continuation_iterations, float gradient_threshold,
+                                                std::uint32_t lane, EnergyGradientFunctor &&compute_energy_gradient,
+                                                float *out_final_energy, std::int32_t *out_iterations,
+                                                std::int32_t *out_status, float *out_final_rms_gradient) {
     float stage_energy = 0.0f;
     float stage_rms_gradient = 0.0f;
     std::int32_t stage_iterations = 0;
@@ -93,8 +94,8 @@ run_fire_stage_(float* positions, float* velocities, float* gradient, std::uint3
 
     bool needs_continuation = false;
     if (lane == 0)
-        needs_continuation =
-            continuation_iterations > 0 && (stage_status != 0 || stage_rms_gradient > gradient_threshold);
+        needs_continuation = continuation_iterations > 0 &&
+                             (stage_status != 0 || stage_rms_gradient > gradient_threshold);
     needs_continuation = __shfl_sync(full_mask, needs_continuation ? 1 : 0, 0) != 0;
 
     if (needs_continuation) {
@@ -117,8 +118,7 @@ run_fire_stage_(float* positions, float* velocities, float* gradient, std::uint3
         *out_final_energy = stage_energy;
         *out_iterations = total_iterations;
         *out_status = stage_status;
-        if (out_final_rms_gradient != nullptr)
-            *out_final_rms_gradient = stage_rms_gradient;
+        if (out_final_rms_gradient != nullptr) *out_final_rms_gradient = stage_rms_gradient;
     }
 }
 
@@ -132,21 +132,18 @@ __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory
     return aligned_bounds_bytes + fire_arrays;
 }
 
-// Stage 3: Initialize from the SmallField-owned metric embedding with per-attempt jitter.
-
-__device__ __forceinline__ void initialize_from_metric_coordinates_(float const* initial_coordinates, float* positions,
+__device__ __forceinline__ void initialize_from_metric_coordinates_(float const *initial_coordinates, float *positions,
                                                                     std::uint32_t initial_coordinate_stride,
                                                                     std::uint32_t num_atoms, std::uint32_t conf,
                                                                     std::uint32_t attempt, std::uint32_t lane,
-                                                                    curandStatePhilox4_32_10_t* rng_state) {
+                                                                    curandStatePhilox4_32_10_t *rng_state) {
     float const xyz_jitter = 0.02f + 0.01f * static_cast<float>((conf + attempt) & 3u);
     float const w_jitter = 0.02f + 0.01f * static_cast<float>(attempt & 3u);
     float const x_reflection = (attempt & 1u) ? -1.0f : 1.0f;
     for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size) {
         for (std::uint32_t dim = 0; dim < 4; ++dim) {
             float base = initial_coordinates[dim * initial_coordinate_stride + atom];
-            if (dim == 0)
-                base *= x_reflection;
+            if (dim == 0) base *= x_reflection;
             float const jitter = (dim < 3) ? xyz_jitter : w_jitter;
             positions[dim * num_atoms + atom] = base + (curand_uniform(rng_state) - 0.5f) * jitter;
         }
@@ -154,10 +151,8 @@ __device__ __forceinline__ void initialize_from_metric_coordinates_(float const*
     __syncwarp(full_mask);
 }
 
-// Stage 9 output: Write conformer data to global memory.
-
-__device__ __forceinline__ void write_conformer_output_(float* coordinates_out, float* energies_out,
-                                                        std::uint8_t* status_out, float const* positions,
+__device__ __forceinline__ void write_conformer_output_(float *coordinates_out, float *energies_out,
+                                                        std::uint8_t *status_out, float const *positions,
                                                         std::uint32_t mol_index, std::uint32_t conformer_index,
                                                         std::uint32_t num_atoms, std::uint32_t output_stride,
                                                         std::uint32_t num_conformers, float energy, bool succeeded,
@@ -176,25 +171,25 @@ __device__ __forceinline__ void write_conformer_output_(float* coordinates_out, 
 }
 
 /**
- * Persistent warp-loop ETKDG pipeline kernel.
+ *  Persistent warp-loop ETKDG pipeline kernel.
  *
- * Launch: <<<min(total_molecules, max_concurrent_warps), 32, shared_bytes>>>
- * Each warp loops over molecules with stride = gridDim.x.
+ *  Launch: <<<min(total_molecules, max_concurrent_warps), 32, shared_bytes>>>
+ *  Each warp loops over molecules with stride = gridDim.x.
  */
 __global__ void etkdg_pipeline_warp_kernel(
-    float const* __restrict__ bounds_matrices, float const* __restrict__ initial_coordinates,
-    chiral_center_descriptor_t const* __restrict__ chiral_centers,
-    etk_torsion_descriptor_t const* __restrict__ torsion_terms,
-    distance_constraint_t const* __restrict__ distance_constraints,
-    etk_atom_interaction_t const* __restrict__ etk_interactions,
-    etk_atom_offsets_t const* __restrict__ etk_atom_offsets,
-    mmff94_nonbonded_pair_t const* __restrict__ mmff_nonbonded_pairs, mmff94_bond_t const* __restrict__ mmff_bond_terms,
-    mmff94_angle_t const* __restrict__ mmff_angle_terms, mmff94_torsion_t const* __restrict__ mmff_torsion_terms,
-    mmff94_oop_t const* __restrict__ mmff_oop_terms, mmff94_stretchbend_t const* __restrict__ mmff_stretchbend_terms,
-    mmff94_atom_interaction_t const* __restrict__ mmff_interactions,
-    mmff94_atom_offsets_t const* __restrict__ mmff_atom_offsets,
-    etkdg_molecule_metadata_t const* __restrict__ molecule_metadata, float* __restrict__ conformer_coordinates_out,
-    float* __restrict__ conformer_energies_out, std::uint8_t* __restrict__ conformer_status_out,
+    float const *__restrict__ bounds_matrices, float const *__restrict__ initial_coordinates,
+    chiral_center_descriptor_t const *__restrict__ chiral_centers,
+    etk_torsion_descriptor_t const *__restrict__ torsion_terms,
+    distance_constraint_t const *__restrict__ distance_constraints,
+    etk_atom_interaction_t const *__restrict__ etk_interactions,
+    etk_atom_offsets_t const *__restrict__ etk_atom_offsets,
+    mmff94_nonbonded_pair_t const *__restrict__ mmff_nonbonded_pairs, mmff94_bond_t const *__restrict__ mmff_bond_terms,
+    mmff94_angle_t const *__restrict__ mmff_angle_terms, mmff94_torsion_t const *__restrict__ mmff_torsion_terms,
+    mmff94_oop_t const *__restrict__ mmff_oop_terms, mmff94_stretchbend_t const *__restrict__ mmff_stretchbend_terms,
+    mmff94_atom_interaction_t const *__restrict__ mmff_interactions,
+    mmff94_atom_offsets_t const *__restrict__ mmff_atom_offsets,
+    etkdg_molecule_metadata_t const *__restrict__ molecule_metadata, float *__restrict__ conformer_coordinates_out,
+    float *__restrict__ conformer_energies_out, std::uint8_t *__restrict__ conformer_status_out,
     std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t max_stereo_attempts,
     std::uint32_t max_atoms_per_molecule, std::uint32_t initial_coordinate_stride, std::uint32_t output_atoms_stride,
     std::uint64_t random_seed) {
@@ -203,13 +198,13 @@ __global__ void etkdg_pipeline_warp_kernel(
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const grid_stride = gridDim.x;
 
-    // Layout shared memory as [bounds matrix: N^2 halves] [positions, velocities, gradient: 3 * 4N floats].
+    // Layout shared memory as [bounds matrix: N² halves] [positions, velocities, gradient: 3 * 4N floats].
     extern __shared__ char shared_raw[];
     std::uint32_t const max_n = max_atoms_per_molecule;
-    __half* shared_bounds = reinterpret_cast<__half*>(shared_raw);
+    __half *shared_bounds = reinterpret_cast<__half *>(shared_raw);
     std::uint32_t const bounds_bytes = max_n * max_n * sizeof(__half);
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
-    float* shared_float = reinterpret_cast<float*>(shared_raw + aligned_bounds_bytes);
+    float *shared_float = reinterpret_cast<float *>(shared_raw + aligned_bounds_bytes);
 
     // Process molecules in a warp loop with gridDim.x stride.
     for (std::uint32_t mol = warp_id; mol < total_molecules; mol += grid_stride) {
@@ -221,29 +216,29 @@ __global__ void etkdg_pipeline_warp_kernel(
 
         // FIRE shared memory: positions + velocities + gradient (3 arrays).
         std::uint32_t off = 0;
-        float* positions = shared_float + off;
+        float *positions = shared_float + off;
         off += dim4;
-        float* velocities = shared_float + off;
+        float *velocities = shared_float + off;
         off += dim4;
-        float* gradient = shared_float + off;
+        float *gradient = shared_float + off;
 
         // Stage 2: Load pre-smoothed bounds and convert to half (vectorized half2 stores).
         std::uint32_t const bounds_size = num_atoms * num_atoms;
-        float const* global_bounds = bounds_matrices + meta.bounds_offset;
+        float const *global_bounds = bounds_matrices + meta.bounds_offset;
         std::uint32_t const bounds_pairs = bounds_size / 2;
         for (std::uint32_t i = lane; i < bounds_pairs; i += warp_size) {
             __half2 packed = __floats2half2_rn(global_bounds[2 * i], global_bounds[2 * i + 1]);
-            reinterpret_cast<__half2*>(shared_bounds)[i] = packed;
+            reinterpret_cast<__half2 *>(shared_bounds)[i] = packed;
         }
         if (lane == 0 && (bounds_size & 1))
             shared_bounds[bounds_size - 1] = __float2half(global_bounds[bounds_size - 1]);
         __syncwarp(full_mask);
 
         // Build molecule-level pointers into the batched arrays.
-        float const* mol_initial_coordinates = initial_coordinates + mol * initial_coordinate_stride * 4;
-        chiral_center_descriptor_t const* mol_chirals = chiral_centers + meta.chiral_offset;
-        etk_torsion_descriptor_t const* mol_torsions = torsion_terms + meta.torsion_offset;
-        distance_constraint_t const* mol_constraints = distance_constraints + meta.constraint_offset;
+        float const *mol_initial_coordinates = initial_coordinates + mol * initial_coordinate_stride * 4;
+        chiral_center_descriptor_t const *mol_chirals = chiral_centers + meta.chiral_offset;
+        etk_torsion_descriptor_t const *mol_torsions = torsion_terms + meta.torsion_offset;
+        distance_constraint_t const *mol_constraints = distance_constraints + meta.constraint_offset;
 
         // Initialize the Philox RNG once per molecule.
         curandStatePhilox4_32_10_t rng_state;
@@ -260,7 +255,7 @@ __global__ void etkdg_pipeline_warp_kernel(
                                                     num_atoms, conf, attempt, lane, &rng_state);
 
                 // Stage 4: Run DG minimization in 4D with up to 100 FIRE iterations.
-                distance_geometry_energy_functor_t dg_functor{
+                distance_geometry_energy_functor_t dg_functor {
                     shared_bounds, mol_chirals, num_atoms, meta.num_chiral_centers, 4, 1.0f, 1.0f, 100.0f, 0.0f};
 
                 float dg_energy = 0.0f;
@@ -285,8 +280,9 @@ __global__ void etkdg_pipeline_warp_kernel(
 
                 // Stage 7: Run ETK torsion refinement in 3D with 100 FIRE iterations.
                 if (meta.num_etk_torsions > 0) {
-                    etk_torsion_energy_functor_t etk_functor{mol_torsions, mol_constraints, etk_interactions,
-                                                             etk_atom_offsets + meta.etk_atom_offsets_start, num_atoms};
+                    etk_torsion_energy_functor_t etk_functor {mol_torsions, mol_constraints, etk_interactions,
+                                                              etk_atom_offsets + meta.etk_atom_offsets_start,
+                                                              num_atoms};
 
                     float etk_energy = 0.0f;
                     float etk_rms_gradient = 0.0f;
@@ -296,9 +292,8 @@ __global__ void etkdg_pipeline_warp_kernel(
                                     refinement_policy.etk_gradient_threshold, lane, etk_functor, &etk_energy,
                                     &etk_iterations, &etk_status, &etk_rms_gradient);
                     final_energy = etk_energy;
-                } else {
-                    final_energy = crush_energy;
                 }
+                else { final_energy = crush_energy; }
 
                 // Stage 8: Run final validation.
                 bool valid = true;
@@ -310,15 +305,15 @@ __global__ void etkdg_pipeline_warp_kernel(
                     // Stage 9: Run MMFF94 polishing in 3D.
                     std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
                     if (total_mmff_terms > 0 && mmff_interactions != nullptr) {
-                        mmff94_energy_functor_t mmff_functor{mmff_nonbonded_pairs + meta.mmff_nonbonded_offset,
-                                                             mmff_bond_terms + meta.mmff_bond_offset,
-                                                             mmff_angle_terms + meta.mmff_angle_offset,
-                                                             mmff_torsion_terms + meta.mmff_torsion_offset,
-                                                             mmff_oop_terms + meta.mmff_oop_offset,
-                                                             mmff_stretchbend_terms + meta.mmff_stretchbend_offset,
-                                                             mmff_interactions,
-                                                             mmff_atom_offsets + meta.mmff_atom_offsets_start,
-                                                             num_atoms};
+                        mmff94_energy_functor_t mmff_functor {mmff_nonbonded_pairs + meta.mmff_nonbonded_offset,
+                                                              mmff_bond_terms + meta.mmff_bond_offset,
+                                                              mmff_angle_terms + meta.mmff_angle_offset,
+                                                              mmff_torsion_terms + meta.mmff_torsion_offset,
+                                                              mmff_oop_terms + meta.mmff_oop_offset,
+                                                              mmff_stretchbend_terms + meta.mmff_stretchbend_offset,
+                                                              mmff_interactions,
+                                                              mmff_atom_offsets + meta.mmff_atom_offsets_start,
+                                                              num_atoms};
 
                         float mmff_energy = 0.0f;
                         float mmff_rms_gradient = 0.0f;

@@ -6,5 +6,82 @@ NamespaceIndentation: None
 ColumnLimit: 120
 ReflowComments: true
 UseTab: Never
-PointerAlignment: Left
-AllowShortCaseLabelsOnASingleLine: True
+
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignEscapedNewlines: true
+AlignOperands: true
+AlignTrailingComments: true
+
+AllowAllArgumentsOnNextLine: false
+AllowAllConstructorInitializersOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowShortBlocksOnASingleLine: Always
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: true
+AllowShortLambdasOnASingleLine: true
+AllowShortLoopsOnASingleLine: true
+AlwaysBreakTemplateDeclarations: Yes
+AlwaysBreakAfterReturnType: None
+PenaltyReturnTypeOnItsOwnLine: 200
+
+BreakBeforeBraces: Custom
+BreakAdjacentStringLiterals: false
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterExternBlock: false
+  AfterFunction: false
+  AfterStruct: false
+  AfterNamespace: false
+  AfterUnion: false
+  BeforeCatch: true
+  BeforeElse: true
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+  IndentBraces: false
+
+SortIncludes: false
+SortUsingDeclarations: true
+
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCpp11BracedList: true
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceInEmptyParentheses: false
+SpacesBeforeTrailingComments: 1
+SpacesInAngles: false
+SpacesInCStyleCastParentheses: false
+SpacesInContainerLiterals: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+BinPackArguments: true
+BinPackParameters: true
+# Requires clang-format 22+; older versions will error on unknown keys below.
+BinPackLongBracedList: true
+BreakBeforeCloseBracketBracedList: false
+PenaltyBreakBeforeFirstCallParameter: 1
+
+# Preprocessor directive indentation: None (flat), AfterHash (#  if), BeforeHash (  #if)
+IndentPPDirectives: None
+
+# Keep pointer alignment consistent: nk_f32_t const *a
+PointerAlignment: Right
+DerivePointerAlignment: false
+
+# Preserve user line breaks in intrinsic-heavy code
+BreakBeforeBinaryOperators: None
+PenaltyBreakAssignment: 50
+
+# Ensure files end with a newline
+InsertNewlineAtEOF: true

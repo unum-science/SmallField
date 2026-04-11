@@ -1,11 +1,8 @@
 /**
- * @file test_dg_energy.cpp
- * @brief Tests for DG energy evaluation, gradient correctness, and L-BFGS convergence.
- * Compiled with g++ (C++20). CUDA kernels in test_dg_energy_kernels.cu.
+ *  @file test_dg_energy.cpp
+ *  @brief Tests for DG energy evaluation, gradient correctness, and L-BFGS convergence.
+ *  Compiled with g++ (C++20). CUDA kernels in test_dg_energy_kernels.cu.
  */
-
-#include "etkdg_preprocess.hpp"
-#include "test_helpers.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -13,21 +10,24 @@
 #include <random>
 #include <vector>
 
+#include "etkdg_preprocess.hpp"
+#include "test_helpers.hpp"
+
 using namespace smallfield;
 using namespace smallfield::test;
 
-extern "C" void gpu_dg_energy(float const* host_coords, float* host_gradient, float const* host_bounds,
+extern "C" void gpu_dg_energy(float const *host_coords, float *host_gradient, float const *host_bounds,
                               std::uint32_t num_atoms, std::uint32_t spatial_dimension, float upper_weight,
-                              float lower_weight, float fourth_dim_weight, float* out_energy);
+                              float lower_weight, float fourth_dim_weight, float *out_energy);
 
-extern "C" void gpu_dg_minimize(float* host_coords, float const* host_bounds, std::uint32_t num_atoms,
+extern "C" void gpu_dg_minimize(float *host_coords, float const *host_bounds, std::uint32_t num_atoms,
                                 std::uint32_t spatial_dimension, float upper_weight, float lower_weight,
                                 float fourth_dim_weight, std::int32_t max_iterations, float gradient_threshold,
-                                float* out_energy, std::int32_t* out_iterations, std::int32_t* out_status);
+                                float *out_energy, std::int32_t *out_iterations, std::int32_t *out_status);
 
 // CPU reference: compute DG distance violation energy in double precision.
 // Uses float32 bounds (the GPU uses half-precision, so energies will differ).
-static double cpu_dg_energy_reference(double const* coords, float const* bounds, std::uint32_t num_atoms,
+static double cpu_dg_energy_reference(double const *coords, float const *bounds, std::uint32_t num_atoms,
                                       std::uint32_t dim, float upper_weight, float lower_weight) {
     double energy = 0.0;
     for (std::uint32_t i = 0; i < num_atoms; ++i) {
@@ -164,8 +164,7 @@ static void test_dg_gradient_finite_difference() {
         float const denom = std::max(1.0f, std::fabs(analytical));
         float const relative_error = abs_error / denom;
 
-        if (relative_error > max_relative_error)
-            max_relative_error = relative_error;
+        if (relative_error > max_relative_error) max_relative_error = relative_error;
 
         if (relative_error > 0.05f && abs_error > 0.01f) {
             if (num_mismatches < 5) {
@@ -188,7 +187,7 @@ static void test_dg_minimize_convergence() {
 
     std::vector<std::string> test_smiles = {"CCO", "CC(=O)O", "c1ccccc1"};
 
-    for (auto const& smiles : test_smiles) {
+    for (auto const &smiles : test_smiles) {
         std::printf("  testing: %s\n", smiles.c_str());
 
         auto prepared = prepare_molecule(smiles);
@@ -202,8 +201,7 @@ static void test_dg_minimize_convergence() {
         std::mt19937 rng(42);
         std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
         std::vector<float> coords(num_elements);
-        for (auto& c : coords)
-            c = dist(rng);
+        for (auto &c : coords) c = dist(rng);
 
         // run DG minimization
         float energy = 0.0f;
@@ -226,10 +224,8 @@ static void test_dg_minimize_convergence() {
                 float upper = prepared.bounds_matrix[i * num_atoms + j];
                 float lower = prepared.bounds_matrix[j * num_atoms + i];
 
-                if (distance > upper)
-                    max_violation = std::max(max_violation, distance - upper);
-                if (distance < lower)
-                    max_violation = std::max(max_violation, lower - distance);
+                if (distance > upper) max_violation = std::max(max_violation, distance - upper);
+                if (distance < lower) max_violation = std::max(max_violation, lower - distance);
             }
         }
         std::printf("    max_violation=%.4f angstrom\n", max_violation);

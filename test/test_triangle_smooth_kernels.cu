@@ -1,40 +1,38 @@
 /**
- * @file test_triangle_smooth_kernels.cu
- * @brief CUDA kernel wrappers for triangle smoothing test.
+ *  @file test_triangle_smooth_kernels.cu
+ *  @brief CUDA kernel wrappers for triangle smoothing test.
  *
- * Compiled by nvcc. The host test code (with RDKit includes) is in
- * test_triangle_smooth.cpp, compiled by g++.
+ *  Compiled by nvcc. The host test code (with RDKit includes) is in
+ *  test_triangle_smooth.cpp, compiled by g++.
  */
 
-#include "triangle_smooth.cuh"
 #include <cstdint>
+
 #include <cuda_runtime.h>
+
+#include "triangle_smooth.cuh"
 
 extern "C" {
 
 // kernel that copies bounds to shared memory, smooths, copies back
-__global__ void triangle_smooth_shared_kernel(float* global_bounds, std::uint32_t num_atoms) {
+__global__ void triangle_smooth_shared_kernel(float *global_bounds, std::uint32_t num_atoms) {
     extern __shared__ float shared_bounds[];
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const total = num_atoms * num_atoms;
 
-    // copy global -> shared
-    for (std::uint32_t i = lane; i < total; i += 32) {
-        shared_bounds[i] = global_bounds[i];
-    }
+    // copy global → shared
+    for (std::uint32_t i = lane; i < total; i += 32) { shared_bounds[i] = global_bounds[i]; }
     __syncwarp(0xFFFFFFFF);
 
     // smooth in shared memory
     smallfield::triangle_smooth_warp_(shared_bounds, num_atoms, lane);
 
-    // copy shared -> global
-    for (std::uint32_t i = lane; i < total; i += 32) {
-        global_bounds[i] = shared_bounds[i];
-    }
+    // copy shared → global
+    for (std::uint32_t i = lane; i < total; i += 32) { global_bounds[i] = shared_bounds[i]; }
 }
 
-void gpu_triangle_smooth(float* host_bounds, std::uint32_t num_atoms) {
-    float* device_bounds = nullptr;
+void gpu_triangle_smooth(float *host_bounds, std::uint32_t num_atoms) {
+    float *device_bounds = nullptr;
     std::size_t const bounds_bytes = num_atoms * num_atoms * sizeof(float);
 
     cudaMalloc(&device_bounds, bounds_bytes);

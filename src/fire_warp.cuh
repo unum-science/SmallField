@@ -1,12 +1,12 @@
 /**
- * @file fire_warp.cuh
- * @brief FIRE (Fast Inertial Relaxation Engine) warp-level optimizer.
+ *  @file fire_warp.cuh
+ *  @brief FIRE (Fast Inertial Relaxation Engine) warp-level optimizer.
  *
- * Bitzek et al., PRL 97, 170201 (2006).
- * Gradient descent with adaptive momentum. Much lighter than L-BFGS:
- * needs only positions + velocities + gradient (3 arrays, no history).
+ *  Bitzek et al., PRL 97, 170201 (2006).
+ *  Gradient descent with adaptive momentum. Much lighter than L-BFGS:
+ *  needs only positions + velocities + gradient (3 arrays, no history).
  *
- * Functor interface:
+ *  Functor interface:
  *   float functor(positions, gradient, num_elements, lane)
  *   float functor.energy_only(positions, num_elements, lane)
  */
@@ -20,30 +20,30 @@
 namespace smallfield {
 
 /**
- * FIRE minimization driver.
+ *  @brief FIRE minimization driver.
  *
- * @tparam EnergyGradientFunctor  Callable: float(positions, gradient, num_elements, lane)
+ *  @tparam EnergyGradientFunctor  Callable: float(positions, gradient, num_elements, lane)
  *
- * @param positions       Coordinate array (modified in place). Length = num_elements.
- * @param velocities      Shared memory for FIRE velocities. Length = num_elements.
- * @param gradient        Shared memory for gradient. Length = num_elements.
- * @param num_elements    Total coordinate dimensions (e.g., 3*N or 4*N).
- * @param max_iterations  Maximum FIRE iterations.
- * @param gradient_threshold  Convergence when rms(gradient) < threshold.
- * @param lane            Warp lane index (threadIdx.x % 32).
- * @param compute_energy_gradient  The energy/gradient functor.
- * @param[out] out_final_energy    Final energy (lane 0).
- * @param[out] out_iterations      Iteration count (lane 0).
- * @param[out] out_status          0=converged, 1=max_iterations (lane 0).
- * @param[out] out_final_rms_gradient  Final RMS gradient (lane 0, optional).
+ *  @param[in,out] positions Coordinate array (modified in place). Length = @p num_elements.
+ *  @param[in,out] velocities Shared memory for FIRE velocities. Length = @p num_elements.
+ *  @param[out] gradient Shared memory for gradient. Length = @p num_elements.
+ *  @param[in] num_elements Total coordinate dimensions (e.g., 3*N or 4*N).
+ *  @param[in] max_iterations Maximum FIRE iterations.
+ *  @param[in] gradient_threshold Convergence when rms(gradient) < threshold.
+ *  @param[in] lane Warp lane index (threadIdx.x % 32).
+ *  @param[in] compute_energy_gradient The energy/gradient functor.
+ *  @param[out] out_final_energy Final energy (lane 0).
+ *  @param[out] out_iterations Iteration count (lane 0).
+ *  @param[out] out_status 0=converged, 1=max_iterations (lane 0).
+ *  @param[out] out_final_rms_gradient Final RMS gradient (lane 0, optional).
  */
 template <typename EnergyGradientFunctor>
-__device__ __forceinline__ void fire_minimize_(float* positions, float* velocities, float* gradient,
+__device__ __forceinline__ void fire_minimize_(float *positions, float *velocities, float *gradient,
                                                std::uint32_t num_elements, std::int32_t max_iterations,
                                                float gradient_threshold, std::uint32_t lane,
-                                               EnergyGradientFunctor&& compute_energy_gradient, float* out_final_energy,
-                                               std::int32_t* out_iterations, std::int32_t* out_status,
-                                               float* out_final_rms_gradient = nullptr) {
+                                               EnergyGradientFunctor &&compute_energy_gradient, float *out_final_energy,
+                                               std::int32_t *out_iterations, std::int32_t *out_status,
+                                               float *out_final_rms_gradient = nullptr) {
     // FIRE parameters (Bitzek et al., PRL 2006)
     constexpr float dt_start = 0.05f;
     constexpr float dt_max = 0.5f;
@@ -59,8 +59,7 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
     float last_rms_gradient = 0.0f;
 
     // zero velocities
-    for (std::uint32_t i = lane; i < num_elements; i += warp_size)
-        velocities[i] = 0.0f;
+    for (std::uint32_t i = lane; i < num_elements; i += warp_size) velocities[i] = 0.0f;
     __syncwarp(full_mask);
 
     for (std::int32_t iteration = 0; iteration < max_iterations; ++iteration) {
@@ -90,8 +89,7 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
                 *out_status = 0;
                 *out_iterations = iteration;
                 *out_final_energy = energy;
-                if (out_final_rms_gradient != nullptr)
-                    *out_final_rms_gradient = rms_gradient;
+                if (out_final_rms_gradient != nullptr) *out_final_rms_gradient = rms_gradient;
             }
             return;
         }
@@ -112,10 +110,10 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
                 alpha *= f_alpha;
             }
             steps_since_reset++;
-        } else {
+        }
+        else {
             // decelerating: reset velocity, shrink step
-            for (std::uint32_t i = lane; i < num_elements; i += warp_size)
-                velocities[i] = 0.0f;
+            for (std::uint32_t i = lane; i < num_elements; i += warp_size) velocities[i] = 0.0f;
             dt *= f_dec;
             alpha = alpha_start;
             steps_since_reset = 0;
@@ -139,8 +137,7 @@ __device__ __forceinline__ void fire_minimize_(float* positions, float* velociti
         *out_status = 1;
         *out_iterations = max_iterations;
         *out_final_energy = final_energy;
-        if (out_final_rms_gradient != nullptr)
-            *out_final_rms_gradient = last_rms_gradient;
+        if (out_final_rms_gradient != nullptr) *out_final_rms_gradient = last_rms_gradient;
     }
 }
 

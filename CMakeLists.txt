@@ -3,7 +3,7 @@ project(SmallField LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # detect GPU architecture at build time
@@ -104,6 +104,28 @@ find_library(CUSOLVER_LIBRARY cusolver
           /usr/local/cuda/lib64)
 
 if(RDKit_FOUND)
+    # RDKit targets needed by the library
+    set(RDKIT_LIBS
+        RDKit::SmilesParse RDKit::GraphMol RDKit::RDGeneral
+        RDKit::ForceFieldHelpers RDKit::ForceField
+        RDKit::DistGeomHelpers RDKit::DistGeometry
+        RDKit::Depictor RDKit::SubstructMatch
+        RDKit::Alignment RDKit::EigenSolvers RDKit::MolTransforms)
+
+    # SmallField library (CUDA + RDKit preprocessing)
+    add_library(smallfield_lib STATIC src/smallfield.cu)
+    set_source_files_properties(src/smallfield.cu PROPERTIES LANGUAGE CUDA)
+    target_include_directories(smallfield_lib PUBLIC ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(smallfield_lib PUBLIC
+        ${RDKIT_LIBS}
+        ${CURAND_LIBRARY}
+        ${CUSOLVER_LIBRARY}
+        cudart
+        OpenMP::OpenMP_CXX)
+    set_target_properties(smallfield_lib PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON)
+
     enable_testing()
     add_subdirectory(test)
     add_subdirectory(bench)

@@ -1,7 +1,7 @@
 /**
- * @file test_chirality.cpp
- * @brief Tests for GPU chirality validation vs RDKit reference.
- * Compiled with g++ (C++20). CUDA kernels in test_chirality_kernels.cu.
+ *  @file test_chirality.cpp
+ *  @brief Tests for GPU chirality validation vs RDKit reference.
+ *  Compiled with g++ (C++20). CUDA kernels in test_chirality_kernels.cu.
  */
 
 #include <cstdio>
@@ -13,7 +13,7 @@
 using namespace smallfield;
 using namespace smallfield::test;
 
-extern "C" bool gpu_validate_chirality(float const* host_coords, chiral_center_descriptor_t const* host_chirals,
+extern "C" bool gpu_validate_chirality(float const *host_coords, chiral_center_descriptor_t const *host_chirals,
                                        std::uint32_t num_atoms, std::uint32_t num_chirals);
 
 static void test_chirality_correct_conformer() {
@@ -27,7 +27,7 @@ static void test_chirality_correct_conformer() {
         "N[C@@H](CC(=O)O)C(=O)O",                 // L-aspartic acid
     };
 
-    for (auto const& smiles : chiral_smiles) {
+    for (auto const &smiles : chiral_smiles) {
         std::printf("  testing: %s\n", smiles.c_str());
 
         auto mol = mol_from_smiles(smiles);
@@ -91,9 +91,7 @@ static void test_chirality_inverted() {
 
     // Flip the target sign. The validation should now fail.
     std::vector<chiral_center_descriptor_t> flipped_chirals = chirals;
-    for (auto& c : flipped_chirals) {
-        c.target_sign = -c.target_sign;
-    }
+    for (auto &c : flipped_chirals) { c.target_sign = -c.target_sign; }
 
     bool result_original = gpu_validate_chirality(coords_soa.data(), chirals.data(), num_atoms,
                                                   static_cast<std::uint32_t>(chirals.size()));

@@ -1,14 +1,14 @@
 /**
- * @file etkdg_types.cuh
- * @brief Data structures for the GPU ETKDG conformer generation pipeline.
+ *  @file etkdg_types.cuh
+ *  @brief Data structures for the GPU ETKDG conformer generation pipeline.
  *
- * Defines the types used to pass preprocessed molecular data from CPU to GPU:
- * - Molecule metadata (atom counts, offsets into batched arrays)
- * - Chiral center descriptors (CIP-ordered neighbors, target sign)
- * - ETK torsion descriptors (CSD Fourier coefficients)
- * - Distance constraints (1-2 bond, 1-3 angle-derived bounds)
+ *  Defines the types used to pass preprocessed molecular data from CPU to GPU:
+ *  - Molecule metadata (atom counts, offsets into batched arrays)
+ *  - Chiral center descriptors (CIP-ordered neighbors, target sign)
+ *  - ETK torsion descriptors (CSD Fourier coefficients)
+ *  - Distance constraints (1-2 bond, 1-3 angle-derived bounds)
  *
- * All structs use `alignas` (C++17) for portable alignment.
+ *  All structs use `alignas` (C++17) for portable alignment.
  */
 
 #pragma once
@@ -18,8 +18,36 @@
 namespace smallfield {
 
 /**
- * Per-molecule metadata for the ETKDG pipeline.
- * One per molecule in the batch; offsets point into concatenated arrays.
+ *  @brief Positional index of an atom within a multi-atom interaction term.
+ *
+ *  For bonds: first/second. For angles: first=end, second=center, third=end.
+ *  For torsions/OOP: first through fourth in atom-list order.
+ */
+enum atom_role_t : std::uint8_t {
+    atom_role_first_k = 0,
+    atom_role_second_k = 1,
+    atom_role_third_k = 2,
+    atom_role_fourth_k = 3,
+};
+
+enum mmff94_interaction_type_t : std::uint8_t {
+    mmff94_nonbonded_k = 0,
+    mmff94_bond_k = 1,
+    mmff94_angle_end_k = 2,
+    mmff94_angle_center_k = 3,
+    mmff94_torsion_k = 4,
+    mmff94_out_of_plane_k = 5,
+    mmff94_stretch_bend_k = 6,
+};
+
+enum etk_interaction_type_t : std::uint8_t {
+    etk_torsion_k = 0,
+    etk_distance_constraint_k = 1,
+};
+
+/**
+ *  Per-molecule metadata for the ETKDG pipeline.
+ *  One per molecule in the batch; offsets point into concatenated arrays.
  */
 struct etkdg_molecule_metadata_t {
     std::uint32_t num_atoms;
@@ -49,12 +77,12 @@ struct etkdg_molecule_metadata_t {
 };
 
 /**
- * Chiral center descriptor.
- * Stores the central atom, its four CIP-priority-ordered neighbors,
- * and the expected sign of the signed tetrahedral volume.
+ *  Chiral center descriptor.
+ *  Stores the central atom, its four CIP-priority-ordered neighbors,
+ *  and the expected sign of the signed tetrahedral volume.
  *
- * Validation: V = (r_b - r_a) . ((r_c - r_a) x (r_d - r_a))
- * where a = center, b,c,d = neighbor_atoms[0..2]; sign(V) must equal target_sign.
+ *  Validation: V = (r_b - r_a) . ((r_c - r_a) x (r_d - r_a))
+ *  where a = center, b,c,d = neighbor_atoms[0..2]; sign(V) must equal target_sign.
  */
 struct alignas(8) chiral_center_descriptor_t {
     std::uint8_t center_atom;       ///< central atom index within molecule
@@ -64,10 +92,10 @@ struct alignas(8) chiral_center_descriptor_t {
 };
 
 /**
- * ETK torsion term from CSD (Cambridge Structural Database) preferences.
+ *  ETK torsion term from CSD (Cambridge Structural Database) preferences.
  *
- * E_torsion = Σₙ₌₁⁶ Vₙ·cos(n·φ)
- * where φ is the dihedral angle defined by atom_indices[0]-[1]-[2]-[3].
+ *  E_torsion = Σₙ₌₁⁶ Vₙ·cos(n·φ)
+ *  where φ is the dihedral angle defined by atom_indices[0]-[1]-[2]-[3].
  */
 struct alignas(32) etk_torsion_descriptor_t {
     std::uint8_t atom_indices[4]; ///< dihedral atoms i-j-k-l within molecule
@@ -76,10 +104,10 @@ struct alignas(32) etk_torsion_descriptor_t {
 };
 
 /**
- * Distance constraint for distance geometry and ETK refinement stages.
+ *  Distance constraint for distance geometry and ETK refinement stages.
  *
- * E = penalty_weight · max(0, dᵢⱼ - upper)² + penalty_weight · max(0, lower - dᵢⱼ)²
- * where dᵢⱼ = ‖rᵢ - rⱼ‖
+ *  E = penalty_weight · max(0, dᵢⱼ - upper)² + penalty_weight · max(0, lower - dᵢⱼ)²
+ *  where dᵢⱼ = ‖rᵢ - rⱼ‖
  */
 struct alignas(16) distance_constraint_t {
     std::uint8_t atom_index_i;    ///< first atom index within molecule
@@ -92,8 +120,8 @@ struct alignas(16) distance_constraint_t {
 };
 
 /**
- * MMFF94 nonbonded pair (VdW + electrostatic). 16 bytes.
- * Each pair stored once (not symmetric like neighbor_t).
+ *  MMFF94 nonbonded pair (VdW + electrostatic). 16 bytes.
+ *  Each pair stored once (not symmetric like neighbor_t).
  */
 struct alignas(16) mmff94_nonbonded_pair_t {
     std::uint8_t atom_i; ///< first atom index within molecule
@@ -105,7 +133,11 @@ struct alignas(16) mmff94_nonbonded_pair_t {
     float charge_product; ///< qi * qj (precomputed)
 };
 
-/** MMFF94 bond stretching term. E = 0.5·143.9325·kb·Δr²·(1 + cs·Δr + 7/12·cs²·Δr²) */
+/**
+ *  @brief MMFF94 bond stretching term.
+ *
+ *  E = 0.5 * 143.9325 * kb * dr² * (1 + cs * dr + 7/12 * cs² * dr²)
+ */
 struct alignas(16) mmff94_bond_t {
     std::uint8_t atom_i;
     std::uint8_t atom_j;
@@ -115,7 +147,11 @@ struct alignas(16) mmff94_bond_t {
     float padding_float;
 };
 
-/** MMFF94 angle bending term. E = 0.5·0.043844·ka·Δθ²·(1 + cb·Δθ) */
+/**
+ *  @brief MMFF94 angle bending term.
+ *
+ *  E = 0.5 * 0.043844 * ka * Δθ² * (1 + cb * Δθ)
+ */
 struct alignas(16) mmff94_angle_t {
     std::uint8_t atom_i;
     std::uint8_t atom_j; ///< central atom
@@ -126,7 +162,11 @@ struct alignas(16) mmff94_angle_t {
     float padding_float;
 };
 
-/** MMFF94 torsion term. E = 0.5·(V₁·(1+cos(φ)) + V₂·(1−cos(2φ)) + V₃·(1+cos(3φ))) */
+/**
+ *  @brief MMFF94 torsion term.
+ *
+ *  E = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
+ */
 struct alignas(16) mmff94_torsion_t {
     std::uint8_t atom_i;
     std::uint8_t atom_j;
@@ -138,8 +178,8 @@ struct alignas(16) mmff94_torsion_t {
 };
 
 /**
- * MMFF94 out-of-plane bending. E = 0.5·0.043844·koop·chi² (chi in degrees).
- * Wilson angle: chi = angle between bond j→i and the plane j-k-l.
+ *  MMFF94 out-of-plane bending. E = 0.5·0.043844·koop·chi² (chi in degrees).
+ *  Wilson angle: chi = angle between bond j→i and the plane j-k-l.
  */
 struct alignas(16) mmff94_oop_t {
     std::uint8_t atom_i;  ///< out-of-plane atom
@@ -150,7 +190,11 @@ struct alignas(16) mmff94_oop_t {
     float padding[2];
 };
 
-/** MMFF94 stretch-bend coupling. E = 2.5121·(kba_ijk·Δr_ij + kba_kji·Δr_kj)·Δθ */
+/**
+ *  @brief MMFF94 stretch-bend coupling term.
+ *
+ *  E = 2.5121 * (kba_ijk * Δrᵢⱼ + kba_kji * Δrₖⱼ) * Δθ
+ */
 struct alignas(32) mmff94_stretchbend_t {
     std::uint8_t atom_i; ///< end atom 1
     std::uint8_t atom_j; ///< central atom
@@ -165,17 +209,19 @@ struct alignas(32) mmff94_stretchbend_t {
 };
 
 /**
- * Per-atom MMFF94 interaction descriptor for the per-atom adjacency list.
- * Each entry says: "atom X participates in term Y with role Z".
- * interaction_type: 0=nonbonded, 1=bond, 2=angle(end), 3=angle(center), 4=torsion, 5=oop, 6=stretch-bend
+ *  Per-atom MMFF94 interaction descriptor for the per-atom adjacency list.
+ *  Each entry says: "atom X participates in term Y with role Z".
+ *  interaction_type: mmff94_nonbonded_k through mmff94_stretch_bend_k
  */
 struct mmff94_atom_interaction_t {
-    std::uint32_t term_index;      ///< index into the type-specific parameter array
-    std::uint8_t interaction_type; ///< 0=nb, 1=bond, 2=angle(end), 3=angle(ctr), 4=tor, 5=oop, 6=stbn
-    std::uint8_t role;             ///< this atom's role (0=i, 1=j, 2=k, 3=l)
+    std::uint32_t term_index;                   ///< index into the type-specific parameter array
+    mmff94_interaction_type_t interaction_type; ///< nonbonded, bond, angle(end/center), torsion, oop, stretch-bend
+    atom_role_t role;
 };
 
-/** Per-atom per-type offsets into the MMFF94 interaction list. */
+/**
+ *  @brief Per-atom per-type offsets into the MMFF94 interaction list.
+ */
 struct mmff94_atom_offsets_t {
     std::uint32_t nonbonded_start;
     std::uint32_t bond_start;
@@ -192,28 +238,34 @@ struct mmff94_atom_offsets_t {
     std::uint8_t padding[2];
 };
 
-/** Per-atom ETK interaction descriptor. interaction_type: 0=torsion, 1=distance_constraint. */
+/**
+ *  @brief Per-atom ETK interaction descriptor.
+ *
+ *  interaction_type: etk_torsion_k or etk_distance_constraint_k.
+ */
 struct etk_atom_interaction_t {
     std::uint32_t term_index;
-    std::uint8_t interaction_type; ///< 0=torsion, 1=distance_constraint
-    std::uint8_t role;             ///< torsion: 0-3 (i,j,k,l), constraint: 0=atom_i, 1=atom_j
+    etk_interaction_type_t interaction_type; ///< etk_torsion_k or etk_distance_constraint_k
+    atom_role_t role;
 };
 
-/** Per-atom offset into the ETK interaction list. */
+/**
+ *  @brief Per-atom offset into the ETK interaction list.
+ */
 struct etk_atom_offsets_t {
     std::uint32_t interaction_start;
     std::uint32_t interaction_count;
 };
 
 /**
- * Bounds matrix layout convention:
+ *  Bounds matrix layout convention:
  *
- * Full N x N float matrix, row-major.
- * bounds[i*N + j] with i < j  stores the upper bound distance (angstroms)
- * bounds[i*N + j] with i > j  stores the lower bound distance (angstroms)
- * bounds[i*N + i]             = 0.0
+ *  Full N x N float matrix, row-major.
+ *  bounds[i*N + j] with i < j  stores the upper bound distance (angstroms)
+ *  bounds[i*N + j] with i > j  stores the lower bound distance (angstroms)
+ *  bounds[i*N + i] = 0.0
  *
- * This matches RDKit's DistGeom::BoundsMatrix convention.
+ *  This matches RDKit's DistGeom::BoundsMatrix convention.
  */
 
 } // namespace smallfield
