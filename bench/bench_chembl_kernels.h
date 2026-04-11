@@ -21,6 +21,8 @@ struct gpu_pipeline_result_t {
     std::uint32_t blocks_per_sm;
 };
 
+extern "C" int gpu_get_device_count();
+
 extern "C" gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     float const* host_bounds, std::uint32_t bounds_total_floats,
     smallfield::chiral_center_descriptor_t const* host_chirals, std::uint32_t chirals_total,
@@ -38,4 +40,5 @@ extern "C" gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     smallfield::mmff94_atom_offsets_t const* host_mmff_offsets, std::uint32_t mmff_offsets_total,
     smallfield::etkdg_molecule_metadata_t const* host_metadata, std::uint32_t num_molecules, float* host_coords_out,
     float* host_energies_out, std::uint8_t* host_status_out, std::uint32_t num_conformers,
-    std::uint32_t max_stereo_attempts, std::uint32_t max_atoms_per_molecule, std::uint64_t seed);
+    std::uint32_t max_stereo_attempts, std::uint32_t max_atoms_per_molecule, std::uint64_t seed,
+    int device_id = 0);

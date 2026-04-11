@@ -346,16 +346,24 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
 
     std::uint32_t const num_atoms = molecule.getNumAtoms();
 
-    // Use a flat exclusion matrix for 1-2 and 1-3 pairs.
-    // Use a flat 1-4 matrix for atoms exactly 3 bonds apart.
-    std::vector<bool> excluded(num_atoms * num_atoms, false);
-    std::vector<bool> is_1_4(num_atoms * num_atoms, false);
+    // Use stack-allocated bitset arrays for exclusion and 1-4 pair detection.
+    constexpr std::uint32_t max_bits = 128 * 128;
+    constexpr std::uint32_t bitset_words = (max_bits + 63) / 64;
+    std::uint64_t excluded[bitset_words] = {};
+    std::uint64_t is_one_four[bitset_words] = {};
+
+    auto set_bit = [](std::uint64_t* bits, std::uint32_t index) {
+        bits[index / 64] |= (std::uint64_t(1) << (index % 64));
+    };
+    auto get_bit = [](std::uint64_t const* bits, std::uint32_t index) -> bool {
+        return (bits[index / 64] >> (index % 64)) & 1;
+    };
 
     // Mark 1-2 bonds as excluded.
     for (auto const& bond : molecule.bonds()) {
         unsigned int a = bond->getBeginAtomIdx(), b = bond->getEndAtomIdx();
-        excluded[a * num_atoms + b] = true;
-        excluded[b * num_atoms + a] = true;
+        set_bit(excluded, a * num_atoms + b);
+        set_bit(excluded, b * num_atoms + a);
     }
 
     // Mark 1-3 pairs as excluded and detect 1-4 pairs from torsion terminals.
@@ -371,8 +379,8 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
         // 1-3 exclusions: all pairs of neighbors
         for (unsigned int a = 0; a < nb_count; ++a) {
             for (unsigned int b = a + 1; b < nb_count; ++b) {
-                excluded[nb_indices[a] * num_atoms + nb_indices[b]] = true;
-                excluded[nb_indices[b] * num_atoms + nb_indices[a]] = true;
+                set_bit(excluded, nb_indices[a] * num_atoms + nb_indices[b]);
+                set_bit(excluded, nb_indices[b] * num_atoms + nb_indices[a]);
             }
         }
     }
@@ -387,8 +395,8 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
                 if (nb_k->getIdx() == j)
                     continue;
                 unsigned int i = nb_j->getIdx(), l = nb_k->getIdx();
-                is_1_4[i * num_atoms + l] = true;
-                is_1_4[l * num_atoms + i] = true;
+                set_bit(is_one_four, i * num_atoms + l);
+                set_bit(is_one_four, l * num_atoms + i);
             }
         }
     }
@@ -401,7 +409,7 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
     // Build nonbonded pairs with O(N^2) iteration and O(1) exclusion lookup.
     for (unsigned int i = 0; i < num_atoms; ++i) {
         for (unsigned int j = i + 1; j < num_atoms; ++j) {
-            if (excluded[i * num_atoms + j])
+            if (get_bit(excluded, i * num_atoms + j))
                 continue;
 
             ForceFields::MMFF::MMFFVdWRijstarEps vdw_params;
@@ -409,8 +417,8 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
                 continue;
 
             result.mmff_nonbonded.push_back({static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(j),
-                                             static_cast<std::uint8_t>(is_1_4[i * num_atoms + j] ? 1 : 0), 0,
-                                             static_cast<float>(vdw_params.epsilon),
+                                             static_cast<std::uint8_t>(get_bit(is_one_four, i * num_atoms + j) ? 1 : 0),
+                                             0, static_cast<float>(vdw_params.epsilon),
                                              static_cast<float>(vdw_params.R_ij_star), charges[i] * charges[j]});
         }
     }
@@ -541,83 +549,112 @@ inline void extract_mmff94_params(RDKit::ROMol const& molecule, etkdg_prepared_m
     auto const& oops = result.mmff_oops;
     auto const& stretchbends = result.mmff_stretchbends;
 
-    // Pass 1: Count interactions per atom.
-    std::vector<std::uint32_t> counts(num_atoms, 0);
+    // pass 1: count per-type interactions per atom
+    struct per_atom_counts_t {
+        std::uint8_t nonbonded, bond, angle, torsion, oop, stretchbend;
+    };
+    std::vector<per_atom_counts_t> type_counts(num_atoms, {0, 0, 0, 0, 0, 0});
     for (auto const& p : nonbonded) {
-        counts[p.atom_i]++;
-        counts[p.atom_j]++;
+        type_counts[p.atom_i].nonbonded++;
+        type_counts[p.atom_j].nonbonded++;
     }
     for (auto const& b : bonds) {
-        counts[b.atom_i]++;
-        counts[b.atom_j]++;
+        type_counts[b.atom_i].bond++;
+        type_counts[b.atom_j].bond++;
     }
     for (auto const& a : angles) {
-        counts[a.atom_i]++;
-        counts[a.atom_j]++;
-        counts[a.atom_k]++;
+        type_counts[a.atom_i].angle++;
+        type_counts[a.atom_j].angle++;
+        type_counts[a.atom_k].angle++;
     }
     for (auto const& t : torsions) {
-        counts[t.atom_i]++;
-        counts[t.atom_j]++;
-        counts[t.atom_k]++;
-        counts[t.atom_l]++;
+        type_counts[t.atom_i].torsion++;
+        type_counts[t.atom_j].torsion++;
+        type_counts[t.atom_k].torsion++;
+        type_counts[t.atom_l].torsion++;
     }
     for (auto const& o : oops) {
-        counts[o.atom_i]++;
-        counts[o.atom_j]++;
-        counts[o.atom_k]++;
-        counts[o.atom_l]++;
+        type_counts[o.atom_i].oop++;
+        type_counts[o.atom_j].oop++;
+        type_counts[o.atom_k].oop++;
+        type_counts[o.atom_l].oop++;
     }
     for (auto const& s : stretchbends) {
-        counts[s.atom_i]++;
-        counts[s.atom_j]++;
-        counts[s.atom_k]++;
+        type_counts[s.atom_i].stretchbend++;
+        type_counts[s.atom_j].stretchbend++;
+        type_counts[s.atom_k].stretchbend++;
     }
 
-    // Compute offsets from the per-atom counts.
+    // compute per-type offsets: all nonbonded first, then bonds, then angles, etc.
     result.mmff_atom_offsets.resize(num_atoms);
     std::uint32_t running = 0;
-    for (std::uint32_t a = 0; a < num_atoms; ++a) {
-        result.mmff_atom_offsets[a] = {running, counts[a]};
-        running += counts[a];
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
+        auto const& counts = type_counts[atom];
+        auto& offsets = result.mmff_atom_offsets[atom];
+        offsets.nonbonded_start = static_cast<std::uint32_t>(running);
+        offsets.nonbonded_count = counts.nonbonded;
+        running += counts.nonbonded;
+        offsets.bond_start = static_cast<std::uint32_t>(running);
+        offsets.bond_count = counts.bond;
+        running += counts.bond;
+        offsets.angle_start = static_cast<std::uint32_t>(running);
+        offsets.angle_count = counts.angle;
+        running += counts.angle;
+        offsets.torsion_start = static_cast<std::uint32_t>(running);
+        offsets.torsion_count = counts.torsion;
+        running += counts.torsion;
+        offsets.oop_start = static_cast<std::uint32_t>(running);
+        offsets.oop_count = counts.oop;
+        running += counts.oop;
+        offsets.stretchbend_start = static_cast<std::uint32_t>(running);
+        offsets.stretchbend_count = counts.stretchbend;
+        running += counts.stretchbend;
     }
 
-    // Pass 2: Fill interaction entries by using per-atom write cursors.
+    // pass 2: fill interaction entries grouped by type per atom
     std::uint32_t const total_interactions = running;
     result.mmff_interactions.resize(total_interactions);
-    std::vector<std::uint32_t> cursors(num_atoms);
-    for (std::uint32_t a = 0; a < num_atoms; ++a)
-        cursors[a] = result.mmff_atom_offsets[a].interaction_start;
 
-    for (std::uint32_t t = 0; t < nonbonded.size(); ++t) {
-        result.mmff_interactions[cursors[nonbonded[t].atom_i]++] = {t, 0, 0};
-        result.mmff_interactions[cursors[nonbonded[t].atom_j]++] = {t, 0, 1};
+    // per-type cursors per atom
+    struct per_atom_cursors_t {
+        std::uint32_t nonbonded, bond, angle, torsion, oop, stretchbend;
+    };
+    std::vector<per_atom_cursors_t> cursors(num_atoms);
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
+        auto const& off = result.mmff_atom_offsets[atom];
+        cursors[atom] = {off.nonbonded_start, off.bond_start, off.angle_start,
+                         off.torsion_start,   off.oop_start,  off.stretchbend_start};
     }
-    for (std::uint32_t t = 0; t < bonds.size(); ++t) {
-        result.mmff_interactions[cursors[bonds[t].atom_i]++] = {t, 1, 0};
-        result.mmff_interactions[cursors[bonds[t].atom_j]++] = {t, 1, 1};
+
+    for (std::uint32_t term = 0; term < nonbonded.size(); ++term) {
+        result.mmff_interactions[cursors[nonbonded[term].atom_i].nonbonded++] = {term, 0, 0};
+        result.mmff_interactions[cursors[nonbonded[term].atom_j].nonbonded++] = {term, 0, 1};
     }
-    for (std::uint32_t t = 0; t < angles.size(); ++t) {
-        result.mmff_interactions[cursors[angles[t].atom_i]++] = {t, 2, 0};
-        result.mmff_interactions[cursors[angles[t].atom_j]++] = {t, 3, 1};
-        result.mmff_interactions[cursors[angles[t].atom_k]++] = {t, 2, 2};
+    for (std::uint32_t term = 0; term < bonds.size(); ++term) {
+        result.mmff_interactions[cursors[bonds[term].atom_i].bond++] = {term, 1, 0};
+        result.mmff_interactions[cursors[bonds[term].atom_j].bond++] = {term, 1, 1};
     }
-    for (std::uint32_t t = 0; t < torsions.size(); ++t) {
-        result.mmff_interactions[cursors[torsions[t].atom_i]++] = {t, 4, 0};
-        result.mmff_interactions[cursors[torsions[t].atom_j]++] = {t, 4, 1};
-        result.mmff_interactions[cursors[torsions[t].atom_k]++] = {t, 4, 2};
-        result.mmff_interactions[cursors[torsions[t].atom_l]++] = {t, 4, 3};
+    for (std::uint32_t term = 0; term < angles.size(); ++term) {
+        result.mmff_interactions[cursors[angles[term].atom_i].angle++] = {term, 2, 0};
+        result.mmff_interactions[cursors[angles[term].atom_j].angle++] = {term, 3, 1};
+        result.mmff_interactions[cursors[angles[term].atom_k].angle++] = {term, 2, 2};
     }
-    for (std::uint32_t t = 0; t < oops.size(); ++t) {
-        result.mmff_interactions[cursors[oops[t].atom_i]++] = {t, 5, 0};
-        result.mmff_interactions[cursors[oops[t].atom_j]++] = {t, 5, 1};
-        result.mmff_interactions[cursors[oops[t].atom_k]++] = {t, 5, 2};
-        result.mmff_interactions[cursors[oops[t].atom_l]++] = {t, 5, 3};
+    for (std::uint32_t term = 0; term < torsions.size(); ++term) {
+        result.mmff_interactions[cursors[torsions[term].atom_i].torsion++] = {term, 4, 0};
+        result.mmff_interactions[cursors[torsions[term].atom_j].torsion++] = {term, 4, 1};
+        result.mmff_interactions[cursors[torsions[term].atom_k].torsion++] = {term, 4, 2};
+        result.mmff_interactions[cursors[torsions[term].atom_l].torsion++] = {term, 4, 3};
     }
-    for (std::uint32_t t = 0; t < stretchbends.size(); ++t) {
-        result.mmff_interactions[cursors[stretchbends[t].atom_i]++] = {t, 6, 0};
-        result.mmff_interactions[cursors[stretchbends[t].atom_j]++] = {t, 6, 1};
-        result.mmff_interactions[cursors[stretchbends[t].atom_k]++] = {t, 6, 2};
+    for (std::uint32_t term = 0; term < oops.size(); ++term) {
+        result.mmff_interactions[cursors[oops[term].atom_i].oop++] = {term, 5, 0};
+        result.mmff_interactions[cursors[oops[term].atom_j].oop++] = {term, 5, 1};
+        result.mmff_interactions[cursors[oops[term].atom_k].oop++] = {term, 5, 2};
+        result.mmff_interactions[cursors[oops[term].atom_l].oop++] = {term, 5, 3};
+    }
+    for (std::uint32_t term = 0; term < stretchbends.size(); ++term) {
+        result.mmff_interactions[cursors[stretchbends[term].atom_i].stretchbend++] = {term, 6, 0};
+        result.mmff_interactions[cursors[stretchbends[term].atom_j].stretchbend++] = {term, 6, 1};
+        result.mmff_interactions[cursors[stretchbends[term].atom_k].stretchbend++] = {term, 6, 2};
     }
 }
 
@@ -790,38 +827,54 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
         batch.input_indices.push_back(m);
 
         // Append the molecule data.
-        batch.bounds_matrices.insert(batch.bounds_matrices.end(), prepared[m].bounds_matrix.begin(),
-                                     prepared[m].bounds_matrix.end());
-        batch.chiral_centers.insert(batch.chiral_centers.end(), prepared[m].chiral_centers.begin(),
-                                    prepared[m].chiral_centers.end());
-        batch.etk_torsions.insert(batch.etk_torsions.end(), prepared[m].etk_torsions.begin(),
-                                  prepared[m].etk_torsions.end());
-        batch.distance_constraints.insert(batch.distance_constraints.end(), prepared[m].distance_constraints.begin(),
-                                          prepared[m].distance_constraints.end());
+        batch.bounds_matrices.insert(batch.bounds_matrices.end(),
+                                     std::make_move_iterator(prepared[m].bounds_matrix.begin()),
+                                     std::make_move_iterator(prepared[m].bounds_matrix.end()));
+        batch.chiral_centers.insert(batch.chiral_centers.end(),
+                                    std::make_move_iterator(prepared[m].chiral_centers.begin()),
+                                    std::make_move_iterator(prepared[m].chiral_centers.end()));
+        batch.etk_torsions.insert(batch.etk_torsions.end(), std::make_move_iterator(prepared[m].etk_torsions.begin()),
+                                  std::make_move_iterator(prepared[m].etk_torsions.end()));
+        batch.distance_constraints.insert(batch.distance_constraints.end(),
+                                          std::make_move_iterator(prepared[m].distance_constraints.begin()),
+                                          std::make_move_iterator(prepared[m].distance_constraints.end()));
         // MMFF94 parameters
-        batch.mmff_nonbonded.insert(batch.mmff_nonbonded.end(), prepared[m].mmff_nonbonded.begin(),
-                                    prepared[m].mmff_nonbonded.end());
-        batch.mmff_bonds.insert(batch.mmff_bonds.end(), prepared[m].mmff_bonds.begin(), prepared[m].mmff_bonds.end());
-        batch.mmff_angles.insert(batch.mmff_angles.end(), prepared[m].mmff_angles.begin(),
-                                 prepared[m].mmff_angles.end());
-        batch.mmff_torsions.insert(batch.mmff_torsions.end(), prepared[m].mmff_torsions.begin(),
-                                   prepared[m].mmff_torsions.end());
-        batch.mmff_oops.insert(batch.mmff_oops.end(), prepared[m].mmff_oops.begin(), prepared[m].mmff_oops.end());
-        batch.mmff_stretchbends.insert(batch.mmff_stretchbends.end(), prepared[m].mmff_stretchbends.begin(),
-                                       prepared[m].mmff_stretchbends.end());
-        // Adjust per-atom interaction offsets for the batched array position.
-        std::uint32_t const interactions_base = static_cast<std::uint32_t>(batch.mmff_interactions.size());
-        batch.mmff_interactions.insert(batch.mmff_interactions.end(), prepared[m].mmff_interactions.begin(),
-                                       prepared[m].mmff_interactions.end());
+        batch.mmff_nonbonded.insert(batch.mmff_nonbonded.end(),
+                                    std::make_move_iterator(prepared[m].mmff_nonbonded.begin()),
+                                    std::make_move_iterator(prepared[m].mmff_nonbonded.end()));
+        batch.mmff_bonds.insert(batch.mmff_bonds.end(), std::make_move_iterator(prepared[m].mmff_bonds.begin()),
+                                std::make_move_iterator(prepared[m].mmff_bonds.end()));
+        batch.mmff_angles.insert(batch.mmff_angles.end(), std::make_move_iterator(prepared[m].mmff_angles.begin()),
+                                 std::make_move_iterator(prepared[m].mmff_angles.end()));
+        batch.mmff_torsions.insert(batch.mmff_torsions.end(),
+                                   std::make_move_iterator(prepared[m].mmff_torsions.begin()),
+                                   std::make_move_iterator(prepared[m].mmff_torsions.end()));
+        batch.mmff_oops.insert(batch.mmff_oops.end(), std::make_move_iterator(prepared[m].mmff_oops.begin()),
+                               std::make_move_iterator(prepared[m].mmff_oops.end()));
+        batch.mmff_stretchbends.insert(batch.mmff_stretchbends.end(),
+                                       std::make_move_iterator(prepared[m].mmff_stretchbends.begin()),
+                                       std::make_move_iterator(prepared[m].mmff_stretchbends.end()));
+        // adjust per-atom per-type interaction offsets for the batched array position
+        std::uint32_t const mmff_interactions_base = static_cast<std::uint32_t>(batch.mmff_interactions.size());
+        batch.mmff_interactions.insert(batch.mmff_interactions.end(),
+                                       std::make_move_iterator(prepared[m].mmff_interactions.begin()),
+                                       std::make_move_iterator(prepared[m].mmff_interactions.end()));
         auto adjusted_offsets = prepared[m].mmff_atom_offsets;
-        for (auto& off : adjusted_offsets)
-            off.interaction_start += interactions_base;
+        for (auto& off : adjusted_offsets) {
+            off.nonbonded_start += mmff_interactions_base;
+            off.bond_start += mmff_interactions_base;
+            off.angle_start += mmff_interactions_base;
+            off.torsion_start += mmff_interactions_base;
+            off.oop_start += mmff_interactions_base;
+            off.stretchbend_start += mmff_interactions_base;
+        }
         batch.mmff_atom_offsets.insert(batch.mmff_atom_offsets.end(), adjusted_offsets.begin(), adjusted_offsets.end());
 
         // ETK interaction list: adjust offsets for batched array position
         std::uint32_t const etk_interactions_base = static_cast<std::uint32_t>(batch.etk_interactions.size());
-        batch.etk_interactions.insert(batch.etk_interactions.end(), prepared[m].etk_interactions.begin(),
-                                      prepared[m].etk_interactions.end());
+        batch.etk_interactions.insert(batch.etk_interactions.end(),
+                                      std::make_move_iterator(prepared[m].etk_interactions.begin()),
+                                      std::make_move_iterator(prepared[m].etk_interactions.end()));
         auto etk_adjusted_offsets = prepared[m].etk_atom_offsets;
         for (auto& off : etk_adjusted_offsets)
             off.interaction_start += etk_interactions_base;

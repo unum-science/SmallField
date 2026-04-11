@@ -123,6 +123,9 @@ cython_debug/
 # Pixi
 .pixi
 
+# CTest temporary files
+Testing/
+
 # CUDA/C++ build artifacts
 *.i
 *.ii

@@ -227,11 +227,16 @@ __global__ void etkdg_pipeline_warp_kernel(
         off += dim4;
         float* gradient = shared_float + off;
 
-        // Stage 2: Load pre-smoothed bounds and convert to half.
+        // Stage 2: Load pre-smoothed bounds and convert to half (vectorized half2 stores).
         std::uint32_t const bounds_size = num_atoms * num_atoms;
         float const* global_bounds = bounds_matrices + meta.bounds_offset;
-        for (std::uint32_t i = lane; i < bounds_size; i += warp_size)
-            shared_bounds[i] = __float2half(global_bounds[i]);
+        std::uint32_t const bounds_pairs = bounds_size / 2;
+        for (std::uint32_t i = lane; i < bounds_pairs; i += warp_size) {
+            __half2 packed = __floats2half2_rn(global_bounds[2 * i], global_bounds[2 * i + 1]);
+            reinterpret_cast<__half2*>(shared_bounds)[i] = packed;
+        }
+        if (lane == 0 && (bounds_size & 1))
+            shared_bounds[bounds_size - 1] = __float2half(global_bounds[bounds_size - 1]);
         __syncwarp(full_mask);
 
         // Build molecule-level pointers into the batched arrays.
@@ -280,11 +285,8 @@ __global__ void etkdg_pipeline_warp_kernel(
 
                 // Stage 7: Run ETK torsion refinement in 3D with 100 FIRE iterations.
                 if (meta.num_etk_torsions > 0) {
-                    etk_torsion_energy_functor_t etk_functor{
-                        mol_torsions, mol_constraints,
-                        etk_interactions,
-                        etk_atom_offsets + meta.etk_atom_offsets_start,
-                        num_atoms};
+                    etk_torsion_energy_functor_t etk_functor{mol_torsions, mol_constraints, etk_interactions,
+                                                             etk_atom_offsets + meta.etk_atom_offsets_start, num_atoms};
 
                     float etk_energy = 0.0f;
                     float etk_rms_gradient = 0.0f;

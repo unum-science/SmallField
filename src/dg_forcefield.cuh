@@ -89,8 +89,8 @@ __device__ __forceinline__ bool validate_chirality_(float const* positions, std:
  * Positions and gradients in SoA float: [x₀..xₙ, y₀..yₙ, z₀..zₙ, (w₀..wₙ)]
  */
 struct distance_geometry_energy_functor_t {
-    __half const* bounds_matrix;
-    chiral_center_descriptor_t const* chiral_centers;
+    __half const* __restrict__ bounds_matrix;
+    chiral_center_descriptor_t const* __restrict__ chiral_centers;
     std::uint32_t num_atoms;
     std::uint32_t num_chiral_centers;
     std::uint32_t spatial_dimension; // 3 or 4

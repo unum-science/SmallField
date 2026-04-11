@@ -182,10 +182,10 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const* posi
  * No atomicAdd. Compatible with fire_minimize_.
  */
 struct etk_torsion_energy_functor_t {
-    etk_torsion_descriptor_t const* torsion_terms;
-    distance_constraint_t const* distance_constraints;
-    etk_atom_interaction_t const* interactions;
-    etk_atom_offsets_t const* atom_offsets;
+    etk_torsion_descriptor_t const* __restrict__ torsion_terms;
+    distance_constraint_t const* __restrict__ distance_constraints;
+    etk_atom_interaction_t const* __restrict__ interactions;
+    etk_atom_offsets_t const* __restrict__ atom_offsets;
     std::uint32_t num_atoms;
 
     __device__ __forceinline__ float operator()(float const* positions, float* gradient, std::uint32_t num_elements,

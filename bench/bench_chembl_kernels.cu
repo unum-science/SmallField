@@ -24,6 +24,12 @@ using namespace smallfield;
 
 extern "C" {
 
+int gpu_get_device_count() {
+    int count = 0;
+    cudaGetDeviceCount(&count);
+    return count;
+}
+
 gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     float const* host_bounds, std::uint32_t bounds_total_floats, chiral_center_descriptor_t const* host_chirals,
     std::uint32_t chirals_total, etk_torsion_descriptor_t const* host_torsions, std::uint32_t torsions_total,
@@ -38,7 +44,9 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     mmff94_atom_offsets_t const* host_mmff_offsets, std::uint32_t mmff_offsets_total,
     etkdg_molecule_metadata_t const* host_metadata, std::uint32_t num_molecules, float* host_coords_out,
     float* host_energies_out, std::uint8_t* host_status_out, std::uint32_t num_conformers,
-    std::uint32_t max_stereo_attempts, std::uint32_t max_atoms_per_molecule, std::uint64_t seed) {
+    std::uint32_t max_stereo_attempts, std::uint32_t max_atoms_per_molecule, std::uint64_t seed, int device_id) {
+
+    cudaSetDevice(device_id);
 
     // Sort molecules by atom count for wave-based dispatch.
     std::vector<std::uint32_t> order(num_molecules);
@@ -52,54 +60,99 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     for (std::uint32_t i = 0; i < num_molecules; ++i)
         sorted_meta[i] = host_metadata[order[i]];
 
-    // Allocate device memory for all input arrays.
-    float* dev_bounds;
-    float* dev_initial_coordinates;
-    chiral_center_descriptor_t* dev_chirals;
-    etk_torsion_descriptor_t* dev_torsions;
-    distance_constraint_t* dev_constraints;
-    etk_atom_interaction_t* dev_etk_interactions;
-    etk_atom_offsets_t* dev_etk_atom_offsets;
-    mmff94_nonbonded_pair_t* dev_mmff_nb;
-    mmff94_bond_t* dev_mmff_bonds;
-    mmff94_angle_t* dev_mmff_angles;
-    mmff94_torsion_t* dev_mmff_torsions;
-    mmff94_oop_t* dev_mmff_oops;
-    mmff94_stretchbend_t* dev_mmff_stbn;
-    mmff94_atom_interaction_t* dev_mmff_inter;
-    mmff94_atom_offsets_t* dev_mmff_offsets;
-    etkdg_molecule_metadata_t* dev_metadata;
-
-    cudaMalloc(&dev_bounds, bounds_total_floats * sizeof(float));
-    cudaMalloc(&dev_chirals, std::max(chirals_total, 1u) * sizeof(chiral_center_descriptor_t));
-    cudaMalloc(&dev_torsions, std::max(torsions_total, 1u) * sizeof(etk_torsion_descriptor_t));
-    cudaMalloc(&dev_constraints, std::max(constraints_total, 1u) * sizeof(distance_constraint_t));
-    cudaMalloc(&dev_etk_interactions, std::max(etk_interactions_total, 1u) * sizeof(etk_atom_interaction_t));
-    cudaMalloc(&dev_etk_atom_offsets, std::max(etk_atom_offsets_total, 1u) * sizeof(etk_atom_offsets_t));
-    cudaMalloc(&dev_mmff_nb, std::max(mmff_nb_total, 1u) * sizeof(mmff94_nonbonded_pair_t));
-    cudaMalloc(&dev_mmff_bonds, std::max(mmff_bonds_total, 1u) * sizeof(mmff94_bond_t));
-    cudaMalloc(&dev_mmff_angles, std::max(mmff_angles_total, 1u) * sizeof(mmff94_angle_t));
-    cudaMalloc(&dev_mmff_torsions, std::max(mmff_torsions_total, 1u) * sizeof(mmff94_torsion_t));
-    cudaMalloc(&dev_mmff_oops, std::max(mmff_oops_total, 1u) * sizeof(mmff94_oop_t));
-    cudaMalloc(&dev_mmff_stbn, std::max(mmff_stbn_total, 1u) * sizeof(mmff94_stretchbend_t));
-    cudaMalloc(&dev_mmff_inter, std::max(mmff_interactions_total, 1u) * sizeof(mmff94_atom_interaction_t));
-    cudaMalloc(&dev_mmff_offsets, std::max(mmff_offsets_total, 1u) * sizeof(mmff94_atom_offsets_t));
-    cudaMalloc(&dev_metadata, num_molecules * sizeof(etkdg_molecule_metadata_t));
-
-    // Allocate output buffers by using the global max_atoms value as the output stride.
+    // Allocate all device memory from a single pool with 256-byte alignment.
     std::uint32_t const total_conf = num_molecules * num_conformers;
     std::uint32_t const total_coords = total_conf * max_atoms_per_molecule * 3;
-    float* dev_coords_out;
-    float* dev_energies_out;
-    std::uint8_t* dev_status_out;
-    cudaMalloc(&dev_coords_out, total_coords * sizeof(float));
-    cudaMalloc(&dev_energies_out, total_conf * sizeof(float));
-    cudaMalloc(&dev_status_out, total_conf * sizeof(std::uint8_t));
-    cudaMalloc(&dev_initial_coordinates,
-               static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float));
+
+    auto align_up = [](std::size_t value, std::size_t alignment) -> std::size_t {
+        return (value + alignment - 1) & ~(alignment - 1);
+    };
+
+    std::size_t pool_size = 0;
+    pool_size += align_up(bounds_total_floats * sizeof(float), 256);
+    pool_size += align_up(std::max(chirals_total, 1u) * sizeof(chiral_center_descriptor_t), 256);
+    pool_size += align_up(std::max(torsions_total, 1u) * sizeof(etk_torsion_descriptor_t), 256);
+    pool_size += align_up(std::max(constraints_total, 1u) * sizeof(distance_constraint_t), 256);
+    pool_size += align_up(std::max(etk_interactions_total, 1u) * sizeof(etk_atom_interaction_t), 256);
+    pool_size += align_up(std::max(etk_atom_offsets_total, 1u) * sizeof(etk_atom_offsets_t), 256);
+    pool_size += align_up(std::max(mmff_nb_total, 1u) * sizeof(mmff94_nonbonded_pair_t), 256);
+    pool_size += align_up(std::max(mmff_bonds_total, 1u) * sizeof(mmff94_bond_t), 256);
+    pool_size += align_up(std::max(mmff_angles_total, 1u) * sizeof(mmff94_angle_t), 256);
+    pool_size += align_up(std::max(mmff_torsions_total, 1u) * sizeof(mmff94_torsion_t), 256);
+    pool_size += align_up(std::max(mmff_oops_total, 1u) * sizeof(mmff94_oop_t), 256);
+    pool_size += align_up(std::max(mmff_stbn_total, 1u) * sizeof(mmff94_stretchbend_t), 256);
+    pool_size += align_up(std::max(mmff_interactions_total, 1u) * sizeof(mmff94_atom_interaction_t), 256);
+    pool_size += align_up(std::max(mmff_offsets_total, 1u) * sizeof(mmff94_atom_offsets_t), 256);
+    pool_size += align_up(num_molecules * sizeof(etkdg_molecule_metadata_t), 256);
+    pool_size += align_up(total_coords * sizeof(float), 256);
+    pool_size += align_up(total_conf * sizeof(float), 256);
+    pool_size += align_up(total_conf * sizeof(std::uint8_t), 256);
+    pool_size += align_up(static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float), 256);
+
+    char* device_pool = nullptr;
+    cudaMalloc(&device_pool, pool_size);
+
+    std::size_t offset = 0;
+
+    float* dev_bounds = reinterpret_cast<float*>(device_pool + offset);
+    offset += align_up(bounds_total_floats * sizeof(float), 256);
+
+    auto* dev_chirals = reinterpret_cast<chiral_center_descriptor_t*>(device_pool + offset);
+    offset += align_up(std::max(chirals_total, 1u) * sizeof(chiral_center_descriptor_t), 256);
+
+    auto* dev_torsions = reinterpret_cast<etk_torsion_descriptor_t*>(device_pool + offset);
+    offset += align_up(std::max(torsions_total, 1u) * sizeof(etk_torsion_descriptor_t), 256);
+
+    auto* dev_constraints = reinterpret_cast<distance_constraint_t*>(device_pool + offset);
+    offset += align_up(std::max(constraints_total, 1u) * sizeof(distance_constraint_t), 256);
+
+    auto* dev_etk_interactions = reinterpret_cast<etk_atom_interaction_t*>(device_pool + offset);
+    offset += align_up(std::max(etk_interactions_total, 1u) * sizeof(etk_atom_interaction_t), 256);
+
+    auto* dev_etk_atom_offsets = reinterpret_cast<etk_atom_offsets_t*>(device_pool + offset);
+    offset += align_up(std::max(etk_atom_offsets_total, 1u) * sizeof(etk_atom_offsets_t), 256);
+
+    auto* dev_mmff_nb = reinterpret_cast<mmff94_nonbonded_pair_t*>(device_pool + offset);
+    offset += align_up(std::max(mmff_nb_total, 1u) * sizeof(mmff94_nonbonded_pair_t), 256);
+
+    auto* dev_mmff_bonds = reinterpret_cast<mmff94_bond_t*>(device_pool + offset);
+    offset += align_up(std::max(mmff_bonds_total, 1u) * sizeof(mmff94_bond_t), 256);
+
+    auto* dev_mmff_angles = reinterpret_cast<mmff94_angle_t*>(device_pool + offset);
+    offset += align_up(std::max(mmff_angles_total, 1u) * sizeof(mmff94_angle_t), 256);
+
+    auto* dev_mmff_torsions = reinterpret_cast<mmff94_torsion_t*>(device_pool + offset);
+    offset += align_up(std::max(mmff_torsions_total, 1u) * sizeof(mmff94_torsion_t), 256);
+
+    auto* dev_mmff_oops = reinterpret_cast<mmff94_oop_t*>(device_pool + offset);
+    offset += align_up(std::max(mmff_oops_total, 1u) * sizeof(mmff94_oop_t), 256);
+
+    auto* dev_mmff_stbn = reinterpret_cast<mmff94_stretchbend_t*>(device_pool + offset);
+    offset += align_up(std::max(mmff_stbn_total, 1u) * sizeof(mmff94_stretchbend_t), 256);
+
+    auto* dev_mmff_inter = reinterpret_cast<mmff94_atom_interaction_t*>(device_pool + offset);
+    offset += align_up(std::max(mmff_interactions_total, 1u) * sizeof(mmff94_atom_interaction_t), 256);
+
+    auto* dev_mmff_offsets = reinterpret_cast<mmff94_atom_offsets_t*>(device_pool + offset);
+    offset += align_up(std::max(mmff_offsets_total, 1u) * sizeof(mmff94_atom_offsets_t), 256);
+
+    auto* dev_metadata = reinterpret_cast<etkdg_molecule_metadata_t*>(device_pool + offset);
+    offset += align_up(num_molecules * sizeof(etkdg_molecule_metadata_t), 256);
+
+    float* dev_coords_out = reinterpret_cast<float*>(device_pool + offset);
+    offset += align_up(total_coords * sizeof(float), 256);
+
+    float* dev_energies_out = reinterpret_cast<float*>(device_pool + offset);
+    offset += align_up(total_conf * sizeof(float), 256);
+
+    auto* dev_status_out = reinterpret_cast<std::uint8_t*>(device_pool + offset);
+    offset += align_up(total_conf * sizeof(std::uint8_t), 256);
+
+    float* dev_initial_coordinates = reinterpret_cast<float*>(device_pool + offset);
+    offset += align_up(static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float), 256);
 
     int num_sms = 0;
-    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id);
 
     // CUDA events for timing.
     cudaEvent_t ev_upload_start, ev_upload_end, ev_kernel_start, ev_kernel_end, ev_download_end;
@@ -109,47 +162,59 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaEventCreate(&ev_kernel_end);
     cudaEventCreate(&ev_download_end);
 
+    // Create a stream for asynchronous uploads.
+    cudaStream_t upload_stream;
+    cudaStreamCreate(&upload_stream);
+
     // Run phase 1 upload because all parameter arrays are shared across waves.
-    cudaEventRecord(ev_upload_start);
-    cudaMemcpy(dev_bounds, host_bounds, bounds_total_floats * sizeof(float), cudaMemcpyHostToDevice);
+    cudaEventRecord(ev_upload_start, upload_stream);
+    cudaMemcpyAsync(dev_bounds, host_bounds, bounds_total_floats * sizeof(float), cudaMemcpyHostToDevice,
+                    upload_stream);
     if (chirals_total > 0)
-        cudaMemcpy(dev_chirals, host_chirals, chirals_total * sizeof(chiral_center_descriptor_t),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_chirals, host_chirals, chirals_total * sizeof(chiral_center_descriptor_t),
+                        cudaMemcpyHostToDevice, upload_stream);
     if (torsions_total > 0)
-        cudaMemcpy(dev_torsions, host_torsions, torsions_total * sizeof(etk_torsion_descriptor_t),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_torsions, host_torsions, torsions_total * sizeof(etk_torsion_descriptor_t),
+                        cudaMemcpyHostToDevice, upload_stream);
     if (constraints_total > 0)
-        cudaMemcpy(dev_constraints, host_constraints, constraints_total * sizeof(distance_constraint_t),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_constraints, host_constraints, constraints_total * sizeof(distance_constraint_t),
+                        cudaMemcpyHostToDevice, upload_stream);
     if (etk_interactions_total > 0)
-        cudaMemcpy(dev_etk_interactions, host_etk_interactions, etk_interactions_total * sizeof(etk_atom_interaction_t),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_etk_interactions, host_etk_interactions,
+                        etk_interactions_total * sizeof(etk_atom_interaction_t), cudaMemcpyHostToDevice, upload_stream);
     if (etk_atom_offsets_total > 0)
-        cudaMemcpy(dev_etk_atom_offsets, host_etk_atom_offsets, etk_atom_offsets_total * sizeof(etk_atom_offsets_t),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_etk_atom_offsets, host_etk_atom_offsets,
+                        etk_atom_offsets_total * sizeof(etk_atom_offsets_t), cudaMemcpyHostToDevice, upload_stream);
     if (mmff_nb_total > 0)
-        cudaMemcpy(dev_mmff_nb, host_mmff_nb, mmff_nb_total * sizeof(mmff94_nonbonded_pair_t), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_mmff_nb, host_mmff_nb, mmff_nb_total * sizeof(mmff94_nonbonded_pair_t),
+                        cudaMemcpyHostToDevice, upload_stream);
     if (mmff_bonds_total > 0)
-        cudaMemcpy(dev_mmff_bonds, host_mmff_bonds, mmff_bonds_total * sizeof(mmff94_bond_t), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_mmff_bonds, host_mmff_bonds, mmff_bonds_total * sizeof(mmff94_bond_t),
+                        cudaMemcpyHostToDevice, upload_stream);
     if (mmff_angles_total > 0)
-        cudaMemcpy(dev_mmff_angles, host_mmff_angles, mmff_angles_total * sizeof(mmff94_angle_t),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_mmff_angles, host_mmff_angles, mmff_angles_total * sizeof(mmff94_angle_t),
+                        cudaMemcpyHostToDevice, upload_stream);
     if (mmff_torsions_total > 0)
-        cudaMemcpy(dev_mmff_torsions, host_mmff_torsions, mmff_torsions_total * sizeof(mmff94_torsion_t),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_mmff_torsions, host_mmff_torsions, mmff_torsions_total * sizeof(mmff94_torsion_t),
+                        cudaMemcpyHostToDevice, upload_stream);
     if (mmff_oops_total > 0)
-        cudaMemcpy(dev_mmff_oops, host_mmff_oops, mmff_oops_total * sizeof(mmff94_oop_t), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_mmff_oops, host_mmff_oops, mmff_oops_total * sizeof(mmff94_oop_t), cudaMemcpyHostToDevice,
+                        upload_stream);
     if (mmff_stbn_total > 0)
-        cudaMemcpy(dev_mmff_stbn, host_mmff_stbn, mmff_stbn_total * sizeof(mmff94_stretchbend_t),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_mmff_stbn, host_mmff_stbn, mmff_stbn_total * sizeof(mmff94_stretchbend_t),
+                        cudaMemcpyHostToDevice, upload_stream);
     if (mmff_interactions_total > 0)
-        cudaMemcpy(dev_mmff_inter, host_mmff_interactions, mmff_interactions_total * sizeof(mmff94_atom_interaction_t),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_mmff_inter, host_mmff_interactions,
+                        mmff_interactions_total * sizeof(mmff94_atom_interaction_t), cudaMemcpyHostToDevice,
+                        upload_stream);
     if (mmff_offsets_total > 0)
-        cudaMemcpy(dev_mmff_offsets, host_mmff_offsets, mmff_offsets_total * sizeof(mmff94_atom_offsets_t),
-                   cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_metadata, sorted_meta.data(), num_molecules * sizeof(etkdg_molecule_metadata_t),
-               cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dev_mmff_offsets, host_mmff_offsets, mmff_offsets_total * sizeof(mmff94_atom_offsets_t),
+                        cudaMemcpyHostToDevice, upload_stream);
+    cudaMemcpyAsync(dev_metadata, sorted_meta.data(), num_molecules * sizeof(etkdg_molecule_metadata_t),
+                    cudaMemcpyHostToDevice, upload_stream);
+
+    // Synchronize before the metric embedding prepass which reads the uploaded data.
+    cudaStreamSynchronize(upload_stream);
     bool const prepass_ok = build_metric_initial_coordinates_on_gpu(
         dev_bounds, dev_metadata, sorted_meta.data(), num_molecules, max_atoms_per_molecule, dev_initial_coordinates);
     if (!prepass_ok)
@@ -217,9 +282,9 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     std::vector<float> sorted_energies(total_conf);
     std::vector<std::uint8_t> sorted_status(total_conf);
 
-    cudaMemcpy(sorted_coords.data(), dev_coords_out, total_coords * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(sorted_energies.data(), dev_energies_out, total_conf * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(sorted_status.data(), dev_status_out, total_conf * sizeof(std::uint8_t), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(sorted_coords.data(), dev_coords_out, total_coords * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(sorted_energies.data(), dev_energies_out, total_conf * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(sorted_status.data(), dev_status_out, total_conf * sizeof(std::uint8_t), cudaMemcpyDeviceToHost);
     cudaEventRecord(ev_download_end);
     cudaEventSynchronize(ev_download_end);
 
@@ -254,25 +319,8 @@ gpu_pipeline_result_t gpu_etkdg_mmff_pipeline(
     cudaEventDestroy(ev_kernel_start);
     cudaEventDestroy(ev_kernel_end);
     cudaEventDestroy(ev_download_end);
-    cudaFree(dev_bounds);
-    cudaFree(dev_initial_coordinates);
-    cudaFree(dev_chirals);
-    cudaFree(dev_torsions);
-    cudaFree(dev_constraints);
-    cudaFree(dev_etk_interactions);
-    cudaFree(dev_etk_atom_offsets);
-    cudaFree(dev_mmff_nb);
-    cudaFree(dev_mmff_bonds);
-    cudaFree(dev_mmff_angles);
-    cudaFree(dev_mmff_torsions);
-    cudaFree(dev_mmff_oops);
-    cudaFree(dev_mmff_stbn);
-    cudaFree(dev_mmff_inter);
-    cudaFree(dev_mmff_offsets);
-    cudaFree(dev_metadata);
-    cudaFree(dev_coords_out);
-    cudaFree(dev_energies_out);
-    cudaFree(dev_status_out);
+    cudaStreamDestroy(upload_stream);
+    cudaFree(device_pool);
 
     return {upload_ms, kernel_ms, download_ms, num_succeeded, total_grid, max_bpsm};
 }

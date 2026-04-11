@@ -463,14 +463,14 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const* posi
  * Zero-waste iteration: each atom only processes its own interactions.
  */
 struct mmff94_energy_functor_t {
-    mmff94_nonbonded_pair_t const* nonbonded_params;
-    mmff94_bond_t const* bond_params;
-    mmff94_angle_t const* angle_params;
-    mmff94_torsion_t const* torsion_params;
-    mmff94_oop_t const* oop_params;
-    mmff94_stretchbend_t const* stretchbend_params;
-    mmff94_atom_interaction_t const* interactions;
-    mmff94_atom_offsets_t const* atom_offsets;
+    mmff94_nonbonded_pair_t const* __restrict__ nonbonded_params;
+    mmff94_bond_t const* __restrict__ bond_params;
+    mmff94_angle_t const* __restrict__ angle_params;
+    mmff94_torsion_t const* __restrict__ torsion_params;
+    mmff94_oop_t const* __restrict__ oop_params;
+    mmff94_stretchbend_t const* __restrict__ stretchbend_params;
+    mmff94_atom_interaction_t const* __restrict__ interactions;
+    mmff94_atom_offsets_t const* __restrict__ atom_offsets;
     std::uint32_t num_atoms;
 
     __device__ __forceinline__ float operator()(float const* positions, float* gradient, std::uint32_t num_elements,
@@ -496,46 +496,45 @@ struct mmff94_energy_functor_t {
         float total_energy = 0.0f;
 
         for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size) {
-            float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+            float gradient_x = 0.0f, gradient_y = 0.0f, gradient_z = 0.0f;
+            auto const& offsets = atom_offsets[atom];
 
-            std::uint32_t const start = atom_offsets[atom].interaction_start;
-            std::uint32_t const count = atom_offsets[atom].interaction_count;
+            // per-type sub-loops: all lanes in the warp execute the same function (zero switch divergence)
+            for (std::uint32_t index = offsets.nonbonded_start;
+                 index < offsets.nonbonded_start + offsets.nonbonded_count; ++index)
+                mmff_nonbonded_contribution_(positions, num_atoms, atom,
+                                             nonbonded_params[interactions[index].term_index], interactions[index].role,
+                                             &total_energy, &gradient_x, &gradient_y, &gradient_z);
 
-            for (std::uint32_t idx = start; idx < start + count; ++idx) {
-                auto const& inter = interactions[idx];
-                switch (inter.interaction_type) {
-                case 0: // nonbonded
-                    mmff_nonbonded_contribution_(positions, num_atoms, atom, nonbonded_params[inter.term_index],
-                                                 inter.role, &total_energy, &gx, &gy, &gz);
-                    break;
-                case 1: // bond
-                    mmff_bond_contribution_(positions, num_atoms, atom, bond_params[inter.term_index], inter.role,
-                                            &total_energy, &gx, &gy, &gz);
-                    break;
-                case 2: // angle (end atom)
-                case 3: // angle (center atom)
-                    mmff_angle_contribution_(positions, num_atoms, atom, angle_params[inter.term_index], inter.role,
-                                             &total_energy, &gx, &gy, &gz);
-                    break;
-                case 4: // torsion
-                    mmff_torsion_contribution_(positions, num_atoms, atom, torsion_params[inter.term_index], inter.role,
-                                               &total_energy, &gx, &gy, &gz);
-                    break;
-                case 5: // out-of-plane bending
-                    mmff_oop_contribution_(positions, num_atoms, atom, oop_params[inter.term_index], inter.role,
-                                           &total_energy, &gx, &gy, &gz);
-                    break;
-                case 6: // stretch-bend coupling
-                    mmff_stretchbend_contribution_(positions, num_atoms, atom, stretchbend_params[inter.term_index],
-                                                   inter.role, &total_energy, &gx, &gy, &gz);
-                    break;
-                }
-            }
+            for (std::uint32_t index = offsets.bond_start; index < offsets.bond_start + offsets.bond_count; ++index)
+                mmff_bond_contribution_(positions, num_atoms, atom, bond_params[interactions[index].term_index],
+                                        interactions[index].role, &total_energy, &gradient_x, &gradient_y, &gradient_z);
+
+            for (std::uint32_t index = offsets.angle_start; index < offsets.angle_start + offsets.angle_count; ++index)
+                mmff_angle_contribution_(positions, num_atoms, atom, angle_params[interactions[index].term_index],
+                                         interactions[index].role, &total_energy, &gradient_x, &gradient_y,
+                                         &gradient_z);
+
+            for (std::uint32_t index = offsets.torsion_start; index < offsets.torsion_start + offsets.torsion_count;
+                 ++index)
+                mmff_torsion_contribution_(positions, num_atoms, atom, torsion_params[interactions[index].term_index],
+                                           interactions[index].role, &total_energy, &gradient_x, &gradient_y,
+                                           &gradient_z);
+
+            for (std::uint32_t index = offsets.oop_start; index < offsets.oop_start + offsets.oop_count; ++index)
+                mmff_oop_contribution_(positions, num_atoms, atom, oop_params[interactions[index].term_index],
+                                       interactions[index].role, &total_energy, &gradient_x, &gradient_y, &gradient_z);
+
+            for (std::uint32_t index = offsets.stretchbend_start;
+                 index < offsets.stretchbend_start + offsets.stretchbend_count; ++index)
+                mmff_stretchbend_contribution_(
+                    positions, num_atoms, atom, stretchbend_params[interactions[index].term_index],
+                    interactions[index].role, &total_energy, &gradient_x, &gradient_y, &gradient_z);
 
             if (write_gradient) {
-                gradient[atom] = gx;
-                gradient[num_atoms + atom] = gy;
-                gradient[2 * num_atoms + atom] = gz;
+                gradient[atom] = gradient_x;
+                gradient[num_atoms + atom] = gradient_y;
+                gradient[2 * num_atoms + atom] = gradient_z;
             }
         }
 

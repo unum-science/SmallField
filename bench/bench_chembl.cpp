@@ -13,10 +13,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <GraphMol/DistGeomHelpers/Embedder.h>
@@ -200,6 +202,180 @@ static void bench_smallfield_gpu(std::vector<std::string> const& smiles, std::ui
                 bounds_bytes / 1e6, params_bytes / 1e6);
 }
 
+// Section 2b: SmallField multi-GPU benchmark.
+static void bench_smallfield_multi_gpu(std::vector<std::string> const& smiles, std::uint32_t num_conformers,
+                                       std::uint32_t max_stereo_attempts) {
+    int gpu_count = gpu_get_device_count();
+    if (gpu_count <= 1) {
+        std::printf("\n=== System B (multi-GPU): skipped (only %d GPU available) ===\n", gpu_count);
+        return;
+    }
+    std::printf("\n=== System B: SmallField multi-GPU (%d GPUs) ===\n", gpu_count);
+
+    // Phase 1: CPU preprocessing (shared across all GPUs).
+    std::printf("  Preprocessing %zu molecules (OpenMP)...\n", smiles.size());
+    auto t0 = clock_type::now();
+    etkdg_molecule_batch_t batch = prepare_molecule_batch(smiles);
+    auto t1_preproc = clock_type::now();
+    double const preproc_ms = std::chrono::duration<double, std::milli>(t1_preproc - t0).count();
+    std::printf("  Preprocessed: %u molecules, max_atoms=%u\n", batch.num_molecules, batch.max_atoms_per_molecule);
+    std::printf("  Preprocessing: %.0f ms\n", preproc_ms);
+
+    // Sort metadata by atom count (same order as single-GPU path) so we can split evenly.
+    std::uint32_t const n = batch.num_molecules;
+    std::vector<std::uint32_t> order(n);
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
+        return batch.molecule_metadata[a].num_atoms < batch.molecule_metadata[b].num_atoms;
+    });
+    std::vector<etkdg_molecule_metadata_t> sorted_meta(n);
+    std::vector<std::uint32_t> sorted_input_indices(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        sorted_meta[i] = batch.molecule_metadata[order[i]];
+        sorted_input_indices[i] = batch.input_indices[order[i]];
+    }
+
+    // Allocate global output buffers.
+    std::uint32_t const total_conf = n * num_conformers;
+    std::uint32_t const coord_stride = batch.max_atoms_per_molecule * 3;
+    std::uint32_t const total_coords = total_conf * coord_stride;
+    std::vector<float> coords_out(total_coords);
+    std::vector<float> energies_out(total_conf);
+    std::vector<std::uint8_t> status_out(total_conf);
+
+    // Distribute molecules round-robin across GPUs for load balance.
+    // The sorted list goes small→large; interleaving ensures each GPU gets an equal mix.
+    std::vector<std::vector<std::uint32_t>> gpu_molecule_indices(static_cast<std::size_t>(gpu_count));
+    for (std::uint32_t i = 0; i < n; ++i)
+        gpu_molecule_indices[i % static_cast<std::uint32_t>(gpu_count)].push_back(i);
+
+    // Build per-GPU metadata slices (contiguous arrays of the round-robin selected molecules).
+    struct gpu_slice_t {
+        std::vector<etkdg_molecule_metadata_t> metadata;
+        std::vector<std::uint32_t> original_sorted_indices; // map back to sorted_meta position
+    };
+    std::vector<gpu_slice_t> slices(static_cast<std::size_t>(gpu_count));
+    for (int g = 0; g < gpu_count; ++g) {
+        auto const& indices = gpu_molecule_indices[static_cast<std::size_t>(g)];
+        slices[static_cast<std::size_t>(g)].metadata.resize(indices.size());
+        slices[static_cast<std::size_t>(g)].original_sorted_indices = indices;
+        for (std::size_t k = 0; k < indices.size(); ++k)
+            slices[static_cast<std::size_t>(g)].metadata[k] = sorted_meta[indices[k]];
+    }
+
+    // Per-GPU output buffers and results.
+    std::vector<std::vector<float>> per_gpu_coords(static_cast<std::size_t>(gpu_count));
+    std::vector<std::vector<float>> per_gpu_energies(static_cast<std::size_t>(gpu_count));
+    std::vector<std::vector<std::uint8_t>> per_gpu_status(static_cast<std::size_t>(gpu_count));
+    std::vector<gpu_pipeline_result_t> per_gpu_result(static_cast<std::size_t>(gpu_count));
+
+    for (int g = 0; g < gpu_count; ++g) {
+        std::uint32_t const gpu_molecule_count = static_cast<std::uint32_t>(slices[static_cast<std::size_t>(g)].metadata.size());
+        per_gpu_coords[static_cast<std::size_t>(g)].resize(gpu_molecule_count * num_conformers * coord_stride);
+        per_gpu_energies[static_cast<std::size_t>(g)].resize(gpu_molecule_count * num_conformers);
+        per_gpu_status[static_cast<std::size_t>(g)].resize(gpu_molecule_count * num_conformers);
+    }
+
+    // Launch one thread per GPU. Each GPU gets ALL the global parameter arrays
+    // (metadata offsets index into them) but only its slice of the metadata.
+    auto t_gpu_start = clock_type::now();
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(gpu_count));
+
+    for (int g = 0; g < gpu_count; ++g) {
+        threads.emplace_back([&, g]() {
+            std::size_t const gi = static_cast<std::size_t>(g);
+            auto const& slice = slices[gi];
+            std::uint32_t const gpu_molecule_count = static_cast<std::uint32_t>(slice.metadata.size());
+            if (gpu_molecule_count == 0)
+                return;
+
+            per_gpu_result[gi] = gpu_etkdg_mmff_pipeline(
+                batch.bounds_matrices.data(), static_cast<std::uint32_t>(batch.bounds_matrices.size()),
+                batch.chiral_centers.empty() ? nullptr : batch.chiral_centers.data(),
+                static_cast<std::uint32_t>(batch.chiral_centers.size()),
+                batch.etk_torsions.empty() ? nullptr : batch.etk_torsions.data(),
+                static_cast<std::uint32_t>(batch.etk_torsions.size()),
+                batch.distance_constraints.empty() ? nullptr : batch.distance_constraints.data(),
+                static_cast<std::uint32_t>(batch.distance_constraints.size()),
+                batch.etk_interactions.empty() ? nullptr : batch.etk_interactions.data(),
+                static_cast<std::uint32_t>(batch.etk_interactions.size()),
+                batch.etk_atom_offsets.empty() ? nullptr : batch.etk_atom_offsets.data(),
+                static_cast<std::uint32_t>(batch.etk_atom_offsets.size()),
+                batch.mmff_nonbonded.empty() ? nullptr : batch.mmff_nonbonded.data(),
+                static_cast<std::uint32_t>(batch.mmff_nonbonded.size()),
+                batch.mmff_bonds.empty() ? nullptr : batch.mmff_bonds.data(),
+                static_cast<std::uint32_t>(batch.mmff_bonds.size()),
+                batch.mmff_angles.empty() ? nullptr : batch.mmff_angles.data(),
+                static_cast<std::uint32_t>(batch.mmff_angles.size()),
+                batch.mmff_torsions.empty() ? nullptr : batch.mmff_torsions.data(),
+                static_cast<std::uint32_t>(batch.mmff_torsions.size()),
+                batch.mmff_oops.empty() ? nullptr : batch.mmff_oops.data(),
+                static_cast<std::uint32_t>(batch.mmff_oops.size()),
+                batch.mmff_stretchbends.empty() ? nullptr : batch.mmff_stretchbends.data(),
+                static_cast<std::uint32_t>(batch.mmff_stretchbends.size()),
+                batch.mmff_interactions.empty() ? nullptr : batch.mmff_interactions.data(),
+                static_cast<std::uint32_t>(batch.mmff_interactions.size()),
+                batch.mmff_atom_offsets.empty() ? nullptr : batch.mmff_atom_offsets.data(),
+                static_cast<std::uint32_t>(batch.mmff_atom_offsets.size()),
+                slice.metadata.data(), gpu_molecule_count, per_gpu_coords[gi].data(),
+                per_gpu_energies[gi].data(), per_gpu_status[gi].data(), num_conformers, max_stereo_attempts,
+                batch.max_atoms_per_molecule, 42 + static_cast<std::uint64_t>(g), g);
+        });
+    }
+
+    for (auto& t : threads)
+        t.join();
+    auto t_gpu_end = clock_type::now();
+    double const gpu_wall_ms = std::chrono::duration<double, std::milli>(t_gpu_end - t_gpu_start).count();
+
+    // Gather results: unsort per-GPU outputs back into global output buffers.
+    // Each GPU's output is internally sorted by atom count; map back via original_sorted_indices → order.
+    std::uint32_t total_succeeded = 0;
+    for (int g = 0; g < gpu_count; ++g) {
+        std::size_t const gi = static_cast<std::size_t>(g);
+        auto const& slice = slices[gi];
+        for (std::uint32_t local = 0; local < static_cast<std::uint32_t>(slice.metadata.size()); ++local) {
+            std::uint32_t const sorted_idx = slice.original_sorted_indices[local];
+            std::uint32_t const orig_idx = order[sorted_idx];
+            for (std::uint32_t c = 0; c < num_conformers; ++c) {
+                std::uint32_t const src_slot = local * num_conformers + c;
+                std::uint32_t const dst_slot = orig_idx * num_conformers + c;
+                energies_out[dst_slot] = per_gpu_energies[gi][src_slot];
+                status_out[dst_slot] = per_gpu_status[gi][src_slot];
+                std::memcpy(coords_out.data() + dst_slot * coord_stride,
+                            per_gpu_coords[gi].data() + src_slot * coord_stride, coord_stride * sizeof(float));
+                if (per_gpu_status[gi][src_slot] == 0)
+                    total_succeeded++;
+            }
+        }
+    }
+
+    // Report per-GPU stats.
+    float max_upload = 0, max_kernel = 0, max_download = 0;
+    for (int g = 0; g < gpu_count; ++g) {
+        std::size_t const gi = static_cast<std::size_t>(g);
+        auto const& r = per_gpu_result[gi];
+        std::uint32_t const gpu_molecule_count = static_cast<std::uint32_t>(slices[gi].metadata.size());
+        std::printf("  GPU %d: %u molecules, grid=%u, upload=%.2f ms, kernel=%.2f ms, download=%.2f ms\n", g,
+                    gpu_molecule_count, r.upload_time_ms, r.kernel_time_ms, r.download_time_ms);
+        max_upload = std::max(max_upload, r.upload_time_ms);
+        max_kernel = std::max(max_kernel, r.kernel_time_ms);
+        max_download = std::max(max_download, r.download_time_ms);
+    }
+
+    double const e2e_ms = preproc_ms + gpu_wall_ms;
+    double const mol_per_sec = n / (e2e_ms / 1000.0);
+    double const conf_per_sec = total_succeeded / (e2e_ms / 1000.0);
+
+    std::printf("  GPU wall:    %.2f ms (max upload=%.2f, max kernel=%.2f, max download=%.2f)\n", gpu_wall_ms,
+                max_upload, max_kernel, max_download);
+    std::printf("  End-to-end:  %.0f ms (preproc %.0f + GPU wall %.0f)\n", e2e_ms, preproc_ms, gpu_wall_ms);
+    std::printf("  Mol/s:       %.1f\n", mol_per_sec);
+    std::printf("  Conf/s:      %.1f\n", conf_per_sec);
+    std::printf("  Succeeded:   %u / %u conformers\n", total_succeeded, total_conf);
+}
+
 // Section 3: Quality cross-validation.
 static void cross_validate(std::vector<std::string> const& smiles, etkdg_molecule_batch_t const& batch,
                            std::vector<float> const& coords, std::vector<float> const& energies,
@@ -336,6 +512,7 @@ int main(int argc, char** argv) {
     std::uint32_t quality_samples = 10000;
 
     // Parse the command line.
+    bool multi_gpu_only = false;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--smi" && i + 1 < argc)
@@ -344,6 +521,8 @@ int main(int argc, char** argv) {
             num_conformers = static_cast<std::uint32_t>(std::atoi(argv[++i]));
         else if (arg == "--quality-samples" && i + 1 < argc)
             quality_samples = static_cast<std::uint32_t>(std::atoi(argv[++i]));
+        else if (arg == "--multi-gpu-only")
+            multi_gpu_only = true;
     }
 
     std::printf("Dataset:     %s\n", smi_path.c_str());
@@ -355,6 +534,12 @@ int main(int argc, char** argv) {
     if (all_smiles.empty()) {
         std::fprintf(stderr, "No SMILES loaded from %s\n", smi_path.c_str());
         return 1;
+    }
+
+    if (multi_gpu_only) {
+        bench_smallfield_multi_gpu(all_smiles, num_conformers, max_stereo_attempts);
+        std::printf("\nDone.\n");
+        return 0;
     }
 
     // Run the scaling analysis at multiple batch sizes.
@@ -377,6 +562,11 @@ int main(int argc, char** argv) {
         std::vector<std::uint8_t> status;
         etkdg_molecule_batch_t batch;
         bench_smallfield_gpu(smiles, num_conformers, max_stereo_attempts, coords, energies_f, status, batch);
+
+        // Run system B (multi-GPU) on the largest batch size.
+        if (batch_size == batch_sizes.back()) {
+            bench_smallfield_multi_gpu(smiles, num_conformers, max_stereo_attempts);
+        }
 
         // Run quality cross-validation only on the full dataset.
         if (batch_size == static_cast<std::uint32_t>(all_smiles.size()) || batch_size == batch_sizes.back()) {

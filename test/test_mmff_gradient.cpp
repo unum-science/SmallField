@@ -65,14 +65,16 @@ etkdg_prepared_molecule_t build_single_oop_prepared(etkdg_prepared_molecule_t co
     etkdg_prepared_molecule_t single{};
     single.num_atoms = prepared.num_atoms;
     single.mmff_oops.push_back(prepared.mmff_oops.front());
-    single.mmff_atom_offsets.assign(prepared.num_atoms, {0, 0});
+    single.mmff_atom_offsets.assign(prepared.num_atoms, {});
 
     mmff94_oop_t const& oop = single.mmff_oops.front();
     std::uint8_t const atoms[] = {oop.atom_i, oop.atom_j, oop.atom_k, oop.atom_l};
     for (std::uint32_t role = 0; role < 4; ++role) {
         std::uint8_t const atom = atoms[role];
-        single.mmff_atom_offsets[atom].interaction_start = static_cast<std::uint32_t>(single.mmff_interactions.size());
-        single.mmff_atom_offsets[atom].interaction_count = 1;
+        std::uint32_t const position = static_cast<std::uint16_t>(single.mmff_interactions.size());
+        single.mmff_atom_offsets[atom] = {};
+        single.mmff_atom_offsets[atom].oop_start = position;
+        single.mmff_atom_offsets[atom].oop_count = 1;
         single.mmff_interactions.push_back({0, 5, static_cast<std::uint8_t>(role)});
     }
     return single;

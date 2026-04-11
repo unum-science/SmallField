@@ -126,29 +126,30 @@ Dataset: 8,948 ChEMBL molecules, 3 conformers each, single GPU.
 
 ### Throughput scaling
 
-| Batch | RDKit CPU mol/s | SmallField GPU mol/s | GPU speedup |
-| ----- | --------------- | -------------------- | ----------- |
-| 100   | 18              | 17                   | 0.9x        |
-| 500   | 88              | 76                   | 0.9x        |
-| 1,000 | 185             | 148                  | 0.8x        |
-| 2,000 | 296             | 275                  | 0.9x        |
-| 5,000 | 561             | 605                  | 1.1x        |
-| 8,948 | 628             | 823                  | 1.3x        |
+| Batch | RDKit CPU mol/s | SmallField 1-GPU mol/s | 8-GPU mol/s | 1-GPU speedup |
+| ----- | --------------- | ---------------------- | ----------- | ------------- |
+| 100   | 21              | 22                     | —           | 1.0x          |
+| 500   | 100             | 94                     | —           | 0.9x          |
+| 1,000 | 183             | 184                    | —           | 1.0x          |
+| 2,000 | 301             | 350                    | —           | 1.2x          |
+| 5,000 | 558             | 744                    | —           | 1.3x          |
+| 8,948 | 627             | 1,010                  | 1,353       | 1.6x / 2.2x   |
+| 241K  | —               | —                      | 3,076       | —             |
 
 RDKit CPU uses 192 OpenMP threads with `schedule(dynamic, 1)` and `numThreads=1` per molecule.
-GPU throughput is end-to-end (preprocessing + upload + prepass + kernel + download).
-GPU overtakes CPU at ~5,000 molecules; at full dataset the GPU is 1.3x faster.
-For smaller batches the GPU prepass and upload overhead dominate, making it slower than 192 CPU cores.
+1-GPU throughput is end-to-end (preprocessing + upload + prepass + kernel + download).
+8-GPU uses round-robin molecule distribution across GPUs for load balance.
+At 241K molecules, preprocessing (56s) dominates end-to-end; GPU-only throughput is 10,800 mol/s.
 
-### GPU time breakdown (8,948 molecules)
+### GPU time breakdown (8,948 molecules, single GPU)
 
-| Phase                      | Time          | %     |
-| -------------------------- | ------------- | ----- |
-| CPU preprocessing (OpenMP) | 1,249 ms      | 11.5% |
-| GPU upload + prepass       | 994 ms        | 9.1%  |
-| GPU kernel (8 waves)       | 8,596 ms      | 79.1% |
-| GPU download               | 31 ms         | 0.3%  |
-| __Total__                  | __10,870 ms__ |       |
+| Phase                      | Time         | %     |
+| -------------------------- | ------------ | ----- |
+| CPU preprocessing (OpenMP) | 1,150 ms     | 13.1% |
+| GPU upload + prepass       | 857 ms       | 9.8%  |
+| GPU kernel (8 waves)       | 6,597 ms     | 75.3% |
+| GPU download               | 16 ms        | 0.2%  |
+| __Total__                  | __8,762 ms__ |       |
 
 ### Wave dispatch breakdown
 
@@ -163,25 +164,20 @@ For smaller batches the GPU prepass and upload overhead dominate, making it slow
 | 6    | 112       | 310       | 3         | 310   |
 | 7    | 128       | 200       | 2         | 200   |
 
-### Per-wave kernel profiling (nsys, 8,948 molecules)
+### Multi-GPU scaling (8x RTX PRO 6000 Blackwell)
 
-Profiled with `nsys profile` (CUDA 13.0, Blackwell SM 12.0).
-Pipeline kernel accounts for 97.5% of total GPU time; metric embedding prepass is 2.5%.
+Round-robin molecule distribution across GPUs for load balance.
+Each GPU processes ~30K molecules with an equal mix of small and large.
 
-| Wave | Atoms | Mols  | Grid  | Kernel ms | ms/mol | us/conf | % of kernel |
-| ---- | ----- | ----- | ----- | --------- | ------ | ------- | ----------- |
-| 0    | 16    | 46    | 46    | 59        | 1.28   | 425     | 0.4%        |
-| 1    | 32    | 1,502 | 1,502 | 465       | 0.31   | 103     | 3.0%        |
-| 2    | 48    | 3,049 | 2,256 | 1,669     | 0.55   | 182     | 10.7%       |
-| 3    | 64    | 2,267 | 1,504 | 2,077     | 0.92   | 305     | 13.4%       |
-| 4    | 80    | 1,023 | 940   | 2,715     | 2.65   | 885     | 17.5%       |
-| 5    | 96    | 551   | 551   | 2,376     | 4.31   | 1,437   | 15.3%       |
-| 6    | 112   | 310   | 310   | 2,865     | 9.24   | 3,081   | 18.4%       |
-| 7    | 128   | 200   | 200   | 3,302     | 16.51  | 5,503   | 21.3%       |
+| GPUs | Molecules | Preproc (s) | GPU wall (s) | End-to-end (s) | mol/s |
+| ---- | --------- | ----------- | ------------ | -------------- | ----- |
+| 1    | 8,948     | 1.2         | 7.5          | 8.8            | 1,010 |
+| 8    | 8,948     | 1.3         | 6.3          | 7.7            | 1,353 |
+| 8    | 241,596   | 56.1        | 22.4         | 78.5           | 3,076 |
 
-Per-molecule cost scales ~50x from N=32 to N=128.
-Waves 4-7 (atoms > 64) contain only 23% of molecules but consume 72% of kernel time.
-The dominant cost is the O(N²) pairwise MMFF94 interaction computation in stage 9.
+At 241K molecules, GPU-only throughput is 10,800 mol/s (241K / 22.4s).
+CPU preprocessing (56s) is the bottleneck at scale — dominated by RDKit's `getExperimentalTorsions()`.
+Kernel time per GPU: 14.6-15.3s (within 5% across GPUs thanks to round-robin distribution).
 
 ## Quality
 
@@ -189,14 +185,14 @@ Cross-validation uses 10,000 random SmallField conformers evaluated by RDKit's `
 
 ### Summary
 
-| Metric                                              | Value                    |
-| --------------------------------------------------- | ------------------------ |
+| Metric                                              | Value                   |
+| --------------------------------------------------- | ----------------------- |
 | Kernel success rate (stereo + MMFF path)            | 96.2% (25,822 / 26,844) |
-| Finite MMFF94 energy (RDKit cross-val)              | 97.4%                    |
-| Median RDKit MMFF94 energy of SmallField conformers | 58.5 kcal/mol            |
-| Median SmallField final MMFF94 energy               | 58.5 kcal/mol            |
+| Finite MMFF94 energy (RDKit cross-val)              | 97.4%                   |
+| Median RDKit MMFF94 energy of SmallField conformers | 58.5 kcal/mol           |
+| Median SmallField final MMFF94 energy               | 58.5 kcal/mol           |
 | P5 / P95 RDKit energy                               | -67.2 / 183.1 kcal/mol  |
-| Expected for valid conformers                       | < 200 kcal/mol           |
+| Expected for valid conformers                       | < 200 kcal/mol          |
 
 The catastrophic-energy regime is gone.
 On the corrected SmallField-native path with GPU metric embedding, the typical conformer lands in a chemically reasonable MMFF94 range.
@@ -208,43 +204,54 @@ Median cross-validated energy stays below 200 kcal/mol through the 80-100 atom b
 
 | Atoms   | Count | RDKit P50 (kcal/mol) | SmallField P50 (kcal/mol) |
 | ------- | ----- | -------------------- | ------------------------- |
-| 0-20    | 191   | 0.6                  | 0.6                       |
-| 20-40   | 3,366 | 36.0                 | 36.0                      |
-| 40-60   | 3,737 | 65.1                 | 65.2                      |
-| 60-80   | 1,584 | 83.8                 | 83.8                      |
-| 80-100  | 603   | 121.2                | 121.2                     |
-| 100-128 | 251   | 149.3                | 149.3                     |
+| 0-20    | 189   | 1.2                  | 1.2                       |
+| 20-40   | 3,391 | 36.1                 | 36.1                      |
+| 40-60   | 3,751 | 67.2                 | 67.2                      |
+| 60-80   | 1,530 | 82.4                 | 82.4                      |
+| 80-100  | 619   | 121.9                | 121.9                     |
+| 100-128 | 260   | 136.4                | 136.4                     |
 
 ### Diagnosis
 
-The current bottlenecks are different from the original report.
+1. __CPU preprocessing is the bottleneck at scale.__
+   At 241K molecules on 8 GPUs, preprocessing takes 56s (72% of end-to-end) while the 8 GPUs together take 22s.
+   The dominant CPU cost is `getExperimentalTorsions()` in the ETK extraction (~38% of per-molecule preprocessing).
+   Skipping ETK and relying on MMFF94 torsions alone degrades median energy by only 2.7% (58.5 → 60.1 kcal/mol) and could be made a configurable option.
 
-1. __Large-molecule tail.__
-   The GPU native metric embedding fixes the startup geometry, but molecules above roughly 100 atoms still carry a noticeably heavier MMFF tail after stage 9.
+2. __Multi-GPU scaling is near-linear with round-robin distribution.__
+   At 8,948 molecules (1,119/GPU), scaling is ~1.3x due to upload overhead dominating.
+   At 241K molecules (30K/GPU), kernel time dominates and all 8 GPUs finish within 5% of each other.
 
-2. __GPU prepass cost.__
-   Moving metric embedding onto the GPU removed the old CPU eigendecomposition cost, but the upload-plus-prepass phase is now about 15.2% of end-to-end time on the full dataset.
-   That is acceptable, but it is now large enough to deserve its own tuning pass.
+3. __Single-GPU kernel is 75% of end-to-end.__
+   Per-molecule cost scales ~50x from N=32 to N=128.
+   MMFF94 per-type sub-loops eliminated switch divergence; ETK per-atom interaction lists eliminated brute-force scan.
+   Further kernel optimization would require fundamentally different parallelism (e.g., cooperative groups for large molecules).
 
-3. __Kernel remains dominant.__
-   Even with 8 wave bins, the GPU kernel is still about 68.6% of end-to-end runtime on the full dataset.
-   Any further throughput work now needs to focus on reducing stage-4, stage-7, and stage-9 iteration cost instead of fixing startup geometry.
+## Optimizations applied
+
+- rsqrtf intrinsics replacing 17 sqrtf+frcp pairs across all force fields
+- Interleaved triple warp reduction in FIRE for instruction-level parallelism
+- FMA in FIRE velocity Verlet step
+- ETK per-atom interaction lists replacing O(N*T) brute-force scan in stage 7
+- MMFF94 per-type sub-loops replacing 7-case switch dispatch in stage 9
+- `__restrict__` on all functor parameter pointers
+- 2D bitset for exclusion matrices (16x smaller, stack-allocated)
+- Move semantics in batch packing (zero-copy vector transfer)
+- Pool allocator (19 cudaMalloc → 1)
+- Async cudaMemcpyAsync with dedicated upload stream
+- half2 vectorized bounds loading
+- 8-GPU round-robin dispatch with load-balanced molecule distribution
 
 ## Next improvements
 
-1. __Reduce the >80 atom quality tail.__
-   The accuracy floor is now acceptable, but large molecules still drift above the `<200 kcal/mol` target too often.
-   The next quality pass should focus on stronger ETK and MMFF cleanup for the two largest bins.
+1. __Pipeline preprocessing with GPU execution.__
+   Overlap CPU batch construction with GPU kernel execution using double-buffering.
+   At 241K molecules, this would hide the 56s preprocessing behind GPU work.
 
-2. __Trim the prepass overhead.__
-   The architecture is now end-to-end on the GPU after batch construction, but the upload-plus-prepass phase is still over a second on the full dataset.
-   The next pass should focus on reducing workspace traffic, grouping overhead, and global-memory writes in the prepass.
+2. __Optional ETK bypass.__
+   Add a `use_csd_torsions` flag that skips `getExperimentalTorsions()` and stage 7 entirely.
+   Saves 38% preprocessing time and 8% kernel time at the cost of 2.7% quality degradation.
 
-3. __Parallelize ETK interactions like MMFF.__
-   Stage 7 still scans torsions and constraints less efficiently than stage 9's per-atom adjacency layout.
-
-4. __Overlap preprocessing and execution.__
-   Double-buffering batches would hide part of the 1.46 s CPU preprocessing cost behind the GPU waves.
-
-5. __Multi-GPU dispatch.__
-   The current benchmark still uses a single GPU on an 8-GPU machine.
+3. __Reduce the >100 atom quality tail.__
+   P95 energy for 100-128 atoms is 434 kcal/mol.
+   More FIRE iterations or a second MMFF polish pass for the heaviest bin could help.
