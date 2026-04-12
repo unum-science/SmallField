@@ -90,9 +90,10 @@ struct metric_scratch_t {
     syevjInfo_t syevj_params = nullptr; ///< reused across calls
 };
 
-// Forward-declare persistent per-device launch scratch.  Defined in smallfield.cu so
-// the public header does not need to pull in CUDA RAII wrappers.
+// Forward-declare persistent per-device launch scratch + per-context output staging.
+// Defined in smallfield.cu so the public header does not need CUDA RAII wrappers.
 struct launch_scratch_t;
+struct output_staging_t;
 
 struct context_t {
     std::vector<int> device_ids;
@@ -100,6 +101,7 @@ struct context_t {
     std::vector<cusolverDnHandle_t> solvers;
     std::vector<metric_scratch_t> metric_scratch;   ///< one per device
     std::vector<launch_scratch_t *> launch_scratch; ///< one per device, heap-allocated
+    output_staging_t *output_staging = nullptr;     ///< shared across devices, pinned
 
     /**
      *  @brief Construct for the given GPUs.

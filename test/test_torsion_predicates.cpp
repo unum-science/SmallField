@@ -99,11 +99,14 @@ void validate_predicate_for_molecule(predicate_case_t const &pc, RDKit::ROMol co
         if (native_hit != rdkit_hit) {
             std::fprintf(
                 stderr,
-                "Predicate mismatch: %s (SMARTS \"%s\") atom=%u native=%d rdkit=%d\n" "  element=%u aromatic=%d "
-                                                                                      "degree=%u nH=%u hyb=%u\n" "  "
-                                                                                                                 "SMILE"
-                                                                                                                 "S: "
-                                                                                                                 "%s\n",
+                "Predicate mismatch: %s (SMARTS \"%s\") atom=%u native=%d rdkit=%d\n" "  element=%u " "aromatic=%d " "d"
+                                                                                                                     "e"
+                                                                                                                     "g"
+                                                                                                                     "r"
+                                                                                                                     "e"
+                                                                                                                     "e"
+                                                                                                                     "="
+                                                                                                                     "%" "u nH=%u " "hyb=%u\n" "  " "SMILE" "S: " "%s\n",
                 pc.name, pc.smarts, a, native_hit ? 1 : 0, rdkit_hit ? 1 : 0, desc.element[a],
                 atom_has_flag(desc, a, atom_flag_aromatic_k) ? 1 : 0, desc.degree[a], desc.num_hydrogens[a],
                 desc.hybridization[a], smiles.c_str());

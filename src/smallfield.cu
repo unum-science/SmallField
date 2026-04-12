@@ -49,6 +49,32 @@ struct launch_scratch_t {
     pinned_byte_buffer_t host_staging;
 };
 
+/**
+ *  @brief Shared pinned buffers for the caller's float32 coords / energies / status
+ *  output region.  Grow-only, allocated once per @c context_t, reused across every
+ *  @c generate_conformers call.  Each chunk's GPU writes into a slice of these via
+ *  the launch handle; @c finalize_gpu_pipeline then permutes sorted → input-order.
+ */
+struct output_staging_t {
+    pinned_byte_buffer_t pool;
+    std::size_t coords_offset = 0;
+    std::size_t coords_count = 0;
+    std::size_t energies_offset = 0;
+    std::size_t energies_count = 0;
+    std::size_t status_offset = 0;
+    std::size_t status_count = 0;
+
+    std::span<float> coords() noexcept {
+        return {reinterpret_cast<float *>(pool.data() + coords_offset), coords_count};
+    }
+    std::span<float> energies() noexcept {
+        return {reinterpret_cast<float *>(pool.data() + energies_offset), energies_count};
+    }
+    std::span<std::uint8_t> status() noexcept {
+        return {reinterpret_cast<std::uint8_t *>(pool.data() + status_offset), status_count};
+    }
+};
+
 context_t::context_t(std::span<int const> devices) {
     if (devices.empty()) {
         int count = 0;
@@ -61,6 +87,7 @@ context_t::context_t(std::span<int const> devices) {
     solvers.resize(device_ids.size());
     metric_scratch.resize(device_ids.size());
     launch_scratch.resize(device_ids.size(), nullptr);
+    output_staging = new output_staging_t;
 
     for (std::size_t i = 0; i < device_ids.size(); ++i) {
         cudaSetDevice(device_ids[i]);
@@ -86,6 +113,25 @@ context_t::~context_t() {
         cusolverDnDestroy(solvers[i]);
         cudaStreamDestroy(streams[i]);
     }
+    delete output_staging;
+}
+
+/**
+ *  @brief Size the shared pinned output region for a given batch shape.
+ *  Grow-only; successive calls reuse the allocation if it already fits.
+ */
+void ensure_output_staging(output_staging_t &s, std::size_t total_conformers, std::size_t coord_stride) {
+    std::size_t const coords_bytes = align_up(total_conformers * coord_stride * sizeof(float), 256);
+    std::size_t const energies_bytes = align_up(total_conformers * sizeof(float), 256);
+    std::size_t const status_bytes = align_up(total_conformers * sizeof(std::uint8_t), 256);
+    std::size_t const total = coords_bytes + energies_bytes + status_bytes;
+    s.pool.ensure_capacity(total);
+    s.coords_offset = 0;
+    s.coords_count = total_conformers * coord_stride;
+    s.energies_offset = coords_bytes;
+    s.energies_count = total_conformers;
+    s.status_offset = coords_bytes + energies_bytes;
+    s.status_count = total_conformers;
 }
 
 /**
@@ -425,14 +471,18 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     std::uint32_t const total_conf = num_input * num_conformers;
     std::uint32_t const coord_stride = max_atoms_per_molecule * 3;
 
-    // Convert string_view inputs to std::string for RDKit.
-    std::vector<std::string> smiles_strings(smiles.begin(), smiles.end());
+    // Keep SMILES as string_view throughout — the single unavoidable std::string copy
+    // lives inside prepare_molecule at the RDKit::SmilesToMol call site.
 
-    // Allocate intermediate float32 buffers for GPU output — sized for the full input.
-    // Per-chunk GPU launches write directly into their slice of these buffers.
-    std::vector<float> host_coords(static_cast<std::size_t>(total_conf) * coord_stride, 0.0f);
-    std::vector<float> host_energies(total_conf, 0.0f);
-    std::vector<std::uint8_t> host_status(total_conf, 255);
+    // Grow the shared pinned output region in context_t to fit this call.  Allocated
+    // once per context and reused — avoids a ~1 GB pageable malloc per call at 241K.
+    ensure_output_staging(*output_staging, total_conf, coord_stride);
+    std::span<float> host_coords = output_staging->coords();
+    std::span<float> host_energies = output_staging->energies();
+    std::span<std::uint8_t> host_status = output_staging->status();
+    std::fill(host_coords.begin(), host_coords.end(), 0.0f);
+    std::fill(host_energies.begin(), host_energies.end(), 0.0f);
+    std::fill(host_status.begin(), host_status.end(), std::uint8_t {255});
     std::vector<bool> preprocessed_ok(num_input, false);
 
     std::uint32_t const num_devices = static_cast<std::uint32_t>(device_ids.size());
@@ -460,10 +510,19 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         std::vector<std::vector<std::uint32_t>> per_gpu_indices(num_devices);
         for (std::uint32_t i = 0; i < batch.num_molecules; ++i) per_gpu_indices[i % num_devices].push_back(i);
 
-        // Pre-grow each GPU's metric scratch pool for the worst-case atom-count group.
+        // Round to the next metric-prepass bin boundary; cusolver runs at binned N,
+        // not raw atoms, so the workspace + gram pool must fit that.  Must stay in
+        // sync with bin_ns[] in build_metric_initial_coordinates_on_gpu.
+        auto bin_ceiling = [](std::uint32_t n) -> std::uint32_t {
+            static constexpr std::uint32_t bin_ns[] = {16, 32, 48, 64, 80, 96, 112, 128};
+            for (auto b : bin_ns)
+                if (n <= b) return b;
+            return bin_ns[7];
+        };
+        std::uint32_t const metric_bin_atoms = bin_ceiling(effective_max_atoms);
         for (std::uint32_t d = 0; d < num_devices; ++d) {
             if (per_gpu_indices[d].empty()) continue;
-            ensure_metric_scratch(*this, d, per_gpu_indices[d].size(), effective_max_atoms);
+            ensure_metric_scratch(*this, d, per_gpu_indices[d].size(), metric_bin_atoms);
         }
 
         std::size_t const conf_offset = static_cast<std::size_t>(chunk_base) * num_conformers;
@@ -501,7 +560,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     if (!pipeline) {
         // Non-pipelined: single prep, single launch, single finalize.  Identical
         // behaviour to the pre-pipelining code path.
-        etkdg_molecule_batch_t batch = prepare_molecule_batch(smiles_strings);
+        etkdg_molecule_batch_t batch = prepare_molecule_batch(smiles);
         effective_max_atoms = std::max(max_atoms_per_molecule, batch.max_atoms_per_molecule);
         std::vector<gpu_pipeline_handle_t> handles;
         launch_chunk(batch, /*chunk_base=*/0, handles);
@@ -515,8 +574,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
             chunks.emplace_back(i, std::min(i + chunk_size_target, num_input));
 
         auto prep_slice = [&](std::uint32_t begin, std::uint32_t end) {
-            return prepare_molecule_batch(
-                std::vector<std::string>(smiles_strings.begin() + begin, smiles_strings.begin() + end));
+            return prepare_molecule_batch(smiles.subspan(begin, end - begin));
         };
 
         // Two-slot ring buffer for both batches and handles.  Fixed-size

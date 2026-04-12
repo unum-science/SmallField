@@ -48,10 +48,10 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | __5,884 mol/s__   | __1.88×__   |
-| 241,596 | —                   | —                | __4,008 mol/s__   | —           |
+| 241,596 | —                   | —                | __4,475 mol/s__   | —           |
 
-At 241,596 molecules on all 8 GPUs: 60.3 seconds end-to-end (median of 3 runs).
-Quality is unchanged: P50 ≈ 57 kcal/mol vs RDKit 59 kcal/mol, 95.5 % of conformers successful.
+At 241,596 molecules on all 8 GPUs: 53.9 seconds end-to-end (median of 3 runs).
+Quality is unchanged: P50 ≈ 56 kcal/mol vs RDKit 61 kcal/mol, 96 % of conformers successful.
 
 Two observations about the 1→8 scaling:
 
@@ -63,6 +63,44 @@ Two observations about the 1→8 scaling:
    The earlier regression at 241K (4,356 mol/s) came from the serial Phase 2 pack, which is now parallelized.
 
 ## Optimizations that landed
+
+### Metric prepass 8-bin padded syevjBatched
+
+`build_metric_initial_coordinates_on_gpu` used to group molecules by exact atom count and call `cusolverDnSsyevjBatched` once per distinct N — drug-like distributions span 30+ values, and per-call cusolver overhead dominated the per-launch wall at ~500 ms per GPU.
+
+Now molecules are binned into the same 8 buckets the wave dispatcher uses (`{16, 32, 48, 64, 80, 96, 112, 128}`).
+Each bin issues ONE `cusolverDnSsyevjBatched` at the bin's padded N.
+Shorter molecules zero-pad the Gram matrix up to the bin size — the padding creates zero eigenvalues that sort below the real ones, so the top-4 eigenvectors still reconstruct the same 4D embedding.
+The kernel smooths only the real N × N sub-block (no wasted Floyd-Warshall work).
+
+Result: per-launch wall dropped from ~700 ms to ~430 ms.
+Dispatcher critical path at 8 GPUs went from 5.6 s/chunk to ~3.4 s/chunk.
+
+### Native bounds matrix builder (no RDKit `setTopolBounds`)
+
+The old `build_bounds_matrix` called RDKit's `setTopolBounds`, which allocates a fresh `DistGeom::BoundsMatrix` plus two `boost::shared_array<double>` and two `boost::shared_array<int>` per molecule (~140 KB of throwaway heap) and walks RDKit's atom typer.
+At 241K molecules that's ~33 GB of transient allocator traffic per batch.
+
+The replacement reads only the flat `molecule_descriptor_t` and the small tables in `src/forcefield_tables.hpp`:
+
+- Covalent radii per atomic number + bond-order shortening factor produce the 1-2 bond length (±2 % tolerance).
+- Ideal-angle-by-hybridization + law of cosines produce the 1-3 distance (±3 % tolerance).
+- BFS distance = 3 with a conservative cis/trans envelope produces the 1-4 bound.
+- VdW radii produce the long-range lower bound for `bond_distance > 3`.
+
+Writes directly into the caller's `std::vector<float>` — zero other heap activity per call.
+Quality gate holds (P50 energy within ~5 kcal/mol of the RDKit baseline; the subsequent triangle-smoothing + FIRE refinement absorbs the residual).
+
+### Persistent pinned host output buffers
+
+`host_coords` (1.1 GB at 241K × 3 conformers × 128 atoms), `host_energies`, and `host_status` used to be pageable `std::vector`s allocated per `generate_conformers` call.
+They now live in a shared `output_staging_t` owned by `context_t`: one `pinned_byte_buffer_t` that grows monotonically across calls.
+Eliminates a ~1 GB `malloc` + zero-fill per call.
+
+### SMILES kept as `std::string_view` end-to-end
+
+`prepare_molecule` used to take `std::string const &`, so `generate_conformers` copied its `std::span<std::string_view const>` input into a fresh `std::vector<std::string>` (~24 MB at 241K) and `prep_slice` copied another range per chunk.
+The API now takes `std::span<std::string_view const>` all the way down; one unavoidable `std::string` materialization happens at the single `RDKit::SmilesToMol` call inside `prepare_molecule` — scoped to microseconds of stack/SSO storage.
 
 ### Unified `batch_pool_t` with pinned host + persistent device mirrors
 

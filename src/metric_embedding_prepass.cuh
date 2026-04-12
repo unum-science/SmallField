@@ -21,8 +21,10 @@
 #if defined(__CUDACC__)
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
+#include <span>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -67,27 +69,42 @@ __device__ __forceinline__ float midpoint_distance_squared_(float const *bounds,
     return distance * distance;
 }
 
+/**
+ *  @brief Triangle-smooth the per-molecule bounds, build a zero-padded Gram
+ *  matrix at a uniform @p bin_n × @p bin_n stride, and write it to @p gram_matrices.
+ *
+ *  The actual per-molecule size is @c meta.num_atoms, always ≤ @p bin_n.  The
+ *  kernel smooths only the real N×N sub-block, zeros the Gram padding region,
+ *  and writes into the bin-sized slot.  cusolverDnSsyevjBatched can then
+ *  operate on a single uniform N across all molecules in the bin.
+ */
 __global__ void smooth_and_build_gram_kernel(float *__restrict__ bounds_matrices,
                                              etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
                                              std::uint32_t const *__restrict__ molecule_indices,
-                                             float *__restrict__ gram_matrices, std::uint32_t num_atoms) {
+                                             float *__restrict__ gram_matrices, std::uint32_t bin_n) {
     std::uint32_t const group_index = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const molecule_index = molecule_indices[group_index];
     auto const meta = molecule_metadata[molecule_index];
+    std::uint32_t const num_atoms = meta.num_atoms;
 
+    // Shared layout: shared_bounds[num_atoms × num_atoms] + row_means[num_atoms] + grand_mean.
+    // Sized by the host launcher for bin_n (the worst case in this bin).
     extern __shared__ float gram_shared_raw[];
     float *shared_bounds = gram_shared_raw;
     float *row_means = shared_bounds + num_atoms * num_atoms;
     float *grand_mean_ptr = row_means + num_atoms;
 
     float *global_bounds = bounds_matrices + meta.bounds_offset;
-    float *gram = gram_matrices + group_index * num_atoms * num_atoms;
+    float *gram = gram_matrices + group_index * bin_n * bin_n;
     std::uint32_t const total_entries = num_atoms * num_atoms;
+    std::uint32_t const gram_total = bin_n * bin_n;
 
+    // Load per-molecule bounds (at actual stride num_atoms) into shared memory.
     for (std::uint32_t idx = lane; idx < total_entries; idx += blockDim.x) shared_bounds[idx] = global_bounds[idx];
     __syncthreads();
 
+    // Floyd-Warshall on the real N×N block only.
     for (std::uint32_t pivot = 0; pivot < num_atoms; ++pivot) {
         for (std::uint32_t idx = lane; idx < total_entries; idx += blockDim.x) {
             std::uint32_t const i = idx / num_atoms;
@@ -112,6 +129,7 @@ __global__ void smooth_and_build_gram_kernel(float *__restrict__ bounds_matrices
         __syncthreads();
     }
 
+    // Persist the smoothed bounds back to global memory (at the molecule's own stride).
     for (std::uint32_t idx = lane; idx < total_entries; idx += blockDim.x) global_bounds[idx] = shared_bounds[idx];
 
     for (std::uint32_t atom = lane; atom < num_atoms; atom += blockDim.x) {
@@ -130,35 +148,52 @@ __global__ void smooth_and_build_gram_kernel(float *__restrict__ bounds_matrices
     __syncthreads();
 
     float const grand_mean = grand_mean_ptr[0];
-    for (std::uint32_t idx = lane; idx < total_entries; idx += blockDim.x) {
-        std::uint32_t const i = idx / num_atoms;
-        std::uint32_t const j = idx % num_atoms;
-        float const squared_distance = midpoint_distance_squared_(shared_bounds, num_atoms, i, j);
-        gram[j * num_atoms + i] = -0.5f * (squared_distance - row_means[i] - row_means[j] + grand_mean);
+    // Fill the whole bin-sized Gram block: real values inside [0, num_atoms)², zeros
+    // outside.  The zero-pad rows/cols contribute zero eigenvalues that sort below the
+    // real ones, so the top-4 eigenvectors reconstruct the same 4D embedding.
+    for (std::uint32_t idx = lane; idx < gram_total; idx += blockDim.x) {
+        std::uint32_t const i = idx / bin_n;
+        std::uint32_t const j = idx % bin_n;
+        float value = 0.0f;
+        if (i < num_atoms && j < num_atoms) {
+            float const squared_distance = midpoint_distance_squared_(shared_bounds, num_atoms, i, j);
+            value = -0.5f * (squared_distance - row_means[i] - row_means[j] + grand_mean);
+        }
+        gram[j * bin_n + i] = value;
     }
 }
 
+/**
+ *  @brief Project the top-4 eigenvectors into 4D coordinates.
+ *
+ *  The eigenproblem was solved at a uniform @p bin_n; each molecule's actual size is
+ *  @c meta.num_atoms ≤ @p bin_n.  Eigenvectors are stored with stride @p bin_n; we read
+ *  only the first @c meta.num_atoms components.  The last 4 eigenvalues (largest under
+ *  cusolver's ascending sort) carry the real 4D embedding — zero-padded rows produced
+ *  trailing zero eigenvalues that sort below.
+ */
 __global__ void project_metric_coordinates_kernel(float const *__restrict__ eigenvectors,
                                                   float const *__restrict__ eigenvalues,
+                                                  etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
                                                   std::uint32_t const *__restrict__ molecule_indices,
                                                   float *__restrict__ initial_coordinates,
-                                                  std::uint32_t max_atoms_per_molecule, std::uint32_t num_atoms) {
+                                                  std::uint32_t max_atoms_per_molecule, std::uint32_t bin_n) {
     std::uint32_t const group_index = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const molecule_index = molecule_indices[group_index];
+    std::uint32_t const num_atoms = molecule_metadata[molecule_index].num_atoms;
 
-    float const *molecule_eigenvectors = eigenvectors + group_index * num_atoms * num_atoms;
-    float const *molecule_eigenvalues = eigenvalues + group_index * num_atoms;
+    float const *molecule_eigenvectors = eigenvectors + group_index * bin_n * bin_n;
+    float const *molecule_eigenvalues = eigenvalues + group_index * bin_n;
     float *molecule_coordinates = initial_coordinates + molecule_index * max_atoms_per_molecule * 4;
 
     for (std::uint32_t atom = lane; atom < num_atoms; atom += blockDim.x) {
         for (std::uint32_t dim = 0; dim < 4; ++dim) {
-            std::int32_t const eigen_index = static_cast<std::int32_t>(num_atoms) - 1 - static_cast<std::int32_t>(dim);
+            std::int32_t const eigen_index = static_cast<std::int32_t>(bin_n) - 1 - static_cast<std::int32_t>(dim);
             float value = 0.0f;
             if (eigen_index >= 0) {
                 float const eigenvalue = fmaxf(molecule_eigenvalues[eigen_index], 0.0f);
-                if (eigenvalue > 1.0e-8f)
-                    value = sqrtf(eigenvalue) * molecule_eigenvectors[atom + eigen_index * num_atoms];
+                if (eigenvalue > 1.0e-8f) value = sqrtf(eigenvalue) * molecule_eigenvectors[atom + eigen_index * bin_n];
             }
             molecule_coordinates[dim * max_atoms_per_molecule + atom] = value;
         }
@@ -198,15 +233,28 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
             "cudaMemsetAsync(metric coordinates)"))
         return false;
 
-    // Group molecules by atom count.  Scratch space is shared across groups —
-    // within a call only one group runs at a time, but the scratch pool is sized
-    // once at context_t creation for the worst-case group size, so no per-group
-    // allocation happens here.
-    std::vector<std::vector<std::uint32_t>> molecule_groups(max_atoms_per_molecule + 1);
+    // Bin molecules into 8 fixed wave-dispatch buckets {16,32,48,64,80,96,112,128}.
+    // Everything in a bin padds up to the bin's N for the eigendecomposition, so
+    // cusolver is called ONCE per bin instead of once per exact atom count (~30 calls
+    // today).  Per-call CPU overhead inside cusolver dominated the per-launch wall.
+    constexpr std::uint32_t bin_ns[] = {16, 32, 48, 64, 80, 96, 112, 128};
+    constexpr std::uint32_t num_bins = sizeof(bin_ns) / sizeof(bin_ns[0]);
+
+    auto bin_for = [&](std::uint32_t num_atoms) -> int {
+        for (std::uint32_t b = 0; b < num_bins; ++b)
+            if (num_atoms <= bin_ns[b]) return static_cast<int>(b);
+        return -1;
+    };
+
+    // Bins are reused across calls via a thread_local store; no per-call allocation.
+    thread_local std::array<std::vector<std::uint32_t>, num_bins> bin_groups;
+    for (auto &g : bin_groups) g.clear();
     for (std::uint32_t mol = 0; mol < num_molecules; ++mol) {
         std::uint32_t const num_atoms = host_metadata[mol].num_atoms;
         if (num_atoms == 0 || num_atoms > max_atoms_per_molecule) continue;
-        molecule_groups[num_atoms].push_back(mol);
+        int const bin = bin_for(num_atoms);
+        if (bin < 0) continue;
+        bin_groups[bin].push_back(mol);
     }
 
     // The caller already called cusolverDnSetStream(solver_handle, stream) at context
@@ -216,20 +264,20 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
     constexpr std::uint32_t block_size = 128;
     bool success = true;
 
-    for (std::uint32_t num_atoms = 1; num_atoms <= max_atoms_per_molecule && success; ++num_atoms) {
-        auto const &group = molecule_groups[num_atoms];
+    for (std::uint32_t b = 0; b < num_bins && success; ++b) {
+        auto const &group = bin_groups[b];
         if (group.empty()) continue;
 
+        std::uint32_t const bin_n = bin_ns[b];
         std::size_t const group_size = group.size();
-        if (group_size > scratch.max_group_size || num_atoms > scratch.max_atoms) {
+        if (group_size > scratch.max_group_size || bin_n > scratch.max_atoms) {
             std::fprintf(
                 stderr,
-                "metric_embedding_prepass: scratch too small (need group=%zu atoms=%u, have group=%zu atoms=%u)\n",
-                group_size, num_atoms, scratch.max_group_size, scratch.max_atoms);
+                "metric_embedding_prepass: scratch too small (need group=%zu bin_n=%u, have group=%zu atoms=%u)\n",
+                group_size, bin_n, scratch.max_group_size, scratch.max_atoms);
             return false;
         }
 
-        // All scratch spans come from the pre-allocated pool; no cudaMalloc.
         std::uint32_t *const dev_group_indices = scratch.group_indices.data();
         float *const dev_gram_matrices = scratch.gram_matrices.data();
         float *const dev_eigenvalues = scratch.eigenvalues.data();
@@ -237,18 +285,13 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
         int *const dev_info = scratch.info.data();
         int const lwork = scratch.max_workspace_floats;
 
-        std::size_t const matrix_elements = group_size * num_atoms * num_atoms;
-        (void)matrix_elements;
-        std::size_t const shared_bytes = static_cast<std::size_t>(num_atoms * num_atoms + num_atoms + 1) *
-                                         sizeof(float);
+        // Shared memory sized for the bin's worst-case N.
+        std::size_t const shared_bytes = static_cast<std::size_t>(bin_n * bin_n + bin_n + 1) * sizeof(float);
 
-        // Upload the group indices — cudaMemcpyAsync from pageable host memory is
-        // technically synchronous but the transfer here is tiny (≤ max_group_size × 4 B,
-        // a few tens of KB) so it's measured in microseconds.
         success &= check_cuda_status_(
             cudaMemcpyAsync(dev_group_indices, group.data(), group_size * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
                             stream),
-            "cudaMemcpyAsync(group indices)");
+            "cudaMemcpyAsync(bin group indices)");
         success &= check_cuda_status_(
             cudaFuncSetAttribute(smooth_and_build_gram_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  static_cast<int>(shared_bytes)),
@@ -256,38 +299,28 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
         if (!success) continue;
 
         smooth_and_build_gram_kernel<<<static_cast<unsigned int>(group_size), block_size, shared_bytes, stream>>>(
-            dev_bounds, dev_metadata, dev_group_indices, dev_gram_matrices, num_atoms);
+            dev_bounds, dev_metadata, dev_group_indices, dev_gram_matrices, bin_n);
         success &= check_cuda_status_(cudaGetLastError(), "smooth_and_build_gram_kernel launch");
         if (!success) continue;
 
-        // Workspace size was probed at context creation (ensure_metric_scratch) and
-        // fits the worst-case (max_group_size × max_atoms × max_atoms).  No bufferSize
-        // query here — that call is synchronous and was a per-chunk CPU stall.
         success &= check_cusolver_status_(
             cusolverDnSsyevjBatched(solver_handle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER,
-                                    static_cast<int>(num_atoms), dev_gram_matrices, static_cast<int>(num_atoms),
+                                    static_cast<int>(bin_n), dev_gram_matrices, static_cast<int>(bin_n),
                                     dev_eigenvalues, dev_workspace, lwork, dev_info, scratch.syevj_params,
                                     static_cast<int>(group_size)),
             "cusolverDnSsyevjBatched");
         if (!success) continue;
 
-        // We deliberately do not read dev_info back here.  The previous sync version
-        // that did caused a ~800 ms CPU stall per chunk per GPU.  cuSOLVER failures on
-        // Gram matrices from well-formed bounds are vanishingly rare; when they do
-        // happen the downstream ETKDG/MMFF kernels report affected conformers as
-        // stereo_failure / mmff_unconverged anyway.
-
         project_metric_coordinates_kernel<<<static_cast<unsigned int>(group_size), block_size, 0, stream>>>(
-            dev_gram_matrices, dev_eigenvalues, dev_group_indices, dev_initial_coordinates, max_atoms_per_molecule,
-            num_atoms);
+            dev_gram_matrices, dev_eigenvalues, dev_metadata, dev_group_indices, dev_initial_coordinates,
+            max_atoms_per_molecule, bin_n);
         success &= check_cuda_status_(cudaGetLastError(), "project_metric_coordinates_kernel launch");
     }
 
     // Solver handle is owned by the caller (context_t) — do NOT destroy it here.
     // No final stream sync: the prepass is stream-ordered with whatever work the
-    // caller launches next on the same stream, so blocking the CPU here would defeat
-    // the pipelined dispatcher.  Caller's `finalize_gpu_pipeline` syncs the stream
-    // once per chunk, which is enough.
+    // caller launches next on the same stream.  Caller's `finalize_gpu_pipeline`
+    // syncs the stream once per chunk, which is enough.
     return success;
 }
 
