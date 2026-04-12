@@ -65,14 +65,16 @@ struct etkdg_prepared_molecule_t {
     std::vector<chiral_center_descriptor_t> chiral_centers;
     std::vector<etk_torsion_descriptor_t> etk_torsions;
     std::vector<distance_constraint_t> distance_constraints; ///< 1-2 bond, 1-3 angle
-    // MMFF94 force field parameters (stage 9).
-    std::vector<mmff94_nonbonded_pair_t> mmff_nonbonded;
+    // MMFF94 per-atom data (kernel enumerates nonbonded pairs on-the-fly from bond_distance).
+    std::vector<mmff94_atom_vdw_params_t> mmff_atom_vdw; ///< one per atom
+    std::vector<float> mmff_atom_charge;                 ///< one per atom
+    std::vector<std::uint8_t> bond_distance;             ///< N x N BFS matrix (copy of descriptor's)
     std::vector<mmff94_bond_t> mmff_bonds;
     std::vector<mmff94_angle_t> mmff_angles;
     std::vector<mmff94_torsion_t> mmff_torsions;
     std::vector<mmff94_oop_t> mmff_oops;
     std::vector<mmff94_stretchbend_t> mmff_stretchbends;
-    // Per-atom MMFF94 interaction lists built from the term arrays above.
+    // Per-atom MMFF94 interaction lists (no nonbonded entries).
     std::vector<mmff94_atom_interaction_t> mmff_interactions;
     std::vector<mmff94_atom_offsets_t> mmff_atom_offsets;
     // Per-atom ETK interaction lists (torsions + distance constraints).
@@ -468,7 +470,9 @@ inline void build_etk_interaction_lists(etkdg_prepared_molecule_t &result) {
  */
 inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
                                   etkdg_prepared_molecule_t &result) {
-    result.mmff_nonbonded.clear();
+    result.mmff_atom_vdw.clear();
+    result.mmff_atom_charge.clear();
+    result.bond_distance.clear();
     result.mmff_bonds.clear();
     result.mmff_angles.clear();
     result.mmff_torsions.clear();
@@ -483,45 +487,36 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
 
     std::uint32_t const num_atoms = desc.num_atoms;
 
-    // Cache partial charges in a single pass.
-    float charges[128];
-    for (std::uint32_t i = 0; i < num_atoms; ++i) charges[i] = static_cast<float>(mmff_props.getMMFFPartialCharge(i));
-
-    // Build nonbonded pairs using descriptor's bond_distance for O(1) exclusion detection.
-    // Excluded: bond_distance == 1 (1-2) or == 2 (1-3). 1-4: bond_distance == 3.
-    //
-    // VdW optimization: RDKit's MMFFMolProperties::getMMFFVdWParams(i, j) does a pair of
-    // singleton-map lookups on atom type → MMFFVdW params for EACH of N²/2 pairs.
-    // We hoist those lookups to a per-atom pass (N lookups), cache the pointers, and call
-    // the Halgren combining-rule helpers directly. Eliminates ~N²/2 binary searches plus
-    // the per-call MMFFVdWRijstarEps stack object and the isValid() branch.
-    {
-        auto const *mmff_vdw_coll = RDKit::MMFF::DefaultParameters::getMMFFVdW();
-        ForceFields::MMFF::MMFFVdW const *per_atom_vdw[128] = {nullptr};
-        for (std::uint32_t a = 0; a < num_atoms; ++a) {
-            std::uint32_t const atom_type = mmff_props.getMMFFAtomType(a);
-            per_atom_vdw[a] = (*mmff_vdw_coll)(atom_type);
+    // Per-atom data: VdW params + partial charge.  The kernel's nonbonded loop enumerates
+    // pairs on the fly from the bond_distance matrix and applies Halgren's R* combining
+    // rule plus Slater-Kirkwood epsilon combining inline — no per-pair host emission.
+    result.mmff_atom_vdw.resize(num_atoms);
+    result.mmff_atom_charge.resize(num_atoms);
+    auto const *mmff_vdw_coll = RDKit::MMFF::DefaultParameters::getMMFFVdW();
+    for (std::uint32_t a = 0; a < num_atoms; ++a) {
+        std::uint32_t const atom_type = mmff_props.getMMFFAtomType(a);
+        ForceFields::MMFF::MMFFVdW const *vdw = (*mmff_vdw_coll)(atom_type);
+        mmff94_atom_vdw_params_t params {};
+        if (vdw) {
+            params.alpha = static_cast<float>(vdw->alpha_i);
+            params.n_effective = static_cast<float>(vdw->N_i);
+            params.a_scale = static_cast<float>(vdw->A_i);
+            params.g_factor = static_cast<float>(vdw->G_i);
+            params.r_star = static_cast<float>(vdw->R_star);
+            // DA flag: RDKit stores the character 'D'/'A'/'-' in vdw->DA.
+            params.donor_acceptor = (vdw->DA == 'D') ? 2 : (vdw->DA == 'A') ? 1 : 0;
         }
-        for (std::uint32_t i = 0; i < num_atoms; ++i) {
-            auto const *vdw_i = per_atom_vdw[i];
-            if (vdw_i == nullptr) continue;
-            for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
-                std::uint8_t const d = bonds_between(desc, i, j);
-                if (d <= 2) continue; // 1-2 or 1-3 excluded
-                auto const *vdw_j = per_atom_vdw[j];
-                if (vdw_j == nullptr) continue;
-
-                double r_star = ForceFields::MMFF::Utils::calcUnscaledVdWMinimum(mmff_vdw_coll, vdw_i, vdw_j);
-                double epsilon = ForceFields::MMFF::Utils::calcUnscaledVdWWellDepth(r_star, vdw_i, vdw_j);
-                ForceFields::MMFF::Utils::scaleVdWParams(r_star, epsilon, mmff_vdw_coll, vdw_i, vdw_j);
-
-                std::uint8_t const is_1_4 = (d == 3) ? 1 : 0;
-                result.mmff_nonbonded.push_back({static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(j), is_1_4, 0,
-                                                 static_cast<float>(epsilon), static_cast<float>(r_star),
-                                                 charges[i] * charges[j]});
-            }
-        }
+        result.mmff_atom_vdw[a] = params;
+        result.mmff_atom_charge[a] = static_cast<float>(mmff_props.getMMFFPartialCharge(a));
     }
+
+    // Copy the N x N bond_distance slice from the descriptor into a per-molecule packed
+    // block (no 128-row stride).  The kernel reads bond_distance[i * N + j] with N =
+    // meta.num_atoms.
+    result.bond_distance.resize(static_cast<std::size_t>(num_atoms) * num_atoms);
+    for (std::uint32_t i = 0; i < num_atoms; ++i)
+        for (std::uint32_t j = 0; j < num_atoms; ++j)
+            result.bond_distance[i * num_atoms + j] = desc.bond_distance[i * max_atoms_k + j];
 
     // Build bond terms — iterate descriptor's bond list (no RDKit traversal).
     for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
@@ -633,8 +628,8 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
         }
     }
 
-    // Build per-atom interaction lists in two passes without vector-of-vectors.
-    auto const &nonbonded = result.mmff_nonbonded;
+    // Build per-atom interaction lists for bonded terms only.  Nonbonded pairs are
+    // enumerated on the GPU from bond_distance — they do not go into the CSR.
     auto const &bonds = result.mmff_bonds;
     auto const &angles = result.mmff_angles;
     auto const &torsions = result.mmff_torsions;
@@ -643,13 +638,9 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
 
     // pass 1: count per-type interactions per atom
     struct per_atom_counts_t {
-        std::uint8_t nonbonded, bond, angle, torsion, oop, stretchbend;
+        std::uint8_t bond, angle, torsion, oop, stretchbend;
     };
-    std::vector<per_atom_counts_t> type_counts(num_atoms, {0, 0, 0, 0, 0, 0});
-    for (auto const &p : nonbonded) {
-        type_counts[p.atom_i].nonbonded++;
-        type_counts[p.atom_j].nonbonded++;
-    }
+    std::vector<per_atom_counts_t> type_counts(num_atoms, {0, 0, 0, 0, 0});
     for (auto const &b : bonds) {
         type_counts[b.atom_i].bond++;
         type_counts[b.atom_j].bond++;
@@ -677,15 +668,12 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
         type_counts[s.atom_k].stretchbend++;
     }
 
-    // compute per-type offsets: all nonbonded first, then bonds, then angles, etc.
+    // compute per-type offsets: bonds first, then angles, etc.  No nonbonded range.
     result.mmff_atom_offsets.resize(num_atoms);
     std::uint32_t running = 0;
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
         auto const &counts = type_counts[atom];
         auto &offsets = result.mmff_atom_offsets[atom];
-        offsets.nonbonded_start = static_cast<std::uint32_t>(running);
-        offsets.nonbonded_count = counts.nonbonded;
-        running += counts.nonbonded;
         offsets.bond_start = static_cast<std::uint32_t>(running);
         offsets.bond_count = counts.bond;
         running += counts.bond;
@@ -709,21 +697,14 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
 
     // per-type cursors per atom
     struct per_atom_cursors_t {
-        std::uint32_t nonbonded, bond, angle, torsion, oop, stretchbend;
+        std::uint32_t bond, angle, torsion, oop, stretchbend;
     };
     std::vector<per_atom_cursors_t> cursors(num_atoms);
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
         auto const &off = result.mmff_atom_offsets[atom];
-        cursors[atom] = {off.nonbonded_start, off.bond_start, off.angle_start,
-                         off.torsion_start,   off.oop_start,  off.stretchbend_start};
+        cursors[atom] = {off.bond_start, off.angle_start, off.torsion_start, off.oop_start, off.stretchbend_start};
     }
 
-    for (std::uint32_t term = 0; term < nonbonded.size(); ++term) {
-        result.mmff_interactions[cursors[nonbonded[term].atom_i].nonbonded++] = {term, mmff94_nonbonded_k,
-                                                                                 atom_role_first_k};
-        result.mmff_interactions[cursors[nonbonded[term].atom_j].nonbonded++] = {term, mmff94_nonbonded_k,
-                                                                                 atom_role_second_k};
-    }
     for (std::uint32_t term = 0; term < bonds.size(); ++term) {
         result.mmff_interactions[cursors[bonds[term].atom_i].bond++] = {term, mmff94_bond_k, atom_role_first_k};
         result.mmff_interactions[cursors[bonds[term].atom_j].bond++] = {term, mmff94_bond_k, atom_role_second_k};
@@ -818,7 +799,6 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string_view smiles) {
     result.metadata.num_chiral_centers = static_cast<std::uint32_t>(result.chiral_centers.size());
     result.metadata.num_etk_torsions = static_cast<std::uint32_t>(result.etk_torsions.size());
     result.metadata.num_distance_constraints = static_cast<std::uint32_t>(result.distance_constraints.size());
-    result.metadata.num_mmff_nonbonded = static_cast<std::uint32_t>(result.mmff_nonbonded.size());
     result.metadata.num_mmff_bonds = static_cast<std::uint32_t>(result.mmff_bonds.size());
     result.metadata.num_mmff_angles = static_cast<std::uint32_t>(result.mmff_angles.size());
     result.metadata.num_mmff_torsions = static_cast<std::uint32_t>(result.mmff_torsions.size());
@@ -828,7 +808,9 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string_view smiles) {
     result.metadata.chiral_offset = 0;
     result.metadata.torsion_offset = 0;
     result.metadata.constraint_offset = 0;
-    result.metadata.mmff_nonbonded_offset = 0;
+    result.metadata.mmff_atom_vdw_offset = 0;
+    result.metadata.mmff_atom_charge_offset = 0;
+    result.metadata.bond_distance_offset = 0;
     result.metadata.mmff_bond_offset = 0;
     result.metadata.mmff_angle_offset = 0;
     result.metadata.mmff_torsion_offset = 0;
@@ -868,7 +850,9 @@ struct alignas(64) per_mol_sizes_t {
     std::uint32_t chirals;
     std::uint32_t torsions;
     std::uint32_t dcons;
-    std::uint32_t mmff_nonbonded;
+    std::uint32_t mmff_atom_vdw;    ///< = num_atoms for valid mols
+    std::uint32_t mmff_atom_charge; ///< = num_atoms for valid mols
+    std::uint32_t bond_distance;    ///< = num_atoms² for valid mols
     std::uint32_t mmff_bonds;
     std::uint32_t mmff_angles;
     std::uint32_t mmff_torsions;
@@ -879,9 +863,9 @@ struct alignas(64) per_mol_sizes_t {
     std::uint32_t etk_interactions;
     std::uint32_t etk_atom_offsets;
     std::uint32_t valid; ///< 0 if the molecule failed preprocessing, 1 otherwise
-    std::uint32_t padding;
+    std::uint32_t padding[3];
 };
-static_assert(sizeof(per_mol_sizes_t) == 64, "per_mol_sizes_t must be exactly one cache line");
+static_assert(sizeof(per_mol_sizes_t) == 128, "per_mol_sizes_t must be two cache lines");
 
 /** Field-wise sum used both by the prefix scan and as the identity-additive operation. */
 constexpr per_mol_sizes_t operator+(per_mol_sizes_t a, per_mol_sizes_t const &b) {
@@ -889,7 +873,9 @@ constexpr per_mol_sizes_t operator+(per_mol_sizes_t a, per_mol_sizes_t const &b)
     a.chirals += b.chirals;
     a.torsions += b.torsions;
     a.dcons += b.dcons;
-    a.mmff_nonbonded += b.mmff_nonbonded;
+    a.mmff_atom_vdw += b.mmff_atom_vdw;
+    a.mmff_atom_charge += b.mmff_atom_charge;
+    a.bond_distance += b.bond_distance;
     a.mmff_bonds += b.mmff_bonds;
     a.mmff_angles += b.mmff_angles;
     a.mmff_torsions += b.mmff_torsions;
@@ -911,7 +897,9 @@ inline per_mol_sizes_t extract_sizes(etkdg_prepared_molecule_t const &p) {
     s.chirals = static_cast<std::uint32_t>(p.chiral_centers.size());
     s.torsions = static_cast<std::uint32_t>(p.etk_torsions.size());
     s.dcons = static_cast<std::uint32_t>(p.distance_constraints.size());
-    s.mmff_nonbonded = static_cast<std::uint32_t>(p.mmff_nonbonded.size());
+    s.mmff_atom_vdw = static_cast<std::uint32_t>(p.mmff_atom_vdw.size());
+    s.mmff_atom_charge = static_cast<std::uint32_t>(p.mmff_atom_charge.size());
+    s.bond_distance = static_cast<std::uint32_t>(p.bond_distance.size());
     s.mmff_bonds = static_cast<std::uint32_t>(p.mmff_bonds.size());
     s.mmff_angles = static_cast<std::uint32_t>(p.mmff_angles.size());
     s.mmff_torsions = static_cast<std::uint32_t>(p.mmff_torsions.size());
@@ -942,7 +930,9 @@ inline etkdg_molecule_metadata_t make_meta(etkdg_molecule_metadata_t base, per_m
     base.chiral_offset = o.chirals;
     base.torsion_offset = o.torsions;
     base.constraint_offset = o.dcons;
-    base.mmff_nonbonded_offset = o.mmff_nonbonded;
+    base.mmff_atom_vdw_offset = o.mmff_atom_vdw;
+    base.mmff_atom_charge_offset = o.mmff_atom_charge;
+    base.bond_distance_offset = o.bond_distance;
     base.mmff_bond_offset = o.mmff_bonds;
     base.mmff_angle_offset = o.mmff_angles;
     base.mmff_torsion_offset = o.mmff_torsions;
@@ -974,8 +964,12 @@ inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::u
     layout.count_torsions = totals.torsions;
     layout.offset_distance_cons = place_region_<distance_constraint_t>(running, totals.dcons);
     layout.count_distance_cons = totals.dcons;
-    layout.offset_mmff_nonbonded = place_region_<mmff94_nonbonded_pair_t>(running, totals.mmff_nonbonded);
-    layout.count_mmff_nonbonded = totals.mmff_nonbonded;
+    layout.offset_mmff_atom_vdw = place_region_<mmff94_atom_vdw_params_t>(running, totals.mmff_atom_vdw);
+    layout.count_mmff_atom_vdw = totals.mmff_atom_vdw;
+    layout.offset_mmff_atom_charge = place_region_<float>(running, totals.mmff_atom_charge);
+    layout.count_mmff_atom_charge = totals.mmff_atom_charge;
+    layout.offset_bond_distance = place_region_<std::uint8_t>(running, totals.bond_distance);
+    layout.count_bond_distance = totals.bond_distance;
     layout.offset_mmff_bonds = place_region_<mmff94_bond_t>(running, totals.mmff_bonds);
     layout.count_mmff_bonds = totals.mmff_bonds;
     layout.offset_mmff_angles = place_region_<mmff94_angle_t>(running, totals.mmff_angles);
@@ -1079,7 +1073,9 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
     auto chirals_span = batch.chiral_centers();
     auto torsions_span = batch.etk_torsions();
     auto dcons_span = batch.distance_constraints();
-    auto mmff_nb_span = batch.mmff_nonbonded();
+    auto mmff_vdw_span = batch.mmff_atom_vdw();
+    auto mmff_charge_span = batch.mmff_atom_charge();
+    auto bond_distance_span = batch.bond_distance();
     auto mmff_bonds_span = batch.mmff_bonds();
     auto mmff_angles_span = batch.mmff_angles();
     auto mmff_tors_span = batch.mmff_torsions();
@@ -1105,7 +1101,9 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
         append_slice(chirals_span, o.chirals, p.chiral_centers);
         append_slice(torsions_span, o.torsions, p.etk_torsions);
         append_slice(dcons_span, o.dcons, p.distance_constraints);
-        append_slice(mmff_nb_span, o.mmff_nonbonded, p.mmff_nonbonded);
+        append_slice(mmff_vdw_span, o.mmff_atom_vdw, p.mmff_atom_vdw);
+        append_slice(mmff_charge_span, o.mmff_atom_charge, p.mmff_atom_charge);
+        append_slice(bond_distance_span, o.bond_distance, p.bond_distance);
         append_slice(mmff_bonds_span, o.mmff_bonds, p.mmff_bonds);
         append_slice(mmff_angles_span, o.mmff_angles, p.mmff_angles);
         append_slice(mmff_tors_span, o.mmff_torsions, p.mmff_torsions);
@@ -1119,7 +1117,6 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
         // fields to rebase in one memcpy, so do it inline.
         for (std::size_t k = 0; k < p.mmff_atom_offsets.size(); ++k) {
             auto entry = p.mmff_atom_offsets[k];
-            entry.nonbonded_start += o.mmff_interactions;
             entry.bond_start += o.mmff_interactions;
             entry.angle_start += o.mmff_interactions;
             entry.torsion_start += o.mmff_interactions;

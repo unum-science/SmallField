@@ -145,8 +145,12 @@ struct batch_layout_t {
     std::size_t count_torsions = 0; // etk_torsion_descriptor_t
     std::size_t offset_distance_cons = 0;
     std::size_t count_distance_cons = 0; // distance_constraint_t
-    std::size_t offset_mmff_nonbonded = 0;
-    std::size_t count_mmff_nonbonded = 0; // mmff94_nonbonded_pair_t
+    std::size_t offset_mmff_atom_vdw = 0;
+    std::size_t count_mmff_atom_vdw = 0; // mmff94_atom_vdw_params_t (one per atom)
+    std::size_t offset_mmff_atom_charge = 0;
+    std::size_t count_mmff_atom_charge = 0; // float (one per atom)
+    std::size_t offset_bond_distance = 0;
+    std::size_t count_bond_distance = 0; // std::uint8_t (N² per molecule)
     std::size_t offset_mmff_bonds = 0;
     std::size_t count_mmff_bonds = 0; // mmff94_bond_t
     std::size_t offset_mmff_angles = 0;
@@ -229,8 +233,14 @@ struct batch_pool_view_t {
     std::span<distance_constraint_t> distance_constraints() const noexcept {
         return region<distance_constraint_t>(layout->offset_distance_cons, layout->count_distance_cons);
     }
-    std::span<mmff94_nonbonded_pair_t> mmff_nonbonded() const noexcept {
-        return region<mmff94_nonbonded_pair_t>(layout->offset_mmff_nonbonded, layout->count_mmff_nonbonded);
+    std::span<mmff94_atom_vdw_params_t> mmff_atom_vdw() const noexcept {
+        return region<mmff94_atom_vdw_params_t>(layout->offset_mmff_atom_vdw, layout->count_mmff_atom_vdw);
+    }
+    std::span<float> mmff_atom_charge() const noexcept {
+        return region<float>(layout->offset_mmff_atom_charge, layout->count_mmff_atom_charge);
+    }
+    std::span<std::uint8_t> bond_distance() const noexcept {
+        return region<std::uint8_t>(layout->offset_bond_distance, layout->count_bond_distance);
     }
     std::span<mmff94_bond_t> mmff_bonds() const noexcept {
         return region<mmff94_bond_t>(layout->offset_mmff_bonds, layout->count_mmff_bonds);
@@ -290,7 +300,9 @@ struct batch_pool_t {
     std::span<chiral_center_descriptor_t> chiral_centers() noexcept { return host_view().chiral_centers(); }
     std::span<etk_torsion_descriptor_t> etk_torsions() noexcept { return host_view().etk_torsions(); }
     std::span<distance_constraint_t> distance_constraints() noexcept { return host_view().distance_constraints(); }
-    std::span<mmff94_nonbonded_pair_t> mmff_nonbonded() noexcept { return host_view().mmff_nonbonded(); }
+    std::span<mmff94_atom_vdw_params_t> mmff_atom_vdw() noexcept { return host_view().mmff_atom_vdw(); }
+    std::span<float> mmff_atom_charge() noexcept { return host_view().mmff_atom_charge(); }
+    std::span<std::uint8_t> bond_distance() noexcept { return host_view().bond_distance(); }
     std::span<mmff94_bond_t> mmff_bonds() noexcept { return host_view().mmff_bonds(); }
     std::span<mmff94_angle_t> mmff_angles() noexcept { return host_view().mmff_angles(); }
     std::span<mmff94_torsion_t> mmff_torsions() noexcept { return host_view().mmff_torsions(); }

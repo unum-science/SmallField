@@ -15,8 +15,8 @@ using namespace smallfield;
 using namespace smallfield::test;
 
 extern "C" void gpu_mmff_energy(float const *host_positions, std::uint32_t num_atoms,
-                                mmff94_nonbonded_pair_t const *host_nonbonded_params,
-                                std::uint32_t num_nonbonded_params, mmff94_bond_t const *host_bond_params,
+                                mmff94_atom_vdw_params_t const *host_atom_vdw, float const *host_atom_charge,
+                                std::uint8_t const *host_bond_distance, mmff94_bond_t const *host_bond_params,
                                 std::uint32_t num_bond_params, mmff94_angle_t const *host_angle_params,
                                 std::uint32_t num_angle_params, mmff94_torsion_t const *host_torsion_params,
                                 std::uint32_t num_torsion_params, mmff94_oop_t const *host_oop_params,
@@ -44,8 +44,9 @@ void evaluate_mmff_energy_and_gradient(etkdg_prepared_molecule_t const &prepared
                                        std::vector<float> &gradient_out) {
     gradient_out.assign(positions_soa.size(), 0.0f);
     gpu_mmff_energy(positions_soa.data(), prepared.num_atoms,
-                    prepared.mmff_nonbonded.empty() ? nullptr : prepared.mmff_nonbonded.data(),
-                    static_cast<std::uint32_t>(prepared.mmff_nonbonded.size()),
+                    prepared.mmff_atom_vdw.empty() ? nullptr : prepared.mmff_atom_vdw.data(),
+                    prepared.mmff_atom_charge.empty() ? nullptr : prepared.mmff_atom_charge.data(),
+                    prepared.bond_distance.empty() ? nullptr : prepared.bond_distance.data(),
                     prepared.mmff_bonds.empty() ? nullptr : prepared.mmff_bonds.data(),
                     static_cast<std::uint32_t>(prepared.mmff_bonds.size()),
                     prepared.mmff_angles.empty() ? nullptr : prepared.mmff_angles.data(),

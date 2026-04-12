@@ -58,13 +58,14 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t chiral_offset;
     std::uint32_t torsion_offset;
     std::uint32_t constraint_offset;
-    std::uint32_t num_mmff_nonbonded;
     std::uint32_t num_mmff_bonds;
     std::uint32_t num_mmff_angles;
     std::uint32_t num_mmff_torsions;
     std::uint32_t num_mmff_oops;
     std::uint32_t num_mmff_stretchbends;
-    std::uint32_t mmff_nonbonded_offset;
+    std::uint32_t mmff_atom_vdw_offset;    ///< offset into batched per-atom VdW params (= atom offset)
+    std::uint32_t mmff_atom_charge_offset; ///< offset into batched per-atom charge (= atom offset)
+    std::uint32_t bond_distance_offset;    ///< offset into batched per-molecule N×N bond_distance
     std::uint32_t mmff_bond_offset;
     std::uint32_t mmff_angle_offset;
     std::uint32_t mmff_torsion_offset;
@@ -120,18 +121,26 @@ struct alignas(16) distance_constraint_t {
 };
 
 /**
- *  MMFF94 nonbonded pair (VdW + electrostatic). 16 bytes.
- *  Each pair stored once (not symmetric like neighbor_t).
+ *  @brief Per-atom MMFF94 VdW parameters.
+ *
+ *  Stored once per atom; combined pairwise inside the kernel via Halgren's
+ *  combining rule (R*_ij) and Slater-Kirkwood (epsilon_ij).  Replaces the
+ *  materialized nonbonded pair array — the kernel enumerates pairs on the
+ *  fly from the descriptor's `bond_distance` matrix.
+ *
+ *  Matches the atom-level data surfaced by RDKit's MMFFVdW entry plus
+ *  the donor-acceptor flag used by `scaleVdWParams`.
  */
-struct alignas(16) mmff94_nonbonded_pair_t {
-    std::uint8_t atom_i; ///< first atom index within molecule
-    std::uint8_t atom_j; ///< second atom index within molecule
-    std::uint8_t is_1_4; ///< 1 if 1-4 pair (scaled electrostatics), 0 otherwise
-    std::uint8_t padding;
-    float epsilon;        ///< VdW well depth (kcal/mol)
-    float r_star;         ///< VdW equilibrium distance (angstroms)
-    float charge_product; ///< qi * qj (precomputed)
+struct alignas(8) mmff94_atom_vdw_params_t {
+    float alpha;                 ///< polarizability (α)
+    float n_effective;           ///< effective number of valence electrons (N)
+    float a_scale;               ///< A_i — preserved for parity with other MMFF variants
+    float g_factor;              ///< G_i (Slater-Kirkwood factor)
+    float r_star;                ///< this atom's VdW radius (R*)
+    std::uint8_t donor_acceptor; ///< 0 = '-', 1 = 'A' acceptor, 2 = 'D' donor
+    std::uint8_t padding[3];
 };
+static_assert(sizeof(mmff94_atom_vdw_params_t) == 24);
 
 /**
  *  @brief MMFF94 bond stretching term.
@@ -221,21 +230,22 @@ struct mmff94_atom_interaction_t {
 
 /**
  *  @brief Per-atom per-type offsets into the MMFF94 interaction list.
+ *
+ *  No `nonbonded_*` fields — the nonbonded kernel loop enumerates pairs
+ *  on the fly from the `bond_distance` matrix.
  */
 struct mmff94_atom_offsets_t {
-    std::uint32_t nonbonded_start;
     std::uint32_t bond_start;
     std::uint32_t angle_start;
     std::uint32_t torsion_start;
     std::uint32_t oop_start;
     std::uint32_t stretchbend_start;
-    std::uint8_t nonbonded_count;
     std::uint8_t bond_count;
     std::uint8_t angle_count;
     std::uint8_t torsion_count;
     std::uint8_t oop_count;
     std::uint8_t stretchbend_count;
-    std::uint8_t padding[2];
+    std::uint8_t padding[3];
 };
 
 /**

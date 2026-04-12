@@ -63,22 +63,55 @@ __device__ __forceinline__ float3_mmff_t scale_float3_mmff_(float3_mmff_t const 
 /**
  *  @brief Compute nonbonded (VdW + electrostatic) energy and gradient contribution for one atom.
  *
+ *  Inlines Halgren's R* combining rule (with the donor-suppression clause) and
+ *  Slater-Kirkwood's epsilon combining rule, then applies donor-acceptor
+ *  scaling, reproducing RDKit's `calcUnscaledVdWMinimum` + `calcUnscaledVdWWellDepth`
+ *  + `scaleVdWParams` in registers.  Replaces the pre-computed pair-array path.
+ *
  *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
  *  @param[in] num_atoms Number of atoms in the molecule.
  *  @param[in] atom Index of the atom this thread is accumulating for.
- *  @param[in] pair Nonbonded pair descriptor with VdW and electrostatic parameters.
- *  @param[in] role This atom's role in the pair (atom_role_first_k, atom_role_second_k).
- *  @param[in,out] energy Accumulated energy (incremented when @p role is 0).
+ *  @param[in] other Other atom participating in the pair.
+ *  @param[in] p_atom Per-atom VdW params for @p atom.
+ *  @param[in] p_other Per-atom VdW params for @p other.
+ *  @param[in] charge_product Pre-multiplied q_atom * q_other.
+ *  @param[in] is_1_4 Whether bond_distance == 3 (electrostatic scaling applies).
+ *  @param[in] first_endpoint True if this call is from the "lower-index" endpoint —
+ *              only first_endpoint calls accumulate energy to avoid double-counting.
+ *  @param[in,out] energy Accumulated energy (only incremented when @p first_endpoint).
  *  @param[in,out] gradient_x Accumulated x-gradient for @p atom.
  *  @param[in,out] gradient_y Accumulated y-gradient for @p atom.
  *  @param[in,out] gradient_z Accumulated z-gradient for @p atom.
  */
-__device__ __forceinline__ void mmff_nonbonded_contribution_(float const *positions, std::uint32_t num_atoms,
-                                                             std::uint32_t atom, mmff94_nonbonded_pair_t const &pair,
-                                                             atom_role_t role, float *energy, float *gradient_x,
-                                                             float *gradient_y, float *gradient_z) {
+__device__ __forceinline__ void mmff_nonbonded_contribution_(
+    float const *positions, std::uint32_t num_atoms, std::uint32_t atom, std::uint32_t other,
+    mmff94_atom_vdw_params_t const &p_atom, mmff94_atom_vdw_params_t const &p_other, float charge_product, bool is_1_4,
+    bool first_endpoint, float *energy, float *gradient_x, float *gradient_y, float *gradient_z) {
 
-    std::uint32_t const other = (role == atom_role_first_k) ? pair.atom_j : pair.atom_i;
+    // --- Halgren R* combining (donor-suppression clause) + Slater-Kirkwood epsilon ---
+    float const R_i = p_atom.r_star;
+    float const R_j = p_other.r_star;
+    float const gamma = (R_i - R_j) * __frcp_rn(R_i + R_j);
+    bool const has_donor = (p_atom.donor_acceptor == 2) || (p_other.donor_acceptor == 2);
+    float const factor = has_donor ? 0.0f : 0.2f * (1.0f - expf(-12.0f * gamma * gamma));
+    float R_star_ij = 0.5f * (R_i + R_j) * (1.0f + factor);
+
+    float const R2 = R_star_ij * R_star_ij;
+    float const R6 = R2 * R2 * R2;
+    float eps_ij = 181.16f * p_atom.g_factor * p_other.g_factor * p_atom.alpha * p_other.alpha *
+                   __frcp_rn((sqrtf(p_atom.alpha * __frcp_rn(p_atom.n_effective)) +
+                              sqrtf(p_other.alpha * __frcp_rn(p_other.n_effective))) *
+                             R6);
+
+    // Donor-acceptor scaling (RDKit's scaleVdWParams when DA pairing is detected).
+    bool const is_DA = (p_atom.donor_acceptor == 2 && p_other.donor_acceptor == 1) ||
+                       (p_atom.donor_acceptor == 1 && p_other.donor_acceptor == 2);
+    if (is_DA) {
+        R_star_ij *= 0.8f;
+        eps_ij *= 0.5f;
+    }
+
+    // --- Pair geometry ---
     float const ax = positions[atom], ay = positions[num_atoms + atom], az = positions[2 * num_atoms + atom];
     float const bx = positions[other], by = positions[num_atoms + other], bz = positions[2 * num_atoms + other];
     float const dx = bx - ax, dy = by - ay, dz = bz - az;
@@ -86,29 +119,28 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(float const *positi
     float const inverse_distance = rsqrtf(r_sq);
     float const r = r_sq * inverse_distance;
 
-    // VdW: buffered 14-7
-    float const rho = r * __frcp_rn(pair.r_star);
+    // --- VdW buffered 14-7 ---
+    float const rho = r * __frcp_rn(R_star_ij);
     float const rho7 = rho * rho * rho * rho * rho * rho * rho;
     float const rep_d = rho + mmff_vdw_d;
     float const rep_ratio = (1.0f + mmff_vdw_d) * __frcp_rn(rep_d);
     float const rep7 = rep_ratio * rep_ratio * rep_ratio * rep_ratio * rep_ratio * rep_ratio * rep_ratio;
     float const att = (1.0f + mmff_vdw_g) * __frcp_rn(rho7 + mmff_vdw_g) - 2.0f;
-    float const e_vdw = pair.epsilon * rep7 * att;
+    float const e_vdw = eps_ij * rep7 * att;
     float const d_rep = -7.0f * rep7 * __frcp_rn(rep_d);
     float const d_att = -7.0f * (1.0f + mmff_vdw_g) * rho7 * __frcp_rn(rho * (rho7 + mmff_vdw_g) * (rho7 + mmff_vdw_g));
-    float const energy_gradient_vdw = pair.epsilon * (d_rep * att + rep7 * d_att) * __frcp_rn(pair.r_star);
+    float const energy_gradient_vdw = eps_ij * (d_rep * att + rep7 * d_att) * __frcp_rn(R_star_ij);
 
-    // electrostatic
-    float const scale = (pair.is_1_4 != 0) ? mmff_1_4_scale : 1.0f;
+    // --- Electrostatic ---
+    float const scale = is_1_4 ? mmff_1_4_scale : 1.0f;
     float const r_buf = r + mmff_elec_buf;
-    float const e_elec = mmff_coulomb * pair.charge_product * __frcp_rn(r_buf) * scale;
-    float const energy_gradient_electrostatic = -mmff_coulomb * pair.charge_product * __frcp_rn(r_buf * r_buf) * scale;
+    float const e_elec = mmff_coulomb * charge_product * __frcp_rn(r_buf) * scale;
+    float const energy_gradient_electrostatic = -mmff_coulomb * charge_product * __frcp_rn(r_buf * r_buf) * scale;
 
-    // count energy only once per pair (first atom owns the energy)
-    if (role == atom_role_first_k) *energy += e_vdw + e_elec;
+    // Only the lower-index endpoint adds to total energy.
+    if (first_endpoint) *energy += e_vdw + e_elec;
 
     float const energy_gradient_distance = energy_gradient_vdw + energy_gradient_electrostatic;
-    // gradient: ∂E/∂rᵢ = −∂E/∂r · dx/r (dx = other − atom)
     *gradient_x -= energy_gradient_distance * dx * inverse_distance;
     *gradient_y -= energy_gradient_distance * dy * inverse_distance;
     *gradient_z -= energy_gradient_distance * dz * inverse_distance;
@@ -565,29 +597,19 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
 }
 
 /**
- *  @brief MMFF94 energy and gradient evaluation using per-atom interaction lists.
+ *  @brief MMFF94 energy and gradient evaluation.
  *
- *  Zero-waste iteration: each atom only processes its own interactions.
+ *  Nonbonded pairs are enumerated on the fly from the `bond_distance` matrix and
+ *  their parameters are combined in registers; bonded terms still iterate the
+ *  pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) — those terms
+ *  are small and not worth packing out.
  *
  *  @tparam write_gradient  When true, computes and writes gradient; when false, energy only.
- *  @param[in] nonbonded_params Array of nonbonded pair descriptors.
- *  @param[in] bond_params Array of bond stretching descriptors.
- *  @param[in] angle_params Array of angle bending descriptors.
- *  @param[in] torsion_params Array of torsion descriptors.
- *  @param[in] oop_params Array of out-of-plane bending descriptors.
- *  @param[in] stretchbend_params Array of stretch-bend coupling descriptors.
- *  @param[in] interactions Per-atom interaction list entries.
- *  @param[in] atom_offsets Per-atom offsets into the interaction list.
- *  @param[in] num_atoms Number of atoms in the molecule.
- *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
- *  @param[out] gradient Output gradient array (same layout as positions), unused when !write_gradient.
- *  @param[in] num_elements Total number of coordinate elements.
- *  @param[in] lane Warp lane index (0-31).
- *  @return Total energy (same value in all lanes after warp reduction).
  */
 template <bool write_gradient>
 __device__ __forceinline__ float evaluate_mmff94_energy(
-    mmff94_nonbonded_pair_t const *__restrict__ nonbonded_params, mmff94_bond_t const *__restrict__ bond_params,
+    mmff94_atom_vdw_params_t const *__restrict__ atom_vdw_params, float const *__restrict__ atom_charge,
+    std::uint8_t const *__restrict__ bond_distance, mmff94_bond_t const *__restrict__ bond_params,
     mmff94_angle_t const *__restrict__ angle_params, mmff94_torsion_t const *__restrict__ torsion_params,
     mmff94_oop_t const *__restrict__ oop_params, mmff94_stretchbend_t const *__restrict__ stretchbend_params,
     mmff94_atom_interaction_t const *__restrict__ interactions, mmff94_atom_offsets_t const *__restrict__ atom_offsets,
@@ -603,13 +625,27 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
     for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size) {
         float gradient_x = 0.0f, gradient_y = 0.0f, gradient_z = 0.0f;
         auto const &offsets = atom_offsets[atom];
+        mmff94_atom_vdw_params_t const p_atom = atom_vdw_params[atom];
+        float const q_atom = atom_charge[atom];
 
-        // per-type sub-loops: all lanes in the warp execute the same function (zero switch divergence)
-        for (std::uint32_t index = offsets.nonbonded_start; index < offsets.nonbonded_start + offsets.nonbonded_count;
-             ++index)
-            mmff_nonbonded_contribution_(positions, num_atoms, atom, nonbonded_params[interactions[index].term_index],
-                                         interactions[index].role, &total_energy, &gradient_x, &gradient_y,
-                                         &gradient_z);
+        // Nonbonded pairs, enumerated from bond_distance.  Two passes: "j > atom" owns
+        // the pair's energy + adds this atom's gradient contribution as the first
+        // endpoint; "j < atom" adds this atom's gradient contribution as the second
+        // endpoint (no energy — already counted by the other thread when atom < j).
+        for (std::uint32_t j = atom + 1; j < num_atoms; ++j) {
+            std::uint8_t const bd = bond_distance[atom * num_atoms + j];
+            if (bd < 3 || bd == 255) continue;
+            mmff_nonbonded_contribution_(positions, num_atoms, atom, j, p_atom, atom_vdw_params[j],
+                                         q_atom * atom_charge[j], bd == 3, /*first_endpoint=*/true, &total_energy,
+                                         &gradient_x, &gradient_y, &gradient_z);
+        }
+        for (std::uint32_t j = 0; j < atom; ++j) {
+            std::uint8_t const bd = bond_distance[j * num_atoms + atom];
+            if (bd < 3 || bd == 255) continue;
+            mmff_nonbonded_contribution_(positions, num_atoms, atom, j, p_atom, atom_vdw_params[j],
+                                         q_atom * atom_charge[j], bd == 3, /*first_endpoint=*/false, &total_energy,
+                                         &gradient_x, &gradient_y, &gradient_z);
+        }
 
         for (std::uint32_t index = offsets.bond_start; index < offsets.bond_start + offsets.bond_count; ++index)
             mmff_bond_contribution_(positions, num_atoms, atom, bond_params[interactions[index].term_index],
@@ -651,7 +687,9 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
  *  operator() / energy_only() interface expected by fire_minimize_.
  */
 struct mmff94_energy_functor_t {
-    mmff94_nonbonded_pair_t const *__restrict__ nonbonded_params;
+    mmff94_atom_vdw_params_t const *__restrict__ atom_vdw_params;
+    float const *__restrict__ atom_charge;
+    std::uint8_t const *__restrict__ bond_distance;
     mmff94_bond_t const *__restrict__ bond_params;
     mmff94_angle_t const *__restrict__ angle_params;
     mmff94_torsion_t const *__restrict__ torsion_params;
@@ -663,16 +701,16 @@ struct mmff94_energy_functor_t {
 
     __device__ __forceinline__ float operator()(float const *positions, float *gradient, std::uint32_t num_elements,
                                                 std::uint32_t lane) const {
-        return evaluate_mmff94_energy<true>(nonbonded_params, bond_params, angle_params, torsion_params, oop_params,
-                                            stretchbend_params, interactions, atom_offsets, num_atoms, positions,
-                                            gradient, num_elements, lane);
+        return evaluate_mmff94_energy<true>(atom_vdw_params, atom_charge, bond_distance, bond_params, angle_params,
+                                            torsion_params, oop_params, stretchbend_params, interactions, atom_offsets,
+                                            num_atoms, positions, gradient, num_elements, lane);
     }
 
     __device__ __forceinline__ float energy_only(float const *positions, std::uint32_t num_elements,
                                                  std::uint32_t lane) const {
-        return evaluate_mmff94_energy<false>(nonbonded_params, bond_params, angle_params, torsion_params, oop_params,
-                                             stretchbend_params, interactions, atom_offsets, num_atoms, positions,
-                                             nullptr, num_elements, lane);
+        return evaluate_mmff94_energy<false>(atom_vdw_params, atom_charge, bond_distance, bond_params, angle_params,
+                                             torsion_params, oop_params, stretchbend_params, interactions, atom_offsets,
+                                             num_atoms, positions, nullptr, num_elements, lane);
     }
 };
 

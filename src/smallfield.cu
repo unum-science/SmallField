@@ -385,9 +385,10 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes, stream>>>(
             dev_view.bounds_matrices().data(), device_initial_coordinates + wave_start * max_atoms_per_molecule * 4,
             dev_view.chiral_centers().data(), dev_view.etk_torsions().data(), dev_view.distance_constraints().data(),
-            dev_view.etk_interactions().data(), dev_view.etk_atom_offsets().data(), dev_view.mmff_nonbonded().data(),
-            dev_view.mmff_bonds().data(), dev_view.mmff_angles().data(), dev_view.mmff_torsions().data(),
-            dev_view.mmff_oops().data(), dev_view.mmff_stretchbends().data(), dev_view.mmff_interactions().data(),
+            dev_view.etk_interactions().data(), dev_view.etk_atom_offsets().data(), dev_view.mmff_atom_vdw().data(),
+            dev_view.mmff_atom_charge().data(), dev_view.bond_distance().data(), dev_view.mmff_bonds().data(),
+            dev_view.mmff_angles().data(), dev_view.mmff_torsions().data(), dev_view.mmff_oops().data(),
+            dev_view.mmff_stretchbends().data(), dev_view.mmff_interactions().data(),
             dev_view.mmff_atom_offsets().data(), device_metadata_sorted + wave_start,
             handle.device_coords_out.data() + wave_start * num_conformers * max_atoms_per_molecule * 3,
             handle.device_energies_out.data() + wave_start * num_conformers,

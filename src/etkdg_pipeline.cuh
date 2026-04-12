@@ -48,8 +48,11 @@ __host__ __device__ __forceinline__ std::uint32_t align_up_(std::uint32_t value,
 }
 
 __host__ __device__ __forceinline__ std::uint32_t total_mmff_terms_(etkdg_molecule_metadata_t const &meta) {
-    return meta.num_mmff_nonbonded + meta.num_mmff_bonds + meta.num_mmff_angles + meta.num_mmff_torsions +
-           meta.num_mmff_oops + meta.num_mmff_stretchbends;
+    // Nonbonded pairs are enumerated on the fly — approximate their contribution as
+    // N²/2 to keep the "is this a heavy case" heuristic calibrated similarly.
+    std::uint32_t const approx_nonbonded = meta.num_atoms * (meta.num_atoms - 1u) / 2u;
+    return approx_nonbonded + meta.num_mmff_bonds + meta.num_mmff_angles + meta.num_mmff_torsions + meta.num_mmff_oops +
+           meta.num_mmff_stretchbends;
 }
 
 __host__ __device__ __forceinline__ bool is_heavy_refinement_case_(etkdg_molecule_metadata_t const &meta) {
@@ -182,10 +185,11 @@ __global__ void etkdg_pipeline_warp_kernel(
     etk_torsion_descriptor_t const *__restrict__ torsion_terms,
     distance_constraint_t const *__restrict__ distance_constraints,
     etk_atom_interaction_t const *__restrict__ etk_interactions,
-    etk_atom_offsets_t const *__restrict__ etk_atom_offsets,
-    mmff94_nonbonded_pair_t const *__restrict__ mmff_nonbonded_pairs, mmff94_bond_t const *__restrict__ mmff_bond_terms,
-    mmff94_angle_t const *__restrict__ mmff_angle_terms, mmff94_torsion_t const *__restrict__ mmff_torsion_terms,
-    mmff94_oop_t const *__restrict__ mmff_oop_terms, mmff94_stretchbend_t const *__restrict__ mmff_stretchbend_terms,
+    etk_atom_offsets_t const *__restrict__ etk_atom_offsets, mmff94_atom_vdw_params_t const *__restrict__ mmff_atom_vdw,
+    float const *__restrict__ mmff_atom_charge, std::uint8_t const *__restrict__ bond_distance,
+    mmff94_bond_t const *__restrict__ mmff_bond_terms, mmff94_angle_t const *__restrict__ mmff_angle_terms,
+    mmff94_torsion_t const *__restrict__ mmff_torsion_terms, mmff94_oop_t const *__restrict__ mmff_oop_terms,
+    mmff94_stretchbend_t const *__restrict__ mmff_stretchbend_terms,
     mmff94_atom_interaction_t const *__restrict__ mmff_interactions,
     mmff94_atom_offsets_t const *__restrict__ mmff_atom_offsets,
     etkdg_molecule_metadata_t const *__restrict__ molecule_metadata, float *__restrict__ conformer_coordinates_out,
@@ -305,7 +309,9 @@ __global__ void etkdg_pipeline_warp_kernel(
                     // Stage 9: Run MMFF94 polishing in 3D.
                     std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
                     if (total_mmff_terms > 0 && mmff_interactions != nullptr) {
-                        mmff94_energy_functor_t mmff_functor {mmff_nonbonded_pairs + meta.mmff_nonbonded_offset,
+                        mmff94_energy_functor_t mmff_functor {mmff_atom_vdw + meta.mmff_atom_vdw_offset,
+                                                              mmff_atom_charge + meta.mmff_atom_charge_offset,
+                                                              bond_distance + meta.bond_distance_offset,
                                                               mmff_bond_terms + meta.mmff_bond_offset,
                                                               mmff_angle_terms + meta.mmff_angle_offset,
                                                               mmff_torsion_terms + meta.mmff_torsion_offset,

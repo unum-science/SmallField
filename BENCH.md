@@ -47,22 +47,99 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | ------- | ------------------- | ---------------- | ----------------- | ----------- |
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
-| 100,000 | 1,725 mol/s         | 3,123 mol/s      | __5,884 mol/s__   | __1.88×__   |
-| 241,596 | —                   | —                | __4,475 mol/s__   | —           |
+| 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
+| 241,596 | 873 mol/s           | __1,716 mol/s__  | __5,340 mol/s__   | __3.11×__   |
 
-At 241,596 molecules on all 8 GPUs: 53.9 seconds end-to-end (median of 3 runs).
-Quality is unchanged: P50 ≈ 56 kcal/mol vs RDKit 61 kcal/mol, 96 % of conformers successful.
+At 241,596 molecules on all 8 GPUs: 45.2 seconds end-to-end (median of 3 runs post-D).
+Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
 
-Two observations about the 1→8 scaling:
+The 1→8 scaling improved from 1.88× (pre-session) to 3.11× after the session's work (G, H, F, C′, D).
+The path to linear scaling is described in the "Scaling analysis" section below.
 
-1. __1→8 GPU scaling is 1.88×, not 8×.__
-   The ceiling is not the GPU kernel itself — kernel-only throughput at 241K is 15,895 mol/s on 8 GPUs.
-   The remaining wall is (a) per-GPU fixed overhead in the metric embedding prepass (~800 ms of cusolver CPU-side setup per chunk), and (b) CPU preprocessing of chunk 0 that cannot yet be overlapped with anything.
+## Scaling analysis (241,596 molecules)
 
-2. __Multi-GPU throughput is now stable at 5,884 mol/s from 100K upward.__
-   The earlier regression at 241K (4,356 mol/s) came from the serial Phase 2 pack, which is now parallelized.
+### Terminology
+
+- __chunk__ — a slice of the input batch.
+  `generate_conformers` splits input into chunks of ≤50,000 molecules so CPU prep of chunk N+1 overlaps GPU work of chunk N.
+  At 241K input there are ~5 chunks of ~48K molecules each.
+- __per-GPU slice__ — the portion of one chunk assigned to one GPU.
+  At 8 GPUs that's ~48K / 8 = 6,000 molecules per GPU per chunk.
+- __launch__ — one `launch_gpu_pipeline` call: one chunk's slice on one GPU.
+  8 launches per chunk when running on 8 GPUs.
+
+### GPU scaling (SmallField) on 241K
+
+| Config | Wall time | Throughput | Scaling |
+|--------|-----------|------------|---------|
+| 1 GPU  | 140.8 s   | 1,716 mol/s | 1.0×    |
+| 8 GPUs | 45.2 s    | 5,340 mol/s | 3.11×   |
+
+Observed per-launch wall (instrumentation, post-D): `setup=0.3 mallocpool=0 upload=0.2 metric=400–560 kernels_post=0.2 total≈400–560 ms`.
+
+### CPU scaling (RDKit) on 241K
+
+| OMP threads | Throughput      | Notes |
+|-------------|-----------------|-------|
+| 192         | 873 mol/s       | Allocator + NUMA overhead dominates; worse than smaller batches |
+| 192 (8,948 mol batch) | 1,672 mol/s | Peak CPU throughput |
+
+RDKit's `MMFFMolProperties` per-molecule heap traffic (internal lookup tables + exclusion matrices) scales poorly on large batches because the allocator starts contending.
+Peak CPU throughput is ~1,700 mol/s regardless of core count beyond 96.
+
+### Where the per-chunk 9 s/chunk wall time goes at 8 GPUs
+
+45.2 s end-to-end / 5 chunks = __9 s per chunk__ on 8 GPUs.
+Breakdown:
+
+| Phase                              | Per chunk          | Notes |
+|------------------------------------|--------------------|-------|
+| CPU `prepare_molecule_batch`       | ~5 s               | OpenMP parallel, 192 threads |
+| Dispatcher (8 sequential launches) | ~4 s (500 ms × 8)  | Single-threaded; one thread calls `launch_gpu_pipeline` 8× |
+| Kernel (wall, 8 GPUs concurrent)   | ~0.5 s             | GPU is idle most of the chunk |
+
+CPU prep and dispatcher partially overlap via the chunk ring buffer, but the dispatcher is now the critical path because it's sequential across GPUs.
+
+### Why 1→8 scaling is 3.11× not 8×
+
+Three compounding factors:
+
+1. __Dispatcher is single-threaded and sequential across GPUs.__
+   Per-launch wall is ~500 ms.
+   At 1 GPU that's 0.5 s/chunk; at 8 GPUs that's 4 s/chunk.
+   The dispatcher grows linearly with GPU count while the GPU work shrinks — the curves cross past ~4 GPUs.
+2. __CPU prep is constant per chunk regardless of GPU count.__  ~5 s/chunk × 5 chunks = 25 s of CPU work.
+   At 1 GPU the GPU work (~30 s of kernel) dominates, so CPU prep fully overlaps.
+   At 8 GPUs the GPU work drops to ~4 s/chunk and CPU prep becomes the tail.
+3. __Metric prepass CPU overhead per launch.__
+   Even after the 8-bin fix (G), each launch spends ~400–560 ms of CPU time setting up and calling `cusolverDnSsyevjBatched` 8 times.
+   That's ~8 × 60 ms per bin — cusolver has non-trivial state-update work per call that isn't pure stream enqueue.
 
 ## Optimizations that landed
+
+### MMFF nonbonded pair enumeration on GPU (workstream D)
+
+`extract_mmff94_params` used to materialize a `std::vector<mmff94_nonbonded_pair_t>` with every non-excluded (i, j) pair — up to N(N-1)/2 × 16 B = 128 KB per N=128 molecule, ~6.4 GB per 50K-molecule chunk.
+The kernel iterated a per-atom CSR into that pair array.
+
+The rewrite uploads __per-atom__ MMFF data instead:
+
+- `mmff94_atom_vdw_params_t` (α, N, A, G, R*, donor/acceptor flag) — 24 B per atom.
+- `mmff_atom_charge` — 4 B per atom.
+- `bond_distance` — 1 B × N² per molecule (copied from the descriptor's BFS matrix).
+
+Inside the nonbonded kernel loop, each atom enumerates partners from `bond_distance[i][j] > 3` and combines pair parameters inline using RDKit's Halgren R* rule (with the donor-suppression clause) + Slater-Kirkwood ε combining + donor-acceptor scaling.
+The combining constants (B=0.2, β=12, DARAD=0.8, DAEPS=0.5) match `MMFFDefaultParameters::getMMFFVdW()` exactly.
+
+Two kernel sub-loops preserve the existing role-first / role-second symmetry: `j > atom` owns the pair's energy + this atom's gradient as the first endpoint; `j < atom` adds only this atom's gradient as the second endpoint.
+
+Upload savings: ~6.4 GB → ~180 MB per chunk (35× reduction).
+Also eliminates the O(N²) CPU pair-construction loop inside `extract_mmff94_params`.
+
+Validation: `test_mmff_gradient` (the MMFF parity test against RDKit) passes within its existing tolerance.
+2K-mol quality gate: P50 = 73 kcal/mol vs RDKit 78.
+
+End-to-end impact (241K × 8 GPU median of 3 runs): 53.9 s → 45.2 s (+19 %).
 
 ### Metric prepass 8-bin padded syevjBatched
 
