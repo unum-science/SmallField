@@ -6,6 +6,41 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+# Default build type: Release with host-native vectorization and CUDA fast-math.
+# The default CMake `Release` uses `-O3 -DNDEBUG` for CXX; we additionally enable
+# `-march=native` so the AVX-512 on Xeon 6776P is actually used, and
+# `--use_fast_math` on nvcc which maps `expf`/`logf`/`sqrtf`/etc. to their hardware
+# intrinsic variants.  Users can override with `-DCMAKE_BUILD_TYPE=Debug` or by
+# passing their own `-DCMAKE_CXX_FLAGS_RELEASE=...`.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    message(STATUS "Defaulting to Release build (use -DCMAKE_BUILD_TYPE=... to override)")
+endif()
+# Append our performance flags to the Release preset without clobbering any the
+# user may have set.  AppendStringsToCache would be cleaner; we do the explicit
+# form because CMake doesn't provide it for language flag variables.
+foreach(_lang CXX CUDA)
+    # CMake-supplied default for *_FLAGS_RELEASE is already "-O3 -DNDEBUG" for CXX
+    # and "-O3 -DNDEBUG" passed through to host for CUDA.  We add -march=native
+    # (CXX + forwarded to host via -Xcompiler for CUDA) and --use_fast_math (CUDA only).
+endforeach()
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    if(NOT CMAKE_CXX_FLAGS_RELEASE MATCHES "-march=")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+    endif()
+    if(NOT CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "-march=")
+        set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -march=native")
+    endif()
+    if(NOT CMAKE_CUDA_FLAGS_RELEASE MATCHES "use_fast_math")
+        set(CMAKE_CUDA_FLAGS_RELEASE
+            "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3")
+    endif()
+    if(NOT CMAKE_CUDA_FLAGS_RELWITHDEBINFO MATCHES "use_fast_math")
+        set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO
+            "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3")
+    endif()
+endif()
+
 # detect GPU architecture at build time
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     # detect highest GPU compute capability via nvidia-smi
@@ -122,6 +157,12 @@ if(RDKit_FOUND)
         ${CUSOLVER_LIBRARY}
         cudart
         OpenMP::OpenMP_CXX)
+    # Pass -fopenmp to the host compiler through nvcc so #pragma omp inside
+    # etkdg_preprocess.hpp (included by smallfield.cu) actually parallelizes.
+    # Without this the OpenMP pragma is silently ignored by nvcc's host pass
+    # and prepare_molecule_batch runs single-threaded.
+    target_compile_options(smallfield_lib PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>)
     set_target_properties(smallfield_lib PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         POSITION_INDEPENDENT_CODE ON)

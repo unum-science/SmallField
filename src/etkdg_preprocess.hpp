@@ -15,25 +15,41 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include <boost/shared_array.hpp>
+
 // clang-format off
 #include <DistGeom/BoundsMatrix.h>
+#include <ForceField/MMFF/Nonbonded.h>
+#include <ForceField/MMFF/Params.h>
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/Chirality.h>
 #include <GraphMol/DistGeomHelpers/BoundsMatrixBuilder.h>
 #include <GraphMol/ForceFieldHelpers/CrystalFF/TorsionPreferences.h>
+#include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 // clang-format on
 
+#include "batch_pool.hpp"
 #include "etkdg_types.cuh"
+#include "molecule_descriptor.hpp"
+#include "csd_torsion_extract.hpp"
 
 namespace smallfield {
 
@@ -77,11 +93,33 @@ struct etkdg_prepared_molecule_t {
  *  @param[in] molecule RDKit molecule with explicit hydrogens.
  *  @param[out] bounds Flat N x N float array filled in row-major order.
  */
-inline void build_bounds_matrix(RDKit::ROMol const &molecule, std::vector<float> &bounds) {
-    std::uint32_t const num_atoms = molecule.getNumAtoms();
+inline void build_bounds_matrix(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
+                                std::vector<float> &bounds) {
+    std::uint32_t const num_atoms = desc.num_atoms;
     bounds.resize(num_atoms * num_atoms, 0.0f);
 
-    // Use RDKit's bounds matrix builder.
+    // Hand RDKit our BFS-computed distance matrix — setTopolBounds() will pick it up
+    // from the property cache instead of running Floyd-Warshall (O(N³)). The descriptor
+    // already has bond_distance[] as uint8; we up-convert to double for RDKit's API.
+    {
+        auto *distance_matrix = new double[num_atoms * num_atoms];
+        auto *path_matrix = new int[num_atoms * num_atoms];
+        constexpr double inf = 1e8;
+        for (std::uint32_t i = 0; i < num_atoms * num_atoms; ++i) path_matrix[i] = -1;
+        for (std::uint32_t i = 0; i < num_atoms; ++i) {
+            for (std::uint32_t j = 0; j < num_atoms; ++j) {
+                std::uint8_t const d = desc.bond_distance[i * max_atoms_k + j];
+                distance_matrix[i * num_atoms + j] = (d == 255) ? inf : static_cast<double>(d);
+            }
+        }
+        auto &mut_mol = const_cast<RDKit::ROMol &>(molecule);
+        boost::shared_array<double> dist_sptr(distance_matrix);
+        mut_mol.setProp("DistanceMatrix", dist_sptr, true);
+        boost::shared_array<int> path_sptr(path_matrix);
+        mut_mol.setProp("DistanceMatrix_Paths", path_sptr, true);
+    }
+
+    // Use RDKit's bounds matrix builder — it will find our cached distance matrix.
     auto *bounds_raw = new DistGeom::BoundsMatrix(num_atoms);
     DistGeom::BoundsMatPtr bounds_mat(bounds_raw);
     RDKit::DGeomHelpers::initBoundsMat(bounds_raw);
@@ -107,7 +145,7 @@ inline void build_bounds_matrix(RDKit::ROMol const &molecule, std::vector<float>
  *  @param[in] molecule RDKit molecule with stereochemistry assigned.
  *  @param[out] chiral_centers Filled with one descriptor per tetrahedral center.
  */
-inline void extract_chiral_centers(RDKit::ROMol const &molecule,
+inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
                                    std::vector<chiral_center_descriptor_t> &chiral_centers) {
     chiral_centers.clear();
     auto &stereo_molecule = const_cast<RDKit::ROMol &>(molecule);
@@ -116,28 +154,38 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule,
     RDKit::UINT_VECT cip_ranks(molecule.getNumAtoms(), 0);
     RDKit::Chirality::assignAtomCIPRanks(molecule, cip_ranks);
 
-    for (auto const &atom : molecule.atoms()) {
-        auto chirality = atom->getChiralTag();
-        if (chirality != RDKit::Atom::CHI_TETRAHEDRAL_CW && chirality != RDKit::Atom::CHI_TETRAHEDRAL_CCW) continue;
+    std::uint32_t const num_atoms = desc.num_atoms;
+    for (std::uint32_t a = 0; a < num_atoms; ++a) {
+        if (desc.chiral_tag[a] == 0) continue;
+        if (desc.degree[a] < 3) continue;
+
+        auto const *atom = molecule.getAtomWithIdx(a);
         if (!atom->hasProp("_CIPCode")) continue;
 
         chiral_center_descriptor_t descriptor {};
-        descriptor.center_atom = static_cast<std::uint8_t>(atom->getIdx());
+        descriptor.center_atom = static_cast<std::uint8_t>(a);
 
-        if (atom->getDegree() < 3) continue;
+        // Collect neighbors via descriptor's CSR adjacency, sort by CIP rank.
+        std::uint8_t ordered[4] = {0, 0, 0, 0};
+        std::uint32_t count = 0;
+        std::uint16_t const nstart = desc.neighbor_offset[a];
+        std::uint16_t const nend = desc.neighbor_offset[a + 1];
+        for (std::uint16_t n = nstart; n < nend && count < 4; ++n) ordered[count++] = desc.neighbor_atom[n];
+        // Insertion sort by (cip_rank desc, idx asc) — at most 4 elements.
+        for (std::uint32_t i = 1; i < count; ++i) {
+            std::uint8_t const v = ordered[i];
+            std::uint32_t j = i;
+            while (j > 0) {
+                std::uint8_t const u = ordered[j - 1];
+                bool const before = (cip_ranks[u] != cip_ranks[v]) ? (cip_ranks[u] < cip_ranks[v]) : (u > v);
+                if (!before) break;
+                ordered[j] = u;
+                --j;
+            }
+            ordered[j] = v;
+        }
 
-        std::vector<std::uint32_t> ordered_neighbors;
-        ordered_neighbors.reserve(4);
-        for (auto const &neighbor : molecule.atomNeighbors(atom)) { ordered_neighbors.push_back(neighbor->getIdx()); }
-        std::sort(ordered_neighbors.begin(), ordered_neighbors.end(), [&](std::uint32_t lhs, std::uint32_t rhs) {
-            if (cip_ranks[lhs] != cip_ranks[rhs]) return cip_ranks[lhs] > cip_ranks[rhs];
-            return lhs < rhs;
-        });
-        std::uint32_t const neighbor_count = static_cast<std::uint32_t>(ordered_neighbors.size());
-        if (neighbor_count < 3) continue;
-
-        for (std::uint32_t i = 0; i < 4 && i < neighbor_count; ++i)
-            descriptor.neighbor_atoms[i] = static_cast<std::uint8_t>(ordered_neighbors[i]);
+        for (std::uint32_t i = 0; i < 4; ++i) descriptor.neighbor_atoms[i] = ordered[i];
 
         std::string cip_code;
         atom->getProp("_CIPCode", cip_code);
@@ -158,15 +206,23 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule,
  *  @param[in] bounds_matrix Flat N x N distance bounds (row-major, from build_bounds_matrix()).
  *  @param[out] constraints Filled with 1-2 bond and 1-3 angle distance constraints.
  */
-inline void extract_distance_constraints(RDKit::ROMol const &molecule, std::vector<float> const &bounds_matrix,
+inline void extract_distance_constraints(molecule_descriptor_t const &desc, std::vector<float> const &bounds_matrix,
                                          std::vector<distance_constraint_t> &constraints) {
     constraints.clear();
-    std::uint32_t const num_atoms = molecule.getNumAtoms();
+    std::uint32_t const num_atoms = desc.num_atoms;
 
-    // 1-2 bond constraints: read actual bounds from the matrix
-    for (auto const &bond : molecule.bonds()) {
-        std::uint32_t const atom_i = bond->getBeginAtomIdx();
-        std::uint32_t const atom_j = bond->getEndAtomIdx();
+    // Reserve exact capacity: 1-2 count = num_bonds, 1-3 count = sum choose(degree, 2).
+    std::uint32_t num_13 = 0;
+    for (std::uint32_t a = 0; a < num_atoms; ++a) {
+        std::uint32_t d = desc.degree[a];
+        num_13 += d * (d - 1) / 2;
+    }
+    constraints.reserve(desc.num_bonds + num_13);
+
+    // 1-2 bond constraints: one emit per bond, exact bounds from the matrix.
+    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
+        std::uint32_t const atom_i = desc.bond_atom_i[b];
+        std::uint32_t const atom_j = desc.bond_atom_j[b];
         std::uint32_t const row_min = std::min(atom_i, atom_j);
         std::uint32_t const row_max = std::max(atom_i, atom_j);
 
@@ -180,15 +236,14 @@ inline void extract_distance_constraints(RDKit::ROMol const &molecule, std::vect
         constraints.push_back(constraint);
     }
 
-    // 1-3 constraints from angles: read from bounds matrix
-    for (auto const &atom : molecule.atoms()) {
-        std::vector<unsigned int> neighbors;
-        for (auto const &neighbor : molecule.atomNeighbors(atom)) { neighbors.push_back(neighbor->getIdx()); }
-
-        for (std::size_t a = 0; a < neighbors.size(); ++a) {
-            for (std::size_t b = a + 1; b < neighbors.size(); ++b) {
-                std::uint32_t const ni = neighbors[a];
-                std::uint32_t const nj = neighbors[b];
+    // 1-3 constraints: iterate each atom as center, enumerate neighbor pairs via CSR.
+    for (std::uint32_t center = 0; center < num_atoms; ++center) {
+        std::uint16_t const start = desc.neighbor_offset[center];
+        std::uint16_t const end = desc.neighbor_offset[center + 1];
+        for (std::uint16_t a = start; a < end; ++a) {
+            for (std::uint16_t b = a + 1; b < end; ++b) {
+                std::uint32_t const ni = desc.neighbor_atom[a];
+                std::uint32_t const nj = desc.neighbor_atom[b];
                 std::uint32_t const row_min = std::min(ni, nj);
                 std::uint32_t const row_max = std::max(ni, nj);
 
@@ -352,93 +407,67 @@ inline void build_etk_interaction_lists(etkdg_prepared_molecule_t &result) {
  *  @param[in] molecule RDKit molecule with explicit hydrogens.
  *  @param[in,out] result Prepared molecule; MMFF94 arrays are filled in place.
  */
-inline void extract_mmff94_params(RDKit::ROMol const &molecule, etkdg_prepared_molecule_t &result) {
+inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
+                                  etkdg_prepared_molecule_t &result) {
     result.mmff_nonbonded.clear();
     result.mmff_bonds.clear();
     result.mmff_angles.clear();
     result.mmff_torsions.clear();
 
     auto &mol = const_cast<RDKit::ROMol &>(molecule);
+    // Skip redundant Kekulize inside MMFFMolProperties — SmilesToMol already sanitized.
+    if (!mol.hasProp(RDKit::common_properties::_MMFFSanitized)) {
+        mol.setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
+    }
     RDKit::MMFF::MMFFMolProperties mmff_props(mol);
     if (!mmff_props.isValid()) return;
 
-    std::uint32_t const num_atoms = molecule.getNumAtoms();
-
-    // Use stack-allocated bitset arrays for exclusion and 1-4 pair detection.
-    constexpr std::uint32_t max_bits = 128 * 128;
-    constexpr std::uint32_t bitset_words = (max_bits + 63) / 64;
-    std::uint64_t excluded[bitset_words] = {};
-    std::uint64_t is_one_four[bitset_words] = {};
-
-    auto set_bit = [](std::uint64_t *bits, std::uint32_t index) {
-        bits[index / 64] |= (std::uint64_t(1) << (index % 64));
-    };
-    auto get_bit = [](std::uint64_t const *bits, std::uint32_t index) -> bool {
-        return (bits[index / 64] >> (index % 64)) & 1;
-    };
-
-    // Mark 1-2 bonds as excluded.
-    for (auto const &bond : molecule.bonds()) {
-        unsigned int a = bond->getBeginAtomIdx(), b = bond->getEndAtomIdx();
-        set_bit(excluded, a * num_atoms + b);
-        set_bit(excluded, b * num_atoms + a);
-    }
-
-    // Mark 1-3 pairs as excluded and detect 1-4 pairs from torsion terminals.
-    for (auto const &atom : molecule.atoms()) {
-        unsigned int center = atom->getIdx();
-        // Collect neighbors by inline iteration without a temporary vector.
-        unsigned int neighbor_indices[8]; // Max 8 neighbors (typical max valence).
-        unsigned int neighbor_count = 0;
-        for (auto const &nb : molecule.atomNeighbors(atom)) {
-            if (neighbor_count < 8) neighbor_indices[neighbor_count++] = nb->getIdx();
-        }
-        // 1-3 exclusions: all pairs of neighbors
-        for (unsigned int a = 0; a < neighbor_count; ++a) {
-            for (unsigned int b = a + 1; b < neighbor_count; ++b) {
-                set_bit(excluded, neighbor_indices[a] * num_atoms + neighbor_indices[b]);
-                set_bit(excluded, neighbor_indices[b] * num_atoms + neighbor_indices[a]);
-            }
-        }
-    }
-
-    // 1-4 pairs from torsion terminals: for each bond j-k, pair (i,l) where i∈N(j)\k, l∈N(k)\j
-    for (auto const &bond : molecule.bonds()) {
-        unsigned int j = bond->getBeginAtomIdx(), k = bond->getEndAtomIdx();
-        for (auto const &neighbor_j : molecule.atomNeighbors(molecule.getAtomWithIdx(j))) {
-            if (neighbor_j->getIdx() == k) continue;
-            for (auto const &neighbor_k : molecule.atomNeighbors(molecule.getAtomWithIdx(k))) {
-                if (neighbor_k->getIdx() == j) continue;
-                unsigned int i = neighbor_j->getIdx(), l = neighbor_k->getIdx();
-                set_bit(is_one_four, i * num_atoms + l);
-                set_bit(is_one_four, l * num_atoms + i);
-            }
-        }
-    }
+    std::uint32_t const num_atoms = desc.num_atoms;
 
     // Cache partial charges in a single pass.
-    float charges[256]; // Stack-allocated, max 256 atoms.
-    for (unsigned int i = 0; i < num_atoms && i < 256; ++i)
-        charges[i] = static_cast<float>(mmff_props.getMMFFPartialCharge(i));
+    float charges[128];
+    for (std::uint32_t i = 0; i < num_atoms; ++i) charges[i] = static_cast<float>(mmff_props.getMMFFPartialCharge(i));
 
-    // Build nonbonded pairs with O(N²) iteration and O(1) exclusion lookup.
-    for (unsigned int i = 0; i < num_atoms; ++i) {
-        for (unsigned int j = i + 1; j < num_atoms; ++j) {
-            if (get_bit(excluded, i * num_atoms + j)) continue;
+    // Build nonbonded pairs using descriptor's bond_distance for O(1) exclusion detection.
+    // Excluded: bond_distance == 1 (1-2) or == 2 (1-3). 1-4: bond_distance == 3.
+    //
+    // VdW optimization: RDKit's MMFFMolProperties::getMMFFVdWParams(i, j) does a pair of
+    // singleton-map lookups on atom type → MMFFVdW params for EACH of N²/2 pairs.
+    // We hoist those lookups to a per-atom pass (N lookups), cache the pointers, and call
+    // the Halgren combining-rule helpers directly. Eliminates ~N²/2 binary searches plus
+    // the per-call MMFFVdWRijstarEps stack object and the isValid() branch.
+    {
+        auto const *mmff_vdw_coll = RDKit::MMFF::DefaultParameters::getMMFFVdW();
+        ForceFields::MMFF::MMFFVdW const *per_atom_vdw[128] = {nullptr};
+        for (std::uint32_t a = 0; a < num_atoms; ++a) {
+            std::uint32_t const atom_type = mmff_props.getMMFFAtomType(a);
+            per_atom_vdw[a] = (*mmff_vdw_coll)(atom_type);
+        }
+        for (std::uint32_t i = 0; i < num_atoms; ++i) {
+            auto const *vdw_i = per_atom_vdw[i];
+            if (vdw_i == nullptr) continue;
+            for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
+                std::uint8_t const d = bonds_between(desc, i, j);
+                if (d <= 2) continue; // 1-2 or 1-3 excluded
+                auto const *vdw_j = per_atom_vdw[j];
+                if (vdw_j == nullptr) continue;
 
-            ForceFields::MMFF::MMFFVdWRijstarEps vdw_params;
-            if (!mmff_props.getMMFFVdWParams(i, j, vdw_params)) continue;
+                double r_star = ForceFields::MMFF::Utils::calcUnscaledVdWMinimum(mmff_vdw_coll, vdw_i, vdw_j);
+                double epsilon = ForceFields::MMFF::Utils::calcUnscaledVdWWellDepth(r_star, vdw_i, vdw_j);
+                ForceFields::MMFF::Utils::scaleVdWParams(r_star, epsilon, mmff_vdw_coll, vdw_i, vdw_j);
 
-            result.mmff_nonbonded.push_back({static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(j),
-                                             static_cast<std::uint8_t>(get_bit(is_one_four, i * num_atoms + j) ? 1 : 0),
-                                             0, static_cast<float>(vdw_params.epsilon),
-                                             static_cast<float>(vdw_params.R_ij_star), charges[i] * charges[j]});
+                std::uint8_t const is_1_4 = (d == 3) ? 1 : 0;
+                result.mmff_nonbonded.push_back({static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(j), is_1_4, 0,
+                                                 static_cast<float>(epsilon), static_cast<float>(r_star),
+                                                 charges[i] * charges[j]});
+            }
         }
     }
 
-    // Build bond terms.
-    for (auto const &bond : molecule.bonds()) {
-        unsigned int i = bond->getBeginAtomIdx(), j = bond->getEndAtomIdx();
+    // Build bond terms — iterate descriptor's bond list (no RDKit traversal).
+    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
+        std::uint32_t const i = desc.bond_atom_i[b];
+        std::uint32_t const j = desc.bond_atom_j[b];
         unsigned int bond_type;
         ForceFields::MMFF::MMFFBond bp;
         if (!mmff_props.getMMFFBondStretchParams(mol, i, j, bond_type, bp)) continue;
@@ -450,94 +479,95 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, etkdg_prepared_m
                                      0.0f});
     }
 
-    // Build angle terms by iterating atoms as centers and pairing their neighbors.
-    for (auto const &atom : molecule.atoms()) {
-        unsigned int j = atom->getIdx();
-        unsigned int nonbonded[8];
-        unsigned int neighbor_count = 0;
-        for (auto const &n : molecule.atomNeighbors(atom))
-            if (neighbor_count < 8) nonbonded[neighbor_count++] = n->getIdx();
-
-        for (unsigned int a = 0; a < neighbor_count; ++a) {
-            for (unsigned int b = a + 1; b < neighbor_count; ++b) {
+    // Build angle terms — iterate atoms as angle centers, enumerate neighbor pairs via CSR.
+    for (std::uint32_t center = 0; center < num_atoms; ++center) {
+        std::uint16_t const nstart = desc.neighbor_offset[center];
+        std::uint16_t const nend = desc.neighbor_offset[center + 1];
+        for (std::uint16_t a = nstart; a < nend; ++a) {
+            for (std::uint16_t b = a + 1; b < nend; ++b) {
+                std::uint32_t const ai = desc.neighbor_atom[a];
+                std::uint32_t const aj = desc.neighbor_atom[b];
                 unsigned int angle_type;
                 ForceFields::MMFF::MMFFAngle ap;
-                if (!mmff_props.getMMFFAngleBendParams(mol, nonbonded[a], j, nonbonded[b], angle_type, ap)) continue;
-                result.mmff_angles.push_back({static_cast<std::uint8_t>(nonbonded[a]), static_cast<std::uint8_t>(j),
-                                              static_cast<std::uint8_t>(nonbonded[b]), 0, static_cast<float>(ap.ka),
+                if (!mmff_props.getMMFFAngleBendParams(mol, ai, center, aj, angle_type, ap)) continue;
+                result.mmff_angles.push_back({static_cast<std::uint8_t>(ai), static_cast<std::uint8_t>(center),
+                                              static_cast<std::uint8_t>(aj), 0, static_cast<float>(ap.ka),
                                               static_cast<float>(ap.theta0 * M_PI / 180.0), 0.0f});
             }
         }
     }
 
-    // Build torsion terms.
-    for (auto const &bond : molecule.bonds()) {
-        unsigned int j = bond->getBeginAtomIdx(), k = bond->getEndAtomIdx();
-        for (auto const &nj : molecule.atomNeighbors(molecule.getAtomWithIdx(j))) {
-            if (nj->getIdx() == k) continue;
-            for (auto const &nk : molecule.atomNeighbors(molecule.getAtomWithIdx(k))) {
-                if (nk->getIdx() == j) continue;
+    // Build torsion terms — iterate descriptor's bonds as central, enumerate end-atom neighbors.
+    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
+        std::uint32_t const j = desc.bond_atom_i[b];
+        std::uint32_t const k = desc.bond_atom_j[b];
+        std::uint16_t const jstart = desc.neighbor_offset[j];
+        std::uint16_t const jend = desc.neighbor_offset[j + 1];
+        std::uint16_t const kstart = desc.neighbor_offset[k];
+        std::uint16_t const kend = desc.neighbor_offset[k + 1];
+        for (std::uint16_t nj = jstart; nj < jend; ++nj) {
+            std::uint32_t const i = desc.neighbor_atom[nj];
+            if (i == k) continue;
+            for (std::uint16_t nk = kstart; nk < kend; ++nk) {
+                std::uint32_t const l = desc.neighbor_atom[nk];
+                if (l == j) continue;
                 unsigned int torsion_type;
                 ForceFields::MMFF::MMFFTor tp;
-                if (!mmff_props.getMMFFTorsionParams(mol, nj->getIdx(), j, k, nk->getIdx(), torsion_type, tp)) continue;
-                result.mmff_torsions.push_back({static_cast<std::uint8_t>(nj->getIdx()), static_cast<std::uint8_t>(j),
-                                                static_cast<std::uint8_t>(k), static_cast<std::uint8_t>(nk->getIdx()),
+                if (!mmff_props.getMMFFTorsionParams(mol, i, j, k, l, torsion_type, tp)) continue;
+                result.mmff_torsions.push_back({static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(j),
+                                                static_cast<std::uint8_t>(k), static_cast<std::uint8_t>(l),
                                                 static_cast<float>(tp.V1), static_cast<float>(tp.V2),
                                                 static_cast<float>(tp.V3)});
             }
         }
     }
 
-    // Build out-of-plane bending terms for each sp2 center with 3 or more neighbors.
-    for (auto const &atom : molecule.atoms()) {
-        unsigned int j = atom->getIdx();
-        unsigned int neighbor_indices[8];
-        unsigned int neighbor_count = 0;
-        for (auto const &n : molecule.atomNeighbors(atom))
-            if (neighbor_count < 8) neighbor_indices[neighbor_count++] = n->getIdx();
-        if (neighbor_count < 3) continue;
+    // Build out-of-plane bending terms for sp2 centers with ≥3 neighbors.
+    for (std::uint32_t center = 0; center < num_atoms; ++center) {
+        std::uint32_t const degree = desc.degree[center];
+        if (degree < 3) continue;
+        std::uint16_t const nstart = desc.neighbor_offset[center];
+        std::uint8_t neighbor_cache[8];
+        std::uint32_t neighbor_count = 0;
+        for (std::uint16_t n = nstart; n < desc.neighbor_offset[center + 1] && neighbor_count < 8; ++n)
+            neighbor_cache[neighbor_count++] = desc.neighbor_atom[n];
 
-        for (unsigned int a = 0; a < neighbor_count; ++a) {
-            // Treat neighbor_indices[a] as the out-of-plane atom and the other two as the plane atoms.
-            unsigned int plane[2];
-            unsigned int plane_count = 0;
-            for (unsigned int b = 0; b < neighbor_count && plane_count < 2; ++b)
-                if (b != a) plane[plane_count++] = neighbor_indices[b];
+        for (std::uint32_t a = 0; a < neighbor_count; ++a) {
+            std::uint8_t plane[2];
+            std::uint32_t plane_count = 0;
+            for (std::uint32_t b = 0; b < neighbor_count && plane_count < 2; ++b)
+                if (b != a) plane[plane_count++] = neighbor_cache[b];
             if (plane_count < 2) continue;
-
             ForceFields::MMFF::MMFFOop oop_params;
-            if (!mmff_props.getMMFFOopBendParams(mol, neighbor_indices[a], j, plane[0], plane[1], oop_params)) continue;
-            result.mmff_oops.push_back({static_cast<std::uint8_t>(neighbor_indices[a]),
-                                        static_cast<std::uint8_t>(j),
-                                        static_cast<std::uint8_t>(plane[0]),
-                                        static_cast<std::uint8_t>(plane[1]),
+            if (!mmff_props.getMMFFOopBendParams(mol, neighbor_cache[a], center, plane[0], plane[1], oop_params))
+                continue;
+            result.mmff_oops.push_back({neighbor_cache[a],
+                                        static_cast<std::uint8_t>(center),
+                                        plane[0],
+                                        plane[1],
                                         static_cast<float>(oop_params.koop),
                                         {0.0f, 0.0f}});
         }
     }
 
-    // Build stretch-bend terms by reusing angle topology.
-    for (auto const &atom : molecule.atoms()) {
-        unsigned int j = atom->getIdx();
-        unsigned int neighbor_indices[8];
-        unsigned int neighbor_count = 0;
-        for (auto const &n : molecule.atomNeighbors(atom))
-            if (neighbor_count < 8) neighbor_indices[neighbor_count++] = n->getIdx();
-
-        for (unsigned int a = 0; a < neighbor_count; ++a) {
-            for (unsigned int b = a + 1; b < neighbor_count; ++b) {
+    // Build stretch-bend terms — same topology as angles.
+    for (std::uint32_t center = 0; center < num_atoms; ++center) {
+        std::uint16_t const nstart = desc.neighbor_offset[center];
+        std::uint16_t const nend = desc.neighbor_offset[center + 1];
+        for (std::uint16_t a = nstart; a < nend; ++a) {
+            for (std::uint16_t b = a + 1; b < nend; ++b) {
+                std::uint32_t const ai = desc.neighbor_atom[a];
+                std::uint32_t const aj = desc.neighbor_atom[b];
                 unsigned int stretchbend_type;
                 ForceFields::MMFF::MMFFStbn stretchbend_params;
                 ForceFields::MMFF::MMFFBond bond_params[2];
                 ForceFields::MMFF::MMFFAngle angle_params;
-                if (!mmff_props.getMMFFStretchBendParams(mol, neighbor_indices[a], j, neighbor_indices[b],
-                                                         stretchbend_type, stretchbend_params, bond_params,
-                                                         angle_params))
+                if (!mmff_props.getMMFFStretchBendParams(mol, ai, center, aj, stretchbend_type, stretchbend_params,
+                                                         bond_params, angle_params))
                     continue;
                 result.mmff_stretchbends.push_back(
-                    {static_cast<std::uint8_t>(neighbor_indices[a]), static_cast<std::uint8_t>(j),
-                     static_cast<std::uint8_t>(neighbor_indices[b]), 0, static_cast<float>(stretchbend_params.kbaIJK),
-                     static_cast<float>(stretchbend_params.kbaKJI),
+                    {static_cast<std::uint8_t>(ai), static_cast<std::uint8_t>(center), static_cast<std::uint8_t>(aj), 0,
+                     static_cast<float>(stretchbend_params.kbaIJK), static_cast<float>(stretchbend_params.kbaKJI),
                      static_cast<float>(angle_params.theta0 * M_PI / 180.0), static_cast<float>(bond_params[0].r0),
                      static_cast<float>(bond_params[1].r0), 0.0f});
             }
@@ -703,12 +733,18 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const &smiles) {
     if (result.num_atoms > 128) return result; // Too large for the single-warp pipeline.
 
     try {
-        build_bounds_matrix(*mol, result.bounds_matrix);
-        extract_chiral_centers(*mol, result.chiral_centers);
-        extract_etk_torsions(*mol, result.etk_torsions);
-        extract_distance_constraints(*mol, result.bounds_matrix, result.distance_constraints);
+        // Build the flat descriptor once. All downstream stages read from this.
+        molecule_descriptor_t desc;
+        if (!build_descriptor(*mol, desc)) {
+            result.num_atoms = 0;
+            return result;
+        }
+        build_bounds_matrix(*mol, desc, result.bounds_matrix);
+        extract_chiral_centers(*mol, desc, result.chiral_centers);
+        extract_etk_torsions_native(*mol, desc, result.etk_torsions);
+        extract_distance_constraints(desc, result.bounds_matrix, result.distance_constraints);
         build_etk_interaction_lists(result);
-        extract_mmff94_params(*mol, result);
+        extract_mmff94_params(*mol, desc, result);
     }
     catch (...) {
         result.num_atoms = 0; // Mark as failed.
@@ -743,35 +779,174 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string const &smiles) {
 }
 
 /**
- *  @brief Batch of molecules packed into contiguous GPU-ready arrays.
+ *  @brief Batch of molecules packed into a single pinned host buffer.
+ *
+ *  Type alias onto `batch_pool_t`, which owns one contiguous pinned host
+ *  allocation plus a byte-level `batch_layout_t` describing 16 sub-regions
+ *  (14 per-molecule arrays + metadata + input_indices).  Every sub-array is
+ *  exposed as a `std::span<T>` view via member accessors on `batch_pool_t`.
+ *  The launch path issues ONE `cudaMemcpyAsync` of the host buffer into a
+ *  per-GPU device mirror, replacing 14 pageable-source transfers that
+ *  previously serialized the dispatcher.
  */
-struct etkdg_molecule_batch_t {
-    std::vector<float> bounds_matrices;                      ///< concatenated Nᵢ x Nᵢ
-    std::vector<chiral_center_descriptor_t> chiral_centers;  ///< concatenated
-    std::vector<etk_torsion_descriptor_t> etk_torsions;      ///< concatenated
-    std::vector<distance_constraint_t> distance_constraints; ///< concatenated
-    // MMFF94 parameters (stage 9)
-    std::vector<mmff94_nonbonded_pair_t> mmff_nonbonded;      ///< concatenated
-    std::vector<mmff94_bond_t> mmff_bonds;                    ///< concatenated
-    std::vector<mmff94_angle_t> mmff_angles;                  ///< concatenated
-    std::vector<mmff94_torsion_t> mmff_torsions;              ///< concatenated
-    std::vector<mmff94_oop_t> mmff_oops;                      ///< concatenated
-    std::vector<mmff94_stretchbend_t> mmff_stretchbends;      ///< concatenated
-    std::vector<mmff94_atom_interaction_t> mmff_interactions; ///< per-atom MMFF94 interaction lists
-    std::vector<mmff94_atom_offsets_t> mmff_atom_offsets;     ///< per-atom MMFF94 offsets
-    std::vector<etk_atom_interaction_t> etk_interactions;     ///< per-atom ETK interaction lists
-    std::vector<etk_atom_offsets_t> etk_atom_offsets;         ///< per-atom ETK offsets
-    std::vector<etkdg_molecule_metadata_t> molecule_metadata; ///< one per molecule
-    std::vector<std::uint32_t> input_indices;                 ///< packed molecule index -> original input index
-    std::uint32_t num_molecules = 0;
-    std::uint32_t max_atoms_per_molecule = 0;
+using etkdg_molecule_batch_t = batch_pool_t;
+
+/**
+ *  @brief Per-molecule sizes of every output array in etkdg_molecule_batch_t.
+ *
+ *  Packed into one 64-byte-aligned struct so the prefix scan over per-molecule sizes
+ *  is one pass over a single @c std::vector<per_mol_sizes_t>, not fourteen parallel
+ *  push_back chains.  The @c valid field doubles as the dense-output compaction
+ *  counter: after the scan, @c offsets[m].valid equals the count of valid molecules
+ *  with index < m, i.e. the slot where metadata/input_indices for molecule m land.
+ */
+struct alignas(64) per_mol_sizes_t {
+    std::uint32_t bounds;
+    std::uint32_t chirals;
+    std::uint32_t torsions;
+    std::uint32_t dcons;
+    std::uint32_t mmff_nonbonded;
+    std::uint32_t mmff_bonds;
+    std::uint32_t mmff_angles;
+    std::uint32_t mmff_torsions;
+    std::uint32_t mmff_oops;
+    std::uint32_t mmff_stretchbends;
+    std::uint32_t mmff_interactions;
+    std::uint32_t mmff_atom_offsets;
+    std::uint32_t etk_interactions;
+    std::uint32_t etk_atom_offsets;
+    std::uint32_t valid; ///< 0 if the molecule failed preprocessing, 1 otherwise
+    std::uint32_t padding;
 };
+static_assert(sizeof(per_mol_sizes_t) == 64, "per_mol_sizes_t must be exactly one cache line");
+
+/** Field-wise sum used both by the prefix scan and as the identity-additive operation. */
+constexpr per_mol_sizes_t operator+(per_mol_sizes_t a, per_mol_sizes_t const &b) {
+    a.bounds += b.bounds;
+    a.chirals += b.chirals;
+    a.torsions += b.torsions;
+    a.dcons += b.dcons;
+    a.mmff_nonbonded += b.mmff_nonbonded;
+    a.mmff_bonds += b.mmff_bonds;
+    a.mmff_angles += b.mmff_angles;
+    a.mmff_torsions += b.mmff_torsions;
+    a.mmff_oops += b.mmff_oops;
+    a.mmff_stretchbends += b.mmff_stretchbends;
+    a.mmff_interactions += b.mmff_interactions;
+    a.mmff_atom_offsets += b.mmff_atom_offsets;
+    a.etk_interactions += b.etk_interactions;
+    a.etk_atom_offsets += b.etk_atom_offsets;
+    a.valid += b.valid;
+    return a;
+}
+
+/** Extract per-molecule output sizes; returns {} (all zeros, valid=0) for failed mols. */
+inline per_mol_sizes_t extract_sizes(etkdg_prepared_molecule_t const &p) {
+    if (p.num_atoms == 0) return per_mol_sizes_t {};
+    per_mol_sizes_t s {};
+    s.bounds = static_cast<std::uint32_t>(p.bounds_matrix.size());
+    s.chirals = static_cast<std::uint32_t>(p.chiral_centers.size());
+    s.torsions = static_cast<std::uint32_t>(p.etk_torsions.size());
+    s.dcons = static_cast<std::uint32_t>(p.distance_constraints.size());
+    s.mmff_nonbonded = static_cast<std::uint32_t>(p.mmff_nonbonded.size());
+    s.mmff_bonds = static_cast<std::uint32_t>(p.mmff_bonds.size());
+    s.mmff_angles = static_cast<std::uint32_t>(p.mmff_angles.size());
+    s.mmff_torsions = static_cast<std::uint32_t>(p.mmff_torsions.size());
+    s.mmff_oops = static_cast<std::uint32_t>(p.mmff_oops.size());
+    s.mmff_stretchbends = static_cast<std::uint32_t>(p.mmff_stretchbends.size());
+    s.mmff_interactions = static_cast<std::uint32_t>(p.mmff_interactions.size());
+    s.mmff_atom_offsets = static_cast<std::uint32_t>(p.mmff_atom_offsets.size());
+    s.etk_interactions = static_cast<std::uint32_t>(p.etk_interactions.size());
+    s.etk_atom_offsets = static_cast<std::uint32_t>(p.etk_atom_offsets.size());
+    s.valid = 1;
+    return s;
+}
+
+/**
+ *  Copy @p src into the slice of @p dst that starts at @p offset.  Uses std::memcpy
+ *  because every output type is trivially copyable POD; the static_assert keeps us
+ *  honest if that ever changes.
+ */
+template <typename T>
+inline void append_slice(std::span<T> dst, std::uint32_t offset, std::vector<T> const &src) {
+    static_assert(std::is_trivially_copyable_v<T>, "append_slice requires trivially-copyable elements");
+    if (!src.empty()) std::memcpy(dst.data() + offset, src.data(), src.size() * sizeof(T));
+}
+
+/** Build the per-molecule metadata entry with batch-wide offsets baked in. */
+inline etkdg_molecule_metadata_t make_meta(etkdg_molecule_metadata_t base, per_mol_sizes_t const &o) {
+    base.bounds_offset = o.bounds;
+    base.chiral_offset = o.chirals;
+    base.torsion_offset = o.torsions;
+    base.constraint_offset = o.dcons;
+    base.mmff_nonbonded_offset = o.mmff_nonbonded;
+    base.mmff_bond_offset = o.mmff_bonds;
+    base.mmff_angle_offset = o.mmff_angles;
+    base.mmff_torsion_offset = o.mmff_torsions;
+    base.mmff_oop_offset = o.mmff_oops;
+    base.mmff_stretchbend_offset = o.mmff_stretchbends;
+    base.mmff_atom_offsets_start = o.mmff_atom_offsets;
+    base.etk_interaction_offset = o.etk_interactions;
+    base.etk_atom_offsets_start = o.etk_atom_offsets;
+    return base;
+}
+
+/**
+ *  Derive the `batch_layout_t` from total per-region counts.  Every region's
+ *  byte offset is aligned to `batch_layout_t::region_alignment` so the GPU
+ *  pool slicing in `launch_gpu_pipeline` inherits correct alignment for free.
+ *
+ *  Regions are placed in a fixed order; the order itself is an implementation
+ *  detail — consumers only read `offset_*` / `count_*` pairs.
+ */
+inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::uint32_t n_valid) {
+    batch_layout_t layout {};
+    std::size_t running = 0;
+
+    layout.offset_bounds = place_region_<float>(running, totals.bounds);
+    layout.count_bounds = totals.bounds;
+    layout.offset_chirals = place_region_<chiral_center_descriptor_t>(running, totals.chirals);
+    layout.count_chirals = totals.chirals;
+    layout.offset_torsions = place_region_<etk_torsion_descriptor_t>(running, totals.torsions);
+    layout.count_torsions = totals.torsions;
+    layout.offset_distance_cons = place_region_<distance_constraint_t>(running, totals.dcons);
+    layout.count_distance_cons = totals.dcons;
+    layout.offset_mmff_nonbonded = place_region_<mmff94_nonbonded_pair_t>(running, totals.mmff_nonbonded);
+    layout.count_mmff_nonbonded = totals.mmff_nonbonded;
+    layout.offset_mmff_bonds = place_region_<mmff94_bond_t>(running, totals.mmff_bonds);
+    layout.count_mmff_bonds = totals.mmff_bonds;
+    layout.offset_mmff_angles = place_region_<mmff94_angle_t>(running, totals.mmff_angles);
+    layout.count_mmff_angles = totals.mmff_angles;
+    layout.offset_mmff_torsions = place_region_<mmff94_torsion_t>(running, totals.mmff_torsions);
+    layout.count_mmff_torsions = totals.mmff_torsions;
+    layout.offset_mmff_oops = place_region_<mmff94_oop_t>(running, totals.mmff_oops);
+    layout.count_mmff_oops = totals.mmff_oops;
+    layout.offset_mmff_stretchbends = place_region_<mmff94_stretchbend_t>(running, totals.mmff_stretchbends);
+    layout.count_mmff_stretchbends = totals.mmff_stretchbends;
+    layout.offset_mmff_interactions = place_region_<mmff94_atom_interaction_t>(running, totals.mmff_interactions);
+    layout.count_mmff_interactions = totals.mmff_interactions;
+    layout.offset_mmff_atom_offsets = place_region_<mmff94_atom_offsets_t>(running, totals.mmff_atom_offsets);
+    layout.count_mmff_atom_offsets = totals.mmff_atom_offsets;
+    layout.offset_etk_interactions = place_region_<etk_atom_interaction_t>(running, totals.etk_interactions);
+    layout.count_etk_interactions = totals.etk_interactions;
+    layout.offset_etk_atom_offsets = place_region_<etk_atom_offsets_t>(running, totals.etk_atom_offsets);
+    layout.count_etk_atom_offsets = totals.etk_atom_offsets;
+    layout.offset_metadata = place_region_<etkdg_molecule_metadata_t>(running, n_valid);
+    layout.count_metadata = n_valid;
+    layout.offset_input_indices = place_region_<std::uint32_t>(running, n_valid);
+    layout.count_input_indices = n_valid;
+
+    layout.bytes_uploaded = running;
+    layout.bytes_total = running;
+    return layout;
+}
 
 /**
  *  @brief Prepare a batch of molecules from SMILES strings.
  *
  *  Phase 1 (OpenMP parallel): prepare each molecule independently.
- *  Phase 2 (sequential): pack into contiguous GPU-ready arrays.
+ *  Phase 2 (three-pass): extract sizes (parallel), prefix-scan the struct-of-sizes
+ *  (serial, cache-local), append slices (parallel).  No push_back / insert anywhere.
  *
  *  @param[in] smiles_list Vector of SMILES strings to process.
  *  @return Batched molecule data with contiguous arrays for GPU upload.
@@ -780,132 +955,125 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::vector<std::string> co
 
     etkdg_molecule_batch_t batch {};
     // Phase 1: Prepare molecules in parallel. RDKit calls are thread-safe for independent molecules.
-    std::vector<etkdg_prepared_molecule_t> prepared(smiles_list.size());
+    //
+    // CRITICAL: this file is included by `smallfield.cu` which is compiled with nvcc.
+    // For OpenMP to actually parallelize here, the CMake target must pass
+    // `-Xcompiler=-fopenmp` through nvcc to the host compiler. Otherwise nvcc silently
+    // ignores the pragma and this loop runs single-threaded — which costs 20x.
+    std::size_t const n = smiles_list.size();
+    std::vector<etkdg_prepared_molecule_t> prepared(n);
 #pragma omp parallel for schedule(dynamic, 4)
-    for (std::size_t i = 0; i < smiles_list.size(); ++i) { prepared[i] = prepare_molecule(smiles_list[i]); }
+    for (std::size_t i = 0; i < n; ++i) { prepared[i] = prepare_molecule(smiles_list[i]); }
 
-    // Pre-allocate batch vectors to avoid reallocation during the insert loop.
-    {
-        std::size_t total_bounds = 0, total_chirals = 0, total_etk = 0, total_dcons = 0;
-        std::size_t total_nb = 0, total_bonds = 0, total_angles = 0, total_torsions = 0;
-        std::size_t total_oops = 0, total_stretchbend = 0;
-        std::size_t total_mmff_inter = 0, total_mmff_off = 0;
-        std::size_t total_etk_inter = 0, total_etk_off = 0;
-        for (auto const &p : prepared) {
-            total_bounds += p.bounds_matrix.size();
-            total_chirals += p.chiral_centers.size();
-            total_etk += p.etk_torsions.size();
-            total_dcons += p.distance_constraints.size();
-            total_nb += p.mmff_nonbonded.size();
-            total_bonds += p.mmff_bonds.size();
-            total_angles += p.mmff_angles.size();
-            total_torsions += p.mmff_torsions.size();
-            total_oops += p.mmff_oops.size();
-            total_stretchbend += p.mmff_stretchbends.size();
-            total_mmff_inter += p.mmff_interactions.size();
-            total_mmff_off += p.mmff_atom_offsets.size();
-            total_etk_inter += p.etk_interactions.size();
-            total_etk_off += p.etk_atom_offsets.size();
+    // Phase 2 — produce one contiguous pinned host buffer containing all 14
+    // per-molecule arrays plus molecule_metadata and input_indices.  Three passes:
+    //
+    //   Pass 1 (parallel): extract per-molecule sizes into one `std::vector<per_mol_sizes_t>`.
+    //   Pass 2 (serial):   prefix-scan into `offsets` (n + 1 entries).  Then derive the
+    //                      `batch_layout_t` from the totals and pin-allocate one pool
+    //                      buffer of size `layout.bytes_total`.
+    //   Pass 3 (parallel): one loop over m memcpys each per-molecule sub-array into its
+    //                      slice of the pinned pool.
+    //
+    // The dense metadata slot is `offsets[m].valid` — the prefix sum of the `valid`
+    // flag doubles as the compaction index for `molecule_metadata` / `input_indices`.
+
+    // Pass 1: parallel size extraction.
+    std::vector<per_mol_sizes_t> sizes(n);
+#pragma omp parallel for schedule(static)
+    for (std::size_t m = 0; m < n; ++m) sizes[m] = extract_sizes(prepared[m]);
+
+    // Pass 2: serial prefix scan over the struct of sizes.  offsets[m] is the
+    // (exclusive) starting offset for molecule m into each batch array; offsets[n]
+    // holds the total sizes.
+    std::vector<per_mol_sizes_t> offsets(n + 1);
+    offsets[0] = per_mol_sizes_t {};
+    for (std::size_t m = 0; m < n; ++m) offsets[m + 1] = offsets[m] + sizes[m];
+    std::uint32_t const n_valid = offsets[n].valid;
+    batch.num_molecules = n_valid;
+
+    // Single reduction pass over num_atoms to get the batch-wide max.
+    std::uint32_t max_atoms_reduction = 0;
+#pragma omp parallel for schedule(static) reduction(max : max_atoms_reduction)
+    for (std::size_t m = 0; m < n; ++m)
+        if (prepared[m].num_atoms > max_atoms_reduction) max_atoms_reduction = prepared[m].num_atoms;
+    batch.max_atoms_per_molecule = max_atoms_reduction;
+
+    // Compute the layout and allocate one pinned host buffer.  The launch path
+    // mirrors this into a per-GPU device buffer via a single cudaMemcpyAsync.
+    batch.layout = compute_batch_layout(offsets[n], n_valid);
+    if (batch.layout.bytes_total > 0) {
+        if (!batch.host.ensure_capacity(batch.layout.bytes_total)) {
+            batch.num_molecules = 0;
+            batch.layout = batch_layout_t {};
+            return batch;
         }
-        batch.bounds_matrices.reserve(total_bounds);
-        batch.chiral_centers.reserve(total_chirals);
-        batch.etk_torsions.reserve(total_etk);
-        batch.distance_constraints.reserve(total_dcons);
-        batch.mmff_nonbonded.reserve(total_nb);
-        batch.mmff_bonds.reserve(total_bonds);
-        batch.mmff_angles.reserve(total_angles);
-        batch.mmff_torsions.reserve(total_torsions);
-        batch.mmff_oops.reserve(total_oops);
-        batch.mmff_stretchbends.reserve(total_stretchbend);
-        batch.mmff_interactions.reserve(total_mmff_inter);
-        batch.mmff_atom_offsets.reserve(total_mmff_off);
-        batch.etk_interactions.reserve(total_etk_inter);
-        batch.etk_atom_offsets.reserve(total_etk_off);
-        batch.molecule_metadata.reserve(prepared.size());
-        batch.input_indices.reserve(prepared.size());
     }
 
-    // Phase 2: Pack into contiguous arrays sequentially without reallocations.
-    for (std::uint32_t m = 0; m < static_cast<std::uint32_t>(prepared.size()); ++m) {
-        if (prepared[m].num_atoms == 0) continue;
+    // Bind typed spans over the pinned pool once so Pass 3 doesn't re-derive
+    // them per iteration.  Each span is a non-owning view into `batch.host`.
+    auto bounds_span = batch.bounds_matrices();
+    auto chirals_span = batch.chiral_centers();
+    auto torsions_span = batch.etk_torsions();
+    auto dcons_span = batch.distance_constraints();
+    auto mmff_nb_span = batch.mmff_nonbonded();
+    auto mmff_bonds_span = batch.mmff_bonds();
+    auto mmff_angles_span = batch.mmff_angles();
+    auto mmff_tors_span = batch.mmff_torsions();
+    auto mmff_oops_span = batch.mmff_oops();
+    auto mmff_sb_span = batch.mmff_stretchbends();
+    auto mmff_inter_span = batch.mmff_interactions();
+    auto mmff_aoff_span = batch.mmff_atom_offsets();
+    auto etk_inter_span = batch.etk_interactions();
+    auto etk_aoff_span = batch.etk_atom_offsets();
+    auto metadata_span = batch.molecule_metadata();
+    auto input_idx_span = batch.input_indices();
 
-        batch.max_atoms_per_molecule = std::max(batch.max_atoms_per_molecule, prepared[m].num_atoms);
+    // Pass 3: parallel copy.  Each iteration writes into a unique slice of every
+    // output array — no data race.  Failed molecules (sizes[m].valid == 0) are
+    // skipped cheaply.
+#pragma omp parallel for schedule(static)
+    for (std::size_t m = 0; m < n; ++m) {
+        if (sizes[m].valid == 0) continue;
+        auto const &p = prepared[m];
+        auto const &o = offsets[m];
 
-        // Set offsets before appending to the batched arrays.
-        etkdg_molecule_metadata_t meta = prepared[m].metadata;
-        meta.bounds_offset = static_cast<std::uint32_t>(batch.bounds_matrices.size());
-        meta.chiral_offset = static_cast<std::uint32_t>(batch.chiral_centers.size());
-        meta.torsion_offset = static_cast<std::uint32_t>(batch.etk_torsions.size());
-        meta.constraint_offset = static_cast<std::uint32_t>(batch.distance_constraints.size());
-        meta.mmff_nonbonded_offset = static_cast<std::uint32_t>(batch.mmff_nonbonded.size());
-        meta.mmff_bond_offset = static_cast<std::uint32_t>(batch.mmff_bonds.size());
-        meta.mmff_angle_offset = static_cast<std::uint32_t>(batch.mmff_angles.size());
-        meta.mmff_torsion_offset = static_cast<std::uint32_t>(batch.mmff_torsions.size());
-        meta.mmff_oop_offset = static_cast<std::uint32_t>(batch.mmff_oops.size());
-        meta.mmff_stretchbend_offset = static_cast<std::uint32_t>(batch.mmff_stretchbends.size());
-        meta.mmff_atom_offsets_start = static_cast<std::uint32_t>(batch.mmff_atom_offsets.size());
-        meta.etk_interaction_offset = static_cast<std::uint32_t>(batch.etk_interactions.size());
-        meta.etk_atom_offsets_start = static_cast<std::uint32_t>(batch.etk_atom_offsets.size());
+        append_slice(bounds_span, o.bounds, p.bounds_matrix);
+        append_slice(chirals_span, o.chirals, p.chiral_centers);
+        append_slice(torsions_span, o.torsions, p.etk_torsions);
+        append_slice(dcons_span, o.dcons, p.distance_constraints);
+        append_slice(mmff_nb_span, o.mmff_nonbonded, p.mmff_nonbonded);
+        append_slice(mmff_bonds_span, o.mmff_bonds, p.mmff_bonds);
+        append_slice(mmff_angles_span, o.mmff_angles, p.mmff_angles);
+        append_slice(mmff_tors_span, o.mmff_torsions, p.mmff_torsions);
+        append_slice(mmff_oops_span, o.mmff_oops, p.mmff_oops);
+        append_slice(mmff_sb_span, o.mmff_stretchbends, p.mmff_stretchbends);
+        append_slice(mmff_inter_span, o.mmff_interactions, p.mmff_interactions);
+        append_slice(etk_inter_span, o.etk_interactions, p.etk_interactions);
 
-        batch.molecule_metadata.push_back(meta);
-        batch.input_indices.push_back(m);
-
-        // Append the molecule data.
-        batch.bounds_matrices.insert(batch.bounds_matrices.end(),
-                                     std::make_move_iterator(prepared[m].bounds_matrix.begin()),
-                                     std::make_move_iterator(prepared[m].bounds_matrix.end()));
-        batch.chiral_centers.insert(batch.chiral_centers.end(),
-                                    std::make_move_iterator(prepared[m].chiral_centers.begin()),
-                                    std::make_move_iterator(prepared[m].chiral_centers.end()));
-        batch.etk_torsions.insert(batch.etk_torsions.end(), std::make_move_iterator(prepared[m].etk_torsions.begin()),
-                                  std::make_move_iterator(prepared[m].etk_torsions.end()));
-        batch.distance_constraints.insert(batch.distance_constraints.end(),
-                                          std::make_move_iterator(prepared[m].distance_constraints.begin()),
-                                          std::make_move_iterator(prepared[m].distance_constraints.end()));
-        // MMFF94 parameters
-        batch.mmff_nonbonded.insert(batch.mmff_nonbonded.end(),
-                                    std::make_move_iterator(prepared[m].mmff_nonbonded.begin()),
-                                    std::make_move_iterator(prepared[m].mmff_nonbonded.end()));
-        batch.mmff_bonds.insert(batch.mmff_bonds.end(), std::make_move_iterator(prepared[m].mmff_bonds.begin()),
-                                std::make_move_iterator(prepared[m].mmff_bonds.end()));
-        batch.mmff_angles.insert(batch.mmff_angles.end(), std::make_move_iterator(prepared[m].mmff_angles.begin()),
-                                 std::make_move_iterator(prepared[m].mmff_angles.end()));
-        batch.mmff_torsions.insert(batch.mmff_torsions.end(),
-                                   std::make_move_iterator(prepared[m].mmff_torsions.begin()),
-                                   std::make_move_iterator(prepared[m].mmff_torsions.end()));
-        batch.mmff_oops.insert(batch.mmff_oops.end(), std::make_move_iterator(prepared[m].mmff_oops.begin()),
-                               std::make_move_iterator(prepared[m].mmff_oops.end()));
-        batch.mmff_stretchbends.insert(batch.mmff_stretchbends.end(),
-                                       std::make_move_iterator(prepared[m].mmff_stretchbends.begin()),
-                                       std::make_move_iterator(prepared[m].mmff_stretchbends.end()));
-        // adjust per-atom per-type interaction offsets for the batched array position
-        std::uint32_t const mmff_interactions_base = static_cast<std::uint32_t>(batch.mmff_interactions.size());
-        batch.mmff_interactions.insert(batch.mmff_interactions.end(),
-                                       std::make_move_iterator(prepared[m].mmff_interactions.begin()),
-                                       std::make_move_iterator(prepared[m].mmff_interactions.end()));
-        auto adjusted_offsets = prepared[m].mmff_atom_offsets;
-        for (auto &off : adjusted_offsets) {
-            off.nonbonded_start += mmff_interactions_base;
-            off.bond_start += mmff_interactions_base;
-            off.angle_start += mmff_interactions_base;
-            off.torsion_start += mmff_interactions_base;
-            off.oop_start += mmff_interactions_base;
-            off.stretchbend_start += mmff_interactions_base;
+        // MMFF atom offsets store offsets INTO the batched interaction array and
+        // must be rebased by the batch-wide offset for this molecule.  Too many
+        // fields to rebase in one memcpy, so do it inline.
+        for (std::size_t k = 0; k < p.mmff_atom_offsets.size(); ++k) {
+            auto entry = p.mmff_atom_offsets[k];
+            entry.nonbonded_start += o.mmff_interactions;
+            entry.bond_start += o.mmff_interactions;
+            entry.angle_start += o.mmff_interactions;
+            entry.torsion_start += o.mmff_interactions;
+            entry.oop_start += o.mmff_interactions;
+            entry.stretchbend_start += o.mmff_interactions;
+            mmff_aoff_span[o.mmff_atom_offsets + k] = entry;
         }
-        batch.mmff_atom_offsets.insert(batch.mmff_atom_offsets.end(), adjusted_offsets.begin(), adjusted_offsets.end());
+        for (std::size_t k = 0; k < p.etk_atom_offsets.size(); ++k) {
+            auto entry = p.etk_atom_offsets[k];
+            entry.interaction_start += o.etk_interactions;
+            etk_aoff_span[o.etk_atom_offsets + k] = entry;
+        }
 
-        // ETK interaction list: adjust offsets for batched array position
-        std::uint32_t const etk_interactions_base = static_cast<std::uint32_t>(batch.etk_interactions.size());
-        batch.etk_interactions.insert(batch.etk_interactions.end(),
-                                      std::make_move_iterator(prepared[m].etk_interactions.begin()),
-                                      std::make_move_iterator(prepared[m].etk_interactions.end()));
-        auto etk_adjusted_offsets = prepared[m].etk_atom_offsets;
-        for (auto &off : etk_adjusted_offsets) off.interaction_start += etk_interactions_base;
-        batch.etk_atom_offsets.insert(batch.etk_atom_offsets.end(), etk_adjusted_offsets.begin(),
-                                      etk_adjusted_offsets.end());
+        std::uint32_t const vi = o.valid; // dense index — offsets[m].valid counts prior valid mols
+        metadata_span[vi] = make_meta(p.metadata, o);
+        input_idx_span[vi] = static_cast<std::uint32_t>(m);
     }
-
-    batch.num_molecules = static_cast<std::uint32_t>(batch.molecule_metadata.size());
 
     return batch;
 }

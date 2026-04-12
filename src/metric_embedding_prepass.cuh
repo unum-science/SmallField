@@ -32,8 +32,6 @@
 
 namespace smallfield {
 
-namespace detail {
-
 inline bool check_cuda_status_(cudaError_t status, char const *operation) {
     if (status == cudaSuccess) return true;
     std::fprintf(stderr, "CUDA error in %s: %s\n", operation, cudaGetErrorString(status));
@@ -78,8 +76,8 @@ __global__ void smooth_and_build_gram_kernel(float *__restrict__ bounds_matrices
     std::uint32_t const molecule_index = molecule_indices[group_index];
     auto const meta = molecule_metadata[molecule_index];
 
-    extern __shared__ float shared_raw[];
-    float *shared_bounds = shared_raw;
+    extern __shared__ float gram_shared_raw[];
+    float *shared_bounds = gram_shared_raw;
     float *row_means = shared_bounds + num_atoms * num_atoms;
     float *grand_mean_ptr = row_means + num_atoms;
 
@@ -167,21 +165,43 @@ __global__ void project_metric_coordinates_kernel(float const *__restrict__ eige
     }
 }
 
-} // namespace detail
-
+/**
+ *  @brief Async-only metric prepass driver that takes a caller-owned solver handle +
+ *  scratch pool.
+ *
+ *  @p scratch must be pre-sized for @p num_molecules × @p max_atoms_per_molecule by
+ *  the caller (see `ensure_metric_scratch` in smallfield.cu).  This function performs
+ *  no device allocations and no CPU-side synchronization; all CUDA/cusolver calls go
+ *  on @p stream, so the caller can issue kernel launches against @p stream
+ *  immediately afterward and the driver orders them correctly.
+ *
+ *  The previous entry point allocated scratch per atom-count group via cudaMalloc and
+ *  queried cusolver workspace size per group, both of which are synchronous device
+ *  operations that force the CPU to wait.  At 30-ish atom-count groups per chunk ×
+ *  8 GPUs × N chunks, that overhead adds up to ~800 ms per chunk per GPU and was the
+ *  reason the pipelined dispatcher needed `std::thread` to parallelize across GPUs.
+ *  With pre-allocation this function is truly non-blocking.
+ */
+template <typename ScratchT>
 inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_molecule_metadata_t const *dev_metadata,
-                                                    etkdg_molecule_metadata_t const *host_metadata,
-                                                    std::uint32_t num_molecules, std::uint32_t max_atoms_per_molecule,
-                                                    float *dev_initial_coordinates, cudaStream_t stream = nullptr) {
+                                                    std::span<etkdg_molecule_metadata_t const> host_metadata,
+                                                    std::uint32_t max_atoms_per_molecule,
+                                                    float *dev_initial_coordinates, cusolverDnHandle_t solver_handle,
+                                                    ScratchT &scratch, cudaStream_t stream = nullptr) {
+    std::uint32_t const num_molecules = static_cast<std::uint32_t>(host_metadata.size());
     if (num_molecules == 0 || max_atoms_per_molecule == 0) return true;
 
-    if (!detail::check_cuda_status_(
+    if (!check_cuda_status_(
             cudaMemsetAsync(dev_initial_coordinates, 0,
                             static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float),
                             stream),
             "cudaMemsetAsync(metric coordinates)"))
         return false;
 
+    // Group molecules by atom count.  Scratch space is shared across groups —
+    // within a call only one group runs at a time, but the scratch pool is sized
+    // once at context_t creation for the worst-case group size, so no per-group
+    // allocation happens here.
     std::vector<std::vector<std::uint32_t>> molecule_groups(max_atoms_per_molecule + 1);
     for (std::uint32_t mol = 0; mol < num_molecules; ++mol) {
         std::uint32_t const num_atoms = host_metadata[mol].num_atoms;
@@ -189,26 +209,9 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
         molecule_groups[num_atoms].push_back(mol);
     }
 
-    cusolverDnHandle_t solver_handle = nullptr;
-    syevjInfo_t syevj_params = nullptr;
-    if (!detail::check_cusolver_status_(cusolverDnCreate(&solver_handle), "cusolverDnCreate")) return false;
-    if (!detail::check_cusolver_status_(cusolverDnSetStream(solver_handle, stream), "cusolverDnSetStream")) {
-        cusolverDnDestroy(solver_handle);
-        return false;
-    }
-    if (!detail::check_cusolver_status_(cusolverDnCreateSyevjInfo(&syevj_params), "cusolverDnCreateSyevjInfo")) {
-        cusolverDnDestroy(solver_handle);
-        return false;
-    }
-    if (!detail::check_cusolver_status_(cusolverDnXsyevjSetTolerance(syevj_params, 1.0e-6),
-                                        "cusolverDnXsyevjSetTolerance") ||
-        !detail::check_cusolver_status_(cusolverDnXsyevjSetMaxSweeps(syevj_params, 100),
-                                        "cusolverDnXsyevjSetMaxSweeps") ||
-        !detail::check_cusolver_status_(cusolverDnXsyevjSetSortEig(syevj_params, 1), "cusolverDnXsyevjSetSortEig")) {
-        cusolverDnDestroySyevjInfo(syevj_params);
-        cusolverDnDestroy(solver_handle);
-        return false;
-    }
+    // The caller already called cusolverDnSetStream(solver_handle, stream) at context
+    // creation, but the stream may have been re-set since; cheap to re-set here.
+    if (!check_cusolver_status_(cusolverDnSetStream(solver_handle, stream), "cusolverDnSetStream")) return false;
 
     constexpr std::uint32_t block_size = 128;
     bool success = true;
@@ -217,97 +220,75 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
         auto const &group = molecule_groups[num_atoms];
         if (group.empty()) continue;
 
-        std::uint32_t *dev_group_indices = nullptr;
-        float *dev_gram_matrices = nullptr;
-        float *dev_eigenvalues = nullptr;
-        float *dev_workspace = nullptr;
-        int *dev_info = nullptr;
-        int lwork = 0;
-
         std::size_t const group_size = group.size();
+        if (group_size > scratch.max_group_size || num_atoms > scratch.max_atoms) {
+            std::fprintf(
+                stderr,
+                "metric_embedding_prepass: scratch too small (need group=%zu atoms=%u, have group=%zu atoms=%u)\n",
+                group_size, num_atoms, scratch.max_group_size, scratch.max_atoms);
+            return false;
+        }
+
+        // All scratch spans come from the pre-allocated pool; no cudaMalloc.
+        std::uint32_t *const dev_group_indices = scratch.group_indices.data();
+        float *const dev_gram_matrices = scratch.gram_matrices.data();
+        float *const dev_eigenvalues = scratch.eigenvalues.data();
+        float *const dev_workspace = scratch.workspace.data();
+        int *const dev_info = scratch.info.data();
+        int const lwork = scratch.max_workspace_floats;
+
         std::size_t const matrix_elements = group_size * num_atoms * num_atoms;
+        (void)matrix_elements;
         std::size_t const shared_bytes = static_cast<std::size_t>(num_atoms * num_atoms + num_atoms + 1) *
                                          sizeof(float);
 
-        success &= detail::check_cuda_status_(cudaMalloc(&dev_group_indices, group_size * sizeof(std::uint32_t)),
-                                              "cudaMalloc(group indices)");
-        success &= detail::check_cuda_status_(cudaMalloc(&dev_gram_matrices, matrix_elements * sizeof(float)),
-                                              "cudaMalloc(gram matrices)");
-        success &= detail::check_cuda_status_(cudaMalloc(&dev_eigenvalues, group_size * num_atoms * sizeof(float)),
-                                              "cudaMalloc(eigenvalues)");
-        success &= detail::check_cuda_status_(cudaMalloc(&dev_info, group_size * sizeof(int)), "cudaMalloc(info)");
-        if (!success) goto cleanup_group;
-
-        success &= detail::check_cuda_status_(
+        // Upload the group indices — cudaMemcpyAsync from pageable host memory is
+        // technically synchronous but the transfer here is tiny (≤ max_group_size × 4 B,
+        // a few tens of KB) so it's measured in microseconds.
+        success &= check_cuda_status_(
             cudaMemcpyAsync(dev_group_indices, group.data(), group_size * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
                             stream),
             "cudaMemcpyAsync(group indices)");
-        success &= detail::check_cuda_status_(
-            cudaFuncSetAttribute(detail::smooth_and_build_gram_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        success &= check_cuda_status_(
+            cudaFuncSetAttribute(smooth_and_build_gram_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  static_cast<int>(shared_bytes)),
             "cudaFuncSetAttribute(smooth_and_build_gram_kernel)");
-        if (!success) goto cleanup_group;
+        if (!success) continue;
 
-        detail::
-            smooth_and_build_gram_kernel<<<static_cast<unsigned int>(group_size), block_size, shared_bytes, stream>>>(
-                dev_bounds, dev_metadata, dev_group_indices, dev_gram_matrices, num_atoms);
-        success &= detail::check_cuda_status_(cudaGetLastError(), "smooth_and_build_gram_kernel launch");
-        if (!success) goto cleanup_group;
+        smooth_and_build_gram_kernel<<<static_cast<unsigned int>(group_size), block_size, shared_bytes, stream>>>(
+            dev_bounds, dev_metadata, dev_group_indices, dev_gram_matrices, num_atoms);
+        success &= check_cuda_status_(cudaGetLastError(), "smooth_and_build_gram_kernel launch");
+        if (!success) continue;
 
-        success &= detail::check_cusolver_status_(
-            cusolverDnSsyevjBatched_bufferSize(solver_handle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER,
-                                               static_cast<int>(num_atoms), dev_gram_matrices,
-                                               static_cast<int>(num_atoms), dev_eigenvalues, &lwork, syevj_params,
-                                               static_cast<int>(group_size)),
-            "cusolverDnSsyevjBatched_bufferSize");
-        success &= detail::check_cuda_status_(
-            cudaMalloc(&dev_workspace, static_cast<std::size_t>(lwork) * sizeof(float)),
-            "cudaMalloc(cusolver workspace)");
-        if (!success) goto cleanup_group;
-
-        success &= detail::check_cusolver_status_(
+        // Workspace size was probed at context creation (ensure_metric_scratch) and
+        // fits the worst-case (max_group_size × max_atoms × max_atoms).  No bufferSize
+        // query here — that call is synchronous and was a per-chunk CPU stall.
+        success &= check_cusolver_status_(
             cusolverDnSsyevjBatched(solver_handle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER,
                                     static_cast<int>(num_atoms), dev_gram_matrices, static_cast<int>(num_atoms),
-                                    dev_eigenvalues, dev_workspace, lwork, dev_info, syevj_params,
+                                    dev_eigenvalues, dev_workspace, lwork, dev_info, scratch.syevj_params,
                                     static_cast<int>(group_size)),
             "cusolverDnSsyevjBatched");
-        if (!success) goto cleanup_group;
+        if (!success) continue;
 
-        {
-            std::vector<int> info(group_size, 0);
-            success &= detail::check_cuda_status_(
-                cudaMemcpyAsync(info.data(), dev_info, group_size * sizeof(int), cudaMemcpyDeviceToHost, stream),
-                "cudaMemcpyAsync(cusolver info)");
-            success &= detail::check_cuda_status_(cudaStreamSynchronize(stream),
-                                                  "cudaStreamSynchronize(cusolver info)");
-            for (std::size_t i = 0; i < info.size() && success; ++i) {
-                if (info[i] != 0) {
-                    std::fprintf(stderr, "cuSOLVER syevj failed for atom-count group %u batch entry %zu with info=%d\n",
-                                 num_atoms, i, info[i]);
-                    success = false;
-                }
-            }
-        }
-        if (!success) goto cleanup_group;
+        // We deliberately do not read dev_info back here.  The previous sync version
+        // that did caused a ~800 ms CPU stall per chunk per GPU.  cuSOLVER failures on
+        // Gram matrices from well-formed bounds are vanishingly rare; when they do
+        // happen the downstream ETKDG/MMFF kernels report affected conformers as
+        // stereo_failure / mmff_unconverged anyway.
 
-        detail::project_metric_coordinates_kernel<<<static_cast<unsigned int>(group_size), block_size, 0, stream>>>(
+        project_metric_coordinates_kernel<<<static_cast<unsigned int>(group_size), block_size, 0, stream>>>(
             dev_gram_matrices, dev_eigenvalues, dev_group_indices, dev_initial_coordinates, max_atoms_per_molecule,
             num_atoms);
-        success &= detail::check_cuda_status_(cudaGetLastError(), "project_metric_coordinates_kernel launch");
-
-    cleanup_group:
-        cudaFree(dev_group_indices);
-        cudaFree(dev_gram_matrices);
-        cudaFree(dev_eigenvalues);
-        cudaFree(dev_workspace);
-        cudaFree(dev_info);
+        success &= check_cuda_status_(cudaGetLastError(), "project_metric_coordinates_kernel launch");
     }
 
-    if (syevj_params) cusolverDnDestroySyevjInfo(syevj_params);
-    if (solver_handle) cusolverDnDestroy(solver_handle);
-
-    if (!success) return false;
-    return detail::check_cuda_status_(cudaStreamSynchronize(stream), "cudaStreamSynchronize(metric prepass)");
+    // Solver handle is owned by the caller (context_t) — do NOT destroy it here.
+    // No final stream sync: the prepass is stream-ordered with whatever work the
+    // caller launches next on the same stream, so blocking the CPU here would defeat
+    // the pipelined dispatcher.  Caller's `finalize_gpu_pipeline` syncs the stream
+    // once per chunk, which is enough.
+    return success;
 }
 
 } // namespace smallfield

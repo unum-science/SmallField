@@ -70,7 +70,9 @@ static void test_dg_energy_known_violation() {
 
     // get smoothed bounds matrix
     std::vector<float> bounds;
-    build_bounds_matrix(*mol, bounds);
+    molecule_descriptor_t desc;
+    build_descriptor(*mol, desc);
+    build_bounds_matrix(*mol, desc, bounds);
 
     // create 4D coords from RDKit 3D coords + random 4th dim
     auto coords_3d = extract_coords_interleaved(*mol);
@@ -118,7 +120,9 @@ static void test_dg_gradient_finite_difference() {
     std::uint32_t const num_elements = dim * num_atoms;
 
     std::vector<float> bounds;
-    build_bounds_matrix(*mol, bounds);
+    molecule_descriptor_t desc;
+    build_descriptor(*mol, desc);
+    build_bounds_matrix(*mol, desc, bounds);
 
     // create SoA coords with small perturbation (moderate violations)
     auto coords_3d = extract_coords_interleaved(*mol);

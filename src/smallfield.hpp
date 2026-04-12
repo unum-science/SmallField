@@ -31,6 +31,7 @@
 struct __half;
 typedef void *cudaStream_t;
 typedef void *cusolverDnHandle_t;
+typedef void *syevjInfo_t;
 #endif
 
 #include <cstdint>
@@ -66,10 +67,39 @@ struct config_t {
  *
  *  Reuse across multiple generate_conformers() calls to avoid re-initialization.
  */
+/**
+ *  @brief Per-GPU persistent scratch buffers for the metric-embedding prepass.
+ *
+ *  Allocated once per @c context_t so the prepass can run fully stream-async
+ *  without per-chunk @c cudaMalloc / @c cudaFree pairs that otherwise serialize
+ *  the launch phase.  Sized for the worst case: all molecules in a chunk having
+ *  the maximum supported atom count.
+ */
+struct metric_scratch_t {
+    void *pool = nullptr; ///< one contiguous device allocation, carved below
+    std::size_t pool_bytes = 0;
+    // Non-owning spans into @c pool.  Rebind in @c ensure_metric_scratch on growth.
+    std::span<std::uint32_t> group_indices {}; ///< [max_group_size]
+    std::span<float> gram_matrices {};         ///< [max_group_size × max_atoms²]
+    std::span<float> eigenvalues {};           ///< [max_group_size × max_atoms]
+    std::span<int> info {};                    ///< [max_group_size]
+    std::span<float> workspace {};             ///< [max_workspace_floats]
+    std::size_t max_group_size = 0;
+    std::uint32_t max_atoms = 0;
+    int max_workspace_floats = 0;
+    syevjInfo_t syevj_params = nullptr; ///< reused across calls
+};
+
+// Forward-declare persistent per-device launch scratch.  Defined in smallfield.cu so
+// the public header does not need to pull in CUDA RAII wrappers.
+struct launch_scratch_t;
+
 struct context_t {
     std::vector<int> device_ids;
     std::vector<cudaStream_t> streams;
     std::vector<cusolverDnHandle_t> solvers;
+    std::vector<metric_scratch_t> metric_scratch;   ///< one per device
+    std::vector<launch_scratch_t *> launch_scratch; ///< one per device, heap-allocated
 
     /**
      *  @brief Construct for the given GPUs.
