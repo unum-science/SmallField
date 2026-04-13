@@ -742,46 +742,60 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
 }
 
 /**
- *  @brief Convert a SMILES string to a fully prepared molecule (stages 0-1 complete).
+ *  @brief Fill a caller-owned @p result with stages 0-1 output for one SMILES.
  *
- *  Parses the SMILES, adds hydrogens, builds the bounds matrix, extracts chiral
- *  centers, torsions, distance constraints, and MMFF94 parameters. Returns a
- *  molecule with num_atoms == 0 on failure.
- *
- *  @param[in] smiles SMILES string for the input molecule.
- *  @return Fully populated etkdg_prepared_molecule_t, or an empty one on failure.
+ *  Called from @c prepare_molecule_batch with a thread-local @c result that is
+ *  reused across every molecule the thread processes — each molecule's vectors
+ *  keep their capacity from the previous call, so push_back stays on the hot
+ *  path without heap allocation after the first few molecules.  Sets
+ *  @c result.num_atoms = 0 on failure.
  */
-inline etkdg_prepared_molecule_t prepare_molecule(std::string_view smiles) {
-    etkdg_prepared_molecule_t result {};
+inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecule_t &result) {
+    result.num_atoms = 0;
+    result.bounds_matrix.clear();
+    result.chiral_centers.clear();
+    result.etk_torsions.clear();
+    result.distance_constraints.clear();
+    result.mmff_atom_vdw.clear();
+    result.mmff_atom_charge.clear();
+    result.bond_distance.clear();
+    result.mmff_bonds.clear();
+    result.mmff_angles.clear();
+    result.mmff_torsions.clear();
+    result.mmff_oops.clear();
+    result.mmff_stretchbends.clear();
+    result.mmff_interactions.clear();
+    result.mmff_atom_offsets.clear();
+    result.etk_interactions.clear();
+    result.etk_atom_offsets.clear();
 
     std::unique_ptr<RDKit::RWMol> mol;
     try {
-        // RDKit::SmilesToMol takes std::string const& — one unavoidable copy per
-        // molecule on this path.  Kept scoped to this single call so callers stay
-        // allocation-free.
+        // RDKit::SmilesToMol takes std::string const& — one unavoidable std::string
+        // construction per molecule.  Kept scoped to this single call.
         std::string const smiles_str {smiles};
         mol.reset(RDKit::SmilesToMol(smiles_str));
     }
     catch (...) {
-        return result;
+        return;
     }
-    if (!mol) return result;
+    if (!mol) return;
 
     try {
         RDKit::MolOps::addHs(*mol);
     }
     catch (...) {
-        return result;
+        return;
     }
-    result.num_atoms = mol->getNumAtoms();
-    if (result.num_atoms > 128) return result; // Too large for the single-warp pipeline.
+    std::uint32_t const num_atoms = mol->getNumAtoms();
+    if (num_atoms > 128) return; // too large for the single-warp pipeline
+    result.num_atoms = num_atoms;
 
     try {
-        // Build the flat descriptor once. All downstream stages read from this.
         molecule_descriptor_t desc;
         if (!build_descriptor(*mol, desc)) {
             result.num_atoms = 0;
-            return result;
+            return;
         }
         build_bounds_matrix(desc, result.bounds_matrix);
         extract_chiral_centers(*mol, desc, result.chiral_centers);
@@ -791,8 +805,8 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string_view smiles) {
         extract_mmff94_params(*mol, desc, result);
     }
     catch (...) {
-        result.num_atoms = 0; // Mark as failed.
-        return result;
+        result.num_atoms = 0;
+        return;
     }
 
     result.metadata.num_atoms = result.num_atoms;
@@ -819,7 +833,19 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string_view smiles) {
     result.metadata.mmff_atom_offsets_start = 0;
     result.metadata.etk_interaction_offset = 0;
     result.metadata.etk_atom_offsets_start = 0;
+}
 
+/**
+ *  @brief Convert a SMILES string to a fresh `etkdg_prepared_molecule_t`.
+ *
+ *  Thin wrapper around `prepare_molecule_into` used by tests and by the
+ *  non-pipelined path.  Allocates a fresh struct per call — NOT the hot path;
+ *  the batched path inside `prepare_molecule_batch` uses thread_local scratch
+ *  to keep vector capacities.
+ */
+inline etkdg_prepared_molecule_t prepare_molecule(std::string_view smiles) {
+    etkdg_prepared_molecule_t result {};
+    prepare_molecule_into(smiles, result);
     return result;
 }
 
@@ -1018,47 +1044,218 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
     // `-Xcompiler=-fopenmp` through nvcc to the host compiler. Otherwise nvcc silently
     // ignores the pragma and this loop runs single-threaded — which costs 20x.
     std::size_t const n = smiles_list.size();
-    std::vector<etkdg_prepared_molecule_t> prepared(n);
-#pragma omp parallel for schedule(dynamic, 4)
-    for (std::size_t i = 0; i < n; ++i) { prepared[i] = prepare_molecule(smiles_list[i]); }
-
-    // Phase 2 — produce one contiguous pinned host buffer containing all 14
-    // per-molecule arrays plus molecule_metadata and input_indices.  Three passes:
+    // Phase 1 rewrites:
     //
-    //   Pass 1 (parallel): extract per-molecule sizes into one `std::vector<per_mol_sizes_t>`.
-    //   Pass 2 (serial):   prefix-scan into `offsets` (n + 1 entries).  Then derive the
-    //                      `batch_layout_t` from the totals and pin-allocate one pool
-    //                      buffer of size `layout.bytes_total`.
-    //   Pass 3 (parallel): one loop over m memcpys each per-molecule sub-array into its
-    //                      slice of the pinned pool.
+    //   Pass 1 (parallel): each OpenMP thread owns ONE reusable
+    //                      `etkdg_prepared_molecule_t` scratch whose vector capacities
+    //                      persist across its molecules — `prepare_molecule_into` clears
+    //                      sizes, push_back stays on the hot path without heap activity
+    //                      after the first few mols.  Each mol's output is byte-appended
+    //                      into the thread's per-region contribution buffers.
+    //   Serial (fast):     prefix-scan per-thread totals into per-thread pool bases.
+    //   Pass 3 (parallel): one `std::memcpy` per thread per region copies the thread's
+    //                      accumulator into its slice of the pinned pool, and the
+    //                      per-mol metadata is rebased to pool-wide offsets.
     //
-    // The dense metadata slot is `offsets[m].valid` — the prefix sum of the `valid`
-    // flag doubles as the compaction index for `molecule_metadata` / `input_indices`.
+    // Eliminates the old `std::vector<etkdg_prepared_molecule_t> prepared(n)` that
+    // caused 3.4 M heap allocations per 241K batch.
 
-    // Pass 1: parallel size extraction.
-    std::vector<per_mol_sizes_t> sizes(n);
-#pragma omp parallel for schedule(static)
-    for (std::size_t m = 0; m < n; ++m) sizes[m] = extract_sizes(prepared[m]);
+    struct alignas(64) thread_contribution_t {
+        etkdg_prepared_molecule_t scratch;
+        std::vector<std::byte> bounds_bytes;
+        std::vector<std::byte> chirals_bytes;
+        std::vector<std::byte> torsions_bytes;
+        std::vector<std::byte> dcons_bytes;
+        std::vector<std::byte> atom_vdw_bytes;
+        std::vector<std::byte> atom_charge_bytes;
+        std::vector<std::byte> bond_distance_bytes;
+        std::vector<std::byte> mmff_bonds_bytes;
+        std::vector<std::byte> mmff_angles_bytes;
+        std::vector<std::byte> mmff_torsions_bytes;
+        std::vector<std::byte> mmff_oops_bytes;
+        std::vector<std::byte> mmff_stretchbends_bytes;
+        std::vector<std::byte> mmff_interactions_bytes;
+        std::vector<std::byte> mmff_atom_offsets_bytes;
+        std::vector<std::byte> etk_interactions_bytes;
+        std::vector<std::byte> etk_atom_offsets_bytes;
 
-    // Pass 2: serial prefix scan over the struct of sizes.  offsets[m] is the
-    // (exclusive) starting offset for molecule m into each batch array; offsets[n]
-    // holds the total sizes.
-    std::vector<per_mol_sizes_t> offsets(n + 1);
-    offsets[0] = per_mol_sizes_t {};
-    for (std::size_t m = 0; m < n; ++m) offsets[m + 1] = offsets[m] + sizes[m];
-    std::uint32_t const n_valid = offsets[n].valid;
-    batch.num_molecules = n_valid;
+        struct per_mol_record_t {
+            std::uint32_t original_idx;
+            etkdg_molecule_metadata_t metadata; ///< `*_offset` fields hold THREAD-LOCAL byte indices
+        };
+        std::vector<per_mol_record_t> mols;
+        std::uint32_t max_atoms_seen = 0;
+    };
 
-    // Single reduction pass over num_atoms to get the batch-wide max.
+    int const n_threads_max = omp_get_max_threads();
+    std::vector<thread_contribution_t> contribs(n_threads_max);
+
+    auto append_bytes = [](std::vector<std::byte> &dst, void const *src, std::size_t bytes) -> std::size_t {
+        std::size_t const offset = dst.size();
+        if (bytes > 0) {
+            dst.resize(offset + bytes);
+            std::memcpy(dst.data() + offset, src, bytes);
+        }
+        return offset;
+    };
+
+#pragma omp parallel
+    {
+        int const tid = omp_get_thread_num();
+        auto &tc = contribs[tid];
+#pragma omp for schedule(dynamic, 64)
+        for (std::size_t m = 0; m < n; ++m) {
+            prepare_molecule_into(smiles_list[m], tc.scratch);
+            auto const &p = tc.scratch;
+            if (p.num_atoms == 0) continue;
+            if (p.num_atoms > tc.max_atoms_seen) tc.max_atoms_seen = p.num_atoms;
+
+            typename thread_contribution_t::per_mol_record_t rec;
+            rec.original_idx = static_cast<std::uint32_t>(m);
+            rec.metadata = p.metadata;
+            rec.metadata.bounds_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.bounds_bytes, p.bounds_matrix.data(), p.bounds_matrix.size() * sizeof(float)) /
+                sizeof(float));
+            rec.metadata.chiral_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.chirals_bytes, p.chiral_centers.data(),
+                             p.chiral_centers.size() * sizeof(chiral_center_descriptor_t)) /
+                sizeof(chiral_center_descriptor_t));
+            rec.metadata.torsion_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.torsions_bytes, p.etk_torsions.data(),
+                             p.etk_torsions.size() * sizeof(etk_torsion_descriptor_t)) /
+                sizeof(etk_torsion_descriptor_t));
+            rec.metadata.constraint_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.dcons_bytes, p.distance_constraints.data(),
+                             p.distance_constraints.size() * sizeof(distance_constraint_t)) /
+                sizeof(distance_constraint_t));
+            rec.metadata.mmff_atom_vdw_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.atom_vdw_bytes, p.mmff_atom_vdw.data(),
+                             p.mmff_atom_vdw.size() * sizeof(mmff94_atom_vdw_params_t)) /
+                sizeof(mmff94_atom_vdw_params_t));
+            rec.metadata.mmff_atom_charge_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.atom_charge_bytes, p.mmff_atom_charge.data(),
+                             p.mmff_atom_charge.size() * sizeof(float)) /
+                sizeof(float));
+            rec.metadata.bond_distance_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.bond_distance_bytes, p.bond_distance.data(),
+                             p.bond_distance.size() * sizeof(std::uint8_t)) /
+                sizeof(std::uint8_t));
+            rec.metadata.mmff_bond_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.mmff_bonds_bytes, p.mmff_bonds.data(), p.mmff_bonds.size() * sizeof(mmff94_bond_t)) /
+                sizeof(mmff94_bond_t));
+            rec.metadata.mmff_angle_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.mmff_angles_bytes, p.mmff_angles.data(),
+                             p.mmff_angles.size() * sizeof(mmff94_angle_t)) /
+                sizeof(mmff94_angle_t));
+            rec.metadata.mmff_torsion_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.mmff_torsions_bytes, p.mmff_torsions.data(),
+                             p.mmff_torsions.size() * sizeof(mmff94_torsion_t)) /
+                sizeof(mmff94_torsion_t));
+            rec.metadata.mmff_oop_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.mmff_oops_bytes, p.mmff_oops.data(), p.mmff_oops.size() * sizeof(mmff94_oop_t)) /
+                sizeof(mmff94_oop_t));
+            rec.metadata.mmff_stretchbend_offset = static_cast<std::uint32_t>(
+                append_bytes(tc.mmff_stretchbends_bytes, p.mmff_stretchbends.data(),
+                             p.mmff_stretchbends.size() * sizeof(mmff94_stretchbend_t)) /
+                sizeof(mmff94_stretchbend_t));
+            // Thread-local start of this mol's block inside mmff_interactions / etk_interactions.
+            std::uint32_t const tl_mmff_inter_base = static_cast<std::uint32_t>(
+                append_bytes(tc.mmff_interactions_bytes, p.mmff_interactions.data(),
+                             p.mmff_interactions.size() * sizeof(mmff94_atom_interaction_t)) /
+                sizeof(mmff94_atom_interaction_t));
+            rec.metadata.mmff_atom_offsets_start = static_cast<std::uint32_t>(
+                append_bytes(tc.mmff_atom_offsets_bytes, p.mmff_atom_offsets.data(),
+                             p.mmff_atom_offsets.size() * sizeof(mmff94_atom_offsets_t)) /
+                sizeof(mmff94_atom_offsets_t));
+            std::uint32_t const tl_etk_inter_base = static_cast<std::uint32_t>(
+                append_bytes(tc.etk_interactions_bytes, p.etk_interactions.data(),
+                             p.etk_interactions.size() * sizeof(etk_atom_interaction_t)) /
+                sizeof(etk_atom_interaction_t));
+            rec.metadata.etk_atom_offsets_start = static_cast<std::uint32_t>(
+                append_bytes(tc.etk_atom_offsets_bytes, p.etk_atom_offsets.data(),
+                             p.etk_atom_offsets.size() * sizeof(etk_atom_offsets_t)) /
+                sizeof(etk_atom_offsets_t));
+            // Rebase the per-atom offsets from per-mol-local to thread-local by adding
+            // this mol's thread-local base in the interactions array.  Phase 2 then adds
+            // the pool-wide base.
+            std::size_t const aoff_byte = rec.metadata.mmff_atom_offsets_start * sizeof(mmff94_atom_offsets_t);
+            auto *aoff_ptr = reinterpret_cast<mmff94_atom_offsets_t *>(tc.mmff_atom_offsets_bytes.data() + aoff_byte);
+            for (std::size_t k = 0; k < p.mmff_atom_offsets.size(); ++k) {
+                aoff_ptr[k].bond_start += tl_mmff_inter_base;
+                aoff_ptr[k].angle_start += tl_mmff_inter_base;
+                aoff_ptr[k].torsion_start += tl_mmff_inter_base;
+                aoff_ptr[k].oop_start += tl_mmff_inter_base;
+                aoff_ptr[k].stretchbend_start += tl_mmff_inter_base;
+            }
+            // rec.metadata.etk_interaction_offset isn't a real field on the metadata;
+            // etk_atom_offsets entries carry the interaction_start which we rebase now.
+            std::size_t const etk_aoff_byte = rec.metadata.etk_atom_offsets_start * sizeof(etk_atom_offsets_t);
+            auto *etk_aoff_ptr = reinterpret_cast<etk_atom_offsets_t *>(tc.etk_atom_offsets_bytes.data() +
+                                                                        etk_aoff_byte);
+            for (std::size_t k = 0; k < p.etk_atom_offsets.size(); ++k)
+                etk_aoff_ptr[k].interaction_start += tl_etk_inter_base;
+            rec.metadata.etk_interaction_offset = tl_etk_inter_base;
+
+            tc.mols.push_back(rec);
+        }
+    }
+
+    // Serial prefix scan: per-thread pool bases per region + dense metadata slot bases.
+    // Also collects totals for the batch layout.
+    struct thread_bases_t {
+        std::size_t bounds, chirals, torsions, dcons;
+        std::size_t atom_vdw, atom_charge, bond_distance;
+        std::size_t mmff_bonds, mmff_angles, mmff_torsions, mmff_oops, mmff_stretchbends;
+        std::size_t mmff_interactions, mmff_atom_offsets;
+        std::size_t etk_interactions, etk_atom_offsets;
+        std::size_t dense_slot;
+    };
+    std::vector<thread_bases_t> bases(n_threads_max);
+    per_mol_sizes_t totals {};
+    std::uint32_t n_valid = 0;
     std::uint32_t max_atoms_reduction = 0;
-#pragma omp parallel for schedule(static) reduction(max : max_atoms_reduction)
-    for (std::size_t m = 0; m < n; ++m)
-        if (prepared[m].num_atoms > max_atoms_reduction) max_atoms_reduction = prepared[m].num_atoms;
+    for (int t = 0; t < n_threads_max; ++t) {
+        auto const &tc = contribs[t];
+        bases[t].bounds = totals.bounds;
+        totals.bounds += tc.bounds_bytes.size() / sizeof(float);
+        bases[t].chirals = totals.chirals;
+        totals.chirals += tc.chirals_bytes.size() / sizeof(chiral_center_descriptor_t);
+        bases[t].torsions = totals.torsions;
+        totals.torsions += tc.torsions_bytes.size() / sizeof(etk_torsion_descriptor_t);
+        bases[t].dcons = totals.dcons;
+        totals.dcons += tc.dcons_bytes.size() / sizeof(distance_constraint_t);
+        bases[t].atom_vdw = totals.mmff_atom_vdw;
+        totals.mmff_atom_vdw += tc.atom_vdw_bytes.size() / sizeof(mmff94_atom_vdw_params_t);
+        bases[t].atom_charge = totals.mmff_atom_charge;
+        totals.mmff_atom_charge += tc.atom_charge_bytes.size() / sizeof(float);
+        bases[t].bond_distance = totals.bond_distance;
+        totals.bond_distance += tc.bond_distance_bytes.size() / sizeof(std::uint8_t);
+        bases[t].mmff_bonds = totals.mmff_bonds;
+        totals.mmff_bonds += tc.mmff_bonds_bytes.size() / sizeof(mmff94_bond_t);
+        bases[t].mmff_angles = totals.mmff_angles;
+        totals.mmff_angles += tc.mmff_angles_bytes.size() / sizeof(mmff94_angle_t);
+        bases[t].mmff_torsions = totals.mmff_torsions;
+        totals.mmff_torsions += tc.mmff_torsions_bytes.size() / sizeof(mmff94_torsion_t);
+        bases[t].mmff_oops = totals.mmff_oops;
+        totals.mmff_oops += tc.mmff_oops_bytes.size() / sizeof(mmff94_oop_t);
+        bases[t].mmff_stretchbends = totals.mmff_stretchbends;
+        totals.mmff_stretchbends += tc.mmff_stretchbends_bytes.size() / sizeof(mmff94_stretchbend_t);
+        bases[t].mmff_interactions = totals.mmff_interactions;
+        totals.mmff_interactions += tc.mmff_interactions_bytes.size() / sizeof(mmff94_atom_interaction_t);
+        bases[t].mmff_atom_offsets = totals.mmff_atom_offsets;
+        totals.mmff_atom_offsets += tc.mmff_atom_offsets_bytes.size() / sizeof(mmff94_atom_offsets_t);
+        bases[t].etk_interactions = totals.etk_interactions;
+        totals.etk_interactions += tc.etk_interactions_bytes.size() / sizeof(etk_atom_interaction_t);
+        bases[t].etk_atom_offsets = totals.etk_atom_offsets;
+        totals.etk_atom_offsets += tc.etk_atom_offsets_bytes.size() / sizeof(etk_atom_offsets_t);
+        bases[t].dense_slot = n_valid;
+        n_valid += static_cast<std::uint32_t>(tc.mols.size());
+        if (tc.max_atoms_seen > max_atoms_reduction) max_atoms_reduction = tc.max_atoms_seen;
+    }
+    totals.valid = n_valid;
+    batch.num_molecules = n_valid;
     batch.max_atoms_per_molecule = max_atoms_reduction;
-
-    // Compute the layout and allocate one pinned host buffer.  The launch path
-    // mirrors this into a per-GPU device buffer via a single cudaMemcpyAsync.
-    batch.layout = compute_batch_layout(offsets[n], n_valid);
+    batch.layout = compute_batch_layout(totals, n_valid);
     if (batch.layout.bytes_total > 0) {
         if (!batch.host.ensure_capacity(batch.layout.bytes_total)) {
             batch.num_molecules = 0;
@@ -1067,8 +1264,6 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
         }
     }
 
-    // Bind typed spans over the pinned pool once so Pass 3 doesn't re-derive
-    // them per iteration.  Each span is a non-owning view into `batch.host`.
     auto bounds_span = batch.bounds_matrices();
     auto chirals_span = batch.chiral_centers();
     auto torsions_span = batch.etk_torsions();
@@ -1088,51 +1283,90 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
     auto metadata_span = batch.molecule_metadata();
     auto input_idx_span = batch.input_indices();
 
-    // Pass 3: parallel copy.  Each iteration writes into a unique slice of every
-    // output array — no data race.  Failed molecules (sizes[m].valid == 0) are
-    // skipped cheaply.
+    // Pass 3: parallel per-thread memcpy + metadata rebase.
 #pragma omp parallel for schedule(static)
-    for (std::size_t m = 0; m < n; ++m) {
-        if (sizes[m].valid == 0) continue;
-        auto const &p = prepared[m];
-        auto const &o = offsets[m];
-
-        append_slice(bounds_span, o.bounds, p.bounds_matrix);
-        append_slice(chirals_span, o.chirals, p.chiral_centers);
-        append_slice(torsions_span, o.torsions, p.etk_torsions);
-        append_slice(dcons_span, o.dcons, p.distance_constraints);
-        append_slice(mmff_vdw_span, o.mmff_atom_vdw, p.mmff_atom_vdw);
-        append_slice(mmff_charge_span, o.mmff_atom_charge, p.mmff_atom_charge);
-        append_slice(bond_distance_span, o.bond_distance, p.bond_distance);
-        append_slice(mmff_bonds_span, o.mmff_bonds, p.mmff_bonds);
-        append_slice(mmff_angles_span, o.mmff_angles, p.mmff_angles);
-        append_slice(mmff_tors_span, o.mmff_torsions, p.mmff_torsions);
-        append_slice(mmff_oops_span, o.mmff_oops, p.mmff_oops);
-        append_slice(mmff_sb_span, o.mmff_stretchbends, p.mmff_stretchbends);
-        append_slice(mmff_inter_span, o.mmff_interactions, p.mmff_interactions);
-        append_slice(etk_inter_span, o.etk_interactions, p.etk_interactions);
-
-        // MMFF atom offsets store offsets INTO the batched interaction array and
-        // must be rebased by the batch-wide offset for this molecule.  Too many
-        // fields to rebase in one memcpy, so do it inline.
-        for (std::size_t k = 0; k < p.mmff_atom_offsets.size(); ++k) {
-            auto entry = p.mmff_atom_offsets[k];
-            entry.bond_start += o.mmff_interactions;
-            entry.angle_start += o.mmff_interactions;
-            entry.torsion_start += o.mmff_interactions;
-            entry.oop_start += o.mmff_interactions;
-            entry.stretchbend_start += o.mmff_interactions;
-            mmff_aoff_span[o.mmff_atom_offsets + k] = entry;
+    for (int t = 0; t < n_threads_max; ++t) {
+        auto const &tc = contribs[t];
+        auto const &b = bases[t];
+        if (!tc.bounds_bytes.empty())
+            std::memcpy(bounds_span.data() + b.bounds, tc.bounds_bytes.data(), tc.bounds_bytes.size());
+        if (!tc.chirals_bytes.empty())
+            std::memcpy(chirals_span.data() + b.chirals, tc.chirals_bytes.data(), tc.chirals_bytes.size());
+        if (!tc.torsions_bytes.empty())
+            std::memcpy(torsions_span.data() + b.torsions, tc.torsions_bytes.data(), tc.torsions_bytes.size());
+        if (!tc.dcons_bytes.empty())
+            std::memcpy(dcons_span.data() + b.dcons, tc.dcons_bytes.data(), tc.dcons_bytes.size());
+        if (!tc.atom_vdw_bytes.empty())
+            std::memcpy(mmff_vdw_span.data() + b.atom_vdw, tc.atom_vdw_bytes.data(), tc.atom_vdw_bytes.size());
+        if (!tc.atom_charge_bytes.empty())
+            std::memcpy(mmff_charge_span.data() + b.atom_charge, tc.atom_charge_bytes.data(),
+                        tc.atom_charge_bytes.size());
+        if (!tc.bond_distance_bytes.empty())
+            std::memcpy(bond_distance_span.data() + b.bond_distance, tc.bond_distance_bytes.data(),
+                        tc.bond_distance_bytes.size());
+        if (!tc.mmff_bonds_bytes.empty())
+            std::memcpy(mmff_bonds_span.data() + b.mmff_bonds, tc.mmff_bonds_bytes.data(), tc.mmff_bonds_bytes.size());
+        if (!tc.mmff_angles_bytes.empty())
+            std::memcpy(mmff_angles_span.data() + b.mmff_angles, tc.mmff_angles_bytes.data(),
+                        tc.mmff_angles_bytes.size());
+        if (!tc.mmff_torsions_bytes.empty())
+            std::memcpy(mmff_tors_span.data() + b.mmff_torsions, tc.mmff_torsions_bytes.data(),
+                        tc.mmff_torsions_bytes.size());
+        if (!tc.mmff_oops_bytes.empty())
+            std::memcpy(mmff_oops_span.data() + b.mmff_oops, tc.mmff_oops_bytes.data(), tc.mmff_oops_bytes.size());
+        if (!tc.mmff_stretchbends_bytes.empty())
+            std::memcpy(mmff_sb_span.data() + b.mmff_stretchbends, tc.mmff_stretchbends_bytes.data(),
+                        tc.mmff_stretchbends_bytes.size());
+        if (!tc.mmff_interactions_bytes.empty())
+            std::memcpy(mmff_inter_span.data() + b.mmff_interactions, tc.mmff_interactions_bytes.data(),
+                        tc.mmff_interactions_bytes.size());
+        // mmff_atom_offsets: rebase thread-local interaction offsets by the thread's
+        // pool-wide mmff_interactions base, then write to pool.
+        std::size_t const n_aoff = tc.mmff_atom_offsets_bytes.size() / sizeof(mmff94_atom_offsets_t);
+        auto const *src_aoff = reinterpret_cast<mmff94_atom_offsets_t const *>(tc.mmff_atom_offsets_bytes.data());
+        for (std::size_t k = 0; k < n_aoff; ++k) {
+            mmff94_atom_offsets_t entry = src_aoff[k];
+            entry.bond_start += b.mmff_interactions;
+            entry.angle_start += b.mmff_interactions;
+            entry.torsion_start += b.mmff_interactions;
+            entry.oop_start += b.mmff_interactions;
+            entry.stretchbend_start += b.mmff_interactions;
+            mmff_aoff_span[b.mmff_atom_offsets + k] = entry;
         }
-        for (std::size_t k = 0; k < p.etk_atom_offsets.size(); ++k) {
-            auto entry = p.etk_atom_offsets[k];
-            entry.interaction_start += o.etk_interactions;
-            etk_aoff_span[o.etk_atom_offsets + k] = entry;
+        if (!tc.etk_interactions_bytes.empty())
+            std::memcpy(etk_inter_span.data() + b.etk_interactions, tc.etk_interactions_bytes.data(),
+                        tc.etk_interactions_bytes.size());
+        std::size_t const n_etk_aoff = tc.etk_atom_offsets_bytes.size() / sizeof(etk_atom_offsets_t);
+        auto const *src_etk_aoff = reinterpret_cast<etk_atom_offsets_t const *>(tc.etk_atom_offsets_bytes.data());
+        for (std::size_t k = 0; k < n_etk_aoff; ++k) {
+            etk_atom_offsets_t entry = src_etk_aoff[k];
+            entry.interaction_start += b.etk_interactions;
+            etk_aoff_span[b.etk_atom_offsets + k] = entry;
         }
 
-        std::uint32_t const vi = o.valid; // dense index — offsets[m].valid counts prior valid mols
-        metadata_span[vi] = make_meta(p.metadata, o);
-        input_idx_span[vi] = static_cast<std::uint32_t>(m);
+        // Per-molecule metadata: rebase every region offset by the thread's pool base.
+        for (std::size_t k = 0; k < tc.mols.size(); ++k) {
+            auto const &rec = tc.mols[k];
+            etkdg_molecule_metadata_t meta = rec.metadata;
+            meta.bounds_offset += static_cast<std::uint32_t>(b.bounds);
+            meta.chiral_offset += static_cast<std::uint32_t>(b.chirals);
+            meta.torsion_offset += static_cast<std::uint32_t>(b.torsions);
+            meta.constraint_offset += static_cast<std::uint32_t>(b.dcons);
+            meta.mmff_atom_vdw_offset += static_cast<std::uint32_t>(b.atom_vdw);
+            meta.mmff_atom_charge_offset += static_cast<std::uint32_t>(b.atom_charge);
+            meta.bond_distance_offset += static_cast<std::uint32_t>(b.bond_distance);
+            meta.mmff_bond_offset += static_cast<std::uint32_t>(b.mmff_bonds);
+            meta.mmff_angle_offset += static_cast<std::uint32_t>(b.mmff_angles);
+            meta.mmff_torsion_offset += static_cast<std::uint32_t>(b.mmff_torsions);
+            meta.mmff_oop_offset += static_cast<std::uint32_t>(b.mmff_oops);
+            meta.mmff_stretchbend_offset += static_cast<std::uint32_t>(b.mmff_stretchbends);
+            meta.mmff_atom_offsets_start += static_cast<std::uint32_t>(b.mmff_atom_offsets);
+            meta.etk_interaction_offset += static_cast<std::uint32_t>(b.etk_interactions);
+            meta.etk_atom_offsets_start += static_cast<std::uint32_t>(b.etk_atom_offsets);
+            std::size_t const slot = b.dense_slot + k;
+            metadata_span[slot] = meta;
+            input_idx_span[slot] = rec.original_idx;
+        }
     }
 
     return batch;

@@ -48,13 +48,16 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
-| 241,596 | 873 mol/s           | __1,716 mol/s__  | __9,400 mol/s__   | __5.48×__   |
+| 241,596 | 873 mol/s           | 4,482 mol/s      | __9,792 mol/s__   | __2.18×__   |
 
-At 241,596 molecules on all 8 GPUs: 25.7 seconds end-to-end (median of 2 runs post-`cusolverDnXsyevBatched`).
+At 241,596 molecules on all 8 GPUs: 24.7 seconds end-to-end (median of 3 runs post-E).
 Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
 
-The 1→8 scaling improved from 1.88× (pre-session) to 5.48× after the session's work (G, H, F, C′, D, J, K).
-The path to linear scaling is described in the "Scaling analysis" section below.
+Session-level progress: the 241K × 8-GPU throughput went from 4,008 mol/s (60.3 s baseline) to 9,792 mol/s (24.7 s) — __+144%__.
+Single-GPU climbed from 1,716 to 4,482 mol/s (+161%) since per-launch metric prep CPU work and the MMFF nonbonded upload both shrank dramatically.
+
+The 1→8 scaling looks "worse" (from 3.11× earlier in the session to 2.18× now) because single-GPU throughput improved faster than 8-GPU throughput — both paths now share the same ~5 s/chunk CPU preprocessing ceiling.
+Absolute throughput is the metric that matters: at 1 GPU the critical path was GPU work (~30 s of kernel); at 8 GPUs it's CPU prep (~25 s total).
 
 ## Scaling analysis (241,596 molecules)
 
@@ -115,6 +118,28 @@ Two compounding factors (was three; dispatcher is no longer sequential):
    It could drop to near zero with a custom warp-cooperative Jacobi kernel (no cusolver state setup) but the gain is small (~500 ms / 5.8 s ≈ 9 %) compared to E's CPU-prep reduction.
 
 ## Optimizations that landed
+
+### Direct-to-pool Phase 1 preprocessing (workstream E)
+
+`prepare_molecule_batch` used to build `std::vector<etkdg_prepared_molecule_t> prepared(n)` — 241K structs each carrying 14 `std::vector<T>` members.
+First-touch per molecule allocated each inner vector's backing storage: roughly 3.4 million allocations per 241K batch, plus ~15 GB of transient per-molecule data that Phase 2 then memcpy'd into the pool and threw away.
+
+The rewrite eliminates the `prepared[n]` outer container entirely.
+Each OpenMP thread owns ONE reusable `etkdg_prepared_molecule_t` whose vectors keep their capacity across every molecule that thread processes — after the first few molecules on a thread, every `push_back` stays on the allocator's fast path.
+Each thread also owns a `thread_contribution_t` with 16 `std::vector<std::byte>` segments (one per pool region) that byte-append the current molecule's data.
+
+Three passes:
+
+1. __Parallel__: `prepare_molecule_into(smiles, tc.scratch)` fills the thread's scratch; `append_bytes` appends each region into `tc.*_bytes` and records a thread-local `per_mol_record_t` with region offsets.
+2. __Serial prefix scan__ (fast): per-thread pool bases per region + per-thread dense metadata slot bases.
+   Takes a few hundred microseconds.
+3. __Parallel__: per-thread `std::memcpy` from `tc.*_bytes` to pool + per-molecule metadata write with pool-wide offset rebase.
+
+End-to-end 241K × 8 GPU: 25.7 s → 24.7 s (+5 %), 9,400 → 9,792 mol/s.
+The modest absolute gain reflects that most per-molecule heap pressure is inside RDKit's `SmilesToMol` / `addHs` / `MMFFMolProperties` which this pass doesn't touch.
+The cleaner design is the bigger win.
+
+The `prepare_molecule(smiles) -> etkdg_prepared_molecule_t` entry point remains as a thin wrapper over `prepare_molecule_into` so tests keep working unchanged.
 
 ### cusolverDnXsyevBatched in place of cusolverDnSsyevjBatched (workstream K)
 
