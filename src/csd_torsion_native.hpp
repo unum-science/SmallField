@@ -22,6 +22,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -50,7 +51,8 @@ struct simple_neighbor_constraint_t {
     std::uint8_t bond_require_flags;  ///< bond_flag_t bits MUST be set
     std::uint8_t bond_forbid_flags;   ///< bond_flag_t bits MUST NOT be set
     std::uint8_t active;              ///< 1 if this slot carries a real constraint
-    std::uint8_t padding[3];
+    std::int8_t formal_charge;        ///< exact formal charge; INT8_MIN = no constraint
+    std::uint8_t padding[2];
 };
 
 /**
@@ -71,7 +73,8 @@ struct simple_atom_constraint_t {
     std::uint8_t forbid_flags;  ///< atom_flag_t bits that MUST NOT be set
     std::uint8_t predicate;     ///< csd_predicate_t; csd_predicate_none_k (0) = no recursive predicate check
     std::uint8_t num_neighbor_branches; ///< 0, 1, or 2 inline `(...)` neighbour branches
-    std::uint8_t padding[6];
+    std::int8_t formal_charge;  ///< exact formal charge; INT8_MIN (=-128) = no constraint
+    std::uint8_t padding[5];
     simple_neighbor_constraint_t neighbor_branch[2]; ///< active slots defined by num_neighbor_branches
 };
 
@@ -340,6 +343,32 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
             }
             continue;
         }
+        if (c == '+' || c == '-') {
+            // Workstream N+++ — SMARTS formal-charge specifier:
+            //   "+"    = charge +1
+            //   "+<n>" = charge +n
+            //   "-"    = charge -1
+            //   "-<n>" = charge -n
+            // RDKit's getFormalCharge returns signed int; we store as int8_t.
+            if (negate_next) return false; // negated charge isn't in the CSD library
+            std::int8_t sign = (c == '+') ? static_cast<std::int8_t>(1) : static_cast<std::int8_t>(-1);
+            ++p;
+            std::int8_t magnitude = 1;
+            if (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
+                std::uint32_t num = 0;
+                while (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
+                    num = num * 10 + (token[p] - '0');
+                    ++p;
+                }
+                if (num == 0 || num > 8) return false; // sanity bound
+                magnitude = static_cast<std::int8_t>(num);
+            }
+            std::int8_t const chg = static_cast<std::int8_t>(sign * magnitude);
+            std::int8_t constexpr kNoCharge = std::numeric_limits<std::int8_t>::min();
+            if (ac.formal_charge != kNoCharge && ac.formal_charge != chg) return false; // conflicting charges
+            ac.formal_charge = chg;
+            continue;
+        }
         if (c == '^') {
             // Hybridization: "^<n>" — 1 = SP, 2 = SP2, 3 = SP3, etc.
             if (negate_next) return false;
@@ -493,19 +522,13 @@ inline bool parse_atom_spec(std::string_view spec, simple_atom_constraint_t &ac)
     ac.element_mask = 0;
     ac.exact_h_count = 0xFF;
 
+    ac.formal_charge = std::numeric_limits<std::int8_t>::min(); // sentinel: no charge constraint
     if (spec.empty()) return false;
     if (spec.find('|') != std::string_view::npos) return false;
-    if (spec.find('+') != std::string_view::npos) return false;
-    // Reject '-' as charge indicator (always mid-spec in SMARTS). But `-` inside a
-    // `{...}` block is a range separator for `r{N-M}`, so skip characters inside braces.
-    {
-        bool in_brace = false;
-        for (std::size_t i = 1; i < spec.size(); ++i) {
-            if (spec[i] == '{') in_brace = true;
-            else if (spec[i] == '}') in_brace = false;
-            else if (spec[i] == '-' && !in_brace) return false;
-        }
-    }
+    // Workstream N+++ — formal charges (`+`, `-`, `+N`, `-N`) are now handled
+    // inside `parse_atom_term`, so `spec.find('+')` is no longer a bail-out.
+    // We still need to keep `-` inside `{...}` (range separator for `r{N-M}`)
+    // disambiguated from the charge indicator; parse_atom_term does that per-term.
 
     // Pre-process: pull out a top-level recursive sub-query `$(...)` if present and
     // translate it to a predicate ID. `$` inside a disjunct (i.e. comma-joined OR)
@@ -542,6 +565,7 @@ inline bool parse_atom_spec(std::string_view spec, simple_atom_constraint_t &ac)
         simple_atom_constraint_t disjunct_ac {};
         disjunct_ac.element_mask = 0;
         disjunct_ac.exact_h_count = 0xFF;
+        disjunct_ac.formal_charge = std::numeric_limits<std::int8_t>::min(); // sentinel: no constraint
         std::uint64_t disjunct_mask = 0;
         bool disjunct_has_element = false;
 
@@ -577,6 +601,7 @@ inline bool parse_atom_spec(std::string_view spec, simple_atom_constraint_t &ac)
             if (ac.hybridization != disjunct_ac.hybridization) return false;
             if (ac.require_flags != disjunct_ac.require_flags) return false;
             if (ac.forbid_flags != disjunct_ac.forbid_flags) return false;
+            if (ac.formal_charge != disjunct_ac.formal_charge) return false;
             // Union element masks.
             if (any_uses_element && disjunct_has_element) full_mask |= disjunct_mask;
             else if (disjunct_has_element) {
@@ -698,6 +723,7 @@ inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
 inline bool parse_branch_spec(std::string_view branch, simple_neighbor_constraint_t &nb) {
     nb = {};
     nb.exact_h_count = 0xFF;
+    nb.formal_charge = std::numeric_limits<std::int8_t>::min();
     if (branch.empty()) return false;
     // Nested branches inside a branch are outside our scope.
     if (branch.find('(') != std::string_view::npos) return false;
@@ -773,6 +799,7 @@ inline bool parse_branch_spec(std::string_view branch, simple_neighbor_constrain
     nb.bond_order = bc.bond_order;
     nb.bond_require_flags = bc.require_flags;
     nb.bond_forbid_flags = bc.forbid_flags;
+    nb.formal_charge = ac.formal_charge;
     nb.active = 1;
     return true;
 }
@@ -885,6 +912,8 @@ inline bool atom_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx
         }
     }
     if (ac.hybridization != 0 && desc.hybridization[atom_idx] != ac.hybridization) return false;
+    std::int8_t constexpr kNoCharge = std::numeric_limits<std::int8_t>::min();
+    if (ac.formal_charge != kNoCharge && desc.formal_charge[atom_idx] != ac.formal_charge) return false;
     std::uint8_t const flags = desc.atom_flags[atom_idx];
     if ((flags & ac.require_flags) != ac.require_flags) return false;
     if ((flags & ac.forbid_flags) != 0) return false;
@@ -941,6 +970,8 @@ inline bool neighbor_match(molecule_descriptor_t const &desc, std::uint32_t atom
         }
     }
     if (nc.hybridization != 0 && desc.hybridization[atom_idx] != nc.hybridization) return false;
+    std::int8_t constexpr kNoCharge_nb = std::numeric_limits<std::int8_t>::min();
+    if (nc.formal_charge != kNoCharge_nb && desc.formal_charge[atom_idx] != nc.formal_charge) return false;
     std::uint8_t const aflags = desc.atom_flags[atom_idx];
     if ((aflags & nc.require_flags) != nc.require_flags) return false;
     if ((aflags & nc.forbid_flags) != 0) return false;
