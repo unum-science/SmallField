@@ -31,6 +31,29 @@
 namespace smallfield {
 
 /**
+ *  Per-atom branch-neighbor constraint. Represents an inline neighbour specified
+ *  in SMARTS via `]([…])` — e.g. `[c:2]([cH1])` = carbon with an aromatic-CH
+ *  neighbour. Deliberately flatter than @ref simple_atom_constraint_t: branches
+ *  cannot themselves have branches or recursive predicates.
+ */
+struct simple_neighbor_constraint_t {
+    std::uint64_t element_mask;       ///< bit N = element N allowed; 0 = any
+    std::uint8_t min_degree;          ///< 0 = any
+    std::uint8_t heavy_degree;        ///< 0 = any
+    std::uint8_t exact_h_count;       ///< 0xFF = any
+    std::uint8_t ring_size;           ///< smallest-ring lower bound; 0 = any
+    std::uint8_t ring_size_max;       ///< upper bound; 0 = exact match on ring_size
+    std::uint8_t hybridization;       ///< 0 = any
+    std::uint8_t require_flags;       ///< atom_flag_t bits MUST be set
+    std::uint8_t forbid_flags;        ///< atom_flag_t bits MUST NOT be set
+    std::uint8_t bond_order;          ///< bond order from parent atom; 0 = any
+    std::uint8_t bond_require_flags;  ///< bond_flag_t bits MUST be set
+    std::uint8_t bond_forbid_flags;   ///< bond_flag_t bits MUST NOT be set
+    std::uint8_t active;              ///< 1 if this slot carries a real constraint
+    std::uint8_t padding[3];
+};
+
+/**
  *  Per-atom constraint extracted from SMARTS. All fields stack-allocated.
  *  element_mask supports logical OR of elements (e.g. [N,O,S]) via a 64-bit bitmap —
  *  bit N of element_mask set means atomic number N is an allowed element.
@@ -47,7 +70,9 @@ struct simple_atom_constraint_t {
     std::uint8_t require_flags; ///< atom_flag_t bits that MUST be set
     std::uint8_t forbid_flags;  ///< atom_flag_t bits that MUST NOT be set
     std::uint8_t predicate;     ///< csd_predicate_t; csd_predicate_none_k (0) = no recursive predicate check
-    std::uint8_t padding[7];
+    std::uint8_t num_neighbor_branches; ///< 0, 1, or 2 inline `(...)` neighbour branches
+    std::uint8_t padding[6];
+    simple_neighbor_constraint_t neighbor_branch[2]; ///< active slots defined by num_neighbor_branches
 };
 
 /** Per-bond constraint extracted from SMARTS. */
@@ -129,7 +154,7 @@ inline std::uint8_t symbol_to_element(std::string_view sym) {
  *   - `:<n>` — atom map label (ignored; labels are tracked externally via idx[])
  */
 inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac, std::uint64_t &term_mask,
-                            bool term_has_element) {
+                            bool &term_has_element) {
     bool negate_next = false;
     std::size_t p = 0;
     bool aromatic_lowercase_seen = false;
@@ -656,22 +681,119 @@ inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
 }
 
 /**
- *  Attempt to parse a linear 4-atom SMARTS pattern into simple_torsion_pattern_t.
- *  Returns false on any feature we don't handle (branches, recursion, etc.).
+ *  Parse a branch content string (what sits between `(` and `)` after an atom
+ *  bracket in SMARTS — e.g. `"cH1"` from `([cH1])` or `"=O"` from `(=O)`).
+ *  Accepts an optional leading bond operator followed by either a bracketed
+ *  atom spec `[…]` or a shorthand element symbol (one or two letters).
  *
- *  Expected syntax: [atom0]<op01>[atom1]<op12>[atom2]<op23>[atom3]
- *  where <opNN> can be empty or a bond operator.
+ *  Returns false on any feature we can't flatten into a @ref
+ *  simple_neighbor_constraint_t — nested branches, recursive sub-queries,
+ *  charge signs, etc. On success, @p nb is fully populated with active=1.
+ */
+inline bool parse_branch_spec(std::string_view branch, simple_neighbor_constraint_t &nb) {
+    nb = {};
+    nb.exact_h_count = 0xFF;
+    if (branch.empty()) return false;
+    // Nested branches inside a branch are outside our scope.
+    if (branch.find('(') != std::string_view::npos) return false;
+    // Atom-map labels `:<n>` inside a branch would place a numbered torsion atom
+    // away from the linear chain — a topology we don't handle natively.
+    if (branch.find(':') != std::string_view::npos) return false;
+
+    // Split into bond-op prefix + atom body. Bond ops use only a handful of
+    // characters (-, =, #, :, ~, @, !, ;), none of which start an atom spec.
+    std::size_t p = 0;
+    while (p < branch.size() && branch[p] != '[' && !std::isalpha(static_cast<unsigned char>(branch[p]))) ++p;
+    simple_bond_constraint_t bc {};
+    if (!parse_bond_op(branch.substr(0, p), bc)) return false;
+
+    simple_atom_constraint_t ac {};
+    if (p < branch.size() && branch[p] == '[') {
+        // Bracketed atom spec.
+        ++p;
+        std::size_t atom_start = p;
+        int depth_b = 0, depth_p = 0;
+        while (p < branch.size() && (branch[p] != ']' || depth_b > 0 || depth_p > 0)) {
+            if (branch[p] == '[') ++depth_b;
+            else if (branch[p] == ']') --depth_b;
+            else if (branch[p] == '(') ++depth_p;
+            else if (branch[p] == ')') --depth_p;
+            ++p;
+        }
+        if (p >= branch.size() || branch[p] != ']') return false;
+        std::string_view spec = branch.substr(atom_start, p - atom_start);
+        ++p; // skip ']'
+        if (p != branch.size()) return false; // stray chars after ']'
+        if (!parse_atom_spec(spec, ac)) return false;
+    }
+    else if (p < branch.size()) {
+        // Shorthand element: 1-2 letters (e.g. "C", "c", "Cl", "Br"). No modifiers.
+        std::string_view rest = branch.substr(p);
+        std::uint8_t elem = 0;
+        std::size_t consumed = 0;
+        if (rest.size() >= 2 && std::isalpha(static_cast<unsigned char>(rest[0])) &&
+            std::islower(static_cast<unsigned char>(rest[1]))) {
+            elem = symbol_to_element(rest.substr(0, 2));
+            if (elem != 0) consumed = 2;
+        }
+        if (consumed == 0) {
+            elem = symbol_to_element(rest.substr(0, 1));
+            if (elem != 0) consumed = 1;
+        }
+        if (consumed == 0 || elem >= 64 || consumed != rest.size()) return false;
+        ac.element_mask = (1ULL << elem);
+        ac.exact_h_count = 0xFF;
+        // Case-derived aromaticity (same convention as parse_atom_term).
+        if (std::islower(static_cast<unsigned char>(rest[0]))) ac.require_flags |= atom_flag_aromatic_k;
+        else ac.forbid_flags |= atom_flag_aromatic_k;
+    }
+    else {
+        return false; // bond op without atom
+    }
+
+    // Branches must not recurse or carry predicates — both are handled by
+    // falling through to the RDKit fallback for the whole pattern.
+    if (ac.num_neighbor_branches != 0) return false;
+    if (ac.predicate != csd_predicate_none_k) return false;
+
+    nb.element_mask = ac.element_mask;
+    nb.min_degree = ac.min_degree;
+    nb.heavy_degree = ac.heavy_degree;
+    nb.exact_h_count = ac.exact_h_count;
+    nb.ring_size = ac.ring_size;
+    nb.ring_size_max = ac.ring_size_max;
+    nb.hybridization = ac.hybridization;
+    nb.require_flags = ac.require_flags;
+    nb.forbid_flags = ac.forbid_flags;
+    nb.bond_order = bc.bond_order;
+    nb.bond_require_flags = bc.require_flags;
+    nb.bond_forbid_flags = bc.forbid_flags;
+    nb.active = 1;
+    return true;
+}
+
+/**
+ *  Attempt to parse a linear 4-atom SMARTS pattern into simple_torsion_pattern_t.
+ *  Returns false on any feature we don't handle (recursion, nested branches, …).
+ *
+ *  Accepted syntax: [atom0]<op01>[atom1](<br>)…<op12>[atom2](<br>)…<op23>[atom3](<br>)…
+ *  where each `<opNN>` is empty or a bond operator, and each atom may carry up
+ *  to 2 inline `(<br>)` branches specifying one neighbour constraint.
  */
 inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern_t &pat) {
     pat = {};
     // We expect exactly 4 bracketed atom specs separated by bond operators.
     std::string_view atoms[4];
     std::string_view ops[3];
+    std::string_view branch_text[4][2];
+    std::uint8_t branch_count[4] = {0, 0, 0, 0};
     std::size_t atom_count = 0;
     std::size_t p = 0;
 
     while (p < smarts.size()) {
         // Parse bond op before this atom (atoms 1/2/3 have preceding op; atom 0 has none).
+        // `(` characters belong to post-atom branches we already consumed, so they
+        // should never appear here — if they do, the input is malformed for us.
         std::size_t op_start = p;
         while (p < smarts.size() && smarts[p] != '[') ++p;
         if (p >= smarts.size()) break;
@@ -694,17 +816,43 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
         }
         if (p >= smarts.size() || smarts[p] != ']') return false;
         if (atom_count >= 4) return false;
+        std::size_t const current = atom_count;
         atoms[atom_count++] = smarts.substr(atom_start, p - atom_start);
         ++p; // skip ']'
+
+        // Consume any inline `(...)` branches attached to this atom. Each branch
+        // becomes one @ref simple_neighbor_constraint_t attached to the atom;
+        // more than 2 branches per atom forces a fallback.
+        while (p < smarts.size() && smarts[p] == '(') {
+            ++p; // skip '('
+            std::size_t branch_start = p;
+            int bd = 0, bp = 0;
+            while (p < smarts.size() && (smarts[p] != ')' || bd > 0 || bp > 0)) {
+                if (smarts[p] == '[') ++bd;
+                else if (smarts[p] == ']') --bd;
+                else if (smarts[p] == '(') ++bp;
+                else if (smarts[p] == ')') --bp;
+                ++p;
+            }
+            if (p >= smarts.size() || smarts[p] != ')') return false;
+            if (branch_count[current] >= 2) return false;
+            branch_text[current][branch_count[current]++] = smarts.substr(branch_start, p - branch_start);
+            ++p; // skip ')'
+        }
     }
 
     if (atom_count != 4) return false;
 
-    // Parse each atom and bond spec.
+    // Parse each atom and bond spec, then attach any branches.
     for (std::uint32_t i = 0; i < 4; ++i)
         if (!parse_atom_spec(atoms[i], pat.atom[i])) return false;
     for (std::uint32_t i = 0; i < 3; ++i)
         if (!parse_bond_op(ops[i], pat.bond[i])) return false;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        pat.atom[i].num_neighbor_branches = branch_count[i];
+        for (std::uint32_t j = 0; j < branch_count[i]; ++j)
+            if (!parse_branch_spec(branch_text[i][j], pat.atom[i].neighbor_branch[j])) return false;
+    }
 
     return true;
 }
@@ -739,6 +887,98 @@ inline bool atom_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx
         !csd_predicate_check(desc, atom_idx, static_cast<csd_predicate_t>(ac.predicate)))
         return false;
     return true;
+}
+
+/**
+ *  Check whether (atom_idx, bond_idx) — a neighbour of some parent atom — satisfies
+ *  a branch constraint.  Inlines the atom and bond rules so the hot path has no
+ *  indirection: the parent @ref atom_match already covered the parent itself.
+ */
+inline bool neighbor_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx, std::uint32_t bond_idx,
+                           simple_neighbor_constraint_t const &nc) {
+    // Bond rules first — cheapest + most selective for double-bond branches like `(=O)`.
+    if (nc.bond_order != 0) {
+        std::uint8_t const bo = desc.bond_order[bond_idx];
+        bool const is_aromatic = (desc.bond_flags[bond_idx] & bond_flag_aromatic_k) != 0;
+        if (nc.bond_order == 1) {
+            if (is_aromatic) return false;
+            if (bo != 1) return false;
+        }
+        else if (nc.bond_order == 2) {
+            if (bo != 2 || is_aromatic) return false;
+        }
+        else if (nc.bond_order == 3) {
+            if (bo != 3) return false;
+        }
+    }
+    std::uint8_t const bflags = desc.bond_flags[bond_idx];
+    if ((bflags & nc.bond_require_flags) != nc.bond_require_flags) return false;
+    if ((bflags & nc.bond_forbid_flags) != 0) return false;
+
+    std::uint8_t const el = desc.element[atom_idx];
+    if (nc.element_mask != 0 && el < 64 && (nc.element_mask & (1ULL << el)) == 0) return false;
+    if (nc.element_mask != 0 && el >= 64) return false;
+    if (nc.min_degree != 0 && desc.degree[atom_idx] != nc.min_degree) return false;
+    if (nc.heavy_degree != 0) {
+        std::uint8_t const dg = desc.degree[atom_idx];
+        std::uint8_t const nh = desc.num_hydrogens[atom_idx];
+        std::uint8_t const heavy = (dg >= nh) ? static_cast<std::uint8_t>(dg - nh) : 0;
+        if (heavy != nc.heavy_degree) return false;
+    }
+    if (nc.exact_h_count != 0xFF && desc.num_hydrogens[atom_idx] != nc.exact_h_count) return false;
+    if (nc.ring_size != 0) {
+        std::uint8_t const rs = desc.smallest_ring[atom_idx];
+        if (nc.ring_size_max == 0) {
+            if (rs != nc.ring_size) return false;
+        }
+        else {
+            if (rs < nc.ring_size || rs > nc.ring_size_max) return false;
+        }
+    }
+    if (nc.hybridization != 0 && desc.hybridization[atom_idx] != nc.hybridization) return false;
+    std::uint8_t const aflags = desc.atom_flags[atom_idx];
+    if ((aflags & nc.require_flags) != nc.require_flags) return false;
+    if ((aflags & nc.forbid_flags) != 0) return false;
+    return true;
+}
+
+/**
+ *  Verify that @p atom_idx has enough neighbours satisfying @p ac's branch list.
+ *  Branch neighbours are drawn from @p atom_idx's adjacency, excluding the two
+ *  chain-adjacent atoms @p chain_a and @p chain_b (pass 0xFF if unused).  When
+ *  two branches are present we try both orderings so a pattern like
+ *  `(~[N,n])(~[N,n])` can map either way.
+ */
+inline bool check_branch_neighbors(molecule_descriptor_t const &desc, std::uint32_t atom_idx,
+                                   simple_atom_constraint_t const &ac, std::uint32_t chain_a, std::uint32_t chain_b) {
+    std::uint8_t const n_br = ac.num_neighbor_branches;
+    if (n_br == 0) return true;
+    std::uint16_t const s = desc.neighbor_offset[atom_idx];
+    std::uint16_t const e = desc.neighbor_offset[atom_idx + 1];
+
+    if (n_br == 1) {
+        for (std::uint16_t n = s; n < e; ++n) {
+            std::uint8_t const na = desc.neighbor_atom[n];
+            if (na == chain_a || na == chain_b) continue;
+            if (neighbor_match(desc, na, desc.neighbor_bond[n], ac.neighbor_branch[0])) return true;
+        }
+        return false;
+    }
+
+    // n_br == 2: need two distinct neighbours, one per branch slot.
+    for (std::uint16_t n0 = s; n0 < e; ++n0) {
+        std::uint8_t const a0 = desc.neighbor_atom[n0];
+        if (a0 == chain_a || a0 == chain_b) continue;
+        std::uint16_t const b0 = desc.neighbor_bond[n0];
+        if (!neighbor_match(desc, a0, b0, ac.neighbor_branch[0])) continue;
+        for (std::uint16_t n1 = s; n1 < e; ++n1) {
+            if (n1 == n0) continue;
+            std::uint8_t const a1 = desc.neighbor_atom[n1];
+            if (a1 == chain_a || a1 == chain_b) continue;
+            if (neighbor_match(desc, a1, desc.neighbor_bond[n1], ac.neighbor_branch[1])) return true;
+        }
+    }
+    return false;
 }
 
 inline bool bond_match(molecule_descriptor_t const &desc, std::uint32_t bond_idx, simple_bond_constraint_t const &bc) {
@@ -797,12 +1037,19 @@ inline void match_linear_pattern(molecule_descriptor_t const &desc, simple_torsi
             // Iterate neighbors of a2 (excluding a3) for atom[0] (aka :1).
             std::uint16_t const s2 = desc.neighbor_offset[a2];
             std::uint16_t const e2 = desc.neighbor_offset[a2 + 1];
+            constexpr std::uint32_t kNone = 0xFFu;
             for (std::uint16_t n1 = s2; n1 < e2; ++n1) {
                 std::uint8_t const a1 = desc.neighbor_atom[n1];
                 if (a1 == a3) continue;
                 std::uint16_t const b01 = desc.neighbor_bond[n1];
                 if (!atom_match(desc, a1, pat.atom[0])) continue;
                 if (!bond_match(desc, b01, pat.bond[0])) continue;
+
+                // Branches on atom[0] depend only on (a1, a2); branches on
+                // atom[1] depend on (a2, a1, a3).  Both are independent of a4,
+                // so check them before iterating a4's candidates.
+                if (!check_branch_neighbors(desc, a1, pat.atom[0], a2, kNone)) continue;
+                if (!check_branch_neighbors(desc, a2, pat.atom[1], a1, a3)) continue;
 
                 // Iterate neighbors of a3 (excluding a2) for atom[3] (aka :4).
                 std::uint16_t const s3 = desc.neighbor_offset[a3];
@@ -813,6 +1060,10 @@ inline void match_linear_pattern(molecule_descriptor_t const &desc, simple_torsi
                     std::uint16_t const b23 = desc.neighbor_bond[n4];
                     if (!atom_match(desc, a4, pat.atom[3])) continue;
                     if (!bond_match(desc, b23, pat.bond[2])) continue;
+
+                    // Branches on atom[2] depend on a4; atom[3] depends on a3, a4.
+                    if (!check_branch_neighbors(desc, a3, pat.atom[2], a2, a4)) continue;
+                    if (!check_branch_neighbors(desc, a4, pat.atom[3], a3, kNone)) continue;
 
                     // Match! Call emit; it marks done_bonds and returns.
                     if (emit(a1, a2, a3, a4, b)) goto next_bond;

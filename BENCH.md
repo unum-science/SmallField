@@ -48,7 +48,7 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
-| 241,596 | 873 mol/s           | 4,482 mol/s      | __10,107 mol/s__  | __2.26×__   |
+| 241,596 | 1,753 mol/s         | 4,520 mol/s      | __10,130 mol/s__  | __2.24×__   |
 
 At 241,596 molecules on all 8 GPUs: 23.9 seconds end-to-end (median of 3 runs post-O).
 Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
@@ -85,8 +85,8 @@ The 8 launches run concurrently on 8 OpenMP threads, so their wall contribution 
 
 | OMP threads           | Throughput  | Notes                                                           |
 | --------------------- | ----------- | --------------------------------------------------------------- |
-| 192                   | 873 mol/s   | Allocator + NUMA overhead dominates; worse than smaller batches |
-| 192 (8,948 mol batch) | 1,672 mol/s | Peak CPU throughput                                             |
+| 192                   | 1,753 mol/s | Warm allocator post-workstream-N run; earlier cold runs hit ~873 mol/s before jemalloc settled |
+| 192 (8,948 mol batch) | 1,672 mol/s | Peak CPU throughput on small batch                              |
 
 RDKit's `MMFFMolProperties` per-molecule heap traffic (internal lookup tables + exclusion matrices) scales poorly on large batches because the allocator starts contending.
 Peak CPU throughput is ~1,700 mol/s regardless of core count beyond 96.
@@ -118,6 +118,23 @@ Two compounding factors (was three; dispatcher is no longer sequential):
    It could drop to near zero with a custom warp-cooperative Jacobi kernel (no cusolver state setup) but the gain is small (~500 ms / 5.8 s ≈ 9 %) compared to E's CPU-prep reduction.
 
 ## Optimizations that landed
+
+### Native CSD SMARTS branch support + element-mask fix (workstream N)
+
+`parse_linear_torsion` now accepts inline `]([…])` branches on any of the four chain atoms.
+Each branch becomes a `simple_neighbor_constraint_t` stored on its parent atom; `match_linear_pattern` verifies up to two distinct branch neighbours after the 4-atom chain is matched (both orderings tried so `(~[N,n])(~[N,n])` maps either way).
+Two slot types of content are accepted: bracketed `[spec]` (same disjunct / conjunction grammar as the main atom) and shorthand elements with an optional bond operator (`=O`, `Cl`, `c`).
+Branches that contain atom-map labels, nested parens, recursive sub-queries, or charge signs still fall through to RDKit.
+
+This also fixed a pre-existing correctness bug in `parse_atom_term`: the `term_has_element` parameter was passed by value, so simple atom specs like `[O:1]` left `disjunct_has_element=false` and ended up with `element_mask=0` (i.e. "any element").
+The native matcher was silently wildcard-matching non-O bonds as if they were `[O]`; the downstream `done_bonds` dedup masked the symptom in aggregate but broken per-pattern torsion assignments existed latently.
+Fixed by passing the flag by reference.
+
+Native pattern coverage: __216 / 472 → 300 / 470__ (46% → 64%).
+Throughput at 241K × 8 GPU: 10,107 → 10,130 mol/s (median of two runs; 10,154 and 10,105 individually).
+Flat within run-to-run noise — the RDKit `SubstructMatch` fallback was already fast after the element prefilter, so converting 84 more patterns to native saves only microseconds of per-molecule CPU time.
+The real CPU-prep cost is `MMFFMolProperties` (atom typing), which this workstream does not touch.
+Net: a correctness improvement with no throughput regression; the pre-existing wildcard matcher was producing spurious torsions that the ETKDG refiner then had to spend iterations cleaning up.
 
 ### Fused bounds-smooth + Gram + power-iter embedding kernel (workstream O)
 
