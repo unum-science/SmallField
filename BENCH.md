@@ -48,12 +48,12 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
-| 241,596 | 873 mol/s           | __1,716 mol/s__  | __5,340 mol/s__   | __3.11×__   |
+| 241,596 | 873 mol/s           | __1,716 mol/s__  | __8,344 mol/s__   | __4.86×__   |
 
-At 241,596 molecules on all 8 GPUs: 45.2 seconds end-to-end (median of 3 runs post-D).
+At 241,596 molecules on all 8 GPUs: 29.0 seconds end-to-end (median of 3 runs post-OpenMP dispatcher).
 Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
 
-The 1→8 scaling improved from 1.88× (pre-session) to 3.11× after the session's work (G, H, F, C′, D).
+The 1→8 scaling improved from 1.88× (pre-session) to 4.86× after the session's work (G, H, F, C′, D, J).
 The path to linear scaling is described in the "Scaling analysis" section below.
 
 ## Scaling analysis (241,596 molecules)
@@ -73,9 +73,10 @@ The path to linear scaling is described in the "Scaling analysis" section below.
 | Config | Wall time | Throughput | Scaling |
 |--------|-----------|------------|---------|
 | 1 GPU  | 140.8 s   | 1,716 mol/s | 1.0×    |
-| 8 GPUs | 45.2 s    | 5,340 mol/s | 3.11×   |
+| 8 GPUs | 29.0 s    | 8,344 mol/s | 4.86×   |
 
-Observed per-launch wall (instrumentation, post-D): `setup=0.3 mallocpool=0 upload=0.2 metric=400–560 kernels_post=0.2 total≈400–560 ms`.
+Observed per-launch wall (instrumentation, post-OpenMP dispatcher): `setup=0.3 mallocpool=0 upload=0.2 metric=400–560 kernels_post=0.2 total≈400–560 ms`.
+The 8 launches run concurrently on 8 OpenMP threads, so their wall contribution to the chunk is ≈ max(500 ms) rather than sum.
 
 ### CPU scaling (RDKit) on 241K
 
@@ -87,35 +88,46 @@ Observed per-launch wall (instrumentation, post-D): `setup=0.3 mallocpool=0 uplo
 RDKit's `MMFFMolProperties` per-molecule heap traffic (internal lookup tables + exclusion matrices) scales poorly on large batches because the allocator starts contending.
 Peak CPU throughput is ~1,700 mol/s regardless of core count beyond 96.
 
-### Where the per-chunk 9 s/chunk wall time goes at 8 GPUs
+### Where the per-chunk 5.8 s/chunk wall time goes at 8 GPUs (post-J)
 
-45.2 s end-to-end / 5 chunks = __9 s per chunk__ on 8 GPUs.
+29.0 s end-to-end / 5 chunks = __5.8 s per chunk__ on 8 GPUs.
 Breakdown:
 
 | Phase                              | Per chunk          | Notes |
 |------------------------------------|--------------------|-------|
-| CPU `prepare_molecule_batch`       | ~5 s               | OpenMP parallel, 192 threads |
-| Dispatcher (8 sequential launches) | ~4 s (500 ms × 8)  | Single-threaded; one thread calls `launch_gpu_pipeline` 8× |
+| CPU `prepare_molecule_batch`       | ~5 s               | __now the critical path__; OpenMP parallel, 192 threads |
+| Dispatcher (8 parallel launches)   | ~0.5 s             | OpenMP-parallel across 8 threads, one per GPU |
 | Kernel (wall, 8 GPUs concurrent)   | ~0.5 s             | GPU is idle most of the chunk |
 
-CPU prep and dispatcher partially overlap via the chunk ring buffer, but the dispatcher is now the critical path because it's sequential across GPUs.
+The pipeline overlaps CPU prep of chunk N+1 with dispatcher + kernel of chunk N.
+With dispatcher now 0.5 s (was 4 s), the critical path is the 5 s CPU prep — the last remaining large synchronous phase.
 
-### Why 1→8 scaling is 3.11× not 8×
+### Why 1→8 scaling is 4.86× not 8×
 
-Three compounding factors:
+Two compounding factors (was three; dispatcher is no longer sequential):
 
-1. __Dispatcher is single-threaded and sequential across GPUs.__
-   Per-launch wall is ~500 ms.
-   At 1 GPU that's 0.5 s/chunk; at 8 GPUs that's 4 s/chunk.
-   The dispatcher grows linearly with GPU count while the GPU work shrinks — the curves cross past ~4 GPUs.
-2. __CPU prep is constant per chunk regardless of GPU count.__  ~5 s/chunk × 5 chunks = 25 s of CPU work.
-   At 1 GPU the GPU work (~30 s of kernel) dominates, so CPU prep fully overlaps.
-   At 8 GPUs the GPU work drops to ~4 s/chunk and CPU prep becomes the tail.
-3. __Metric prepass CPU overhead per launch.__
-   Even after the 8-bin fix (G), each launch spends ~400–560 ms of CPU time setting up and calling `cusolverDnSsyevjBatched` 8 times.
-   That's ~8 × 60 ms per bin — cusolver has non-trivial state-update work per call that isn't pure stream enqueue.
+1. __CPU prep is constant per chunk regardless of GPU count.__  ~5 s/chunk × 5 chunks = 25 s of CPU work.
+   At 1 GPU the GPU work (~30 s of kernel) dominates so CPU prep fully overlaps.
+   At 8 GPUs the GPU work drops to ~0.5 s/chunk and CPU prep becomes the tail — this is now the __#1 bottleneck__.
+2. __Metric prepass CPU overhead per launch.__
+   Each launch spends ~400–560 ms of CPU time in the 8 `cusolverDnSsyevjBatched` calls.
+   Now that the 8 launches run concurrently (one per GPU), this contributes max(500 ms), not sum(500 ms × 8).
+   It could drop to near zero with a custom warp-cooperative Jacobi kernel (no cusolver state setup) but the gain is small (~500 ms / 5.8 s ≈ 9 %) compared to E's CPU-prep reduction.
 
 ## Optimizations that landed
+
+### Parallel dispatcher via OpenMP (workstream J)
+
+`launch_chunk` used to call `launch_gpu_pipeline` 8 times sequentially on one thread.
+Each call takes ~500 ms of CPU-side work (mostly cusolver state update for the metric prepass and group-indices gather), so dispatcher wall at 8 GPUs was 4 s/chunk — more than the kernel itself.
+
+Replaced the sequential loop with `#pragma omp parallel for num_threads(num_devices) schedule(static, 1)`.
+Each OpenMP thread owns one device's state (`streams[d]`, `solvers[d]`, `metric_scratch[d]`, `launch_scratch[d]`) — no cross-thread contention.
+The 8 launches now run concurrently on 8 cores.
+
+Dispatcher wall per chunk: 4 s → ~0.5 s.
+End-to-end 241K × 8 GPU: 45.2 s → 29.0 s (+56 %).
+1→8 GPU scaling: 3.11× → 4.86×.
 
 ### MMFF nonbonded pair enumeration on GPU (workstream D)
 

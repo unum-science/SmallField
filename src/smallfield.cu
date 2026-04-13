@@ -534,6 +534,14 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         std::span<std::uint8_t> chunk_status {host_status.data() + conf_offset, chunk_conformers};
 
         handles_out.resize(num_devices);
+        // Dispatcher runs the 8 launches in parallel on 8 OpenMP threads.  Each
+        // launch call takes ~500 ms of CPU-side work (mostly cusolver state update
+        // for the metric prepass), and the eight per-device state structs
+        // (streams[d], solvers[d], metric_scratch[d], launch_scratch[d]) are
+        // isolated, so the parallelization is safe and effectively free.
+        // schedule(static, 1) pins one thread per device so cudaSetDevice stickiness
+        // is deterministic.
+#pragma omp parallel for num_threads(num_devices) schedule(static, 1)
         for (std::uint32_t d = 0; d < num_devices; ++d) {
             if (per_gpu_indices[d].empty()) continue;
             auto _lt0 = std::chrono::high_resolution_clock::now();
