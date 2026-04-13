@@ -48,7 +48,7 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
-| 241,596 | 1,764 mol/s         | 4,852 mol/s      | __10,155 mol/s__  | __2.09×__   |
+| 241,596 | 1,764 mol/s         | 4,897 mol/s      | __10,168 mol/s__  | __2.08×__   |
 
 At 241,596 molecules on all 8 GPUs: 23.9 seconds end-to-end (median of 3 runs post-O).
 Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
@@ -154,6 +154,24 @@ Two compounding factors (was three; dispatcher is no longer sequential):
    Workstream EE (smallest-chunk-last) addresses this by sorting molecules globally so the last chunk has the cheapest GPU work.
 
 ## Optimizations that landed
+
+### Mega-kernel launch_bounds + context-ctor pre-warm (workstreams W, DD, Y)
+
+Three small-but-related fixes for cold-start and occupancy latency-hiding:
+
+__W — `__launch_bounds__(32, 2)` on `etkdg_pipeline_warp_kernel`.__  ncu showed the mega-kernel ran at 2 % achieved occupancy due to 128 regs/thread capping blocks-per-SM to 1.
+The hint tells nvcc to compile for ≥ 2 blocks/SM; the compiler spills some registers to shared/local memory to recover occupancy.
+Top warp stalls in ncu were `wait` (32 %) and `long_scoreboard` (26 %), both latency-bound — so more concurrent warps should help.
+At production 240K scale the gain is within noise (10,168 mol/s vs 10,155), but smaller batches see the bigger relative improvement (single-GPU 240K 4,852 → 4,897 mol/s).
+
+__DD — context_t ctor pre-warms cusolver workspace + metric scratch.__
+The first user call paid ~100 ms cusolver-workspace-probe per device and a cold cudaMalloc.
+Now `context_t()` calls `ensure_metric_scratch` at a default (5 K molecules × 128 atoms) so the first user launch finds the scratch already sized and the cusolver handshake done.
+
+__Y — context_t ctor pre-allocates 256 MB device + 256 MB host staging per device.__  nsys traces showed `cudaHostAlloc` as a 915 ms isolated stall on first launch for large batches; the persistent pool sidesteps that for any workload that fits the default.
+Bigger batches still grow on demand via the existing `ensure_capacity` path.
+
+Net effect on 240K × 8 GPU: wall is unchanged within noise (10,155 → 10,168 mol/s), but startup predictability improves — the first user call no longer hits a multi-hundred-ms cold stall, which matters for latency-sensitive library use.
 
 ### Native fast-paths for top SubstructMatch hot-spots (workstream N++)
 

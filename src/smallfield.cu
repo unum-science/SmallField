@@ -88,6 +88,12 @@ struct output_staging_t {
     }
 };
 
+// Forward declaration — definition lives below.  context_t's ctor pre-warms
+// the per-device metric scratch at construction time so the first user call
+// doesn't pay the cusolver workspace probe + cudaMalloc cost.
+void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t max_group_size,
+                           std::uint32_t max_atoms);
+
 context_t::context_t(std::span<int const> devices) {
     if (devices.empty()) {
         int count = 0;
@@ -119,6 +125,30 @@ context_t::context_t(std::span<int const> devices) {
         cudaEventCreateWithFlags(&launch_scratch[i]->evt_kernels_start, cudaEventBlockingSync);
         cudaEventCreateWithFlags(&launch_scratch[i]->evt_download_start, cudaEventBlockingSync);
         cudaEventCreateWithFlags(&launch_scratch[i]->evt_end, cudaEventBlockingSync);
+    }
+    // Workstreams DD + Y — pre-warm the dispatcher so the first user call
+    // doesn't pay cold-start costs.  Cold chunk 0 has "mallocpool" ~100-130 ms
+    // per device for the first cudaMalloc + cudaHostAlloc (910 ms total across
+    // 8 GPUs per prior nsys capture), plus a ~60 ms cusolver workspace probe
+    // inside ensure_metric_scratch.  Pre-sizing both at construction moves
+    // those costs off the user's hot path.  The sizes are conservative
+    // first-call defaults: a 5 K-molecule chunk with max_atoms=128 covers any
+    // small-batch workload; bigger batches grow the pool on demand via
+    // ensure_capacity (which is already the existing growth path).
+    constexpr std::size_t kPrewarmGroup = 5'000;
+    constexpr std::uint32_t kPrewarmAtoms = 128;
+    constexpr std::size_t kPrewarmDevicePoolBytes = 256ULL << 20;  // 256 MB
+    constexpr std::size_t kPrewarmHostStagingBytes = 256ULL << 20; // 256 MB
+    for (std::size_t i = 0; i < device_ids.size(); ++i) {
+        cudaSetDevice(device_ids[i]);
+        // Probes cusolver + allocates metric_scratch.pool.  Sets max_group_size,
+        // max_atoms, max_device_workspace_bytes so subsequent calls with ≤ these
+        // dimensions skip the slow probe.
+        ensure_metric_scratch(*this, i, kPrewarmGroup, kPrewarmAtoms);
+        // Pre-grow the per-launch device + host staging pools so the first
+        // launch's cudaMalloc / cudaHostAlloc doesn't stall the hot path.
+        launch_scratch[i]->device_pool.ensure_capacity(kPrewarmDevicePoolBytes);
+        launch_scratch[i]->host_staging.ensure_capacity(kPrewarmHostStagingBytes);
     }
 }
 

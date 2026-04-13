@@ -178,8 +178,15 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
  *
  *  Launch: <<<min(total_molecules, max_concurrent_warps), 32, shared_bytes>>>
  *  Each warp loops over molecules with stride = gridDim.x.
+ *
+ *  `__launch_bounds__(32, 2)` hints the compiler to fit at least 2 blocks per
+ *  SM — 1 warp × 32 threads × 2 blocks = 64 warps/SM of occupancy — which
+ *  improves latency hiding on the long_scoreboard / wait stalls that dominate
+ *  this kernel per ncu.  Without the hint, nvcc picks register count first
+ *  (~128 regs/thread here) which caps concurrency at 1 block/SM.  The cap at
+ *  2 blocks/SM lets nvcc spill some registers to recover occupancy.  Workstream W.
  */
-__global__ void etkdg_pipeline_warp_kernel(
+__global__ __launch_bounds__(32, 2) void etkdg_pipeline_warp_kernel(
     float const *__restrict__ bounds_matrices, float const *__restrict__ initial_coordinates,
     chiral_center_descriptor_t const *__restrict__ chiral_centers,
     etk_torsion_descriptor_t const *__restrict__ torsion_terms,
