@@ -48,6 +48,17 @@ enum csd_predicate_t : std::uint8_t {
     csd_predicate_c_nb_nx3_k,      ///< $(C([NX3]))   — aliphatic C with an aliphatic degree-3 N neighbour
     csd_predicate_cx3_nb_c_k,      ///< $([CX3]([C])) — sp² C (degree 3) with an aliphatic C neighbour
     csd_predicate_ch0_nb_cl_k,     ///< $([cH0](Cl))  — aromatic C with zero H and a Cl neighbour
+    /** @name Workstream N++ — top SubstructMatch hot-spots
+     *  Multi-dataset profiling identified two patterns dominating 75-85 % of the
+     *  RDKit-fallback CPU on every tested dataset.  These three predicates cover
+     *  the recursive sub-queries that block the native matcher from accepting
+     *  patterns p94, p95 and p114.
+     *  @{ */
+    csd_predicate_a_nb_cH1_k,           ///< $([a]([cH1]))           — aromatic atom with an aromatic-CH (1-H) neighbour
+    csd_predicate_aH0_nb_nonring_O_k,   ///< $([aH0](!@O))           — aromatic, 0 H, with a non-ring aliphatic O neighbour
+    csd_predicate_c_two_cH_or_nX2H0_k,  ///< $([c]([cH,nX2H0])[cH,nX2H0]) — aromatic C with two neighbours each (cH OR nX2H0)
+    csd_predicate_cH0_nb_NH12_k,        ///< $([cH0]([NH1,NH2]))     — aromatic C with 0 H and an aliphatic NH1 or NH2 neighbour
+    /** @} */
     csd_predicate_count_k,         ///< number of defined predicates (keep last)
 };
 
@@ -185,6 +196,99 @@ inline bool predicate_ch0_nb_cl(molecule_descriptor_t const &desc, std::uint32_t
 }
 
 /**
+ *  @brief `$([a]([cH1]))` — aromatic atom (any element) with at least one neighbour
+ *  that is an aromatic C with exactly one H.  Workstream N++ — covers the dominant
+ *  pattern p114 hot-spot in GDB-13 / Enamine combinatorial datasets.
+ */
+inline bool predicate_a_nb_cH1(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
+    if ((desc.atom_flags[atom_idx] & atom_flag_aromatic_k) == 0) return false;
+    std::uint16_t const start = desc.neighbor_offset[atom_idx];
+    std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
+    for (std::uint16_t n = start; n < end; ++n) {
+        std::uint8_t const nb = desc.neighbor_atom[n];
+        if (desc.element[nb] != 6) continue;
+        if ((desc.atom_flags[nb] & atom_flag_aromatic_k) == 0) continue;
+        if (desc.num_hydrogens[nb] != 1) continue;
+        return true;
+    }
+    return false;
+}
+
+/**
+ *  @brief `$([aH0](!@O))` — aromatic atom with 0 hydrogens and at least one neighbour
+ *  that is an aliphatic O reached via a non-ring bond.  Workstream N++ — covers
+ *  the second half of pattern p114.
+ */
+inline bool predicate_aH0_nb_nonring_O(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
+    if ((desc.atom_flags[atom_idx] & atom_flag_aromatic_k) == 0) return false;
+    if (desc.num_hydrogens[atom_idx] != 0) return false;
+    std::uint16_t const start = desc.neighbor_offset[atom_idx];
+    std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
+    for (std::uint16_t n = start; n < end; ++n) {
+        std::uint8_t const nb = desc.neighbor_atom[n];
+        if (desc.element[nb] != 8) continue;
+        if ((desc.atom_flags[nb] & atom_flag_aromatic_k) != 0) continue; // uppercase O = aliphatic only
+        std::uint16_t const bid = desc.neighbor_bond[n];
+        if ((desc.bond_flags[bid] & bond_flag_in_ring_k) != 0) continue; // !@ = non-ring bond
+        return true;
+    }
+    return false;
+}
+
+/**
+ *  @brief `$([cH0]([NH1,NH2]))` — aromatic C with 0 H and at least one neighbour
+ *  that is an aliphatic N with degree 3 and either 1 or 2 H.  Workstream N++ —
+ *  covers pattern p249.
+ */
+inline bool predicate_cH0_nb_NH12(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
+    if (desc.element[atom_idx] != 6) return false;
+    if ((desc.atom_flags[atom_idx] & atom_flag_aromatic_k) == 0) return false;
+    if (desc.num_hydrogens[atom_idx] != 0) return false;
+    std::uint16_t const start = desc.neighbor_offset[atom_idx];
+    std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
+    for (std::uint16_t n = start; n < end; ++n) {
+        std::uint8_t const nb = desc.neighbor_atom[n];
+        if (desc.element[nb] != 7) continue;
+        if ((desc.atom_flags[nb] & atom_flag_aromatic_k) != 0) continue; // uppercase N = aliphatic
+        if (desc.degree[nb] != 3) continue;
+        std::uint8_t const h = desc.num_hydrogens[nb];
+        if (h != 1 && h != 2) continue;
+        return true;
+    }
+    return false;
+}
+
+/**
+ *  @brief `$([c]([cH,nX2H0])[cH,nX2H0])` — aromatic C with at least two distinct
+ *  neighbours, each of which is either (aromatic C with exactly 1 H) or
+ *  (aromatic N with degree 2 and 0 H).  Workstream N++ — covers patterns p94/p95.
+ */
+inline bool predicate_c_two_cH_or_nX2H0(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
+    if (desc.element[atom_idx] != 6) return false;
+    if ((desc.atom_flags[atom_idx] & atom_flag_aromatic_k) == 0) return false;
+    auto neighbour_qualifies = [&](std::uint8_t nb) {
+        bool const aromatic = (desc.atom_flags[nb] & atom_flag_aromatic_k) != 0;
+        if (!aromatic) return false;
+        std::uint8_t const el = desc.element[nb];
+        std::uint8_t const h = desc.num_hydrogens[nb];
+        std::uint8_t const dg = desc.degree[nb];
+        // cH = aromatic C with exactly 1 H.
+        if (el == 6 && h == 1) return true;
+        // nX2H0 = aromatic N with degree 2 and 0 H.
+        if (el == 7 && dg == 2 && h == 0) return true;
+        return false;
+    };
+    std::uint16_t const start = desc.neighbor_offset[atom_idx];
+    std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
+    std::uint32_t hits = 0;
+    for (std::uint16_t n = start; n < end; ++n) {
+        if (neighbour_qualifies(desc.neighbor_atom[n])) ++hits;
+        if (hits >= 2) return true;
+    }
+    return false;
+}
+
+/**
  *  @brief Evaluate a recursive-SMARTS predicate against an atom in a descriptor.
  *
  *  @param desc Molecule descriptor filled by @ref build_descriptor.
@@ -206,6 +310,10 @@ inline bool csd_predicate_check(molecule_descriptor_t const &desc, std::uint32_t
     case csd_predicate_c_nb_nx3_k: return predicate_c_nb_nx3(desc, atom_idx);
     case csd_predicate_cx3_nb_c_k: return predicate_cx3_nb_c(desc, atom_idx);
     case csd_predicate_ch0_nb_cl_k: return predicate_ch0_nb_cl(desc, atom_idx);
+    case csd_predicate_a_nb_cH1_k: return predicate_a_nb_cH1(desc, atom_idx);
+    case csd_predicate_aH0_nb_nonring_O_k: return predicate_aH0_nb_nonring_O(desc, atom_idx);
+    case csd_predicate_c_two_cH_or_nX2H0_k: return predicate_c_two_cH_or_nX2H0(desc, atom_idx);
+    case csd_predicate_cH0_nb_NH12_k: return predicate_cH0_nb_NH12(desc, atom_idx);
     case csd_predicate_count_k: return false;
     }
     return false;

@@ -426,6 +426,11 @@ inline csd_predicate_t lookup_predicate(std::string_view body) {
         {"[NX3H1]", csd_predicate_nx3h1_k},       {"[NX3H2]", csd_predicate_nx3h2_k},
         {"C([NX3])", csd_predicate_c_nb_nx3_k},   {"[CX3]([C])", csd_predicate_cx3_nb_c_k},
         {"[cH0](Cl)", csd_predicate_ch0_nb_cl_k},
+        // Workstream N++ — top-of-distribution SubstructMatch hot-spots.
+        {"[a]([cH1])", csd_predicate_a_nb_cH1_k},
+        {"[aH0](!@O)", csd_predicate_aH0_nb_nonring_O_k},
+        {"[c]([cH,nX2H0])[cH,nX2H0]", csd_predicate_c_two_cH_or_nX2H0_k},
+        {"[cH0][NH1,NH2]", csd_predicate_cH0_nb_NH12_k},
     };
     for (auto const &e : table)
         if (body == e.body) return e.id;
