@@ -37,10 +37,13 @@
 #include <GraphMol/SmilesParse/SmartsWrite.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 #include <GraphMol/Substruct/SubstructMatch.h>
+#include <GraphMol/ChemTransforms/ChemTransforms.h>
+#include <GraphMol/SmilesParse/SmilesWrite.h>
 
 #include "etkdg_types.cuh"
 #include "molecule_descriptor.hpp"
 #include "csd_torsion_native.hpp"
+#include "scaffold_cache.hpp"
 
 namespace smallfield {
 
@@ -163,8 +166,10 @@ inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
  *  Also handles the "basic knowledge" torsions (flat aromatic rings, sp2 centers
  *  with 3 neighbors) that getExperimentalTorsions produces.
  */
+
 inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
-                                        std::vector<etk_torsion_descriptor_t> &torsions) {
+                                        std::vector<etk_torsion_descriptor_t> &torsions,
+                                        scaffold_cache_t *cache = nullptr) {
     torsions.clear();
 
     std::uint32_t const num_atoms = desc.num_atoms;
@@ -217,7 +222,91 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
     }
 
     auto const &patterns = csd_patterns();
-    for (auto const &pat : patterns) {
+
+    // ---- Workstream SC-2: scaffold-cache setup -------------------------------
+    // When the caller passed a non-null cache, MurckoDecompose the molecule and
+    // try to look up the scaffold's precomputed RDKit-fallback matches.  The
+    // miss path populates a fresh entry; the hit path translates cached
+    // scaffold-atom-index 4-tuples back into molecule-atom-index space via the
+    // molecule→scaffold atom map computed by SubstructMatch(molecule, scaffold).
+    std::unique_ptr<RDKit::ROMol> scaffold;
+    std::uint64_t scaffold_hash = 0;
+    std::int8_t scaffold_to_mol[max_atoms_k];
+    std::int8_t mol_to_scaffold[max_atoms_k];
+    bool mol_in_scaffold[max_atoms_k] = {};
+    std::memset(scaffold_to_mol, -1, sizeof(scaffold_to_mol));
+    std::memset(mol_to_scaffold, -1, sizeof(mol_to_scaffold));
+    bool have_scaffold_path = false;
+    scaffold_cache_entry_t const *cached_entry = nullptr;
+    scaffold_cache_entry_t fresh_entry; // populated on miss; inserted at end
+    bool will_populate = false;
+
+    if (cache != nullptr) {
+        try {
+            scaffold.reset(RDKit::MurckoDecompose(molecule));
+        } catch (...) { /* acyclic mol or RDKit failure → skip cache */ }
+        if (scaffold && scaffold->getNumAtoms() > 0) {
+            std::string scaffold_smi;
+            try {
+                scaffold_smi = RDKit::MolToSmiles(*scaffold, /*doIsomericSmiles=*/false,
+                                                  /*doKekule=*/false, /*rootedAtAtom=*/-1,
+                                                  /*canonical=*/true);
+            } catch (...) {}
+            if (!scaffold_smi.empty()) {
+                scaffold_hash = hash_scaffold_smiles(scaffold_smi);
+                std::vector<RDKit::MatchVectType> map_matches;
+                RDKit::SubstructMatch(molecule, *scaffold, map_matches, /*uniquify=*/true,
+                                      /*recursionPossible=*/true);
+                if (!map_matches.empty()) {
+                    auto const &m = map_matches[0];
+                    for (auto const &p : m) {
+                        if (p.first >= 0 && p.first < static_cast<int>(max_atoms_k) &&
+                            p.second >= 0 && p.second < static_cast<int>(num_atoms)) {
+                            scaffold_to_mol[p.first] = static_cast<std::int8_t>(p.second);
+                            mol_to_scaffold[p.second] = static_cast<std::int8_t>(p.first);
+                            mol_in_scaffold[p.second] = true;
+                        }
+                    }
+                    have_scaffold_path = true;
+                    cached_entry = cache->lookup(scaffold_hash);
+                    if (cached_entry == nullptr) {
+                        will_populate = true;
+                        fresh_entry.pattern_matches_flat.assign(patterns.size(), {});
+                        fresh_entry.has_r_group_matches.assign(patterns.size(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    auto emit_torsion_for = [&](std::uint8_t a1, std::uint8_t a2, std::uint8_t a3, std::uint8_t a4,
+                                csd_compiled_pattern_t const &pat) {
+        auto const *bnd = molecule.getBondBetweenAtoms(a2, a3);
+        if (!bnd) return;
+        unsigned int const bid = bnd->getIdx();
+        if (excluded_bonds[bid] || ring_info->numBondRings(bid) > 3) {
+            done_bonds.set(bid);
+            done_bonds_u8[bid] = 1;
+            return;
+        }
+        if (done_bonds[bid]) return;
+        done_bonds.set(bid);
+        done_bonds_u8[bid] = 1;
+        etk_torsion_descriptor_t torsion {};
+        torsion.atom_indices[0] = a1;
+        torsion.atom_indices[1] = a2;
+        torsion.atom_indices[2] = a3;
+        torsion.atom_indices[3] = a4;
+        for (std::uint32_t i = 0; i < 6; ++i) {
+            double const sign = (i < pat.signs.size()) ? static_cast<double>(pat.signs[i]) : 1.0;
+            double const V = (i < pat.V.size()) ? pat.V[i] : 0.0;
+            torsion.fourier_coefficients[i] = static_cast<float>(sign * V);
+        }
+        torsions.push_back(torsion);
+    };
+
+    for (std::size_t pat_idx = 0; pat_idx < patterns.size(); ++pat_idx) {
+        auto const &pat = patterns[pat_idx];
         // Element prefilter: skip patterns whose required elements are absent.
         if ((pat.required_elements & ~molecule_elements) != 0) continue;
         if (pat.requires_aromatic && !has_aromatic) continue;
@@ -249,42 +338,66 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
             continue;
         }
 
-        // Fallback: RDKit SubstructMatch for complex patterns.
+        // ---- Workstream SC-2: cache HIT path -----------------------------
+        // If we have a cached entry and this pattern was recorded as fully
+        // scaffold-local (no R-group-spanning matches were observed when the
+        // entry was populated), we can skip the full-molecule SubstructMatch
+        // and translate the cached scaffold-atom-index 4-tuples into molecule
+        // indices via scaffold_to_mol[].
+        if (cached_entry != nullptr && have_scaffold_path && pat_idx < cached_entry->has_r_group_matches.size() &&
+            cached_entry->has_r_group_matches[pat_idx] == 0) {
+            auto const &flat = cached_entry->pattern_matches_flat[pat_idx];
+            for (std::size_t k = 0; k + 3 < flat.size(); k += 4) {
+                std::int8_t const m1 = scaffold_to_mol[flat[k + 0]];
+                std::int8_t const m2 = scaffold_to_mol[flat[k + 1]];
+                std::int8_t const m3 = scaffold_to_mol[flat[k + 2]];
+                std::int8_t const m4 = scaffold_to_mol[flat[k + 3]];
+                if (m1 < 0 || m2 < 0 || m3 < 0 || m4 < 0) continue;
+                emit_torsion_for(static_cast<std::uint8_t>(m1), static_cast<std::uint8_t>(m2),
+                                 static_cast<std::uint8_t>(m3), static_cast<std::uint8_t>(m4), pat);
+            }
+            continue; // skip full-molecule SubstructMatch
+        }
+
+        // ---- Fallback: RDKit SubstructMatch on the full molecule ----------
         std::vector<RDKit::MatchVectType> matches;
         RDKit::SubstructMatch(molecule, *pat.pattern, matches, /*uniquify=*/false, /*recursionPossible=*/true);
 
+        bool any_r_group = false;
         for (auto const &match : matches) {
             unsigned int const a1 = match[pat.idx[0]].second;
             unsigned int const a2 = match[pat.idx[1]].second;
             unsigned int const a3 = match[pat.idx[2]].second;
             unsigned int const a4 = match[pat.idx[3]].second;
-            auto const *bnd = molecule.getBondBetweenAtoms(a2, a3);
-            if (!bnd) continue;
-            unsigned int const bid = bnd->getIdx();
 
-            if (excluded_bonds[bid] || ring_info->numBondRings(bid) > 3) {
-                done_bonds.set(bid);
-                done_bonds_u8[bid] = 1;
-                continue;
+            // Classify match for cache population: scaffold-local (all 4 atoms
+            // in scaffold) or R-group-spanning.  Only scaffold-local matches
+            // are cached; R-group matches force re-running SubstructMatch on
+            // future hits (we record the bit but otherwise skip caching them).
+            bool const all_in_scaffold = have_scaffold_path && a1 < num_atoms && a2 < num_atoms &&
+                                         a3 < num_atoms && a4 < num_atoms && mol_in_scaffold[a1] &&
+                                         mol_in_scaffold[a2] && mol_in_scaffold[a3] && mol_in_scaffold[a4];
+            if (!all_in_scaffold) any_r_group = true;
+            if (will_populate && all_in_scaffold) {
+                std::int8_t const s1 = mol_to_scaffold[a1];
+                std::int8_t const s2 = mol_to_scaffold[a2];
+                std::int8_t const s3 = mol_to_scaffold[a3];
+                std::int8_t const s4 = mol_to_scaffold[a4];
+                if (s1 >= 0 && s2 >= 0 && s3 >= 0 && s4 >= 0) {
+                    auto &flat = fresh_entry.pattern_matches_flat[pat_idx];
+                    flat.push_back(static_cast<std::uint8_t>(s1));
+                    flat.push_back(static_cast<std::uint8_t>(s2));
+                    flat.push_back(static_cast<std::uint8_t>(s3));
+                    flat.push_back(static_cast<std::uint8_t>(s4));
+                }
             }
-            if (done_bonds[bid]) continue;
 
-            done_bonds.set(bid);
-            done_bonds_u8[bid] = 1;
-
-            etk_torsion_descriptor_t torsion {};
-            torsion.atom_indices[0] = static_cast<std::uint8_t>(a1);
-            torsion.atom_indices[1] = static_cast<std::uint8_t>(a2);
-            torsion.atom_indices[2] = static_cast<std::uint8_t>(a3);
-            torsion.atom_indices[3] = static_cast<std::uint8_t>(a4);
-            for (std::uint32_t i = 0; i < 6; ++i) {
-                double const sign = (i < pat.signs.size()) ? static_cast<double>(pat.signs[i]) : 1.0;
-                double const V = (i < pat.V.size()) ? pat.V[i] : 0.0;
-                torsion.fourier_coefficients[i] = static_cast<float>(sign * V);
-            }
-            torsions.push_back(torsion);
+            emit_torsion_for(static_cast<std::uint8_t>(a1), static_cast<std::uint8_t>(a2),
+                             static_cast<std::uint8_t>(a3), static_cast<std::uint8_t>(a4), pat);
         }
+        if (will_populate) fresh_entry.has_r_group_matches[pat_idx] = any_r_group ? 1 : 0;
     }
+    if (will_populate) cache->insert(scaffold_hash, std::move(fresh_entry));
 
     // Matches RDKit getExperimentalTorsions' useBasicKnowledge=true behavior.
     if (ring_info != nullptr && ring_info->isInitialized()) {

@@ -55,6 +55,13 @@ struct scaffold_cache_entry_t {
      *  equals the total pattern count (most entries are empty vectors for
      *  patterns whose 4-atom match is never scaffold-local). */
     std::vector<std::vector<std::uint8_t>> pattern_matches_flat; // [p] → [a0,b0,c0,d0, a1,b1,c1,d1, ...]
+    /** Per-pattern flag: 1 if the scaffold's SubstructMatch returned at least
+     *  one match whose atoms partly span an R-group (i.e. an atom whose
+     *  scaffold-atom-set membership test failed because the molecule's match
+     *  reached an R-group atom).  Forces the full-molecule SubstructMatch on
+     *  cache hits for that pattern; 0 lets the hit translate cached matches
+     *  alone.  Sized identically to @ref pattern_matches_flat. */
+    std::vector<std::uint8_t> has_r_group_matches;
 };
 
 /** Runtime-tunable knobs for the cache. */

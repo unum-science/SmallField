@@ -87,6 +87,7 @@ struct alignas(8) molecule_descriptor_t {
     std::uint8_t smallest_ring[max_atoms_k]; ///< smallest SSSR ring size containing atom (0 if none)
     std::uint8_t cip_rank[max_atoms_k];      ///< CIP priority rank (0 = lowest)
     std::uint8_t chiral_tag[max_atoms_k];    ///< 0=none, 1=CW, 2=CCW
+    std::uint8_t isotope[max_atoms_k];       ///< isotope mass number (0 = natural / unspecified)
 
     std::uint8_t bond_atom_i[max_bonds_k];
     std::uint8_t bond_atom_j[max_bonds_k];
@@ -140,6 +141,7 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
         desc.degree[a] = static_cast<std::uint8_t>(atom->getDegree());
         desc.num_hydrogens[a] = static_cast<std::uint8_t>(atom->getTotalNumHs(true));
         desc.formal_charge[a] = static_cast<std::int8_t>(atom->getFormalCharge());
+        desc.isotope[a] = static_cast<std::uint8_t>(std::min<unsigned>(atom->getIsotope(), 255));
         desc.smallest_ring[a] = 0;
         desc.cip_rank[a] = 0;
         desc.chiral_tag[a] = 0;

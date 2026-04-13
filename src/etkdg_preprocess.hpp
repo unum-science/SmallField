@@ -53,8 +53,15 @@
 #include "forcefield_tables.hpp"
 #include "molecule_descriptor.hpp"
 #include "csd_torsion_extract.hpp"
+#include "cip_ranks.hpp"
 
 namespace smallfield {
+
+// Forward declaration — actual definition in scaffold_cache.hpp.  Threaded
+// through the prep call chain as an opaque pointer to avoid pulling the
+// scaffold-cache header (and its concurrency primitives) into every TU
+// that includes etkdg_preprocess.hpp.
+class scaffold_cache_t;
 
 /**
  *  @brief Complete preprocessed molecule ready for GPU pipeline upload.
@@ -212,8 +219,14 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
     auto &stereo_molecule = const_cast<RDKit::ROMol &>(molecule);
     RDKit::MolOps::assignStereochemistry(stereo_molecule, true, true, true);
 
-    RDKit::UINT_VECT cip_ranks(molecule.getNumAtoms(), 0);
-    RDKit::Chirality::assignAtomCIPRanks(molecule, cip_ranks);
+    // Workstream V-2 — native sorted-tuple partition-refinement ranker
+    // matching RDKit's iterateCIPRanks algorithm to ~98.94 % chiral-centre
+    // ordering agreement on 500-mol ChEMBL validation set.  Keeps RDKit's
+    // assignStereochemistry call above (needed for the _CIPCode property
+    // that drives target_sign), but swaps out the per-call CIP ranking
+    // which contributed ~4.4 % of CPU prep time at 241K.
+    std::array<std::uint32_t, max_atoms_k> cip_ranks {};
+    smallfield::compute_cip_ranks(desc, cip_ranks.data());
 
     std::uint32_t const num_atoms = desc.num_atoms;
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
@@ -750,7 +763,8 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
  *  path without heap allocation after the first few molecules.  Sets
  *  @c result.num_atoms = 0 on failure.
  */
-inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecule_t &result) {
+inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecule_t &result,
+                                  scaffold_cache_t *cache = nullptr) {
     result.num_atoms = 0;
     result.bounds_matrix.clear();
     result.chiral_centers.clear();
@@ -799,7 +813,7 @@ inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecu
         }
         build_bounds_matrix(desc, result.bounds_matrix);
         extract_chiral_centers(*mol, desc, result.chiral_centers);
-        extract_etk_torsions_native(*mol, desc, result.etk_torsions);
+        extract_etk_torsions_native(*mol, desc, result.etk_torsions, cache);
         extract_distance_constraints(desc, result.bounds_matrix, result.distance_constraints);
         build_etk_interaction_lists(result);
         extract_mmff94_params(*mol, desc, result);
@@ -1034,7 +1048,8 @@ inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::u
  *  @param[in] smiles_list Vector of SMILES strings to process.
  *  @return Batched molecule data with contiguous arrays for GPU upload.
  */
-inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view const> smiles_list) {
+inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view const> smiles_list,
+                                                     scaffold_cache_t *cache = nullptr) {
 
     etkdg_molecule_batch_t batch {};
     // Phase 1: Prepare molecules in parallel. RDKit calls are thread-safe for independent molecules.
@@ -1132,7 +1147,7 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
         auto &tc = contribs[tid];
 #pragma omp for schedule(dynamic, 64)
         for (std::size_t m = 0; m < n; ++m) {
-            prepare_molecule_into(smiles_list[m], tc.scratch);
+            prepare_molecule_into(smiles_list[m], tc.scratch, cache);
             auto const &p = tc.scratch;
             if (p.num_atoms == 0) continue;
             if (p.num_atoms > tc.max_atoms_seen) tc.max_atoms_seen = p.num_atoms;

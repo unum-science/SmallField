@@ -107,6 +107,7 @@ if(DEFINED RDKIT_PREFIX)
         rdkit_add_lib(RDKit::SubstructMatch   RDKitSubstructMatch)
         rdkit_add_lib(RDKit::Alignment        RDKitAlignment)
         rdkit_add_lib(RDKit::EigenSolvers     RDKitEigenSolvers)
+        rdkit_add_lib(RDKit::ChemTransforms   RDKitChemTransforms)
 
         # Boost libs that RDKit links against
         find_library(_boost_serialization NAMES boost_serialization
@@ -145,7 +146,8 @@ if(RDKit_FOUND)
         RDKit::ForceFieldHelpers RDKit::ForceField
         RDKit::DistGeomHelpers RDKit::DistGeometry
         RDKit::Depictor RDKit::SubstructMatch
-        RDKit::Alignment RDKit::EigenSolvers RDKit::MolTransforms)
+        RDKit::Alignment RDKit::EigenSolvers RDKit::MolTransforms
+        RDKit::ChemTransforms)
 
     # SmallField library (CUDA + RDKit preprocessing)
     add_library(smallfield_lib STATIC src/smallfield.cu)

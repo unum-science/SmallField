@@ -747,7 +747,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         // behaviour to the pre-pipelining code path.
         chunk_records.push_back({0, num_input, 0, 0, 0, 0, 0, 0, {}});
         chunk_records.back().prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-        etkdg_molecule_batch_t batch = prepare_molecule_batch(smiles_view);
+        etkdg_molecule_batch_t batch = prepare_molecule_batch(smiles_view, scaffold_cache);
         chunk_records.back().prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
         effective_max_atoms = std::max(max_atoms_per_molecule, batch.max_atoms_per_molecule);
         std::vector<gpu_pipeline_handle_t> handles;
@@ -771,7 +771,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         }
 
         auto prep_slice = [&](std::uint32_t begin, std::uint32_t end) {
-            return prepare_molecule_batch(smiles_view.subspan(begin, end - begin));
+            return prepare_molecule_batch(smiles_view.subspan(begin, end - begin), scaffold_cache);
         };
 
         // Two-slot ring buffer for both batches and handles.  Fixed-size
