@@ -219,14 +219,16 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
     auto &stereo_molecule = const_cast<RDKit::ROMol &>(molecule);
     RDKit::MolOps::assignStereochemistry(stereo_molecule, true, true, true);
 
-    // Workstream V-2 was attempted (native sorted-tuple partition-refinement,
-    // 98.94 % chiral-centre ordering agreement with RDKit on 500-mol ChEMBL
-    // validation set) but reverted: the 1.06 % disagreement caused a P50
-    // energy regression (-5.8 vs -3 kcal/mol) on the 240K cross-validation,
-    // suggesting the mis-ordered centres flip chirality sign in the GPU
-    // kernel.  Keep RDKit's assignAtomCIPRanks until cip_ranks.hpp matches
-    // RDKit at > 99.5 %.  Implementation kept in src/cip_ranks.hpp for
-    // future iteration; see IMPROVE.md.
+    // Workstream V — keep RDKit's CIP ranker.  Two native attempts so far:
+    //   V-2  initial sorted-tuple partition refinement: 98.94 % agreement,
+    //        P50 energy delta widened -5.4 → -5.8, throughput -2 %.  Reverted.
+    //   V-3  + aromatic-bond multiplier=2 fix: 99.71 % agreement, P50 delta
+    //        widened to -6.3, throughput -2.8 %.  Even at 99.71 % the 5 / 1698
+    //        residual chiral mis-orderings flip the GPU's chirality penalty
+    //        sign on those centres, producing measurably worse conformers.
+    // Investigation in IMPROVE.md §6 — needs a CIP rule-1c phantom-atom
+    // implementation (asymmetric duplicate atoms for π-bond endpoints) to
+    // close the last 0.29 %.  Until then RDKit's call is faster AND correct.
     RDKit::UINT_VECT cip_ranks(molecule.getNumAtoms(), 0);
     RDKit::Chirality::assignAtomCIPRanks(molecule, cip_ranks);
 
