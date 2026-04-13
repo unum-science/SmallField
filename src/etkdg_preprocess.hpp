@@ -1087,8 +1087,35 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
         std::uint32_t max_atoms_seen = 0;
     };
 
+    // Persistent per-call scratch.  `static` here means the outer vector and every
+    // inner `thread_contribution_t::*_bytes` keep their capacity across calls — after
+    // the first chunk the allocator's fast path is all we touch.  Safe as long as
+    // `prepare_molecule_batch` is not called concurrently (the dispatcher in
+    // `generate_conformers` calls it serially from one thread per chunk; tests call
+    // it once per invocation).
+    static std::vector<thread_contribution_t> contribs;
     int const n_threads_max = omp_get_max_threads();
-    std::vector<thread_contribution_t> contribs(n_threads_max);
+    if (static_cast<int>(contribs.size()) < n_threads_max) contribs.resize(n_threads_max);
+    for (auto &tc : contribs) {
+        tc.bounds_bytes.clear();
+        tc.chirals_bytes.clear();
+        tc.torsions_bytes.clear();
+        tc.dcons_bytes.clear();
+        tc.atom_vdw_bytes.clear();
+        tc.atom_charge_bytes.clear();
+        tc.bond_distance_bytes.clear();
+        tc.mmff_bonds_bytes.clear();
+        tc.mmff_angles_bytes.clear();
+        tc.mmff_torsions_bytes.clear();
+        tc.mmff_oops_bytes.clear();
+        tc.mmff_stretchbends_bytes.clear();
+        tc.mmff_interactions_bytes.clear();
+        tc.mmff_atom_offsets_bytes.clear();
+        tc.etk_interactions_bytes.clear();
+        tc.etk_atom_offsets_bytes.clear();
+        tc.mols.clear();
+        tc.max_atoms_seen = 0;
+    }
 
     auto append_bytes = [](std::vector<std::byte> &dst, void const *src, std::size_t bytes) -> std::size_t {
         std::size_t const offset = dst.size();
