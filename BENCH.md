@@ -48,12 +48,12 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
-| 241,596 | 873 mol/s           | __1,716 mol/s__  | __8,344 mol/s__   | __4.86×__   |
+| 241,596 | 873 mol/s           | __1,716 mol/s__  | __9,400 mol/s__   | __5.48×__   |
 
-At 241,596 molecules on all 8 GPUs: 29.0 seconds end-to-end (median of 3 runs post-OpenMP dispatcher).
+At 241,596 molecules on all 8 GPUs: 25.7 seconds end-to-end (median of 2 runs post-`cusolverDnXsyevBatched`).
 Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
 
-The 1→8 scaling improved from 1.88× (pre-session) to 4.86× after the session's work (G, H, F, C′, D, J).
+The 1→8 scaling improved from 1.88× (pre-session) to 5.48× after the session's work (G, H, F, C′, D, J, K).
 The path to linear scaling is described in the "Scaling analysis" section below.
 
 ## Scaling analysis (241,596 molecules)
@@ -115,6 +115,17 @@ Two compounding factors (was three; dispatcher is no longer sequential):
    It could drop to near zero with a custom warp-cooperative Jacobi kernel (no cusolver state setup) but the gain is small (~500 ms / 5.8 s ≈ 9 %) compared to E's CPU-prep reduction.
 
 ## Optimizations that landed
+
+### cusolverDnXsyevBatched in place of cusolverDnSsyevjBatched (workstream K)
+
+The metric prepass used `cusolverDnSsyevjBatched` (a batched Jacobi eigensolver).
+Per-call CPU setup was ~60 ms × 8 bins per launch = 480 ms per launch of CPU work inside cusolver state bookkeeping.
+
+Swapped to `cusolverDnXsyevBatched` (CUDA 13's 64-bit generic batched eigen API).
+It takes `cusolverDnParams_t` instead of the Jacobi-specific `syevjInfo_t` — no Jacobi sweep state tracking, lower per-call overhead.
+Also needs both a device and host workspace buffer; host workspace lives in `metric_scratch_t::host_workspace` (grow-only `std::vector<std::byte>`).
+
+End-to-end 241K × 8 GPU: 29.0 s → 25.7 s (+13 %), 8,344 → 9,400 mol/s.
 
 ### Parallel dispatcher via OpenMP (workstream J)
 

@@ -281,9 +281,11 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
         std::uint32_t *const dev_group_indices = scratch.group_indices.data();
         float *const dev_gram_matrices = scratch.gram_matrices.data();
         float *const dev_eigenvalues = scratch.eigenvalues.data();
-        float *const dev_workspace = scratch.workspace.data();
+        void *const dev_workspace = scratch.workspace.data();
         int *const dev_info = scratch.info.data();
-        int const lwork = scratch.max_workspace_floats;
+        std::size_t const dev_ws_bytes = scratch.max_device_workspace_bytes;
+        void *const host_workspace = scratch.host_workspace.data();
+        std::size_t const host_ws_bytes = scratch.max_host_workspace_bytes;
 
         // Shared memory sized for the bin's worst-case N.
         std::size_t const shared_bytes = static_cast<std::size_t>(bin_n * bin_n + bin_n + 1) * sizeof(float);
@@ -303,12 +305,15 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
         success &= check_cuda_status_(cudaGetLastError(), "smooth_and_build_gram_kernel launch");
         if (!success) continue;
 
+        // Generic 64-bit batched eigen API.  Lower per-call CPU overhead than the
+        // legacy cusolverDnSsyevjBatched — no Jacobi state bookkeeping.
         success &= check_cusolver_status_(
-            cusolverDnSsyevjBatched(solver_handle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER,
-                                    static_cast<int>(bin_n), dev_gram_matrices, static_cast<int>(bin_n),
-                                    dev_eigenvalues, dev_workspace, lwork, dev_info, scratch.syevj_params,
-                                    static_cast<int>(group_size)),
-            "cusolverDnSsyevjBatched");
+            cusolverDnXsyevBatched(solver_handle, scratch.xsyev_params, CUSOLVER_EIG_MODE_VECTOR,
+                                   CUBLAS_FILL_MODE_UPPER, static_cast<int64_t>(bin_n), CUDA_R_32F, dev_gram_matrices,
+                                   static_cast<int64_t>(bin_n), CUDA_R_32F, dev_eigenvalues, CUDA_R_32F, dev_workspace,
+                                   dev_ws_bytes, host_workspace, host_ws_bytes, dev_info,
+                                   static_cast<int64_t>(group_size)),
+            "cusolverDnXsyevBatched");
         if (!success) continue;
 
         project_metric_coordinates_kernel<<<static_cast<unsigned int>(group_size), block_size, 0, stream>>>(

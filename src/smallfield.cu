@@ -94,12 +94,10 @@ context_t::context_t(std::span<int const> devices) {
         cudaStreamCreate(&streams[i]);
         cusolverDnCreate(&solvers[i]);
         cusolverDnSetStream(solvers[i], streams[i]);
-        // Reuse one syevjInfo_t per device across all calls.  Configuration matches
-        // the defaults used by build_metric_initial_coordinates_on_gpu.
-        cusolverDnCreateSyevjInfo(&metric_scratch[i].syevj_params);
-        cusolverDnXsyevjSetTolerance(metric_scratch[i].syevj_params, 1.0e-6);
-        cusolverDnXsyevjSetMaxSweeps(metric_scratch[i].syevj_params, 100);
-        cusolverDnXsyevjSetSortEig(metric_scratch[i].syevj_params, 1);
+        // Reuse one cusolverDnParams_t per device across all calls.  The
+        // generic 64-bit batched eigen API (cusolverDnXsyevBatched) takes this
+        // instead of the legacy syevjInfo_t — lower per-call CPU overhead.
+        cusolverDnCreateParams(&metric_scratch[i].xsyev_params);
         launch_scratch[i] = new launch_scratch_t;
     }
 }
@@ -107,7 +105,7 @@ context_t::context_t(std::span<int const> devices) {
 context_t::~context_t() {
     for (std::size_t i = 0; i < device_ids.size(); ++i) {
         cudaSetDevice(device_ids[i]);
-        if (metric_scratch[i].syevj_params) cusolverDnDestroySyevjInfo(metric_scratch[i].syevj_params);
+        if (metric_scratch[i].xsyev_params) cusolverDnDestroyParams(metric_scratch[i].xsyev_params);
         if (metric_scratch[i].pool) cudaFree(metric_scratch[i].pool);
         delete launch_scratch[i]; // device_byte_buffer_t + pinned_byte_buffer_t free their holdings
         cusolverDnDestroy(solvers[i]);
@@ -153,18 +151,19 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
     cudaSetDevice(ctx.device_ids[device_idx]);
 
     // Probe cusolver for the worst-case workspace size at the new dimensions.
-    // This call is synchronous but we do it O(once per growth), not per chunk.
-    int new_workspace_floats = 0;
+    // Probe cusolverDnXsyevBatched for the worst-case device + host workspace sizes.
+    // Once per growth, not per chunk.
+    std::size_t new_dev_ws_bytes = 0;
+    std::size_t new_host_ws_bytes = 0;
     {
         float *probe_gram = nullptr;
         float *probe_eig = nullptr;
-        // Dummy pointers are fine for a bufferSize query — cusolver only reads dims.
         cudaMalloc(&probe_gram, sizeof(float));
         cudaMalloc(&probe_eig, sizeof(float));
-        cusolverDnSsyevjBatched_bufferSize(ctx.solvers[device_idx], CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER,
-                                           static_cast<int>(new_atoms), probe_gram, static_cast<int>(new_atoms),
-                                           probe_eig, &new_workspace_floats, s.syevj_params,
-                                           static_cast<int>(new_group));
+        cusolverDnXsyevBatched_bufferSize(
+            ctx.solvers[device_idx], s.xsyev_params, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER,
+            static_cast<int64_t>(new_atoms), CUDA_R_32F, probe_gram, static_cast<int64_t>(new_atoms), CUDA_R_32F,
+            probe_eig, CUDA_R_32F, &new_dev_ws_bytes, &new_host_ws_bytes, static_cast<int64_t>(new_group));
         cudaFree(probe_gram);
         cudaFree(probe_eig);
     }
@@ -175,7 +174,7 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
                                             256);
     std::size_t const eig_bytes = align_up(new_group * new_atoms * sizeof(float), 256);
     std::size_t const info_bytes = align_up(new_group * sizeof(int), 256);
-    std::size_t const ws_bytes = align_up(static_cast<std::size_t>(new_workspace_floats) * sizeof(float), 256);
+    std::size_t const ws_bytes = align_up(new_dev_ws_bytes, 256);
     std::size_t const total = group_bytes + gram_bytes + eig_bytes + info_bytes + ws_bytes;
 
     if (s.pool) cudaFree(s.pool);
@@ -192,10 +191,15 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
     off += eig_bytes;
     s.info = {reinterpret_cast<int *>(base + off), new_group};
     off += info_bytes;
-    s.workspace = {reinterpret_cast<float *>(base + off), static_cast<std::size_t>(new_workspace_floats)};
+    // Device workspace as a std::span<float> over raw bytes — cusolver just needs a
+    // pointer + bytes, so we store the float pointer but the true capacity is
+    // @c max_device_workspace_bytes.
+    s.workspace = {reinterpret_cast<float *>(base + off), new_dev_ws_bytes / sizeof(float)};
+    s.host_workspace.resize(new_host_ws_bytes);
     s.max_group_size = new_group;
     s.max_atoms = new_atoms;
-    s.max_workspace_floats = new_workspace_floats;
+    s.max_device_workspace_bytes = new_dev_ws_bytes;
+    s.max_host_workspace_bytes = new_host_ws_bytes;
 }
 
 /**

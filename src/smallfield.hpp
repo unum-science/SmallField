@@ -32,6 +32,7 @@ struct __half;
 typedef void *cudaStream_t;
 typedef void *cusolverDnHandle_t;
 typedef void *syevjInfo_t;
+typedef void *cusolverDnParams_t;
 #endif
 
 #include <cstdint>
@@ -83,11 +84,13 @@ struct metric_scratch_t {
     std::span<float> gram_matrices {};         ///< [max_group_size × max_atoms²]
     std::span<float> eigenvalues {};           ///< [max_group_size × max_atoms]
     std::span<int> info {};                    ///< [max_group_size]
-    std::span<float> workspace {};             ///< [max_workspace_floats]
+    std::span<float> workspace {};             ///< device workspace for cusolverDnXsyevBatched
+    std::vector<std::byte> host_workspace;     ///< host workspace for cusolverDnXsyevBatched
     std::size_t max_group_size = 0;
     std::uint32_t max_atoms = 0;
-    int max_workspace_floats = 0;
-    syevjInfo_t syevj_params = nullptr; ///< reused across calls
+    std::size_t max_device_workspace_bytes = 0;
+    std::size_t max_host_workspace_bytes = 0;
+    cusolverDnParams_t xsyev_params = nullptr; ///< shared across calls — reused
 };
 
 // Forward-declare persistent per-device launch scratch + per-context output staging.
