@@ -48,7 +48,7 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
-| 241,596 | 1,764 mol/s         | 4,897 mol/s      | __10,168 mol/s__  | __2.08×__   |
+| 241,596 | 1,764 mol/s         | 4,800 mol/s      | __10,204 mol/s__  | __2.13×__   |
 
 At 241,596 molecules on all 8 GPUs: 23.9 seconds end-to-end (median of 3 runs post-O).
 Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
@@ -155,14 +155,32 @@ Two compounding factors (was three; dispatcher is no longer sequential):
 
 ## Optimizations that landed
 
-### Mega-kernel launch_bounds + context-ctor pre-warm (workstreams W, DD, Y)
+### Native formal-charge support in CSD parser (workstream N+++)
+
+Extended `parse_atom_term` to accept SMARTS formal-charge specifiers (`+`, `+N`, `-`, `-N`).
+Stored into `simple_atom_constraint_t::formal_charge` (int8, `INT8_MIN` = no constraint) and checked against the descriptor's `formal_charge[]` array in `atom_match` and `neighbor_match`.
+`parse_atom_spec` no longer bails on `+` / `-` characters.
+
+Native pattern coverage: __303 → 314 patterns__ (+11).
+The newly-native patterns include the p249 family (benzoate-NH torsions with `[O-]` carboxylate branches) which previously fell back to RDKit SubstructMatch.
+
+Wall-time at 241K × 8 GPU held within noise (10,168 → 10,174 mol/s) — the CPU/GPU phase balance dominates at that scale.
+Gain is on single-GPU and small-batch workloads where CPU prep is the critical path.
+
+### Scaffold-cache infrastructure (workstream SC, partial)
+
+Landed `scaffold_cache_t` (64-shard concurrent `unordered_map` keyed on scaffold-SMILES 64-bit FNV-1a hash) + `context_t::enable_scaffold_cache` opt-in API + stats observability.
+The integration with `extract_etk_torsions_native` (MurckoDecompose + scaffold→molecule atom map + cache population + hit translation) is pending as an isolated follow-up commit — the feasibility analysis and expected 25–30 % SubstructMatch CPU reduction are documented in `IMPROVE.md §4`.
+
+### Mega-kernel launch_bounds + context-ctor pre-warm (workstreams W, X, DD, Y)
 
 Three small-but-related fixes for cold-start and occupancy latency-hiding:
 
-__W — `__launch_bounds__(32, 2)` on `etkdg_pipeline_warp_kernel`.__  ncu showed the mega-kernel ran at 2 % achieved occupancy due to 128 regs/thread capping blocks-per-SM to 1.
-The hint tells nvcc to compile for ≥ 2 blocks/SM; the compiler spills some registers to shared/local memory to recover occupancy.
-Top warp stalls in ncu were `wait` (32 %) and `long_scoreboard` (26 %), both latency-bound — so more concurrent warps should help.
-At production 240K scale the gain is within noise (10,168 mol/s vs 10,155), but smaller batches see the bigger relative improvement (single-GPU 240K 4,852 → 4,897 mol/s).
+__W + X — `__launch_bounds__(32, 4)` on `etkdg_pipeline_warp_kernel`.__  ncu showed the mega-kernel ran at 2 % achieved occupancy due to 128 regs/thread capping blocks-per-SM to 1.
+W first landed `(32, 2)` to force ≥ 2 blocks/SM; X pushed to `(32, 4)` = 128 concurrent warps/SM of occupancy.
+The compiler spills more registers to local/L1 to recover occupancy.
+Top warp stalls in ncu were `wait` (32 %) and `long_scoreboard` (26 %), both latency-bound — more concurrent warps hide them.
+At production 240K scale the gain is within noise but nominally positive (10,155 → 10,168 → 10,204 mol/s across W, N+++, X).
 
 __DD — context_t ctor pre-warms cusolver workspace + metric scratch.__
 The first user call paid ~100 ms cusolver-workspace-probe per device and a cold cudaMalloc.
