@@ -31,13 +31,17 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     if(NOT CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "-march=")
         set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -march=native")
     endif()
+    # `--generate-line-info` (= -lineinfo) is workstream GP-0: makes ncu's
+    # source-counter attribution map stalls back to specific source lines in
+    # etkdg_pipeline.cuh / dg_forcefield.cuh / mmff94_functor.cuh.  No
+    # optimisation impact — pure debug info that survives -O3.
     if(NOT CMAKE_CUDA_FLAGS_RELEASE MATCHES "use_fast_math")
         set(CMAKE_CUDA_FLAGS_RELEASE
-            "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3")
+            "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3 --generate-line-info")
     endif()
     if(NOT CMAKE_CUDA_FLAGS_RELWITHDEBINFO MATCHES "use_fast_math")
         set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO
-            "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3")
+            "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3 --generate-line-info")
     endif()
 endif()
 

@@ -48,16 +48,27 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
-| 241,596 | 1,763 mol/s         | 4,900 mol/s      | __14,713 mol/s__  | __3.00×__   |
+| 241,596 | 1,763 mol/s         | 4,900 mol/s      | __14,727 mol/s__  | __3.00×__   |
 
-At 241,596 molecules on all 8 GPUs: ~16.4 seconds end-to-end (post-SC scaffold cache).
-Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
+At 241,596 molecules on all 8 GPUs: ~16.4 seconds end-to-end (post-SC scaffold cache + MS-1 `removeHs=false` + MM-1 native Murcko).
+Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96.7 % of conformers successful.
 
-Session-level progress: the 241K × 8-GPU throughput went from 4,008 mol/s (60.3 s baseline) to 9,792 mol/s (24.7 s) — __+144%__.
-Single-GPU climbed from 1,716 to 4,482 mol/s (+161%) since per-launch metric prep CPU work and the MMFF nonbonded upload both shrank dramatically.
+### CPU-prep acceleration progression (2026-04-13)
 
-The 1→8 scaling looks "worse" (from 3.11× earlier in the session to 2.18× now) because single-GPU throughput improved faster than 8-GPU throughput — both paths now share the same ~5 s/chunk CPU preprocessing ceiling.
-Absolute throughput is the metric that matters: at 1 GPU the critical path was GPU work (~30 s of kernel); at 8 GPUs it's CPU prep (~25 s total).
+Single-threaded `profile_driver` (bypasses 8-GPU pipelining to isolate per-molecule CPU share) and full 240K × 8 GPU bench:
+
+| Phase              | profile_driver mol/s | 240K × 8 GPU mol/s (median) | Top CPU share change                                                                                    |
+| ------------------ | -------------------: | --------------------------: | ------------------------------------------------------------------------------------------------------- |
+| Baseline (post-SC) |               12,644 |                      14,670 | FloydWarshall 15.1 %, MurckoDecompose 18.3 %, sanitize/removeHs 5.7 %, SubstructMatch ~0 % (SC killed) |
+| + MS-1             |               14,366 |                         n/a | `removeHs` path eliminated (5.7 % → 0 %) — +14 % on single-threaded, GPU-bound at 8 GPU scale            |
+| + MM-1             |               14,430 |                      14,727 | FloydWarshall + MurckoDecompose + MolToSmiles all eliminated (33 % → 0 %) — MMFF 18 % → 23 % now #1      |
+
+Session-level progress: the 241K × 8-GPU throughput went from 4,008 mol/s (60.3 s baseline) to 14,727 mol/s (16.4 s) — __+267 %__.
+Single-GPU climbed from 1,716 to ~4,830 mol/s (+181 %) as per-launch metric prep CPU work and the MMFF nonbonded upload both shrank.
+
+1→8 scaling on the current build is __3.04 ×__ (measured 3.042, 3.057, 3.040 across three runs; 1-GPU range 0.7 %, 8-GPU range 1.1 %).
+Fine-grained scaling deltas (< 3 %) are within measurement noise — reading a scaling _trend_ across historical snapshots of the codebase isn't reliable, so the earlier "3.11× → 2.18×" discussion is removed.
+Absolute throughput on the latest build at 241K × 8 GPU is the metric that matters.
 
 ## Scaling analysis (241,596 molecules)
 

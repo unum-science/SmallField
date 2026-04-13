@@ -43,6 +43,7 @@
 #include "etkdg_types.cuh"
 #include "molecule_descriptor.hpp"
 #include "csd_torsion_native.hpp"
+#include "native_murcko.hpp"
 #include "scaffold_cache.hpp"
 
 namespace smallfield {
@@ -223,13 +224,13 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
 
     auto const &patterns = csd_patterns();
 
-    // ---- Workstream SC-2: scaffold-cache setup -------------------------------
-    // When the caller passed a non-null cache, MurckoDecompose the molecule and
-    // try to look up the scaffold's precomputed RDKit-fallback matches.  The
-    // miss path populates a fresh entry; the hit path translates cached
-    // scaffold-atom-index 4-tuples back into molecule-atom-index space via the
-    // molecule→scaffold atom map computed by SubstructMatch(molecule, scaffold).
-    std::unique_ptr<RDKit::ROMol> scaffold;
+    // ---- Workstream SC + MM-1: native Murcko scaffold extraction -----------
+    // MM-1 replaces `RDKit::MurckoDecompose` (O(N³) via FloydWarshall) with a
+    // native O(N+M) peel on the pre-computed ring info.  `compute_native_murcko`
+    // also canonicalizes the scaffold's atom order via Weisfeiler-Lehman
+    // refinement, so `scaffold_to_mol` / `mol_to_scaffold` are defined without
+    // a second SubstructMatch call.  Symmetric scaffolds (WL-tied atoms) skip
+    // the cache — rare in drug-like molecules.
     std::uint64_t scaffold_hash = 0;
     std::int8_t scaffold_to_mol[max_atoms_k];
     std::int8_t mol_to_scaffold[max_atoms_k];
@@ -242,39 +243,18 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
     bool will_populate = false;
 
     if (cache != nullptr) {
-        try {
-            scaffold.reset(RDKit::MurckoDecompose(molecule));
-        } catch (...) { /* acyclic mol or RDKit failure → skip cache */ }
-        if (scaffold && scaffold->getNumAtoms() > 0) {
-            std::string scaffold_smi;
-            try {
-                scaffold_smi = RDKit::MolToSmiles(*scaffold, /*doIsomericSmiles=*/false,
-                                                  /*doKekule=*/false, /*rootedAtAtom=*/-1,
-                                                  /*canonical=*/true);
-            } catch (...) {}
-            if (!scaffold_smi.empty()) {
-                scaffold_hash = hash_scaffold_smiles(scaffold_smi);
-                std::vector<RDKit::MatchVectType> map_matches;
-                RDKit::SubstructMatch(molecule, *scaffold, map_matches, /*uniquify=*/true,
-                                      /*recursionPossible=*/true);
-                if (!map_matches.empty()) {
-                    auto const &m = map_matches[0];
-                    for (auto const &p : m) {
-                        if (p.first >= 0 && p.first < static_cast<int>(max_atoms_k) &&
-                            p.second >= 0 && p.second < static_cast<int>(num_atoms)) {
-                            scaffold_to_mol[p.first] = static_cast<std::int8_t>(p.second);
-                            mol_to_scaffold[p.second] = static_cast<std::int8_t>(p.first);
-                            mol_in_scaffold[p.second] = true;
-                        }
-                    }
-                    have_scaffold_path = true;
-                    cached_entry = cache->lookup(scaffold_hash);
-                    if (cached_entry == nullptr) {
-                        will_populate = true;
-                        fresh_entry.pattern_matches_flat.assign(patterns.size(), {});
-                        fresh_entry.has_r_group_matches.assign(patterns.size(), 0);
-                    }
-                }
+        native_murcko_result_t nm;
+        if (compute_native_murcko(desc, nm) && nm.valid && nm.canonicalizable) {
+            scaffold_hash = nm.scaffold_hash;
+            std::memcpy(scaffold_to_mol, nm.scaffold_to_mol, sizeof(scaffold_to_mol));
+            std::memcpy(mol_to_scaffold, nm.mol_to_scaffold, sizeof(mol_to_scaffold));
+            for (std::uint32_t a = 0; a < num_atoms; ++a) mol_in_scaffold[a] = nm.mol_in_scaffold[a];
+            have_scaffold_path = true;
+            cached_entry = cache->lookup(scaffold_hash);
+            if (cached_entry == nullptr) {
+                will_populate = true;
+                fresh_entry.pattern_matches_flat.assign(patterns.size(), {});
+                fresh_entry.has_r_group_matches.assign(patterns.size(), 0);
             }
         }
     }

@@ -791,8 +791,14 @@ inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecu
     try {
         // RDKit::SmilesToMol takes std::string const& — one unavoidable std::string
         // construction per molecule.  Kept scoped to this single call.
+        // removeHs=false: we immediately call addHs() below, so letting the parser
+        // strip explicit Hs first is pure waste (MS-1 workstream: ~5 % CPU prep).
         std::string const smiles_str {smiles};
-        mol.reset(RDKit::SmilesToMol(smiles_str));
+        RDKit::SmilesParserParams params;
+        params.sanitize = true;
+        params.removeHs = false;
+        params.strictCXSMILES = false;
+        mol.reset(RDKit::SmilesToMol(smiles_str, params));
     }
     catch (...) {
         return;

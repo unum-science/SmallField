@@ -41,6 +41,17 @@ target_include_directories(test_descriptor PRIVATE
 set_target_properties(test_descriptor PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME test_descriptor COMMAND test_descriptor)
 
+# test_native_murcko cross-validates compute_native_murcko against RDKit's
+# MurckoDecompose on a 500-molecule ChEMBL set.  Gate: ≥ 99 % agreement.
+add_executable(test_native_murcko test_native_murcko.cpp)
+target_link_libraries(test_native_murcko PRIVATE test_helpers smallfield_lib)
+target_include_directories(test_native_murcko PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+set_target_properties(test_native_murcko PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME test_native_murcko COMMAND test_native_murcko)
+
 # test_torsion_predicates cross-validates the hand-coded recursive-SMARTS predicates
 # against RDKit's SubstructMatch on a large set of ChEMBL-derived molecules.
 add_executable(test_torsion_predicates test_torsion_predicates.cpp)
