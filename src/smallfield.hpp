@@ -97,6 +97,9 @@ struct metric_scratch_t {
 // Defined in smallfield.cu so the public header does not need CUDA RAII wrappers.
 struct launch_scratch_t;
 struct output_staging_t;
+class scaffold_cache_t;
+struct scaffold_cache_config_t;
+struct scaffold_cache_stats_t;
 
 struct context_t {
     std::vector<int> device_ids;
@@ -105,6 +108,14 @@ struct context_t {
     std::vector<metric_scratch_t> metric_scratch;   ///< one per device
     std::vector<launch_scratch_t *> launch_scratch; ///< one per device, heap-allocated
     output_staging_t *output_staging = nullptr;     ///< shared across devices, pinned
+    /**
+     *  @brief Optional scaffold cache, disabled by default.  When enabled,
+     *  SubstructMatch calls for the CSD torsion patterns that remain RDKit
+     *  fallback (patterns not yet handled natively) are amortised across
+     *  molecules sharing the same Bemis–Murcko scaffold.  Enable via
+     *  @ref enable_scaffold_cache; stats via @ref scaffold_cache_stats.
+     */
+    scaffold_cache_t *scaffold_cache = nullptr;
 
     /**
      *  @brief Construct for the given GPUs.
@@ -113,6 +124,15 @@ struct context_t {
      */
     explicit context_t(std::span<int const> devices = {});
     ~context_t();
+
+    /**
+     *  @brief Opt in to scaffold-based SubstructMatch caching.  Must be called
+     *  before the first @ref generate_conformers call.  No-op if already
+     *  enabled.  Cache lives for the lifetime of the context_t.
+     */
+    void enable_scaffold_cache();
+    /** @brief Snapshot of hit / miss / entry-count counters. */
+    scaffold_cache_stats_t get_scaffold_cache_stats() const;
 
     context_t(context_t const &) = delete;
     context_t &operator=(context_t const &) = delete;

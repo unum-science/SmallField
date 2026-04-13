@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "scaffold_cache.hpp"
+
 #if defined(SMALLFIELD_BUILD_PYTHON)
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -169,6 +171,16 @@ context_t::~context_t() {
         cudaStreamDestroy(streams[i]);
     }
     delete output_staging;
+    delete scaffold_cache; // no-op if null
+}
+
+void context_t::enable_scaffold_cache() {
+    if (scaffold_cache == nullptr) scaffold_cache = new scaffold_cache_t;
+}
+
+scaffold_cache_stats_t context_t::get_scaffold_cache_stats() const {
+    if (scaffold_cache == nullptr) return {};
+    return scaffold_cache->stats();
 }
 
 /**
