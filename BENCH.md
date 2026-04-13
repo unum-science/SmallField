@@ -61,7 +61,8 @@ Single-threaded `profile_driver` (bypasses 8-GPU pipelining to isolate per-molec
 | ------------------ | -------------------: | --------------------------: | ------------------------------------------------------------------------------------------------------- |
 | Baseline (post-SC) |               12,644 |                      14,670 | FloydWarshall 15.1 %, MurckoDecompose 18.3 %, sanitize/removeHs 5.7 %, SubstructMatch ~0 % (SC killed) |
 | + MS-1             |               14,366 |                         n/a | `removeHs` path eliminated (5.7 % → 0 %) — +14 % on single-threaded, GPU-bound at 8 GPU scale            |
-| + MM-1             |               14,430 |                      14,727 | FloydWarshall + MurckoDecompose + MolToSmiles all eliminated (33 % → 0 %) — MMFF 18 % → 23 % now #1      |
+| + MM-1             |               14,430 |                      14,727 | FloydWarshall + MurckoDecompose + MolToSmiles all eliminated (33 % → 0 %) — MMFF 23 % now #1             |
+| + MM-N             |               14,641 |                      14,800 | MMFF per-term lookups cached by `(atom_type_tuple, bond_signature)` — share 23 % → 9 %                   |
 
 Session-level progress: the 241K × 8-GPU throughput went from 4,008 mol/s (60.3 s baseline) to 14,727 mol/s (16.4 s) — __+267 %__.
 Single-GPU climbed from 1,716 to ~4,830 mol/s (+181 %) as per-launch metric prep CPU work and the MMFF nonbonded upload both shrank.

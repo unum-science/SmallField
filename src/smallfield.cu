@@ -152,6 +152,16 @@ context_t::context_t(std::span<int const> devices) {
         launch_scratch[i]->device_pool.ensure_capacity(kPrewarmDevicePoolBytes);
         launch_scratch[i]->host_staging.ensure_capacity(kPrewarmHostStagingBytes);
     }
+    // Pre-warm the shared pinned output buffer to a size that covers a
+    // 241 K × K=1 workload (≈ 370 MB).  Larger K values or larger batches
+    // grow on demand via `output_staging->pool.ensure_capacity` inside
+    // `ensure_output_staging`, which remains grow-only so subsequent calls
+    // reuse the allocation.  Without this pre-warm, the first
+    // `generate_conformers` call pays a ≈ 370 MB `cudaHostAlloc` serialized
+    // on the driver lock — nsys showed it hit 2.44 s of wall time.
+    cudaSetDevice(device_ids[0]);
+    constexpr std::size_t kPrewarmOutputBytes = 512ULL << 20; // 512 MB
+    output_staging->pool.ensure_capacity(kPrewarmOutputBytes);
 }
 
 context_t::~context_t() {
@@ -770,8 +780,12 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
             chunk_records[i].n_mol = chunks[i].second - chunks[i].first;
         }
 
-        auto prep_slice = [&](std::uint32_t begin, std::uint32_t end) {
-            return prepare_molecule_batch(smiles_view.subspan(begin, end - begin), scaffold_cache);
+        // Reuse the same batches slots across all chunks so their pinned host
+        // buffers (allocated once at first chunk, grown-only) don't round-trip
+        // through cudaHostAlloc/cudaFreeHost — those serialize on a driver
+        // lock and dominate CUDA API time at 8-GPU scale (measured via nsys).
+        auto prep_slice_into = [&](etkdg_molecule_batch_t &batch, std::uint32_t begin, std::uint32_t end) {
+            prepare_molecule_batch_into(smiles_view.subspan(begin, end - begin), batch, scaffold_cache);
         };
 
         // Two-slot ring buffer for both batches and handles.  Fixed-size
@@ -789,7 +803,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         // Bootstrap: prep + launch chunk 0.  chunk 0's GPU work runs in the background
         // on the CUDA streams while the main-thread loop below preps chunk 1.
         chunk_records[0].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-        batches[0] = prep_slice(chunks[0].first, chunks[0].second);
+        prep_slice_into(batches[0], chunks[0].first, chunks[0].second);
         chunk_records[0].prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
         effective_max_atoms = std::max(effective_max_atoms, batches[0].max_atoms_per_molecule);
         chunk_records[0].launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
@@ -802,7 +816,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         //     So it's safe to overwrite with chunk i's batch.
         for (std::size_t i = 1; i < chunks.size(); ++i) {
             chunk_records[i].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-            batches[i % 2] = prep_slice(chunks[i].first, chunks[i].second); // CPU work
+            prep_slice_into(batches[i % 2], chunks[i].first, chunks[i].second); // CPU work
             chunk_records[i].prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
             effective_max_atoms = std::max(effective_max_atoms, batches[i % 2].max_atoms_per_molecule);
             finalize_chunk_timed(in_flight[(i - 1) % 2], static_cast<std::uint32_t>(i - 1));

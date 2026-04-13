@@ -14,6 +14,7 @@
 
 int main(int argc, char **argv) {
     char const *path = argc > 1 ? argv[1] : "/tmp/chembl_240k.smi";
+    std::uint32_t const n_conf_arg = argc > 2 ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 1;
     std::vector<std::string> storage;
     std::ifstream in(path);
     std::string line;
@@ -29,7 +30,8 @@ int main(int argc, char **argv) {
     for (auto const &s : storage) smiles_views.emplace_back(s);
 
     std::uint32_t const max_atoms = 128;
-    std::uint32_t const n_conf = 1;
+    std::uint32_t const n_conf = n_conf_arg;
+    std::printf("Conformers/molecule: %u\n", n_conf);
     std::vector<__half> coords(storage.size() * n_conf * max_atoms * 3);
     std::vector<float> energies(storage.size() * n_conf);
     std::vector<smallfield::conformer_status_t> status(storage.size() * n_conf);

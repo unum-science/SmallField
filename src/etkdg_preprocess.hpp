@@ -53,6 +53,7 @@
 #include "forcefield_tables.hpp"
 #include "molecule_descriptor.hpp"
 #include "csd_torsion_extract.hpp"
+#include "mmff_param_cache.hpp"
 #include "cip_ranks.hpp"
 
 namespace smallfield {
@@ -504,6 +505,26 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
 
     std::uint32_t const num_atoms = desc.num_atoms;
 
+    // ---- MM-N: precompute per-atom MMFF types + per-bond signatures for
+    //      the global parameter cache (src/mmff_param_cache.hpp).  Atom
+    //      types are cheap array reads from mmff_props; bond signatures
+    //      come straight from `desc`.  These feed the cache-key packers
+    //      so we can short-circuit RDKit's per-term std::map lookups.
+    std::uint8_t atom_type[max_atoms_k];
+    for (std::uint32_t a = 0; a < num_atoms; ++a)
+        atom_type[a] = static_cast<std::uint8_t>(mmff_props.getMMFFAtomType(a));
+    std::uint8_t bond_signature[max_bonds_k];
+    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
+        bool const arom = (desc.bond_flags[b] & bond_flag_aromatic_k) != 0;
+        bool const in_ring = (desc.bond_flags[b] & bond_flag_in_ring_k) != 0;
+        bond_signature[b] = pack_bond_signature_(desc.bond_order[b], arom, in_ring);
+    }
+    auto find_bond_idx = [&](std::uint32_t i, std::uint32_t j) -> std::int32_t {
+        for (std::uint16_t n = desc.neighbor_offset[i]; n < desc.neighbor_offset[i + 1]; ++n)
+            if (desc.neighbor_atom[n] == j) return desc.neighbor_bond[n];
+        return -1;
+    };
+
     // Per-atom data: VdW params + partial charge.  The kernel's nonbonded loop enumerates
     // pairs on the fly from the bond_distance matrix and applies Halgren's R* combining
     // rule plus Slater-Kirkwood epsilon combining inline — no per-pair host emission.
@@ -536,17 +557,28 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
             result.bond_distance[i * num_atoms + j] = desc.bond_distance[i * max_atoms_k + j];
 
     // Build bond terms — iterate descriptor's bond list (no RDKit traversal).
+    // Cache-first: key by (atom_type_pair, bond_signature).  Cache hit skips
+    // RDKit's getMMFFBondStretchParams + its internal std::map lookup.
     for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
         std::uint32_t const i = desc.bond_atom_i[b];
         std::uint32_t const j = desc.bond_atom_j[b];
-        unsigned int bond_type;
-        ForceFields::MMFF::MMFFBond bp;
-        if (!mmff_props.getMMFFBondStretchParams(mol, i, j, bond_type, bp)) continue;
+        std::uint64_t const key = make_bond_stretch_key_(atom_type[i], atom_type[j], bond_signature[b]);
+        mmff_bond_cached_t cached_vals {};
+        if (auto const *hit = mmff_bond_cache().find(key)) {
+            cached_vals = *hit;
+        } else {
+            unsigned int bond_type;
+            ForceFields::MMFF::MMFFBond bp;
+            if (!mmff_props.getMMFFBondStretchParams(mol, i, j, bond_type, bp)) continue;
+            cached_vals.kb = static_cast<float>(bp.kb);
+            cached_vals.r0 = static_cast<float>(bp.r0);
+            mmff_bond_cache().insert(key, cached_vals);
+        }
         result.mmff_bonds.push_back({static_cast<std::uint8_t>(i),
                                      static_cast<std::uint8_t>(j),
                                      {0, 0},
-                                     static_cast<float>(bp.kb),
-                                     static_cast<float>(bp.r0),
+                                     cached_vals.kb,
+                                     cached_vals.r0,
                                      0.0f});
     }
 
@@ -558,12 +590,25 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
             for (std::uint16_t b = a + 1; b < nend; ++b) {
                 std::uint32_t const ai = desc.neighbor_atom[a];
                 std::uint32_t const aj = desc.neighbor_atom[b];
-                unsigned int angle_type;
-                ForceFields::MMFF::MMFFAngle ap;
-                if (!mmff_props.getMMFFAngleBendParams(mol, ai, center, aj, angle_type, ap)) continue;
+                std::int32_t const bid_ic = find_bond_idx(ai, center);
+                std::int32_t const bid_cj = find_bond_idx(center, aj);
+                if (bid_ic < 0 || bid_cj < 0) continue;
+                std::uint64_t const key = make_angle_key_(atom_type[ai], atom_type[center], atom_type[aj],
+                                                          bond_signature[bid_ic], bond_signature[bid_cj]);
+                mmff_angle_cached_t cached_vals {};
+                if (auto const *hit = mmff_angle_cache().find(key)) {
+                    cached_vals = *hit;
+                } else {
+                    unsigned int angle_type;
+                    ForceFields::MMFF::MMFFAngle ap;
+                    if (!mmff_props.getMMFFAngleBendParams(mol, ai, center, aj, angle_type, ap)) continue;
+                    cached_vals.ka = static_cast<float>(ap.ka);
+                    cached_vals.theta0_rad = static_cast<float>(ap.theta0 * M_PI / 180.0);
+                    mmff_angle_cache().insert(key, cached_vals);
+                }
                 result.mmff_angles.push_back({static_cast<std::uint8_t>(ai), static_cast<std::uint8_t>(center),
-                                              static_cast<std::uint8_t>(aj), 0, static_cast<float>(ap.ka),
-                                              static_cast<float>(ap.theta0 * M_PI / 180.0), 0.0f});
+                                              static_cast<std::uint8_t>(aj), 0, cached_vals.ka,
+                                              cached_vals.theta0_rad, 0.0f});
             }
         }
     }
@@ -576,19 +621,34 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
         std::uint16_t const jend = desc.neighbor_offset[j + 1];
         std::uint16_t const kstart = desc.neighbor_offset[k];
         std::uint16_t const kend = desc.neighbor_offset[k + 1];
+        std::uint8_t const bsig_jk = bond_signature[b];
         for (std::uint16_t nj = jstart; nj < jend; ++nj) {
             std::uint32_t const i = desc.neighbor_atom[nj];
             if (i == k) continue;
+            std::uint16_t const bid_ij = desc.neighbor_bond[nj];
+            std::uint8_t const bsig_ij = bond_signature[bid_ij];
             for (std::uint16_t nk = kstart; nk < kend; ++nk) {
                 std::uint32_t const l = desc.neighbor_atom[nk];
                 if (l == j) continue;
-                unsigned int torsion_type;
-                ForceFields::MMFF::MMFFTor tp;
-                if (!mmff_props.getMMFFTorsionParams(mol, i, j, k, l, torsion_type, tp)) continue;
+                std::uint16_t const bid_kl = desc.neighbor_bond[nk];
+                std::uint8_t const bsig_kl = bond_signature[bid_kl];
+                std::uint64_t const key = make_torsion_key_(atom_type[i], atom_type[j], atom_type[k],
+                                                            atom_type[l], bsig_ij, bsig_jk, bsig_kl);
+                mmff_torsion_cached_t cached_vals {};
+                if (auto const *hit = mmff_torsion_cache().find(key)) {
+                    cached_vals = *hit;
+                } else {
+                    unsigned int torsion_type;
+                    ForceFields::MMFF::MMFFTor tp;
+                    if (!mmff_props.getMMFFTorsionParams(mol, i, j, k, l, torsion_type, tp)) continue;
+                    cached_vals.V1 = static_cast<float>(tp.V1);
+                    cached_vals.V2 = static_cast<float>(tp.V2);
+                    cached_vals.V3 = static_cast<float>(tp.V3);
+                    mmff_torsion_cache().insert(key, cached_vals);
+                }
                 result.mmff_torsions.push_back({static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(j),
                                                 static_cast<std::uint8_t>(k), static_cast<std::uint8_t>(l),
-                                                static_cast<float>(tp.V1), static_cast<float>(tp.V2),
-                                                static_cast<float>(tp.V3)});
+                                                cached_vals.V1, cached_vals.V2, cached_vals.V3});
             }
         }
     }
@@ -609,14 +669,23 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
             for (std::uint32_t b = 0; b < neighbor_count && plane_count < 2; ++b)
                 if (b != a) plane[plane_count++] = neighbor_cache[b];
             if (plane_count < 2) continue;
-            ForceFields::MMFF::MMFFOop oop_params;
-            if (!mmff_props.getMMFFOopBendParams(mol, neighbor_cache[a], center, plane[0], plane[1], oop_params))
-                continue;
+            std::uint64_t const key = make_oop_key_(atom_type[center], atom_type[neighbor_cache[a]],
+                                                    atom_type[plane[0]], atom_type[plane[1]]);
+            mmff_oop_cached_t cached_vals {};
+            if (auto const *hit = mmff_oop_cache().find(key)) {
+                cached_vals = *hit;
+            } else {
+                ForceFields::MMFF::MMFFOop oop_params;
+                if (!mmff_props.getMMFFOopBendParams(mol, neighbor_cache[a], center, plane[0], plane[1], oop_params))
+                    continue;
+                cached_vals.koop = static_cast<float>(oop_params.koop);
+                mmff_oop_cache().insert(key, cached_vals);
+            }
             result.mmff_oops.push_back({neighbor_cache[a],
                                         static_cast<std::uint8_t>(center),
                                         plane[0],
                                         plane[1],
-                                        static_cast<float>(oop_params.koop),
+                                        cached_vals.koop,
                                         {0.0f, 0.0f}});
         }
     }
@@ -629,18 +698,33 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
             for (std::uint16_t b = a + 1; b < nend; ++b) {
                 std::uint32_t const ai = desc.neighbor_atom[a];
                 std::uint32_t const aj = desc.neighbor_atom[b];
-                unsigned int stretchbend_type;
-                ForceFields::MMFF::MMFFStbn stretchbend_params;
-                ForceFields::MMFF::MMFFBond bond_params[2];
-                ForceFields::MMFF::MMFFAngle angle_params;
-                if (!mmff_props.getMMFFStretchBendParams(mol, ai, center, aj, stretchbend_type, stretchbend_params,
-                                                         bond_params, angle_params))
-                    continue;
+                std::int32_t const bid_ic = find_bond_idx(ai, center);
+                std::int32_t const bid_cj = find_bond_idx(center, aj);
+                if (bid_ic < 0 || bid_cj < 0) continue;
+                std::uint64_t const key = make_stretchbend_key_(atom_type[ai], atom_type[center], atom_type[aj],
+                                                                bond_signature[bid_ic], bond_signature[bid_cj]);
+                mmff_stretchbend_cached_t cached_vals {};
+                if (auto const *hit = mmff_stretchbend_cache().find(key)) {
+                    cached_vals = *hit;
+                } else {
+                    unsigned int stretchbend_type;
+                    ForceFields::MMFF::MMFFStbn stretchbend_params;
+                    ForceFields::MMFF::MMFFBond bond_params[2];
+                    ForceFields::MMFF::MMFFAngle angle_params;
+                    if (!mmff_props.getMMFFStretchBendParams(mol, ai, center, aj, stretchbend_type, stretchbend_params,
+                                                             bond_params, angle_params))
+                        continue;
+                    cached_vals.kbaIJK = static_cast<float>(stretchbend_params.kbaIJK);
+                    cached_vals.kbaKJI = static_cast<float>(stretchbend_params.kbaKJI);
+                    cached_vals.theta0_rad = static_cast<float>(angle_params.theta0 * M_PI / 180.0);
+                    cached_vals.r0_ij = static_cast<float>(bond_params[0].r0);
+                    cached_vals.r0_jk = static_cast<float>(bond_params[1].r0);
+                    mmff_stretchbend_cache().insert(key, cached_vals);
+                }
                 result.mmff_stretchbends.push_back(
                     {static_cast<std::uint8_t>(ai), static_cast<std::uint8_t>(center), static_cast<std::uint8_t>(aj), 0,
-                     static_cast<float>(stretchbend_params.kbaIJK), static_cast<float>(stretchbend_params.kbaKJI),
-                     static_cast<float>(angle_params.theta0 * M_PI / 180.0), static_cast<float>(bond_params[0].r0),
-                     static_cast<float>(bond_params[1].r0), 0.0f});
+                     cached_vals.kbaIJK, cached_vals.kbaKJI, cached_vals.theta0_rad, cached_vals.r0_ij,
+                     cached_vals.r0_jk, 0.0f});
             }
         }
     }
@@ -1058,10 +1142,19 @@ inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::u
  *  @param[in] smiles_list Vector of SMILES strings to process.
  *  @return Batched molecule data with contiguous arrays for GPU upload.
  */
-inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view const> smiles_list,
-                                                     scaffold_cache_t *cache = nullptr) {
-
-    etkdg_molecule_batch_t batch {};
+/**
+ *  In-place variant: fills @p batch in place, reusing its pinned host buffer
+ *  across calls.  This is the lever that kills pinned-memory allocator
+ *  contention at 8-GPU scale — `cudaHostAlloc`/`cudaFreeHost` serialize on a
+ *  driver lock, so recycling the buffer across chunks matters a lot more than
+ *  you'd expect.
+ */
+inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list,
+                                        etkdg_molecule_batch_t &batch,
+                                        scaffold_cache_t *cache = nullptr) {
+    batch.num_molecules = 0;
+    batch.max_atoms_per_molecule = 0;
+    batch.layout = batch_layout_t {};
     // Phase 1: Prepare molecules in parallel. RDKit calls are thread-safe for independent molecules.
     //
     // CRITICAL: this file is included by `smallfield.cu` which is compiled with nvcc.
@@ -1312,7 +1405,7 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
         if (!batch.host.ensure_capacity(batch.layout.bytes_total)) {
             batch.num_molecules = 0;
             batch.layout = batch_layout_t {};
-            return batch;
+            return;
         }
     }
 
@@ -1420,7 +1513,18 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
             input_idx_span[slot] = rec.original_idx;
         }
     }
+}
 
+/**
+ *  Convenience wrapper that returns a fresh batch (allocates a new pinned
+ *  buffer every call).  Kept for call sites that don't participate in the
+ *  pipelined dispatcher — tests, one-shot invocations.  The hot path should
+ *  prefer @ref prepare_molecule_batch_into.
+ */
+inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view const> smiles_list,
+                                                     scaffold_cache_t *cache = nullptr) {
+    etkdg_molecule_batch_t batch {};
+    prepare_molecule_batch_into(smiles_list, batch, cache);
     return batch;
 }
 
