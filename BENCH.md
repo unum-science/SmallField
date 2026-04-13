@@ -91,31 +91,67 @@ The 8 launches run concurrently on 8 OpenMP threads, so their wall contribution 
 RDKit's `MMFFMolProperties` per-molecule heap traffic (internal lookup tables + exclusion matrices) scales poorly on large batches because the allocator starts contending.
 Peak CPU throughput is ~1,700 mol/s regardless of core count beyond 96.
 
-### Where the per-chunk 5.8 s/chunk wall time goes at 8 GPUs (post-J)
+### Where the per-chunk wall time goes at 8 GPUs (measured via `cudaEvent_t`)
 
-29.0 s end-to-end / 5 chunks = __5.8 s per chunk__ on 8 GPUs.
-Breakdown:
+Workstream FF added stream-local `cudaEvent_t` markers around each per-launch phase (upload, metric prepass, kernel waves, download).
+This gives __measured GPU phase timings__ rather than the prior call-site estimates.
+Numbers below are from a single representative 241K × 8-GPU run, captured into per-chunk records and printed by `generate_conformers`.
 
-| Phase                            | Per chunk | Notes                                                   |
-| -------------------------------- | --------- | ------------------------------------------------------- |
-| CPU `prepare_molecule_batch`     | ~5 s      | __now the critical path__; OpenMP parallel, 192 threads |
-| Dispatcher (8 parallel launches) | ~0.5 s    | OpenMP-parallel across 8 threads, one per GPU           |
-| Kernel (wall, 8 GPUs concurrent) | ~0.5 s    | GPU is idle most of the chunk                           |
+Per-chunk per-device GPU phase wall (ms), sample at chunk 1 (warm; chunk 0 includes the cold dispatcher + first cudaHostAlloc):
 
-The pipeline overlaps CPU prep of chunk N+1 with dispatcher + kernel of chunk N.
-With dispatcher now 0.5 s (was 4 s), the critical path is the 5 s CPU prep — the last remaining large synchronous phase.
+| Device  | Upload H2D | Metric prepass | Kernel waves | Download D2H | Total |
+|---------|-----------:|---------------:|-------------:|-------------:|------:|
+| gpu0    | 62         | 17             | 2273         | 0.3          | 2353  |
+| gpu1    | 63         | 17             | 2462         | 0.4          | 2542  |
+| gpu2    | 82         | 17             | 2451         | 0.3          | 2550  |
+| gpu3    | 82         | 16             | 2458         | 0.2          | 2556  |
+| gpu4    | 74         | 18             | 2437         | 0.4          | 2530  |
+| gpu5    | 74         | 22             | 3153         | 0.4          | 3249  |
+| gpu6    | 84         | 17             | 2452         | 0.4          | 2554  |
+| gpu7    | 84         | 15             | 2484         | 0.3          | 2585  |
+
+Observations:
+- __Kernel waves are 95–99 % of per-device GPU wall.__
+  Upload is ~3 %, metric prepass < 1 %, download < 0.1 %.
+  Memory bandwidth is __not__ the bottleneck.
+- __Per-device GPU wall ≈ 2.5–3.2 s for a 50K-mol chunk on 8 GPUs.__
+  The spread (gpu5 at 3249 ms vs gpu0 at 2353 ms — 38 % wider) is straggler variance from the wave-binned dispatch (one large molecule stretches the block it's in).
+- __Chunk GPU wall (max across devices) ≈ 3.2 s.__
+  Sum across devices ≈ 20.7 s.
+
+Per-chunk host-wall layout (measured by `std::chrono::steady_clock` at boundaries of `prepare_molecule_batch` / `launch_chunk` / `finalize_chunk`):
+
+```
+chunk      0       1       2       3       4
+prep    ▓▓▓▓    ▓▓▓▓    ▓▓▓▓    ▓▓▓▓    ▓▓▓
+gpu      ▓▓▓▓    ▓▓▓▓    ▓▓▓▓    ▓▓▓▓    ▓▓▓
+fin       ░       ░       ░       ░       ▓▓▓ ← only chunk 4's GPU wall is fully unhidden
+
+ t=0    4s      8s     12s     16s     20s   23s
+```
+
+- CPU prep: ~4.0 s per 50K-mol chunk.
+- GPU wall per chunk: ~3.2 s (chunk-wide max across the 8 devices).
+- Pipeline overlap: chunk N+1's CPU prep runs in parallel with chunk N's GPU work.
+  Per-chunk wall = max(prep, GPU) ≈ 4.0 s.
+- Tail: chunk 4's GPU wall is fully unhidden (no chunk 5's prep to hide it).
+  At 41,596 mols (smaller than 50 K), chunk 4's GPU wall is ~3 s.
+
+Total wall ≈ prep_chunk_0 + 4 × 4.0 s prep + chunk_4 GPU wall ≈ 4 + 16 + 3 = 23 s.
+
+The critical path is __CPU prep__ (slightly longer than GPU wall per chunk), with the unhidden chunk-4 GPU wall as the visible tail.
 
 ### Why 1→8 scaling is 4.86× not 8×
 
 Two compounding factors (was three; dispatcher is no longer sequential):
 
-1. __CPU prep is constant per chunk regardless of GPU count.__  ~5 s/chunk × 5 chunks = 25 s of CPU work.
-   At 1 GPU the GPU work (~30 s of kernel) dominates so CPU prep fully overlaps.
-   At 8 GPUs the GPU work drops to ~0.5 s/chunk and CPU prep becomes the tail — this is now the __#1 bottleneck__.
-2. __Metric prepass CPU overhead per launch.__
-   Each launch spends ~400–560 ms of CPU time in the 8 `cusolverDnSsyevjBatched` calls.
-   Now that the 8 launches run concurrently (one per GPU), this contributes max(500 ms), not sum(500 ms × 8).
-   It could drop to near zero with a custom warp-cooperative Jacobi kernel (no cusolver state setup) but the gain is small (~500 ms / 5.8 s ≈ 9 %) compared to E's CPU-prep reduction.
+1. __CPU prep is constant per chunk regardless of GPU count.__  ~4.0 s/chunk × 5 chunks = 20 s of CPU work.
+   At 1 GPU the GPU work (~10 s of kernel per chunk on one device) dominates so CPU prep fully overlaps.
+   At 8 GPUs the GPU work drops to ~3.2 s/chunk (8 devices in parallel) so CPU prep becomes the slightly-longer phase — this is the __per-chunk__ critical path.
+2. __Unhidden last-chunk GPU tail.__
+   After the last chunk's CPU prep finishes, the GPU's still working — that wall is fully unhidden.
+   At 8 GPUs the unhidden tail is ~3 s.
+   Workstream EE (smallest-chunk-last) addresses this by sorting molecules globally so the last chunk has the cheapest GPU work.
 
 ## Optimizations that landed
 
