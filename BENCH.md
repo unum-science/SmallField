@@ -48,9 +48,9 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
-| 241,596 | 873 mol/s           | 4,482 mol/s      | __9,792 mol/s__   | __2.18×__   |
+| 241,596 | 873 mol/s           | 4,482 mol/s      | __10,107 mol/s__  | __2.26×__   |
 
-At 241,596 molecules on all 8 GPUs: 24.7 seconds end-to-end (median of 3 runs post-E).
+At 241,596 molecules on all 8 GPUs: 23.9 seconds end-to-end (median of 3 runs post-O).
 Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
 
 Session-level progress: the 241K × 8-GPU throughput went from 4,008 mol/s (60.3 s baseline) to 9,792 mol/s (24.7 s) — __+144%__.
@@ -73,8 +73,8 @@ Absolute throughput is the metric that matters: at 1 GPU the critical path was G
 
 ### GPU scaling (SmallField) on 241K
 
-| Config | Wall time | Throughput | Scaling |
-|--------|-----------|------------|---------|
+| Config | Wall time | Throughput  | Scaling |
+| ------ | --------- | ----------- | ------- |
 | 1 GPU  | 140.8 s   | 1,716 mol/s | 1.0×    |
 | 8 GPUs | 29.0 s    | 8,344 mol/s | 4.86×   |
 
@@ -83,10 +83,10 @@ The 8 launches run concurrently on 8 OpenMP threads, so their wall contribution 
 
 ### CPU scaling (RDKit) on 241K
 
-| OMP threads | Throughput      | Notes |
-|-------------|-----------------|-------|
-| 192         | 873 mol/s       | Allocator + NUMA overhead dominates; worse than smaller batches |
-| 192 (8,948 mol batch) | 1,672 mol/s | Peak CPU throughput |
+| OMP threads           | Throughput  | Notes                                                           |
+| --------------------- | ----------- | --------------------------------------------------------------- |
+| 192                   | 873 mol/s   | Allocator + NUMA overhead dominates; worse than smaller batches |
+| 192 (8,948 mol batch) | 1,672 mol/s | Peak CPU throughput                                             |
 
 RDKit's `MMFFMolProperties` per-molecule heap traffic (internal lookup tables + exclusion matrices) scales poorly on large batches because the allocator starts contending.
 Peak CPU throughput is ~1,700 mol/s regardless of core count beyond 96.
@@ -96,11 +96,11 @@ Peak CPU throughput is ~1,700 mol/s regardless of core count beyond 96.
 29.0 s end-to-end / 5 chunks = __5.8 s per chunk__ on 8 GPUs.
 Breakdown:
 
-| Phase                              | Per chunk          | Notes |
-|------------------------------------|--------------------|-------|
-| CPU `prepare_molecule_batch`       | ~5 s               | __now the critical path__; OpenMP parallel, 192 threads |
-| Dispatcher (8 parallel launches)   | ~0.5 s             | OpenMP-parallel across 8 threads, one per GPU |
-| Kernel (wall, 8 GPUs concurrent)   | ~0.5 s             | GPU is idle most of the chunk |
+| Phase                            | Per chunk | Notes                                                   |
+| -------------------------------- | --------- | ------------------------------------------------------- |
+| CPU `prepare_molecule_batch`     | ~5 s      | __now the critical path__; OpenMP parallel, 192 threads |
+| Dispatcher (8 parallel launches) | ~0.5 s    | OpenMP-parallel across 8 threads, one per GPU           |
+| Kernel (wall, 8 GPUs concurrent) | ~0.5 s    | GPU is idle most of the chunk                           |
 
 The pipeline overlaps CPU prep of chunk N+1 with dispatcher + kernel of chunk N.
 With dispatcher now 0.5 s (was 4 s), the critical path is the 5 s CPU prep — the last remaining large synchronous phase.
@@ -118,6 +118,22 @@ Two compounding factors (was three; dispatcher is no longer sequential):
    It could drop to near zero with a custom warp-cooperative Jacobi kernel (no cusolver state setup) but the gain is small (~500 ms / 5.8 s ≈ 9 %) compared to E's CPU-prep reduction.
 
 ## Optimizations that landed
+
+### Fused bounds-smooth + Gram + power-iter embedding kernel (workstream O)
+
+The three-stage metric prepass (smooth_and_build_gram_kernel → cusolverDnXsyevBatched → project_metric_coordinates_kernel) collapses into ONE kernel: `embed_4d_power_iter_kernel` in `src/metric_embedding_prepass.cuh`.
+
+One block per molecule.
+Shared memory holds the Gram matrix (built in place over the smoothed bounds — Floyd-Warshall + row-mean centering unchanged) plus four eigenvector slots + scratch (~67 KB at N=128).
+Deflated power iteration extracts the top-4 eigenvalues: initialize `v_k` near `e_k`, then iterate `w = G·v_k` → Gram-Schmidt against `v_{0..k-1}` → normalize → check eigenvalue stability.
+Up to 60 sweeps; converges in 10-20 for drug-like molecules.
+Output `v_k × sqrt(λ_k)` goes directly into `initial_coordinates` — no global Gram, no cusolver, no separate projection kernel.
+
+Removes the three CPU-side cusolver launch costs per bin, the host workspace buffer, the batched-Gram global memory traffic, and the separate project kernel.
+The cusolverDnParams_t state in `metric_scratch_t` is now unused (kept for backward compatibility).
+
+End-to-end 241K × 8 GPU: 24.7 s → 23.9 s (+3 %), 9,792 → 10,107 mol/s — __above the 10K target__.
+All 7 ctests pass; P50 = 72.7 kcal/mol vs RDKit 79.1 at 2K (within baseline noise).
 
 ### Direct-to-pool Phase 1 preprocessing (workstream E)
 
