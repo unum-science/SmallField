@@ -48,7 +48,7 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 8,948   | 1,672 mol/s         | 1,954 mol/s      | 2,429 mol/s       | 1.24×       |
 | 50,000  | 1,730 mol/s         | 2,449 mol/s      | 4,766 mol/s       | 1.95×       |
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
-| 241,596 | 1,753 mol/s         | 4,520 mol/s      | __10,130 mol/s__  | __2.24×__   |
+| 241,596 | 1,764 mol/s         | 4,852 mol/s      | __10,155 mol/s__  | __2.09×__   |
 
 At 241,596 molecules on all 8 GPUs: 23.9 seconds end-to-end (median of 3 runs post-O).
 Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96 % of conformers successful.
@@ -154,6 +154,70 @@ Two compounding factors (was three; dispatcher is no longer sequential):
    Workstream EE (smallest-chunk-last) addresses this by sorting molecules globally so the last chunk has the cheapest GPU work.
 
 ## Optimizations that landed
+
+### Native fast-paths for top SubstructMatch hot-spots (workstream N++)
+
+Multi-dataset profiling (chembl / moses / zinc / gdb13 / synth-scaffold / synth-noise) identified that __two CSD torsion patterns — p94 and p114 — cover 75–85 % of RDKit SubstructMatch fallback CPU on every dataset__.
+Whichever is #1 depends on input: p94 dominates drug-like libraries (Moses, ZINC at 73–76 %), p114 dominates enumerative combinatorial libraries (GDB-13, scaffold-decorated at 78–82 %).
+Together they universally dominate.
+
+Four new predicate helpers in `src/csd_torsion_predicates.hpp`:
+
+| Predicate | Body | Use |
+|---|---|---|
+| `a_nb_cH1` | `$([a]([cH1]))` | aromatic atom with aromatic-CH neighbour |
+| `aH0_nb_nonring_O` | `$([aH0](!@O))` | aromatic, 0 H, non-ring O neighbour |
+| `c_two_cH_or_nX2H0` | `$([c]([cH,nX2H0])[cH,nX2H0])` | aromatic C with two cH-or-nX2H0 neighbours |
+| `cH0_nb_NH12` | `$([cH0][NH1,NH2])` | aromatic C, 0 H, with NH1 or NH2 neighbour |
+
+Pattern coverage rises 300 / 470 → 303 / 470; three patterns (p94, p95, p114) now compile to native form.
+All 13 total predicates cross-validate against `RDKit::SubstructMatch` on 210 ChEMBL molecules (every atom of every molecule produces the same verdict).
+
+End-to-end throughput at 241K × 8 GPU held within noise of the pre-N++ baseline (10,130 → 10,155 mol/s median of two runs) — the wall is co-balanced between CPU prep and GPU kernel phases at this scale, so the SubstructMatch reduction is absorbed into remaining CPU slack.
+Largest single-GPU gain observed: 4,520 → 4,852 mol/s (+7 %), matching the agent's prediction that single-GPU runs (where CPU prep dominates) get the biggest benefit.
+
+### Smallest-chunk-last molecule sort (workstream EE)
+
+Before chunking, `generate_conformers` sorts the full input by descending SMILES length (proxy for atom count).
+The LAST chunk thus contains the smallest molecules, minimising the unhidden GPU tail that would otherwise dominate the last few hundred milliseconds of wall time.
+Outputs are permuted back to the caller's original input order in the post-loop write loop, so the public API behaviour is unchanged.
+
+Measured effect on 241K × 8 GPU (per-chunk `cudaEvent` timings from workstream FF):
+
+| Chunk | GPU max wall (pre-EE) | GPU max wall (post-EE) |
+|------:|----------------------:|-----------------------:|
+| 0     | 3,206 ms              | 5,818 ms               |
+| 1     | 3,169 ms              | 3,279 ms               |
+| 2     | 3,230 ms              | 2,159 ms               |
+| 3     | 3,209 ms              | 1,033 ms               |
+| 4     | 2,969 ms              | __792 ms__             |
+
+Chunk 4's unhidden GPU tail dropped by __~2.2 s__ (2,969 → 792).
+At this dataset's molecule-size variance, the saving is offset by chunk 0's heavier prep + GPU (since the largest molecules now live there), so total wall is ~neutral — but the behaviour is much more predictable for datasets with extreme size variance (e.g. mixed GDB-13 + drug-like).
+Keeps wall-time budget stable even as input distribution shifts.
+
+### cudaEvent phase instrumentation (workstream FF)
+
+Added stream-local `cudaEvent_t` markers around each per-launch GPU phase (upload H2D, metric prepass, kernel waves, download D2H).
+Events live in a persistent per-device pool inside `launch_scratch_t` — created with `cudaEventBlockingSync` at context construction and reused for the lifetime of the `context_t`.
+
+A prior prototype created/destroyed events per launch and hit an intermittent multi-GPU regression (240K success rate dropped to 60 % on chunks 3–4) caused by a race between `cudaEventDestroy` on one stream and the next launch's `cudaEventCreate` on a different OpenMP dispatcher thread.
+Persistent reuse sidesteps the issue entirely.
+
+Per-chunk records hold host-wall markers (prep / launch / finalize boundaries via `std::chrono::steady_clock`) plus per-device `gpu_phase_ms_t` copies from `cudaEventElapsedTime`.
+End of `generate_conformers` prints an ASCII timeline:
+
+```
+=== chunk timeline (ms, host wall + per-device GPU phase) ===
+  ck   n_mol  prep_lo  prep_hi  lnch_lo  lnch_hi   fin_lo   fin_hi  gpu_max  gpu_sum  gpu_avg
+   0   50000      0.0   5990.8   5990.8   6286.4  10367.0  11952.1   5817.6  37657.0   4707.1
+   ...
+=== per-device phase breakdown (ms): U=upload  M=metric  K=kernels  D=download  T=total ===
+ck=0 dev=0  U=113.8  M=34.3  K=4249.6  D=0.4  T=4398.1
+   ...
+```
+
+This is the foundation for the next-tier GPU optimizations (W, X, Z) documented in `IMPROVE.md`.
 
 ### Native CSD SMARTS branch support + element-mask fix (workstream N)
 
