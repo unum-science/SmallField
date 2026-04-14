@@ -24,13 +24,17 @@
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 
 #include "molecule_descriptor.hpp"
+#include "mmff94_tables.hpp"
 #include "mmff94_typer.hpp"
 
 using namespace smallfield;
 
 namespace {
+mmff94_tables_host_t tables;
 int n_atoms_checked = 0;
 int n_atoms_mismatch = 0;
+int n_charges_checked = 0;
+int n_charges_mismatch = 0;
 int n_mols_tested = 0;
 int n_mols_mismatch = 0;
 
@@ -65,6 +69,9 @@ void test_one(std::string const &smiles, bool verbose) {
     if (!build_descriptor(*mol, desc)) return;
     std::vector<std::uint8_t> nat(desc.num_atoms);
     native_compute_mmff_atom_types(desc, nat);
+    std::vector<float> nat_fc(desc.num_atoms), nat_pc(desc.num_atoms);
+    native_compute_mmff_formal_charges(desc, nat, nat_fc);
+    native_compute_mmff_partial_charges(desc, tables, nat, nat_fc, nat_pc);
 
     ++n_mols_tested;
     bool this_mol_ok = true;
@@ -74,8 +81,23 @@ void test_one(std::string const &smiles, bool verbose) {
         if (rdk_t != nat[a]) {
             ++n_atoms_mismatch;
             this_mol_ok = false;
-            if (verbose && mismatches.size() < 20) {
+            if (verbose && mismatches.size() < 20)
                 mismatches.push_back({(int)desc.element[a], rdk_t, nat[a], smiles});
+        }
+        if (rdk_t == nat[a]) {
+            ++n_charges_checked;
+            float const rdk_pc = (float)props.getMMFFPartialCharge(a);
+            float const diff = std::fabs(rdk_pc - nat_pc[a]);
+            if (diff > 1e-3f) {
+                ++n_charges_mismatch;
+                this_mol_ok = false;
+                if (verbose && mismatches.size() < 20) {
+                    summary_t m; m.el = (int)desc.element[a];
+                    m.smiles = std::string("chg ") + smiles +
+                               " (rdk=" + std::to_string(rdk_pc) +
+                               " nat=" + std::to_string(nat_pc[a]) + ")";
+                    mismatches.push_back(m);
+                }
             }
         }
     }
@@ -84,7 +106,8 @@ void test_one(std::string const &smiles, bool verbose) {
 } // namespace
 
 int main(int argc, char **argv) {
-    std::printf("=== test_mmff_typer: MG-1.5/1.6 gate ===\n");
+    std::printf("=== test_mmff_typer: MG-1.5/1.6/1.7 gate ===\n");
+    extract_mmff94_tables_from_rdkit(tables);
 
     std::vector<std::string> probe = {
         "CC(=O)OC1=CC=CC=C1C(=O)O",
@@ -116,13 +139,17 @@ int main(int argc, char **argv) {
         }
     }
 
-    std::printf("molecules: %d tested, %d with ≥ 1 type mismatch\n",
+    std::printf("molecules: %d tested, %d with ≥ 1 type or charge mismatch\n",
                 n_mols_tested, n_mols_mismatch);
-    std::printf("atoms: %d checked, %d mismatches\n",
+    std::printf("atoms: %d checked, %d type mismatches\n",
                 n_atoms_checked, n_atoms_mismatch);
+    std::printf("charges: %d checked, %d mismatches (> 1e-3)\n",
+                n_charges_checked, n_charges_mismatch);
     double const atom_match = n_atoms_checked ? 100.0 * (1.0 - (double)n_atoms_mismatch / n_atoms_checked) : 100.0;
     double const mol_match = n_mols_tested ? 100.0 * (1.0 - (double)n_mols_mismatch / n_mols_tested) : 100.0;
-    std::printf("atom match: %.4f %%, molecule match: %.3f %%\n", atom_match, mol_match);
+    double const chg_match = n_charges_checked ? 100.0 * (1.0 - (double)n_charges_mismatch / n_charges_checked) : 100.0;
+    std::printf("atom match: %.4f %%, charge match: %.4f %%, molecule match: %.3f %%\n",
+                 atom_match, chg_match, mol_match);
     for (auto const &m : mismatches) {
         std::printf("  el=%d rdk=%u nat=%u  [%s]\n", m.el, m.expected, m.got, m.smiles.c_str());
     }

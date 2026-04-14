@@ -862,6 +862,248 @@ inline std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const &d
     return atom_type;
 }
 
+// ---- MMFF charge computation ---------------------------------------------
+
+/** Compute MMFF formal charges per atom.  Port of the first half of
+ *  `computeMMFFCharges` (AtomTyper.cpp:3094-3421).  Sets per-atom formal
+ *  charges for atom types with special allocation rules (carboxylate
+ *  charge sharing, N5M anion splitting, conjugated nitrogen flood fill).
+ *  All other atoms keep `desc.formal_charge` (the RDKit-assigned formal
+ *  charge from SMILES parsing). */
+inline void native_compute_mmff_formal_charges(molecule_descriptor_t const &desc,
+                                               std::span<std::uint8_t const> atom_types,
+                                               std::span<float> formal_charges) noexcept {
+    std::uint32_t const n = desc.num_atoms;
+    // Initialise with zero — only atom types listed below get overridden.
+    for (std::uint32_t a = 0; a < n; ++a) formal_charges[a] = 0.0f;
+
+    // Scratch bitset for the conjugated-nitrogen flood fill (types 55/56/81).
+    std::array<std::uint32_t, (max_atoms_k + 31) / 32> conj_bits {};
+    auto conj_set = [&](std::uint32_t i) { conj_bits[i >> 5] |= (1u << (i & 31)); };
+    auto conj_get = [&](std::uint32_t i) -> bool {
+        return (conj_bits[i >> 5] & (1u << (i & 31))) != 0;
+    };
+    auto conj_reset = [&]() { conj_bits.fill(0); };
+
+    for (std::uint32_t idx = 0; idx < n; ++idx) {
+        std::uint8_t const at = atom_types[idx];
+        float fc = 0.0f;
+        switch (at) {
+            case 32: // O2CM — carboxylate / phosphate / sulfonate oxygen
+            case 72: // SM   — anionic terminal sulfur
+            {
+                std::uint16_t const ns = desc.neighbor_offset[idx];
+                std::uint16_t const ne = desc.neighbor_offset[idx + 1];
+                for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
+                    std::uint8_t const nb = desc.neighbor_atom[n0];
+                    std::uint8_t const nbt = atom_types[nb];
+                    int nSecNbondedToNbr = 0;
+                    int nTermOSbondedToNbr = 0;
+                    std::uint16_t const bs = desc.neighbor_offset[nb];
+                    std::uint16_t const be = desc.neighbor_offset[nb + 1];
+                    for (std::uint16_t n1 = bs; n1 < be; ++n1) {
+                        std::uint8_t const nb2 = desc.neighbor_atom[n1];
+                        if (desc.element[nb2] == 7 && desc.degree[nb2] == 2 &&
+                            !(desc.atom_flags[nb2] & atom_flag_aromatic_k)) ++nSecNbondedToNbr;
+                        if ((desc.element[nb2] == 8 || desc.element[nb2] == 16) &&
+                            desc.degree[nb2] == 1) ++nTermOSbondedToNbr;
+                    }
+                    // Sulfonamide with 2 terminal O + 1 sec N: don't treat N
+                    // as an O replacement.
+                    if (desc.element[nb] == 16 && nTermOSbondedToNbr == 2 && nSecNbondedToNbr == 1)
+                        nSecNbondedToNbr = 0;
+
+                    if (desc.element[nb] == 6 && nTermOSbondedToNbr) {
+                        fc = (nTermOSbondedToNbr == 1)
+                                 ? -1.0f
+                                 : -((float)(nTermOSbondedToNbr - 1) / (float)nTermOSbondedToNbr);
+                        break;
+                    }
+                    if (nbt == 45 && nTermOSbondedToNbr == 3) {
+                        fc = -1.0f / 3.0f; break;
+                    }
+                    if (nbt == 25 && nTermOSbondedToNbr) {
+                        fc = (nTermOSbondedToNbr == 1)
+                                 ? 0.0f
+                                 : -((float)(nTermOSbondedToNbr - 1) / (float)nTermOSbondedToNbr);
+                        break;
+                    }
+                    if (nbt == 18 && nTermOSbondedToNbr) {
+                        fc = ((nSecNbondedToNbr + nTermOSbondedToNbr) == 2)
+                                 ? 0.0f
+                                 : -((float)((nSecNbondedToNbr + nTermOSbondedToNbr) - 2) /
+                                     (float)nTermOSbondedToNbr);
+                        break;
+                    }
+                    if (nbt == 73 && nTermOSbondedToNbr) {
+                        fc = (nTermOSbondedToNbr == 1)
+                                 ? 0.0f
+                                 : -((float)(nTermOSbondedToNbr - 1) / (float)nTermOSbondedToNbr);
+                        break;
+                    }
+                    if (nbt == 77 && nTermOSbondedToNbr) {
+                        fc = -(1.0f / (float)nTermOSbondedToNbr);
+                        break;
+                    }
+                }
+                break;
+            }
+            case 76: {
+                // N5M: find the 5-ring containing this atom, share -1
+                // across all N5M atoms in that ring.
+                std::uint32_t const bitmap = desc.atom_ring_bitmap[idx];
+                for (unsigned r = 0; r < desc.num_rings; ++r) {
+                    if (!(bitmap & (1u << r))) continue;
+                    unsigned const rs = desc.ring_offset[r + 1] - desc.ring_offset[r];
+                    if (rs != 5) continue;
+                    unsigned nN76 = 0;
+                    for (unsigned p = desc.ring_offset[r]; p < desc.ring_offset[r + 1]; ++p)
+                        if (atom_types[desc.ring_atoms[p]] == 76) ++nN76;
+                    if (nN76) fc = -1.0f / (float)nN76;
+                    break;
+                }
+                break;
+            }
+            case 55: case 56: case 81: {
+                // Conjugated nitrogen (amidinium / guanidinium /
+                // imidazolium).  Flood-fill through carbon types 57/80,
+                // collecting all conjugated 55/56/81 atoms, sum formal
+                // charges, split evenly.
+                fc = (float)desc.formal_charge[idx];
+                unsigned nConj = 1, oldNConj = 0;
+                conj_reset();
+                conj_set(idx);
+                while (nConj > oldNConj) {
+                    oldNConj = nConj;
+                    for (std::uint32_t i = 0; i < n; ++i) {
+                        if (!conj_get(i)) continue;
+                        std::uint16_t const ns = desc.neighbor_offset[i];
+                        std::uint16_t const ne = desc.neighbor_offset[i + 1];
+                        for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
+                            std::uint8_t const c = desc.neighbor_atom[n0];
+                            std::uint8_t const ct = atom_types[c];
+                            if (ct != 57 && ct != 80) continue;
+                            std::uint16_t const cs = desc.neighbor_offset[c];
+                            std::uint16_t const ce = desc.neighbor_offset[c + 1];
+                            for (std::uint16_t n1 = cs; n1 < ce; ++n1) {
+                                std::uint8_t const nn = desc.neighbor_atom[n1];
+                                std::uint8_t const nnt = atom_types[nn];
+                                if (nnt != 55 && nnt != 56 && nnt != 81) continue;
+                                if (!conj_get(nn)) {
+                                    conj_set(nn);
+                                    fc += (float)desc.formal_charge[nn];
+                                    ++nConj;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (nConj) fc /= (float)nConj;
+                break;
+            }
+            case 61: {
+                // Isonitrile C.  If bonded to type 42 (triply bonded N),
+                // set +1 (on the N, via ipso bookkeeping).
+                std::uint16_t const ns = desc.neighbor_offset[idx];
+                std::uint16_t const ne = desc.neighbor_offset[idx + 1];
+                for (std::uint16_t n0 = ns; n0 < ne; ++n0)
+                    if (atom_types[desc.neighbor_atom[n0]] == 42) { fc = 1.0f; break; }
+                break;
+            }
+            case 34: case 49: case 51: case 54: case 58: case 92: case 93:
+            case 94: case 97:
+                fc = 1.0f; break;
+            case 87: case 95: case 96: case 98: case 99:
+                fc = 2.0f; break;
+            case 88: fc = 3.0f; break;
+            case 35: case 62: case 89: case 90: case 91:
+                fc = -1.0f; break;
+        }
+        formal_charges[idx] = fc;
+    }
+}
+
+/** Compute MMFF partial charges — second half of `computeMMFFCharges`
+ *  (AtomTyper.cpp:3423-3487).  Applies bond-charge increments (BCIs)
+ *  from the extracted `chg` table, with the PBCI fallback when no BCI
+ *  is tabulated.  Formal-charge distribution follows equation 15 of
+ *  MMFF.V. */
+inline void native_compute_mmff_partial_charges(molecule_descriptor_t const &desc,
+                                                mmff94_tables_host_t const &tables,
+                                                std::span<std::uint8_t const> atom_types,
+                                                std::span<float const> formal_charges,
+                                                std::span<float> partial_charges) noexcept {
+    std::uint32_t const n = desc.num_atoms;
+    for (std::uint32_t idx = 0; idx < n; ++idx) {
+        std::uint8_t const at = atom_types[idx];
+        auto const *prop = lookup_prop(tables, at);
+        if (!prop) { partial_charges[idx] = formal_charges[idx]; continue; }
+        double const M = (double)prop->crd;
+
+        auto pbci_ipso = std::lower_bound(
+            tables.pbci.begin(), tables.pbci.end(), at,
+            [](mmff94_pbci_entry_t const &e, std::uint8_t v) { return e.atom_type < v; });
+        double v = 0.0;
+        double pbci_ipso_val = 0.0;
+        if (pbci_ipso != tables.pbci.end() && pbci_ipso->atom_type == at) {
+            v = (double)pbci_ipso->fcadj;
+            pbci_ipso_val = (double)pbci_ipso->pbci;
+        }
+
+        double q0 = (double)formal_charges[idx];
+        bool const v_zero = std::fabs(v) < 1.0e-10;
+
+        std::uint16_t const ns = desc.neighbor_offset[idx];
+        std::uint16_t const ne = desc.neighbor_offset[idx + 1];
+        if (v_zero) {
+            for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
+                std::uint8_t const nb = desc.neighbor_atom[n0];
+                double const nbFC = (double)formal_charges[nb];
+                if (nbFC < 0.0) q0 += nbFC / (2.0 * (double)desc.degree[nb]);
+            }
+        }
+        if (at == 62) {
+            for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
+                std::uint8_t const nb = desc.neighbor_atom[n0];
+                double const nbFC = (double)formal_charges[nb];
+                if (nbFC > 0.0) q0 -= nbFC / 2.0;
+            }
+        }
+        double sumFC = 0.0, sumPC = 0.0;
+        for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
+            std::uint8_t const nb = desc.neighbor_atom[n0];
+            std::uint8_t const nbt = atom_types[nb];
+            std::uint16_t const bid = desc.neighbor_bond[n0];
+            // Native bond type: replicate `getMMFFBondType`.
+            std::uint8_t bond_type = 0;
+            bool const arom_bond = (desc.bond_flags[bid] & bond_flag_aromatic_k) != 0;
+            bool const single_bond = desc.bond_order[bid] == 1 && !arom_bond;
+            if (single_bond) {
+                auto const *pi = lookup_prop(tables, at);
+                auto const *pj = lookup_prop(tables, nbt);
+                if (pi && pj && ((pi->sbmb && pj->sbmb) || (pi->arom && pj->arom)))
+                    bond_type = 1;
+            }
+            auto const chg_hit = lookup_chg(tables, bond_type, at, nbt);
+            if (chg_hit.second) {
+                sumPC += (double)chg_hit.first * (double)chg_hit.second->bci;
+            }
+            else {
+                auto pbci_nb = std::lower_bound(
+                    tables.pbci.begin(), tables.pbci.end(), nbt,
+                    [](mmff94_pbci_entry_t const &e, std::uint8_t v) { return e.atom_type < v; });
+                double const nb_pbci = (pbci_nb != tables.pbci.end() &&
+                                         pbci_nb->atom_type == nbt)
+                                             ? (double)pbci_nb->pbci : 0.0;
+                sumPC += pbci_ipso_val - nb_pbci;
+            }
+            sumFC += (double)formal_charges[nb];
+        }
+        double const pChg = (1.0 - M * v) * q0 + v * sumFC + sumPC;
+        partial_charges[idx] = (float)pChg;
+    }
+}
+
 // ---- Top-level: type every atom ----------------------------------------
 
 /** Populate `atom_types[]` with MMFF94 atom types for every atom in the
