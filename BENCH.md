@@ -57,12 +57,12 @@ Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96.7 % of 
 
 Single-threaded `profile_driver` (bypasses 8-GPU pipelining to isolate per-molecule CPU share) and full 240K × 8 GPU bench:
 
-| Phase              | profile_driver mol/s | 240K × 8 GPU mol/s (median) | Top CPU share change                                                                                    |
-| ------------------ | -------------------: | --------------------------: | ------------------------------------------------------------------------------------------------------- |
+| Phase              | profile_driver mol/s | 240K × 8 GPU mol/s (median) | Top CPU share change                                                                                   |
+| ------------------ | -------------------: | --------------------------: | ------------------------------------------------------------------------------------------------------ |
 | Baseline (post-SC) |               12,644 |                      14,670 | FloydWarshall 15.1 %, MurckoDecompose 18.3 %, sanitize/removeHs 5.7 %, SubstructMatch ~0 % (SC killed) |
-| + MS-1             |               14,366 |                         n/a | `removeHs` path eliminated (5.7 % → 0 %) — +14 % on single-threaded, GPU-bound at 8 GPU scale            |
-| + MM-1             |               14,430 |                      14,727 | FloydWarshall + MurckoDecompose + MolToSmiles all eliminated (33 % → 0 %) — MMFF 23 % now #1             |
-| + MM-N             |               14,641 |                      14,800 | MMFF per-term lookups cached by `(atom_type_tuple, bond_signature)` — share 23 % → 9 %                   |
+| + MS-1             |               14,366 |                         n/a | `removeHs` path eliminated (5.7 % → 0 %) — +14 % on single-threaded, GPU-bound at 8 GPU scale          |
+| + MM-1             |               14,430 |                      14,727 | FloydWarshall + MurckoDecompose + MolToSmiles all eliminated (33 % → 0 %) — MMFF 23 % now #1           |
+| + MM-N             |               14,641 |                      14,800 | MMFF per-term lookups cached by `(atom_type_tuple, bond_signature)` — share 23 % → 9 %                 |
 
 Session-level progress: the 241K × 8-GPU throughput went from 4,008 mol/s (60.3 s baseline) to 14,727 mol/s (16.4 s) — __+267 %__.
 Single-GPU climbed from 1,716 to ~4,830 mol/s (+181 %) as per-launch metric prep CPU work and the MMFF nonbonded upload both shrank.
@@ -70,6 +70,68 @@ Single-GPU climbed from 1,716 to ~4,830 mol/s (+181 %) as per-launch metric prep
 1→8 scaling on the current build is __3.04 ×__ (measured 3.042, 3.057, 3.040 across three runs; 1-GPU range 0.7 %, 8-GPU range 1.1 %).
 Fine-grained scaling deltas (< 3 %) are within measurement noise — reading a scaling _trend_ across historical snapshots of the codebase isn't reliable, so the earlier "3.11× → 2.18×" discussion is removed.
 Absolute throughput on the latest build at 241K × 8 GPU is the metric that matters.
+
+## USearchMolecules cross-dataset benchmark (2026-04-14)
+
+Three real-world chemical libraries downloaded from `s3://usearch-molecules`.
+Each test uses 100 K molecules from a single shard so CPU / 1-GPU / 8-GPU numbers are directly comparable.
+System A = RDKit's ETKDG + MMFF94 on 192 CPU threads; System B = SmallField on 1 or 8 GPUs.
+
+### Same-size comparison (100 K mols)
+
+| Dataset                        | Avg heavy atoms | CPU (RDKit, 192 thr) |        1 GPU |       8 GPUs | 1→8 scaling | 8-GPU speedup vs CPU |
+| ------------------------------ | --------------: | -------------------: | -----------: | -----------: | ----------: | -------------------: |
+| GDB13 (enumerated, ≤ 13 heavy) |              13 |     __10,035 mol/s__ | 13,232 mol/s | 16,563 mol/s |       1.25× |                1.65× |
+| PubChem                        |              40 |          1,298 mol/s |  5,285 mol/s | 10,275 mol/s |       1.94× |                7.92× |
+| Enamine REAL                   |              25 |          1,929 mol/s |  6,444 mol/s |  9,440 mol/s |       1.47× |                4.89× |
+| ChEMBL-big (filtered N ≥ 70)   |             ~75 |                    — |  1,268 mol/s |  3,773 mol/s |       2.97× |                    — |
+| ChEMBL 241 K (mixed drug-like) |              48 |          1,763 mol/s |  4,849 mol/s | 14,727 mol/s |       3.04× |                8.35× |
+
+Takeaways:
+- __GDB13 flips the usual pattern__ — RDKit CPU (10 K mol/s) is almost as fast as SmallField 8-GPU (16.5 K), because ETKDG setup cost dominates on 13-atom molecules and GPU launch overhead is a huge fraction of per-mol work.
+  For small molecules, CPU is competitive.
+- __PubChem and REAL__ show 8-GPU ÷ CPU = 5-8 ×, but 1 → 8 GPU scaling is only 1.5 – 2 ×.
+  The CPU ↔ GPU crossover is clear; the missing efficiency sits in multi-GPU dispatch.
+- __ChEMBL drug-like (mixed N) and ChEMBL-big (large N) both hit ~3 ×__ scaling, the best the current architecture achieves.
+  Reaching the 3 × ceiling requires enough per-molecule GPU work to amortize per-chunk dispatch overhead.
+
+### At-scale (3–4 M mols) — same datasets at production-sized batches
+
+| Dataset      | Count | 8-GPU mol/s | Success | Scaffold-cache hit |  Wall |
+| ------------ | ----: | ----------: | ------: | -----------------: | ----: |
+| GDB13        |   3 M |      26,032 | 100.0 % |             40.9 % | 108 s |
+| PubChem      |   4 M |      18,337 |  95.8 % |             41.5 % | 208 s |
+| Enamine REAL |   3 M |      16,099 |  99.4 % |             13.9 % | 180 s |
+
+At this scale, throughput is 20–60 % higher than the 100 K numbers — per-chunk overhead amortizes across many chunks.
+__Larger inputs scale better, not worse.__
+
+### 7 B-molecule extrapolation (full USearchMolecules)
+
+Using at-scale 8-GPU throughput (K = 1 conformer/mol):
+
+| Dataset         | Count | 8-GPU mol/s | K = 1 wall | K = 3 wall (~2.6× factor) |
+| --------------- | ----: | ----------: | ---------: | ------------------------: |
+| PubChem         | 115 M |      18,337 |     1.74 h |                     4.5 h |
+| GDB13           | 977 M |      26,032 |     10.4 h |                    27.1 h |
+| Enamine REAL    |   6 B |      16,099 |    103.6 h |                     269 h |
+| __Total 7.1 B__ |       |             |  __116 h__ |       __~300 h (12.5 d)__ |
+
+Output disk at 7 B × 3 conformers:
+- Current padded layout (`__half coords[128][3]` = 768 B/conformer): __16.1 TB__ (doesn't fit in 7.6 TB free).
+- __N-packed layout__ (12 B header + 6·N B coords, avg N=30 across mix): __3.3 TB__, fits uncompressed.
+- Output format change is required for billion-scale.
+
+### Scaffold cache is a ChEMBL-specific optimization
+
+Hit rate correlates with dataset __curation__, not molecular chemistry:
+- ChEMBL 241 K: __96.7 %__ (heavily curated, repetitive scaffolds)
+- GDB13 3 M: __40.9 %__ (enumerated, many novel scaffolds)
+- PubChem 4 M: __41.5 %__
+- Enamine REAL 3 M: __13.9 %__ (combinatorial, massive scaffold diversity)
+
+On REAL, the `MurckoDecompose + canonical hash + lookup` overhead likely exceeds the match-reuse savings — consider a hit-rate-triggered auto-disable after the first few thousand molecules on a cold cache.
+Alternative: __presort the input by scaffold hash__ so molecules sharing a scaffold are adjacent → hit rate approaches 100 % on any dataset, not just curated ones.
 
 ## Scaling analysis (241,596 molecules)
 
