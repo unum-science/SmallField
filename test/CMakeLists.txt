@@ -64,6 +64,16 @@ target_include_directories(test_mmff_cpu_port PRIVATE
 set_target_properties(test_mmff_cpu_port PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME test_mmff_cpu_port COMMAND test_mmff_cpu_port)
 
+# test_mmff_typer (MG-1.5/1.6 gate): native atom typer vs RDKit.
+add_executable(test_mmff_typer test_mmff_typer.cpp)
+target_link_libraries(test_mmff_typer PRIVATE test_helpers smallfield_lib)
+target_include_directories(test_mmff_typer PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+set_target_properties(test_mmff_typer PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME test_mmff_typer COMMAND test_mmff_typer)
+
 # test_native_murcko cross-validates compute_native_murcko against RDKit's
 # MurckoDecompose on a 500-molecule ChEMBL set.  Gate: ≥ 99 % agreement.
 add_executable(test_native_murcko test_native_murcko.cpp)
