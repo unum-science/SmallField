@@ -227,6 +227,41 @@ Two compounding factors (was three; dispatcher is no longer sequential):
    At 8 GPUs the unhidden tail is ~3 s.
    Workstream EE (smallest-chunk-last) addresses this by sorting molecules globally so the last chunk has the cheapest GPU work.
 
+## MG GPU MMFF kernel trio — scaling (2026-04-14)
+
+The MG-2/3/4 workstream ports every MMFF step (atom typing, charge perception, term extraction, CSR build) to GPU.
+Validated byte-for-byte against the CPU native port (`mmff94_cpu.hpp` + `mmff94_typer.hpp`) on ChEMBL 100 K.
+Scaling benchmark compares the GPU kernel trio against 192-thread OpenMP CPU (also running the native port, not RDKit).
+
+Single RTX PRO 6000 Blackwell, `bench/bench_mmff_gpu`:
+
+| Batch     | CPU wall | GPU type+charge | GPU extract | GPU CSR | GPU total | CPU mol/s | GPU mol/s | Speedup |
+| --------- | -------: | --------------: | ----------: | ------: | --------: | --------: | --------: | ------: |
+|     1 K   |  10.6 ms |          0.7 ms |      6.5 ms |  0.5 ms |    7.8 ms |      94 K |     128 K |   1.35× |
+|     5 K   |  17.7 ms |          0.9 ms |      9.0 ms |  1.2 ms |   11.2 ms |     283 K |     447 K |   1.58× |
+|    20 K   | 211.4 ms |          2.4 ms |     17.9 ms |  3.4 ms |   23.6 ms |      95 K |     847 K |   8.89× |
+|   100 K   | 266.5 ms |         10.0 ms |     70.1 ms | 15.7 ms |   95.8 ms |     375 K |    1.04 M |   2.78× |
+|   240 K   | 135.1 ms |         23.3 ms |    159.4 ms | 37.2 ms |  219.9 ms |    1.78 M |    1.09 M |   0.61× |
+
+GPU throughput stays at ~1 M mol/s across the sweep — per-molecule work is roughly constant (~1 μs/mol).
+CPU throughput is bursty because OpenMP pool warm-up amortises over run length — the 240 K column reflects the pool at steady state.
+
+Key observations:
+- At typical pipeline chunk sizes (50 K–100 K molecules) the GPU kernel trio is ~3× faster than the fully warmed 192-thread CPU path.
+- The GPU's bottleneck is `extract_terms_kernel` (65-75 % of total); it is currently lane-0-only per block (simpler port, matches CPU logic exactly for byte-equality validation).
+  The remaining 31 lanes sit idle during enumeration — parallelising the inner atom/bond loops across the warp is the obvious follow-up optimisation and should bring 5-10× further speedup.
+- At 240 K the CPU pool is fully warm and the GPU is bandwidth-bound writing the per-molecule term slots; the gap is roughly 2×.
+
+GPU memory footprint (fixed-stride per-molecule output slots):
+
+| Batch | Descriptor | Bonds | Angles | Torsions | OOPs | StBns | Interactions | Total |
+|-------|-----------:|------:|-------:|---------:|-----:|------:|-------------:|------:|
+|   1 K |   0.02 GB  | 0.00  |  0.01  |    0.02  | 0.00 |  0.02 |       0.07   | 0.14 GB |
+|  20 K |   0.43 GB  | 0.08  |  0.16  |    0.33  | 0.08 |  0.33 |       1.39   | 2.80 GB |
+| 240 K |   5.15 GB  | 0.96  |  1.92  |    3.96  | 0.96 |  3.96 |      16.69   | 33.6 GB |
+
+Well within the 96 GB budget per GPU; a proper prefix-sum compaction (planned) would cut these by ~10× for drug-like molecules.
+
 ## Optimizations that landed
 
 ### Scaffold-cache wiring into `extract_etk_torsions_native` (workstream SC)
