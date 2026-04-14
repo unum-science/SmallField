@@ -31,6 +31,7 @@ add_mixed_test(test_dg_energy)
 add_mixed_test(test_chirality)
 add_mixed_test(test_mmff_gradient)
 add_mixed_test(test_mmff_gpu_typer)
+add_mixed_test(test_mmff_gpu_extract)
 
 # test_descriptor is a pure C++ unit test (no CUDA).
 add_executable(test_descriptor test_descriptor.cpp)

@@ -41,13 +41,26 @@
 #include "mmff94_typer.hpp"
 #include "molecule_descriptor.hpp"
 
+// `extract_mmff94_params_native` + `extract_mmff94_params_fully_native`
+// at the bottom of this file use `etkdg_prepared_molecule_t` from
+// `etkdg_preprocess.hpp`.  That header transitively pulls in RDKit and
+// cannot be compiled by a .cu file's host pass.  Gate the two extract
+// functions on the presence of the full struct definition so .cu
+// callers that only want the helpers (`native_*`, periodic-table rows,
+// etc.) can include `mmff94_cpu.hpp` via `SMALLFIELD_MMFF_TABLES_NO_RDKIT`.
+#if !defined(SMALLFIELD_MMFF_TABLES_NO_RDKIT)
+#define SMALLFIELD_MMFF_CPU_HAS_PREP 1
+#else
+#define SMALLFIELD_MMFF_CPU_HAS_PREP 0
+#endif
+
 namespace smallfield {
 
 // ---- Periodic-table row utilities (match RDKit's helpers) ----------------
 
 /** Matches `RDKit::MMFF::getPeriodicTableRow` — row 0 (H, He), 1 (Li-Ne),
  *  2 (Na-Ar), 3 (K-Kr), 4 (Rb-Xe). */
-inline std::uint8_t periodic_table_row(std::uint8_t atomic_num) noexcept {
+SMALLFIELD_HD inline std::uint8_t periodic_table_row(std::uint8_t atomic_num) noexcept {
     if (atomic_num >= 3 && atomic_num <= 10) return 1;
     if (atomic_num >= 11 && atomic_num <= 18) return 2;
     if (atomic_num >= 19 && atomic_num <= 36) return 3;
@@ -57,7 +70,7 @@ inline std::uint8_t periodic_table_row(std::uint8_t atomic_num) noexcept {
 
 /** Matches `RDKit::MMFF::getPeriodicTableRowHL` — 1-based, transition
  *  metals ×10.  Used only by the Herschbach-Laurie fallback. */
-inline std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num) noexcept {
+SMALLFIELD_HD inline std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num) noexcept {
     std::uint8_t row = 0;
     if (atomic_num == 2) row = 1;
     else if (atomic_num >= 3 && atomic_num <= 10) row = 2;
@@ -76,7 +89,7 @@ inline std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num) noexcept {
 /** Find the bond index between atoms i and j via the descriptor's
  *  neighbor CSR.  Returns -1 on miss.  Matches `find_bond_idx` in
  *  `etkdg_preprocess.hpp`. */
-inline std::int32_t find_bond_idx(molecule_descriptor_t const &desc,
+SMALLFIELD_HD inline std::int32_t find_bond_idx(molecule_descriptor_t const &desc,
                                   std::uint32_t i, std::uint32_t j) noexcept {
     std::uint16_t const start = desc.neighbor_offset[i];
     std::uint16_t const end = desc.neighbor_offset[i + 1];
@@ -88,14 +101,14 @@ inline std::int32_t find_bond_idx(molecule_descriptor_t const &desc,
 /** Are `atom_i` and `atom_k` both adjacent to `atom_j` AND to each other?
  *  I.e., does the i-j-k angle close back into a 3-ring.  Purely uses the
  *  descriptor's CSR — no ring info required. */
-inline bool angle_in_ring_of_size_3(molecule_descriptor_t const &desc,
+SMALLFIELD_HD inline bool angle_in_ring_of_size_3(molecule_descriptor_t const &desc,
                                     std::uint32_t i, std::uint32_t k) noexcept {
     return find_bond_idx(desc, i, k) >= 0;
 }
 
 /** Do atoms i and k share a common neighbor that isn't j?  Matches
  *  `RDKit::MMFF::isAngleInRingOfSize3or4`'s size-4 branch exactly. */
-inline bool angle_has_common_neighbor(molecule_descriptor_t const &desc,
+SMALLFIELD_HD inline bool angle_has_common_neighbor(molecule_descriptor_t const &desc,
                                       std::uint32_t i, std::uint32_t j,
                                       std::uint32_t k) noexcept {
     std::uint16_t const i_start = desc.neighbor_offset[i];
@@ -110,7 +123,7 @@ inline bool angle_has_common_neighbor(molecule_descriptor_t const &desc,
 
 /** Ring size containing the i-j-k angle, or 0 if not 3/4.  Matches
  *  `isAngleInRingOfSize3or4` exactly. */
-inline unsigned native_is_angle_in_ring_3_or_4(molecule_descriptor_t const &desc,
+SMALLFIELD_HD inline unsigned native_is_angle_in_ring_3_or_4(molecule_descriptor_t const &desc,
                                                std::uint32_t i, std::uint32_t j,
                                                std::uint32_t k) noexcept {
     // Caller should hold that i-j and j-k are real bonds; we only
@@ -123,7 +136,7 @@ inline unsigned native_is_angle_in_ring_3_or_4(molecule_descriptor_t const &desc
 
 /** Ring size containing the i-j-k-l torsion, or 0 if not 4/5.  Matches
  *  `isTorsionInRingOfSize4or5` exactly. */
-inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const &desc,
+SMALLFIELD_HD inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const &desc,
                                                  std::uint32_t i, std::uint32_t j,
                                                  std::uint32_t k, std::uint32_t l) noexcept {
     if (find_bond_idx(desc, i, j) < 0 || find_bond_idx(desc, j, k) < 0 ||
@@ -152,7 +165,7 @@ inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const &de
 /** Native port of `MMFFMolProperties::getMMFFBondType`.  Returns 1 iff the
  *  bond is SINGLE and both endpoints are sbmb atoms or both are aromatic
  *  atoms (per MMFFProp).  Otherwise returns 0. */
-inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &desc,
+SMALLFIELD_HD inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &desc,
                                               mmff94_tables_view_t const &t,
                                               std::span<std::uint8_t const> atom_types,
                                               std::uint32_t bond_idx) noexcept {
@@ -172,7 +185,7 @@ inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &desc,
 }
 
 /** Native port of `MMFFMolProperties::getMMFFAngleType`. */
-inline std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &desc,
+SMALLFIELD_HD inline std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &desc,
                                                std::span<std::uint8_t const> bond_types,
                                                std::uint32_t i, std::uint32_t j,
                                                std::uint32_t k) noexcept {
@@ -191,7 +204,7 @@ inline std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &desc
 
 /** Native port of `MMFFMolProperties::getMMFFTorsionType`, returning
  *  (primary, secondary) matching RDKit's pair. */
-inline std::pair<std::uint8_t, std::uint8_t>
+SMALLFIELD_HD inline std::pair<std::uint8_t, std::uint8_t>
 native_get_mmff_torsion_type(molecule_descriptor_t const &desc,
                              std::span<std::uint8_t const> atom_types,
                              std::span<std::uint8_t const> bond_types,
@@ -235,7 +248,7 @@ native_get_mmff_torsion_type(molecule_descriptor_t const &desc,
 }
 
 /** Native port of the free function `getMMFFStretchBendType`. */
-inline std::uint8_t native_get_mmff_stretch_bend_type(unsigned angle_type,
+SMALLFIELD_HD inline std::uint8_t native_get_mmff_stretch_bend_type(unsigned angle_type,
                                                       unsigned bt_1, unsigned bt_2) noexcept {
     switch (angle_type) {
         case 1: return (bt_1 || (bt_1 == bt_2)) ? 1 : 2;
@@ -256,7 +269,7 @@ inline std::uint8_t native_get_mmff_stretch_bend_type(unsigned angle_type,
  *  `getMMFFBondStretchEmpiricalRuleParams`.  Returns (kb, r0) by value.
  *  Internally uses `double` to match RDKit's precision; inputs/outputs are
  *  float for parity with the extracted-table pipeline. */
-inline std::pair<float, float> native_bond_empirical(mmff94_tables_view_t const &t,
+SMALLFIELD_HD inline std::pair<float, float> native_bond_empirical(mmff94_tables_view_t const &t,
                                                      std::uint8_t atomic_i,
                                                      std::uint8_t atomic_j) noexcept {
     auto const *cov_i = lookup_covrad(t, atomic_i);
@@ -291,7 +304,7 @@ inline std::pair<float, float> native_bond_empirical(mmff94_tables_view_t const 
  *  is finite (≥ 0), it replaces the crd/mltb/val-derived default θ₀; use
  *  this to match RDKit's behaviour when a table entry exists with ka=0
  *  (then RDKit keeps the table's θ₀ and recomputes ka empirically). */
-inline std::pair<float, float> native_angle_empirical(
+SMALLFIELD_HD inline std::pair<float, float> native_angle_empirical(
     molecule_descriptor_t const &desc, mmff94_tables_view_t const &t,
     std::span<std::uint8_t const> atom_types, std::uint32_t i, std::uint32_t j,
     std::uint32_t k, float r0_ij, float r0_jk,
@@ -358,7 +371,7 @@ inline std::pair<float, float> native_angle_empirical(
 /** Empirical torsion rule (MMFF.V rules a-h).  Matches
  *  `getMMFFTorsionEmpiricalRuleParams`.  Returns (V1, V2, V3).  Bond type
  *  of the central bond is passed in so we avoid re-looking-it-up. */
-inline std::array<float, 3> native_torsion_empirical(
+SMALLFIELD_HD inline std::array<float, 3> native_torsion_empirical(
     molecule_descriptor_t const &desc, mmff94_tables_view_t const &t,
     std::span<std::uint8_t const> atom_types, std::uint32_t j, std::uint32_t k,
     std::int32_t bond_jk_idx) noexcept {
@@ -473,7 +486,7 @@ inline std::array<float, 3> native_torsion_empirical(
 
 /** isDoubleZero predicate matching RDKit's 1e-10 threshold.  Used by the
  *  angle-bend + torsion fallback logic. */
-inline bool native_is_zero(float v) noexcept { return std::fabs(v) < 1.0e-10f; }
+SMALLFIELD_HD inline bool native_is_zero(float v) noexcept { return std::fabs(v) < 1.0e-10f; }
 
 /** Native MMFF94 term + CSR extractor.
  *
@@ -490,6 +503,7 @@ inline bool native_is_zero(float v) noexcept { return std::fabs(v) < 1.0e-10f; }
  *  Matches `extract_mmff94_params` (the RDKit-backed path) byte-for-byte
  *  on well-typed drug-like inputs.
  */
+#if SMALLFIELD_MMFF_CPU_HAS_PREP
 inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
                                          std::span<std::uint8_t const> atom_types,
                                          std::span<float const> charges,
@@ -824,5 +838,6 @@ inline bool extract_mmff94_params_fully_native(molecule_descriptor_t const &desc
     extract_mmff94_params_native(desc, atom_types, partial_charges, tables, result);
     return true;
 }
+#endif // SMALLFIELD_MMFF_CPU_HAS_PREP
 
 } // namespace smallfield
