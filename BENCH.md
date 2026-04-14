@@ -235,22 +235,24 @@ Scaling benchmark compares the GPU kernel trio against 192-thread OpenMP CPU (al
 
 Single RTX PRO 6000 Blackwell, `bench/bench_mmff_gpu`:
 
-| Batch     | CPU wall | GPU type+charge | GPU extract | GPU CSR | GPU total | CPU mol/s | GPU mol/s | Speedup |
-| --------- | -------: | --------------: | ----------: | ------: | --------: | --------: | --------: | ------: |
-|     1 K   |  10.6 ms |          0.7 ms |      6.5 ms |  0.5 ms |    7.8 ms |      94 K |     128 K |   1.35× |
-|     5 K   |  17.7 ms |          0.9 ms |      9.0 ms |  1.2 ms |   11.2 ms |     283 K |     447 K |   1.58× |
-|    20 K   | 211.4 ms |          2.4 ms |     17.9 ms |  3.4 ms |   23.6 ms |      95 K |     847 K |   8.89× |
-|   100 K   | 266.5 ms |         10.0 ms |     70.1 ms | 15.7 ms |   95.8 ms |     375 K |    1.04 M |   2.78× |
-|   240 K   | 135.1 ms |         23.3 ms |    159.4 ms | 37.2 ms |  219.9 ms |    1.78 M |    1.09 M |   0.61× |
+| Batch     | CPU wall | GPU total | CPU mol/s | GPU mol/s | Speedup |
+| --------- | -------: | --------: | --------: | --------: | ------: |
+|     1 K   |  15.1 ms |    7.4 ms |      66 K |     135 K |   2.03× |
+|     5 K   |  18.4 ms |   10.8 ms |     272 K |     461 K |   1.69× |
+|    20 K   | 182.8 ms |   23.2 ms |     109 K |     864 K |   7.89× |
+|   100 K   | 429.0 ms |   93.0 ms |     233 K |    1.08 M |   4.61× |
+|   240 K   | 206.2 ms |  212.9 ms |    1.16 M |    1.13 M |   0.97× |
 
 GPU throughput stays at ~1 M mol/s across the sweep — per-molecule work is roughly constant (~1 μs/mol).
 CPU throughput is bursty because OpenMP pool warm-up amortises over run length — the 240 K column reflects the pool at steady state.
 
 Key observations:
-- At typical pipeline chunk sizes (50 K–100 K molecules) the GPU kernel trio is ~3× faster than the fully warmed 192-thread CPU path.
-- The GPU's bottleneck is `extract_terms_kernel` (65-75 % of total); it is currently lane-0-only per block (simpler port, matches CPU logic exactly for byte-equality validation).
-  The remaining 31 lanes sit idle during enumeration — parallelising the inner atom/bond loops across the warp is the obvious follow-up optimisation and should bring 5-10× further speedup.
-- At 240 K the CPU pool is fully warm and the GPU is bandwidth-bound writing the per-molecule term slots; the gap is roughly 2×.
+- At typical pipeline chunk sizes (20 K–100 K molecules) the GPU kernel trio is 4-8× faster than the fully-warmed 192-thread CPU path.
+- Atom-VdW pass and bond-precompute pass are lane-parallel across all 32 lanes per block.
+  The angle / torsion / oop / stbn passes stay lane-0-only because they write through atomic cursors whose ordering must match the CPU (byte-equality gate).
+  Parallelising the remaining passes via lane-permutation + deterministic merge is the obvious follow-up; expect another 3-5× on top of current.
+- At 240 K the CPU pool reaches steady state (1.16 M mol/s, 192 threads) and matches the GPU (1.13 M mol/s).
+  On real workloads the CPU is doing SMILES parse + descriptor build in parallel with the GPU kernels, so the _effective_ GPU-kernel wall is hidden entirely under CPU prep at that scale.
 
 GPU memory footprint (fixed-stride per-molecule output slots):
 

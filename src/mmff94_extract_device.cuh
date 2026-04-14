@@ -109,14 +109,15 @@ __global__ void mmff94_extract_terms_kernel(
 
     std::uint32_t const mol = blockIdx.x;
     if (mol >= num_molecules) return;
-    if (threadIdx.x != 0) return;
-    // If the molecule was flagged as typing-failed, skip it entirely —
-    // the CPU fallback (MG-D) will produce the outputs for this slot.
+
+    // Early-exit status check runs on all 32 lanes so they all
+    // agree to fall out together (no warp divergence afterwards).
     if (typing_status[mol] != 0) {
-        per_mol_counts[mol] = {};
+        if (threadIdx.x == 0) per_mol_counts[mol] = {};
         return;
     }
 
+    std::uint32_t const lane = threadIdx.x;
     molecule_descriptor_t const &desc = descriptors[mol];
     std::uint32_t const atom_off = atom_offsets[mol];
     std::uint8_t const *atom_types = atom_types_all + atom_off;
@@ -133,12 +134,9 @@ __global__ void mmff94_extract_terms_kernel(
     mmff94_oop_t *oops_out = out_oops + (std::size_t)mol * max_mmff_oops_per_mol_k;
     mmff94_stretchbend_t *stbns_out = out_stbns + (std::size_t)mol * max_mmff_stretchbends_per_mol_k;
 
-    std::uint32_t bond_count = 0, angle_count = 0, torsion_count = 0,
-                 oop_count = 0, stbn_count = 0;
-    std::uint8_t overflow = 0;
-
-    // Atom VdW + charge
-    for (std::uint32_t a = 0; a < n; ++a) {
+    // Atom VdW + charge — lane-parallel over atoms (each atom's work
+    // is independent and written to its own slot).
+    for (std::uint32_t a = lane; a < n; a += 32) {
         auto const *vdw = lookup_vdw(tables, atom_types[a]);
         mmff94_atom_vdw_params_t p {};
         if (vdw) {
@@ -153,10 +151,11 @@ __global__ void mmff94_extract_terms_kernel(
         charge_out[a] = charges[a];
     }
 
-    // Precompute per-bond bond_type + bond-stretch params (kb, r0).
-    std::uint8_t bond_type_arr[max_bonds_k];
-    float bond_r0[max_bonds_k];
-    for (std::uint32_t b = 0; b < nb; ++b) {
+    // Precompute per-bond bond_type + bond-stretch params — lane-parallel
+    // over bonds.  Shared-memory scratch for downstream angle/stbn reuse.
+    __shared__ std::uint8_t s_bond_type[max_bonds_k];
+    __shared__ float s_bond_r0[max_bonds_k];
+    for (std::uint32_t b = lane; b < nb; b += 32) {
         std::uint8_t const i = desc.bond_atom_i[b];
         std::uint8_t const j = desc.bond_atom_j[b];
         std::uint8_t bt = 0;
@@ -166,7 +165,7 @@ __global__ void mmff94_extract_terms_kernel(
             auto const *pj = lookup_prop(tables, atom_types[j]);
             if (pi && pj && ((pi->sbmb && pj->sbmb) || (pi->arom && pj->arom))) bt = 1;
         }
-        bond_type_arr[b] = bt;
+        s_bond_type[b] = bt;
         auto const *bp = lookup_bond(tables, bt, atom_types[i], atom_types[j]);
         float kb = 0.0f, r0 = 0.0f;
         if (bp) { kb = bp->kb; r0 = bp->r0; }
@@ -174,12 +173,28 @@ __global__ void mmff94_extract_terms_kernel(
             auto const emp = native_bond_empirical(tables, desc.element[i], desc.element[j]);
             kb = emp.first; r0 = emp.second;
         }
-        bond_r0[b] = r0;
-        if (bond_count < max_mmff_bonds_per_mol_k) {
-            bonds_out[bond_count++] = {i, j, {0, 0}, kb, r0, 0.0f};
+        s_bond_r0[b] = r0;
+        // Emit bond at deterministic position = original bond index `b`
+        // so output ordering matches the CPU (which also iterates bonds
+        // in index order and push_backs in order).
+        if (b < max_mmff_bonds_per_mol_k) {
+            bonds_out[b] = {i, j, {0, 0}, kb, r0, 0.0f};
         }
-        else { overflow = 1; }
     }
+    __syncwarp();
+
+    // From here on the passes with atomic cursors must run on lane-0
+    // only to preserve deterministic ordering for byte-equality with CPU.
+    if (lane != 0) return;
+
+    // Wire the shared scratch back into the rest of the kernel body via
+    // the existing names — avoid renaming the remaining 200+ LOC.
+    std::uint8_t const *bond_type_arr = s_bond_type;
+    float const *bond_r0 = s_bond_r0;
+
+    std::uint32_t bond_count = nb < max_mmff_bonds_per_mol_k ? nb : max_mmff_bonds_per_mol_k;
+    std::uint32_t angle_count = 0, torsion_count = 0, oop_count = 0, stbn_count = 0;
+    std::uint8_t overflow = (nb > max_mmff_bonds_per_mol_k) ? 1 : 0;
 
     // Angle terms (and angle-scratch for stretch-bend reuse).
     detail_extract::angle_scratch_t as[max_mmff_angles_per_mol_k];
