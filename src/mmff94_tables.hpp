@@ -43,6 +43,17 @@
 
 #include <ForceField/MMFF/Params.h>
 
+// The hidden DefaultParameters getters for Bond/Chg/Bndk/CovRadPauEle are not
+// exposed in the public AtomTyper.h header, but they ARE exported from
+// libRDKitForceFieldHelpers.so (verified with `nm -D`).  Forward-declare them
+// here so we can pull the tables into our flat POD arrays at context init.
+namespace RDKit { namespace MMFF { namespace DefaultParameters {
+ForceFields::MMFF::MMFFBondCollection const *getMMFFBond();
+ForceFields::MMFF::MMFFChgCollection const *getMMFFChg();
+ForceFields::MMFF::MMFFBndkCollection const *getMMFFBndk();
+ForceFields::MMFF::MMFFCovRadPauEleCollection const *getMMFFCovRadPauEle();
+}}}
+
 namespace smallfield {
 
 // ---- Flat POD entries -----------------------------------------------------
@@ -142,6 +153,23 @@ struct alignas(8) mmff94_dfsb_entry_t {
 };
 static_assert(sizeof(mmff94_dfsb_entry_t) == 16);
 
+/** MMFFProp — per-atom-type chemical properties.  Used by
+ *  `getMMFFBondType` (sbmb / arom fields) and by the empirical
+ *  angle-bending rule (crd / val / mltb / linh fields).  Dense array
+ *  indexed directly by atom_type (one slot per possible type, zeros
+ *  for unused slots), mirroring `mmff94_def_entry_t`. */
+struct alignas(8) mmff94_prop_entry_t {
+    std::uint8_t atomic_num;
+    std::uint8_t crd;
+    std::uint8_t val;
+    std::uint8_t pilp;
+    std::uint8_t mltb;
+    std::uint8_t arom;
+    std::uint8_t linh;
+    std::uint8_t sbmb;
+};
+static_assert(sizeof(mmff94_prop_entry_t) == 8);
+
 /** MMFFDef equivalence levels — 4 bytes per atom type.  Indexed directly
  *  by `atom_type` (stored as dense array, one entry per possible type in
  *  [1, max_atom_type], with zeros for unused slots). */
@@ -221,6 +249,7 @@ struct mmff94_tables_host_t {
     std::vector<mmff94_stbn_entry_t> stbn;        ///< sorted by (j, i, k, sb_type)
     std::vector<mmff94_dfsb_entry_t> dfsb;        ///< sorted by (row_i, row_j, row_k)
     std::vector<mmff94_def_entry_t> def;          ///< dense: indexed directly by atom_type
+    std::vector<mmff94_prop_entry_t> prop;        ///< dense: indexed directly by atom_type
     std::vector<mmff94_pbci_entry_t> pbci;        ///< sorted by atom_type
     std::vector<mmff94_chg_entry_t> chg;          ///< sorted by (i, j, bond_type)
     std::vector<mmff94_bndk_entry_t> bndk;        ///< sorted by (atomic_num_i, atomic_num_j)
@@ -278,13 +307,24 @@ inline void extract_mmff94_tables_from_rdkit(mmff94_tables_host_t &out) {
         }
     }
 
-    // --- Bond — TODO(MG-1): RDKit doesn't expose `getMMFFBond()` in the
-    //     public DefaultParameters API.  Direct construction
-    //     (`MMFFBondCollection bc;`) segfaults on initial data load,
-    //     suggesting the symbol is private to libRDKitForceField.cpp.
-    //     We'll reach these via `MMFFMolProperties::getMMFFBondStretchParams`
-    //     during the MG-1 CPU port and capture the table at that point.
-    out.bond.clear();
+    // --- Bond — the hidden `DefaultParameters::getMMFFBond()` singleton
+    //     is exported from libRDKitForceFieldHelpers; we forward-declared
+    //     it at the top of this file to avoid needing an internal header.
+    {
+        auto const *bc = RDKit::MMFF::DefaultParameters::getMMFFBond();
+        std::size_t const n = bc->d_iAtomType.size();
+        out.bond.resize(n);
+        for (std::size_t k = 0; k < n; ++k) {
+            auto &e = out.bond[k];
+            e.i_type = bc->d_iAtomType[k];
+            e.j_type = bc->d_jAtomType[k];
+            e.bond_type = bc->d_bondType[k];
+            e.padding = 0;
+            e.kb = static_cast<float>(bc->d_params[k].kb);
+            e.r0 = static_cast<float>(bc->d_params[k].r0);
+            e.padding_float = 0.0f;
+        }
+    }
 
     // --- Angle -------------------------------------------------------------
     {
@@ -419,12 +459,35 @@ inline void extract_mmff94_tables_from_rdkit(mmff94_tables_host_t &out) {
         }
     }
 
-    // --- Chg — TODO(MG-1): same situation as Bond.  Will be captured
-    //     via MMFFMolProperties calls during the CPU port.
-    out.chg.clear();
+    // --- Chg (bond-charge increments) --------------------------------
+    {
+        auto const *cc = RDKit::MMFF::DefaultParameters::getMMFFChg();
+        std::size_t const n = cc->d_iAtomType.size();
+        out.chg.resize(n);
+        for (std::size_t k = 0; k < n; ++k) {
+            auto &e = out.chg[k];
+            e.i_type = cc->d_iAtomType[k];
+            e.j_type = cc->d_jAtomType[k];
+            e.bond_type = cc->d_bondType[k];
+            e.padding = 0;
+            e.bci = static_cast<float>(cc->d_params[k].bci);
+        }
+    }
 
-    // --- Bndk — TODO(MG-1): not in public API. ------------------------
-    out.bndk.clear();
+    // --- Bndk (empirical default bond, by atomic-number pair) --------
+    {
+        auto const *bc = RDKit::MMFF::DefaultParameters::getMMFFBndk();
+        std::size_t const n = bc->d_iAtomicNum.size();
+        out.bndk.resize(n);
+        for (std::size_t k = 0; k < n; ++k) {
+            auto &e = out.bndk[k];
+            e.atomic_num_i = bc->d_iAtomicNum[k];
+            e.atomic_num_j = bc->d_jAtomicNum[k];
+            e.padding[0] = e.padding[1] = 0;
+            e.kb = static_cast<float>(bc->d_params[k].kb);
+            e.r0 = static_cast<float>(bc->d_params[k].r0);
+        }
+    }
 
     // --- Herschbach-Laurie --------------------------------------------------
     {
@@ -442,8 +505,43 @@ inline void extract_mmff94_tables_from_rdkit(mmff94_tables_host_t &out) {
         }
     }
 
-    // --- CovRadPauEle — TODO(MG-1): not in public API. -----------------
-    out.covrad.clear();
+    // --- CovRadPauEle (covalent radius + Pauling electronegativity) --
+    {
+        auto const *cc = RDKit::MMFF::DefaultParameters::getMMFFCovRadPauEle();
+        std::size_t const n = cc->d_atomicNum.size();
+        out.covrad.resize(n);
+        for (std::size_t k = 0; k < n; ++k) {
+            auto &e = out.covrad[k];
+            e.atomic_num = cc->d_atomicNum[k];
+            e.padding[0] = e.padding[1] = e.padding[2] = 0;
+            e.r0 = static_cast<float>(cc->d_params[k].r0);
+            e.chi = static_cast<float>(cc->d_params[k].chi);
+        }
+    }
+
+    // --- MMFFProp — dense array indexed by atom_type, parallels MMFFDef.
+    //     `operator()(at)` in RDKit does an equal_range on d_iAtomType.
+    //     We flatten to dense for O(1) device access.
+    {
+        auto const *pc = RDKit::MMFF::DefaultParameters::getMMFFProp();
+        std::size_t const dense_n = static_cast<std::size_t>(out.max_atom_type) + 1;
+        out.prop.assign(dense_n, mmff94_prop_entry_t {});
+        std::size_t const n = pc->d_iAtomType.size();
+        for (std::size_t k = 0; k < n; ++k) {
+            std::uint8_t const at = pc->d_iAtomType[k];
+            if (at >= dense_n) continue;
+            auto const &p = pc->d_params[k];
+            auto &e = out.prop[at];
+            e.atomic_num = p.atno;
+            e.crd = p.crd;
+            e.val = p.val;
+            e.pilp = p.pilp;
+            e.mltb = p.mltb;
+            e.arom = p.arom;
+            e.linh = p.linh;
+            e.sbmb = p.sbmb;
+        }
+    }
 }
 
 // ---- Host-side lookups matching RDKit's operator() behaviour ------------
@@ -530,9 +628,258 @@ inline mmff94_angle_entry_t const *lookup_angle(mmff94_tables_host_t const &t,
     return nullptr;
 }
 
-// Torsion and OOP lookups with their respective multi-level equivalence
-// cascades are more complex — they're implemented fully in MG-1 when the
-// CPU port is written.  MG-0 only needs to validate the simpler
-// (VdW/Bond/Angle) lookups byte-equal RDKit's.
+/** MMFFProp dense lookup — `nullptr` for unknown atom types. */
+inline mmff94_prop_entry_t const *lookup_prop(mmff94_tables_host_t const &t,
+                                              std::uint8_t atom_type) noexcept {
+    if (atom_type == 0 || atom_type >= t.prop.size()) return nullptr;
+    return &t.prop[atom_type];
+}
+
+/** Signed bond-charge-increment lookup.  Mirrors
+ *  `MMFFChgCollection::getMMFFChgParams`: returns (sign, bci) where sign
+ *  is -1 if (i_type <= j_type) held in the tabulation order, +1 if the
+ *  arguments had to be swapped.  Returns {0, nullptr} on miss. */
+inline std::pair<int, mmff94_chg_entry_t const *> lookup_chg(mmff94_tables_host_t const &t,
+                                                             std::uint8_t bond_type,
+                                                             std::uint8_t atom_i,
+                                                             std::uint8_t atom_j) noexcept {
+    int sign = -1;
+    std::uint8_t lo = atom_i, hi = atom_j;
+    if (atom_i > atom_j) { lo = atom_j; hi = atom_i; sign = 1; }
+    auto i_begin = t.chg.begin();
+    auto i_end = t.chg.end();
+    auto i_lo = std::lower_bound(i_begin, i_end, lo,
+                                  [](auto const &e, std::uint8_t v) { return e.i_type < v; });
+    auto i_hi = std::lower_bound(i_lo, i_end, static_cast<std::uint8_t>(lo + 1),
+                                  [](auto const &e, std::uint8_t v) { return e.i_type < v; });
+    if (i_lo == i_hi) return {sign, nullptr};
+    auto j_lo = std::lower_bound(i_lo, i_hi, hi,
+                                  [](auto const &e, std::uint8_t v) { return e.j_type < v; });
+    auto j_hi = std::lower_bound(j_lo, i_hi, static_cast<std::uint8_t>(hi + 1),
+                                  [](auto const &e, std::uint8_t v) { return e.j_type < v; });
+    if (j_lo == j_hi) return {sign, nullptr};
+    auto bt_lo = std::lower_bound(j_lo, j_hi, bond_type,
+                                   [](auto const &e, std::uint8_t v) { return e.bond_type < v; });
+    if (bt_lo != j_hi && bt_lo->bond_type == bond_type) return {sign, &*bt_lo};
+    return {sign, nullptr};
+}
+
+/** Bndk (default bond by atomic-number pair) lookup. */
+inline mmff94_bndk_entry_t const *lookup_bndk(mmff94_tables_host_t const &t,
+                                              std::uint8_t atomic_i,
+                                              std::uint8_t atomic_j) noexcept {
+    std::uint8_t lo = atomic_i, hi = atomic_j;
+    if (lo > hi) std::swap(lo, hi);
+    auto i_lo = std::lower_bound(t.bndk.begin(), t.bndk.end(), lo,
+                                  [](auto const &e, std::uint8_t v) { return e.atomic_num_i < v; });
+    auto i_hi = std::lower_bound(i_lo, t.bndk.end(), static_cast<std::uint8_t>(lo + 1),
+                                  [](auto const &e, std::uint8_t v) { return e.atomic_num_i < v; });
+    if (i_lo == i_hi) return nullptr;
+    auto j_lo = std::lower_bound(i_lo, i_hi, hi,
+                                  [](auto const &e, std::uint8_t v) { return e.atomic_num_j < v; });
+    if (j_lo != i_hi && j_lo->atomic_num_j == hi) return &*j_lo;
+    return nullptr;
+}
+
+/** Covalent radius + Pauling electronegativity lookup by atomic number. */
+inline mmff94_covrad_entry_t const *lookup_covrad(mmff94_tables_host_t const &t,
+                                                  std::uint8_t atomic_num) noexcept {
+    auto it = std::lower_bound(t.covrad.begin(), t.covrad.end(), atomic_num,
+                               [](auto const &e, std::uint8_t v) { return e.atomic_num < v; });
+    if (it != t.covrad.end() && it->atomic_num == atomic_num) return &*it;
+    return nullptr;
+}
+
+/** Herschbach-Laurie lookup by periodic-table-row pair. */
+inline mmff94_hl_entry_t const *lookup_hl(mmff94_tables_host_t const &t,
+                                          std::uint8_t row_i, std::uint8_t row_j) noexcept {
+    std::uint8_t lo = row_i, hi = row_j;
+    if (lo > hi) std::swap(lo, hi);
+    auto i_lo = std::lower_bound(t.hl.begin(), t.hl.end(), lo,
+                                  [](auto const &e, std::uint8_t v) { return e.row_i < v; });
+    auto i_hi = std::lower_bound(i_lo, t.hl.end(), static_cast<std::uint8_t>(lo + 1),
+                                  [](auto const &e, std::uint8_t v) { return e.row_i < v; });
+    if (i_lo == i_hi) return nullptr;
+    auto j_lo = std::lower_bound(i_lo, i_hi, hi,
+                                  [](auto const &e, std::uint8_t v) { return e.row_j < v; });
+    if (j_lo != i_hi && j_lo->row_j == hi) return &*j_lo;
+    return nullptr;
+}
+
+/** OOP bend lookup with 4-stage equivalence cascade.  Matches
+ *  `MMFFOopCollection::operator()` exactly. */
+inline mmff94_oop_entry_t const *lookup_oop(mmff94_tables_host_t const &t,
+                                            std::uint8_t atom_i, std::uint8_t atom_j,
+                                            std::uint8_t atom_k, std::uint8_t atom_l) noexcept {
+    for (int iter = 0; iter < 4; ++iter) {
+        std::uint8_t ikl[3] = {
+            (atom_i < t.def.size()) ? t.def[atom_i].eq_level[iter] : std::uint8_t {0},
+            (atom_k < t.def.size()) ? t.def[atom_k].eq_level[iter] : std::uint8_t {0},
+            (atom_l < t.def.size()) ? t.def[atom_l].eq_level[iter] : std::uint8_t {0},
+        };
+        std::sort(std::begin(ikl), std::end(ikl));
+        auto j_lo = std::lower_bound(t.oop.begin(), t.oop.end(), atom_j,
+                                      [](auto const &e, std::uint8_t v) { return e.j_type < v; });
+        auto j_hi = std::lower_bound(j_lo, t.oop.end(), static_cast<std::uint8_t>(atom_j + 1),
+                                      [](auto const &e, std::uint8_t v) { return e.j_type < v; });
+        if (j_lo == j_hi) continue;
+        auto i_lo = std::lower_bound(j_lo, j_hi, ikl[0],
+                                      [](auto const &e, std::uint8_t v) { return e.i_type < v; });
+        auto i_hi = std::lower_bound(i_lo, j_hi, static_cast<std::uint8_t>(ikl[0] + 1),
+                                      [](auto const &e, std::uint8_t v) { return e.i_type < v; });
+        if (i_lo == i_hi) continue;
+        auto k_lo = std::lower_bound(i_lo, i_hi, ikl[1],
+                                      [](auto const &e, std::uint8_t v) { return e.k_type < v; });
+        auto k_hi = std::lower_bound(k_lo, i_hi, static_cast<std::uint8_t>(ikl[1] + 1),
+                                      [](auto const &e, std::uint8_t v) { return e.k_type < v; });
+        if (k_lo == k_hi) continue;
+        auto l_lo = std::lower_bound(k_lo, k_hi, ikl[2],
+                                      [](auto const &e, std::uint8_t v) { return e.l_type < v; });
+        if (l_lo != k_hi && l_lo->l_type == ikl[2]) return &*l_lo;
+    }
+    return nullptr;
+}
+
+/** Stretch-bend lookup with swap tracking.  No equivalence cascade (the
+ *  STBN table is a single level).  Swap indicates whether kba_ijk and
+ *  kba_kji should be exchanged — matches
+ *  `MMFFStbnCollection::getMMFFStbnParams`. */
+inline std::pair<bool, mmff94_stbn_entry_t const *> lookup_stbn(mmff94_tables_host_t const &t,
+                                                                std::uint8_t stretch_bend_type,
+                                                                std::uint8_t bond_type_1,
+                                                                std::uint8_t bond_type_2,
+                                                                std::uint8_t atom_i,
+                                                                std::uint8_t atom_j_center,
+                                                                std::uint8_t atom_k) noexcept {
+    bool swap = false;
+    std::uint8_t lo = atom_i, hi = atom_k;
+    if (atom_i > atom_k) { lo = atom_k; hi = atom_i; swap = true; }
+    else if (atom_i == atom_k) swap = bond_type_1 < bond_type_2;
+
+    auto j_lo = std::lower_bound(t.stbn.begin(), t.stbn.end(), atom_j_center,
+                                  [](auto const &e, std::uint8_t v) { return e.j_type < v; });
+    auto j_hi = std::lower_bound(j_lo, t.stbn.end(),
+                                  static_cast<std::uint8_t>(atom_j_center + 1),
+                                  [](auto const &e, std::uint8_t v) { return e.j_type < v; });
+    if (j_lo == j_hi) return {swap, nullptr};
+    auto i_lo = std::lower_bound(j_lo, j_hi, lo,
+                                  [](auto const &e, std::uint8_t v) { return e.i_type < v; });
+    auto i_hi = std::lower_bound(i_lo, j_hi, static_cast<std::uint8_t>(lo + 1),
+                                  [](auto const &e, std::uint8_t v) { return e.i_type < v; });
+    if (i_lo == i_hi) return {swap, nullptr};
+    auto k_lo = std::lower_bound(i_lo, i_hi, hi,
+                                  [](auto const &e, std::uint8_t v) { return e.k_type < v; });
+    auto k_hi = std::lower_bound(k_lo, i_hi, static_cast<std::uint8_t>(hi + 1),
+                                  [](auto const &e, std::uint8_t v) { return e.k_type < v; });
+    if (k_lo == k_hi) return {swap, nullptr};
+    auto sb_lo = std::lower_bound(k_lo, k_hi, stretch_bend_type,
+                                   [](auto const &e, std::uint8_t v) {
+                                       return e.stretch_bend_type < v;
+                                   });
+    if (sb_lo != k_hi && sb_lo->stretch_bend_type == stretch_bend_type)
+        return {swap, &*sb_lo};
+    return {swap, nullptr};
+}
+
+/** DFSB fallback lookup by periodic-table-row triple, with swap. */
+inline std::pair<bool, mmff94_dfsb_entry_t const *> lookup_dfsb(mmff94_tables_host_t const &t,
+                                                                std::uint8_t row_i,
+                                                                std::uint8_t row_j,
+                                                                std::uint8_t row_k) noexcept {
+    bool swap = false;
+    std::uint8_t lo = row_i, hi = row_k;
+    if (lo > hi) { std::swap(lo, hi); swap = true; }
+    auto ri_lo = std::lower_bound(t.dfsb.begin(), t.dfsb.end(), lo,
+                                   [](auto const &e, std::uint8_t v) { return e.row_i < v; });
+    auto ri_hi = std::lower_bound(ri_lo, t.dfsb.end(), static_cast<std::uint8_t>(lo + 1),
+                                   [](auto const &e, std::uint8_t v) { return e.row_i < v; });
+    if (ri_lo == ri_hi) return {swap, nullptr};
+    auto rj_lo = std::lower_bound(ri_lo, ri_hi, row_j,
+                                   [](auto const &e, std::uint8_t v) { return e.row_j < v; });
+    auto rj_hi = std::lower_bound(rj_lo, ri_hi, static_cast<std::uint8_t>(row_j + 1),
+                                   [](auto const &e, std::uint8_t v) { return e.row_j < v; });
+    if (rj_lo == rj_hi) return {swap, nullptr};
+    auto rk_lo = std::lower_bound(rj_lo, rj_hi, hi,
+                                   [](auto const &e, std::uint8_t v) { return e.row_k < v; });
+    if (rk_lo != rj_hi && rk_lo->row_k == hi) return {swap, &*rk_lo};
+    return {swap, nullptr};
+}
+
+/** Torsion lookup with 5-stage equivalence cascade + fallback to the
+ *  secondary torsion type.  Mirrors
+ *  `MMFFTorCollection::getMMFFTorParams` exactly.  Returns the resolved
+ *  (canonical torsion type, params pointer) — caller uses the canonical
+ *  tor type for downstream debug/metrics, and nullptr params on miss. */
+inline std::pair<unsigned, mmff94_torsion_entry_t const *>
+lookup_torsion(mmff94_tables_host_t const &t,
+               std::uint8_t tor_type_primary,
+               std::uint8_t tor_type_secondary,
+               std::uint8_t atom_i, std::uint8_t atom_j,
+               std::uint8_t atom_k, std::uint8_t atom_l) noexcept {
+    mmff94_torsion_entry_t const *hit = nullptr;
+    unsigned canTorType = tor_type_primary;
+    unsigned iter = 0;
+    unsigned maxIter = 5;
+    while (((iter < maxIter) && ((!hit) || (maxIter == 4))) ||
+           ((iter == 4) && (tor_type_primary == 5) && tor_type_secondary)) {
+        // Secondary fallback: after the 5-stage attempt with the primary
+        // tor type, retry the first 4 stages with the secondary tor type.
+        if ((maxIter == 5) && (iter == 4)) {
+            maxIter = 4;
+            iter = 0;
+            canTorType = tor_type_secondary;
+        }
+        unsigned iWildCard = iter, lWildCard = iter;
+        if (iter == 1) { iWildCard = 1; lWildCard = 3; }
+        else if (iter == 2) { iWildCard = 3; lWildCard = 1; }
+
+        std::uint8_t canI = (atom_i < t.def.size()) ? t.def[atom_i].eq_level[iWildCard] : 0;
+        std::uint8_t canJ = atom_j;
+        std::uint8_t canK = atom_k;
+        std::uint8_t canL = (atom_l < t.def.size()) ? t.def[atom_l].eq_level[lWildCard] : 0;
+        if (canJ > canK) {
+            std::swap(canJ, canK);
+            std::swap(canI, canL);
+        }
+        else if (canJ == canK && canI > canL) std::swap(canI, canL);
+
+        // Cascade of 5 binary searches: j → k → i → l → tor_type.
+        auto j_lo = std::lower_bound(t.torsion.begin(), t.torsion.end(), canJ,
+                                      [](auto const &e, std::uint8_t v) { return e.j_type < v; });
+        auto j_hi = std::lower_bound(j_lo, t.torsion.end(), static_cast<std::uint8_t>(canJ + 1),
+                                      [](auto const &e, std::uint8_t v) { return e.j_type < v; });
+        if (j_lo != j_hi) {
+            auto k_lo = std::lower_bound(j_lo, j_hi, canK,
+                                          [](auto const &e, std::uint8_t v) { return e.k_type < v; });
+            auto k_hi = std::lower_bound(k_lo, j_hi, static_cast<std::uint8_t>(canK + 1),
+                                          [](auto const &e, std::uint8_t v) { return e.k_type < v; });
+            if (k_lo != k_hi) {
+                auto i_lo = std::lower_bound(k_lo, k_hi, canI,
+                                              [](auto const &e, std::uint8_t v) { return e.i_type < v; });
+                auto i_hi = std::lower_bound(i_lo, k_hi, static_cast<std::uint8_t>(canI + 1),
+                                              [](auto const &e, std::uint8_t v) { return e.i_type < v; });
+                if (i_lo != i_hi) {
+                    auto l_lo = std::lower_bound(i_lo, i_hi, canL,
+                                                  [](auto const &e, std::uint8_t v) { return e.l_type < v; });
+                    auto l_hi = std::lower_bound(l_lo, i_hi, static_cast<std::uint8_t>(canL + 1),
+                                                  [](auto const &e, std::uint8_t v) { return e.l_type < v; });
+                    if (l_lo != l_hi) {
+                        auto tt_lo = std::lower_bound(l_lo, l_hi,
+                                                       static_cast<std::uint8_t>(canTorType),
+                                                       [](auto const &e, std::uint8_t v) {
+                                                           return e.tor_type < v;
+                                                       });
+                        if (tt_lo != l_hi && tt_lo->tor_type == canTorType) {
+                            hit = &*tt_lo;
+                            if (maxIter == 4) break;
+                        }
+                    }
+                }
+            }
+        }
+        ++iter;
+    }
+    return {canTorType, hit};
+}
 
 } // namespace smallfield

@@ -53,6 +53,17 @@ target_include_directories(test_mmff94_tables PRIVATE
 set_target_properties(test_mmff94_tables PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME test_mmff94_tables COMMAND test_mmff94_tables)
 
+# test_mmff_cpu_port (MG-1 gate): cross-validate our native MMFF CPU port
+# against the existing RDKit-backed path on a drug-like probe set.
+add_executable(test_mmff_cpu_port test_mmff_cpu_port.cpp)
+target_link_libraries(test_mmff_cpu_port PRIVATE test_helpers smallfield_lib)
+target_include_directories(test_mmff_cpu_port PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+set_target_properties(test_mmff_cpu_port PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME test_mmff_cpu_port COMMAND test_mmff_cpu_port)
+
 # test_native_murcko cross-validates compute_native_murcko against RDKit's
 # MurckoDecompose on a 500-molecule ChEMBL set.  Gate: ≥ 99 % agreement.
 add_executable(test_native_murcko test_native_murcko.cpp)
