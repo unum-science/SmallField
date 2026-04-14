@@ -392,6 +392,12 @@ void run_one(std::string_view smiles, mmff94_tables_host_t const &tables, bool v
     nat_result.num_atoms = num_atoms;
     extract_mmff94_params_native(desc, atom_types, charges, tables, nat_result);
 
+    // Fully-native: zero runtime RDKit.  Term counts should match the
+    // hybrid path on molecules where our typer agrees with RDKit.
+    etkdg_prepared_molecule_t fn;
+    fn.num_atoms = num_atoms;
+    (void)extract_mmff94_params_fully_native(desc, tables, fn);
+
     int const fails_before = n_fails;
     bool const ok = compare_mol(smiles, rdk_result, nat_result, verbose);
     if (ok && n_fails == fails_before) ++n_mol_pass;

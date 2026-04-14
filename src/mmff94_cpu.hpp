@@ -38,6 +38,7 @@
 
 #include "etkdg_types.cuh"
 #include "mmff94_tables.hpp"
+#include "mmff94_typer.hpp"
 #include "molecule_descriptor.hpp"
 
 namespace smallfield {
@@ -799,6 +800,29 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
         result.mmff_interactions[cur[sb_v[t].atom_j].stretchbend++] = {t, mmff94_stretch_bend_k, atom_role_second_k};
         result.mmff_interactions[cur[sb_v[t].atom_k].stretchbend++] = {t, mmff94_stretch_bend_k, atom_role_third_k};
     }
+}
+
+/** Fully native end-to-end MMFF extraction: atom typing + charges +
+ *  all terms + CSR.  Zero RDKit calls at runtime.  Returns true on
+ *  successful typing; false means one or more atoms could not be typed
+ *  and the caller should route the molecule through the RDKit fallback. */
+inline bool extract_mmff94_params_fully_native(molecule_descriptor_t const &desc,
+                                               mmff94_tables_host_t const &tables,
+                                               etkdg_prepared_molecule_t &result) {
+    std::uint32_t const n = desc.num_atoms;
+    std::array<std::uint8_t, max_atoms_k> atom_types_buf {};
+    std::array<float, max_atoms_k> formal_charges_buf {};
+    std::array<float, max_atoms_k> partial_charges_buf {};
+    std::span<std::uint8_t> atom_types {atom_types_buf.data(), n};
+    std::span<float> formal_charges {formal_charges_buf.data(), n};
+    std::span<float> partial_charges {partial_charges_buf.data(), n};
+
+    if (!native_compute_mmff_atom_types(desc, atom_types)) return false;
+    native_compute_mmff_formal_charges(desc, atom_types, formal_charges);
+    native_compute_mmff_partial_charges(desc, tables, atom_types, formal_charges, partial_charges);
+
+    extract_mmff94_params_native(desc, atom_types, partial_charges, tables, result);
+    return true;
 }
 
 } // namespace smallfield
