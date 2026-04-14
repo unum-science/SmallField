@@ -48,7 +48,9 @@ void run_mmff94_gpu_extract(mmff94_tables_host_t const &tables_host,
                              mmff94_angle_t *out_angles, std::uint32_t angle_stride,
                              mmff94_torsion_t *out_torsions, std::uint32_t torsion_stride,
                              mmff94_oop_t *out_oops, std::uint32_t oop_stride,
-                             mmff94_stretchbend_t *out_stbns, std::uint32_t stbn_stride) {
+                             mmff94_stretchbend_t *out_stbns, std::uint32_t stbn_stride,
+                             mmff94_atom_interaction_t *out_interactions,
+                             mmff94_atom_offsets_t *out_atom_offsets) {
     mmff94_tables_device_t tables_dev;
     upload_mmff94_tables_to_device(tables_host, tables_dev);
     if (tables_dev.arena == nullptr) {
@@ -100,6 +102,27 @@ void run_mmff94_gpu_extract(mmff94_tables_host_t const &tables_host,
     if (err != cudaSuccess) {
         std::fprintf(stderr, "extract kernel error: %s\n", cudaGetErrorString(err));
     }
+
+    // CSR build kernel.
+    mmff94_atom_interaction_t *d_inter = nullptr;
+    mmff94_atom_offsets_t *d_aoff = nullptr;
+    cudaMalloc(&d_inter, (std::size_t)num_mols * max_mmff_interactions_per_mol_k * sizeof(mmff94_atom_interaction_t));
+    cudaMalloc(&d_aoff, (std::size_t)total_atoms * sizeof(mmff94_atom_offsets_t));
+    launch_mmff94_build_csr(d_desc, d_off, num_mols, d_counts,
+                             d_bonds, d_angles, d_tors, d_oops, d_stbn,
+                             d_inter, d_aoff, d_status);
+    cudaDeviceSynchronize();
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "CSR build kernel error: %s\n", cudaGetErrorString(err));
+    }
+    cudaMemcpy(out_interactions, d_inter,
+                (std::size_t)num_mols * max_mmff_interactions_per_mol_k * sizeof(mmff94_atom_interaction_t),
+                cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_atom_offsets, d_aoff,
+                (std::size_t)total_atoms * sizeof(mmff94_atom_offsets_t),
+                cudaMemcpyDeviceToHost);
+    cudaFree(d_inter); cudaFree(d_aoff);
 
     cudaMemcpy(out_status, d_status, num_mols * sizeof(std::uint8_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(out_counts, d_counts, num_mols * sizeof(mmff94_per_mol_counts_t), cudaMemcpyDeviceToHost);

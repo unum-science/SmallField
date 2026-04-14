@@ -335,6 +335,157 @@ __global__ void mmff94_extract_terms_kernel(
     };
 }
 
+/** Build the MMFF per-atom CSR interaction list from emitted terms.
+ *  Mirrors `mmff94_cpu.hpp:731-802` — two-pass count + write.  One
+ *  block per molecule, lane-0-only (the CSR-build cost is tiny
+ *  relative to the term extractor and cross-molecule parallelism
+ *  dominates). */
+__launch_bounds__(32, 8)
+__global__ void mmff94_build_csr_kernel(
+    molecule_descriptor_t const * __restrict__ descriptors,
+    std::uint32_t const * __restrict__ atom_offsets,
+    std::uint32_t num_molecules,
+    mmff94_per_mol_counts_t * __restrict__ per_mol_counts,
+    mmff94_bond_t const * __restrict__ bonds_all,
+    mmff94_angle_t const * __restrict__ angles_all,
+    mmff94_torsion_t const * __restrict__ torsions_all,
+    mmff94_oop_t const * __restrict__ oops_all,
+    mmff94_stretchbend_t const * __restrict__ stbns_all,
+    mmff94_atom_interaction_t * __restrict__ interactions_all,
+    mmff94_atom_offsets_t * __restrict__ atom_offsets_all,
+    std::uint8_t const * __restrict__ typing_status) {
+
+    std::uint32_t const mol = blockIdx.x;
+    if (mol >= num_molecules) return;
+    if (threadIdx.x != 0) return;
+    if (typing_status[mol] != 0) return;
+
+    auto const &desc = descriptors[mol];
+    std::uint32_t const n = desc.num_atoms;
+    std::uint32_t const ao = atom_offsets[mol];
+    auto const &c = per_mol_counts[mol];
+
+    mmff94_bond_t const *bonds = bonds_all + (std::size_t)mol * max_mmff_bonds_per_mol_k;
+    mmff94_angle_t const *angles = angles_all + (std::size_t)mol * max_mmff_angles_per_mol_k;
+    mmff94_torsion_t const *torsions = torsions_all + (std::size_t)mol * max_mmff_torsions_per_mol_k;
+    mmff94_oop_t const *oops = oops_all + (std::size_t)mol * max_mmff_oops_per_mol_k;
+    mmff94_stretchbend_t const *stbns = stbns_all + (std::size_t)mol * max_mmff_stretchbends_per_mol_k;
+
+    std::uint32_t const ints_base = (std::uint32_t)mol * max_mmff_interactions_per_mol_k;
+    mmff94_atom_interaction_t *interactions = interactions_all + ints_base;
+    mmff94_atom_offsets_t *offsets = atom_offsets_all + ao;
+
+    // Pass 1 — count per-atom per-term-type.
+    for (std::uint32_t a = 0; a < n; ++a) offsets[a] = {};
+    for (std::uint32_t t = 0; t < c.bonds; ++t) {
+        offsets[bonds[t].atom_i].bond_count++;
+        offsets[bonds[t].atom_j].bond_count++;
+    }
+    for (std::uint32_t t = 0; t < c.angles; ++t) {
+        offsets[angles[t].atom_i].angle_count++;
+        offsets[angles[t].atom_j].angle_count++;
+        offsets[angles[t].atom_k].angle_count++;
+    }
+    for (std::uint32_t t = 0; t < c.torsions; ++t) {
+        offsets[torsions[t].atom_i].torsion_count++;
+        offsets[torsions[t].atom_j].torsion_count++;
+        offsets[torsions[t].atom_k].torsion_count++;
+        offsets[torsions[t].atom_l].torsion_count++;
+    }
+    for (std::uint32_t t = 0; t < c.oops; ++t) {
+        offsets[oops[t].atom_i].oop_count++;
+        offsets[oops[t].atom_j].oop_count++;
+        offsets[oops[t].atom_k].oop_count++;
+        offsets[oops[t].atom_l].oop_count++;
+    }
+    for (std::uint32_t t = 0; t < c.stretchbends; ++t) {
+        offsets[stbns[t].atom_i].stretchbend_count++;
+        offsets[stbns[t].atom_j].stretchbend_count++;
+        offsets[stbns[t].atom_k].stretchbend_count++;
+    }
+
+    // Compute per-type offsets + running total.
+    std::uint32_t running = 0;
+    for (std::uint32_t a = 0; a < n; ++a) {
+        auto &off = offsets[a];
+        off.bond_start = running; running += off.bond_count;
+        off.angle_start = running; running += off.angle_count;
+        off.torsion_start = running; running += off.torsion_count;
+        off.oop_start = running; running += off.oop_count;
+        off.stretchbend_start = running; running += off.stretchbend_count;
+    }
+    // Running is the total interactions for this molecule.  Store in
+    // per_mol_counts for downstream CSR consumers.
+    per_mol_counts[mol].interactions = (std::uint16_t)running;
+
+    // Per-atom per-type cursors (reuse `_start` as running cursor).
+    std::uint32_t cursors_bond[max_atoms_k];
+    std::uint32_t cursors_angle[max_atoms_k];
+    std::uint32_t cursors_torsion[max_atoms_k];
+    std::uint32_t cursors_oop[max_atoms_k];
+    std::uint32_t cursors_sb[max_atoms_k];
+    for (std::uint32_t a = 0; a < n; ++a) {
+        cursors_bond[a] = offsets[a].bond_start;
+        cursors_angle[a] = offsets[a].angle_start;
+        cursors_torsion[a] = offsets[a].torsion_start;
+        cursors_oop[a] = offsets[a].oop_start;
+        cursors_sb[a] = offsets[a].stretchbend_start;
+    }
+
+    // Pass 2 — write interactions.
+    for (std::uint32_t t = 0; t < c.bonds; ++t) {
+        interactions[cursors_bond[bonds[t].atom_i]++] = {t, mmff94_bond_k, atom_role_first_k};
+        interactions[cursors_bond[bonds[t].atom_j]++] = {t, mmff94_bond_k, atom_role_second_k};
+    }
+    for (std::uint32_t t = 0; t < c.angles; ++t) {
+        interactions[cursors_angle[angles[t].atom_i]++] = {t, mmff94_angle_end_k, atom_role_first_k};
+        interactions[cursors_angle[angles[t].atom_j]++] = {t, mmff94_angle_center_k, atom_role_second_k};
+        interactions[cursors_angle[angles[t].atom_k]++] = {t, mmff94_angle_end_k, atom_role_third_k};
+    }
+    for (std::uint32_t t = 0; t < c.torsions; ++t) {
+        interactions[cursors_torsion[torsions[t].atom_i]++] = {t, mmff94_torsion_k, atom_role_first_k};
+        interactions[cursors_torsion[torsions[t].atom_j]++] = {t, mmff94_torsion_k, atom_role_second_k};
+        interactions[cursors_torsion[torsions[t].atom_k]++] = {t, mmff94_torsion_k, atom_role_third_k};
+        interactions[cursors_torsion[torsions[t].atom_l]++] = {t, mmff94_torsion_k, atom_role_fourth_k};
+    }
+    for (std::uint32_t t = 0; t < c.oops; ++t) {
+        interactions[cursors_oop[oops[t].atom_i]++] = {t, mmff94_out_of_plane_k, atom_role_first_k};
+        interactions[cursors_oop[oops[t].atom_j]++] = {t, mmff94_out_of_plane_k, atom_role_second_k};
+        interactions[cursors_oop[oops[t].atom_k]++] = {t, mmff94_out_of_plane_k, atom_role_third_k};
+        interactions[cursors_oop[oops[t].atom_l]++] = {t, mmff94_out_of_plane_k, atom_role_fourth_k};
+    }
+    for (std::uint32_t t = 0; t < c.stretchbends; ++t) {
+        interactions[cursors_sb[stbns[t].atom_i]++] = {t, mmff94_stretch_bend_k, atom_role_first_k};
+        interactions[cursors_sb[stbns[t].atom_j]++] = {t, mmff94_stretch_bend_k, atom_role_second_k};
+        interactions[cursors_sb[stbns[t].atom_k]++] = {t, mmff94_stretch_bend_k, atom_role_third_k};
+    }
+}
+#endif // __CUDACC__
+
+#if defined(__CUDACC__)
+inline void launch_mmff94_build_csr(
+    molecule_descriptor_t const *descriptors,
+    std::uint32_t const *atom_offsets,
+    std::uint32_t num_molecules,
+    mmff94_per_mol_counts_t *per_mol_counts,
+    mmff94_bond_t const *bonds,
+    mmff94_angle_t const *angles,
+    mmff94_torsion_t const *torsions,
+    mmff94_oop_t const *oops,
+    mmff94_stretchbend_t const *stbns,
+    mmff94_atom_interaction_t *interactions,
+    mmff94_atom_offsets_t *atom_offsets_out,
+    std::uint8_t const *typing_status,
+    cudaStream_t stream = nullptr) {
+    if (num_molecules == 0) return;
+    mmff94_build_csr_kernel<<<num_molecules, 32, 0, stream>>>(
+        descriptors, atom_offsets, num_molecules, per_mol_counts,
+        bonds, angles, torsions, oops, stbns,
+        interactions, atom_offsets_out, typing_status);
+}
+#endif
+
+#if defined(__CUDACC__)
 inline void launch_mmff94_extract_terms(
     molecule_descriptor_t const *descriptors,
     std::uint8_t const *atom_types_all,

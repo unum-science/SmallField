@@ -44,7 +44,9 @@ void run_mmff94_gpu_extract(mmff94_tables_host_t const &tables_host,
                              mmff94_angle_t *out_angles, std::uint32_t angle_stride,
                              mmff94_torsion_t *out_torsions, std::uint32_t torsion_stride,
                              mmff94_oop_t *out_oops, std::uint32_t oop_stride,
-                             mmff94_stretchbend_t *out_stbns, std::uint32_t stbn_stride);
+                             mmff94_stretchbend_t *out_stbns, std::uint32_t stbn_stride,
+                             mmff94_atom_interaction_t *out_interactions,
+                             mmff94_atom_offsets_t *out_atom_offsets);
 } // namespace smallfield
 
 namespace {
@@ -130,6 +132,8 @@ int main(int argc, char **argv) {
     std::vector<mmff94_torsion_t> torsions((std::size_t)num_mols * max_mmff_torsions_per_mol_k);
     std::vector<mmff94_oop_t> oops((std::size_t)num_mols * max_mmff_oops_per_mol_k);
     std::vector<mmff94_stretchbend_t> stbns((std::size_t)num_mols * max_mmff_stretchbends_per_mol_k);
+    std::vector<mmff94_atom_interaction_t> interactions((std::size_t)num_mols * max_mmff_interactions_per_mol_k);
+    std::vector<mmff94_atom_offsets_t> atom_offs_out(total_atoms);
 
     run_mmff94_gpu_extract(tables_host, descriptors.data(), num_mols,
                              atom_offsets.data(), total_atoms,
@@ -138,7 +142,8 @@ int main(int argc, char **argv) {
                              angles.data(), max_mmff_angles_per_mol_k,
                              torsions.data(), max_mmff_torsions_per_mol_k,
                              oops.data(), max_mmff_oops_per_mol_k,
-                             stbns.data(), max_mmff_stretchbends_per_mol_k);
+                             stbns.data(), max_mmff_stretchbends_per_mol_k,
+                             interactions.data(), atom_offs_out.data());
 
     // CPU reference via extract_mmff94_params_fully_native.
     int mol_ok = 0, mol_skipped = 0, mol_bad = 0;
@@ -147,6 +152,7 @@ int main(int argc, char **argv) {
     int tor_ok = 0, tor_bad = 0;
     int oop_ok = 0, oop_bad = 0;
     int sb_ok = 0, sb_bad = 0;
+    int csr_ok = 0, csr_bad = 0;
 
     for (std::uint32_t m = 0; m < num_mols; ++m) {
         if (status[m] != 0) { ++mol_skipped; continue; }
@@ -216,6 +222,41 @@ int main(int argc, char **argv) {
             else { ++sb_bad; ok = false; }
         }
 
+        // CSR comparison.  The CPU's `extract_mmff94_params_fully_native`
+        // produces `mmff_interactions` and `mmff_atom_offsets`; we diff
+        // the GPU CSR against it.  Per-atom ordering is deterministic
+        // on both sides (atoms walked in index order, term types in
+        // bond/angle/torsion/oop/sb order).
+        auto const ao = atom_offsets[m];
+        for (std::uint32_t a = 0; a < desc.num_atoms; ++a) {
+            auto const &cpu_off = cpu.mmff_atom_offsets[a];
+            auto const &gpu_off = atom_offs_out[ao + a];
+            // GPU offsets are per-molecule (relative to this mol's
+            // `max_mmff_interactions_per_mol_k` slot); CPU offsets are
+            // per-molecule as well (into the mol's own interactions
+            // vector).  Both start at 0 per molecule, so the counts are
+            // the comparison metric.
+            if (cpu_off.bond_count != gpu_off.bond_count ||
+                cpu_off.angle_count != gpu_off.angle_count ||
+                cpu_off.torsion_count != gpu_off.torsion_count ||
+                cpu_off.oop_count != gpu_off.oop_count ||
+                cpu_off.stretchbend_count != gpu_off.stretchbend_count) {
+                ++csr_bad; ok = false;
+                if (csr_bad < 5) {
+                    std::printf("  mol=%u atom=%u CSR count diff: "
+                                 "cpu=(b%u a%u t%u o%u s%u) gpu=(b%u a%u t%u o%u s%u)\n",
+                                 m, a, cpu_off.bond_count, cpu_off.angle_count,
+                                 cpu_off.torsion_count, cpu_off.oop_count,
+                                 cpu_off.stretchbend_count,
+                                 gpu_off.bond_count, gpu_off.angle_count,
+                                 gpu_off.torsion_count, gpu_off.oop_count,
+                                 gpu_off.stretchbend_count);
+                }
+            } else {
+                ++csr_ok;
+            }
+        }
+
         if (ok) ++mol_ok; else ++mol_bad;
     }
 
@@ -226,6 +267,7 @@ int main(int argc, char **argv) {
     std::printf("torsions: %d / %d\n", tor_ok, tor_bad);
     std::printf("oops:     %d / %d\n", oop_ok, oop_bad);
     std::printf("stbns:    %d / %d\n", sb_ok, sb_bad);
+    std::printf("csr atoms: %d / %d\n", csr_ok, csr_bad);
     if (mol_bad > 0) { std::printf("FAIL\n"); return 1; }
     std::printf("PASS\n");
     return 0;
