@@ -348,7 +348,7 @@ void rdkit_direct_extract(RDKit::ROMol &mol, molecule_descriptor_t const &desc,
     }
 }
 
-void run_one(std::string_view smiles, mmff94_tables_host_t const &tables, bool verbose) {
+void run_one(std::string_view smiles, mmff94_tables_view_t const &tables, bool verbose) {
     // Native + RDKit preprocessing share the same SmilesToMol/addHs/build_descriptor path.
     std::unique_ptr<RDKit::RWMol> mol;
     try {
@@ -425,12 +425,13 @@ std::vector<std::string> load_smiles(std::string const &path, std::size_t max_co
 int main(int argc, char **argv) {
     std::printf("=== test_mmff_cpu_port: MG-1 gate ===\n");
 
-    mmff94_tables_host_t tables;
-    extract_mmff94_tables_from_rdkit(tables);
+    mmff94_tables_host_t tables_host;
+    extract_mmff94_tables_from_rdkit(tables_host);
+    mmff94_tables_view_t const tables = tables_host.view();
     std::printf("extracted tables: vdw=%zu bond=%zu angle=%zu tor=%zu oop=%zu stbn=%zu dfsb=%zu\n",
-                tables.vdw.size(), tables.bond.size(), tables.angle.size(),
-                tables.torsion.size(), tables.oop.size(), tables.stbn.size(),
-                tables.dfsb.size());
+                tables_host.vdw.size(), tables_host.bond.size(), tables_host.angle.size(),
+                tables_host.torsion.size(), tables_host.oop.size(), tables_host.stbn.size(),
+                tables_host.dfsb.size());
 
     // Curated handful of drug-like SMILES (aspirin, caffeine, ibuprofen,
     // paracetamol, benzodiazepine, adenine, imidazolium, carboxylate).

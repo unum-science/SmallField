@@ -35,13 +35,22 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     # source-counter attribution map stalls back to specific source lines in
     # etkdg_pipeline.cuh / dg_forcefield.cuh / mmff94_functor.cuh.  No
     # optimisation impact — pure debug info that survives -O3.
+    # `--expt-relaxed-constexpr` lets `__host__ __device__` functions call any
+    # `constexpr` function including the libstdc++ <algorithm> facilities
+    # (`std::lower_bound`, `std::equal_range`) we use in the MMFF device
+    # lookups.  `--extended-lambda` enables lambdas passed as comparators
+    # inside those same lookups.  Required for the MG-2/3 GPU kernels.
     if(NOT CMAKE_CUDA_FLAGS_RELEASE MATCHES "use_fast_math")
         set(CMAKE_CUDA_FLAGS_RELEASE
-            "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3 --generate-line-info")
+            "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3 --generate-line-info --expt-relaxed-constexpr --extended-lambda")
     endif()
     if(NOT CMAKE_CUDA_FLAGS_RELWITHDEBINFO MATCHES "use_fast_math")
         set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO
-            "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3 --generate-line-info")
+            "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3 --generate-line-info --expt-relaxed-constexpr --extended-lambda")
+    endif()
+    if(NOT CMAKE_CUDA_FLAGS MATCHES "expt-relaxed-constexpr")
+        set(CMAKE_CUDA_FLAGS
+            "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr --extended-lambda")
     endif()
 endif()
 

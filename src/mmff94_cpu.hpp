@@ -153,7 +153,7 @@ inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const &de
  *  bond is SINGLE and both endpoints are sbmb atoms or both are aromatic
  *  atoms (per MMFFProp).  Otherwise returns 0. */
 inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &desc,
-                                              mmff94_tables_host_t const &t,
+                                              mmff94_tables_view_t const &t,
                                               std::span<std::uint8_t const> atom_types,
                                               std::uint32_t bond_idx) noexcept {
     std::uint8_t const bo = desc.bond_order[bond_idx];
@@ -256,7 +256,7 @@ inline std::uint8_t native_get_mmff_stretch_bend_type(unsigned angle_type,
  *  `getMMFFBondStretchEmpiricalRuleParams`.  Returns (kb, r0) by value.
  *  Internally uses `double` to match RDKit's precision; inputs/outputs are
  *  float for parity with the extracted-table pipeline. */
-inline std::pair<float, float> native_bond_empirical(mmff94_tables_host_t const &t,
+inline std::pair<float, float> native_bond_empirical(mmff94_tables_view_t const &t,
                                                      std::uint8_t atomic_i,
                                                      std::uint8_t atomic_j) noexcept {
     auto const *cov_i = lookup_covrad(t, atomic_i);
@@ -292,7 +292,7 @@ inline std::pair<float, float> native_bond_empirical(mmff94_tables_host_t const 
  *  this to match RDKit's behaviour when a table entry exists with ka=0
  *  (then RDKit keeps the table's θ₀ and recomputes ka empirically). */
 inline std::pair<float, float> native_angle_empirical(
-    molecule_descriptor_t const &desc, mmff94_tables_host_t const &t,
+    molecule_descriptor_t const &desc, mmff94_tables_view_t const &t,
     std::span<std::uint8_t const> atom_types, std::uint32_t i, std::uint32_t j,
     std::uint32_t k, float r0_ij, float r0_jk,
     float theta0_override_deg = -1.0f) noexcept {
@@ -359,7 +359,7 @@ inline std::pair<float, float> native_angle_empirical(
  *  `getMMFFTorsionEmpiricalRuleParams`.  Returns (V1, V2, V3).  Bond type
  *  of the central bond is passed in so we avoid re-looking-it-up. */
 inline std::array<float, 3> native_torsion_empirical(
-    molecule_descriptor_t const &desc, mmff94_tables_host_t const &t,
+    molecule_descriptor_t const &desc, mmff94_tables_view_t const &t,
     std::span<std::uint8_t const> atom_types, std::uint32_t j, std::uint32_t k,
     std::int32_t bond_jk_idx) noexcept {
     auto const *jp = lookup_prop(t, atom_types[j]);
@@ -493,7 +493,7 @@ inline bool native_is_zero(float v) noexcept { return std::fabs(v) < 1.0e-10f; }
 inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
                                          std::span<std::uint8_t const> atom_types,
                                          std::span<float const> charges,
-                                         mmff94_tables_host_t const &tables,
+                                         mmff94_tables_view_t const &tables,
                                          etkdg_prepared_molecule_t &result) {
     result.mmff_atom_vdw.clear();
     result.mmff_atom_charge.clear();
@@ -807,7 +807,7 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
  *  successful typing; false means one or more atoms could not be typed
  *  and the caller should route the molecule through the RDKit fallback. */
 inline bool extract_mmff94_params_fully_native(molecule_descriptor_t const &desc,
-                                               mmff94_tables_host_t const &tables,
+                                               mmff94_tables_view_t const &tables,
                                                etkdg_prepared_molecule_t &result) {
     std::uint32_t const n = desc.num_atoms;
     std::array<std::uint8_t, max_atoms_k> atom_types_buf {};

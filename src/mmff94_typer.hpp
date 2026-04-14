@@ -1029,7 +1029,7 @@ inline void native_compute_mmff_formal_charges(molecule_descriptor_t const &desc
  *  is tabulated.  Formal-charge distribution follows equation 15 of
  *  MMFF.V. */
 inline void native_compute_mmff_partial_charges(molecule_descriptor_t const &desc,
-                                                mmff94_tables_host_t const &tables,
+                                                mmff94_tables_view_t const &tables,
                                                 std::span<std::uint8_t const> atom_types,
                                                 std::span<float const> formal_charges,
                                                 std::span<float> partial_charges) noexcept {
@@ -1040,12 +1040,10 @@ inline void native_compute_mmff_partial_charges(molecule_descriptor_t const &des
         if (!prop) { partial_charges[idx] = formal_charges[idx]; continue; }
         double const M = (double)prop->crd;
 
-        auto pbci_ipso = std::lower_bound(
-            tables.pbci.begin(), tables.pbci.end(), at,
-            [](mmff94_pbci_entry_t const &e, std::uint8_t v) { return e.atom_type < v; });
+        auto const *pbci_ipso = lookup_pbci(tables, at);
         double v = 0.0;
         double pbci_ipso_val = 0.0;
-        if (pbci_ipso != tables.pbci.end() && pbci_ipso->atom_type == at) {
+        if (pbci_ipso) {
             v = (double)pbci_ipso->fcadj;
             pbci_ipso_val = (double)pbci_ipso->pbci;
         }
@@ -1089,12 +1087,8 @@ inline void native_compute_mmff_partial_charges(molecule_descriptor_t const &des
                 sumPC += (double)chg_hit.first * (double)chg_hit.second->bci;
             }
             else {
-                auto pbci_nb = std::lower_bound(
-                    tables.pbci.begin(), tables.pbci.end(), nbt,
-                    [](mmff94_pbci_entry_t const &e, std::uint8_t v) { return e.atom_type < v; });
-                double const nb_pbci = (pbci_nb != tables.pbci.end() &&
-                                         pbci_nb->atom_type == nbt)
-                                             ? (double)pbci_nb->pbci : 0.0;
+                auto const *pbci_nb = lookup_pbci(tables, nbt);
+                double const nb_pbci = pbci_nb ? (double)pbci_nb->pbci : 0.0;
                 sumPC += pbci_ipso_val - nb_pbci;
             }
             sumFC += (double)formal_charges[nb];

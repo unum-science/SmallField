@@ -30,7 +30,8 @@
 using namespace smallfield;
 
 namespace {
-mmff94_tables_host_t tables;
+mmff94_tables_host_t tables_host;
+mmff94_tables_view_t tables;
 int n_atoms_checked = 0;
 int n_atoms_mismatch = 0;
 int n_charges_checked = 0;
@@ -107,7 +108,8 @@ void test_one(std::string const &smiles, bool verbose) {
 
 int main(int argc, char **argv) {
     std::printf("=== test_mmff_typer: MG-1.5/1.6/1.7 gate ===\n");
-    extract_mmff94_tables_from_rdkit(tables);
+    extract_mmff94_tables_from_rdkit(tables_host);
+    tables = tables_host.view();
 
     std::vector<std::string> probe = {
         "CC(=O)OC1=CC=CC=C1C(=O)O",

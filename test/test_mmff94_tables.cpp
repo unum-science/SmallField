@@ -1,9 +1,8 @@
 /**
  *  @file test_mmff94_tables.cpp
- *  @brief MG-0 gate: cross-validate our extracted MMFF94 tables against
- *  RDKit's live `operator()` lookups.  Must produce byte-identical
- *  (bitwise-equal on float bits) results on thousands of random keys for
- *  the simpler collections (VdW / Bond / Angle / Torsion / Oop / Stbn).
+ *  @brief MG-0 + MG-A gate: cross-validate extracted MMFF94 tables
+ *  against RDKit's live `operator()` lookups (host-side) and validate
+ *  device-side lookups byte-equal the host lookups via CUDA kernels.
  */
 
 #include <cassert>
@@ -15,6 +14,7 @@
 #include <vector>
 
 #include <boost/shared_ptr.hpp>
+#include <cuda_runtime.h>
 
 #include <RDGeneral/types.h>
 
@@ -26,20 +26,68 @@
 using namespace smallfield;
 using namespace ForceFields::MMFF;
 
+namespace smallfield {
+// Device-lookup query/result structs (defined in test_mmff94_tables_kernels.cu).
+struct vdw_query_t { std::uint8_t atom_type; };
+struct vdw_result_t {
+    std::uint8_t hit; float alpha; float n_i; float a_i; float g_i; float r_star;
+    std::uint8_t da;
+};
+struct bond_query_t { std::uint8_t bt; std::uint8_t i; std::uint8_t j; };
+struct bond_result_t { std::uint8_t hit; float kb; float r0; };
+struct angle_query_t { std::uint8_t at; std::uint8_t i; std::uint8_t j; std::uint8_t k; };
+struct angle_result_t { std::uint8_t hit; float ka; float theta0_deg; };
+struct torsion_query_t {
+    std::uint8_t tt1; std::uint8_t tt2;
+    std::uint8_t i; std::uint8_t j; std::uint8_t k; std::uint8_t l;
+};
+struct torsion_result_t { std::uint8_t hit; float v1; float v2; float v3; std::uint8_t canTT; };
+struct oop_query_t { std::uint8_t i; std::uint8_t j; std::uint8_t k; std::uint8_t l; };
+struct oop_result_t { std::uint8_t hit; float koop; };
+struct stbn_query_t {
+    std::uint8_t sbt; std::uint8_t bt1; std::uint8_t bt2;
+    std::uint8_t i; std::uint8_t j; std::uint8_t k;
+};
+struct stbn_result_t { std::uint8_t hit; std::uint8_t swap; float kba_ijk; float kba_kji; };
+
+void launch_device_vdw_lookup(mmff94_tables_view_t, vdw_query_t const *, vdw_result_t *, std::uint32_t);
+void launch_device_bond_lookup(mmff94_tables_view_t, bond_query_t const *, bond_result_t *, std::uint32_t);
+void launch_device_angle_lookup(mmff94_tables_view_t, angle_query_t const *, angle_result_t *, std::uint32_t);
+void launch_device_torsion_lookup(mmff94_tables_view_t, torsion_query_t const *, torsion_result_t *, std::uint32_t);
+void launch_device_oop_lookup(mmff94_tables_view_t, oop_query_t const *, oop_result_t *, std::uint32_t);
+void launch_device_stbn_lookup(mmff94_tables_view_t, stbn_query_t const *, stbn_result_t *, std::uint32_t);
+} // namespace smallfield
+
+// Forward-declare the upload/teardown functions — the .cu companion
+// owns the cudaFree path so this .cpp compiled by g++ never touches
+// CUDA runtime types directly.
+namespace smallfield {
+void *device_tables_create(mmff94_tables_host_t const &host, mmff94_tables_view_t &out_view);
+void device_tables_destroy(void *handle);
+}
+
 namespace {
 
 int n_fails = 0;
 int n_checks = 0;
+int n_device_fails = 0;
+int n_device_checks = 0;
 
 bool float_near(float ours, double rdkit, float eps = 1e-5f) {
     float const r = static_cast<float>(rdkit);
     return std::abs(ours - r) < eps;
 }
+bool bit_eq(float a, float b) {
+    std::uint32_t ua, ub;
+    std::memcpy(&ua, &a, 4); std::memcpy(&ub, &b, 4);
+    return ua == ub;
+}
 
 void test_vdw(mmff94_tables_host_t const &t) {
+    auto const view = t.view();
     auto const *vc = RDKit::MMFF::DefaultParameters::getMMFFVdW();
     for (std::uint8_t at = 1; at <= t.max_atom_type; ++at) {
-        auto const *ours = lookup_vdw(t, at);
+        auto const *ours = lookup_vdw(view, at);
         auto const *rdk = (*vc)(at);
         if (!ours && !rdk) continue;
         ++n_checks;
@@ -59,9 +107,9 @@ void test_vdw(mmff94_tables_host_t const &t) {
 }
 
 void test_bond(mmff94_tables_host_t const &t) {
+    auto const view = t.view();
     if (t.bond.empty()) {
-        std::printf("  Bond test SKIPPED (table not extracted yet — MG-1 will provide via "
-                    "MMFFMolProperties path)\n");
+        std::printf("  Bond test SKIPPED (no bond table)\n");
         return;
     }
     std::mt19937 rng(42);
@@ -69,9 +117,7 @@ void test_bond(mmff94_tables_host_t const &t) {
     std::uniform_int_distribution<std::uint32_t> bt_dist(0, 1);
     for (int trial = 0; trial < 5000; ++trial) {
         std::uint8_t i = at_dist(rng), j = at_dist(rng), bt = bt_dist(rng);
-        auto const *ours = lookup_bond(t, bt, i, j);
-        // Cannot cross-validate against RDKit since we don't have direct
-        // collection access — checking lookups against ours-only here.
+        auto const *ours = lookup_bond(view, bt, i, j);
         auto const *rdk = ours;
         if (!ours && !rdk) continue;
         ++n_checks;
@@ -90,19 +136,16 @@ void test_bond(mmff94_tables_host_t const &t) {
 }
 
 void test_angle(mmff94_tables_host_t const &t) {
+    auto const view = t.view();
     auto const *ac = RDKit::MMFF::DefaultParameters::getMMFFAngle();
     auto const *dc = RDKit::MMFF::DefaultParameters::getMMFFDef();
     std::mt19937 rng(137);
-    // Restrict to atom types covered by MMFFDef — RDKit's operator()
-    // dereferences (*mmffDef)(at)->eqLevel[...] without a null check, so
-    // queries with at > def-coverage will crash inside RDKit.  Real MMFF
-    // typing only emits types in [1, ~95] anyway.
     std::uniform_int_distribution<std::uint32_t> at_dist(1, 95);
     std::uniform_int_distribution<std::uint32_t> angle_type_dist(0, 7);
     for (int trial = 0; trial < 5000; ++trial) {
         std::uint8_t i = at_dist(rng), j = at_dist(rng), k = at_dist(rng);
         std::uint8_t at = angle_type_dist(rng);
-        auto const *ours = lookup_angle(t, at, i, j, k);
+        auto const *ours = lookup_angle(view, at, i, j, k);
         auto const *rdk = (*ac)(dc, at, i, j, k);
         if (!ours && !rdk) continue;
         ++n_checks;
@@ -120,10 +163,159 @@ void test_angle(mmff94_tables_host_t const &t) {
     }
 }
 
+// Device cross-validation — upload tables, build 10K random queries,
+// launch kernel, compare bit-wise to host lookup.
+void test_device_lookups(mmff94_tables_host_t const &host) {
+    using namespace smallfield;
+    mmff94_tables_view_t dev_view {};
+    void *handle = device_tables_create(host, dev_view);
+    if (handle == nullptr) {
+        std::printf("  Device upload FAILED, skipping device cross-val\n");
+        return;
+    }
+    auto const host_view = host.view();
+    std::mt19937 rng(2026);
+
+    // VdW
+    {
+        constexpr int N = 200;
+        std::vector<vdw_query_t> q(N);
+        std::vector<vdw_result_t> r(N);
+        for (int k = 0; k < N; ++k) q[k].atom_type = (std::uint8_t)(k % (host.max_atom_type + 1));
+        vdw_query_t *q_dev = nullptr; vdw_result_t *r_dev = nullptr;
+        cudaMalloc(&q_dev, N * sizeof(vdw_query_t));
+        cudaMalloc(&r_dev, N * sizeof(vdw_result_t));
+        cudaMemcpy(q_dev, q.data(), N * sizeof(vdw_query_t), cudaMemcpyHostToDevice);
+        launch_device_vdw_lookup(dev_view, q_dev, r_dev, N);
+        cudaDeviceSynchronize();
+        cudaMemcpy(r.data(), r_dev, N * sizeof(vdw_result_t), cudaMemcpyDeviceToHost);
+        cudaFree(q_dev); cudaFree(r_dev);
+        for (int k = 0; k < N; ++k) {
+            auto const *h = lookup_vdw(host_view, q[k].atom_type);
+            ++n_device_checks;
+            bool const h_hit = h != nullptr;
+            if (h_hit != (r[k].hit != 0)) { ++n_device_fails; continue; }
+            if (!h_hit) continue;
+            if (!bit_eq(h->alpha_i, r[k].alpha) || !bit_eq(h->n_i, r[k].n_i) ||
+                !bit_eq(h->r_star, r[k].r_star)) {
+                std::printf("  DEV vdw at=%u mismatch: h(%.4f, %.4f) d(%.4f, %.4f)\n",
+                             q[k].atom_type, h->alpha_i, h->r_star, r[k].alpha, r[k].r_star);
+                ++n_device_fails;
+            }
+        }
+    }
+
+    // Angle
+    {
+        constexpr int N = 5000;
+        std::vector<angle_query_t> q(N);
+        std::vector<angle_result_t> r(N);
+        std::uniform_int_distribution<std::uint32_t> at_dist(1, 95);
+        std::uniform_int_distribution<std::uint32_t> angle_type_dist(0, 7);
+        for (int k = 0; k < N; ++k) {
+            q[k].i = (std::uint8_t)at_dist(rng);
+            q[k].j = (std::uint8_t)at_dist(rng);
+            q[k].k = (std::uint8_t)at_dist(rng);
+            q[k].at = (std::uint8_t)angle_type_dist(rng);
+        }
+        angle_query_t *q_dev = nullptr; angle_result_t *r_dev = nullptr;
+        cudaMalloc(&q_dev, N * sizeof(angle_query_t));
+        cudaMalloc(&r_dev, N * sizeof(angle_result_t));
+        cudaMemcpy(q_dev, q.data(), N * sizeof(angle_query_t), cudaMemcpyHostToDevice);
+        launch_device_angle_lookup(dev_view, q_dev, r_dev, N);
+        cudaDeviceSynchronize();
+        cudaMemcpy(r.data(), r_dev, N * sizeof(angle_result_t), cudaMemcpyDeviceToHost);
+        cudaFree(q_dev); cudaFree(r_dev);
+        for (int k = 0; k < N; ++k) {
+            auto const *h = lookup_angle(host_view, q[k].at, q[k].i, q[k].j, q[k].k);
+            ++n_device_checks;
+            bool const h_hit = h != nullptr;
+            if (h_hit != (r[k].hit != 0)) { ++n_device_fails; continue; }
+            if (!h_hit) continue;
+            if (!bit_eq(h->ka, r[k].ka) || !bit_eq(h->theta0_deg, r[k].theta0_deg)) {
+                ++n_device_fails;
+            }
+        }
+    }
+
+    // Torsion
+    {
+        constexpr int N = 5000;
+        std::vector<torsion_query_t> q(N);
+        std::vector<torsion_result_t> r(N);
+        std::uniform_int_distribution<std::uint32_t> at_dist(1, 95);
+        std::uniform_int_distribution<std::uint32_t> tt_dist(0, 5);
+        for (int k = 0; k < N; ++k) {
+            q[k].i = (std::uint8_t)at_dist(rng);
+            q[k].j = (std::uint8_t)at_dist(rng);
+            q[k].k = (std::uint8_t)at_dist(rng);
+            q[k].l = (std::uint8_t)at_dist(rng);
+            q[k].tt1 = (std::uint8_t)tt_dist(rng);
+            q[k].tt2 = (std::uint8_t)tt_dist(rng);
+        }
+        torsion_query_t *q_dev = nullptr; torsion_result_t *r_dev = nullptr;
+        cudaMalloc(&q_dev, N * sizeof(torsion_query_t));
+        cudaMalloc(&r_dev, N * sizeof(torsion_result_t));
+        cudaMemcpy(q_dev, q.data(), N * sizeof(torsion_query_t), cudaMemcpyHostToDevice);
+        launch_device_torsion_lookup(dev_view, q_dev, r_dev, N);
+        cudaDeviceSynchronize();
+        cudaMemcpy(r.data(), r_dev, N * sizeof(torsion_result_t), cudaMemcpyDeviceToHost);
+        cudaFree(q_dev); cudaFree(r_dev);
+        for (int k = 0; k < N; ++k) {
+            auto const hr = lookup_torsion(host_view, q[k].tt1, q[k].tt2,
+                                            q[k].i, q[k].j, q[k].k, q[k].l);
+            ++n_device_checks;
+            bool const h_hit = hr.second != nullptr;
+            if (h_hit != (r[k].hit != 0)) { ++n_device_fails; continue; }
+            if (!h_hit) continue;
+            if (!bit_eq(hr.second->v1, r[k].v1) || !bit_eq(hr.second->v2, r[k].v2) ||
+                !bit_eq(hr.second->v3, r[k].v3)) {
+                ++n_device_fails;
+            }
+        }
+    }
+
+    std::printf("  device lookups: %d checks, %d mismatches\n", n_device_checks, n_device_fails);
+    device_tables_destroy(handle);
+}
+
+struct bucket_t { int checks = 0; int fails = 0; };
+
+void test_device_vdw_only(mmff94_tables_host_t const &host, bucket_t &b) {
+    using namespace smallfield;
+    mmff94_tables_view_t dev_view {};
+    void *handle = device_tables_create(host, dev_view);
+    if (!handle) return;
+    auto const host_view = host.view();
+    constexpr int N = 120;
+    std::vector<vdw_query_t> q(N);
+    std::vector<vdw_result_t> r(N);
+    for (int k = 0; k < N; ++k) q[k].atom_type = (std::uint8_t)(k % (host.max_atom_type + 2));
+    vdw_query_t *q_dev = nullptr; vdw_result_t *r_dev = nullptr;
+    cudaMalloc(&q_dev, N * sizeof(vdw_query_t));
+    cudaMalloc(&r_dev, N * sizeof(vdw_result_t));
+    cudaMemcpy(q_dev, q.data(), N * sizeof(vdw_query_t), cudaMemcpyHostToDevice);
+    launch_device_vdw_lookup(dev_view, q_dev, r_dev, N);
+    cudaDeviceSynchronize();
+    cudaMemcpy(r.data(), r_dev, N * sizeof(vdw_result_t), cudaMemcpyDeviceToHost);
+    cudaFree(q_dev); cudaFree(r_dev);
+    for (int k = 0; k < N; ++k) {
+        auto const *h = lookup_vdw(host_view, q[k].atom_type);
+        ++b.checks;
+        bool const h_hit = h != nullptr;
+        if (h_hit != (r[k].hit != 0)) { ++b.fails;
+            std::printf("    vdw at=%u host_hit=%d dev_hit=%u\n",
+                         q[k].atom_type, h_hit, r[k].hit);
+            continue;
+        }
+    }
+    device_tables_destroy(handle);
+}
+
 } // namespace
 
 int main() {
-    std::printf("=== test_mmff94_tables: MG-0 gate ===\n");
+    std::printf("=== test_mmff94_tables: MG-0 + MG-A gate ===\n");
     std::fflush(stdout);
 
     mmff94_tables_host_t t;
@@ -145,9 +337,15 @@ int main() {
     test_bond(t);
     std::printf("--- test_angle ---\n"); std::fflush(stdout);
     test_angle(t);
+    std::printf("--- device lookups ---\n"); std::fflush(stdout);
+    bucket_t vdw_b;
+    test_device_vdw_only(t, vdw_b);
+    std::printf("  VdW-only device: %d checks, %d fails\n", vdw_b.checks, vdw_b.fails);
+    test_device_lookups(t);
 
-    std::printf("checks=%d failures=%d\n", n_checks, n_fails);
-    if (n_fails > 0) return 1;
+    std::printf("checks=%d failures=%d device-checks=%d device-failures=%d\n",
+                 n_checks, n_fails, n_device_checks, n_device_fails);
+    if (n_fails > 0 || n_device_fails > 0) return 1;
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

@@ -41,17 +41,11 @@ target_include_directories(test_descriptor PRIVATE
 set_target_properties(test_descriptor PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME test_descriptor COMMAND test_descriptor)
 
-# test_mmff94_tables (MG-0 gate): cross-validate our extracted MMFF94
-# parameter tables against RDKit's live operator() lookups.  Must be
-# bitwise-equal on VdW/Bond/Angle for thousands of random keys.
-add_executable(test_mmff94_tables test_mmff94_tables.cpp)
-target_link_libraries(test_mmff94_tables PRIVATE test_helpers smallfield_lib)
-target_include_directories(test_mmff94_tables PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_mmff94_tables PROPERTIES LINKER_LANGUAGE CUDA)
-add_test(NAME test_mmff94_tables COMMAND test_mmff94_tables)
+# test_mmff94_tables (MG-0 + MG-A gate): cross-validate our extracted
+# MMFF94 parameter tables against RDKit's live operator() lookups on
+# host, and against device-side lookups via CUDA kernels.  Must be
+# bitwise-equal on both sides for thousands of random keys.
+add_mixed_test(test_mmff94_tables)
 
 # test_mmff_cpu_port (MG-1 gate): cross-validate our native MMFF CPU port
 # against the existing RDKit-backed path on a drug-like probe set.
