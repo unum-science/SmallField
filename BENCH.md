@@ -227,6 +227,53 @@ Two compounding factors (was three; dispatcher is no longer sequential):
    At 8 GPUs the unhidden tail is ~3 s.
    Workstream EE (smallest-chunk-last) addresses this by sorting molecules globally so the last chunk has the cheapest GPU work.
 
+## Pipeline scaling — 100 K ChEMBL × 3 conformers (2026-04-14)
+
+End-to-end `context_t::generate_conformers` wall time (SMILES parse → descriptor build → CPU MMFF extract → H2D upload → metric prepass → ETKDG kernel → D2H download) at fixed __100 K ChEMBL molecules, 3 conformers each__.
+Measured via `bench_chembl --multi-gpu-only` with the persistent per-device `cudaEvent_t` breakdown (`U` = upload, `M` = metric prepass, `K` = ETKDG kernel, `D` = download).
+
+### GPU count scaling (192 CPU threads)
+
+| GPUs | Wall    | mol/s  | Speedup | K (chunk 0 ms) | K (chunk 1 ms) |
+| ---: | ------: | -----: | ------: | -------------: | -------------: |
+| 1    | 58.5 s  | 1,710  |   1.00× |       43,420   |        10,223  |
+| 2    | 34.2 s  | 2,921  |   1.71× |              — |              — |
+| 4    | 21.2 s  | 4,710  |   2.76× |              — |              — |
+| 8    | 17.6 s  | 5,691  |   3.33× |          8,248 |          2,960 |
+
+__1→8 GPU scaling is 3.33×__, not 8×.
+Sub-linear because the CPU prep path cannot feed 8 GPUs of kernel work in parallel — the last chunk's CPU prep ends before its GPU kernel; the gap widens as more GPUs shorten the per-chunk GPU wall.
+
+### CPU-thread scaling (8 GPUs)
+
+| Threads | Wall    | mol/s | Speedup | K (chunk 0) | K (chunk 1) |
+| ------: | ------: | ----: | ------: | ----------: | ----------: |
+| 1       | 48.1 s  | 2,080 |   1.00× |     8,674   |     2,975   |
+| 8       | 22.2 s  | 4,510 |   2.17× |     8,572   |     2,907   |
+| 48      | 17.9 s  | 5,592 |   2.69× |     8,358   |     2,872   |
+| 96      | 17.8 s  | 5,615 |   2.70× |     8,237   |     2,892   |
+| 192     | 17.6 s  | 5,691 |   2.74× |     8,248   |     2,960   |
+
+__K (ETKDG kernel) wall is invariant across thread count__ — that's 100 % GPU work.
+CPU threads only hide the prep wall behind the kernel wall; past ~48 threads the prep is already fully hidden for 8 GPUs on this workload, and the remaining ceiling is the kernel itself.
+
+### Per-phase share of chunk wall at 8 GPUs / 192 threads
+
+| Phase                          | ms (chunk 0) | ms (chunk 1) | Share |
+| ------------------------------ | -----------: | -----------: | ----: |
+| U — H2D upload                 |          106 |           50 |  ~1 % |
+| M — metric prepass (GPU)       |           24 |            7 | ~0.2% |
+| __K — ETKDG warp kernel (GPU)__|    __8,248__ |    __2,960__ | __~98 %__ |
+| D — D2H download               |            1 |            1 | ~0 %  |
+
+__Current bottleneck: the main ETKDG warp kernel__ (FIRE refinement × MMFF energy/gradient × 3 conformers × ~500 iterations per atom).
+CPU MMFF extract is < 1 % of total wall; moving it to GPU (the MG workstream) improves 1→8 GPU scaling a little but won't move the headline mol/s until the ETKDG kernel shrinks.
+
+### USearchMolecules (3 conformers, 8 GPUs, 192 threads)
+
+- PubChem 500 K subset: 86.7 s → 5,770 mol/s (16,782 conf/s)
+- Extrapolation to 10 M: ~29 min (1,700 s) → __30 M conformers in half an hour__ on one 8-GPU box.  ~15 days per billion at current throughput; MG wiring + ETKDG kernel optimisations are the two levers for pushing this below 10 days.
+
 ## MG GPU MMFF kernel trio — scaling (2026-04-14)
 
 The MG-2/3/4 workstream ports every MMFF step (atom typing, charge perception, term extraction, CSR build) to GPU.
