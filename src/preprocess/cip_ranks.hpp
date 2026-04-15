@@ -56,23 +56,21 @@ inline void compute_cip_ranks(molecule_descriptor_t const &desc, std::uint32_t *
     std::uint32_t const N = desc.num_atoms;
     if (N == 0) return;
 
-    // ---- Step 1: initial invariant per atom ---------------------------------
-    // Layout chosen so atomic number occupies the most-significant byte (CIP
-    // rule 1 primary).  Isotope, formal_charge (offset by 128 so it stays
-    // unsigned), H-count, aromaticity provide finer secondary keys.
-    // RDKit's buildCIPInvariants uses just (atomic_number, isotope, map_number).
-    // map_number is 0 for normal molecules; we skip it.  Adding finer fields
-    // (formal_charge, H-count, aromaticity) creates initial partitions that
-    // don't match RDKit's, so even at convergence the ranks differ.
+    // Build the initial invariant per atom. The layout puts atomic number in the most-significant byte
+    // so CIP rule 1 dominates; isotope, formal_charge biased by +128 to stay unsigned, H-count, and
+    // aromaticity provide finer secondary keys. RDKit's buildCIPInvariants uses just `(atomic_number,
+    // isotope, map_number)` and leaves map_number at 0 for normal molecules, so we skip it. Adding finer
+    // fields such as formal_charge, H-count, and aromaticity would create initial partitions that don't
+    // match RDKit's, and at convergence the ranks would differ.
     std::array<std::uint64_t, max_atoms_k> initial_key {};
     for (std::uint32_t a = 0; a < N; ++a) {
-        std::uint64_t const el = desc.element[a];
+        std::uint64_t const element = desc.element[a];
         std::uint64_t const iso = desc.isotope[a];
-        initial_key[a] = (el << 32) | (iso << 16);
+        initial_key[a] = (element << 32) | (iso << 16);
     }
 
-    // ---- Step 2: initial partition by sort order of initial_key ---------------
-    // Build {key, atom} pairs, sort, then assign class IDs by run-length.
+    // Build the initial partition from the sort order of initial_key: pair each atom with its key,
+    // sort, then assign class IDs by run-length.
     std::array<std::pair<std::uint64_t, std::uint32_t>, max_atoms_k> sort_buf {};
     for (std::uint32_t a = 0; a < N; ++a) sort_buf[a] = {initial_key[a], a};
     std::sort(sort_buf.begin(), sort_buf.begin() + N,
@@ -94,18 +92,16 @@ inline void compute_cip_ranks(molecule_descriptor_t const &desc, std::uint32_t *
         }
     }
 
-    // ---- Step 3-5: iterative refinement ---------------------------------------
-    // Each atom's refined key is (old_class_id, sorted_neighbour_class_list).
-    // We compare keys lexicographically — this is what CIP rule 2 requires and
-    // what a hash collapse cannot reproduce.  The encoding below packs old
-    // class + 4 neighbour classes (weighted by bond order) into a 128-bit
-    // key represented as two 64-bit words for fast std::sort.
+    // Run the iterative refinement. Each atom's refined key is `(old_class_id,
+    // sorted_neighbour_class_list)`. We compare keys lexicographically — this is what CIP rule 2 requires
+    // and what a hash collapse cannot reproduce. The encoding below packs old class plus four neighbour
+    // classes, weighted by bond order, into a 128-bit key represented as two 64-bit words for fast std::sort.
 
     std::array<std::array<std::uint32_t, 8>, max_atoms_k> neighbour_buf {}; // ≤ 6 effective entries
 
     std::uint32_t prev_n_classes = next_class;
     for (std::uint32_t iter = 0; iter < kMaxIters; ++iter) {
-        // Build refined keys.  std::pair<uint64_t,uint64_t> sortable via std::less.
+        // Build refined keys. std::pair<uint64_t,uint64_t> sortable via std::less.
         std::array<std::pair<std::uint64_t, std::uint64_t>, max_atoms_k> refined_key {};
         for (std::uint32_t a = 0; a < N; ++a) {
             // Collect neighbour class IDs weighted by bond order: double-bonded
@@ -120,11 +116,11 @@ inline void compute_cip_ranks(molecule_descriptor_t const &desc, std::uint32_t *
                 std::uint16_t const bid = desc.neighbor_bond[n];
                 std::uint32_t const cls = class_id[nb];
                 // Bond-order weighting: each neighbour appears once per bond
-                // order unit.  Empirically validated against RDKit on 1,698
+                // order unit. Empirically validated against RDKit on 1,698
                 // ChEMBL chiral centres — aromatic bonds also weight as 2
                 // (matching their effective bond order in CIP rule 1c, which
                 // treats them as 1.5 but the integer-multiplier scheme rounds
-                // up).  This single weighting lifts neighbour-ordering
+                // up). This single weighting lifts neighbour-ordering
                 // agreement from 98.94 % to 99.71 %; the remaining 0.29 %
                 // residual is exotic flavonoid/steroid cases where two
                 // sub-trees diverge only via a phantom-atom rule that
@@ -143,7 +139,7 @@ inline void compute_cip_ranks(molecule_descriptor_t const &desc, std::uint32_t *
             std::sort(neighbour_buf[a].begin(), neighbour_buf[a].begin() + cnt,
                       [](std::uint32_t x, std::uint32_t y) { return x > y; });
             // Pack (old_class, n0, n1, n2, n3, n4, n5, ...) into two 64-bit
-            // words.  Each class ID is given 8 bits — sufficient since we
+            // words. Each class ID is given 8 bits — sufficient since we
             // start with N ≤ 128 distinct initial classes and refinement can
             // only split, not introduce new partition counts beyond N.
             // Words:
@@ -192,7 +188,7 @@ inline void compute_cip_ranks(molecule_descriptor_t const &desc, std::uint32_t *
 
     // Class IDs are the ranks (higher class = higher priority because we
     // sorted atoms by ascending key, and the highest atomic-number atoms
-    // have the largest keys).  Copy to caller's output.
+    // have the largest keys). Copy to caller's output.
     for (std::uint32_t a = 0; a < N; ++a) ranks[a] = class_id[a];
 }
 

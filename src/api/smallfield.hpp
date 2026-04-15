@@ -79,7 +79,7 @@ struct config_t {
 struct metric_scratch_t {
     void *pool = nullptr; ///< one contiguous device allocation, carved below
     std::size_t pool_bytes = 0;
-    // Non-owning spans into @c pool.  Rebind in @c ensure_metric_scratch on growth.
+    // Non-owning spans into @c pool. Rebind in @c ensure_metric_scratch on growth.
     std::span<std::uint32_t> group_indices {}; ///< [max_group_size]
     std::span<float> gram_matrices {};         ///< [max_group_size × max_atoms²]
     std::span<float> eigenvalues {};           ///< [max_group_size × max_atoms]

@@ -1,8 +1,7 @@
 /**
  *  @file test_mmff_gpu_typer.cpp
- *  @brief MG-C gate: run the GPU MMFF typer kernel against the native
- *  CPU typer on a set of drug-like SMILES.  Gate: byte-identical atom
- *  types + per-atom partial charges.
+ *  @brief Run the GPU MMFF typer kernel against the native CPU typer on a set of drug-like SMILES.
+ *  Gate: byte-identical atom types and per-atom partial charges.
  */
 
 #include <cstdio>
@@ -68,15 +67,15 @@ std::vector<std::string> load_smiles(std::string const &path, std::size_t cap) {
 } // namespace
 
 int main(int argc, char **argv) {
-    std::printf("=== test_mmff_gpu_typer: MG-C gate ===\n");
+    std::printf("=== test_mmff_gpu_typer: GPU vs CPU MMFF typer byte-equality gate ===\n");
 
     mmff94_tables_host_t tables_host;
     extract_mmff94_tables_from_rdkit(tables_host);
     mmff94_tables_view_t host_view = tables_host.view();
 
-    mmff94_tables_view_t dev_view {};
-    void *dev_handle = device_tables_create(tables_host, dev_view);
-    if (!dev_handle) {
+    mmff94_tables_view_t device_view {};
+    void *device_handle = device_tables_create(tables_host, device_view);
+    if (!device_handle) {
         std::printf("FAIL: device table upload failed\n");
         return 1;
     }
@@ -131,7 +130,7 @@ int main(int argc, char **argv) {
     std::vector<float> gpu_charges(total_atoms);
     std::vector<std::uint8_t> gpu_status(descriptors.size());
 
-    run_mmff94_gpu_typer(dev_view,
+    run_mmff94_gpu_typer(device_view,
                           descriptors.data(),
                           (std::uint32_t)descriptors.size(),
                           atom_offsets.data(),
@@ -171,13 +170,13 @@ int main(int argc, char **argv) {
             else {
                 ++atom_bad;
                 if (atom_bad < 10)
-                    std::printf("  mol=%zu atom=%u el=%u cpu=%u gpu=%u\n",
+                    std::printf("  mol=%zu atom=%u element=%u cpu=%u gpu=%u\n",
                                  m, a, desc.element[a], cpu_types[a], gpu_types[off + a]);
                 mol_match = false;
             }
             // Skip charge comparison when the molecule is flagged for CPU
             // fallback — GPU intentionally zeroed its charges there, the
-            // real value will come from the OMP fallback in MG-D.
+            // real value will come from the OpenMP CPU fallback.
             if (!flagged && cpu_types[a] == gpu_types[off + a] && cpu_types[a] != 0) {
                 if (near_float(cpu_pc[a], gpu_charges[off + a])) ++charge_ok;
                 else {
@@ -198,7 +197,7 @@ int main(int argc, char **argv) {
     std::printf("charges: %d match / %d mismatch\n", charge_ok, charge_bad);
     std::printf("molecules: %d match / %d mismatch\n", mol_ok, mol_bad);
 
-    device_tables_destroy(dev_handle);
+    device_tables_destroy(device_handle);
     if (atom_bad > 0 || charge_bad > 0) {
         std::printf("FAIL\n");
         return 1;

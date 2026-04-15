@@ -1,9 +1,7 @@
 # SmallField Benchmark
-
 ETKDG + MMFF94 conformer generation: CPU (RDKit) vs GPU (SmallField).
 
 ## Hardware
-
 | Component | Specification                                                        |
 | --------- | -------------------------------------------------------------------- |
 | GPU       | 8x NVIDIA RTX PRO 6000 Blackwell (188 SMs each, SM 12.0, 96 GB VRAM) |
@@ -11,7 +9,6 @@ ETKDG + MMFF94 conformer generation: CPU (RDKit) vs GPU (SmallField).
 | RAM       | 1.7 TB DDR5                                                          |
 
 ## Dataset
-
 ChEMBL drug-like molecules, pre-filtered to N ≤ 128 atoms (including explicit H).
 
 | Stat               | Value                                       |
@@ -22,13 +19,11 @@ ChEMBL drug-like molecules, pre-filtered to N ≤ 128 atoms (including explicit 
 | P90 / Max          | 84 / 128                                    |
 
 ## Throughput
-
 All numbers below use jemalloc preloaded and all current optimizations enabled.
 No RDKit binary patches.
 Invoke with `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ./bench/bench_chembl --smi … --conformers 1`.
 
 ### Build flags
-
 The CMake default is now `Release` with these flags baked in (set automatically unless the user overrides `CMAKE_BUILD_TYPE` or the per-language flag variables):
 
 - CXX: `-O3 -DNDEBUG -march=native -fopenmp -std=gnu++20`
@@ -50,19 +45,18 @@ The flags still matter for SmallField's own hot paths (descriptor build, native 
 | 100,000 | 1,725 mol/s         | 3,123 mol/s      | 5,884 mol/s       | 1.88×       |
 | 241,596 | 1,763 mol/s         | 4,900 mol/s      | __14,727 mol/s__  | __3.00×__   |
 
-At 241,596 molecules on all 8 GPUs: ~16.4 seconds end-to-end (post-SC scaffold cache + MS-1 `removeHs=false` + MM-1 native Murcko).
+At 241,596 molecules on all 8 GPUs: ~16.4 seconds end-to-end (scaffold cache enabled, `removeHs=false` in the SMILES parser, and the native Murcko peel).
 Quality is unchanged: P50 ≈ 73 kcal/mol vs RDKit 78 kcal/mol at 2K, 96.7 % of conformers successful.
 
 ### CPU-prep acceleration progression (2026-04-13)
-
 Single-threaded `profile_driver` (bypasses 8-GPU pipelining to isolate per-molecule CPU share) and full 240K × 8 GPU bench:
 
 | Phase              | profile_driver mol/s | 240K × 8 GPU mol/s (median) | Top CPU share change                                                                                   |
 | ------------------ | -------------------: | --------------------------: | ------------------------------------------------------------------------------------------------------ |
 | Baseline (post-SC) |               12,644 |                      14,670 | FloydWarshall 15.1 %, MurckoDecompose 18.3 %, sanitize/removeHs 5.7 %, SubstructMatch ~0 % (SC killed) |
 | + MS-1             |               14,366 |                         n/a | `removeHs` path eliminated (5.7 % → 0 %) — +14 % on single-threaded, GPU-bound at 8 GPU scale          |
-| + MM-1             |               14,430 |                      14,727 | FloydWarshall + MurckoDecompose + MolToSmiles all eliminated (33 % → 0 %) — MMFF 23 % now #1           |
-| + MM-N             |               14,641 |                      14,800 | MMFF per-term lookups cached by `(atom_type_tuple, bond_signature)` — share 23 % → 9 %                 |
+| native Murcko      |               14,430 |                      14,727 | FloydWarshall + MurckoDecompose + MolToSmiles all eliminated (33 % → 0 %) — MMFF 23 % now #1           |
+| MMFF param cache   |               14,641 |                      14,800 | MMFF per-term lookups cached by `(atom_type_tuple, bond_signature)` — share 23 % → 9 %                 |
 
 Session-level progress: the 241K × 8-GPU throughput went from 4,008 mol/s (60.3 s baseline) to 14,727 mol/s (16.4 s) — __+267 %__.
 Single-GPU climbed from 1,716 to ~4,830 mol/s (+181 %) as per-launch metric prep CPU work and the MMFF nonbonded upload both shrank.
@@ -72,13 +66,11 @@ Fine-grained scaling deltas (< 3 %) are within measurement noise — reading a s
 Absolute throughput on the latest build at 241K × 8 GPU is the metric that matters.
 
 ## USearchMolecules cross-dataset benchmark (2026-04-14)
-
 Three real-world chemical libraries downloaded from `s3://usearch-molecules`.
 Each test uses 100 K molecules from a single shard so CPU / 1-GPU / 8-GPU numbers are directly comparable.
 System A = RDKit's ETKDG + MMFF94 on 192 CPU threads; System B = SmallField on 1 or 8 GPUs.
 
 ### Same-size comparison (100 K mols)
-
 | Dataset                        | Avg heavy atoms | CPU (RDKit, 192 thr) |        1 GPU |       8 GPUs | 1→8 scaling | 8-GPU speedup vs CPU |
 | ------------------------------ | --------------: | -------------------: | -----------: | -----------: | ----------: | -------------------: |
 | GDB13 (enumerated, ≤ 13 heavy) |              13 |     __10,035 mol/s__ | 13,232 mol/s | 16,563 mol/s |       1.25× |                1.65× |
@@ -96,7 +88,6 @@ Takeaways:
   Reaching the 3 × ceiling requires enough per-molecule GPU work to amortize per-chunk dispatch overhead.
 
 ### At-scale (3–4 M mols) — same datasets at production-sized batches
-
 | Dataset      | Count | 8-GPU mol/s | Success | Scaffold-cache hit |  Wall |
 | ------------ | ----: | ----------: | ------: | -----------------: | ----: |
 | GDB13        |   3 M |      26,032 | 100.0 % |             40.9 % | 108 s |
@@ -107,7 +98,6 @@ At this scale, throughput is 20–60 % higher than the 100 K numbers — per-chu
 __Larger inputs scale better, not worse.__
 
 ### 7 B-molecule extrapolation (full USearchMolecules)
-
 Using at-scale 8-GPU throughput (K = 1 conformer/mol):
 
 | Dataset         | Count | 8-GPU mol/s | K = 1 wall | K = 3 wall (~2.6× factor) |
@@ -123,7 +113,6 @@ Output disk at 7 B × 3 conformers:
 - Output format change is required for billion-scale.
 
 ### Scaffold cache is a ChEMBL-specific optimization
-
 Hit rate correlates with dataset __curation__, not molecular chemistry:
 - ChEMBL 241 K: __96.7 %__ (heavily curated, repetitive scaffolds)
 - GDB13 3 M: __40.9 %__ (enumerated, many novel scaffolds)
@@ -134,9 +123,7 @@ On REAL, the `MurckoDecompose + canonical hash + lookup` overhead likely exceeds
 Alternative: __presort the input by scaffold hash__ so molecules sharing a scaffold are adjacent → hit rate approaches 100 % on any dataset, not just curated ones.
 
 ## Scaling analysis (241,596 molecules)
-
 ### Terminology
-
 - __chunk__ — a slice of the input batch.
   `generate_conformers` splits input into chunks of ≤50,000 molecules so CPU prep of chunk N+1 overlaps GPU work of chunk N.
   At 241K input there are ~5 chunks of ~48K molecules each.
@@ -146,7 +133,6 @@ Alternative: __presort the input by scaffold hash__ so molecules sharing a scaff
   8 launches per chunk when running on 8 GPUs.
 
 ### GPU scaling (SmallField) on 241K
-
 | Config | Wall time | Throughput  | Scaling |
 | ------ | --------- | ----------- | ------- |
 | 1 GPU  | 140.8 s   | 1,716 mol/s | 1.0×    |
@@ -156,18 +142,16 @@ Observed per-launch wall (instrumentation, post-OpenMP dispatcher): `setup=0.3 m
 The 8 launches run concurrently on 8 OpenMP threads, so their wall contribution to the chunk is ≈ max(500 ms) rather than sum.
 
 ### CPU scaling (RDKit) on 241K
-
-| OMP threads           | Throughput  | Notes                                                                                          |
-| --------------------- | ----------- | ---------------------------------------------------------------------------------------------- |
-| 192                   | 1,753 mol/s | Warm allocator post-workstream-N run; earlier cold runs hit ~873 mol/s before jemalloc settled |
-| 192 (8,948 mol batch) | 1,672 mol/s | Peak CPU throughput on small batch                                                             |
+| OMP threads           | Throughput  | Notes                                                                                   |
+| --------------------- | ----------- | --------------------------------------------------------------------------------------- |
+| 192                   | 1,753 mol/s | Warm allocator warm allocator; earlier cold runs hit ~873 mol/s before jemalloc settled |
+| 192 (8,948 mol batch) | 1,672 mol/s | Peak CPU throughput on small batch                                                      |
 
 RDKit's `MMFFMolProperties` per-molecule heap traffic (internal lookup tables + exclusion matrices) scales poorly on large batches because the allocator starts contending.
 Peak CPU throughput is ~1,700 mol/s regardless of core count beyond 96.
 
 ### Where the per-chunk wall time goes at 8 GPUs (measured via `cudaEvent_t`)
-
-Workstream FF added stream-local `cudaEvent_t` markers around each per-launch phase (upload, metric prepass, kernel waves, download).
+We added stream-local `cudaEvent_t` markers around each per-launch phase (upload, metric prepass, kernel waves, download).
 This gives __measured GPU phase timings__ rather than the prior call-site estimates.
 Numbers below are from a single representative 241K × 8-GPU run, captured into per-chunk records and printed by `generate_conformers`.
 
@@ -216,7 +200,6 @@ Total wall ≈ prep_chunk_0 + 4 × 4.0 s prep + chunk_4 GPU wall ≈ 4 + 16 + 3 
 The critical path is __CPU prep__ (slightly longer than GPU wall per chunk), with the unhidden chunk-4 GPU wall as the visible tail.
 
 ### Why 1→8 scaling is 4.86× not 8×
-
 Two compounding factors (was three; dispatcher is no longer sequential):
 
 1. __CPU prep is constant per chunk regardless of GPU count.__  ~4.0 s/chunk × 5 chunks = 20 s of CPU work.
@@ -225,70 +208,64 @@ Two compounding factors (was three; dispatcher is no longer sequential):
 2. __Unhidden last-chunk GPU tail.__
    After the last chunk's CPU prep finishes, the GPU's still working — that wall is fully unhidden.
    At 8 GPUs the unhidden tail is ~3 s.
-   Workstream EE (smallest-chunk-last) addresses this by sorting molecules globally so the last chunk has the cheapest GPU work.
+   Smallest-chunk-last scheduling addresses this by sorting molecules globally so the last chunk has the cheapest GPU work.
 
 ## Pipeline scaling — 100 K ChEMBL × 3 conformers (2026-04-14)
-
 End-to-end `context_t::generate_conformers` wall time (SMILES parse → descriptor build → CPU MMFF extract → H2D upload → metric prepass → ETKDG kernel → D2H download) at fixed __100 K ChEMBL molecules, 3 conformers each__.
 Measured via `bench_chembl --multi-gpu-only` with the persistent per-device `cudaEvent_t` breakdown (`U` = upload, `M` = metric prepass, `K` = ETKDG kernel, `D` = download).
 
 ### GPU count scaling (192 CPU threads)
-
-| GPUs | Wall    | mol/s  | Speedup | K (chunk 0 ms) | K (chunk 1 ms) |
-| ---: | ------: | -----: | ------: | -------------: | -------------: |
-| 1    | 58.5 s  | 1,710  |   1.00× |       43,420   |        10,223  |
-| 2    | 34.2 s  | 2,921  |   1.71× |              — |              — |
-| 4    | 21.2 s  | 4,710  |   2.76× |              — |              — |
-| 8    | 17.6 s  | 5,691  |   3.33× |          8,248 |          2,960 |
+| GPUs |   Wall | mol/s | Speedup | K (chunk 0 ms) | K (chunk 1 ms) |
+| ---: | -----: | ----: | ------: | -------------: | -------------: |
+|    1 | 58.5 s | 1,710 |   1.00× |         43,420 |         10,223 |
+|    2 | 34.2 s | 2,921 |   1.71× |              — |              — |
+|    4 | 21.2 s | 4,710 |   2.76× |              — |              — |
+|    8 | 17.6 s | 5,691 |   3.33× |          8,248 |          2,960 |
 
 __1→8 GPU scaling is 3.33×__, not 8×.
 Sub-linear because the CPU prep path cannot feed 8 GPUs of kernel work in parallel — the last chunk's CPU prep ends before its GPU kernel; the gap widens as more GPUs shorten the per-chunk GPU wall.
 
 ### CPU-thread scaling (8 GPUs)
-
-| Threads | Wall    | mol/s | Speedup | K (chunk 0) | K (chunk 1) |
-| ------: | ------: | ----: | ------: | ----------: | ----------: |
-| 1       | 48.1 s  | 2,080 |   1.00× |     8,674   |     2,975   |
-| 8       | 22.2 s  | 4,510 |   2.17× |     8,572   |     2,907   |
-| 48      | 17.9 s  | 5,592 |   2.69× |     8,358   |     2,872   |
-| 96      | 17.8 s  | 5,615 |   2.70× |     8,237   |     2,892   |
-| 192     | 17.6 s  | 5,691 |   2.74× |     8,248   |     2,960   |
+| Threads |   Wall | mol/s | Speedup | K (chunk 0) | K (chunk 1) |
+| ------: | -----: | ----: | ------: | ----------: | ----------: |
+|       1 | 48.1 s | 2,080 |   1.00× |       8,674 |       2,975 |
+|       8 | 22.2 s | 4,510 |   2.17× |       8,572 |       2,907 |
+|      48 | 17.9 s | 5,592 |   2.69× |       8,358 |       2,872 |
+|      96 | 17.8 s | 5,615 |   2.70× |       8,237 |       2,892 |
+|     192 | 17.6 s | 5,691 |   2.74× |       8,248 |       2,960 |
 
 __K (ETKDG kernel) wall is invariant across thread count__ — that's 100 % GPU work.
 CPU threads only hide the prep wall behind the kernel wall; past ~48 threads the prep is already fully hidden for 8 GPUs on this workload, and the remaining ceiling is the kernel itself.
 
 ### Per-phase share of chunk wall at 8 GPUs / 192 threads
-
-| Phase                          | ms (chunk 0) | ms (chunk 1) | Share |
-| ------------------------------ | -----------: | -----------: | ----: |
-| U — H2D upload                 |          106 |           50 |  ~1 % |
-| M — metric prepass (GPU)       |           24 |            7 | ~0.2% |
-| __K — ETKDG warp kernel (GPU)__|    __8,248__ |    __2,960__ | __~98 %__ |
-| D — D2H download               |            1 |            1 | ~0 %  |
+| Phase                           | ms (chunk 0) | ms (chunk 1) |     Share |
+| ------------------------------- | -----------: | -----------: | --------: |
+| U — H2D upload                  |          106 |           50 |      ~1 % |
+| M — metric prepass (GPU)        |           24 |            7 |     ~0.2% |
+| __K — ETKDG warp kernel (GPU)__ |    __8,248__ |    __2,960__ | __~98 %__ |
+| D — D2H download                |            1 |            1 |      ~0 % |
 
 __Current bottleneck: the main ETKDG warp kernel__ (FIRE refinement × MMFF energy/gradient × 3 conformers × ~500 iterations per atom).
-CPU MMFF extract is < 1 % of total wall; moving it to GPU (the MG workstream) improves 1→8 GPU scaling a little but won't move the headline mol/s until the ETKDG kernel shrinks.
+CPU MMFF extract is < 1 % of total wall; moving it to GPU (the GPU MMFF port) improves 1→8 GPU scaling a little but won't move the headline mol/s until the ETKDG kernel shrinks.
 
 ### USearchMolecules (3 conformers, 8 GPUs, 192 threads)
-
 - PubChem 500 K subset: 86.7 s → 5,770 mol/s (16,782 conf/s)
 - Extrapolation to 10 M: ~29 min (1,700 s) → __30 M conformers in half an hour__ on one 8-GPU box.  ~15 days per billion at current throughput; MG wiring + ETKDG kernel optimisations are the two levers for pushing this below 10 days.
 
 ## MG GPU MMFF kernel trio — scaling (2026-04-14)
-
-The MG-2/3/4 workstream ports every MMFF step (atom typing, charge perception, term extraction, CSR build) to GPU.
+The GPU MMFF port ports every MMFF step (atom typing, charge perception, term extraction, CSR build) to GPU.
 Validated byte-for-byte against the CPU native port (`mmff94_cpu.hpp` + `mmff94_typer.hpp`) on ChEMBL 100 K.
 Scaling benchmark compares the GPU kernel trio against 192-thread OpenMP CPU (also running the native port, not RDKit).
 
 Single RTX PRO 6000 Blackwell, `bench/bench_mmff_gpu`:
 
-| Batch     | CPU wall | GPU total | CPU mol/s | GPU mol/s | Speedup |
-| --------- | -------: | --------: | --------: | --------: | ------: |
-|     1 K   |  15.1 ms |    7.4 ms |      66 K |     135 K |   2.03× |
-|     5 K   |  18.4 ms |   10.8 ms |     272 K |     461 K |   1.69× |
-|    20 K   | 182.8 ms |   23.2 ms |     109 K |     864 K |   7.89× |
-|   100 K   | 429.0 ms |   93.0 ms |     233 K |    1.08 M |   4.61× |
-|   240 K   | 206.2 ms |  212.9 ms |    1.16 M |    1.13 M |   0.97× |
+| Batch | CPU wall | GPU total | CPU mol/s | GPU mol/s | Speedup |
+| ----- | -------: | --------: | --------: | --------: | ------: |
+| 1 K   |  15.1 ms |    7.4 ms |      66 K |     135 K |   2.03× |
+| 5 K   |  18.4 ms |   10.8 ms |     272 K |     461 K |   1.69× |
+| 20 K  | 182.8 ms |   23.2 ms |     109 K |     864 K |   7.89× |
+| 100 K | 429.0 ms |   93.0 ms |     233 K |    1.08 M |   4.61× |
+| 240 K | 206.2 ms |  212.9 ms |    1.16 M |    1.13 M |   0.97× |
 
 GPU throughput stays at ~1 M mol/s across the sweep — per-molecule work is roughly constant (~1 μs/mol).
 CPU throughput is bursty because OpenMP pool warm-up amortises over run length — the 240 K column reflects the pool at steady state.
@@ -303,36 +280,26 @@ Key observations:
 
 GPU memory footprint (fixed-stride per-molecule output slots):
 
-| Batch | Descriptor | Bonds | Angles | Torsions | OOPs | StBns | Interactions | Total |
-|-------|-----------:|------:|-------:|---------:|-----:|------:|-------------:|------:|
-|   1 K |   0.02 GB  | 0.00  |  0.01  |    0.02  | 0.00 |  0.02 |       0.07   | 0.14 GB |
-|  20 K |   0.43 GB  | 0.08  |  0.16  |    0.33  | 0.08 |  0.33 |       1.39   | 2.80 GB |
-| 240 K |   5.15 GB  | 0.96  |  1.92  |    3.96  | 0.96 |  3.96 |      16.69   | 33.6 GB |
+| Batch | Descriptor | Bonds | Angles | Torsions | OOPs | StBns | Interactions |   Total |
+| ----- | ---------: | ----: | -----: | -------: | ---: | ----: | -----------: | ------: |
+| 1 K   |    0.02 GB |  0.00 |   0.01 |     0.02 | 0.00 |  0.02 |         0.07 | 0.14 GB |
+| 20 K  |    0.43 GB |  0.08 |   0.16 |     0.33 | 0.08 |  0.33 |         1.39 | 2.80 GB |
+| 240 K |    5.15 GB |  0.96 |   1.92 |     3.96 | 0.96 |  3.96 |        16.69 | 33.6 GB |
 
 Well within the 96 GB budget per GPU; a proper prefix-sum compaction (planned) would cut these by ~10× for drug-like molecules.
 
 ## Optimizations that landed
-
-### Scaffold-cache wiring into `extract_etk_torsions_native` (workstream SC)
-
+### Scaffold-cache wiring into `extract_etk_torsions_native`
 Previously the scaffold-cache infrastructure (`scaffold_cache_t`, `enable_scaffold_cache`, sharded concurrent map) was landed but __unused__ because the integration with the prep path wasn't done.
 This commit wires it in:
 
 1. Thread `scaffold_cache_t *cache` through `prepare_molecule_batch` → `prepare_molecule_into` → `extract_etk_torsions_native`.
    Default `nullptr` preserves the existing API behaviour.
 2. Inside the extractor, when `cache != nullptr`:
-   - `MurckoDecompose(molecule)` → canonical scaffold SMILES → 64-bit
-     FNV-1a hash.
-   - `SubstructMatch(molecule, scaffold)` once to build the molecule →
-     scaffold atom-index map.
-   - __Cache hit__: for each non-native pattern flagged "fully scaffold-
-     local" (no R-group-spanning matches were observed when populated),
-     translate the cached 4-tuples through the atom map and emit torsions
-     — __skipping the full-molecule `SubstructMatch` entirely__.
-   - __Cache miss__: run `SubstructMatch` on the full molecule (existing
-     code path); classify each match as scaffold-local (all 4 atoms in
-     scaffold) or R-group-spanning; cache the scaffold-local matches in
-     scaffold-atom-index space; record the R-group flag for future hits.
+   - `MurckoDecompose(molecule)` → canonical scaffold SMILES → 64-bit FNV-1a hash.
+   - `SubstructMatch(molecule, scaffold)` once to build the molecule → scaffold atom-index map.
+   - __Cache hit__: for each non-native pattern flagged "fully scaffold- local" (no R-group-spanning matches were observed when populated), translate the cached 4-tuples through the atom map and emit torsions — __skipping the full-molecule `SubstructMatch` entirely__.
+   - __Cache miss__: run `SubstructMatch` on the full molecule (existing code path); classify each match as scaffold-local (all 4 atoms in scaffold) or R-group-spanning; cache the scaffold-local matches in scaffold-atom-index space; record the R-group flag for future hits.
 3. `bench_chembl.cpp` opts in via `ctx.enable_scaffold_cache()`.
 
 Effect at 241K × 8 GPU: __10,204 → 14,713 mol/s__ (+44 %).
@@ -340,8 +307,7 @@ Single-GPU is roughly unchanged (4,800 → 4,900 mol/s) because the GPU is the l
 Multi-GPU success rate 96.7 % (no regression).
 Per-mol overhead of `MurckoDecompose` + `MolToSmiles` + `SubstructMatch(mol, scaffold)` is ~150 µs but is amortised across all molecules sharing the scaffold (98 % reuse on the curated 241K ChEMBL subset per the prior feasibility experiment).
 
-### Native CIP rank ranker (workstream V — investigated, reverted)
-
+### Native CIP rank ranker  — investigated, reverted
 A `compute_cip_ranks` implementation in `src/cip_ranks.hpp` uses iterative sorted-tuple partition refinement (matching RDKit's `iterateCIPRanks` algorithm).
 Cross-validated against RDKit's UINT_VECT output on 1,698 chiral centres in 500 ChEMBL molecules: __98.94 % chiral-centre ordering agreement__.
 This is far better than the prior Morgan-hash attempt (4.24 %), but the residual 1.06 % causes a small P50-energy regression (-5.8 vs -5.4 kcal/mol against RDKit baseline) AND costs ~280 mol/s of throughput at 241K × 8 GPU because the iterative algorithm is slower than RDKit's optimised internal call.
@@ -349,8 +315,7 @@ This is far better than the prior Morgan-hash attempt (4.24 %), but the residual
 Decision: revert the swap-in for now; keep the implementation in `src/cip_ranks.hpp` for future work.
 IMPROVE.md tracks V as "investigated, deferred until ≥ 99.5 % agreement is reached".
 
-### Native formal-charge support in CSD parser (workstream N+++)
-
+### Native formal-charge support in CSD parser
 Extended `parse_atom_term` to accept SMARTS formal-charge specifiers (`+`, `+N`, `-`, `-N`).
 Stored into `simple_atom_constraint_t::formal_charge` (int8, `INT8_MIN` = no constraint) and checked against the descriptor's `formal_charge[]` array in `atom_match` and `neighbor_match`.
 `parse_atom_spec` no longer bails on `+` / `-` characters.
@@ -361,13 +326,11 @@ The newly-native patterns include the p249 family (benzoate-NH torsions with `[O
 Wall-time at 241K × 8 GPU held within noise (10,168 → 10,174 mol/s) — the CPU/GPU phase balance dominates at that scale.
 Gain is on single-GPU and small-batch workloads where CPU prep is the critical path.
 
-### Scaffold-cache infrastructure (workstream SC, partial)
-
+### Scaffold-cache infrastructure  — partial
 Landed `scaffold_cache_t` (64-shard concurrent `unordered_map` keyed on scaffold-SMILES 64-bit FNV-1a hash) + `context_t::enable_scaffold_cache` opt-in API + stats observability.
 The integration with `extract_etk_torsions_native` (MurckoDecompose + scaffold→molecule atom map + cache population + hit translation) is pending as an isolated follow-up commit — the feasibility analysis and expected 25–30 % SubstructMatch CPU reduction are documented in `IMPROVE.md §4`.
 
-### Mega-kernel launch_bounds + context-ctor pre-warm (workstreams W, X, DD, Y)
-
+### Mega-kernel launch_bounds + context-ctor pre-warm
 Three small-but-related fixes for cold-start and occupancy latency-hiding:
 
 __W + X — `__launch_bounds__(32, 4)` on `etkdg_pipeline_warp_kernel`.__  ncu showed the mega-kernel ran at 2 % achieved occupancy due to 128 regs/thread capping blocks-per-SM to 1.
@@ -385,8 +348,7 @@ Bigger batches still grow on demand via the existing `ensure_capacity` path.
 
 Net effect on 240K × 8 GPU: wall is unchanged within noise (10,155 → 10,168 mol/s), but startup predictability improves — the first user call no longer hits a multi-hundred-ms cold stall, which matters for latency-sensitive library use.
 
-### Native fast-paths for top SubstructMatch hot-spots (workstream N++)
-
+### Native fast-paths for top SubstructMatch hot-spots
 Multi-dataset profiling (chembl / moses / zinc / gdb13 / synth-scaffold / synth-noise) identified that __two CSD torsion patterns — p94 and p114 — cover 75–85 % of RDKit SubstructMatch fallback CPU on every dataset__.
 Whichever is #1 depends on input: p94 dominates drug-like libraries (Moses, ZINC at 73–76 %), p114 dominates enumerative combinatorial libraries (GDB-13, scaffold-decorated at 78–82 %).
 Together they universally dominate.
@@ -406,13 +368,12 @@ All 13 total predicates cross-validate against `RDKit::SubstructMatch` on 210 Ch
 End-to-end throughput at 241K × 8 GPU held within noise of the pre-N++ baseline (10,130 → 10,155 mol/s median of two runs) — the wall is co-balanced between CPU prep and GPU kernel phases at this scale, so the SubstructMatch reduction is absorbed into remaining CPU slack.
 Largest single-GPU gain observed: 4,520 → 4,852 mol/s (+7 %), matching the agent's prediction that single-GPU runs (where CPU prep dominates) get the biggest benefit.
 
-### Smallest-chunk-last molecule sort (workstream EE)
-
+### Smallest-chunk-last molecule sort
 Before chunking, `generate_conformers` sorts the full input by descending SMILES length (proxy for atom count).
 The LAST chunk thus contains the smallest molecules, minimising the unhidden GPU tail that would otherwise dominate the last few hundred milliseconds of wall time.
 Outputs are permuted back to the caller's original input order in the post-loop write loop, so the public API behaviour is unchanged.
 
-Measured effect on 241K × 8 GPU (per-chunk `cudaEvent` timings from workstream FF):
+Measured effect on 241K × 8 GPU (per-chunk `cudaEvent` timings from cudaEvent phase instrumentation):
 
 | Chunk | GPU max wall (pre-EE) | GPU max wall (post-EE) |
 | ----: | --------------------: | ---------------------: |
@@ -426,8 +387,7 @@ Chunk 4's unhidden GPU tail dropped by __~2.2 s__ (2,969 → 792).
 At this dataset's molecule-size variance, the saving is offset by chunk 0's heavier prep + GPU (since the largest molecules now live there), so total wall is ~neutral — but the behaviour is much more predictable for datasets with extreme size variance (e.g. mixed GDB-13 + drug-like).
 Keeps wall-time budget stable even as input distribution shifts.
 
-### cudaEvent phase instrumentation (workstream FF)
-
+### cudaEvent phase instrumentation
 Added stream-local `cudaEvent_t` markers around each per-launch GPU phase (upload H2D, metric prepass, kernel waves, download D2H).
 Events live in a persistent per-device pool inside `launch_scratch_t` — created with `cudaEventBlockingSync` at context construction and reused for the lifetime of the `context_t`.
 
@@ -449,8 +409,7 @@ ck=0 dev=0  U=113.8  M=34.3  K=4249.6  D=0.4  T=4398.1
 
 This is the foundation for the next-tier GPU optimizations (W, X, Z) documented in `IMPROVE.md`.
 
-### Native CSD SMARTS branch support + element-mask fix (workstream N)
-
+### Native CSD SMARTS branch support + element-mask fix
 `parse_linear_torsion` now accepts inline `]([…])` branches on any of the four chain atoms.
 Each branch becomes a `simple_neighbor_constraint_t` stored on its parent atom; `match_linear_pattern` verifies up to two distinct branch neighbours after the 4-atom chain is matched (both orderings tried so `(~[N,n])(~[N,n])` maps either way).
 Two slot types of content are accepted: bracketed `[spec]` (same disjunct / conjunction grammar as the main atom) and shorthand elements with an optional bond operator (`=O`, `Cl`, `c`).
@@ -463,11 +422,10 @@ Fixed by passing the flag by reference.
 Native pattern coverage: __216 / 472 → 300 / 470__ (46% → 64%).
 Throughput at 241K × 8 GPU: 10,107 → 10,130 mol/s (median of two runs; 10,154 and 10,105 individually).
 Flat within run-to-run noise — the RDKit `SubstructMatch` fallback was already fast after the element prefilter, so converting 84 more patterns to native saves only microseconds of per-molecule CPU time.
-The real CPU-prep cost is `MMFFMolProperties` (atom typing), which this workstream does not touch.
+The real CPU-prep cost is `MMFFMolProperties` (atom typing), which this pass does not touch.
 Net: a correctness improvement with no throughput regression; the pre-existing wildcard matcher was producing spurious torsions that the ETKDG refiner then had to spend iterations cleaning up.
 
-### Fused bounds-smooth + Gram + power-iter embedding kernel (workstream O)
-
+### Fused bounds-smooth + Gram + power-iter embedding kernel
 The three-stage metric prepass (smooth_and_build_gram_kernel → cusolverDnXsyevBatched → project_metric_coordinates_kernel) collapses into ONE kernel: `embed_4d_power_iter_kernel` in `src/metric_embedding_prepass.cuh`.
 
 One block per molecule.
@@ -482,8 +440,7 @@ The cusolverDnParams_t state in `metric_scratch_t` is now unused (kept for backw
 End-to-end 241K × 8 GPU: 24.7 s → 23.9 s (+3 %), 9,792 → 10,107 mol/s — __above the 10K target__.
 All 7 ctests pass; P50 = 72.7 kcal/mol vs RDKit 79.1 at 2K (within baseline noise).
 
-### Direct-to-pool Phase 1 preprocessing (workstream E)
-
+### Direct-to-pool Phase 1 preprocessing
 `prepare_molecule_batch` used to build `std::vector<etkdg_prepared_molecule_t> prepared(n)` — 241K structs each carrying 14 `std::vector<T>` members.
 First-touch per molecule allocated each inner vector's backing storage: roughly 3.4 million allocations per 241K batch, plus ~15 GB of transient per-molecule data that Phase 2 then memcpy'd into the pool and threw away.
 
@@ -504,8 +461,7 @@ The cleaner design is the bigger win.
 
 The `prepare_molecule(smiles) -> etkdg_prepared_molecule_t` entry point remains as a thin wrapper over `prepare_molecule_into` so tests keep working unchanged.
 
-### cusolverDnXsyevBatched in place of cusolverDnSsyevjBatched (workstream K)
-
+### cusolverDnXsyevBatched in place of cusolverDnSsyevjBatched
 The metric prepass used `cusolverDnSsyevjBatched` (a batched Jacobi eigensolver).
 Per-call CPU setup was ~60 ms × 8 bins per launch = 480 ms per launch of CPU work inside cusolver state bookkeeping.
 
@@ -515,8 +471,7 @@ Also needs both a device and host workspace buffer; host workspace lives in `met
 
 End-to-end 241K × 8 GPU: 29.0 s → 25.7 s (+13 %), 8,344 → 9,400 mol/s.
 
-### Parallel dispatcher via OpenMP (workstream J)
-
+### Parallel dispatcher via OpenMP
 `launch_chunk` used to call `launch_gpu_pipeline` 8 times sequentially on one thread.
 Each call takes ~500 ms of CPU-side work (mostly cusolver state update for the metric prepass and group-indices gather), so dispatcher wall at 8 GPUs was 4 s/chunk — more than the kernel itself.
 
@@ -528,8 +483,7 @@ Dispatcher wall per chunk: 4 s → ~0.5 s.
 End-to-end 241K × 8 GPU: 45.2 s → 29.0 s (+56 %).
 1→8 GPU scaling: 3.11× → 4.86×.
 
-### MMFF nonbonded pair enumeration on GPU (workstream D)
-
+### MMFF nonbonded pair enumeration on GPU
 `extract_mmff94_params` used to materialize a `std::vector<mmff94_nonbonded_pair_t>` with every non-excluded (i, j) pair — up to N(N-1)/2 × 16 B = 128 KB per N=128 molecule, ~6.4 GB per 50K-molecule chunk.
 The kernel iterated a per-atom CSR into that pair array.
 
@@ -553,7 +507,6 @@ Validation: `test_mmff_gradient` (the MMFF parity test against RDKit) passes wit
 End-to-end impact (241K × 8 GPU median of 3 runs): 53.9 s → 45.2 s (+19 %).
 
 ### Metric prepass 8-bin padded syevjBatched
-
 `build_metric_initial_coordinates_on_gpu` used to group molecules by exact atom count and call `cusolverDnSsyevjBatched` once per distinct N — drug-like distributions span 30+ values, and per-call cusolver overhead dominated the per-launch wall at ~500 ms per GPU.
 
 Now molecules are binned into the same 8 buckets the wave dispatcher uses (`{16, 32, 48, 64, 80, 96, 112, 128}`).
@@ -565,7 +518,6 @@ Result: per-launch wall dropped from ~700 ms to ~430 ms.
 Dispatcher critical path at 8 GPUs went from 5.6 s/chunk to ~3.4 s/chunk.
 
 ### Native bounds matrix builder (no RDKit `setTopolBounds`)
-
 The old `build_bounds_matrix` called RDKit's `setTopolBounds`, which allocates a fresh `DistGeom::BoundsMatrix` plus two `boost::shared_array<double>` and two `boost::shared_array<int>` per molecule (~140 KB of throwaway heap) and walks RDKit's atom typer.
 At 241K molecules that's ~33 GB of transient allocator traffic per batch.
 
@@ -580,18 +532,15 @@ Writes directly into the caller's `std::vector<float>` — zero other heap activ
 Quality gate holds (P50 energy within ~5 kcal/mol of the RDKit baseline; the subsequent triangle-smoothing + FIRE refinement absorbs the residual).
 
 ### Persistent pinned host output buffers
-
 `host_coords` (1.1 GB at 241K × 3 conformers × 128 atoms), `host_energies`, and `host_status` used to be pageable `std::vector`s allocated per `generate_conformers` call.
 They now live in a shared `output_staging_t` owned by `context_t`: one `pinned_byte_buffer_t` that grows monotonically across calls.
 Eliminates a ~1 GB `malloc` + zero-fill per call.
 
 ### SMILES kept as `std::string_view` end-to-end
-
 `prepare_molecule` used to take `std::string const &`, so `generate_conformers` copied its `std::span<std::string_view const>` input into a fresh `std::vector<std::string>` (~24 MB at 241K) and `prep_slice` copied another range per chunk.
 The API now takes `std::span<std::string_view const>` all the way down; one unavoidable `std::string` materialization happens at the single `RDKit::SmilesToMol` call inside `prepare_molecule` — scoped to microseconds of stack/SSO storage.
 
 ### Unified `batch_pool_t` with pinned host + persistent device mirrors
-
 `etkdg_molecule_batch_t` used to hold 14 separate `std::vector<T>` fields.
 The launch path carved 14 device slices out of one pool, then issued 14 `cudaMemcpyAsync` calls whose sources were pageable `std::vector` storage.
 CUDA silently degrades async H2D from pageable memory to synchronous, so each of the 14 calls blocked the dispatcher for its full transfer time.
@@ -606,14 +555,12 @@ End-to-end: `launch_gpu_pipeline` per-GPU time dropped from ~1.5 s (synchronous 
 We evaluated `cudaMallocManaged` + `cudaMemPrefetchAsync` for a truly unified pointer; on consumer-tier PCIe Blackwell the HMM bookkeeping cost about 2× more than pinned+explicit, so we stayed with explicit copies.
 
 ### `std::span` sweep over scratch + handle state
-
 `metric_scratch_t` and `gpu_pipeline_handle_t` used to expose raw `T*` + length pairs.
 All of them are now `std::span<T>` — length is carried with the pointer and consumers can `.size()` / `.data()` interchangeably.
 `launch_gpu_pipeline` and `run_gpu_pipeline` take non-owning input/output arrays as `std::span` parameters.
 Kernel signatures still take `(T* __restrict__, int N)` pairs — nvcc's `mdspan` support under `__restrict__` is incomplete, so we keep the aliasing guarantee at the kernel boundary and pass `.data()` / `.size()` there.
 
 ### The `-fopenmp` through-nvcc bug (the one-line fix that gave 4×)
-
 Prior benchmarks reported ~587 mol/s on 8 GPUs, which looked terrible.
 Root cause: `smallfield.cu` is compiled by nvcc, and nvcc silently ignores `#pragma omp parallel for` unless you forward `-fopenmp` to the host compiler:
 
@@ -627,7 +574,6 @@ Preprocessing 8,948 molecules took __13.3 seconds__ instead of 625 ms — a 21×
 The CMake one-liner restored the correct parallelism and was worth __16× end-to-end__ on the 241K batch.
 
 ### Parallel Phase 2 pack (struct-of-sizes + parallel memcpy)
-
 Phase 2 of `prepare_molecule_batch` used to be a serial loop of 14 `std::vector::insert` concatenations per molecule.
 At 241K molecules this cost ~15 s on its own and dominated the CPU side.
 
@@ -637,7 +583,6 @@ The prefix scan of the `valid` field doubles as the dense-output compaction inde
 At 241K, Phase 2 drops from ~15 s to ~1 s.
 
 ### CPU/GPU pipelining via async CUDA streams
-
 `generate_conformers` now splits large inputs into ~50K-molecule chunks.
 While GPU runs chunk N, the calling thread preprocesses chunk N+1.
 No `std::thread`, no queue — CUDA streams already provide the asynchrony; the main thread drives the loop.
@@ -659,7 +604,6 @@ To make pipelining actually pipeline, two sub-fixes were needed:
 With both fixes, `launch_gpu_pipeline` returns in ~1.6 s (down from 3.8 s), and the pipelined path shaves ~10 % off 241K end-to-end.
 
 ### Native CSD torsion extraction with SMARTS predicates
-
 The CSD torsion SMARTS library (470 patterns) is matched via a stack-only native matcher.
 46% of patterns (216 of 470) parse into a compact constraint struct and run with zero heap allocations — no VF2, no `std::vector` per match, no RDKit functor objects.
 The remaining 54% fall back to RDKit's `SubstructMatch`.
@@ -673,30 +617,25 @@ At 192 threads that heap churn caps preprocessing at ~13K mol/s no matter how ma
 With the native matcher + jemalloc, peak CPU throughput reaches ~17K mol/s.
 
 ### Flat molecule descriptor
-
 One pass through RDKit's slow accessor API fills a 22 KB stack-allocated SoA struct (atoms, bonds, CSR adjacency, BFS distance matrix, SSSR rings, atom/bond flags).
 All downstream stages (chiral centers, distance constraints, nonbonded exclusion) read this flat data with no RDKit accessors in the hot path.
 Build cost: 0.026 ms/mol.
 
 ### MMFF VdW pointer caching
-
 RDKit's `MMFFMolProperties::getMMFFVdWParams(i, j)` does two singleton-map lookups per call.
 We hoist those lookups to an N-element per-atom `MMFFVdW const *` array, then call Halgren's combining rules directly.
 Eliminates ~N²/2 binary searches per molecule in the O(N²) nonbonded pair construction loop.
 
 ### BFS shortest-path injection
-
 The descriptor's BFS distance matrix is cast to `double[N²]` and injected into RDKit's molecule property cache under the key `DistanceMatrix`.
 `setTopolBounds()` picks it up instead of running Floyd-Warshall O(N³).
 Saves ~7 % of preprocessing time, no correctness change.
 
 ### MMFF pre-sanitization
-
 Set the `_MMFFSanitized` property on the molecule before constructing `MMFFMolProperties` so the constructor skips its redundant Kekulize step.
 1.6× on the MMFF constructor, small absolute win.
 
 ### GPU-side optimizations (pre-existing)
-
 - `rsqrtf` replaces 17 `sqrtf` + `__frcp_rn` pairs.
 - Interleaved triple warp reduction in the FIRE optimizer.
 - FMA in the FIRE velocity-Verlet step.
@@ -710,7 +649,6 @@ Set the `_MMFFSanitized` property on the molecule before constructing `MMFFMolPr
 - 8-GPU round-robin dispatch with atom-count-sorted waves.
 
 ## Where the time still goes
-
 At 241K molecules × 8 GPUs, after everything above.
 Numbers from the pipelined path with 5 chunks of ~48K molecules each.
 
@@ -724,7 +662,6 @@ Numbers from the pipelined path with 5 chunks of ~48K molecules each.
 The remaining bottlenecks, ordered by impact:
 
 ### 1. Per-GPU fixed overhead (800 ms of cusolver CPU setup per chunk per GPU)
-
 `metric_embedding_prepass.cuh` does group-by-atom-count setup that involves cusolver workspace sizing, per-group cudaMalloc×4, and buffer preparation.
 The cusolver API calls themselves are not purely stream-async — some query the device synchronously.
 This currently dominates `launch_gpu_pipeline` wall time.
@@ -737,13 +674,11 @@ Two fixes worth trying:
 Expected: launch time drops from 1.6 s to a few hundred ms, end-to-end 241K drops toward ~30 s.
 
 ### 2. Bounds matrix construction on GPU
-
 `build_bounds_matrix` is ~13 % of CPU preprocessing today.
 With pipelining in place, freeing 13 % of CPU time lets the overlap reach further (or lets us shrink each chunk for better per-GPU balance).
 Port `set12`/`set13`/`set14` and VdW lower bounds to four embarrassingly parallel GPU kernels (one thread per bond, angle, 1-4 path, atom pair).
 
 ### 3. Avoid materializing N²/2 nonbonded pairs on CPU
-
 Per molecule we currently build `std::vector<mmff94_nonbonded_pair_t>` with all non-excluded pairs (up to 128 KB per molecule), then upload it.
 At 50K mols/chunk that's ~6 GB of host-side construction per chunk.
 Alternative: upload only atom types + charges (≈ 2 KB/mol) + the bond_distance matrix (16 KB/mol), and enumerate pairs on the fly in the MMFF nonbonded force pass from `bond_distance[i,j] > 3`.
@@ -751,7 +686,6 @@ Saves ~50× on upload bandwidth and removes the O(N²) CPU pair construction.
 Requires changes to `mmff94_functor.cuh`.
 
 ## NUMA notes
-
 Machine topology: 2 NUMA nodes × 48 physical cores × 2 HT = 192 logical CPUs, 20× remote-vs-local memory distance penalty.
 
 Pure CPU preprocessing (8,948 mols, `bench_threaded`):
@@ -778,7 +712,6 @@ Do not bake NUMA defaults into the library.
 Users running CPU-only preprocessing can opt in with `OMP_PROC_BIND=close OMP_PLACES=cores`; everyone else should leave the default.
 
 ## Quality
-
 Cross-validation: random conformer sample evaluated by RDKit's `MMFF::calcEnergy()`.
 
 | Metric                   | Value                                   |
@@ -791,7 +724,6 @@ RDKit and SmallField energies agree within ~2 kcal/mol at median.
 Half-precision coordinate output introduces ~0.1% quantization error.
 
 ### Per-atom-count breakdown (8,948-molecule subset)
-
 | Atoms   | Count | RDKit P50 | SmallField P50 |
 | ------- | ----- | --------- | -------------- |
 | 0-20    | 189   | 1.2       | 1.2            |

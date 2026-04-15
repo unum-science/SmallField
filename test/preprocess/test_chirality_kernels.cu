@@ -26,26 +26,26 @@ bool gpu_validate_chirality(float const *host_coords, chiral_center_descriptor_t
                             std::uint32_t num_atoms, std::uint32_t num_chirals) {
 
     std::uint32_t const coord_elements = 3 * num_atoms; // 3D only for chirality
-    float *dev_coords;
-    chiral_center_descriptor_t *dev_chirals;
-    bool *dev_result;
+    float *device_coords;
+    chiral_center_descriptor_t *device_chirals;
+    bool *device_result;
 
-    cudaMalloc(&dev_coords, coord_elements * sizeof(float));
-    cudaMalloc(&dev_chirals, num_chirals * sizeof(chiral_center_descriptor_t));
-    cudaMalloc(&dev_result, sizeof(bool));
+    cudaMalloc(&device_coords, coord_elements * sizeof(float));
+    cudaMalloc(&device_chirals, num_chirals * sizeof(chiral_center_descriptor_t));
+    cudaMalloc(&device_result, sizeof(bool));
 
-    cudaMemcpy(dev_coords, host_coords, coord_elements * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_chirals, host_chirals, num_chirals * sizeof(chiral_center_descriptor_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_coords, host_coords, coord_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_chirals, host_chirals, num_chirals * sizeof(chiral_center_descriptor_t), cudaMemcpyHostToDevice);
 
-    chirality_check_kernel<<<1, 32>>>(dev_coords, num_atoms, dev_chirals, num_chirals, dev_result);
+    chirality_check_kernel<<<1, 32>>>(device_coords, num_atoms, device_chirals, num_chirals, device_result);
     cudaDeviceSynchronize();
 
     bool result = false;
-    cudaMemcpy(&result, dev_result, sizeof(bool), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&result, device_result, sizeof(bool), cudaMemcpyDeviceToHost);
 
-    cudaFree(dev_coords);
-    cudaFree(dev_chirals);
-    cudaFree(dev_result);
+    cudaFree(device_coords);
+    cudaFree(device_chirals);
+    cudaFree(device_result);
 
     return result;
 }

@@ -149,7 +149,7 @@ __global__ void smooth_and_build_gram_kernel(float *__restrict__ bounds_matrices
 
     float const grand_mean = grand_mean_ptr[0];
     // Fill the whole bin-sized Gram block: real values inside [0, num_atoms)², zeros
-    // outside.  The zero-pad rows/cols contribute zero eigenvalues that sort below the
+    // outside. The zero-pad rows/cols contribute zero eigenvalues that sort below the
     // real ones, so the top-4 eigenvectors reconstruct the same 4D embedding.
     for (std::uint32_t idx = lane; idx < gram_total; idx += blockDim.x) {
         std::uint32_t const i = idx / bin_n;
@@ -213,11 +213,11 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     float *molecule_coordinates = initial_coordinates + molecule_index * max_atoms_per_molecule * 4;
     std::uint32_t const total_entries = num_atoms * num_atoms;
 
-    // --- Phase 1: load bounds into shared (shared_gram used as bounds scratch) ---
+    // Load bounds into shared memory; shared_gram doubles as the bounds scratch.
     for (std::uint32_t idx = lane; idx < total_entries; idx += block_size) shared_gram[idx] = global_bounds[idx];
     __syncthreads();
 
-    // --- Phase 2: Floyd-Warshall triangle smoothing on the N × N block ---
+    // Floyd-Warshall triangle smoothing on the N × N block.
     for (std::uint32_t pivot = 0; pivot < num_atoms; ++pivot) {
         for (std::uint32_t idx = lane; idx < total_entries; idx += block_size) {
             std::uint32_t const i = idx / num_atoms;
@@ -240,10 +240,10 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
         __syncthreads();
     }
 
-    // --- Phase 3: persist smoothed bounds back to global memory ---
+    // Persist smoothed bounds back to global memory.
     for (std::uint32_t idx = lane; idx < total_entries; idx += block_size) global_bounds[idx] = shared_gram[idx];
 
-    // --- Phase 4: row means + grand mean ---
+    // Row means and grand mean for double-centering.
     for (std::uint32_t atom = lane; atom < num_atoms; atom += block_size) {
         float row_sum = 0.0f;
         for (std::uint32_t other = 0; other < num_atoms; ++other)
@@ -259,26 +259,11 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     __syncthreads();
     float const grand_mean = grand_mean_ptr[0];
 
-    // --- Phase 5: build Gram in place (overwrites smoothed bounds) ---
-    // Process off-diagonals in a separate pass so we don't read squared distances AFTER
-    // the buffer has been overwritten by Gram values.  The midpoint_distance_squared_
-    // helper reads upper/lower bound entries; Gram assignment is commutative (symmetric).
-    // We compute a temporary tile per pass since N² may exceed the number of threads.
-    // Strategy: iterate (i, j) pairs; each thread computes its Gram entry from bounds,
-    // stashes into a register, then a __syncthreads() later writes all into shared.
-    // Simpler equivalent: compute G[i][j] for i<=j in a first pass into registers (one
-    // per active thread), then write back after a fence.  For simplicity do this in two
-    // passes reading the same locations — read of shared is safe within one phase.
-    // Build Gram by iterating each entry once and overwriting the bounds slot with the
-    // Gram value.  Because midpoint_distance_squared_ reads both [i,j] upper and [j,i]
-    // lower bounds, we must complete ALL reads before ANY writes.  Double-buffer via w
-    // is too small (only N floats).  Instead: reinterpret the storage — we have shared
-    // memory space for ANOTHER N × N after shared_gram if we place the eigenvector
-    // arrays AFTER a fresh Gram slot.  To avoid that, do the Gram build in a scratch
-    // pattern: each thread computes M Gram entries in registers, then writes after a
-    // full-block barrier.  Upper-bounded at (N² + block_size − 1) / block_size entries
-    // per thread — fits in local memory comfortably even at N=128 (128²/128 = 128 floats
-    // per thread = 512 B).
+    // Build the Gram matrix in place, overwriting the smoothed bounds. Every thread computes
+    // its Gram entries into registers first, then writes them back after a full-block barrier;
+    // midpoint_distance_squared_ reads both upper and lower bound entries, so all reads must complete
+    // before any writes. Each thread holds at most ⌈N²/block_size⌉ entries — at N=128 with 128 threads
+    // that's 128 floats or 512 B per thread, comfortable in local memory.
     constexpr std::uint32_t kMaxPerThread = 128; // supports up to N=128 at 128 threads
     float reg_buf[kMaxPerThread];
     std::uint32_t n_per_thread = 0;
@@ -293,7 +278,7 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     for (std::uint32_t idx = lane; idx < total_entries; idx += block_size) shared_gram[idx] = reg_buf[n_per_thread++];
     __syncthreads();
 
-    // --- Phase 6: deflated power iteration for top-4 eigenvectors ---
+    // Deflated power iteration for the top-4 eigenvectors.
     // For each k in 0..3, iterate v_k ← (G - Σ_{j<k} λ_j v_j v_j^T) v_k / ‖·‖.
     // With positive-semidefinite Gram matrices the top eigenvalues are all
     // non-negative and power iteration converges.
@@ -367,7 +352,7 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
         __syncthreads();
     }
 
-    // --- Phase 7: write 4D coordinates ---
+    // Write the 4D metric coordinates.
     for (std::uint32_t atom = lane; atom < num_atoms; atom += block_size) {
         for (std::uint32_t dim = 0; dim < 4; ++dim) {
             float const lam = fmaxf(lambda_ptr[dim], 0.0f);
@@ -432,16 +417,16 @@ __global__ void project_metric_coordinates_kernel(float const *__restrict__ eige
  *  With pre-allocation this function is truly non-blocking.
  */
 template <typename ScratchT>
-inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_molecule_metadata_t const *dev_metadata,
+inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds, etkdg_molecule_metadata_t const *device_metadata,
                                                     std::span<etkdg_molecule_metadata_t const> host_metadata,
                                                     std::uint32_t max_atoms_per_molecule,
-                                                    float *dev_initial_coordinates, cusolverDnHandle_t solver_handle,
+                                                    float *device_initial_coordinates, cusolverDnHandle_t solver_handle,
                                                     ScratchT &scratch, cudaStream_t stream = nullptr) {
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(host_metadata.size());
     if (num_molecules == 0 || max_atoms_per_molecule == 0) return true;
 
     if (!check_cuda_status_(
-            cudaMemsetAsync(dev_initial_coordinates, 0,
+            cudaMemsetAsync(device_initial_coordinates, 0,
                             static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float),
                             stream),
             "cudaMemsetAsync(metric coordinates)"))
@@ -450,7 +435,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
     // Bin molecules into 8 fixed wave-dispatch buckets {16,32,48,64,80,96,112,128}.
     // Everything in a bin padds up to the bin's N for the eigendecomposition, so
     // cusolver is called ONCE per bin instead of once per exact atom count (~30 calls
-    // today).  Per-call CPU overhead inside cusolver dominated the per-launch wall.
+    // today). Per-call CPU overhead inside cusolver dominated the per-launch wall.
     constexpr std::uint32_t bin_ns[] = {16, 32, 48, 64, 80, 96, 112, 128};
     constexpr std::uint32_t num_bins = sizeof(bin_ns) / sizeof(bin_ns[0]);
 
@@ -492,7 +477,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
             return false;
         }
 
-        std::uint32_t *const dev_group_indices = scratch.group_indices.data();
+        std::uint32_t *const device_group_indices = scratch.group_indices.data();
 
         // Shared memory for embed_4d_power_iter_kernel:
         //   gram[N²] + row_means[N] + grand_mean[1] + v[4][N] + w[N] + lambda[4] + dot[1]
@@ -500,7 +485,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
             static_cast<std::size_t>(bin_n * bin_n + bin_n + 1 + 4 * bin_n + bin_n + 4 + 1) * sizeof(float);
 
         success &= check_cuda_status_(
-            cudaMemcpyAsync(dev_group_indices, group.data(), group_size * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+            cudaMemcpyAsync(device_group_indices, group.data(), group_size * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
                             stream),
             "cudaMemcpyAsync(bin group indices)");
         success &= check_cuda_status_(
@@ -510,9 +495,9 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
         if (!success) continue;
 
         // One kernel launch replaces the smooth-and-build-gram + cusolverDnXsyevBatched +
-        // project chain.  No cusolver state updates, no global Gram/eigenvalue buffers.
+        // project chain. No cusolver state updates, no global Gram/eigenvalue buffers.
         embed_4d_power_iter_kernel<<<static_cast<unsigned int>(group_size), block_size, shared_bytes, stream>>>(
-            dev_bounds, dev_metadata, dev_group_indices, dev_initial_coordinates, max_atoms_per_molecule);
+            device_bounds, device_metadata, device_group_indices, device_initial_coordinates, max_atoms_per_molecule);
         success &= check_cuda_status_(cudaGetLastError(), "embed_4d_power_iter_kernel launch");
     }
 
@@ -522,7 +507,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *dev_bounds, etkdg_mol
 
     // Solver handle is owned by the caller (context_t) — do NOT destroy it here.
     // No final stream sync: the prepass is stream-ordered with whatever work the
-    // caller launches next on the same stream.  Caller's `finalize_gpu_pipeline`
+    // caller launches next on the same stream. Caller's `finalize_gpu_pipeline`
     // syncs the stream once per chunk, which is enough.
     return success;
 }

@@ -177,13 +177,13 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
 
     // All GPUs (empty device span).
     context_t ctx;
-    // Workstream SC-2 — opt in to scaffold-based SubstructMatch caching.
+    // Opt in to scaffold-based SubstructMatch caching.
     // Amortises RDKit fallback cost across molecules sharing the same Murcko
     // scaffold; safe no-op if disabled or for acyclic molecules.
     ctx.enable_scaffold_cache();
 
     // Allow 1-GPU runs via --multi-gpu-only (used by scaling sweeps that
-    // control GPU count via CUDA_VISIBLE_DEVICES).  The "multi" in the
+    // control GPU count via CUDA_VISIBLE_DEVICES). The "multi" in the
     // flag name is historical; the path still runs correctly on 1 GPU.
     if (ctx.device_ids.empty()) {
         std::printf("  Skipped (no GPU available)\n");

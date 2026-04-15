@@ -49,19 +49,19 @@ static inline std::size_t align_up(std::size_t value, std::size_t alignment) {
 struct launch_scratch_t {
     device_byte_buffer_t device_pool;
     pinned_byte_buffer_t host_staging;
-    // Persistent CUDA events for per-phase timing.  Created once per device on
-    // first launch and reused across every chunk.  Allocating events inside the
+    // Persistent CUDA events for per-phase timing. Created once per device on
+    // first launch and reused across every chunk. Allocating events inside the
     // hot loop and destroying them after each finalize triggered an intermittent
     // multi-GPU regression (chunks 3-4 silently dropped at 240K) — likely a
     // race between cudaEventDestroy on one stream and cudaEventCreate from the
-    // next launch's omp parallel-for thread.  Persistent reuse sidesteps the
-    // problem entirely.  cudaEventBlockingSync avoids spin-waiting inside
+    // next launch's omp parallel-for thread. Persistent reuse sidesteps the
+    // problem entirely. cudaEventBlockingSync avoids spin-waiting inside
     // cudaStreamSynchronize, which matters when many streams share host CPUs.
-    cudaEvent_t evt_upload_start = nullptr;
-    cudaEvent_t evt_metric_start = nullptr;
-    cudaEvent_t evt_kernels_start = nullptr;
-    cudaEvent_t evt_download_start = nullptr;
-    cudaEvent_t evt_end = nullptr;
+    cudaEvent_t event_upload_start = nullptr;
+    cudaEvent_t event_metric_start = nullptr;
+    cudaEvent_t event_kernels_start = nullptr;
+    cudaEvent_t event_download_start = nullptr;
+    cudaEvent_t event_end = nullptr;
 };
 
 /**
@@ -90,7 +90,7 @@ struct output_staging_t {
     }
 };
 
-// Forward declaration — definition lives below.  context_t's ctor pre-warms
+// Forward declaration — definition lives below. context_t's ctor pre-warms
 // the per-device metric scratch at construction time so the first user call
 // doesn't pay the cusolver workspace probe + cudaMalloc cost.
 void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t max_group_size,
@@ -115,25 +115,25 @@ context_t::context_t(std::span<int const> devices) {
         cudaStreamCreate(&streams[i]);
         cusolverDnCreate(&solvers[i]);
         cusolverDnSetStream(solvers[i], streams[i]);
-        // Reuse one cusolverDnParams_t per device across all calls.  The
+        // Reuse one cusolverDnParams_t per device across all calls. The
         // generic 64-bit batched eigen API (cusolverDnXsyevBatched) takes this
         // instead of the legacy syevjInfo_t — lower per-call CPU overhead.
         cusolverDnCreateParams(&metric_scratch[i].xsyev_params);
         launch_scratch[i] = new launch_scratch_t;
         // Persistent timing events live with the per-device launch scratch.
         // BlockingSync = host doesn't busy-wait inside cudaStreamSynchronize.
-        cudaEventCreateWithFlags(&launch_scratch[i]->evt_upload_start, cudaEventBlockingSync);
-        cudaEventCreateWithFlags(&launch_scratch[i]->evt_metric_start, cudaEventBlockingSync);
-        cudaEventCreateWithFlags(&launch_scratch[i]->evt_kernels_start, cudaEventBlockingSync);
-        cudaEventCreateWithFlags(&launch_scratch[i]->evt_download_start, cudaEventBlockingSync);
-        cudaEventCreateWithFlags(&launch_scratch[i]->evt_end, cudaEventBlockingSync);
+        cudaEventCreateWithFlags(&launch_scratch[i]->event_upload_start, cudaEventBlockingSync);
+        cudaEventCreateWithFlags(&launch_scratch[i]->event_metric_start, cudaEventBlockingSync);
+        cudaEventCreateWithFlags(&launch_scratch[i]->event_kernels_start, cudaEventBlockingSync);
+        cudaEventCreateWithFlags(&launch_scratch[i]->event_download_start, cudaEventBlockingSync);
+        cudaEventCreateWithFlags(&launch_scratch[i]->event_end, cudaEventBlockingSync);
     }
-    // Workstreams DD + Y — pre-warm the dispatcher so the first user call
-    // doesn't pay cold-start costs.  Cold chunk 0 has "mallocpool" ~100-130 ms
+    // Pre-warm the dispatcher so the first user call does not pay cold-start costs.
+    // Cold chunk 0 has "mallocpool" ~100-130 ms
     // per device for the first cudaMalloc + cudaHostAlloc (910 ms total across
     // 8 GPUs per prior nsys capture), plus a ~60 ms cusolver workspace probe
-    // inside ensure_metric_scratch.  Pre-sizing both at construction moves
-    // those costs off the user's hot path.  The sizes are conservative
+    // inside ensure_metric_scratch. Pre-sizing both at construction moves
+    // those costs off the user's hot path. The sizes are conservative
     // first-call defaults: a 5 K-molecule chunk with max_atoms=128 covers any
     // small-batch workload; bigger batches grow the pool on demand via
     // ensure_capacity (which is already the existing growth path).
@@ -143,7 +143,7 @@ context_t::context_t(std::span<int const> devices) {
     constexpr std::size_t kPrewarmHostStagingBytes = 256ULL << 20; // 256 MB
     for (std::size_t i = 0; i < device_ids.size(); ++i) {
         cudaSetDevice(device_ids[i]);
-        // Probes cusolver + allocates metric_scratch.pool.  Sets max_group_size,
+        // Probes cusolver + allocates metric_scratch.pool. Sets max_group_size,
         // max_atoms, max_device_workspace_bytes so subsequent calls with ≤ these
         // dimensions skip the slow probe.
         ensure_metric_scratch(*this, i, kPrewarmGroup, kPrewarmAtoms);
@@ -153,10 +153,10 @@ context_t::context_t(std::span<int const> devices) {
         launch_scratch[i]->host_staging.ensure_capacity(kPrewarmHostStagingBytes);
     }
     // Pre-warm the shared pinned output buffer to a size that covers a
-    // 241 K × K=1 workload (≈ 370 MB).  Larger K values or larger batches
+    // 241 K × K=1 workload (≈ 370 MB). Larger K values or larger batches
     // grow on demand via `output_staging->pool.ensure_capacity` inside
     // `ensure_output_staging`, which remains grow-only so subsequent calls
-    // reuse the allocation.  Without this pre-warm, the first
+    // reuse the allocation. Without this pre-warm, the first
     // `generate_conformers` call pays a ≈ 370 MB `cudaHostAlloc` serialized
     // on the driver lock — nsys showed it hit 2.44 s of wall time.
     cudaSetDevice(device_ids[0]);
@@ -170,11 +170,11 @@ context_t::~context_t() {
         if (metric_scratch[i].xsyev_params) cusolverDnDestroyParams(metric_scratch[i].xsyev_params);
         if (metric_scratch[i].pool) cudaFree(metric_scratch[i].pool);
         if (launch_scratch[i] != nullptr) {
-            if (launch_scratch[i]->evt_upload_start) cudaEventDestroy(launch_scratch[i]->evt_upload_start);
-            if (launch_scratch[i]->evt_metric_start) cudaEventDestroy(launch_scratch[i]->evt_metric_start);
-            if (launch_scratch[i]->evt_kernels_start) cudaEventDestroy(launch_scratch[i]->evt_kernels_start);
-            if (launch_scratch[i]->evt_download_start) cudaEventDestroy(launch_scratch[i]->evt_download_start);
-            if (launch_scratch[i]->evt_end) cudaEventDestroy(launch_scratch[i]->evt_end);
+            if (launch_scratch[i]->event_upload_start) cudaEventDestroy(launch_scratch[i]->event_upload_start);
+            if (launch_scratch[i]->event_metric_start) cudaEventDestroy(launch_scratch[i]->event_metric_start);
+            if (launch_scratch[i]->event_kernels_start) cudaEventDestroy(launch_scratch[i]->event_kernels_start);
+            if (launch_scratch[i]->event_download_start) cudaEventDestroy(launch_scratch[i]->event_download_start);
+            if (launch_scratch[i]->event_end) cudaEventDestroy(launch_scratch[i]->event_end);
         }
         delete launch_scratch[i]; // device_byte_buffer_t + pinned_byte_buffer_t free their holdings
         cusolverDnDestroy(solvers[i]);
@@ -329,11 +329,11 @@ struct gpu_pipeline_handle_t {
     std::span<float> host_energies_out {};
     std::span<std::uint8_t> host_status_out {};
     // Stream-local phase timing events — recorded in launch, consumed in finalize.
-    cudaEvent_t evt_upload_start = nullptr;
-    cudaEvent_t evt_metric_start = nullptr;
-    cudaEvent_t evt_kernels_start = nullptr;
-    cudaEvent_t evt_download_start = nullptr;
-    cudaEvent_t evt_end = nullptr;
+    cudaEvent_t event_upload_start = nullptr;
+    cudaEvent_t event_metric_start = nullptr;
+    cudaEvent_t event_kernels_start = nullptr;
+    cudaEvent_t event_download_start = nullptr;
+    cudaEvent_t event_end = nullptr;
     gpu_phase_ms_t *timings_out = nullptr; ///< caller-owned slot; finalize writes per-phase ms
 };
 
@@ -368,24 +368,24 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
 
     // Region 1: batch-input mirror (target of the single H2D).
     // Region 2: sorted metadata subset (tiny H2D from pinned host_staging).
-    // Region 3: kernel outputs (coords / energies / status).  Downloaded D2H
+    // Region 3: kernel outputs (coords / energies / status). Downloaded D2H
     //           to host_staging at the end of this function.
     // Region 4: GPU-only 4D scratch produced by the metric prepass.
     auto const sizeof_meta = sizeof(etkdg_molecule_metadata_t);
-    std::size_t dev_offset = 0;
-    std::size_t const dev_off_batch = align_up(dev_offset, 256);
-    dev_offset = dev_off_batch + align_up(batch.layout.bytes_total, 256);
-    std::size_t const dev_off_sorted_meta = dev_offset;
-    dev_offset += align_up(local_count * sizeof_meta, 256);
-    std::size_t const dev_off_coords = dev_offset;
-    dev_offset += align_up(total_coords * sizeof(float), 256);
-    std::size_t const dev_off_energies = dev_offset;
-    dev_offset += align_up(total_conf * sizeof(float), 256);
-    std::size_t const dev_off_status = dev_offset;
-    dev_offset += align_up(total_conf * sizeof(std::uint8_t), 256);
-    std::size_t const dev_off_initial = dev_offset;
-    dev_offset += align_up(static_cast<std::size_t>(local_count) * max_atoms_per_molecule * 4 * sizeof(float), 256);
-    std::size_t const dev_pool_bytes = dev_offset;
+    std::size_t device_offset = 0;
+    std::size_t const device_off_batch = align_up(device_offset, 256);
+    device_offset = device_off_batch + align_up(batch.layout.bytes_total, 256);
+    std::size_t const device_off_sorted_meta = device_offset;
+    device_offset += align_up(local_count * sizeof_meta, 256);
+    std::size_t const device_off_coords = device_offset;
+    device_offset += align_up(total_coords * sizeof(float), 256);
+    std::size_t const device_off_energies = device_offset;
+    device_offset += align_up(total_conf * sizeof(float), 256);
+    std::size_t const device_off_status = device_offset;
+    device_offset += align_up(total_conf * sizeof(std::uint8_t), 256);
+    std::size_t const device_off_initial = device_offset;
+    device_offset += align_up(static_cast<std::size_t>(local_count) * max_atoms_per_molecule * 4 * sizeof(float), 256);
+    std::size_t const device_pool_bytes = device_offset;
 
     // Inputs: sorted metadata (written by CPU, async-uploaded).
     // Outputs: kernel results (async-downloaded into here so finalize is free).
@@ -416,8 +416,8 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
     handle.host_energies_out = host_energies_out;
     handle.host_status_out = host_status_out;
 
-    if (!launch_buffers.device_pool.ensure_capacity(dev_pool_bytes)) {
-        std::fprintf(stderr, "launch_gpu_pipeline: cudaMalloc(%zu bytes) failed on gpu %d\n", dev_pool_bytes,
+    if (!launch_buffers.device_pool.ensure_capacity(device_pool_bytes)) {
+        std::fprintf(stderr, "launch_gpu_pipeline: cudaMalloc(%zu bytes) failed on gpu %d\n", device_pool_bytes,
                      device_id);
         return handle;
     }
@@ -428,27 +428,27 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
     }
     auto _P_post_malloc = std::chrono::high_resolution_clock::now();
 
-    // Reuse the persistent per-device events from launch_scratch_t.  These were
+    // Reuse the persistent per-device events from launch_scratch_t. These were
     // allocated once at context construction and live until context destruction;
     // re-recording them here is safe because the prior chunk's
     // cudaStreamSynchronize in finalize_gpu_pipeline drained their previous use.
-    handle.evt_upload_start = launch_buffers.evt_upload_start;
-    handle.evt_metric_start = launch_buffers.evt_metric_start;
-    handle.evt_kernels_start = launch_buffers.evt_kernels_start;
-    handle.evt_download_start = launch_buffers.evt_download_start;
-    handle.evt_end = launch_buffers.evt_end;
+    handle.event_upload_start = launch_buffers.event_upload_start;
+    handle.event_metric_start = launch_buffers.event_metric_start;
+    handle.event_kernels_start = launch_buffers.event_kernels_start;
+    handle.event_download_start = launch_buffers.event_download_start;
+    handle.event_end = launch_buffers.event_end;
 
-    std::byte *const dev_base = launch_buffers.device_pool.data();
+    std::byte *const device_base = launch_buffers.device_pool.data();
     std::byte *const host_base = launch_buffers.host_staging.data();
 
     // Device view over the batch-input mirror — same layout as batch.host_view().
-    batch_pool_dev_view_t dev_view {dev_base + dev_off_batch, &batch.layout};
+    batch_pool_dev_view_t device_view {device_base + device_off_batch, &batch.layout};
 
-    auto *device_metadata_sorted = reinterpret_cast<etkdg_molecule_metadata_t *>(dev_base + dev_off_sorted_meta);
-    handle.device_coords_out = {reinterpret_cast<float *>(dev_base + dev_off_coords), total_coords};
-    handle.device_energies_out = {reinterpret_cast<float *>(dev_base + dev_off_energies), total_conf};
-    handle.device_status_out = {reinterpret_cast<std::uint8_t *>(dev_base + dev_off_status), total_conf};
-    auto *device_initial_coordinates = reinterpret_cast<float *>(dev_base + dev_off_initial);
+    auto *device_metadata_sorted = reinterpret_cast<etkdg_molecule_metadata_t *>(device_base + device_off_sorted_meta);
+    handle.device_coords_out = {reinterpret_cast<float *>(device_base + device_off_coords), total_coords};
+    handle.device_energies_out = {reinterpret_cast<float *>(device_base + device_off_energies), total_conf};
+    handle.device_status_out = {reinterpret_cast<std::uint8_t *>(device_base + device_off_status), total_conf};
+    auto *device_initial_coordinates = reinterpret_cast<float *>(device_base + device_off_initial);
 
     auto *host_sorted_meta = reinterpret_cast<etkdg_molecule_metadata_t *>(host_base + host_off_sorted_meta);
     handle.host_coords_sorted = {reinterpret_cast<float *>(host_base + host_off_coords), total_coords};
@@ -461,22 +461,22 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
 
     // Replaces 14 pageable-source cudaMemcpyAsync calls with ONE pinned-source
     // transfer that actually returns immediately and runs on the stream.
-    cudaEventRecord(handle.evt_upload_start, stream);
+    cudaEventRecord(handle.event_upload_start, stream);
     if (batch.layout.bytes_total > 0)
-        cudaMemcpyAsync(dev_base + dev_off_batch, batch.host.data(), batch.layout.bytes_total, cudaMemcpyHostToDevice,
+        cudaMemcpyAsync(device_base + device_off_batch, batch.host.data(), batch.layout.bytes_total, cudaMemcpyHostToDevice,
                         stream);
     if (local_count > 0)
         cudaMemcpyAsync(device_metadata_sorted, host_sorted_meta, local_count * sizeof_meta, cudaMemcpyHostToDevice,
                         stream);
 
     auto _P_post_upload = std::chrono::high_resolution_clock::now();
-    cudaEventRecord(handle.evt_metric_start, stream);
-    build_metric_initial_coordinates_on_gpu(dev_view.bounds_matrices().data(), device_metadata_sorted,
+    cudaEventRecord(handle.event_metric_start, stream);
+    build_metric_initial_coordinates_on_gpu(device_view.bounds_matrices().data(), device_metadata_sorted,
                                             std::span<etkdg_molecule_metadata_t const> {host_sorted_meta, local_count},
                                             max_atoms_per_molecule, device_initial_coordinates, solver_handle, scratch,
                                             stream);
     auto _P_post_metric = std::chrono::high_resolution_clock::now();
-    cudaEventRecord(handle.evt_kernels_start, stream);
+    cudaEventRecord(handle.event_kernels_start, stream);
 
     // Wave-based kernel dispatch (8 bins: 16,32,48,64,80,96,112,128).
     constexpr std::uint32_t wave_bins[] = {16, 32, 48, 64, 80, 96, 112, 128};
@@ -503,13 +503,13 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         std::uint32_t const grid_size = std::min(wave_size, static_cast<std::uint32_t>(blocks_per_sm * num_sms));
 
         etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes, stream>>>(
-            dev_view.bounds_matrices().data(), device_initial_coordinates + wave_start * max_atoms_per_molecule * 4,
-            dev_view.chiral_centers().data(), dev_view.etk_torsions().data(), dev_view.distance_constraints().data(),
-            dev_view.etk_interactions().data(), dev_view.etk_atom_offsets().data(), dev_view.mmff_atom_vdw().data(),
-            dev_view.mmff_atom_charge().data(), dev_view.bond_distance().data(), dev_view.mmff_bonds().data(),
-            dev_view.mmff_angles().data(), dev_view.mmff_torsions().data(), dev_view.mmff_oops().data(),
-            dev_view.mmff_stretchbends().data(), dev_view.mmff_interactions().data(),
-            dev_view.mmff_atom_offsets().data(), device_metadata_sorted + wave_start,
+            device_view.bounds_matrices().data(), device_initial_coordinates + wave_start * max_atoms_per_molecule * 4,
+            device_view.chiral_centers().data(), device_view.etk_torsions().data(), device_view.distance_constraints().data(),
+            device_view.etk_interactions().data(), device_view.etk_atom_offsets().data(), device_view.mmff_atom_vdw().data(),
+            device_view.mmff_atom_charge().data(), device_view.bond_distance().data(), device_view.mmff_bonds().data(),
+            device_view.mmff_angles().data(), device_view.mmff_torsions().data(), device_view.mmff_oops().data(),
+            device_view.mmff_stretchbends().data(), device_view.mmff_interactions().data(),
+            device_view.mmff_atom_offsets().data(), device_metadata_sorted + wave_start,
             handle.device_coords_out.data() + wave_start * num_conformers * max_atoms_per_molecule * 3,
             handle.device_energies_out.data() + wave_start * num_conformers,
             handle.device_status_out.data() + wave_start * num_conformers, wave_size, num_conformers,
@@ -518,10 +518,10 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         wave_start = wave_end;
     }
 
-    // Enqueue pinned D2H for all three output arrays.  Pinned destination means
+    // Enqueue pinned D2H for all three output arrays. Pinned destination means
     // these return immediately and the transfers run on the stream after the
-    // kernels.  `finalize_gpu_pipeline` just waits on the stream and permutes.
-    cudaEventRecord(handle.evt_download_start, stream);
+    // kernels. `finalize_gpu_pipeline` just waits on the stream and permutes.
+    cudaEventRecord(handle.event_download_start, stream);
     if (total_coords > 0)
         cudaMemcpyAsync(handle.host_coords_sorted.data(), handle.device_coords_out.data(), total_coords * sizeof(float),
                         cudaMemcpyDeviceToHost, stream);
@@ -531,7 +531,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         cudaMemcpyAsync(handle.host_status_sorted.data(), handle.device_status_out.data(),
                         total_conf * sizeof(std::uint8_t), cudaMemcpyDeviceToHost, stream);
     }
-    cudaEventRecord(handle.evt_end, stream);
+    cudaEventRecord(handle.event_end, stream);
 
     auto _P_end = std::chrono::high_resolution_clock::now();
     auto elapsed_milliseconds = [](auto begin_time, auto end_time) {
@@ -560,14 +560,14 @@ void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
     cudaStreamSynchronize(handle.stream);
 
     // Compute stream-local phase elapsed times — events are persistent in the
-    // launch_scratch_t so no destroy here.  All ignored failures (events not
+    // launch_scratch_t so no destroy here. All ignored failures (events not
     // recorded, etc.) leave the timing slot at its default zero.
-    if (handle.timings_out != nullptr && handle.evt_end != nullptr) {
-        cudaEventElapsedTime(&handle.timings_out->upload_ms, handle.evt_upload_start, handle.evt_metric_start);
-        cudaEventElapsedTime(&handle.timings_out->metric_ms, handle.evt_metric_start, handle.evt_kernels_start);
-        cudaEventElapsedTime(&handle.timings_out->kernels_ms, handle.evt_kernels_start, handle.evt_download_start);
-        cudaEventElapsedTime(&handle.timings_out->download_ms, handle.evt_download_start, handle.evt_end);
-        cudaEventElapsedTime(&handle.timings_out->total_ms, handle.evt_upload_start, handle.evt_end);
+    if (handle.timings_out != nullptr && handle.event_end != nullptr) {
+        cudaEventElapsedTime(&handle.timings_out->upload_ms, handle.event_upload_start, handle.event_metric_start);
+        cudaEventElapsedTime(&handle.timings_out->metric_ms, handle.event_metric_start, handle.event_kernels_start);
+        cudaEventElapsedTime(&handle.timings_out->kernels_ms, handle.event_kernels_start, handle.event_download_start);
+        cudaEventElapsedTime(&handle.timings_out->download_ms, handle.event_download_start, handle.event_end);
+        cudaEventElapsedTime(&handle.timings_out->total_ms, handle.event_upload_start, handle.event_end);
     }
 
     auto input_indices = handle.batch->input_indices();
@@ -614,12 +614,12 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     // Keep SMILES as string_view throughout — the single unavoidable std::string copy
     // lives inside prepare_molecule at the RDKit::SmilesToMol call site.
 
-    // Workstream EE — sort molecules by descending SMILES length so the LAST chunk
-    // contains the smallest molecules.  At 8 GPUs the per-chunk wall is dominated
-    // by max(CPU prep, GPU kernels).  Chunk N's GPU work is the only fully unhidden
+    // Sort molecules by descending SMILES length so the last chunk
+    // contains the smallest molecules. At 8 GPUs the per-chunk wall is dominated
+    // by max(CPU prep, GPU kernels). Chunk N's GPU work is the only fully unhidden
     // phase (no chunk N+1 to overlap with), so making chunk N the cheapest shrinks
-    // the tail.  SMILES length is a fast proxy for atom count — strongly correlated
-    // and avoids a parse pass on the host.  Permutation is undone in the output
+    // the tail. SMILES length is a fast proxy for atom count — strongly correlated
+    // and avoids a parse pass on the host. Permutation is undone in the output
     // write loop below so callers see results in their original input order.
     std::vector<std::uint32_t> sort_perm(num_input);
     std::iota(sort_perm.begin(), sort_perm.end(), 0u);
@@ -630,7 +630,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     for (std::uint32_t k = 0; k < num_input; ++k) sorted_smiles_storage[k] = smiles[sort_perm[k]];
     std::span<std::string_view const> smiles_view = sorted_smiles_storage;
 
-    // Grow the shared pinned output region in context_t to fit this call.  Allocated
+    // Grow the shared pinned output region in context_t to fit this call. Allocated
     // once per context and reused — avoids a ~1 GB pageable malloc per call at 241K.
     ensure_output_staging(*output_staging, total_conf, coord_stride);
     std::span<float> host_coords = output_staging->coords();
@@ -643,9 +643,9 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
 
     std::uint32_t const num_devices = static_cast<std::uint32_t>(device_ids.size());
 
-    // Chunk policy: small batches take the non-pipelined path.  For large batches we
+    // Chunk policy: small batches take the non-pipelined path. For large batches we
     // split into ~50 K-molecule chunks so CPU prep of chunk N+1 overlaps GPU work of
-    // chunk N.  All GPU operations are stream-async, so the pipeline is driven by the
+    // chunk N. All GPU operations are stream-async, so the pipeline is driven by the
     // calling thread — no std::thread, no queue.
     std::uint32_t const chunk_size_target = 50'000;
     bool const pipeline = num_input > chunk_size_target * 3 / 2;
@@ -653,7 +653,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     std::uint32_t effective_max_atoms = max_atoms_per_molecule;
 
     // Per-chunk timing accumulator: one row per chunk holding host-wall markers and
-    // per-device GPU phase elapsed times.  Filled in launch_chunk + finalize_chunk;
+    // per-device GPU phase elapsed times. Filled in launch_chunk + finalize_chunk;
     // pretty-printed at the end of generate_conformers as an ASCII timeline.
     struct chunk_record_t {
         std::uint32_t chunk_idx;
@@ -672,9 +672,9 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         return std::chrono::duration<double, std::milli>(t - t_call_start).count();
     };
 
-    // Launch fans out across GPUs with a pure single-threaded for-loop.  Every CUDA
+    // Launch fans out across GPUs with a pure single-threaded for-loop. Every CUDA
     // call below is stream-async after the cusolver scratch is pre-allocated, so the
-    // loop just enqueues work and returns.  GPU d's stream runs concurrently with
+    // loop just enqueues work and returns. GPU d's stream runs concurrently with
     // GPU d+1's enqueue and with the main thread's next prep_slice().
     auto launch_chunk = [&](etkdg_molecule_batch_t const &batch, std::uint32_t chunk_base,
                             std::vector<gpu_pipeline_handle_t> &handles_out,
@@ -686,7 +686,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
 
         // Distribute molecules across devices via round-robin (i % num_devices).
         // One flat arena + per-device [start, end) offsets, rather than
-        // num_devices nested std::vectors.  Two passes: first counts, then fills.
+        // num_devices nested std::vectors. Two passes: first counts, then fills.
         std::vector<std::uint32_t> per_gpu_indices_flat(batch.num_molecules);
         std::vector<std::uint32_t> per_gpu_offsets(num_devices + 1, 0);
         for (std::uint32_t i = 0; i < batch.num_molecules; ++i)
@@ -706,7 +706,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         };
 
         // Round to the next metric-prepass bin boundary; cusolver runs at binned N,
-        // not raw atoms, so the workspace + gram pool must fit that.  Must stay in
+        // not raw atoms, so the workspace + gram pool must fit that. Must stay in
         // sync with bin_ns[] in build_metric_initial_coordinates_on_gpu.
         auto bin_ceiling = [](std::uint32_t n) -> std::uint32_t {
             static constexpr std::uint32_t bin_ns[] = {16, 32, 48, 64, 80, 96, 112, 128};
@@ -730,7 +730,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
 
         handles_out.resize(num_devices);
         timings_out.assign(num_devices, gpu_phase_ms_t{});
-        // Dispatcher runs the 8 launches in parallel on 8 OpenMP threads.  Each
+        // Dispatcher runs the 8 launches in parallel on 8 OpenMP threads. Each
         // launch call takes ~500 ms of CPU-side work (mostly cusolver state update
         // for the metric prepass), and the eight per-device state structs
         // (streams[d], solvers[d], metric_scratch[d], launch_scratch[d]) are
@@ -753,7 +753,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         }
     };
 
-    // Finalize walks the 8 per-GPU handles sequentially.  The first finalize's
+    // Finalize walks the 8 per-GPU handles sequentially. The first finalize's
     // cudaStreamSynchronize blocks until that stream drains; by the time it returns,
     // the other 7 GPUs have almost always finished their chunk too (they started
     // within microseconds of each other and have the same work), so the remaining
@@ -779,7 +779,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     };
 
     if (!pipeline) {
-        // Non-pipelined: single prep, single launch, single finalize.  Identical
+        // Non-pipelined: single prep, single launch, single finalize. Identical
         // behaviour to the pre-pipelining code path.
         chunk_records.push_back({0, num_input, 0, 0, 0, 0, 0, 0, {}});
         chunk_records.back().prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
@@ -814,7 +814,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
             prepare_molecule_batch_into(smiles_view.subspan(begin, end - begin), batch, scaffold_cache);
         };
 
-        // Two-slot ring buffer for both batches and handles.  Fixed-size
+        // Two-slot ring buffer for both batches and handles. Fixed-size
         // `std::array` keeps everything in contiguous storage — no vector growth,
         // no indirection per access, and `gpu_pipeline_handle_t::batch` can hold
         // a stable pointer into `batches[slot]` for the lifetime of one chunk.
@@ -826,7 +826,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         in_flight[0].resize(num_devices);
         in_flight[1].resize(num_devices);
 
-        // Bootstrap: prep + launch chunk 0.  chunk 0's GPU work runs in the background
+        // Bootstrap: prep + launch chunk 0. chunk 0's GPU work runs in the background
         // on the CUDA streams while the main-thread loop below preps chunk 1.
         chunk_records[0].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
         prep_slice_into(batches[0], chunks[0].first, chunks[0].second);
@@ -836,7 +836,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         launch_chunk(batches[0], chunks[0].first, in_flight[0], timing_slots[0]);
         chunk_records[0].launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
 
-        // Main pipeline loop.  At the top of iteration i:
+        // Main pipeline loop. At the top of iteration i:
         //   - GPU work for chunk i-1 is in flight in slot (i-1) % 2.
         //   - Batch slot (i % 2) held chunk i-2, which was finalized at iteration i-1.
         //     So it's safe to overwrite with chunk i's batch.
@@ -856,7 +856,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         chunk_records[last_idx].per_device_gpu = timing_slots[last_idx % 2];
     }
 
-    // Pretty-print per-chunk timeline.  See generate_conformers epilogue below.
+    // Pretty-print per-chunk timeline. See generate_conformers epilogue below.
     {
         double const total_wall_ms = host_ms(std::chrono::high_resolution_clock::now());
         std::printf("\n=== chunk timeline (ms, host wall + per-device GPU phase) ===\n");
@@ -890,11 +890,11 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         std::printf("\nWall time (call total): %.1f ms\n", total_wall_ms);
     }
 
-    // Workstream EE — invert the sort_perm permutation here so callers see
-    // results in their original input order.  host_* arrays are indexed by
+    // Invert the sort_perm permutation here so callers see
+    // results in their original input order. host_* arrays are indexed by
     // sorted_idx (the position in our descending-size processing order); we
     // copy each element to position sort_perm[sorted_idx] in the caller's
-    // output.  The conformer-stride and coord-stride permutations are blocky
+    // output. The conformer-stride and coord-stride permutations are blocky
     // enough that this is cache-friendly.
     bool any_success = false;
     for (std::uint32_t sorted_idx = 0; sorted_idx < num_input; ++sorted_idx) {

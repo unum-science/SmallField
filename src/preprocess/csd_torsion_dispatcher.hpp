@@ -215,8 +215,8 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
     boost::dynamic_bitset<> done_bonds(num_bonds);
     auto const *ring_info = molecule.getRingInfo();
 
-    // ---- Done-bonds as a raw uint8_t array on stack (avoids dynamic_bitset heap alloc
-    //      in the native matcher hot path). Sync with the dynamic_bitset used by fallback.
+    // Done-bonds as a raw uint8_t array on the stack, avoiding a dynamic_bitset heap allocation on the
+    // native matcher's hot path. Kept in sync with the dynamic_bitset used by the fallback path.
     std::uint8_t done_bonds_u8[max_bonds_k] = {};
     for (std::uint32_t b = 0; b < num_bonds; ++b) {
         if (done_bonds[b]) done_bonds_u8[b] = 1;
@@ -224,12 +224,11 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
 
     auto const &patterns = csd_patterns();
 
-    // ---- Workstream SC + MM-1: native Murcko scaffold extraction -----------
-    // MM-1 replaces `RDKit::MurckoDecompose` (O(N³) via FloydWarshall) with a
-    // native O(N+M) peel on the pre-computed ring info.  `compute_native_murcko`
+    // Native Murcko scaffold extraction. This replaces `RDKit::MurckoDecompose`, which is O(N³) via
+    // Floyd-Warshall, with a native O(N+M) peel on the pre-computed ring info. `compute_native_murcko`
     // also canonicalizes the scaffold's atom order via Weisfeiler-Lehman
     // refinement, so `scaffold_to_mol` / `mol_to_scaffold` are defined without
-    // a second SubstructMatch call.  Symmetric scaffolds (WL-tied atoms) skip
+    // a second SubstructMatch call. Symmetric scaffolds (WL-tied atoms) skip
     // the cache — rare in drug-like molecules.
     std::uint64_t scaffold_hash = 0;
     std::int8_t scaffold_to_mol[max_atoms_k];
@@ -285,8 +284,8 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
         torsions.push_back(torsion);
     };
 
-    for (std::size_t pat_idx = 0; pat_idx < patterns.size(); ++pat_idx) {
-        auto const &pat = patterns[pat_idx];
+    for (std::size_t pattern_index = 0; pattern_index < patterns.size(); ++pattern_index) {
+        auto const &pat = patterns[pattern_index];
         // Element prefilter: skip patterns whose required elements are absent.
         if ((pat.required_elements & ~molecule_elements) != 0) continue;
         if (pat.requires_aromatic && !has_aromatic) continue;
@@ -318,15 +317,15 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
             continue;
         }
 
-        // ---- Workstream SC-2: cache HIT path -----------------------------
+        // Scaffold-cache hit path.
         // If we have a cached entry and this pattern was recorded as fully
         // scaffold-local (no R-group-spanning matches were observed when the
         // entry was populated), we can skip the full-molecule SubstructMatch
         // and translate the cached scaffold-atom-index 4-tuples into molecule
         // indices via scaffold_to_mol[].
-        if (cached_entry != nullptr && have_scaffold_path && pat_idx < cached_entry->has_r_group_matches.size() &&
-            cached_entry->has_r_group_matches[pat_idx] == 0) {
-            auto const &flat = cached_entry->pattern_matches_flat[pat_idx];
+        if (cached_entry != nullptr && have_scaffold_path && pattern_index < cached_entry->has_r_group_matches.size() &&
+            cached_entry->has_r_group_matches[pattern_index] == 0) {
+            auto const &flat = cached_entry->pattern_matches_flat[pattern_index];
             for (std::size_t k = 0; k + 3 < flat.size(); k += 4) {
                 std::int8_t const m1 = scaffold_to_mol[flat[k + 0]];
                 std::int8_t const m2 = scaffold_to_mol[flat[k + 1]];
@@ -339,9 +338,9 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
             continue; // skip full-molecule SubstructMatch
         }
 
-        // ---- Fallback: RDKit SubstructMatch on the full molecule ----------
+        // Fallback: run RDKit SubstructMatch on the full molecule.
         // Thread-local: capacity persists across calls on the same thread so
-        // repeated fallbacks don't re-allocate.  `.clear()` keeps the
+        // repeated fallbacks don't re-allocate. `.clear()` keeps the
         // reserved storage.
         thread_local std::vector<RDKit::MatchVectType> matches;
         matches.clear();
@@ -355,7 +354,7 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
             unsigned int const a4 = match[pat.idx[3]].second;
 
             // Classify match for cache population: scaffold-local (all 4 atoms
-            // in scaffold) or R-group-spanning.  Only scaffold-local matches
+            // in scaffold) or R-group-spanning. Only scaffold-local matches
             // are cached; R-group matches force re-running SubstructMatch on
             // future hits (we record the bit but otherwise skip caching them).
             bool const all_in_scaffold = have_scaffold_path && a1 < num_atoms && a2 < num_atoms &&
@@ -368,7 +367,7 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
                 std::int8_t const s3 = mol_to_scaffold[a3];
                 std::int8_t const s4 = mol_to_scaffold[a4];
                 if (s1 >= 0 && s2 >= 0 && s3 >= 0 && s4 >= 0) {
-                    auto &flat = fresh_entry.pattern_matches_flat[pat_idx];
+                    auto &flat = fresh_entry.pattern_matches_flat[pattern_index];
                     flat.push_back(static_cast<std::uint8_t>(s1));
                     flat.push_back(static_cast<std::uint8_t>(s2));
                     flat.push_back(static_cast<std::uint8_t>(s3));
@@ -379,7 +378,7 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
             emit_torsion_for(static_cast<std::uint8_t>(a1), static_cast<std::uint8_t>(a2),
                              static_cast<std::uint8_t>(a3), static_cast<std::uint8_t>(a4), pat);
         }
-        if (will_populate) fresh_entry.has_r_group_matches[pat_idx] = any_r_group ? 1 : 0;
+        if (will_populate) fresh_entry.has_r_group_matches[pattern_index] = any_r_group ? 1 : 0;
     }
     if (will_populate) cache->insert(scaffold_hash, std::move(fresh_entry));
 

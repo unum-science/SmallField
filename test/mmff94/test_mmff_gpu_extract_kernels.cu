@@ -1,6 +1,6 @@
 /**
  *  @file test_mmff_gpu_extract_kernels.cu
- *  @brief MG-E validation: run the GPU MMFF term extractor and hand
+ *  @brief Validate the GPU MMFF term-extractor kernel: run it and hand
  *  results back to the host for byte-level diff vs the CPU native
  *  extractor.
  */

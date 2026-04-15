@@ -82,7 +82,7 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
             }
 
             // FixedSizeList cannot have null list entries (Arrow limitation):
-            // when the row failed, emit zero-filled coordinates.  Readers must
+            // when the row failed, emit zero-filled coordinates. Readers must
             // check `solver == 2` OR `energy_kcal_per_mol IS NULL` to detect
             // invalid rows.
             (void)coord_list_builder.Append();

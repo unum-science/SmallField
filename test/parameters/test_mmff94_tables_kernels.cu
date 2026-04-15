@@ -1,6 +1,6 @@
 /**
  *  @file test_mmff94_tables_kernels.cu
- *  @brief MG-A device-side validation kernels for test_mmff94_tables.
+ *  @brief Device-side validation kernels for test_mmff94_tables.
  *
  *  Launches one device lookup per probe key (vdw / bond / angle / torsion
  *  / oop / stbn) and writes the resolved parameters into a device output
@@ -13,7 +13,7 @@
 
 // Exclude the RDKit-dependent `extract_mmff94_tables_from_rdkit` from
 // the .cu compilation — it pulls in `<GraphMol/.../AtomTyper.h>` which
-// the nvcc host pass cannot compile.  The extraction runs on the host
+// the nvcc host pass cannot compile. The extraction runs on the host
 // side (compiled by g++) in the .cpp; here we only need the POD entry
 // structs + the lookup functions.
 #define SMALLFIELD_MMFF_TABLES_NO_RDKIT 1
@@ -134,7 +134,7 @@ __global__ void stbn_lookup_kernel(mmff94_tables_view_t view,
     out[idx] = r;
 }
 
-// ---- Host-callable launchers -------------------------------------------
+// Host-callable launchers.
 
 void launch_device_vdw_lookup(mmff94_tables_view_t view, vdw_query_t const *q_dev,
                               vdw_result_t *out_dev, std::uint32_t n) {

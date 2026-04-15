@@ -69,10 +69,10 @@ inline bool compute_native_murcko(molecule_descriptor_t const &desc, native_murc
         }
     if (!any_ring) return false;
 
-    // ---- Phase 1a: peel ALL terminal non-ring atoms (including Hs) -------
-    // Start with every atom in scaffold; iteratively drop non-ring atoms
-    // with ≤ 1 live neighbor.  Hs (always degree 1) drop in the first pass;
-    // side chains drop next; linkers (≥ 2 scaffold neighbors) survive.
+    // Peel every terminal non-ring atom, hydrogens included. Start with every atom in the scaffold;
+    // iteratively drop non-ring atoms with at most one live neighbor. Hydrogens, which are always
+    // degree 1, fall out in the first pass; side chains fall out next; linkers with two or more
+    // scaffold neighbors survive.
     bool in_scaffold[max_atoms_k] = {};
     for (std::uint32_t atom_index = 0; atom_index < total_atoms; ++atom_index) in_scaffold[atom_index] = true;
 
@@ -94,10 +94,9 @@ inline bool compute_native_murcko(molecule_descriptor_t const &desc, native_murc
         }
     }
 
-    // ---- Phase 1b: add back exocyclic =X (Bemis-Murcko rule) -------------
-    // RDKit::MurckoDecompose keeps any terminal atom double-bonded to a
-    // scaffold atom (ring or linker) — including =CH2 exocyclic alkenes, not
-    // just heteroatoms.  Heavy-only degree excludes the H removed in Phase 1a.
+    // Add back exocyclic =X per the Bemis-Murcko rule. RDKit::MurckoDecompose keeps any terminal
+    // atom double-bonded to a scaffold ring or linker atom — this includes =CH2 exocyclic alkenes,
+    // not just heteroatoms. Heavy-only degree excludes the hydrogens removed by the peel pass.
     auto heavy_degree = [&](std::uint8_t atom_index) {
         std::uint32_t heavy_count = 0;
         std::uint16_t const neighbor_start = desc.neighbor_offset[atom_index];
@@ -126,7 +125,7 @@ inline bool compute_native_murcko(molecule_descriptor_t const &desc, native_murc
     result.num_scaffold_atoms = num_scaffold_atoms;
     result.valid = true;
 
-    // ---- Phase 2: Weisfeiler-Lehman refinement (4 rounds) -----------------
+    // Refine labels with four rounds of Weisfeiler-Lehman iteration.
     auto fnv_step = [](std::uint64_t hash_value, std::uint64_t value) -> std::uint64_t {
         hash_value ^= value;
         hash_value *= 1099511628211ULL;
@@ -177,10 +176,9 @@ inline bool compute_native_murcko(molecule_descriptor_t const &desc, native_murc
             if (in_scaffold[atom_index]) label[atom_index] = next_label[atom_index];
     }
 
-    // ---- Phase 3: sort scaffold atoms by WL label (ties broken by atom idx).
-    // Automorphic scaffold atoms (equal WL label) map to the same scaffold
-    // positions by symmetry — cached torsion matches are invariant under
-    // scaffold automorphism because Murcko scaffolds carry no R-group labels.
+    // Sort scaffold atoms by WL label, breaking ties on atom index. Automorphic scaffold atoms with
+    // equal WL label map to the same scaffold positions by symmetry, so cached torsion matches are
+    // invariant under scaffold automorphism — Murcko scaffolds carry no R-group labels.
     std::pair<std::uint64_t, std::uint8_t> by_label[max_atoms_k];
     std::uint32_t scaffold_cursor = 0;
     for (std::uint32_t atom_index = 0; atom_index < total_atoms; ++atom_index)
@@ -189,7 +187,7 @@ inline bool compute_native_murcko(molecule_descriptor_t const &desc, native_murc
     std::sort(by_label, by_label + num_scaffold_atoms);
     result.canonicalizable = true;
 
-    // ---- Phase 4: produce scaffold_to_mol map + hash ----------------------
+    // Produce the scaffold_to_mol map and the scaffold hash.
     std::uint64_t hash_acc = 14695981039346656037ULL;
     for (std::uint32_t scaffold_index = 0; scaffold_index < num_scaffold_atoms; ++scaffold_index) {
         std::uint8_t const mol_atom = by_label[scaffold_index].second;

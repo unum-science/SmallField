@@ -1,7 +1,6 @@
 /**
  *  @file mmff94_extract_device.cuh
- *  @brief Workstream MG-E — `mmff94_extract_terms_kernel`: runs the
- *  native MMFF term extractor on GPU.
+ *  @brief `mmff94_extract_terms_kernel` runs the native MMFF term extractor on the GPU.
  *
  *  Layout decisions (initial pass, optimisable later):
  *   - One block per molecule; lane-0 does all the work within a
@@ -58,8 +57,8 @@ namespace detail_extract {
 struct angle_scratch_t {
     std::uint8_t i, j, k;
     std::uint8_t angle_type;
-    std::uint8_t bt_ij, bt_jk;
-    std::int16_t bid_ij, bid_jk;
+    std::uint8_t bond_type_ij, bond_type_jk;
+    std::int16_t bond_index_ij, bond_index_jk;
     float theta0_deg;
     float ka;
 };
@@ -137,7 +136,7 @@ __global__ void mmff94_extract_terms_kernel(
     }
 
     // Precompute per-bond bond_type + bond-stretch params — lane-parallel
-    // over bonds.  Shared-memory scratch for downstream angle/stbn reuse.
+    // over bonds. Shared-memory scratch for downstream angle/stbn reuse.
     __shared__ std::uint8_t s_bond_type[max_bonds_k];
     __shared__ float s_bond_r0[max_bonds_k];
     for (std::uint32_t b = lane; b < nb; b += 32) {
@@ -194,9 +193,9 @@ __global__ void mmff94_extract_terms_kernel(
             for (std::uint16_t b = a + 1; b < nend; ++b) {
                 std::uint32_t const ai = desc.neighbor_atom[a];
                 std::uint32_t const aj = desc.neighbor_atom[b];
-                std::int32_t const bid_ic = find_bond_idx(desc, ai, center);
-                std::int32_t const bid_cj = find_bond_idx(desc, center, aj);
-                if (bid_ic < 0 || bid_cj < 0) continue;
+                std::int32_t const bond_index_ic = find_bond_idx(desc, ai, center);
+                std::int32_t const bond_index_cj = find_bond_idx(desc, center, aj);
+                if (bond_index_ic < 0 || bond_index_cj < 0) continue;
                 std::uint8_t const at_code = native_get_mmff_angle_type(desc, bond_types, ai, center, aj);
                 auto const *ap = lookup_angle(tables, at_code, atom_types[ai],
                                                 atom_types[center], atom_types[aj]);
@@ -204,8 +203,8 @@ __global__ void mmff94_extract_terms_kernel(
                 bool use_empirical = !ap || native_is_zero(ap->ka);
                 if (!use_empirical) { ka = ap->ka; theta0_deg = ap->theta0_deg; }
                 if (use_empirical) {
-                    float const r0_ic = bond_r0[bid_ic];
-                    float const r0_cj = bond_r0[bid_cj];
+                    float const r0_ic = bond_r0[bond_index_ic];
+                    float const r0_cj = bond_r0[bond_index_cj];
                     float const override_deg = ap ? ap->theta0_deg : -1.0f;
                     auto const emp = native_angle_empirical(desc, tables, at_span,
                                                               ai, center, aj,
@@ -220,8 +219,8 @@ __global__ void mmff94_extract_terms_kernel(
                 else { overflow = 1; }
                 if (as_count < max_mmff_angles_per_mol_k) {
                     as[as_count++] = {(std::uint8_t)ai, (std::uint8_t)center, (std::uint8_t)aj,
-                                       at_code, bond_type_arr[bid_ic], bond_type_arr[bid_cj],
-                                       (std::int16_t)bid_ic, (std::int16_t)bid_cj,
+                                       at_code, bond_type_arr[bond_index_ic], bond_type_arr[bond_index_cj],
+                                       (std::int16_t)bond_index_ic, (std::int16_t)bond_index_cj,
                                        theta0_deg, ka};
                 }
             }
@@ -269,21 +268,21 @@ __global__ void mmff94_extract_terms_kernel(
         std::uint32_t const deg = desc.degree[center];
         if (deg < 3) continue;
         std::uint16_t const nstart = desc.neighbor_offset[center];
-        std::uint8_t nb_cache[8];
-        std::uint32_t nb_count = 0;
+        std::uint8_t neighbor_cache[8];
+        std::uint32_t neighbor_count = 0;
         for (std::uint16_t nn = nstart;
-             nn < desc.neighbor_offset[center + 1] && nb_count < 8; ++nn)
-            nb_cache[nb_count++] = desc.neighbor_atom[nn];
-        for (std::uint32_t a = 0; a < nb_count; ++a) {
+             nn < desc.neighbor_offset[center + 1] && neighbor_count < 8; ++nn)
+            neighbor_cache[neighbor_count++] = desc.neighbor_atom[nn];
+        for (std::uint32_t a = 0; a < neighbor_count; ++a) {
             std::uint8_t plane[2]; std::uint32_t plane_count = 0;
-            for (std::uint32_t c = 0; c < nb_count && plane_count < 2; ++c)
-                if (c != a) plane[plane_count++] = nb_cache[c];
+            for (std::uint32_t c = 0; c < neighbor_count && plane_count < 2; ++c)
+                if (c != a) plane[plane_count++] = neighbor_cache[c];
             if (plane_count < 2) continue;
-            auto const *op = lookup_oop(tables, atom_types[nb_cache[a]], atom_types[center],
+            auto const *op = lookup_oop(tables, atom_types[neighbor_cache[a]], atom_types[center],
                                           atom_types[plane[0]], atom_types[plane[1]]);
             if (!op) continue;
             if (oop_count < max_mmff_oops_per_mol_k) {
-                oops_out[oop_count++] = {nb_cache[a], (std::uint8_t)center,
+                oops_out[oop_count++] = {neighbor_cache[a], (std::uint8_t)center,
                                            plane[0], plane[1], op->koop, {0.0f, 0.0f}};
             }
             else { overflow = 1; }
@@ -297,9 +296,9 @@ __global__ void mmff94_extract_terms_kernel(
         if (prop_j && prop_j->linh) continue;
         std::uint8_t const sbt = native_get_mmff_stretch_bend_type(
             a.angle_type,
-            (atom_types[a.i] <= atom_types[a.k]) ? a.bt_ij : a.bt_jk,
-            (atom_types[a.i] <  atom_types[a.k]) ? a.bt_jk : a.bt_ij);
-        auto stbn = lookup_stbn(tables, sbt, a.bt_ij, a.bt_jk,
+            (atom_types[a.i] <= atom_types[a.k]) ? a.bond_type_ij : a.bond_type_jk,
+            (atom_types[a.i] <  atom_types[a.k]) ? a.bond_type_jk : a.bond_type_ij);
+        auto stbn = lookup_stbn(tables, sbt, a.bond_type_ij, a.bond_type_jk,
                                   atom_types[a.i], atom_types[a.j], atom_types[a.k]);
         float kba_ijk = 0.0f, kba_kji = 0.0f;
         bool swap_flag = false;
@@ -320,8 +319,8 @@ __global__ void mmff94_extract_terms_kernel(
         if (native_is_zero(kba_ijk) && native_is_zero(kba_kji)) continue;
         if (swap_flag) { float tmp = kba_ijk; kba_ijk = kba_kji; kba_kji = tmp; }
         float const theta0_rad = a.theta0_deg * (float)M_PI / 180.0f;
-        float const r0_ij = bond_r0[a.bid_ij];
-        float const r0_jk = bond_r0[a.bid_jk];
+        float const r0_ij = bond_r0[a.bond_index_ij];
+        float const r0_jk = bond_r0[a.bond_index_jk];
         if (stbn_count < max_mmff_stretchbends_per_mol_k) {
             stbns_out[stbn_count++] = {a.i, a.j, a.k, 0, kba_ijk, kba_kji,
                                          theta0_rad, r0_ij, r0_jk, 0.0f};
@@ -414,7 +413,7 @@ __global__ void mmff94_build_csr_kernel(
         off.oop_start = running; running += off.oop_count;
         off.stretchbend_start = running; running += off.stretchbend_count;
     }
-    // Running is the total interactions for this molecule.  Store in
+    // Running is the total interactions for this molecule. Store in
     // per_mol_counts for downstream CSR consumers.
     per_mol_counts[mol].interactions = (std::uint16_t)running;
 

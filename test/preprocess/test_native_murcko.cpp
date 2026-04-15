@@ -109,9 +109,9 @@ int main(int argc, char **argv) {
         bool match = true;
         for (std::uint32_t a = 0; a < desc.num_atoms; ++a) {
             // RDKit's scaffold has heavy atoms + their Hs removed; after addHs
-            // we get Hs back.  The scaffold mapping covers heavy atoms.  Our
+            // we get Hs back. The scaffold mapping covers heavy atoms. Our
             // native Murcko operates on the full (heavy + H) molecule; but the
-            // peel naturally removes terminal Hs (degree 1, non-ring).  So
+            // peel naturally removes terminal Hs (degree 1, non-ring). So
             // only compare on heavy atoms.
             if (mol->getAtomWithIdx(a)->getAtomicNum() == 1) continue;
             if (rdk_in_scaffold[a] != nm.mol_in_scaffold[a]) {
@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
     std::printf("  rdkit-empty / we-populated: %llu\n", static_cast<unsigned long long>(rdkit_empty_we_populated));
     std::printf("  we-empty / rdkit-populated: %llu\n", static_cast<unsigned long long>(we_empty_rdkit_populated));
 
-    // Gate at 98 %.  Remaining residual is edge-case disagreement (spiro junctions,
+    // Gate at 98 %. Remaining residual is edge-case disagreement (spiro junctions,
     // fused-ring SSSR selection, dense natural-product scaffolds) that causes
     // cache fragmentation on those specific molecules but no correctness issue —
     // the native Murcko definition is deterministic and consistent within our

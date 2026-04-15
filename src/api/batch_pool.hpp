@@ -8,9 +8,9 @@
  *  `cudaMemcpyAsync` calls (which silently degrade to synchronous).
  *
  *  Flow:
- *    1. Phase 2 of `prepare_molecule_batch` computes `batch_layout_t`
- *       from the per-molecule prefix-scanned sizes, resizes one pinned
- *       host buffer, and memcpys per-molecule arrays at their byte offsets.
+ *    1. `prepare_molecule_batch` computes `batch_layout_t` from the per-molecule prefix-scanned
+ *       sizes, resizes one pinned host buffer, and memcpys per-molecule arrays at their byte
+ *       offsets.
  *    2. `launch_gpu_pipeline` issues ONE `cudaMemcpyAsync` of the host
  *       buffer into a per-GPU persistent device mirror (owned by
  *       `context_t`), then carves typed `std::span<T>` views over the
@@ -128,7 +128,7 @@ using device_byte_buffer_t = byte_buffer_t<device_alloc_t, device_dealloc_t>;
  *    written by GPU kernels; the host buffer does not allocate space for
  *    them.
  *
- *  Workstream A: all regions are uploaded, so `bytes_uploaded == bytes_total`.
+ *  Currently every region is uploaded, so `bytes_uploaded == bytes_total`.
  */
 struct batch_layout_t {
     static constexpr std::size_t region_alignment = 256;
@@ -295,7 +295,7 @@ struct batch_pool_t {
     batch_pool_view_t host_view() const noexcept { return {const_cast<std::byte *>(host.data()), &layout}; }
 
     // Thin forwarders so call sites can keep using `pool.foo()` as with the
-    // prior std::vector<T>-backed design.  Equivalent to `host_view().foo()`.
+    // prior std::vector<T>-backed design. Equivalent to `host_view().foo()`.
     std::span<float> bounds_matrices() noexcept { return host_view().bounds_matrices(); }
     std::span<chiral_center_descriptor_t> chiral_centers() noexcept { return host_view().chiral_centers(); }
     std::span<etk_torsion_descriptor_t> etk_torsions() noexcept { return host_view().etk_torsions(); }

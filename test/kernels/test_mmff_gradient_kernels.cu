@@ -49,83 +49,83 @@ void gpu_mmff_energy(float const *host_positions, std::uint32_t num_atoms,
 
     std::uint32_t const num_elements = 3 * num_atoms;
 
-    float *dev_positions = nullptr;
-    float *dev_gradient = nullptr;
-    float *dev_energy = nullptr;
-    mmff94_atom_vdw_params_t *dev_atom_vdw = nullptr;
-    float *dev_atom_charge = nullptr;
-    std::uint8_t *dev_bond_distance = nullptr;
-    mmff94_bond_t *dev_bond_params = nullptr;
-    mmff94_angle_t *dev_angle_params = nullptr;
-    mmff94_torsion_t *dev_torsion_params = nullptr;
-    mmff94_oop_t *dev_oop_params = nullptr;
-    mmff94_stretchbend_t *dev_stretchbend_params = nullptr;
-    mmff94_atom_interaction_t *dev_interactions = nullptr;
-    mmff94_atom_offsets_t *dev_atom_offsets = nullptr;
+    float *device_positions = nullptr;
+    float *device_gradient = nullptr;
+    float *device_energy = nullptr;
+    mmff94_atom_vdw_params_t *device_atom_vdw = nullptr;
+    float *device_atom_charge = nullptr;
+    std::uint8_t *device_bond_distance = nullptr;
+    mmff94_bond_t *device_bond_params = nullptr;
+    mmff94_angle_t *device_angle_params = nullptr;
+    mmff94_torsion_t *device_torsion_params = nullptr;
+    mmff94_oop_t *device_oop_params = nullptr;
+    mmff94_stretchbend_t *device_stretchbend_params = nullptr;
+    mmff94_atom_interaction_t *device_interactions = nullptr;
+    mmff94_atom_offsets_t *device_atom_offsets = nullptr;
 
-    cudaMalloc(&dev_positions, num_elements * sizeof(float));
-    cudaMalloc(&dev_gradient, num_elements * sizeof(float));
-    cudaMalloc(&dev_energy, sizeof(float));
-    cudaMalloc(&dev_atom_vdw, std::max(num_atoms, 1u) * sizeof(mmff94_atom_vdw_params_t));
-    cudaMalloc(&dev_atom_charge, std::max(num_atoms, 1u) * sizeof(float));
-    cudaMalloc(&dev_bond_distance, std::max(num_atoms * num_atoms, 1u) * sizeof(std::uint8_t));
-    cudaMalloc(&dev_bond_params, std::max(num_bond_params, 1u) * sizeof(mmff94_bond_t));
-    cudaMalloc(&dev_angle_params, std::max(num_angle_params, 1u) * sizeof(mmff94_angle_t));
-    cudaMalloc(&dev_torsion_params, std::max(num_torsion_params, 1u) * sizeof(mmff94_torsion_t));
-    cudaMalloc(&dev_oop_params, std::max(num_oop_params, 1u) * sizeof(mmff94_oop_t));
-    cudaMalloc(&dev_stretchbend_params, std::max(num_stretchbend_params, 1u) * sizeof(mmff94_stretchbend_t));
-    cudaMalloc(&dev_interactions, std::max(num_interactions, 1u) * sizeof(mmff94_atom_interaction_t));
-    cudaMalloc(&dev_atom_offsets, std::max(num_atom_offsets, 1u) * sizeof(mmff94_atom_offsets_t));
+    cudaMalloc(&device_positions, num_elements * sizeof(float));
+    cudaMalloc(&device_gradient, num_elements * sizeof(float));
+    cudaMalloc(&device_energy, sizeof(float));
+    cudaMalloc(&device_atom_vdw, std::max(num_atoms, 1u) * sizeof(mmff94_atom_vdw_params_t));
+    cudaMalloc(&device_atom_charge, std::max(num_atoms, 1u) * sizeof(float));
+    cudaMalloc(&device_bond_distance, std::max(num_atoms * num_atoms, 1u) * sizeof(std::uint8_t));
+    cudaMalloc(&device_bond_params, std::max(num_bond_params, 1u) * sizeof(mmff94_bond_t));
+    cudaMalloc(&device_angle_params, std::max(num_angle_params, 1u) * sizeof(mmff94_angle_t));
+    cudaMalloc(&device_torsion_params, std::max(num_torsion_params, 1u) * sizeof(mmff94_torsion_t));
+    cudaMalloc(&device_oop_params, std::max(num_oop_params, 1u) * sizeof(mmff94_oop_t));
+    cudaMalloc(&device_stretchbend_params, std::max(num_stretchbend_params, 1u) * sizeof(mmff94_stretchbend_t));
+    cudaMalloc(&device_interactions, std::max(num_interactions, 1u) * sizeof(mmff94_atom_interaction_t));
+    cudaMalloc(&device_atom_offsets, std::max(num_atom_offsets, 1u) * sizeof(mmff94_atom_offsets_t));
 
-    cudaMemcpy(dev_positions, host_positions, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_positions, host_positions, num_elements * sizeof(float), cudaMemcpyHostToDevice);
     if (num_atoms > 0) {
-        cudaMemcpy(dev_atom_vdw, host_atom_vdw, num_atoms * sizeof(mmff94_atom_vdw_params_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(dev_atom_charge, host_atom_charge, num_atoms * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(dev_bond_distance, host_bond_distance, num_atoms * num_atoms * sizeof(std::uint8_t),
+        cudaMemcpy(device_atom_vdw, host_atom_vdw, num_atoms * sizeof(mmff94_atom_vdw_params_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(device_atom_charge, host_atom_charge, num_atoms * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(device_bond_distance, host_bond_distance, num_atoms * num_atoms * sizeof(std::uint8_t),
                    cudaMemcpyHostToDevice);
     }
     if (num_bond_params > 0)
-        cudaMemcpy(dev_bond_params, host_bond_params, num_bond_params * sizeof(mmff94_bond_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(device_bond_params, host_bond_params, num_bond_params * sizeof(mmff94_bond_t), cudaMemcpyHostToDevice);
     if (num_angle_params > 0)
-        cudaMemcpy(dev_angle_params, host_angle_params, num_angle_params * sizeof(mmff94_angle_t),
+        cudaMemcpy(device_angle_params, host_angle_params, num_angle_params * sizeof(mmff94_angle_t),
                    cudaMemcpyHostToDevice);
     if (num_torsion_params > 0)
-        cudaMemcpy(dev_torsion_params, host_torsion_params, num_torsion_params * sizeof(mmff94_torsion_t),
+        cudaMemcpy(device_torsion_params, host_torsion_params, num_torsion_params * sizeof(mmff94_torsion_t),
                    cudaMemcpyHostToDevice);
     if (num_oop_params > 0)
-        cudaMemcpy(dev_oop_params, host_oop_params, num_oop_params * sizeof(mmff94_oop_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(device_oop_params, host_oop_params, num_oop_params * sizeof(mmff94_oop_t), cudaMemcpyHostToDevice);
     if (num_stretchbend_params > 0)
-        cudaMemcpy(dev_stretchbend_params, host_stretchbend_params,
+        cudaMemcpy(device_stretchbend_params, host_stretchbend_params,
                    num_stretchbend_params * sizeof(mmff94_stretchbend_t), cudaMemcpyHostToDevice);
     if (num_interactions > 0)
-        cudaMemcpy(dev_interactions, host_interactions, num_interactions * sizeof(mmff94_atom_interaction_t),
+        cudaMemcpy(device_interactions, host_interactions, num_interactions * sizeof(mmff94_atom_interaction_t),
                    cudaMemcpyHostToDevice);
     if (num_atom_offsets > 0)
-        cudaMemcpy(dev_atom_offsets, host_atom_offsets, num_atom_offsets * sizeof(mmff94_atom_offsets_t),
+        cudaMemcpy(device_atom_offsets, host_atom_offsets, num_atom_offsets * sizeof(mmff94_atom_offsets_t),
                    cudaMemcpyHostToDevice);
 
-    mmff_energy_eval_kernel<<<1, 32>>>(dev_positions, dev_gradient, dev_atom_vdw, dev_atom_charge, dev_bond_distance,
-                                       dev_bond_params, dev_angle_params, dev_torsion_params, dev_oop_params,
-                                       dev_stretchbend_params, dev_interactions, dev_atom_offsets, num_atoms,
-                                       dev_energy);
+    mmff_energy_eval_kernel<<<1, 32>>>(device_positions, device_gradient, device_atom_vdw, device_atom_charge, device_bond_distance,
+                                       device_bond_params, device_angle_params, device_torsion_params, device_oop_params,
+                                       device_stretchbend_params, device_interactions, device_atom_offsets, num_atoms,
+                                       device_energy);
     cudaDeviceSynchronize();
 
-    cudaMemcpy(host_gradient, dev_gradient, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out_energy, dev_energy, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_gradient, device_gradient, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_energy, device_energy, sizeof(float), cudaMemcpyDeviceToHost);
 
-    cudaFree(dev_positions);
-    cudaFree(dev_gradient);
-    cudaFree(dev_energy);
-    cudaFree(dev_atom_vdw);
-    cudaFree(dev_atom_charge);
-    cudaFree(dev_bond_distance);
-    cudaFree(dev_bond_params);
-    cudaFree(dev_angle_params);
-    cudaFree(dev_torsion_params);
-    cudaFree(dev_oop_params);
-    cudaFree(dev_stretchbend_params);
-    cudaFree(dev_interactions);
-    cudaFree(dev_atom_offsets);
+    cudaFree(device_positions);
+    cudaFree(device_gradient);
+    cudaFree(device_energy);
+    cudaFree(device_atom_vdw);
+    cudaFree(device_atom_charge);
+    cudaFree(device_bond_distance);
+    cudaFree(device_bond_params);
+    cudaFree(device_angle_params);
+    cudaFree(device_torsion_params);
+    cudaFree(device_oop_params);
+    cudaFree(device_stretchbend_params);
+    cudaFree(device_interactions);
+    cudaFree(device_atom_offsets);
 }
 
 } // extern "C"

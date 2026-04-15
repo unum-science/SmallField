@@ -184,8 +184,8 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
  *  improves latency hiding on the long_scoreboard / wait stalls that dominate
  *  this kernel per ncu.  Without the hint, nvcc picks register count first
  *  (~128 regs/thread here) which caps concurrency at 1 block/SM.  The cap at
- *  4 blocks/SM (workstream X, bumped from workstream W's 2) lets nvcc spill
- *  more registers to recover 4x occupancy.  The trade-off is extra spill
+ *  4 blocks/SM — raised from an earlier 2 blocks/SM setting — lets nvcc spill
+ *  more registers to recover 4x occupancy. The trade-off is extra spill
  *  traffic to local memory; on Blackwell's large register file and L1 this
  *  has consistently been a net win on drug-like ChEMBL molecules.
  */

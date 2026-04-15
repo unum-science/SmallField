@@ -1,6 +1,6 @@
 /**
  *  @file test_mmff_gpu_extract.cpp
- *  @brief MG-E gate: compare the GPU MMFF term extractor output against
+ *  @brief Compare the GPU MMFF term extractor output against
  *  the CPU native extractor on a batch of drug-like SMILES.  Byte-
  *  identity required for every bonded term of every molecule where the
  *  GPU typer flagged success (typing_status == 0).
@@ -74,7 +74,7 @@ std::vector<std::string> load_smiles(std::string const &path, std::size_t cap) {
 } // namespace
 
 int main(int argc, char **argv) {
-    std::printf("=== test_mmff_gpu_extract: MG-E gate ===\n");
+    std::printf("=== test_mmff_gpu_extract: GPU vs CPU MMFF extractor byte-equality gate ===\n");
 
     mmff94_tables_host_t tables_host;
     extract_mmff94_tables_from_rdkit(tables_host);
@@ -222,9 +222,9 @@ int main(int argc, char **argv) {
             else { ++sb_bad; ok = false; }
         }
 
-        // CSR comparison.  The CPU's `extract_mmff94_params_fully_native`
+        // CSR comparison. The CPU's `extract_mmff94_params_fully_native`
         // produces `mmff_interactions` and `mmff_atom_offsets`; we diff
-        // the GPU CSR against it.  Per-atom ordering is deterministic
+        // the GPU CSR against it. Per-atom ordering is deterministic
         // on both sides (atoms walked in index order, term types in
         // bond/angle/torsion/oop/sb order).
         auto const ao = atom_offsets[m];
@@ -234,7 +234,7 @@ int main(int argc, char **argv) {
             // GPU offsets are per-molecule (relative to this mol's
             // `max_mmff_interactions_per_mol_k` slot); CPU offsets are
             // per-molecule as well (into the mol's own interactions
-            // vector).  Both start at 0 per molecule, so the counts are
+            // vector). Both start at 0 per molecule, so the counts are
             // the comparison metric.
             if (cpu_off.bond_count != gpu_off.bond_count ||
                 cpu_off.angle_count != gpu_off.angle_count ||

@@ -1,6 +1,6 @@
 /**
  *  @file mmff94_typer.hpp
- *  @brief MG-1.5/1.6 — native C++ port of RDKit's MMFF atom typer.
+ *  @brief Native C++ port of RDKit's MMFF atom typer.
  *
  *  Reads `molecule_descriptor_t` + MMFFProp table and produces the
  *  RDKit-equivalent MMFF atom type (1..99) for each atom.  This
@@ -41,7 +41,7 @@
 
 namespace smallfield {
 
-// ---- Ring-info queries on the descriptor --------------------------------
+// Ring-info queries on the descriptor.
 
 /** Number of SSSR rings that contain atom. */
 SMALLFIELD_HD inline unsigned atom_num_rings(molecule_descriptor_t const &desc,
@@ -132,7 +132,7 @@ SMALLFIELD_HD inline unsigned atom_total_valence(molecule_descriptor_t const &de
         unsigned bo = desc.bond_order[b];
         // Aromatic bonds count as 1.5 for valence — RDKit rounds up in
         // `getValence(ExplicitType)`, so we add the integer part + a
-        // correction on alternating aromatic bonds.  For MMFF typing the
+        // correction on alternating aromatic bonds. For MMFF typing the
         // simpler convention (AROMATIC → 1, RDKit handles via Kekulize)
         // matches since addHs/sanitize kekulizes implicitly where needed.
         if (desc.bond_flags[b] & bond_flag_aromatic_k) bo = 1; // kekulized σ-bond count
@@ -202,20 +202,19 @@ SMALLFIELD_HD inline bool bond_is_aromatic_between(molecule_descriptor_t const &
     return false;
 }
 
-// ---- Heavy atom typer -----------------------------------------------------
+// Heavy atom typer.
 
-/** Match of `RDKit::MMFF::setMMFFHeavyAtomType`.  Returns an MMFF atom
- *  type in [1, 99], or 0 on failure.  Faithful line-by-line port of
- *  AtomTyper.cpp:504-2078 — element-keyed dispatch with the same branch
- *  order and break semantics.  Hydrogen atoms should not be passed here;
- *  use `native_set_mmff_hydrogen_type` for those. */
+/** Match of `RDKit::MMFF::setMMFFHeavyAtomType`. Returns an MMFF atom type in [1, 99], or 0 on failure.
+ *  Faithful line-by-line port of AtomTyper.cpp:504-2078 with element-keyed dispatch, the same branch
+ *  order, and identical break semantics. Hydrogen atoms should not be passed here; use
+ *  `native_set_mmff_hydrogen_type` for those. */
 SMALLFIELD_HD inline std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t const &desc,
                                                     std::uint32_t atom_idx) noexcept {
     std::uint8_t atom_type = 0;
     unsigned const element = desc.element[atom_idx];
     bool const aromatic = (desc.atom_flags[atom_idx] & atom_flag_aromatic_k) != 0;
 
-    // ---- Aromatic typing (5-ring, 6-ring) -------------------------------
+    // Aromatic typing handles 5-ring and 6-ring cases.
     if (aromatic) {
         bool const in_5 = atom_in_aromatic_ring_of_size(desc, atom_idx, 5);
         bool const in_6 = atom_in_aromatic_ring_of_size(desc, atom_idx, 6);
@@ -351,7 +350,7 @@ SMALLFIELD_HD inline std::uint8_t native_set_mmff_heavy_atom_type(molecule_descr
         }
     }
 
-    // ---- Aliphatic heavy atom typing ------------------------------------
+    // Aliphatic heavy atom typing.
     if (!atom_type) {
         std::uint16_t const nstart = desc.neighbor_offset[atom_idx];
         std::uint16_t const nend = desc.neighbor_offset[atom_idx + 1];
@@ -619,7 +618,7 @@ SMALLFIELD_HD inline std::uint8_t native_set_mmff_heavy_atom_type(molecule_descr
                     if (atom_total_valence(desc, atom_idx) == 3) {
                         atom_type = 51; break;
                     }
-                    // OH2 (water): two H neighbors.  `desc.num_hydrogens`
+                    // OH2 (water): two H neighbors. `desc.num_hydrogens`
                     // already counts them (since addHs is called before
                     // build_descriptor), so there is no separate implicit
                     // contribution to add.
@@ -798,10 +797,10 @@ SMALLFIELD_HD inline std::uint8_t native_set_mmff_heavy_atom_type(molecule_descr
     return atom_type;
 }
 
-// ---- Hydrogen typer -------------------------------------------------------
+// Hydrogen typer.
 
-/** Port of `setMMFFHydrogenType`.  Takes the already-computed heavy-atom
- *  types so the H-typing nested switches can key on them. */
+/** Port of `setMMFFHydrogenType`. Takes the already-computed heavy-atom types so the H-typing nested
+ *  switches can key on them. */
 SMALLFIELD_HD inline std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const &desc,
                                                   std::uint32_t atom_idx,
                                                   std::span<std::uint8_t const> atom_types) noexcept {
@@ -810,8 +809,8 @@ SMALLFIELD_HD inline std::uint8_t native_set_mmff_hydrogen_type(molecule_descrip
     std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
     for (std::uint16_t n = start; n < end; ++n) {
         std::uint8_t const nb = desc.neighbor_atom[n];
-        unsigned const el = desc.element[nb];
-        switch (el) {
+        unsigned const element = desc.element[nb];
+        switch (element) {
             case 6:
             case 14: atom_type = 5; break;
             case 7: {
@@ -870,10 +869,10 @@ SMALLFIELD_HD inline std::uint8_t native_set_mmff_hydrogen_type(molecule_descrip
     return atom_type;
 }
 
-// ---- MMFF charge computation ---------------------------------------------
+// MMFF charge computation.
 
-/** Compute MMFF formal charges per atom.  Port of the first half of
- *  `computeMMFFCharges` (AtomTyper.cpp:3094-3421).  Sets per-atom formal
+/** Compute MMFF formal charges per atom. Port of the first half of `computeMMFFCharges` at
+ *  AtomTyper.cpp:3094-3421. Sets per-atom formal
  *  charges for atom types with special allocation rules (carboxylate
  *  charge sharing, N5M anion splitting, conjugated nitrogen flood fill).
  *  All other atoms keep `desc.formal_charge` (the RDKit-assigned formal
@@ -974,7 +973,7 @@ SMALLFIELD_HD inline void native_compute_mmff_formal_charges(molecule_descriptor
             }
             case 55: case 56: case 81: {
                 // Conjugated nitrogen (amidinium / guanidinium /
-                // imidazolium).  Flood-fill through carbon types 57/80,
+                // imidazolium). Flood-fill through carbon types 57/80,
                 // collecting all conjugated 55/56/81 atoms, sum formal
                 // charges, split evenly.
                 fc = (float)desc.formal_charge[idx];
@@ -1010,7 +1009,7 @@ SMALLFIELD_HD inline void native_compute_mmff_formal_charges(molecule_descriptor
                 break;
             }
             case 61: {
-                // Isonitrile C.  If bonded to type 42 (triply bonded N),
+                // Isonitrile C. If bonded to type 42 (triply bonded N),
                 // set +1 (on the N, via ipso bookkeeping).
                 std::uint16_t const ns = desc.neighbor_offset[idx];
                 std::uint16_t const ne = desc.neighbor_offset[idx + 1];
@@ -1106,7 +1105,7 @@ SMALLFIELD_HD inline void native_compute_mmff_partial_charges(molecule_descripto
     }
 }
 
-// ---- Top-level: type every atom ----------------------------------------
+// Top-level entry point that types every atom.
 
 /** Populate `atom_types[]` with MMFF94 atom types for every atom in the
  *  molecule.  Returns true iff every atom was typed successfully. */

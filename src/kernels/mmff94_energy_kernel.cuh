@@ -88,7 +88,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     mmff94_atom_vdw_params_t const &p_atom, mmff94_atom_vdw_params_t const &p_other, float charge_product, bool is_1_4,
     bool first_endpoint, float *energy, float *gradient_x, float *gradient_y, float *gradient_z) {
 
-    // --- Halgren R* combining (donor-suppression clause) + Slater-Kirkwood epsilon ---
+    // Halgren R* combining rule with donor-suppression clause, plus Slater-Kirkwood epsilon.
     float const R_i = p_atom.r_star;
     float const R_j = p_other.r_star;
     float const gamma = (R_i - R_j) * __frcp_rn(R_i + R_j);
@@ -111,7 +111,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
         eps_ij *= 0.5f;
     }
 
-    // --- Pair geometry ---
+    // Pair geometry.
     float const atom_x = positions[atom];
     float const atom_y = positions[num_atoms + atom];
     float const atom_z = positions[2 * num_atoms + atom];
@@ -126,7 +126,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const inverse_distance = rsqrtf(distance_squared);
     float const distance = distance_squared * inverse_distance;
 
-    // --- VdW buffered 14-7 ---
+    // VdW buffered 14-7 energy and gradient.
     float const density_ratio = distance * __frcp_rn(R_star_ij);             // ρ = r / R*
     float const density_ratio_pow7 = density_ratio * density_ratio * density_ratio *
                                      density_ratio * density_ratio * density_ratio * density_ratio;
@@ -145,7 +145,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const energy_gradient_vdw = eps_ij * (d_repulsion * attractive_term
                                                 + repulsion_pow7 * d_attractive) * __frcp_rn(R_star_ij);
 
-    // --- Electrostatic ---
+    // Electrostatic energy and gradient.
     float const scale = is_1_4 ? mmff_1_4_scale : 1.0f;
     float const buffered_distance = distance + mmff_elec_buf;
     float const energy_electrostatic = mmff_coulomb * charge_product
@@ -644,7 +644,7 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
         mmff94_atom_vdw_params_t const p_atom = atom_vdw_params[atom];
         float const q_atom = atom_charge[atom];
 
-        // Nonbonded pairs, enumerated from bond_distance.  Two passes: "j > atom" owns
+        // Nonbonded pairs, enumerated from bond_distance. Two passes: "j > atom" owns
         // the pair's energy + adds this atom's gradient contribution as the first
         // endpoint; "j < atom" adds this atom's gradient contribution as the second
         // endpoint (no energy — already counted by the other thread when atom < j).

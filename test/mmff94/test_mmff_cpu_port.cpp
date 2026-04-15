@@ -1,6 +1,6 @@
 /**
  *  @file test_mmff_cpu_port.cpp
- *  @brief MG-1 gate: cross-validate the native MMFF CPU port
+ *  @brief Cross-validate the native MMFF CPU port
  *  (`extract_mmff94_params_native`) against the existing RDKit-backed
  *  path (`extract_mmff94_params`).  Must produce byte-identical MMFF
  *  term arrays on a curated SMILES set; small numerical deltas (≤ 1e-3)
@@ -232,7 +232,7 @@ bool compare_mol(std::string_view smiles,
     }
 
     // CSR interactions are built only by the native path in this test
-    // (the rdkit_direct_extract baseline leaves them empty).  Skip that
+    // (the rdkit_direct_extract baseline leaves them empty). Skip that
     // comparison — the native CSR is validated implicitly by the bonded
     // term counts above plus cross-checks in downstream ETKDG kernels.
 
@@ -392,7 +392,7 @@ void run_one(std::string_view smiles, mmff94_tables_view_t const &tables, bool v
     nat_result.num_atoms = num_atoms;
     extract_mmff94_params_native(desc, atom_types, charges, tables, nat_result);
 
-    // Fully-native: zero runtime RDKit.  Term counts should match the
+    // Fully-native: zero runtime RDKit. Term counts should match the
     // hybrid path on molecules where our typer agrees with RDKit.
     etkdg_prepared_molecule_t fn;
     fn.num_atoms = num_atoms;
@@ -423,7 +423,7 @@ std::vector<std::string> load_smiles(std::string const &path, std::size_t max_co
 } // namespace
 
 int main(int argc, char **argv) {
-    std::printf("=== test_mmff_cpu_port: MG-1 gate ===\n");
+    std::printf("=== test_mmff_cpu_port: native MMFF term extractor gate ===\n");
 
     mmff94_tables_host_t tables_host;
     extract_mmff94_tables_from_rdkit(tables_host);
@@ -481,8 +481,8 @@ int main(int argc, char **argv) {
         std::printf("ppm: molecules with any failure=%.1f, term failures=%.1f\n",
                      mol_fail_ppm, term_fail_ppm);
     }
-    // MG-1 gate: ≤ 100 ppm mol-level failures, ≤ 500 ppm term failures on
-    // drug-like ChEMBL.  Exotic structures (pentacoordinate P porphyrins,
+    // Gate: ≤ 100 ppm mol-level failures, ≤ 500 ppm term failures on
+    // drug-like ChEMBL. Exotic structures (pentacoordinate P porphyrins,
     // etc.) can exceed this and should be triaged on the full 10M USearch set.
     if (n_mol_fail > 0) {
         std::printf("FAIL (structural mismatches)\n");

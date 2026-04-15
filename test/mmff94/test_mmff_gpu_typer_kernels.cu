@@ -1,6 +1,6 @@
 /**
  *  @file test_mmff_gpu_typer_kernels.cu
- *  @brief MG-C validation: run the GPU MMFF typer on a batch of
+ *  @brief Validate the GPU MMFF typer kernel: run it on a batch of
  *  descriptors and hand results back to the host .cpp for byte-level
  *  comparison vs the CPU native typer.
  */

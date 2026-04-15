@@ -344,7 +344,7 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
             continue;
         }
         if (c == '+' || c == '-') {
-            // Workstream N+++ — SMARTS formal-charge specifier:
+            // SMARTS formal-charge specifier.
             //   "+"    = charge +1
             //   "+<n>" = charge +n
             //   "-"    = charge -1
@@ -455,7 +455,7 @@ inline csd_predicate_t lookup_predicate(std::string_view body) {
         {"[NX3H1]", csd_predicate_nx3h1_k},       {"[NX3H2]", csd_predicate_nx3h2_k},
         {"C([NX3])", csd_predicate_c_nb_nx3_k},   {"[CX3]([C])", csd_predicate_cx3_nb_c_k},
         {"[cH0](Cl)", csd_predicate_ch0_nb_cl_k},
-        // Workstream N++ — top-of-distribution SubstructMatch hot-spots.
+        // Top-of-distribution SubstructMatch hot-spots.
         {"[a]([cH1])", csd_predicate_a_nb_cH1_k},
         {"[aH0](!@O)", csd_predicate_aH0_nb_nonring_O_k},
         {"[c]([cH,nX2H0])[cH,nX2H0]", csd_predicate_c_two_cH_or_nX2H0_k},
@@ -525,8 +525,8 @@ inline bool parse_atom_spec(std::string_view spec, simple_atom_constraint_t &ac)
     ac.formal_charge = std::numeric_limits<std::int8_t>::min(); // sentinel: no charge constraint
     if (spec.empty()) return false;
     if (spec.find('|') != std::string_view::npos) return false;
-    // Workstream N+++ — formal charges (`+`, `-`, `+N`, `-N`) are now handled
-    // inside `parse_atom_term`, so `spec.find('+')` is no longer a bail-out.
+    // Formal charges `+`, `-`, `+N`, `-N` are handled inside `parse_atom_term`, so `spec.find('+')` is
+    // no longer a bail-out.
     // We still need to keep `-` inside `{...}` (range separator for `r{N-M}`)
     // disambiguated from the charge indicator; parse_atom_term does that per-term.
 
@@ -891,14 +891,14 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
 
 /** Check one atom against a constraint. All stack, no allocations. */
 inline bool atom_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx, simple_atom_constraint_t const &ac) {
-    std::uint8_t const el = desc.element[atom_idx];
-    if (ac.element_mask != 0 && el < 64 && (ac.element_mask & (1ULL << el)) == 0) return false;
-    if (ac.element_mask != 0 && el >= 64) return false; // outside our element range
+    std::uint8_t const element = desc.element[atom_idx];
+    if (ac.element_mask != 0 && element < 64 && (ac.element_mask & (1ULL << element)) == 0) return false;
+    if (ac.element_mask != 0 && element >= 64) return false; // outside our element range
     if (ac.min_degree != 0 && desc.degree[atom_idx] != ac.min_degree) return false;
     if (ac.heavy_degree != 0) {
         std::uint8_t const dg = desc.degree[atom_idx];
-        std::uint8_t const nh = desc.num_hydrogens[atom_idx];
-        std::uint8_t const heavy = (dg >= nh) ? static_cast<std::uint8_t>(dg - nh) : 0;
+        std::uint8_t const num_hydrogens = desc.num_hydrogens[atom_idx];
+        std::uint8_t const heavy = (dg >= num_hydrogens) ? static_cast<std::uint8_t>(dg - num_hydrogens) : 0;
         if (heavy != ac.heavy_degree) return false;
     }
     if (ac.exact_h_count != 0xFF && desc.num_hydrogens[atom_idx] != ac.exact_h_count) return false;
@@ -949,14 +949,14 @@ inline bool neighbor_match(molecule_descriptor_t const &desc, std::uint32_t atom
     if ((bflags & nc.bond_require_flags) != nc.bond_require_flags) return false;
     if ((bflags & nc.bond_forbid_flags) != 0) return false;
 
-    std::uint8_t const el = desc.element[atom_idx];
-    if (nc.element_mask != 0 && el < 64 && (nc.element_mask & (1ULL << el)) == 0) return false;
-    if (nc.element_mask != 0 && el >= 64) return false;
+    std::uint8_t const element = desc.element[atom_idx];
+    if (nc.element_mask != 0 && element < 64 && (nc.element_mask & (1ULL << element)) == 0) return false;
+    if (nc.element_mask != 0 && element >= 64) return false;
     if (nc.min_degree != 0 && desc.degree[atom_idx] != nc.min_degree) return false;
     if (nc.heavy_degree != 0) {
         std::uint8_t const dg = desc.degree[atom_idx];
-        std::uint8_t const nh = desc.num_hydrogens[atom_idx];
-        std::uint8_t const heavy = (dg >= nh) ? static_cast<std::uint8_t>(dg - nh) : 0;
+        std::uint8_t const num_hydrogens = desc.num_hydrogens[atom_idx];
+        std::uint8_t const heavy = (dg >= num_hydrogens) ? static_cast<std::uint8_t>(dg - num_hydrogens) : 0;
         if (heavy != nc.heavy_degree) return false;
     }
     if (nc.exact_h_count != 0xFF && desc.num_hydrogens[atom_idx] != nc.exact_h_count) return false;
@@ -1082,7 +1082,7 @@ inline void match_linear_pattern(molecule_descriptor_t const &desc, simple_torsi
                 if (!bond_match(desc, b01, pat.bond[0])) continue;
 
                 // Branches on atom[0] depend only on (a1, a2); branches on
-                // atom[1] depend on (a2, a1, a3).  Both are independent of a4,
+                // atom[1] depend on (a2, a1, a3). Both are independent of a4,
                 // so check them before iterating a4's candidates.
                 if (!check_branch_neighbors(desc, a1, pat.atom[0], a2, kNone)) continue;
                 if (!check_branch_neighbors(desc, a2, pat.atom[1], a1, a3)) continue;

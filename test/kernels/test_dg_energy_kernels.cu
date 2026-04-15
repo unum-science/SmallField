@@ -73,27 +73,27 @@ void gpu_dg_energy(float const *host_coords, float *host_gradient, float const *
     std::uint32_t const num_elements = spatial_dimension * num_atoms;
     std::uint32_t const bounds_size = num_atoms * num_atoms;
 
-    float *dev_coords, *dev_gradient, *dev_bounds, *dev_energy;
-    cudaMalloc(&dev_coords, num_elements * sizeof(float));
-    cudaMalloc(&dev_gradient, num_elements * sizeof(float));
-    cudaMalloc(&dev_bounds, bounds_size * sizeof(float));
-    cudaMalloc(&dev_energy, sizeof(float));
+    float *device_coords, *device_gradient, *device_bounds, *device_energy;
+    cudaMalloc(&device_coords, num_elements * sizeof(float));
+    cudaMalloc(&device_gradient, num_elements * sizeof(float));
+    cudaMalloc(&device_bounds, bounds_size * sizeof(float));
+    cudaMalloc(&device_energy, sizeof(float));
 
-    cudaMemcpy(dev_coords, host_coords, num_elements * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_bounds, host_bounds, bounds_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_coords, host_coords, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_bounds, host_bounds, bounds_size * sizeof(float), cudaMemcpyHostToDevice);
 
     std::uint32_t const shared_bytes = bounds_size * sizeof(__half) + num_elements * sizeof(float);
-    dg_energy_eval_kernel<<<1, 32, shared_bytes>>>(dev_coords, dev_gradient, dev_bounds, num_atoms, spatial_dimension,
-                                                   upper_weight, lower_weight, fourth_dim_weight, dev_energy);
+    dg_energy_eval_kernel<<<1, 32, shared_bytes>>>(device_coords, device_gradient, device_bounds, num_atoms, spatial_dimension,
+                                                   upper_weight, lower_weight, fourth_dim_weight, device_energy);
     cudaDeviceSynchronize();
 
-    cudaMemcpy(out_energy, dev_energy, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_gradient, dev_gradient, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_energy, device_energy, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_gradient, device_gradient, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
 
-    cudaFree(dev_coords);
-    cudaFree(dev_gradient);
-    cudaFree(dev_bounds);
-    cudaFree(dev_energy);
+    cudaFree(device_coords);
+    cudaFree(device_gradient);
+    cudaFree(device_bounds);
+    cudaFree(device_energy);
 }
 
 void gpu_dg_minimize(float *host_coords, float const *host_bounds, std::uint32_t num_atoms,
@@ -104,36 +104,36 @@ void gpu_dg_minimize(float *host_coords, float const *host_bounds, std::uint32_t
     std::uint32_t const num_elements = spatial_dimension * num_atoms;
     std::uint32_t const bounds_size = num_atoms * num_atoms;
 
-    float *dev_coords, *dev_bounds, *dev_energy;
-    std::int32_t *dev_iterations, *dev_status;
-    cudaMalloc(&dev_coords, num_elements * sizeof(float));
-    cudaMalloc(&dev_bounds, bounds_size * sizeof(float));
-    cudaMalloc(&dev_energy, sizeof(float));
-    cudaMalloc(&dev_iterations, sizeof(std::int32_t));
-    cudaMalloc(&dev_status, sizeof(std::int32_t));
+    float *device_coords, *device_bounds, *device_energy;
+    std::int32_t *device_iterations, *device_status;
+    cudaMalloc(&device_coords, num_elements * sizeof(float));
+    cudaMalloc(&device_bounds, bounds_size * sizeof(float));
+    cudaMalloc(&device_energy, sizeof(float));
+    cudaMalloc(&device_iterations, sizeof(std::int32_t));
+    cudaMalloc(&device_status, sizeof(std::int32_t));
 
-    cudaMemcpy(dev_coords, host_coords, num_elements * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_bounds, host_bounds, bounds_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_coords, host_coords, num_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_bounds, host_bounds, bounds_size * sizeof(float), cudaMemcpyHostToDevice);
 
     // shared memory: bounds_half + velocities + gradient (FIRE: 2 arrays beyond positions)
     std::uint32_t const bounds_half_bytes = bounds_size * sizeof(__half);
     std::uint32_t const shared_bytes = bounds_half_bytes + 2 * num_elements * sizeof(float);
 
-    dg_minimize_kernel<<<1, 32, shared_bytes>>>(dev_coords, dev_bounds, num_atoms, spatial_dimension, upper_weight,
+    dg_minimize_kernel<<<1, 32, shared_bytes>>>(device_coords, device_bounds, num_atoms, spatial_dimension, upper_weight,
                                                 lower_weight, fourth_dim_weight, max_iterations, gradient_threshold,
-                                                dev_energy, dev_iterations, dev_status);
+                                                device_energy, device_iterations, device_status);
     cudaDeviceSynchronize();
 
-    cudaMemcpy(host_coords, dev_coords, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out_energy, dev_energy, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out_iterations, dev_iterations, sizeof(std::int32_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out_status, dev_status, sizeof(std::int32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_coords, device_coords, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_energy, device_energy, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_iterations, device_iterations, sizeof(std::int32_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(out_status, device_status, sizeof(std::int32_t), cudaMemcpyDeviceToHost);
 
-    cudaFree(dev_coords);
-    cudaFree(dev_bounds);
-    cudaFree(dev_energy);
-    cudaFree(dev_iterations);
-    cudaFree(dev_status);
+    cudaFree(device_coords);
+    cudaFree(device_bounds);
+    cudaFree(device_energy);
+    cudaFree(device_iterations);
+    cudaFree(device_status);
 }
 
 } // extern "C"

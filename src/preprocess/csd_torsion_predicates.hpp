@@ -48,11 +48,10 @@ enum csd_predicate_t : std::uint8_t {
     csd_predicate_c_nb_nx3_k,      ///< $(C([NX3]))   — aliphatic C with an aliphatic degree-3 N neighbour
     csd_predicate_cx3_nb_c_k,      ///< $([CX3]([C])) — sp² C (degree 3) with an aliphatic C neighbour
     csd_predicate_ch0_nb_cl_k,     ///< $([cH0](Cl))  — aromatic C with zero H and a Cl neighbour
-    /** @name Workstream N++ — top SubstructMatch hot-spots
-     *  Multi-dataset profiling identified two patterns dominating 75-85 % of the
-     *  RDKit-fallback CPU on every tested dataset.  These three predicates cover
-     *  the recursive sub-queries that block the native matcher from accepting
-     *  patterns p94, p95 and p114.
+    /** @name Top SubstructMatch hot-spots.
+     *  Multi-dataset profiling identified two patterns dominating 75-85 % of the RDKit-fallback CPU on
+     *  every tested dataset. These three predicates cover the recursive sub-queries that block the
+     *  native matcher from accepting patterns p94, p95 and p114.
      *  @{ */
     csd_predicate_a_nb_cH1_k,           ///< $([a]([cH1]))           — aromatic atom with an aromatic-CH (1-H) neighbour
     csd_predicate_aH0_nb_nonring_O_k,   ///< $([aH0](!@O))           — aromatic, 0 H, with a non-ring aliphatic O neighbour
@@ -196,9 +195,9 @@ inline bool predicate_ch0_nb_cl(molecule_descriptor_t const &desc, std::uint32_t
 }
 
 /**
- *  @brief `$([a]([cH1]))` — aromatic atom (any element) with at least one neighbour
- *  that is an aromatic C with exactly one H.  Workstream N++ — covers the dominant
- *  pattern p114 hot-spot in GDB-13 / Enamine combinatorial datasets.
+ *  @brief `$([a]([cH1]))` — aromatic atom of any element with at least one neighbour that is an
+ *  aromatic C with exactly one H. Covers the dominant pattern p114 hot-spot in GDB-13 and Enamine
+ *  combinatorial datasets.
  */
 inline bool predicate_a_nb_cH1(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
     if ((desc.atom_flags[atom_idx] & atom_flag_aromatic_k) == 0) return false;
@@ -215,9 +214,8 @@ inline bool predicate_a_nb_cH1(molecule_descriptor_t const &desc, std::uint32_t 
 }
 
 /**
- *  @brief `$([aH0](!@O))` — aromatic atom with 0 hydrogens and at least one neighbour
- *  that is an aliphatic O reached via a non-ring bond.  Workstream N++ — covers
- *  the second half of pattern p114.
+ *  @brief `$([aH0](!@O))` — aromatic atom with 0 hydrogens and at least one neighbour that is an
+ *  aliphatic O reached via a non-ring bond. Covers the second half of pattern p114.
  */
 inline bool predicate_aH0_nb_nonring_O(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
     if ((desc.atom_flags[atom_idx] & atom_flag_aromatic_k) == 0) return false;
@@ -236,9 +234,8 @@ inline bool predicate_aH0_nb_nonring_O(molecule_descriptor_t const &desc, std::u
 }
 
 /**
- *  @brief `$([cH0]([NH1,NH2]))` — aromatic C with 0 H and at least one neighbour
- *  that is an aliphatic N with degree 3 and either 1 or 2 H.  Workstream N++ —
- *  covers pattern p249.
+ *  @brief `$([cH0]([NH1,NH2]))` — aromatic C with 0 H and at least one neighbour that is an
+ *  aliphatic N with degree 3 and either 1 or 2 H. Covers pattern p249.
  */
 inline bool predicate_cH0_nb_NH12(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
     if (desc.element[atom_idx] != 6) return false;
@@ -260,8 +257,8 @@ inline bool predicate_cH0_nb_NH12(molecule_descriptor_t const &desc, std::uint32
 
 /**
  *  @brief `$([c]([cH,nX2H0])[cH,nX2H0])` — aromatic C with at least two distinct
- *  neighbours, each of which is either (aromatic C with exactly 1 H) or
- *  (aromatic N with degree 2 and 0 H).  Workstream N++ — covers patterns p94/p95.
+ *  neighbours, each of which is either an aromatic C with exactly one H, or an aromatic N with
+ *  degree 2 and zero H. Covers patterns p94 and p95.
  */
 inline bool predicate_c_two_cH_or_nX2H0(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
     if (desc.element[atom_idx] != 6) return false;
@@ -269,13 +266,13 @@ inline bool predicate_c_two_cH_or_nX2H0(molecule_descriptor_t const &desc, std::
     auto neighbour_qualifies = [&](std::uint8_t nb) {
         bool const aromatic = (desc.atom_flags[nb] & atom_flag_aromatic_k) != 0;
         if (!aromatic) return false;
-        std::uint8_t const el = desc.element[nb];
+        std::uint8_t const element = desc.element[nb];
         std::uint8_t const h = desc.num_hydrogens[nb];
         std::uint8_t const dg = desc.degree[nb];
         // cH = aromatic C with exactly 1 H.
-        if (el == 6 && h == 1) return true;
+        if (element == 6 && h == 1) return true;
         // nX2H0 = aromatic N with degree 2 and 0 H.
-        if (el == 7 && dg == 2 && h == 0) return true;
+        if (element == 7 && dg == 2 && h == 0) return true;
         return false;
     };
     std::uint16_t const start = desc.neighbor_offset[atom_idx];

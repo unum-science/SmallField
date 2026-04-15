@@ -1,9 +1,8 @@
 /**
  *  @file test_mmff_typer.cpp
- *  @brief MG-1.5/1.6 gate — cross-validate native MMFF atom typer against
- *  RDKit's `MMFFMolProperties::getMMFFAtomType` on drug-like SMILES.
- *  Target: ≥ 99 % per-atom match on ChEMBL 20K (some discrepancy expected
- *  from MMFF-specific aromaticity we don't yet invoke).
+ *  @brief Cross-validate the native MMFF atom typer against RDKit's
+ *  `MMFFMolProperties::getMMFFAtomType` on drug-like SMILES. Target: ≥ 99 % per-atom match on
+ *  ChEMBL 20K. Some discrepancy is expected because we don't yet invoke MMFF-specific aromaticity.
  */
 
 #include <cstdio>
@@ -40,7 +39,7 @@ int n_mols_tested = 0;
 int n_mols_mismatch = 0;
 
 struct summary_t {
-    int el = 0;
+    int element = 0;
     std::uint8_t expected = 0;
     std::uint8_t got = 0;
     std::string smiles;
@@ -93,7 +92,7 @@ void test_one(std::string const &smiles, bool verbose) {
                 ++n_charges_mismatch;
                 this_mol_ok = false;
                 if (verbose && mismatches.size() < 20) {
-                    summary_t m; m.el = (int)desc.element[a];
+                    summary_t m; m.element = (int)desc.element[a];
                     m.smiles = std::string("chg ") + smiles +
                                " (rdk=" + std::to_string(rdk_pc) +
                                " nat=" + std::to_string(nat_pc[a]) + ")";
@@ -107,7 +106,7 @@ void test_one(std::string const &smiles, bool verbose) {
 } // namespace
 
 int main(int argc, char **argv) {
-    std::printf("=== test_mmff_typer: MG-1.5/1.6/1.7 gate ===\n");
+    std::printf("=== test_mmff_typer: native MMFF atom-typer + BCI charge gate ===\n");
     extract_mmff94_tables_from_rdkit(tables_host);
     tables = tables_host.view();
 
@@ -153,7 +152,7 @@ int main(int argc, char **argv) {
     std::printf("atom match: %.4f %%, charge match: %.4f %%, molecule match: %.3f %%\n",
                  atom_match, chg_match, mol_match);
     for (auto const &m : mismatches) {
-        std::printf("  el=%d rdk=%u nat=%u  [%s]\n", m.el, m.expected, m.got, m.smiles.c_str());
+        std::printf("  element=%d rdk=%u nat=%u  [%s]\n", m.element, m.expected, m.got, m.smiles.c_str());
     }
     // Gate: 99 % atom-level match for curated + 95 % for full ChEMBL.
     double const min_match = (argc > 1) ? 95.0 : 99.9;

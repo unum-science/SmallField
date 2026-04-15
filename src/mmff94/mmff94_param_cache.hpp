@@ -1,8 +1,9 @@
 /**
- *  @file mmff_param_cache.hpp
+ *  @file mmff94_param_cache.hpp
  *  @brief Global cache for MMFF94 per-term parameter lookups.
  *
- *  Post-MM-1, `extract_mmff94_params` is 23 % of prep CPU.  The bulk is in
+ *  Once the native MMFF port replaced the RDKit parameter calls, `extract_mmff94_params` still
+ *  accounted for 23 % of prep CPU. The bulk is in
  *  `getMMFFTorsionParams` (6.2 %), `getMMFFStretchBendParams` (5.3 %),
  *  `getMMFFAngleBendParams` (3.7 %), and ancillary type-determination
  *  (`getMMFFBondType`, `getMMFFAngleType`, `getMMFFTorsionType`).  The
@@ -98,9 +99,8 @@ private:
     std::unordered_map<std::uint64_t, Value> map_;
 };
 
-// ---- Per-thread cache instances ------------------------------------------
-// Process-local + thread-local.  All MMFF94 param tables are globally fixed;
-// deriving once per thread is safe.  Caches persist for the thread's
+// Per-thread cache instances. All MMFF94 param tables are globally fixed, so deriving once per thread
+// is safe. Caches are process-local and thread-local and persist for the thread's
 // lifetime, so warmup cost amortises across every molecule that thread
 // handles via OpenMP's persistent pool.
 
@@ -125,9 +125,8 @@ inline mmff_cache_t<mmff_stretchbend_cached_t> &mmff_stretchbend_cache() {
     return c;
 }
 
-// ---- Key packing --------------------------------------------------------
-// MMFF atom types fit in 7 bits (max 99).  Bond signatures pack
-// (bond_order 2 bits, aromatic 1 bit, in_ring 1 bit) = 4 bits.  All keys
+// Key packing. MMFF atom types fit in 7 bits — the maximum type number is 99. Bond signatures pack
+// into 4 bits: 2 bits for bond_order, 1 bit for aromatic, 1 bit for in_ring. All keys
 // fit comfortably in 64 bits with room for a 4-bit "kind" tag.
 
 enum : std::uint64_t {
@@ -165,7 +164,7 @@ inline std::uint64_t make_angle_key_(std::uint8_t at_i, std::uint8_t at_center, 
 inline std::uint64_t make_torsion_key_(std::uint8_t at_i, std::uint8_t at_j, std::uint8_t at_k,
                                        std::uint8_t at_l, std::uint8_t bsig_ij, std::uint8_t bsig_jk,
                                        std::uint8_t bsig_kl) noexcept {
-    // Torsion params are symmetric under (i,j,k,l) ↔ (l,k,j,i).  Canonicalize
+    // Torsion params are symmetric under (i,j,k,l) ↔ (l,k,j,i). Canonicalize
     // by comparing the two endpoint-type pairs; flip the whole thing if the
     // reverse ordering is smaller.
     bool flip = false;
@@ -186,7 +185,7 @@ inline std::uint64_t make_torsion_key_(std::uint8_t at_i, std::uint8_t at_j, std
 inline std::uint64_t make_oop_key_(std::uint8_t at_center, std::uint8_t at_a, std::uint8_t at_b,
                                    std::uint8_t at_c) noexcept {
     // Out-of-plane: center is fixed, the three planar neighbors are
-    // interchangeable.  Sort (a, b, c) ascending.
+    // interchangeable. Sort (a, b, c) ascending.
     std::uint8_t nbrs[3] = {at_a, at_b, at_c};
     if (nbrs[0] > nbrs[1]) std::swap(nbrs[0], nbrs[1]);
     if (nbrs[1] > nbrs[2]) std::swap(nbrs[1], nbrs[2]);
@@ -198,7 +197,7 @@ inline std::uint64_t make_oop_key_(std::uint8_t at_center, std::uint8_t at_a, st
 
 inline std::uint64_t make_stretchbend_key_(std::uint8_t at_i, std::uint8_t at_center, std::uint8_t at_j,
                                            std::uint8_t bsig_ic, std::uint8_t bsig_cj) noexcept {
-    // Stretch-bend is directional (kbaIJK ≠ kbaKJI in general).  Do NOT
+    // Stretch-bend is directional (kbaIJK ≠ kbaKJI in general). Do NOT
     // canonicalize endpoint order.
     return (mmff_key_kind_stretchbend_k << 60) | (static_cast<std::uint64_t>(at_i) << 32) |
            (static_cast<std::uint64_t>(at_center) << 24) | (static_cast<std::uint64_t>(at_j) << 16) |

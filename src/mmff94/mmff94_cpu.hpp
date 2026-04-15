@@ -1,28 +1,26 @@
 /**
  *  @file mmff94_cpu.hpp
- *  @brief Workstream MG-1 — self-contained CPU port of MMFF94 term extraction.
+ *  @brief Self-contained CPU port of MMFF94 term extraction.
  *
- *  Reads `molecule_descriptor_t` + per-atom MMFF types + partial charges and
- *  produces a fully populated `etkdg_prepared_molecule_t` without any runtime
- *  RDKit calls.  Serves three roles:
+ *  Reads `molecule_descriptor_t` plus per-atom MMFF types and partial charges, and produces a fully
+ *  populated `etkdg_prepared_molecule_t` without any runtime RDKit calls. Serves three roles:
  *
- *   1. GPU debugging reference — every GPU kernel in MG-2/3/4 must match
- *      the output of this module byte-for-byte on the same inputs.
- *   2. Production fallback — molecules the GPU atom-typer cannot classify
- *      are re-routed through this path on the host.
- *   3. Throughput ceiling — pure C++ lookups against our flat POD tables
- *      bound the best the GPU port can do before taking over.
+ *   1. GPU debugging reference — every GPU kernel must match the output of this module byte-for-byte
+ *      on the same inputs.
+ *   2. Production fallback — molecules the GPU atom-typer cannot classify are re-routed through this
+ *      path on the host.
+ *   3. Throughput ceiling — pure C++ lookups against our flat POD tables bound the best the GPU port
+ *      can do before taking over.
  *
- *  All parameter resolution goes through `src/mmff94_tables.hpp` — the
- *  extracted RDKit tables plus the `lookup_*` cascades that mirror RDKit's
- *  `operator()` behaviour.  The empirical rules (bond stretch, angle bend,
- *  torsion) are reimplemented in-file from MMFF.V equations 18/19/(g)/(h),
- *  feeding off the `covrad`, `bndk`, `hl`, and `prop` tables.
+ *  All parameter resolution goes through `parameters/mmff94_tables.hpp` — the extracted RDKit tables
+ *  plus the `lookup_*` cascades that mirror RDKit's `operator()` behaviour. The empirical rules for
+ *  bond stretch, angle bend, and torsion are reimplemented in-file from MMFF.V equations 18, 19, (g),
+ *  and (h), feeding off the `covrad`, `bndk`, `hl`, and `prop` tables.
  *
- *  Atom types and partial charges are caller-provided for MG-1.  The native
- *  atom typer + BCI charge perception live in MG-2's GPU kernel; the host-
- *  side fallback pulls types/charges from `MMFFMolProperties` in the caller
- *  (see `etkdg_preprocess.hpp::extract_mmff94_params_via_cpu_port`).
+ *  Atom types and partial charges are caller-provided. The native atom typer and BCI charge
+ *  perception live in the GPU kernel; the host-side fallback pulls types and charges from
+ *  `MMFFMolProperties` in the caller — see
+ *  `preprocess/etkdg_prepare_batch.hpp::extract_mmff94_params_via_cpu_port`.
  */
 
 #pragma once
@@ -44,8 +42,8 @@
 
 // `extract_mmff94_params_native` + `extract_mmff94_params_fully_native`
 // at the bottom of this file use `etkdg_prepared_molecule_t` from
-// `etkdg_preprocess.hpp`.  That header transitively pulls in RDKit and
-// cannot be compiled by a .cu file's host pass.  Gate the two extract
+// `etkdg_preprocess.hpp`. That header transitively pulls in RDKit and
+// cannot be compiled by a .cu file's host pass. Gate the two extract
 // functions on the presence of the full struct definition so .cu
 // callers that only want the helpers (`native_*`, periodic-table rows,
 // etc.) can include `mmff94_cpu.hpp` via `SMALLFIELD_MMFF_TABLES_NO_RDKIT`.
@@ -57,10 +55,10 @@
 
 namespace smallfield {
 
-// ---- Periodic-table row utilities (match RDKit's helpers) ----------------
+// Periodic-table row utilities that match RDKit's helpers.
 
-/** Matches `RDKit::MMFF::getPeriodicTableRow` — row 0 (H, He), 1 (Li-Ne),
- *  2 (Na-Ar), 3 (K-Kr), 4 (Rb-Xe). */
+/** Matches `RDKit::MMFF::getPeriodicTableRow`: row 0 holds H and He; row 1 Li through Ne;
+ *  row 2 Na through Ar; row 3 K through Kr; row 4 Rb through Xe. */
 SMALLFIELD_HD inline std::uint8_t periodic_table_row(std::uint8_t atomic_num) noexcept {
     if (atomic_num >= 3 && atomic_num <= 10) return 1;
     if (atomic_num >= 11 && atomic_num <= 18) return 2;
@@ -85,10 +83,10 @@ SMALLFIELD_HD inline std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num)
     return row;
 }
 
-// ---- Neighbor CSR convenience ---------------------------------------------
+// Neighbor CSR convenience helpers.
 
-/** Find the bond index between atoms i and j via the descriptor's
- *  neighbor CSR.  Returns -1 on miss.  Matches `find_bond_idx` in
+/** Find the bond index between atoms i and j via the descriptor's neighbor CSR.
+ *  Returns -1 on miss. Matches `find_bond_idx` in
  *  `etkdg_preprocess.hpp`. */
 SMALLFIELD_HD inline std::int32_t find_bond_idx(molecule_descriptor_t const &desc,
                                   std::uint32_t i, std::uint32_t j) noexcept {
@@ -164,10 +162,10 @@ SMALLFIELD_HD inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descript
     return 0;
 }
 
-// ---- Native MMFF type classification --------------------------------------
+// Native MMFF type classification.
 
-/** Native port of `MMFFMolProperties::getMMFFBondType`.  Returns 1 iff the
- *  bond is SINGLE and both endpoints are sbmb atoms or both are aromatic
+/** Native port of `MMFFMolProperties::getMMFFBondType`. Returns 1 iff the bond is SINGLE and both
+ *  endpoints are sbmb atoms or both are aromatic
  *  atoms (per MMFFProp).  Otherwise returns 0. */
 SMALLFIELD_HD inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &desc,
                                               mmff94_tables_view_t const &t,
@@ -175,7 +173,7 @@ SMALLFIELD_HD inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_
                                               std::uint32_t bond_idx) noexcept {
     std::uint8_t const bo = desc.bond_order[bond_idx];
     bool const aromatic_bond = (desc.bond_flags[bond_idx] & bond_flag_aromatic_k) != 0;
-    // RDKit's rule triggers only when the bond is SINGLE.  Aromatic bonds in
+    // RDKit's rule triggers only when the bond is SINGLE. Aromatic bonds in
     // the descriptor report order=1 with the aromatic flag set, so we key on
     // `bo == 1 && !aromatic_bond` to exclude aromatic.
     if (!(bo == 1 && !aromatic_bond)) return 0;
@@ -193,15 +191,15 @@ SMALLFIELD_HD inline std::uint8_t native_get_mmff_angle_type(molecule_descriptor
                                                std::span<std::uint8_t const> bond_types,
                                                std::uint32_t i, std::uint32_t j,
                                                std::uint32_t k) noexcept {
-    std::int32_t const bid_ij = find_bond_idx(desc, i, j);
-    std::int32_t const bid_jk = find_bond_idx(desc, j, k);
-    if (bid_ij < 0 || bid_jk < 0) return 0;
-    unsigned const bt_sum = bond_types[bid_ij] + bond_types[bid_jk];
-    unsigned angle_type = bt_sum;
+    std::int32_t const bond_index_ij = find_bond_idx(desc, i, j);
+    std::int32_t const bond_index_jk = find_bond_idx(desc, j, k);
+    if (bond_index_ij < 0 || bond_index_jk < 0) return 0;
+    unsigned const bond_type_sum = bond_types[bond_index_ij] + bond_types[bond_index_jk];
+    unsigned angle_type = bond_type_sum;
     unsigned const size = native_is_angle_in_ring_3_or_4(desc, i, j, k);
     if (size) {
         angle_type = size;
-        if (bt_sum) angle_type += (bt_sum + size - 2);
+        if (bond_type_sum) angle_type += (bond_type_sum + size - 2);
     }
     return static_cast<std::uint8_t>(angle_type);
 }
@@ -214,20 +212,20 @@ native_get_mmff_torsion_type(molecule_descriptor_t const &desc,
                              std::span<std::uint8_t const> bond_types,
                              std::uint32_t i, std::uint32_t j,
                              std::uint32_t k, std::uint32_t l) noexcept {
-    std::int32_t const bid_jk = find_bond_idx(desc, j, k);
-    std::int32_t const bid_ij = find_bond_idx(desc, i, j);
-    std::int32_t const bid_kl = find_bond_idx(desc, k, l);
-    if (bid_jk < 0 || bid_ij < 0 || bid_kl < 0) return {0, 0};
+    std::int32_t const bond_index_jk = find_bond_idx(desc, j, k);
+    std::int32_t const bond_index_ij = find_bond_idx(desc, i, j);
+    std::int32_t const bond_index_kl = find_bond_idx(desc, k, l);
+    if (bond_index_jk < 0 || bond_index_ij < 0 || bond_index_kl < 0) return {0, 0};
 
-    std::uint8_t const bt_ij = bond_types[bid_ij];
-    std::uint8_t const bt_jk = bond_types[bid_jk];
-    std::uint8_t const bt_kl = bond_types[bid_kl];
-    bool const jk_single = (desc.bond_order[bid_jk] == 1) &&
-                           !(desc.bond_flags[bid_jk] & bond_flag_aromatic_k);
+    std::uint8_t const bond_type_ij = bond_types[bond_index_ij];
+    std::uint8_t const bond_type_jk = bond_types[bond_index_jk];
+    std::uint8_t const bond_type_kl = bond_types[bond_index_kl];
+    bool const jk_single = (desc.bond_order[bond_index_jk] == 1) &&
+                           !(desc.bond_flags[bond_index_jk] & bond_flag_aromatic_k);
 
-    unsigned torsion_type = bt_jk;
+    unsigned torsion_type = bond_type_jk;
     unsigned secondary = 0;
-    if (bt_jk == 0 && jk_single && (bt_ij == 1 || bt_kl == 1)) torsion_type = 2;
+    if (bond_type_jk == 0 && jk_single && (bond_type_ij == 1 || bond_type_kl == 1)) torsion_type = 2;
 
     unsigned const size = native_is_torsion_in_ring_4_or_5(desc, i, j, k, l);
     if (size == 4) {
@@ -253,24 +251,24 @@ native_get_mmff_torsion_type(molecule_descriptor_t const &desc,
 
 /** Native port of the free function `getMMFFStretchBendType`. */
 SMALLFIELD_HD inline std::uint8_t native_get_mmff_stretch_bend_type(unsigned angle_type,
-                                                      unsigned bt_1, unsigned bt_2) noexcept {
+                                                      unsigned bond_type_1, unsigned bond_type_2) noexcept {
     switch (angle_type) {
-        case 1: return (bt_1 || (bt_1 == bt_2)) ? 1 : 2;
+        case 1: return (bond_type_1 || (bond_type_1 == bond_type_2)) ? 1 : 2;
         case 2: return 3;
         case 4: return 4;
         case 3: return 5;
-        case 5: return (bt_1 || (bt_1 == bt_2)) ? 6 : 7;
+        case 5: return (bond_type_1 || (bond_type_1 == bond_type_2)) ? 6 : 7;
         case 6: return 8;
-        case 7: return (bt_1 || (bt_1 == bt_2)) ? 9 : 10;
+        case 7: return (bond_type_1 || (bond_type_1 == bond_type_2)) ? 9 : 10;
         case 8: return 11;
         default: return 0;
     }
 }
 
-// ---- Empirical fallback rules --------------------------------------------
+// Empirical fallback rules used when a parameter lookup misses.
 
-/** Empirical bond-stretch rule (MMFF.V eq 18-19).  Matches
- *  `getMMFFBondStretchEmpiricalRuleParams`.  Returns (kb, r0) by value.
+/** Empirical bond-stretch rule from MMFF.V equations 18-19. Matches
+ *  `getMMFFBondStretchEmpiricalRuleParams` and returns (kb, r0) by value.
  *  Internally uses `double` to match RDKit's precision; inputs/outputs are
  *  float for parity with the extracted-table pipeline. */
 SMALLFIELD_HD inline std::pair<float, float> native_bond_empirical(mmff94_tables_view_t const &t,
@@ -486,9 +484,9 @@ SMALLFIELD_HD inline std::array<float, 3> native_torsion_empirical(
     return out;
 }
 
-// ---- Top-level native extractor -------------------------------------------
+// Top-level native extractor.
 
-/** isDoubleZero predicate matching RDKit's 1e-10 threshold.  Used by the
+/** isDoubleZero predicate matching RDKit's 1e-10 threshold. Used by the
  *  angle-bend + torsion fallback logic. */
 SMALLFIELD_HD inline bool native_is_zero(float v) noexcept { return std::fabs(v) < 1.0e-10f; }
 
@@ -527,7 +525,7 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
     std::uint32_t const num_atoms = desc.num_atoms;
     std::uint32_t const num_bonds = desc.num_bonds;
 
-    // --- Per-atom VdW + charge -------------------------------------------
+    // Per-atom VdW parameters and partial charge.
     result.mmff_atom_vdw.resize(num_atoms);
     result.mmff_atom_charge.resize(num_atoms);
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
@@ -545,21 +543,20 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
         result.mmff_atom_charge[a] = charges[a];
     }
 
-    // --- Bond-distance copy (N×N, packed, no stride) --------------------
+    // Bond-distance copy: N×N, packed, no stride padding.
     result.bond_distance.resize(static_cast<std::size_t>(num_atoms) * num_atoms);
     for (std::uint32_t i = 0; i < num_atoms; ++i)
         for (std::uint32_t j = 0; j < num_atoms; ++j)
             result.bond_distance[i * num_atoms + j] = desc.bond_distance[i * max_atoms_k + j];
 
-    // --- Precompute per-bond MMFF bond type ------------------------------
+    // Precompute per-bond MMFF bond type.
     std::array<std::uint8_t, max_bonds_k> bond_type_arr {};
     for (std::uint32_t b = 0; b < num_bonds; ++b) {
         bond_type_arr[b] = native_get_mmff_bond_type(desc, tables, atom_types, b);
     }
     std::span<std::uint8_t const> bond_types {bond_type_arr.data(), num_bonds};
 
-    // --- Bond terms ------------------------------------------------------
-    // Retain r0_ij / kb per bond for downstream angle+stretchbend reuse.
+    // Bond terms. Retain r0_ij and kb per bond for downstream angle and stretchbend reuse.
     std::array<float, max_bonds_k> bond_r0 {};
     std::array<float, max_bonds_k> bond_kb {};
     for (std::uint32_t b = 0; b < num_bonds; ++b) {
@@ -580,18 +577,18 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
                                      static_cast<std::uint8_t>(j), {0, 0}, kb, r0, 0.0f});
     }
 
-    // --- Angle terms + per-angle scratch (θ₀, ka, bond_type pair) used
-    //     by the stretchbend pass below ----------------------------------
+    // Angle terms. Also emit per-angle scratch — θ₀, ka, and the bond-type pair — consumed below
+    // by the stretchbend pass.
     struct angle_scratch_t {
         std::uint8_t i, j, k;
         std::uint8_t angle_type;
-        std::uint8_t bt_ij, bt_jk;
-        std::int32_t bid_ij, bid_jk;
+        std::uint8_t bond_type_ij, bond_type_jk;
+        std::int32_t bond_index_ij, bond_index_jk;
         float theta0_deg;
         float ka;
     };
     // Stack-allocated scratch — upper bound matches the GPU's per-molecule
-    // angle slot count.  Avoids a per-molecule heap allocation on the hot
+    // angle slot count. Avoids a per-molecule heap allocation on the hot
     // prep path.
     std::array<angle_scratch_t, max_mmff_angles_per_mol_k> angles_scratch;
     std::uint32_t num_angles_scratch = 0;
@@ -603,9 +600,9 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
             for (std::uint16_t b = a + 1; b < nend; ++b) {
                 std::uint32_t const ai = desc.neighbor_atom[a];
                 std::uint32_t const aj = desc.neighbor_atom[b];
-                std::int32_t const bid_ic = find_bond_idx(desc, ai, center);
-                std::int32_t const bid_cj = find_bond_idx(desc, center, aj);
-                if (bid_ic < 0 || bid_cj < 0) continue;
+                std::int32_t const bond_index_ic = find_bond_idx(desc, ai, center);
+                std::int32_t const bond_index_cj = find_bond_idx(desc, center, aj);
+                if (bond_index_ic < 0 || bond_index_cj < 0) continue;
                 std::uint8_t const at = native_get_mmff_angle_type(desc, bond_types, ai,
                                                                     center, aj);
                 auto const *ap = lookup_angle(tables, at, atom_types[ai],
@@ -617,8 +614,8 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
                     theta0_deg = ap->theta0_deg;
                 }
                 if (use_empirical) {
-                    float const r0_ic = bond_r0[bid_ic];
-                    float const r0_cj = bond_r0[bid_cj];
+                    float const r0_ic = bond_r0[bond_index_ic];
+                    float const r0_cj = bond_r0[bond_index_cj];
                     // If a table entry exists with ka=0, RDKit keeps its θ₀ and
                     // uses it inside the empirical ka computation — pass it as
                     // the override so we match byte-for-byte.
@@ -637,13 +634,13 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
                 angles_scratch[num_angles_scratch++] = {static_cast<std::uint8_t>(ai),
                                            static_cast<std::uint8_t>(center),
                                            static_cast<std::uint8_t>(aj), at,
-                                           bond_types[bid_ic], bond_types[bid_cj],
-                                           bid_ic, bid_cj, theta0_deg, ka};
+                                           bond_types[bond_index_ic], bond_types[bond_index_cj],
+                                           bond_index_ic, bond_index_cj, theta0_deg, ka};
             }
         }
     }
 
-    // --- Torsion terms ---------------------------------------------------
+    // Torsion terms.
     for (std::uint32_t b = 0; b < num_bonds; ++b) {
         std::uint32_t const j = desc.bond_atom_i[b];
         std::uint32_t const k = desc.bond_atom_j[b];
@@ -685,32 +682,32 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
         }
     }
 
-    // --- Out-of-plane bending terms --------------------------------------
+    // Out-of-plane bending terms.
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
         std::uint32_t const degree = desc.degree[center];
         if (degree < 3) continue;
         std::uint16_t const nstart = desc.neighbor_offset[center];
-        std::uint8_t nb_cache[8];
-        std::uint32_t nb_count = 0;
-        for (std::uint16_t n = nstart; n < desc.neighbor_offset[center + 1] && nb_count < 8; ++n)
-            nb_cache[nb_count++] = desc.neighbor_atom[n];
+        std::uint8_t neighbor_cache[8];
+        std::uint32_t neighbor_count = 0;
+        for (std::uint16_t n = nstart; n < desc.neighbor_offset[center + 1] && neighbor_count < 8; ++n)
+            neighbor_cache[neighbor_count++] = desc.neighbor_atom[n];
 
-        for (std::uint32_t a = 0; a < nb_count; ++a) {
+        for (std::uint32_t a = 0; a < neighbor_count; ++a) {
             std::uint8_t plane[2];
             std::uint32_t plane_count = 0;
-            for (std::uint32_t c = 0; c < nb_count && plane_count < 2; ++c)
-                if (c != a) plane[plane_count++] = nb_cache[c];
+            for (std::uint32_t c = 0; c < neighbor_count && plane_count < 2; ++c)
+                if (c != a) plane[plane_count++] = neighbor_cache[c];
             if (plane_count < 2) continue;
-            auto const *op = lookup_oop(tables, atom_types[nb_cache[a]],
+            auto const *op = lookup_oop(tables, atom_types[neighbor_cache[a]],
                                          atom_types[center], atom_types[plane[0]],
                                          atom_types[plane[1]]);
             if (!op) continue;
-            result.mmff_oops.push_back({nb_cache[a], static_cast<std::uint8_t>(center),
+            result.mmff_oops.push_back({neighbor_cache[a], static_cast<std::uint8_t>(center),
                                          plane[0], plane[1], op->koop, {0.0f, 0.0f}});
         }
     }
 
-    // --- Stretch-bend terms ----------------------------------------------
+    // Stretch-bend terms.
     for (std::uint32_t angle_index = 0; angle_index < num_angles_scratch; ++angle_index) {
         auto const &as = angles_scratch[angle_index];
         auto const *prop_j = lookup_prop(tables, atom_types[as.j]);
@@ -718,11 +715,11 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
 
         std::uint8_t const sbt = native_get_mmff_stretch_bend_type(
             as.angle_type,
-            (atom_types[as.i] <= atom_types[as.k]) ? as.bt_ij : as.bt_jk,
-            (atom_types[as.i] <  atom_types[as.k]) ? as.bt_jk : as.bt_ij);
-        auto stbn = lookup_stbn(tables, sbt, as.bt_ij, as.bt_jk,
+            (atom_types[as.i] <= atom_types[as.k]) ? as.bond_type_ij : as.bond_type_jk,
+            (atom_types[as.i] <  atom_types[as.k]) ? as.bond_type_jk : as.bond_type_ij);
+        auto stbn = lookup_stbn(tables, sbt, as.bond_type_ij, as.bond_type_jk,
                                 atom_types[as.i], atom_types[as.j], atom_types[as.k]);
-        // RDKit falls back to DFSB ONLY when the STBN pointer is null.  If
+        // RDKit falls back to DFSB ONLY when the STBN pointer is null. If
         // STBN has an entry with both kba=0 (e.g., cyclopropane CR3R-CR3R-
         // CR3R), the term is dropped rather than re-looked-up in DFSB.
         float kba_ijk = 0.0f, kba_kji = 0.0f;
@@ -744,13 +741,13 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
         if (native_is_zero(kba_ijk) && native_is_zero(kba_kji)) continue;
         if (swap_flag) std::swap(kba_ijk, kba_kji);
         float const theta0_rad = as.theta0_deg * static_cast<float>(M_PI) / 180.0f;
-        float const r0_ij = bond_r0[as.bid_ij];
-        float const r0_jk = bond_r0[as.bid_jk];
+        float const r0_ij = bond_r0[as.bond_index_ij];
+        float const r0_jk = bond_r0[as.bond_index_jk];
         result.mmff_stretchbends.push_back({as.i, as.j, as.k, 0, kba_ijk, kba_kji,
                                               theta0_rad, r0_ij, r0_jk, 0.0f});
     }
 
-    // --- Per-atom CSR interaction list (same layout as the RDKit path) --
+    // Per-atom CSR interaction list with the same layout as the RDKit path.
     auto const &bonds = result.mmff_bonds;
     auto const &ang_v = result.mmff_angles;
     auto const &tor_v = result.mmff_torsions;
@@ -760,24 +757,24 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
     struct type_counts_t {
         std::uint8_t bond, angle, torsion, oop, stretchbend;
     };
-    std::array<type_counts_t, max_atoms_k> tc {};
-    for (auto const &e : bonds) { tc[e.atom_i].bond++; tc[e.atom_j].bond++; }
-    for (auto const &e : ang_v) { tc[e.atom_i].angle++; tc[e.atom_j].angle++; tc[e.atom_k].angle++; }
+    std::array<type_counts_t, max_atoms_k> type_counts {};
+    for (auto const &e : bonds) { type_counts[e.atom_i].bond++; type_counts[e.atom_j].bond++; }
+    for (auto const &e : ang_v) { type_counts[e.atom_i].angle++; type_counts[e.atom_j].angle++; type_counts[e.atom_k].angle++; }
     for (auto const &e : tor_v) {
-        tc[e.atom_i].torsion++; tc[e.atom_j].torsion++;
-        tc[e.atom_k].torsion++; tc[e.atom_l].torsion++;
+        type_counts[e.atom_i].torsion++; type_counts[e.atom_j].torsion++;
+        type_counts[e.atom_k].torsion++; type_counts[e.atom_l].torsion++;
     }
     for (auto const &e : oop_v) {
-        tc[e.atom_i].oop++; tc[e.atom_j].oop++; tc[e.atom_k].oop++; tc[e.atom_l].oop++;
+        type_counts[e.atom_i].oop++; type_counts[e.atom_j].oop++; type_counts[e.atom_k].oop++; type_counts[e.atom_l].oop++;
     }
     for (auto const &e : sb_v) {
-        tc[e.atom_i].stretchbend++; tc[e.atom_j].stretchbend++; tc[e.atom_k].stretchbend++;
+        type_counts[e.atom_i].stretchbend++; type_counts[e.atom_j].stretchbend++; type_counts[e.atom_k].stretchbend++;
     }
 
     result.mmff_atom_offsets.resize(num_atoms);
     std::uint32_t running = 0;
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
-        auto const &c = tc[a];
+        auto const &c = type_counts[a];
         auto &off = result.mmff_atom_offsets[a];
         off.bond_start = running;       off.bond_count = c.bond;           running += c.bond;
         off.angle_start = running;      off.angle_count = c.angle;         running += c.angle;
@@ -790,37 +787,37 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc,
     struct cursors_t {
         std::uint32_t bond, angle, torsion, oop, stretchbend;
     };
-    std::array<cursors_t, max_atoms_k> cur {};
+    std::array<cursors_t, max_atoms_k> cursors {};
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
         auto const &off = result.mmff_atom_offsets[a];
-        cur[a] = {off.bond_start, off.angle_start, off.torsion_start, off.oop_start,
+        cursors[a] = {off.bond_start, off.angle_start, off.torsion_start, off.oop_start,
                   off.stretchbend_start};
     }
     for (std::uint32_t t = 0; t < bonds.size(); ++t) {
-        result.mmff_interactions[cur[bonds[t].atom_i].bond++] = {t, mmff94_bond_k, atom_role_first_k};
-        result.mmff_interactions[cur[bonds[t].atom_j].bond++] = {t, mmff94_bond_k, atom_role_second_k};
+        result.mmff_interactions[cursors[bonds[t].atom_i].bond++] = {t, mmff94_bond_k, atom_role_first_k};
+        result.mmff_interactions[cursors[bonds[t].atom_j].bond++] = {t, mmff94_bond_k, atom_role_second_k};
     }
     for (std::uint32_t t = 0; t < ang_v.size(); ++t) {
-        result.mmff_interactions[cur[ang_v[t].atom_i].angle++] = {t, mmff94_angle_end_k, atom_role_first_k};
-        result.mmff_interactions[cur[ang_v[t].atom_j].angle++] = {t, mmff94_angle_center_k, atom_role_second_k};
-        result.mmff_interactions[cur[ang_v[t].atom_k].angle++] = {t, mmff94_angle_end_k, atom_role_third_k};
+        result.mmff_interactions[cursors[ang_v[t].atom_i].angle++] = {t, mmff94_angle_end_k, atom_role_first_k};
+        result.mmff_interactions[cursors[ang_v[t].atom_j].angle++] = {t, mmff94_angle_center_k, atom_role_second_k};
+        result.mmff_interactions[cursors[ang_v[t].atom_k].angle++] = {t, mmff94_angle_end_k, atom_role_third_k};
     }
     for (std::uint32_t t = 0; t < tor_v.size(); ++t) {
-        result.mmff_interactions[cur[tor_v[t].atom_i].torsion++] = {t, mmff94_torsion_k, atom_role_first_k};
-        result.mmff_interactions[cur[tor_v[t].atom_j].torsion++] = {t, mmff94_torsion_k, atom_role_second_k};
-        result.mmff_interactions[cur[tor_v[t].atom_k].torsion++] = {t, mmff94_torsion_k, atom_role_third_k};
-        result.mmff_interactions[cur[tor_v[t].atom_l].torsion++] = {t, mmff94_torsion_k, atom_role_fourth_k};
+        result.mmff_interactions[cursors[tor_v[t].atom_i].torsion++] = {t, mmff94_torsion_k, atom_role_first_k};
+        result.mmff_interactions[cursors[tor_v[t].atom_j].torsion++] = {t, mmff94_torsion_k, atom_role_second_k};
+        result.mmff_interactions[cursors[tor_v[t].atom_k].torsion++] = {t, mmff94_torsion_k, atom_role_third_k};
+        result.mmff_interactions[cursors[tor_v[t].atom_l].torsion++] = {t, mmff94_torsion_k, atom_role_fourth_k};
     }
     for (std::uint32_t t = 0; t < oop_v.size(); ++t) {
-        result.mmff_interactions[cur[oop_v[t].atom_i].oop++] = {t, mmff94_out_of_plane_k, atom_role_first_k};
-        result.mmff_interactions[cur[oop_v[t].atom_j].oop++] = {t, mmff94_out_of_plane_k, atom_role_second_k};
-        result.mmff_interactions[cur[oop_v[t].atom_k].oop++] = {t, mmff94_out_of_plane_k, atom_role_third_k};
-        result.mmff_interactions[cur[oop_v[t].atom_l].oop++] = {t, mmff94_out_of_plane_k, atom_role_fourth_k};
+        result.mmff_interactions[cursors[oop_v[t].atom_i].oop++] = {t, mmff94_out_of_plane_k, atom_role_first_k};
+        result.mmff_interactions[cursors[oop_v[t].atom_j].oop++] = {t, mmff94_out_of_plane_k, atom_role_second_k};
+        result.mmff_interactions[cursors[oop_v[t].atom_k].oop++] = {t, mmff94_out_of_plane_k, atom_role_third_k};
+        result.mmff_interactions[cursors[oop_v[t].atom_l].oop++] = {t, mmff94_out_of_plane_k, atom_role_fourth_k};
     }
     for (std::uint32_t t = 0; t < sb_v.size(); ++t) {
-        result.mmff_interactions[cur[sb_v[t].atom_i].stretchbend++] = {t, mmff94_stretch_bend_k, atom_role_first_k};
-        result.mmff_interactions[cur[sb_v[t].atom_j].stretchbend++] = {t, mmff94_stretch_bend_k, atom_role_second_k};
-        result.mmff_interactions[cur[sb_v[t].atom_k].stretchbend++] = {t, mmff94_stretch_bend_k, atom_role_third_k};
+        result.mmff_interactions[cursors[sb_v[t].atom_i].stretchbend++] = {t, mmff94_stretch_bend_k, atom_role_first_k};
+        result.mmff_interactions[cursors[sb_v[t].atom_j].stretchbend++] = {t, mmff94_stretch_bend_k, atom_role_second_k};
+        result.mmff_interactions[cursors[sb_v[t].atom_k].stretchbend++] = {t, mmff94_stretch_bend_k, atom_role_third_k};
     }
 }
 

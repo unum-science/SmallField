@@ -1,7 +1,7 @@
 /**
  *  @file mmff94_typer_device.cuh
- *  @brief Workstream MG-C — `mmff94_type_and_charge_kernel`: runs the
- *  native MMFF atom typer + charge computation on the GPU.
+ *  @brief `mmff94_type_and_charge_kernel` runs the native MMFF atom typer and charge computation
+ *  on the GPU.
  *
  *  Each block = one warp = one molecule.  Inside the block, atoms are
  *  assigned lane-strided (lane `l` handles atoms `l, l+32, ...`) for the
@@ -22,7 +22,7 @@
  *   - `atom_types[mol_atom_offset ...]` — u8 per atom.
  *   - `atom_charges[mol_atom_offset ...]` — f32 per atom.
  *   - `typing_status[mol_idx]` — 0 on full success, non-zero if any atom
- *     failed to type (routes to CPU fallback in MG-D).
+ *     failed to type. Non-zero molecules route to the CPU fallback.
  */
 
 #pragma once
@@ -62,14 +62,14 @@ __global__ void mmff94_type_and_charge_kernel(
     std::uint8_t *types = atom_types_out + atom_off;
     float *charges = atom_charges_out + atom_off;
 
-    // Phase 1 — heavy atoms, lane-strided.
+    // Heavy atoms, lane-strided.
     for (std::uint32_t a = lane; a < n; a += warp_size) {
         if (desc.element[a] == 1) { types[a] = 0; continue; }
         types[a] = native_set_mmff_heavy_atom_type(desc, a);
     }
     __syncwarp();
 
-    // Phase 2 — hydrogens (key on heavy neighbors, so must be after phase 1).
+    // Hydrogens, keyed on heavy-atom types, so must run after the heavy-atom pass.
     std::span<std::uint8_t const> types_span(types, n);
     for (std::uint32_t a = lane; a < n; a += warp_size) {
         if (desc.element[a] != 1) continue;
@@ -77,7 +77,7 @@ __global__ void mmff94_type_and_charge_kernel(
     }
     __syncwarp();
 
-    // Phase 3 — lane-0-only charge computation (flood fill is serial).
+    // Lane-0-only charge computation; the flood fill is serial.
     // Reserve per-molecule scratch for formal charges in a shared buffer
     // owned by this block — fits within max_atoms_k = 128 ≤ 512 B.
     __shared__ float formal_charges_shared[max_atoms_k];
@@ -96,7 +96,7 @@ __global__ void mmff94_type_and_charge_kernel(
             native_compute_mmff_partial_charges(desc, tables_view, at_const, fc_const, pc_span);
         }
         else {
-            // Failed — zero charges as a defensive default.  CPU fallback
+            // Failed — zero charges as a defensive default. CPU fallback
             // will overwrite with the full native pipeline.
             for (std::uint32_t a = 0; a < n; ++a) charges[a] = 0.0f;
         }

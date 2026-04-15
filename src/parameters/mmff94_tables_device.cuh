@@ -1,6 +1,6 @@
 /**
  *  @file mmff94_tables_device.cuh
- *  @brief Workstream MG-A — upload MMFF94 tables from host to device.
+ *  @brief Upload MMFF94 tables from host to device.
  *
  *  Mirrors `mmff94_tables_host_t` on the device.  The host side extracts
  *  RDKit's tables into flat POD vectors (see `mmff94_tables.hpp`); this
@@ -37,10 +37,8 @@
 
 namespace smallfield {
 
-// ---- Constant-memory tables ---------------------------------------------
-
-// Budgets sized for MMFF94 + headroom.  RDKit's live counts (as of
-// 2026-04-14): prop has 99 entries, def 100, covrad 54, hl 25, bndk 35.
+// Constant-memory tables. Budgets sized for MMFF94 with headroom; as of 2026-04-14 RDKit's live counts
+// are 99 prop entries, 100 def, 54 covrad, 25 hl, and 35 bndk.
 // The chosen slot sizes leave 10-30 % headroom for future RDKit updates.
 inline constexpr std::size_t mmff94_prop_const_cap_k = 128;
 inline constexpr std::size_t mmff94_def_const_cap_k = 128;
@@ -112,10 +110,10 @@ mmff94_span_t<T> place_const_or_global_(void *arena, std::size_t &offset,
                                         std::vector<T> const &src,
                                         void const *const_symbol_dev_ptr,
                                         std::size_t const_cap) {
-    // Always use global memory for now.  Constant-memory placement via
+    // Always use global memory for now. Constant-memory placement via
     // cudaGetSymbolAddress + reading through a plain device pointer is
     // valid on Blackwell but adds one more variable to debug; we can
-    // revisit as a perf tweak once MG-A is green.
+    // revisit as a perf tweak once the current upload path is stable.
     (void)const_symbol_dev_ptr;
     (void)const_cap;
     return place_table_(arena, offset, src);

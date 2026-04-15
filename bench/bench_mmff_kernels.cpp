@@ -1,6 +1,6 @@
 /**
  *  @file bench_mmff_gpu.cpp
- *  @brief MG-Phase F scaling benchmark: measure end-to-end wall time
+ *  @brief GPU MMFF kernel-trio scaling benchmark: measure end-to-end wall time
  *  of the GPU MMFF kernel trio (type+charge, term extraction, CSR
  *  build) vs the CPU native path across large batches.  Reports
  *  mol/s throughput + per-stage timing breakdown.
@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     std::string const smi_path = argv[1];
     std::size_t const cap = (argc > 2) ? std::strtoull(argv[2], nullptr, 10) : 10'000;
 
-    std::printf("=== bench_mmff_gpu: MG-Phase F scaling benchmark ===\n");
+    std::printf("=== bench_mmff_kernels: GPU MMFF scaling benchmark ===\n");
     std::printf("input: %s (cap %zu)\n", smi_path.c_str(), cap);
 
     // Table extraction once.
@@ -148,11 +148,9 @@ int main(int argc, char **argv) {
 
     if (N == 0) { std::printf("no molecules — aborting\n"); return 1; }
 
-    // -------- CPU timing --------
-    // Run extract_mmff94_params_fully_native on every molecule with OpenMP
-    // parallelism, matching the prep path's production settings.  Sink
-    // a cheap derived quantity into a shared atomic so `-O3` doesn't DCE
-    // the call body when it sees the result go out of scope.
+    // CPU timing. Run extract_mmff94_params_fully_native on every molecule with OpenMP parallelism,
+    // matching the prep path's production settings. Sink a cheap derived quantity into a shared atomic
+    // so `-O3` does not DCE the call body when it sees the result go out of scope.
     std::size_t sink = 0;
     auto const t_cpu_start = clock_t_::now();
 #pragma omp parallel for schedule(dynamic, 64) reduction(+:sink)
@@ -172,7 +170,7 @@ int main(int argc, char **argv) {
     std::printf("  wall = %.1f ms  → %.1f mol/s  (%d OMP threads)\n",
                  cpu_ms, cpu_throughput, omp_get_max_threads());
 
-    // -------- GPU timing --------
+    // GPU timing.
     float type_ms = 0.0f, extract_ms = 0.0f, csr_ms = 0.0f, total_ms = 0.0f;
     bench_run_gpu_mmff(tables_host, descs.data(), N, atom_offsets.data(),
                         total_atoms,

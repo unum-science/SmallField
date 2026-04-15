@@ -74,10 +74,10 @@ coords, energies, status = ctx.generate_conformers(
 ```bash
 cd build
 cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc) bench_chembl
+make -j$(nproc) bench_pipeline_throughput
 
 LD_LIBRARY_PATH=/path/to/conda/env/lib:$LD_LIBRARY_PATH \
-    ./bench/bench_chembl --smi /path/to/chembl.smi
+    ./bench/bench_pipeline_throughput --smi /path/to/chembl.smi
 ```
 
 This runs both the RDKit CPU path with OpenMP and `numThreads=1` per molecule, and the SmallField GPU path.
@@ -103,24 +103,20 @@ ctest --output-on-failure
 ## Project Layout
 
 ```
-src/
-  warp_primitives.cuh     warp_size, full_mask, warp_reduce_sum_f32_
-  fire_warp.cuh           FIRE optimizer (warp-level, functor-generic)
-  triangle_smooth.cuh     Floyd-Warshall on half-precision bounds
-  etkdg_types.cuh         GPU data structures (metadata, descriptors, MMFF94 terms)
-  dg_forcefield.cuh       distance geometry energy + gradient (atom-centric)
-  etk_forcefield.cuh      ETK torsion Fourier energy + gradient (atom-centric)
-  mmff94_functor.cuh      MMFF94 energy + gradient (per-atom interaction lists)
-  etkdg_pipeline.cuh      persistent warp-loop kernel (stages 2-9)
-  etkdg_preprocess.hpp    CPU preprocessing (RDKit -> GPU-ready arrays)
-  smallfield.cu           pybind11 bindings
-test/                     C++ tests cross-validated against RDKit
-bench/                    C++ benchmark (RDKit CPU vs SmallField GPU)
-python/smallfield/        Python package
+src/api/                            public C++ API (smallfield.hpp, batch_pool.hpp)
+src/types/                          plain data structures shared host + device
+src/parameters/                     MMFF94 parameter tables (host extraction, device upload)
+src/preprocess/                     CPU preprocessing: SMILES parse, bounds, CIP, CSD torsions, scaffold cache
+src/mmff94/                         native MMFF94 typer, charge, term extractor (CPU + GPU)
+src/kernels/                        CUDA kernels: metric embedding, DG, ETK, MMFF, FIRE, pipeline driver
+binary/                             smallfield_batch — restartable CLI over Parquet shards
+test/                               C++ tests cross-validated against RDKit
+bench/                              C++ benchmarks: pipeline throughput + isolated MMFF kernels
+python/smallfield/                  Python package including tools/smi_to_parquet.py
 ```
 
-The project is about 2,500 lines of CUDA and C++.
-There are no dependencies beyond CUDA 12+ and RDKit for preprocessing only.
+There are no dependencies beyond CUDA 12+ and RDKit for preprocessing.
+Apache Arrow + Parquet are optional and only needed for the batch CLI binary.
 
 ## License
 

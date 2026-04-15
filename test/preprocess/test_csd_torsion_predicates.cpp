@@ -123,7 +123,7 @@ int main() {
         {"c_nb_nx3", "C([NX3])", csd_predicate_c_nb_nx3_k},
         {"cx3_nb_c", "[CX3]([C])", csd_predicate_cx3_nb_c_k},
         {"ch0_nb_cl", "[cH0](Cl)", csd_predicate_ch0_nb_cl_k},
-        // Workstream N++ — top-of-distribution SubstructMatch hot-spots.
+        // Top-of-distribution SubstructMatch hot-spots.
         {"a_nb_cH1", "[a]([cH1])", csd_predicate_a_nb_cH1_k},
         {"aH0_nb_nonring_O", "[aH0](!@O)", csd_predicate_aH0_nb_nonring_O_k},
         {"c_two_cH_or_nX2H0", "[c]([cH,nX2H0])[cH,nX2H0]", csd_predicate_c_two_cH_or_nX2H0_k},

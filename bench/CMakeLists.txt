@@ -20,7 +20,7 @@ target_include_directories(profile_pipeline PRIVATE
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 set_target_properties(profile_pipeline PROPERTIES LINKER_LANGUAGE CUDA)
 
-# MMFF kernel scaling benchmark (MG-Phase F): measures GPU kernel trio isolation.
+# MMFF kernel scaling benchmark: measures GPU kernel trio isolation.
 # Mixed .cpp/.cu build: .cpp drives RDKit + OpenMP CPU timing, .cu launches
 # the kernels with cudaEvent timing.
 add_executable(bench_mmff_kernels bench_mmff_kernels.cpp bench_mmff_kernels_device.cu)
