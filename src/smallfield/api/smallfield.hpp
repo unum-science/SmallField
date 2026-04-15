@@ -37,6 +37,7 @@ typedef void *syevjInfo_t;
 typedef void *cusolverDnParams_t;
 #endif
 
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -161,5 +162,27 @@ struct context_t {
                                            std::uint32_t max_atoms_per_molecule, std::span<__half> coordinates_out,
                                            std::span<float> energies_out, std::span<conformer_status_t> status_out);
 };
+
+/**
+ *  @brief Process-wide CUDA error accumulator, incremented by the library's internal
+ *  `check_cuda_status_` helper every time a CUDA API call returns non-success.
+ *
+ *  Inline so a single instance exists across every translation unit that includes this header.
+ *  Callers use the @ref cuda_error_count / @ref reset_cuda_error_count accessors.
+ */
+inline std::atomic<std::uint64_t> cuda_error_counter {0};
+
+/**
+ *  @brief Read the cumulative CUDA error count since process start or the last reset.
+ *
+ *  Exposed so production callers and benchmarks can detect silent failures that would otherwise
+ *  hide behind per-chunk zero-filled outputs.  A robust driver calls @ref reset_cuda_error_count
+ *  before each batch, invokes @ref generate_conformers, and exits non-zero if this returns
+ *  a positive value.
+ */
+inline std::uint64_t cuda_error_count() noexcept { return cuda_error_counter.load(std::memory_order_relaxed); }
+
+/** @brief Reset @ref cuda_error_count to zero. */
+inline void reset_cuda_error_count() noexcept { cuda_error_counter.store(0, std::memory_order_relaxed); }
 
 } // namespace smallfield::api

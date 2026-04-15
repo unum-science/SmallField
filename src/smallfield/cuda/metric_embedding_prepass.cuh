@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 #include <cusolverDn.h>
 
+#include "smallfield/api/smallfield.hpp" // for cuda_error_counter
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::cuda {
@@ -44,12 +45,14 @@ using namespace smallfield::types;
 inline bool check_cuda_status_(cudaError_t status, char const *operation) {
     if (status == cudaSuccess) return true;
     std::fprintf(stderr, "CUDA error in %s: %s\n", operation, cudaGetErrorString(status));
+    smallfield::api::cuda_error_counter.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 
 inline bool check_cusolver_status_(cusolverStatus_t status, char const *operation) {
     if (status == CUSOLVER_STATUS_SUCCESS) return true;
     std::fprintf(stderr, "cuSOLVER error in %s: %d\n", operation, static_cast<int>(status));
+    smallfield::api::cuda_error_counter.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 

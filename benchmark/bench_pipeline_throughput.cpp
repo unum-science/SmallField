@@ -59,6 +59,15 @@ static double percentile(std::vector<double> &sorted_values, double p) {
     return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac;
 }
 
+static int report_cuda_errors(char const *context, std::uint64_t cuda_errors) {
+    std::fprintf(
+        stderr,
+        "\nFAIL: %llu CUDA errors reported by the library during %s; " "throughput numbers above are unreliable. "
+                                                                       "Clean-rebuild and retry.\n",
+        static_cast<unsigned long long>(cuda_errors), context);
+    return 2;
+}
+
 static void bench_rdkit_cpu(std::vector<std::string> const &smiles, std::uint32_t num_conformers,
                             std::uint32_t max_stereo_attempts) {
     int num_threads = omp_get_max_threads();
@@ -372,8 +381,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    sfapi::reset_cuda_error_count();
+
     if (multi_gpu_only) {
         bench_smallfield_multi_gpu(all_smiles, num_conformers, max_stereo_attempts);
+        std::uint64_t const cuda_errors = sfapi::cuda_error_count();
+        if (cuda_errors > 0) return report_cuda_errors("generate_conformers", cuda_errors);
         std::printf("\nDone.\n");
         return 0;
     }
@@ -412,6 +425,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    std::uint64_t const cuda_errors = sfapi::cuda_error_count();
+    if (cuda_errors > 0) return report_cuda_errors("one of the GPU runs", cuda_errors);
     std::printf("\nDone.\n");
     return 0;
 }

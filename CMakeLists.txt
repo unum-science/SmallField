@@ -140,17 +140,14 @@ endif()
 # OpenMP for CPU parallelism
 find_package(OpenMP REQUIRED)
 
-# curand library
-find_library(CURAND_LIBRARY curand
-    HINTS ${CUDAToolkit_LIBRARY_DIR}
-          ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib64
-          /usr/local/cuda/lib64)
-
-# cusolver library
-find_library(CUSOLVER_LIBRARY cusolver
-    HINTS ${CUDAToolkit_LIBRARY_DIR}
-          ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/../lib64
-          /usr/local/cuda/lib64)
+# CUDA runtime libraries via CMake's modern CUDAToolkit module.  This picks up
+# curand / cusolver / cudart wherever the active CUDA install keeps them
+# (/usr/local/cuda/lib64, /usr/local/cuda-XX.Y/targets/x86_64-linux/lib, or a
+# conda-forge prefix) and exposes them as imported targets that carry the
+# correct include paths, link ordering, and rpath.  Using CUDA::* targets
+# instead of raw find_library calls also means cross-version upgrades (13.0 →
+# 13.1 → 14.x) do not require CMakeLists edits.
+find_package(CUDAToolkit REQUIRED)
 
 if(RDKit_FOUND)
     # RDKit targets needed by the library
@@ -168,9 +165,9 @@ if(RDKit_FOUND)
         target_include_directories(${target_name} PUBLIC ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(${target_name} PUBLIC
             ${RDKIT_LIBS}
-            ${CURAND_LIBRARY}
-            ${CUSOLVER_LIBRARY}
-            cudart
+            CUDA::curand
+            CUDA::cusolver
+            CUDA::cudart
             OpenMP::OpenMP_CXX)
         # Pass -fopenmp to the host compiler through nvcc so #pragma omp inside
         # etkdg_prepare_batch.hpp (included by smallfield.cu) actually parallelizes.

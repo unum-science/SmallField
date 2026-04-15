@@ -3,6 +3,12 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Local benchmark artifacts — scripts, captures, stratified samples, run
+# logs.  Profiling captures are large (20-30 MB each) and regenerable;
+# keep this whole tree out of version control.
+benchmark/profiling/
+benchmark/results/
+
 # C extensions
 *.so
 

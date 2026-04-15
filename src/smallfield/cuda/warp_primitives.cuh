@@ -32,6 +32,26 @@ __device__ __forceinline__ float warp_reduce_sum_f32_(float value) {
     return value;
 }
 
+/** Warp min reduction via butterfly XOR shuffles. All lanes get the result. */
+__device__ __forceinline__ float warp_reduce_min_f32_(float value) {
+    value = fminf(value, __shfl_xor_sync(full_mask, value, 16));
+    value = fminf(value, __shfl_xor_sync(full_mask, value, 8));
+    value = fminf(value, __shfl_xor_sync(full_mask, value, 4));
+    value = fminf(value, __shfl_xor_sync(full_mask, value, 2));
+    value = fminf(value, __shfl_xor_sync(full_mask, value, 1));
+    return value;
+}
+
+/** Warp max reduction via butterfly XOR shuffles. All lanes get the result. */
+__device__ __forceinline__ float warp_reduce_max_f32_(float value) {
+    value = fmaxf(value, __shfl_xor_sync(full_mask, value, 16));
+    value = fmaxf(value, __shfl_xor_sync(full_mask, value, 8));
+    value = fmaxf(value, __shfl_xor_sync(full_mask, value, 4));
+    value = fmaxf(value, __shfl_xor_sync(full_mask, value, 2));
+    value = fmaxf(value, __shfl_xor_sync(full_mask, value, 1));
+    return value;
+}
+
 } // namespace smallfield::cuda
 
 #endif // __CUDACC__

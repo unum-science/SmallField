@@ -13,20 +13,50 @@
 
 namespace sfc = smallfield::cuda;
 
-/** Evaluate DG energy with half-precision bounds in shared memory. */
+/**
+ *  Quantize the incoming float bounds into the int8 shared-memory layout that
+ *  the production `distance_geometry_energy_functor_t` now consumes.
+ *  Returns the per-warp dequantization pair via the out-params.
+ */
+__device__ __forceinline__ void quantize_bounds_into_shared_(float const *bounds_float, std::uint8_t *shared_bounds,
+                                                             std::uint32_t bounds_size, std::uint32_t lane,
+                                                             float *out_mol_min, float *out_inv_scale) {
+    float lane_min = __FLT_MAX__;
+    float lane_max = -__FLT_MAX__;
+    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size) {
+        float const v = bounds_float[i];
+        lane_min = fminf(lane_min, v);
+        lane_max = fmaxf(lane_max, v);
+    }
+    float const mol_min = sfc::warp_reduce_min_f32_(lane_min);
+    float const mol_max = sfc::warp_reduce_max_f32_(lane_max);
+    float const range = fmaxf(mol_max - mol_min, 1e-6f);
+    float const scale_quantize = 255.0f / range;
+    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size) {
+        int q = __float2int_rn((bounds_float[i] - mol_min) * scale_quantize);
+        q = max(0, min(255, q));
+        shared_bounds[i] = static_cast<std::uint8_t>(q);
+    }
+    __syncwarp(sfc::full_mask);
+    *out_mol_min = mol_min;
+    *out_inv_scale = range * (1.0f / 255.0f);
+}
+
+/** Evaluate DG energy with int8-quantized bounds in shared memory. */
 __global__ void dg_energy_eval_kernel(float const *positions, float *gradient, float const *bounds_float,
                                       std::uint32_t num_atoms, std::uint32_t spatial_dimension, float upper_weight,
                                       float lower_weight, float fourth_dim_weight, float *out_energy) {
 
-    extern __shared__ __half shared_bounds[];
+    extern __shared__ std::uint8_t shared_bounds[];
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const bounds_size = num_atoms * num_atoms;
 
-    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size) shared_bounds[i] = __float2half(bounds_float[i]);
-    __syncwarp(sfc::full_mask);
+    float mol_min = 0.0f, inv_scale = 0.0f;
+    quantize_bounds_into_shared_(bounds_float, shared_bounds, bounds_size, lane, &mol_min, &inv_scale);
 
-    sfc::distance_geometry_energy_functor_t functor {
-        shared_bounds, nullptr, num_atoms, 0, spatial_dimension, upper_weight, lower_weight, 0.0f, fourth_dim_weight};
+    sfc::distance_geometry_energy_functor_t functor {shared_bounds, nullptr, mol_min,           inv_scale,
+                                                     num_atoms,     0,       spatial_dimension, upper_weight,
+                                                     lower_weight,  0.0f,    fourth_dim_weight};
 
     std::uint32_t const num_elements = spatial_dimension * num_atoms;
     float const energy = functor(positions, gradient, num_elements, lane);
@@ -34,7 +64,7 @@ __global__ void dg_energy_eval_kernel(float const *positions, float *gradient, f
     if (lane == 0) *out_energy = energy;
 }
 
-/** Minimize DG energy with FIRE optimizer and half-precision bounds. */
+/** Minimize DG energy with FIRE optimizer and int8-quantized bounds. */
 __global__ void dg_minimize_kernel(float *positions, float const *bounds_float, std::uint32_t num_atoms,
                                    std::uint32_t spatial_dimension, float upper_weight, float lower_weight,
                                    float fourth_dim_weight, std::int32_t max_iterations, float gradient_threshold,
@@ -45,20 +75,21 @@ __global__ void dg_minimize_kernel(float *positions, float const *bounds_float, 
     std::uint32_t const num_elements = spatial_dimension * num_atoms;
     std::uint32_t const bounds_size = num_atoms * num_atoms;
 
-    // shared memory: bounds_half + positions + velocities + gradient (FIRE needs 3 arrays)
-    __half *shared_bounds = reinterpret_cast<__half *>(shared_raw);
-    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size) shared_bounds[i] = __float2half(bounds_float[i]);
-    __syncwarp(sfc::full_mask);
+    // Shared layout: [bounds_uint8: N²] [velocities + gradient: 2 × num_elements floats].
+    std::uint8_t *shared_bounds = reinterpret_cast<std::uint8_t *>(shared_raw);
+    float mol_min = 0.0f, inv_scale = 0.0f;
+    quantize_bounds_into_shared_(bounds_float, shared_bounds, bounds_size, lane, &mol_min, &inv_scale);
 
-    std::uint32_t const bounds_half_bytes = bounds_size * sizeof(__half);
-    std::uint32_t const float_offset = (bounds_half_bytes + sizeof(float) - 1) / sizeof(float);
-    float *shared_float = reinterpret_cast<float *>(shared_raw) + float_offset;
+    std::uint32_t const bounds_bytes_aligned = (bounds_size * sizeof(std::uint8_t) + sizeof(float) - 1) &
+                                               ~(sizeof(float) - 1);
+    float *shared_float = reinterpret_cast<float *>(shared_raw + bounds_bytes_aligned);
 
     float *velocities = shared_float;
     float *gradient = velocities + num_elements;
 
-    sfc::distance_geometry_energy_functor_t functor {
-        shared_bounds, nullptr, num_atoms, 0, spatial_dimension, upper_weight, lower_weight, 0.0f, fourth_dim_weight};
+    sfc::distance_geometry_energy_functor_t functor {shared_bounds, nullptr, mol_min,           inv_scale,
+                                                     num_atoms,     0,       spatial_dimension, upper_weight,
+                                                     lower_weight,  0.0f,    fourth_dim_weight};
 
     sfc::fire_minimize_(positions, velocities, gradient, num_elements, max_iterations, gradient_threshold, lane,
                         functor, out_energy, out_iterations, out_status);
@@ -82,7 +113,7 @@ void gpu_dg_energy(float const *host_coords, float *host_gradient, float const *
     cudaMemcpy(device_coords, host_coords, num_elements * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(device_bounds, host_bounds, bounds_size * sizeof(float), cudaMemcpyHostToDevice);
 
-    std::uint32_t const shared_bytes = bounds_size * sizeof(__half) + num_elements * sizeof(float);
+    std::uint32_t const shared_bytes = bounds_size * sizeof(std::uint8_t);
     dg_energy_eval_kernel<<<1, 32, shared_bytes>>>(device_coords, device_gradient, device_bounds, num_atoms,
                                                    spatial_dimension, upper_weight, lower_weight, fourth_dim_weight,
                                                    device_energy);
@@ -116,9 +147,10 @@ void gpu_dg_minimize(float *host_coords, float const *host_bounds, std::uint32_t
     cudaMemcpy(device_coords, host_coords, num_elements * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(device_bounds, host_bounds, bounds_size * sizeof(float), cudaMemcpyHostToDevice);
 
-    // shared memory: bounds_half + velocities + gradient (FIRE: 2 arrays beyond positions)
-    std::uint32_t const bounds_half_bytes = bounds_size * sizeof(__half);
-    std::uint32_t const shared_bytes = bounds_half_bytes + 2 * num_elements * sizeof(float);
+    // Shared memory: bounds_uint8 + velocities + gradient (FIRE: 2 arrays beyond positions).
+    std::uint32_t const bounds_bytes_aligned = (bounds_size * sizeof(std::uint8_t) + sizeof(float) - 1) &
+                                               ~(sizeof(float) - 1);
+    std::uint32_t const shared_bytes = bounds_bytes_aligned + 2 * num_elements * sizeof(float);
 
     dg_minimize_kernel<<<1, 32, shared_bytes>>>(device_coords, device_bounds, num_atoms, spatial_dimension,
                                                 upper_weight, lower_weight, fourth_dim_weight, max_iterations,

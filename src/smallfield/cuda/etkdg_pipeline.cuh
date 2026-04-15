@@ -25,6 +25,7 @@
 
 #if defined(__CUDACC__)
 
+#include <cfloat>
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 
@@ -132,11 +133,17 @@ __device__ __forceinline__ void run_fire_stage_(float *positions, float *velocit
     }
 }
 
-/** Compute shared memory bytes for the pipeline kernel. */
+/** Compute shared memory bytes for the pipeline kernel.
+ *
+ *  Layout: [bounds matrix: N² × uint8_t][positions, velocities, gradient: 3 × 4N × float].
+ *  Bounds are int8-quantized with a per-molecule (min, inv_scale) pair kept in
+ *  registers — halves the bounds footprint vs the previous __half layout
+ *  (32 KB → 16 KB at N=128).
+ */
 __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory_bytes(std::uint32_t max_atoms,
                                                                                        std::uint32_t /*unused*/) {
     std::uint32_t const dim4 = 4 * max_atoms;
-    std::uint32_t const bounds_bytes = max_atoms * max_atoms * sizeof(__half);
+    std::uint32_t const bounds_bytes = max_atoms * max_atoms * sizeof(std::uint8_t);
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
     std::uint32_t const fire_arrays = 3 * dim4 * sizeof(float);
     return aligned_bounds_bytes + fire_arrays;
@@ -219,11 +226,11 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const grid_stride = gridDim.x;
 
-    // Layout shared memory as [bounds matrix: N² halves] [positions, velocities, gradient: 3 * 4N floats].
+    // Layout shared memory as [bounds matrix: N² uint8_t] [positions, velocities, gradient: 3 * 4N floats].
     extern __shared__ char shared_raw[];
     std::uint32_t const max_n = max_atoms_per_molecule;
-    __half *shared_bounds = reinterpret_cast<__half *>(shared_raw);
-    std::uint32_t const bounds_bytes = max_n * max_n * sizeof(__half);
+    std::uint8_t *shared_bounds = reinterpret_cast<std::uint8_t *>(shared_raw);
+    std::uint32_t const bounds_bytes = max_n * max_n * sizeof(std::uint8_t);
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
     float *shared_float = reinterpret_cast<float *>(shared_raw + aligned_bounds_bytes);
 
@@ -243,16 +250,34 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         off += dim4;
         float *gradient = shared_float + off;
 
-        // Stage 2: Load pre-smoothed bounds and convert to half (vectorized half2 stores).
+        // Stage 2: Load pre-smoothed bounds, find per-molecule [min, max],
+        // and int8-quantize into shared memory.  Linear quantization:
+        // `q = round((x − mol_min) · scale_quantize)`,
+        // `x ≈ q · inv_scale + mol_min` at read.  Halves bounds storage vs the
+        // old __half layout (N² bytes vs 2 N²) and keeps the per-molecule
+        // dequant pair (mol_min, inv_scale) in registers — broadcast across lanes.
         std::uint32_t const bounds_size = num_atoms * num_atoms;
         float const *global_bounds = bounds_matrices + meta.bounds_offset;
-        std::uint32_t const bounds_pairs = bounds_size / 2;
-        for (std::uint32_t i = lane; i < bounds_pairs; i += warp_size) {
-            __half2 packed = __floats2half2_rn(global_bounds[2 * i], global_bounds[2 * i + 1]);
-            reinterpret_cast<__half2 *>(shared_bounds)[i] = packed;
+
+        float lane_min = FLT_MAX;
+        float lane_max = -FLT_MAX;
+        for (std::uint32_t i = lane; i < bounds_size; i += warp_size) {
+            float const v = global_bounds[i];
+            lane_min = fminf(lane_min, v);
+            lane_max = fmaxf(lane_max, v);
         }
-        if (lane == 0 && (bounds_size & 1))
-            shared_bounds[bounds_size - 1] = __float2half(global_bounds[bounds_size - 1]);
+        float const mol_min = warp_reduce_min_f32_(lane_min);
+        float const mol_max = warp_reduce_max_f32_(lane_max);
+        float const range = fmaxf(mol_max - mol_min, 1e-6f);
+        float const scale_quantize = 255.0f / range;
+        float const inv_scale = range * (1.0f / 255.0f);
+
+        for (std::uint32_t i = lane; i < bounds_size; i += warp_size) {
+            float const v = global_bounds[i];
+            int q = __float2int_rn((v - mol_min) * scale_quantize);
+            q = max(0, min(255, q));
+            shared_bounds[i] = static_cast<std::uint8_t>(q);
+        }
         __syncwarp(full_mask);
 
         // Build molecule-level pointers into the batched arrays.
@@ -277,7 +302,8 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
 
                 // Stage 4: Run DG minimization in 4D with up to 100 FIRE iterations.
                 distance_geometry_energy_functor_t dg_functor {
-                    shared_bounds, mol_chirals, num_atoms, meta.num_chiral_centers, 4, 1.0f, 1.0f, 100.0f, 0.0f};
+                    shared_bounds, mol_chirals, mol_min,           inv_scale, num_atoms, meta.num_chiral_centers, 4,
+                    1.0f,          1.0f,        100.0f,            0.0f};
 
                 float dg_energy = 0.0f;
                 float dg_rms_gradient = 0.0f;
