@@ -1,5 +1,7 @@
 # C++ / CUDA test executables linking against RDKit for cross-validation.
-# Each test is a standalone executable with its own main().
+# Each test is a standalone executable with its own main().  Tests are
+# organised into subfolders mirroring src/: api, parameters, preprocess,
+# mmff94, kernels.
 
 # shared test utilities (header-only)
 add_library(test_helpers INTERFACE)
@@ -8,10 +10,14 @@ target_include_directories(test_helpers INTERFACE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Tests that use mixed .cpp/.cu compilation (g++ for RDKit headers, nvcc for CUDA kernels).
-macro(add_mixed_test test_name)
-    add_executable(${test_name} ${test_name}.cpp ${test_name}_kernels.cu)
-    set_source_files_properties(${test_name}.cpp PROPERTIES LANGUAGE CXX)
+# Mixed .cpp/.cu test: given a base name like "triangle_smooth" and a subfolder
+# like "kernels", builds an executable from test_<base>.cpp + test_<base>_kernels.cu.
+macro(add_mixed_test subfolder base_name)
+    set(test_name test_${base_name})
+    add_executable(${test_name}
+        ${subfolder}/${test_name}.cpp
+        ${subfolder}/${test_name}_kernels.cu)
+    set_source_files_properties(${subfolder}/${test_name}.cpp PROPERTIES LANGUAGE CXX)
     target_link_libraries(${test_name} PRIVATE
         test_helpers
         smallfield_lib
@@ -26,75 +32,45 @@ macro(add_mixed_test test_name)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endmacro()
 
-add_mixed_test(test_triangle_smooth)
-add_mixed_test(test_dg_energy)
-add_mixed_test(test_chirality)
-add_mixed_test(test_mmff_gradient)
-add_mixed_test(test_mmff_gpu_typer)
-add_mixed_test(test_mmff_gpu_extract)
+# Pure C++ test (no CUDA kernels).  Still linked with CUDA because smallfield_lib is CUDA.
+macro(add_cpp_test subfolder base_name)
+    set(test_name test_${base_name})
+    add_executable(${test_name} ${subfolder}/${test_name}.cpp)
+    target_link_libraries(${test_name} PRIVATE
+        test_helpers
+        smallfield_lib
+        OpenMP::OpenMP_CXX)
+    target_include_directories(${test_name} PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    set_target_properties(${test_name} PROPERTIES LINKER_LANGUAGE CUDA)
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endmacro()
 
-# test_descriptor is a pure C++ unit test (no CUDA).
-add_executable(test_descriptor test_descriptor.cpp)
-target_link_libraries(test_descriptor PRIVATE test_helpers smallfield_lib)
-target_include_directories(test_descriptor PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_descriptor PROPERTIES LINKER_LANGUAGE CUDA)
-add_test(NAME test_descriptor COMMAND test_descriptor)
+# --- kernels/ ---
+add_mixed_test(kernels triangle_smooth)
+add_mixed_test(kernels dg_energy)
+add_mixed_test(kernels mmff_gradient)
 
-# test_mmff94_tables (MG-0 + MG-A gate): cross-validate our extracted
-# MMFF94 parameter tables against RDKit's live operator() lookups on
-# host, and against device-side lookups via CUDA kernels.  Must be
-# bitwise-equal on both sides for thousands of random keys.
-add_mixed_test(test_mmff94_tables)
+# --- preprocess/ ---
+add_mixed_test(preprocess chirality)
+add_cpp_test(preprocess descriptor)
+add_cpp_test(preprocess native_murcko)
+add_cpp_test(preprocess csd_torsion_predicates)
 
-# test_mmff_cpu_port (MG-1 gate): cross-validate our native MMFF CPU port
-# against the existing RDKit-backed path on a drug-like probe set.
-add_executable(test_mmff_cpu_port test_mmff_cpu_port.cpp)
-target_link_libraries(test_mmff_cpu_port PRIVATE test_helpers smallfield_lib)
-target_include_directories(test_mmff_cpu_port PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_mmff_cpu_port PROPERTIES LINKER_LANGUAGE CUDA)
-add_test(NAME test_mmff_cpu_port COMMAND test_mmff_cpu_port)
+# --- parameters/ ---
+add_mixed_test(parameters mmff94_tables)
 
-# test_mmff_typer (MG-1.5/1.6 gate): native atom typer vs RDKit.
-add_executable(test_mmff_typer test_mmff_typer.cpp)
-target_link_libraries(test_mmff_typer PRIVATE test_helpers smallfield_lib)
-target_include_directories(test_mmff_typer PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_mmff_typer PROPERTIES LINKER_LANGUAGE CUDA)
-add_test(NAME test_mmff_typer COMMAND test_mmff_typer)
+# --- mmff94/ ---
+add_mixed_test(mmff94 mmff_gpu_typer)
+add_mixed_test(mmff94 mmff_gpu_extract)
+add_cpp_test(mmff94 mmff_cpu_port)
+add_cpp_test(mmff94 mmff_typer)
 
-# test_native_murcko cross-validates compute_native_murcko against RDKit's
-# MurckoDecompose on a 500-molecule ChEMBL set.  Gate: ≥ 99 % agreement.
-add_executable(test_native_murcko test_native_murcko.cpp)
-target_link_libraries(test_native_murcko PRIVATE test_helpers smallfield_lib)
-target_include_directories(test_native_murcko PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_native_murcko PROPERTIES LINKER_LANGUAGE CUDA)
-add_test(NAME test_native_murcko COMMAND test_native_murcko)
-
-# test_torsion_predicates cross-validates the hand-coded recursive-SMARTS predicates
-# against RDKit's SubstructMatch on a large set of ChEMBL-derived molecules.
-add_executable(test_torsion_predicates test_torsion_predicates.cpp)
-target_link_libraries(test_torsion_predicates PRIVATE test_helpers smallfield_lib)
-target_include_directories(test_torsion_predicates PRIVATE
-    ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_torsion_predicates PROPERTIES LINKER_LANGUAGE CUDA)
-add_test(NAME test_torsion_predicates COMMAND test_torsion_predicates)
-
-# test_pipeline uses the library API directly (no separate _kernels.cu)
-add_executable(test_pipeline test_pipeline.cpp)
-set_source_files_properties(test_pipeline.cpp PROPERTIES LANGUAGE CXX)
+# --- api/ ---
+add_executable(test_pipeline api/test_pipeline.cpp)
+set_source_files_properties(api/test_pipeline.cpp PROPERTIES LANGUAGE CXX)
 target_link_libraries(test_pipeline PRIVATE
     test_helpers
     smallfield_lib
@@ -103,6 +79,5 @@ target_include_directories(test_pipeline PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_pipeline PROPERTIES
-    LINKER_LANGUAGE CUDA)
+set_target_properties(test_pipeline PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME test_pipeline COMMAND test_pipeline)

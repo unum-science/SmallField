@@ -163,8 +163,8 @@ if(RDKit_FOUND)
         RDKit::ChemTransforms)
 
     # SmallField library (CUDA + RDKit preprocessing)
-    add_library(smallfield_lib STATIC src/smallfield.cu)
-    set_source_files_properties(src/smallfield.cu PROPERTIES LANGUAGE CUDA)
+    add_library(smallfield_lib STATIC src/kernels/smallfield.cu)
+    set_source_files_properties(src/kernels/smallfield.cu PROPERTIES LANGUAGE CUDA)
     target_include_directories(smallfield_lib PUBLIC ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(smallfield_lib PUBLIC
         ${RDKIT_LIBS}
@@ -173,7 +173,7 @@ if(RDKit_FOUND)
         cudart
         OpenMP::OpenMP_CXX)
     # Pass -fopenmp to the host compiler through nvcc so #pragma omp inside
-    # etkdg_preprocess.hpp (included by smallfield.cu) actually parallelizes.
+    # etkdg_prepare_batch.hpp (included by smallfield.cu) actually parallelizes.
     # Without this the OpenMP pragma is silently ignored by nvcc's host pass
     # and prepare_molecule_batch runs single-threaded.
     target_compile_options(smallfield_lib PRIVATE
@@ -185,4 +185,5 @@ if(RDKit_FOUND)
     enable_testing()
     add_subdirectory(test)
     add_subdirectory(bench)
+    add_subdirectory(binary)
 endif()
