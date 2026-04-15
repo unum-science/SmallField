@@ -162,28 +162,33 @@ if(RDKit_FOUND)
         RDKit::Alignment RDKit::EigenSolvers RDKit::MolTransforms
         RDKit::ChemTransforms)
 
-    # SmallField library (CUDA + RDKit preprocessing)
-    add_library(smallfield_lib STATIC src/kernels/smallfield.cu)
-    set_source_files_properties(src/kernels/smallfield.cu PROPERTIES LANGUAGE CUDA)
-    target_include_directories(smallfield_lib PUBLIC ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(smallfield_lib PUBLIC
-        ${RDKIT_LIBS}
-        ${CURAND_LIBRARY}
-        ${CUSOLVER_LIBRARY}
-        cudart
-        OpenMP::OpenMP_CXX)
-    # Pass -fopenmp to the host compiler through nvcc so #pragma omp inside
-    # etkdg_prepare_batch.hpp (included by smallfield.cu) actually parallelizes.
-    # Without this the OpenMP pragma is silently ignored by nvcc's host pass
-    # and prepare_molecule_batch runs single-threaded.
-    target_compile_options(smallfield_lib PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>)
-    set_target_properties(smallfield_lib PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        POSITION_INDEPENDENT_CODE ON)
+    function(configure_smallfield_library target_name library_type)
+        add_library(${target_name} ${library_type} src/smallfield/api/smallfield.cu)
+        set_source_files_properties(src/smallfield/api/smallfield.cu PROPERTIES LANGUAGE CUDA)
+        target_include_directories(${target_name} PUBLIC ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(${target_name} PUBLIC
+            ${RDKIT_LIBS}
+            ${CURAND_LIBRARY}
+            ${CUSOLVER_LIBRARY}
+            cudart
+            OpenMP::OpenMP_CXX)
+        # Pass -fopenmp to the host compiler through nvcc so #pragma omp inside
+        # etkdg_prepare_batch.hpp (included by smallfield.cu) actually parallelizes.
+        # Without this the OpenMP pragma is silently ignored by nvcc's host pass
+        # and prepare_molecule_batch runs single-threaded.
+        target_compile_options(${target_name} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>)
+        set_target_properties(${target_name} PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            POSITION_INDEPENDENT_CODE ON)
+    endfunction()
+
+    # SmallField libraries (CUDA + RDKit preprocessing)
+    configure_smallfield_library(smallfield_lib STATIC)
+    configure_smallfield_library(smallfield_python_lib SHARED)
 
     enable_testing()
-    add_subdirectory(test)
-    add_subdirectory(bench)
-    add_subdirectory(binary)
+    add_subdirectory(tests)
+    add_subdirectory(benchmark)
+    add_subdirectory(cli)
 endif()

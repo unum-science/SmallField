@@ -38,13 +38,13 @@ __GPU (one warp per molecule, shared memory):__
 
 ## Performance
 
-Measured on ChEMBL 8,948 drug-like molecules with $N \le 128$ atoms including explicit hydrogens, with 3 conformers per molecule.
+Measured on the current 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host with jemalloc preloaded.
 See [BENCH.md](BENCH.md) for full methodology.
 
-| System         | Hardware                    |   Mol/s | Conformers/s |
-| :------------- | :-------------------------- | ------: | -----------: |
-| __SmallField__ | 1x RTX PRO 6000 Blackwell   | __797__ |        2,312 |
-| RDKit CPU      | 2x Xeon 6776P (192 threads) |     410 |        1,122 |
+| Dataset | Workload | RDKit CPU (192 thr) | SmallField 1 GPU | SmallField 8 GPU | Notes |
+| :------ | :------- | ------------------: | ---------------: | ---------------: | :---- |
+| ChEMBL 8,948 | 3 conformers / molecule | 588.3 mol/s | 1,032.9 mol/s | 1,342.6 mol/s | 2.28x faster than RDKit at 8 GPU; 96.7% conformer success |
+| ChEMBL 241,596 | 1 conformer / molecule | 1,734.8 mol/s | 4,900.7 mol/s | 16,826.6 mol/s | 9.70x faster than RDKit at 8 GPU; 96.6% conformer success |
 
 NVIDIA's [nvMolKit](https://docs.nvidia.com/bionemo/) also targets GPU conformer generation, but it requires the BioNeMo proprietary stack.
 SmallField is open-source, runs on any CUDA 12+ GPU, and uses a single persistent warp-loop kernel.
@@ -52,10 +52,10 @@ SmallField is open-source, runs on any CUDA 12+ GPU, and uses a single persisten
 ## Python
 
 ```python
-import smallfield
+import smallfield.api as sf
 
-coords = smallfield.generate_conformers("c1ccc(CC(=O)O)cc1", num_conformers=10)
-print(coords.shape)  # (K, N, 3) where K = successful conformers
+coordinates = sf.generate_conformers("c1ccc(CC(=O)O)cc1", num_conformers=10)
+print(coordinates.shape)  # (K, N, 3) where K = successful conformers
 ```
 
 Requires RDKit for preprocessing.
@@ -63,10 +63,15 @@ Install it with `pip install rdkit`.
 The GPU pipeline context is also available directly:
 
 ```python
-ctx = smallfield.EtkdgContext(max_atoms=128, max_molecules=1000, max_conformers=10)
-coords, energies, status = ctx.generate_conformers(
-    bounds_flat, chirals, torsions, constraints, metadata,
-    num_conformers=10, max_stereo_attempts=20, random_seed=42)
+context = sf.Context()
+coordinates_flat, energies, status = context.generate_conformers(
+    ["CCO", "c1ccccc1"],
+    num_conformers=3,
+    max_atoms_per_molecule=128,
+    max_stereo_attempts=10,
+    use_csd_torsions=True,
+    random_seed=42,
+)
 ```
 
 ## C++ Benchmark
@@ -77,18 +82,18 @@ cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc) bench_pipeline_throughput
 
 LD_LIBRARY_PATH=/path/to/conda/env/lib:$LD_LIBRARY_PATH \
-    ./bench/bench_pipeline_throughput --smi /path/to/chembl.smi
+    ./benchmark/bench_pipeline_throughput --smi /path/to/chembl.smi
 ```
 
-This runs both the RDKit CPU path with OpenMP and `numThreads=1` per molecule, and the SmallField GPU path.
-It reports per-stage timing, the wave-dispatch breakdown, and quality cross-validation against RDKit's MMFF94 energy evaluator.
+Default mode reports RDKit CPU vs SmallField 1-GPU throughput plus an RDKit MMFF94 quality check.
+Use `--multi-gpu-only` for isolated 1/2/4/8-GPU scaling runs.
 
 ## Installation
 
 __Python:__
 
 ```bash
-pip install -e .[gpu] # builds CUDA extension via nvcc
+pip install -e .
 ```
 
 __C++ tests and benchmarks (requires RDKit from conda-forge):__
@@ -103,15 +108,15 @@ ctest --output-on-failure
 ## Project Layout
 
 ```
-src/api/                            public C++ API (smallfield.hpp, batch_pool.hpp)
-src/types/                          plain data structures shared host + device
-src/parameters/                     MMFF94 parameter tables (host extraction, device upload)
-src/preprocess/                     CPU preprocessing: SMILES parse, bounds, CIP, CSD torsions, scaffold cache
-src/mmff94/                         native MMFF94 typer, charge, term extractor (CPU + GPU)
-src/kernels/                        CUDA kernels: metric embedding, DG, ETK, MMFF, FIRE, pipeline driver
-binary/                             smallfield_batch — restartable CLI over Parquet shards
-test/                               C++ tests cross-validated against RDKit
-bench/                              C++ benchmarks: pipeline throughput + isolated MMFF kernels
+src/smallfield/api/                 public C++ API
+src/smallfield/types/               plain data structures shared host + device
+src/smallfield/parameters/          MMFF94 parameter tables (host extraction, device upload)
+src/smallfield/preprocess/          CPU preprocessing: SMILES parse, bounds, CIP, CSD torsions, scaffold cache
+src/smallfield/mmff94/              native MMFF94 typer, charge, term extractor (CPU + GPU)
+src/smallfield/cuda/                CUDA kernels: metric embedding, DG, ETK, MMFF, FIRE, pipeline driver
+cli/                                smallfield_batch — restartable CLI over Parquet shards
+tests/                              C++ and Python tests cross-validated against RDKit
+benchmark/                          C++ benchmarks: throughput + isolated MMFF kernels
 python/smallfield/                  Python package including tools/smi_to_parquet.py
 ```
 

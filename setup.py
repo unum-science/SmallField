@@ -1,5 +1,7 @@
 import os
 import platform
+import subprocess
+import sys
 from setuptools import setup
 from setuptools.extension import Extension
 from setuptools.command.build_ext import build_ext
@@ -14,9 +16,75 @@ is_nvcc_available = os.system("which nvcc > /dev/null 2>&1") == 0
 enable_openmp = not is_macos
 enable_cuda = is_linux and is_nvcc_available
 
+# RDKit ships no pkg-config, so probe the usual prefixes most-explicit first.
+# RDKIT_PREFIX mirrors the CMake flag, CONDA_PREFIX covers an active conda or
+# pixi environment, and sys.prefix covers an install run from inside one.
+rdkit_prefix_candidates = [
+    os.environ.get("RDKIT_PREFIX"),
+    os.environ.get("CONDA_PREFIX"),
+    sys.prefix,
+]
+rdkit_prefix = next(
+    (
+        candidate
+        for candidate in rdkit_prefix_candidates
+        if candidate and os.path.exists(os.path.join(candidate, "include", "rdkit", "GraphMol", "ROMol.h"))
+    ),
+    "",
+)
+if not rdkit_prefix:
+    raise SystemExit(
+        "SmallField needs the RDKit development headers to build.\n"
+        "Install them with `micromamba install -c conda-forge librdkit-dev`, then either\n"
+        "build from inside that environment or pass RDKIT_PREFIX=/path/to/conda/env."
+    )
+
+rdkit_include_root = os.path.join(rdkit_prefix, "include")
+rdkit_include_dir = os.path.join(rdkit_include_root, "rdkit")
+rdkit_lib_dir = os.path.join(rdkit_prefix, "lib")
+
+cuda_root_candidates = [
+    os.environ.get("CUDA_HOME"),
+    os.environ.get("CUDA_PATH"),
+    "/usr/local/cuda-13.0",
+    "/usr/local/cuda",
+    "/usr",
+]
+cuda_root = next((candidate for candidate in cuda_root_candidates if candidate and os.path.exists(candidate)), "")
+cuda_include_dirs = [
+    os.path.join(cuda_root, "targets", "x86_64-linux", "include"),
+    os.path.join(cuda_root, "include"),
+    "/usr/include/cuda",
+]
+cuda_library_dirs = [
+    os.path.join(cuda_root, "targets", "x86_64-linux", "lib"),
+    os.path.join(cuda_root, "lib64"),
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/wsl/lib",
+]
+
+rdkit_libraries = [
+    "RDKitSmilesParse",
+    "RDKitGraphMol",
+    "RDKitRDGeneral",
+    "RDKitForceFieldHelpers",
+    "RDKitForceField",
+    "RDKitDistGeomHelpers",
+    "RDKitDistGeometry",
+    "RDKitDepictor",
+    "RDKitSubstructMatch",
+    "RDKitAlignment",
+    "RDKitEigenSolvers",
+    "RDKitMolTransforms",
+    "RDKitChemTransforms",
+]
+
+boost_libraries = ["boost_serialization", "boost_iostreams"]
+
 
 class BuildExt(build_ext):
     def build_extensions(self):
+        self.ensure_smallfield_libraries()
         self.compiler.src_extensions.append(".cu")
 
         for ext in self.extensions:
@@ -27,6 +95,19 @@ class BuildExt(build_ext):
                     self.build_gcc_extension(ext)
             else:
                 super().build_extension(ext)
+
+    def ensure_smallfield_libraries(self):
+        static_library = os.path.join("build", "libsmallfield_lib.a")
+        shared_library = os.path.join("build", "libsmallfield_python_lib.so")
+        if os.path.exists(static_library) and os.path.exists(shared_library):
+            return
+
+        configure_cmd = ["cmake", "-S", ".", "-B", "build"]
+        configure_cmd.append(f"-DRDKIT_PREFIX={rdkit_prefix}")
+        subprocess.run(configure_cmd, check=True)
+        subprocess.run(
+            ["cmake", "--build", "build", "--target", "smallfield_lib", "smallfield_python_lib", "-j"], check=True
+        )
 
     def build_cuda_extension(self, ext):
         # Compile CUDA source files
@@ -43,8 +124,9 @@ class BuildExt(build_ext):
                     output_dir=self.build_temp,
                     extra_postargs=[
                         "-fPIC",
-                        "-std=c++17",
+                        "-std=c++20",
                         "-fdiagnostics-color=always",
+                        "-DSMALLFIELD_BUILD_PYTHON=1",
                     ]
                     + ext.extra_compile_args,
                     include_dirs=ext.include_dirs,
@@ -73,8 +155,9 @@ class BuildExt(build_ext):
                     extra_preargs=["-x", "c++"],
                     extra_postargs=[
                         "-fPIC",
-                        "-std=c++17",
+                        "-std=c++20",
                         "-fdiagnostics-color=always",
+                        "-DSMALLFIELD_BUILD_PYTHON=1",
                     ]
                     + ext.extra_compile_args
                     + (["-fopenmp"] if enable_openmp else []),
@@ -86,8 +169,9 @@ class BuildExt(build_ext):
                     output_dir=self.build_temp,
                     extra_postargs=[
                         "-fPIC",
-                        "-std=c++17",
+                        "-std=c++20",
                         "-fdiagnostics-color=always",
+                        "-DSMALLFIELD_BUILD_PYTHON=1",
                     ]
                     + ext.extra_compile_args
                     + (["-fopenmp"] if enable_openmp else []),
@@ -145,9 +229,9 @@ class BuildExt(build_ext):
         if enable_openmp:
             host_flags += ",-fopenmp"
         cmd = (
-            f"nvcc -c {source} -o {output_file} -std=c++17 "
+            f"nvcc -c {source} -o {output_file} -std=c++20 "
             f"-gencode=arch=compute_{arch_code},code=sm_{arch_code} "
-            f"-Xcompiler {host_flags} {include_dirs} -O3 -g"
+            f"-Xcompiler {host_flags} {include_dirs} -DSMALLFIELD_BUILD_PYTHON=1 -O3 -g"
         )
         if os.system(cmd) != 0:
             raise RuntimeError(f"nvcc compilation of {source} failed")
@@ -167,26 +251,26 @@ python_lib_name = os.path.basename(python_lib_dir).replace(".so", "")
 ext_modules = [
     Extension(
         "_smallfield",
-        ["src/smallfield.cu"],
+        ["python/smallfield/_binding.cpp"],
         include_dirs=[
             pybind11.get_include(),
             np.get_include(),
             get_python_inc(),
             "src",
-            "/usr/local/cuda/include/",
-            "/usr/include/cuda/",
-        ],
-        library_dirs=[
-            "/usr/local/cuda/lib64",
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib/wsl/lib",
-            python_lib_dir,
-        ],
+            rdkit_include_root,
+            rdkit_include_dir,
+        ]
+        + [path for path in cuda_include_dirs if path and os.path.exists(path)],
+        library_dirs=[python_lib_dir, rdkit_lib_dir, "build"]
+        + [path for path in cuda_library_dirs if path and os.path.exists(path)],
+        extra_objects=[os.path.abspath(os.path.join("build", "libsmallfield_python_lib.so"))],
         libraries=[python_lib_name.replace(".a", "")]
+        + rdkit_libraries
+        + boost_libraries
         + (["cudart", "cuda", "curand", "cusolver"] if enable_cuda else [])
         + (["gomp"] if enable_openmp else []),
         extra_compile_args=[
-            "-std=c++17",
+            "-std=c++20",
             "-fPIC",
             "-mavx512f",
             "-mavx512bw",
@@ -197,6 +281,8 @@ ext_modules = [
         ]
         + (["-fopenmp"] if enable_openmp else []),
         extra_link_args=[f"-Wl,-rpath,{python_lib_dir}"]
+        + [f"-Wl,-rpath,{os.path.abspath('build')}"]
+        + [f"-Wl,-rpath,{rdkit_lib_dir}"]
         + (["-fopenmp"] if enable_openmp else []),
         language="c++",
     ),
