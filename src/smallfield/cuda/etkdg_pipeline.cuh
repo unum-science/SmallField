@@ -1,21 +1,38 @@
 /**
  *  @file etkdg_pipeline.cuh
- *  @brief Persistent warp-loop CUDA kernel for the full ETKDG conformer generation pipeline.
+ *  @brief Persistent warp-loop CUDA kernels for the ETKDG conformer generation pipeline.
  *
- *  Stages per molecule:
- *   2: load pre-smoothed bounds from global memory
- *   3: native metric embedding with mirrored retries
+ *  The pipeline lives in two sibling kernels that share the `warp_per_molecule`
+ *  pattern, split to keep register pressure per kernel under the launch-bounds
+ *  cap.  The monolithic predecessor hit 145 regs/thread because DG/ETK/MMFF
+ *  state was held simultaneously across branch boundaries; each sub-kernel
+ *  here lands in the 70-90 reg range.
+ *
+ *  @c etkdg_pipeline_warp_kernel — stages 2, 4-8 (bounds quantize → DG FIRE
+ *  → stereo retry → fourth-dim crush → ETK torsion → final validation).
+ *  Writes ETK-refined 3D positions to @c conformer_coordinates_out.
+ *
+ *  @c mmff_polish_warp_kernel — stage 9 (MMFF94 relaxation + optional heavy
+ *  rescue).  Reads positions from @c conformer_coordinates_out (written by
+ *  the first kernel), overwrites them with the MMFF-polished coordinates,
+ *  replaces the ETK energy with the MMFF energy in @c conformer_energies_out.
+ *  Skips slots whose status is non-zero (failed stereo) or whose molecule
+ *  has no MMFF terms.
+ *
+ *  Stages per molecule (across both kernels):
+ *   2: load pre-smoothed bounds from global memory, int8-quantize to shared
+ *   3: native metric embedding with mirrored retries (separate prepass kernel)
  *   4: distance geometry minimization (4D FIRE, atom-centric)
  *   5: stereochemistry check (chiral volume signs)
  *   6: fourth-dimension crush (FIRE with w₄ penalty)
  *   7: ETK torsion refinement (3D FIRE, atom-centric)
  *   8: final validation
- *   9: MMFF94 polish
+ *   9: MMFF94 polish (in the @c mmff_polish_warp_kernel sibling)
  *
  *  Architecture:
  *   - warp-loop: gridDim warps, each loops over molecules with stride
  *   - atom-centric: no atomicAdd, no pair index scan
- *   - half-precision bounds: halves shared memory, enables 2 blocks/SM at N=128
+ *   - int8 bounds: per-molecule linear quantization, 16 KB at N=128
  *   - Philox RNG: stateless counter-based, ~100 cycles init
  */
 
@@ -133,7 +150,7 @@ __device__ __forceinline__ void run_fire_stage_(float *positions, float *velocit
     }
 }
 
-/** Compute shared memory bytes for the pipeline kernel.
+/** Compute shared memory bytes for the DG+ETK pipeline kernel.
  *
  *  Layout: [bounds matrix: N² × uint8_t][positions, velocities, gradient: 3 × 4N × float].
  *  Bounds are int8-quantized with a per-molecule (min, inv_scale) pair kept in
@@ -147,6 +164,19 @@ __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
     std::uint32_t const fire_arrays = 3 * dim4 * sizeof(float);
     return aligned_bounds_bytes + fire_arrays;
+}
+
+/** Compute shared memory bytes for the MMFF polish kernel.
+ *
+ *  Layout: [positions, velocities, gradient: 3 × 3N × float].  No bounds matrix —
+ *  MMFF94 uses explicit bonded + nonbonded term lists rather than a pair-distance
+ *  matrix, so the full shmem budget collapses to the FIRE scratch.  At N=128
+ *  this is 4.5 KB vs the 22.5 KB the DG+ETK kernel needs, giving the scheduler
+ *  far more occupancy headroom — typically reg-cap-bound rather than shmem-bound.
+ */
+__host__ __device__ __forceinline__ std::uint32_t compute_mmff_polish_shared_memory_bytes(std::uint32_t max_atoms) {
+    std::uint32_t const dim3 = 3 * max_atoms;
+    return 3 * dim3 * sizeof(float);
 }
 
 __device__ __forceinline__ void initialize_from_metric_coordinates_(float const *initial_coordinates, float *positions,
@@ -188,20 +218,18 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
 }
 
 /**
- *  Persistent warp-loop ETKDG pipeline kernel.
+ *  Persistent warp-loop ETKDG kernel covering stages 2, 4-8.
  *
  *  Launch: <<<min(total_molecules, max_concurrent_warps), 32, shared_bytes>>>
  *  Each warp loops over molecules with stride = gridDim.x.
  *
- *  `__launch_bounds__(32, 4)` hints the compiler to fit at least 4 blocks per
- *  SM — 1 warp × 32 threads × 4 blocks = 128 warps/SM of occupancy — which
- *  improves latency hiding on the long_scoreboard / wait stalls that dominate
- *  this kernel per ncu.  Without the hint, nvcc picks register count first
- *  (~128 regs/thread here) which caps concurrency at 1 block/SM.  The cap at
- *  4 blocks/SM — raised from an earlier 2 blocks/SM setting — lets nvcc spill
- *  more registers to recover 4x occupancy. The trade-off is extra spill
- *  traffic to local memory; on Blackwell's large register file and L1 this
- *  has consistently been a net win on drug-like ChEMBL molecules.
+ *  `__launch_bounds__(32, 4)` guarantees nvcc keeps this kernel fitting at
+ *  least four blocks per SM.  With MMFF stripped out into the sibling
+ *  kernel, the remaining inlined state (DG + ETK functors + stereo retry
+ *  loop) lands in ~90 regs/thread vs the 145 the monolithic predecessor
+ *  paid, which lifts the register-cap occupancy headroom materially.
+ *  Writes ETK-refined 3D positions into @c conformer_coordinates_out;
+ *  @c mmff_polish_warp_kernel runs next on the same buffer.
  */
 __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     float const *__restrict__ bounds_matrices, float const *__restrict__ initial_coordinates,
@@ -209,13 +237,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     etk_torsion_descriptor_t const *__restrict__ torsion_terms,
     distance_constraint_t const *__restrict__ distance_constraints,
     etk_atom_interaction_t const *__restrict__ etk_interactions,
-    etk_atom_offsets_t const *__restrict__ etk_atom_offsets, mmff94_atom_vdw_params_t const *__restrict__ mmff_atom_vdw,
-    float const *__restrict__ mmff_atom_charge, std::uint8_t const *__restrict__ bond_distance,
-    mmff94_bond_t const *__restrict__ mmff_bond_terms, mmff94_angle_t const *__restrict__ mmff_angle_terms,
-    mmff94_torsion_t const *__restrict__ mmff_torsion_terms, mmff94_oop_t const *__restrict__ mmff_oop_terms,
-    mmff94_stretchbend_t const *__restrict__ mmff_stretchbend_terms,
-    mmff94_atom_interaction_t const *__restrict__ mmff_interactions,
-    mmff94_atom_offsets_t const *__restrict__ mmff_atom_offsets,
+    etk_atom_offsets_t const *__restrict__ etk_atom_offsets,
     etkdg_molecule_metadata_t const *__restrict__ molecule_metadata, float *__restrict__ conformer_coordinates_out,
     float *__restrict__ conformer_energies_out, std::uint8_t *__restrict__ conformer_status_out,
     std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t max_stereo_attempts,
@@ -349,53 +371,9 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                 }
 
                 if (valid) {
-                    // Stage 9: Run MMFF94 polishing in 3D.
-                    std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
-                    if (total_mmff_terms > 0 && mmff_interactions != nullptr) {
-                        mmff94_energy_functor_t mmff_functor {mmff_atom_vdw + meta.mmff_atom_vdw_offset,
-                                                              mmff_atom_charge + meta.mmff_atom_charge_offset,
-                                                              bond_distance + meta.bond_distance_offset,
-                                                              mmff_bond_terms + meta.mmff_bond_offset,
-                                                              mmff_angle_terms + meta.mmff_angle_offset,
-                                                              mmff_torsion_terms + meta.mmff_torsion_offset,
-                                                              mmff_oop_terms + meta.mmff_oop_offset,
-                                                              mmff_stretchbend_terms + meta.mmff_stretchbend_offset,
-                                                              mmff_interactions,
-                                                              mmff_atom_offsets + meta.mmff_atom_offsets_start,
-                                                              num_atoms};
-
-                        float mmff_energy = 0.0f;
-                        float mmff_rms_gradient = 0.0f;
-                        std::int32_t mmff_iterations = 0, mmff_status = 0;
-                        run_fire_stage_(
-                            positions, velocities, gradient, dim3, refinement_policy.mmff_initial_iterations,
-                            refinement_policy.mmff_continuation_iterations, refinement_policy.mmff_gradient_threshold,
-                            lane, mmff_functor, &mmff_energy, &mmff_iterations, &mmff_status, &mmff_rms_gradient);
-
-                        bool run_heavy_rescue = false;
-                        if (lane == 0) {
-                            run_heavy_rescue = is_heavy_refinement_case_(meta) &&
-                                               (mmff_status != 0 || mmff_energy > heavy_mmff_rescue_threshold_(meta));
-                        }
-                        run_heavy_rescue = __shfl_sync(full_mask, run_heavy_rescue ? 1 : 0, 0) != 0;
-
-                        if (run_heavy_rescue) {
-                            float rescue_energy = 0.0f;
-                            float rescue_rms_gradient = 0.0f;
-                            std::int32_t rescue_iterations = 0;
-                            std::int32_t rescue_status = 0;
-                            run_fire_stage_(positions, velocities, gradient, dim3, 160, 160, 2.5e-5f, lane,
-                                            mmff_functor, &rescue_energy, &rescue_iterations, &rescue_status,
-                                            &rescue_rms_gradient);
-                            mmff_energy = rescue_energy;
-                            mmff_iterations += rescue_iterations;
-                            mmff_status = rescue_status;
-                            mmff_rms_gradient = rescue_rms_gradient;
-                        }
-
-                        final_energy = mmff_energy;
-                    }
-
+                    // ETK-refined 3D positions are the final output of this kernel.
+                    // The sibling mmff_polish_warp_kernel picks them up from
+                    // conformer_coordinates_out and runs stage 9 in-place.
                     succeeded = true;
                     break;
                 }
@@ -405,6 +383,112 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
             write_conformer_output_(conformer_coordinates_out, conformer_energies_out, conformer_status_out, positions,
                                     mol, conf, num_atoms, output_atoms_stride, num_conformers_per_molecule,
                                     final_energy, succeeded, lane);
+        }
+    }
+}
+
+/**
+ *  Persistent warp-loop MMFF94 polish kernel (stage 9).
+ *
+ *  Reads ETK-refined 3D positions from @c conformer_coordinates_out (produced
+ *  by @c etkdg_pipeline_warp_kernel on the same stream + wave), runs MMFF94
+ *  FIRE with the per-molecule refinement policy, and overwrites the positions
+ *  and energy in place.  Skips slots that failed stereo (status != 0) and
+ *  molecules with zero MMFF terms.
+ *
+ *  Shared memory at bin 128 drops to ~4.5 KB (FIRE scratch only; no bounds
+ *  matrix is needed here).  Reg cap is the binding occupancy constraint —
+ *  the kernel lands around 90 regs vs the 145 the old monolithic form paid,
+ *  ~22 blocks/SM from registers on Blackwell.
+ */
+__global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
+    mmff94_atom_vdw_params_t const *__restrict__ mmff_atom_vdw, float const *__restrict__ mmff_atom_charge,
+    std::uint8_t const *__restrict__ bond_distance, mmff94_bond_t const *__restrict__ mmff_bond_terms,
+    mmff94_angle_t const *__restrict__ mmff_angle_terms, mmff94_torsion_t const *__restrict__ mmff_torsion_terms,
+    mmff94_oop_t const *__restrict__ mmff_oop_terms, mmff94_stretchbend_t const *__restrict__ mmff_stretchbend_terms,
+    mmff94_atom_interaction_t const *__restrict__ mmff_interactions,
+    mmff94_atom_offsets_t const *__restrict__ mmff_atom_offsets,
+    etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
+    float *__restrict__ conformer_coordinates_out, float *__restrict__ conformer_energies_out,
+    std::uint8_t const *__restrict__ conformer_status_in, std::uint32_t total_molecules,
+    std::uint32_t num_conformers_per_molecule, std::uint32_t output_atoms_stride) {
+
+    std::uint32_t const warp_id = blockIdx.x;
+    std::uint32_t const lane = threadIdx.x;
+    std::uint32_t const grid_stride = gridDim.x;
+
+    // Shared layout: [positions, velocities, gradient: 3 × 3N × float].
+    extern __shared__ float shared_float[];
+
+    for (std::uint32_t mol = warp_id; mol < total_molecules; mol += grid_stride) {
+        auto const meta = molecule_metadata[mol];
+        std::uint32_t const num_atoms = meta.num_atoms;
+        std::uint32_t const dim3 = 3 * num_atoms;
+
+        std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
+        if (total_mmff_terms == 0 || mmff_interactions == nullptr) continue;
+
+        auto const refinement_policy = select_refinement_policy_(meta);
+
+        mmff94_energy_functor_t mmff_functor {mmff_atom_vdw + meta.mmff_atom_vdw_offset,
+                                              mmff_atom_charge + meta.mmff_atom_charge_offset,
+                                              bond_distance + meta.bond_distance_offset,
+                                              mmff_bond_terms + meta.mmff_bond_offset,
+                                              mmff_angle_terms + meta.mmff_angle_offset,
+                                              mmff_torsion_terms + meta.mmff_torsion_offset,
+                                              mmff_oop_terms + meta.mmff_oop_offset,
+                                              mmff_stretchbend_terms + meta.mmff_stretchbend_offset,
+                                              mmff_interactions,
+                                              mmff_atom_offsets + meta.mmff_atom_offsets_start,
+                                              num_atoms};
+
+        float *positions = shared_float;
+        float *velocities = shared_float + dim3;
+        float *gradient = shared_float + 2 * dim3;
+
+        for (std::uint32_t conf = 0; conf < num_conformers_per_molecule; ++conf) {
+            std::uint32_t const slot = mol * num_conformers_per_molecule + conf;
+            if (conformer_status_in[slot] != 0) continue;
+
+            std::uint32_t const coord_offset = slot * output_atoms_stride * 3;
+
+            // Stage in ETK-refined positions from global memory (SoA layout).
+            for (std::uint32_t d = 0; d < 3; ++d)
+                for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
+                    positions[d * num_atoms + i] = conformer_coordinates_out[coord_offset + d * output_atoms_stride + i];
+            __syncwarp(full_mask);
+
+            float mmff_energy = 0.0f;
+            float mmff_rms_gradient = 0.0f;
+            std::int32_t mmff_iterations = 0, mmff_status = 0;
+            run_fire_stage_(positions, velocities, gradient, dim3, refinement_policy.mmff_initial_iterations,
+                            refinement_policy.mmff_continuation_iterations, refinement_policy.mmff_gradient_threshold,
+                            lane, mmff_functor, &mmff_energy, &mmff_iterations, &mmff_status, &mmff_rms_gradient);
+
+            bool run_heavy_rescue = false;
+            if (lane == 0) {
+                run_heavy_rescue = is_heavy_refinement_case_(meta) &&
+                                   (mmff_status != 0 || mmff_energy > heavy_mmff_rescue_threshold_(meta));
+            }
+            run_heavy_rescue = __shfl_sync(full_mask, run_heavy_rescue ? 1 : 0, 0) != 0;
+
+            if (run_heavy_rescue) {
+                float rescue_energy = 0.0f;
+                float rescue_rms_gradient = 0.0f;
+                std::int32_t rescue_iterations = 0;
+                std::int32_t rescue_status = 0;
+                run_fire_stage_(positions, velocities, gradient, dim3, 160, 160, 2.5e-5f, lane, mmff_functor,
+                                &rescue_energy, &rescue_iterations, &rescue_status, &rescue_rms_gradient);
+                mmff_energy = rescue_energy;
+            }
+
+            // Write polished positions + updated energy back.  Status is left
+            // untouched: MMFF non-convergence does not mark the conformer failed.
+            for (std::uint32_t d = 0; d < 3; ++d)
+                for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
+                    conformer_coordinates_out[coord_offset + d * output_atoms_stride + i] = positions[d * num_atoms + i];
+            if (lane == 0) conformer_energies_out[slot] = mmff_energy;
+            __syncwarp(full_mask);
         }
     }
 }

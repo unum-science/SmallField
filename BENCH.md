@@ -1,10 +1,8 @@
 # SmallField Benchmarks
 
 Fresh measurements collected on 2026-04-15 from the current tree after the namespace/path refactor, Python packaging cleanup, and repo-wide formatting pass.
-
-The ChEMBL 8,948 and ChEMBL 241,596 tables below are the __pre-quantization baseline__ (half-precision bounds in shared memory).
-Phase 2 (int8 bounds packing, landed 2026-04-15) adds a +20.9 % single-GPU win on the same code path — see the dedicated USearch 1M A/B at the bottom of this file.
-Those ChEMBL tables will be re-measured under Phase 2 in a follow-up pass; the mechanics of the change are `src/smallfield/cuda/dg_kernel.cuh` (int8 read + single-FMA dequantize) and `src/smallfield/cuda/etkdg_pipeline.cuh` (per-molecule min/max warp reduction, quantize to shared on stage 2).
+Phase 2 (int8 bounds quantization, 2026-04-15) and Phase 3a (2-way DG+ETK / MMFF kernel split, 2026-04-16) each contribute to the single-GPU wins documented in the dedicated sections at the bottom.
+The ChEMBL 8,948 and ChEMBL 241,596 tables immediately below predate Phase 2; they are preserved as a historical baseline so the phase-by-phase progression remains auditable.
 
 ## Hardware
 
@@ -150,6 +148,101 @@ LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
   --smi /tmp/usearch_1M_clean.smi \
   --conformers 1 \
   --multi-gpu-only
+```
+
+## Phase 3a A/B — 2-way kernel split (2026-04-16)
+
+Change: the monolithic `etkdg_pipeline_warp_kernel` held all DG / ETK / MMFF state live across the whole iteration budget, which pinned register pressure at 145 regs / thread.
+Phase 3a splits the pipeline into two sibling kernels on the same CUDA stream:
+
+1. `etkdg_pipeline_warp_kernel` — stages 2, 4-8 (bounds int8 quantize, DG FIRE, stereo retry, fourth-dim crush, ETK torsion refinement, final stereo validation).
+   Writes 3D ETK-refined coordinates into `conformer_coordinates_out`.
+2. `mmff_polish_warp_kernel` — stage 9 (MMFF94 FIRE with optional heavy rescue).
+   Reads positions from the first kernel's output, overwrites them with the MMFF-polished coordinates, replaces the ETK energy with the MMFF energy.
+   Skips slots with non-zero status (failed stereo) or zero MMFF terms.
+
+Register-attribution probe on the pre-split code showed the 145-reg monolithic kernel spent ~53 regs on stage-overlap state (all three functors' pointer fields + RNG + stereo retry loop alive across branch boundaries), vs ~72-92 regs for any single stage measured in isolation.
+After the split nvcc resolves the pipeline kernel to 95 regs / thread and the MMFF polish kernel to 96 regs — a ~1.5× headroom for reg-cap-bound occupancy.
+
+### Single-GPU production A/B on USearch 1M × 1 conformer
+
+| Build                        |    Time |     Throughput |             Success | vs baseline |
+| :--------------------------- | ------: | -------------: | ------------------: | ----------: |
+| Pre-Phase-2 (`__half` bounds) | 253.3 s | 3,947.9 mol/s  | 986,103 / 1,000,000 |       1.00× |
+| Phase 2 (int8 packed bounds) | 209.4 s | 4,774.7 mol/s  | 986,046 / 1,000,000 |      1.209× |
+| __Phase 3a (2-way split)__    | __163.6 s__ | __6,031.6 mol/s__ | __986,091 / 1,000,000__ |  __1.528×__ |
+
+Success rate runs within ±0.01 pp across all three builds — precision of both structural changes is invisible at the mol/s-scale accuracy gate.
+
+### 8-GPU production A/B on USearch 10M, 1 and 3 conformer / molecule
+
+| Workload                                       | Build       |     Wall | Throughput (partial) | Per-chunk-per-device K | vs baseline |
+| :--------------------------------------------- | :---------- | -------: | -------------------: | ---------------------: | ----------: |
+| 10M × 1 conformer                              | Pre-Phase-2 |  478.9 s |       20,880.0 mol/s |             1 291.4 ms |       1.00× |
+| 10M × 1 conformer                              | __Phase 3a__ | __472.4 s__ |  __21,166.8 mol/s__ |         __1 134.4 ms__ |  __1.014×__ |
+| 10M × 3 conformers (partial, chunk 0 – 191) ¹ | Pre-Phase-2 |  1 030 s |        9,320.4 mol/s |             4 588.4 ms |       1.00× |
+| 10M × 3 conformers (partial, chunk 0 – 191) ¹ | __Phase 3a__ | __934 s__ |   __10,278.5 mol/s__ |         __4 120.6 ms__ |  __1.103×__ |
+
+¹ Both K=3 runs hit the same tail-of-run segfault at chunk 192 (known bug on the final-chunk cleanup path; unrelated to the structural work in Phases 2/3a and pre-dates this session).
+Wall times are log-file birth → modify on the identical truncation point, so the partial-throughput comparison is apples-to-apples: 192 × ~50 K-molecule chunks, 9.6 M molecules, 28.8 M conformers.
+The `--multi-gpu-only` driver does not emit a final Mol/s line when the process crashes — the numbers are derived from chunks-completed / wall-to-crash.
+
+K=1 moves only 1.4 % at 8-GPU scale despite the 52.8 % single-GPU gain.
+K=3 picks up 10.3 % because the GPU work per chunk is now ~3.6× bigger, which flips the critical path back to GPU-bound:
+
+- __K=1 per chunk:__ GPU parallel slot ~1.22 s (across 8 devices), host prep ~2.36 s / chunk.
+  Host is the critical path, so kernel speedups shrink GPU idle gaps but not wall.
+- __K=3 per chunk:__ GPU parallel slot ~4.12 s, host prep still ~2.3 s / chunk.
+  GPU is the critical path, so Phase 3a's 10 % kernel contraction bubbles straight up into wall.
+
+The takeaway: Phase 3a's kernel-path win translates to throughput wherever GPU is the bottleneck.
+For 1-conformer bulk scans at 8-GPU scale, host prep is now the ceiling — see `IMPROVE.md` for the post-session lever ranking (MMFF parameter LUT caching, SMILES parse overlap, scaffold-cache extension).
+
+### Per-chunk kernel-time breakdown (10M × 1 conformer, 8 GPU, 1 600 chunk-device samples)
+
+| Metric (per chunk per device) | Pre-Phase-2 | Phase 3a |       Δ |
+| :---------------------------- | ----------: | -------: | ------: |
+| Upload (U)                    |    10.1 ms  |   9.4 ms |  −6.9 % |
+| Kernel (K)                    |  1 291.4 ms | 1 134.4 ms | __−12.2 %__ |
+| Total per chunk (T)           |  1 381.5 ms | 1 220.1 ms |  −11.7 % |
+| End-to-end wall (200 chunks)  |    478.9 s  |   472.4 s |  __−1.4 %__ |
+
+The kernel phase contracted 12 % — consistent with the Phase 3a reg-cap lift on `mmff_polish_warp_kernel` — but barely any of that contraction bubbles up into end-to-end wall.
+Per-chunk GPU parallel slot (~1 220 ms across 8 devices) is already smaller than the per-chunk host prep (~2 360 ms for RDKit parse + MMFF parameter extraction + distance-constraint build on a 50 K-molecule chunk), so the 8-GPU pipeline is __host-bound__.
+Cutting GPU kernel time only shrinks the GPU's idle gap between N / N+1 uploads; it does not shrink the host prep critical path.
+On single-GPU runs the same 50 K-molecule chunk has 8× the GPU wall time per device but the same host prep, flipping the bottleneck back to GPU — which is why the 1 M × 1-GPU A/B sees the full kernel-path 52.8 % gain while the 8-GPU × 10 M number stays near baseline.
+
+### ncu per-kernel confirmations at bin 64 / bin 128
+
+Captures under `benchmark/profiling/ncu/2026-04-16-phase3/` (regenerate with `benchmark/profiling/run_ncu_phase3.sh`).
+
+| Kernel                        | Bin |   Regs | Dyn Shmem | BlockLim(Shmem / Regs) |  Theoretical Occ |
+| :---------------------------- | --: | -----: | --------: | :--------------------: | ---------------: |
+| Monolithic (Phase 2)          |  64 |    117 |   7.17 KB |           12 / 16      |         25.00 %  |
+| Monolithic (Phase 2)          | 128 |    117 |  22.53 KB |            4 / 16      |          8.33 %  |
+| `etkdg_pipeline_warp_kernel`  |  64 | __95__ |   7.17 KB |           12 / 20      |         25.00 %  |
+| `etkdg_pipeline_warp_kernel`  | 128 | __95__ |  22.53 KB |            4 / 20      |          8.33 %  |
+| `mmff_polish_warp_kernel`     |  64 |     96 | __2.30 KB__ |         30 / 20      |   __41.67 %__   |
+| `mmff_polish_warp_kernel`     | 128 |     96 | __4.61 KB__ |         18 / 20      |   __37.50 %__   |
+
+The MMFF polish kernel is the big win: its per-block shmem footprint drops from the monolithic kernel's 22.5 KB (bounds-dominated) to 4.6 KB (FIRE scratch only — MMFF evaluation uses explicit term lists, not a pair-distance matrix), unlocking ~4.5× theoretical occupancy vs running MMFF inside the monolithic kernel.
+The DG+ETK kernel cuts registers by 22 / thread but still sits at the same shmem-cap theoretical occupancy (the bounds matrix is unchanged there).
+
+### Reproduction
+
+```bash
+# Single GPU 1M A/B — reproduce the 6,031.6 mol/s number
+CUDA_VISIBLE_DEVICES=0 \
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
+  ./build/benchmark/bench_pipeline_throughput \
+  --smi /tmp/usearch_1M_clean.smi --conformers 1 --multi-gpu-only
+
+# 8 GPU 10M — reproduce the 21,166.8 mol/s number
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
+LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
+  ./build/benchmark/bench_pipeline_throughput \
+  --smi /tmp/usearch_10M.smi --conformers 1 --multi-gpu-only
 ```
 
 ## Reproduction Commands

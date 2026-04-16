@@ -499,26 +499,44 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         std::uint32_t const wave_size = wave_end - wave_start;
         std::uint32_t const wave_max_atoms = wave_bins[bin];
 
-        std::uint32_t const shared_bytes = compute_pipeline_shared_memory_bytes(wave_max_atoms, 0);
-        cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
+        // Kernel 1 — DG + stereo retry + fourth-dim crush + ETK torsion refinement.
+        std::uint32_t const shared_bytes_dg = compute_pipeline_shared_memory_bytes(wave_max_atoms, 0);
+        cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes_dg);
 
-        int blocks_per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, etkdg_pipeline_warp_kernel, 32, shared_bytes);
-        std::uint32_t const grid_size = std::min(wave_size, static_cast<std::uint32_t>(blocks_per_sm * num_sms));
+        int blocks_per_sm_dg = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_dg, etkdg_pipeline_warp_kernel, 32, shared_bytes_dg);
+        std::uint32_t const grid_size_dg = std::min(wave_size, static_cast<std::uint32_t>(blocks_per_sm_dg * num_sms));
 
-        etkdg_pipeline_warp_kernel<<<grid_size, 32, shared_bytes, stream>>>(
+        etkdg_pipeline_warp_kernel<<<grid_size_dg, 32, shared_bytes_dg, stream>>>(
             device_view.bounds_matrices().data(), device_initial_coordinates + wave_start * max_atoms_per_molecule * 4,
             device_view.chiral_centers().data(), device_view.etk_torsions().data(),
             device_view.distance_constraints().data(), device_view.etk_interactions().data(),
-            device_view.etk_atom_offsets().data(), device_view.mmff_atom_vdw().data(),
-            device_view.mmff_atom_charge().data(), device_view.bond_distance().data(), device_view.mmff_bonds().data(),
-            device_view.mmff_angles().data(), device_view.mmff_torsions().data(), device_view.mmff_oops().data(),
-            device_view.mmff_stretchbends().data(), device_view.mmff_interactions().data(),
-            device_view.mmff_atom_offsets().data(), device_metadata_sorted + wave_start,
+            device_view.etk_atom_offsets().data(), device_metadata_sorted + wave_start,
             handle.device_coords_out.data() + wave_start * num_conformers * max_atoms_per_molecule * 3,
             handle.device_energies_out.data() + wave_start * num_conformers,
             handle.device_status_out.data() + wave_start * num_conformers, wave_size, num_conformers,
             max_stereo_attempts, wave_max_atoms, max_atoms_per_molecule, max_atoms_per_molecule, seed);
+
+        // Kernel 2 — MMFF94 polish in place on the per-conformer coordinates
+        // produced by Kernel 1.  Skips slots whose status is non-zero.
+        std::uint32_t const shared_bytes_mmff = compute_mmff_polish_shared_memory_bytes(wave_max_atoms);
+        cudaFuncSetAttribute(mmff_polish_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes_mmff);
+
+        int blocks_per_sm_mmff = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_mmff, mmff_polish_warp_kernel, 32, shared_bytes_mmff);
+        std::uint32_t const grid_size_mmff =
+            std::min(wave_size, static_cast<std::uint32_t>(blocks_per_sm_mmff * num_sms));
+
+        mmff_polish_warp_kernel<<<grid_size_mmff, 32, shared_bytes_mmff, stream>>>(
+            device_view.mmff_atom_vdw().data(), device_view.mmff_atom_charge().data(),
+            device_view.bond_distance().data(), device_view.mmff_bonds().data(), device_view.mmff_angles().data(),
+            device_view.mmff_torsions().data(), device_view.mmff_oops().data(), device_view.mmff_stretchbends().data(),
+            device_view.mmff_interactions().data(), device_view.mmff_atom_offsets().data(),
+            device_metadata_sorted + wave_start,
+            handle.device_coords_out.data() + wave_start * num_conformers * max_atoms_per_molecule * 3,
+            handle.device_energies_out.data() + wave_start * num_conformers,
+            handle.device_status_out.data() + wave_start * num_conformers, wave_size, num_conformers,
+            max_atoms_per_molecule);
 
         wave_start = wave_end;
     }
