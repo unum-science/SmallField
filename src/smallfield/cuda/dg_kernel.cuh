@@ -108,10 +108,9 @@ __device__ __forceinline__ bool validate_chirality_(float const *positions, std:
  *  gradients in registers. All-pairs distance violations are computed by iterating
  *  other atoms in 32-atom tiles via __shfl_sync.
  *
- *  @tparam write_gradient  When true, computes and writes gradient; when false, energy only.
- *  @param[in] bounds_matrix Int8-quantized bounds matrix in shared memory.  Upper
- *                           bound lives at [min_idx × N + max_idx], lower at [max_idx × N + min_idx],
- *                           each as a uint8_t.  Dequantize with `q · inv_scale + mol_min`.
+ *  @tparam write_gradient When true, computes and writes gradient; when false, energy only.
+ *  @param[in] bounds_matrix Int8-quantized bounds matrix in shared memory. Upper bound at [min_idx × N + max_idx],
+ *      lower at [max_idx × N + min_idx]. Dequantize with `q · inv_scale + mol_min`.
  *  @param[in] mol_min Per-molecule floor — the dequantization baseline.
  *  @param[in] inv_scale Per-molecule range / 255 — the per-step size.
  *  @param[in] chiral_centers Array of chiral center descriptors.
@@ -127,6 +126,7 @@ __device__ __forceinline__ bool validate_chirality_(float const *positions, std:
  *  @param[in] num_elements Total number of coordinate elements.
  *  @param[in] lane Warp lane index (0-31).
  *  @return Total energy (same value in all lanes after warp reduction).
+ *  @see fire_minimize_
  */
 template <bool write_gradient>
 __device__ __forceinline__ float evaluate_distance_geometry_energy(

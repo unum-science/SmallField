@@ -47,6 +47,7 @@ using smallfield::types::bond_flag_aromatic_k;
 using smallfield::types::max_atoms_k;
 using smallfield::types::molecule_descriptor_t;
 
+/** @brief Bemis-Murcko scaffold hash and ring-system membership for one molecule. */
 struct native_murcko_result_t {
     std::uint64_t scaffold_hash;
     bool valid;           ///< false if molecule is acyclic
@@ -57,6 +58,7 @@ struct native_murcko_result_t {
     bool mol_in_scaffold[max_atoms_k];
 };
 
+/** @brief Compute native Murcko decomposition — BFS ring peel + WL canonical hash. */
 inline bool compute_native_murcko(molecule_descriptor_t const &desc, native_murcko_result_t &result) {
     std::uint32_t const total_atoms = desc.num_atoms;
     result.valid = false;

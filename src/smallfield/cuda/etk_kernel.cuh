@@ -74,7 +74,7 @@ __device__ __forceinline__ float compute_dihedral_angle_(float const *positions,
  *  Accumulates gradient for the specified @p atom_role (first through fourth)
  *  into the provided @p grad_x / @p grad_y / @p grad_z accumulators.
  *
- *  @tparam write_gradient  When true, computes and writes gradient; when false, energy only.
+ *  @tparam write_gradient When true, computes and writes gradient; when false, energy only.
  *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
  *  @param[in] num_atoms Number of atoms in the molecule.
  *  @param[in] torsion Torsion descriptor with atom indices and Fourier coefficients.
@@ -82,7 +82,7 @@ __device__ __forceinline__ float compute_dihedral_angle_(float const *positions,
  *  @param[out] grad_x Accumulated x-gradient for the atom.
  *  @param[out] grad_y Accumulated y-gradient for the atom.
  *  @param[out] grad_z Accumulated z-gradient for the atom.
- *  @return  Torsion energy contribution (kcal/mol).
+ *  @return Torsion energy contribution (kcal/mol).
  */
 template <bool write_gradient>
 __device__ __forceinline__ float compute_torsion_contribution_(float const *positions, std::uint32_t num_atoms,
@@ -223,7 +223,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
  *  Each thread owns atoms, iterates all torsions checking participation.
  *  No atomicAdd.
  *
- *  @tparam write_gradient  When true, computes and writes gradient; when false, energy only.
+ *  @tparam write_gradient When true, computes and writes gradient; when false, energy only.
  *  @param[in] torsion_terms Array of torsion descriptors.
  *  @param[in] distance_constraints Array of distance constraint descriptors.
  *  @param[in] interactions Per-atom interaction list entries.
@@ -234,6 +234,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
  *  @param[in] num_elements Total number of coordinate elements.
  *  @param[in] lane Warp lane index (0-31).
  *  @return Total energy (same value in all lanes after warp reduction).
+ *  @see fire_minimize_
  */
 template <bool write_gradient>
 __device__ __forceinline__ float evaluate_etk_torsion_energy(

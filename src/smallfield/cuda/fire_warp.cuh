@@ -24,10 +24,10 @@ namespace smallfield::cuda {
 /**
  *  @brief FIRE minimization driver.
  *
- *  @tparam energy_gradient_functor_  Callable: float(positions, gradient, num_elements, lane)
+ *  @tparam energy_gradient_functor_ Callable: float(positions, gradient, num_elements, lane)
  *
- *  @param[in,out] positions Coordinate array (modified in place). Length = @p num_elements.
- *  @param[in,out] velocities Shared memory for FIRE velocities. Length = @p num_elements.
+ *  @param[inout] positions Coordinate array (modified in place). Length = @p num_elements.
+ *  @param[inout] velocities Shared memory for FIRE velocities. Length = @p num_elements.
  *  @param[out] gradient Shared memory for gradient. Length = @p num_elements.
  *  @param[in] num_elements Total coordinate dimensions (e.g., 3*N or 4*N).
  *  @param[in] max_iterations Maximum FIRE iterations.
@@ -38,6 +38,7 @@ namespace smallfield::cuda {
  *  @param[out] out_iterations Iteration count (lane 0).
  *  @param[out] out_status 0=converged, 1=max_iterations (lane 0).
  *  @param[out] out_final_rms_gradient Final RMS gradient (lane 0, optional).
+ *  @see distance_geometry_energy_functor_t, etk_torsion_energy_functor_t, mmff94_energy_functor_t
  */
 template <typename energy_gradient_functor_>
 __device__ __forceinline__ void fire_minimize_(float *positions, float *velocities, float *gradient,

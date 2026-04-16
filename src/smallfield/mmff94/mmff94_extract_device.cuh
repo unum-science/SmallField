@@ -95,7 +95,7 @@ namespace detail_extract {
 /** Angle scratch — populated during the angle pass and consumed by the
  *  stretch-bend pass.  Sized at `max_mmff_angles_per_mol_k` slots per
  *  molecule and stored in shared memory (≤ 16 B × 512 = 8 KB per block
- *  — fits within the 228 KB Blackwell shared-memory cap). */
+ *  — fits comfortably within the SM shared-memory cap. */
 struct angle_scratch_t {
     std::uint8_t i, j, k;
     std::uint8_t angle_type;

@@ -488,7 +488,7 @@ inline void extract_etk_torsions(RDKit::ROMol const &molecule, std::vector<etk_t
  *  Reads torsion and constraint arrays from @p result and populates the
  *  per-atom ETK interaction list and offset arrays.
  *
- *  @param[in,out] result Prepared molecule; ETK interaction lists are filled in place.
+ *  @param[inout] result Prepared molecule; ETK interaction lists are filled in place.
  */
 inline void build_etk_interaction_lists(etkdg_prepared_molecule_t &result) {
     std::uint32_t const num_atoms = result.num_atoms;
@@ -546,7 +546,7 @@ inline void build_etk_interaction_lists(etkdg_prepared_molecule_t &result) {
  *  heap allocations.
  *
  *  @param[in] molecule RDKit molecule with explicit hydrogens.
- *  @param[in,out] result Prepared molecule; MMFF94 arrays are filled in place.
+ *  @param[inout] result Prepared molecule; MMFF94 arrays are filled in place.
  */
 inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
                                   etkdg_prepared_molecule_t &result) {

@@ -19,9 +19,8 @@
  *   - Each entry stores, per non-native CSD pattern, the list of 4-atom
  *     match tuples in **scaffold atom space**.  Callers translate via a
  *     scaffold-to-molecule atom index map produced at cache-miss time.
- *   - Grow-only; LRU-style eviction lives behind a size cap.  For 1B+
- *     workloads (Enamine REAL projection: ~100K unique scaffolds) the
- *     natural ceiling is ~2.5 GB host RAM — well under the 1.7 TB budget.
+ *   - Grow-only; LRU-style eviction lives behind a size cap.
+ *     Even at ~100 K unique scaffolds the cache stays under ~2.5 GB.
  *
  *  Opt-in via @ref context_t::enable_scaffold_cache — disabled by default
  *  so the existing public API behaviour is unchanged.

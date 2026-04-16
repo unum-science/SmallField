@@ -130,43 +130,29 @@ inline std::uint8_t symbol_to_element(std::string_view sym) {
 }
 
 /**
- *  Parse a single atom specification from SMARTS. @p spec is the content between '[' and ']'
- *  (exclusive of brackets). Returns true if fully parsed; false signals "complex" (caller
- *  should fall back to RDKit).
+ *  @brief Parse one atom-constraint token from a SMARTS-like torsion pattern string into a simple_atom_constraint_t.
  *
- *  Handles:
- *   - element: C, N, O, S, c, n, o, s, #6, #7, ...
- *   - any: *, A
- *   - connectivity: X<n>
- *   - H count: H, H<n>
- *   - negation: !<spec> for single-atom negation (e.g. !#1)
- *   - aromatic flag via lowercase element
- *   - labels :<n> (parsed and ignored — used externally via idx[])
- *   - ring membership: R (in ring), R0 (not in ring)
- *
- *  Explicitly unsupported (returns false):
- *   - recursive queries: $(...)
- *   - logical operators inside: ',' (OR), '|'
- *   - charge: + / - / <n>+ / <n>-
- *   - isotope: <n><sym>
- *   - chirality: @/@@
- *   - most query modifiers we haven't enumerated
- */
-/**
- *  Parse one "term" — a conjunction of primitives separated by `&` or implicit
- *  concatenation, sharing one aromatic-setting + one element. Returns a 64-bit
- *  element mask for the term (0 = unconstrained) plus the other constraints
- *  merged into @p ac. On negation (`!<sym>`), removes bits from the mask.
+ *  A "term" is a conjunction of primitives separated by `&` or implicit
+ *  concatenation, sharing one aromatic-setting and one element.
+ *  Returns a 64-bit element mask for the term (0 = unconstrained) plus the
+ *  other constraints merged into @p ac.
+ *  On negation (`!<sym>`), removes bits from the mask.
  *
  *  Tokens supported:
- *   - `*` `A` `a` — wildcard / aliphatic / aromatic
- *   - `#<n>` — atomic number
- *   - `C`, `N`, `Cl`, `Br`, ... — element symbol (uppercase = aliphatic; lowercase = aromatic)
- *   - `X<n>` — connectivity
- *   - `H` / `H<n>` — H count
- *   - `R` / `R0` — ring membership
- *   - `r<n>` — smallest ring size
- *   - `:<n>` — atom map label (ignored; labels are tracked externally via idx[])
+ *  - `*` `A` `a` -- wildcard / aliphatic / aromatic
+ *  - `#<n>` -- atomic number
+ *  - `C`, `N`, `Cl`, `Br`, ... -- element symbol (uppercase = aliphatic; lowercase = aromatic)
+ *  - `X<n>` -- connectivity
+ *  - `H` / `H<n>` -- H count
+ *  - `R` / `R0` -- ring membership
+ *  - `r<n>` -- smallest ring size
+ *  - `:<n>` -- atom map label (ignored; labels are tracked externally via idx[])
+ *
+ *  @param[in] token The SMARTS-like token to parse.
+ *  @param[inout] ac Atom constraint accumulator to merge parsed primitives into.
+ *  @param[out] term_mask 64-bit element mask for the parsed term (0 = unconstrained).
+ *  @param[out] term_has_element Set to true if the term constrains a specific element.
+ *  @return True on success, false if the token contains unsupported syntax.
  */
 inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac, std::uint64_t &term_mask,
                             bool &term_has_element) {
@@ -905,7 +891,7 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
     return true;
 }
 
-/** Check one atom against a constraint. All stack, no allocations. */
+/** @brief Test whether a single atom satisfies a parsed atom constraint from a torsion-pattern term. */
 inline bool atom_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx, simple_atom_constraint_t const &ac) {
     std::uint8_t const element = desc.element[atom_idx];
     if (ac.element_mask != 0 && element < 64 && (ac.element_mask & (1ULL << element)) == 0) return false;
@@ -940,9 +926,17 @@ inline bool atom_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx
 }
 
 /**
- *  Check whether (atom_idx, bond_idx) — a neighbour of some parent atom — satisfies
- *  a branch constraint.  Inlines the atom and bond rules so the hot path has no
- *  indirection: the parent @ref atom_match already covered the parent itself.
+ *  @brief Test whether the neighbor of atom_idx across bond_idx satisfies a single-atom constraint from a parsed
+ *  torsion-pattern term.
+ *
+ *  Inlines the atom and bond rules so the hot path has no indirection: the
+ *  parent @ref atom_match already covered the parent itself.
+ *
+ *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] atom_idx Index of the neighbor atom to test.
+ *  @param[in] bond_idx Index of the bond connecting the parent atom to @p atom_idx.
+ *  @param[in] nc Neighbor constraint parsed from a branch sub-pattern.
+ *  @return True if the neighbor satisfies every primitive in @p nc.
  */
 inline bool neighbor_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx, std::uint32_t bond_idx,
                            simple_neighbor_constraint_t const &nc) {
@@ -1033,6 +1027,7 @@ inline bool check_branch_neighbors(molecule_descriptor_t const &desc, std::uint3
     return false;
 }
 
+/** @brief Test whether a bond satisfies a parsed bond constraint from a torsion-pattern term. */
 inline bool bond_match(molecule_descriptor_t const &desc, std::uint32_t bond_idx, simple_bond_constraint_t const &bc) {
     if (bc.bond_order != 0) {
         std::uint8_t bo = desc.bond_order[bond_idx];

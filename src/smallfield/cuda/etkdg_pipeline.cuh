@@ -68,6 +68,7 @@ using smallfield::types::mmff94_oop_t;
 using smallfield::types::mmff94_stretchbend_t;
 using smallfield::types::mmff94_torsion_t;
 
+/** @brief Per-molecule FIRE iteration budgets for ETK torsion refinement and MMFF94 polish. */
 struct refinement_policy_t {
     std::int32_t etk_initial_iterations;
     std::int32_t etk_continuation_iterations;
@@ -162,9 +163,11 @@ __device__ __forceinline__ void run_fire_stage_(float *positions, float *velocit
 /** Compute shared memory bytes for the DG+ETK pipeline kernel.
  *
  *  Layout: [bounds matrix: N² × uint8_t][positions, velocities, gradient: 3 × 4N × float].
- *  Bounds are int8-quantized with a per-molecule (min, inv_scale) pair kept in
- *  registers — halves the bounds footprint vs the previous __half layout
- *  (32 KB → 16 KB at N=128).
+ *  Bounds are int8-quantized with a per-molecule min/inv_scale pair kept in
+ *  registers — halves the bounds footprint vs the previous `__half` layout,
+ *  32 KB → 16 KB at N=128.
+ *
+ *  @see compute_mmff_polish_shared_memory_bytes
  */
 __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory_bytes(std::uint32_t max_atoms,
                                                                                        std::uint32_t /*unused*/) {
@@ -177,17 +180,36 @@ __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory
 
 /** Compute shared memory bytes for the MMFF polish kernel.
  *
- *  Layout: [positions, velocities, gradient: 3 × 3N × float].  No bounds matrix —
- *  MMFF94 uses explicit bonded + nonbonded term lists rather than a pair-distance
- *  matrix, so the full shmem budget collapses to the FIRE scratch.  At N=128
- *  this is 4.5 KB vs the 22.5 KB the DG+ETK kernel needs, giving the scheduler
- *  far more occupancy headroom — typically reg-cap-bound rather than shmem-bound.
+ *  Layout: [positions, velocities, gradient: 3 × 3N × float].
+ *  No bounds matrix — MMFF94 uses explicit bonded + nonbonded term lists rather
+ *  than a pair-distance matrix, so the full shmem budget collapses to the FIRE scratch.
+ *  At N=128 this is 4.5 KB vs the 22.5 KB the DG+ETK kernel needs, giving the
+ *  scheduler far more occupancy headroom — typically reg-cap-bound rather than shmem-bound.
+ *
+ *  @see compute_pipeline_shared_memory_bytes
  */
 __host__ __device__ __forceinline__ std::uint32_t compute_mmff_polish_shared_memory_bytes(std::uint32_t max_atoms) {
     std::uint32_t const dim3 = 3 * max_atoms;
     return 3 * dim3 * sizeof(float);
 }
 
+/**
+ *  @brief Load 4D metric-embedding coordinates into shared-memory positions.
+ *
+ *  Adds per-conformer jitter and optionally reflects the x-axis for stereo retries.
+ *  Called once at the start of each stereo attempt inside the DG+ETK pipeline kernel.
+ *
+ *  @param[in] initial_coordinates Global 4D embedding, SoA at @p initial_coordinate_stride.
+ *  @param[out] positions Shared-memory SoA positions to fill — 4 × @p num_atoms floats.
+ *  @param[in] initial_coordinate_stride Atom stride in the global embedding array.
+ *  @param[in] num_atoms Number of atoms in this molecule.
+ *  @param[in] conf Conformer index — affects jitter magnitude.
+ *  @param[in] attempt Stereo-retry attempt — odd attempts reflect x.
+ *  @param[in] lane Warp lane index, 0–31.
+ *  @param[inout] rng_state Philox RNG state for uniform jitter draws.
+ *
+ *  @see etkdg_pipeline_warp_kernel
+ */
 __device__ __forceinline__ void initialize_from_metric_coordinates_(float const *initial_coordinates, float *positions,
                                                                     std::uint32_t initial_coordinate_stride,
                                                                     std::uint32_t num_atoms, std::uint32_t conf,
@@ -207,6 +229,29 @@ __device__ __forceinline__ void initialize_from_metric_coordinates_(float const 
     __syncwarp(full_mask_k);
 }
 
+/**
+ *  @brief Copy one conformer's 3D positions from shared memory to the global output array.
+ *
+ *  Writes energy and status for the conformer slot.
+ *  The output uses @p output_stride between atoms — which may differ from @p num_atoms —
+ *  while shared-memory positions are packed at @p num_atoms stride.
+ *
+ *  @param[out] coordinates_out Global output coordinate buffer, SoA at @p output_stride.
+ *  @param[out] energies_out Global output energy buffer, one float per conformer slot.
+ *  @param[out] status_out Global output status buffer, 0 = success, 1 = failed.
+ *  @param[in] positions Shared-memory SoA positions — 3 × @p num_atoms floats.
+ *  @param[in] mol_index Molecule index within this wave's dispatch.
+ *  @param[in] conformer_index Conformer index within this molecule.
+ *  @param[in] num_atoms Number of atoms in this molecule.
+ *  @param[in] output_stride Atom stride in the global output arrays.
+ *  @param[in] num_conformers Conformers per molecule — used to compute the flat slot.
+ *  @param[in] energy Final energy to write for this conformer.
+ *  @param[in] succeeded Whether this conformer passed stereo validation.
+ *  @param[in] lane Warp lane index, 0–31.
+ *
+ *  @see etkdg_pipeline_warp_kernel
+ *  @see mmff_polish_warp_kernel
+ */
 __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, float *energies_out,
                                                         std::uint8_t *status_out, float const *positions,
                                                         std::uint32_t mol_index, std::uint32_t conformer_index,
@@ -239,6 +284,8 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
  *  paid, which lifts the register-cap occupancy headroom materially.
  *  Writes ETK-refined 3D positions into @c conformer_coordinates_out;
  *  @c mmff_polish_warp_kernel runs next on the same buffer.
+ *
+ *  @see mmff_polish_warp_kernel
  */
 __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     float const *__restrict__ bounds_matrices, float const *__restrict__ initial_coordinates,
@@ -408,7 +455,9 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
  *  Shared memory at bin 128 drops to ~4.5 KB (FIRE scratch only; no bounds
  *  matrix is needed here).  Reg cap is the binding occupancy constraint —
  *  the kernel lands around 90 regs vs the 145 the old monolithic form paid,
- *  ~22 blocks/SM from registers on Blackwell.
+ *  ~22 blocks/SM from registers.
+ *
+ *  @see etkdg_pipeline_warp_kernel
  */
 __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
     mmff94_atom_vdw_params_t const *__restrict__ mmff_atom_vdw, float const *__restrict__ mmff_atom_charge,

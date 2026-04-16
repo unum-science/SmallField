@@ -65,7 +65,7 @@ inline std::unique_ptr<RDKit::RWMol> mol_from_smiles(std::string const &smiles) 
 /**
  *  @brief Embed a molecule with ETKDGv3.
  *
- *  @param[in,out] mol Molecule to embed (modified in place with 3D coordinates).
+ *  @param[inout] mol Molecule to embed (modified in place with 3D coordinates).
  *  @param[in] seed Random seed for the embedding.
  *  @return True on success.
  */
@@ -101,7 +101,7 @@ inline std::vector<float> extract_coords_interleaved(RDKit::ROMol const &mol, in
  *
  *  Used to inject GPU-generated coordinates back into RDKit for cross-validation.
  *
- *  @param[in,out] mol Molecule whose conformer coordinates will be overwritten.
+ *  @param[inout] mol Molecule whose conformer coordinates will be overwritten.
  *  @param[in] coords Flat interleaved xyz coordinate array.
  *  @param[in] conformer_id Conformer index (-1 for the default conformer).
  */
@@ -118,7 +118,7 @@ inline void set_coords_interleaved(RDKit::RWMol &mol, float const *coords, int c
 /**
  *  @brief Evaluate MMFF94 energy at current coordinates without optimizing.
  *
- *  @param[in,out] mol Molecule with coordinates to evaluate.
+ *  @param[inout] mol Molecule with coordinates to evaluate.
  *  @param[in] conformer_id Conformer index (-1 for the default conformer).
  *  @return Energy in kcal/mol, or NaN if MMFF94 properties cannot be computed.
  */
@@ -135,7 +135,7 @@ inline double rdkit_mmff94_energy(RDKit::RWMol &mol, int conformer_id = -1) {
 /**
  *  @brief Get the smoothed bounds matrix from RDKit as a flat N x N double array.
  *
- *  @param[in,out] mol Molecule to compute bounds for.
+ *  @param[inout] mol Molecule to compute bounds for.
  *  @return Row-major N x N flat double vector (upper triangle = upper bounds, lower = lower bounds).
  */
 inline std::vector<double> rdkit_bounds_matrix(RDKit::RWMol &mol) {

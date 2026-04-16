@@ -39,6 +39,7 @@ namespace smallfield::cuda {
 using smallfield::api::cuda_error_counter;
 using smallfield::types::etkdg_molecule_metadata_t;
 
+/** @brief Log and count a CUDA runtime error if status is not cudaSuccess. */
 inline bool check_cuda_status_(cudaError_t status, char const *operation) {
     if (status == cudaSuccess) return true;
     std::fprintf(stderr, "CUDA error in %s: %s\n", operation, cudaGetErrorString(status));
@@ -46,6 +47,7 @@ inline bool check_cuda_status_(cudaError_t status, char const *operation) {
     return false;
 }
 
+/** @brief Log and count a cuSOLVER error if status is not CUSOLVER_STATUS_SUCCESS. */
 inline bool check_cusolver_status_(cusolverStatus_t status, char const *operation) {
     if (status == CUSOLVER_STATUS_SUCCESS) return true;
     std::fprintf(stderr, "cuSOLVER error in %s: %d\n", operation, static_cast<int>(status));
@@ -53,6 +55,17 @@ inline bool check_cusolver_status_(cusolverStatus_t status, char const *operatio
     return false;
 }
 
+/**
+ * @brief Reads the upper distance bound for atom pair (i, j) from the float bounds matrix.
+ *
+ * The upper bound is stored at bounds[min(i, j) * N + max(i, j)].
+ *
+ * @param[in] bounds Flat N x N bounds matrix in row-major order.
+ * @param[in] num_atoms Number of atoms N in the molecule.
+ * @param[in] atom_a First atom index.
+ * @param[in] atom_b Second atom index.
+ * @return Upper distance bound between atom_a and atom_b.
+ */
 __device__ __forceinline__ float read_upper_bound_float_(float const *bounds, std::uint32_t num_atoms,
                                                          std::uint32_t atom_a, std::uint32_t atom_b) {
     std::uint32_t const row = min(atom_a, atom_b);
@@ -60,6 +73,17 @@ __device__ __forceinline__ float read_upper_bound_float_(float const *bounds, st
     return bounds[row * num_atoms + col];
 }
 
+/**
+ * @brief Reads the lower distance bound for atom pair (i, j) from the float bounds matrix.
+ *
+ * The lower bound is stored at bounds[max(i, j) * N + min(i, j)].
+ *
+ * @param[in] bounds Flat N x N bounds matrix in row-major order.
+ * @param[in] num_atoms Number of atoms N in the molecule.
+ * @param[in] atom_a First atom index.
+ * @param[in] atom_b Second atom index.
+ * @return Lower distance bound between atom_a and atom_b.
+ */
 __device__ __forceinline__ float read_lower_bound_float_(float const *bounds, std::uint32_t num_atoms,
                                                          std::uint32_t atom_a, std::uint32_t atom_b) {
     std::uint32_t const row = max(atom_a, atom_b);
@@ -67,6 +91,19 @@ __device__ __forceinline__ float read_lower_bound_float_(float const *bounds, st
     return bounds[row * num_atoms + col];
 }
 
+/**
+ * @brief Returns ((upper + lower) / 2)^2 for Gram-matrix double-centering.
+ *
+ * Computes the squared midpoint distance between two atoms from their upper and lower bounds.
+ * Returns zero when atom_i equals atom_j.
+ *
+ * @param[in] bounds Flat N x N bounds matrix in row-major order.
+ * @param[in] num_atoms Number of atoms N in the molecule.
+ * @param[in] atom_i First atom index.
+ * @param[in] atom_j Second atom index.
+ * @return Squared midpoint distance between atom_i and atom_j.
+ * @see smooth_and_build_gram_kernel
+ */
 __device__ __forceinline__ float midpoint_distance_squared_(float const *bounds, std::uint32_t num_atoms,
                                                             std::uint32_t atom_i, std::uint32_t atom_j) {
     if (atom_i == atom_j) return 0.0f;
@@ -84,6 +121,8 @@ __device__ __forceinline__ float midpoint_distance_squared_(float const *bounds,
  *  kernel smooths only the real N×N sub-block, zeros the Gram padding region,
  *  and writes into the bin-sized slot.  cusolverDnSsyevjBatched can then
  *  operate on a single uniform N across all molecules in the bin.
+ *
+ *  @see embed_4d_power_iter_kernel
  */
 __global__ void smooth_and_build_gram_kernel(float *__restrict__ bounds_matrices,
                                              etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
@@ -192,6 +231,8 @@ __global__ void smooth_and_build_gram_kernel(float *__restrict__ bounds_matrices
  *    lambda[4]                  (eigenvalue estimates)
  *    dot[1]                     (reduction scratch)
  *  At N=128: 16384 + 128 + 1 + 512 + 128 + 4 + 1 = 17158 floats ≈ 67 KB.
+ *
+ *  @see smooth_and_build_gram_kernel
  */
 __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
                                            etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,

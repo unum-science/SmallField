@@ -61,7 +61,7 @@ __device__ __forceinline__ float read_lower_bound_(__half const *bounds, std::ui
  *
  *  Operates in float arithmetic, writes results back as half.
  *
- *  @param[in,out] bounds Half-precision N x N bounds matrix (modified in place).
+ *  @param[inout] bounds Half-precision N x N bounds matrix (modified in place).
  *  @param[in] num_atoms Number of atoms (matrix dimension).
  *  @param[in] lane Warp lane index (0-31).
  */
@@ -107,7 +107,7 @@ __device__ __forceinline__ void triangle_smooth_warp_half_(__half *bounds, std::
 /**
  *  @brief Float-precision version (kept for backward compatibility with tests).
  *
- *  @param[in,out] bounds Float N x N bounds matrix (modified in place).
+ *  @param[inout] bounds Float N x N bounds matrix (modified in place).
  *  @param[in] num_atoms Number of atoms (matrix dimension).
  *  @param[in] lane Warp lane index (0-31).
  */
@@ -156,7 +156,7 @@ __device__ __forceinline__ void triangle_smooth_warp_(float *bounds, std::uint32
 /**
  *  @brief Standalone kernel for testing float-precision smoothing.
  *
- *  @param[in,out] bounds Float N x N bounds matrix (modified in place).
+ *  @param[inout] bounds Float N x N bounds matrix (modified in place).
  *  @param[in] num_atoms Number of atoms (matrix dimension).
  */
 __global__ void triangle_smooth_kernel(float *bounds, std::uint32_t num_atoms) {

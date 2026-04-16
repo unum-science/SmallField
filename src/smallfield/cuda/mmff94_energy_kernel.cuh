@@ -84,11 +84,11 @@ __device__ __forceinline__ float3 scale_float3_(float3 const &value, float scale
  *  @param[in] charge_product Pre-multiplied q_atom * q_other.
  *  @param[in] is_1_4 Whether bond_distance == 3 (electrostatic scaling applies).
  *  @param[in] first_endpoint True if this call is from the "lower-index" endpoint —
- *              only first_endpoint calls accumulate energy to avoid double-counting.
- *  @param[in,out] energy Accumulated energy (only incremented when @p first_endpoint).
- *  @param[in,out] gradient_x Accumulated x-gradient for @p atom.
- *  @param[in,out] gradient_y Accumulated y-gradient for @p atom.
- *  @param[in,out] gradient_z Accumulated z-gradient for @p atom.
+ *      only first_endpoint calls accumulate energy to avoid double-counting.
+ *  @param[inout] energy Accumulated energy (only incremented when @p first_endpoint).
+ *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
+ *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
+ *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const *positions, std::uint32_t num_atoms, std::uint32_t atom, std::uint32_t other,
@@ -173,10 +173,10 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
  *  @param[in] atom Index of the atom this thread is accumulating for.
  *  @param[in] bond Bond stretching descriptor with force constant and equilibrium distance.
  *  @param[in] role This atom's role in the bond (atom_role_first_k, atom_role_second_k).
- *  @param[in,out] energy Accumulated energy (incremented when @p role is 0).
- *  @param[in,out] gradient_x Accumulated x-gradient for @p atom.
- *  @param[in,out] gradient_y Accumulated y-gradient for @p atom.
- *  @param[in,out] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
+ *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
+ *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
+ *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_bond_contribution_(float const *positions, std::uint32_t num_atoms,
                                                         std::uint32_t atom, mmff94_bond_t const &bond, atom_role_t role,
@@ -213,10 +213,10 @@ __device__ __forceinline__ void mmff_bond_contribution_(float const *positions, 
  *  @param[in] atom Index of the atom this thread is accumulating for.
  *  @param[in] angle Angle bending descriptor with force constant and equilibrium angle.
  *  @param[in] role This atom's role in the angle (first atom, second atom (center), third atom).
- *  @param[in,out] energy Accumulated energy (incremented when @p role is 0).
- *  @param[in,out] gradient_x Accumulated x-gradient for @p atom.
- *  @param[in,out] gradient_y Accumulated y-gradient for @p atom.
- *  @param[in,out] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
+ *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
+ *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
+ *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_angle_contribution_(float const *positions, std::uint32_t num_atoms,
                                                          std::uint32_t atom, mmff94_angle_t const &angle,
@@ -294,10 +294,10 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
  *  @param[in] atom Index of the atom this thread is accumulating for.
  *  @param[in] tor Torsion descriptor with barrier heights V1, V2, V3.
  *  @param[in] role This atom's role in the torsion (first through fourth in atom-list order).
- *  @param[in,out] energy Accumulated energy (incremented when @p role is 0).
- *  @param[in,out] gradient_x Accumulated x-gradient for @p atom.
- *  @param[in,out] gradient_y Accumulated y-gradient for @p atom.
- *  @param[in,out] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
+ *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
+ *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
+ *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_torsion_contribution_(float const *positions, std::uint32_t num_atoms,
                                                            std::uint32_t atom, mmff94_torsion_t const &tor,
@@ -431,7 +431,7 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
  *  @param[in] ly Y-coordinate of in-plane neighbor l.
  *  @param[in] lz Z-coordinate of in-plane neighbor l.
  *  @param[in] oop OOP bending descriptor with force constant.
- *  @return  OOP bending energy (kcal/mol).
+ *  @return OOP bending energy (kcal/mol).
  */
 __device__ __forceinline__ float mmff_oop_energy_(float ix, float iy, float iz, float jx, float jy, float jz, float kx,
                                                   float ky, float kz, float lx, float ly, float lz,
@@ -458,10 +458,10 @@ __device__ __forceinline__ float mmff_oop_energy_(float ix, float iy, float iz, 
  *  @param[in] atom Index of the atom this thread is accumulating for (unused in body).
  *  @param[in] oop OOP bending descriptor with atom indices and force constant.
  *  @param[in] role This atom's role (first=out-of-plane, second=center, third/fourth=in-plane).
- *  @param[in,out] energy Accumulated energy (incremented when @p role is 0).
- *  @param[in,out] gradient_x Accumulated x-gradient for @p atom.
- *  @param[in,out] gradient_y Accumulated y-gradient for @p atom.
- *  @param[in,out] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
+ *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
+ *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
+ *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, std::uint32_t num_atoms,
                                                        std::uint32_t /*atom*/, mmff94_oop_t const &oop,
@@ -548,10 +548,10 @@ __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, s
  *  @param[in] atom Index of the atom this thread is accumulating for.
  *  @param[in] sb Stretch-bend descriptor with coupling constants and equilibrium geometry.
  *  @param[in] role This atom's role (first atom end, second atom (center), third atom end).
- *  @param[in,out] energy Accumulated energy (incremented when @p role is 0).
- *  @param[in,out] gradient_x Accumulated x-gradient for @p atom.
- *  @param[in,out] gradient_y Accumulated y-gradient for @p atom.
- *  @param[in,out] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
+ *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
+ *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
+ *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *positions, std::uint32_t num_atoms,
                                                                std::uint32_t atom, mmff94_stretchbend_t const &sb,
@@ -645,7 +645,8 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
  *  pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) — those terms
  *  are small and not worth packing out.
  *
- *  @tparam write_gradient  When true, computes and writes gradient; when false, energy only.
+ *  @tparam write_gradient When true, computes and writes gradient; when false, energy only.
+ *  @see fire_minimize_
  */
 template <bool write_gradient>
 __device__ __forceinline__ float evaluate_mmff94_energy(

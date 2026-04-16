@@ -111,7 +111,7 @@ mmff94_span_t<element_> place_const_or_global_(void *arena, std::size_t &offset,
                                                void const *const_symbol_dev_ptr, std::size_t const_cap) {
     // Always use global memory for now. Constant-memory placement via
     // cudaGetSymbolAddress + reading through a plain device pointer is
-    // valid on Blackwell but adds one more variable to debug; we can
+    // valid but adds one more variable to debug; we can
     // revisit as a perf tweak once the current upload path is stable.
     (void)const_symbol_dev_ptr;
     (void)const_cap;

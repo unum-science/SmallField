@@ -156,8 +156,8 @@ context_t::context_t(std::span<int const> devices) {
         launch_scratch[i]->device_pool.ensure_capacity(kPrewarmDevicePoolBytes);
         launch_scratch[i]->host_staging.ensure_capacity(kPrewarmHostStagingBytes);
     }
-    // Pre-warm the shared pinned output buffer to a size that covers a
-    // 241 K × K=1 workload (≈ 370 MB). Larger K values or larger batches
+    // Pre-warm the shared pinned output buffer to ~370 MB — enough for
+    // ~240 K molecules × K=1. Larger K values or larger batches
     // grow on demand via `output_staging->pool.ensure_capacity` inside
     // `ensure_output_staging`, which remains grow-only so subsequent calls
     // reuse the allocation. Without this pre-warm, the first

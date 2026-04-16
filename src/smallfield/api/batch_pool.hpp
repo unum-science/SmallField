@@ -17,10 +17,10 @@
  *       device pool via the same layout.
  *
  *  We considered `cudaMallocManaged` + `cudaMemPrefetchAsync` for a
- *  truly unified pointer, but on consumer-tier PCIe Blackwell the HMM
- *  overhead and prefetch bookkeeping were 2× slower than pinned+explicit
- *  for batch sizes this project ships at.  The layout and span surface
- *  are identical — swap the backing store if Grace-Hopper-class hardware
+ *  truly unified pointer, but HMM overhead and prefetch bookkeeping
+ *  were 2× slower than pinned+explicit for the batch sizes this project
+ *  ships at.  The layout and span surface are identical — swap the
+ *  backing store if unified-memory hardware
  *  makes managed competitive.
  */
 
@@ -55,7 +55,7 @@ using smallfield::types::mmff94_oop_t;
 using smallfield::types::mmff94_stretchbend_t;
 using smallfield::types::mmff94_torsion_t;
 
-/** Grow-only RAII byte buffer, parameterized by the allocator / deallocator pair. */
+/** @brief Grow-only RAII byte buffer — used for both pinned-host and device memory pools. */
 template <typename allocator_, typename deallocator_>
 class byte_buffer_t {
     std::byte *ptr_ = nullptr;

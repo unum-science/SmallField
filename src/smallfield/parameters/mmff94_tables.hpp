@@ -230,12 +230,11 @@ static_assert(sizeof(mmff94_covrad_entry_t) == 12);
 
 // Read-only view over the tables, shared between host and device.
 
-/** Opaque read-only span pair, pointer plus length. Behaves like
- *  `std::span<T const>` but avoids the libstdc++ layout — we hit an
- *  ABI mismatch passing `std::span` by value to `__global__` kernels
- *  where the device pass reads fields at the wrong offsets.  Stick to a
- *  POD struct of (data, size) so the host and device agree bit-for-bit.
- *  Provides the subset of the span API the `lookup_*` functions use. */
+/** @brief POD read-only span — typed pointer + length, ABI-safe across host and device.
+ *
+ *  Replaces `std::span<T const>` to avoid a libstdc++ ABI mismatch when passing
+ *  spans by value to `__global__` kernels.
+ */
 template <typename element_>
 struct mmff94_span_t {
     element_ const *ptr_ = nullptr;
