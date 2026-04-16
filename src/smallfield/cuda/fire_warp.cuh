@@ -20,16 +20,11 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::cuda {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::preprocess;
-using namespace smallfield::types;
 
 /**
  *  @brief FIRE minimization driver.
  *
- *  @tparam EnergyGradientFunctor  Callable: float(positions, gradient, num_elements, lane)
+ *  @tparam energy_gradient_functor_  Callable: float(positions, gradient, num_elements, lane)
  *
  *  @param[in,out] positions Coordinate array (modified in place). Length = @p num_elements.
  *  @param[in,out] velocities Shared memory for FIRE velocities. Length = @p num_elements.
@@ -44,13 +39,13 @@ using namespace smallfield::types;
  *  @param[out] out_status 0=converged, 1=max_iterations (lane 0).
  *  @param[out] out_final_rms_gradient Final RMS gradient (lane 0, optional).
  */
-template <typename EnergyGradientFunctor>
+template <typename energy_gradient_functor_>
 __device__ __forceinline__ void fire_minimize_(float *positions, float *velocities, float *gradient,
                                                std::uint32_t num_elements, std::int32_t max_iterations,
                                                float gradient_threshold, std::uint32_t lane,
-                                               EnergyGradientFunctor &&compute_energy_gradient, float *out_final_energy,
-                                               std::int32_t *out_iterations, std::int32_t *out_status,
-                                               float *out_final_rms_gradient = nullptr) {
+                                               energy_gradient_functor_ &&compute_energy_gradient,
+                                               float *out_final_energy, std::int32_t *out_iterations,
+                                               std::int32_t *out_status, float *out_final_rms_gradient = nullptr) {
     // FIRE parameters (Bitzek et al., PRL 2006)
     constexpr float initial_timestep_k = 0.05f;
     constexpr float max_timestep_k = 0.5f;
@@ -66,19 +61,19 @@ __device__ __forceinline__ void fire_minimize_(float *positions, float *velociti
     float last_rms_gradient = 0.0f;
 
     // zero velocities
-    for (std::uint32_t i = lane; i < num_elements; i += warp_size) velocities[i] = 0.0f;
-    __syncwarp(full_mask);
+    for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) velocities[i] = 0.0f;
+    __syncwarp(full_mask_k);
 
     for (std::int32_t iteration = 0; iteration < max_iterations; ++iteration) {
         // compute energy and gradient (gradient = -force, so force = -gradient)
         float const energy = compute_energy_gradient(positions, gradient, num_elements, lane);
-        __syncwarp(full_mask);
+        __syncwarp(full_mask_k);
 
         // fused computation: rms_gradient, power, velocity_norm, force_norm in a single pass
         float gradient_dot_gradient = 0.0f;
         float gradient_dot_velocity = 0.0f;
         float velocity_dot_velocity = 0.0f;
-        for (std::uint32_t i = lane; i < num_elements; i += warp_size) {
+        for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) {
             float const gradient_value = gradient[i];
             float const velocity_value = velocities[i];
             gradient_dot_gradient = fmaf(gradient_value, gradient_value, gradient_dot_gradient);
@@ -87,9 +82,9 @@ __device__ __forceinline__ void fire_minimize_(float *positions, float *velociti
         }
         // interleaved warp reduction for instruction-level parallelism
         for (int offset = 16; offset > 0; offset >>= 1) {
-            gradient_dot_gradient += __shfl_xor_sync(full_mask, gradient_dot_gradient, offset);
-            gradient_dot_velocity += __shfl_xor_sync(full_mask, gradient_dot_velocity, offset);
-            velocity_dot_velocity += __shfl_xor_sync(full_mask, velocity_dot_velocity, offset);
+            gradient_dot_gradient += __shfl_xor_sync(full_mask_k, gradient_dot_gradient, offset);
+            gradient_dot_velocity += __shfl_xor_sync(full_mask_k, gradient_dot_velocity, offset);
+            velocity_dot_velocity += __shfl_xor_sync(full_mask_k, velocity_dot_velocity, offset);
         }
 
         float const rms_gradient = sqrtf(gradient_dot_gradient * __frcp_rn(static_cast<float>(num_elements)));
@@ -111,7 +106,7 @@ __device__ __forceinline__ void fire_minimize_(float *positions, float *velociti
             float const velocity_over_force_ratio = velocity_norm * inverse_force_norm;
 
             // v = (1-α)·v + α·|v|·F̂  where F = -gradient
-            for (std::uint32_t i = lane; i < num_elements; i += warp_size) {
+            for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) {
                 velocities[i] = (1.0f - alpha) * velocities[i] - alpha * velocity_over_force_ratio * gradient[i];
             }
 
@@ -123,22 +118,22 @@ __device__ __forceinline__ void fire_minimize_(float *positions, float *velociti
         }
         else {
             // decelerating: reset velocity, shrink step
-            for (std::uint32_t i = lane; i < num_elements; i += warp_size) velocities[i] = 0.0f;
+            for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) velocities[i] = 0.0f;
             timestep *= timestep_decrease_factor_k;
             alpha = initial_alpha_k;
             steps_since_reset = 0;
         }
-        __syncwarp(full_mask);
+        __syncwarp(full_mask_k);
 
         // velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt
         float const half_timestep_squared = 0.5f * timestep * timestep;
-        for (std::uint32_t i = lane; i < num_elements; i += warp_size) {
+        for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) {
             float displacement = fmaf(velocities[i], timestep, -gradient[i] * half_timestep_squared);
             displacement = fmaxf(-0.5f, fminf(0.5f, displacement));
             positions[i] += displacement;
             velocities[i] = fmaf(gradient[i], -timestep, velocities[i]);
         }
-        __syncwarp(full_mask);
+        __syncwarp(full_mask_k);
     }
 
     // max iterations reached — report the last computed energy

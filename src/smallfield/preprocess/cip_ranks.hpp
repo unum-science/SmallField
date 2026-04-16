@@ -44,10 +44,9 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield::preprocess {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::types;
+using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::max_atoms_k;
+using smallfield::types::molecule_descriptor_t;
 
 /**
  *  @brief Compute CIP-equivalent canonical ranks for each atom in @p desc.

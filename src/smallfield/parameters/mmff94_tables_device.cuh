@@ -38,7 +38,6 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 
 namespace smallfield::parameters {
-using namespace smallfield::types;
 
 // Constant-memory tables. Budgets sized for MMFF94 with headroom; as of 2026-04-14 RDKit's live counts
 // are 99 prop entries, 100 def, 54 covrad, 25 hl, and 35 bndk.
@@ -96,20 +95,20 @@ inline std::size_t align_up_(std::size_t v, std::size_t a) { return (v + a - 1) 
 /** Helper: copy a host vector to device at the given offset, returning a
  *  span that targets the device arena at that location.  Updates `offset`
  *  to the next 256-byte-aligned position. */
-template <typename T>
-mmff94_span_t<T> place_table_(void *arena, std::size_t &offset, std::vector<T> const &src) {
-    if (src.empty()) return mmff94_span_t<T> {};
-    std::size_t const bytes = src.size() * sizeof(T);
+template <typename element_>
+mmff94_span_t<element_> place_table_(void *arena, std::size_t &offset, std::vector<element_> const &src) {
+    if (src.empty()) return mmff94_span_t<element_> {};
+    std::size_t const bytes = src.size() * sizeof(element_);
     offset = align_up_(offset, 256);
-    T *dst = reinterpret_cast<T *>(static_cast<std::byte *>(arena) + offset);
+    element_ *dst = reinterpret_cast<element_ *>(static_cast<std::byte *>(arena) + offset);
     cudaMemcpy(dst, src.data(), bytes, cudaMemcpyHostToDevice);
     offset += bytes;
-    return mmff94_span_t<T> {dst, src.size()};
+    return mmff94_span_t<element_> {dst, src.size()};
 }
 
-template <typename T>
-mmff94_span_t<T> place_const_or_global_(void *arena, std::size_t &offset, std::vector<T> const &src,
-                                        void const *const_symbol_dev_ptr, std::size_t const_cap) {
+template <typename element_>
+mmff94_span_t<element_> place_const_or_global_(void *arena, std::size_t &offset, std::vector<element_> const &src,
+                                               void const *const_symbol_dev_ptr, std::size_t const_cap) {
     // Always use global memory for now. Constant-memory placement via
     // cudaGetSymbolAddress + reading through a plain device pointer is
     // valid on Blackwell but adds one more variable to debug; we can

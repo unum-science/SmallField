@@ -23,7 +23,7 @@ __device__ __forceinline__ void quantize_bounds_into_shared_(float const *bounds
                                                              float *out_mol_min, float *out_inv_scale) {
     float lane_min = __FLT_MAX__;
     float lane_max = -__FLT_MAX__;
-    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size) {
+    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size_k) {
         float const v = bounds_float[i];
         lane_min = fminf(lane_min, v);
         lane_max = fmaxf(lane_max, v);
@@ -32,12 +32,12 @@ __device__ __forceinline__ void quantize_bounds_into_shared_(float const *bounds
     float const mol_max = sfc::warp_reduce_max_f32_(lane_max);
     float const range = fmaxf(mol_max - mol_min, 1e-6f);
     float const scale_quantize = 255.0f / range;
-    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size) {
+    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size_k) {
         int q = __float2int_rn((bounds_float[i] - mol_min) * scale_quantize);
         q = max(0, min(255, q));
         shared_bounds[i] = static_cast<std::uint8_t>(q);
     }
-    __syncwarp(sfc::full_mask);
+    __syncwarp(sfc::full_mask_k);
     *out_mol_min = mol_min;
     *out_inv_scale = range * (1.0f / 255.0f);
 }

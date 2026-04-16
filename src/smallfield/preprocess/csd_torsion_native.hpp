@@ -32,10 +32,16 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield::preprocess {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::types;
+using smallfield::types::atom_flag_aromatic_k;
+using smallfield::types::atom_flag_in_ring_k;
+using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::bond_flag_in_ring_k;
+using smallfield::types::hybridization_sp2_k;
+using smallfield::types::hybridization_sp3_k;
+using smallfield::types::hybridization_sp3d2_k;
+using smallfield::types::hybridization_sp3d_k;
+using smallfield::types::hybridization_sp_k;
+using smallfield::types::molecule_descriptor_t;
 
 /**
  *  Per-atom branch-neighbor constraint. Represents an inline neighbour specified
@@ -1060,9 +1066,9 @@ inline bool bond_match(molecule_descriptor_t const &desc, std::uint32_t bond_idx
  *
  *  Stops scanning once @p done[bond_idx] == true for the central bond.
  */
-template <typename EmitFn>
+template <typename emit_fn_>
 inline void match_linear_pattern(molecule_descriptor_t const &desc, simple_torsion_pattern_t const &pat,
-                                 std::uint8_t const *done_bonds, EmitFn &&emit) {
+                                 std::uint8_t const *done_bonds, emit_fn_ &&emit) {
     std::uint32_t const nb = desc.num_bonds;
 
     for (std::uint32_t b = 0; b < nb; ++b) {

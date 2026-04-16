@@ -12,13 +12,6 @@
 
 #include <cuda_runtime.h>
 
-// Exclude the RDKit-dependent `extract_mmff94_tables_from_rdkit` from
-// the .cu compilation - it pulls in `<GraphMol/.../AtomTyper.h>` which
-// the nvcc host pass cannot compile. The extraction runs on the host
-// side (compiled by g++) in the .cpp; here we only need the POD entry
-// structs + the lookup functions.
-#define SMALLFIELD_MMFF_TABLES_NO_RDKIT 1
-
 #include "test_mmff94_tables_kernels.hpp"
 
 namespace sf = smallfield;

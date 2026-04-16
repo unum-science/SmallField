@@ -29,7 +29,9 @@
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/mmff94/mmff94_cpu.hpp"
+#include "smallfield/mmff94/mmff94_cpu_extract.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
+#include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace sfp = smallfield::preprocess;
@@ -219,12 +221,13 @@ bool compare_mol(std::string_view smiles, sfp::etkdg_prepared_molecule_t const &
             !near(r.equilibrium_distance_ij, n.equilibrium_distance_ij) ||
             !near(r.equilibrium_distance_kj, n.equilibrium_distance_kj)) {
             if (verbose)
-                std::printf(
-                    "    sb[%zu] ijk=%u-%u-%u rdk k=(%.4f, %.4f) θ₀=%.4f r0=(%.4f, %.4f) " "nat k=(%.4f, %.4f) θ₀=%.4f "
-                                                                                           "r0=(%.4f, %.4f)\n",
-                    t, r.atom_i, r.atom_j, r.atom_k, r.kba_ijk, r.kba_kji, r.equilibrium_angle,
-                    r.equilibrium_distance_ij, r.equilibrium_distance_kj, n.kba_ijk, n.kba_kji, n.equilibrium_angle,
-                    n.equilibrium_distance_ij, n.equilibrium_distance_kj);
+                std::
+                    printf("    sb[%zu] ijk=%u-%u-%u rdk k=(%.4f, %.4f) θ₀=%.4f r0=(%.4f, %.4f) " "nat k=(%.4f, %.4f) "
+                                                                                                  "θ₀=%.4f " "r0=(%.4f,"
+                                                                                                             " %.4f)\n",
+                           t, r.atom_i, r.atom_j, r.atom_k, r.kba_ijk, r.kba_kji, r.equilibrium_angle,
+                           r.equilibrium_distance_ij, r.equilibrium_distance_kj, n.kba_ijk, n.kba_kji,
+                           n.equilibrium_angle, n.equilibrium_distance_ij, n.equilibrium_distance_kj);
             ++n_fails;
         }
     }

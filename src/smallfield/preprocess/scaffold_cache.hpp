@@ -42,10 +42,6 @@
 #include <vector>
 
 namespace smallfield::preprocess {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::types;
 
 /**
  *  @brief Per-scaffold precomputed SubstructMatch results for a subset of

@@ -53,11 +53,20 @@
 #include "smallfield/cuda/mmff94_energy_kernel.cuh"
 
 namespace smallfield::cuda {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::preprocess;
-using namespace smallfield::types;
+using smallfield::types::chiral_center_descriptor_t;
+using smallfield::types::distance_constraint_t;
+using smallfield::types::etk_atom_interaction_t;
+using smallfield::types::etk_atom_offsets_t;
+using smallfield::types::etk_torsion_descriptor_t;
+using smallfield::types::etkdg_molecule_metadata_t;
+using smallfield::types::mmff94_angle_t;
+using smallfield::types::mmff94_atom_interaction_t;
+using smallfield::types::mmff94_atom_offsets_t;
+using smallfield::types::mmff94_atom_vdw_params_t;
+using smallfield::types::mmff94_bond_t;
+using smallfield::types::mmff94_oop_t;
+using smallfield::types::mmff94_stretchbend_t;
+using smallfield::types::mmff94_torsion_t;
 
 struct refinement_policy_t {
     std::int32_t etk_initial_iterations;
@@ -103,11 +112,11 @@ select_refinement_policy_(etkdg_molecule_metadata_t const &meta) {
     return {100, 40, 1.0e-4f, 200, 80, 1.0e-4f};
 }
 
-template <typename EnergyGradientFunctor>
+template <typename energy_gradient_functor_>
 __device__ __forceinline__ void run_fire_stage_(float *positions, float *velocities, float *gradient,
                                                 std::uint32_t num_elements, std::int32_t initial_iterations,
                                                 std::int32_t continuation_iterations, float gradient_threshold,
-                                                std::uint32_t lane, EnergyGradientFunctor &&compute_energy_gradient,
+                                                std::uint32_t lane, energy_gradient_functor_ &&compute_energy_gradient,
                                                 float *out_final_energy, std::int32_t *out_iterations,
                                                 std::int32_t *out_status, float *out_final_rms_gradient) {
     float stage_energy = 0.0f;
@@ -124,7 +133,7 @@ __device__ __forceinline__ void run_fire_stage_(float *positions, float *velocit
     if (lane == 0)
         needs_continuation = continuation_iterations > 0 &&
                              (stage_status != 0 || stage_rms_gradient > gradient_threshold);
-    needs_continuation = __shfl_sync(full_mask, needs_continuation ? 1 : 0, 0) != 0;
+    needs_continuation = __shfl_sync(full_mask_k, needs_continuation ? 1 : 0, 0) != 0;
 
     if (needs_continuation) {
         float continuation_energy = 0.0f;
@@ -187,7 +196,7 @@ __device__ __forceinline__ void initialize_from_metric_coordinates_(float const 
     float const xyz_jitter = 0.02f + 0.01f * static_cast<float>((conf + attempt) & 3u);
     float const w_jitter = 0.02f + 0.01f * static_cast<float>(attempt & 3u);
     float const x_reflection = (attempt & 1u) ? -1.0f : 1.0f;
-    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size) {
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
         for (std::uint32_t dim = 0; dim < 4; ++dim) {
             float base = initial_coordinates[dim * initial_coordinate_stride + atom];
             if (dim == 0) base *= x_reflection;
@@ -195,7 +204,7 @@ __device__ __forceinline__ void initialize_from_metric_coordinates_(float const 
             positions[dim * num_atoms + atom] = base + (curand_uniform(rng_state) - 0.5f) * jitter;
         }
     }
-    __syncwarp(full_mask);
+    __syncwarp(full_mask_k);
 }
 
 __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, float *energies_out,
@@ -208,13 +217,13 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
     std::uint32_t const coord_offset = slot * output_stride * 3;
     // Positions use SoA layout with num_atoms stride, while output uses output_stride.
     for (std::uint32_t d = 0; d < 3; ++d)
-        for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
+        for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
             coordinates_out[coord_offset + d * output_stride + i] = positions[d * num_atoms + i];
     if (lane == 0) {
         energies_out[slot] = energy;
         status_out[slot] = succeeded ? 0 : 1;
     }
-    __syncwarp(full_mask);
+    __syncwarp(full_mask_k);
 }
 
 /**
@@ -283,7 +292,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
 
         float lane_min = FLT_MAX;
         float lane_max = -FLT_MAX;
-        for (std::uint32_t i = lane; i < bounds_size; i += warp_size) {
+        for (std::uint32_t i = lane; i < bounds_size; i += warp_size_k) {
             float const v = global_bounds[i];
             lane_min = fminf(lane_min, v);
             lane_max = fmaxf(lane_max, v);
@@ -294,13 +303,13 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         float const scale_quantize = 255.0f / range;
         float const inv_scale = range * (1.0f / 255.0f);
 
-        for (std::uint32_t i = lane; i < bounds_size; i += warp_size) {
+        for (std::uint32_t i = lane; i < bounds_size; i += warp_size_k) {
             float const v = global_bounds[i];
             int q = __float2int_rn((v - mol_min) * scale_quantize);
             q = max(0, min(255, q));
             shared_bounds[i] = static_cast<std::uint8_t>(q);
         }
-        __syncwarp(full_mask);
+        __syncwarp(full_mask_k);
 
         // Build molecule-level pointers into the batched arrays.
         float const *mol_initial_coordinates = initial_coordinates + mol * initial_coordinate_stride * 4;
@@ -324,8 +333,8 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
 
                 // Stage 4: Run DG minimization in 4D with up to 100 FIRE iterations.
                 distance_geometry_energy_functor_t dg_functor {
-                    shared_bounds, mol_chirals, mol_min,           inv_scale, num_atoms, meta.num_chiral_centers, 4,
-                    1.0f,          1.0f,        100.0f,            0.0f};
+                    shared_bounds, mol_chirals, mol_min, inv_scale, num_atoms, meta.num_chiral_centers, 4,
+                    1.0f,          1.0f,        100.0f,  0.0f};
 
                 float dg_energy = 0.0f;
                 float dg_rms_gradient = 0.0f;
@@ -408,10 +417,9 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
     mmff94_oop_t const *__restrict__ mmff_oop_terms, mmff94_stretchbend_t const *__restrict__ mmff_stretchbend_terms,
     mmff94_atom_interaction_t const *__restrict__ mmff_interactions,
     mmff94_atom_offsets_t const *__restrict__ mmff_atom_offsets,
-    etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
-    float *__restrict__ conformer_coordinates_out, float *__restrict__ conformer_energies_out,
-    std::uint8_t const *__restrict__ conformer_status_in, std::uint32_t total_molecules,
-    std::uint32_t num_conformers_per_molecule, std::uint32_t output_atoms_stride) {
+    etkdg_molecule_metadata_t const *__restrict__ molecule_metadata, float *__restrict__ conformer_coordinates_out,
+    float *__restrict__ conformer_energies_out, std::uint8_t const *__restrict__ conformer_status_in,
+    std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t output_atoms_stride) {
 
     std::uint32_t const warp_id = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
@@ -454,9 +462,10 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
 
             // Stage in ETK-refined positions from global memory (SoA layout).
             for (std::uint32_t d = 0; d < 3; ++d)
-                for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
-                    positions[d * num_atoms + i] = conformer_coordinates_out[coord_offset + d * output_atoms_stride + i];
-            __syncwarp(full_mask);
+                for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
+                    positions[d * num_atoms + i] =
+                        conformer_coordinates_out[coord_offset + d * output_atoms_stride + i];
+            __syncwarp(full_mask_k);
 
             float mmff_energy = 0.0f;
             float mmff_rms_gradient = 0.0f;
@@ -470,7 +479,7 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
                 run_heavy_rescue = is_heavy_refinement_case_(meta) &&
                                    (mmff_status != 0 || mmff_energy > heavy_mmff_rescue_threshold_(meta));
             }
-            run_heavy_rescue = __shfl_sync(full_mask, run_heavy_rescue ? 1 : 0, 0) != 0;
+            run_heavy_rescue = __shfl_sync(full_mask_k, run_heavy_rescue ? 1 : 0, 0) != 0;
 
             if (run_heavy_rescue) {
                 float rescue_energy = 0.0f;
@@ -485,10 +494,11 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
             // Write polished positions + updated energy back.  Status is left
             // untouched: MMFF non-convergence does not mark the conformer failed.
             for (std::uint32_t d = 0; d < 3; ++d)
-                for (std::uint32_t i = lane; i < num_atoms; i += warp_size)
-                    conformer_coordinates_out[coord_offset + d * output_atoms_stride + i] = positions[d * num_atoms + i];
+                for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
+                    conformer_coordinates_out[coord_offset + d * output_atoms_stride + i] =
+                        positions[d * num_atoms + i];
             if (lane == 0) conformer_energies_out[slot] = mmff_energy;
-            __syncwarp(full_mask);
+            __syncwarp(full_mask_k);
         }
     }
 }

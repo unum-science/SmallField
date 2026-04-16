@@ -1,5 +1,5 @@
 /**
- *  @file etkdg_types.cuh
+ *  @file etkdg_types.hpp
  *  @brief Data structures for the GPU ETKDG conformer generation pipeline.
  *
  *  Defines the types used to pass preprocessed molecular data from CPU to GPU:

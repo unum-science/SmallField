@@ -38,9 +38,10 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::mmff94 {
-using namespace smallfield::cuda;
-using namespace smallfield::parameters;
-using namespace smallfield::types;
+using smallfield::cuda::warp_size_k;
+using smallfield::parameters::mmff94_tables_view_t;
+using smallfield::types::max_atoms_k;
+using smallfield::types::molecule_descriptor_t;
 
 /** Kernel: one block per molecule, 32 threads per block.  Reads the
  *  molecule's descriptor from global memory (not shared — typer only
@@ -59,12 +60,12 @@ __launch_bounds__(32, 8) __global__
 
     molecule_descriptor_t const &desc = descriptors[mol];
     std::uint32_t const atom_off = atom_offsets[mol];
-    std::uint32_t const n = desc.num_atoms;
+    std::uint32_t const num_atoms = desc.num_atoms;
     std::uint8_t *types = atom_types_out + atom_off;
     float *charges = atom_charges_out + atom_off;
 
     // Heavy atoms, lane-strided.
-    for (std::uint32_t a = lane; a < n; a += warp_size) {
+    for (std::uint32_t a = lane; a < num_atoms; a += warp_size_k) {
         if (desc.element[a] == 1) {
             types[a] = 0;
             continue;
@@ -74,8 +75,8 @@ __launch_bounds__(32, 8) __global__
     __syncwarp();
 
     // Hydrogens, keyed on heavy-atom types, so must run after the heavy-atom pass.
-    std::span<std::uint8_t const> types_span(types, n);
-    for (std::uint32_t a = lane; a < n; a += warp_size) {
+    std::span<std::uint8_t const> types_span(types, num_atoms);
+    for (std::uint32_t a = lane; a < num_atoms; a += warp_size_k) {
         if (desc.element[a] != 1) continue;
         types[a] = native_set_mmff_hydrogen_type(desc, a, types_span);
     }
@@ -88,24 +89,24 @@ __launch_bounds__(32, 8) __global__
     if (lane == 0) {
         // Status: if any atom type is 0, this molecule failed typing.
         std::uint8_t status = 0;
-        for (std::uint32_t a = 0; a < n; ++a)
+        for (std::uint32_t a = 0; a < num_atoms; ++a)
             if (types[a] == 0) {
                 status = 1;
                 break;
             }
         typing_status[mol] = status;
         if (status == 0) {
-            std::span<std::uint8_t const> at_const(types, n);
-            std::span<float> fc_span(formal_charges_shared, n);
+            std::span<std::uint8_t const> at_const(types, num_atoms);
+            std::span<float> fc_span(formal_charges_shared, num_atoms);
             native_compute_mmff_formal_charges(desc, at_const, fc_span);
-            std::span<float const> fc_const(formal_charges_shared, n);
-            std::span<float> pc_span(charges, n);
+            std::span<float const> fc_const(formal_charges_shared, num_atoms);
+            std::span<float> pc_span(charges, num_atoms);
             native_compute_mmff_partial_charges(desc, tables_view, at_const, fc_const, pc_span);
         }
         else {
             // Failed — zero charges as a defensive default. CPU fallback
             // will overwrite with the full native pipeline.
-            for (std::uint32_t a = 0; a < n; ++a) charges[a] = 0.0f;
+            for (std::uint32_t a = 0; a < num_atoms; ++a) charges[a] = 0.0f;
         }
     }
 }

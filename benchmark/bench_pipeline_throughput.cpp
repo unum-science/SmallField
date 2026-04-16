@@ -60,11 +60,11 @@ static double percentile(std::vector<double> &sorted_values, double p) {
 }
 
 static int report_cuda_errors(char const *context, std::uint64_t cuda_errors) {
-    std::fprintf(
-        stderr,
-        "\nFAIL: %llu CUDA errors reported by the library during %s; " "throughput numbers above are unreliable. "
-                                                                       "Clean-rebuild and retry.\n",
-        static_cast<unsigned long long>(cuda_errors), context);
+    std::fprintf(stderr,
+                 "\nFAIL: %llu CUDA errors reported by the library during %s; " "throughput numbers above are "
+                                                                                "unreliable. " "Clean-rebuild and "
+                                                                                               "retry.\n",
+                 static_cast<unsigned long long>(cuda_errors), context);
     return 2;
 }
 

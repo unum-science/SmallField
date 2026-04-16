@@ -35,8 +35,46 @@
 #include "smallfield/types/mmff94_bounds.hpp"
 
 namespace smallfield::mmff94 {
-using namespace smallfield::parameters;
-using namespace smallfield::types;
+using smallfield::parameters::lookup_angle;
+using smallfield::parameters::lookup_bndk;
+using smallfield::parameters::lookup_bond;
+using smallfield::parameters::lookup_covrad;
+using smallfield::parameters::lookup_dfsb;
+using smallfield::parameters::lookup_hl;
+using smallfield::parameters::lookup_oop;
+using smallfield::parameters::lookup_prop;
+using smallfield::parameters::lookup_stbn;
+using smallfield::parameters::lookup_torsion;
+using smallfield::parameters::lookup_vdw;
+using smallfield::parameters::mmff94_tables_view_t;
+using smallfield::types::atom_role_first_k;
+using smallfield::types::atom_role_fourth_k;
+using smallfield::types::atom_role_second_k;
+using smallfield::types::atom_role_third_k;
+using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::max_atoms_k;
+using smallfield::types::max_bonds_k;
+using smallfield::types::max_mmff_angles_per_mol_k;
+using smallfield::types::max_mmff_bonds_per_mol_k;
+using smallfield::types::max_mmff_interactions_per_mol_k;
+using smallfield::types::max_mmff_oops_per_mol_k;
+using smallfield::types::max_mmff_stretchbends_per_mol_k;
+using smallfield::types::max_mmff_torsions_per_mol_k;
+using smallfield::types::mmff94_angle_center_k;
+using smallfield::types::mmff94_angle_end_k;
+using smallfield::types::mmff94_angle_t;
+using smallfield::types::mmff94_atom_interaction_t;
+using smallfield::types::mmff94_atom_offsets_t;
+using smallfield::types::mmff94_atom_vdw_params_t;
+using smallfield::types::mmff94_bond_k;
+using smallfield::types::mmff94_bond_t;
+using smallfield::types::mmff94_oop_t;
+using smallfield::types::mmff94_out_of_plane_k;
+using smallfield::types::mmff94_stretch_bend_k;
+using smallfield::types::mmff94_stretchbend_t;
+using smallfield::types::mmff94_torsion_k;
+using smallfield::types::mmff94_torsion_t;
+using smallfield::types::molecule_descriptor_t;
 
 /** Per-molecule term counts.  Written by the emit kernel; consumed by
  *  the CSR build kernel and by downstream pipeline stages that need
@@ -102,8 +140,8 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     std::uint32_t const atom_off = atom_offsets[mol];
     std::uint8_t const *atom_types = atom_types_all + atom_off;
     float const *charges = atom_charges_all + atom_off;
-    std::uint32_t const n = desc.num_atoms;
-    std::uint32_t const nb = desc.num_bonds;
+    std::uint32_t const num_atoms = desc.num_atoms;
+    std::uint32_t const num_bonds = desc.num_bonds;
 
     // Per-molecule output bases.
     mmff94_atom_vdw_params_t *vdw_out = out_atom_vdw + atom_off;
@@ -116,7 +154,7 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
 
     // Atom VdW + charge — lane-parallel over atoms (each atom's work
     // is independent and written to its own slot).
-    for (std::uint32_t a = lane; a < n; a += 32) {
+    for (std::uint32_t a = lane; a < num_atoms; a += 32) {
         auto const *vdw = lookup_vdw(tables, atom_types[a]);
         mmff94_atom_vdw_params_t p {};
         if (vdw) {
@@ -135,7 +173,7 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     // over bonds. Shared-memory scratch for downstream angle/stbn reuse.
     __shared__ std::uint8_t s_bond_type[max_bonds_k];
     __shared__ float s_bond_r0[max_bonds_k];
-    for (std::uint32_t b = lane; b < nb; b += 32) {
+    for (std::uint32_t b = lane; b < num_bonds; b += 32) {
         std::uint8_t const i = desc.bond_atom_i[b];
         std::uint8_t const j = desc.bond_atom_j[b];
         std::uint8_t bt = 0;
@@ -174,17 +212,17 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     std::uint8_t const *bond_type_arr = s_bond_type;
     float const *bond_r0 = s_bond_r0;
 
-    std::uint32_t bond_count = nb < max_mmff_bonds_per_mol_k ? nb : max_mmff_bonds_per_mol_k;
+    std::uint32_t bond_count = num_bonds < max_mmff_bonds_per_mol_k ? num_bonds : max_mmff_bonds_per_mol_k;
     std::uint32_t angle_count = 0, torsion_count = 0, oop_count = 0, stbn_count = 0;
-    std::uint8_t overflow = (nb > max_mmff_bonds_per_mol_k) ? 1 : 0;
+    std::uint8_t overflow = (num_bonds > max_mmff_bonds_per_mol_k) ? 1 : 0;
 
     // Angle terms (and angle-scratch for stretch-bend reuse).
     detail_extract::angle_scratch_t as[max_mmff_angles_per_mol_k];
     std::uint32_t as_count = 0;
 
-    std::span<std::uint8_t const> bond_types {bond_type_arr, nb};
-    std::span<std::uint8_t const> at_span {atom_types, n};
-    for (std::uint32_t center = 0; center < n; ++center) {
+    std::span<std::uint8_t const> bond_types {bond_type_arr, num_bonds};
+    std::span<std::uint8_t const> at_span {atom_types, num_atoms};
+    for (std::uint32_t center = 0; center < num_atoms; ++center) {
         std::uint16_t const nstart = desc.neighbor_offset[center];
         std::uint16_t const nend = desc.neighbor_offset[center + 1];
         for (std::uint16_t a = nstart; a < nend; ++a) {
@@ -234,7 +272,7 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     }
 
     // Torsion terms.
-    for (std::uint32_t b = 0; b < nb; ++b) {
+    for (std::uint32_t b = 0; b < num_bonds; ++b) {
         std::uint32_t const j = desc.bond_atom_i[b];
         std::uint32_t const k = desc.bond_atom_j[b];
         std::uint16_t const jstart = desc.neighbor_offset[j];
@@ -273,7 +311,7 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     }
 
     // OOP terms.
-    for (std::uint32_t center = 0; center < n; ++center) {
+    for (std::uint32_t center = 0; center < num_atoms; ++center) {
         std::uint32_t const deg = desc.degree[center];
         if (deg < 3) continue;
         std::uint16_t const nstart = desc.neighbor_offset[center];
@@ -367,7 +405,7 @@ __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
     if (typing_status[mol] != 0) return;
 
     auto const &desc = descriptors[mol];
-    std::uint32_t const n = desc.num_atoms;
+    std::uint32_t const num_atoms = desc.num_atoms;
     std::uint32_t const ao = atom_offsets[mol];
     auto const &c = per_mol_counts[mol];
 
@@ -382,7 +420,7 @@ __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
     mmff94_atom_offsets_t *offsets = atom_offsets_all + ao;
 
     // Pass 1 — count per-atom per-term-type.
-    for (std::uint32_t a = 0; a < n; ++a) offsets[a] = {};
+    for (std::uint32_t a = 0; a < num_atoms; ++a) offsets[a] = {};
     for (std::uint32_t t = 0; t < c.bonds; ++t) {
         offsets[bonds[t].atom_i].bond_count++;
         offsets[bonds[t].atom_j].bond_count++;
@@ -412,7 +450,7 @@ __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
 
     // Compute per-type offsets + running total.
     std::uint32_t running = 0;
-    for (std::uint32_t a = 0; a < n; ++a) {
+    for (std::uint32_t a = 0; a < num_atoms; ++a) {
         auto &off = offsets[a];
         off.bond_start = running;
         running += off.bond_count;
@@ -435,7 +473,7 @@ __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
     std::uint32_t cursors_torsion[max_atoms_k];
     std::uint32_t cursors_oop[max_atoms_k];
     std::uint32_t cursors_sb[max_atoms_k];
-    for (std::uint32_t a = 0; a < n; ++a) {
+    for (std::uint32_t a = 0; a < num_atoms; ++a) {
         cursors_bond[a] = offsets[a].bond_start;
         cursors_angle[a] = offsets[a].angle_start;
         cursors_torsion[a] = offsets[a].torsion_start;

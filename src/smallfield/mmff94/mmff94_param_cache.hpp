@@ -37,8 +37,6 @@
 #include <unordered_map>
 
 namespace smallfield::mmff94 {
-using namespace smallfield::parameters;
-using namespace smallfield::types;
 
 /** Per-bond stretch parameter (MMFFBond in RDKit). */
 struct mmff_bond_cached_t {
@@ -87,20 +85,20 @@ struct mmff_stretchbend_cached_t {
  *  drug-like ChEMBL × 192 threads × ~24 bytes ≈ 23 MB total).  On a 1.7 TB
  *  RAM machine this is negligible; the throughput win dwarfs the duplication.
  */
-template <typename Value>
+template <typename value_>
 class mmff_cache_t {
   public:
-    Value const *find(std::uint64_t key) const noexcept {
+    value_ const *find(std::uint64_t key) const noexcept {
         auto it = map_.find(key);
         return (it == map_.end()) ? nullptr : &it->second;
     }
 
-    void insert(std::uint64_t key, Value const &value) { map_.try_emplace(key, value); }
+    void insert(std::uint64_t key, value_ const &value) { map_.try_emplace(key, value); }
 
     std::size_t size() const noexcept { return map_.size(); }
 
   private:
-    std::unordered_map<std::uint64_t, Value> map_;
+    std::unordered_map<std::uint64_t, value_> map_;
 };
 
 // Per-thread cache instances. All MMFF94 param tables are globally fixed, so deriving once per thread

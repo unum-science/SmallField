@@ -23,11 +23,6 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::cuda {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::preprocess;
-using namespace smallfield::types;
 
 /**
  *  @brief Read upper bound between atoms @p atom_a and @p atom_b (a != b).
@@ -75,7 +70,7 @@ __device__ __forceinline__ void triangle_smooth_warp_half_(__half *bounds, std::
     std::uint32_t const total_pairs = num_atoms * num_atoms;
 
     for (std::uint32_t k = 0; k < num_atoms; ++k) {
-        for (std::uint32_t linear_index = lane; linear_index < total_pairs; linear_index += warp_size) {
+        for (std::uint32_t linear_index = lane; linear_index < total_pairs; linear_index += warp_size_k) {
             std::uint32_t const i = linear_index / num_atoms;
             std::uint32_t const j = linear_index % num_atoms;
             if (i == j || i == k || j == k) continue;
@@ -105,7 +100,7 @@ __device__ __forceinline__ void triangle_smooth_warp_half_(__half *bounds, std::
                 if (candidate > current) bounds[i * num_atoms + j] = __float2half(candidate);
             }
         }
-        __syncwarp(full_mask);
+        __syncwarp(full_mask_k);
     }
 }
 
@@ -120,7 +115,7 @@ __device__ __forceinline__ void triangle_smooth_warp_(float *bounds, std::uint32
     std::uint32_t const total_pairs = num_atoms * num_atoms;
 
     for (std::uint32_t k = 0; k < num_atoms; ++k) {
-        for (std::uint32_t linear_index = lane; linear_index < total_pairs; linear_index += warp_size) {
+        for (std::uint32_t linear_index = lane; linear_index < total_pairs; linear_index += warp_size_k) {
             std::uint32_t const i = linear_index / num_atoms;
             std::uint32_t const j = linear_index % num_atoms;
             if (i == j || i == k || j == k) continue;
@@ -154,7 +149,7 @@ __device__ __forceinline__ void triangle_smooth_warp_(float *bounds, std::uint32
                 if (candidate > current) bounds[i * num_atoms + j] = candidate;
             }
         }
-        __syncwarp(full_mask);
+        __syncwarp(full_mask_k);
     }
 }
 

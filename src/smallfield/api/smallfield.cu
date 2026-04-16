@@ -504,7 +504,8 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes_dg);
 
         int blocks_per_sm_dg = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_dg, etkdg_pipeline_warp_kernel, 32, shared_bytes_dg);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_dg, etkdg_pipeline_warp_kernel, 32,
+                                                      shared_bytes_dg);
         std::uint32_t const grid_size_dg = std::min(wave_size, static_cast<std::uint32_t>(blocks_per_sm_dg * num_sms));
 
         etkdg_pipeline_warp_kernel<<<grid_size_dg, 32, shared_bytes_dg, stream>>>(
@@ -523,9 +524,10 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         cudaFuncSetAttribute(mmff_polish_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes_mmff);
 
         int blocks_per_sm_mmff = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_mmff, mmff_polish_warp_kernel, 32, shared_bytes_mmff);
-        std::uint32_t const grid_size_mmff =
-            std::min(wave_size, static_cast<std::uint32_t>(blocks_per_sm_mmff * num_sms));
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_mmff, mmff_polish_warp_kernel, 32,
+                                                      shared_bytes_mmff);
+        std::uint32_t const grid_size_mmff = std::min(wave_size,
+                                                      static_cast<std::uint32_t>(blocks_per_sm_mmff * num_sms));
 
         mmff_polish_warp_kernel<<<grid_size_mmff, 32, shared_bytes_mmff, stream>>>(
             device_view.mmff_atom_vdw().data(), device_view.mmff_atom_charge().data(),

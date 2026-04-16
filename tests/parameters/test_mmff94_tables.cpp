@@ -21,6 +21,7 @@
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 
 #include "smallfield/parameters/mmff94_tables.hpp"
+#include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 
 #include "test_mmff94_tables_kernels.hpp"
 

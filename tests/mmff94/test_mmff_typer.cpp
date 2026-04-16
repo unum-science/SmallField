@@ -26,6 +26,7 @@
 
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
+#include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"
 
 namespace sfparam = smallfield::parameters;

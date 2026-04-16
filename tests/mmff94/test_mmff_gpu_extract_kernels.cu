@@ -11,7 +11,6 @@
 
 #include <cuda_runtime.h>
 
-#define SMALLFIELD_MMFF_TABLES_NO_RDKIT 1
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"

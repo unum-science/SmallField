@@ -42,13 +42,17 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield::mmff94 {
-using namespace smallfield::parameters;
-using namespace smallfield::types;
+using smallfield::parameters::lookup_prop;
+using smallfield::parameters::mmff94_tables_view_t;
+using smallfield::types::atom_flag_aromatic_k;
+using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::max_atoms_k;
+using smallfield::types::molecule_descriptor_t;
 
 // Ring-info queries on the descriptor.
 
 /** Number of SSSR rings that contain atom. */
-SMALLFIELD_HD inline unsigned atom_num_rings(molecule_descriptor_t const &desc, std::uint32_t atom_idx) noexcept {
+SMALLFIELD_HD_ inline unsigned atom_num_rings(molecule_descriptor_t const &desc, std::uint32_t atom_idx) noexcept {
     std::uint32_t const bitmap = desc.atom_ring_bitmap[atom_idx];
     unsigned n = 0;
     for (unsigned r = 0; r < desc.num_rings; ++r)
@@ -57,8 +61,8 @@ SMALLFIELD_HD inline unsigned atom_num_rings(molecule_descriptor_t const &desc, 
 }
 
 /** True iff atom is in at least one SSSR ring of exactly `size` atoms. */
-SMALLFIELD_HD inline bool atom_in_ring_of_size(molecule_descriptor_t const &desc, std::uint32_t atom_idx,
-                                               unsigned size) noexcept {
+SMALLFIELD_HD_ inline bool atom_in_ring_of_size(molecule_descriptor_t const &desc, std::uint32_t atom_idx,
+                                                unsigned size) noexcept {
     std::uint32_t const bitmap = desc.atom_ring_bitmap[atom_idx];
     for (unsigned r = 0; r < desc.num_rings; ++r) {
         if (!(bitmap & (1u << r))) continue;
@@ -69,8 +73,8 @@ SMALLFIELD_HD inline bool atom_in_ring_of_size(molecule_descriptor_t const &desc
 }
 
 /** True iff all atoms in a size-`size` SSSR ring containing atom are aromatic. */
-SMALLFIELD_HD inline bool atom_in_aromatic_ring_of_size(molecule_descriptor_t const &desc, std::uint32_t atom_idx,
-                                                        unsigned size) noexcept {
+SMALLFIELD_HD_ inline bool atom_in_aromatic_ring_of_size(molecule_descriptor_t const &desc, std::uint32_t atom_idx,
+                                                         unsigned size) noexcept {
     std::uint32_t const bitmap = desc.atom_ring_bitmap[atom_idx];
     for (unsigned r = 0; r < desc.num_rings; ++r) {
         if (!(bitmap & (1u << r))) continue;
@@ -90,8 +94,8 @@ SMALLFIELD_HD inline bool atom_in_aromatic_ring_of_size(molecule_descriptor_t co
 }
 
 /** True iff atoms i and j appear in the same SSSR ring of exactly `size`. */
-SMALLFIELD_HD inline bool atoms_in_same_ring_of_size(molecule_descriptor_t const &desc, std::uint32_t i,
-                                                     std::uint32_t j, unsigned size) noexcept {
+SMALLFIELD_HD_ inline bool atoms_in_same_ring_of_size(molecule_descriptor_t const &desc, std::uint32_t i,
+                                                      std::uint32_t j, unsigned size) noexcept {
     std::uint32_t const bits = desc.atom_ring_bitmap[i] & desc.atom_ring_bitmap[j];
     for (unsigned r = 0; r < desc.num_rings; ++r) {
         if (!(bits & (1u << r))) continue;
@@ -102,8 +106,8 @@ SMALLFIELD_HD inline bool atoms_in_same_ring_of_size(molecule_descriptor_t const
 }
 
 /** True iff atoms i and j share any aromatic SSSR ring. */
-SMALLFIELD_HD inline bool atoms_in_same_aromatic_ring(molecule_descriptor_t const &desc, std::uint32_t i,
-                                                      std::uint32_t j) noexcept {
+SMALLFIELD_HD_ inline bool atoms_in_same_aromatic_ring(molecule_descriptor_t const &desc, std::uint32_t i,
+                                                       std::uint32_t j) noexcept {
     if (!(desc.atom_flags[i] & atom_flag_aromatic_k) || !(desc.atom_flags[j] & atom_flag_aromatic_k)) return false;
     std::uint32_t const bits = desc.atom_ring_bitmap[i] & desc.atom_ring_bitmap[j];
     for (unsigned r = 0; r < desc.num_rings; ++r) {
@@ -125,7 +129,7 @@ SMALLFIELD_HD inline bool atoms_in_same_aromatic_ring(molecule_descriptor_t cons
 /** Total valence = explicit bond-order sum + implicit-H count.  Matches
  *  `atom->getValence(ExplicitType) + atom->getNumImplicitHs()` — we
  *  recover it from the descriptor by summing neighbor bond orders. */
-SMALLFIELD_HD inline unsigned atom_total_valence(molecule_descriptor_t const &desc, std::uint32_t atom_idx) noexcept {
+SMALLFIELD_HD_ inline unsigned atom_total_valence(molecule_descriptor_t const &desc, std::uint32_t atom_idx) noexcept {
     unsigned v = 0;
     std::uint16_t const start = desc.neighbor_offset[atom_idx];
     std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
@@ -149,13 +153,13 @@ SMALLFIELD_HD inline unsigned atom_total_valence(molecule_descriptor_t const &de
  *  already counts them.  `desc.num_hydrogens` also counts them (RDKit's
  *  `getTotalNumHs(true)` includes neighbor Hs), so we must NOT add it
  *  a second time — that would double-count H neighbors. */
-SMALLFIELD_HD inline unsigned atom_total_degree(molecule_descriptor_t const &desc, std::uint32_t atom_idx) noexcept {
+SMALLFIELD_HD_ inline unsigned atom_total_degree(molecule_descriptor_t const &desc, std::uint32_t atom_idx) noexcept {
     return desc.degree[atom_idx];
 }
 
 /** N-oxide detector.  Matches `RDKit::MMFF::isAtomNOxide`: nitrogen
  *  with total degree ≥ 3 bonded to a singly-coordinated oxygen. */
-SMALLFIELD_HD inline bool is_atom_n_oxide(molecule_descriptor_t const &desc, std::uint32_t atom_idx) noexcept {
+SMALLFIELD_HD_ inline bool is_atom_n_oxide(molecule_descriptor_t const &desc, std::uint32_t atom_idx) noexcept {
     if (desc.element[atom_idx] != 7) return false;
     if (atom_total_degree(desc, atom_idx) < 3) return false;
     std::uint16_t const start = desc.neighbor_offset[atom_idx];
@@ -168,8 +172,8 @@ SMALLFIELD_HD inline bool is_atom_n_oxide(molecule_descriptor_t const &desc, std
 }
 
 /** Count terminal oxygens single-bonded to `atom_idx`. */
-SMALLFIELD_HD inline unsigned count_terminal_o_neighbors(molecule_descriptor_t const &desc,
-                                                         std::uint32_t atom_idx) noexcept {
+SMALLFIELD_HD_ inline unsigned count_terminal_o_neighbors(molecule_descriptor_t const &desc,
+                                                          std::uint32_t atom_idx) noexcept {
     unsigned n = 0;
     std::uint16_t const start = desc.neighbor_offset[atom_idx];
     std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
@@ -183,8 +187,8 @@ SMALLFIELD_HD inline unsigned count_terminal_o_neighbors(molecule_descriptor_t c
 /** The bond order of the bond between two atoms (0 if not adjacent).
  *  Aromatic bonds report order 1 with the aromatic flag set, matching
  *  the descriptor's encoding convention. */
-SMALLFIELD_HD inline std::uint8_t bond_order_between(molecule_descriptor_t const &desc, std::uint32_t i,
-                                                     std::uint32_t j) noexcept {
+SMALLFIELD_HD_ inline std::uint8_t bond_order_between(molecule_descriptor_t const &desc, std::uint32_t i,
+                                                      std::uint32_t j) noexcept {
     std::uint16_t const start = desc.neighbor_offset[i];
     std::uint16_t const end = desc.neighbor_offset[i + 1];
     for (std::uint16_t n = start; n < end; ++n)
@@ -192,8 +196,8 @@ SMALLFIELD_HD inline std::uint8_t bond_order_between(molecule_descriptor_t const
     return 0;
 }
 
-SMALLFIELD_HD inline bool bond_is_aromatic_between(molecule_descriptor_t const &desc, std::uint32_t i,
-                                                   std::uint32_t j) noexcept {
+SMALLFIELD_HD_ inline bool bond_is_aromatic_between(molecule_descriptor_t const &desc, std::uint32_t i,
+                                                    std::uint32_t j) noexcept {
     std::uint16_t const start = desc.neighbor_offset[i];
     std::uint16_t const end = desc.neighbor_offset[i + 1];
     for (std::uint16_t n = start; n < end; ++n)
@@ -207,8 +211,8 @@ SMALLFIELD_HD inline bool bond_is_aromatic_between(molecule_descriptor_t const &
  *  Faithful line-by-line port of AtomTyper.cpp:504-2078 with element-keyed dispatch, the same branch
  *  order, and identical break semantics. Hydrogen atoms should not be passed here; use
  *  `native_set_mmff_hydrogen_type` for those. */
-SMALLFIELD_HD inline std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t const &desc,
-                                                                  std::uint32_t atom_idx) noexcept {
+SMALLFIELD_HD_ inline std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t const &desc,
+                                                                   std::uint32_t atom_idx) noexcept {
     std::uint8_t atom_type = 0;
     unsigned const element = desc.element[atom_idx];
     bool const aromatic = (desc.atom_flags[atom_idx] & atom_flag_aromatic_k) != 0;
@@ -935,9 +939,9 @@ SMALLFIELD_HD inline std::uint8_t native_set_mmff_heavy_atom_type(molecule_descr
 
 /** Port of `setMMFFHydrogenType`. Takes the already-computed heavy-atom types so the H-typing nested
  *  switches can key on them. */
-SMALLFIELD_HD inline std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const &desc,
-                                                                std::uint32_t atom_idx,
-                                                                std::span<std::uint8_t const> atom_types) noexcept {
+SMALLFIELD_HD_ inline std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const &desc,
+                                                                 std::uint32_t atom_idx,
+                                                                 std::span<std::uint8_t const> atom_types) noexcept {
     std::uint8_t atom_type = 0;
     std::uint16_t const start = desc.neighbor_offset[atom_idx];
     std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
@@ -1029,12 +1033,12 @@ SMALLFIELD_HD inline std::uint8_t native_set_mmff_hydrogen_type(molecule_descrip
  *  charge sharing, N5M anion splitting, conjugated nitrogen flood fill).
  *  All other atoms keep `desc.formal_charge` (the RDKit-assigned formal
  *  charge from SMILES parsing). */
-SMALLFIELD_HD inline void native_compute_mmff_formal_charges(molecule_descriptor_t const &desc,
-                                                             std::span<std::uint8_t const> atom_types,
-                                                             std::span<float> formal_charges) noexcept {
-    std::uint32_t const n = desc.num_atoms;
+SMALLFIELD_HD_ inline void native_compute_mmff_formal_charges(molecule_descriptor_t const &desc,
+                                                              std::span<std::uint8_t const> atom_types,
+                                                              std::span<float> formal_charges) noexcept {
+    std::uint32_t const num_atoms = desc.num_atoms;
     // Initialise with zero — only atom types listed below get overridden.
-    for (std::uint32_t a = 0; a < n; ++a) formal_charges[a] = 0.0f;
+    for (std::uint32_t a = 0; a < num_atoms; ++a) formal_charges[a] = 0.0f;
 
     // Scratch bitset for the conjugated-nitrogen flood fill (types 55/56/81).
     std::array<std::uint32_t, (max_atoms_k + 31) / 32> conj_bits {};
@@ -1042,7 +1046,7 @@ SMALLFIELD_HD inline void native_compute_mmff_formal_charges(molecule_descriptor
     auto conj_get = [&](std::uint32_t i) -> bool { return (conj_bits[i >> 5] & (1u << (i & 31))) != 0; };
     auto conj_reset = [&]() { conj_bits.fill(0); };
 
-    for (std::uint32_t idx = 0; idx < n; ++idx) {
+    for (std::uint32_t idx = 0; idx < num_atoms; ++idx) {
         std::uint8_t const at = atom_types[idx];
         float fc = 0.0f;
         switch (at) {
@@ -1131,7 +1135,7 @@ SMALLFIELD_HD inline void native_compute_mmff_formal_charges(molecule_descriptor
             conj_set(idx);
             while (nConj > oldNConj) {
                 oldNConj = nConj;
-                for (std::uint32_t i = 0; i < n; ++i) {
+                for (std::uint32_t i = 0; i < num_atoms; ++i) {
                     if (!conj_get(i)) continue;
                     std::uint16_t const ns = desc.neighbor_offset[i];
                     std::uint16_t const ne = desc.neighbor_offset[i + 1];
@@ -1199,13 +1203,13 @@ SMALLFIELD_HD inline void native_compute_mmff_formal_charges(molecule_descriptor
  *  from the extracted `chg` table, with the PBCI fallback when no BCI
  *  is tabulated.  Formal-charge distribution follows equation 15 of
  *  MMFF.V. */
-SMALLFIELD_HD inline void native_compute_mmff_partial_charges(molecule_descriptor_t const &desc,
-                                                              mmff94_tables_view_t const &tables,
-                                                              std::span<std::uint8_t const> atom_types,
-                                                              std::span<float const> formal_charges,
-                                                              std::span<float> partial_charges) noexcept {
-    std::uint32_t const n = desc.num_atoms;
-    for (std::uint32_t idx = 0; idx < n; ++idx) {
+SMALLFIELD_HD_ inline void native_compute_mmff_partial_charges(molecule_descriptor_t const &desc,
+                                                               mmff94_tables_view_t const &tables,
+                                                               std::span<std::uint8_t const> atom_types,
+                                                               std::span<float const> formal_charges,
+                                                               std::span<float> partial_charges) noexcept {
+    std::uint32_t const num_atoms = desc.num_atoms;
+    for (std::uint32_t idx = 0; idx < num_atoms; ++idx) {
         std::uint8_t const at = atom_types[idx];
         auto const *prop = lookup_prop(tables, at);
         if (!prop) {
@@ -1273,12 +1277,12 @@ SMALLFIELD_HD inline void native_compute_mmff_partial_charges(molecule_descripto
 
 /** Populate `atom_types[]` with MMFF94 atom types for every atom in the
  *  molecule.  Returns true iff every atom was typed successfully. */
-SMALLFIELD_HD inline bool native_compute_mmff_atom_types(molecule_descriptor_t const &desc,
-                                                         std::span<std::uint8_t> atom_types) noexcept {
-    std::uint32_t const n = desc.num_atoms;
+SMALLFIELD_HD_ inline bool native_compute_mmff_atom_types(molecule_descriptor_t const &desc,
+                                                          std::span<std::uint8_t> atom_types) noexcept {
+    std::uint32_t const num_atoms = desc.num_atoms;
     bool ok = true;
     // Heavy atoms first.
-    for (std::uint32_t a = 0; a < n; ++a) {
+    for (std::uint32_t a = 0; a < num_atoms; ++a) {
         if (desc.element[a] == 1) {
             atom_types[a] = 0;
             continue;
@@ -1287,7 +1291,7 @@ SMALLFIELD_HD inline bool native_compute_mmff_atom_types(molecule_descriptor_t c
         if (atom_types[a] == 0) ok = false;
     }
     // Then hydrogens (need heavy atom types populated first).
-    for (std::uint32_t a = 0; a < n; ++a) {
+    for (std::uint32_t a = 0; a < num_atoms; ++a) {
         if (desc.element[a] != 1) continue;
         atom_types[a] = native_set_mmff_hydrogen_type(desc, a, atom_types);
         if (atom_types[a] == 0) ok = false;

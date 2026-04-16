@@ -1,5 +1,5 @@
 /**
- *  @file mmff94_functor.cuh
+ *  @file mmff94_energy_kernel.cuh
  *  @brief MMFF94 energy and gradient functor for ETKDG pipeline stage 9.
  *
  *  Uses per-atom interaction lists for zero-waste iteration.
@@ -19,51 +19,51 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::cuda {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::preprocess;
-using namespace smallfield::types;
+using smallfield::types::atom_role_first_k;
+using smallfield::types::atom_role_fourth_k;
+using smallfield::types::atom_role_second_k;
+using smallfield::types::atom_role_t;
+using smallfield::types::atom_role_third_k;
+using smallfield::types::mmff94_angle_t;
+using smallfield::types::mmff94_atom_interaction_t;
+using smallfield::types::mmff94_atom_offsets_t;
+using smallfield::types::mmff94_atom_vdw_params_t;
+using smallfield::types::mmff94_bond_t;
+using smallfield::types::mmff94_oop_t;
+using smallfield::types::mmff94_stretchbend_t;
+using smallfield::types::mmff94_torsion_t;
 
-constexpr float mmff_coulomb = 332.0716f;
-constexpr float mmff_elec_buf = 0.05f;
-constexpr float mmff_1_4_scale = 0.75f;
-constexpr float mmff_vdw_d = 0.07f; // delta
-constexpr float mmff_vdw_g = 0.12f; // gamma
-constexpr float mmff_bond_pf = 143.9325f;
-constexpr float mmff_bond_cs = -2.0f;
-constexpr float mmff_angle_pf = 0.043844f;
-constexpr float mmff_angle_cb = -0.007f;
-constexpr float mmff_tor_pf = 0.5f;
-constexpr float mmff_stbn_pf = 2.51210f;
-constexpr float mmff_deg2rad = 3.14159265f / 180.0f;
-constexpr float mmff_rad2deg = 180.0f / 3.14159265f;
+constexpr float mmff_coulomb_k = 332.0716f;
+constexpr float mmff_electrostatic_buffer_k = 0.05f;
+constexpr float mmff_1_4_scale_k = 0.75f;
+constexpr float mmff_vdw_delta_k = 0.07f; // delta
+constexpr float mmff_vdw_gamma_k = 0.12f; // gamma
+constexpr float mmff_bond_prefactor_k = 143.9325f;
+constexpr float mmff_bond_cubic_stretch_k = -2.0f;
+constexpr float mmff_angle_prefactor_k = 0.043844f;
+constexpr float mmff_angle_cubic_bend_k = -0.007f;
+constexpr float mmff_torsion_prefactor_k = 0.5f;
+constexpr float mmff_stretch_bend_prefactor_k = 2.51210f;
+constexpr float mmff_degrees_to_radians_k = 3.14159265f / 180.0f;
+constexpr float mmff_radians_to_degrees_k = 180.0f / 3.14159265f;
 
-struct float3_mmff_t {
-    float x;
-    float y;
-    float z;
-};
-
-__device__ __forceinline__ float3_mmff_t make_float3_mmff_(float x, float y, float z) { return {x, y, z}; }
-
-__device__ __forceinline__ float dot_float3_mmff_(float3_mmff_t const &lhs, float3_mmff_t const &rhs) {
+__device__ __forceinline__ float dot_float3_(float3 const &lhs, float3 const &rhs) {
     return fmaf(lhs.x, rhs.x, fmaf(lhs.y, rhs.y, lhs.z * rhs.z));
 }
 
-__device__ __forceinline__ float3_mmff_t cross_float3_mmff_(float3_mmff_t const &lhs, float3_mmff_t const &rhs) {
+__device__ __forceinline__ float3 cross_float3_(float3 const &lhs, float3 const &rhs) {
     return {lhs.y * rhs.z - lhs.z * rhs.y, lhs.z * rhs.x - lhs.x * rhs.z, lhs.x * rhs.y - lhs.y * rhs.x};
 }
 
-__device__ __forceinline__ float3_mmff_t add_float3_mmff_(float3_mmff_t const &lhs, float3_mmff_t const &rhs) {
+__device__ __forceinline__ float3 add_float3_(float3 const &lhs, float3 const &rhs) {
     return {lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z};
 }
 
-__device__ __forceinline__ float3_mmff_t sub_float3_mmff_(float3_mmff_t const &lhs, float3_mmff_t const &rhs) {
+__device__ __forceinline__ float3 sub_float3_(float3 const &lhs, float3 const &rhs) {
     return {lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z};
 }
 
-__device__ __forceinline__ float3_mmff_t scale_float3_mmff_(float3_mmff_t const &value, float scale) {
+__device__ __forceinline__ float3 scale_float3_(float3 const &value, float scale) {
     return {value.x * scale, value.y * scale, value.z * scale};
 }
 
@@ -96,12 +96,12 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     bool first_endpoint, float *energy, float *gradient_x, float *gradient_y, float *gradient_z) {
 
     // Halgren R* combining rule with donor-suppression clause, plus Slater-Kirkwood epsilon.
-    float const R_i = p_atom.r_star;
-    float const R_j = p_other.r_star;
-    float const gamma = (R_i - R_j) * __frcp_rn(R_i + R_j);
+    float const vdw_radius_i = p_atom.r_star;
+    float const vdw_radius_j = p_other.r_star;
+    float const gamma = (vdw_radius_i - vdw_radius_j) * __frcp_rn(vdw_radius_i + vdw_radius_j);
     bool const has_donor = (p_atom.donor_acceptor == 2) || (p_other.donor_acceptor == 2);
     float const factor = has_donor ? 0.0f : 0.2f * (1.0f - expf(-12.0f * gamma * gamma));
-    float R_star_ij = 0.5f * (R_i + R_j) * (1.0f + factor);
+    float R_star_ij = 0.5f * (vdw_radius_i + vdw_radius_j) * (1.0f + factor);
 
     float const R2 = R_star_ij * R_star_ij;
     float const R6 = R2 * R2 * R2;
@@ -136,24 +136,24 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const density_ratio = distance * __frcp_rn(R_star_ij); // ρ = r / R*
     float const density_ratio_pow7 = density_ratio * density_ratio * density_ratio * density_ratio * density_ratio *
                                      density_ratio * density_ratio;
-    float const repulsion_denominator = density_ratio + mmff_vdw_d; // ρ + δ
-    float const repulsion_base = (1.0f + mmff_vdw_d) * __frcp_rn(repulsion_denominator);
+    float const repulsion_denominator = density_ratio + mmff_vdw_delta_k; // ρ + δ
+    float const repulsion_base = (1.0f + mmff_vdw_delta_k) * __frcp_rn(repulsion_denominator);
     float const repulsion_pow7 = repulsion_base * repulsion_base * repulsion_base * repulsion_base * repulsion_base *
                                  repulsion_base * repulsion_base;
-    float const attractive_term = (1.0f + mmff_vdw_g) * __frcp_rn(density_ratio_pow7 + mmff_vdw_g) - 2.0f;
+    float const attractive_term = (1.0f + mmff_vdw_gamma_k) * __frcp_rn(density_ratio_pow7 + mmff_vdw_gamma_k) - 2.0f;
     float const energy_vdw = eps_ij * repulsion_pow7 * attractive_term;
     float const d_repulsion = -7.0f * repulsion_pow7 * __frcp_rn(repulsion_denominator);
-    float const d_attractive = -7.0f * (1.0f + mmff_vdw_g) * density_ratio_pow7 *
-                               __frcp_rn(density_ratio * (density_ratio_pow7 + mmff_vdw_g) *
-                                         (density_ratio_pow7 + mmff_vdw_g));
+    float const d_attractive = -7.0f * (1.0f + mmff_vdw_gamma_k) * density_ratio_pow7 *
+                               __frcp_rn(density_ratio * (density_ratio_pow7 + mmff_vdw_gamma_k) *
+                                         (density_ratio_pow7 + mmff_vdw_gamma_k));
     float const energy_gradient_vdw = eps_ij * (d_repulsion * attractive_term + repulsion_pow7 * d_attractive) *
                                       __frcp_rn(R_star_ij);
 
     // Electrostatic energy and gradient.
-    float const scale = is_1_4 ? mmff_1_4_scale : 1.0f;
-    float const buffered_distance = distance + mmff_elec_buf;
-    float const energy_electrostatic = mmff_coulomb * charge_product * __frcp_rn(buffered_distance) * scale;
-    float const energy_gradient_electrostatic = -mmff_coulomb * charge_product *
+    float const scale = is_1_4 ? mmff_1_4_scale_k : 1.0f;
+    float const buffered_distance = distance + mmff_electrostatic_buffer_k;
+    float const energy_electrostatic = mmff_coulomb_k * charge_product * __frcp_rn(buffered_distance) * scale;
+    float const energy_gradient_electrostatic = -mmff_coulomb_k * charge_product *
                                                 __frcp_rn(buffered_distance * buffered_distance) * scale;
 
     // Only the lower-index endpoint adds to total energy.
@@ -191,13 +191,13 @@ __device__ __forceinline__ void mmff_bond_contribution_(float const *positions, 
     float const inverse_distance = rsqrtf(r_sq);
     float const r = r_sq * inverse_distance;
     float const dr = r - bond.equilibrium_distance;
-    float const cs = mmff_bond_cs;
+    float const cs = mmff_bond_cubic_stretch_k;
 
     if (role == atom_role_first_k)
-        *energy += 0.5f * mmff_bond_pf * bond.force_constant * dr * dr *
+        *energy += 0.5f * mmff_bond_prefactor_k * bond.force_constant * dr * dr *
                    (1.0f + cs * dr + (7.0f / 12.0f) * cs * cs * dr * dr);
 
-    float const energy_gradient_distance = mmff_bond_pf * bond.force_constant * dr *
+    float const energy_gradient_distance = mmff_bond_prefactor_k * bond.force_constant * dr *
                                            (1.0f + 1.5f * cs * dr + (7.0f / 6.0f) * cs * cs * dr * dr);
     // bond gradient: same sign convention
     *gradient_x -= energy_gradient_distance * dx * inverse_distance;
@@ -246,17 +246,17 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
     float const sin_theta_sq = 1.0f - cos_theta * cos_theta;
     float const sin_theta = (sin_theta_sq > 1e-12f) ? sqrtf(sin_theta_sq) : 1e-6f;
     float const theta = acosf(cos_theta);
-    float const dtheta_deg = (theta - angle.equilibrium_angle) * mmff_rad2deg;
+    float const dtheta_deg = (theta - angle.equilibrium_angle) * mmff_radians_to_degrees_k;
 
     // energy (counted once, by role 0 = atom_i)
     if (role == atom_role_first_k)
-        *energy += 0.5f * mmff_angle_pf * angle.force_constant * dtheta_deg * dtheta_deg *
-                   (1.0f + mmff_angle_cb * dtheta_deg);
+        *energy += 0.5f * mmff_angle_prefactor_k * angle.force_constant * dtheta_deg * dtheta_deg *
+                   (1.0f + mmff_angle_cubic_bend_k * dtheta_deg);
 
     // ∂E/∂θ
     // the extra rad2deg converts the derivative to work with the -1/sinθ chain rule
-    float const energy_gradient_angle = mmff_rad2deg * mmff_angle_pf * angle.force_constant * dtheta_deg *
-                                        (1.0f + 1.5f * mmff_angle_cb * dtheta_deg);
+    float const energy_gradient_angle = mmff_radians_to_degrees_k * mmff_angle_prefactor_k * angle.force_constant *
+                                        dtheta_deg * (1.0f + 1.5f * mmff_angle_cubic_bend_k * dtheta_deg);
     float const inverse_sine = __frcp_rn(sin_theta);
 
     // ∂E/∂rᵢ = ∂E/∂θ · ∂cosθ/∂rᵢ · (−1/sinθ)
@@ -304,48 +304,53 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
                                                            atom_role_t role, float *energy, float *gradient_x,
                                                            float *gradient_y, float *gradient_z) {
 
-    float const *p = positions;
-    std::uint32_t const n = num_atoms;
-
     // bond vectors
-    float const r0x = p[tor.atom_i] - p[tor.atom_j];
-    float const r0y = p[n + tor.atom_i] - p[n + tor.atom_j];
-    float const r0z = p[2 * n + tor.atom_i] - p[2 * n + tor.atom_j];
-    float const r1x = p[tor.atom_k] - p[tor.atom_j];
-    float const r1y = p[n + tor.atom_k] - p[n + tor.atom_j];
-    float const r1z = p[2 * n + tor.atom_k] - p[2 * n + tor.atom_j];
-    float const r2x = -r1x, r2y = -r1y, r2z = -r1z;
-    float const r3x = p[tor.atom_l] - p[tor.atom_k];
-    float const r3y = p[n + tor.atom_l] - p[n + tor.atom_k];
-    float const r3z = p[2 * n + tor.atom_l] - p[2 * n + tor.atom_k];
+    float const bond_vec_0_x = positions[tor.atom_i] - positions[tor.atom_j];
+    float const bond_vec_0_y = positions[num_atoms + tor.atom_i] - positions[num_atoms + tor.atom_j];
+    float const bond_vec_0_z = positions[2 * num_atoms + tor.atom_i] - positions[2 * num_atoms + tor.atom_j];
+    float const bond_vec_1_x = positions[tor.atom_k] - positions[tor.atom_j];
+    float const bond_vec_1_y = positions[num_atoms + tor.atom_k] - positions[num_atoms + tor.atom_j];
+    float const bond_vec_1_z = positions[2 * num_atoms + tor.atom_k] - positions[2 * num_atoms + tor.atom_j];
+    float const bond_vec_2_x = -bond_vec_1_x, bond_vec_2_y = -bond_vec_1_y, bond_vec_2_z = -bond_vec_1_z;
+    float const bond_vec_3_x = positions[tor.atom_l] - positions[tor.atom_k];
+    float const bond_vec_3_y = positions[num_atoms + tor.atom_l] - positions[num_atoms + tor.atom_k];
+    float const bond_vec_3_z = positions[2 * num_atoms + tor.atom_l] - positions[2 * num_atoms + tor.atom_k];
 
     // normals
-    float t0x = r0y * r1z - r0z * r1y, t0y = r0z * r1x - r0x * r1z, t0z = r0x * r1y - r0y * r1x;
-    float const id0 = rsqrtf(fmaxf(t0x * t0x + t0y * t0y + t0z * t0z, 1e-10f));
-    t0x *= id0;
-    t0y *= id0;
-    t0z *= id0;
+    float normal_0_x = bond_vec_0_y * bond_vec_1_z - bond_vec_0_z * bond_vec_1_y;
+    float normal_0_y = bond_vec_0_z * bond_vec_1_x - bond_vec_0_x * bond_vec_1_z;
+    float normal_0_z = bond_vec_0_x * bond_vec_1_y - bond_vec_0_y * bond_vec_1_x;
+    float const inverse_normal_length_0 = rsqrtf(
+        fmaxf(normal_0_x * normal_0_x + normal_0_y * normal_0_y + normal_0_z * normal_0_z, 1e-10f));
+    normal_0_x *= inverse_normal_length_0;
+    normal_0_y *= inverse_normal_length_0;
+    normal_0_z *= inverse_normal_length_0;
 
-    float t1x = r2y * r3z - r2z * r3y, t1y = r2z * r3x - r2x * r3z, t1z = r2x * r3y - r2y * r3x;
-    float const id1 = rsqrtf(fmaxf(t1x * t1x + t1y * t1y + t1z * t1z, 1e-10f));
-    t1x *= id1;
-    t1y *= id1;
-    t1z *= id1;
+    float normal_1_x = bond_vec_2_y * bond_vec_3_z - bond_vec_2_z * bond_vec_3_y;
+    float normal_1_y = bond_vec_2_z * bond_vec_3_x - bond_vec_2_x * bond_vec_3_z;
+    float normal_1_z = bond_vec_2_x * bond_vec_3_y - bond_vec_2_y * bond_vec_3_x;
+    float const inverse_normal_length_1 = rsqrtf(
+        fmaxf(normal_1_x * normal_1_x + normal_1_y * normal_1_y + normal_1_z * normal_1_z, 1e-10f));
+    normal_1_x *= inverse_normal_length_1;
+    normal_1_y *= inverse_normal_length_1;
+    normal_1_z *= inverse_normal_length_1;
 
-    float const cos_phi = fmaxf(-1.0f, fminf(1.0f, t0x * t1x + t0y * t1y + t0z * t1z));
+    float const cos_phi = fmaxf(
+        -1.0f, fminf(1.0f, normal_0_x * normal_1_x + normal_0_y * normal_1_y + normal_0_z * normal_1_z));
 
-    // signed sin(φ) from the triple product (t0 × t1) · r1_hat
-    // r1 = bond j→k (the central bond), same direction as bond_jk
-    float const inv_r1_len = rsqrtf(fmaxf(r1x * r1x + r1y * r1y + r1z * r1z, 1e-10f));
-    float const cross_n_x = t0y * t1z - t0z * t1y;
-    float const cross_n_y = t0z * t1x - t0x * t1z;
-    float const cross_n_z = t0x * t1y - t0y * t1x;
-    float const sin_phi = (cross_n_x * r1x + cross_n_y * r1y + cross_n_z * r1z) * inv_r1_len;
+    // signed sin(φ) from the triple product (normal_0 × normal_1) · bond_vec_1_hat
+    float const inv_bond_vec_1_len = rsqrtf(
+        fmaxf(bond_vec_1_x * bond_vec_1_x + bond_vec_1_y * bond_vec_1_y + bond_vec_1_z * bond_vec_1_z, 1e-10f));
+    float const cross_n_x = normal_0_y * normal_1_z - normal_0_z * normal_1_y;
+    float const cross_n_y = normal_0_z * normal_1_x - normal_0_x * normal_1_z;
+    float const cross_n_z = normal_0_x * normal_1_y - normal_0_y * normal_1_x;
+    float const sin_phi = (cross_n_x * bond_vec_1_x + cross_n_y * bond_vec_1_y + cross_n_z * bond_vec_1_z) *
+                          inv_bond_vec_1_len;
 
     // energy (uses cos_phi only, sign-independent)
     float const cos2 = 2.0f * cos_phi * cos_phi - 1.0f;
     float const cos3 = cos_phi * (4.0f * cos_phi * cos_phi - 3.0f);
-    float const tor_energy = mmff_tor_pf *
+    float const tor_energy = mmff_torsion_prefactor_k *
                              (tor.v1 * (1.0f + cos_phi) + tor.v2 * (1.0f - cos2) + tor.v3 * (1.0f + cos3));
 
     if (role == atom_role_first_k) *energy += tor_energy;
@@ -353,7 +358,7 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
     // ∂E/∂φ = 0.5 * (-V1·sin(φ) + 2V2·sin(2φ) - 3V3·sin(3φ)) using SIGNED sin
     float const sin2 = 2.0f * sin_phi * cos_phi;
     float const sin3 = sin_phi * (3.0f - 4.0f * sin_phi * sin_phi);
-    float const energy_gradient_dihedral = mmff_tor_pf *
+    float const energy_gradient_dihedral = mmff_torsion_prefactor_k *
                                            (-tor.v1 * sin_phi + 2.0f * tor.v2 * sin2 - 3.0f * tor.v3 * sin3);
 
     float const abs_sin = fabsf(sin_phi);
@@ -361,32 +366,48 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
     float const sin_term = (abs_sin < 1e-8f) ? (-energy_gradient_dihedral / cos_phi)
                                              : (-energy_gradient_dihedral / sin_phi);
 
-    float const dc[6] = {
-        id0 * (t1x - cos_phi * t0x), id0 * (t1y - cos_phi * t0y), id0 * (t1z - cos_phi * t0z),
-        id1 * (t0x - cos_phi * t1x), id1 * (t0y - cos_phi * t1y), id1 * (t0z - cos_phi * t1z),
+    float const cosine_gradient[6] = {
+        inverse_normal_length_0 * (normal_1_x - cos_phi * normal_0_x),
+        inverse_normal_length_0 * (normal_1_y - cos_phi * normal_0_y),
+        inverse_normal_length_0 * (normal_1_z - cos_phi * normal_0_z),
+        inverse_normal_length_1 * (normal_0_x - cos_phi * normal_1_x),
+        inverse_normal_length_1 * (normal_0_y - cos_phi * normal_1_y),
+        inverse_normal_length_1 * (normal_0_z - cos_phi * normal_1_z),
     };
 
     float force_x = 0.0f, force_y = 0.0f, force_z = 0.0f;
     switch (role) {
     case atom_role_first_k:
-        force_x = sin_term * (dc[2] * r1y - dc[1] * r1z);
-        force_y = sin_term * (dc[0] * r1z - dc[2] * r1x);
-        force_z = sin_term * (dc[1] * r1x - dc[0] * r1y);
+        force_x = sin_term * (cosine_gradient[2] * bond_vec_1_y - cosine_gradient[1] * bond_vec_1_z);
+        force_y = sin_term * (cosine_gradient[0] * bond_vec_1_z - cosine_gradient[2] * bond_vec_1_x);
+        force_z = sin_term * (cosine_gradient[1] * bond_vec_1_x - cosine_gradient[0] * bond_vec_1_y);
         break;
     case atom_role_second_k:
-        force_x = sin_term * (dc[1] * (r1z - r0z) + dc[2] * (r0y - r1y) + dc[4] * (-r3z) + dc[5] * r3y);
-        force_y = sin_term * (dc[0] * (r0z - r1z) + dc[2] * (r1x - r0x) + dc[3] * r3z + dc[5] * (-r3x));
-        force_z = sin_term * (dc[0] * (r1y - r0y) + dc[1] * (r0x - r1x) + dc[3] * (-r3y) + dc[4] * r3x);
+        force_x = sin_term * (cosine_gradient[1] * (bond_vec_1_z - bond_vec_0_z) +
+                              cosine_gradient[2] * (bond_vec_0_y - bond_vec_1_y) +
+                              cosine_gradient[4] * (-bond_vec_3_z) + cosine_gradient[5] * bond_vec_3_y);
+        force_y = sin_term * (cosine_gradient[0] * (bond_vec_0_z - bond_vec_1_z) +
+                              cosine_gradient[2] * (bond_vec_1_x - bond_vec_0_x) + cosine_gradient[3] * bond_vec_3_z +
+                              cosine_gradient[5] * (-bond_vec_3_x));
+        force_z = sin_term * (cosine_gradient[0] * (bond_vec_1_y - bond_vec_0_y) +
+                              cosine_gradient[1] * (bond_vec_0_x - bond_vec_1_x) +
+                              cosine_gradient[3] * (-bond_vec_3_y) + cosine_gradient[4] * bond_vec_3_x);
         break;
     case atom_role_third_k:
-        force_x = sin_term * (dc[1] * r0z + dc[2] * (-r0y) + dc[4] * (r3z - r2z) + dc[5] * (r2y - r3y));
-        force_y = sin_term * (dc[0] * (-r0z) + dc[2] * r0x + dc[3] * (r2z - r3z) + dc[5] * (r3x - r2x));
-        force_z = sin_term * (dc[0] * r0y + dc[1] * (-r0x) + dc[3] * (r3y - r2y) + dc[4] * (r2x - r3x));
+        force_x = sin_term * (cosine_gradient[1] * bond_vec_0_z + cosine_gradient[2] * (-bond_vec_0_y) +
+                              cosine_gradient[4] * (bond_vec_3_z - bond_vec_2_z) +
+                              cosine_gradient[5] * (bond_vec_2_y - bond_vec_3_y));
+        force_y = sin_term * (cosine_gradient[0] * (-bond_vec_0_z) + cosine_gradient[2] * bond_vec_0_x +
+                              cosine_gradient[3] * (bond_vec_2_z - bond_vec_3_z) +
+                              cosine_gradient[5] * (bond_vec_3_x - bond_vec_2_x));
+        force_z = sin_term * (cosine_gradient[0] * bond_vec_0_y + cosine_gradient[1] * (-bond_vec_0_x) +
+                              cosine_gradient[3] * (bond_vec_3_y - bond_vec_2_y) +
+                              cosine_gradient[4] * (bond_vec_2_x - bond_vec_3_x));
         break;
     case atom_role_fourth_k:
-        force_x = sin_term * (dc[4] * r2z - dc[5] * r2y);
-        force_y = sin_term * (dc[5] * r2x - dc[3] * r2z);
-        force_z = sin_term * (dc[3] * r2y - dc[4] * r2x);
+        force_x = sin_term * (cosine_gradient[4] * bond_vec_2_z - cosine_gradient[5] * bond_vec_2_y);
+        force_y = sin_term * (cosine_gradient[5] * bond_vec_2_x - cosine_gradient[3] * bond_vec_2_z);
+        force_z = sin_term * (cosine_gradient[3] * bond_vec_2_y - cosine_gradient[4] * bond_vec_2_x);
         break;
     }
     *gradient_x += force_x;
@@ -425,8 +446,8 @@ __device__ __forceinline__ float mmff_oop_energy_(float ix, float iy, float iz, 
     float const inv_n_len = rsqrtf(fmaxf(nx * nx + ny * ny + nz * nz, 1e-12f));
     float const inv_rji_len = rsqrtf(fmaxf(rji_x * rji_x + rji_y * rji_y + rji_z * rji_z, 1e-12f));
     float const sin_chi = fmaxf(-1.0f, fminf(1.0f, (rji_x * nx + rji_y * ny + rji_z * nz) * inv_rji_len * inv_n_len));
-    float const chi_deg = asinf(sin_chi) * mmff_rad2deg;
-    return 0.5f * mmff_angle_pf * oop.force_constant * chi_deg * chi_deg;
+    float const chi_deg = asinf(sin_chi) * mmff_radians_to_degrees_k;
+    return 0.5f * mmff_angle_prefactor_k * oop.force_constant * chi_deg * chi_deg;
 }
 
 /**
@@ -458,39 +479,40 @@ __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, s
     float const base_energy = mmff_oop_energy_(ix, iy, iz, jx, jy, jz, kx, ky, kz, lx, ly, lz, oop);
     if (role == atom_role_first_k) *energy += base_energy;
 
-    float3_mmff_t const atom_i_position = make_float3_mmff_(ix, iy, iz);
-    float3_mmff_t const atom_j_position = make_float3_mmff_(jx, jy, jz);
-    float3_mmff_t const atom_k_position = make_float3_mmff_(kx, ky, kz);
-    float3_mmff_t const atom_l_position = make_float3_mmff_(lx, ly, lz);
+    float3 const atom_i_position = make_float3(ix, iy, iz);
+    float3 const atom_j_position = make_float3(jx, jy, jz);
+    float3 const atom_k_position = make_float3(kx, ky, kz);
+    float3 const atom_l_position = make_float3(lx, ly, lz);
 
-    float3_mmff_t const bond_ji = sub_float3_mmff_(atom_i_position, atom_j_position);
-    float3_mmff_t const bond_jk = sub_float3_mmff_(atom_k_position, atom_j_position);
-    float3_mmff_t const bond_jl = sub_float3_mmff_(atom_l_position, atom_j_position);
-    float3_mmff_t const plane_normal = cross_float3_mmff_(bond_jk, bond_jl);
+    float3 const bond_ji = sub_float3_(atom_i_position, atom_j_position);
+    float3 const bond_jk = sub_float3_(atom_k_position, atom_j_position);
+    float3 const bond_jl = sub_float3_(atom_l_position, atom_j_position);
+    float3 const plane_normal = cross_float3_(bond_jk, bond_jl);
 
-    float const inverse_bond_ji_length = rsqrtf(fmaxf(dot_float3_mmff_(bond_ji, bond_ji), 1e-12f));
-    float const inverse_plane_normal_length = rsqrtf(fmaxf(dot_float3_mmff_(plane_normal, plane_normal), 1e-12f));
+    float const inverse_bond_ji_length = rsqrtf(fmaxf(dot_float3_(bond_ji, bond_ji), 1e-12f));
+    float const inverse_plane_normal_length = rsqrtf(fmaxf(dot_float3_(plane_normal, plane_normal), 1e-12f));
 
-    float3_mmff_t const bond_ji_unit = scale_float3_mmff_(bond_ji, inverse_bond_ji_length);
-    float3_mmff_t const plane_normal_unit = scale_float3_mmff_(plane_normal, inverse_plane_normal_length);
+    float3 const bond_ji_unit = scale_float3_(bond_ji, inverse_bond_ji_length);
+    float3 const plane_normal_unit = scale_float3_(plane_normal, inverse_plane_normal_length);
 
-    float const sin_chi = fmaxf(-1.0f, fminf(1.0f, dot_float3_mmff_(bond_ji_unit, plane_normal_unit)));
-    float const chi_deg = asinf(sin_chi) * mmff_rad2deg;
+    float const sin_chi = fmaxf(-1.0f, fminf(1.0f, dot_float3_(bond_ji_unit, plane_normal_unit)));
+    float const chi_deg = asinf(sin_chi) * mmff_radians_to_degrees_k;
     float const inverse_cos_chi = rsqrtf(fmaxf(1.0f - sin_chi * sin_chi, 1e-10f));
-    float const energy_gradient_sin_chi = mmff_angle_pf * oop.force_constant * chi_deg * mmff_rad2deg * inverse_cos_chi;
+    float const energy_gradient_sin_chi = mmff_angle_prefactor_k * oop.force_constant * chi_deg *
+                                          mmff_radians_to_degrees_k * inverse_cos_chi;
 
-    float3_mmff_t const sin_chi_gradient_ji = scale_float3_mmff_(
-        sub_float3_mmff_(plane_normal_unit, scale_float3_mmff_(bond_ji_unit, sin_chi)), inverse_bond_ji_length);
-    float3_mmff_t const sin_chi_gradient_normal = scale_float3_mmff_(
-        sub_float3_mmff_(bond_ji_unit, scale_float3_mmff_(plane_normal_unit, sin_chi)), inverse_plane_normal_length);
-    float3_mmff_t const sin_chi_gradient_jk = cross_float3_mmff_(bond_jl, sin_chi_gradient_normal);
-    float3_mmff_t const sin_chi_gradient_jl = cross_float3_mmff_(sin_chi_gradient_normal, bond_jk);
+    float3 const sin_chi_gradient_ji = scale_float3_(
+        sub_float3_(plane_normal_unit, scale_float3_(bond_ji_unit, sin_chi)), inverse_bond_ji_length);
+    float3 const sin_chi_gradient_normal = scale_float3_(
+        sub_float3_(bond_ji_unit, scale_float3_(plane_normal_unit, sin_chi)), inverse_plane_normal_length);
+    float3 const sin_chi_gradient_jk = cross_float3_(bond_jl, sin_chi_gradient_normal);
+    float3 const sin_chi_gradient_jl = cross_float3_(sin_chi_gradient_normal, bond_jk);
 
-    float3_mmff_t const gradient_i = scale_float3_mmff_(sin_chi_gradient_ji, energy_gradient_sin_chi);
-    float3_mmff_t const gradient_k = scale_float3_mmff_(sin_chi_gradient_jk, energy_gradient_sin_chi);
-    float3_mmff_t const gradient_l = scale_float3_mmff_(sin_chi_gradient_jl, energy_gradient_sin_chi);
-    float3_mmff_t const gradient_j = scale_float3_mmff_(
-        add_float3_mmff_(add_float3_mmff_(sin_chi_gradient_ji, sin_chi_gradient_jk), sin_chi_gradient_jl),
+    float3 const gradient_i = scale_float3_(sin_chi_gradient_ji, energy_gradient_sin_chi);
+    float3 const gradient_k = scale_float3_(sin_chi_gradient_jk, energy_gradient_sin_chi);
+    float3 const gradient_l = scale_float3_(sin_chi_gradient_jl, energy_gradient_sin_chi);
+    float3 const gradient_j = scale_float3_(
+        add_float3_(add_float3_(sin_chi_gradient_ji, sin_chi_gradient_jk), sin_chi_gradient_jl),
         -energy_gradient_sin_chi);
 
     switch (role) {
@@ -557,11 +579,11 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
 
     float const delta_r_ij = rij_len - sb.equilibrium_distance_ij;
     float const delta_r_kj = rkj_len - sb.equilibrium_distance_kj;
-    float const delta_theta = (theta - sb.equilibrium_angle) * mmff_rad2deg; // in degrees
+    float const delta_theta = (theta - sb.equilibrium_angle) * mmff_radians_to_degrees_k; // in degrees
 
     // E = 2.5121 * (kba_ijk * Δr_ij + kba_kji * Δr_kj) * Δθ
     float const stretch_term = sb.kba_ijk * delta_r_ij + sb.kba_kji * delta_r_kj;
-    if (role == atom_role_first_k) *energy += mmff_stbn_pf * stretch_term * delta_theta;
+    if (role == atom_role_first_k) *energy += mmff_stretch_bend_prefactor_k * stretch_term * delta_theta;
 
     // gradient has two parts: ∂E/∂r (stretch) and ∂E/∂θ (bend)
     // ∂E/∂r_ij = 2.5121 * kba_ijk * Δθ * (r_ij_hat)
@@ -573,11 +595,11 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
                 p32_z = rkj_z * inverse_distance_kj;
 
     // stretch gradient component
-    float const energy_gradient_distance_ij = mmff_stbn_pf * sb.kba_ijk * delta_theta;
-    float const energy_gradient_distance_kj = mmff_stbn_pf * sb.kba_kji * delta_theta;
+    float const energy_gradient_distance_ij = mmff_stretch_bend_prefactor_k * sb.kba_ijk * delta_theta;
+    float const energy_gradient_distance_kj = mmff_stretch_bend_prefactor_k * sb.kba_kji * delta_theta;
 
     // bend gradient component: ∂E/∂θ * dtheta/dr
-    float const energy_gradient_angle = mmff_stbn_pf * stretch_term * mmff_rad2deg;
+    float const energy_gradient_angle = mmff_stretch_bend_prefactor_k * stretch_term * mmff_radians_to_degrees_k;
     float const bend_factor = energy_gradient_angle * (-inverse_sine);
 
     if (role == atom_role_first_k) { // first atom:
@@ -635,13 +657,13 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
     std::uint32_t num_atoms, float const *positions, float *gradient, std::uint32_t num_elements, std::uint32_t lane) {
 
     if constexpr (write_gradient) {
-        for (std::uint32_t i = lane; i < num_elements; i += warp_size) gradient[i] = 0.0f;
-        __syncwarp(full_mask);
+        for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) gradient[i] = 0.0f;
+        __syncwarp(full_mask_k);
     }
 
     float total_energy = 0.0f;
 
-    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size) {
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
         float gradient_x = 0.0f, gradient_y = 0.0f, gradient_z = 0.0f;
         auto const &offsets = atom_offsets[atom];
         mmff94_atom_vdw_params_t const p_atom = atom_vdw_params[atom];

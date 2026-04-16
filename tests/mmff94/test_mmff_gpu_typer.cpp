@@ -26,6 +26,7 @@
 
 #include "smallfield/mmff94/mmff94_typer.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
+#include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "test_mmff_gpu_typer_kernels.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 

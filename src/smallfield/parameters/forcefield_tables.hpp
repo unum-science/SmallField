@@ -23,7 +23,11 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield::parameters {
-using namespace smallfield::types;
+using smallfield::types::hybridization_sp2_k;
+using smallfield::types::hybridization_sp3_k;
+using smallfield::types::hybridization_sp3d2_k;
+using smallfield::types::hybridization_sp3d_k;
+using smallfield::types::hybridization_sp_k;
 
 /** Covalent radius in Å, indexed by atomic number (0-54 covers drug-like space). */
 inline constexpr std::array<float, 55> covalent_radius_angstrom_k = []() {

@@ -40,15 +40,28 @@
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::api {
-using namespace smallfield::types;
+using smallfield::types::chiral_center_descriptor_t;
+using smallfield::types::distance_constraint_t;
+using smallfield::types::etk_atom_interaction_t;
+using smallfield::types::etk_atom_offsets_t;
+using smallfield::types::etk_torsion_descriptor_t;
+using smallfield::types::etkdg_molecule_metadata_t;
+using smallfield::types::mmff94_angle_t;
+using smallfield::types::mmff94_atom_interaction_t;
+using smallfield::types::mmff94_atom_offsets_t;
+using smallfield::types::mmff94_atom_vdw_params_t;
+using smallfield::types::mmff94_bond_t;
+using smallfield::types::mmff94_oop_t;
+using smallfield::types::mmff94_stretchbend_t;
+using smallfield::types::mmff94_torsion_t;
 
 /** Grow-only RAII byte buffer, parameterized by the allocator / deallocator pair. */
-template <typename Alloc, typename Dealloc>
+template <typename allocator_, typename deallocator_>
 class byte_buffer_t {
     std::byte *ptr_ = nullptr;
     std::size_t bytes_ = 0;
-    [[no_unique_address]] Alloc alloc_;
-    [[no_unique_address]] Dealloc dealloc_;
+    [[no_unique_address]] allocator_ alloc_;
+    [[no_unique_address]] deallocator_ dealloc_;
 
   public:
     byte_buffer_t() noexcept = default;
@@ -187,23 +200,23 @@ constexpr std::size_t align_up_bytes_(std::size_t value, std::size_t alignment) 
  *  cursor, return the aligned offset.  The caller assigns this into the
  *  layout's `offset_*` field.
  */
-template <typename T>
+template <typename element_>
 constexpr std::size_t place_region_(std::size_t &running_offset, std::size_t count) noexcept {
     running_offset = align_up_bytes_(running_offset, batch_layout_t::region_alignment);
     std::size_t const here = running_offset;
-    running_offset += count * sizeof(T);
+    running_offset += count * sizeof(element_);
     return here;
 }
 
 /** View a sub-region of a byte buffer as a typed span. */
-template <typename T, typename Buffer>
-std::span<T> span_at_(Buffer &buffer, std::size_t byte_offset, std::size_t count) noexcept {
-    return {reinterpret_cast<T *>(buffer.data() + byte_offset), count};
+template <typename element_, typename buffer_>
+std::span<element_> span_at_(buffer_ &buffer, std::size_t byte_offset, std::size_t count) noexcept {
+    return {reinterpret_cast<element_ *>(buffer.data() + byte_offset), count};
 }
 
-template <typename T, typename Buffer>
-std::span<T const> span_at_(Buffer const &buffer, std::size_t byte_offset, std::size_t count) noexcept {
-    return {reinterpret_cast<T const *>(buffer.data() + byte_offset), count};
+template <typename element_, typename buffer_>
+std::span<element_ const> span_at_(buffer_ const &buffer, std::size_t byte_offset, std::size_t count) noexcept {
+    return {reinterpret_cast<element_ const *>(buffer.data() + byte_offset), count};
 }
 
 /**
@@ -218,10 +231,10 @@ struct batch_pool_view_t {
     std::byte *base = nullptr;
     batch_layout_t const *layout = nullptr;
 
-    template <typename T>
-    std::span<T> region(std::size_t byte_offset, std::size_t count) const noexcept {
+    template <typename element_>
+    std::span<element_> region(std::size_t byte_offset, std::size_t count) const noexcept {
         if (!base) return {};
-        return {reinterpret_cast<T *>(base + byte_offset), count};
+        return {reinterpret_cast<element_ *>(base + byte_offset), count};
     }
 
     std::span<float> bounds_matrices() const noexcept {

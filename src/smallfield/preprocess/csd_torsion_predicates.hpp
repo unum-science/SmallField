@@ -31,10 +31,10 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield::preprocess {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::types;
+using smallfield::types::atom_flag_aromatic_k;
+using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::bond_flag_in_ring_k;
+using smallfield::types::molecule_descriptor_t;
 
 /**
  *  @brief Identifier for a compiled recursive SMARTS sub-query.

@@ -1,5 +1,5 @@
 /**
- *  @file etk_forcefield.cuh
+ *  @file etk_kernel.cuh
  *  @brief Atom-centric ETK torsion energy and gradient for warp-level L-BFGS.
  *
  *  Implements CSD-derived torsion Fourier potentials for ETKDG stage 7:
@@ -23,11 +23,15 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::cuda {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::preprocess;
-using namespace smallfield::types;
+using smallfield::types::atom_role_first_k;
+using smallfield::types::atom_role_fourth_k;
+using smallfield::types::atom_role_second_k;
+using smallfield::types::atom_role_third_k;
+using smallfield::types::distance_constraint_t;
+using smallfield::types::etk_atom_interaction_t;
+using smallfield::types::etk_atom_offsets_t;
+using smallfield::types::etk_torsion_descriptor_t;
+using smallfield::types::etk_torsion_k;
 
 /** Compute dihedral angle φ for atoms i-j-k-l. Returns radians in [-π, π]. */
 __device__ __forceinline__ float compute_dihedral_angle_(float const *positions, std::uint32_t num_atoms,
@@ -85,44 +89,47 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
                                                                etk_torsion_descriptor_t const &torsion,
                                                                std::uint32_t atom_role, float *grad_x, float *grad_y,
                                                                float *grad_z) {
-    std::uint8_t const ai = torsion.atom_indices[0];
-    std::uint8_t const aj = torsion.atom_indices[1];
-    std::uint8_t const ak = torsion.atom_indices[2];
-    std::uint8_t const al = torsion.atom_indices[3];
+    std::uint8_t const atom_i = torsion.atom_indices[0];
+    std::uint8_t const atom_j = torsion.atom_indices[1];
+    std::uint8_t const atom_k = torsion.atom_indices[2];
+    std::uint8_t const atom_l = torsion.atom_indices[3];
 
     // bond vectors
-    float const r0x = positions[ai] - positions[aj];
-    float const r0y = positions[num_atoms + ai] - positions[num_atoms + aj];
-    float const r0z = positions[2 * num_atoms + ai] - positions[2 * num_atoms + aj];
+    float const bond_vec_0_x = positions[atom_i] - positions[atom_j];
+    float const bond_vec_0_y = positions[num_atoms + atom_i] - positions[num_atoms + atom_j];
+    float const bond_vec_0_z = positions[2 * num_atoms + atom_i] - positions[2 * num_atoms + atom_j];
 
-    float const r1x = positions[ak] - positions[aj];
-    float const r1y = positions[num_atoms + ak] - positions[num_atoms + aj];
-    float const r1z = positions[2 * num_atoms + ak] - positions[2 * num_atoms + aj];
+    float const bond_vec_1_x = positions[atom_k] - positions[atom_j];
+    float const bond_vec_1_y = positions[num_atoms + atom_k] - positions[num_atoms + atom_j];
+    float const bond_vec_1_z = positions[2 * num_atoms + atom_k] - positions[2 * num_atoms + atom_j];
 
-    float const r2x = -r1x, r2y = -r1y, r2z = -r1z;
+    float const bond_vec_2_x = -bond_vec_1_x, bond_vec_2_y = -bond_vec_1_y, bond_vec_2_z = -bond_vec_1_z;
 
-    float const r3x = positions[al] - positions[ak];
-    float const r3y = positions[num_atoms + al] - positions[num_atoms + ak];
-    float const r3z = positions[2 * num_atoms + al] - positions[2 * num_atoms + ak];
+    float const bond_vec_3_x = positions[atom_l] - positions[atom_k];
+    float const bond_vec_3_y = positions[num_atoms + atom_l] - positions[num_atoms + atom_k];
+    float const bond_vec_3_z = positions[2 * num_atoms + atom_l] - positions[2 * num_atoms + atom_k];
 
     // normals
-    float t0x = r0y * r1z - r0z * r1y;
-    float t0y = r0z * r1x - r0x * r1z;
-    float t0z = r0x * r1y - r0y * r1x;
-    float const inverse_normal_length_0 = rsqrtf(fmaxf(t0x * t0x + t0y * t0y + t0z * t0z, 1e-10f));
-    t0x *= inverse_normal_length_0;
-    t0y *= inverse_normal_length_0;
-    t0z *= inverse_normal_length_0;
+    float normal_0_x = bond_vec_0_y * bond_vec_1_z - bond_vec_0_z * bond_vec_1_y;
+    float normal_0_y = bond_vec_0_z * bond_vec_1_x - bond_vec_0_x * bond_vec_1_z;
+    float normal_0_z = bond_vec_0_x * bond_vec_1_y - bond_vec_0_y * bond_vec_1_x;
+    float const inverse_normal_length_0 = rsqrtf(
+        fmaxf(normal_0_x * normal_0_x + normal_0_y * normal_0_y + normal_0_z * normal_0_z, 1e-10f));
+    normal_0_x *= inverse_normal_length_0;
+    normal_0_y *= inverse_normal_length_0;
+    normal_0_z *= inverse_normal_length_0;
 
-    float t1x = r2y * r3z - r2z * r3y;
-    float t1y = r2z * r3x - r2x * r3z;
-    float t1z = r2x * r3y - r2y * r3x;
-    float const inverse_normal_length_1 = rsqrtf(fmaxf(t1x * t1x + t1y * t1y + t1z * t1z, 1e-10f));
-    t1x *= inverse_normal_length_1;
-    t1y *= inverse_normal_length_1;
-    t1z *= inverse_normal_length_1;
+    float normal_1_x = bond_vec_2_y * bond_vec_3_z - bond_vec_2_z * bond_vec_3_y;
+    float normal_1_y = bond_vec_2_z * bond_vec_3_x - bond_vec_2_x * bond_vec_3_z;
+    float normal_1_z = bond_vec_2_x * bond_vec_3_y - bond_vec_2_y * bond_vec_3_x;
+    float const inverse_normal_length_1 = rsqrtf(
+        fmaxf(normal_1_x * normal_1_x + normal_1_y * normal_1_y + normal_1_z * normal_1_z, 1e-10f));
+    normal_1_x *= inverse_normal_length_1;
+    normal_1_y *= inverse_normal_length_1;
+    normal_1_z *= inverse_normal_length_1;
 
-    float const cos_phi = fmaxf(-1.0f, fminf(1.0f, t0x * t1x + t0y * t1y + t0z * t1z));
+    float const cos_phi = fmaxf(
+        -1.0f, fminf(1.0f, normal_0_x * normal_1_x + normal_0_y * normal_1_y + normal_0_z * normal_1_z));
     float const sin_phi_sq = 1.0f - cos_phi * cos_phi;
     float const sin_phi = (sin_phi_sq > 0.0f) ? sqrtf(sin_phi_sq) : 0.0f;
 
@@ -160,44 +167,53 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
                                : (-energy_second_gradient_dihedral / fmaxf(fabsf(cos_phi), 1e-10f));
 
     float const cosine_gradient[6] = {
-        inverse_normal_length_0 * (t1x - cos_phi * t0x), inverse_normal_length_0 * (t1y - cos_phi * t0y),
-        inverse_normal_length_0 * (t1z - cos_phi * t0z), inverse_normal_length_1 * (t0x - cos_phi * t1x),
-        inverse_normal_length_1 * (t0y - cos_phi * t1y), inverse_normal_length_1 * (t0z - cos_phi * t1z),
+        inverse_normal_length_0 * (normal_1_x - cos_phi * normal_0_x),
+        inverse_normal_length_0 * (normal_1_y - cos_phi * normal_0_y),
+        inverse_normal_length_0 * (normal_1_z - cos_phi * normal_0_z),
+        inverse_normal_length_1 * (normal_0_x - cos_phi * normal_1_x),
+        inverse_normal_length_1 * (normal_0_y - cos_phi * normal_1_y),
+        inverse_normal_length_1 * (normal_0_z - cos_phi * normal_1_z),
     };
 
     // Wilson B-matrix chain rule for the atom at atom_role
-    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    float force_x = 0.0f, force_y = 0.0f, force_z = 0.0f;
     switch (atom_role) {
     case atom_role_first_k:
-        fx = sin_term * (cosine_gradient[2] * r1y - cosine_gradient[1] * r1z);
-        fy = sin_term * (cosine_gradient[0] * r1z - cosine_gradient[2] * r1x);
-        fz = sin_term * (cosine_gradient[1] * r1x - cosine_gradient[0] * r1y);
+        force_x = sin_term * (cosine_gradient[2] * bond_vec_1_y - cosine_gradient[1] * bond_vec_1_z);
+        force_y = sin_term * (cosine_gradient[0] * bond_vec_1_z - cosine_gradient[2] * bond_vec_1_x);
+        force_z = sin_term * (cosine_gradient[1] * bond_vec_1_x - cosine_gradient[0] * bond_vec_1_y);
         break;
     case atom_role_second_k:
-        fx = sin_term * (cosine_gradient[1] * (r1z - r0z) + cosine_gradient[2] * (r0y - r1y) +
-                         cosine_gradient[4] * (-r3z) + cosine_gradient[5] * r3y);
-        fy = sin_term * (cosine_gradient[0] * (r0z - r1z) + cosine_gradient[2] * (r1x - r0x) +
-                         cosine_gradient[3] * r3z + cosine_gradient[5] * (-r3x));
-        fz = sin_term * (cosine_gradient[0] * (r1y - r0y) + cosine_gradient[1] * (r0x - r1x) +
-                         cosine_gradient[3] * (-r3y) + cosine_gradient[4] * r3x);
+        force_x = sin_term * (cosine_gradient[1] * (bond_vec_1_z - bond_vec_0_z) +
+                              cosine_gradient[2] * (bond_vec_0_y - bond_vec_1_y) +
+                              cosine_gradient[4] * (-bond_vec_3_z) + cosine_gradient[5] * bond_vec_3_y);
+        force_y = sin_term * (cosine_gradient[0] * (bond_vec_0_z - bond_vec_1_z) +
+                              cosine_gradient[2] * (bond_vec_1_x - bond_vec_0_x) + cosine_gradient[3] * bond_vec_3_z +
+                              cosine_gradient[5] * (-bond_vec_3_x));
+        force_z = sin_term * (cosine_gradient[0] * (bond_vec_1_y - bond_vec_0_y) +
+                              cosine_gradient[1] * (bond_vec_0_x - bond_vec_1_x) +
+                              cosine_gradient[3] * (-bond_vec_3_y) + cosine_gradient[4] * bond_vec_3_x);
         break;
     case atom_role_third_k:
-        fx = sin_term * (cosine_gradient[1] * r0z + cosine_gradient[2] * (-r0y) + cosine_gradient[4] * (r3z - r2z) +
-                         cosine_gradient[5] * (r2y - r3y));
-        fy = sin_term * (cosine_gradient[0] * (-r0z) + cosine_gradient[2] * r0x + cosine_gradient[3] * (r2z - r3z) +
-                         cosine_gradient[5] * (r3x - r2x));
-        fz = sin_term * (cosine_gradient[0] * r0y + cosine_gradient[1] * (-r0x) + cosine_gradient[3] * (r3y - r2y) +
-                         cosine_gradient[4] * (r2x - r3x));
+        force_x = sin_term * (cosine_gradient[1] * bond_vec_0_z + cosine_gradient[2] * (-bond_vec_0_y) +
+                              cosine_gradient[4] * (bond_vec_3_z - bond_vec_2_z) +
+                              cosine_gradient[5] * (bond_vec_2_y - bond_vec_3_y));
+        force_y = sin_term * (cosine_gradient[0] * (-bond_vec_0_z) + cosine_gradient[2] * bond_vec_0_x +
+                              cosine_gradient[3] * (bond_vec_2_z - bond_vec_3_z) +
+                              cosine_gradient[5] * (bond_vec_3_x - bond_vec_2_x));
+        force_z = sin_term * (cosine_gradient[0] * bond_vec_0_y + cosine_gradient[1] * (-bond_vec_0_x) +
+                              cosine_gradient[3] * (bond_vec_3_y - bond_vec_2_y) +
+                              cosine_gradient[4] * (bond_vec_2_x - bond_vec_3_x));
         break;
     case atom_role_fourth_k:
-        fx = sin_term * (cosine_gradient[4] * r2z - cosine_gradient[5] * r2y);
-        fy = sin_term * (cosine_gradient[5] * r2x - cosine_gradient[3] * r2z);
-        fz = sin_term * (cosine_gradient[3] * r2y - cosine_gradient[4] * r2x);
+        force_x = sin_term * (cosine_gradient[4] * bond_vec_2_z - cosine_gradient[5] * bond_vec_2_y);
+        force_y = sin_term * (cosine_gradient[5] * bond_vec_2_x - cosine_gradient[3] * bond_vec_2_z);
+        force_z = sin_term * (cosine_gradient[3] * bond_vec_2_y - cosine_gradient[4] * bond_vec_2_x);
         break;
     }
-    *grad_x += fx;
-    *grad_y += fy;
-    *grad_z += fz;
+    *grad_x += force_x;
+    *grad_y += force_y;
+    *grad_z += force_z;
     return energy;
 }
 
@@ -227,13 +243,13 @@ __device__ __forceinline__ float evaluate_etk_torsion_energy(
     std::uint32_t num_atoms, float const *positions, float *gradient, std::uint32_t num_elements, std::uint32_t lane) {
 
     if constexpr (write_gradient) {
-        for (std::uint32_t i = lane; i < num_elements; i += warp_size) gradient[i] = 0.0f;
-        __syncwarp(full_mask);
+        for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) gradient[i] = 0.0f;
+        __syncwarp(full_mask_k);
     }
 
     float total_energy = 0.0f;
 
-    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size) {
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
         float gradient_x = 0.0f, gradient_y = 0.0f, gradient_z = 0.0f;
 
         std::uint32_t const interaction_start = atom_offsets[atom].interaction_start;

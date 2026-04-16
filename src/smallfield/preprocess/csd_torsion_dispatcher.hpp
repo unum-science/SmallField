@@ -1,5 +1,5 @@
 /**
- *  @file csd_torsion_extract.hpp
+ *  @file csd_torsion_dispatcher.hpp
  *  @brief Native CSD torsion extraction with element prefiltering.
  *
  *  Replaces ForceFields::CrystalFF::getExperimentalTorsions() with a matching loop
@@ -49,10 +49,14 @@
 #include "smallfield/preprocess/scaffold_cache.hpp"
 
 namespace smallfield::preprocess {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::types;
+using smallfield::types::atom_flag_aromatic_k;
+using smallfield::types::atom_has_flag;
+using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::etk_torsion_descriptor_t;
+using smallfield::types::hybridization_sp2_k;
+using smallfield::types::max_atoms_k;
+using smallfield::types::max_bonds_k;
+using smallfield::types::molecule_descriptor_t;
 
 /** Compiled CSD torsion pattern. */
 struct csd_compiled_pattern_t {

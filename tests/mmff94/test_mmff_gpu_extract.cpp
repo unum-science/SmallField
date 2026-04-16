@@ -26,8 +26,10 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
 #include "smallfield/mmff94/mmff94_cpu.hpp"
+#include "smallfield/mmff94/mmff94_cpu_extract.hpp"
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"
+#include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "test_mmff_gpu_extract_kernels.hpp"
 #include "smallfield/types/etkdg_types.hpp"

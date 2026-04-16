@@ -60,10 +60,63 @@
 #include "smallfield/preprocess/cip_ranks.hpp"
 
 namespace smallfield::preprocess {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::types;
+using smallfield::api::batch_layout_t;
+using smallfield::api::batch_pool_t;
+using smallfield::api::place_region_;
+using smallfield::mmff94::make_angle_key_;
+using smallfield::mmff94::make_bond_stretch_key_;
+using smallfield::mmff94::make_oop_key_;
+using smallfield::mmff94::make_stretchbend_key_;
+using smallfield::mmff94::make_torsion_key_;
+using smallfield::mmff94::mmff_angle_cache;
+using smallfield::mmff94::mmff_angle_cached_t;
+using smallfield::mmff94::mmff_bond_cache;
+using smallfield::mmff94::mmff_bond_cached_t;
+using smallfield::mmff94::mmff_oop_cache;
+using smallfield::mmff94::mmff_oop_cached_t;
+using smallfield::mmff94::mmff_stretchbend_cache;
+using smallfield::mmff94::mmff_stretchbend_cached_t;
+using smallfield::mmff94::mmff_torsion_cache;
+using smallfield::mmff94::mmff_torsion_cached_t;
+using smallfield::mmff94::pack_bond_signature_;
+using smallfield::parameters::ideal_angle_radians;
+using smallfield::parameters::ideal_bond_length_angstrom;
+using smallfield::parameters::vdw_lower_bound_angstrom;
+using smallfield::types::atom_flag_aromatic_k;
+using smallfield::types::atom_has_flag;
+using smallfield::types::atom_role_first_k;
+using smallfield::types::atom_role_fourth_k;
+using smallfield::types::atom_role_second_k;
+using smallfield::types::atom_role_third_k;
+using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::bond_flag_in_ring_k;
+using smallfield::types::build_descriptor;
+using smallfield::types::chiral_center_descriptor_t;
+using smallfield::types::distance_constraint_t;
+using smallfield::types::etk_atom_interaction_t;
+using smallfield::types::etk_atom_offsets_t;
+using smallfield::types::etk_distance_constraint_k;
+using smallfield::types::etk_torsion_descriptor_t;
+using smallfield::types::etk_torsion_k;
+using smallfield::types::etkdg_molecule_metadata_t;
+using smallfield::types::hybridization_sp2_k;
+using smallfield::types::max_atoms_k;
+using smallfield::types::max_bonds_k;
+using smallfield::types::mmff94_angle_center_k;
+using smallfield::types::mmff94_angle_end_k;
+using smallfield::types::mmff94_angle_t;
+using smallfield::types::mmff94_atom_interaction_t;
+using smallfield::types::mmff94_atom_offsets_t;
+using smallfield::types::mmff94_atom_vdw_params_t;
+using smallfield::types::mmff94_bond_k;
+using smallfield::types::mmff94_bond_t;
+using smallfield::types::mmff94_oop_t;
+using smallfield::types::mmff94_out_of_plane_k;
+using smallfield::types::mmff94_stretch_bend_k;
+using smallfield::types::mmff94_stretchbend_t;
+using smallfield::types::mmff94_torsion_k;
+using smallfield::types::mmff94_torsion_t;
+using smallfield::types::molecule_descriptor_t;
 
 // Forward declaration — actual definition in scaffold_cache.hpp. Threaded
 // through the prep call chain as an opaque pointer to avoid pulling the
@@ -1054,10 +1107,10 @@ inline per_mol_sizes_t extract_sizes(etkdg_prepared_molecule_t const &p) {
  *  because every output type is trivially copyable POD; the static_assert keeps us
  *  honest if that ever changes.
  */
-template <typename T>
-inline void append_slice(std::span<T> dst, std::uint32_t offset, std::vector<T> const &src) {
-    static_assert(std::is_trivially_copyable_v<T>, "append_slice requires trivially-copyable elements");
-    if (!src.empty()) std::memcpy(dst.data() + offset, src.data(), src.size() * sizeof(T));
+template <typename element_>
+inline void append_slice(std::span<element_> dst, std::uint32_t offset, std::vector<element_> const &src) {
+    static_assert(std::is_trivially_copyable_v<element_>, "append_slice requires trivially-copyable elements");
+    if (!src.empty()) std::memcpy(dst.data() + offset, src.data(), src.size() * sizeof(element_));
 }
 
 /** Build the per-molecule metadata entry with batch-wide offsets baked in. */

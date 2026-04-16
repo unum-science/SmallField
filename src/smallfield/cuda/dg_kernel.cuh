@@ -1,5 +1,5 @@
 /**
- *  @file dg_forcefield.cuh
+ *  @file dg_kernel.cuh
  *  @brief Atom-centric distance geometry energy and gradient for warp-level L-BFGS.
  *
  *  Implements the DG violation energy used in ETKDG stages 4 and 6:
@@ -30,11 +30,7 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::cuda {
-using namespace smallfield::api;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::preprocess;
-using namespace smallfield::types;
+using smallfield::types::chiral_center_descriptor_t;
 
 /**
  *  @brief Compute the signed tetrahedral volume for one chiral center.
@@ -94,7 +90,7 @@ __device__ __forceinline__ bool validate_chirality_(float const *positions, std:
                                                     chiral_center_descriptor_t const *chiral_centers,
                                                     std::uint32_t num_chiral_centers, std::uint32_t lane) {
     bool lane_ok = true;
-    for (std::uint32_t c = lane; c < num_chiral_centers; c += warp_size) {
+    for (std::uint32_t c = lane; c < num_chiral_centers; c += warp_size_k) {
         auto const &center = chiral_centers[c];
         float const volume = compute_signed_tetrahedral_volume_(positions, num_atoms, center.center_atom,
                                                                 center.neighbor_atoms[0], center.neighbor_atoms[1],
@@ -102,7 +98,7 @@ __device__ __forceinline__ bool validate_chirality_(float const *positions, std:
         std::int8_t const actual_sign = (volume > 0.0f) ? 1 : -1;
         if (actual_sign != center.target_sign) lane_ok = false;
     }
-    return __ballot_sync(full_mask, lane_ok) == full_mask;
+    return __ballot_sync(full_mask_k, lane_ok) == full_mask_k;
 }
 
 /**
@@ -141,11 +137,11 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
     float const *positions, float *gradient, std::uint32_t num_elements, std::uint32_t lane) {
 
     std::uint32_t const dim = spatial_dimension;
-    std::uint32_t const num_tiles = (num_atoms + warp_size - 1) / warp_size;
+    std::uint32_t const num_tiles = (num_atoms + warp_size_k - 1) / warp_size_k;
 
     if constexpr (write_gradient) {
-        for (std::uint32_t i = lane; i < num_elements; i += warp_size) gradient[i] = 0.0f;
-        __syncwarp(full_mask);
+        for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) gradient[i] = 0.0f;
+        __syncwarp(full_mask_k);
     }
 
     float total_energy = 0.0f;
@@ -153,7 +149,7 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
     // process atoms in 32-atom tiles
     // for each tile of "owned" atoms, iterate all other atoms via shuffle tiles
     for (std::uint32_t tile_a = 0; tile_a < num_tiles; ++tile_a) {
-        std::uint32_t const atom = tile_a * warp_size + lane;
+        std::uint32_t const atom = tile_a * warp_size_k + lane;
         bool const atom_valid = atom < num_atoms;
 
         // load this tile's coordinates into registers
@@ -167,7 +163,7 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
 
         // iterate all other atoms in tiles
         for (std::uint32_t tile_b = 0; tile_b < num_tiles; ++tile_b) {
-            std::uint32_t const other_base = tile_b * warp_size;
+            std::uint32_t const other_base = tile_b * warp_size_k;
 
             // load tile_b's coordinates into registers for shuffling
             float coord_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -177,16 +173,16 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
             }
 
             // each lane broadcasts one atom from tile_b
-            // all lanes MUST participate in __shfl_sync (full_mask),
+            // all lanes MUST participate in __shfl_sync (full_mask_k),
             // so shuffles are outside the validity check
-            for (std::uint32_t slot = 0; slot < warp_size; ++slot) {
+            for (std::uint32_t slot = 0; slot < warp_size_k; ++slot) {
                 std::uint32_t const other = other_base + slot;
 
                 // all lanes participate in shuffles
-                float const bx = __shfl_sync(full_mask, coord_b[0], slot);
-                float const by = __shfl_sync(full_mask, coord_b[1], slot);
-                float const bz = __shfl_sync(full_mask, coord_b[2], slot);
-                float const bw = (dim == 4) ? __shfl_sync(full_mask, coord_b[3], slot) : 0.0f;
+                float const bx = __shfl_sync(full_mask_k, coord_b[0], slot);
+                float const by = __shfl_sync(full_mask_k, coord_b[1], slot);
+                float const bz = __shfl_sync(full_mask_k, coord_b[2], slot);
+                float const bw = (dim == 4) ? __shfl_sync(full_mask_k, coord_b[3], slot) : 0.0f;
 
                 // skip invalid pairs after shuffles
                 if (!atom_valid || other >= num_atoms || other == atom) continue;
@@ -258,39 +254,45 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
 
                 if constexpr (write_gradient) {
                     // dV/dr for this atom's role
-                    std::uint8_t const aa = center.center_atom;
-                    std::uint8_t const ab = center.neighbor_atoms[0];
-                    std::uint8_t const ac = center.neighbor_atoms[1];
-                    std::uint8_t const ad = center.neighbor_atoms[2];
+                    std::uint8_t const chiral_center_atom = center.center_atom;
+                    std::uint8_t const chiral_neighbor_a = center.neighbor_atoms[0];
+                    std::uint8_t const chiral_neighbor_b = center.neighbor_atoms[1];
+                    std::uint8_t const chiral_neighbor_c = center.neighbor_atoms[2];
                     float const scale = 2.0f * chiral_volume_weight * volume;
 
-                    float const edge_bx = positions[ab] - positions[aa];
-                    float const edge_by = positions[num_atoms + ab] - positions[num_atoms + aa];
-                    float const edge_bz = positions[2 * num_atoms + ab] - positions[2 * num_atoms + aa];
-                    float const edge_cx = positions[ac] - positions[aa];
-                    float const edge_cy = positions[num_atoms + ac] - positions[num_atoms + aa];
-                    float const edge_cz = positions[2 * num_atoms + ac] - positions[2 * num_atoms + aa];
-                    float const edge_dx = positions[ad] - positions[aa];
-                    float const edge_dy = positions[num_atoms + ad] - positions[num_atoms + aa];
-                    float const edge_dz = positions[2 * num_atoms + ad] - positions[2 * num_atoms + aa];
+                    float const edge_bx = positions[chiral_neighbor_a] - positions[chiral_center_atom];
+                    float const edge_by = positions[num_atoms + chiral_neighbor_a] -
+                                          positions[num_atoms + chiral_center_atom];
+                    float const edge_bz = positions[2 * num_atoms + chiral_neighbor_a] -
+                                          positions[2 * num_atoms + chiral_center_atom];
+                    float const edge_cx = positions[chiral_neighbor_b] - positions[chiral_center_atom];
+                    float const edge_cy = positions[num_atoms + chiral_neighbor_b] -
+                                          positions[num_atoms + chiral_center_atom];
+                    float const edge_cz = positions[2 * num_atoms + chiral_neighbor_b] -
+                                          positions[2 * num_atoms + chiral_center_atom];
+                    float const edge_dx = positions[chiral_neighbor_c] - positions[chiral_center_atom];
+                    float const edge_dy = positions[num_atoms + chiral_neighbor_c] -
+                                          positions[num_atoms + chiral_center_atom];
+                    float const edge_dz = positions[2 * num_atoms + chiral_neighbor_c] -
+                                          positions[2 * num_atoms + chiral_center_atom];
 
                     // dV/dr_b = c x d,  dV/dr_c = d x b,  dV/dr_d = b x c
-                    if (atom == ab) {
+                    if (atom == chiral_neighbor_a) {
                         grad_a[0] += scale * (edge_cy * edge_dz - edge_cz * edge_dy);
                         grad_a[1] += scale * (edge_cz * edge_dx - edge_cx * edge_dz);
                         grad_a[2] += scale * (edge_cx * edge_dy - edge_cy * edge_dx);
                     }
-                    else if (atom == ac) {
+                    else if (atom == chiral_neighbor_b) {
                         grad_a[0] += scale * (edge_dy * edge_bz - edge_dz * edge_by);
                         grad_a[1] += scale * (edge_dz * edge_bx - edge_dx * edge_bz);
                         grad_a[2] += scale * (edge_dx * edge_by - edge_dy * edge_bx);
                     }
-                    else if (atom == ad) {
+                    else if (atom == chiral_neighbor_c) {
                         grad_a[0] += scale * (edge_by * edge_cz - edge_bz * edge_cy);
                         grad_a[1] += scale * (edge_bz * edge_cx - edge_bx * edge_cz);
                         grad_a[2] += scale * (edge_bx * edge_cy - edge_by * edge_cx);
                     }
-                    else if (atom == aa) {
+                    else if (atom == chiral_center_atom) {
                         float const dvdb_x = edge_cy * edge_dz - edge_cz * edge_dy;
                         float const dvdb_y = edge_cz * edge_dx - edge_cx * edge_dz;
                         float const dvdb_z = edge_cx * edge_dy - edge_cy * edge_dx;
@@ -380,9 +382,8 @@ struct distance_geometry_energy_functor_t {
                                                  std::uint32_t lane) const {
         return evaluate_distance_geometry_energy<false>(
             bounds_matrix, mol_min, inv_scale, chiral_centers, num_atoms, num_chiral_centers, spatial_dimension,
-            upper_violation_weight,
-            lower_violation_weight, chiral_volume_weight, fourth_dimension_penalty_weight, positions, nullptr,
-            num_elements, lane);
+            upper_violation_weight, lower_violation_weight, chiral_volume_weight, fourth_dimension_penalty_weight,
+            positions, nullptr, num_elements, lane);
     }
 };
 
