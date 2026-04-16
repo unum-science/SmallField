@@ -138,8 +138,9 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     generation_config.num_conformers = num_conformers;
     generation_config.max_stereo_attempts = max_stereo_attempts;
 
-    // Allocate output buffers.
-    std::uint32_t const total_conformers = num_smiles * num_conformers;
+    // Allocate output buffers.  Use size_t arithmetic — the coordinate
+    // buffer for 10M × K=3 × 128 atoms × 3 dims exceeds UINT32_MAX elements.
+    std::size_t const total_conformers = static_cast<std::size_t>(num_smiles) * num_conformers;
     coords_out.resize(total_conformers * max_atoms * 3);
     energies_out.resize(total_conformers);
     status_out.resize(total_conformers);
@@ -180,8 +181,9 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     generation_config.num_conformers = num_conformers;
     generation_config.max_stereo_attempts = max_stereo_attempts;
 
-    // Allocate output buffers.
-    std::uint32_t const total_conformers = num_smiles * num_conformers;
+    // Allocate output buffers.  Use size_t arithmetic — the coordinate
+    // buffer for 10M × K=3 × 128 atoms × 3 dims exceeds UINT32_MAX elements.
+    std::size_t const total_conformers = static_cast<std::size_t>(num_smiles) * num_conformers;
     std::vector<__half> coords(total_conformers * max_atoms * 3);
     std::vector<float> energies(total_conformers);
     std::vector<sfapi::conformer_status_t> status(total_conformers);

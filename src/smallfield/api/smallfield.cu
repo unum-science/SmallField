@@ -367,8 +367,8 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         return meta_full[local_indices[a]].num_atoms < meta_full[local_indices[b]].num_atoms;
     });
 
-    std::uint32_t const total_conf = local_count * num_conformers;
-    std::uint32_t const total_coords = total_conf * max_atoms_per_molecule * 3;
+    std::size_t const total_conf = static_cast<std::size_t>(local_count) * num_conformers;
+    std::size_t const total_coords = total_conf * max_atoms_per_molecule * 3;
 
     // Region 1: batch-input mirror (target of the single H2D).
     // Region 2: sorted metadata subset (tiny H2D from pinned host_staging).
