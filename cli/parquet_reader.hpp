@@ -28,6 +28,6 @@ struct shard_data_t {
     std::uint64_t num_rows() const noexcept { return smiles.size(); }
 };
 
-bool read_shard(std::filesystem::path const &path, std::string const &smiles_column, shard_data_t &out);
+[[nodiscard]] bool read_shard(std::filesystem::path const &path, std::string const &smiles_column, shard_data_t &out);
 
 } // namespace smallfield::cli

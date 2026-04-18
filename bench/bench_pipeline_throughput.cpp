@@ -142,7 +142,8 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     sfapi::context_t gpu_context(std::span<int const>(&device_id, 1));
 
     auto const start_time = clock_type::now();
-    gpu_context.generate_conformers(smiles_views, generation_config, max_atoms, coords_out, energies_out, status_out);
+    (void)gpu_context.generate_conformers(smiles_views, generation_config, max_atoms, coords_out, energies_out,
+                                          status_out);
     auto const end_time = clock_type::now();
 
     double const elapsed_ms_value = std::chrono::duration<double, std::milli>(end_time - start_time).count();
@@ -199,7 +200,7 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     std::printf("  Using %zu GPUs\n", gpu_context.device_ids.size());
 
     auto const start_time = clock_type::now();
-    gpu_context.generate_conformers(smiles_views, generation_config, max_atoms, coords, energies, status);
+    (void)gpu_context.generate_conformers(smiles_views, generation_config, max_atoms, coords, energies, status);
     auto const end_time = clock_type::now();
 
     double const elapsed_ms_value = std::chrono::duration<double, std::milli>(end_time - start_time).count();

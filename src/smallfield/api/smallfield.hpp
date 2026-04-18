@@ -31,10 +31,10 @@
 #else
 // forward-declare for non-CUDA translation units
 struct __half;
-typedef void *cudaStream_t;
-typedef void *cusolverDnHandle_t;
-typedef void *syevjInfo_t;
-typedef void *cusolverDnParams_t;
+using cudaStream_t = void *;
+using cusolverDnHandle_t = void *;
+using syevjInfo_t = void *;
+using cusolverDnParams_t = void *;
 #endif
 
 #include <array>
@@ -190,9 +190,11 @@ struct context_t {
      *  @param[out] status_out Output per-conformer status. Size: molecules * conformers.
      *  @return Batch-level status (success if at least one conformer succeeded).
      */
-    conformer_status_t generate_conformers(std::span<std::string_view const> smiles, config_t const &config,
-                                           std::uint32_t max_atoms_per_molecule, std::span<__half> coordinates_out,
-                                           std::span<float> energies_out, std::span<conformer_status_t> status_out);
+    [[nodiscard]] conformer_status_t generate_conformers(std::span<std::string_view const> smiles,
+                                                         config_t const &config, std::uint32_t max_atoms_per_molecule,
+                                                         std::span<__half> coordinates_out,
+                                                         std::span<float> energies_out,
+                                                         std::span<conformer_status_t> status_out);
 };
 
 } // namespace smallfield::api

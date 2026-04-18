@@ -30,6 +30,6 @@ struct writer_inputs_t {
     std::span<float const> energies;
 };
 
-bool write_shard(std::filesystem::path const &path, writer_inputs_t const &inputs);
+[[nodiscard]] bool write_shard(std::filesystem::path const &path, writer_inputs_t const &inputs);
 
 } // namespace smallfield::cli

@@ -417,7 +417,12 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
         std::fill_n(buf->energies.data(), total_conformers, 0.0f);
         std::fill_n(buf->status.data(), total_conformers, sfapi::conformer_status_t::mmff_unconverged);
 
-        gpu_context.generate_conformers(
+        // Aggregate status is advisory only: per-conformer status sits in
+        // `buf->status` and that is what the fallback + writer act on.  Even
+        // a batch-level `mmff_unconverged` return may still have the majority
+        // of conformers succeed, so we discard the aggregate and let the
+        // per-conformer codes drive subsequent stages.
+        (void)gpu_context.generate_conformers(
             std::span<std::string_view const>(accumulator.combined_smiles), generation_config, config.max_atoms,
             std::span<__half>(buf->coordinates.data(), total_conformers * config.max_atoms * 3u),
             std::span<float>(buf->energies.data(), total_conformers),
