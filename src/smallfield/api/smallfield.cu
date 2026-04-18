@@ -628,11 +628,140 @@ void run_gpu_pipeline(int device_id, cudaStream_t stream, cusolverDnHandle_t sol
                       std::uint32_t max_stereo_attempts, std::uint32_t max_atoms_per_molecule, std::uint64_t seed,
                       std::span<__half> host_coords_out, std::span<float> host_energies_out,
                       std::span<conformer_status_t> host_status_out) {
+    cuda_error_sink_t const sink {};
     auto handle = launch_gpu_pipeline(device_id, stream, solver_handle, scratch, launch_buffers, batch, local_indices,
                                       num_conformers, max_stereo_attempts, max_atoms_per_molecule, seed,
                                       /*wave_base=*/0, /*sort_perm=*/ {}, host_coords_out, host_energies_out,
-                                      host_status_out);
+                                      host_status_out, sink);
     finalize_gpu_pipeline(std::move(handle));
+}
+
+/**
+ *  @brief Per-`embedding-wave` timing accumulator populated by `launch_wave`
+ *  and `finalize_wave`.  Pretty-printed by @ref print_wave_timeline_ at the
+ *  end of @ref generate_conformers when `logger.verbose_level >= 1`.
+ */
+struct wave_record_t {
+    std::uint32_t wave_idx;
+    std::uint32_t n_mol;
+    double prep_start_ms;     ///< host wall, ms relative to call start
+    double prep_end_ms;       ///< "
+    double launch_start_ms;   ///< "  (when launch_wave entered)
+    double launch_end_ms;     ///< "  (when launch_wave returned)
+    double finalize_start_ms; ///< "  (when finalize_wave entered for this wave)
+    double finalize_end_ms;   ///< "
+    std::vector<gpu_phase_ms_t> per_device_gpu;
+};
+
+/**
+ *  @brief Compute the target `embedding-wave` size in molecules.
+ *
+ *  Honours `config.wave_size` when non-zero; otherwise auto-sizes against the
+ *  smallest visible GPU's free VRAM (75 % budget, 6× headroom on top of the
+ *  per-molecule mirror + outputs estimate).  Clamps to [10 K, 400 K] and caps
+ *  per-GPU group size at 10 K so the cusolver batched-eigen workspace stays
+ *  reasonable at N=128 (~1 MB/molecule at that bin).
+ */
+static std::uint32_t compute_wave_size_(context_t const &ctx, config_t const &config,
+                                        std::uint32_t max_atoms_per_molecule, cuda_error_sink_t const &sink) {
+    if (config.wave_size != 0) return config.wave_size;
+
+    std::uint32_t const num_devices = static_cast<std::uint32_t>(ctx.device_ids.size());
+    std::uint32_t const num_conformers = config.num_conformers;
+
+    std::size_t smallest_free = 0;
+    std::size_t smallest_total = 0;
+    bool have_any = false;
+    for (std::size_t d = 0; d < ctx.device_ids.size(); ++d) {
+        if (!sink.check(cudaSetDevice(ctx.device_ids[d]), "cudaSetDevice(memgetinfo)")) continue;
+        std::size_t free_b = 0, total_b = 0;
+        if (!sink.check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo")) continue;
+        if (!have_any || free_b < smallest_free) smallest_free = free_b;
+        if (!have_any || total_b < smallest_total) smallest_total = total_b;
+        have_any = true;
+    }
+    // Leave 25 % of the free pool untouched for cusolver + peak spikes.
+    std::size_t const budget_bytes = have_any ? smallest_free * 3u / 4u
+                                              : (smallest_total > 0 ? smallest_total / 2u : 0u);
+
+    std::size_t const bytes_per_molecule =
+        estimate_per_molecule_batch_bytes(max_atoms_per_molecule) +
+        static_cast<std::size_t>(max_atoms_per_molecule) * num_conformers * 3u * sizeof(float) * 6u;
+
+    std::uint64_t auto_wave = 50'000;
+    if (bytes_per_molecule > 0 && budget_bytes > 0) auto_wave = budget_bytes / bytes_per_molecule;
+    if (auto_wave < 10'000u) auto_wave = 10'000u;
+    if (auto_wave > 400'000u) auto_wave = 400'000u;
+
+    // Cusolver batched eigen workspace in ensure_metric_scratch is the dominant
+    // per-GPU allocation (~1 MB/molecule at N=128).  Cap per-GPU group size at
+    // 10 K so even a 1-GPU run has headroom.  Matches the v8 working density.
+    constexpr std::uint64_t per_gpu_wave_cap = 10'000;
+    std::uint64_t const total_cap_from_cusolver = per_gpu_wave_cap * std::max<std::uint64_t>(num_devices, 1u);
+    if (auto_wave > total_cap_from_cusolver) auto_wave = total_cap_from_cusolver;
+    return static_cast<std::uint32_t>(auto_wave);
+}
+
+/**
+ *  @brief Build a descending-by-SMILES-length permutation of the input and
+ *  write the reordered SMILES views into @p sorted_smiles_storage.
+ *
+ *  Putting the smallest molecules in the last `embedding-wave` shortens the
+ *  tail: wave N's GPU work is the only fully unhidden wave-step (no wave N+1
+ *  to overlap with), so making wave N the cheapest shrinks overall wall.
+ *  `finalize_gpu_pipeline` folds this permutation into the same reorder that
+ *  undoes the per-GPU atom-count sort.
+ */
+static void sort_input_by_smiles_length_(std::span<std::string_view const> smiles,
+                                         std::vector<std::uint32_t> &sort_perm,
+                                         std::vector<std::string_view> &sorted_smiles_storage) {
+    std::uint32_t const num_input = static_cast<std::uint32_t>(smiles.size());
+    sort_perm.resize(num_input);
+    std::iota(sort_perm.begin(), sort_perm.end(), 0u);
+    std::sort(sort_perm.begin(), sort_perm.end(),
+              [smiles](std::uint32_t a, std::uint32_t b) { return smiles[a].size() > smiles[b].size(); });
+    sorted_smiles_storage.resize(num_input);
+    for (std::uint32_t k = 0; k < num_input; ++k) sorted_smiles_storage[k] = smiles[sort_perm[k]];
+}
+
+/**
+ *  @brief Verbose-tier-1 per-wave summary + verbose-tier-2 per-device
+ *  breakdown.  No-op when `logger.verbose_level < 1`.
+ */
+static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record_t> const &wave_records,
+                                 double total_wall_ms) {
+    if (logger.verbose_level < 1) return;
+    logger.trace("wave   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / "
+                 "download");
+    for (auto const &cr : wave_records) {
+        float gpu_max = 0.f, gpu_sum = 0.f, upload = 0.f, metric = 0.f, kernels = 0.f, download = 0.f;
+        std::uint32_t n_active = 0;
+        for (auto const &pd : cr.per_device_gpu) {
+            if (pd.total_ms <= 0.f) continue;
+            gpu_max = std::max(gpu_max, pd.total_ms);
+            gpu_sum += pd.total_ms;
+            upload += pd.upload_ms;
+            metric += pd.metric_ms;
+            kernels += pd.kernels_ms;
+            download += pd.download_ms;
+            ++n_active;
+        }
+        float const inv = n_active > 0 ? 1.f / static_cast<float>(n_active) : 0.f;
+        logger.trace("{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / "
+                     "{:>6.1f} / {:>6.1f}",
+                     cr.wave_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms,
+                     cr.launch_end_ms - cr.launch_start_ms, cr.finalize_end_ms - cr.finalize_start_ms,
+                     gpu_sum * inv, gpu_max, upload * inv, metric * inv, kernels * inv, download * inv);
+    }
+    logger.trace("wall {:.1f} ms", total_wall_ms);
+    for (auto const &cr : wave_records) {
+        for (std::uint32_t d = 0; d < cr.per_device_gpu.size(); ++d) {
+            auto const &pd = cr.per_device_gpu[d];
+            if (pd.total_ms <= 0.f) continue;
+            logger.trace2("  ck={} dev={}  upload={:.1f}  metric={:.1f}  kernels={:.1f}  download={:.1f}  total={:.1f}",
+                          cr.wave_idx, d, pd.upload_ms, pd.metric_ms, pd.kernels_ms, pd.download_ms, pd.total_ms);
+        }
+    }
 }
 
 conformer_status_t context_t::generate_conformers(std::span<std::string_view const> smiles, config_t const &config,
@@ -645,11 +774,9 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     std::uint32_t const num_input = static_cast<std::uint32_t>(smiles.size());
     std::uint32_t const num_conformers = config.num_conformers;
 
-    // Pre-initialize caller output buffers. `finalize_gpu_pipeline` writes only
+    // Pre-initialize caller output buffers.  `finalize_gpu_pipeline` writes only
     // into the slots whose molecules made it through preprocessing; the rest
-    // stay at these defaults (invalid_smiles / zero coords / zero energy). The
-    // single reorder inside finalize drops directly into caller space via the
-    // wave_base + sort_perm pair, so there is no second pass here.
+    // stay at these defaults (invalid_smiles / zero coords / zero energy).
     std::fill_n(status_out.begin(), status_out.size(), conformer_status_t::invalid_smiles);
     std::fill_n(energies_out.begin(), energies_out.size(), 0.0f);
     {
@@ -657,99 +784,27 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         std::fill_n(coordinates_out.begin(), coordinates_out.size(), zero);
     }
 
-    // Keep SMILES as string_view throughout — the single unavoidable std::string copy
-    // lives inside prepare_molecule at the RDKit::SmilesToMol call site.
-
-    // Sort molecules by descending SMILES length so the last wave contains the
-    // smallest molecules. At 8 GPUs the per-wave wall is dominated by
-    // max(CPU prep, GPU kernels). Chunk N's GPU work is the only fully unhidden
-    // phase (no wave N+1 to overlap with), so making wave N the cheapest shrinks
-    // the tail. SMILES length is a fast proxy for atom count. `finalize_gpu_pipeline`
-    // folds this permutation into the same reorder that undoes the per-GPU
-    // atom-count sort, so there's no separate unsort pass at call end.
-    std::vector<std::uint32_t> sort_perm(num_input);
-    std::iota(sort_perm.begin(), sort_perm.end(), 0u);
-    std::sort(sort_perm.begin(), sort_perm.end(),
-              [smiles](std::uint32_t a, std::uint32_t b) { return smiles[a].size() > smiles[b].size(); });
-    std::vector<std::string_view> sorted_smiles_storage(num_input);
-    for (std::uint32_t k = 0; k < num_input; ++k) sorted_smiles_storage[k] = smiles[sort_perm[k]];
+    // Sort SMILES by descending length so the last `embedding-wave` carries
+    // the smallest molecules — shortens the unhidden tail wave.
+    std::vector<std::uint32_t> sort_perm;
+    std::vector<std::string_view> sorted_smiles_storage;
+    sort_input_by_smiles_length_(smiles, sort_perm, sorted_smiles_storage);
     std::span<std::string_view const> smiles_view = sorted_smiles_storage;
     std::span<std::uint32_t const> const sort_perm_view = sort_perm;
 
     std::uint32_t const num_devices = static_cast<std::uint32_t>(device_ids.size());
-
-    // VRAM-aware wave sizing. Each wave lands device_pool_bytes + metric
-    // scratch on every GPU; the smallest GPU in the system caps our throughput.
-    // `cudaMemGetInfo` reports free VRAM at call time and accounts for whatever
-    // other contexts are consuming on that device right now. Empirically the
-    // per-molecule device footprint at max_atoms=128, K=1 hovers around
-    // ~4 KB/molecule for the mirror + outputs; leave 6× headroom for scratch +
-    // metric prepass gram+workspace which scale with group_size * N².
-    std::uint32_t wave_size_target = config.wave_size;
-    if (wave_size_target == 0) {
-        std::size_t smallest_free = 0;
-        std::size_t smallest_total = 0;
-        bool have_any = false;
-        for (std::size_t d = 0; d < device_ids.size(); ++d) {
-            if (!sink.check(cudaSetDevice(device_ids[d]), "cudaSetDevice(memgetinfo)")) continue;
-            std::size_t free_b = 0, total_b = 0;
-            if (!sink.check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo")) continue;
-            if (!have_any || free_b < smallest_free) smallest_free = free_b;
-            if (!have_any || total_b < smallest_total) smallest_total = total_b;
-            have_any = true;
-        }
-        std::size_t budget_bytes = 0;
-        if (have_any) {
-            // Leave 25% of the free pool untouched for cusolver + peak spikes.
-            budget_bytes = smallest_free * 3u / 4u;
-        }
-        else if (smallest_total > 0) { budget_bytes = smallest_total / 2u; }
-        std::size_t const bytes_per_molecule = estimate_per_molecule_batch_bytes(max_atoms_per_molecule) +
-                                               static_cast<std::size_t>(max_atoms_per_molecule) * num_conformers * 3u *
-                                                   sizeof(float) * 6u;
-        std::uint64_t auto_wave = 50'000;
-        if (bytes_per_molecule > 0 && budget_bytes > 0) auto_wave = budget_bytes / bytes_per_molecule;
-        // Clamp to a sane [10K, 400K] envelope.
-        if (auto_wave < 10'000u) auto_wave = 10'000u;
-        if (auto_wave > 400'000u) auto_wave = 400'000u;
-        // Cusolver batched eigen workspace in ensure_metric_scratch is the
-        // dominant per-GPU allocation: observed ~1 MB per molecule at N=128, so
-        // 50K molecules per GPU already eats 50 GB.  Cap the per-GPU group size
-        // at 10K so even a 1-GPU run leaves ample headroom for the batch mirror,
-        // coords buffers, and the metric-prepass scratch itself.  Matches the
-        // v8 working configuration's effective per-GPU density.
-        constexpr std::uint64_t per_gpu_wave_cap = 10'000;
-        std::uint64_t const total_cap_from_cusolver = per_gpu_wave_cap * std::max<std::uint64_t>(num_devices, 1u);
-        if (auto_wave > total_cap_from_cusolver) auto_wave = total_cap_from_cusolver;
-        wave_size_target = static_cast<std::uint32_t>(auto_wave);
-    }
+    std::uint32_t const wave_size_target = compute_wave_size_(*this, config, max_atoms_per_molecule, sink);
     this->logger.trace("generate_conformers: n={} K={} wave={} pipeline={}", num_input, num_conformers,
                        wave_size_target, num_input > wave_size_target * 3 / 2 ? "yes" : "no");
 
     bool const pipeline = num_input > wave_size_target * 3 / 2;
 
     // CRITICAL: keep the kernel stride fixed at the caller's max_atoms_per_molecule
-    // across ALL waves.  Earlier code shrank the stride to the first wave's observed
-    // max, which caused the finalize/kernel/output-buffer strides to diverge in
-    // multi-wave runs (the caller's buffer is sized for max_atoms_per_molecule but the
-    // kernel wrote with a smaller stride).  Symptoms were "illegal memory access" and
-    // "operation not supported on global/shared address space" in mmff_polish.
+    // across ALL waves.  Shrinking to the first wave's observed max caused
+    // "illegal memory access" in multi-wave runs where the caller's buffer is
+    // sized for max_atoms_per_molecule but the kernel wrote with a smaller stride.
     std::uint32_t const effective_max_atoms = max_atoms_per_molecule;
 
-    // Per-wave timing accumulator: one row per wave holding host-wall markers and
-    // per-device GPU phase elapsed times. Filled in launch_wave + finalize_wave;
-    // pretty-printed at the end of generate_conformers as an ASCII timeline.
-    struct wave_record_t {
-        std::uint32_t wave_idx;
-        std::uint32_t n_mol;
-        double prep_start_ms;     ///< host wall, ms relative to call start
-        double prep_end_ms;       ///<     "
-        double launch_start_ms;   ///<     "  (when launch_wave entered)
-        double launch_end_ms;     ///<     "  (when launch_wave returned)
-        double finalize_start_ms; ///<     "  (when finalize_wave entered for this wave)
-        double finalize_end_ms;   ///<     "
-        std::vector<gpu_phase_ms_t> per_device_gpu;
-    };
     std::vector<wave_record_t> wave_records;
     auto const t_call_start = std::chrono::high_resolution_clock::now();
     auto host_ms = [&](std::chrono::high_resolution_clock::time_point t) {
@@ -943,46 +998,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         wave_records[last_idx].per_device_gpu = timing_slots[last_idx % 2];
     }
 
-    // Per-wave summary (verbose tier 1) and per-device breakdown (tier 2).
-    // Skipped entirely in the default silent mode.
-    if (this->logger.verbose_level >= 1) {
-        double const total_wall_ms = host_ms(std::chrono::high_resolution_clock::now());
-        this->logger.trace(
-            "wave   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / " "download");
-        for (auto const &cr : wave_records) {
-            float gpu_max = 0.f, gpu_sum = 0.f, upload = 0.f, metric = 0.f, kernels = 0.f, download = 0.f;
-            std::uint32_t n_active = 0;
-            for (auto const &pd : cr.per_device_gpu) {
-                if (pd.total_ms <= 0.f) continue;
-                gpu_max = std::max(gpu_max, pd.total_ms);
-                gpu_sum += pd.total_ms;
-                upload += pd.upload_ms;
-                metric += pd.metric_ms;
-                kernels += pd.kernels_ms;
-                download += pd.download_ms;
-                ++n_active;
-            }
-            float const inv = n_active > 0 ? 1.f / static_cast<float>(n_active) : 0.f;
-            this->logger.trace(
-                "{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / " "{:>6.1f}" " "
-                                                                                                                     "/"
-                                                                                                                     " " "{:" ">6" ".1" "f" "}",
-                cr.wave_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms, cr.launch_end_ms - cr.launch_start_ms,
-                cr.finalize_end_ms - cr.finalize_start_ms, gpu_sum * inv, gpu_max, upload * inv, metric * inv,
-                kernels * inv, download * inv);
-        }
-        this->logger.trace("wall {:.1f} ms", total_wall_ms);
-        // Tier 2: per-device per-wave breakdown.
-        for (auto const &cr : wave_records) {
-            for (std::uint32_t d = 0; d < cr.per_device_gpu.size(); ++d) {
-                auto const &pd = cr.per_device_gpu[d];
-                if (pd.total_ms <= 0.f) continue;
-                this->logger.trace2(
-                    "  ck={} dev={}  upload={:.1f}  metric={:.1f}  kernels={:.1f}  download={:.1f}  total={:.1f}",
-                    cr.wave_idx, d, pd.upload_ms, pd.metric_ms, pd.kernels_ms, pd.download_ms, pd.total_ms);
-            }
-        }
-    }
+    print_wave_timeline_(this->logger, wave_records, host_ms(std::chrono::high_resolution_clock::now()));
 
     // All output permutation already happened inside `finalize_gpu_pipeline`:
     // each wave's per-GPU sort + the outer SMILES-length sort are folded into

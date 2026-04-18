@@ -22,6 +22,7 @@
 #pragma once
 
 #include <chrono>
+#include <concepts>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -55,11 +56,14 @@ inline std::locale const &grouping_locale() {
     return loc;
 }
 
-/** @brief `1234567 → "1,234,567"`.  Uses @ref grouping_locale. */
-inline std::string thousands(std::uint64_t v) { return fmt::format(grouping_locale(), "{:L}", v); }
-inline std::string thousands(std::int64_t v) { return fmt::format(grouping_locale(), "{:L}", v); }
-inline std::string thousands(std::size_t v) {
-    return fmt::format(grouping_locale(), "{:L}", static_cast<std::uint64_t>(v));
+/** @brief `1234567 → "1,234,567"`. Uses @ref grouping_locale. */
+template <typename integer_>
+    requires std::integral<integer_>
+inline std::string thousands(integer_ v) {
+    if constexpr (std::is_signed_v<integer_>)
+        return fmt::format(grouping_locale(), "{:L}", static_cast<std::int64_t>(v));
+    else
+        return fmt::format(grouping_locale(), "{:L}", static_cast<std::uint64_t>(v));
 }
 
 /** @brief Wall-clock `time_point` formatted as "YYYY-MM-DD HH:MM:SS" in local time. */
