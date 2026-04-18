@@ -1,16 +1,16 @@
 # Benchmark executables linking against the SmallField library + RDKit for cross-validation.
 
-add_executable(bench_pipeline_throughput bench_pipeline_throughput.cpp)
-set_source_files_properties(bench_pipeline_throughput.cpp PROPERTIES LANGUAGE CXX)
-target_link_libraries(bench_pipeline_throughput PRIVATE
+add_executable(bench_conformers bench_conformers.cpp)
+set_source_files_properties(bench_conformers.cpp PROPERTIES LANGUAGE CXX)
+target_link_libraries(bench_conformers PRIVATE
     smallfield_lib
     OpenMP::OpenMP_CXX
     $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
-target_include_directories(bench_pipeline_throughput PRIVATE
+target_include_directories(bench_conformers PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/test
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(bench_pipeline_throughput PROPERTIES
+set_target_properties(bench_conformers PROPERTIES
     LINKER_LANGUAGE CUDA)
 
 add_executable(bench_profile bench_profile.cpp)

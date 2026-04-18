@@ -16,7 +16,7 @@ See [`GLOSSARY.md`](GLOSSARY.md) for the canonical vocabulary used below (`parqu
 ## Method
 
 - Build: `cmake -S . -B build -DRDKIT_PREFIX=$CONDA_PREFIX -DSMALLFIELD_BUILD_BATCH_BINARY=ON`
-- Benchmark binary: `build/bench/bench_pipeline_throughput`
+- Benchmark binary: `build/bench/bench_conformers`
 - Allocator: `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2`
 - Primary dataset: USearch Molecules — 9,998,572 SMILES at `/tmp/usearch_10M.smi`, 1 M clean subset at `/tmp/usearch_1M_clean.smi`.
 - Multi-GPU runs use `--multi-gpu-only` from a fresh process.
@@ -144,7 +144,7 @@ Per-bin medians from the same quality sample:
 # USearch 10M production-scale sweep — 8 GPUs
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
 LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
-  ./build/bench/bench_pipeline_throughput \
+  ./build/bench/bench_conformers \
   --smi /tmp/usearch_10M.smi \
   --conformers 3 \
   --multi-gpu-only
@@ -153,14 +153,14 @@ LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
 CUDA_VISIBLE_DEVICES=0 \
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
 LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
-  ./build/bench/bench_pipeline_throughput \
+  ./build/bench/bench_conformers \
   --smi /tmp/usearch_1M_clean.smi \
   --conformers 1 \
   --multi-gpu-only
 
 # Quality check — ChEMBL 9K, 3 conformers, 256 samples
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
-  ./build/bench/bench_pipeline_throughput \
+  ./build/bench/bench_conformers \
   --smi /tmp/chembl_valid.smi \
   --conformers 3 \
   --quality-samples 256

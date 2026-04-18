@@ -80,10 +80,10 @@ coordinates_flat, energies, status = context.generate_conformers(
 ```bash
 cd build
 cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc) bench_pipeline_throughput
+make -j$(nproc) bench_conformers
 
 LD_LIBRARY_PATH=/path/to/conda/env/lib:$LD_LIBRARY_PATH \
-    ./bench/bench_pipeline_throughput --smi /path/to/chembl.smi
+    ./bench/bench_conformers --smi /path/to/chembl.smi
 ```
 
 Default mode reports RDKit CPU vs SmallField 1-GPU throughput plus an RDKit MMFF94 quality check.
