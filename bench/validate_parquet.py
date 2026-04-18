@@ -71,9 +71,7 @@ aggregate.add_row("failed", thousands(total_failed))
 if len(energies_all) > 0:
     aggregate.add_row("energy P50 kcal/mol", f"{np.median(energies_all):.1f}")
     aggregate.add_row("energy P95 kcal/mol", f"{np.percentile(energies_all, 95):.1f}")
-    aggregate.add_row(
-        "energy range kcal/mol", f"[{np.min(energies_all):.1f}, {np.max(energies_all):.1f}]"
-    )
+    aggregate.add_row("energy range kcal/mol", f"[{np.min(energies_all):.1f}, {np.max(energies_all):.1f}]")
 _default_log.console.print(aggregate)
 
 # RDKit cross-validation on a sample of successful conformers.
@@ -164,10 +162,6 @@ if energy_deltas:
     xval.add_row("energy Δ P50 kcal/mol", f"{np.median(deltas):.2f}")
     xval.add_row("energy Δ P95 kcal/mol", f"{np.percentile(deltas, 95):.2f}")
     xval.add_row("energy Δ max kcal/mol", f"{np.max(deltas):.2f}")
-    xval.add_row(
-        "within 1 kcal", f"{int(np.sum(deltas < 1.0))} / {len(deltas)} ({100 * np.mean(deltas < 1.0):.1f}%)"
-    )
-    xval.add_row(
-        "within 5 kcal", f"{int(np.sum(deltas < 5.0))} / {len(deltas)} ({100 * np.mean(deltas < 5.0):.1f}%)"
-    )
+    xval.add_row("within 1 kcal", f"{int(np.sum(deltas < 1.0))} / {len(deltas)} ({100 * np.mean(deltas < 1.0):.1f}%)")
+    xval.add_row("within 5 kcal", f"{int(np.sum(deltas < 5.0))} / {len(deltas)} ({100 * np.mean(deltas < 5.0):.1f}%)")
 _default_log.console.print(xval)

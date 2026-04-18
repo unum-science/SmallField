@@ -43,9 +43,7 @@ def bench_smallfield(gpu_ids, label):
     sf.generate_conformers(smiles[:100], num_conformers=num_conformers, device_ids=gpu_ids)
 
     t0 = time.perf_counter()
-    _coords, _energies, status = sf.generate_conformers(
-        smiles, num_conformers=num_conformers, device_ids=gpu_ids
-    )
+    _coords, _energies, status = sf.generate_conformers(smiles, num_conformers=num_conformers, device_ids=gpu_ids)
     total = time.perf_counter() - t0
 
     status_arr = np.array(status, dtype=np.uint8)

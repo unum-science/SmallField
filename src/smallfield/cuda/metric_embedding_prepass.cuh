@@ -463,9 +463,9 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(host_metadata.size());
     if (num_molecules == 0 || max_atoms_per_molecule == 0) return true;
 
-    if (!sink.check(cudaMemsetAsync(device_initial_coordinates, 0,
-                                    static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float),
-                                    stream),
+    if (!sink.check(cudaMemsetAsync(
+                        device_initial_coordinates, 0,
+                        static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float), stream),
                     "cudaMemsetAsync(metric coordinates)"))
         return false;
 
@@ -508,9 +508,9 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         std::size_t const group_size = group.size();
         if (group_size > scratch.max_group_size || bin_n > scratch.max_atoms) {
             if (sink.log != nullptr)
-                sink.log->error("metric_embedding_prepass: scratch too small (need group={} bin_n={}, have group={} "
-                                "atoms={})",
-                                group_size, bin_n, scratch.max_group_size, scratch.max_atoms);
+                sink.log->error(
+                    "metric_embedding_prepass: scratch too small (need group={} bin_n={}, have group={} " "atoms={})",
+                    group_size, bin_n, scratch.max_group_size, scratch.max_atoms);
             return false;
         }
 
@@ -521,13 +521,13 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         std::size_t const shared_bytes =
             static_cast<std::size_t>(bin_n * bin_n + bin_n + 1 + 4 * bin_n + bin_n + 4 + 1) * sizeof(float);
 
-        success &= sink.check(cudaMemcpyAsync(device_group_indices, group.data(),
-                                              group_size * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream),
+        success &= sink.check(cudaMemcpyAsync(device_group_indices, group.data(), group_size * sizeof(std::uint32_t),
+                                              cudaMemcpyHostToDevice, stream),
                               "cudaMemcpyAsync(bin group indices)");
-        success &= sink.check(cudaFuncSetAttribute(embed_4d_power_iter_kernel,
-                                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                   static_cast<int>(shared_bytes)),
-                              "cudaFuncSetAttribute(embed_4d_power_iter_kernel)");
+        success &= sink.check(
+            cudaFuncSetAttribute(embed_4d_power_iter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(shared_bytes)),
+            "cudaFuncSetAttribute(embed_4d_power_iter_kernel)");
         if (!success) continue;
 
         // One kernel launch replaces the smooth-and-build-gram + cusolverDnXsyevBatched +

@@ -563,15 +563,13 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
         // fragment is omitted when no molecule needed RDKit recovery.
         std::string fallback_fragment;
         if (result.fallback_attempted > 0)
-            fallback_fragment =
-                fmt::format("  fallback {}→{} rec", thousands(result.fallback_attempted),
-                            thousands(result.fallback_recovered));
+            fallback_fragment = fmt::format("  fallback {}→{} rec", thousands(result.fallback_attempted),
+                                            thousands(result.fallback_recovered));
 
-        logger.info("{:>4}/{:<4} done {:.0f}s  {} mol/s{}  cumulative {}  avg {} mol/s  ETA {}",
-                    thousands(files_done), thousands(counters.total_input_files), batch_seconds,
+        logger.info("{:>4}/{:<4} done {:.0f}s  {} mol/s{}  cumulative {}  avg {} mol/s  ETA {}", thousands(files_done),
+                    thousands(counters.total_input_files), batch_seconds,
                     thousands(static_cast<std::uint64_t>(num_molecules / std::max(batch_seconds, 0.001))),
-                    fallback_fragment, thousands(cumul_mol),
-                    thousands(static_cast<std::uint64_t>(cumul_rate)),
+                    fallback_fragment, thousands(cumul_mol), thousands(static_cast<std::uint64_t>(cumul_rate)),
                     smallfield::format_wall_time(eta_wall));
     }
 }
@@ -648,8 +646,8 @@ int main(int argc, char **argv) {
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - counters.start_time).count();
     std::uint64_t const done = counters.molecules_completed.load();
-    logger.info("complete  {} mols  {} mol/s",
-                thousands(done), thousands(static_cast<std::uint64_t>(done / std::max(total, 0.001))));
+    logger.info("complete  {} mols  {} mol/s", thousands(done),
+                thousands(static_cast<std::uint64_t>(done / std::max(total, 0.001))));
     std::uint64_t const cuda_errors = gpu_context.cuda_error_count.load();
     if (cuda_errors > 0) {
         logger.error("{} CUDA errors reported by the library — output is unreliable", thousands(cuda_errors));

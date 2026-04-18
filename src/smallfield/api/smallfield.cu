@@ -287,8 +287,8 @@ struct gpu_pipeline_handle_t {
     std::vector<std::uint32_t> order;
     std::vector<std::uint32_t> local_indices_copy;
     // Device-side output spans into scratch->device_pool.
-    std::span<float> device_coords_fp32 {};   ///< kernel output (fp32)
-    std::span<__half> device_coords_fp16 {};  ///< post-convert coords for D2H
+    std::span<float> device_coords_fp32 {};  ///< kernel output (fp32)
+    std::span<__half> device_coords_fp16 {}; ///< post-convert coords for D2H
     std::span<float> device_energies_out {};
     std::span<std::uint8_t> device_status_out {};
     // Pinned host-side readback spans into scratch->host_staging; finalize drains
@@ -406,7 +406,8 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
     }
     if (!launch_buffers.host_staging.ensure_capacity(host_pool_bytes)) {
         if (sink.log != nullptr)
-            sink.log->error("launch_gpu_pipeline: cudaHostAlloc({} bytes) failed on gpu {}", host_pool_bytes, device_id);
+            sink.log->error("launch_gpu_pipeline: cudaHostAlloc({} bytes) failed on gpu {}", host_pool_bytes,
+                            device_id);
         return handle;
     }
     auto _P_post_malloc = std::chrono::high_resolution_clock::now();
@@ -625,7 +626,7 @@ void run_gpu_pipeline(int device_id, cudaStream_t stream, cusolverDnHandle_t sol
                       std::span<conformer_status_t> host_status_out) {
     auto handle = launch_gpu_pipeline(device_id, stream, solver_handle, scratch, launch_buffers, batch, local_indices,
                                       num_conformers, max_stereo_attempts, max_atoms_per_molecule, seed,
-                                      /*chunk_base=*/0, /*sort_perm=*/{}, host_coords_out, host_energies_out,
+                                      /*chunk_base=*/0, /*sort_perm=*/ {}, host_coords_out, host_energies_out,
                                       host_status_out);
     finalize_gpu_pipeline(std::move(handle));
 }
@@ -699,9 +700,9 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
             budget_bytes = smallest_free * 3u / 4u;
         }
         else if (smallest_total > 0) { budget_bytes = smallest_total / 2u; }
-        std::size_t const bytes_per_molecule =
-            estimate_per_molecule_batch_bytes(max_atoms_per_molecule) + static_cast<std::size_t>(max_atoms_per_molecule) *
-                                                                            num_conformers * 3u * sizeof(float) * 6u;
+        std::size_t const bytes_per_molecule = estimate_per_molecule_batch_bytes(max_atoms_per_molecule) +
+                                               static_cast<std::size_t>(max_atoms_per_molecule) * num_conformers * 3u *
+                                                   sizeof(float) * 6u;
         std::uint64_t auto_chunk = 50'000;
         if (bytes_per_molecule > 0 && budget_bytes > 0) auto_chunk = budget_bytes / bytes_per_molecule;
         // Clamp to a sane [10K, 400K] envelope.
@@ -808,11 +809,10 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
             auto gpu_span = per_gpu_indices_span(d);
             if (gpu_span.empty()) continue;
             auto _lt0 = std::chrono::high_resolution_clock::now();
-            handles_out[d] = launch_gpu_pipeline(device_ids[d], streams[d], solvers[d], metric_scratch[d],
-                                                 *launch_scratch[d], batch, gpu_span, num_conformers,
-                                                 config.max_stereo_attempts, effective_max_atoms, config.random_seed,
-                                                 chunk_base, sort_perm_view, coordinates_out, energies_out, status_out,
-                                                 sink);
+            handles_out[d] = launch_gpu_pipeline(
+                device_ids[d], streams[d], solvers[d], metric_scratch[d], *launch_scratch[d], batch, gpu_span,
+                num_conformers, config.max_stereo_attempts, effective_max_atoms, config.random_seed, chunk_base,
+                sort_perm_view, coordinates_out, energies_out, status_out, sink);
             handles_out[d].timings_out = &timings_out[d];
             (void)_lt0;
         }
@@ -943,8 +943,8 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     // Skipped entirely in the default silent mode.
     if (this->logger.verbose_level >= 1) {
         double const total_wall_ms = host_ms(std::chrono::high_resolution_clock::now());
-        this->logger.trace("chunk   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / "
-                           "download");
+        this->logger.trace(
+            "chunk   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / " "download");
         for (auto const &cr : chunk_records) {
             float gpu_max = 0.f, gpu_sum = 0.f, upload = 0.f, metric = 0.f, kernels = 0.f, download = 0.f;
             std::uint32_t n_active = 0;
@@ -959,11 +959,13 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
                 ++n_active;
             }
             float const inv = n_active > 0 ? 1.f / static_cast<float>(n_active) : 0.f;
-            this->logger.trace("{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / "
-                               "{:>6.1f} / {:>6.1f}",
-                               cr.chunk_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms,
-                               cr.launch_end_ms - cr.launch_start_ms, cr.finalize_end_ms - cr.finalize_start_ms,
-                               gpu_sum * inv, gpu_max, upload * inv, metric * inv, kernels * inv, download * inv);
+            this->logger.trace(
+                "{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / " "{:>6.1f}" " "
+                                                                                                                     "/"
+                                                                                                                     " " "{:" ">6" ".1" "f" "}",
+                cr.chunk_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms, cr.launch_end_ms - cr.launch_start_ms,
+                cr.finalize_end_ms - cr.finalize_start_ms, gpu_sum * inv, gpu_max, upload * inv, metric * inv,
+                kernels * inv, download * inv);
         }
         this->logger.trace("wall {:.1f} ms", total_wall_ms);
         // Tier 2: per-device per-chunk breakdown.

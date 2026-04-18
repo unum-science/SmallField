@@ -13,30 +13,37 @@ This script validates that SmallField produces comparable results to RDKit
 before we proceed with SIMD/GPU optimization.
 """
 
-import numpy as np
+import sys
 from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+from rich.table import Table
+
+from smallfield.log import Logger
+
+log = Logger()
 
 try:
     from rdkit import Chem
     from rdkit.Chem import AllChem, rdForceFieldHelpers
 except ImportError:
-    print("ERROR: RDKit required. Install with: pixi add rdkit")
-    exit(1)
+    log.error("RDKit required. Install with: pixi add rdkit")
+    sys.exit(1)
 
 # MMFF94 Constants (must match Mojo implementation exactly)
 MMFF_BOND_PREFACTOR = 143.9325  # mdyn*A -> kcal/mol
-MMFF_CUBIC_STRETCH = -2.0       # A^-1
+MMFF_CUBIC_STRETCH = -2.0  # A^-1
 
 MMFF_ANGLE_PREFACTOR = 0.021922  # 0.5 * 0.043844 (mdyn*A/rad^2 -> kcal/mol)
 MMFF_ANGLE_CUBIC = -0.006981317  # Exact RDKit cb value (degree^-1)
 
-MMFF_TORSION_PREFACTOR = 0.5     # kcal/mol
+MMFF_TORSION_PREFACTOR = 0.5  # kcal/mol
 
-MMFF_VDW_DELTA = 0.07            # Buffering parameter
-MMFF_VDW_GAMMA = 0.12            # Buffering parameter
+MMFF_VDW_DELTA = 0.07  # Buffering parameter
+MMFF_VDW_GAMMA = 0.12  # Buffering parameter
 
-MMFF_ELEC_CONSTANT = 332.0716    # e^2/(4*pi*eps0) in kcal*A/mol
-MMFF_ELEC_BUFFER = 0.05          # Angstrom buffer for singularity
+MMFF_ELEC_CONSTANT = 332.0716  # e^2/(4*pi*eps0) in kcal*A/mol
+MMFF_ELEC_BUFFER = 0.05  # Angstrom buffer for singularity
 
 # Additional terms
 MMFF_OOP_PREFACTOR = 0.5 * 0.043844  # 0.5 * c2 = 0.5 * 143.9325 * DEG2RAD^2
@@ -48,7 +55,7 @@ def bond_energy(r: float, r0: float, kb: float) -> float:
     dr = r - r0
     dr2 = dr * dr
     cs = MMFF_CUBIC_STRETCH
-    return 0.5 * MMFF_BOND_PREFACTOR * kb * dr2 * (1.0 + cs * dr + (7.0/12.0) * cs * cs * dr2)
+    return 0.5 * MMFF_BOND_PREFACTOR * kb * dr2 * (1.0 + cs * dr + (7.0 / 12.0) * cs * cs * dr2)
 
 
 def angle_energy(theta_rad: float, theta0_rad: float, ka: float) -> float:
@@ -63,11 +70,7 @@ def torsion_energy(phi_rad: float, v1: float, v2: float, v3: float) -> float:
     cos_phi = np.cos(phi_rad)
     cos_2phi = np.cos(2.0 * phi_rad)
     cos_3phi = np.cos(3.0 * phi_rad)
-    return MMFF_TORSION_PREFACTOR * (
-        v1 * (1.0 + cos_phi) +
-        v2 * (1.0 - cos_2phi) +
-        v3 * (1.0 + cos_3phi)
-    )
+    return MMFF_TORSION_PREFACTOR * (v1 * (1.0 + cos_phi) + v2 * (1.0 - cos_2phi) + v3 * (1.0 + cos_3phi))
 
 
 def vdw_energy(r: float, epsilon: float, r_star: float) -> float:
@@ -76,13 +79,13 @@ def vdw_energy(r: float, epsilon: float, r_star: float) -> float:
     gamma = MMFF_VDW_GAMMA
 
     # Repulsive term: (1.07 * R* / (R + 0.07*R*))^7
-    r_star_7 = r_star ** 7
+    r_star_7 = r_star**7
     denom_rep = r + delta * r_star
     ratio_rep = (1.0 + delta) * r_star / denom_rep
-    rep_term = ratio_rep ** 7
+    rep_term = ratio_rep**7
 
     # Attractive term: (1.12*R*^7)/(R^7 + 0.12*R*^7) - 2
-    r_7 = r ** 7
+    r_7 = r**7
     denom_att = r_7 + gamma * r_star_7
     att_term = (1.0 + gamma) * r_star_7 / denom_att - 2.0
 
@@ -104,8 +107,7 @@ def oop_energy(chi_deg: float, koop: float) -> float:
     return MMFF_OOP_PREFACTOR * koop * chi_deg * chi_deg
 
 
-def stretch_bend_energy(dr1: float, dr2: float, dtheta_deg: float,
-                        kba_ijk: float, kba_kji: float) -> float:
+def stretch_bend_energy(dr1: float, dr2: float, dtheta_deg: float, kba_ijk: float, kba_kji: float) -> float:
     """MMFF94 stretch-bend coupling energy.
 
     E = c5 * dtheta * (kba_ijk * dr1 + kba_kji * dr2)
@@ -120,31 +122,31 @@ def compute_oop_angle(pos: np.ndarray, i: int, j: int, k: int, l: int) -> float:
     Atom j is the central sp2 atom, with i, k, l as neighbors.
     chi is the angle between the j-l bond and the plane defined by i-j-k.
     """
-    rJI = pos[i] - pos[j]
-    rJK = pos[k] - pos[j]
-    rJL = pos[l] - pos[j]
+    r_ji = pos[i] - pos[j]
+    r_jk = pos[k] - pos[j]
+    r_jl = pos[l] - pos[j]
 
     # Normalize
-    nJI = np.linalg.norm(rJI)
-    nJK = np.linalg.norm(rJK)
-    nJL = np.linalg.norm(rJL)
+    n_ji = np.linalg.norm(r_ji)
+    n_jk = np.linalg.norm(r_jk)
+    n_jl = np.linalg.norm(r_jl)
 
-    if nJI < 1e-10 or nJK < 1e-10 or nJL < 1e-10:
+    if n_ji < 1e-10 or n_jk < 1e-10 or n_jl < 1e-10:
         return 0.0
 
-    rJI = rJI / nJI
-    rJK = rJK / nJK
-    rJL = rJL / nJL
+    r_ji = r_ji / n_ji
+    r_jk = r_jk / n_jk
+    r_jl = r_jl / n_jl
 
     # Normal to the i-j-k plane
-    n = np.cross(rJI, rJK)
-    n_norm = np.linalg.norm(n)
-    if n_norm < 1e-10:
+    plane_normal = np.cross(r_ji, r_jk)
+    plane_normal_length = np.linalg.norm(plane_normal)
+    if plane_normal_length < 1e-10:
         return 0.0
-    n = n / n_norm
+    plane_normal = plane_normal / plane_normal_length
 
-    # sin(chi) = rJL dot n
-    sin_chi = np.dot(rJL, n)
+    # sin(chi) = r_jl dot plane_normal
+    sin_chi = np.dot(r_jl, plane_normal)
     sin_chi = np.clip(sin_chi, -1.0, 1.0)
 
     return np.degrees(np.arcsin(sin_chi))
@@ -221,7 +223,7 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        return {'error': f'Invalid SMILES: {smiles}'}
+        return {"error": f"Invalid SMILES: {smiles}"}
 
     mol = Chem.AddHs(mol)
 
@@ -229,12 +231,12 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
     params = AllChem.ETKDGv3()
     params.randomSeed = 42
     if AllChem.EmbedMolecule(mol, params) == -1:
-        return {'error': 'Could not embed molecule'}
+        return {"error": "Could not embed molecule"}
 
     # Get MMFF properties
     mmff_props = AllChem.MMFFGetMoleculeProperties(mol)
     if mmff_props is None:
-        return {'error': 'Could not get MMFF properties'}
+        return {"error": "Could not get MMFF properties"}
 
     # Get RDKit force field for reference total
     ff = AllChem.MMFFGetMoleculeForceField(mol, mmff_props)
@@ -280,7 +282,7 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
         j = atom.GetIdx()
         neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
         for idx1, i in enumerate(neighbors):
-            for k in neighbors[idx1+1:]:
+            for k in neighbors[idx1 + 1 :]:
                 if (i, j, k) not in angles_seen and (k, j, i) not in angles_seen:
                     angles_seen.add((i, j, k))
 
@@ -412,7 +414,7 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
         j = atom.GetIdx()
         neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
         for idx1, i in enumerate(neighbors):
-            for k in neighbors[idx1+1:]:
+            for k in neighbors[idx1 + 1 :]:
                 # Get stretch-bend parameters
                 stbn_params = mmff_props.GetMMFFStretchBendParams(mol, i, j, k)
                 if stbn_params:
@@ -454,14 +456,16 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
 
         if len(neighbors) == 3:
             # Try all permutations of i, k, l around central atom j
-            for perm_idx, (i, k, l) in enumerate([
-                (neighbors[0], neighbors[1], neighbors[2]),
-                (neighbors[0], neighbors[2], neighbors[1]),
-                (neighbors[1], neighbors[0], neighbors[2]),
-                (neighbors[1], neighbors[2], neighbors[0]),
-                (neighbors[2], neighbors[0], neighbors[1]),
-                (neighbors[2], neighbors[1], neighbors[0]),
-            ]):
+            for perm_idx, (i, k, l) in enumerate(
+                [
+                    (neighbors[0], neighbors[1], neighbors[2]),
+                    (neighbors[0], neighbors[2], neighbors[1]),
+                    (neighbors[1], neighbors[0], neighbors[2]),
+                    (neighbors[1], neighbors[2], neighbors[0]),
+                    (neighbors[2], neighbors[0], neighbors[1]),
+                    (neighbors[2], neighbors[1], neighbors[0]),
+                ]
+            ):
                 # Get OOP parameters
                 oop_params = mmff_props.GetMMFFOopBendParams(mol, i, j, k, l)
                 if oop_params:
@@ -475,55 +479,61 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
     # =========================================================================
     # SUMMARY
     # =========================================================================
-    smallfield_total = smallfield_bond + smallfield_angle + smallfield_stbn + smallfield_oop + smallfield_torsion + smallfield_vdw + smallfield_elec
+    smallfield_total = (
+        smallfield_bond
+        + smallfield_angle
+        + smallfield_stbn
+        + smallfield_oop
+        + smallfield_torsion
+        + smallfield_vdw
+        + smallfield_elec
+    )
 
     result = {
-        'smiles': smiles,
-        'n_atoms': n_atoms,
-        'n_bonds': n_bonds,
-        'n_angles': n_angles,
-        'n_stbn': n_stbn,
-        'n_oop': n_oop,
-        'n_torsions': n_torsions,
-        'n_vdw_pairs': n_vdw,
-        'n_elec_pairs': n_elec,
-        'smallfield': {
-            'bond': smallfield_bond,
-            'angle': smallfield_angle,
-            'stbn': smallfield_stbn,
-            'oop': smallfield_oop,
-            'torsion': smallfield_torsion,
-            'vdw': smallfield_vdw,
-            'elec': smallfield_elec,
-            'total': smallfield_total
+        "smiles": smiles,
+        "n_atoms": n_atoms,
+        "n_bonds": n_bonds,
+        "n_angles": n_angles,
+        "n_stbn": n_stbn,
+        "n_oop": n_oop,
+        "n_torsions": n_torsions,
+        "n_vdw_pairs": n_vdw,
+        "n_elec_pairs": n_elec,
+        "smallfield": {
+            "bond": smallfield_bond,
+            "angle": smallfield_angle,
+            "stbn": smallfield_stbn,
+            "oop": smallfield_oop,
+            "torsion": smallfield_torsion,
+            "vdw": smallfield_vdw,
+            "elec": smallfield_elec,
+            "total": smallfield_total,
         },
-        'rdkit_total': rdkit_total,
-        'difference': smallfield_total - rdkit_total,
-        'relative_error': abs(smallfield_total - rdkit_total) / abs(rdkit_total) if abs(rdkit_total) > 1e-10 else 0.0
+        "rdkit_total": rdkit_total,
+        "difference": smallfield_total - rdkit_total,
+        "relative_error": abs(smallfield_total - rdkit_total) / abs(rdkit_total) if abs(rdkit_total) > 1e-10 else 0.0,
     }
 
     if verbose:
-        print(f"\n{'='*70}")
-        print(f"Molecule: {smiles}")
-        print(f"{'='*70}")
-        print(f"  Atoms: {n_atoms}, Bonds: {n_bonds}, Angles: {n_angles}, Torsions: {n_torsions}")
-        print(f"  Stretch-bend: {n_stbn}, OOP: {n_oop}, vdW: {n_vdw}, Elec: {n_elec}")
-        print()
-        print(f"  SmallField Energy Breakdown:")
-        print(f"    Bond:          {smallfield_bond:12.4f} kcal/mol")
-        print(f"    Angle:         {smallfield_angle:12.4f} kcal/mol")
-        print(f"    Stretch-bend:  {smallfield_stbn:12.4f} kcal/mol")
-        print(f"    Out-of-plane:  {smallfield_oop:12.4f} kcal/mol")
-        print(f"    Torsion:       {smallfield_torsion:12.4f} kcal/mol")
-        print(f"    van der Waals: {smallfield_vdw:12.4f} kcal/mol")
-        print(f"    Electrostatic: {smallfield_elec:12.4f} kcal/mol")
-        print(f"    -----------------------------------")
-        print(f"    TOTAL:         {smallfield_total:12.4f} kcal/mol")
-        print()
-        print(f"  RDKit MMFF94 Total: {rdkit_total:12.4f} kcal/mol")
-        print()
-        print(f"  Difference:         {result['difference']:12.4f} kcal/mol")
-        print(f"  Relative Error:     {result['relative_error']*100:12.2f} %")
+        breakdown = Table(
+            title=f"{smiles}  ({n_atoms} atoms, {n_bonds} bonds, {n_angles} angles, "
+            f"{n_torsions} torsions, {n_stbn} stbn, {n_oop} oop, {n_vdw} vdW, {n_elec} elec)",
+            show_header=False,
+        )
+        breakdown.add_column("term", style="bold")
+        breakdown.add_column("kcal/mol", justify="right")
+        breakdown.add_row("Bond", f"{smallfield_bond:12.4f}")
+        breakdown.add_row("Angle", f"{smallfield_angle:12.4f}")
+        breakdown.add_row("Stretch-bend", f"{smallfield_stbn:12.4f}")
+        breakdown.add_row("Out-of-plane", f"{smallfield_oop:12.4f}")
+        breakdown.add_row("Torsion", f"{smallfield_torsion:12.4f}")
+        breakdown.add_row("van der Waals", f"{smallfield_vdw:12.4f}")
+        breakdown.add_row("Electrostatic", f"{smallfield_elec:12.4f}")
+        breakdown.add_row("[bold]SmallField TOTAL[/]", f"[bold]{smallfield_total:12.4f}[/]")
+        breakdown.add_row("RDKit MMFF94 total", f"{rdkit_total:12.4f}")
+        breakdown.add_row("difference", f"{result['difference']:12.4f}")
+        breakdown.add_row("relative error", f"{result['relative_error']*100:12.2f} %")
+        log.console.print(breakdown)
 
     return result
 
@@ -531,14 +541,15 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
 def load_usearch_molecules(filepath: str, n_samples: int = 50, seed: int = 42) -> List[str]:
     """Load random sample of molecules from USearchMolecules SMILES file."""
     import random
+
     random.seed(seed)
 
     molecules = []
-    with open(filepath, 'r') as f:
+    with open(filepath, "r") as f:
         for line in f:
             # Each line may contain multiple molecules separated by '.'
             # Take the first molecule from each line
-            smiles = line.strip().split('.')[0]
+            smiles = line.strip().split(".")[0]
             if smiles and len(smiles) < 100:  # Skip very long SMILES
                 molecules.append(smiles)
             if len(molecules) >= 10000:  # Read max 10k to sample from
@@ -558,71 +569,66 @@ def test_validation_formula_track_rdkit_for_ethanol():
 
 
 def main():
-    import sys
     import os
 
-    print("="*70)
-    print("SmallField vs RDKit MMFF94 Validation")
-    print("="*70)
+    log.info("SmallField vs RDKit MMFF94 validation")
 
     # Optional corpus for `--usearch`; point SMALLFIELD_SMI_CORPUS at a .smi file.
     usearch_path = os.environ.get("SMALLFIELD_SMI_CORPUS", "")
 
     if os.path.exists(usearch_path) and len(sys.argv) > 1 and sys.argv[1] == "--usearch":
-        print("\nLoading molecules from USearchMolecules dataset...")
+        log.info("loading molecules from USearchMolecules dataset")
         test_molecules = load_usearch_molecules(usearch_path, n_samples=50)
-        print(f"Loaded {len(test_molecules)} random molecules\n")
+        log.info("loaded {} random molecules", len(test_molecules))
     else:
         # Test molecules of increasing complexity
         test_molecules = [
-            "C",                    # Methane
-            "CC",                   # Ethane
-            "CCC",                  # Propane
-            "CCO",                  # Ethanol
-            "CCCC",                 # Butane
-            "c1ccccc1",             # Benzene
-            "CC(=O)O",              # Acetic acid
-            "CCCCCCCCC",            # Nonane
-            "c1ccc(O)cc1",          # Phenol
+            "C",  # Methane
+            "CC",  # Ethane
+            "CCC",  # Propane
+            "CCO",  # Ethanol
+            "CCCC",  # Butane
+            "c1ccccc1",  # Benzene
+            "CC(=O)O",  # Acetic acid
+            "CCCCCCCCC",  # Nonane
+            "c1ccc(O)cc1",  # Phenol
         ]
 
     results = []
     for smiles in test_molecules:
         result = validate_molecule(smiles, verbose=True)
-        if 'error' not in result:
+        if "error" not in result:
             results.append(result)
 
-    # Summary
-    print("\n" + "="*70)
-    print("VALIDATION SUMMARY")
-    print("="*70)
-    print()
-    print(f"{'Molecule':<20} {'Atoms':>6} {'SF Total':>12} {'RDKit':>12} {'Error %':>10}")
-    print("-"*70)
-
+    summary = Table(title="Validation summary", show_header=True, header_style="bold")
+    summary.add_column("Molecule")
+    summary.add_column("Atoms", justify="right")
+    summary.add_column("SF total", justify="right")
+    summary.add_column("RDKit", justify="right")
+    summary.add_column("Error %", justify="right")
     for r in results:
-        print(f"{r['smiles']:<20} {r['n_atoms']:>6} {r['smallfield']['total']:>12.4f} {r['rdkit_total']:>12.4f} {r['relative_error']*100:>10.2f}")
-
-    print("-"*70)
+        summary.add_row(
+            r["smiles"],
+            str(r["n_atoms"]),
+            f"{r['smallfield']['total']:.4f}",
+            f"{r['rdkit_total']:.4f}",
+            f"{r['relative_error']*100:.2f}",
+        )
+    log.console.print(summary)
 
     # Overall accuracy assessment
-    avg_error = np.mean([r['relative_error'] for r in results]) * 100
-    max_error = np.max([r['relative_error'] for r in results]) * 100
+    avg_error = np.mean([r["relative_error"] for r in results]) * 100
+    max_error = np.max([r["relative_error"] for r in results]) * 100
 
-    print()
-    print(f"Average Relative Error: {avg_error:.2f}%")
-    print(f"Maximum Relative Error: {max_error:.2f}%")
-    print()
+    log.info("average relative error: {:.2f}%", avg_error)
+    log.info("maximum relative error: {:.2f}%", max_error)
 
     if max_error < 5.0:
-        print("PASS: SmallField matches RDKit within 5% tolerance")
-        print("Ready for SIMD/GPU optimization!")
+        log.info("PASS: SmallField matches RDKit within 5% tolerance — ready for SIMD/GPU optimization")
     elif max_error < 10.0:
-        print("WARNING: Some discrepancies detected (5-10%)")
-        print("Review parameter handling before optimization")
+        log.warn("some discrepancies detected (5-10%) — review parameter handling before optimization")
     else:
-        print("FAIL: Significant discrepancies detected (>10%)")
-        print("Fix accuracy issues before SIMD/GPU optimization")
+        log.error("significant discrepancies detected (>10%) — fix accuracy before SIMD/GPU optimization")
 
 
 if __name__ == "__main__":

@@ -1047,60 +1047,73 @@ SMALLFIELD_HD_ inline void native_compute_mmff_formal_charges(molecule_descripto
     auto conj_reset = [&]() { conj_bits.fill(0); };
 
     for (std::uint32_t idx = 0; idx < num_atoms; ++idx) {
-        std::uint8_t const at = atom_types[idx];
-        float fc = 0.0f;
-        switch (at) {
+        std::uint8_t const atom_type = atom_types[idx];
+        float formal_charge = 0.0f;
+        switch (atom_type) {
         case 32: // O2CM — carboxylate / phosphate / sulfonate oxygen
         case 72: // SM   — anionic terminal sulfur
         {
-            std::uint16_t const ns = desc.neighbor_offset[idx];
-            std::uint16_t const ne = desc.neighbor_offset[idx + 1];
-            for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
-                std::uint8_t const nb = desc.neighbor_atom[n0];
-                std::uint8_t const nbt = atom_types[nb];
-                int nSecNbondedToNbr = 0;
-                int nTermOSbondedToNbr = 0;
-                std::uint16_t const bs = desc.neighbor_offset[nb];
-                std::uint16_t const be = desc.neighbor_offset[nb + 1];
-                for (std::uint16_t n1 = bs; n1 < be; ++n1) {
-                    std::uint8_t const nb2 = desc.neighbor_atom[n1];
-                    if (desc.element[nb2] == 7 && desc.degree[nb2] == 2 &&
-                        !(desc.atom_flags[nb2] & atom_flag_aromatic_k))
-                        ++nSecNbondedToNbr;
-                    if ((desc.element[nb2] == 8 || desc.element[nb2] == 16) && desc.degree[nb2] == 1)
-                        ++nTermOSbondedToNbr;
+            std::uint16_t const neighbor_start = desc.neighbor_offset[idx];
+            std::uint16_t const neighbor_end = desc.neighbor_offset[idx + 1];
+            for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
+                std::uint8_t const neighbor_idx = desc.neighbor_atom[neighbor_slot];
+                std::uint8_t const neighbor_type = atom_types[neighbor_idx];
+                int num_sec_n_bonded_to_neighbor = 0;
+                int num_terminal_os_bonded_to_neighbor = 0;
+                std::uint16_t const second_shell_start = desc.neighbor_offset[neighbor_idx];
+                std::uint16_t const second_shell_end = desc.neighbor_offset[neighbor_idx + 1];
+                for (std::uint16_t second_shell_slot = second_shell_start; second_shell_slot < second_shell_end;
+                     ++second_shell_slot) {
+                    std::uint8_t const second_shell_idx = desc.neighbor_atom[second_shell_slot];
+                    if (desc.element[second_shell_idx] == 7 && desc.degree[second_shell_idx] == 2 &&
+                        !(desc.atom_flags[second_shell_idx] & atom_flag_aromatic_k))
+                        ++num_sec_n_bonded_to_neighbor;
+                    if ((desc.element[second_shell_idx] == 8 || desc.element[second_shell_idx] == 16) &&
+                        desc.degree[second_shell_idx] == 1)
+                        ++num_terminal_os_bonded_to_neighbor;
                 }
                 // Sulfonamide with 2 terminal O + 1 sec N: don't treat N
                 // as an O replacement.
-                if (desc.element[nb] == 16 && nTermOSbondedToNbr == 2 && nSecNbondedToNbr == 1) nSecNbondedToNbr = 0;
+                if (desc.element[neighbor_idx] == 16 && num_terminal_os_bonded_to_neighbor == 2 &&
+                    num_sec_n_bonded_to_neighbor == 1)
+                    num_sec_n_bonded_to_neighbor = 0;
 
-                if (desc.element[nb] == 6 && nTermOSbondedToNbr) {
-                    fc = (nTermOSbondedToNbr == 1) ? -1.0f
-                                                   : -((float)(nTermOSbondedToNbr - 1) / (float)nTermOSbondedToNbr);
+                if (desc.element[neighbor_idx] == 6 && num_terminal_os_bonded_to_neighbor) {
+                    formal_charge = (num_terminal_os_bonded_to_neighbor == 1)
+                                        ? -1.0f
+                                        : -(static_cast<float>(num_terminal_os_bonded_to_neighbor - 1) /
+                                            static_cast<float>(num_terminal_os_bonded_to_neighbor));
                     break;
                 }
-                if (nbt == 45 && nTermOSbondedToNbr == 3) {
-                    fc = -1.0f / 3.0f;
+                if (neighbor_type == 45 && num_terminal_os_bonded_to_neighbor == 3) {
+                    formal_charge = -1.0f / 3.0f;
                     break;
                 }
-                if (nbt == 25 && nTermOSbondedToNbr) {
-                    fc = (nTermOSbondedToNbr == 1) ? 0.0f
-                                                   : -((float)(nTermOSbondedToNbr - 1) / (float)nTermOSbondedToNbr);
+                if (neighbor_type == 25 && num_terminal_os_bonded_to_neighbor) {
+                    formal_charge = (num_terminal_os_bonded_to_neighbor == 1)
+                                        ? 0.0f
+                                        : -(static_cast<float>(num_terminal_os_bonded_to_neighbor - 1) /
+                                            static_cast<float>(num_terminal_os_bonded_to_neighbor));
                     break;
                 }
-                if (nbt == 18 && nTermOSbondedToNbr) {
-                    fc = ((nSecNbondedToNbr + nTermOSbondedToNbr) == 2)
-                             ? 0.0f
-                             : -((float)((nSecNbondedToNbr + nTermOSbondedToNbr) - 2) / (float)nTermOSbondedToNbr);
+                if (neighbor_type == 18 && num_terminal_os_bonded_to_neighbor) {
+                    formal_charge =
+                        ((num_sec_n_bonded_to_neighbor + num_terminal_os_bonded_to_neighbor) == 2)
+                            ? 0.0f
+                            : -(static_cast<float>((num_sec_n_bonded_to_neighbor + num_terminal_os_bonded_to_neighbor) -
+                                                   2) /
+                                static_cast<float>(num_terminal_os_bonded_to_neighbor));
                     break;
                 }
-                if (nbt == 73 && nTermOSbondedToNbr) {
-                    fc = (nTermOSbondedToNbr == 1) ? 0.0f
-                                                   : -((float)(nTermOSbondedToNbr - 1) / (float)nTermOSbondedToNbr);
+                if (neighbor_type == 73 && num_terminal_os_bonded_to_neighbor) {
+                    formal_charge = (num_terminal_os_bonded_to_neighbor == 1)
+                                        ? 0.0f
+                                        : -(static_cast<float>(num_terminal_os_bonded_to_neighbor - 1) /
+                                            static_cast<float>(num_terminal_os_bonded_to_neighbor));
                     break;
                 }
-                if (nbt == 77 && nTermOSbondedToNbr) {
-                    fc = -(1.0f / (float)nTermOSbondedToNbr);
+                if (neighbor_type == 77 && num_terminal_os_bonded_to_neighbor) {
+                    formal_charge = -(1.0f / static_cast<float>(num_terminal_os_bonded_to_neighbor));
                     break;
                 }
             }
@@ -1109,15 +1122,16 @@ SMALLFIELD_HD_ inline void native_compute_mmff_formal_charges(molecule_descripto
         case 76: {
             // N5M: find the 5-ring containing this atom, share -1
             // across all N5M atoms in that ring.
-            std::uint32_t const bitmap = desc.atom_ring_bitmap[idx];
-            for (unsigned r = 0; r < desc.num_rings; ++r) {
-                if (!(bitmap & (1u << r))) continue;
-                unsigned const rs = desc.ring_offset[r + 1] - desc.ring_offset[r];
-                if (rs != 5) continue;
-                unsigned nN76 = 0;
-                for (unsigned p = desc.ring_offset[r]; p < desc.ring_offset[r + 1]; ++p)
-                    if (atom_types[desc.ring_atoms[p]] == 76) ++nN76;
-                if (nN76) fc = -1.0f / (float)nN76;
+            std::uint32_t const ring_bitmap = desc.atom_ring_bitmap[idx];
+            for (unsigned ring_idx = 0; ring_idx < desc.num_rings; ++ring_idx) {
+                if (!(ring_bitmap & (1u << ring_idx))) continue;
+                unsigned const ring_size = desc.ring_offset[ring_idx + 1] - desc.ring_offset[ring_idx];
+                if (ring_size != 5) continue;
+                unsigned num_n76_in_ring = 0;
+                for (unsigned ring_atom_slot = desc.ring_offset[ring_idx];
+                     ring_atom_slot < desc.ring_offset[ring_idx + 1]; ++ring_atom_slot)
+                    if (atom_types[desc.ring_atoms[ring_atom_slot]] == 76) ++num_n76_in_ring;
+                if (num_n76_in_ring) formal_charge = -1.0f / static_cast<float>(num_n76_in_ring);
                 break;
             }
             break;
@@ -1129,46 +1143,47 @@ SMALLFIELD_HD_ inline void native_compute_mmff_formal_charges(molecule_descripto
             // imidazolium). Flood-fill through carbon types 57/80,
             // collecting all conjugated 55/56/81 atoms, sum formal
             // charges, split evenly.
-            fc = (float)desc.formal_charge[idx];
-            unsigned nConj = 1, oldNConj = 0;
+            formal_charge = static_cast<float>(desc.formal_charge[idx]);
+            unsigned num_conjugated = 1, prev_num_conjugated = 0;
             conj_reset();
             conj_set(idx);
-            while (nConj > oldNConj) {
-                oldNConj = nConj;
-                for (std::uint32_t i = 0; i < num_atoms; ++i) {
-                    if (!conj_get(i)) continue;
-                    std::uint16_t const ns = desc.neighbor_offset[i];
-                    std::uint16_t const ne = desc.neighbor_offset[i + 1];
-                    for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
-                        std::uint8_t const c = desc.neighbor_atom[n0];
-                        std::uint8_t const ct = atom_types[c];
-                        if (ct != 57 && ct != 80) continue;
-                        std::uint16_t const cs = desc.neighbor_offset[c];
-                        std::uint16_t const ce = desc.neighbor_offset[c + 1];
-                        for (std::uint16_t n1 = cs; n1 < ce; ++n1) {
-                            std::uint8_t const nn = desc.neighbor_atom[n1];
-                            std::uint8_t const nnt = atom_types[nn];
-                            if (nnt != 55 && nnt != 56 && nnt != 81) continue;
-                            if (!conj_get(nn)) {
-                                conj_set(nn);
-                                fc += (float)desc.formal_charge[nn];
-                                ++nConj;
+            while (num_conjugated > prev_num_conjugated) {
+                prev_num_conjugated = num_conjugated;
+                for (std::uint32_t atom_in_conj = 0; atom_in_conj < num_atoms; ++atom_in_conj) {
+                    if (!conj_get(atom_in_conj)) continue;
+                    std::uint16_t const neighbor_start = desc.neighbor_offset[atom_in_conj];
+                    std::uint16_t const neighbor_end = desc.neighbor_offset[atom_in_conj + 1];
+                    for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
+                        std::uint8_t const carbon_idx = desc.neighbor_atom[neighbor_slot];
+                        std::uint8_t const carbon_type = atom_types[carbon_idx];
+                        if (carbon_type != 57 && carbon_type != 80) continue;
+                        std::uint16_t const carbon_neighbor_start = desc.neighbor_offset[carbon_idx];
+                        std::uint16_t const carbon_neighbor_end = desc.neighbor_offset[carbon_idx + 1];
+                        for (std::uint16_t carbon_neighbor_slot = carbon_neighbor_start;
+                             carbon_neighbor_slot < carbon_neighbor_end; ++carbon_neighbor_slot) {
+                            std::uint8_t const candidate_idx = desc.neighbor_atom[carbon_neighbor_slot];
+                            std::uint8_t const candidate_type = atom_types[candidate_idx];
+                            if (candidate_type != 55 && candidate_type != 56 && candidate_type != 81) continue;
+                            if (!conj_get(candidate_idx)) {
+                                conj_set(candidate_idx);
+                                formal_charge += static_cast<float>(desc.formal_charge[candidate_idx]);
+                                ++num_conjugated;
                             }
                         }
                     }
                 }
             }
-            if (nConj) fc /= (float)nConj;
+            if (num_conjugated) formal_charge /= static_cast<float>(num_conjugated);
             break;
         }
         case 61: {
             // Isonitrile C. If bonded to type 42 (triply bonded N),
             // set +1 (on the N, via ipso bookkeeping).
-            std::uint16_t const ns = desc.neighbor_offset[idx];
-            std::uint16_t const ne = desc.neighbor_offset[idx + 1];
-            for (std::uint16_t n0 = ns; n0 < ne; ++n0)
-                if (atom_types[desc.neighbor_atom[n0]] == 42) {
-                    fc = 1.0f;
+            std::uint16_t const neighbor_start = desc.neighbor_offset[idx];
+            std::uint16_t const neighbor_end = desc.neighbor_offset[idx + 1];
+            for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot)
+                if (atom_types[desc.neighbor_atom[neighbor_slot]] == 42) {
+                    formal_charge = 1.0f;
                     break;
                 }
             break;
@@ -1181,20 +1196,20 @@ SMALLFIELD_HD_ inline void native_compute_mmff_formal_charges(molecule_descripto
         case 92:
         case 93:
         case 94:
-        case 97: fc = 1.0f; break;
+        case 97: formal_charge = 1.0f; break;
         case 87:
         case 95:
         case 96:
         case 98:
-        case 99: fc = 2.0f; break;
-        case 88: fc = 3.0f; break;
+        case 99: formal_charge = 2.0f; break;
+        case 88: formal_charge = 3.0f; break;
         case 35:
         case 62:
         case 89:
         case 90:
-        case 91: fc = -1.0f; break;
+        case 91: formal_charge = -1.0f; break;
         }
-        formal_charges[idx] = fc;
+        formal_charges[idx] = formal_charge;
     }
 }
 
@@ -1210,66 +1225,73 @@ SMALLFIELD_HD_ inline void native_compute_mmff_partial_charges(molecule_descript
                                                                std::span<float> partial_charges) noexcept {
     std::uint32_t const num_atoms = desc.num_atoms;
     for (std::uint32_t idx = 0; idx < num_atoms; ++idx) {
-        std::uint8_t const at = atom_types[idx];
-        auto const *prop = lookup_prop(tables, at);
-        if (!prop) {
+        std::uint8_t const atom_type = atom_types[idx];
+        auto const *prop_entry = lookup_prop(tables, atom_type);
+        if (!prop_entry) {
             partial_charges[idx] = formal_charges[idx];
             continue;
         }
-        double const M = (double)prop->crd;
+        double const crd_count = static_cast<double>(prop_entry->crd);
 
-        auto const *pbci_ipso = lookup_pbci(tables, at);
-        double v = 0.0;
-        double pbci_ipso_val = 0.0;
-        if (pbci_ipso) {
-            v = (double)pbci_ipso->fcadj;
-            pbci_ipso_val = (double)pbci_ipso->pbci;
+        auto const *pbci_self = lookup_pbci(tables, atom_type);
+        double fc_adjust = 0.0;
+        double pbci_self_value = 0.0;
+        if (pbci_self) {
+            fc_adjust = static_cast<double>(pbci_self->fcadj);
+            pbci_self_value = static_cast<double>(pbci_self->pbci);
         }
 
-        double q0 = (double)formal_charges[idx];
-        bool const v_zero = std::fabs(v) < 1.0e-10;
+        double charge_base = static_cast<double>(formal_charges[idx]);
+        bool const fc_adjust_is_zero = std::fabs(fc_adjust) < 1.0e-10;
 
-        std::uint16_t const ns = desc.neighbor_offset[idx];
-        std::uint16_t const ne = desc.neighbor_offset[idx + 1];
-        if (v_zero) {
-            for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
-                std::uint8_t const nb = desc.neighbor_atom[n0];
-                double const nbFC = (double)formal_charges[nb];
-                if (nbFC < 0.0) q0 += nbFC / (2.0 * (double)desc.degree[nb]);
+        std::uint16_t const neighbor_start = desc.neighbor_offset[idx];
+        std::uint16_t const neighbor_end = desc.neighbor_offset[idx + 1];
+        if (fc_adjust_is_zero) {
+            for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
+                std::uint8_t const neighbor_idx = desc.neighbor_atom[neighbor_slot];
+                double const neighbor_formal_charge = static_cast<double>(formal_charges[neighbor_idx]);
+                if (neighbor_formal_charge < 0.0)
+                    charge_base += neighbor_formal_charge / (2.0 * static_cast<double>(desc.degree[neighbor_idx]));
             }
         }
-        if (at == 62) {
-            for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
-                std::uint8_t const nb = desc.neighbor_atom[n0];
-                double const nbFC = (double)formal_charges[nb];
-                if (nbFC > 0.0) q0 -= nbFC / 2.0;
+        if (atom_type == 62) {
+            for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
+                std::uint8_t const neighbor_idx = desc.neighbor_atom[neighbor_slot];
+                double const neighbor_formal_charge = static_cast<double>(formal_charges[neighbor_idx]);
+                if (neighbor_formal_charge > 0.0) charge_base -= neighbor_formal_charge / 2.0;
             }
         }
-        double sumFC = 0.0, sumPC = 0.0;
-        for (std::uint16_t n0 = ns; n0 < ne; ++n0) {
-            std::uint8_t const nb = desc.neighbor_atom[n0];
-            std::uint8_t const nbt = atom_types[nb];
-            std::uint16_t const bid = desc.neighbor_bond[n0];
+        double sum_formal_charge = 0.0, sum_partial_charge = 0.0;
+        for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
+            std::uint8_t const neighbor_idx = desc.neighbor_atom[neighbor_slot];
+            std::uint8_t const neighbor_type = atom_types[neighbor_idx];
+            std::uint16_t const bond_id = desc.neighbor_bond[neighbor_slot];
             // Native bond type: replicate `getMMFFBondType`.
             std::uint8_t bond_type = 0;
-            bool const arom_bond = (desc.bond_flags[bid] & bond_flag_aromatic_k) != 0;
-            bool const single_bond = desc.bond_order[bid] == 1 && !arom_bond;
+            bool const aromatic_bond = (desc.bond_flags[bond_id] & bond_flag_aromatic_k) != 0;
+            bool const single_bond = desc.bond_order[bond_id] == 1 && !aromatic_bond;
             if (single_bond) {
-                auto const *pi = lookup_prop(tables, at);
-                auto const *pj = lookup_prop(tables, nbt);
-                if (pi && pj && ((pi->sbmb && pj->sbmb) || (pi->arom && pj->arom))) bond_type = 1;
+                auto const *prop_self = lookup_prop(tables, atom_type);
+                auto const *prop_neighbor = lookup_prop(tables, neighbor_type);
+                if (prop_self && prop_neighbor &&
+                    ((prop_self->sbmb && prop_neighbor->sbmb) || (prop_self->arom && prop_neighbor->arom)))
+                    bond_type = 1;
             }
-            auto const chg_hit = lookup_chg(tables, bond_type, at, nbt);
-            if (chg_hit.second) { sumPC += (double)chg_hit.first * (double)chg_hit.second->bci; }
+            auto const charge_entry = lookup_chg(tables, bond_type, atom_type, neighbor_type);
+            if (charge_entry.second) {
+                sum_partial_charge += static_cast<double>(charge_entry.first) *
+                                      static_cast<double>(charge_entry.second->bci);
+            }
             else {
-                auto const *pbci_nb = lookup_pbci(tables, nbt);
-                double const nb_pbci = pbci_nb ? (double)pbci_nb->pbci : 0.0;
-                sumPC += pbci_ipso_val - nb_pbci;
+                auto const *pbci_neighbor = lookup_pbci(tables, neighbor_type);
+                double const neighbor_pbci = pbci_neighbor ? static_cast<double>(pbci_neighbor->pbci) : 0.0;
+                sum_partial_charge += pbci_self_value - neighbor_pbci;
             }
-            sumFC += (double)formal_charges[nb];
+            sum_formal_charge += static_cast<double>(formal_charges[neighbor_idx]);
         }
-        double const pChg = (1.0 - M * v) * q0 + v * sumFC + sumPC;
-        partial_charges[idx] = (float)pChg;
+        double const partial_charge = (1.0 - crd_count * fc_adjust) * charge_base + fc_adjust * sum_formal_charge +
+                                      sum_partial_charge;
+        partial_charges[idx] = static_cast<float>(partial_charge);
     }
 }
 

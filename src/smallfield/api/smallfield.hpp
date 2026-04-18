@@ -118,7 +118,7 @@ struct context_t {
     std::vector<int> device_ids;
     std::vector<cudaStream_t> streams;
     std::vector<cusolverDnHandle_t> solvers;
-    std::vector<metric_scratch_t> metric_scratch;                ///< one per device
+    std::vector<metric_scratch_t> metric_scratch;                  ///< one per device
     std::vector<std::unique_ptr<launch_scratch_t>> launch_scratch; ///< one per device
     /**
      *  @brief Persistent 2-slot ring of batch prep buffers.

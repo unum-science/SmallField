@@ -47,7 +47,8 @@ inline std::locale const &grouping_locale() {
     static std::locale const loc = []() {
         try {
             return std::locale("en_US.UTF-8");
-        } catch (std::runtime_error const &) {
+        }
+        catch (std::runtime_error const &) {
             return std::locale::classic();
         }
     }();
@@ -98,7 +99,7 @@ inline bool detect_color_enabled() {
  *  e.g. `ctx.logger.verbose_level = 2` before `generate_conformers`.
  */
 struct logger_t {
-    int verbose_level = 0;                   ///< 0 silent, 1 summary, 2 per-device detail
+    int verbose_level = 0; ///< 0 silent, 1 summary, 2 per-device detail
     std::FILE *info_stream = stdout;
     std::FILE *warn_stream = stderr;
     std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
@@ -117,14 +118,13 @@ struct logger_t {
 
     template <typename... args_types_>
     void warn(fmt::format_string<args_types_...> fmt_string, args_types_ &&...args) const {
-        write_(warn_stream, color_enabled ? fmt::fg(fmt::color::yellow) : fmt::text_style {},
-               fmt_string, std::forward<args_types_>(args)...);
+        write_(warn_stream, color_enabled ? fmt::fg(fmt::color::yellow) : fmt::text_style {}, fmt_string,
+               std::forward<args_types_>(args)...);
     }
 
     template <typename... args_types_>
     void error(fmt::format_string<args_types_...> fmt_string, args_types_ &&...args) const {
-        write_(warn_stream,
-               color_enabled ? (fmt::fg(fmt::color::red) | fmt::emphasis::bold) : fmt::text_style {},
+        write_(warn_stream, color_enabled ? (fmt::fg(fmt::color::red) | fmt::emphasis::bold) : fmt::text_style {},
                fmt_string, std::forward<args_types_>(args)...);
     }
 

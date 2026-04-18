@@ -59,7 +59,6 @@ static double percentile(std::vector<double> &sorted_values, double p) {
     return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac;
 }
 
-
 static void bench_rdkit_cpu(std::vector<std::string> const &smiles, std::uint32_t num_conformers,
                             std::uint32_t max_stereo_attempts) {
     int num_threads = omp_get_max_threads();
