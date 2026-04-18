@@ -27,6 +27,7 @@ namespace py = pybind11;
 
 #include "smallfield/api/batch_pool.hpp"
 #include "smallfield/cuda/etkdg_pipeline.cuh"
+#include "smallfield/cuda_error.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/cuda/metric_embedding_prepass.cuh"
 #include "smallfield/api/smallfield.hpp"
@@ -38,19 +39,10 @@ using namespace smallfield::parameters;
 using namespace smallfield::preprocess;
 using namespace smallfield::types;
 
+using smallfield::cuda_error_sink_t;
+
 static inline std::size_t align_up(std::size_t value, std::size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
-}
-
-static thread_local bool verbose_logging = false;
-
-/** @brief Thin wrapper: log non-cudaSuccess and bump the process-wide counter. */
-static inline bool check_cuda_status_(cudaError_t rc, char const *label) {
-    if (rc == cudaSuccess) return true;
-    std::fprintf(stderr, "CUDA error in %s: %s\n", label, cudaGetErrorString(rc));
-    std::fflush(stderr);
-    cuda_error_counter.fetch_add(1, std::memory_order_relaxed);
-    return false;
 }
 
 /**
@@ -195,6 +187,7 @@ scaffold_cache_stats_t context_t::get_scaffold_cache_stats() const {
  */
 void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t max_group_size,
                            std::uint32_t max_atoms) {
+    cuda_error_sink_t const sink {&ctx.logger, &ctx.cuda_error_count};
     auto &s = ctx.metric_scratch[device_idx];
     if (max_group_size <= s.max_group_size && max_atoms <= s.max_atoms && s.pool.data() != nullptr) return;
 
@@ -213,14 +206,14 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
     {
         float *probe_gram = nullptr;
         float *probe_eig = nullptr;
-        check_cuda_status_(cudaMalloc(&probe_gram, sizeof(float)), "cudaMalloc(probe_gram)");
-        check_cuda_status_(cudaMalloc(&probe_eig, sizeof(float)), "cudaMalloc(probe_eig)");
+        sink.check(cudaMalloc(&probe_gram, sizeof(float)), "cudaMalloc(probe_gram)");
+        sink.check(cudaMalloc(&probe_eig, sizeof(float)), "cudaMalloc(probe_eig)");
         cusolverDnXsyevBatched_bufferSize(
             ctx.solvers[device_idx], s.xsyev_params, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER,
             static_cast<int64_t>(new_atoms), CUDA_R_32F, probe_gram, static_cast<int64_t>(new_atoms), CUDA_R_32F,
             probe_eig, CUDA_R_32F, &new_dev_ws_bytes, &new_host_ws_bytes, static_cast<int64_t>(new_group));
-        check_cuda_status_(cudaFree(probe_gram), "cudaFree(probe_gram)");
-        check_cuda_status_(cudaFree(probe_eig), "cudaFree(probe_eig)");
+        sink.check(cudaFree(probe_gram), "cudaFree(probe_gram)");
+        sink.check(cudaFree(probe_eig), "cudaFree(probe_eig)");
     }
 
     // Compute pool layout with 256-byte alignment.
@@ -233,7 +226,7 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
     std::size_t const total = group_bytes + gram_bytes + eig_bytes + info_bytes + ws_bytes;
 
     if (!s.pool.ensure_capacity(total)) {
-        std::fprintf(stderr, "ensure_metric_scratch: device allocation (%zu bytes) failed\n", total);
+        ctx.logger.error("ensure_metric_scratch: device allocation ({} bytes) failed", total);
         return;
     }
     std::size_t off = 0;
@@ -316,6 +309,7 @@ struct gpu_pipeline_handle_t {
     cudaEvent_t event_download_start = nullptr;
     cudaEvent_t event_end = nullptr;
     gpu_phase_ms_t *timings_out = nullptr; ///< caller-owned slot; finalize writes per-phase ms
+    cuda_error_sink_t sink {};             ///< routes errors through caller's logger + counter
 };
 
 /**
@@ -330,10 +324,10 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
                                           std::uint32_t max_atoms_per_molecule, std::uint64_t seed,
                                           std::uint32_t chunk_base, std::span<std::uint32_t const> sort_perm,
                                           std::span<__half> host_coords_out, std::span<float> host_energies_out,
-                                          std::span<conformer_status_t> host_status_out) {
+                                          std::span<conformer_status_t> host_status_out, cuda_error_sink_t sink) {
 
     auto _P0 = std::chrono::high_resolution_clock::now();
-    check_cuda_status_(cudaSetDevice(device_id), "cudaSetDevice(launch_gpu_pipeline)");
+    sink.check(cudaSetDevice(device_id), "cudaSetDevice(launch_gpu_pipeline)");
 
     std::uint32_t const local_count = static_cast<std::uint32_t>(local_indices.size());
 
@@ -403,15 +397,16 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
     handle.host_energies_out = host_energies_out;
     handle.host_status_out = host_status_out;
     handle.sort_perm = sort_perm;
+    handle.sink = sink;
 
     if (!launch_buffers.device_pool.ensure_capacity(device_pool_bytes)) {
-        std::fprintf(stderr, "launch_gpu_pipeline: cudaMalloc(%zu bytes) failed on gpu %d\n", device_pool_bytes,
-                     device_id);
+        if (sink.log != nullptr)
+            sink.log->error("launch_gpu_pipeline: cudaMalloc({} bytes) failed on gpu {}", device_pool_bytes, device_id);
         return handle;
     }
     if (!launch_buffers.host_staging.ensure_capacity(host_pool_bytes)) {
-        std::fprintf(stderr, "launch_gpu_pipeline: cudaHostAlloc(%zu bytes) failed on gpu %d\n", host_pool_bytes,
-                     device_id);
+        if (sink.log != nullptr)
+            sink.log->error("launch_gpu_pipeline: cudaHostAlloc({} bytes) failed on gpu {}", host_pool_bytes, device_id);
         return handle;
     }
     auto _P_post_malloc = std::chrono::high_resolution_clock::now();
@@ -452,20 +447,20 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
     // transfer that actually returns immediately and runs on the stream.
     cudaEventRecord(handle.event_upload_start, stream);
     if (batch.layout.bytes_total > 0)
-        check_cuda_status_(cudaMemcpyAsync(device_base + device_off_batch, batch.host.data(), batch.layout.bytes_total,
-                                           cudaMemcpyHostToDevice, stream),
-                           "H2D batch pool");
+        sink.check(cudaMemcpyAsync(device_base + device_off_batch, batch.host.data(), batch.layout.bytes_total,
+                                   cudaMemcpyHostToDevice, stream),
+                   "H2D batch pool");
     if (local_count > 0)
-        check_cuda_status_(cudaMemcpyAsync(device_metadata_sorted, host_sorted_meta, local_count * sizeof_meta,
-                                           cudaMemcpyHostToDevice, stream),
-                           "H2D sorted metadata");
+        sink.check(cudaMemcpyAsync(device_metadata_sorted, host_sorted_meta, local_count * sizeof_meta,
+                                   cudaMemcpyHostToDevice, stream),
+                   "H2D sorted metadata");
 
     auto _P_post_upload = std::chrono::high_resolution_clock::now();
     cudaEventRecord(handle.event_metric_start, stream);
     build_metric_initial_coordinates_on_gpu(device_view.bounds_matrices().data(), device_metadata_sorted,
                                             std::span<etkdg_molecule_metadata_t const> {host_sorted_meta, local_count},
                                             max_atoms_per_molecule, device_initial_coordinates, solver_handle, scratch,
-                                            stream);
+                                            sink, stream);
     auto _P_post_metric = std::chrono::high_resolution_clock::now();
     cudaEventRecord(handle.event_kernels_start, stream);
 
@@ -488,14 +483,14 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
 
         // Kernel 1 — DG + stereo retry + fourth-dim crush + ETK torsion refinement.
         std::uint32_t const shared_bytes_dg = compute_pipeline_shared_memory_bytes(wave_max_atoms, 0);
-        check_cuda_status_(cudaFuncSetAttribute(etkdg_pipeline_warp_kernel,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes_dg),
-                           "cudaFuncSetAttribute(etkdg_pipeline_warp_kernel)");
+        sink.check(cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        shared_bytes_dg),
+                   "cudaFuncSetAttribute(etkdg_pipeline_warp_kernel)");
 
         int blocks_per_sm_dg = 0;
-        check_cuda_status_(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_dg, etkdg_pipeline_warp_kernel,
-                                                                         32, shared_bytes_dg),
-                           "cudaOccupancyMaxActiveBlocksPerMultiprocessor(etkdg)");
+        sink.check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_dg, etkdg_pipeline_warp_kernel, 32,
+                                                                 shared_bytes_dg),
+                   "cudaOccupancyMaxActiveBlocksPerMultiprocessor(etkdg)");
         std::uint32_t const grid_size_dg = std::min(wave_size, static_cast<std::uint32_t>(blocks_per_sm_dg * num_sms));
 
         etkdg_pipeline_warp_kernel<<<grid_size_dg, 32, shared_bytes_dg, stream>>>(
@@ -507,19 +502,19 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
             handle.device_energies_out.data() + wave_start * num_conformers,
             handle.device_status_out.data() + wave_start * num_conformers, wave_size, num_conformers,
             max_stereo_attempts, wave_max_atoms, max_atoms_per_molecule, max_atoms_per_molecule, seed);
-        check_cuda_status_(cudaPeekAtLastError(), "etkdg_pipeline_warp_kernel launch");
+        sink.check(cudaPeekAtLastError(), "etkdg_pipeline_warp_kernel launch");
 
         // Kernel 2 — MMFF94 polish in place on the per-conformer coordinates
         // produced by Kernel 1.  Skips slots whose status is non-zero.
         std::uint32_t const shared_bytes_mmff = compute_mmff_polish_shared_memory_bytes(wave_max_atoms);
-        check_cuda_status_(cudaFuncSetAttribute(mmff_polish_warp_kernel,
-                                                cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes_mmff),
-                           "cudaFuncSetAttribute(mmff_polish_warp_kernel)");
+        sink.check(cudaFuncSetAttribute(mmff_polish_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        shared_bytes_mmff),
+                   "cudaFuncSetAttribute(mmff_polish_warp_kernel)");
 
         int blocks_per_sm_mmff = 0;
-        check_cuda_status_(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_mmff, mmff_polish_warp_kernel,
-                                                                         32, shared_bytes_mmff),
-                           "cudaOccupancyMaxActiveBlocksPerMultiprocessor(mmff)");
+        sink.check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_mmff, mmff_polish_warp_kernel, 32,
+                                                                 shared_bytes_mmff),
+                   "cudaOccupancyMaxActiveBlocksPerMultiprocessor(mmff)");
         std::uint32_t const grid_size_mmff = std::min(wave_size,
                                                       static_cast<std::uint32_t>(blocks_per_sm_mmff * num_sms));
 
@@ -533,7 +528,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
             handle.device_energies_out.data() + wave_start * num_conformers,
             handle.device_status_out.data() + wave_start * num_conformers, wave_size, num_conformers,
             max_atoms_per_molecule);
-        check_cuda_status_(cudaPeekAtLastError(), "mmff_polish_warp_kernel launch");
+        sink.check(cudaPeekAtLastError(), "mmff_polish_warp_kernel launch");
 
         wave_start = wave_end;
     }
@@ -546,7 +541,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         std::uint32_t const convert_grid = (num_elements + convert_block - 1) / convert_block;
         convert_coords_fp32_to_fp16_kernel<<<convert_grid, convert_block, 0, stream>>>(
             handle.device_coords_fp32.data(), handle.device_coords_fp16.data(), num_elements);
-        check_cuda_status_(cudaPeekAtLastError(), "convert_coords_fp32_to_fp16_kernel launch");
+        sink.check(cudaPeekAtLastError(), "convert_coords_fp32_to_fp16_kernel launch");
     }
 
     // Enqueue pinned D2H for all three output arrays. Pinned destination means
@@ -554,31 +549,23 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
     // kernels. `finalize_gpu_pipeline` just waits on the stream and permutes.
     cudaEventRecord(handle.event_download_start, stream);
     if (total_coords > 0)
-        check_cuda_status_(cudaMemcpyAsync(handle.host_coords_sorted.data(), handle.device_coords_fp16.data(),
-                                           total_coords * sizeof(__half), cudaMemcpyDeviceToHost, stream),
-                           "D2H coords_fp16");
+        sink.check(cudaMemcpyAsync(handle.host_coords_sorted.data(), handle.device_coords_fp16.data(),
+                                   total_coords * sizeof(__half), cudaMemcpyDeviceToHost, stream),
+                   "D2H coords_fp16");
     if (total_conf > 0) {
-        check_cuda_status_(cudaMemcpyAsync(handle.host_energies_sorted.data(), handle.device_energies_out.data(),
-                                           total_conf * sizeof(float), cudaMemcpyDeviceToHost, stream),
-                           "D2H energies");
-        check_cuda_status_(cudaMemcpyAsync(handle.host_status_sorted.data(), handle.device_status_out.data(),
-                                           total_conf * sizeof(std::uint8_t), cudaMemcpyDeviceToHost, stream),
-                           "D2H status");
+        sink.check(cudaMemcpyAsync(handle.host_energies_sorted.data(), handle.device_energies_out.data(),
+                                   total_conf * sizeof(float), cudaMemcpyDeviceToHost, stream),
+                   "D2H energies");
+        sink.check(cudaMemcpyAsync(handle.host_status_sorted.data(), handle.device_status_out.data(),
+                                   total_conf * sizeof(std::uint8_t), cudaMemcpyDeviceToHost, stream),
+                   "D2H status");
     }
     cudaEventRecord(handle.event_end, stream);
-
-    auto _P_end = std::chrono::high_resolution_clock::now();
-    if (verbose_logging) {
-        auto elapsed_milliseconds = [](auto begin_time, auto end_time) {
-            return std::chrono::duration<double, std::milli>(end_time - begin_time).count();
-        };
-        std::printf(
-            "  [gpu%d] setup=%.1f mallocpool=%.1f upload=%.1f metric=%.1f kernels_post=%.1f total=%.1f\n", device_id,
-            elapsed_milliseconds(_P0, _P_pre_malloc), elapsed_milliseconds(_P_pre_malloc, _P_post_malloc),
-            elapsed_milliseconds(_P_post_malloc, _P_post_upload), elapsed_milliseconds(_P_post_upload, _P_post_metric),
-            elapsed_milliseconds(_P_post_metric, _P_end), elapsed_milliseconds(_P0, _P_end));
-        std::fflush(stdout);
-    }
+    (void)_P0;
+    (void)_P_pre_malloc;
+    (void)_P_post_malloc;
+    (void)_P_post_upload;
+    (void)_P_post_metric;
     return handle;
 }
 
@@ -589,8 +576,8 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
  *  and does a permutation memcpy.
  */
 void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
-    check_cuda_status_(cudaSetDevice(handle.device_id), "cudaSetDevice(finalize_gpu_pipeline)");
-    check_cuda_status_(cudaStreamSynchronize(handle.stream), "cudaStreamSynchronize(finalize)");
+    handle.sink.check(cudaSetDevice(handle.device_id), "cudaSetDevice(finalize_gpu_pipeline)");
+    handle.sink.check(cudaStreamSynchronize(handle.stream), "cudaStreamSynchronize(finalize)");
 
     // Compute stream-local phase elapsed times — events are persistent in the
     // launch_scratch_t so no destroy here. All ignored failures (events not
@@ -648,7 +635,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
                                                   std::span<__half> coordinates_out, std::span<float> energies_out,
                                                   std::span<conformer_status_t> status_out) {
 
-    verbose_logging = config.verbose;
+    cuda_error_sink_t const sink {&this->logger, &this->cuda_error_count};
 
     std::uint32_t const num_input = static_cast<std::uint32_t>(smiles.size());
     std::uint32_t const num_conformers = config.num_conformers;
@@ -699,9 +686,9 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         std::size_t smallest_total = 0;
         bool have_any = false;
         for (std::size_t d = 0; d < device_ids.size(); ++d) {
-            if (!check_cuda_status_(cudaSetDevice(device_ids[d]), "cudaSetDevice(memgetinfo)")) continue;
+            if (!sink.check(cudaSetDevice(device_ids[d]), "cudaSetDevice(memgetinfo)")) continue;
             std::size_t free_b = 0, total_b = 0;
-            if (!check_cuda_status_(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo")) continue;
+            if (!sink.check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo")) continue;
             if (!have_any || free_b < smallest_free) smallest_free = free_b;
             if (!have_any || total_b < smallest_total) smallest_total = total_b;
             have_any = true;
@@ -731,9 +718,8 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         if (auto_chunk > total_cap_from_cusolver) auto_chunk = total_cap_from_cusolver;
         chunk_size_target = static_cast<std::uint32_t>(auto_chunk);
     }
-    if (verbose_logging)
-        std::printf("generate_conformers: n=%u K=%u chunk=%u pipeline=%d\n", num_input, num_conformers,
-                    chunk_size_target, num_input > chunk_size_target * 3 / 2 ? 1 : 0);
+    this->logger.trace("generate_conformers: n={} K={} chunk={} pipeline={}", num_input, num_conformers,
+                       chunk_size_target, num_input > chunk_size_target * 3 / 2 ? "yes" : "no");
 
     bool const pipeline = num_input > chunk_size_target * 3 / 2;
 
@@ -825,14 +811,10 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
             handles_out[d] = launch_gpu_pipeline(device_ids[d], streams[d], solvers[d], metric_scratch[d],
                                                  *launch_scratch[d], batch, gpu_span, num_conformers,
                                                  config.max_stereo_attempts, effective_max_atoms, config.random_seed,
-                                                 chunk_base, sort_perm_view, coordinates_out, energies_out, status_out);
+                                                 chunk_base, sort_perm_view, coordinates_out, energies_out, status_out,
+                                                 sink);
             handles_out[d].timings_out = &timings_out[d];
-            auto _lt1 = std::chrono::high_resolution_clock::now();
-            if (verbose_logging) {
-                std::printf("[launch gpu%d] %.1fms\n", d,
-                            std::chrono::duration<double, std::milli>(_lt1 - _lt0).count());
-                std::fflush(stdout);
-            }
+            (void)_lt0;
         }
     };
 
@@ -957,38 +939,43 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         chunk_records[last_idx].per_device_gpu = timing_slots[last_idx % 2];
     }
 
-    // Pretty-print per-chunk timeline. Only when the caller opted into verbose
-    // logging — otherwise this is pure overhead on production callers.
-    if (verbose_logging) {
+    // Per-chunk summary (verbose tier 1) and per-device breakdown (tier 2).
+    // Skipped entirely in the default silent mode.
+    if (this->logger.verbose_level >= 1) {
         double const total_wall_ms = host_ms(std::chrono::high_resolution_clock::now());
-        std::printf("\n=== chunk timeline (ms, host wall + per-device GPU phase) ===\n");
-        std::printf("%4s %7s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n", "ck", "n_mol", "prep_lo", "prep_hi", "lnch_lo",
-                    "lnch_hi", "fin_lo", "fin_hi", "gpu_max", "gpu_sum", "gpu_avg");
+        this->logger.trace("chunk   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / "
+                           "download");
         for (auto const &cr : chunk_records) {
-            float gpu_max = 0.f, gpu_sum = 0.f;
+            float gpu_max = 0.f, gpu_sum = 0.f, upload = 0.f, metric = 0.f, kernels = 0.f, download = 0.f;
             std::uint32_t n_active = 0;
             for (auto const &pd : cr.per_device_gpu) {
                 if (pd.total_ms <= 0.f) continue;
                 gpu_max = std::max(gpu_max, pd.total_ms);
                 gpu_sum += pd.total_ms;
+                upload += pd.upload_ms;
+                metric += pd.metric_ms;
+                kernels += pd.kernels_ms;
+                download += pd.download_ms;
                 ++n_active;
             }
-            float gpu_avg = n_active > 0 ? gpu_sum / n_active : 0.f;
-            std::printf("%4u %7u %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f\n", cr.chunk_idx, cr.n_mol,
-                        cr.prep_start_ms, cr.prep_end_ms, cr.launch_start_ms, cr.launch_end_ms, cr.finalize_start_ms,
-                        cr.finalize_end_ms, gpu_max, gpu_sum, gpu_avg);
+            float const inv = n_active > 0 ? 1.f / static_cast<float>(n_active) : 0.f;
+            this->logger.trace("{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / "
+                               "{:>6.1f} / {:>6.1f}",
+                               cr.chunk_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms,
+                               cr.launch_end_ms - cr.launch_start_ms, cr.finalize_end_ms - cr.finalize_start_ms,
+                               gpu_sum * inv, gpu_max, upload * inv, metric * inv, kernels * inv, download * inv);
         }
-        // Per-device per-chunk phase breakdown (compact).
-        std::printf("\n=== per-device phase breakdown (ms): U=upload  M=metric  K=kernels  D=download  T=total ===\n");
+        this->logger.trace("wall {:.1f} ms", total_wall_ms);
+        // Tier 2: per-device per-chunk breakdown.
         for (auto const &cr : chunk_records) {
             for (std::uint32_t d = 0; d < cr.per_device_gpu.size(); ++d) {
                 auto const &pd = cr.per_device_gpu[d];
                 if (pd.total_ms <= 0.f) continue;
-                std::printf("ck=%u dev=%u  U=%5.1f  M=%5.1f  K=%6.1f  D=%5.1f  T=%6.1f\n", cr.chunk_idx, d,
-                            pd.upload_ms, pd.metric_ms, pd.kernels_ms, pd.download_ms, pd.total_ms);
+                this->logger.trace2(
+                    "  ck={} dev={}  upload={:.1f}  metric={:.1f}  kernels={:.1f}  download={:.1f}  total={:.1f}",
+                    cr.chunk_idx, d, pd.upload_ms, pd.metric_ms, pd.kernels_ms, pd.download_ms, pd.total_ms);
             }
         }
-        std::printf("\nWall time (call total): %.1f ms\n", total_wall_ms);
     }
 
     // All output permutation already happened inside `finalize_gpu_pipeline`:

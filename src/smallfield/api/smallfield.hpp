@@ -46,6 +46,7 @@ typedef void *cusolverDnParams_t;
 #include <vector>
 
 #include "smallfield/api/batch_pool.hpp"
+#include "smallfield/log.hpp"
 
 namespace smallfield::preprocess {
 class scaffold_cache_t;
@@ -74,8 +75,6 @@ struct config_t {
     std::uint32_t max_stereo_attempts = 10;
     /** @brief Target chunk size for pipelined dispatch; 0 = VRAM-aware auto. */
     std::uint32_t chunk_size = 0;
-    /** @brief Emit per-chunk and per-device breadcrumb lines when true. */
-    bool verbose = false;
     std::uint64_t random_seed = 42;
 };
 
@@ -141,6 +140,25 @@ struct context_t {
     std::unique_ptr<scaffold_cache_t> scaffold_cache;
 
     /**
+     *  @brief Owned per-context logger.  Tune verbosity via
+     *  `ctx.logger.verbose_level = 1;` before calling @ref generate_conformers.
+     *  Library diagnostics (chunk timing table, per-device breakdown) route
+     *  through `logger.trace` / `logger.trace2`; CUDA errors through
+     *  `logger.error`.
+     */
+    smallfield::logger_t logger;
+
+    /**
+     *  @brief Per-context CUDA error accumulator, incremented by
+     *  `check_cuda_status_` every time a CUDA / cuSOLVER API call returns a
+     *  non-success status.  Production callers read this after each
+     *  @ref generate_conformers call and exit non-zero if it is positive,
+     *  catching silent failures that would otherwise hide behind per-chunk
+     *  zero-filled outputs.  Reset via `ctx.cuda_error_count.store(0)`.
+     */
+    std::atomic<std::uint64_t> cuda_error_count {0};
+
+    /**
      *  @brief Construct for the given GPUs.
      *
      *  @param[in] devices GPU device IDs. Empty span = all available GPUs.
@@ -176,27 +194,5 @@ struct context_t {
                                            std::uint32_t max_atoms_per_molecule, std::span<__half> coordinates_out,
                                            std::span<float> energies_out, std::span<conformer_status_t> status_out);
 };
-
-/**
- *  @brief Process-wide CUDA error accumulator, incremented by the library's internal
- *  `check_cuda_status_` helper every time a CUDA API call returns non-success.
- *
- *  Inline so a single instance exists across every translation unit that includes this header.
- *  Callers use the @ref cuda_error_count / @ref reset_cuda_error_count accessors.
- */
-inline std::atomic<std::uint64_t> cuda_error_counter {0};
-
-/**
- *  @brief Read the cumulative CUDA error count since process start or the last reset.
- *
- *  Exposed so production callers and benchmarks can detect silent failures that would otherwise
- *  hide behind per-chunk zero-filled outputs.  A robust driver calls @ref reset_cuda_error_count
- *  before each batch, invokes @ref generate_conformers, and exits non-zero if this returns
- *  a positive value.
- */
-inline std::uint64_t cuda_error_count() noexcept { return cuda_error_counter.load(std::memory_order_relaxed); }
-
-/** @brief Reset @ref cuda_error_count to zero. */
-inline void reset_cuda_error_count() noexcept { cuda_error_counter.store(0, std::memory_order_relaxed); }
 
 } // namespace smallfield::api

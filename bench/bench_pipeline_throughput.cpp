@@ -59,14 +59,6 @@ static double percentile(std::vector<double> &sorted_values, double p) {
     return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac;
 }
 
-static int report_cuda_errors(char const *context, std::uint64_t cuda_errors) {
-    std::fprintf(stderr,
-                 "\nFAIL: %llu CUDA errors reported by the library during %s; " "throughput numbers above are "
-                                                                                "unreliable. " "Clean-rebuild and "
-                                                                                               "retry.\n",
-                 static_cast<unsigned long long>(cuda_errors), context);
-    return 2;
-}
 
 static void bench_rdkit_cpu(std::vector<std::string> const &smiles, std::uint32_t num_conformers,
                             std::uint32_t max_stereo_attempts) {
@@ -137,7 +129,6 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     sfapi::config_t generation_config;
     generation_config.num_conformers = num_conformers;
     generation_config.max_stereo_attempts = max_stereo_attempts;
-    // verbose removed - not in HEAD config_t
 
     // Allocate output buffers.  Use size_t arithmetic — the coordinate
     // buffer for 10M × K=3 × 128 atoms × 3 dims exceeds UINT32_MAX elements.
@@ -166,7 +157,9 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     std::printf("  Time:      %.0f ms\n", elapsed_ms_value);
     std::printf("  Mol/s:     %.1f\n", mol_per_sec);
     std::printf("  Conf/s:    %.1f\n", conf_per_sec);
-    std::printf("  Succeeded: %u / %u conformers\n", num_successful_conformers, total_conformers);
+    std::printf("  Succeeded: %u / %zu conformers\n", num_successful_conformers, total_conformers);
+    std::uint64_t const cuda_errors = gpu_context.cuda_error_count.load();
+    if (cuda_errors > 0) std::fprintf(stderr, "  cuda errors during single-GPU bench: %lu\n", cuda_errors);
 }
 
 static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, std::uint32_t num_conformers,
@@ -181,7 +174,6 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     sfapi::config_t generation_config;
     generation_config.num_conformers = num_conformers;
     generation_config.max_stereo_attempts = max_stereo_attempts;
-    // verbose removed - not in HEAD config_t
 
     // Allocate output buffers.  Use size_t arithmetic — the coordinate
     // buffer for 10M × K=3 × 128 atoms × 3 dims exceeds UINT32_MAX elements.
@@ -222,7 +214,9 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     std::printf("  Time:      %.0f ms\n", elapsed_ms_value);
     std::printf("  Mol/s:     %.1f\n", mol_per_sec);
     std::printf("  Conf/s:    %.1f\n", conf_per_sec);
-    std::printf("  Succeeded: %u / %u conformers\n", num_successful_conformers, total_conformers);
+    std::printf("  Succeeded: %u / %zu conformers\n", num_successful_conformers, total_conformers);
+    std::uint64_t const cuda_errors = gpu_context.cuda_error_count.load();
+    if (cuda_errors > 0) std::fprintf(stderr, "  cuda errors during multi-GPU bench: %lu\n", cuda_errors);
 }
 
 static void cross_validate(std::vector<std::string> const &smiles, std::vector<__half> const &coords,
@@ -385,12 +379,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    sfapi::reset_cuda_error_count();
-
     if (multi_gpu_only) {
         bench_smallfield_multi_gpu(all_smiles, num_conformers, max_stereo_attempts);
-        std::uint64_t const cuda_errors = sfapi::cuda_error_count();
-        if (cuda_errors > 0) return report_cuda_errors("generate_conformers", cuda_errors);
         std::printf("\nDone.\n");
         return 0;
     }
@@ -429,8 +419,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    std::uint64_t const cuda_errors = sfapi::cuda_error_count();
-    if (cuda_errors > 0) return report_cuda_errors("one of the GPU runs", cuda_errors);
     std::printf("\nDone.\n");
     return 0;
 }

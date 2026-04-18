@@ -32,28 +32,11 @@
 #include <cuda_runtime.h>
 #include <cusolverDn.h>
 
-#include "smallfield/api/smallfield.hpp" // for cuda_error_counter
+#include "smallfield/cuda_error.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::cuda {
-using smallfield::api::cuda_error_counter;
 using smallfield::types::etkdg_molecule_metadata_t;
-
-/** @brief Log and count a CUDA runtime error if status is not cudaSuccess. */
-inline bool check_cuda_status_(cudaError_t status, char const *operation) {
-    if (status == cudaSuccess) return true;
-    std::fprintf(stderr, "CUDA error in %s: %s\n", operation, cudaGetErrorString(status));
-    smallfield::api::cuda_error_counter.fetch_add(1, std::memory_order_relaxed);
-    return false;
-}
-
-/** @brief Log and count a cuSOLVER error if status is not CUSOLVER_STATUS_SUCCESS. */
-inline bool check_cusolver_status_(cusolverStatus_t status, char const *operation) {
-    if (status == CUSOLVER_STATUS_SUCCESS) return true;
-    std::fprintf(stderr, "cuSOLVER error in %s: %d\n", operation, static_cast<int>(status));
-    smallfield::api::cuda_error_counter.fetch_add(1, std::memory_order_relaxed);
-    return false;
-}
 
 /**
  * @brief Reads the upper distance bound for atom pair (i, j) from the float bounds matrix.
@@ -475,15 +458,15 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
                                                     std::span<etkdg_molecule_metadata_t const> host_metadata,
                                                     std::uint32_t max_atoms_per_molecule,
                                                     float *device_initial_coordinates, cusolverDnHandle_t solver_handle,
-                                                    scratch_ &scratch, cudaStream_t stream = nullptr) {
+                                                    scratch_ &scratch, cuda_error_sink_t sink,
+                                                    cudaStream_t stream = nullptr) {
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(host_metadata.size());
     if (num_molecules == 0 || max_atoms_per_molecule == 0) return true;
 
-    if (!check_cuda_status_(
-            cudaMemsetAsync(device_initial_coordinates, 0,
-                            static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float),
-                            stream),
-            "cudaMemsetAsync(metric coordinates)"))
+    if (!sink.check(cudaMemsetAsync(device_initial_coordinates, 0,
+                                    static_cast<std::size_t>(num_molecules) * max_atoms_per_molecule * 4 * sizeof(float),
+                                    stream),
+                    "cudaMemsetAsync(metric coordinates)"))
         return false;
 
     // Bin molecules into 8 fixed wave-dispatch buckets {16,32,48,64,80,96,112,128}.
@@ -512,7 +495,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
 
     // The caller already called cusolverDnSetStream(solver_handle, stream) at context
     // creation, but the stream may have been re-set since; cheap to re-set here.
-    if (!check_cusolver_status_(cusolverDnSetStream(solver_handle, stream), "cusolverDnSetStream")) return false;
+    if (!sink.check(cusolverDnSetStream(solver_handle, stream), "cusolverDnSetStream")) return false;
 
     constexpr std::uint32_t block_size_k = 128;
     bool success = true;
@@ -524,10 +507,10 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         std::uint32_t const bin_n = bin_atom_counts_k[b];
         std::size_t const group_size = group.size();
         if (group_size > scratch.max_group_size || bin_n > scratch.max_atoms) {
-            std::fprintf(
-                stderr,
-                "metric_embedding_prepass: scratch too small (need group=%zu bin_n=%u, have group=%zu atoms=%u)\n",
-                group_size, bin_n, scratch.max_group_size, scratch.max_atoms);
+            if (sink.log != nullptr)
+                sink.log->error("metric_embedding_prepass: scratch too small (need group={} bin_n={}, have group={} "
+                                "atoms={})",
+                                group_size, bin_n, scratch.max_group_size, scratch.max_atoms);
             return false;
         }
 
@@ -538,21 +521,20 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         std::size_t const shared_bytes =
             static_cast<std::size_t>(bin_n * bin_n + bin_n + 1 + 4 * bin_n + bin_n + 4 + 1) * sizeof(float);
 
-        success &= check_cuda_status_(
-            cudaMemcpyAsync(device_group_indices, group.data(), group_size * sizeof(std::uint32_t),
-                            cudaMemcpyHostToDevice, stream),
-            "cudaMemcpyAsync(bin group indices)");
-        success &= check_cuda_status_(
-            cudaFuncSetAttribute(embed_4d_power_iter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(shared_bytes)),
-            "cudaFuncSetAttribute(embed_4d_power_iter_kernel)");
+        success &= sink.check(cudaMemcpyAsync(device_group_indices, group.data(),
+                                              group_size * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream),
+                              "cudaMemcpyAsync(bin group indices)");
+        success &= sink.check(cudaFuncSetAttribute(embed_4d_power_iter_kernel,
+                                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                   static_cast<int>(shared_bytes)),
+                              "cudaFuncSetAttribute(embed_4d_power_iter_kernel)");
         if (!success) continue;
 
         // One kernel launch replaces the smooth-and-build-gram + cusolverDnXsyevBatched +
         // project chain. No cusolver state updates, no global Gram/eigenvalue buffers.
         embed_4d_power_iter_kernel<<<static_cast<unsigned int>(group_size), block_size_k, shared_bytes, stream>>>(
             device_bounds, device_metadata, device_group_indices, device_initial_coordinates, max_atoms_per_molecule);
-        success &= check_cuda_status_(cudaGetLastError(), "embed_4d_power_iter_kernel launch");
+        success &= sink.check(cudaGetLastError(), "embed_4d_power_iter_kernel launch");
     }
 
     // The solver handle is no longer used inside this function but we keep the
