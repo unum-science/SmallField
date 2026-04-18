@@ -8,18 +8,18 @@ target_link_libraries(bench_pipeline_throughput PRIVATE
     $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
 target_include_directories(bench_pipeline_throughput PRIVATE
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/tests
+    ${CMAKE_SOURCE_DIR}/test
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 set_target_properties(bench_pipeline_throughput PROPERTIES
     LINKER_LANGUAGE CUDA)
 
-add_executable(profile_pipeline profile_pipeline.cpp)
-set_source_files_properties(profile_pipeline.cpp PROPERTIES LANGUAGE CXX)
-target_link_libraries(profile_pipeline PRIVATE smallfield_lib OpenMP::OpenMP_CXX $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
-target_include_directories(profile_pipeline PRIVATE
+add_executable(bench_profile bench_profile.cpp)
+set_source_files_properties(bench_profile.cpp PROPERTIES LANGUAGE CXX)
+target_link_libraries(bench_profile PRIVATE smallfield_lib OpenMP::OpenMP_CXX $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
+target_include_directories(bench_profile PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(profile_pipeline PROPERTIES LINKER_LANGUAGE CUDA)
+set_target_properties(bench_profile PROPERTIES LINKER_LANGUAGE CUDA)
 
 # MMFF kernel scaling benchmark: measures GPU kernel trio isolation.
 # Mixed .cpp/.cu build: .cpp drives RDKit + OpenMP CPU timing, .cu launches

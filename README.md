@@ -81,7 +81,7 @@ cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc) bench_pipeline_throughput
 
 LD_LIBRARY_PATH=/path/to/conda/env/lib:$LD_LIBRARY_PATH \
-    ./benchmark/bench_pipeline_throughput --smi /path/to/chembl.smi
+    ./bench/bench_pipeline_throughput --smi /path/to/chembl.smi
 ```
 
 Default mode reports RDKit CPU vs SmallField 1-GPU throughput plus an RDKit MMFF94 quality check.
@@ -114,8 +114,8 @@ src/smallfield/preprocess/          CPU preprocessing: SMILES parse, bounds, CIP
 src/smallfield/mmff94/              native MMFF94 typer, charge, term extractor (CPU + GPU)
 src/smallfield/cuda/                CUDA kernels: metric embedding, DG, ETK, MMFF, FIRE, pipeline driver
 cli/                                smallfield_batch — restartable CLI over Parquet shards
-tests/                              C++ and Python tests cross-validated against RDKit
-benchmark/                          C++ benchmarks: throughput + isolated MMFF kernels
+test/                               C++ and Python tests cross-validated against RDKit
+bench/                              C++ benchmarks: throughput + isolated MMFF kernels
 python/smallfield/                  Python package including tools/smi_to_parquet.py
 ```
 

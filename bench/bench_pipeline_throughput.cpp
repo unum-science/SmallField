@@ -137,6 +137,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     sfapi::config_t generation_config;
     generation_config.num_conformers = num_conformers;
     generation_config.max_stereo_attempts = max_stereo_attempts;
+    // verbose removed - not in HEAD config_t
 
     // Allocate output buffers.  Use size_t arithmetic — the coordinate
     // buffer for 10M × K=3 × 128 atoms × 3 dims exceeds UINT32_MAX elements.
@@ -180,6 +181,7 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     sfapi::config_t generation_config;
     generation_config.num_conformers = num_conformers;
     generation_config.max_stereo_attempts = max_stereo_attempts;
+    // verbose removed - not in HEAD config_t
 
     // Allocate output buffers.  Use size_t arithmetic — the coordinate
     // buffer for 10M × K=3 × 128 atoms × 3 dims exceeds UINT32_MAX elements.
