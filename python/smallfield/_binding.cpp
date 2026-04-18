@@ -36,11 +36,10 @@ PYBIND11_MODULE(_smallfield, m) {
             "generate_conformers",
             [](smallfield::api::context_t &gpu_context, std::vector<std::string> const &smiles_list,
                std::uint32_t num_conformers, std::uint32_t max_atoms_per_molecule,
-               std::uint32_t max_stereo_attempts, bool use_csd_torsions, std::uint64_t random_seed) {
+               std::uint32_t max_stereo_attempts, std::uint64_t random_seed) {
                 smallfield::api::config_t config;
                 config.num_conformers = num_conformers;
                 config.max_stereo_attempts = max_stereo_attempts;
-                config.use_csd_torsions = use_csd_torsions;
                 config.random_seed = random_seed;
 
                 std::uint32_t const num_molecules = static_cast<std::uint32_t>(smiles_list.size());
@@ -81,6 +80,5 @@ PYBIND11_MODULE(_smallfield, m) {
             py::arg("num_conformers") = 3,
             py::arg("max_atoms_per_molecule") = 128,
             py::arg("max_stereo_attempts") = 10,
-            py::arg("use_csd_torsions") = true,
             py::arg("random_seed") = 42);
 }

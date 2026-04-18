@@ -68,7 +68,6 @@ def generate_conformers(
     num_conformers: int = 3,
     max_atoms_per_molecule: int = 128,
     max_stereo_attempts: int = 10,
-    use_csd_torsions: bool = True,
     random_seed: int = 42,
     device_ids: Optional[Iterable[int]] = None,
 ):
@@ -89,7 +88,6 @@ def generate_conformers(
             num_conformers,
             max_atoms_per_molecule,
             max_stereo_attempts,
-            use_csd_torsions,
             random_seed,
         )
         return _reshape_single_molecule(
@@ -106,7 +104,6 @@ def generate_conformers(
         num_conformers,
         max_atoms_per_molecule,
         max_stereo_attempts,
-        use_csd_torsions,
         random_seed,
     )
 

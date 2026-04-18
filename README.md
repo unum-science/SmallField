@@ -69,7 +69,6 @@ coordinates_flat, energies, status = context.generate_conformers(
     num_conformers=3,
     max_atoms_per_molecule=128,
     max_stereo_attempts=10,
-    use_csd_torsions=True,
     random_seed=42,
 )
 ```
