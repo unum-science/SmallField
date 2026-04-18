@@ -38,6 +38,7 @@
 #include <cuda_fp16.h>
 
 #include "smallfield/api/smallfield.hpp"
+#include "smallfield/log.hpp"
 
 #include "parquet_reader.hpp"
 #include "parquet_writer.hpp"
@@ -47,6 +48,8 @@
 namespace fs = std::filesystem;
 namespace sfapi = smallfield::api;
 namespace sfcli = smallfield::cli;
+using smallfield::logger_t;
+using smallfield::thousands;
 
 /** All CLI flags.  Immutable after parse. */
 struct cli_config_t {
@@ -60,20 +63,23 @@ struct cli_config_t {
     int rdkit_fallback_threads = 0;
     bool resume = true;
     std::uint64_t random_seed = 42;
+    int verbose_level = 0; ///< 0 silent; 1 chunk table; 2 per-device detail
 };
 
 void print_usage() {
-    std::fprintf(stderr, R"(Usage: smallfield_batch --input DIR --output DIR [options]
+    fmt::print(stderr, R"(Usage: smallfield_batch --input DIR --output DIR [options]
   --input DIR                 folder of *.parquet input-files
   --output DIR                folder to write *_3D.parquet output-files
   --smiles-column NAME        input column name (default: smiles)
   --num-conformers K          conformers per molecule (default: 3)
   --max-atoms N               per-molecule atom cap (default: 128)
   --gpus-batch-size N         molecules per gpus-batch (default: auto = 100K per GPU)
+  --chunk-size N              alias for --gpus-batch-size
   --gpus a,b,c                GPU device IDs (default: all visible)
   --rdkit-fallback-threads N  OpenMP threads for RDKit fallback (default: max)
   --restart                   overwrite already-complete output-files
   --seed N                    RNG seed for both GPU and RDKit fallback
+  --verbose[=LEVEL]           library diagnostics: 1 = chunk table, 2 = +per-device
 )");
 }
 
@@ -95,7 +101,7 @@ bool parse_cli(int argc, char **argv, cli_config_t &config) {
         std::string_view flag = argv[argument_index];
         auto require_value = [&](char const *flag_name) -> char const * {
             if (argument_index + 1 >= argc) {
-                std::fprintf(stderr, "--%s requires a value\n", flag_name);
+                fmt::print(stderr, "--{} requires a value\n", flag_name);
                 return nullptr;
             }
             return argv[++argument_index];
@@ -152,12 +158,16 @@ bool parse_cli(int argc, char **argv, cli_config_t &config) {
             if (!value) return false;
             config.random_seed = std::strtoull(value, nullptr, 10);
         }
+        else if (flag == "--verbose") { config.verbose_level = 1; }
+        else if (flag.starts_with("--verbose=")) {
+            config.verbose_level = static_cast<int>(std::strtol(flag.data() + 10, nullptr, 10));
+        }
         else if (flag == "--help" || flag == "-h") {
             print_usage();
             return false;
         }
         else {
-            std::fprintf(stderr, "unknown flag: %.*s\n", static_cast<int>(flag.size()), flag.data());
+            fmt::print(stderr, "unknown flag: {}\n", flag);
             return false;
         }
     }
@@ -227,6 +237,11 @@ struct gpus_batch_result_t {
     gpus_batch_accumulator_t accumulator;
     output_buffers_t *buffers = nullptr;
     bool done = false;
+    /// When the gpu_runner picked up this batch — used by the writer to derive
+    /// per-shard wall time (GPU + fallback + write) for the single progress line.
+    std::chrono::steady_clock::time_point batch_start {};
+    std::uint64_t fallback_attempted = 0; ///< number of molecules sent into RDKit fallback
+    std::uint64_t fallback_recovered = 0; ///< number for which RDKit filled at least one slot
 };
 
 /** Bounded ring-buffer producer/consumer channel.
@@ -352,15 +367,8 @@ struct progress_counters_t {
     std::chrono::steady_clock::time_point start_time;
 };
 
-void format_elapsed(double seconds, char *buf, std::size_t buf_size) {
-    int const hours = static_cast<int>(seconds / 3600);
-    int const minutes = static_cast<int>(std::fmod(seconds, 3600) / 60);
-    int const secs = static_cast<int>(std::fmod(seconds, 60));
-    std::snprintf(buf, buf_size, "%02d:%02d:%02d", hours, minutes, secs);
-}
-
 void reader_loop(std::vector<sfcli::shard_pair_t const *> const &pending, cli_config_t const &config,
-                 std::uint32_t gpus_batch_target, thread_budget_t const &budget,
+                 std::uint32_t gpus_batch_target, thread_budget_t const &budget, logger_t const &logger,
                  handoff_t<gpus_batch_accumulator_t> &out) {
     omp_set_num_threads(budget.reader);
     gpus_batch_accumulator_t accumulator;
@@ -368,7 +376,7 @@ void reader_loop(std::vector<sfcli::shard_pair_t const *> const &pending, cli_co
     for (auto const *pair : pending) {
         sfcli::shard_data_t data;
         if (!sfcli::read_shard(pair->input_path, config.smiles_column, data)) {
-            std::fprintf(stderr, "  read failed, skipping: %s\n", pair->input_path.string().c_str());
+            logger.error("read failed, skipping: {}", pair->input_path.string());
             continue;
         }
         accumulator.add_input_file(std::move(data), pair);
@@ -390,6 +398,7 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
                      handoff_t<gpus_batch_accumulator_t> &in, handoff_t<gpus_batch_result_t> &out, buffer_pool_t &pool,
                      progress_counters_t &counters) {
     omp_set_num_threads(budget.gpu_runner);
+    (void)counters;
 
     sfapi::config_t generation_config;
     generation_config.num_conformers = config.num_conformers;
@@ -401,14 +410,7 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
 
         std::uint64_t const num_molecules = accumulator.total_molecules;
         std::uint64_t const total_conformers = num_molecules * config.num_conformers;
-
-        char elapsed_buf[16];
-        double const wall =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - counters.start_time).count();
-        format_elapsed(wall, elapsed_buf, sizeof(elapsed_buf));
-        std::printf("[%s] gpus-batch %zu input-files, %zu molecules\n", elapsed_buf,
-                    accumulator.input_file_pairs.size(), static_cast<std::size_t>(num_molecules));
-        std::fflush(stdout);
+        auto const batch_start = std::chrono::steady_clock::now();
 
         output_buffers_t *buf = pool.acquire();
         buf->resize_for(num_molecules, config.num_conformers, config.max_atoms);
@@ -443,6 +445,7 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
         gpus_batch_result_t result;
         result.accumulator = std::move(accumulator);
         result.buffers = buf;
+        result.batch_start = batch_start;
         out.send(std::move(result));
     }
 
@@ -452,7 +455,7 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
 }
 
 void fallback_loop(cli_config_t const &config, thread_budget_t const &budget, handoff_t<gpus_batch_result_t> &in,
-                   handoff_t<gpus_batch_result_t> &out, progress_counters_t &counters) {
+                   handoff_t<gpus_batch_result_t> &out) {
     omp_set_num_threads(budget.fallback);
 
     for (;;) {
@@ -484,29 +487,22 @@ void fallback_loop(cli_config_t const &config, thread_budget_t const &budget, ha
                 std::span<float>(buf->energies.data(), total_conformers),
             };
             auto const num_recovered = sfcli::rdkit_fallback(fallback_inputs, fallback_outputs);
-
-            char elapsed_buf[16];
-            double const wall =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - counters.start_time).count();
-            format_elapsed(wall, elapsed_buf, sizeof(elapsed_buf));
-            std::printf("[%s]   RDKit fallback %zu → %zu recovered\n", elapsed_buf, buf->retry_indices.size(),
-                        static_cast<std::size_t>(num_recovered));
-            std::fflush(stdout);
+            result.fallback_attempted = buf->retry_indices.size();
+            result.fallback_recovered = num_recovered;
         }
 
         out.send(std::move(result));
     }
 }
 
-void writer_loop(cli_config_t const &config, thread_budget_t const &budget, handoff_t<gpus_batch_result_t> &in,
-                 buffer_pool_t &pool, progress_counters_t &counters) {
+void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logger_t const &logger,
+                 handoff_t<gpus_batch_result_t> &in, buffer_pool_t &pool, progress_counters_t &counters) {
     omp_set_num_threads(budget.writer);
 
     for (;;) {
         auto result = in.receive();
         if (result.done) break;
 
-        auto const batch_start = std::chrono::steady_clock::now();
         output_buffers_t *buf = result.buffers;
         auto &acc = result.accumulator;
         std::uint64_t const num_molecules = acc.total_molecules;
@@ -536,8 +532,7 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, hand
             };
 
             if (!sfcli::write_shard(acc.input_file_pairs[file_idx]->output_path, writer_inputs)) {
-                std::fprintf(stderr, "  write failed: %s\n",
-                             acc.input_file_pairs[file_idx]->output_path.string().c_str());
+                logger.error("write failed: {}", acc.input_file_pairs[file_idx]->output_path.string());
             }
 
             counters.molecules_completed.fetch_add(file_molecules);
@@ -546,24 +541,33 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, hand
 
         pool.release(buf);
 
-        double const batch_seconds =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - batch_start).count();
-        double const wall =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - counters.start_time).count();
-        double const cumul_mol = static_cast<double>(counters.molecules_completed.load());
-        double const cumul_rate = cumul_mol / std::max(wall, 0.001);
+        auto const now = std::chrono::steady_clock::now();
+        double const batch_seconds = std::chrono::duration<double>(now - result.batch_start).count();
+        double const wall = std::chrono::duration<double>(now - counters.start_time).count();
+        std::uint64_t const cumul_mol = counters.molecules_completed.load();
+        double const cumul_rate = static_cast<double>(cumul_mol) / std::max(wall, 0.001);
         std::uint64_t const files_done = counters.input_files_completed.load();
         std::uint64_t const files_remaining = counters.total_input_files - files_done;
-        double const eta = files_remaining > 0 ? (files_remaining * wall / files_done) : 0;
+        double const remaining_seconds = files_remaining > 0 && files_done > 0
+                                             ? static_cast<double>(files_remaining) * wall / files_done
+                                             : 0.0;
+        auto const eta_wall = std::chrono::system_clock::now() +
+                              std::chrono::milliseconds(static_cast<std::int64_t>(remaining_seconds * 1000.0));
 
-        char elapsed_buf[16], eta_buf[16];
-        format_elapsed(wall, elapsed_buf, sizeof(elapsed_buf));
-        format_elapsed(eta, eta_buf, sizeof(eta_buf));
-        std::printf("[%s] %3zu/%-3zu  done  %.0fs  %.0f mol/s  cumulative: %.1fM mol  %.0f mol/s  eta %s\n",
-                    elapsed_buf, static_cast<std::size_t>(files_done),
-                    static_cast<std::size_t>(counters.total_input_files), batch_seconds,
-                    num_molecules / std::max(batch_seconds, 0.001), cumul_mol / 1e6, cumul_rate, eta_buf);
-        std::fflush(stdout);
+        // Collapse gpus-batch start + fallback + done into one line.  Fallback
+        // fragment is omitted when no molecule needed RDKit recovery.
+        std::string fallback_fragment;
+        if (result.fallback_attempted > 0)
+            fallback_fragment =
+                fmt::format("  fallback {}→{} rec", thousands(result.fallback_attempted),
+                            thousands(result.fallback_recovered));
+
+        logger.info("{:>4}/{:<4} done {:.0f}s  {} mol/s{}  cumulative {}  avg {} mol/s  ETA {}",
+                    thousands(files_done), thousands(counters.total_input_files), batch_seconds,
+                    thousands(static_cast<std::uint64_t>(num_molecules / std::max(batch_seconds, 0.001))),
+                    fallback_fragment, thousands(cumul_mol),
+                    thousands(static_cast<std::uint64_t>(cumul_rate)),
+                    smallfield::format_wall_time(eta_wall));
     }
 }
 
@@ -571,10 +575,13 @@ int main(int argc, char **argv) {
     cli_config_t config;
     if (!parse_cli(argc, argv, config)) return 2;
 
+    logger_t logger;
+    logger.verbose_level = config.verbose_level;
+
     auto shard_pairs = sfcli::inventory_shards(config.input_dir, config.output_dir, config.num_conformers,
                                                config.resume);
     if (shard_pairs.empty()) {
-        std::fprintf(stderr, "no input-files found in %s\n", config.input_dir.string().c_str());
+        logger.error("no input-files found in {}", config.input_dir.string());
         return 1;
     }
 
@@ -585,29 +592,32 @@ int main(int argc, char **argv) {
         else { pending.push_back(&pair); }
     }
 
-    std::printf("smallfield_batch: %zu input-files, %zu pending, %zu complete\n", shard_pairs.size(), pending.size(),
-                static_cast<std::size_t>(skipped));
+    logger.info("smallfield_batch: {} input-files, {} pending, {} complete", thousands(shard_pairs.size()),
+                thousands(pending.size()), thousands(skipped));
 
     if (pending.empty()) {
-        std::puts("smallfield_batch: nothing to do");
+        logger.info("nothing to do");
         return 0;
     }
 
     sfapi::context_t gpu_context(std::span<int const>(config.gpu_ids));
+    // Share the CLI's verbose level with the library so `--verbose=1|2` enables
+    // the per-chunk table and per-device breakdown emitted from smallfield.cu.
+    gpu_context.logger.verbose_level = config.verbose_level;
+    gpu_context.logger.start_time = logger.start_time;
     std::uint32_t const num_gpus = config.gpu_ids.empty() ? static_cast<std::uint32_t>(gpu_context.device_ids.size())
                                                           : static_cast<std::uint32_t>(config.gpu_ids.size());
     std::uint32_t const gpus_batch_target = config.gpus_batch_size > 0 ? config.gpus_batch_size : num_gpus * 100'000u;
-    std::printf("  %u GPUs, gpus-batch target: %u molecules\n", num_gpus, gpus_batch_target);
 
     thread_budget_t const budget = compute_thread_budget(config.rdkit_fallback_threads);
-    std::printf("  thread budget (on %d procs): reader=%d gpu_runner=%d fallback=%d writer=%d\n", omp_get_num_procs(),
-                budget.reader, budget.gpu_runner, budget.fallback, budget.writer);
+    logger.info("  {} GPUs, gpus-batch target {} mols, threads reader={} gpu_runner={} fallback={} writer={}", num_gpus,
+                thousands(gpus_batch_target), budget.reader, budget.gpu_runner, budget.fallback, budget.writer);
 
     omp_set_max_active_levels(2);
 
     progress_counters_t counters;
     counters.total_input_files = pending.size();
-    counters.start_time = std::chrono::steady_clock::now();
+    counters.start_time = logger.start_time;
 
     // Pipeline depth picks how many gpus-batches the upstream may stage before
     // back-pressuring.  Depth 3 lets reader stay 2 ahead of GPU and GPU stay 1
@@ -622,20 +632,23 @@ int main(int argc, char **argv) {
 #pragma omp parallel sections num_threads(4)
     {
 #pragma omp section
-        { reader_loop(pending, config, gpus_batch_target, budget, reader_to_gpu); }
+        { reader_loop(pending, config, gpus_batch_target, budget, logger, reader_to_gpu); }
 #pragma omp section
         { gpu_runner_loop(gpu_context, config, budget, reader_to_gpu, gpu_to_fallback, pool, counters); }
 #pragma omp section
-        { fallback_loop(config, budget, gpu_to_fallback, fallback_to_writer, counters); }
+        { fallback_loop(config, budget, gpu_to_fallback, fallback_to_writer); }
 #pragma omp section
-        { writer_loop(config, budget, fallback_to_writer, pool, counters); }
+        { writer_loop(config, budget, logger, fallback_to_writer, pool, counters); }
     }
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - counters.start_time).count();
-    char elapsed_buf[16];
-    format_elapsed(total, elapsed_buf, sizeof(elapsed_buf));
-    std::printf("[%s] complete  %.1fM molecules  %.0f mol/s\n", elapsed_buf,
-                static_cast<double>(counters.molecules_completed.load()) / 1e6,
-                counters.molecules_completed.load() / std::max(total, 0.001));
+    std::uint64_t const done = counters.molecules_completed.load();
+    logger.info("complete  {} mols  {} mol/s",
+                thousands(done), thousands(static_cast<std::uint64_t>(done / std::max(total, 0.001))));
+    std::uint64_t const cuda_errors = gpu_context.cuda_error_count.load();
+    if (cuda_errors > 0) {
+        logger.error("{} CUDA errors reported by the library — output is unreliable", thousands(cuda_errors));
+        return 2;
+    }
     return 0;
 }

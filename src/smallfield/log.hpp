@@ -54,6 +54,28 @@ inline std::locale const &grouping_locale() {
     return loc;
 }
 
+/** @brief `1234567 → "1,234,567"`.  Uses @ref grouping_locale. */
+inline std::string thousands(std::uint64_t v) { return fmt::format(grouping_locale(), "{:L}", v); }
+inline std::string thousands(std::int64_t v) { return fmt::format(grouping_locale(), "{:L}", v); }
+inline std::string thousands(std::size_t v) {
+    return fmt::format(grouping_locale(), "{:L}", static_cast<std::uint64_t>(v));
+}
+
+/** @brief Wall-clock `time_point` formatted as "YYYY-MM-DD HH:MM:SS" in local time. */
+inline std::string format_wall_time(std::chrono::system_clock::time_point const &tp) {
+    std::time_t const seconds_since_epoch = std::chrono::system_clock::to_time_t(tp);
+    std::tm tm_local {};
+    ::localtime_r(&seconds_since_epoch, &tm_local);
+    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", tm_local.tm_year + 1900, tm_local.tm_mon + 1,
+                       tm_local.tm_mday, tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
+}
+
+/** @brief Elapsed `duration` formatted as "HH:MM:SS" for pairing with wall clock. */
+inline std::string format_hms(std::chrono::steady_clock::duration const &d) {
+    auto const total_seconds = std::chrono::duration_cast<std::chrono::seconds>(d).count();
+    return fmt::format("{:02}:{:02}:{:02}", total_seconds / 3600, (total_seconds / 60) % 60, total_seconds % 60);
+}
+
 /**
  *  @brief True when ANSI styling should be emitted to stdout.
  *
@@ -84,16 +106,8 @@ struct logger_t {
 
     /** @brief `"[2026-04-18 10:17:15 | +00:13:27]"` — wall clock plus elapsed. */
     std::string timestamp_prefix() const {
-        auto const now_wall = std::chrono::system_clock::now();
-        auto const elapsed = std::chrono::steady_clock::now() - start_time;
-        auto const total_seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
-        std::time_t const wall_seconds = std::chrono::system_clock::to_time_t(now_wall);
-        std::tm tm_local {};
-        ::localtime_r(&wall_seconds, &tm_local);
-        return fmt::format("[{:04}-{:02}-{:02} {:02}:{:02}:{:02} | +{:02}:{:02}:{:02}]",
-                           tm_local.tm_year + 1900, tm_local.tm_mon + 1, tm_local.tm_mday,
-                           tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec,
-                           total_seconds / 3600, (total_seconds / 60) % 60, total_seconds % 60);
+        return fmt::format("[{} | +{}]", format_wall_time(std::chrono::system_clock::now()),
+                           format_hms(std::chrono::steady_clock::now() - start_time));
     }
 
     template <typename... args_types_>
