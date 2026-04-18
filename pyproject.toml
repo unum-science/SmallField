@@ -13,7 +13,7 @@ authors = [
   { name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com" },
 ]
 urls = { Homepage = "https://github.com/unum-science/SmallField" }
-dependencies = ["numpy"]
+dependencies = ["numpy", "rich>=13"]
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-benchmark", "rdkit"]

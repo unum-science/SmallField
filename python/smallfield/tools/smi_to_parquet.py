@@ -32,6 +32,10 @@ from typing import Iterator, List, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from smallfield.log import Logger
+
+_log = Logger()
+
 
 SHARD_NAME_FMT = "shard_{start:010d}_{end:010d}.parquet"
 
@@ -126,7 +130,7 @@ def convert_smi_to_parquet(
 
     if pool is not None:
         for out_path in pool.imap_unordered(_worker_write_shard, pending_tasks):
-            print(f"[smi_to_parquet] wrote {out_path}", file=sys.stderr)
+            _log.info("wrote {}", out_path)
         pool.close()
         pool.join()
 
@@ -171,7 +175,7 @@ def main() -> int:
         workers=max(1, args.workers),
         compression=compression,
     )
-    print(f"[smi_to_parquet] wrote {num_rows:,} rows to {args.output}")
+    _log.info("wrote {} rows to {}", f"{num_rows:,}", args.output)
     return 0
 
 
