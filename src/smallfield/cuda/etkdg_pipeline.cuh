@@ -8,11 +8,12 @@
  *  state was held simultaneously across branch boundaries; each sub-kernel
  *  here lands in the 70-90 reg range.
  *
- *  @c etkdg_pipeline_warp_kernel — stages 2, 4-8 (bounds quantize → DG FIRE
- *  → stereo retry → fourth-dim crush → ETK torsion → final validation).
+ *  @c etkdg_pipeline_warp_kernel — bounds quantization through final validation
+ *  (bounds quantize → DG FIRE → stereo retry → fourth-dim crush → ETK torsion
+ *  → final validation).
  *  Writes ETK-refined 3D positions to @c conformer_coordinates_out.
  *
- *  @c mmff_polish_warp_kernel — stage 9 (MMFF94 relaxation + optional heavy
+ *  @c mmff_polish_warp_kernel — MMFF94 polish (MMFF94 relaxation + optional heavy
  *  rescue).  Reads positions from @c conformer_coordinates_out (written by
  *  the first kernel), overwrites them with the MMFF-polished coordinates,
  *  replaces the ETK energy with the MMFF energy in @c conformer_energies_out.
@@ -20,14 +21,14 @@
  *  has no MMFF terms.
  *
  *  Stages per molecule (across both kernels):
- *   2: load pre-smoothed bounds from global memory, int8-quantize to shared
- *   3: native metric embedding with mirrored retries (separate prepass kernel)
- *   4: distance geometry minimization (4D FIRE, atom-centric)
- *   5: stereochemistry check (chiral volume signs)
- *   6: fourth-dimension crush (FIRE with w₄ penalty)
- *   7: ETK torsion refinement (3D FIRE, atom-centric)
- *   8: final validation
- *   9: MMFF94 polish (in the @c mmff_polish_warp_kernel sibling)
+ *   bounds quantization: load pre-smoothed bounds from global memory, int8-quantize to shared
+ *   metric embedding: native metric embedding with mirrored retries (separate prepass kernel)
+ *   distance geometry minimization: 4D FIRE, atom-centric
+ *   stereochemistry validation: chiral volume signs
+ *   fourth-dimension crush: FIRE with w₄ penalty
+ *   torsion refinement: ETK 3D FIRE, atom-centric
+ *   final validation: post-refinement stereochemistry check
+ *   MMFF94 polish: in the @c mmff_polish_warp_kernel sibling
  *
  *  Architecture:
  *   - warp-loop: gridDim warps, each loops over molecules with stride
@@ -272,7 +273,7 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
 }
 
 /**
- *  Persistent warp-loop ETKDG kernel covering stages 2, 4-8.
+ *  Persistent warp-loop ETKDG kernel covering bounds quantization through final validation.
  *
  *  Launch: <<<min(total_molecules, max_concurrent_warps), 32, shared_bytes>>>
  *  Each warp loops over molecules with stride = gridDim.x.
@@ -328,7 +329,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         off += dim4;
         float *gradient = shared_float + off;
 
-        // Stage 2: Load pre-smoothed bounds, find per-molecule [min, max],
+        // Bounds quantization: Load pre-smoothed bounds, find per-molecule [min, max],
         // and int8-quantize into shared memory.  Linear quantization:
         // `q = round((x − mol_min) · scale_quantize)`,
         // `x ≈ q · inv_scale + mol_min` at read.  Halves bounds storage vs the
@@ -378,7 +379,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                 initialize_from_metric_coordinates_(mol_initial_coordinates, positions, initial_coordinate_stride,
                                                     num_atoms, conf, attempt, lane, &rng_state);
 
-                // Stage 4: Run DG minimization in 4D with up to 100 FIRE iterations.
+                // Distance geometry minimization: Run DG minimization in 4D with up to 100 FIRE iterations.
                 distance_geometry_energy_functor_t dg_functor {
                     shared_bounds, mol_chirals, mol_min, inv_scale, num_atoms, meta.num_chiral_centers, 4,
                     1.0f,          1.0f,        100.0f,  0.0f};
@@ -389,13 +390,13 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                 fire_minimize_(positions, velocities, gradient, dim4, 100, 1e-4f, lane, dg_functor, &dg_energy,
                                &dg_iterations, &dg_status, &dg_rms_gradient);
 
-                // Stage 5: Check stereochemistry.
+                // Stereochemistry validation: Check stereochemistry.
                 if (meta.num_chiral_centers > 0) {
                     if (!validate_chirality_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane))
                         continue;
                 }
 
-                // Stage 6: Crush the fourth dimension with 50 FIRE iterations.
+                // Fourth-dimension crush: Crush the fourth dimension with 50 FIRE iterations.
                 dg_functor.fourth_dimension_penalty_weight = 10.0f;
                 float crush_energy = 0.0f;
                 float crush_rms_gradient = 0.0f;
@@ -403,7 +404,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                 fire_minimize_(positions, velocities, gradient, dim4, 50, 1e-4f, lane, dg_functor, &crush_energy,
                                &crush_iterations, &crush_status, &crush_rms_gradient);
 
-                // Stage 7: Run ETK torsion refinement in 3D with 100 FIRE iterations.
+                // Torsion refinement: Run ETK torsion refinement in 3D with 100 FIRE iterations.
                 if (meta.num_etk_torsions > 0) {
                     etk_torsion_energy_functor_t etk_functor {mol_torsions, mol_constraints, etk_interactions,
                                                               etk_atom_offsets + meta.etk_atom_offsets_start,
@@ -420,7 +421,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                 }
                 else { final_energy = crush_energy; }
 
-                // Stage 8: Run final validation.
+                // Final validation: Run final validation.
                 bool valid = true;
                 if (meta.num_chiral_centers > 0) {
                     valid = validate_chirality_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane);
@@ -429,7 +430,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                 if (valid) {
                     // ETK-refined 3D positions are the final output of this kernel.
                     // The sibling mmff_polish_warp_kernel picks them up from
-                    // conformer_coordinates_out and runs stage 9 in-place.
+                    // conformer_coordinates_out and runs MMFF94 polish in-place.
                     succeeded = true;
                     break;
                 }
@@ -444,7 +445,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
 }
 
 /**
- *  Persistent warp-loop MMFF94 polish kernel (stage 9).
+ *  Persistent warp-loop MMFF94 polish kernel.
  *
  *  Reads ETK-refined 3D positions from @c conformer_coordinates_out (produced
  *  by @c etkdg_pipeline_warp_kernel on the same stream + wave), runs MMFF94
@@ -550,6 +551,25 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
             __syncwarp(full_mask_k);
         }
     }
+}
+
+/**
+ *  @brief Element-wise fp32 → fp16 conversion of the coordinate buffer.
+ *
+ *  Launched after @c mmff_polish_warp_kernel as the final stream step before D2H.
+ *  Halves the device→host bandwidth and removes the host-side @c __float2half loop
+ *  that previously ran on the calling thread inside @c generate_conformers.
+ *
+ *  One thread per element, vector-friendly grid:
+ *  @code{.cpp}
+ *  std::uint32_t const block = 256;
+ *  std::uint32_t const grid = (num_elements + block - 1) / block;
+ *  convert_coords_fp32_to_fp16_kernel<<<grid, block, 0, stream>>>(src, dst, num_elements);
+ *  @endcode
+ */
+__global__ void convert_coords_fp32_to_fp16_kernel(float const *src, __half *dst, std::uint32_t num_elements) {
+    std::uint32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_elements) dst[idx] = __float2half_rn(src[idx]);
 }
 
 } // namespace smallfield::cuda

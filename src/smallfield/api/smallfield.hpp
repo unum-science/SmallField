@@ -37,11 +37,15 @@ typedef void *syevjInfo_t;
 typedef void *cusolverDnParams_t;
 #endif
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
+
+#include "smallfield/api/batch_pool.hpp"
 
 namespace smallfield::preprocess {
 class scaffold_cache_t;
@@ -68,7 +72,10 @@ enum class conformer_status_t : std::uint8_t {
 struct config_t {
     std::uint32_t num_conformers = 3;
     std::uint32_t max_stereo_attempts = 10;
-    bool use_csd_torsions = true;
+    /** @brief Target chunk size for pipelined dispatch; 0 = VRAM-aware auto. */
+    std::uint32_t chunk_size = 0;
+    /** @brief Emit per-chunk and per-device breadcrumb lines when true. */
+    bool verbose = false;
     std::uint64_t random_seed = 42;
 };
 
@@ -86,8 +93,7 @@ struct config_t {
  *  the maximum supported atom count.
  */
 struct metric_scratch_t {
-    void *pool = nullptr; ///< one contiguous device allocation, carved below
-    std::size_t pool_bytes = 0;
+    device_byte_buffer_t pool; ///< owning grow-only device buffer, carved below
     // Non-owning spans into @c pool. Rebind in @c ensure_metric_scratch on growth.
     std::span<std::uint32_t> group_indices {}; ///< [max_group_size]
     std::span<float> gram_matrices {};         ///< [max_group_size × max_atoms²]
@@ -102,10 +108,9 @@ struct metric_scratch_t {
     cusolverDnParams_t xsyev_params = nullptr; ///< shared across calls — reused
 };
 
-// Forward-declare persistent per-device launch scratch + per-context output staging.
-// Defined in smallfield.cu so the public header does not need CUDA RAII wrappers.
+// Forward-declare persistent per-device launch scratch. Defined in smallfield.cu
+// so the public header does not need CUDA RAII wrappers.
 struct launch_scratch_t;
-struct output_staging_t;
 using smallfield::preprocess::scaffold_cache_config_t;
 using smallfield::preprocess::scaffold_cache_stats_t;
 using smallfield::preprocess::scaffold_cache_t;
@@ -114,9 +119,18 @@ struct context_t {
     std::vector<int> device_ids;
     std::vector<cudaStream_t> streams;
     std::vector<cusolverDnHandle_t> solvers;
-    std::vector<metric_scratch_t> metric_scratch;   ///< one per device
-    std::vector<launch_scratch_t *> launch_scratch; ///< one per device, heap-allocated
-    output_staging_t *output_staging = nullptr;     ///< shared across devices, pinned
+    std::vector<metric_scratch_t> metric_scratch;                ///< one per device
+    std::vector<std::unique_ptr<launch_scratch_t>> launch_scratch; ///< one per device
+    /**
+     *  @brief Persistent 2-slot ring of batch prep buffers.
+     *
+     *  Moving the chunk-prep buffers out of @c generate_conformers and onto the
+     *  context fixes a use-after-free: a later chunk's @c prepare_molecule_batch_into
+     *  can trigger @c host.ensure_capacity, reallocating the pinned pointer while an
+     *  earlier chunk still has H2D commands queued against the old address.  With the
+     *  ring persistent and pre-sized at call entry, no reallocation happens mid-call.
+     */
+    std::array<batch_pool_t, 2> batch_ring {};
     /**
      *  @brief Optional scaffold cache, disabled by default.  When enabled,
      *  SubstructMatch calls for the CSD torsion patterns that remain RDKit
@@ -124,7 +138,7 @@ struct context_t {
      *  molecules sharing the same Bemis–Murcko scaffold.  Enable via
      *  @ref enable_scaffold_cache; stats via @ref scaffold_cache_stats.
      */
-    scaffold_cache_t *scaffold_cache = nullptr;
+    std::unique_ptr<scaffold_cache_t> scaffold_cache;
 
     /**
      *  @brief Construct for the given GPUs.

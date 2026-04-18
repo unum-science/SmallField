@@ -101,22 +101,26 @@ class byte_buffer_t {
     std::size_t size() const noexcept { return bytes_; }
 };
 
+/** @brief CUDA pinned-host memory allocator functor for byte_buffer_t. */
 struct pinned_alloc_t {
     void *operator()(std::size_t bytes) const noexcept {
         void *raw = nullptr;
         return cudaHostAlloc(&raw, bytes, cudaHostAllocDefault) == cudaSuccess ? raw : nullptr;
     }
 };
+/** @brief CUDA pinned-host memory deallocator functor for byte_buffer_t. */
 struct pinned_dealloc_t {
     void operator()(void *ptr) const noexcept { cudaFreeHost(ptr); }
 };
 
+/** @brief CUDA device memory allocator functor for byte_buffer_t. */
 struct device_alloc_t {
     void *operator()(std::size_t bytes) const noexcept {
         void *raw = nullptr;
         return cudaMalloc(&raw, bytes) == cudaSuccess ? raw : nullptr;
     }
 };
+/** @brief CUDA device memory deallocator functor for byte_buffer_t. */
 struct device_dealloc_t {
     void operator()(void *ptr) const noexcept { cudaFree(ptr); }
 };

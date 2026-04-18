@@ -1218,13 +1218,13 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
     std::size_t const n = smiles_list.size();
     // Pipeline:
     //
-    //   Parallel pass:     each OpenMP thread owns ONE reusable `etkdg_prepared_molecule_t` scratch
+    //   Per-molecule extraction pass: each OpenMP thread owns ONE reusable `etkdg_prepared_molecule_t` scratch
     //                      whose vector capacities persist across its molecules — `prepare_molecule_into`
     //                      clears sizes, so push_back stays on the hot path without heap activity after
     //                      the first few molecules. Each molecule's output is byte-appended into the
     //                      thread's per-region contribution buffers.
-    //   Serial prefix scan: accumulate per-thread totals into per-thread pool bases.
-    //   Pass 3 (parallel): one `std::memcpy` per thread per region copies the thread's
+    //   Prefix-scan pass: accumulate per-thread totals into per-thread pool bases.
+    //   Batched memcpy pass (parallel): one `std::memcpy` per thread per region copies the thread's
     //                      accumulator into its slice of the pinned pool, and the
     //                      per-mol metadata is rebased to pool-wide offsets.
     //
@@ -1258,12 +1258,14 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
         std::uint32_t max_atoms_seen = 0;
     };
 
-    // Persistent per-call scratch. `static` here means the outer vector and every
-    // inner `thread_contribution_t::*_bytes` keep their capacity across calls — after
-    // the first chunk the allocator's fast path is all we touch. Safe as long as
-    // `prepare_molecule_batch` is not called concurrently (the dispatcher in
-    // `generate_conformers` calls it serially from one thread per chunk; tests call
-    // it once per invocation).
+    // Persistent per-call scratch.  `static` keeps the outer vector and every
+    // inner `thread_contribution_t::*_bytes` at full capacity across calls — after
+    // the first chunk the allocator's fast path is all we touch.  Safe as long as
+    // this function is not called concurrently from multiple outer threads.  The
+    // current 4-section CLI pipeline guarantees this (prep runs only on the
+    // gpu_runner section thread).  A future streaming submit API that drives
+    // prep concurrently from multiple threads would need a caller-owned scratch
+    // vector; revisit at that point.
     static std::vector<thread_contribution_t> contribs;
     int const n_threads_max = omp_get_max_threads();
     if (static_cast<int>(contribs.size()) < n_threads_max) contribs.resize(n_threads_max);
@@ -1401,7 +1403,7 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
         }
     }
 
-    // Serial prefix scan: per-thread pool bases per region + dense metadata slot bases.
+    // Prefix-scan pass: per-thread pool bases per region + dense metadata slot bases.
     // Also collects totals for the batch layout.
     struct thread_bases_t {
         std::size_t bounds, chirals, torsions, dcons;
@@ -1484,7 +1486,7 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
     auto metadata_span = batch.molecule_metadata();
     auto input_idx_span = batch.input_indices();
 
-    // Pass 3: parallel per-thread memcpy + metadata rebase.
+    // Batched memcpy pass: parallel per-thread memcpy + metadata rebase.
 #pragma omp parallel for schedule(static)
     for (int t = 0; t < n_threads_max; ++t) {
         auto const &type_counts = contribs[t];
