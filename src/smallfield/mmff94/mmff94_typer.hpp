@@ -49,7 +49,13 @@ using smallfield::types::bond_flag_aromatic_k;
 using smallfield::types::max_atoms_k;
 using smallfield::types::molecule_descriptor_t;
 
-// Ring-info queries on the descriptor.
+/**
+ *  @defgroup ring_queries Ring-info queries on the descriptor
+ *  Helpers that read `desc.atom_ring_bitmap` + `desc.ring_offset` /
+ *  `desc.ring_atoms` to answer the "is atom X in a ring of size Y" /
+ *  "do atoms X and Y share a ring" questions the MMFF typer needs.
+ *  @{
+ */
 
 /** Number of SSSR rings that contain atom. */
 SMALLFIELD_HD_ inline unsigned atom_num_rings(molecule_descriptor_t const &desc, std::uint32_t atom_idx) noexcept {
@@ -205,12 +211,15 @@ SMALLFIELD_HD_ inline bool bond_is_aromatic_between(molecule_descriptor_t const 
     return false;
 }
 
-// Heavy atom typer.
+/** @} */ // end of ring_queries
 
-/** Match of `RDKit::MMFF::setMMFFHeavyAtomType`. Returns an MMFF atom type in [1, 99], or 0 on failure.
- *  Faithful line-by-line port of AtomTyper.cpp:504-2078 with element-keyed dispatch, the same branch
- *  order, and identical break semantics. Hydrogen atoms should not be passed here; use
- *  `native_set_mmff_hydrogen_type` for those. */
+/**
+ *  @brief Match of `RDKit::MMFF::setMMFFHeavyAtomType`.  Returns an MMFF atom type in [1, 99], or 0 on failure.
+ *
+ *  Faithful line-by-line port of `AtomTyper.cpp:504-2078` with element-keyed dispatch, the same branch
+ *  order, and identical break semantics.  Hydrogen atoms should not be passed here; use
+ *  `native_set_mmff_hydrogen_type` for those.
+ */
 SMALLFIELD_HD_ inline std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t const &desc,
                                                                    std::uint32_t atom_idx) noexcept {
     std::uint8_t atom_type = 0;
@@ -935,10 +944,10 @@ SMALLFIELD_HD_ inline std::uint8_t native_set_mmff_heavy_atom_type(molecule_desc
     return atom_type;
 }
 
-// Hydrogen typer.
-
-/** Port of `setMMFFHydrogenType`. Takes the already-computed heavy-atom types so the H-typing nested
- *  switches can key on them. */
+/**
+ *  @brief Port of `setMMFFHydrogenType`.  Takes the already-computed heavy-atom types so the H-typing nested
+ *  switches can key on them.
+ */
 SMALLFIELD_HD_ inline std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const &desc,
                                                                  std::uint32_t atom_idx,
                                                                  std::span<std::uint8_t const> atom_types) noexcept {
@@ -1025,14 +1034,15 @@ SMALLFIELD_HD_ inline std::uint8_t native_set_mmff_hydrogen_type(molecule_descri
     return atom_type;
 }
 
-// MMFF charge computation.
-
-/** Compute MMFF formal charges per atom. Port of the first half of `computeMMFFCharges` at
- *  AtomTyper.cpp:3094-3421. Sets per-atom formal
- *  charges for atom types with special allocation rules (carboxylate
- *  charge sharing, N5M anion splitting, conjugated nitrogen flood fill).
- *  All other atoms keep `desc.formal_charge` (the RDKit-assigned formal
- *  charge from SMILES parsing). */
+/**
+ *  @brief Compute MMFF formal charges per atom.
+ *
+ *  Port of the first half of `computeMMFFCharges` at `AtomTyper.cpp:3094-3421`.
+ *  Sets per-atom formal charges for atom types with special allocation rules
+ *  (carboxylate charge sharing, N5M anion splitting, conjugated nitrogen flood
+ *  fill).  All other atoms keep `desc.formal_charge` (the RDKit-assigned
+ *  formal charge from SMILES parsing).
+ */
 SMALLFIELD_HD_ inline void native_compute_mmff_formal_charges(molecule_descriptor_t const &desc,
                                                               std::span<std::uint8_t const> atom_types,
                                                               std::span<float> formal_charges) noexcept {
@@ -1295,10 +1305,14 @@ SMALLFIELD_HD_ inline void native_compute_mmff_partial_charges(molecule_descript
     }
 }
 
-// Top-level entry point that types every atom.
-
-/** Populate `atom_types[]` with MMFF94 atom types for every atom in the
- *  molecule.  Returns true iff every atom was typed successfully. */
+/**
+ *  @brief Top-level entry point that types every atom in the molecule.
+ *
+ *  Populates `atom_types[]` with MMFF94 atom types for every atom (heavy atoms
+ *  via `native_set_mmff_heavy_atom_type`, hydrogens via
+ *  `native_set_mmff_hydrogen_type`).  Returns true iff every atom was typed
+ *  successfully.
+ */
 SMALLFIELD_HD_ inline bool native_compute_mmff_atom_types(molecule_descriptor_t const &desc,
                                                           std::span<std::uint8_t> atom_types) noexcept {
     std::uint32_t const num_atoms = desc.num_atoms;

@@ -90,9 +90,13 @@ struct launch_scratch_t {
     cudaEvent_t event_end = nullptr;
 };
 
-// Forward declaration — definition lives below. context_t's ctor pre-warms
-// the per-device metric scratch at construction time so the first user call
-// doesn't pay the cusolver workspace probe + cudaMalloc cost.
+/**
+ *  @brief Grow the per-device metric scratch pool to the given dimensions; no-op on shrink.
+ *
+ *  Definition lives below.  @ref context_t "context_t's" ctor pre-warms the
+ *  per-device metric scratch at construction time so the first user call
+ *  doesn't pay the cusolver workspace probe + `cudaMalloc` cost.
+ */
 void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t max_group_size, std::uint32_t max_atoms);
 
 context_t::context_t(std::span<int const> devices) {
