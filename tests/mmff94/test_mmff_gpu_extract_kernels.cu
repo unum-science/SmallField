@@ -31,7 +31,7 @@ void launch_mmff94_gpu_extract_pipeline(
     sft::mmff94_atom_interaction_t *out_interactions, sft::mmff94_atom_offsets_t *out_atom_offsets) {
     sfparam::mmff94_tables_device_t device_tables;
     sfparam::upload_mmff94_tables_to_device(tables_host, device_tables);
-    if (device_tables.arena == nullptr) {
+    if (device_tables.arena.data() == nullptr) {
         std::fprintf(stderr, "table upload failed\n");
         return;
     }

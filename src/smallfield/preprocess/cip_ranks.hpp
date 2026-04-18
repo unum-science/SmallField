@@ -18,7 +18,7 @@
  *     class IDs, weighted by bond order (double-bonded neighbours are
  *     duplicated so they outrank single-bonded; aromatic counts as 1.5
  *     by appending the same neighbour once and a "half" sentinel).
- *     The new key per atom is `(old_class, sorted_neighbour_classes)`.
+ *     The key per atom is (old_class, lexicographically-sorted neighbor class IDs).
  *  4. Re-rank by sorting atoms on the new key and assigning new class IDs.
  *  5. Stop early when the partition stabilises (no new classes created).
  *
@@ -144,8 +144,8 @@ inline void compute_cip_ranks(molecule_descriptor_t const &desc, std::uint32_t *
                       [](std::uint32_t x, std::uint32_t y) { return x > y; });
             // Pack (old_class, n0, n1, n2, n3, n4, n5, ...) into two 64-bit
             // words. Each class ID is given 8 bits — sufficient since we
-            // start with N ≤ 128 distinct initial classes and refinement can
-            // only split, not introduce new partition counts beyond N.
+            // start with N ≤ 128 distinct initial classes.
+            // CIP refinement partitions existing classes; never creates more than N classes.
             // Words:
             //   high = (old_class << 56) | (n0 << 48) | (n1 << 40) | (n2 << 32) | (n3 << 24) | (n4 << 16) | (n5 << 8) |
             //   n6 low  = (n7 << 56) | (cnt << 48)  -- and zeros below

@@ -159,7 +159,7 @@ void *device_tables_create(sf::parameters::mmff94_tables_host_t const &host_tabl
                            sf::parameters::mmff94_tables_view_t &out_view) {
     auto *device_tables = new sf::parameters::mmff94_tables_device_t;
     sf::parameters::upload_mmff94_tables_to_device(host_tables, *device_tables);
-    if (device_tables->arena == nullptr) {
+    if (device_tables->arena.data() == nullptr) {
         delete device_tables;
         return nullptr;
     }

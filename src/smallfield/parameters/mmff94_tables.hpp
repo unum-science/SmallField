@@ -230,11 +230,7 @@ static_assert(sizeof(mmff94_covrad_entry_t) == 12);
 
 // Read-only view over the tables, shared between host and device.
 
-/** @brief POD read-only span — typed pointer + length, ABI-safe across host and device.
- *
- *  Replaces `std::span<T const>` to avoid a libstdc++ ABI mismatch when passing
- *  spans by value to `__global__` kernels.
- */
+/** @brief POD read-only span for MMFF94 table rows, ABI-safe across host and device. */
 template <typename element_>
 struct mmff94_span_t {
     element_ const *ptr_ = nullptr;

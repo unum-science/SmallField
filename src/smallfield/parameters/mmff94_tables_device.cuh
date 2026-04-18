@@ -4,7 +4,7 @@
  *
  *  Mirrors `mmff94_tables_host_t` on the device.  The host side extracts
  *  RDKit's tables into flat POD vectors (see `mmff94_tables.hpp`); this
- *  header owns a one-time-per-GPU `cudaMalloc` arena holding exactly the
+ *  header owns a one-time-per-GPU RAII device byte arena holding exactly the
  *  same POD entries, and returns an `mmff94_tables_view_t` whose
  *  `std::span<T const>` fields point at the device arena.  Every
  *  `lookup_*` in `mmff94_tables.hpp` then works identically host-side and
@@ -31,13 +31,17 @@
 #include <cstdio>
 #include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
 
+#include "smallfield/api/batch_pool.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 
 namespace smallfield::parameters {
+
+using smallfield::api::device_byte_buffer_t;
 
 // Constant-memory tables. Budgets sized for MMFF94 with headroom; as of 2026-04-14 RDKit's live counts
 // are 99 prop entries, 100 def, 54 covrad, 25 hl, and 35 bndk.
@@ -56,33 +60,50 @@ __constant__ mmff94_hl_entry_t c_mmff94_hl[mmff94_hl_const_cap_k];
 __constant__ mmff94_bndk_entry_t c_mmff94_bndk[mmff94_bndk_const_cap_k];
 #endif
 
-/** Per-GPU device-resident view.  Owns a `cudaMalloc`ed arena for the
+/** Per-GPU device-resident view.  Owns a grow-only device byte arena for the
  *  large tables; the `view` field plugs into every `lookup_*`.
  *  Pointers inside `view.prop/def/covrad/hl/bndk` target the
  *  `__constant__` symbols when the small-table capacities were sufficient;
  *  otherwise they fall back to device-global slots inside this arena. */
 struct mmff94_tables_device_t {
-    void *arena = nullptr; ///< single cudaMalloc, grows to fit
-    std::size_t arena_bytes = 0;
-    mmff94_tables_view_t view; ///< spans point into arena / __constant__
+    device_byte_buffer_t arena;   ///< single grow-only device allocation, RAII-managed
+    mmff94_tables_view_t view;    ///< spans point into arena / __constant__
     int device_id = -1;
 
     mmff94_tables_device_t() = default;
     mmff94_tables_device_t(mmff94_tables_device_t const &) = delete;
     mmff94_tables_device_t &operator=(mmff94_tables_device_t const &) = delete;
     mmff94_tables_device_t(mmff94_tables_device_t &&other) noexcept
-        : arena(other.arena), arena_bytes(other.arena_bytes), view(other.view), device_id(other.device_id) {
-        other.arena = nullptr;
-        other.arena_bytes = 0;
+        : arena(std::move(other.arena)), view(other.view), device_id(other.device_id) {
         other.view = {};
         other.device_id = -1;
     }
+    mmff94_tables_device_t &operator=(mmff94_tables_device_t &&other) noexcept {
+        if (this != &other) {
+            // Ensure the old arena is freed on the right device before being replaced.
+            if (arena.data()) {
+                int prev = -1;
+                cudaGetDevice(&prev);
+                if (device_id >= 0 && device_id != prev) cudaSetDevice(device_id);
+                arena = device_byte_buffer_t {};
+                if (device_id >= 0 && device_id != prev && prev >= 0) cudaSetDevice(prev);
+            }
+            arena = std::move(other.arena);
+            view = other.view;
+            device_id = other.device_id;
+            other.view = {};
+            other.device_id = -1;
+        }
+        return *this;
+    }
     ~mmff94_tables_device_t() {
-        if (arena) {
+        if (arena.data()) {
+            // The device byte buffer's dtor calls cudaFree; make sure we're on the
+            // owning device so the free targets the right context.
             int prev = -1;
             cudaGetDevice(&prev);
             if (device_id >= 0 && device_id != prev) cudaSetDevice(device_id);
-            cudaFree(arena);
+            arena = device_byte_buffer_t {};
             if (device_id >= 0 && device_id != prev && prev >= 0) cudaSetDevice(prev);
         }
     }
@@ -96,26 +117,27 @@ inline std::size_t align_up_(std::size_t v, std::size_t a) { return (v + a - 1) 
  *  span that targets the device arena at that location.  Updates `offset`
  *  to the next 256-byte-aligned position. */
 template <typename element_>
-mmff94_span_t<element_> place_table_(void *arena, std::size_t &offset, std::vector<element_> const &src) {
+mmff94_span_t<element_> place_table_(std::byte *arena_base, std::size_t &offset, std::vector<element_> const &src) {
     if (src.empty()) return mmff94_span_t<element_> {};
     std::size_t const bytes = src.size() * sizeof(element_);
     offset = align_up_(offset, 256);
-    element_ *dst = reinterpret_cast<element_ *>(static_cast<std::byte *>(arena) + offset);
+    element_ *dst = reinterpret_cast<element_ *>(arena_base + offset);
     cudaMemcpy(dst, src.data(), bytes, cudaMemcpyHostToDevice);
     offset += bytes;
     return mmff94_span_t<element_> {dst, src.size()};
 }
 
 template <typename element_>
-mmff94_span_t<element_> place_const_or_global_(void *arena, std::size_t &offset, std::vector<element_> const &src,
-                                               void const *const_symbol_dev_ptr, std::size_t const_cap) {
+mmff94_span_t<element_> place_const_or_global_(std::byte *arena_base, std::size_t &offset,
+                                               std::vector<element_> const &src, void const *const_symbol_dev_ptr,
+                                               std::size_t const_cap) {
     // Always use global memory for now. Constant-memory placement via
     // cudaGetSymbolAddress + reading through a plain device pointer is
     // valid but adds one more variable to debug; we can
     // revisit as a perf tweak once the current upload path is stable.
     (void)const_symbol_dev_ptr;
     (void)const_cap;
-    return place_table_(arena, offset, src);
+    return place_table_(arena_base, offset, src);
 }
 
 } // namespace detail_mmff94
@@ -142,14 +164,11 @@ inline void upload_mmff94_tables_to_device(mmff94_tables_host_t const &host, mmf
     total += host.hl.size() * sizeof(mmff94_hl_entry_t) + 256;
     total += host.covrad.size() * sizeof(mmff94_covrad_entry_t) + 256;
 
-    out.arena_bytes = total;
-    cudaError_t err = cudaMalloc(&out.arena, total);
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "upload_mmff94_tables_to_device: cudaMalloc(%zu) failed: %s\n", total,
-                     cudaGetErrorString(err));
-        out.arena = nullptr;
+    if (!out.arena.ensure_capacity(total)) {
+        std::fprintf(stderr, "upload_mmff94_tables_to_device: device arena allocation (%zu bytes) failed\n", total);
         return;
     }
+    std::byte *const arena_base = out.arena.data();
 
     std::size_t offset = 0;
 
@@ -169,24 +188,25 @@ inline void upload_mmff94_tables_to_device(mmff94_tables_host_t const &host, mmf
 #endif
 
     // Large tables → global arena.
-    out.view.vdw = detail_mmff94::place_table_(out.arena, offset, host.vdw);
-    out.view.bond = detail_mmff94::place_table_(out.arena, offset, host.bond);
-    out.view.angle = detail_mmff94::place_table_(out.arena, offset, host.angle);
-    out.view.torsion = detail_mmff94::place_table_(out.arena, offset, host.torsion);
-    out.view.oop = detail_mmff94::place_table_(out.arena, offset, host.oop);
-    out.view.stbn = detail_mmff94::place_table_(out.arena, offset, host.stbn);
-    out.view.dfsb = detail_mmff94::place_table_(out.arena, offset, host.dfsb);
-    out.view.pbci = detail_mmff94::place_table_(out.arena, offset, host.pbci);
-    out.view.chg = detail_mmff94::place_table_(out.arena, offset, host.chg);
+    out.view.vdw = detail_mmff94::place_table_(arena_base, offset, host.vdw);
+    out.view.bond = detail_mmff94::place_table_(arena_base, offset, host.bond);
+    out.view.angle = detail_mmff94::place_table_(arena_base, offset, host.angle);
+    out.view.torsion = detail_mmff94::place_table_(arena_base, offset, host.torsion);
+    out.view.oop = detail_mmff94::place_table_(arena_base, offset, host.oop);
+    out.view.stbn = detail_mmff94::place_table_(arena_base, offset, host.stbn);
+    out.view.dfsb = detail_mmff94::place_table_(arena_base, offset, host.dfsb);
+    out.view.pbci = detail_mmff94::place_table_(arena_base, offset, host.pbci);
+    out.view.chg = detail_mmff94::place_table_(arena_base, offset, host.chg);
 
     // Small tables → __constant__ (with global fallback).
-    out.view.prop = detail_mmff94::place_const_or_global_(out.arena, offset, host.prop, prop_dev,
+    out.view.prop = detail_mmff94::place_const_or_global_(arena_base, offset, host.prop, prop_dev,
                                                           mmff94_prop_const_cap_k);
-    out.view.def = detail_mmff94::place_const_or_global_(out.arena, offset, host.def, def_dev, mmff94_def_const_cap_k);
-    out.view.covrad = detail_mmff94::place_const_or_global_(out.arena, offset, host.covrad, covrad_dev,
+    out.view.def = detail_mmff94::place_const_or_global_(arena_base, offset, host.def, def_dev,
+                                                         mmff94_def_const_cap_k);
+    out.view.covrad = detail_mmff94::place_const_or_global_(arena_base, offset, host.covrad, covrad_dev,
                                                             mmff94_covrad_const_cap_k);
-    out.view.hl = detail_mmff94::place_const_or_global_(out.arena, offset, host.hl, hl_dev, mmff94_hl_const_cap_k);
-    out.view.bndk = detail_mmff94::place_const_or_global_(out.arena, offset, host.bndk, bndk_dev,
+    out.view.hl = detail_mmff94::place_const_or_global_(arena_base, offset, host.hl, hl_dev, mmff94_hl_const_cap_k);
+    out.view.bndk = detail_mmff94::place_const_or_global_(arena_base, offset, host.bndk, bndk_dev,
                                                           mmff94_bndk_const_cap_k);
 
     out.view.vdw_power = host.vdw_power;
