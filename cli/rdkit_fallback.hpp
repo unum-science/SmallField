@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <cuda_fp16.h>
@@ -21,7 +22,7 @@
 namespace smallfield::cli {
 
 struct rdkit_fallback_inputs_t {
-    std::span<std::string const> smiles;          ///< length N (may contain empty strings)
+    std::span<std::string_view const> smiles;     ///< length N (may contain empty strings)
     std::span<std::uint32_t const> retry_indices; ///< subset of [0, N) to re-attempt
     std::uint32_t num_conformers;
     std::uint32_t max_atoms;

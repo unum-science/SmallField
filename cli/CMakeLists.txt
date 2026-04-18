@@ -34,7 +34,8 @@ target_link_libraries(smallfield_batch PRIVATE
     smallfield_lib
     OpenMP::OpenMP_CXX
     Arrow::arrow_shared
-    Parquet::parquet_shared)
+    Parquet::parquet_shared
+    $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
 
 target_include_directories(smallfield_batch PRIVATE
     ${CMAKE_SOURCE_DIR}/src

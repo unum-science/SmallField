@@ -31,20 +31,25 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
 
     std::atomic<std::uint64_t> num_recovered {0};
 
-    int const num_threads = inputs.num_threads > 0 ? inputs.num_threads : 1;
+    int const num_threads = inputs.num_threads > 0 ? inputs.num_threads : omp_get_max_threads();
 
 #pragma omp parallel for schedule(dynamic, 16) num_threads(num_threads) if (num_threads > 1)
     for (std::uint64_t retry_entry = 0; retry_entry < num_retries; ++retry_entry) {
         std::uint32_t const molecule_index = inputs.retry_indices[retry_entry];
-        std::string const &smiles = inputs.smiles[molecule_index];
+        std::string_view const smiles = inputs.smiles[molecule_index];
 
-        // Smallest mutation that keeps `solver=2` on failures below: default everything
-        // to the "failed" sentinel and flip only on success.
+        // Conformer-granular fallback: count per-slot failures and only re-embed
+        // for the slots that actually need attention.  Successful GPU conformers
+        // (solver==0, status==success) are preserved untouched — they keep their
+        // GPU coordinates, energy, and status.  Anything not flipped to success
+        // by this loop keeps its existing failed status; the solver code below
+        // is only updated when we successfully recover a slot.
+        std::uint32_t needed_slots = 0;
         for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index) {
-            outputs.status[molecule_index * num_conformers + conformer_index] = static_cast<std::uint8_t>(
-                sfapi::conformer_status_t::mmff_unconverged);
-            outputs.solver[molecule_index * num_conformers + conformer_index] = 2;
+            std::uint8_t const slot_status = outputs.status[molecule_index * num_conformers + conformer_index];
+            if (slot_status != static_cast<std::uint8_t>(sfapi::conformer_status_t::success)) ++needed_slots;
         }
+        if (needed_slots == 0) continue;
 
         if (smiles.empty()) {
             for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
@@ -59,7 +64,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
             params.sanitize = true;
             params.removeHs = false;
             params.strictCXSMILES = false;
-            mol.reset(RDKit::SmilesToMol(smiles, params));
+            mol.reset(RDKit::SmilesToMol(std::string(smiles), params));
         }
         catch (...) { /* ignore */
         }
@@ -90,9 +95,13 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         embed_params.randomSeed = static_cast<int>(inputs.random_seed);
         embed_params.maxIterations = 200;
 
+        // Only embed as many fresh conformers as we actually need to fill in.
+        // EmbedMultipleConfs is the dominant CPU cost in this path; halving the
+        // count halves the per-molecule fallback wall when failures cluster in
+        // one of K (the common case).
         std::vector<int> conformer_ids;
         try {
-            conformer_ids = RDKit::DGeomHelpers::EmbedMultipleConfs(*mol, static_cast<unsigned int>(num_conformers),
+            conformer_ids = RDKit::DGeomHelpers::EmbedMultipleConfs(*mol, static_cast<unsigned int>(needed_slots),
                                                                     embed_params);
         }
         catch (...) { /* ignore */
@@ -101,9 +110,12 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         if (conformer_ids.empty()) continue;
 
         bool recovered_any = false;
+        std::uint32_t fresh_idx = 0;
         for (std::uint32_t conformer_slot = 0; conformer_slot < num_conformers; ++conformer_slot) {
-            if (conformer_slot >= conformer_ids.size()) break;
-            int const rdkit_conformer_id = conformer_ids[conformer_slot];
+            std::uint8_t const slot_status = outputs.status[molecule_index * num_conformers + conformer_slot];
+            if (slot_status == static_cast<std::uint8_t>(sfapi::conformer_status_t::success)) continue;
+            if (fresh_idx >= conformer_ids.size()) break;
+            int const rdkit_conformer_id = conformer_ids[fresh_idx++];
 
             // MMFF optimise this conformer in place.
             float energy_kcal_per_mol = 0.0f;

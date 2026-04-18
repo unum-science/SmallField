@@ -18,6 +18,7 @@
 
 namespace smallfield::cli {
 
+/** @brief One input/output Parquet shard with its row count and completion flag. */
 struct shard_pair_t {
     std::filesystem::path input_path;
     std::filesystem::path output_path;
