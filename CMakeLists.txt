@@ -6,6 +6,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+# Named fallback for the CUDA architecture used when nvidia-smi probing fails.
+# SM 12.0 targets Blackwell RTX PRO, the primary dev/test GPU for SmallField.
+set(SMALLFIELD_DEFAULT_CUDA_ARCH "120" CACHE STRING "Fallback CUDA SM architecture if auto-detection fails")
+
+# Enable -Wall -Wextra globally on non-MSVC toolchains.
+# CUDA device code gets the host warnings forwarded through -Xcompiler.
+# We intentionally avoid -Werror: warnings should surface but not block builds.
+if(NOT MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall>
+                        $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+                        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+endif()
+
 # Default build type: Release with host-native vectorization and CUDA fast-math.
 # The default CMake `Release` uses `-O3 -DNDEBUG` for CXX; we additionally enable
 # `-march=native` so the AVX-512 on Xeon 6776P is actually used, and
@@ -69,12 +82,12 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
             set(CMAKE_CUDA_ARCHITECTURES "${_arch_code}")
             message(STATUS "Detected GPU compute capability: ${_cap_match} (SM ${_arch_code})")
         else()
-            set(CMAKE_CUDA_ARCHITECTURES "90")
-            message(STATUS "Could not parse GPU capability, defaulting to SM 90")
+            set(CMAKE_CUDA_ARCHITECTURES "${SMALLFIELD_DEFAULT_CUDA_ARCH}")
+            message(STATUS "Could not parse GPU capability, defaulting to SM ${SMALLFIELD_DEFAULT_CUDA_ARCH}")
         endif()
     else()
-        set(CMAKE_CUDA_ARCHITECTURES "90")
-        message(STATUS "nvidia-smi not found, defaulting to SM 90")
+        set(CMAKE_CUDA_ARCHITECTURES "${SMALLFIELD_DEFAULT_CUDA_ARCH}")
+        message(STATUS "nvidia-smi not found, defaulting to SM ${SMALLFIELD_DEFAULT_CUDA_ARCH}")
     endif()
 endif()
 
@@ -122,11 +135,6 @@ if(DEFINED RDKIT_PREFIX)
         rdkit_add_lib(RDKit::EigenSolvers     RDKitEigenSolvers)
         rdkit_add_lib(RDKit::ChemTransforms   RDKitChemTransforms)
 
-        # Boost libs that RDKit links against
-        find_library(_boost_serialization NAMES boost_serialization
-            PATHS "${_rdkit_lib}" NO_DEFAULT_PATH)
-        find_library(_boost_iostreams NAMES boost_iostreams
-            PATHS "${_rdkit_lib}" NO_DEFAULT_PATH)
     else()
         message(WARNING "RDKit headers not found at ${_rdkit_inc}. "
                         "Install rdkit-dev: micromamba install -c conda-forge rdkit-dev")
@@ -139,6 +147,19 @@ endif()
 
 # OpenMP for CPU parallelism
 find_package(OpenMP REQUIRED)
+
+# jemalloc for allocation-heavy CPU paths (RDKit SMILES parsing, MMFF parameter lookups).
+find_library(JEMALLOC_LIB NAMES jemalloc)
+if(JEMALLOC_LIB)
+    message(STATUS "Found jemalloc: ${JEMALLOC_LIB}")
+else()
+    message(STATUS "jemalloc not found — consider installing for better allocation performance")
+endif()
+
+# Host-side link-time optimization for CPU-bound paths.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
 
 # CUDA runtime libraries via CMake's modern CUDAToolkit module.  This picks up
 # curand / cusolver / cudart wherever the active CUDA install keeps them

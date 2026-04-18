@@ -4,7 +4,8 @@ add_executable(bench_pipeline_throughput bench_pipeline_throughput.cpp)
 set_source_files_properties(bench_pipeline_throughput.cpp PROPERTIES LANGUAGE CXX)
 target_link_libraries(bench_pipeline_throughput PRIVATE
     smallfield_lib
-    OpenMP::OpenMP_CXX)
+    OpenMP::OpenMP_CXX
+    $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
 target_include_directories(bench_pipeline_throughput PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/tests
@@ -14,7 +15,7 @@ set_target_properties(bench_pipeline_throughput PROPERTIES
 
 add_executable(profile_pipeline profile_pipeline.cpp)
 set_source_files_properties(profile_pipeline.cpp PROPERTIES LANGUAGE CXX)
-target_link_libraries(profile_pipeline PRIVATE smallfield_lib OpenMP::OpenMP_CXX)
+target_link_libraries(profile_pipeline PRIVATE smallfield_lib OpenMP::OpenMP_CXX $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
 target_include_directories(profile_pipeline PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -25,7 +26,7 @@ set_target_properties(profile_pipeline PROPERTIES LINKER_LANGUAGE CUDA)
 # the kernels with cudaEvent timing.
 add_executable(bench_mmff_kernels bench_mmff_kernels.cpp bench_mmff_kernels_device.cu)
 set_source_files_properties(bench_mmff_kernels.cpp PROPERTIES LANGUAGE CXX)
-target_link_libraries(bench_mmff_kernels PRIVATE smallfield_lib OpenMP::OpenMP_CXX)
+target_link_libraries(bench_mmff_kernels PRIVATE smallfield_lib OpenMP::OpenMP_CXX $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
 target_include_directories(bench_mmff_kernels PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
