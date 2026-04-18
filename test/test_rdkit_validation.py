@@ -51,7 +51,19 @@ MMFF_STBN_PREFACTOR = 143.9325 * np.pi / 180.0  # c5 = MDYNE_A_TO_KCAL_MOL * DEG
 
 
 def bond_energy(r: float, r0: float, kb: float) -> float:
-    """MMFF94 bond stretching energy."""
+    """MMFF94 bond stretching energy, quartic-with-cubic-correction form.
+
+    ``E = ½ · 143.9325 · kb · (r − r0)² · [1 + cs·(r − r0) + (7/12)·cs²·(r − r0)²]``
+    with ``cs = −2.0 Å⁻¹`` (the MMFF94 cubic stretch constant).
+
+    Args:
+        r: Current bond length in Å.
+        r0: Equilibrium bond length in Å.
+        kb: Bond-stretching force constant in mdyn/Å.
+
+    Returns:
+        Energy in kcal/mol.
+    """
     dr = r - r0
     dr2 = dr * dr
     cs = MMFF_CUBIC_STRETCH
@@ -59,14 +71,38 @@ def bond_energy(r: float, r0: float, kb: float) -> float:
 
 
 def angle_energy(theta_rad: float, theta0_rad: float, ka: float) -> float:
-    """MMFF94 angle bending energy."""
+    """MMFF94 angle-bending energy, quadratic-with-cubic-correction in degrees.
+
+    ``E = 0.021922 · ka · Δθ² · (1 + cb · Δθ)`` where ``Δθ`` is ``(θ − θ0)`` in
+    degrees and ``cb = −0.006981317 deg⁻¹`` is the MMFF94 cubic-bend constant.
+
+    Args:
+        theta_rad: Current angle i-j-k in radians.
+        theta0_rad: Equilibrium angle i-j-k in radians.
+        ka: Angle-bending force constant in mdyn·Å/rad².
+
+    Returns:
+        Energy in kcal/mol.
+    """
     dtheta_deg = (theta_rad - theta0_rad) * 180.0 / np.pi
     dtheta_deg2 = dtheta_deg * dtheta_deg
     return MMFF_ANGLE_PREFACTOR * ka * dtheta_deg2 * (1.0 + MMFF_ANGLE_CUBIC * dtheta_deg)
 
 
 def torsion_energy(phi_rad: float, v1: float, v2: float, v3: float) -> float:
-    """MMFF94 torsion energy."""
+    """MMFF94 three-term torsion energy.
+
+    ``E = ½ · [V1·(1 + cos φ) + V2·(1 − cos 2φ) + V3·(1 + cos 3φ)]``.
+
+    Args:
+        phi_rad: Dihedral angle i-j-k-l in radians.
+        v1: 1-fold Fourier coefficient (kcal/mol).
+        v2: 2-fold Fourier coefficient (kcal/mol).
+        v3: 3-fold Fourier coefficient (kcal/mol).
+
+    Returns:
+        Energy in kcal/mol.
+    """
     cos_phi = np.cos(phi_rad)
     cos_2phi = np.cos(2.0 * phi_rad)
     cos_3phi = np.cos(3.0 * phi_rad)
@@ -74,7 +110,19 @@ def torsion_energy(phi_rad: float, v1: float, v2: float, v3: float) -> float:
 
 
 def vdw_energy(r: float, epsilon: float, r_star: float) -> float:
-    """MMFF94 buffered 14-7 van der Waals energy."""
+    """MMFF94 buffered 14-7 van der Waals energy.
+
+    ``E = ε · [(1+δ)·R* / (r + δ·R*)]⁷ · [(1+γ)·R*⁷ / (r⁷ + γ·R*⁷) − 2]``
+    with buffering constants ``δ = 0.07`` and ``γ = 0.12``.
+
+    Args:
+        r: Distance between the two atoms in Å.
+        epsilon: Well depth ε in kcal/mol.
+        r_star: Minimum-energy separation R* in Å.
+
+    Returns:
+        Energy in kcal/mol.
+    """
     delta = MMFF_VDW_DELTA
     gamma = MMFF_VDW_GAMMA
 
@@ -93,7 +141,21 @@ def vdw_energy(r: float, epsilon: float, r_star: float) -> float:
 
 
 def elec_energy(r: float, qi: float, qj: float, dielectric: float = 1.0) -> float:
-    """MMFF94 electrostatic energy."""
+    """MMFF94 buffered Coulomb electrostatic energy.
+
+    ``E = 332.0716 · qi · qj / [dielectric · (r + 0.05)]``.  The 0.05 Å buffer
+    prevents singularity at short range; 332.0716 converts e²/(4π·ε₀) to
+    kcal·Å/mol.
+
+    Args:
+        r: Distance between the two atoms in Å.
+        qi: Partial charge on atom i in electron units.
+        qj: Partial charge on atom j in electron units.
+        dielectric: Dielectric constant (default 1.0 for gas-phase).
+
+    Returns:
+        Energy in kcal/mol.
+    """
     r_eff = r + MMFF_ELEC_BUFFER
     return MMFF_ELEC_CONSTANT * qi * qj / (dielectric * r_eff)
 
@@ -101,8 +163,16 @@ def elec_energy(r: float, qi: float, qj: float, dielectric: float = 1.0) -> floa
 def oop_energy(chi_deg: float, koop: float) -> float:
     """MMFF94 out-of-plane bending energy.
 
-    E = 0.5 * c2 * koop * chi^2
-    where c2 = MDYNE_A_TO_KCAL_MOL * DEG2RAD^2 = 0.043844
+    ``E = ½ · c2 · koop · χ²`` where ``c2 = 0.043844`` kcal/(mol·deg²) converts
+    mdyn·Å·rad⁻² into kcal/(mol·deg²).
+
+    Args:
+        chi_deg: Out-of-plane angle χ in degrees (the angle between the j→l
+            bond and the plane defined by i-j-k, with j the central sp² atom).
+        koop: Out-of-plane force constant in mdyn·Å/rad².
+
+    Returns:
+        Energy in kcal/mol.
     """
     return MMFF_OOP_PREFACTOR * koop * chi_deg * chi_deg
 
@@ -110,8 +180,21 @@ def oop_energy(chi_deg: float, koop: float) -> float:
 def stretch_bend_energy(dr1: float, dr2: float, dtheta_deg: float, kba_ijk: float, kba_kji: float) -> float:
     """MMFF94 stretch-bend coupling energy.
 
-    E = c5 * dtheta * (kba_ijk * dr1 + kba_kji * dr2)
-    where c5 = MDYNE_A_TO_KCAL_MOL * DEG2RAD
+    ``E = c5 · Δθ · (kba_ijk · Δr_ij + kba_kji · Δr_jk)`` where
+    ``c5 = 143.9325 · π/180`` converts the mixed mdyn-mdyn·Å / rad-deg units
+    into kcal/mol.
+
+    Args:
+        dr1: Bond-length deviation Δr_ij = r_ij − r0_ij for the i-j bond, in Å.
+        dr2: Bond-length deviation Δr_jk = r_jk − r0_jk for the j-k bond, in Å.
+        dtheta_deg: Angle deviation Δθ = θ_ijk − θ0_ijk in degrees.
+        kba_ijk: Stretch-bend force constant coupling the i-j bond to the
+            i-j-k angle, in mdyn/rad.
+        kba_kji: Stretch-bend force constant coupling the k-j bond to the
+            i-j-k angle, in mdyn/rad.
+
+    Returns:
+        Energy in kcal/mol.
     """
     return MMFF_STBN_PREFACTOR * dtheta_deg * (kba_ijk * dr1 + kba_kji * dr2)
 
