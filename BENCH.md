@@ -25,24 +25,25 @@ All numbers are conformers per second — succeeded conformers divided by wall t
 
 ### SmallField — 8 GPUs, USearch 10M
 
-|    K |    c/s |               Succeeded | Success |    Wall |
-| ---: | -----: | ----------------------: | ------: | ------: |
-|    1 | 20,372 |  9,859,890 /  9,998,572 | 98.61 % |   484 s |
-|    3 | 29,302 | 29,580,111 / 29,995,716 | 98.61 % | 1,010 s |
-|   10 | 27,143 | 98,601,092 / 99,985,720 | 98.61 % | 3,202 s |
+| System            | Input |    K |    c/s |               Succeeded | Success |    Wall |
+| :---------------- | ----: | ---: | -----: | ----------------------: | ------: | ------: |
+| SmallField 8 GPUs |   10M |    1 | 20,372 |  9,859,890 /  9,998,572 |  98.6 % |   484 s |
+| SmallField 8 GPUs |   10M |    3 | 29,302 | 29,580,111 / 29,995,716 |  98.6 % | 1,010 s |
+| SmallField 8 GPUs |   10M |   10 | 27,143 | 98,601,092 / 99,985,720 |  98.6 % | 3,202 s |
 
-Success rate is 98.61 % across all three K values.
+Success rate is 98.6 % across all three K values.
 Conformer generation quality is independent of K.
 
 ### SmallField vs RDKit — 1 GPU / CPU 192T, USearch 1M
 
-| System             |    K |   c/s |               Succeeded | Success |      Wall |
-| :----------------- | ---: | ----: | ----------------------: | ------: | --------: |
-| SmallField 1 GPU   |    1 | 5,948 |     986,091 / 1,000,000 | 98.61 % |   163.6 s |
-| SmallField 1 GPU ¹ |    1 | 8,541 |     986,017 / 1,000,000 | 98.60 % |   115.4 s |
-| SmallField 1 GPU ¹ |    3 | 9,066 |   2,958,411 / 3,000,000 | 98.61 % |   326.3 s |
-| RDKit CPU 192T ¹   |    1 | 2,458 |             956,961 / — | 95.7 %  |   389.3 s |
-| RDKit CPU 192T ¹   |    3 | 2,671 |           2,870,796 / — | 95.6 %  | 1,074.6 s |
+| System             | Input |    K |   c/s |             Succeeded | Success |      Wall |
+| :----------------- | ----: | ---: | ----: | --------------------: | ------: | --------: |
+| RDKit CPU 192T ¹   |    1M |    1 | 2,458 |           956,961 / — |  95.7 % |   389.3 s |
+| RDKit CPU 192T ¹   |    1M |    3 | 2,671 |         2,870,796 / — |  95.6 % | 1,074.6 s |
+|                    |       |      |       |                       |         |           |
+| SmallField 1 GPU   |    1M |    1 | 5,948 |   986,091 / 1,000,000 |  98.6 % |   163.6 s |
+| SmallField 1 GPU ¹ |    1M |    1 | 8,541 |   986,017 / 1,000,000 |  98.6 % |   115.4 s |
+| SmallField 1 GPU ¹ |    1M |    3 | 9,066 | 2,958,411 / 3,000,000 |  98.6 % |   326.3 s |
 
 ¹ Archived measurement from an earlier build — same hardware, same dataset.
 The 1-GPU numbers will be refreshed on the current build.
@@ -51,6 +52,37 @@ Speedups vs RDKit CPU 192T on USearch 1M:
 
 - K=1 — SmallField 1 GPU is 3.5× faster.
 - K=3 — SmallField 1 GPU is 3.4× faster.
+
+### SmallField vs nvMolKit 0.4.0
+
+[nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) is NVIDIA's open-source (Apache 2.0) GPU conformer generator.
+ETKDGv3 embedding + MMFF94 optimization, CUDA/C++ with Python bindings.
+Installed via `conda install -c conda-forge nvmolkit`.
+
+nvMolKit was benchmarked in 5 000-molecule chunks because it throws a hard `RuntimeError` on any batch containing a molecule it cannot prepare.
+No per-molecule graceful degradation.
+
+| System             | Input |    K |    c/s |        Succeeded | Success |      Wall |
+| :----------------- | ----: | ---: | -----: | ---------------: | ------: | --------: |
+| nvMolKit 1 GPU     |    1M |    3 |    510 |   2,902,811 / 3M |  96.8 % | 5,691.8 s |
+| nvMolKit "8 GPUs"² |    1M |    3 |    755 |   2,903,363 / 3M |  96.8 % | 3,847.1 s |
+|                    |       |      |        |                  |         |           |
+| SmallField 1 GPU   |    1M |    3 |  9,226 |   2,958,359 / 3M |  98.6 % |   320.6 s |
+| SmallField 8 GPUs  |    1M |    3 | 17,715 |   2,958,295 / 3M |  98.6 % |   167.0 s |
+| SmallField 8 GPUs  |   10M |    3 | 29,302 | 29,580,111 / 30M |  98.6 % | 1,010.0 s |
+
+² `nvidia-smi` shows only GPU 0 active during the embed phase (91 % of wall time).
+The MMFF optimization phase (9 %) does distribute across devices.
+
+SmallField throughput grows with batch size: 11K → 18K → 29K conf/s at 100K → 1M → 10M molecules.
+The pipelined chunk scheduler overlaps CPU prep with GPU execution across devices, so larger batches amortize host overhead better.
+
+- SmallField is __18× faster__ on 1 GPU and __39× faster__ on 8 GPUs at production scale.
+- nvMolKit's embed phase does not scale across GPUs — multi-GPU speedup is only 1.48×, entirely from the MMFF phase.
+  SmallField achieves 1.92× at 1M and 2.9× at 10M.
+- nvMolKit crashes on 1 of 200 chunks, losing 5 000 molecules per crash.
+  SmallField marks individual failures and continues (98.6 % vs 96.8 %).
+- nvMolKit would need ~55 hours to process 10M at its observed 1-GPU rate.
 
 ## Bottleneck Summary
 
