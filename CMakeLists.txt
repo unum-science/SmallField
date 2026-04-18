@@ -145,6 +145,11 @@ if(NOT RDKit_FOUND)
                     "Pass -DRDKIT_PREFIX=/path/to/conda/env")
 endif()
 
+# `{fmt}` — used everywhere for formatted and colored logging.  Conda-forge
+# ships it at `$CONDA_PREFIX/lib/cmake/fmt/`; pass `-Dfmt_DIR=<prefix>/lib/cmake/fmt`
+# if the package is installed outside CMAKE_PREFIX_PATH.
+find_package(fmt REQUIRED CONFIG)
+
 # OpenMP for CPU parallelism
 find_package(OpenMP REQUIRED)
 
@@ -189,7 +194,8 @@ if(RDKit_FOUND)
             CUDA::curand
             CUDA::cusolver
             CUDA::cudart
-            OpenMP::OpenMP_CXX)
+            OpenMP::OpenMP_CXX
+            fmt::fmt)
         # Pass -fopenmp to the host compiler through nvcc so #pragma omp inside
         # etkdg_prepare_batch.hpp (included by smallfield.cu) actually parallelizes.
         # Without this the OpenMP pragma is silently ignored by nvcc's host pass
