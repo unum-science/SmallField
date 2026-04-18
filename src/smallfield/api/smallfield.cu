@@ -317,9 +317,81 @@ struct gpu_pipeline_handle_t {
 };
 
 /**
+ *  @brief Offsets + sizes for every region carved from `launch_scratch_t`'s
+ *  device pool and pinned host staging, for one `embedding-step`.
+ *
+ *  Device pool regions, in order:
+ *    - batch-input mirror (target of the single H2D)
+ *    - sorted metadata subset (tiny H2D from pinned host staging)
+ *    - coords_fp32 (kernel output, fp32)
+ *    - coords_fp16 (post-convert, D2H source; halves DMA bandwidth)
+ *    - energies_out (fp32)
+ *    - status_out (u8)
+ *    - 4D metric-embedding scratch (GPU-only, consumed by the prepass)
+ *  Host staging regions, in order:
+ *    - sorted metadata (CPU-written, source of the H2D)
+ *    - coords_fp16 / energies / status (pinned D2H destinations)
+ */
+struct pipeline_pool_layout_t {
+    std::size_t device_off_batch;
+    std::size_t device_off_sorted_meta;
+    std::size_t device_off_coords_fp32;
+    std::size_t device_off_coords_fp16;
+    std::size_t device_off_energies;
+    std::size_t device_off_status;
+    std::size_t device_off_initial;
+    std::size_t device_pool_bytes;
+
+    std::size_t host_off_sorted_meta;
+    std::size_t host_off_coords;
+    std::size_t host_off_energies;
+    std::size_t host_off_status;
+    std::size_t host_pool_bytes;
+};
+
+/** @brief Compute every offset and size for the launch pool given this dispatch's shape. */
+static pipeline_pool_layout_t compute_pipeline_pool_layout_(std::size_t batch_bytes_total, std::uint32_t local_count,
+                                                            std::uint32_t num_conformers,
+                                                            std::uint32_t max_atoms_per_molecule) {
+    auto const sizeof_meta = sizeof(etkdg_molecule_metadata_t);
+    std::size_t const total_conf = static_cast<std::size_t>(local_count) * num_conformers;
+    std::size_t const total_coords = total_conf * max_atoms_per_molecule * 3;
+
+    pipeline_pool_layout_t layout {};
+    std::size_t device_offset = 0;
+    layout.device_off_batch = align_up(device_offset, 256);
+    device_offset = layout.device_off_batch + align_up(batch_bytes_total, 256);
+    layout.device_off_sorted_meta = device_offset;
+    device_offset += align_up(local_count * sizeof_meta, 256);
+    layout.device_off_coords_fp32 = device_offset;
+    device_offset += align_up(total_coords * sizeof(float), 256);
+    layout.device_off_coords_fp16 = device_offset;
+    device_offset += align_up(total_coords * sizeof(__half), 256);
+    layout.device_off_energies = device_offset;
+    device_offset += align_up(total_conf * sizeof(float), 256);
+    layout.device_off_status = device_offset;
+    device_offset += align_up(total_conf * sizeof(std::uint8_t), 256);
+    layout.device_off_initial = device_offset;
+    device_offset += align_up(static_cast<std::size_t>(local_count) * max_atoms_per_molecule * 4 * sizeof(float), 256);
+    layout.device_pool_bytes = device_offset;
+
+    std::size_t host_offset = 0;
+    layout.host_off_sorted_meta = align_up(host_offset, 256);
+    host_offset = layout.host_off_sorted_meta + align_up(local_count * sizeof_meta, 256);
+    layout.host_off_coords = host_offset;
+    host_offset += align_up(total_coords * sizeof(__half), 256);
+    layout.host_off_energies = host_offset;
+    host_offset += align_up(total_conf * sizeof(float), 256);
+    layout.host_off_status = host_offset;
+    host_offset += align_up(total_conf * sizeof(std::uint8_t), 256);
+    layout.host_pool_bytes = host_offset;
+    return layout;
+}
+
+/**
  *  @brief Enqueue all upload, metric prepass, kernel, and download operations on the
- *  GPU stream; return immediately (no CPU-side sync).  Caller must eventually call
- *  `finalize_gpu_pipeline` with the returned handle.
+ *  GPU stream for one `embedding-wave`'s GPU slice; return immediately.
+ *  Caller eventually calls `finalize_gpu_pipeline` with the returned handle.
  */
 gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cusolverDnHandle_t solver_handle,
                                           metric_scratch_t &scratch, launch_scratch_t &launch_buffers,
@@ -330,12 +402,11 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
                                           std::span<__half> host_coords_out, std::span<float> host_energies_out,
                                           std::span<conformer_status_t> host_status_out, cuda_error_sink_t sink) {
 
-    auto _P0 = std::chrono::high_resolution_clock::now();
     sink.check(cudaSetDevice(device_id), "cudaSetDevice(launch_gpu_pipeline)");
 
     std::uint32_t const local_count = static_cast<std::uint32_t>(local_indices.size());
 
-    // Sort this GPU's molecules by atom count for wave-based dispatch.
+    // Sort this GPU's molecules by atom count to feed `atom-limited-bin` dispatch.
     auto meta_full = batch.molecule_metadata();
     std::vector<std::uint32_t> order(local_count);
     std::iota(order.begin(), order.end(), 0u);
@@ -345,46 +416,22 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
 
     std::size_t const total_conf = static_cast<std::size_t>(local_count) * num_conformers;
     std::size_t const total_coords = total_conf * max_atoms_per_molecule * 3;
-
-    // Region 1: batch-input mirror (target of the single H2D).
-    // Region 2: sorted metadata subset (tiny H2D from pinned host_staging).
-    // Region 3a/3b: kernel outputs. Kernel writes fp32 coords, then a
-    //   convert kernel packs them as fp16 into a sibling region; D2H then
-    //   only pulls the fp16 half. Halves DMA bandwidth for the big array.
-    // Region 4: GPU-only 4D scratch produced by the metric prepass.
+    pipeline_pool_layout_t const layout =
+        compute_pipeline_pool_layout_(batch.layout.bytes_total, local_count, num_conformers, max_atoms_per_molecule);
+    std::size_t const device_off_batch = layout.device_off_batch;
+    std::size_t const device_off_sorted_meta = layout.device_off_sorted_meta;
+    std::size_t const device_off_coords_fp32 = layout.device_off_coords_fp32;
+    std::size_t const device_off_coords_fp16 = layout.device_off_coords_fp16;
+    std::size_t const device_off_energies = layout.device_off_energies;
+    std::size_t const device_off_status = layout.device_off_status;
+    std::size_t const device_off_initial = layout.device_off_initial;
+    std::size_t const device_pool_bytes = layout.device_pool_bytes;
+    std::size_t const host_off_sorted_meta = layout.host_off_sorted_meta;
+    std::size_t const host_off_coords = layout.host_off_coords;
+    std::size_t const host_off_energies = layout.host_off_energies;
+    std::size_t const host_off_status = layout.host_off_status;
+    std::size_t const host_pool_bytes = layout.host_pool_bytes;
     auto const sizeof_meta = sizeof(etkdg_molecule_metadata_t);
-    std::size_t device_offset = 0;
-    std::size_t const device_off_batch = align_up(device_offset, 256);
-    device_offset = device_off_batch + align_up(batch.layout.bytes_total, 256);
-    std::size_t const device_off_sorted_meta = device_offset;
-    device_offset += align_up(local_count * sizeof_meta, 256);
-    std::size_t const device_off_coords_fp32 = device_offset;
-    device_offset += align_up(total_coords * sizeof(float), 256);
-    std::size_t const device_off_coords_fp16 = device_offset;
-    device_offset += align_up(total_coords * sizeof(__half), 256);
-    std::size_t const device_off_energies = device_offset;
-    device_offset += align_up(total_conf * sizeof(float), 256);
-    std::size_t const device_off_status = device_offset;
-    device_offset += align_up(total_conf * sizeof(std::uint8_t), 256);
-    std::size_t const device_off_initial = device_offset;
-    device_offset += align_up(static_cast<std::size_t>(local_count) * max_atoms_per_molecule * 4 * sizeof(float), 256);
-    std::size_t const device_pool_bytes = device_offset;
-
-    // Inputs: sorted metadata (written by CPU, async-uploaded).
-    // Outputs: kernel results as fp16 coords + fp32 energies + u8 status,
-    // async-downloaded into pinned host staging so finalize is near-free.
-    std::size_t host_offset = 0;
-    std::size_t const host_off_sorted_meta = align_up(host_offset, 256);
-    host_offset = host_off_sorted_meta + align_up(local_count * sizeof_meta, 256);
-    std::size_t const host_off_coords = host_offset;
-    host_offset += align_up(total_coords * sizeof(__half), 256);
-    std::size_t const host_off_energies = host_offset;
-    host_offset += align_up(total_conf * sizeof(float), 256);
-    std::size_t const host_off_status = host_offset;
-    host_offset += align_up(total_conf * sizeof(std::uint8_t), 256);
-    std::size_t const host_pool_bytes = host_offset;
-
-    auto _P_pre_malloc = std::chrono::high_resolution_clock::now();
 
     gpu_pipeline_handle_t handle;
     handle.device_id = device_id;
@@ -414,8 +461,6 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
                             device_id);
         return handle;
     }
-    auto _P_post_malloc = std::chrono::high_resolution_clock::now();
-
     // Reuse the persistent per-device events from launch_scratch_t. These were
     // allocated once at context construction and live until context destruction;
     // re-recording them here is safe because the prior wave's
@@ -460,13 +505,11 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
                                    cudaMemcpyHostToDevice, stream),
                    "H2D sorted metadata");
 
-    auto _P_post_upload = std::chrono::high_resolution_clock::now();
     cudaEventRecord(handle.event_metric_start, stream);
     build_metric_initial_coordinates_on_gpu(device_view.bounds_matrices().data(), device_metadata_sorted,
                                             std::span<etkdg_molecule_metadata_t const> {host_sorted_meta, local_count},
                                             max_atoms_per_molecule, device_initial_coordinates, solver_handle, scratch,
                                             sink, stream);
-    auto _P_post_metric = std::chrono::high_resolution_clock::now();
     cudaEventRecord(handle.event_kernels_start, stream);
 
     // Atom-limited-bin kernel dispatch (8 caps: 16, 32, 48, 64, 80, 96, 112, 128).
@@ -566,11 +609,6 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
                    "D2H status");
     }
     cudaEventRecord(handle.event_end, stream);
-    (void)_P0;
-    (void)_P_pre_malloc;
-    (void)_P_post_malloc;
-    (void)_P_post_upload;
-    (void)_P_post_metric;
     return handle;
 }
 
