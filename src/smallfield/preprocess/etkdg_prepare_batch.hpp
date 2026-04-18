@@ -1260,11 +1260,11 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
 
     // Persistent per-call scratch.  `static` keeps the outer vector and every
     // inner `thread_contribution_t::*_bytes` at full capacity across calls — after
-    // the first chunk the allocator's fast path is all we touch.  Safe as long as
-    // this function is not called concurrently from multiple outer threads.  The
-    // current 4-section CLI pipeline guarantees this (prep runs only on the
-    // gpu_runner section thread).  A future streaming submit API that drives
-    // prep concurrently from multiple threads would need a caller-owned scratch
+    // the first embedding-wave the allocator's fast path is all we touch.  Safe as long
+    // as this function is not called concurrently from multiple outer threads.  The
+    // CLI's 4-role pipeline guarantees this (preprocess-step runs only on the
+    // gpu-runner-role thread).  A future streaming submit API that drives prep
+    // concurrently from multiple threads would need a caller-owned scratch
     // vector; revisit at that point.
     static std::vector<thread_contribution_t> contribs;
     int const n_threads_max = omp_get_max_threads();

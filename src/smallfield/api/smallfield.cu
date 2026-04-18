@@ -46,10 +46,10 @@ static inline std::size_t align_up(std::size_t value, std::size_t alignment) {
 }
 
 /**
- *  @brief Rough upper bound on the per-molecule pinned-host footprint in a chunk.
+ *  @brief Rough upper bound on the per-molecule pinned-host footprint in a wave.
  *
  *  Used to pre-size the persistent 2-slot @c batch_ring on @c context_t at call
- *  entry so the pinned host buffer never reallocates while a chunk's H2D is in
+ *  entry so the pinned host buffer never reallocates while a wave's H2D is in
  *  flight.  Overestimates: at @c max_atoms=128 ~91 KB/molecule covers the
  *  bounds matrix, bond-distance byte matrix, MMFF per-atom vdw/charge, and the
  *  variable-length interaction lists plus slack.
@@ -69,16 +69,16 @@ static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_at
  *  @c device_pool holds the batch-input mirror + per-launch outputs + scratch;
  *  @c host_staging holds the sorted-metadata subset (CPU → GPU) plus pinned
  *  readback regions for coords / energies / status (GPU → CPU).  Both are
- *  grow-only and reused across chunks so the single-threaded dispatcher
+ *  grow-only and reused across waves so the single-threaded dispatcher
  *  avoids per-launch allocation churn.
  */
 struct launch_scratch_t {
     device_byte_buffer_t device_pool;
     pinned_byte_buffer_t host_staging;
     // Persistent CUDA events for per-phase timing. Created once per device on
-    // first launch and reused across every chunk. Allocating events inside the
+    // first launch and reused across every wave. Allocating events inside the
     // hot loop and destroying them after each finalize triggered an intermittent
-    // multi-GPU regression (chunks 3-4 silently dropped at 240K) — likely a
+    // multi-GPU regression (waves 3-4 silently dropped at 240K) — likely a
     // race between cudaEventDestroy on one stream and cudaEventCreate from the
     // next launch's omp parallel-for thread. Persistent reuse sidesteps the
     // problem entirely. cudaEventBlockingSync avoids spin-waiting inside
@@ -127,12 +127,12 @@ context_t::context_t(std::span<int const> devices) {
         cudaEventCreateWithFlags(&launch_scratch[i]->event_end, cudaEventBlockingSync);
     }
     // Pre-warm the dispatcher so the first user call does not pay cold-start costs.
-    // Cold chunk 0 has "mallocpool" ~100-130 ms
+    // Cold wave 0 has "mallocpool" ~100-130 ms
     // per device for the first cudaMalloc + cudaHostAlloc (910 ms total across
     // 8 GPUs per prior nsys capture), plus a ~60 ms cusolver workspace probe
     // inside ensure_metric_scratch. Pre-sizing both at construction moves
     // those costs off the user's hot path. The sizes are conservative
-    // first-call defaults: a 5 K-molecule chunk with max_atoms=128 covers any
+    // first-call defaults: a 5 K-molecule wave with max_atoms=128 covers any
     // small-batch workload; bigger batches grow the pool on demand via
     // ensure_capacity (which is already the existing growth path).
     constexpr std::size_t kPrewarmGroup = 5'000;
@@ -182,8 +182,8 @@ scaffold_cache_stats_t context_t::get_scaffold_cache_stats() const {
 /**
  *  @brief Ensure the per-device metric scratch pool is sized for the given
  *  (max_group_size, max_atoms) combination.  Grows only — never shrinks — so
- *  the first chunk of a workload pays the allocation cost and subsequent
- *  chunks reuse it.
+ *  the first wave of a workload pays the allocation cost and subsequent
+ *  waves reuse it.
  */
 void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t max_group_size,
                            std::uint32_t max_atoms) {
@@ -192,7 +192,7 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
     if (max_group_size <= s.max_group_size && max_atoms <= s.max_atoms && s.pool.data() != nullptr) return;
 
     // Grow to at least the new request, but round up a bit to avoid thrashing
-    // across similarly-sized chunks.
+    // across similarly-sized waves.
     std::size_t const new_group = std::max(s.max_group_size, max_group_size);
     std::uint32_t const new_atoms = std::max<std::uint32_t>(s.max_atoms, max_atoms);
 
@@ -200,7 +200,7 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
 
     // Probe cusolver for the worst-case workspace size at the new dimensions.
     // Probe cusolverDnXsyevBatched for the worst-case device + host workspace sizes.
-    // Once per growth, not per chunk.
+    // Once per growth, not per wave.
     std::size_t new_dev_ws_bytes = 0;
     std::size_t new_host_ws_bytes = 0;
     {
@@ -252,12 +252,12 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
 }
 
 /**
- *  @brief Per-chunk, per-GPU stream-local phase timings, populated in
+ *  @brief Per-wave, per-GPU stream-local phase timings, populated in
  *  @ref finalize_gpu_pipeline after the stream drains.  All values are in
  *  milliseconds and are measured by @c cudaEventElapsedTime on events that
  *  were recorded into the device's stream — they reflect actual GPU + DMA
  *  wall, not host-side scheduling.  Aggregator in @ref generate_conformers
- *  combines these across devices to derive per-chunk GPU wall (max) and
+ *  combines these across devices to derive per-wave GPU wall (max) and
  *  total GPU work (sum).
  */
 struct gpu_phase_ms_t {
@@ -269,7 +269,7 @@ struct gpu_phase_ms_t {
 };
 
 /**
- *  @brief Per-chunk, per-GPU state carried from `launch_gpu_pipeline` to `finalize_gpu_pipeline`.
+ *  @brief Per-wave, per-GPU state carried from `launch_gpu_pipeline` to `finalize_gpu_pipeline`.
  *
  *  Holds the device memory pool that stays alive until the stream drains, the host
  *  staging buffers that the async download writes into, and the metadata needed to
@@ -283,7 +283,7 @@ struct gpu_pipeline_handle_t {
     std::uint32_t local_count = 0;
     std::uint32_t num_conformers = 0;
     std::uint32_t max_atoms_per_molecule = 0;
-    std::uint32_t chunk_base = 0; ///< offset into caller's output (sorted space)
+    std::uint32_t wave_base = 0; ///< offset into caller's output (sorted space)
     std::vector<std::uint32_t> order;
     std::vector<std::uint32_t> local_indices_copy;
     // Device-side output spans into scratch->device_pool.
@@ -322,7 +322,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
                                           batch_pool_t const &batch, std::span<std::uint32_t const> local_indices,
                                           std::uint32_t num_conformers, std::uint32_t max_stereo_attempts,
                                           std::uint32_t max_atoms_per_molecule, std::uint64_t seed,
-                                          std::uint32_t chunk_base, std::span<std::uint32_t const> sort_perm,
+                                          std::uint32_t wave_base, std::span<std::uint32_t const> sort_perm,
                                           std::span<__half> host_coords_out, std::span<float> host_energies_out,
                                           std::span<conformer_status_t> host_status_out, cuda_error_sink_t sink) {
 
@@ -390,7 +390,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
     handle.local_count = local_count;
     handle.num_conformers = num_conformers;
     handle.max_atoms_per_molecule = max_atoms_per_molecule;
-    handle.chunk_base = chunk_base;
+    handle.wave_base = wave_base;
     handle.order = std::move(order);
     handle.local_indices_copy.assign(local_indices.begin(), local_indices.end());
     handle.host_coords_out = host_coords_out;
@@ -414,7 +414,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
 
     // Reuse the persistent per-device events from launch_scratch_t. These were
     // allocated once at context construction and live until context destruction;
-    // re-recording them here is safe because the prior chunk's
+    // re-recording them here is safe because the prior wave's
     // cudaStreamSynchronize in finalize_gpu_pipeline drained their previous use.
     handle.event_upload_start = launch_buffers.event_upload_start;
     handle.event_metric_start = launch_buffers.event_metric_start;
@@ -465,25 +465,25 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
     auto _P_post_metric = std::chrono::high_resolution_clock::now();
     cudaEventRecord(handle.event_kernels_start, stream);
 
-    // Wave-based kernel dispatch (8 bins: 16,32,48,64,80,96,112,128).
-    constexpr std::uint32_t wave_bins[] = {16, 32, 48, 64, 80, 96, 112, 128};
+    // Atom-limited-bin kernel dispatch (8 caps: 16, 32, 48, 64, 80, 96, 112, 128).
+    constexpr std::uint32_t atom_limited_bin_caps[] = {16, 32, 48, 64, 80, 96, 112, 128};
     constexpr std::uint32_t num_bins = 8;
 
     int num_sms = 0;
     cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id);
 
-    std::uint32_t wave_start = 0;
-    for (std::uint32_t bin = 0; bin < num_bins && wave_start < local_count; ++bin) {
-        std::uint32_t wave_end = wave_start;
-        while (wave_end < local_count && host_sorted_meta[wave_end].num_atoms <= wave_bins[bin]) ++wave_end;
+    std::uint32_t bin_start = 0;
+    for (std::uint32_t bin = 0; bin < num_bins && bin_start < local_count; ++bin) {
+        std::uint32_t bin_end = bin_start;
+        while (bin_end < local_count && host_sorted_meta[bin_end].num_atoms <= atom_limited_bin_caps[bin]) ++bin_end;
 
-        if (wave_end == wave_start) continue;
+        if (bin_end == bin_start) continue;
 
-        std::uint32_t const wave_size = wave_end - wave_start;
-        std::uint32_t const wave_max_atoms = wave_bins[bin];
+        std::uint32_t const bin_size = bin_end - bin_start;
+        std::uint32_t const bin_max_atoms = atom_limited_bin_caps[bin];
 
         // Kernel 1 — DG + stereo retry + fourth-dim crush + ETK torsion refinement.
-        std::uint32_t const shared_bytes_dg = compute_pipeline_shared_memory_bytes(wave_max_atoms, 0);
+        std::uint32_t const shared_bytes_dg = compute_pipeline_shared_memory_bytes(bin_max_atoms, 0);
         sink.check(cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         shared_bytes_dg),
                    "cudaFuncSetAttribute(etkdg_pipeline_warp_kernel)");
@@ -492,22 +492,22 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         sink.check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_dg, etkdg_pipeline_warp_kernel, 32,
                                                                  shared_bytes_dg),
                    "cudaOccupancyMaxActiveBlocksPerMultiprocessor(etkdg)");
-        std::uint32_t const grid_size_dg = std::min(wave_size, static_cast<std::uint32_t>(blocks_per_sm_dg * num_sms));
+        std::uint32_t const grid_size_dg = std::min(bin_size, static_cast<std::uint32_t>(blocks_per_sm_dg * num_sms));
 
         etkdg_pipeline_warp_kernel<<<grid_size_dg, 32, shared_bytes_dg, stream>>>(
-            device_view.bounds_matrices().data(), device_initial_coordinates + wave_start * max_atoms_per_molecule * 4,
+            device_view.bounds_matrices().data(), device_initial_coordinates + bin_start * max_atoms_per_molecule * 4,
             device_view.chiral_centers().data(), device_view.etk_torsions().data(),
             device_view.distance_constraints().data(), device_view.etk_interactions().data(),
-            device_view.etk_atom_offsets().data(), device_metadata_sorted + wave_start,
-            handle.device_coords_fp32.data() + wave_start * num_conformers * max_atoms_per_molecule * 3,
-            handle.device_energies_out.data() + wave_start * num_conformers,
-            handle.device_status_out.data() + wave_start * num_conformers, wave_size, num_conformers,
-            max_stereo_attempts, wave_max_atoms, max_atoms_per_molecule, max_atoms_per_molecule, seed);
+            device_view.etk_atom_offsets().data(), device_metadata_sorted + bin_start,
+            handle.device_coords_fp32.data() + bin_start * num_conformers * max_atoms_per_molecule * 3,
+            handle.device_energies_out.data() + bin_start * num_conformers,
+            handle.device_status_out.data() + bin_start * num_conformers, bin_size, num_conformers,
+            max_stereo_attempts, bin_max_atoms, max_atoms_per_molecule, max_atoms_per_molecule, seed);
         sink.check(cudaPeekAtLastError(), "etkdg_pipeline_warp_kernel launch");
 
         // Kernel 2 — MMFF94 polish in place on the per-conformer coordinates
         // produced by Kernel 1.  Skips slots whose status is non-zero.
-        std::uint32_t const shared_bytes_mmff = compute_mmff_polish_shared_memory_bytes(wave_max_atoms);
+        std::uint32_t const shared_bytes_mmff = compute_mmff_polish_shared_memory_bytes(bin_max_atoms);
         sink.check(cudaFuncSetAttribute(mmff_polish_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         shared_bytes_mmff),
                    "cudaFuncSetAttribute(mmff_polish_warp_kernel)");
@@ -516,7 +516,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         sink.check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_mmff, mmff_polish_warp_kernel, 32,
                                                                  shared_bytes_mmff),
                    "cudaOccupancyMaxActiveBlocksPerMultiprocessor(mmff)");
-        std::uint32_t const grid_size_mmff = std::min(wave_size,
+        std::uint32_t const grid_size_mmff = std::min(bin_size,
                                                       static_cast<std::uint32_t>(blocks_per_sm_mmff * num_sms));
 
         mmff_polish_warp_kernel<<<grid_size_mmff, 32, shared_bytes_mmff, stream>>>(
@@ -524,14 +524,14 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
             device_view.bond_distance().data(), device_view.mmff_bonds().data(), device_view.mmff_angles().data(),
             device_view.mmff_torsions().data(), device_view.mmff_oops().data(), device_view.mmff_stretchbends().data(),
             device_view.mmff_interactions().data(), device_view.mmff_atom_offsets().data(),
-            device_metadata_sorted + wave_start,
-            handle.device_coords_fp32.data() + wave_start * num_conformers * max_atoms_per_molecule * 3,
-            handle.device_energies_out.data() + wave_start * num_conformers,
-            handle.device_status_out.data() + wave_start * num_conformers, wave_size, num_conformers,
+            device_metadata_sorted + bin_start,
+            handle.device_coords_fp32.data() + bin_start * num_conformers * max_atoms_per_molecule * 3,
+            handle.device_energies_out.data() + bin_start * num_conformers,
+            handle.device_status_out.data() + bin_start * num_conformers, bin_size, num_conformers,
             max_atoms_per_molecule);
         sink.check(cudaPeekAtLastError(), "mmff_polish_warp_kernel launch");
 
-        wave_start = wave_end;
+        bin_start = bin_end;
     }
 
     // Post-kernel fp32→fp16 conversion of the coord buffer, on-device, before D2H.
@@ -571,7 +571,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
 }
 
 /**
- *  @brief Wait for a previously-launched chunk to finish and permute results into
+ *  @brief Wait for a previously-launched wave to finish and permute results into
  *  the caller's output arrays.  All three D2H transfers were already enqueued by
  *  `launch_gpu_pipeline` into pinned host staging; this just drains the stream
  *  and does a permutation memcpy.
@@ -601,7 +601,7 @@ void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
         std::uint32_t const local_idx = handle.order[sorted_idx];
         std::uint32_t const orig_idx = handle.local_indices_copy[local_idx];
         std::uint32_t const input_idx = input_indices[orig_idx];
-        std::uint32_t const caller_idx = has_perm ? handle.sort_perm[handle.chunk_base + input_idx] : input_idx;
+        std::uint32_t const caller_idx = has_perm ? handle.sort_perm[handle.wave_base + input_idx] : input_idx;
         for (std::uint32_t c = 0; c < num_conformers; ++c) {
             std::uint32_t const src_slot = sorted_idx * num_conformers + c;
             std::uint32_t const dst_slot = caller_idx * num_conformers + c;
@@ -626,7 +626,7 @@ void run_gpu_pipeline(int device_id, cudaStream_t stream, cusolverDnHandle_t sol
                       std::span<conformer_status_t> host_status_out) {
     auto handle = launch_gpu_pipeline(device_id, stream, solver_handle, scratch, launch_buffers, batch, local_indices,
                                       num_conformers, max_stereo_attempts, max_atoms_per_molecule, seed,
-                                      /*chunk_base=*/0, /*sort_perm=*/ {}, host_coords_out, host_energies_out,
+                                      /*wave_base=*/0, /*sort_perm=*/ {}, host_coords_out, host_energies_out,
                                       host_status_out);
     finalize_gpu_pipeline(std::move(handle));
 }
@@ -645,7 +645,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     // into the slots whose molecules made it through preprocessing; the rest
     // stay at these defaults (invalid_smiles / zero coords / zero energy). The
     // single reorder inside finalize drops directly into caller space via the
-    // chunk_base + sort_perm pair, so there is no second pass here.
+    // wave_base + sort_perm pair, so there is no second pass here.
     std::fill_n(status_out.begin(), status_out.size(), conformer_status_t::invalid_smiles);
     std::fill_n(energies_out.begin(), energies_out.size(), 0.0f);
     {
@@ -656,10 +656,10 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     // Keep SMILES as string_view throughout — the single unavoidable std::string copy
     // lives inside prepare_molecule at the RDKit::SmilesToMol call site.
 
-    // Sort molecules by descending SMILES length so the last chunk contains the
-    // smallest molecules. At 8 GPUs the per-chunk wall is dominated by
+    // Sort molecules by descending SMILES length so the last wave contains the
+    // smallest molecules. At 8 GPUs the per-wave wall is dominated by
     // max(CPU prep, GPU kernels). Chunk N's GPU work is the only fully unhidden
-    // phase (no chunk N+1 to overlap with), so making chunk N the cheapest shrinks
+    // phase (no wave N+1 to overlap with), so making wave N the cheapest shrinks
     // the tail. SMILES length is a fast proxy for atom count. `finalize_gpu_pipeline`
     // folds this permutation into the same reorder that undoes the per-GPU
     // atom-count sort, so there's no separate unsort pass at call end.
@@ -674,15 +674,15 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
 
     std::uint32_t const num_devices = static_cast<std::uint32_t>(device_ids.size());
 
-    // VRAM-aware chunk sizing. Each chunk lands device_pool_bytes + metric
+    // VRAM-aware wave sizing. Each wave lands device_pool_bytes + metric
     // scratch on every GPU; the smallest GPU in the system caps our throughput.
     // `cudaMemGetInfo` reports free VRAM at call time and accounts for whatever
     // other contexts are consuming on that device right now. Empirically the
     // per-molecule device footprint at max_atoms=128, K=1 hovers around
     // ~4 KB/molecule for the mirror + outputs; leave 6× headroom for scratch +
     // metric prepass gram+workspace which scale with group_size * N².
-    std::uint32_t chunk_size_target = config.chunk_size;
-    if (chunk_size_target == 0) {
+    std::uint32_t wave_size_target = config.wave_size;
+    if (wave_size_target == 0) {
         std::size_t smallest_free = 0;
         std::size_t smallest_total = 0;
         bool have_any = false;
@@ -703,50 +703,50 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         std::size_t const bytes_per_molecule = estimate_per_molecule_batch_bytes(max_atoms_per_molecule) +
                                                static_cast<std::size_t>(max_atoms_per_molecule) * num_conformers * 3u *
                                                    sizeof(float) * 6u;
-        std::uint64_t auto_chunk = 50'000;
-        if (bytes_per_molecule > 0 && budget_bytes > 0) auto_chunk = budget_bytes / bytes_per_molecule;
+        std::uint64_t auto_wave = 50'000;
+        if (bytes_per_molecule > 0 && budget_bytes > 0) auto_wave = budget_bytes / bytes_per_molecule;
         // Clamp to a sane [10K, 400K] envelope.
-        if (auto_chunk < 10'000u) auto_chunk = 10'000u;
-        if (auto_chunk > 400'000u) auto_chunk = 400'000u;
+        if (auto_wave < 10'000u) auto_wave = 10'000u;
+        if (auto_wave > 400'000u) auto_wave = 400'000u;
         // Cusolver batched eigen workspace in ensure_metric_scratch is the
         // dominant per-GPU allocation: observed ~1 MB per molecule at N=128, so
         // 50K molecules per GPU already eats 50 GB.  Cap the per-GPU group size
         // at 10K so even a 1-GPU run leaves ample headroom for the batch mirror,
         // coords buffers, and the metric-prepass scratch itself.  Matches the
         // v8 working configuration's effective per-GPU density.
-        constexpr std::uint64_t per_gpu_chunk_cap = 10'000;
-        std::uint64_t const total_cap_from_cusolver = per_gpu_chunk_cap * std::max<std::uint64_t>(num_devices, 1u);
-        if (auto_chunk > total_cap_from_cusolver) auto_chunk = total_cap_from_cusolver;
-        chunk_size_target = static_cast<std::uint32_t>(auto_chunk);
+        constexpr std::uint64_t per_gpu_wave_cap = 10'000;
+        std::uint64_t const total_cap_from_cusolver = per_gpu_wave_cap * std::max<std::uint64_t>(num_devices, 1u);
+        if (auto_wave > total_cap_from_cusolver) auto_wave = total_cap_from_cusolver;
+        wave_size_target = static_cast<std::uint32_t>(auto_wave);
     }
-    this->logger.trace("generate_conformers: n={} K={} chunk={} pipeline={}", num_input, num_conformers,
-                       chunk_size_target, num_input > chunk_size_target * 3 / 2 ? "yes" : "no");
+    this->logger.trace("generate_conformers: n={} K={} wave={} pipeline={}", num_input, num_conformers,
+                       wave_size_target, num_input > wave_size_target * 3 / 2 ? "yes" : "no");
 
-    bool const pipeline = num_input > chunk_size_target * 3 / 2;
+    bool const pipeline = num_input > wave_size_target * 3 / 2;
 
     // CRITICAL: keep the kernel stride fixed at the caller's max_atoms_per_molecule
-    // across ALL chunks.  Earlier code shrank the stride to the first chunk's observed
+    // across ALL waves.  Earlier code shrank the stride to the first wave's observed
     // max, which caused the finalize/kernel/output-buffer strides to diverge in
-    // multi-chunk runs (the caller's buffer is sized for max_atoms_per_molecule but the
+    // multi-wave runs (the caller's buffer is sized for max_atoms_per_molecule but the
     // kernel wrote with a smaller stride).  Symptoms were "illegal memory access" and
     // "operation not supported on global/shared address space" in mmff_polish.
     std::uint32_t const effective_max_atoms = max_atoms_per_molecule;
 
-    // Per-chunk timing accumulator: one row per chunk holding host-wall markers and
-    // per-device GPU phase elapsed times. Filled in launch_chunk + finalize_chunk;
+    // Per-wave timing accumulator: one row per wave holding host-wall markers and
+    // per-device GPU phase elapsed times. Filled in launch_wave + finalize_wave;
     // pretty-printed at the end of generate_conformers as an ASCII timeline.
-    struct chunk_record_t {
-        std::uint32_t chunk_idx;
+    struct wave_record_t {
+        std::uint32_t wave_idx;
         std::uint32_t n_mol;
         double prep_start_ms;     ///< host wall, ms relative to call start
         double prep_end_ms;       ///<     "
-        double launch_start_ms;   ///<     "  (when launch_chunk entered)
-        double launch_end_ms;     ///<     "  (when launch_chunk returned)
-        double finalize_start_ms; ///<     "  (when finalize_chunk entered for this chunk)
+        double launch_start_ms;   ///<     "  (when launch_wave entered)
+        double launch_end_ms;     ///<     "  (when launch_wave returned)
+        double finalize_start_ms; ///<     "  (when finalize_wave entered for this wave)
         double finalize_end_ms;   ///<     "
         std::vector<gpu_phase_ms_t> per_device_gpu;
     };
-    std::vector<chunk_record_t> chunk_records;
+    std::vector<wave_record_t> wave_records;
     auto const t_call_start = std::chrono::high_resolution_clock::now();
     auto host_ms = [&](std::chrono::high_resolution_clock::time_point t) {
         return std::chrono::duration<double, std::milli>(t - t_call_start).count();
@@ -756,7 +756,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     // call below is stream-async after the cusolver scratch is pre-allocated, so the
     // loop just enqueues work and returns. GPU d's stream runs concurrently with
     // GPU d+1's enqueue and with the main thread's next prep_slice().
-    auto launch_chunk = [&](etkdg_molecule_batch_t const &batch, std::uint32_t chunk_base,
+    auto launch_wave = [&](etkdg_molecule_batch_t const &batch, std::uint32_t wave_base,
                             std::vector<gpu_pipeline_handle_t> &handles_out, std::vector<gpu_phase_ms_t> &timings_out) {
         if (batch.num_molecules == 0) return;
 
@@ -811,7 +811,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
             auto _lt0 = std::chrono::high_resolution_clock::now();
             handles_out[d] = launch_gpu_pipeline(
                 device_ids[d], streams[d], solvers[d], metric_scratch[d], *launch_scratch[d], batch, gpu_span,
-                num_conformers, config.max_stereo_attempts, effective_max_atoms, config.random_seed, chunk_base,
+                num_conformers, config.max_stereo_attempts, effective_max_atoms, config.random_seed, wave_base,
                 sort_perm_view, coordinates_out, energies_out, status_out, sink);
             handles_out[d].timings_out = &timings_out[d];
             (void)_lt0;
@@ -820,25 +820,25 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
 
     // Finalize walks the 8 per-GPU handles sequentially. The first finalize's
     // cudaStreamSynchronize blocks until that stream drains; by the time it returns,
-    // the other 7 GPUs have almost always finished their chunk too (they started
+    // the other 7 GPUs have almost always finished their wave too (they started
     // within microseconds of each other and have the same work), so the remaining
     // finalize calls are near-instant.
-    auto finalize_chunk = [&](std::vector<gpu_pipeline_handle_t> &handles) {
+    auto finalize_wave = [&](std::vector<gpu_pipeline_handle_t> &handles) {
         for (auto &h : handles)
             if (h.device_id >= 0) finalize_gpu_pipeline(std::move(h));
         handles.clear();
     };
 
-    auto finalize_chunk_timed = [&](std::vector<gpu_pipeline_handle_t> &handles, std::uint32_t chunk_idx) {
+    auto finalize_wave_timed = [&](std::vector<gpu_pipeline_handle_t> &handles, std::uint32_t wave_idx) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        finalize_chunk(handles);
+        finalize_wave(handles);
         auto t1 = std::chrono::high_resolution_clock::now();
-        if (chunk_idx < chunk_records.size()) {
-            chunk_records[chunk_idx].finalize_start_ms = host_ms(t0);
-            chunk_records[chunk_idx].finalize_end_ms = host_ms(t1);
-            // Pull the per-device timings out of the handles' slots — finalize_chunk
+        if (wave_idx < wave_records.size()) {
+            wave_records[wave_idx].finalize_start_ms = host_ms(t0);
+            wave_records[wave_idx].finalize_end_ms = host_ms(t1);
+            // Pull the per-device timings out of the handles' slots — finalize_wave
             // already invoked finalize_gpu_pipeline which wrote into each timings_out.
-            // The slots live in launch_chunk's `timings_out` argument which the caller
+            // The slots live in launch_wave's `timings_out` argument which the caller
             // owns; we read them back from there via a separate vector below.
         }
     };
@@ -846,33 +846,33 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     if (!pipeline) {
         // Non-pipelined: single prep, single launch, single finalize. Identical
         // behaviour to the pre-pipelining code path.
-        chunk_records.push_back({0, num_input, 0, 0, 0, 0, 0, 0, {}});
-        chunk_records.back().prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
+        wave_records.push_back({0, num_input, 0, 0, 0, 0, 0, 0, {}});
+        wave_records.back().prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
         etkdg_molecule_batch_t batch = prepare_molecule_batch(smiles_view, scaffold_cache.get());
-        chunk_records.back().prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
+        wave_records.back().prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
         // effective_max_atoms is const (kept at caller's max_atoms_per_molecule) — no update here.
         std::vector<gpu_pipeline_handle_t> handles;
         std::vector<gpu_phase_ms_t> timings;
-        chunk_records.back().launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-        launch_chunk(batch, /*chunk_base=*/0, handles, timings);
-        chunk_records.back().launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
-        finalize_chunk_timed(handles, 0);
-        chunk_records.back().per_device_gpu = timings;
+        wave_records.back().launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
+        launch_wave(batch, /*wave_base=*/0, handles, timings);
+        wave_records.back().launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
+        finalize_wave_timed(handles, 0);
+        wave_records.back().per_device_gpu = timings;
     }
     else {
-        // Pipelined: split input into ~50K-molecule chunks, double-buffer the batches,
-        // interleave CPU prep of chunk N+1 with stream-async GPU work of chunk N.
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> chunks; // [begin, end)
-        for (std::uint32_t i = 0; i < num_input; i += chunk_size_target)
-            chunks.emplace_back(i, std::min(i + chunk_size_target, num_input));
-        chunk_records.resize(chunks.size());
-        for (std::uint32_t i = 0; i < chunks.size(); ++i) {
-            chunk_records[i].chunk_idx = i;
-            chunk_records[i].n_mol = chunks[i].second - chunks[i].first;
+        // Pipelined: split input into ~50K-molecule waves, double-buffer the batches,
+        // interleave CPU prep of wave N+1 with stream-async GPU work of wave N.
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> waves; // [begin, end)
+        for (std::uint32_t i = 0; i < num_input; i += wave_size_target)
+            waves.emplace_back(i, std::min(i + wave_size_target, num_input));
+        wave_records.resize(waves.size());
+        for (std::uint32_t i = 0; i < waves.size(); ++i) {
+            wave_records[i].wave_idx = i;
+            wave_records[i].n_mol = waves[i].second - waves[i].first;
         }
 
-        // Reuse the same batches slots across all chunks so their pinned host
-        // buffers (allocated once at first chunk, grown-only) don't round-trip
+        // Reuse the same batches slots across all waves so their pinned host
+        // buffers (allocated once at first wave, grown-only) don't round-trip
         // through cudaHostAlloc/cudaFreeHost — those serialize on a driver
         // lock and dominate CUDA API time at 8-GPU scale (measured via nsys).
         auto prep_slice_into = [&](etkdg_molecule_batch_t &batch, std::uint32_t begin, std::uint32_t end) {
@@ -882,23 +882,23 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         // Two-slot ring buffer for both batches and handles. Fixed-size
         // `std::array` keeps everything in contiguous storage — no vector growth,
         // no indirection per access, and `gpu_pipeline_handle_t::batch` can hold
-        // a stable pointer into `batches[slot]` for the lifetime of one chunk.
-        // At most one chunk is in flight (finalize_chunk(i-1) runs before
-        // launch_chunk(i) overwrites the opposite slot), so two slots suffice.
+        // a stable pointer into `batches[slot]` for the lifetime of one wave.
+        // At most one wave is in flight (finalize_wave(i-1) runs before
+        // launch_wave(i) overwrites the opposite slot), so two slots suffice.
         //
         // Use the persistent `context_t::batch_ring` so the pinned host allocations
         // live across `generate_conformers` calls — no cudaHostAlloc/cudaFreeHost
         // churn between batches.  ensure_capacity is grow-only inside each slot, so
         // the peak size observed over a process's lifetime is retained.  We do NOT
-        // upfront-grow to the worst-case (estimate_per_molecule_batch_bytes × chunk)
+        // upfront-grow to the worst-case (estimate_per_molecule_batch_bytes × wave)
         // because that hits 40+ GB of pinned memory per slot on drug-like workloads,
         // and cudaHostAlloc of that size serializes at ~4 MB/s page-locking.  The
         // 2-slot ordering (prep N → finalize N-1 → launch N) already ensures that
-        // any grow on slot (i % 2) happens after chunk (i-2)'s stream has drained.
+        // any grow on slot (i % 2) happens after wave (i-2)'s stream has drained.
         // Local 2-slot ring of batch prep buffers (NOT context_t::batch_ring).
         // Persistent cross-call batch buffers were found to correlate with a
-        // multi-chunk illegal-memory-access on the MMFF polish kernel that only
-        // triggered at ≥3 chunks per generate_conformers call.  The exact cause
+        // multi-wave illegal-memory-access on the MMFF polish kernel that only
+        // triggered at ≥3 waves per generate_conformers call.  The exact cause
         // inside CUDA's pinned-memory bookkeeping was not isolated; using local
         // per-call pinned allocations (matching the v8 working configuration)
         // eliminates the fault at the cost of one cudaHostAlloc/cudaFreeHost
@@ -909,43 +909,43 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         in_flight[0].resize(num_devices);
         in_flight[1].resize(num_devices);
 
-        // Bootstrap: prep + launch chunk 0. chunk 0's GPU work runs in the background
-        // on the CUDA streams while the main-thread loop below preps chunk 1.
-        chunk_records[0].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-        prep_slice_into(batches[0], chunks[0].first, chunks[0].second);
-        chunk_records[0].prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
+        // Bootstrap: prep + launch wave 0. wave 0's GPU work runs in the background
+        // on the CUDA streams while the main-thread loop below preps wave 1.
+        wave_records[0].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
+        prep_slice_into(batches[0], waves[0].first, waves[0].second);
+        wave_records[0].prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
         // effective_max_atoms stays at caller's max_atoms_per_molecule — see declaration.
-        chunk_records[0].launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-        launch_chunk(batches[0], chunks[0].first, in_flight[0], timing_slots[0]);
-        chunk_records[0].launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
+        wave_records[0].launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
+        launch_wave(batches[0], waves[0].first, in_flight[0], timing_slots[0]);
+        wave_records[0].launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
 
         // Main pipeline loop. At the top of iteration i:
-        //   - GPU work for chunk i-1 is in flight in slot (i-1) % 2.
-        //   - Batch slot (i % 2) held chunk i-2, which was finalized at iteration i-1.
-        //     So it's safe to overwrite with chunk i's batch.
-        for (std::size_t i = 1; i < chunks.size(); ++i) {
-            chunk_records[i].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-            prep_slice_into(batches[i % 2], chunks[i].first, chunks[i].second); // CPU work (overlaps GPU chunk i-1)
-            chunk_records[i].prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
-            // effective_max_atoms stays constant across chunks — see declaration.
-            finalize_chunk_timed(in_flight[(i - 1) % 2], static_cast<std::uint32_t>(i - 1));
-            chunk_records[i - 1].per_device_gpu = timing_slots[(i - 1) % 2];
-            chunk_records[i].launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-            launch_chunk(batches[i % 2], chunks[i].first, in_flight[i % 2], timing_slots[i % 2]); // async dispatch
-            chunk_records[i].launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
+        //   - GPU work for wave i-1 is in flight in slot (i-1) % 2.
+        //   - Batch slot (i % 2) held wave i-2, which was finalized at iteration i-1.
+        //     So it's safe to overwrite with wave i's batch.
+        for (std::size_t i = 1; i < waves.size(); ++i) {
+            wave_records[i].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
+            prep_slice_into(batches[i % 2], waves[i].first, waves[i].second); // CPU work (overlaps GPU wave i-1)
+            wave_records[i].prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
+            // effective_max_atoms stays constant across waves — see declaration.
+            finalize_wave_timed(in_flight[(i - 1) % 2], static_cast<std::uint32_t>(i - 1));
+            wave_records[i - 1].per_device_gpu = timing_slots[(i - 1) % 2];
+            wave_records[i].launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
+            launch_wave(batches[i % 2], waves[i].first, in_flight[i % 2], timing_slots[i % 2]); // async dispatch
+            wave_records[i].launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
         }
-        std::uint32_t const last_idx = static_cast<std::uint32_t>(chunks.size() - 1);
-        finalize_chunk_timed(in_flight[last_idx % 2], last_idx);
-        chunk_records[last_idx].per_device_gpu = timing_slots[last_idx % 2];
+        std::uint32_t const last_idx = static_cast<std::uint32_t>(waves.size() - 1);
+        finalize_wave_timed(in_flight[last_idx % 2], last_idx);
+        wave_records[last_idx].per_device_gpu = timing_slots[last_idx % 2];
     }
 
-    // Per-chunk summary (verbose tier 1) and per-device breakdown (tier 2).
+    // Per-wave summary (verbose tier 1) and per-device breakdown (tier 2).
     // Skipped entirely in the default silent mode.
     if (this->logger.verbose_level >= 1) {
         double const total_wall_ms = host_ms(std::chrono::high_resolution_clock::now());
         this->logger.trace(
-            "chunk   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / " "download");
-        for (auto const &cr : chunk_records) {
+            "wave   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / " "download");
+        for (auto const &cr : wave_records) {
             float gpu_max = 0.f, gpu_sum = 0.f, upload = 0.f, metric = 0.f, kernels = 0.f, download = 0.f;
             std::uint32_t n_active = 0;
             for (auto const &pd : cr.per_device_gpu) {
@@ -963,25 +963,25 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
                 "{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / " "{:>6.1f}" " "
                                                                                                                      "/"
                                                                                                                      " " "{:" ">6" ".1" "f" "}",
-                cr.chunk_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms, cr.launch_end_ms - cr.launch_start_ms,
+                cr.wave_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms, cr.launch_end_ms - cr.launch_start_ms,
                 cr.finalize_end_ms - cr.finalize_start_ms, gpu_sum * inv, gpu_max, upload * inv, metric * inv,
                 kernels * inv, download * inv);
         }
         this->logger.trace("wall {:.1f} ms", total_wall_ms);
-        // Tier 2: per-device per-chunk breakdown.
-        for (auto const &cr : chunk_records) {
+        // Tier 2: per-device per-wave breakdown.
+        for (auto const &cr : wave_records) {
             for (std::uint32_t d = 0; d < cr.per_device_gpu.size(); ++d) {
                 auto const &pd = cr.per_device_gpu[d];
                 if (pd.total_ms <= 0.f) continue;
                 this->logger.trace2(
                     "  ck={} dev={}  upload={:.1f}  metric={:.1f}  kernels={:.1f}  download={:.1f}  total={:.1f}",
-                    cr.chunk_idx, d, pd.upload_ms, pd.metric_ms, pd.kernels_ms, pd.download_ms, pd.total_ms);
+                    cr.wave_idx, d, pd.upload_ms, pd.metric_ms, pd.kernels_ms, pd.download_ms, pd.total_ms);
             }
         }
     }
 
     // All output permutation already happened inside `finalize_gpu_pipeline`:
-    // each chunk's per-GPU sort + the outer SMILES-length sort are folded into
+    // each wave's per-GPU sort + the outer SMILES-length sort are folded into
     // one reorder that writes directly into caller_idx space. Here we just scan
     // the already-permuted status buffer to derive the aggregate return code.
     bool any_success = false;

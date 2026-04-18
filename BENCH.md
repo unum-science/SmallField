@@ -3,6 +3,8 @@
 Throughput, scaling, and quality measurements on the current build.
 Last refreshed 2026-04-16.
 
+See [`GLOSSARY.md`](GLOSSARY.md) for the canonical vocabulary used below (`parquet-shard`, `coprocessed-batch`, `embedding-wave`, `atom-limited-bin`, `pipeline-role`, `wave-step`).
+
 ## Hardware
 
 | Component | Specification                                   |

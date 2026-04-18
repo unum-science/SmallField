@@ -73,8 +73,8 @@ enum class conformer_status_t : std::uint8_t {
 struct config_t {
     std::uint32_t num_conformers = 3;
     std::uint32_t max_stereo_attempts = 10;
-    /** @brief Target chunk size for pipelined dispatch; 0 = VRAM-aware auto. */
-    std::uint32_t chunk_size = 0;
+    /** @brief Target `embedding-wave` size for pipelined dispatch; 0 = VRAM-aware auto. */
+    std::uint32_t wave_size = 0;
     std::uint64_t random_seed = 42;
 };
 
@@ -87,8 +87,8 @@ struct config_t {
  *  @brief Per-GPU persistent scratch buffers for the metric-embedding prepass.
  *
  *  Allocated once per @c context_t so the prepass can run fully stream-async
- *  without per-chunk @c cudaMalloc / @c cudaFree pairs that otherwise serialize
- *  the launch phase.  Sized for the worst case: all molecules in a chunk having
+ *  without per-wave @c cudaMalloc / @c cudaFree pairs that otherwise serialize
+ *  the launch phase.  Sized for the worst case: all molecules in a wave having
  *  the maximum supported atom count.
  */
 struct metric_scratch_t {
@@ -123,10 +123,10 @@ struct context_t {
     /**
      *  @brief Persistent 2-slot ring of batch prep buffers.
      *
-     *  Moving the chunk-prep buffers out of @c generate_conformers and onto the
-     *  context fixes a use-after-free: a later chunk's @c prepare_molecule_batch_into
+     *  Moving the wave-prep buffers out of @c generate_conformers and onto the
+     *  context fixes a use-after-free: a later wave's @c prepare_molecule_batch_into
      *  can trigger @c host.ensure_capacity, reallocating the pinned pointer while an
-     *  earlier chunk still has H2D commands queued against the old address.  With the
+     *  earlier wave still has H2D commands queued against the old address.  With the
      *  ring persistent and pre-sized at call entry, no reallocation happens mid-call.
      */
     std::array<batch_pool_t, 2> batch_ring {};
@@ -142,7 +142,7 @@ struct context_t {
     /**
      *  @brief Owned per-context logger.  Tune verbosity via
      *  `ctx.logger.verbose_level = 1;` before calling @ref generate_conformers.
-     *  Library diagnostics (chunk timing table, per-device breakdown) route
+     *  Library diagnostics (wave timing table, per-device breakdown) route
      *  through `logger.trace` / `logger.trace2`; CUDA errors through
      *  `logger.error`.
      */
@@ -153,7 +153,7 @@ struct context_t {
      *  `check_cuda_status_` every time a CUDA / cuSOLVER API call returns a
      *  non-success status.  Production callers read this after each
      *  @ref generate_conformers call and exit non-zero if it is positive,
-     *  catching silent failures that would otherwise hide behind per-chunk
+     *  catching silent failures that would otherwise hide behind per-wave
      *  zero-filled outputs.  Reset via `ctx.cuda_error_count.store(0)`.
      */
     std::atomic<std::uint64_t> cuda_error_count {0};

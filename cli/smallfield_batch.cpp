@@ -2,18 +2,17 @@
  *  @file smallfield_batch.cpp
  *  @brief Restartable batch processor for bulk conformer generation.
  *
- *  Four-stage ring-buffered pipeline:
- *    reader        → reads input-files, combines into gpus-batches
- *    gpu_runner    → runs generate_conformers on each gpus-batch
- *    fallback      → runs RDKit on conformer slots the GPU could not fill
- *    writer        → emits one output-file per input-file from resolved gpus-batches
+ *  Four `pipeline-roles` (see GLOSSARY.md) with depth-3 ring-buffer handoffs:
+ *    reader-role    → reads parquet-shards, combines into coprocessed-batches
+ *    gpu-runner-role → runs generate_conformers on each coprocessed-batch
+ *    fallback-role  → runs RDKit on conformer slots the GPU could not fill
+ *    writer-role    → emits one output parquet-shard per consumed input shard
  *
- *  Each stage owns a depth-3 ring-buffer handoff to the next.
- *  The reader combines multiple input-files until the gpus-batch target size is
- *  reached, ensuring all GPUs are saturated per generate_conformers call.  The
- *  fallback and writer stages run concurrently with the GPU on the next batch
- *  thanks to the deeper queues.  The fallback is conformer-granular: only the
- *  per-slot failures are re-embedded; partial GPU successes are preserved.
+ *  The reader-role accumulates parquet-shards until the coprocessed-batch size
+ *  target is reached, ensuring all GPUs are saturated per generate_conformers
+ *  call.  Fallback and writer roles run concurrently with the GPU on later
+ *  batches thanks to the deeper queues.  The fallback is conformer-granular:
+ *  only the per-slot failures are re-embedded; partial GPU successes are kept.
  */
 
 #include <atomic>
@@ -58,28 +57,31 @@ struct cli_config_t {
     std::string smiles_column = "smiles";
     std::uint32_t num_conformers = 3;
     std::uint32_t max_atoms = 128;
-    std::uint32_t gpus_batch_size = 0; ///< 0 = auto (100K per GPU)
+    /** @brief Target `coprocessed-batch` size in molecules; 0 = auto (100 K per visible GPU). */
+    std::uint32_t batch_size = 0;
     std::vector<int> gpu_ids;
     int rdkit_fallback_threads = 0;
     bool resume = true;
     std::uint64_t random_seed = 42;
-    int verbose_level = 0; ///< 0 silent; 1 chunk table; 2 per-device detail
+    /** @brief Library verbose tier: 0 silent, 1 per-`embedding-wave` summary, 2 + per-device breakdown. */
+    int verbose_level = 0;
 };
 
 void print_usage() {
     fmt::print(stderr, R"(Usage: smallfield_batch --input DIR --output DIR [options]
-  --input DIR                 folder of *.parquet input-files
-  --output DIR                folder to write *_3D.parquet output-files
+  --input DIR                 folder of input parquet-shards (*.parquet)
+  --output DIR                folder for output parquet-shards (*_3D.parquet)
   --smiles-column NAME        input column name (default: smiles)
   --num-conformers K          conformers per molecule (default: 3)
   --max-atoms N               per-molecule atom cap (default: 128)
-  --gpus-batch-size N         molecules per gpus-batch (default: auto = 100K per GPU)
-  --chunk-size N              alias for --gpus-batch-size
+  --batch-size N              molecules per coprocessed-batch (default: auto = 100K per GPU)
+  --coprocessed-batch-size N         alias for --batch-size
+  --chunk-size N              alias for --batch-size
   --gpus a,b,c                GPU device IDs (default: all visible)
-  --rdkit-fallback-threads N  OpenMP threads for RDKit fallback (default: max)
-  --restart                   overwrite already-complete output-files
+  --rdkit-fallback-threads N  OpenMP threads for fallback-role (default: max)
+  --restart                   overwrite already-complete output shards
   --seed N                    RNG seed for both GPU and RDKit fallback
-  --verbose[=LEVEL]           library diagnostics: 1 = chunk table, 2 = +per-device
+  --verbose[=LEVEL]           library diagnostics: 1 = wave table, 2 = +per-device
 )");
 }
 
@@ -131,10 +133,10 @@ bool parse_cli(int argc, char **argv, cli_config_t &config) {
             if (!value) return false;
             config.max_atoms = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         }
-        else if (flag == "--gpus-batch-size") {
-            auto value = require_value("gpus-batch-size");
+        else if (flag == "--batch-size" || flag == "--coprocessed-batch-size") {
+            auto value = require_value(flag == "--batch-size" ? "batch-size" : "coprocessed-batch-size");
             if (!value) return false;
-            config.gpus_batch_size = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            config.batch_size = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         }
         else if (flag == "--gpus") {
             auto value = require_value("gpus");
@@ -149,7 +151,7 @@ bool parse_cli(int argc, char **argv, cli_config_t &config) {
         else if (flag == "--chunk-size") {
             auto value = require_value("chunk-size");
             if (!value) return false;
-            config.gpus_batch_size = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            config.batch_size = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
         }
         else if (flag == "--restart") { config.resume = false; }
         else if (flag == "--resume") { config.resume = true; }
@@ -201,10 +203,10 @@ struct output_buffers_t {
     }
 };
 
-/** Combined input-files for one gpus-batch.
+/** Combined input parquet-shards for one `coprocessed-batch`.
  *  Owns the Arrow tables that back the SMILES string_views.
- *  The reader fills this until total_molecules >= target, then hands it off. */
-struct gpus_batch_accumulator_t {
+ *  The reader-role fills this until total_molecules >= target, then hands off. */
+struct coprocessed_batch_accumulator_t {
     std::vector<sfcli::shard_data_t> input_file_data;
     std::vector<sfcli::shard_pair_t const *> input_file_pairs;
     std::vector<std::uint64_t> input_file_boundaries;
@@ -231,14 +233,15 @@ struct gpus_batch_accumulator_t {
     }
 };
 
-/** Gpus-batch after GPU processing, handed to the fallback runner.
- *  The fallback patches coordinates/energies in-place via retry_indices. */
-struct gpus_batch_result_t {
-    gpus_batch_accumulator_t accumulator;
+/** `coprocessed-batch` after the `gpu-runner-role`, handed to the `fallback-role`.
+ *  The fallback-role patches coordinates/energies in-place via retry_indices. */
+struct coprocessed_batch_result_t {
+    coprocessed_batch_accumulator_t accumulator;
     output_buffers_t *buffers = nullptr;
     bool done = false;
-    /// When the gpu_runner picked up this batch — used by the writer to derive
-    /// per-shard wall time (GPU + fallback + write) for the single progress line.
+    /// When the gpu-runner-role picked up this batch — used by the writer-role
+    /// to derive per-shard wall time (GPU + fallback + write) for the single
+    /// progress line.
     std::chrono::steady_clock::time_point batch_start {};
     std::uint64_t fallback_attempted = 0; ///< number of molecules sent into RDKit fallback
     std::uint64_t fallback_recovered = 0; ///< number for which RDKit filled at least one slot
@@ -246,7 +249,7 @@ struct gpus_batch_result_t {
 
 /** Bounded ring-buffer producer/consumer channel.
  *  Sender blocks when full, receiver blocks when empty.
- *  Depth picks how many gpus-batches the upstream can stage ahead before
+ *  Depth picks how many coprocessed-batches the upstream can stage ahead before
  *  back-pressuring; the larger the depth the more memory the pipeline
  *  consumes but the better it tolerates downstream stalls. */
 template <typename payload_>
@@ -343,8 +346,9 @@ thread_budget_t compute_thread_budget(int user_fallback_override) {
     int const reader = std::clamp(num_procs / 128, 1, 2);
     // Writer is Arrow-serialize-bound, also mostly single-threaded inside Arrow.
     int const writer = std::clamp(num_procs / 64, 2, 4);
-    // GPU runner's CPU share is chunk prep (RDKit parsing + MMFF typer over
-    // molecules in OpenMP parallel-for).  Most of a chunk's wall is GPU time;
+    // gpu-runner-role's CPU share is embedding-wave prep (RDKit parsing + MMFF
+    // typer over molecules in OpenMP parallel-for).  Most of a wave's wall is
+    // GPU time;
     // match the old proven v8 budget (procs - 4) as the default since lower
     // thread counts showed correlated CUDA instability we could not root-cause.
     int const gpu_runner = std::max(1, num_procs - 4);
@@ -368,10 +372,10 @@ struct progress_counters_t {
 };
 
 void reader_loop(std::vector<sfcli::shard_pair_t const *> const &pending, cli_config_t const &config,
-                 std::uint32_t gpus_batch_target, thread_budget_t const &budget, logger_t const &logger,
-                 handoff_t<gpus_batch_accumulator_t> &out) {
+                 std::uint32_t batch_target, thread_budget_t const &budget, logger_t const &logger,
+                 handoff_t<coprocessed_batch_accumulator_t> &out) {
     omp_set_num_threads(budget.reader);
-    gpus_batch_accumulator_t accumulator;
+    coprocessed_batch_accumulator_t accumulator;
 
     for (auto const *pair : pending) {
         sfcli::shard_data_t data;
@@ -381,7 +385,7 @@ void reader_loop(std::vector<sfcli::shard_pair_t const *> const &pending, cli_co
         }
         accumulator.add_input_file(std::move(data), pair);
 
-        if (accumulator.total_molecules >= gpus_batch_target) {
+        if (accumulator.total_molecules >= batch_target) {
             out.send(std::move(accumulator));
             accumulator.clear();
         }
@@ -389,13 +393,13 @@ void reader_loop(std::vector<sfcli::shard_pair_t const *> const &pending, cli_co
 
     if (accumulator.total_molecules > 0) { out.send(std::move(accumulator)); }
 
-    gpus_batch_accumulator_t sentinel;
+    coprocessed_batch_accumulator_t sentinel;
     sentinel.done = true;
     out.send(std::move(sentinel));
 }
 
 void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, thread_budget_t const &budget,
-                     handoff_t<gpus_batch_accumulator_t> &in, handoff_t<gpus_batch_result_t> &out, buffer_pool_t &pool,
+                     handoff_t<coprocessed_batch_accumulator_t> &in, handoff_t<coprocessed_batch_result_t> &out, buffer_pool_t &pool,
                      progress_counters_t &counters) {
     omp_set_num_threads(budget.gpu_runner);
     (void)counters;
@@ -447,20 +451,20 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
             if (has_failure) buf->retry_indices.push_back(static_cast<std::uint32_t>(mol));
         }
 
-        gpus_batch_result_t result;
+        coprocessed_batch_result_t result;
         result.accumulator = std::move(accumulator);
         result.buffers = buf;
         result.batch_start = batch_start;
         out.send(std::move(result));
     }
 
-    gpus_batch_result_t sentinel;
+    coprocessed_batch_result_t sentinel;
     sentinel.done = true;
     out.send(std::move(sentinel));
 }
 
-void fallback_loop(cli_config_t const &config, thread_budget_t const &budget, handoff_t<gpus_batch_result_t> &in,
-                   handoff_t<gpus_batch_result_t> &out) {
+void fallback_loop(cli_config_t const &config, thread_budget_t const &budget, handoff_t<coprocessed_batch_result_t> &in,
+                   handoff_t<coprocessed_batch_result_t> &out) {
     omp_set_num_threads(budget.fallback);
 
     for (;;) {
@@ -501,7 +505,7 @@ void fallback_loop(cli_config_t const &config, thread_budget_t const &budget, ha
 }
 
 void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logger_t const &logger,
-                 handoff_t<gpus_batch_result_t> &in, buffer_pool_t &pool, progress_counters_t &counters) {
+                 handoff_t<coprocessed_batch_result_t> &in, buffer_pool_t &pool, progress_counters_t &counters) {
     omp_set_num_threads(budget.writer);
 
     for (;;) {
@@ -559,7 +563,7 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
         auto const eta_wall = std::chrono::system_clock::now() +
                               std::chrono::milliseconds(static_cast<std::int64_t>(remaining_seconds * 1000.0));
 
-        // Collapse gpus-batch start + fallback + done into one line.  Fallback
+        // Collapse coprocessed-batch start + fallback + done into one line.  Fallback
         // fragment is omitted when no molecule needed RDKit recovery.
         std::string fallback_fragment;
         if (result.fallback_attempted > 0)
@@ -605,16 +609,16 @@ int main(int argc, char **argv) {
 
     sfapi::context_t gpu_context(std::span<int const>(config.gpu_ids));
     // Share the CLI's verbose level with the library so `--verbose=1|2` enables
-    // the per-chunk table and per-device breakdown emitted from smallfield.cu.
+    // the per-wave table and per-device breakdown emitted from smallfield.cu.
     gpu_context.logger.verbose_level = config.verbose_level;
     gpu_context.logger.start_time = logger.start_time;
     std::uint32_t const num_gpus = config.gpu_ids.empty() ? static_cast<std::uint32_t>(gpu_context.device_ids.size())
                                                           : static_cast<std::uint32_t>(config.gpu_ids.size());
-    std::uint32_t const gpus_batch_target = config.gpus_batch_size > 0 ? config.gpus_batch_size : num_gpus * 100'000u;
+    std::uint32_t const batch_target = config.batch_size > 0 ? config.batch_size : num_gpus * 100'000u;
 
     thread_budget_t const budget = compute_thread_budget(config.rdkit_fallback_threads);
-    logger.info("  {} GPUs, gpus-batch target {} mols, threads reader={} gpu_runner={} fallback={} writer={}", num_gpus,
-                thousands(gpus_batch_target), budget.reader, budget.gpu_runner, budget.fallback, budget.writer);
+    logger.info("  {} GPUs, coprocessed-batch target {} mols, threads reader={} gpu_runner={} fallback={} writer={}", num_gpus,
+                thousands(batch_target), budget.reader, budget.gpu_runner, budget.fallback, budget.writer);
 
     omp_set_max_active_levels(2);
 
@@ -622,20 +626,20 @@ int main(int argc, char **argv) {
     counters.total_input_files = pending.size();
     counters.start_time = logger.start_time;
 
-    // Pipeline depth picks how many gpus-batches the upstream may stage before
+    // Pipeline depth picks how many coprocessed-batches the upstream may stage before
     // back-pressuring.  Depth 3 lets reader stay 2 ahead of GPU and GPU stay 1
     // ahead of fallback while writer drains; pool sized to depth+1 so no stage
     // ever blocks waiting for a free output buffer.
     constexpr std::size_t kPipelineDepth = 3;
     buffer_pool_t pool {kPipelineDepth + 1};
-    handoff_t<gpus_batch_accumulator_t> reader_to_gpu {kPipelineDepth};
-    handoff_t<gpus_batch_result_t> gpu_to_fallback {kPipelineDepth};
-    handoff_t<gpus_batch_result_t> fallback_to_writer {kPipelineDepth};
+    handoff_t<coprocessed_batch_accumulator_t> reader_to_gpu {kPipelineDepth};
+    handoff_t<coprocessed_batch_result_t> gpu_to_fallback {kPipelineDepth};
+    handoff_t<coprocessed_batch_result_t> fallback_to_writer {kPipelineDepth};
 
 #pragma omp parallel sections num_threads(4)
     {
 #pragma omp section
-        { reader_loop(pending, config, gpus_batch_target, budget, logger, reader_to_gpu); }
+        { reader_loop(pending, config, batch_target, budget, logger, reader_to_gpu); }
 #pragma omp section
         { gpu_runner_loop(gpu_context, config, budget, reader_to_gpu, gpu_to_fallback, pool, counters); }
 #pragma omp section

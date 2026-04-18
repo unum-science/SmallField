@@ -4,6 +4,8 @@ __SmallField__ generates 3D conformers from SMILES strings using [ETKDG](https:/
 One CUDA warp processes one molecule and runs all pipeline stages in shared memory with no global-memory atomics.
 CPU preprocessing uses [RDKit](https://github.com/rdkit/rdkit) for SMILES parsing, bounds matrices, CSD torsion lookup, and MMFF94 parameter extraction.
 
+__See [`GLOSSARY.md`](GLOSSARY.md)__ for the canonical vocabulary — `parquet-shard` / `coprocessed-batch` / `embedding-wave` / `atom-limited-bin` at the data-granularity level, and `pipeline-role` (CLI outer pipeline) vs `wave-step` (library inner pipeline) for the pipelining layers.
+
 ## Pipeline
 
 __CPU (OpenMP, per-molecule):__
