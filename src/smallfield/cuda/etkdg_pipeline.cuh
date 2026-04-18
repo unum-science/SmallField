@@ -269,7 +269,9 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
         energies_out[slot] = energy;
         status_out[slot] = succeeded ? 0 : 1;
     }
-    __syncwarp(full_mask_k);
+    // No trailing __syncwarp: writes above are global-only (coordinates_out,
+    // energies_out, status_out) and the helper returns immediately; no
+    // subsequent intra-warp reader depends on them.
 }
 
 /**
@@ -548,7 +550,9 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
                     conformer_coordinates_out[coord_offset + d * output_atoms_stride + i] =
                         positions[d * num_atoms + i];
             if (lane == 0) conformer_energies_out[slot] = mmff_energy;
-            __syncwarp(full_mask_k);
+            // No trailing __syncwarp: next conformer iteration starts by
+            // reloading positions from global memory with its own sync at the
+            // loop head before any cross-lane reader runs.
         }
     }
 }

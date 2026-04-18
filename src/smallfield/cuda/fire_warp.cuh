@@ -61,12 +61,15 @@ __device__ __forceinline__ void fire_minimize_(float *positions, float *velociti
     int steps_since_reset = 0;
     float last_rms_gradient = 0.0f;
 
-    // zero velocities
+    // zero velocities — lane-owned writes (i = lane + k · 32); each lane
+    // subsequently reads only its own slots, so no cross-lane sync is needed.
     for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) velocities[i] = 0.0f;
-    __syncwarp(full_mask_k);
 
     for (std::int32_t iteration = 0; iteration < max_iterations; ++iteration) {
-        // compute energy and gradient (gradient = -force, so force = -gradient)
+        // compute energy and gradient (gradient = -force, so force = -gradient).
+        // compute_energy_gradient uses cross-lane atomic accumulation into
+        // gradient[] internally, so the sync here is load-bearing for the
+        // reads that follow.
         float const energy = compute_energy_gradient(positions, gradient, num_elements, lane);
         __syncwarp(full_mask_k);
 
@@ -124,7 +127,12 @@ __device__ __forceinline__ void fire_minimize_(float *positions, float *velociti
             alpha = initial_alpha_k;
             steps_since_reset = 0;
         }
-        __syncwarp(full_mask_k);
+        // No __syncwarp here: the accelerate/decelerate branches write
+        // velocities[i] lane-owned, and the velocity-Verlet loop immediately
+        // below reads velocities[i] + positions[i] lane-owned.  Cross-lane
+        // reads of positions happen only in the next iteration's
+        // compute_energy_gradient, which is guarded by the sync at the
+        // bottom of this block.
 
         // velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt
         float const half_timestep_squared = 0.5f * timestep * timestep;
@@ -134,6 +142,10 @@ __device__ __forceinline__ void fire_minimize_(float *positions, float *velociti
             positions[i] += displacement;
             velocities[i] = fmaf(gradient[i], -timestep, velocities[i]);
         }
+        // Sync required: next iteration's compute_energy_gradient reads
+        // positions[] cross-lane (pair-sum over atoms).  Without this sync
+        // one lane could begin reading positions[j] before another lane's
+        // write to positions[j] has retired.
         __syncwarp(full_mask_k);
     }
 
