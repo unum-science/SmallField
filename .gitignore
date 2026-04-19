@@ -146,3 +146,4 @@ Testing/
 build_debug
 build_release
 .DS_Store
+.claude/

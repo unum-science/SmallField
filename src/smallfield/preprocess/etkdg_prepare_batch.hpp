@@ -287,7 +287,7 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
     //        widened to -6.3, throughput -2.8 %. Even at 99.71 % the 5 / 1698
     //        residual chiral mis-orderings flip the GPU's chirality penalty
     //        sign on those centres, producing measurably worse conformers.
-    // Investigation in IMPROVE.md §6 — needs a CIP rule-1c phantom-atom
+    // Investigation in ROADMAP.md ("Tried and rejected") — needs a CIP rule-1c phantom-atom
     // implementation (asymmetric duplicate atoms for π-bond endpoints) to
     // close the last 0.29 %. Until then RDKit's call is faster AND correct.
     RDKit::UINT_VECT cip_ranks(molecule.getNumAtoms(), 0);

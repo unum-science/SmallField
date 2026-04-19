@@ -10,7 +10,7 @@
  *  bottleneck — cache-hitting on the scaffold avoids the graph-isomorphism
  *  search for the fraction of matches whose atoms are entirely in the
  *  scaffold (no R-group participation).  See `BENCH.md` §"scaffold-cache
- *  architecture sketch" and `IMPROVE.md` §4 for the design rationale.
+ *  architecture sketch" and `ROADMAP.md` (Dataset roadmap) for the design rationale.
  *
  *  Design:
  *   - Sharded `std::unordered_map<uint64_t, scaffold_cache_entry_t>` keyed on
