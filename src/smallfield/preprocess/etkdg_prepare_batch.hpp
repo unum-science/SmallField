@@ -1204,69 +1204,81 @@ inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::u
  *  driver lock, so recycling the buffer across chunks matters a lot more than
  *  you'd expect.
  */
-inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list, etkdg_molecule_batch_t &batch,
-                                        scaffold_cache_t *cache = nullptr) {
-    batch.num_molecules = 0;
-    batch.max_atoms_per_molecule = 0;
-    batch.layout = batch_layout_t {};
-    // Prepare molecules in parallel. RDKit calls are thread-safe for independent molecules.
-    //
-    // CRITICAL: this file is included by `smallfield.cu` which is compiled with nvcc.
-    // For OpenMP to actually parallelize here, the CMake target must pass
-    // `-Xcompiler=-fopenmp` through nvcc to the host compiler. Otherwise nvcc silently
-    // ignores the pragma and this loop runs single-threaded — which costs 20x.
-    std::size_t const n = smiles_list.size();
-    // Pipeline:
-    //
-    //   Per-molecule extraction pass: each OpenMP thread owns ONE reusable `etkdg_prepared_molecule_t` scratch
-    //                      whose vector capacities persist across its molecules — `prepare_molecule_into`
-    //                      clears sizes, so push_back stays on the hot path without heap activity after
-    //                      the first few molecules. Each molecule's output is byte-appended into the
-    //                      thread's per-region contribution buffers.
-    //   Prefix-scan pass: accumulate per-thread totals into per-thread pool bases.
-    //   Batched memcpy pass (parallel): one `std::memcpy` per thread per region copies the thread's
-    //                      accumulator into its slice of the pinned pool, and the
-    //                      per-mol metadata is rebased to pool-wide offsets.
-    //
-    // Eliminates the old `std::vector<etkdg_prepared_molecule_t> prepared(n)` that
-    // caused 3.4 M heap allocations per 241K batch.
+/**
+ *  @brief One per-OpenMP-thread record accumulated during `prepare_per_thread_contribs_`.
+ *  `*_offset` fields hold THREAD-LOCAL byte indices; the pack-pass rebases
+ *  them by adding the thread's pool-wide base.
+ */
+struct batch_prep_per_mol_record_t {
+    std::uint32_t original_idx;
+    etkdg_molecule_metadata_t metadata;
+};
 
-    struct alignas(64) thread_contribution_t {
-        etkdg_prepared_molecule_t scratch;
-        std::vector<std::byte> bounds_bytes;
-        std::vector<std::byte> chirals_bytes;
-        std::vector<std::byte> torsions_bytes;
-        std::vector<std::byte> dcons_bytes;
-        std::vector<std::byte> atom_vdw_bytes;
-        std::vector<std::byte> atom_charge_bytes;
-        std::vector<std::byte> bond_distance_bytes;
-        std::vector<std::byte> mmff_bonds_bytes;
-        std::vector<std::byte> mmff_angles_bytes;
-        std::vector<std::byte> mmff_torsions_bytes;
-        std::vector<std::byte> mmff_oops_bytes;
-        std::vector<std::byte> mmff_stretchbends_bytes;
-        std::vector<std::byte> mmff_interactions_bytes;
-        std::vector<std::byte> mmff_atom_offsets_bytes;
-        std::vector<std::byte> etk_interactions_bytes;
-        std::vector<std::byte> etk_atom_offsets_bytes;
+/**
+ *  @brief Per-OpenMP-thread contribution buffer for the three-phase
+ *  `preprocess-step` of `prepare_molecule_batch_into`.
+ *
+ *  One instance per thread.  The per-region `*_bytes` accumulators hold the
+ *  concatenation of every molecule that thread processed, in append order.
+ *  The thread's `mols` records carry per-molecule metadata with thread-local
+ *  offsets.  Persisted across calls via a file-scope `static` vector so the
+ *  `std::vector` capacities survive and the allocator's fast path handles
+ *  subsequent calls after the first embedding-wave warmup.
+ */
+struct alignas(64) batch_prep_thread_contribution_t {
+    etkdg_prepared_molecule_t scratch;
+    std::vector<std::byte> bounds_bytes;
+    std::vector<std::byte> chirals_bytes;
+    std::vector<std::byte> torsions_bytes;
+    std::vector<std::byte> dcons_bytes;
+    std::vector<std::byte> atom_vdw_bytes;
+    std::vector<std::byte> atom_charge_bytes;
+    std::vector<std::byte> bond_distance_bytes;
+    std::vector<std::byte> mmff_bonds_bytes;
+    std::vector<std::byte> mmff_angles_bytes;
+    std::vector<std::byte> mmff_torsions_bytes;
+    std::vector<std::byte> mmff_oops_bytes;
+    std::vector<std::byte> mmff_stretchbends_bytes;
+    std::vector<std::byte> mmff_interactions_bytes;
+    std::vector<std::byte> mmff_atom_offsets_bytes;
+    std::vector<std::byte> etk_interactions_bytes;
+    std::vector<std::byte> etk_atom_offsets_bytes;
+    std::vector<batch_prep_per_mol_record_t> mols;
+    std::uint32_t max_atoms_seen = 0;
+};
 
-        struct per_mol_record_t {
-            std::uint32_t original_idx;
-            etkdg_molecule_metadata_t metadata; ///< `*_offset` fields hold THREAD-LOCAL byte indices
-        };
-        std::vector<per_mol_record_t> mols;
-        std::uint32_t max_atoms_seen = 0;
-    };
+/** @brief Per-thread pool-wide base offsets computed by `scan_per_region_offsets_`. */
+struct batch_prep_thread_bases_t {
+    std::size_t bounds, chirals, torsions, dcons;
+    std::size_t atom_vdw, atom_charge, bond_distance;
+    std::size_t mmff_bonds, mmff_angles, mmff_torsions, mmff_oops, mmff_stretchbends;
+    std::size_t mmff_interactions, mmff_atom_offsets;
+    std::size_t etk_interactions, etk_atom_offsets;
+    std::size_t dense_slot;
+};
 
-    // Persistent per-call scratch.  `static` keeps the outer vector and every
-    // inner `thread_contribution_t::*_bytes` at full capacity across calls — after
-    // the first embedding-wave the allocator's fast path is all we touch.  Safe as long
-    // as this function is not called concurrently from multiple outer threads.  The
-    // CLI's 4-role pipeline guarantees this (preprocess-step runs only on the
-    // gpu-runner-role thread).  A future streaming submit API that drives prep
-    // concurrently from multiple threads would need a caller-owned scratch
-    // vector; revisit at that point.
-    static std::vector<thread_contribution_t> contribs;
+/** @brief Append `bytes` bytes from `src` to the back of `dst`; return the pre-append offset. */
+static inline std::size_t append_bytes_(std::vector<std::byte> &dst, void const *src, std::size_t bytes) {
+    std::size_t const offset = dst.size();
+    if (bytes > 0) {
+        dst.resize(offset + bytes);
+        std::memcpy(dst.data() + offset, src, bytes);
+    }
+    return offset;
+}
+
+/**
+ *  @brief Phase 1 of the preprocess-step: parallel per-molecule RDKit parse,
+ *  MMFF typing, and byte-append into each OpenMP thread's contribution buffer.
+ *
+ *  Resizes `contribs` to `omp_get_max_threads()` and clears prior contents
+ *  while preserving the inner `std::vector` capacities.  After return, each
+ *  thread's contribution carries its share of the input molecules with
+ *  thread-local metadata offsets.
+ */
+static inline void prepare_per_thread_contribs_(std::span<std::string_view const> smiles_list,
+                                                scaffold_cache_t *cache,
+                                                std::vector<batch_prep_thread_contribution_t> &contribs) {
     int const n_threads_max = omp_get_max_threads();
     if (static_cast<int>(contribs.size()) < n_threads_max) contribs.resize(n_threads_max);
     for (auto &type_counts : contribs) {
@@ -1290,15 +1302,11 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
         type_counts.max_atoms_seen = 0;
     }
 
-    auto append_bytes = [](std::vector<std::byte> &dst, void const *src, std::size_t bytes) -> std::size_t {
-        std::size_t const offset = dst.size();
-        if (bytes > 0) {
-            dst.resize(offset + bytes);
-            std::memcpy(dst.data() + offset, src, bytes);
-        }
-        return offset;
-    };
-
+    std::size_t const n = smiles_list.size();
+    // CRITICAL: this file is included by `smallfield.cu` which is compiled with nvcc.
+    // For OpenMP to actually parallelize here, the CMake target must pass
+    // `-Xcompiler=-fopenmp` through nvcc to the host compiler.  Otherwise nvcc
+    // silently ignores the pragma and this loop runs single-threaded — 20× slowdown.
 #pragma omp parallel
     {
         int const tid = omp_get_thread_num();
@@ -1310,71 +1318,71 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
             if (p.num_atoms == 0) continue;
             if (p.num_atoms > type_counts.max_atoms_seen) type_counts.max_atoms_seen = p.num_atoms;
 
-            typename thread_contribution_t::per_mol_record_t rec;
+            batch_prep_per_mol_record_t rec;
             rec.original_idx = static_cast<std::uint32_t>(m);
             rec.metadata = p.metadata;
             rec.metadata.bounds_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.bounds_bytes, p.bounds_matrix.data(), p.bounds_matrix.size() * sizeof(float)) /
+                append_bytes_(type_counts.bounds_bytes, p.bounds_matrix.data(), p.bounds_matrix.size() * sizeof(float)) /
                 sizeof(float));
             rec.metadata.chiral_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.chirals_bytes, p.chiral_centers.data(),
+                append_bytes_(type_counts.chirals_bytes, p.chiral_centers.data(),
                              p.chiral_centers.size() * sizeof(chiral_center_descriptor_t)) /
                 sizeof(chiral_center_descriptor_t));
             rec.metadata.torsion_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.torsions_bytes, p.etk_torsions.data(),
+                append_bytes_(type_counts.torsions_bytes, p.etk_torsions.data(),
                              p.etk_torsions.size() * sizeof(etk_torsion_descriptor_t)) /
                 sizeof(etk_torsion_descriptor_t));
             rec.metadata.constraint_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.dcons_bytes, p.distance_constraints.data(),
+                append_bytes_(type_counts.dcons_bytes, p.distance_constraints.data(),
                              p.distance_constraints.size() * sizeof(distance_constraint_t)) /
                 sizeof(distance_constraint_t));
             rec.metadata.mmff_atom_vdw_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.atom_vdw_bytes, p.mmff_atom_vdw.data(),
+                append_bytes_(type_counts.atom_vdw_bytes, p.mmff_atom_vdw.data(),
                              p.mmff_atom_vdw.size() * sizeof(mmff94_atom_vdw_params_t)) /
                 sizeof(mmff94_atom_vdw_params_t));
             rec.metadata.mmff_atom_charge_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.atom_charge_bytes, p.mmff_atom_charge.data(),
+                append_bytes_(type_counts.atom_charge_bytes, p.mmff_atom_charge.data(),
                              p.mmff_atom_charge.size() * sizeof(float)) /
                 sizeof(float));
             rec.metadata.bond_distance_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.bond_distance_bytes, p.bond_distance.data(),
+                append_bytes_(type_counts.bond_distance_bytes, p.bond_distance.data(),
                              p.bond_distance.size() * sizeof(std::uint8_t)) /
                 sizeof(std::uint8_t));
             rec.metadata.mmff_bond_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.mmff_bonds_bytes, p.mmff_bonds.data(),
+                append_bytes_(type_counts.mmff_bonds_bytes, p.mmff_bonds.data(),
                              p.mmff_bonds.size() * sizeof(mmff94_bond_t)) /
                 sizeof(mmff94_bond_t));
             rec.metadata.mmff_angle_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.mmff_angles_bytes, p.mmff_angles.data(),
+                append_bytes_(type_counts.mmff_angles_bytes, p.mmff_angles.data(),
                              p.mmff_angles.size() * sizeof(mmff94_angle_t)) /
                 sizeof(mmff94_angle_t));
             rec.metadata.mmff_torsion_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.mmff_torsions_bytes, p.mmff_torsions.data(),
+                append_bytes_(type_counts.mmff_torsions_bytes, p.mmff_torsions.data(),
                              p.mmff_torsions.size() * sizeof(mmff94_torsion_t)) /
                 sizeof(mmff94_torsion_t));
             rec.metadata.mmff_oop_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.mmff_oops_bytes, p.mmff_oops.data(),
+                append_bytes_(type_counts.mmff_oops_bytes, p.mmff_oops.data(),
                              p.mmff_oops.size() * sizeof(mmff94_oop_t)) /
                 sizeof(mmff94_oop_t));
             rec.metadata.mmff_stretchbend_offset = static_cast<std::uint32_t>(
-                append_bytes(type_counts.mmff_stretchbends_bytes, p.mmff_stretchbends.data(),
+                append_bytes_(type_counts.mmff_stretchbends_bytes, p.mmff_stretchbends.data(),
                              p.mmff_stretchbends.size() * sizeof(mmff94_stretchbend_t)) /
                 sizeof(mmff94_stretchbend_t));
             // Thread-local start of this mol's block inside mmff_interactions / etk_interactions.
             std::uint32_t const tl_mmff_inter_base = static_cast<std::uint32_t>(
-                append_bytes(type_counts.mmff_interactions_bytes, p.mmff_interactions.data(),
+                append_bytes_(type_counts.mmff_interactions_bytes, p.mmff_interactions.data(),
                              p.mmff_interactions.size() * sizeof(mmff94_atom_interaction_t)) /
                 sizeof(mmff94_atom_interaction_t));
             rec.metadata.mmff_atom_offsets_start = static_cast<std::uint32_t>(
-                append_bytes(type_counts.mmff_atom_offsets_bytes, p.mmff_atom_offsets.data(),
+                append_bytes_(type_counts.mmff_atom_offsets_bytes, p.mmff_atom_offsets.data(),
                              p.mmff_atom_offsets.size() * sizeof(mmff94_atom_offsets_t)) /
                 sizeof(mmff94_atom_offsets_t));
             std::uint32_t const tl_etk_inter_base = static_cast<std::uint32_t>(
-                append_bytes(type_counts.etk_interactions_bytes, p.etk_interactions.data(),
+                append_bytes_(type_counts.etk_interactions_bytes, p.etk_interactions.data(),
                              p.etk_interactions.size() * sizeof(etk_atom_interaction_t)) /
                 sizeof(etk_atom_interaction_t));
             rec.metadata.etk_atom_offsets_start = static_cast<std::uint32_t>(
-                append_bytes(type_counts.etk_atom_offsets_bytes, p.etk_atom_offsets.data(),
+                append_bytes_(type_counts.etk_atom_offsets_bytes, p.etk_atom_offsets.data(),
                              p.etk_atom_offsets.size() * sizeof(etk_atom_offsets_t)) /
                 sizeof(etk_atom_offsets_t));
             // Rebase the per-atom offsets from per-molecule-local to thread-local by adding this
@@ -1402,21 +1410,23 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
             type_counts.mols.push_back(rec);
         }
     }
+}
 
-    // Prefix-scan pass: per-thread pool bases per region + dense metadata slot bases.
-    // Also collects totals for the batch layout.
-    struct thread_bases_t {
-        std::size_t bounds, chirals, torsions, dcons;
-        std::size_t atom_vdw, atom_charge, bond_distance;
-        std::size_t mmff_bonds, mmff_angles, mmff_torsions, mmff_oops, mmff_stretchbends;
-        std::size_t mmff_interactions, mmff_atom_offsets;
-        std::size_t etk_interactions, etk_atom_offsets;
-        std::size_t dense_slot;
-    };
-    std::vector<thread_bases_t> bases(n_threads_max);
-    per_mol_sizes_t totals {};
-    std::uint32_t n_valid = 0;
-    std::uint32_t max_atoms_reduction = 0;
+/**
+ *  @brief Phase 2 of the preprocess-step: serial prefix-scan over per-thread
+ *  contribution sizes to compute each thread's pool-wide base offset per
+ *  region, plus the totals that drive the batch-pool layout.
+ *
+ *  `bases` is resized to match `contribs.size()`.
+ */
+static inline void scan_per_region_offsets_(std::vector<batch_prep_thread_contribution_t> const &contribs,
+                                            std::vector<batch_prep_thread_bases_t> &bases, per_mol_sizes_t &totals,
+                                            std::uint32_t &n_valid, std::uint32_t &max_atoms_reduction) {
+    int const n_threads_max = static_cast<int>(contribs.size());
+    bases.assign(n_threads_max, batch_prep_thread_bases_t {});
+    totals = per_mol_sizes_t {};
+    n_valid = 0;
+    max_atoms_reduction = 0;
     for (int t = 0; t < n_threads_max; ++t) {
         auto const &type_counts = contribs[t];
         bases[t].bounds = totals.bounds;
@@ -1456,17 +1466,21 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
         if (type_counts.max_atoms_seen > max_atoms_reduction) max_atoms_reduction = type_counts.max_atoms_seen;
     }
     totals.valid = n_valid;
-    batch.num_molecules = n_valid;
-    batch.max_atoms_per_molecule = max_atoms_reduction;
-    batch.layout = compute_batch_layout(totals, n_valid);
-    if (batch.layout.bytes_total > 0) {
-        if (!batch.host.ensure_capacity(batch.layout.bytes_total)) {
-            batch.num_molecules = 0;
-            batch.layout = batch_layout_t {};
-            return;
-        }
-    }
+}
 
+/**
+ *  @brief Phase 3 of the preprocess-step: parallel per-thread memcpy of every
+ *  byte-accumulator region into the batch's pinned pool, plus metadata rebase
+ *  from thread-local offsets to pool-wide offsets.
+ *
+ *  @pre `batch.host.ensure_capacity(batch.layout.bytes_total)` has succeeded;
+ *       `batch.num_molecules`, `batch.max_atoms_per_molecule`, and
+ *       `batch.layout` are already populated by the caller.
+ */
+static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribution_t> const &contribs,
+                                         std::vector<batch_prep_thread_bases_t> const &bases,
+                                         etkdg_molecule_batch_t &batch) {
+    int const n_threads_max = static_cast<int>(contribs.size());
     auto bounds_span = batch.bounds_matrices();
     auto chirals_span = batch.chiral_centers();
     auto torsions_span = batch.etk_torsions();
@@ -1579,6 +1593,53 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
             input_idx_span[slot] = rec.original_idx;
         }
     }
+}
+
+/**
+ *  @brief In-place `preprocess-step` driver: parses every SMILES, extracts
+ *  ETKDG + MMFF preprocess data, and packs into @p batch's pinned host pool.
+ *
+ *  Three phases chained via helpers (see `GLOSSARY.md` for terminology):
+ *    1. `prepare_per_thread_contribs_` — parallel per-molecule extraction.
+ *    2. `scan_per_region_offsets_` — serial prefix scan over per-thread sizes.
+ *    3. `pack_into_batch_pool_` — parallel memcpy + metadata rebase.
+ *
+ *  This is the lever that kills pinned-memory allocator contention at
+ *  8-GPU scale — `cudaHostAlloc`/`cudaFreeHost` serialize on a driver lock,
+ *  so recycling the buffer across `embedding-waves` matters a lot.  The
+ *  `static` contribs vector persists capacities across calls so the
+ *  allocator's fast path handles every call after the first.
+ */
+inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list, etkdg_molecule_batch_t &batch,
+                                        scaffold_cache_t *cache = nullptr) {
+    batch.num_molecules = 0;
+    batch.max_atoms_per_molecule = 0;
+    batch.layout = batch_layout_t {};
+
+    // Persistent per-call scratch.  Safe as long as this function is not
+    // called concurrently from multiple outer threads.  The CLI's 4-role
+    // pipeline guarantees this (preprocess-step runs only on the
+    // gpu-runner-role thread).  A future streaming submit API that drives
+    // prep concurrently would need a caller-owned scratch.
+    static std::vector<batch_prep_thread_contribution_t> contribs;
+    prepare_per_thread_contribs_(smiles_list, cache, contribs);
+
+    std::vector<batch_prep_thread_bases_t> bases;
+    per_mol_sizes_t totals {};
+    std::uint32_t n_valid = 0;
+    std::uint32_t max_atoms_reduction = 0;
+    scan_per_region_offsets_(contribs, bases, totals, n_valid, max_atoms_reduction);
+
+    batch.num_molecules = n_valid;
+    batch.max_atoms_per_molecule = max_atoms_reduction;
+    batch.layout = compute_batch_layout(totals, n_valid);
+    if (batch.layout.bytes_total > 0 && !batch.host.ensure_capacity(batch.layout.bytes_total)) {
+        batch.num_molecules = 0;
+        batch.layout = batch_layout_t {};
+        return;
+    }
+
+    pack_into_batch_pool_(contribs, bases, batch);
 }
 
 /**
