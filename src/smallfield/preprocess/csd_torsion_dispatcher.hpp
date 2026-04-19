@@ -73,10 +73,37 @@ struct csd_compiled_pattern_t {
     std::vector<std::int8_t> signs;
     std::uint32_t idx[4];                 ///< atom indices in the pattern for labels :1 through :4
     std::uint64_t required_elements;      ///< bitset: bit N = pattern requires element N
+    std::uint8_t required_hybridizations; ///< bitset: bit H = pattern requires hybridization H (see @ref hybridization_t)
     bool requires_aromatic;               ///< true if any pattern atom is aromatic
     bool native;                          ///< true if the pattern parsed cleanly into native form
     simple_torsion_pattern_t native_form; ///< valid only when native == true
 };
+
+/**
+ *  Hybridizations that every match of the pattern must contain.  Per-atom,
+ *  a hybridization H is required iff EVERY disjunct of that atom pins
+ *  hybridization to H; if any disjunct is unconstrained or pins a different
+ *  value, the atom can still match molecules without H.  The pattern's
+ *  overall required mask is the union of these per-atom required sets
+ *  across the 4 labelled atoms (branches excluded — they're soft).
+ */
+inline std::uint8_t compute_required_hybridizations(simple_torsion_pattern_t const &pat) {
+    std::uint8_t mask = 0;
+    for (auto const &a : pat.atom) {
+        if (a.num_disjuncts == 0) continue;
+        std::uint8_t const h0 = a.disjuncts[0].hybridization;
+        if (h0 == 0) continue;
+        bool unanimous = true;
+        for (std::uint8_t i = 1; i < a.num_disjuncts; ++i) {
+            if (a.disjuncts[i].hybridization != h0) {
+                unanimous = false;
+                break;
+            }
+        }
+        if (unanimous && h0 < 8) mask |= static_cast<std::uint8_t>(1u << h0);
+    }
+    return mask;
+}
 
 /** Embedded contents of the RDKit .in files for torsion preferences. */
 inline std::string const &csd_torsionPreferencesV2() {
@@ -131,6 +158,7 @@ inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &b
         // Find the atoms labeled :1 through :4 via their molAtomMapNumber property.
         pat.idx[0] = pat.idx[1] = pat.idx[2] = pat.idx[3] = 0xFFFFFFFFu;
         pat.required_elements = 0;
+        pat.required_hybridizations = 0;
         pat.requires_aromatic = false;
         for (std::uint32_t i = 0; i < pat.pattern->getNumAtoms(); ++i) {
             auto const *patom = pat.pattern->getAtomWithIdx(i);
@@ -155,6 +183,7 @@ inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &b
                 pat.native_form.signs[i] = (i < pat.signs.size()) ? pat.signs[i] : static_cast<std::int8_t>(1);
                 pat.native_form.V[i] = (i < pat.V.size()) ? static_cast<float>(pat.V[i]) : 0.0f;
             }
+            pat.required_hybridizations = compute_required_hybridizations(pat.native_form);
         }
 
         out.push_back(std::move(pat));
@@ -194,11 +223,14 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
     std::uint32_t const num_bonds = desc.num_bonds;
 
     std::uint64_t molecule_elements = 0;
+    std::uint8_t molecule_hybridizations = 0;
     bool has_aromatic = false;
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
         std::uint8_t e = desc.element[a];
         if (e > 0 && e < 64) molecule_elements |= (1ULL << e);
         if (atom_has_flag(desc, a, atom_flag_aromatic_k)) has_aromatic = true;
+        std::uint8_t h = desc.hybridization[a];
+        if (h < 8) molecule_hybridizations |= static_cast<std::uint8_t>(1u << h);
     }
 
     boost::dynamic_bitset<> excluded_bonds(num_bonds);
@@ -306,6 +338,7 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
         // Element prefilter: skip patterns whose required elements are absent.
         if ((pat.required_elements & ~molecule_elements) != 0) continue;
         if (pat.requires_aromatic && !has_aromatic) continue;
+        if ((pat.required_hybridizations & ~molecule_hybridizations) != 0) continue;
 
         if (pat.native) {
             // Stack-only native matcher. Zero heap allocations in this branch.

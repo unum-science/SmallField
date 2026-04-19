@@ -220,6 +220,10 @@ int main() {
         {"a_nb_OH1", "a[OH1]", sfp::csd_predicate_a_nb_OH1_k},
         {"a_nb_NH12", "a[NH1,NH2]", sfp::csd_predicate_a_nb_NH12_k},
         {"c_nb_NH12", "c([NH1,NH2])", sfp::csd_predicate_c_nb_NH12_k},
+        {"cH0_eq_o", "[cH0](=O)", sfp::csd_predicate_cH0_eq_o_k},
+        {"c_not_ring_c", "c!@c", sfp::csd_predicate_c_not_ring_c_k},
+        {"nN_nb_aromatic", "[n,N](-a)", sfp::csd_predicate_nN_nb_aromatic_k},
+        {"a_nb_nH0_or_o", "[a]([nH0,o])", sfp::csd_predicate_a_nb_nH0_or_o_k},
     };
     static_assert(std::size(cases) + 1 == sfp::csd_predicate_count_k, "every csd_predicate_t must appear in `cases`");
 

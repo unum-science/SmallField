@@ -89,12 +89,12 @@ __Bucket ranking__ (sum of related symbols):
 
 Per-bin theoretical occupancy from the register/shared-memory cap analysis (stable across runs):
 
-| Kernel                       | Bin | Regs | Dyn Shmem | Block Limit (shmem / regs) | Theoretical Occ |
-| :--------------------------- | --: | ---: | --------: | -------------------------: | --------------: |
-| `etkdg_pipeline_warp_kernel` |  64 |   95 |   7.17 KB |                    12 / 20 |          25.0 % |
-| `etkdg_pipeline_warp_kernel` | 128 |   95 |  22.53 KB |                     4 / 20 |           8.3 % |
-| `mmff_polish_warp_kernel`    |  64 |   96 |   2.30 KB |                    30 / 20 |          41.7 % |
-| `mmff_polish_warp_kernel`    | 128 |   96 |   4.61 KB |                    18 / 20 |          37.5 % |
+| Kernel                       |  Bin | Regs | Dyn Shmem | Block Limit (shmem / regs) | Theoretical Occ |
+| :--------------------------- | ---: | ---: | --------: | -------------------------: | --------------: |
+| `etkdg_pipeline_warp_kernel` |   64 |   95 |   7.17 KB |                    12 / 20 |          25.0 % |
+| `etkdg_pipeline_warp_kernel` |  128 |   95 |  22.53 KB |                     4 / 20 |           8.3 % |
+| `mmff_polish_warp_kernel`    |   64 |   96 |   2.30 KB |                    30 / 20 |          41.7 % |
+| `mmff_polish_warp_kernel`    |  128 |   96 |   4.61 KB |                    18 / 20 |          37.5 % |
 
 The DG+ETK kernel is shared-memory-bound at large molecules (int8-quantized bounds matrix, 16 KB at N=128).
 The MMFF kernel carries no bounds matrix and hits its ceiling.
@@ -136,19 +136,21 @@ Remaining fallbacks require non-linear topology (ring-closure digits, chain cont
 
 __Measured delta (10M USearch, K=1, 8-GPU)__:
 
-|                         | Baseline (2026-04-19) | After (this commit) |       Delta |
-| :---------------------- | --------------------: | ------------------: | ----------: |
-| Wall                    |                 493 s |           __428 s__ | __−13.2 %__ |
-| Throughput              |          20 283 mol/s |    __23 371 mol/s__ | __+15.2 %__ |
-| Success                 |                98.6 % |              98.6 % |          ±0 |
-| Scaffold-cache hit rate |                33.4 % |              33.4 % |          ±0 |
+|                         | Baseline (2026-04-19) | After `bbe6e01` |    After round 2 |  Cumulative |
+| :---------------------- | --------------------: | --------------: | ---------------: | ----------: |
+| Wall                    |                 493 s |           428 s |      __421.3 s__ | __−14.5 %__ |
+| Throughput              |          20 283 mol/s |    23 371 mol/s | __23 735 mol/s__ | __+16.9 %__ |
+| Success                 |                98.6 % |          98.6 % |           98.6 % |          ±0 |
+| Scaffold-cache hit rate |                33.4 % |          33.4 % |           33.4 % |          ±0 |
 
-The measured gain is below the 20–25 % upper bound from the planning estimate because the residual 16.8 % fallback still runs VF2 on a non-trivial slice of the diverse corpus (non-linear topology patterns tend to match larger fractions of molecules than the simpler native patterns).
+Round-2 adds R-count constraints, chain-in-branch via existing-predicate delegation, four more single-hop recursive predicates, and a hybridization-based per-molecule prefilter.
+The incremental delta over `bbe6e01` is +1.55 % — smaller than round 1's +15.2 % because round 1 already removed the biggest VF2 hot-spots.
+Residual 13.2 % fallback (62 patterns) is dominated by non-linear topology (ring-closure digits, chain continuation inside a parenthesised branch, multi-hop recursive predicates) that would require a structural rewrite of `match_linear_pattern`.
 
 __Correctness__: two-tier byte-equivalence test against RDKit's `SubstructMatch`:
 
-- Tier 1 — 100 K ChEMBL, 39.1 M pattern checks, 2 min 30 s, zero disagreements.
-- Tier 2 — 1 M USearch sample, 387.7 M pattern checks, 20 min 30 s, zero disagreements (~8 K molecules skipped for exceeding the descriptor's 32-ring SSSR cap — pathological polycyclic cages).
+- Tier 1 — 100 K ChEMBL, 40.8 M pattern checks, 2 min 38 s, zero disagreements.
+- Tier 2 — 1 M USearch sample, 404.5 M pattern checks on 991 K molecules, 22 min 18 s, zero disagreements (~8 K molecules skipped for exceeding the descriptor's 32-ring SSSR cap — pathological polycyclic cages).
 
 ### 2. Inner-pipeline ring-buffer depth 3 + async finalize
 

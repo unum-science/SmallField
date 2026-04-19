@@ -87,6 +87,12 @@ enum csd_predicate_t : std::uint8_t {
     csd_predicate_a_nb_NH12_k,         ///< $(a[NH1,NH2]) — aromatic atom with an aliphatic NH1/NH2 neighbour
     csd_predicate_c_nb_NH12_k,         ///< $(c([NH1,NH2])) / $([c]([NH1,NH2])) — aromatic C with an aliphatic NH1/NH2 neighbour
     /** @} */
+    /** @name Round-2 additions (2026-04-19).  Cover the last simple single-hop bodies in the residual fallback. @{ */
+    csd_predicate_cH0_eq_o_k,          ///< $([cH0](=O)) — aromatic C with 0 H and a double bond to aliphatic O
+    csd_predicate_c_not_ring_c_k,      ///< $(c!@c) — aromatic C with an aromatic-C neighbour via a non-ring bond
+    csd_predicate_nN_nb_aromatic_k,    ///< $([n,N](-a)) — aromatic n OR aliphatic N with an aromatic-atom neighbour via a single bond
+    csd_predicate_a_nb_nH0_or_o_k,     ///< $([a]([nH0,o])) — aromatic atom with an aromatic-N-0H or aromatic-O neighbour
+    /** @} */
     csd_predicate_count_k, ///< number of defined predicates (keep last)
 };
 
@@ -597,6 +603,80 @@ inline bool predicate_c_nb_NH12(molecule_descriptor_t const &desc, std::uint32_t
     return false;
 }
 
+/** @brief `$([cH0](=O))` — aromatic C with 0 H and a double bond to aliphatic O. */
+inline bool predicate_cH0_eq_o(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
+    if (desc.element[atom_idx] != 6) return false;
+    if ((desc.atom_flags[atom_idx] & atom_flag_aromatic_k) == 0) return false;
+    if (desc.num_hydrogens[atom_idx] != 0) return false;
+    std::uint16_t const start = desc.neighbor_offset[atom_idx];
+    std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
+    for (std::uint16_t n = start; n < end; ++n) {
+        std::uint8_t const nb = desc.neighbor_atom[n];
+        if (desc.element[nb] != 8) continue;
+        if ((desc.atom_flags[nb] & atom_flag_aromatic_k) != 0) continue;
+        std::uint16_t const bid = desc.neighbor_bond[n];
+        if (desc.bond_order[bid] != 2) continue;
+        if ((desc.bond_flags[bid] & bond_flag_aromatic_k) != 0) continue;
+        return true;
+    }
+    return false;
+}
+
+/** @brief `$(c!@c)` — aromatic C with an aromatic-C neighbour connected by a non-ring bond. */
+inline bool predicate_c_not_ring_c(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
+    if (desc.element[atom_idx] != 6) return false;
+    if ((desc.atom_flags[atom_idx] & atom_flag_aromatic_k) == 0) return false;
+    std::uint16_t const start = desc.neighbor_offset[atom_idx];
+    std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
+    for (std::uint16_t n = start; n < end; ++n) {
+        std::uint8_t const nb = desc.neighbor_atom[n];
+        if (desc.element[nb] != 6) continue;
+        if ((desc.atom_flags[nb] & atom_flag_aromatic_k) == 0) continue;
+        std::uint16_t const bid = desc.neighbor_bond[n];
+        if ((desc.bond_flags[bid] & bond_flag_in_ring_k) != 0) continue;
+        return true;
+    }
+    return false;
+}
+
+/**
+ *  @brief `$([n,N](-a))` — atom is either an aromatic n or an aliphatic N, with at
+ *  least one aromatic-atom neighbour reached via an explicit single bond.
+ */
+inline bool predicate_nN_nb_aromatic(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
+    if (desc.element[atom_idx] != 7) return false;
+    std::uint16_t const start = desc.neighbor_offset[atom_idx];
+    std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
+    for (std::uint16_t n = start; n < end; ++n) {
+        std::uint8_t const nb = desc.neighbor_atom[n];
+        if ((desc.atom_flags[nb] & atom_flag_aromatic_k) == 0) continue;
+        std::uint16_t const bid = desc.neighbor_bond[n];
+        if (desc.bond_order[bid] != 1) continue;
+        if ((desc.bond_flags[bid] & bond_flag_aromatic_k) != 0) continue;
+        return true;
+    }
+    return false;
+}
+
+/**
+ *  @brief `$([a]([nH0,o]))` — aromatic atom with a neighbour that is either
+ *  aromatic nitrogen with 0 H or aromatic oxygen, via single/aromatic bond.
+ */
+inline bool predicate_a_nb_nH0_or_o(molecule_descriptor_t const &desc, std::uint32_t atom_idx) {
+    if ((desc.atom_flags[atom_idx] & atom_flag_aromatic_k) == 0) return false;
+    std::uint16_t const start = desc.neighbor_offset[atom_idx];
+    std::uint16_t const end = desc.neighbor_offset[atom_idx + 1];
+    for (std::uint16_t n = start; n < end; ++n) {
+        std::uint8_t const nb = desc.neighbor_atom[n];
+        if ((desc.atom_flags[nb] & atom_flag_aromatic_k) == 0) continue;
+        std::uint8_t const el = desc.element[nb];
+        if (!((el == 7 && desc.num_hydrogens[nb] == 0) || el == 8)) continue;
+        if (!bond_is_single_or_aromatic(desc, desc.neighbor_bond[n])) continue;
+        return true;
+    }
+    return false;
+}
+
 /**
  *  @brief Evaluate a recursive-SMARTS predicate against an atom in a descriptor.
  *
@@ -638,6 +718,10 @@ inline bool csd_predicate_check(molecule_descriptor_t const &desc, std::uint32_t
     case csd_predicate_a_nb_OH1_k: return predicate_a_nb_OH1(desc, atom_idx);
     case csd_predicate_a_nb_NH12_k: return predicate_a_nb_NH12(desc, atom_idx);
     case csd_predicate_c_nb_NH12_k: return predicate_c_nb_NH12(desc, atom_idx);
+    case csd_predicate_cH0_eq_o_k: return predicate_cH0_eq_o(desc, atom_idx);
+    case csd_predicate_c_not_ring_c_k: return predicate_c_not_ring_c(desc, atom_idx);
+    case csd_predicate_nN_nb_aromatic_k: return predicate_nN_nb_aromatic(desc, atom_idx);
+    case csd_predicate_a_nb_nH0_or_o_k: return predicate_a_nb_nH0_or_o(desc, atom_idx);
     case csd_predicate_count_k: return false;
     }
     return false;
