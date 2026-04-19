@@ -1,0 +1,13 @@
+# Force GitHub linguist to classify CUDA files as Cuda, not C++.
+*.cu  linguist-language=Cuda
+*.cuh linguist-language=Cuda
+
+# Keep vendored / generated / profiling trees out of language stats and diff noise.
+.venv/      linguist-vendored=true
+build/      linguist-generated=true
+benchmark/  linguist-generated=true
+analysis/   linguist-generated=true
+
+# Treat common non-source artefacts as text for diff readability.
+*.smi text
+*.md  text eol=lf

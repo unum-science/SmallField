@@ -3,7 +3,10 @@
 Canonical vocabulary for data granularity and pipeline structure.
 Every doc, code comment, CLI log line, and struct/function name in this repo uses exactly these terms — no aliases, no drift.
 
-## Data granularity — outer to inner
+## Data Granularity
+
+From outer to inner.
+A `parquet-shard` carries roughly a million molecules; a `coprocessed-batch` aggregates enough molecules to saturate every visible GPU; an `embedding-wave` is the unit of CPU/GPU pipelining; an `atom-limited-bin` is what one kernel launch sees.
 
 | Term                    | What it is                                                                                                                                                                                                                   | Typical size                      |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
@@ -14,13 +17,12 @@ Every doc, code comment, CLI log line, and struct/function name in this repo use
 | __`molecule`__          | One input SMILES → K output conformers.                                                                                                                                                                                      | —                                 |
 
 Old names that have been retired: `gpus-batch` → `coprocessed-batch`, `chunk` → `embedding-wave`, `wave bin` → `atom-limited-bin`.
-CLI flag `--gpus-batch-size` stays as an alias for `--batch-size`.
+The CLI flag `--gpus-batch-size` stays as an alias for `--batch-size`.
 
-## Pipeline structure — two distinct layers
+## Pipeline Roles, CLI Outer
 
-### Outer layer — `pipeline-role` (CLI-level)
-
-Four persistent worker threads, each an OpenMP section, with depth-3 ring-buffer handoffs between them:
+Four persistent worker threads, each an OpenMP section, with depth-3 ring-buffer handoffs between them.
+A _role_ is a persistent thread actor; never substitute "section" or "phase".
 
 | Role                  | Responsibility                                                                                   |
 | --------------------- | ------------------------------------------------------------------------------------------------ |
@@ -29,9 +31,10 @@ Four persistent worker threads, each an OpenMP section, with depth-3 ring-buffer
 | __`fallback-role`__   | Runs RDKit CPU for the conformer slots the GPU could not fill (≤5 % on drug-like inputs).        |
 | __`writer-role`__     | Writes one output `parquet-shard` per consumed input `parquet-shard`.                            |
 
-### Inner layer — `wave-step` (library-level)
+## Wave Steps, Library Inner
 
-Three steps per `embedding-wave`, all inside one `generate_conformers` call:
+Three steps per `embedding-wave`, all inside one `generate_conformers` call.
+A _step_ is a discrete transformation on one `embedding-wave`; never substitute "section" or "phase".
 
 | Step                  | Runs on                       | What happens                                                                                                             |
 | --------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -39,15 +42,11 @@ Three steps per `embedding-wave`, all inside one `generate_conformers` call:
 | __`embedding-step`__  | GPU (async on stream)         | H2D upload → metric-embedding prepass → ETKDG kernels → MMFF polish → fp32→fp16 convert → D2H. Host returns immediately. |
 | __`finalize-step`__   | CPU + stream sync             | Block on stream drain → permute pinned outputs into caller's buffer.                                                     |
 
-__Vocabulary rule:__ _role_ = persistent thread actor (CLI layer).
-_step_ = discrete transformation on one `embedding-wave` (library layer).
-Never substitute "section" or "phase" for either — those words drift back toward each other in prose and lose the distinction.
+## Overlap Semantics
 
-## Overlap semantics — ASCII time evolution
+Three views of the same pipeline, time evolving left to right.
 
-### Inner pipeline: three `embedding-waves` in steady state
-
-Best-overlap case, CPU preprocess time ≈ GPU embed time:
+The inner pipeline at three `embedding-waves` of steady state, best-overlap case where CPU preprocess time roughly matches GPU embed time:
 
 ```
           0ms              50ms             100ms            150ms            200ms
@@ -61,13 +60,10 @@ CPU busy: ███████████████████████�
 GPU busy: ░░░░░░░░░░░░░░░░████████████████████████████████████████████░░░░░░░  (bootstrap idle + drain idle)
 ```
 
-One row per `embedding-wave`; segments are `wave-steps` on the labeled resource.
-At steady state, wave N+1's `preprocess-step` runs on CPU while wave N's `embedding-step` runs on GPU — both resources saturated.
-Two idle intervals bracket the run: __bootstrap__ (GPU waits on wave 0's prep) and __drain__ (CPU idles during the final wave's embed + finalize).
+Per-wave wall ≈ `max(CPU preprocess, GPU embed)` rather than their sum — that is the throughput win.
+Two idle intervals bracket the run: bootstrap (GPU waits on wave 0's prep) and drain (CPU idles during the final wave's embed + finalize).
 
-Per-wave wall ≈ `max(CPU preprocess, GPU embed)` rather than their sum — that's why the pipelining is the throughput win.
-
-### Outer pipeline: four `pipeline-roles` streaming `parquet-shards`
+The outer pipeline at four `pipeline-roles` streaming `parquet-shards`, with vertical arrows as ring-buffer handoffs:
 
 ```
 Time →
@@ -85,11 +81,9 @@ fallback-role                ──► RDKit fill-in       ──► RDKit fill-
 writer-role                  ──► write parquet-shard ──► write parquet-shard ──► …
 ```
 
-Each row is a `pipeline-role` on its own thread.
-Vertical arrows are ring-buffer handoffs.
 At steady state all four rows fire simultaneously on different `coprocessed-batches`; steady-state throughput is one batch per tick of the slowest role.
 
-### Run-wide occupancy — single line per resource
+A run-wide single-line view of the same evolution:
 
 ```
 CPU: [prep0][prep1][prep2][prep3]…[prep_{N-1}][prep_N]│░░░░░░│
@@ -108,3 +102,18 @@ Everything in between is full overlap.
 - `batch_pool_t` (`src/smallfield/api/batch_pool.hpp`) — pinned host buffer packed with all per-molecule preprocess output for one `embedding-wave`.
 - `metric_scratch_t` (`src/smallfield/api/smallfield.hpp`) — per-GPU device scratch for the metric-embedding prepass within an `embedding-step`.
 - `launch_scratch_t` (`src/smallfield/api/smallfield.cu`) — per-GPU persistent device pool + pinned host staging; one per GPU, reused across `embedding-waves`.
+
+## Code Map
+
+Glossary terms are vocabulary; the table below points at where each one is grounded in source so a new reader can grep from doc to code.
+
+| Glossary term       | Canonical location in source                                                                  |
+| :------------------ | :-------------------------------------------------------------------------------------------- |
+| `parquet-shard`     | `cli/smallfield_batch.cpp` — path-based iteration, no dedicated struct                        |
+| `coprocessed-batch` | `batch_pool_t` in `src/smallfield/api/batch_pool.hpp` (alias `etkdg_molecule_batch_t` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`) |
+| `embedding-wave`    | `wave_record_t` in `src/smallfield/api/smallfield.cu`                                         |
+| `atom-limited-bin`  | `atom_limited_bin_caps[]` in `src/smallfield/api/smallfield.cu`                               |
+| pipeline roles      | `cli/smallfield_batch.cpp` — architectural comment blocks, no per-role struct                 |
+| `preprocess-step`   | `prepare_molecule_batch_into` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`          |
+| `embedding-step`    | `launch_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                   |
+| `finalize-step`     | `finalize_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                 |
