@@ -27,25 +27,25 @@ All numbers are conformers per second — succeeded conformers divided by wall t
 
 ### SmallField — 8 GPUs, USearch 10M
 
-| System            | Input |    K |    c/s |               Succeeded | Success |    Wall |
-| :---------------- | ----: | ---: | -----: | ----------------------: | ------: | ------: |
-| SmallField 8 GPUs |   10M |    1 | 20,372 |  9,859,890 /  9,998,572 |  98.6 % |   484 s |
-| SmallField 8 GPUs |   10M |    3 | 29,302 | 29,580,111 / 29,995,716 |  98.6 % | 1,010 s |
-| SmallField 8 GPUs |   10M |   10 | 27,143 | 98,601,092 / 99,985,720 |  98.6 % | 3,202 s |
+| System            | Input |   K |    c/s |               Succeeded | Success |    Wall |
+| :---------------- | ----: | --: | -----: | ----------------------: | ------: | ------: |
+| SmallField 8 GPUs |   10M |   1 | 20,372 |   9,859,890 / 9,998,572 |  98.6 % |   484 s |
+| SmallField 8 GPUs |   10M |   3 | 29,302 | 29,580,111 / 29,995,716 |  98.6 % | 1,010 s |
+| SmallField 8 GPUs |   10M |  10 | 27,143 | 98,601,092 / 99,985,720 |  98.6 % | 3,202 s |
 
 Success rate is 98.6 % across all three K values.
 Conformer generation quality is independent of K.
 
 ### SmallField vs RDKit — 1 GPU / CPU 192T, USearch 1M
 
-| System             | Input |    K |   c/s |             Succeeded | Success |      Wall |
-| :----------------- | ----: | ---: | ----: | --------------------: | ------: | --------: |
-| RDKit CPU 192T ¹   |    1M |    1 | 2,458 |           956,961 / — |  95.7 % |   389.3 s |
-| RDKit CPU 192T ¹   |    1M |    3 | 2,671 |         2,870,796 / — |  95.6 % | 1,074.6 s |
-|                    |       |      |       |                       |         |           |
-| SmallField 1 GPU   |    1M |    1 | 5,948 |   986,091 / 1,000,000 |  98.6 % |   163.6 s |
-| SmallField 1 GPU ¹ |    1M |    1 | 8,541 |   986,017 / 1,000,000 |  98.6 % |   115.4 s |
-| SmallField 1 GPU ¹ |    1M |    3 | 9,066 | 2,958,411 / 3,000,000 |  98.6 % |   326.3 s |
+| System             | Input |   K |   c/s |             Succeeded | Success |      Wall |
+| :----------------- | ----: | --: | ----: | --------------------: | ------: | --------: |
+| RDKit CPU 192T ¹   |    1M |   1 | 2,458 |           956,961 / — |  95.7 % |   389.3 s |
+| RDKit CPU 192T ¹   |    1M |   3 | 2,671 |         2,870,796 / — |  95.6 % | 1,074.6 s |
+|                    |       |     |       |                       |         |           |
+| SmallField 1 GPU   |    1M |   1 | 5,948 |   986,091 / 1,000,000 |  98.6 % |   163.6 s |
+| SmallField 1 GPU ¹ |    1M |   1 | 8,541 |   986,017 / 1,000,000 |  98.6 % |   115.4 s |
+| SmallField 1 GPU ¹ |    1M |   3 | 9,066 | 2,958,411 / 3,000,000 |  98.6 % |   326.3 s |
 
 ¹ Archived measurement from an earlier build — same hardware, same dataset.
 The 1-GPU numbers will be refreshed on the current build.
@@ -64,14 +64,14 @@ Installed via `conda install -c conda-forge nvmolkit`.
 nvMolKit was benchmarked in 5 000-molecule chunks because it throws a hard `RuntimeError` on any batch containing a molecule it cannot prepare.
 No per-molecule graceful degradation.
 
-| System             | Input |    K |    c/s |        Succeeded | Success |      Wall |
-| :----------------- | ----: | ---: | -----: | ---------------: | ------: | --------: |
-| nvMolKit 1 GPU     |    1M |    3 |    510 |   2,902,811 / 3M |  96.8 % | 5,691.8 s |
-| nvMolKit "8 GPUs"² |    1M |    3 |    755 |   2,903,363 / 3M |  96.8 % | 3,847.1 s |
-|                    |       |      |        |                  |         |           |
-| SmallField 1 GPU   |    1M |    3 |  9,226 |   2,958,359 / 3M |  98.6 % |   320.6 s |
-| SmallField 8 GPUs  |    1M |    3 | 17,715 |   2,958,295 / 3M |  98.6 % |   167.0 s |
-| SmallField 8 GPUs  |   10M |    3 | 29,302 | 29,580,111 / 30M |  98.6 % | 1,010.0 s |
+| System             | Input |   K |    c/s |        Succeeded | Success |      Wall |
+| :----------------- | ----: | --: | -----: | ---------------: | ------: | --------: |
+| nvMolKit 1 GPU     |    1M |   3 |    510 |   2,902,811 / 3M |  96.8 % | 5,691.8 s |
+| nvMolKit "8 GPUs"² |    1M |   3 |    755 |   2,903,363 / 3M |  96.8 % | 3,847.1 s |
+|                    |       |     |        |                  |         |           |
+| SmallField 1 GPU   |    1M |   3 |  9,226 |   2,958,359 / 3M |  98.6 % |   320.6 s |
+| SmallField 8 GPUs  |    1M |   3 | 17,715 |   2,958,295 / 3M |  98.6 % |   167.0 s |
+| SmallField 8 GPUs  |   10M |   3 | 29,302 | 29,580,111 / 30M |  98.6 % | 1,010.0 s |
 
 ² `nvidia-smi` shows only GPU 0 active during the embed phase (91 % of wall time).
 The MMFF optimization phase (9 %) does distribute across devices.
@@ -106,12 +106,12 @@ Per-chunk breakdown — 10M × K=1, 8 GPUs, 1 600 chunk-device samples:
 Nsight Compute metrics for the two pipeline kernels at wave bins 64 and 128.
 Captures under `bench/profiling/ncu/2026-04-16-phase3/`.
 
-| Kernel                       |  Bin | Regs | Dyn Shmem | Block Limit Shmem / Regs | Theoretical Occ |
-| :--------------------------- | ---: | ---: | --------: | -----------------------: | --------------: |
-| `etkdg_pipeline_warp_kernel` |   64 |   95 |   7.17 KB |                  12 / 20 |         25.00 % |
-| `etkdg_pipeline_warp_kernel` |  128 |   95 |  22.53 KB |                   4 / 20 |          8.33 % |
-| `mmff_polish_warp_kernel`    |   64 |   96 |   2.30 KB |                  30 / 20 |         41.67 % |
-| `mmff_polish_warp_kernel`    |  128 |   96 |   4.61 KB |                  18 / 20 |         37.50 % |
+| Kernel                       | Bin | Regs | Dyn Shmem | Block Limit Shmem / Regs | Theoretical Occ |
+| :--------------------------- | --: | ---: | --------: | -----------------------: | --------------: |
+| `etkdg_pipeline_warp_kernel` |  64 |   95 |   7.17 KB |                  12 / 20 |         25.00 % |
+| `etkdg_pipeline_warp_kernel` | 128 |   95 |  22.53 KB |                   4 / 20 |          8.33 % |
+| `mmff_polish_warp_kernel`    |  64 |   96 |   2.30 KB |                  30 / 20 |         41.67 % |
+| `mmff_polish_warp_kernel`    | 128 |   96 |   4.61 KB |                  18 / 20 |         37.50 % |
 
 The MMFF polish kernel runs with 4.5× higher theoretical occupancy than the DG+ETK kernel at bin 128 because it carries no bounds matrix in shared memory — only the 3D FIRE scratch arrays.
 The DG+ETK kernel is shared-memory-bound at large molecules; its int8-quantized bounds matrix — 16 KB at N=128 — is the binding constraint.

@@ -3,18 +3,21 @@
  *  @brief Stack-only native matcher for simple CSD torsion SMARTS patterns.
  *
  *  Handles linear 4-atom chains like "[C]-[C]-[N]-[*]" entirely on the stack, with
- *  zero heap allocations in the hot path. For patterns with branches, recursive
- *  SMARTS, or logical operators, marks them "complex" and defers to RDKit's
- *  SubstructMatch. Approximately 49% of the CSD pattern set qualifies as "simple".
+ *  zero heap allocations in the hot path. Atom-level OR (`[cH,nX2H0]`), bond-level
+ *  OR (`@;=,:`), ring-size ranges (`r{5-8}`), and a set of hand-coded recursive
+ *  predicates (`$(S(=O)=O)`, `$(C([F])([F])[F])`, …) are all handled natively. Only
+ *  patterns with non-linear topology (ring-closure digits, >4 bracketed atoms, the
+ *  4-torsion-atom embedded inside a branch) or unknown recursive bodies fall back.
  *
  *  Why this matters: 192-thread OpenMP preprocessing saturates at 32 threads today
  *  because every SubstructMatch call allocates and destroys several std::vector
- *  objects plus VF2 state arrays. Removing those allocations for half the patterns
- *  restores linear thread scaling.
+ *  objects plus VF2 state arrays. Removing those allocations for the bulk of the
+ *  patterns restores linear thread scaling.
  *
  *  Correctness: identical matches to RDKit for the patterns we handle natively.
- *  Validated by comparing torsion assignments against RDKit on a 1000-molecule
- *  diff set.
+ *  Validated by a per-pattern per-atom byte-equivalence test against RDKit's
+ *  `SubstructMatch` across the full ChEMBL / USearch validation corpora (see
+ *  `test_csd_torsion_predicates.cpp`).
  */
 
 #pragma once
@@ -44,58 +47,93 @@ using smallfield::types::hybridization_sp_k;
 using smallfield::types::molecule_descriptor_t;
 
 /**
- *  Per-atom branch-neighbor constraint. Represents an inline neighbour specified
- *  in SMARTS via `]([…])` — e.g. `[c:2]([cH1])` = carbon with an aromatic-CH
- *  neighbour. Deliberately flatter than @ref simple_atom_constraint_t: branches
- *  cannot themselves have branches or recursive predicates.
+ *  Maximum number of OR-disjuncts the parser will accept inside a single atom or
+ *  bond bracket.  Covers every case observed in the CSD pattern corpus (the
+ *  longest is `[NX3H0,CX4H0,c]` — three).
  */
-struct simple_neighbor_constraint_t {
-    std::uint64_t element_mask;      ///< bit N = element N allowed; 0 = any
-    std::uint8_t min_degree;         ///< 0 = any
-    std::uint8_t heavy_degree;       ///< 0 = any
-    std::uint8_t exact_h_count;      ///< 0xFF = any
-    std::uint8_t ring_size;          ///< smallest-ring lower bound; 0 = any
-    std::uint8_t ring_size_max;      ///< upper bound; 0 = exact match on ring_size
-    std::uint8_t hybridization;      ///< 0 = any
-    std::uint8_t require_flags;      ///< atom_flag_t bits MUST be set
-    std::uint8_t forbid_flags;       ///< atom_flag_t bits MUST NOT be set
-    std::uint8_t bond_order;         ///< bond order from parent atom; 0 = any
-    std::uint8_t bond_require_flags; ///< bond_flag_t bits MUST be set
-    std::uint8_t bond_forbid_flags;  ///< bond_flag_t bits MUST NOT be set
-    std::uint8_t active;             ///< 1 if this slot carries a real constraint
-    std::int8_t formal_charge;       ///< exact formal charge; INT8_MIN = no constraint
-    std::uint8_t padding[2];
+inline constexpr std::uint8_t max_disjuncts_k = 4;
+
+/**
+ *  One branch of an atom-level SMARTS disjunction, e.g. `cH1` inside `[cH1,n]`.
+ *
+ *  A single `atom_disjunct_t` is equivalent to a chain of SMARTS primitives
+ *  joined by `&`/`;` — an AND of element, degree, H-count, hybridisation,
+ *  aromaticity and charge constraints.  Multiple disjuncts joined by `,`
+ *  (logical OR) are stored alongside each other in an @ref atom_spec_t.
+ *
+ *  Matching semantics: an atom satisfies the parent spec if *any* disjunct
+ *  matches; constraints that apply uniformly across the disjunction
+ *  (recursive predicate, neighbour branches) are stored on the parent and
+ *  checked once, regardless of which disjunct matched.
+ */
+struct atom_disjunct_t {
+    std::uint64_t element_mask;   ///< inclusive: bit N set = element N allowed (0 = any)
+                                  ///< exclusive (when @ref element_mask_exclusive): bit N set = element N FORBIDDEN
+    std::uint8_t element_mask_exclusive; ///< 1 if @ref element_mask is an exclude-set; elements > 63 implicitly match
+    std::uint8_t exact_h_count;   ///< exact H count; 0xFF = any
+    std::uint8_t min_degree;      ///< exact total degree (SMARTS X<n>); 0 = any
+    std::uint8_t heavy_degree;    ///< exact heavy-atom degree (SMARTS D<n>); 0 = any
+    std::uint8_t hybridization;   ///< required hybridization (SMARTS ^<n>); 0 = any
+    std::uint8_t require_flags;   ///< atom_flag_t bits that MUST be set
+    std::uint8_t forbid_flags;    ///< atom_flag_t bits that MUST NOT be set
+    std::uint8_t ring_size;       ///< smallest-ring size lower bound; 0 = any
+    std::uint8_t ring_size_max;   ///< smallest-ring size upper bound; 0 = exact match on ring_size
+    std::int8_t formal_charge;    ///< exact formal charge; INT8_MIN = no constraint
+    std::uint8_t padding[5];
 };
 
 /**
- *  Per-atom constraint extracted from SMARTS. All fields stack-allocated.
- *  element_mask supports logical OR of elements (e.g. [N,O,S]) via a 64-bit bitmap —
- *  bit N of element_mask set means atomic number N is an allowed element.
- *  A zero mask means "any element" (unconstrained).
+ *  One branch of a bond-level SMARTS disjunction, e.g. `=` inside `=,:`.
+ *  Bond-OR appears in patterns like `@;=,:@;-` (ring-bond AND (double OR
+ *  aromatic)).  Defined up here so @ref simple_neighbor_constraint_t can
+ *  embed an array of it directly.
+ */
+struct bond_disjunct_t {
+    std::uint8_t bond_order;    ///< 1/2/3; 0 = any
+    std::uint8_t require_flags; ///< bond_flag_t bits that MUST be set
+    std::uint8_t forbid_flags;  ///< bond_flag_t bits that MUST NOT be set
+    std::uint8_t padding;
+};
+
+/**
+ *  Per-atom branch-neighbor constraint.  Represents an inline neighbour specified
+ *  in SMARTS via `]([…])` — e.g. `[c:2]([cH1])` = carbon with an aromatic-CH
+ *  neighbour.  Supports atom-OR inside the branch (`(~[N,n])`) via a short
+ *  disjunct list and the same OR-bond encoding as top-level bonds (one slot is
+ *  enough for every bond op seen in the CSD corpus, including implicit
+ *  single-or-aromatic which expands to two disjuncts).
+ *  Branches cannot themselves have nested branches or recursive predicates.
+ */
+struct simple_neighbor_constraint_t {
+    atom_disjunct_t atom_disjuncts[max_disjuncts_k];
+    bond_disjunct_t bond_disjuncts[max_disjuncts_k];
+    std::uint8_t num_atom_disjuncts; ///< 1 for a plain atom; up to 4 for `[a,b,c,d]`
+    std::uint8_t num_bond_disjuncts; ///< 1 for an explicit op; 2 for the implicit single-or-aromatic default
+    std::uint8_t active;             ///< 1 if this slot carries a real constraint
+    std::uint8_t padding[5];
+};
+
+/**
+ *  Per-atom constraint extracted from SMARTS.  All fields stack-allocated.
+ *  OR-of-element/of-primitives (`[N,O,S]`, `[cH1,n]`) is expressed via a short
+ *  @ref atom_disjunct_t list; non-disjunct-specific constraints (recursive
+ *  predicate, inline neighbour branches) live at the parent level and apply
+ *  regardless of which disjunct an atom matched.
  */
 struct simple_atom_constraint_t {
-    std::uint64_t element_mask;         ///< bit N = element N is allowed; 0 = any element
-    std::uint8_t min_degree;            ///< exact total degree (SMARTS X<n>); 0 = any
-    std::uint8_t heavy_degree;          ///< exact heavy-atom degree (SMARTS D<n>); 0 = any
-    std::uint8_t exact_h_count;         ///< exact H count; 0xFF = any
-    std::uint8_t ring_size;             ///< smallest-ring size lower bound; 0 = any
-    std::uint8_t ring_size_max;         ///< smallest-ring size upper bound; 0 = exact (match ring_size only)
-    std::uint8_t hybridization;         ///< required hybridization (SMARTS ^<n>); 0 = any. Maps: SP=1,SP2=3,SP3=4.
-    std::uint8_t require_flags;         ///< atom_flag_t bits that MUST be set
-    std::uint8_t forbid_flags;          ///< atom_flag_t bits that MUST NOT be set
+    atom_disjunct_t disjuncts[max_disjuncts_k];
+    std::uint8_t num_disjuncts;         ///< 1 for plain spec; up to 4 for `[a,b,c,d]`
     std::uint8_t predicate;             ///< csd_predicate_t; csd_predicate_none_k (0) = no recursive predicate check
     std::uint8_t num_neighbor_branches; ///< 0, 1, or 2 inline `(...)` neighbour branches
-    std::int8_t formal_charge;          ///< exact formal charge; INT8_MIN (=-128) = no constraint
     std::uint8_t padding[5];
     simple_neighbor_constraint_t neighbor_branch[2]; ///< active slots defined by num_neighbor_branches
 };
 
 /** Per-bond constraint extracted from SMARTS. */
 struct simple_bond_constraint_t {
-    std::uint8_t bond_order;    ///< 1/2/3; 0 = any
-    std::uint8_t require_flags; ///< bond_flag_t bits that MUST be set
-    std::uint8_t forbid_flags;  ///< bond_flag_t bits that MUST NOT be set
-    std::uint8_t padding;
+    bond_disjunct_t disjuncts[max_disjuncts_k];
+    std::uint8_t num_disjuncts; ///< 1 for plain op; up to 4 for `a,b,c,d`
+    std::uint8_t padding[3];
 };
 
 /**
@@ -130,40 +168,42 @@ inline std::uint8_t symbol_to_element(std::string_view sym) {
 }
 
 /**
- *  @brief Parse one atom-constraint token from a SMARTS-like torsion pattern string into a simple_atom_constraint_t.
+ *  @brief Parse one disjunct (the text between `,` separators inside a SMARTS
+ *  bracket expression) into an @ref atom_disjunct_t.
  *
- *  A "term" is a conjunction of primitives separated by `&` or implicit
- *  concatenation, sharing one aromatic-setting and one element.
- *  Returns a 64-bit element mask for the term (0 = unconstrained) plus the
- *  other constraints merged into @p ac.
- *  On negation (`!<sym>`), removes bits from the mask.
+ *  A "term" is a conjunction of primitives separated by `&`/`;` or implicit
+ *  concatenation.  Each atomic-OR branch of the parent expression lives in one
+ *  disjunct and shares one element identity, one aromaticity, one H-count, etc.
  *
  *  Tokens supported:
- *  - `*` `A` `a` -- wildcard / aliphatic / aromatic
- *  - `#<n>` -- atomic number
- *  - `C`, `N`, `Cl`, `Br`, ... -- element symbol (uppercase = aliphatic; lowercase = aromatic)
- *  - `X<n>` -- connectivity
- *  - `H` / `H<n>` -- H count
- *  - `R` / `R0` -- ring membership
- *  - `r<n>` -- smallest ring size
- *  - `:<n>` -- atom map label (ignored; labels are tracked externally via idx[])
+ *  - `*` `A` `a` — wildcard / aliphatic / aromatic
+ *  - `#<n>` — atomic number
+ *  - `C`, `N`, `Cl`, `Br`, ... — element symbol (uppercase = aliphatic; lowercase = aromatic)
+ *  - `X<n>` — connectivity
+ *  - `D<n>` — heavy-atom degree
+ *  - `H` / `H<n>` — H count
+ *  - `R` / `R0` — ring membership
+ *  - `r<n>` / `r{N-M}` / `r{N-}` / `r{-M}` — smallest ring size / range
+ *  - `^<n>` — hybridisation
+ *  - `+` / `-` / `+<n>` / `-<n>` — formal charge
+ *  - `:<n>` — atom map label (ignored; labels are tracked externally via idx[])
  *
- *  @param[in] token The SMARTS-like token to parse.
- *  @param[inout] ac Atom constraint accumulator to merge parsed primitives into.
- *  @param[out] term_mask 64-bit element mask for the parsed term (0 = unconstrained).
- *  @param[out] term_has_element Set to true if the term constrains a specific element.
- *  @return True on success, false if the token contains unsupported syntax.
+ *  @param[in] token The disjunct body (no leading/trailing separators).
+ *  @param[out] disjunct Accumulator populated with parsed primitives.
+ *  @return True on success, false on unsupported syntax.
  */
-inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac, std::uint64_t &term_mask,
-                            bool &term_has_element) {
+inline bool parse_atom_term(std::string_view token, atom_disjunct_t &disjunct) {
     bool negate_next = false;
     std::size_t p = 0;
-    bool aromatic_lowercase_seen = false;
-    bool aliphatic_uppercase_seen = false;
+    bool aromatic_positive = false; ///< non-negated lowercase symbol (e.g. `c`, `n`)
+    bool aliphatic_positive = false; ///< non-negated uppercase symbol (e.g. `C`, `N`)
+    bool term_has_element = false;
+    bool saw_bare_H = false; ///< `H` without trailing digit — may be element or H-count
+    bool saw_wildcard = false;
 
     while (p < token.size()) {
         char c = token[p];
-        if (c == '&') {
+        if (c == '&' || c == ';') {
             ++p;
             continue;
         }
@@ -173,33 +213,32 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
             continue;
         }
         if (c == ':') {
-            // Skip ":<digits>"
             ++p;
             while (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) ++p;
             continue;
         }
         if (c == '*') {
-            // Wildcard. Doesn't constrain element_mask.
             if (negate_next) return false;
+            saw_wildcard = true;
             ++p;
             continue;
         }
         if (c == 'A') {
             if (negate_next) return false;
-            aliphatic_uppercase_seen = true;
+            aliphatic_positive = true;
             ++p;
             continue;
         }
         if (c == 'a') {
             if (negate_next) return false;
-            aromatic_lowercase_seen = true;
+            aromatic_positive = true;
             ++p;
             continue;
         }
         if (c == '#') {
             ++p;
             std::uint32_t num = 0;
-            if (!std::isdigit(static_cast<unsigned char>(token[p]))) return false;
+            if (p >= token.size() || !std::isdigit(static_cast<unsigned char>(token[p]))) return false;
             while (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
                 num = num * 10 + (token[p] - '0');
                 ++p;
@@ -207,17 +246,35 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
             if (num == 0 || num >= 64) return false;
             std::uint64_t const bit = (1ULL << num);
             if (negate_next) {
-                // "!#<n>" — start from all elements, remove one.
-                if (term_mask == 0) term_mask = ~0ULL;
-                term_mask &= ~bit;
-            }
-            else {
-                // Additive within term: element identified.
+                // `!#n` → element ≠ n.  Encode as exclusive mask so elements
+                // beyond bit-63 (heavy metals in the corpus) still match.
                 if (!term_has_element) {
-                    term_mask = bit;
+                    disjunct.element_mask = bit;
+                    disjunct.element_mask_exclusive = 1;
                     term_has_element = true;
                 }
-                else { term_mask |= bit; }
+                else if (disjunct.element_mask_exclusive) { disjunct.element_mask |= bit; }
+                else {
+                    // Inclusive mask in place; negating a different element
+                    // narrows it — just drop the bit if present.
+                    disjunct.element_mask &= ~bit;
+                }
+            }
+            else {
+                if (!term_has_element) {
+                    disjunct.element_mask = bit;
+                    disjunct.element_mask_exclusive = 0;
+                    term_has_element = true;
+                }
+                else if (!disjunct.element_mask_exclusive) { disjunct.element_mask |= bit; }
+                else {
+                    // Exclusive mask already; a positive primitive narrows to
+                    // just that element minus the existing exclusions.  If the
+                    // element was in the exclusion set, the spec is unsatisfiable.
+                    if (disjunct.element_mask & bit) return false;
+                    disjunct.element_mask = bit;
+                    disjunct.element_mask_exclusive = 0;
+                }
             }
             negate_next = false;
             continue;
@@ -226,42 +283,50 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
             if (negate_next) return false;
             ++p;
             std::uint32_t num = 0;
-            if (!std::isdigit(static_cast<unsigned char>(token[p]))) return false;
+            if (p >= token.size() || !std::isdigit(static_cast<unsigned char>(token[p]))) return false;
             while (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
                 num = num * 10 + (token[p] - '0');
                 ++p;
             }
-            if (ac.min_degree != 0 && ac.min_degree != num) return false;
-            ac.min_degree = static_cast<std::uint8_t>(num);
+            if (disjunct.min_degree != 0 && disjunct.min_degree != num) return false;
+            disjunct.min_degree = static_cast<std::uint8_t>(num);
             continue;
         }
         if (c == 'D') {
-            // Heavy-atom degree (count of non-H neighbours).
+            // SMARTS `D<n>` — explicit degree (includes explicit H).  Running
+            // on an `addHs`-ed molecule, this is the same as the atom's
+            // `getDegree()` and matches the SMARTS `X<n>` semantics on the
+            // same input.  Both primitives therefore write to `min_degree`.
             if (negate_next) return false;
             ++p;
             std::uint32_t num = 0;
-            if (!std::isdigit(static_cast<unsigned char>(token[p]))) return false;
+            if (p >= token.size() || !std::isdigit(static_cast<unsigned char>(token[p]))) return false;
             while (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
                 num = num * 10 + (token[p] - '0');
                 ++p;
             }
-            if (ac.heavy_degree != 0 && ac.heavy_degree != num) return false;
-            ac.heavy_degree = static_cast<std::uint8_t>(num);
+            if (disjunct.min_degree != 0 && disjunct.min_degree != num) return false;
+            disjunct.min_degree = static_cast<std::uint8_t>(num);
             continue;
         }
         if (c == 'H') {
             if (negate_next) return false;
             ++p;
-            std::uint32_t num = 1;
             if (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
-                num = 0;
+                std::uint32_t num = 0;
                 while (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
                     num = num * 10 + (token[p] - '0');
                     ++p;
                 }
+                if (disjunct.exact_h_count != 0xFF && disjunct.exact_h_count != num) return false;
+                disjunct.exact_h_count = static_cast<std::uint8_t>(num);
             }
-            if (ac.exact_h_count != 0xFF && ac.exact_h_count != num) return false;
-            ac.exact_h_count = static_cast<std::uint8_t>(num);
+            else {
+                // Bare `H` — decide at end-of-parse: if no element cue appears
+                // in the rest of the term, this was the hydrogen ATOM ([H]);
+                // otherwise it is the implicit H-count-of-1 modifier ([CH]).
+                saw_bare_H = true;
+            }
             continue;
         }
         if (c == 'R') {
@@ -273,16 +338,16 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
                     ++p;
                 }
                 if (num == 0) {
-                    if (negate_next) ac.require_flags |= atom_flag_in_ring_k;
-                    else ac.forbid_flags |= atom_flag_in_ring_k;
+                    if (negate_next) disjunct.require_flags |= atom_flag_in_ring_k;
+                    else disjunct.forbid_flags |= atom_flag_in_ring_k;
                 }
                 else {
                     return false; // RDKit's "R<n>" = "member of <n> SSSR rings" — not supported
                 }
             }
             else {
-                if (negate_next) ac.forbid_flags |= atom_flag_in_ring_k;
-                else ac.require_flags |= atom_flag_in_ring_k;
+                if (negate_next) disjunct.forbid_flags |= atom_flag_in_ring_k;
+                else disjunct.require_flags |= atom_flag_in_ring_k;
             }
             negate_next = false;
             continue;
@@ -311,16 +376,14 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
                 if (p >= token.size() || token[p] != '}') return false;
                 ++p; // skip '}'
                 if (lo > hi || hi > 255) return false;
-                if (ac.ring_size != 0 || ac.ring_size_max != 0) {
-                    // Multiple r-constraints: only accept if identical.
-                    if (ac.ring_size != lo || ac.ring_size_max != hi) return false;
+                if (disjunct.ring_size != 0 || disjunct.ring_size_max != 0) {
+                    if (disjunct.ring_size != lo || disjunct.ring_size_max != hi) return false;
                 }
                 else {
-                    ac.ring_size = static_cast<std::uint8_t>(lo);
-                    ac.ring_size_max = static_cast<std::uint8_t>(hi);
+                    disjunct.ring_size = static_cast<std::uint8_t>(lo);
+                    disjunct.ring_size_max = static_cast<std::uint8_t>(hi);
                 }
-                // r implies in-ring.
-                ac.require_flags |= atom_flag_in_ring_k;
+                disjunct.require_flags |= atom_flag_in_ring_k;
                 continue;
             }
             if (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) {
@@ -330,25 +393,16 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
                     ++p;
                 }
                 if (num > 0 && num < 256) {
-                    ac.ring_size = static_cast<std::uint8_t>(num);
-                    ac.ring_size_max = 0; // exact-match flag
+                    disjunct.ring_size = static_cast<std::uint8_t>(num);
+                    disjunct.ring_size_max = 0;
                 }
                 else return false;
             }
-            else {
-                // "r" alone = in ring (same as R).
-                ac.require_flags |= atom_flag_in_ring_k;
-            }
+            else { disjunct.require_flags |= atom_flag_in_ring_k; }
             continue;
         }
         if (c == '+' || c == '-') {
-            // SMARTS formal-charge specifier.
-            //   "+"    = charge +1
-            //   "+<n>" = charge +n
-            //   "-"    = charge -1
-            //   "-<n>" = charge -n
-            // RDKit's getFormalCharge returns signed int; we store as int8_t.
-            if (negate_next) return false; // negated charge isn't in the CSD library
+            if (negate_next) return false;
             std::int8_t sign = (c == '+') ? static_cast<std::int8_t>(1) : static_cast<std::int8_t>(-1);
             ++p;
             std::int8_t magnitude = 1;
@@ -358,17 +412,16 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
                     num = num * 10 + (token[p] - '0');
                     ++p;
                 }
-                if (num == 0 || num > 8) return false; // sanity bound
+                if (num == 0 || num > 8) return false;
                 magnitude = static_cast<std::int8_t>(num);
             }
             std::int8_t const chg = static_cast<std::int8_t>(sign * magnitude);
             std::int8_t constexpr kNoCharge = std::numeric_limits<std::int8_t>::min();
-            if (ac.formal_charge != kNoCharge && ac.formal_charge != chg) return false; // conflicting charges
-            ac.formal_charge = chg;
+            if (disjunct.formal_charge != kNoCharge && disjunct.formal_charge != chg) return false;
+            disjunct.formal_charge = chg;
             continue;
         }
         if (c == '^') {
-            // Hybridization: "^<n>" — 1 = SP, 2 = SP2, 3 = SP3, etc.
             if (negate_next) return false;
             ++p;
             if (!(p < token.size() && std::isdigit(static_cast<unsigned char>(token[p])))) return false;
@@ -377,8 +430,6 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
                 num = num * 10 + (token[p] - '0');
                 ++p;
             }
-            // SMARTS ^N → map to hybridization_t values (descriptor uses RDKit's ordering:
-            // hybridization_sp_k=2, hybridization_sp2_k=3, hybridization_sp3_k=4).
             std::uint8_t h = 0;
             switch (num) {
             case 1: h = hybridization_sp_k; break;
@@ -388,8 +439,8 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
             case 5: h = hybridization_sp3d2_k; break;
             default: return false;
             }
-            if (ac.hybridization != 0 && ac.hybridization != h) return false;
-            ac.hybridization = h;
+            if (disjunct.hybridization != 0 && disjunct.hybridization != h) return false;
+            disjunct.hybridization = h;
             continue;
         }
         if (std::isalpha(static_cast<unsigned char>(c))) {
@@ -404,35 +455,70 @@ inline bool parse_atom_term(std::string_view token, simple_atom_constraint_t &ac
                 }
             }
             if (elem == 0) return false;
-            if (elem >= 64) return false; // element mask only covers 0..63
+            if (elem >= 64) return false;
             std::uint64_t const bit = (1ULL << elem);
             bool const lowercase_first = std::islower(static_cast<unsigned char>(sym[0]));
-            if (lowercase_first) aromatic_lowercase_seen = true;
-            else aliphatic_uppercase_seen = true;
             if (negate_next) {
-                if (term_mask == 0) term_mask = ~0ULL;
-                term_mask &= ~bit;
-            }
-            else {
                 if (!term_has_element) {
-                    term_mask = bit;
+                    disjunct.element_mask = bit;
+                    disjunct.element_mask_exclusive = 1;
                     term_has_element = true;
                 }
-                else { term_mask |= bit; }
+                else if (disjunct.element_mask_exclusive) { disjunct.element_mask |= bit; }
+                else { disjunct.element_mask &= ~bit; }
+            }
+            else {
+                if (lowercase_first) aromatic_positive = true;
+                else aliphatic_positive = true;
+                if (!term_has_element) {
+                    disjunct.element_mask = bit;
+                    disjunct.element_mask_exclusive = 0;
+                    term_has_element = true;
+                }
+                else if (!disjunct.element_mask_exclusive) { disjunct.element_mask |= bit; }
+                else {
+                    if (disjunct.element_mask & bit) return false;
+                    disjunct.element_mask = bit;
+                    disjunct.element_mask_exclusive = 0;
+                }
             }
             negate_next = false;
             p += sym.size();
             continue;
         }
-        return false; // unknown character
+        return false;
     }
 
-    // Aromaticity from element-symbol case: if ALL symbol-named elements were aromatic
-    // (lowercase), require aromatic; if all aliphatic, forbid aromatic; mixed → leave alone.
-    if (aromatic_lowercase_seen && !aliphatic_uppercase_seen) ac.require_flags |= atom_flag_aromatic_k;
-    else if (aliphatic_uppercase_seen && !aromatic_lowercase_seen) ac.forbid_flags |= atom_flag_aromatic_k;
+    // Resolve bare `H`: if no element / wildcard / aromatic flag was declared,
+    // `[H]` refers to the hydrogen ATOM (element 1); otherwise it is the
+    // implicit H-count-of-1 modifier (e.g. `[CH]`).
+    if (saw_bare_H) {
+        bool const any_element_cue = term_has_element || aromatic_positive || aliphatic_positive || saw_wildcard;
+        if (!any_element_cue) {
+            disjunct.element_mask = (1ULL << 1);
+            term_has_element = true;
+        }
+        else {
+            if (disjunct.exact_h_count != 0xFF && disjunct.exact_h_count != 1) return false;
+            disjunct.exact_h_count = 1;
+        }
+    }
+
+    // Aromaticity from element-symbol case: only driven by NON-negated element
+    // primitives.  `[!O]` (negated uppercase O) leaves aromaticity unconstrained
+    // so that an aromatic C or aromatic O can still match "not aliphatic-O".
+    if (aromatic_positive && !aliphatic_positive) disjunct.require_flags |= atom_flag_aromatic_k;
+    else if (aliphatic_positive && !aromatic_positive) disjunct.forbid_flags |= atom_flag_aromatic_k;
 
     return true;
+}
+
+/** Initialise @p disjunct to an "unconstrained" state where every field is the sentinel. */
+inline void reset_atom_disjunct(atom_disjunct_t &disjunct) {
+    disjunct = {};
+    disjunct.element_mask_exclusive = 0;
+    disjunct.exact_h_count = 0xFF;
+    disjunct.formal_charge = std::numeric_limits<std::int8_t>::min();
 }
 
 /**
@@ -457,11 +543,34 @@ inline csd_predicate_t lookup_predicate(std::string_view body) {
         {"C([NX3])", csd_predicate_c_nb_nx3_k},
         {"[CX3]([C])", csd_predicate_cx3_nb_c_k},
         {"[cH0](Cl)", csd_predicate_ch0_nb_cl_k},
+        {"[cH0]Cl", csd_predicate_ch0_nb_cl_k}, // alias: no-paren form
         // Top-of-distribution SubstructMatch hot-spots.
         {"[a]([cH1])", csd_predicate_a_nb_cH1_k},
         {"[aH0](!@O)", csd_predicate_aH0_nb_nonring_O_k},
         {"[c]([cH,nX2H0])[cH,nX2H0]", csd_predicate_c_two_cH_or_nX2H0_k},
         {"[cH0][NH1,NH2]", csd_predicate_cH0_nb_NH12_k},
+        {"[cH0]([NH1,NH2])", csd_predicate_cH0_nb_NH12_k},     // alias: paren form
+        // Sulfonyl / carbonyl / fluorine families.
+        {"S(=O)=O", csd_predicate_sulfonyl_k},
+        {"S(=O)(=O)", csd_predicate_sulfonyl_k}, // alias: chain vs branch form
+        {"[CX3](=[!O])", csd_predicate_cx3_eq_non_o_k},
+        {"C([F])([F])[F]", csd_predicate_c_trifluoro_k},
+        {"[CX3]([C])([H])", csd_predicate_cx3_nb_c_h_k},
+        {"C([NX3])N", csd_predicate_c_nx3_and_aliph_n_k},
+        {"C([NX3])n", csd_predicate_c_nx3_and_arom_n_k},
+        {"[N][CX4]", csd_predicate_n_nb_cx4_k},
+        {"N[CX4]", csd_predicate_n_nb_cx4_k},     // alias: unbracketed N
+        {"[NH0][CX4]", csd_predicate_n_nb_cx4_k}, // alias: 0-H aliphatic N
+        {"[cH0]F", csd_predicate_cH0_nb_F_k},
+        {"[cH0](F)", csd_predicate_cH0_nb_F_k}, // alias: paren form
+        {"[cH0][OH1]", csd_predicate_cH0_nb_OH1_k},
+        {"[cH0][OH0]", csd_predicate_cH0_nb_OH0_k},
+        {"[cH0]([CX3])", csd_predicate_cH0_nb_cx3_k},
+        {"cO", csd_predicate_c_nb_aliph_O_k},
+        {"a[OH1]", csd_predicate_a_nb_OH1_k},
+        {"a[NH1,NH2]", csd_predicate_a_nb_NH12_k},
+        {"c([NH1,NH2])", csd_predicate_c_nb_NH12_k},
+        {"[c]([NH1,NH2])", csd_predicate_c_nb_NH12_k}, // alias: bracketed-c form
     };
     for (auto const &e : table)
         if (body == e.body) return e.id;
@@ -514,35 +623,38 @@ inline bool strip_recursive_subqueries(std::string_view spec, std::string &strip
 }
 
 /**
- *  Parse full atom spec (content of [...]). Splits on `,` (OR) at the top level,
- *  and on `;` / `&` (AND) within each disjunct. Each disjunct contributes its
- *  element-mask to a union; non-element constraints must be identical across
- *  disjuncts (otherwise we bail to complex).
+ *  Parse the content of a SMARTS atom bracket (`[...]`) into a fully populated
+ *  @ref simple_atom_constraint_t.
+ *
+ *  SMARTS logical-operator precedence: `!` (highest) → `&` (implicit/explicit
+ *  high-precedence AND) → `,` (OR) → `;` (low-precedence AND).  Concretely:
+ *
+ *  - `A,a;r{5-8}`   = `(A,a);(r{5-8})`           = `(A OR a) AND r{5-8}`.
+ *  - `!#1;R2,R3;r5` = `(!#1);(R2,R3);(r5)`       = `!#1 AND (R2 OR R3) AND r5`.
+ *  - `cH1,n`        = single conjunct of 2 alts  = `cH1 OR n`.
+ *
+ *  Representation: each @ref atom_disjunct_t stores one pure conjunction of
+ *  primitives, and an atom matches the parent spec if any disjunct matches.
+ *  Mixed AND/OR specs are converted to disjunctive normal form via the
+ *  cross-product of the `,`-alternatives across every `;`-separated conjunct.
+ *
+ *  A single top-level recursive sub-query `$(...)` is lifted out and attached
+ *  as @ref simple_atom_constraint_t::predicate; recursive bodies inside a
+ *  top-level `,` are rejected — we cannot fold a disjunct-varying predicate
+ *  into a single spec.
  */
 inline bool parse_atom_spec(std::string_view spec, simple_atom_constraint_t &ac) {
     ac = {};
-    ac.element_mask = 0;
-    ac.exact_h_count = 0xFF;
-
-    ac.formal_charge = std::numeric_limits<std::int8_t>::min(); // sentinel: no charge constraint
+    ac.num_disjuncts = 0;
+    for (auto &d : ac.disjuncts) reset_atom_disjunct(d);
     if (spec.empty()) return false;
     if (spec.find('|') != std::string_view::npos) return false;
-    // Formal charges `+`, `-`, `+N`, `-N` are handled inside `parse_atom_term`, so `spec.find('+')` is
-    // no longer a bail-out.
-    // We still need to keep `-` inside `{...}` (range separator for `r{N-M}`)
-    // disambiguated from the charge indicator; parse_atom_term does that per-term.
 
-    // Pre-process: pull out a top-level recursive sub-query `$(...)` if present and
-    // translate it to a predicate ID. `$` inside a disjunct (i.e. comma-joined OR)
-    // is rejected here — all CSD use-sites that we care about put the sub-query at
-    // the top level, optionally joined to other conjuncts with `;` or `&`.
+    // Recursive sub-query extraction (top-level `$(...)`).
     csd_predicate_t predicate_for_spec = csd_predicate_none_k;
     std::string stripped_storage;
     std::string_view working_spec = spec;
     if (spec.find('$') != std::string_view::npos) {
-        // If the sub-query appears inside a top-level disjunct (there is a top-level
-        // `,` anywhere in @p spec), reject — we cannot fold a disjunct-varying
-        // predicate into a single flat constraint.
         {
             int depth = 0;
             for (char c : spec) {
@@ -555,98 +667,94 @@ inline bool parse_atom_spec(std::string_view spec, simple_atom_constraint_t &ac)
         working_spec = stripped_storage;
     }
 
-    // Split on top-level ',' — each comma-separated chunk is a disjunct.
-    // Within a disjunct, split on ';' (AND). Within an AND-chunk, call parse_atom_term.
-    std::uint64_t full_mask = 0;
-    bool any_disjunct = false;
-    std::size_t comma_start = 0;
-    bool any_uses_element = false;
-
-    auto process_disjunct = [&](std::string_view disjunct) -> bool {
-        if (disjunct.empty()) return false;
-        simple_atom_constraint_t disjunct_ac {};
-        disjunct_ac.element_mask = 0;
-        disjunct_ac.exact_h_count = 0xFF;
-        disjunct_ac.formal_charge = std::numeric_limits<std::int8_t>::min(); // sentinel: no constraint
-        std::uint64_t disjunct_mask = 0;
-        bool disjunct_has_element = false;
-
-        // Split on ';'
+    // Step 1: split working_spec on top-level `;` into conjuncts (respecting
+    // `(` depth in case a recursive predicate leaves behind parens).  Each
+    // conjunct is later split on top-level `,` into OR-alternatives.
+    constexpr std::size_t max_conjuncts_k = 6;
+    std::string_view conjuncts[max_conjuncts_k];
+    std::size_t num_conjuncts = 0;
+    {
         std::size_t p = 0;
-        while (p < disjunct.size()) {
+        while (p < working_spec.size()) {
             std::size_t start = p;
-            while (p < disjunct.size() && disjunct[p] != ';') ++p;
-            std::string_view term = disjunct.substr(start, p - start);
-            if (p < disjunct.size()) ++p; // skip ';'
-            std::uint64_t prev_mask = disjunct_mask;
-            bool prev_has = disjunct_has_element;
-            if (!parse_atom_term(term, disjunct_ac, disjunct_mask, disjunct_has_element)) return false;
-            (void)prev_mask;
-            (void)prev_has;
-        }
-
-        // Merge this disjunct into the accumulator. Non-element constraints must match.
-        if (!any_disjunct) {
-            ac = disjunct_ac;
-            full_mask = disjunct_has_element ? disjunct_mask : 0;
-            any_uses_element = disjunct_has_element;
-        }
-        else {
-            // For OR across disjuncts, non-element constraints must be identical
-            // (otherwise the OR has distinct non-element requirements per branch,
-            // which we can't fold into a single constraint).
-            if (ac.min_degree != disjunct_ac.min_degree) return false;
-            if (ac.heavy_degree != disjunct_ac.heavy_degree) return false;
-            if (ac.exact_h_count != disjunct_ac.exact_h_count) return false;
-            if (ac.ring_size != disjunct_ac.ring_size) return false;
-            if (ac.ring_size_max != disjunct_ac.ring_size_max) return false;
-            if (ac.hybridization != disjunct_ac.hybridization) return false;
-            if (ac.require_flags != disjunct_ac.require_flags) return false;
-            if (ac.forbid_flags != disjunct_ac.forbid_flags) return false;
-            if (ac.formal_charge != disjunct_ac.formal_charge) return false;
-            // Union element masks.
-            if (any_uses_element && disjunct_has_element) full_mask |= disjunct_mask;
-            else if (disjunct_has_element) {
-                full_mask = disjunct_mask;
-                any_uses_element = true;
+            int depth = 0;
+            while (p < working_spec.size() && !(working_spec[p] == ';' && depth == 0)) {
+                if (working_spec[p] == '(') ++depth;
+                else if (working_spec[p] == ')') --depth;
+                ++p;
             }
-            // If neither uses element, full_mask stays 0 = any.
+            if (num_conjuncts >= max_conjuncts_k) return false;
+            std::string_view term = working_spec.substr(start, p - start);
+            if (term.empty()) return false;
+            conjuncts[num_conjuncts++] = term;
+            if (p < working_spec.size()) ++p; // skip ';'
         }
-        any_disjunct = true;
-        return true;
-    };
-
-    std::size_t p = 0;
-    while (p < working_spec.size()) {
-        std::size_t start = p;
-        int depth = 0;
-        while (p < working_spec.size() && !(working_spec[p] == ',' && depth == 0)) {
-            if (working_spec[p] == '(') ++depth;
-            else if (working_spec[p] == ')') --depth;
-            ++p;
-        }
-        std::string_view disjunct = working_spec.substr(start, p - start);
-        if (p < working_spec.size()) ++p; // skip ','
-        if (!process_disjunct(disjunct)) return false;
     }
-    (void)comma_start;
+    if (num_conjuncts == 0) return false;
 
-    ac.element_mask = full_mask;
+    // Step 2: for each conjunct, split on top-level `,` into OR-alternatives.
+    constexpr std::size_t max_alts_per_conjunct_k = 4;
+    std::string_view alts[max_conjuncts_k][max_alts_per_conjunct_k];
+    std::size_t num_alts[max_conjuncts_k] = {};
+    for (std::size_t c = 0; c < num_conjuncts; ++c) {
+        std::string_view cstr = conjuncts[c];
+        std::size_t p = 0;
+        while (p < cstr.size()) {
+            std::size_t start = p;
+            int depth = 0;
+            while (p < cstr.size() && !(cstr[p] == ',' && depth == 0)) {
+                if (cstr[p] == '(') ++depth;
+                else if (cstr[p] == ')') --depth;
+                ++p;
+            }
+            if (num_alts[c] >= max_alts_per_conjunct_k) return false;
+            std::string_view alt = cstr.substr(start, p - start);
+            if (alt.empty()) return false;
+            alts[c][num_alts[c]++] = alt;
+            if (p < cstr.size()) ++p; // skip ','
+        }
+        if (num_alts[c] == 0) return false;
+    }
+
+    // Step 3: cross-product to DNF.  Abort if the result exceeds the storage
+    // capacity of @ref simple_atom_constraint_t.
+    std::size_t total = 1;
+    for (std::size_t c = 0; c < num_conjuncts; ++c) total *= num_alts[c];
+    if (total > max_disjuncts_k) return false;
+
+    // Iterate combinations via mixed-radix counter over num_alts[].
+    std::size_t idx[max_conjuncts_k] = {};
+    for (std::size_t combo = 0; combo < total; ++combo) {
+        atom_disjunct_t &disjunct = ac.disjuncts[ac.num_disjuncts];
+        reset_atom_disjunct(disjunct);
+        for (std::size_t c = 0; c < num_conjuncts; ++c) {
+            if (!parse_atom_term(alts[c][idx[c]], disjunct)) return false;
+        }
+        ++ac.num_disjuncts;
+        // increment mixed-radix
+        for (std::size_t c = 0; c < num_conjuncts; ++c) {
+            if (++idx[c] < num_alts[c]) break;
+            idx[c] = 0;
+        }
+    }
+    if (ac.num_disjuncts == 0) return false;
+
     ac.predicate = static_cast<std::uint8_t>(predicate_for_spec);
     return true;
 }
 
-/** Parse the bond operator between two atoms. @p op can be empty (implicit single/aromatic). */
-inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
+/**
+ *  Parse the text of a bond operator chunk (AND-conjunction of primitives) into a
+ *  single @ref bond_disjunct_t.  Shared helper used by @ref parse_bond_op and by
+ *  bond-OR splitting.
+ */
+inline bool parse_bond_conjunct(std::string_view op, bond_disjunct_t &bc) {
     bc = {};
     if (op.empty()) {
-        // No explicit operator — SMARTS default is "single or aromatic". Matches single and aromatic bonds.
-        // Encode as: bond_order=0 (any order), no flag constraint.
-        // This is slightly looser than RDKit but harmless since patterns usually constrain
-        // atoms enough to narrow it.
+        // No explicit operator — SMARTS default is "single or aromatic".
+        // Encode as bond_order=0 (any order), no flag constraint.
         return true;
     }
-    // Handle sequences with ';' (AND), e.g. "!@;-"
     std::size_t p = 0;
     bool negate = false;
     while (p < op.size()) {
@@ -687,13 +795,17 @@ inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
         }
         if (c == ':') {
             if (negate) return false;
+            // Aromatic bonds are stored as order-1 with the aromatic flag in
+            // the descriptor; pinning bond_order prevents stray order-3
+            // aromatised edges (pathological SMILES) from sneaking through.
+            if (bc.bond_order != 0 && bc.bond_order != 1) return false;
+            bc.bond_order = 1;
             bc.require_flags |= bond_flag_aromatic_k;
             negate = false;
             ++p;
             continue;
         }
         if (c == '~') {
-            // Any bond order.
             if (negate) return false;
             negate = false;
             ++p;
@@ -706,31 +818,120 @@ inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
             ++p;
             continue;
         }
-        // Unknown operator.
+        // `/` and `\\` would carry directional-bond stereo; not in any loaded
+        // pattern, so reject to keep the matcher surface minimal.
         return false;
     }
     return true;
 }
 
 /**
+ *  Parse a bond operator into @ref simple_bond_constraint_t, flattening to
+ *  disjunctive normal form.  Follows the same SMARTS precedence as @ref
+ *  parse_atom_spec: `;` is lowest (AND), `,` is OR, `&`/implicit is higher AND.
+ *
+ *  Empty @p op is the SMARTS default "single or aromatic" (two disjuncts).
+ *  A single comma as in `@;=,:` yields two disjuncts: `@ AND =` and `@ AND :`.
+ */
+inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
+    bc = {};
+    if (op.empty()) {
+        // Implicit bond = "single or aromatic" = order-1-and-non-aromatic
+        // OR order-1-and-aromatic.  Both disjuncts pin bond_order to 1 so a
+        // triple bond with an incidental aromatic flag cannot slip through.
+        bc.num_disjuncts = 2;
+        bc.disjuncts[0] = {};
+        bc.disjuncts[0].bond_order = 1;
+        bc.disjuncts[0].forbid_flags = bond_flag_aromatic_k;
+        bc.disjuncts[1] = {};
+        bc.disjuncts[1].bond_order = 1;
+        bc.disjuncts[1].require_flags = bond_flag_aromatic_k;
+        return true;
+    }
+
+    constexpr std::size_t max_conjuncts_k = 4;
+    constexpr std::size_t max_alts_per_conjunct_k = 4;
+    std::string_view conjuncts[max_conjuncts_k];
+    std::size_t num_conjuncts = 0;
+    {
+        std::size_t p = 0;
+        while (p < op.size()) {
+            std::size_t start = p;
+            while (p < op.size() && op[p] != ';') ++p;
+            if (num_conjuncts >= max_conjuncts_k) return false;
+            std::string_view term = op.substr(start, p - start);
+            if (term.empty()) return false;
+            conjuncts[num_conjuncts++] = term;
+            if (p < op.size()) ++p;
+        }
+    }
+    if (num_conjuncts == 0) return false;
+
+    std::string_view alts[max_conjuncts_k][max_alts_per_conjunct_k];
+    std::size_t num_alts[max_conjuncts_k] = {};
+    for (std::size_t c = 0; c < num_conjuncts; ++c) {
+        std::string_view cstr = conjuncts[c];
+        std::size_t p = 0;
+        while (p < cstr.size()) {
+            std::size_t start = p;
+            while (p < cstr.size() && cstr[p] != ',') ++p;
+            if (num_alts[c] >= max_alts_per_conjunct_k) return false;
+            std::string_view alt = cstr.substr(start, p - start);
+            if (alt.empty()) return false;
+            alts[c][num_alts[c]++] = alt;
+            if (p < cstr.size()) ++p;
+        }
+        if (num_alts[c] == 0) return false;
+    }
+
+    std::size_t total = 1;
+    for (std::size_t c = 0; c < num_conjuncts; ++c) total *= num_alts[c];
+    if (total > max_disjuncts_k) return false;
+
+    std::size_t idx[max_conjuncts_k] = {};
+    for (std::size_t combo = 0; combo < total; ++combo) {
+        bond_disjunct_t &disjunct = bc.disjuncts[bc.num_disjuncts];
+        disjunct = {};
+        for (std::size_t c = 0; c < num_conjuncts; ++c) {
+            // Compose "alt[c][idx[c]]" as the current conjunct's primitive
+            // and fold into the disjunct.  parse_bond_conjunct starts from a
+            // fresh disjunct; here we want accumulation, so hand it an empty
+            // then merge the three uint8 fields.
+            bond_disjunct_t next {};
+            if (!parse_bond_conjunct(alts[c][idx[c]], next)) return false;
+            if (next.bond_order != 0) {
+                if (disjunct.bond_order != 0 && disjunct.bond_order != next.bond_order) return false;
+                disjunct.bond_order = next.bond_order;
+            }
+            disjunct.require_flags |= next.require_flags;
+            disjunct.forbid_flags |= next.forbid_flags;
+        }
+        ++bc.num_disjuncts;
+        for (std::size_t c = 0; c < num_conjuncts; ++c) {
+            if (++idx[c] < num_alts[c]) break;
+            idx[c] = 0;
+        }
+    }
+    return bc.num_disjuncts > 0;
+}
+
+/**
  *  Parse a branch content string (what sits between `(` and `)` after an atom
- *  bracket in SMARTS — e.g. `"cH1"` from `([cH1])` or `"=O"` from `(=O)`).
- *  Accepts an optional leading bond operator followed by either a bracketed
- *  atom spec `[…]` or a shorthand element symbol (one or two letters).
+ *  bracket in SMARTS — e.g. `"cH1"` from `([cH1])`, `"=O"` from `(=O)`, or
+ *  `"~[N,n]"` from `(~[N,n])`).  Accepts an optional leading bond operator
+ *  followed by either a bracketed atom spec `[…]` or a shorthand element
+ *  symbol.  Bond-OR is folded into a single disjunct (the bond operator here
+ *  is rarely compound) and atom-OR is preserved as a disjunct list.
  *
  *  Returns false on any feature we can't flatten into a @ref
  *  simple_neighbor_constraint_t — nested branches, recursive sub-queries,
- *  charge signs, etc. On success, @p nb is fully populated with active=1.
+ *  atom-map labels.  On success, @p nb is fully populated with active=1.
  */
 inline bool parse_branch_spec(std::string_view branch, simple_neighbor_constraint_t &nb) {
     nb = {};
-    nb.exact_h_count = 0xFF;
-    nb.formal_charge = std::numeric_limits<std::int8_t>::min();
+    for (auto &d : nb.atom_disjuncts) reset_atom_disjunct(d);
     if (branch.empty()) return false;
-    // Nested branches inside a branch are outside our scope.
     if (branch.find('(') != std::string_view::npos) return false;
-    // Atom-map labels `:<n>` inside a branch would place a numbered torsion atom
-    // away from the linear chain — a topology we don't handle natively.
     if (branch.find(':') != std::string_view::npos) return false;
 
     // Split into bond-op prefix + atom body. Bond ops use only a handful of
@@ -742,7 +943,6 @@ inline bool parse_branch_spec(std::string_view branch, simple_neighbor_constrain
 
     simple_atom_constraint_t ac {};
     if (p < branch.size() && branch[p] == '[') {
-        // Bracketed atom spec.
         ++p;
         std::size_t atom_start = p;
         int depth_b = 0, depth_p = 0;
@@ -774,11 +974,12 @@ inline bool parse_branch_spec(std::string_view branch, simple_neighbor_constrain
             if (elem != 0) consumed = 1;
         }
         if (consumed == 0 || elem >= 64 || consumed != rest.size()) return false;
-        ac.element_mask = (1ULL << elem);
-        ac.exact_h_count = 0xFF;
-        // Case-derived aromaticity (same convention as parse_atom_term).
-        if (std::islower(static_cast<unsigned char>(rest[0]))) ac.require_flags |= atom_flag_aromatic_k;
-        else ac.forbid_flags |= atom_flag_aromatic_k;
+        atom_disjunct_t &d = ac.disjuncts[0];
+        reset_atom_disjunct(d);
+        d.element_mask = (1ULL << elem);
+        if (std::islower(static_cast<unsigned char>(rest[0]))) d.require_flags |= atom_flag_aromatic_k;
+        else d.forbid_flags |= atom_flag_aromatic_k;
+        ac.num_disjuncts = 1;
     }
     else {
         return false; // bond op without atom
@@ -788,20 +989,13 @@ inline bool parse_branch_spec(std::string_view branch, simple_neighbor_constrain
     // falling through to the RDKit fallback for the whole pattern.
     if (ac.num_neighbor_branches != 0) return false;
     if (ac.predicate != csd_predicate_none_k) return false;
+    if (ac.num_disjuncts == 0) return false;
 
-    nb.element_mask = ac.element_mask;
-    nb.min_degree = ac.min_degree;
-    nb.heavy_degree = ac.heavy_degree;
-    nb.exact_h_count = ac.exact_h_count;
-    nb.ring_size = ac.ring_size;
-    nb.ring_size_max = ac.ring_size_max;
-    nb.hybridization = ac.hybridization;
-    nb.require_flags = ac.require_flags;
-    nb.forbid_flags = ac.forbid_flags;
-    nb.bond_order = bc.bond_order;
-    nb.bond_require_flags = bc.require_flags;
-    nb.bond_forbid_flags = bc.forbid_flags;
-    nb.formal_charge = ac.formal_charge;
+    // Copy atom + bond disjuncts over verbatim — the representation matches on both sides.
+    nb.num_atom_disjuncts = ac.num_disjuncts;
+    for (std::uint8_t i = 0; i < ac.num_disjuncts; ++i) nb.atom_disjuncts[i] = ac.disjuncts[i];
+    nb.num_bond_disjuncts = bc.num_disjuncts;
+    for (std::uint8_t i = 0; i < bc.num_disjuncts; ++i) nb.bond_disjuncts[i] = bc.disjuncts[i];
     nb.active = 1;
     return true;
 }
@@ -830,9 +1024,16 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
         // should never appear here — if they do, the input is malformed for us.
         std::size_t op_start = p;
         while (p < smarts.size() && smarts[p] != '[') ++p;
-        if (p >= smarts.size()) break;
+        if (p >= smarts.size()) {
+            // End of input reached.  Any non-empty skipped region after the
+            // 4th atom (e.g. the `=O` trailing tail in `…[C:4]=O`) indicates
+            // extra topology we can't represent as a 4-atom linear chain.
+            if (atom_count >= 4 && op_start != p) return false;
+            break;
+        }
         if (atom_count > 0 && atom_count <= 3) ops[atom_count - 1] = smarts.substr(op_start, p - op_start);
         else if (op_start != p) return false; // stray characters before first atom
+        else if (atom_count >= 4) return false; // >4 bracketed atoms — non-linear
 
         // Parse atom spec. Track both '[' and '(' depths so a recursive sub-query
         // `$(...)` inside the atom bracket does not end the bracket prematurely.
@@ -891,34 +1092,75 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
     return true;
 }
 
-/** @brief Test whether a single atom satisfies a parsed atom constraint from a torsion-pattern term. */
-inline bool atom_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx, simple_atom_constraint_t const &ac) {
+/** @brief Test whether a bond satisfies one @ref bond_disjunct_t. */
+inline bool bond_disjunct_match(molecule_descriptor_t const &desc, std::uint32_t bond_idx,
+                                bond_disjunct_t const &bd) {
+    if (bd.bond_order != 0 && desc.bond_order[bond_idx] != bd.bond_order) return false;
+    std::uint8_t const flags = desc.bond_flags[bond_idx];
+    if ((flags & bd.require_flags) != bd.require_flags) return false;
+    if ((flags & bd.forbid_flags) != 0) return false;
+    return true;
+}
+
+/**
+ *  @brief Test whether a single atom satisfies one @ref atom_disjunct_t (one OR
+ *  branch of a SMARTS atom spec).  Called by @ref atom_match for every disjunct
+ *  until one matches.
+ */
+inline bool atom_disjunct_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx,
+                                atom_disjunct_t const &d) {
     std::uint8_t const element = desc.element[atom_idx];
-    if (ac.element_mask != 0 && element < 64 && (ac.element_mask & (1ULL << element)) == 0) return false;
-    if (ac.element_mask != 0 && element >= 64) return false; // outside our element range
-    if (ac.min_degree != 0 && desc.degree[atom_idx] != ac.min_degree) return false;
-    if (ac.heavy_degree != 0) {
+    if (d.element_mask != 0) {
+        if (d.element_mask_exclusive) {
+            // Exclude-set: bit N set ⇒ element N is forbidden. Elements > 63
+            // are implicitly allowed (they cannot collide with a 64-bit mask).
+            if (element < 64 && (d.element_mask & (1ULL << element)) != 0) return false;
+        }
+        else {
+            // Include-set: bit N set ⇒ element N is accepted.  Elements > 63
+            // cannot match a 64-bit positive enumeration and are rejected.
+            if (element >= 64) return false;
+            if ((d.element_mask & (1ULL << element)) == 0) return false;
+        }
+    }
+    if (d.min_degree != 0 && desc.degree[atom_idx] != d.min_degree) return false;
+    if (d.heavy_degree != 0) {
         std::uint8_t const dg = desc.degree[atom_idx];
         std::uint8_t const num_hydrogens = desc.num_hydrogens[atom_idx];
         std::uint8_t const heavy = (dg >= num_hydrogens) ? static_cast<std::uint8_t>(dg - num_hydrogens) : 0;
-        if (heavy != ac.heavy_degree) return false;
+        if (heavy != d.heavy_degree) return false;
     }
-    if (ac.exact_h_count != 0xFF && desc.num_hydrogens[atom_idx] != ac.exact_h_count) return false;
-    if (ac.ring_size != 0) {
+    if (d.exact_h_count != 0xFF && desc.num_hydrogens[atom_idx] != d.exact_h_count) return false;
+    if (d.ring_size != 0) {
         std::uint8_t const rs = desc.smallest_ring[atom_idx];
-        if (ac.ring_size_max == 0) {
-            if (rs != ac.ring_size) return false;
+        if (d.ring_size_max == 0) {
+            if (rs != d.ring_size) return false;
         }
         else {
-            if (rs < ac.ring_size || rs > ac.ring_size_max) return false;
+            if (rs < d.ring_size || rs > d.ring_size_max) return false;
         }
     }
-    if (ac.hybridization != 0 && desc.hybridization[atom_idx] != ac.hybridization) return false;
+    if (d.hybridization != 0 && desc.hybridization[atom_idx] != d.hybridization) return false;
     std::int8_t constexpr kNoCharge = std::numeric_limits<std::int8_t>::min();
-    if (ac.formal_charge != kNoCharge && desc.formal_charge[atom_idx] != ac.formal_charge) return false;
+    if (d.formal_charge != kNoCharge && desc.formal_charge[atom_idx] != d.formal_charge) return false;
     std::uint8_t const flags = desc.atom_flags[atom_idx];
-    if ((flags & ac.require_flags) != ac.require_flags) return false;
-    if ((flags & ac.forbid_flags) != 0) return false;
+    if ((flags & d.require_flags) != d.require_flags) return false;
+    if ((flags & d.forbid_flags) != 0) return false;
+    return true;
+}
+
+/** @brief Test whether a single atom satisfies a parsed atom constraint. */
+inline bool atom_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx, simple_atom_constraint_t const &ac) {
+    // Atom-OR: any disjunct matches is enough.
+    bool any_disjunct = false;
+    for (std::uint8_t i = 0; i < ac.num_disjuncts; ++i) {
+        if (atom_disjunct_match(desc, atom_idx, ac.disjuncts[i])) {
+            any_disjunct = true;
+            break;
+        }
+    }
+    if (!any_disjunct) return false;
+    // Recursive predicate applies atom-wide, after the disjunct match.
     if (ac.predicate != csd_predicate_none_k &&
         !csd_predicate_check(desc, atom_idx, static_cast<csd_predicate_t>(ac.predicate)))
         return false;
@@ -941,51 +1183,20 @@ inline bool atom_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx
 inline bool neighbor_match(molecule_descriptor_t const &desc, std::uint32_t atom_idx, std::uint32_t bond_idx,
                            simple_neighbor_constraint_t const &nc) {
     // Bond rules first — cheapest + most selective for double-bond branches like `(=O)`.
-    if (nc.bond_order != 0) {
-        std::uint8_t const bo = desc.bond_order[bond_idx];
-        bool const is_aromatic = (desc.bond_flags[bond_idx] & bond_flag_aromatic_k) != 0;
-        if (nc.bond_order == 1) {
-            if (is_aromatic) return false;
-            if (bo != 1) return false;
-        }
-        else if (nc.bond_order == 2) {
-            if (bo != 2 || is_aromatic) return false;
-        }
-        else if (nc.bond_order == 3) {
-            if (bo != 3) return false;
+    bool any_bond_disjunct = false;
+    for (std::uint8_t i = 0; i < nc.num_bond_disjuncts; ++i) {
+        if (bond_disjunct_match(desc, bond_idx, nc.bond_disjuncts[i])) {
+            any_bond_disjunct = true;
+            break;
         }
     }
-    std::uint8_t const bflags = desc.bond_flags[bond_idx];
-    if ((bflags & nc.bond_require_flags) != nc.bond_require_flags) return false;
-    if ((bflags & nc.bond_forbid_flags) != 0) return false;
+    if (!any_bond_disjunct) return false;
 
-    std::uint8_t const element = desc.element[atom_idx];
-    if (nc.element_mask != 0 && element < 64 && (nc.element_mask & (1ULL << element)) == 0) return false;
-    if (nc.element_mask != 0 && element >= 64) return false;
-    if (nc.min_degree != 0 && desc.degree[atom_idx] != nc.min_degree) return false;
-    if (nc.heavy_degree != 0) {
-        std::uint8_t const dg = desc.degree[atom_idx];
-        std::uint8_t const num_hydrogens = desc.num_hydrogens[atom_idx];
-        std::uint8_t const heavy = (dg >= num_hydrogens) ? static_cast<std::uint8_t>(dg - num_hydrogens) : 0;
-        if (heavy != nc.heavy_degree) return false;
+    // Atom-OR: any disjunct matches is enough.
+    for (std::uint8_t i = 0; i < nc.num_atom_disjuncts; ++i) {
+        if (atom_disjunct_match(desc, atom_idx, nc.atom_disjuncts[i])) return true;
     }
-    if (nc.exact_h_count != 0xFF && desc.num_hydrogens[atom_idx] != nc.exact_h_count) return false;
-    if (nc.ring_size != 0) {
-        std::uint8_t const rs = desc.smallest_ring[atom_idx];
-        if (nc.ring_size_max == 0) {
-            if (rs != nc.ring_size) return false;
-        }
-        else {
-            if (rs < nc.ring_size || rs > nc.ring_size_max) return false;
-        }
-    }
-    if (nc.hybridization != 0 && desc.hybridization[atom_idx] != nc.hybridization) return false;
-    std::int8_t constexpr kNoCharge_nb = std::numeric_limits<std::int8_t>::min();
-    if (nc.formal_charge != kNoCharge_nb && desc.formal_charge[atom_idx] != nc.formal_charge) return false;
-    std::uint8_t const aflags = desc.atom_flags[atom_idx];
-    if ((aflags & nc.require_flags) != nc.require_flags) return false;
-    if ((aflags & nc.forbid_flags) != 0) return false;
-    return true;
+    return false;
 }
 
 /**
@@ -1027,29 +1238,13 @@ inline bool check_branch_neighbors(molecule_descriptor_t const &desc, std::uint3
     return false;
 }
 
-/** @brief Test whether a bond satisfies a parsed bond constraint from a torsion-pattern term. */
+/** @brief Test whether a bond satisfies a parsed bond constraint. */
 inline bool bond_match(molecule_descriptor_t const &desc, std::uint32_t bond_idx, simple_bond_constraint_t const &bc) {
-    if (bc.bond_order != 0) {
-        std::uint8_t bo = desc.bond_order[bond_idx];
-        // Aromatic bonds stored with order 1; the aromatic flag distinguishes them.
-        bool const is_aromatic = (desc.bond_flags[bond_idx] & bond_flag_aromatic_k) != 0;
-        if (bc.bond_order == 1 && !is_aromatic) {
-            if (bo != 1) return false;
-        }
-        else if (bc.bond_order == 2) {
-            if (bo != 2 || is_aromatic) return false;
-        }
-        else if (bc.bond_order == 3) {
-            if (bo != 3) return false;
-        }
-        else if (bc.bond_order == 1 && is_aromatic) {
-            return false; // explicit single excludes aromatic
-        }
+    if (bc.num_disjuncts == 0) return true; // empty constraint = "any bond" (defensive)
+    for (std::uint8_t i = 0; i < bc.num_disjuncts; ++i) {
+        if (bond_disjunct_match(desc, bond_idx, bc.disjuncts[i])) return true;
     }
-    std::uint8_t flags = desc.bond_flags[bond_idx];
-    if ((flags & bc.require_flags) != bc.require_flags) return false;
-    if ((flags & bc.forbid_flags) != 0) return false;
-    return true;
+    return false;
 }
 
 /**
@@ -1103,7 +1298,7 @@ inline void match_linear_pattern(molecule_descriptor_t const &desc, simple_torsi
                 std::uint16_t const e3 = desc.neighbor_offset[a3 + 1];
                 for (std::uint16_t n4 = s3; n4 < e3; ++n4) {
                     std::uint8_t const a4 = desc.neighbor_atom[n4];
-                    if (a4 == a2) continue;
+                    if (a4 == a2 || a4 == a1) continue; // all 4 torsion atoms must be distinct
                     std::uint16_t const b23 = desc.neighbor_bond[n4];
                     if (!atom_match(desc, a4, pat.atom[3])) continue;
                     if (!bond_match(desc, b23, pat.bond[2])) continue;

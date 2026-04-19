@@ -5,13 +5,13 @@ Every doc, code comment, CLI log line, and struct/function name in this repo use
 
 ## Data granularity — outer to inner
 
-| Term | What it is | Typical size |
-| --- | --- | --- |
-| __`parquet-shard`__ | One on-disk Parquet file.  Inputs and outputs both use this unit. | ~1 M molecules |
-| __`coprocessed-batch`__ | One call to `context_t::generate_conformers`.  Aggregates molecules from one or more `parquet-shards` into a batch large enough to saturate all visible GPUs. | `num_gpus × 100 K` molecules |
-| __`embedding-wave`__ | Subdivision of a `coprocessed-batch`.  The unit of CPU/GPU pipelined work: wave N+1's CPU step overlaps wave N's GPU step. | ~50 K molecules (VRAM-aware auto) |
-| __`atom-limited-bin`__ | Inside one `embedding-wave`, molecules are grouped into bins whose member atom counts fall under a fixed cap (16, 32, 48, 64, 80, 96, 112, 128).  Each bin dispatches one kernel launch with shared memory sized for the cap. | 6–8 K molecules/bin |
-| __`molecule`__ | One input SMILES → K output conformers. | — |
+| Term                    | What it is                                                                                                                                                                                                                   | Typical size                      |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| __`parquet-shard`__     | One on-disk Parquet file. Inputs and outputs both use this unit.                                                                                                                                                             | ~1 M molecules                    |
+| __`coprocessed-batch`__ | One call to `context_t::generate_conformers`. Aggregates molecules from one or more `parquet-shards` into a batch large enough to saturate all visible GPUs.                                                                 | `num_gpus × 100 K` molecules      |
+| __`embedding-wave`__    | Subdivision of a `coprocessed-batch`. The unit of CPU/GPU pipelined work: wave N+1's CPU step overlaps wave N's GPU step.                                                                                                    | ~50 K molecules (VRAM-aware auto) |
+| __`atom-limited-bin`__  | Inside one `embedding-wave`, molecules are grouped into bins whose member atom counts fall under a fixed cap (16, 32, 48, 64, 80, 96, 112, 128). Each bin dispatches one kernel launch with shared memory sized for the cap. | 6–8 K molecules/bin               |
+| __`molecule`__          | One input SMILES → K output conformers.                                                                                                                                                                                      | —                                 |
 
 Old names that have been retired: `gpus-batch` → `coprocessed-batch`, `chunk` → `embedding-wave`, `wave bin` → `atom-limited-bin`.
 CLI flag `--gpus-batch-size` stays as an alias for `--batch-size`.
@@ -22,22 +22,22 @@ CLI flag `--gpus-batch-size` stays as an alias for `--batch-size`.
 
 Four persistent worker threads, each an OpenMP section, with depth-3 ring-buffer handoffs between them:
 
-| Role | Responsibility |
-| --- | --- |
-| __`reader-role`__ | Reads a `parquet-shard` off disk, extracts SMILES views, accumulates into a `coprocessed-batch`. |
-| __`gpu-runner-role`__ | Calls `context_t::generate_conformers` on each `coprocessed-batch` (inner pipeline runs here). |
-| __`fallback-role`__ | Runs RDKit CPU for the conformer slots the GPU could not fill (≤5 % on drug-like inputs). |
-| __`writer-role`__ | Writes one output `parquet-shard` per consumed input `parquet-shard`. |
+| Role                  | Responsibility                                                                                   |
+| --------------------- | ------------------------------------------------------------------------------------------------ |
+| __`reader-role`__     | Reads a `parquet-shard` off disk, extracts SMILES views, accumulates into a `coprocessed-batch`. |
+| __`gpu-runner-role`__ | Calls `context_t::generate_conformers` on each `coprocessed-batch` (inner pipeline runs here).   |
+| __`fallback-role`__   | Runs RDKit CPU for the conformer slots the GPU could not fill (≤5 % on drug-like inputs).        |
+| __`writer-role`__     | Writes one output `parquet-shard` per consumed input `parquet-shard`.                            |
 
 ### Inner layer — `wave-step` (library-level)
 
 Three steps per `embedding-wave`, all inside one `generate_conformers` call:
 
-| Step | Runs on | What happens |
-| --- | --- | --- |
-| __`preprocess-step`__ | CPU (OpenMP across molecules) | SMILES parse + RDKit / native typing + MMFF atom / charge + pack into pinned host memory. |
-| __`embedding-step`__ | GPU (async on stream) | H2D upload → metric-embedding prepass → ETKDG kernels → MMFF polish → fp32→fp16 convert → D2H.  Host returns immediately. |
-| __`finalize-step`__ | CPU + stream sync | Block on stream drain → permute pinned outputs into caller's buffer. |
+| Step                  | Runs on                       | What happens                                                                                                             |
+| --------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| __`preprocess-step`__ | CPU (OpenMP across molecules) | SMILES parse + RDKit / native typing + MMFF atom / charge + pack into pinned host memory.                                |
+| __`embedding-step`__  | GPU (async on stream)         | H2D upload → metric-embedding prepass → ETKDG kernels → MMFF polish → fp32→fp16 convert → D2H. Host returns immediately. |
+| __`finalize-step`__   | CPU + stream sync             | Block on stream drain → permute pinned outputs into caller's buffer.                                                     |
 
 __Vocabulary rule:__ _role_ = persistent thread actor (CLI layer).
 _step_ = discrete transformation on one `embedding-wave` (library layer).
@@ -103,8 +103,8 @@ Everything in between is full overlap.
 
 ## Related Utilities
 
-  - `logger_t` (`src/smallfield/log.hpp`) — owned per-`context_t` or per-tool; emits timestamp-prefixed log lines.
-  - `cuda_error_sink_t` (`src/smallfield/cuda_error.hpp`) — routes CUDA / cuSOLVER errors through a `logger_t` and bumps an owner-supplied counter.
-  - `batch_pool_t` (`src/smallfield/api/batch_pool.hpp`) — pinned host buffer packed with all per-molecule preprocess output for one `embedding-wave`.
-  - `metric_scratch_t` (`src/smallfield/api/smallfield.hpp`) — per-GPU device scratch for the metric-embedding prepass within an `embedding-step`.
-  - `launch_scratch_t` (`src/smallfield/api/smallfield.cu`) — per-GPU persistent device pool + pinned host staging; one per GPU, reused across `embedding-waves`.
+- `logger_t` (`src/smallfield/log.hpp`) — owned per-`context_t` or per-tool; emits timestamp-prefixed log lines.
+- `cuda_error_sink_t` (`src/smallfield/cuda_error.hpp`) — routes CUDA / cuSOLVER errors through a `logger_t` and bumps an owner-supplied counter.
+- `batch_pool_t` (`src/smallfield/api/batch_pool.hpp`) — pinned host buffer packed with all per-molecule preprocess output for one `embedding-wave`.
+- `metric_scratch_t` (`src/smallfield/api/smallfield.hpp`) — per-GPU device scratch for the metric-embedding prepass within an `embedding-step`.
+- `launch_scratch_t` (`src/smallfield/api/smallfield.cu`) — per-GPU persistent device pool + pinned host staging; one per GPU, reused across `embedding-waves`.

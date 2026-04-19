@@ -27,74 +27,74 @@ When re-profiling to drive a decision, aim for ≥ 1 M molecules and at least 10
 `perf record -F 199 --call-graph dwarf,8192 bench_profile /tmp/usearch_10M.smi 1`.
 493 s wall, 20 283 mol/s, 98.6 % success, 2.9 M samples.
 
-| Symbol (self-time) | Share | Notes |
-| :--- | ---: | :--- |
-| `boost::detail::VF2SubState<…>::match` | 10.38 % | RDKit VF2 subgraph-isomorphism backend, invoked from `SubstructMatch` fallback in the CSD-torsion matcher. |
-| `match_linear_pattern<extract_etk_torsions_native::…>` | 6.86 % | Our native CSD torsion matcher — first-path for ~49 % of patterns. |
-| `RDKit::detail::MatchSubqueries` | 6.20 % | Part of the VF2 subquery walk. |
-| `extract_mmff94_params` | 4.67 % | MMFF term extraction (native). |
-| libc malloc / mutex hotspot | 2.82 % | Allocator + mutex contention. |
-| `gomp_barrier_wait_end` + team variant | 5.17 % | OpenMP load-imbalance at `prepare_per_thread_contribs_` barrier. |
-| `RDKit::SubstructMatch` | 1.83 % | Fallback entry. |
-| `extract_etk_torsions_native` | 1.79 % | ETK torsion extraction outside the matcher. |
-| `RDKit::QueryAtom::Match` | 1.78 % | Query-chain predicate. |
-| `Queries::AndQuery<…>::Match` | 1.75 % | Query combinator. |
-| `Queries::EqualityQuery<…>::Match` | 1.48 % | Atom-spec equality check. |
-| `build_descriptor` | 1.45 % | Molecule descriptor build. |
-| `RDKit::atomCompat` | 1.39 % | Atom compare in VF2. |
-| MMFF force-field helpers (RDKit) | 1.35 % | Per-term lookup tail. |
-| `operator new` | 1.08 % | Allocation. |
-| `RDKit::Chirality::iterateCIPRanks` | 1.00 % | Chirality ranker. |
+| Symbol (self-time)                                     |   Share | Notes                                                                                                      |
+| :----------------------------------------------------- | ------: | :--------------------------------------------------------------------------------------------------------- |
+| `boost::detail::VF2SubState<…>::match`                 | 10.38 % | RDKit VF2 subgraph-isomorphism backend, invoked from `SubstructMatch` fallback in the CSD-torsion matcher. |
+| `match_linear_pattern<extract_etk_torsions_native::…>` |  6.86 % | Our native CSD torsion matcher — first-path for ~49 % of patterns.                                         |
+| `RDKit::detail::MatchSubqueries`                       |  6.20 % | Part of the VF2 subquery walk.                                                                             |
+| `extract_mmff94_params`                                |  4.67 % | MMFF term extraction (native).                                                                             |
+| libc malloc / mutex hotspot                            |  2.82 % | Allocator + mutex contention.                                                                              |
+| `gomp_barrier_wait_end` + team variant                 |  5.17 % | OpenMP load-imbalance at `prepare_per_thread_contribs_` barrier.                                           |
+| `RDKit::SubstructMatch`                                |  1.83 % | Fallback entry.                                                                                            |
+| `extract_etk_torsions_native`                          |  1.79 % | ETK torsion extraction outside the matcher.                                                                |
+| `RDKit::QueryAtom::Match`                              |  1.78 % | Query-chain predicate.                                                                                     |
+| `Queries::AndQuery<…>::Match`                          |  1.75 % | Query combinator.                                                                                          |
+| `Queries::EqualityQuery<…>::Match`                     |  1.48 % | Atom-spec equality check.                                                                                  |
+| `build_descriptor`                                     |  1.45 % | Molecule descriptor build.                                                                                 |
+| `RDKit::atomCompat`                                    |  1.39 % | Atom compare in VF2.                                                                                       |
+| MMFF force-field helpers (RDKit)                       |  1.35 % | Per-term lookup tail.                                                                                      |
+| `operator new`                                         |  1.08 % | Allocation.                                                                                                |
+| `RDKit::Chirality::iterateCIPRanks`                    |  1.00 % | Chirality ranker.                                                                                          |
 
 __DSO share__ — where self-time lives by shared library:
 
-| DSO | Share |
-| :--- | ---: |
-| `libRDKitGraphMol` | 21.6 % |
-| `libRDKitSubstructMatch` | 21.5 % |
+| DSO                           |  Share |
+| :---------------------------- | -----: |
+| `libRDKitGraphMol`            | 21.6 % |
+| `libRDKitSubstructMatch`      | 21.5 % |
 | `bench_profile` (native code) | 18.6 % |
-| `[kernel / unmapped]` | 12.9 % |
-| `libc` | 5.9 % |
-| `libgomp` | 5.2 % |
-| `libRDKitSmilesParse` | 4.9 % |
-| `libjemalloc` | 4.1 % |
-| `libRDKitForceFieldHelpers` | 4.0 % |
+| `[kernel / unmapped]`         | 12.9 % |
+| `libc`                        |  5.9 % |
+| `libgomp`                     |  5.2 % |
+| `libRDKitSmilesParse`         |  4.9 % |
+| `libjemalloc`                 |  4.1 % |
+| `libRDKitForceFieldHelpers`   |  4.0 % |
 
 __Bucket ranking__ (sum of related symbols):
 
-| Concern | Combined % | Commentary |
-| :--- | ---: | :--- |
-| __RDKit VF2 + `SubstructMatch` query-chain__ | __27–30 %__ | VF2 10.38 + MatchSubqueries 6.20 + SubstructMatch 1.83 + QueryAtom::Match 1.78 + AndQuery 1.75 + EqualityQuery 1.48 + atomCompat 1.39 + bondCompat 0.80 + RecursiveMatcher 0.60 + query-chain tail.  #1 CPU opportunity. |
-| __CSD torsion native matcher__ (our code) | ~8.6 % | `match_linear_pattern` 6.86 + `extract_etk_torsions_native` 1.79 — already first-path for ~49 % of patterns. |
-| __MMFF (all)__ | ~8 % | `extract_mmff94_params` 4.67 + RDKit MMFF helpers ~3.3. |
-| __Allocator pressure__ | ~6.9 % | libc 2.82 + libjemalloc 4.10 — temp-alloc churn in the hot loop. |
-| __SMILES parse + descriptor__ | ~6.3 % | libRDKitSmilesParse 4.87 + `build_descriptor` 1.45. |
-| __OpenMP barrier wait__ | 5.17 % | Load imbalance at the prep barrier. |
-| __Chirality (RDKit CIP)__ | ~1 % | Much smaller than previous drafts claimed. |
+| Concern                                      |  Combined % | Commentary                                                                                                                                                                                                              |
+| :------------------------------------------- | ----------: | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| __RDKit VF2 + `SubstructMatch` query-chain__ | __27–30 %__ | VF2 10.38 + MatchSubqueries 6.20 + SubstructMatch 1.83 + QueryAtom::Match 1.78 + AndQuery 1.75 + EqualityQuery 1.48 + atomCompat 1.39 + bondCompat 0.80 + RecursiveMatcher 0.60 + query-chain tail; #1 CPU opportunity. |
+| __CSD torsion native matcher__ (our code)    |      ~8.6 % | `match_linear_pattern` 6.86 + `extract_etk_torsions_native` 1.79 — already first-path for ~49 % of patterns.                                                                                                            |
+| __MMFF (all)__                               |        ~8 % | `extract_mmff94_params` 4.67 + RDKit MMFF helpers ~3.3.                                                                                                                                                                 |
+| __Allocator pressure__                       |      ~6.9 % | libc 2.82 + libjemalloc 4.10 — temp-alloc churn in the hot loop.                                                                                                                                                        |
+| __SMILES parse + descriptor__                |      ~6.3 % | libRDKitSmilesParse 4.87 + `build_descriptor` 1.45.                                                                                                                                                                     |
+| __OpenMP barrier wait__                      |      5.17 % | Load imbalance at the prep barrier.                                                                                                                                                                                     |
+| __Chirality (RDKit CIP)__                    |        ~1 % | Much smaller than previous drafts claimed.                                                                                                                                                                              |
 
 ### GPU per-bin occupancy — 100K ChEMBL, K=1, 1-GPU
 
 `ncu --set basic --launch-skip 32 --launch-count 16 bench_profile /tmp/chembl_100k.smi 1` with `CUDA_VISIBLE_DEVICES=0`.
 
-| Kernel | Grid | shmem (B) | Theoretical Occ | __Achieved Occ__ | SM % | Duration (ms) |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `etkdg_pipeline_warp_kernel` | 328 | 13 824 | 12.5 % | 3.6 % | 1.6 % | 59 |
-| `etkdg_pipeline_warp_kernel` | __2 392__ | 4 608 | 37.5 % | __13.0 %__ | 7.1 % | 59 |
-| `etkdg_pipeline_warp_kernel` | __2 256__ | 7 168 | 25.0 % | __15.2 %__ | 11.8 % | 93 |
-| `etkdg_pipeline_warp_kernel` | 1 216 | 10 240 | 18.8 % | 10.9 % | 5.9 % | 55 |
-| `mmff_polish_warp_kernel` | 328 | 3 456 | 41.7 % | 3.6 % | 5.1 % | 409 |
-| `mmff_polish_warp_kernel` | __2 392__ | 1 728 | 41.7 % | __23.3 %__ | __34.9 %__ | 181 |
-| `mmff_polish_warp_kernel` | __3 760__ | 2 304 | 41.7 % | __32.3 %__ | __37.6 %__ | 543 |
-| `mmff_polish_warp_kernel` | 1 216 | 2 880 | 41.7 % | 12.2 % | 16.5 % | 383 |
+| Kernel                       |      Grid | shmem (B) | Theoretical Occ | __Achieved Occ__ |       SM % | Duration (ms) |
+| :--------------------------- | --------: | --------: | --------------: | ---------------: | ---------: | ------------: |
+| `etkdg_pipeline_warp_kernel` |       328 |    13 824 |          12.5 % |            3.6 % |      1.6 % |            59 |
+| `etkdg_pipeline_warp_kernel` | __2 392__ |     4 608 |          37.5 % |       __13.0 %__ |      7.1 % |            59 |
+| `etkdg_pipeline_warp_kernel` | __2 256__ |     7 168 |          25.0 % |       __15.2 %__ |     11.8 % |            93 |
+| `etkdg_pipeline_warp_kernel` |     1 216 |    10 240 |          18.8 % |           10.9 % |      5.9 % |            55 |
+| `mmff_polish_warp_kernel`    |       328 |     3 456 |          41.7 % |            3.6 % |      5.1 % |           409 |
+| `mmff_polish_warp_kernel`    | __2 392__ |     1 728 |          41.7 % |       __23.3 %__ | __34.9 %__ |           181 |
+| `mmff_polish_warp_kernel`    | __3 760__ |     2 304 |          41.7 % |       __32.3 %__ | __37.6 %__ |           543 |
+| `mmff_polish_warp_kernel`    |     1 216 |     2 880 |          41.7 % |           12.2 % |     16.5 % |           383 |
 
 Per-bin theoretical occupancy from the register/shared-memory cap analysis (stable across runs):
 
-| Kernel | Bin | Regs | Dyn Shmem | Block Limit (shmem / regs) | Theoretical Occ |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| `etkdg_pipeline_warp_kernel` | 64 | 95 | 7.17 KB | 12 / 20 | 25.0 % |
-| `etkdg_pipeline_warp_kernel` | 128 | 95 | 22.53 KB | 4 / 20 | 8.3 % |
-| `mmff_polish_warp_kernel` | 64 | 96 | 2.30 KB | 30 / 20 | 41.7 % |
-| `mmff_polish_warp_kernel` | 128 | 96 | 4.61 KB | 18 / 20 | 37.5 % |
+| Kernel                       | Bin | Regs | Dyn Shmem | Block Limit (shmem / regs) | Theoretical Occ |
+| :--------------------------- | --: | ---: | --------: | -------------------------: | --------------: |
+| `etkdg_pipeline_warp_kernel` |  64 |   95 |   7.17 KB |                    12 / 20 |          25.0 % |
+| `etkdg_pipeline_warp_kernel` | 128 |   95 |  22.53 KB |                     4 / 20 |           8.3 % |
+| `mmff_polish_warp_kernel`    |  64 |   96 |   2.30 KB |                    30 / 20 |          41.7 % |
+| `mmff_polish_warp_kernel`    | 128 |   96 |   4.61 KB |                    18 / 20 |          37.5 % |
 
 The DG+ETK kernel is shared-memory-bound at large molecules (int8-quantized bounds matrix, 16 KB at N=128).
 The MMFF kernel carries no bounds matrix and hits its ceiling.
@@ -116,25 +116,39 @@ Together ≈ 5–8 % of end-to-end throughput that can be clawed back without to
 
 Ranked by measured-gain × risk-adjusted probability of delivery.
 
-### 1. Extend native CSD torsion predicates to cover the VF2 fallback
+### 1. Extend native CSD torsion predicates to cover the VF2 fallback — LANDED 2026-04-19
 
-__Measured basis__: 27–30 % of CPU at 10M USearch goes through RDKit VF2 + query-chain via one single direct call site — `src/smallfield/preprocess/csd_torsion_dispatcher.hpp:357`, the `RDKit::SubstructMatch` fallback inside the CSD-torsion pattern loop.
-Not buried; we own the dispatch code above and below the call.
+__Measured basis__: 27–30 % of CPU at 10M USearch went through RDKit VF2 + query-chain via a single direct call site — `src/smallfield/preprocess/csd_torsion_dispatcher.hpp`, the `RDKit::SubstructMatch` fallback inside the CSD-torsion pattern loop.
 
-__Scope__: the CSD torsion pattern library ships as ~400 fixed SMARTS patterns with RDKit.
-`src/smallfield/preprocess/csd_torsion_native.hpp::match_linear_pattern` already covers ~49 % of them via a purpose-built linear-SMARTS parser plus 13 hardcoded recursive-subquery predicates.
-The remaining ~51 % fall back to VF2 because they use SMARTS features the linear parser doesn't handle (atom-level `OR`, recursive `$(…)` outside the 13 hardcoded ones, more than two inline branches per atom).
+__What landed__: Four parser / matcher extensions in `csd_torsion_native.hpp`, 14 new recursive predicates in `csd_torsion_predicates.hpp`, and a full-pattern byte-equivalence test harness in `test_csd_torsion_predicates.cpp`:
 
-__Engineering__: ~1 000 LOC of additive hand-coded predicates — same pattern as the existing 13.
-Correctness validated against the existing `test/preprocess/test_csd_torsion_predicates.cpp` harness (byte-identical match lists).
-No architectural risk; the dispatcher already selects per-pattern between native and fallback.
+1. __Disjunctive normal form parser__ — SMARTS `,` / `;` precedence is now correctly modelled by cross-producting the `;`-separated conjuncts across `,`-separated alternatives into a flat `atom_disjunct_t[4]` (and `bond_disjunct_t[4]` for bonds).
+   Unblocks `[C,c]`, `[NH1,NH2]`, `[A,a;r{5-8}]`, `@;=,:` and similar.
+2. __Element-mask inclusive/exclusive mode__ — `!#1` is stored as an exclude-set so elements > 63 (heavy metals in the corpus) still match.
+3. __Bare `[H]` as hydrogen element__ — with no other element primitive in the term, `H` refers to the atom, not the H-count.
+   With an element primitive present, it is an H-count modifier as before.
+4. __SMARTS `D<n>` as total degree__ — after `addHs`, explicit and heavy degree coincide; both primitives now write to the same field, matching RDKit.
+5. __New recursive predicates__ (same mechanism as the existing 13): sulfonyl `S(=O)=O`/`S(=O)(=O)`, `[CX3](=[!O])`, `C([F])([F])[F]`, `[CX3]([C])([H])`, `C([NX3])N` / `C([NX3])n` (split by aromaticity of the second N), `[N][CX4]` family, `[cH0]F` / `[cH0][OH1]` / `[cH0][OH0]`, `[cH0]([CX3])`, `cO`, `a[OH1]`, `a[NH1,NH2]`, `c([NH1,NH2])`.
+   All are byte-equivalence-tested.
 
-__Expected gain__: 20–25 % of host CPU at 10M-class diversity (scaffold-cache hit rate 33 %).
-On 50K-ChEMBL-class diversity (scaffold-cache hit rate 85 %), the combined VF2 + query-chain is only ~5 % of CPU — so the same code wins a much smaller fraction.
-__This optimisation's value scales with input diversity__.
+__Coverage__: native pattern parsing rose from __314/470 (66.8 %)__ to __391/470 (83.2 %)__ of the loaded v2 + smallrings patterns.
+Remaining fallbacks require non-linear topology (ring-closure digits, chain continuation inside a parenthesised branch, 5+ bracketed atoms) or 2-hop recursive predicates — both out of scope for a strictly linear matcher.
 
-__Effort__: Medium-High (1 000 LOC, repetitive per-pattern, each new predicate is ~50 LOC).
-__Risk__: Low — all predicates are byte-equivalence-tested.
+__Measured delta (10M USearch, K=1, 8-GPU)__:
+
+|                         | Baseline (2026-04-19) | After (this commit) |       Delta |
+| :---------------------- | --------------------: | ------------------: | ----------: |
+| Wall                    |                 493 s |           __428 s__ | __−13.2 %__ |
+| Throughput              |          20 283 mol/s |    __23 371 mol/s__ | __+15.2 %__ |
+| Success                 |                98.6 % |              98.6 % |          ±0 |
+| Scaffold-cache hit rate |                33.4 % |              33.4 % |          ±0 |
+
+The measured gain is below the 20–25 % upper bound from the planning estimate because the residual 16.8 % fallback still runs VF2 on a non-trivial slice of the diverse corpus (non-linear topology patterns tend to match larger fractions of molecules than the simpler native patterns).
+
+__Correctness__: two-tier byte-equivalence test against RDKit's `SubstructMatch`:
+
+- Tier 1 — 100 K ChEMBL, 39.1 M pattern checks, 2 min 30 s, zero disagreements.
+- Tier 2 — 1 M USearch sample, 387.7 M pattern checks, 20 min 30 s, zero disagreements (~8 K molecules skipped for exceeding the descriptor's 32-ring SSSR cap — pathological polycyclic cages).
 
 ### 2. Inner-pipeline ring-buffer depth 3 + async finalize
 
@@ -283,18 +297,19 @@ __Risk__: Low.
 - __GPU term extraction + CSR build__ — 941 / 1 009 test molecules match; remainder dispatched to CPU.
 - __SMILES parse with `removeHs=false`__ — skipped the `removeHs` + re-`addHs` round-trip.
   Saved ~6 % of CPU prep wall time.
-- __Scaffold cache__ — caches torsion-pattern match results by Bemis-Murcko scaffold.  +44 % throughput on curated ChEMBL (4 698 unique scaffolds across 237 600 cyclic molecules, 98 % reuse).
+- __Scaffold cache__ — caches torsion-pattern match results by Bemis-Murcko scaffold. +44 % throughput on curated ChEMBL (4 698 unique scaffolds across 237 600 cyclic molecules, 98 % reuse).
   Lower hit on diverse corpora.
 - __Per-wave per-device `cudaEvent_t` instrumentation__ — enables the per-chunk breakdown in `BENCH.md`.
 - __Molecule-sort by atom count + output permutation__ — dispatches smaller molecules first, permutes back to input order at finalize.
   Improves `atom-limited-bin` fill.
 - __Pre-warm cusolver + metric scratch in `context_t` ctor__ — avoids first-wave allocation stall.
 - __Pre-grow 256 MB device / host pools per device__ — arena claimed at construction.
-- __Four redundant `__syncwarp` removals__ on lane-owned access paths (2026-04-18).
+- Four redundant `__syncwarp` removals on lane-owned access paths (2026-04-18).
 
 ## Optimizations Tried and Rejected
 
-- __Gradient register tile__ — moved FIRE gradient array from shared to per-lane registers to attack `long_scoreboard` stalls.  ncu showed stalls came from positions/velocities reads, not gradient.
+- __Gradient register tile__ — moved FIRE gradient array from shared to per-lane registers to attack `long_scoreboard` stalls.
+  ncu showed stalls came from positions/velocities reads, not gradient.
   Registers rose 116 → 146 with no occupancy win.
   Reverted.
 - __`__launch_bounds__` bump from 32,4 to 32,6__ — inert because nvcc already fit 8 blocks/SM from the shared-memory cap.
@@ -309,14 +324,15 @@ __Risk__: Low.
   Shelved until edge cases around embedded double-bond systems are resolved upstream.
 - __Branchless `match_linear_pattern` lookup__ — no viable optimization target after profiling.
   Closed.
-- __`__noinline__` on `fire_minimize_`__ — increased register pressure to 207, dropping theoretical occupancy to 16.67 %.  nvcc re-inlined when the hint was removed; compiler default was already optimal.
+- __`__noinline__`on`fire_minimize_`__ — increased register pressure to 207, dropping theoretical occupancy to 16.67 %.
+  nvcc re-inlined when the hint was removed; compiler default was already optimal.
 
 ## Parked (not on roadmap)
 
 - __MMFF parameter static-LUT replacement__ — at 10M scale MMFF-related CPU is ~8 % total; a 66 % reduction on per-term lookup cost gives ≤ 3 % wall.
   The existing `thread_local std::unordered_map` cache is already lock-free; the proposed static-array replacement would add a dep (`tsl::robin_map` or similar) and complexity for modest gain.
   The old 23 % MMFF-lookup figure in earlier drafts reflected pre-cache measurement; the cache already captured the bulk of the win.
-- __Further `__syncwarp` removals__ — four clearly-redundant sites landed on 2026-04-18.
+- Further `__syncwarp` removals — four clearly-redundant sites landed on 2026-04-18.
   The remaining 13 sites are load-bearing (guard cross-lane reads in shared memory).
 - __Bounds matrix int4 nibble-packing__ — marginal gain per author's prior analysis; precision risk on bonded-pair windows.
 
@@ -329,12 +345,12 @@ Remaining gaps at 1–10 B molecule scale are captured in the __Dataset roadmap_
 
 Projected wall time at 10K mol/s host-prep ceiling (no optimisations applied beyond what's landed):
 
-| Library | Molecules | Wall estimate |
-| :--- | ---: | ---: |
-| Enamine REAL | 1.2 B | ~33 hr |
-| GDB-13 | 1.0 B | ~27 hr |
-| REAL Space tier 2 | 7.0 B | ~195 hr |
-| ZINC22 | 37.0 B | weeks |
+| Library           | Molecules | Wall estimate |
+| :---------------- | --------: | ------------: |
+| Enamine REAL      |     1.2 B |        ~33 hr |
+| GDB-13            |     1.0 B |        ~27 hr |
+| REAL Space tier 2 |     7.0 B |       ~195 hr |
+| ZINC22            |    37.0 B |         weeks |
 
 Scaffold Cache internals (for reference): 64-shard `tsl::robin_map<uint64_t, scaffold_cache_entry_t>` at ~5 KB per entry, keyed by Bemis-Murcko hash.
 On curated ChEMBL (4 698 unique scaffolds across 237 600 cyclic molecules, 98 % reuse) adds +44 % throughput.

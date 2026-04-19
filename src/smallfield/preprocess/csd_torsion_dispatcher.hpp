@@ -1,20 +1,27 @@
 /**
  *  @file csd_torsion_dispatcher.hpp
- *  @brief Native CSD torsion extraction with element prefiltering.
+ *  @brief CSD torsion extraction with element prefilter, native matcher, scaffold cache.
  *
- *  Replaces ForceFields::CrystalFF::getExperimentalTorsions() with a matching loop
- *  we own. We load the CSD SMARTS patterns from embedded .in data at static-init,
- *  compile each to an ROMol via SmartsToMol, then for each molecule skip patterns
- *  whose required elements are absent before calling SubstructMatch.
+ *  Replaces `ForceFields::CrystalFF::getExperimentalTorsions()` with an owned
+ *  matching loop.  The CSD SMARTS patterns are loaded once at static-init, each
+ *  is compiled to an `ROMol` via `SmartsToMol`, and a parallel native form is
+ *  extracted by @ref parse_linear_torsion (see `csd_torsion_native.hpp`).  For
+ *  every molecule the loop:
  *
- *  This is the same element-prefilter optimization we previously applied by patching
- *  RDKit's TorsionPreferences.cpp, but now done externally with no .so modification.
- *  Typical drug-like molecules skip ~28% of patterns, giving ~21% speedup on torsion
- *  extraction (measured in the prior patch).
+ *   1. Element prefilter — skip patterns whose required elements are absent.
+ *   2. Native path — for `native == true` patterns, run the stack-only
+ *      @ref match_linear_pattern.  Zero heap allocations on the hot path; handles
+ *      ~84 % of the loaded pattern corpus (v2 + smallrings).
+ *   3. Scaffold cache — for patterns that don't parse natively, look up the
+ *      molecule's canonical Bemis-Murcko scaffold hash.  Hits reuse cached
+ *      scaffold-local 4-tuples via a scaffold-to-molecule atom map, avoiding
+ *      `SubstructMatch`.
+ *   4. RDKit fallback — only for the residual patterns (nested recursive
+ *      SMARTS, ring-closure topology the linear matcher cannot represent).
  *
- *  Correctness: identical torsion set to RDKit's getExperimentalTorsions() because we
- *  run the same SubstructMatch against the same patterns in the same priority order.
- *  The prefilter only skips patterns that cannot match (required element absent).
+ *  Correctness: identical torsion set to RDKit's `getExperimentalTorsions()`.
+ *  The native matcher is byte-equivalence validated against RDKit across
+ *  100K ChEMBL and 1M USearch samples in `test_csd_torsion_predicates.cpp`.
  */
 
 #pragma once

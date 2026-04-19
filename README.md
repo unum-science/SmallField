@@ -14,16 +14,16 @@ SMILES parse + addHs → bounds matrix → chiral centers → CSD torsion Fourie
 
 __GPU (one warp per molecule, shared memory):__
 
-| #    | Stage              | Method                                                    |
-| :--- | :----------------- | :-------------------------------------------------------- |
-| 2    | Triangle smoothing | Floyd-Warshall on half-precision bounds                   |
-| 3    | Native metric init | SmallField classical MDS embedding + mirrored retries     |
-| 4    | DG minimize        | FIRE optimizer, 4D, atom-centric                          |
-| 5    | Stereo check       | Chiral volume sign validation                             |
-| 6    | 4th-dim crush      | FIRE with w&#8324; penalty                                |
-| 7    | ETK torsion refine | FIRE, 3D, 6-term Fourier + distance constraints           |
-| 8    | Final validation   | Repeat stereo check                                       |
-| 9    | MMFF94 polish      | FIRE, 3D, full force field (VdW + electrostatic + bonded) |
+| #   | Stage              | Method                                                    |
+| :-- | :----------------- | :-------------------------------------------------------- |
+| 2   | Triangle smoothing | Floyd-Warshall on half-precision bounds                   |
+| 3   | Native metric init | SmallField classical MDS embedding + mirrored retries     |
+| 4   | DG minimize        | FIRE optimizer, 4D, atom-centric                          |
+| 5   | Stereo check       | Chiral volume sign validation                             |
+| 6   | 4th-dim crush      | FIRE with w&#8324; penalty                                |
+| 7   | ETK torsion refine | FIRE, 3D, 6-term Fourier + distance constraints           |
+| 8   | Final validation   | Repeat stereo check                                       |
+| 9   | MMFF94 polish      | FIRE, 3D, full force field (VdW + electrostatic + bonded) |
 
 ## Architecture
 
