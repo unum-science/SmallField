@@ -1655,4 +1655,294 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
     return batch;
 }
 
+/**
+ *  @brief Distribute an already-packed shared batch into `device_count`
+ *  per-device pinned pools with atom-count-descending stripe partition.
+ *
+ *  Each device ends up with a disjoint subset of the shared batch's
+ *  molecules; the subset is chosen so that per-device num_atoms
+ *  distributions are near-identical (stripe of the descending sort).
+ *  Each mol's bytes are copied from the shared pool into the assigned
+ *  device's pinned pool at per-device-relative offsets, and the mol's
+ *  metadata is rebased to the per-device layout.
+ *
+ *  Within each device's pool the mols are laid out in atom-count ASCENDING
+ *  order so `launch_gpu_pipeline` can bin-dispatch without a per-device
+ *  sort at launch time.
+ *
+ *  Caller ensures `per_device_out[d].host` is pre-sized (via
+ *  `ensure_capacity`) to hold this device's slice of the shared batch;
+ *  the ctor pre-sizing in `context_t` covers typical waves.
+ */
+inline void distribute_batch_to_per_device_pools_(
+    etkdg_molecule_batch_t const &shared, std::uint32_t device_count,
+    std::span<etkdg_molecule_batch_t> per_device_out) {
+
+    std::uint32_t const total_mol_count = shared.num_molecules;
+    auto const shared_metadata = shared.molecule_metadata();
+    auto const shared_input_indices = shared.input_indices();
+
+    for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
+        per_device_out[device_index].num_molecules = 0;
+        per_device_out[device_index].max_atoms_per_molecule = 0;
+        per_device_out[device_index].layout = batch_layout_t {};
+    }
+    if (total_mol_count == 0) return;
+
+    // Atom-count descending stripe partition.  Per-device mol lists end up
+    // in atom-count ASCENDING order (striping from descending positions
+    // spills the biggest first to each device; we reverse at the end to
+    // give each device the ascending order the kernel bin dispatch wants).
+    std::vector<std::uint32_t> shared_index_by_atom_count(total_mol_count);
+    std::iota(shared_index_by_atom_count.begin(), shared_index_by_atom_count.end(), 0u);
+    std::sort(shared_index_by_atom_count.begin(), shared_index_by_atom_count.end(),
+              [&](std::uint32_t a, std::uint32_t b) {
+                  return shared_metadata[a].num_atoms > shared_metadata[b].num_atoms;
+              });
+
+    std::array<std::vector<std::uint32_t>, 32> per_device_mol_list {}; // indexed [0, device_count)
+    for (std::size_t sorted_index = 0; sorted_index < shared_index_by_atom_count.size(); ++sorted_index) {
+        std::uint32_t const device_index = static_cast<std::uint32_t>(sorted_index % device_count);
+        per_device_mol_list[device_index].push_back(shared_index_by_atom_count[sorted_index]);
+    }
+    for (std::uint32_t device_index = 0; device_index < device_count; ++device_index)
+        std::reverse(per_device_mol_list[device_index].begin(), per_device_mol_list[device_index].end());
+
+    auto const shared_view_for_counts = shared.host_view();
+    auto const shared_mmff_atom_offsets = shared_view_for_counts.mmff_atom_offsets();
+    auto const shared_etk_atom_offsets = shared_view_for_counts.etk_atom_offsets();
+    auto compute_mol_interactions_count = [&](etkdg_molecule_metadata_t const &meta) -> std::uint32_t {
+        std::uint32_t total = 0;
+        for (std::uint32_t atom = 0; atom < meta.num_atoms; ++atom) {
+            auto const &entry = shared_mmff_atom_offsets[meta.mmff_atom_offsets_start + atom];
+            total += entry.bond_count + entry.angle_count + entry.torsion_count + entry.oop_count +
+                     entry.stretchbend_count;
+        }
+        return total;
+    };
+    auto compute_mol_etk_interactions_count = [&](etkdg_molecule_metadata_t const &meta) -> std::uint32_t {
+        std::uint32_t total = 0;
+        for (std::uint32_t atom = 0; atom < meta.num_atoms; ++atom) {
+            auto const &entry = shared_etk_atom_offsets[meta.etk_atom_offsets_start + atom];
+            total += entry.interaction_count;
+        }
+        return total;
+    };
+
+#pragma omp parallel for num_threads(static_cast<int>(device_count)) schedule(static, 1)
+    for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
+        auto const &mol_list = per_device_mol_list[device_index];
+        etkdg_molecule_batch_t &out = per_device_out[device_index];
+        std::uint32_t const device_mol_count = static_cast<std::uint32_t>(mol_list.size());
+
+        per_mol_sizes_t totals {};
+        totals.valid = device_mol_count;
+        std::uint32_t max_atoms_seen = 0;
+        std::vector<std::uint32_t> mmff_interactions_per_mol(device_mol_count, 0);
+        std::vector<std::uint32_t> etk_interactions_per_mol(device_mol_count, 0);
+        for (std::uint32_t pos = 0; pos < device_mol_count; ++pos) {
+            auto const &meta = shared_metadata[mol_list[pos]];
+            std::uint32_t const atom_count = meta.num_atoms;
+            if (atom_count > max_atoms_seen) max_atoms_seen = atom_count;
+            totals.bounds += atom_count * atom_count;
+            totals.chirals += meta.num_chiral_centers;
+            totals.torsions += meta.num_etk_torsions;
+            totals.dcons += meta.num_distance_constraints;
+            totals.mmff_atom_vdw += atom_count;
+            totals.mmff_atom_charge += atom_count;
+            totals.bond_distance += atom_count * atom_count;
+            totals.mmff_bonds += meta.num_mmff_bonds;
+            totals.mmff_angles += meta.num_mmff_angles;
+            totals.mmff_torsions += meta.num_mmff_torsions;
+            totals.mmff_oops += meta.num_mmff_oops;
+            totals.mmff_stretchbends += meta.num_mmff_stretchbends;
+            totals.mmff_atom_offsets += atom_count;
+            totals.etk_atom_offsets += atom_count;
+            mmff_interactions_per_mol[pos] = compute_mol_interactions_count(meta);
+            etk_interactions_per_mol[pos] = compute_mol_etk_interactions_count(meta);
+            totals.mmff_interactions += mmff_interactions_per_mol[pos];
+            totals.etk_interactions += etk_interactions_per_mol[pos];
+        }
+
+        batch_layout_t device_layout = compute_batch_layout(totals, device_mol_count);
+        out.num_molecules = device_mol_count;
+        out.max_atoms_per_molecule = max_atoms_seen;
+        out.layout = device_layout;
+        if (device_layout.bytes_total > 0 && !out.host.ensure_capacity(device_layout.bytes_total)) {
+            out.num_molecules = 0;
+            out.layout = batch_layout_t {};
+            continue;
+        }
+        if (device_mol_count == 0) continue;
+
+        auto bounds_dst = out.bounds_matrices();
+        auto chirals_dst = out.chiral_centers();
+        auto torsions_dst = out.etk_torsions();
+        auto dcons_dst = out.distance_constraints();
+        auto vdw_dst = out.mmff_atom_vdw();
+        auto charge_dst = out.mmff_atom_charge();
+        auto bond_distance_dst = out.bond_distance();
+        auto bonds_dst = out.mmff_bonds();
+        auto angles_dst = out.mmff_angles();
+        auto torsions_mmff_dst = out.mmff_torsions();
+        auto oops_dst = out.mmff_oops();
+        auto stretchbends_dst = out.mmff_stretchbends();
+        auto interactions_dst = out.mmff_interactions();
+        auto aoff_dst = out.mmff_atom_offsets();
+        auto etk_inter_dst = out.etk_interactions();
+        auto etk_aoff_dst = out.etk_atom_offsets();
+        auto metadata_dst = out.molecule_metadata();
+        auto input_indices_dst = out.input_indices();
+
+        auto const shared_view = shared.host_view();
+        auto const bounds_src = shared_view.bounds_matrices();
+        auto const chirals_src = shared_view.chiral_centers();
+        auto const torsions_src = shared_view.etk_torsions();
+        auto const dcons_src = shared_view.distance_constraints();
+        auto const vdw_src = shared_view.mmff_atom_vdw();
+        auto const charge_src = shared_view.mmff_atom_charge();
+        auto const bond_distance_src = shared_view.bond_distance();
+        auto const bonds_src = shared_view.mmff_bonds();
+        auto const angles_src = shared_view.mmff_angles();
+        auto const torsions_mmff_src = shared_view.mmff_torsions();
+        auto const oops_src = shared_view.mmff_oops();
+        auto const stretchbends_src = shared_view.mmff_stretchbends();
+        auto const interactions_src = shared_view.mmff_interactions();
+        auto const aoff_src = shared_view.mmff_atom_offsets();
+        auto const etk_inter_src = shared_view.etk_interactions();
+        auto const etk_aoff_src = shared_view.etk_atom_offsets();
+
+        per_mol_sizes_t running {};
+        for (std::uint32_t pos = 0; pos < device_mol_count; ++pos) {
+            std::uint32_t const shared_mol_index = mol_list[pos];
+            auto const &src_meta = shared_metadata[shared_mol_index];
+            std::uint32_t const atom_count = src_meta.num_atoms;
+
+            std::memcpy(bounds_dst.data() + running.bounds, bounds_src.data() + src_meta.bounds_offset,
+                        static_cast<std::size_t>(atom_count) * atom_count * sizeof(float));
+            std::memcpy(chirals_dst.data() + running.chirals, chirals_src.data() + src_meta.chiral_offset,
+                        src_meta.num_chiral_centers * sizeof(chiral_center_descriptor_t));
+            std::memcpy(torsions_dst.data() + running.torsions, torsions_src.data() + src_meta.torsion_offset,
+                        src_meta.num_etk_torsions * sizeof(etk_torsion_descriptor_t));
+            std::memcpy(dcons_dst.data() + running.dcons, dcons_src.data() + src_meta.constraint_offset,
+                        src_meta.num_distance_constraints * sizeof(distance_constraint_t));
+            std::memcpy(vdw_dst.data() + running.mmff_atom_vdw, vdw_src.data() + src_meta.mmff_atom_vdw_offset,
+                        atom_count * sizeof(mmff94_atom_vdw_params_t));
+            std::memcpy(charge_dst.data() + running.mmff_atom_charge,
+                        charge_src.data() + src_meta.mmff_atom_charge_offset, atom_count * sizeof(float));
+            std::memcpy(bond_distance_dst.data() + running.bond_distance,
+                        bond_distance_src.data() + src_meta.bond_distance_offset,
+                        static_cast<std::size_t>(atom_count) * atom_count * sizeof(std::uint8_t));
+            std::memcpy(bonds_dst.data() + running.mmff_bonds, bonds_src.data() + src_meta.mmff_bond_offset,
+                        src_meta.num_mmff_bonds * sizeof(mmff94_bond_t));
+            std::memcpy(angles_dst.data() + running.mmff_angles, angles_src.data() + src_meta.mmff_angle_offset,
+                        src_meta.num_mmff_angles * sizeof(mmff94_angle_t));
+            std::memcpy(torsions_mmff_dst.data() + running.mmff_torsions,
+                        torsions_mmff_src.data() + src_meta.mmff_torsion_offset,
+                        src_meta.num_mmff_torsions * sizeof(mmff94_torsion_t));
+            std::memcpy(oops_dst.data() + running.mmff_oops, oops_src.data() + src_meta.mmff_oop_offset,
+                        src_meta.num_mmff_oops * sizeof(mmff94_oop_t));
+            std::memcpy(stretchbends_dst.data() + running.mmff_stretchbends,
+                        stretchbends_src.data() + src_meta.mmff_stretchbend_offset,
+                        src_meta.num_mmff_stretchbends * sizeof(mmff94_stretchbend_t));
+            // atom_offsets contain per-atom interaction-start offsets that
+            // point into `mmff_interactions`; rebase each entry by the delta
+            // between the source and destination interaction bases.
+            std::uint32_t const source_atom_offsets_base = src_meta.mmff_atom_offsets_start;
+            std::uint32_t const source_interactions_base = aoff_src[source_atom_offsets_base].bond_start;
+            std::int32_t const mmff_interactions_rebase_delta =
+                static_cast<std::int32_t>(running.mmff_interactions) - static_cast<std::int32_t>(source_interactions_base);
+            for (std::uint32_t atom = 0; atom < atom_count; ++atom) {
+                mmff94_atom_offsets_t entry = aoff_src[source_atom_offsets_base + atom];
+                entry.bond_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.bond_start) +
+                                                              mmff_interactions_rebase_delta);
+                entry.angle_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.angle_start) +
+                                                               mmff_interactions_rebase_delta);
+                entry.torsion_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.torsion_start) +
+                                                                 mmff_interactions_rebase_delta);
+                entry.oop_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.oop_start) +
+                                                             mmff_interactions_rebase_delta);
+                entry.stretchbend_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.stretchbend_start) +
+                                                                     mmff_interactions_rebase_delta);
+                aoff_dst[running.mmff_atom_offsets + atom] = entry;
+            }
+            std::memcpy(interactions_dst.data() + running.mmff_interactions,
+                        interactions_src.data() + source_interactions_base,
+                        mmff_interactions_per_mol[pos] * sizeof(mmff94_atom_interaction_t));
+
+            // Same rebase trick for the ETK interaction list.
+            std::uint32_t const source_etk_atom_offsets_base = src_meta.etk_atom_offsets_start;
+            std::uint32_t const source_etk_interactions_base =
+                etk_aoff_src[source_etk_atom_offsets_base].interaction_start;
+            std::int32_t const etk_interactions_rebase_delta =
+                static_cast<std::int32_t>(running.etk_interactions) -
+                static_cast<std::int32_t>(source_etk_interactions_base);
+            for (std::uint32_t atom = 0; atom < atom_count; ++atom) {
+                etk_atom_offsets_t entry = etk_aoff_src[source_etk_atom_offsets_base + atom];
+                entry.interaction_start = static_cast<std::uint32_t>(
+                    static_cast<std::int32_t>(entry.interaction_start) + etk_interactions_rebase_delta);
+                etk_aoff_dst[running.etk_atom_offsets + atom] = entry;
+            }
+            std::memcpy(etk_inter_dst.data() + running.etk_interactions,
+                        etk_inter_src.data() + source_etk_interactions_base,
+                        etk_interactions_per_mol[pos] * sizeof(etk_atom_interaction_t));
+
+            etkdg_molecule_metadata_t dst_meta = src_meta;
+            dst_meta.bounds_offset = running.bounds;
+            dst_meta.chiral_offset = running.chirals;
+            dst_meta.torsion_offset = running.torsions;
+            dst_meta.constraint_offset = running.dcons;
+            dst_meta.mmff_atom_vdw_offset = running.mmff_atom_vdw;
+            dst_meta.mmff_atom_charge_offset = running.mmff_atom_charge;
+            dst_meta.bond_distance_offset = running.bond_distance;
+            dst_meta.mmff_bond_offset = running.mmff_bonds;
+            dst_meta.mmff_angle_offset = running.mmff_angles;
+            dst_meta.mmff_torsion_offset = running.mmff_torsions;
+            dst_meta.mmff_oop_offset = running.mmff_oops;
+            dst_meta.mmff_stretchbend_offset = running.mmff_stretchbends;
+            dst_meta.mmff_atom_offsets_start = running.mmff_atom_offsets;
+            dst_meta.etk_interaction_offset = running.etk_interactions;
+            dst_meta.etk_atom_offsets_start = running.etk_atom_offsets;
+            metadata_dst[pos] = dst_meta;
+            input_indices_dst[pos] = shared_input_indices[shared_mol_index];
+
+            running.bounds += atom_count * atom_count;
+            running.chirals += src_meta.num_chiral_centers;
+            running.torsions += src_meta.num_etk_torsions;
+            running.dcons += src_meta.num_distance_constraints;
+            running.mmff_atom_vdw += atom_count;
+            running.mmff_atom_charge += atom_count;
+            running.bond_distance += atom_count * atom_count;
+            running.mmff_bonds += src_meta.num_mmff_bonds;
+            running.mmff_angles += src_meta.num_mmff_angles;
+            running.mmff_torsions += src_meta.num_mmff_torsions;
+            running.mmff_oops += src_meta.num_mmff_oops;
+            running.mmff_stretchbends += src_meta.num_mmff_stretchbends;
+            running.mmff_atom_offsets += atom_count;
+            running.etk_atom_offsets += atom_count;
+            running.mmff_interactions += mmff_interactions_per_mol[pos];
+            running.etk_interactions += etk_interactions_per_mol[pos];
+        }
+    }
+}
+
+/**
+ *  @brief Preprocess + distribute entry: produce `device_count` per-device
+ *  pinned batch pools with atom-count-descending stripe partition.  Each
+ *  device's pool holds only its assigned mols in atom-count ASCENDING order.
+ *
+ *  Internally reuses the three-phase preprocess (per-thread extract, serial
+ *  prefix scan, parallel pack) against a reusable shared batch, then
+ *  distributes to the per-device pools.  The shared batch's pinned buffer is
+ *  kept as a file-scope `static` (analogous to `contribs`) so its pinned
+ *  allocation is amortised across all calls.
+ */
+inline void prepare_per_device_batches_into(std::span<std::string_view const> smiles_list, std::uint32_t device_count,
+                                             std::span<etkdg_molecule_batch_t> per_device_out,
+                                             scaffold_cache_t *cache = nullptr) {
+    static etkdg_molecule_batch_t shared_scratch;
+    prepare_molecule_batch_into(smiles_list, shared_scratch, cache);
+    distribute_batch_to_per_device_pools_(shared_scratch, device_count, per_device_out);
+}
+
 } // namespace smallfield::preprocess

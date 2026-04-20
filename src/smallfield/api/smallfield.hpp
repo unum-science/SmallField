@@ -78,6 +78,40 @@ struct config_t {
     std::uint64_t random_seed = 42;
 };
 
+/** @brief Upper bound on devices a single `context_t` can manage. */
+inline constexpr std::size_t max_devices_k = 16;
+
+/** @brief Atom-count bins for `atom-limited-bin` kernel dispatch. */
+inline constexpr std::size_t atom_limited_bin_count_k = 8;
+inline constexpr std::array<std::uint32_t, atom_limited_bin_count_k> atom_limited_bin_caps_k = {
+    16, 32, 48, 64, 80, 96, 112, 128,
+};
+
+/** @brief Per-device cap on a single wave's molecule count.  Dominated by the
+ *  cusolver batched-eigen workspace footprint at `max_atoms_per_molecule = 128`
+ *  (roughly 1 MB of workspace per molecule in the group). */
+inline constexpr std::uint32_t per_device_wave_cap_k = 10'000;
+
+/** @brief Maximum atom count the kernels support per molecule.  Matches
+ *  `molecule_descriptor_t::max_atoms_k`; larger molecules are rejected by
+ *  preprocess with `conformer_status_t::too_many_atoms`. */
+inline constexpr std::uint32_t max_atoms_per_molecule_k = 128;
+
+/** @brief Worst-case conformer count used for pre-allocation at construction. */
+inline constexpr std::uint32_t max_conformer_count_k = 16;
+
+/**
+ *  @brief Per-device launch-configuration cache populated once at `context_t`
+ *  construction.  Replaces the per-bin-per-wave `cudaOccupancyMaxActiveBlocksPerMultiprocessor`
+ *  probes that used to fire on the hot path from the OMP-parallel launch
+ *  region on every device for every bin for every wave.
+ */
+struct device_launch_config_t {
+    int streaming_multiprocessor_count = 0;
+    std::array<int, atom_limited_bin_count_k> blocks_per_multiprocessor_etkdg {};
+    std::array<int, atom_limited_bin_count_k> blocks_per_multiprocessor_mmff {};
+};
+
 /**
  *  @brief GPU context managing CUDA streams and cuSOLVER handles.
  *
@@ -116,10 +150,28 @@ using smallfield::preprocess::scaffold_cache_t;
 
 struct context_t {
     std::vector<int> device_ids;
-    std::vector<cudaStream_t> streams;
+    /** @brief Per-device CUDA streams, one each for host-to-device copies,
+     *  kernel compute, and device-to-host copies.  Blackwell has two copy
+     *  engines that can overlap with the compute engine, so splitting the
+     *  pipeline across three streams (chained with events) lets wave `N+1`'s
+     *  upload overlap wave `N`'s compute and wave `N-1`'s download. */
+    std::vector<cudaStream_t> streams_host_to_device;
+    std::vector<cudaStream_t> streams_compute;
+    std::vector<cudaStream_t> streams_device_to_host;
     std::vector<cusolverDnHandle_t> solvers;
     std::vector<metric_scratch_t> metric_scratch;                  ///< one per device
     std::vector<std::unique_ptr<launch_scratch_t>> launch_scratch; ///< one per device
+    std::vector<device_launch_config_t> launch_configs;            ///< one per device
+    /**
+     *  @brief Persistent per-device 2-slot pinned batch pool ring.
+     *
+     *  Each GPU owns its own pinned source buffer per slot; preprocess writes
+     *  every molecule's bytes into the pool assigned to that molecule's target
+     *  device, and the per-device `cudaMemcpyAsync H2D` reads only from its
+     *  own pool.  Eliminates the concurrent-pinned-source-DMA pattern that
+     *  arose when all devices read the same shared pinned buffer.
+     */
+    std::array<std::array<batch_pool_t, max_devices_k>, 2> batch_slots_per_device {};
     /**
      *  @brief Optional scaffold cache, disabled by default.  When enabled,
      *  SubstructMatch calls for the CSD torsion patterns that remain RDKit
