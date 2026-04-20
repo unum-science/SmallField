@@ -6,12 +6,28 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
-## Multi-GPU illegal-memory-access fix — `809dbcf`
+## 3-Stream Chain Reverted — `db25c9d`
+
+The 3-stream chain from `a791e54` was kept as an architectural improvement assuming the copy-engine overlap would show at production scale.
+Measured under PubChem drug-like K=3 it lost on both axes:
+
+- __Throughput.__
+  Shard 47 ran 17 % slower than the single-stream shard-46 baseline at the same input shape and fallback rate (387 s vs 331 s, 2 581 mol/s vs 3 019 mol/s).
+  On 10M USearch K=3 the single-stream build runs 587.9 s (17 007 mol/s / 51 022 conformers/s) vs 3-stream's 661.9 s — a 13 % single-stream advantage on a workload where 3-stream had been claimed to help.
+  The overlap gain is a loss because kernel phases are short enough that the extra `cudaEvent` hand-off overhead dominates the saved copy/compute concurrency.
+- __Stability.__
+  A second `illegal memory access` race surfaced on the 3-stream build at `cudaEventSynchronize(finalize)` on PubChem shard 50, +1:26 into the wave.
+  The per-wave `cudaFuncSetAttribute` fix (`1b786f1`) closed the root cause; the 3-stream chain re-opens a separate race on the event hand-off that was not pinned down.
+
+Reverted `a791e54`'s `smallfield.cu` + `smallfield.hpp` changes (100 lines, 2 files).
+Per-device pinned pools, ctor pre-allocation, and the launch-config cache from the same refactor survive unchanged.
+
+## Multi-GPU Illegal-Memory-Access Fix — `1b786f1`
 
 Dropped a per-wave `cudaFuncSetAttribute(embed_4d_power_iter_kernel, MaxDynSM, 67 KB)` from `build_metric_initial_coordinates_on_gpu` that was reached concurrently from every OMP per-device worker thread inside `launch_wave`.
 The call mutates driver-global per-kernel attribute state on a shared kernel symbol; at ≥ 2 GPUs the 8 worker threads raced on that state, producing a window during which `embed_4d_power_iter_kernel` launched with the 48 KB hardware-default dynamic shared instead of the 67 KB the kernel needs at bin 128.
 The out-of-bounds shared-memory access surfaced on a later kernel launch as `an illegal memory access was encountered`.
-The attribute is already set once per device in `context_t::context_t`; the per-wave re-assert was defensive overkill left over from `89b90fa`, where the ctor hoist landed but the per-wave copy was not removed.
+The attribute is already set once per device in `context_t::context_t`; the per-wave re-assert was defensive overkill left over from `9cb82be`, where the ctor hoist landed but the per-wave copy was not removed.
 
 Symptom matching:
 
@@ -28,7 +44,7 @@ Verification — 10 M USearch K=3, 8 GPUs, post-fix:
 | Pre-fix `CUDA_LAUNCH_BLOCKING=1`    | 1 063 s | 9 404 |      28 211 | 0 |
 | Post-fix non-blocking               |   662 s | 15 106 |      45 319 | 0 |
 
-## Multi-GPU pipeline refactor — `471bb06` + `89b90fa`
+## Multi-GPU Pipeline Refactor — `a791e54` and `9cb82be`
 
 Four architectural changes to the per-wave GPU dispatch path; together they land the host-scheduling items from the roadmap without altering any kernel code.
 
