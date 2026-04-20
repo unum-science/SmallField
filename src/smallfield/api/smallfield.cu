@@ -88,12 +88,6 @@ struct launch_scratch_t {
     cudaEvent_t event_kernels_start = nullptr;
     cudaEvent_t event_download_start = nullptr;
     cudaEvent_t event_end = nullptr;
-    // Hand-off events chain the three per-device streams (H2D → compute → D2H).
-    // `cudaEventDisableTiming` because these are pure ordering barriers; the
-    // five timing events above retain default flags so `cudaEventElapsedTime`
-    // still reads them in finalize.
-    cudaEvent_t event_upload_done = nullptr;
-    cudaEvent_t event_compute_done = nullptr;
 };
 
 /**
@@ -246,22 +240,16 @@ context_t::context_t(std::span<int const> devices) {
     else { device_ids.assign(devices.begin(), devices.end()); }
 
     std::size_t const device_count = device_ids.size();
-    streams_host_to_device.resize(device_count);
-    streams_compute.resize(device_count);
-    streams_device_to_host.resize(device_count);
+    streams.resize(device_count);
     solvers.resize(device_count);
     metric_scratch.resize(device_count);
     launch_scratch.resize(device_count);
 
     for (std::size_t device_index = 0; device_index < device_count; ++device_index) {
         cudaSetDevice(device_ids[device_index]);
-        cudaStreamCreate(&streams_host_to_device[device_index]);
-        cudaStreamCreate(&streams_compute[device_index]);
-        cudaStreamCreate(&streams_device_to_host[device_index]);
+        cudaStreamCreate(&streams[device_index]);
         cusolverDnCreate(&solvers[device_index]);
-        // cusolver runs on the compute stream; H2D / D2H streams are for DMA
-        // only, so cusolver never sees them.
-        cusolverDnSetStream(solvers[device_index], streams_compute[device_index]);
+        cusolverDnSetStream(solvers[device_index], streams[device_index]);
         // Reuse one cusolverDnParams_t per device across all calls.
         cusolverDnCreateParams(&metric_scratch[device_index].xsyev_params);
         launch_scratch[device_index] = std::make_unique<launch_scratch_t>();
@@ -273,9 +261,6 @@ context_t::context_t(std::span<int const> devices) {
         cudaEventCreateWithFlags(&scratch.event_kernels_start, cudaEventBlockingSync);
         cudaEventCreateWithFlags(&scratch.event_download_start, cudaEventBlockingSync);
         cudaEventCreateWithFlags(&scratch.event_end, cudaEventBlockingSync);
-        // Hand-off events chain the three streams; pure ordering, no timing.
-        cudaEventCreateWithFlags(&scratch.event_upload_done, cudaEventDisableTiming | cudaEventBlockingSync);
-        cudaEventCreateWithFlags(&scratch.event_compute_done, cudaEventDisableTiming | cudaEventBlockingSync);
     }
 
     // One-shot launch-config cache so the per-wave dispatch never probes again.
@@ -333,14 +318,10 @@ context_t::~context_t() {
             if (scratch.event_kernels_start) cudaEventDestroy(scratch.event_kernels_start);
             if (scratch.event_download_start) cudaEventDestroy(scratch.event_download_start);
             if (scratch.event_end) cudaEventDestroy(scratch.event_end);
-            if (scratch.event_upload_done) cudaEventDestroy(scratch.event_upload_done);
-            if (scratch.event_compute_done) cudaEventDestroy(scratch.event_compute_done);
         }
         launch_scratch[device_index].reset();
         cusolverDnDestroy(solvers[device_index]);
-        cudaStreamDestroy(streams_host_to_device[device_index]);
-        cudaStreamDestroy(streams_compute[device_index]);
-        cudaStreamDestroy(streams_device_to_host[device_index]);
+        cudaStreamDestroy(streams[device_index]);
     }
     scaffold_cache.reset(); // no-op if null
 }
@@ -452,9 +433,7 @@ struct gpu_phase_ms_t {
  */
 struct gpu_pipeline_handle_t {
     int device_id = -1;
-    cudaStream_t stream_host_to_device = nullptr;
-    cudaStream_t stream_compute = nullptr;
-    cudaStream_t stream_device_to_host = nullptr;
+    cudaStream_t stream = nullptr;
     batch_pool_t const *batch = nullptr; ///< non-owning — per-device slot in the context ring
     launch_scratch_t *scratch = nullptr; ///< non-owning — persistent in context_t
     std::uint32_t per_device_molecule_count = 0;
@@ -492,8 +471,7 @@ struct gpu_pipeline_handle_t {
  *  device's three-stream pipeline.  Returns immediately; caller eventually
  *  calls `finalize_gpu_pipeline` with the returned handle.
  */
-gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream_host_to_device,
-                                          cudaStream_t stream_compute, cudaStream_t stream_device_to_host,
+gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream,
                                           cusolverDnHandle_t solver_handle, metric_scratch_t &scratch,
                                           launch_scratch_t &launch_buffers, batch_pool_t const &per_device_batch,
                                           device_launch_config_t const &launch_config, std::uint32_t conformer_count,
@@ -518,9 +496,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream_hos
 
     gpu_pipeline_handle_t handle;
     handle.device_id = device_id;
-    handle.stream_host_to_device = stream_host_to_device;
-    handle.stream_compute = stream_compute;
-    handle.stream_device_to_host = stream_device_to_host;
+    handle.stream = stream;
     handle.batch = &per_device_batch;
     handle.scratch = &launch_buffers;
     handle.per_device_molecule_count = per_device_molecule_count;
@@ -562,18 +538,15 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream_hos
     handle.host_status_sorted = {reinterpret_cast<std::uint8_t *>(host_base + layout.host_off_status),
                                  total_conformer_slots};
 
-    // === Upload phase on stream_host_to_device ===
-    cudaEventRecord(handle.event_upload_start, stream_host_to_device);
+    // Upload: single H2D of the per-device batch pool (reads from this
+    // device's private pinned buffer — no cross-device sharing).
+    cudaEventRecord(handle.event_upload_start, stream);
     if (per_device_batch.layout.bytes_total > 0)
         sink.check(cudaMemcpyAsync(device_base + layout.device_off_batch, per_device_batch.host.data(),
-                                   per_device_batch.layout.bytes_total, cudaMemcpyHostToDevice,
-                                   stream_host_to_device),
+                                   per_device_batch.layout.bytes_total, cudaMemcpyHostToDevice, stream),
                    "H2D per-device batch pool");
-    cudaEventRecord(launch_buffers.event_upload_done, stream_host_to_device);
 
-    // === Compute phase on stream_compute, chained on upload ===
-    cudaStreamWaitEvent(stream_compute, launch_buffers.event_upload_done, 0);
-    cudaEventRecord(handle.event_metric_start, stream_compute);
+    cudaEventRecord(handle.event_metric_start, stream);
 
     // Kernels read metadata directly from the H2D'd batch mirror; preprocess
     // wrote mols in atom-count ASCENDING order per device, so the per-bin
@@ -582,8 +555,8 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream_hos
 
     build_metric_initial_coordinates_on_gpu(device_view.bounds_matrices().data(), device_metadata_sorted,
                                             host_metadata, max_atoms_per_molecule, device_initial_coordinates,
-                                            solver_handle, scratch, sink, stream_compute);
-    cudaEventRecord(handle.event_kernels_start, stream_compute);
+                                            solver_handle, scratch, sink, stream);
+    cudaEventRecord(handle.event_kernels_start, stream);
 
     int const streaming_multiprocessor_count = launch_config.streaming_multiprocessor_count;
 
@@ -609,7 +582,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream_hos
             bin_size,
             static_cast<std::uint32_t>(blocks_per_multiprocessor_mmff * streaming_multiprocessor_count));
 
-        etkdg_pipeline_warp_kernel<<<grid_size_etkdg, 32, shared_bytes_etkdg, stream_compute>>>(
+        etkdg_pipeline_warp_kernel<<<grid_size_etkdg, 32, shared_bytes_etkdg, stream>>>(
             device_view.bounds_matrices().data(), device_initial_coordinates + bin_start * max_atoms_per_molecule * 4,
             device_view.chiral_centers().data(), device_view.etk_torsions().data(),
             device_view.distance_constraints().data(), device_view.etk_interactions().data(),
@@ -620,7 +593,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream_hos
             stereo_retry_limit, bin_max_atoms, max_atoms_per_molecule, max_atoms_per_molecule, seed);
         sink.check(cudaPeekAtLastError(), "etkdg_pipeline_warp_kernel launch");
 
-        mmff_polish_warp_kernel<<<grid_size_mmff, 32, shared_bytes_mmff, stream_compute>>>(
+        mmff_polish_warp_kernel<<<grid_size_mmff, 32, shared_bytes_mmff, stream>>>(
             device_view.mmff_atom_vdw().data(), device_view.mmff_atom_charge().data(),
             device_view.bond_distance().data(), device_view.mmff_bonds().data(), device_view.mmff_angles().data(),
             device_view.mmff_torsions().data(), device_view.mmff_oops().data(), device_view.mmff_stretchbends().data(),
@@ -639,30 +612,25 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream_hos
         constexpr std::uint32_t convert_block = 256;
         std::uint32_t const num_elements = static_cast<std::uint32_t>(total_coords);
         std::uint32_t const convert_grid = (num_elements + convert_block - 1) / convert_block;
-        convert_coords_fp32_to_fp16_kernel<<<convert_grid, convert_block, 0, stream_compute>>>(
+        convert_coords_fp32_to_fp16_kernel<<<convert_grid, convert_block, 0, stream>>>(
             handle.device_coords_fp32.data(), handle.device_coords_fp16.data(), num_elements);
         sink.check(cudaPeekAtLastError(), "convert_coords_fp32_to_fp16_kernel launch");
     }
-    cudaEventRecord(launch_buffers.event_compute_done, stream_compute);
 
-    // === Download phase on stream_device_to_host, chained on compute ===
-    cudaStreamWaitEvent(stream_device_to_host, launch_buffers.event_compute_done, 0);
-    cudaEventRecord(handle.event_download_start, stream_device_to_host);
+    cudaEventRecord(handle.event_download_start, stream);
     if (total_coords > 0)
         sink.check(cudaMemcpyAsync(handle.host_coords_sorted.data(), handle.device_coords_fp16.data(),
-                                   total_coords * sizeof(__half), cudaMemcpyDeviceToHost, stream_device_to_host),
+                                   total_coords * sizeof(__half), cudaMemcpyDeviceToHost, stream),
                    "D2H coords_fp16");
     if (total_conformer_slots > 0) {
         sink.check(cudaMemcpyAsync(handle.host_energies_sorted.data(), handle.device_energies_out.data(),
-                                   total_conformer_slots * sizeof(float), cudaMemcpyDeviceToHost,
-                                   stream_device_to_host),
+                                   total_conformer_slots * sizeof(float), cudaMemcpyDeviceToHost, stream),
                    "D2H energies");
         sink.check(cudaMemcpyAsync(handle.host_status_sorted.data(), handle.device_status_out.data(),
-                                   total_conformer_slots * sizeof(std::uint8_t), cudaMemcpyDeviceToHost,
-                                   stream_device_to_host),
+                                   total_conformer_slots * sizeof(std::uint8_t), cudaMemcpyDeviceToHost, stream),
                    "D2H status");
     }
-    cudaEventRecord(handle.event_end, stream_device_to_host);
+    cudaEventRecord(handle.event_end, stream);
     return handle;
 }
 
@@ -674,10 +642,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream_hos
  */
 void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
     handle.sink.check(cudaSetDevice(handle.device_id), "cudaSetDevice(finalize_gpu_pipeline)");
-    // `event_end` captures the transitive chain of upload → compute → download
-    // via `cudaStreamWaitEvent`, so synchronising on it drains all three
-    // streams without needing a per-stream cudaStreamSynchronize.
-    handle.sink.check(cudaEventSynchronize(handle.event_end), "cudaEventSynchronize(finalize)");
+    handle.sink.check(cudaStreamSynchronize(handle.stream), "cudaStreamSynchronize(finalize)");
 
     if (handle.timings_out != nullptr && handle.event_end != nullptr) {
         cudaEventElapsedTime(&handle.timings_out->upload_ms, handle.event_upload_start, handle.event_metric_start);
@@ -913,10 +878,10 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         for (std::uint32_t d = 0; d < num_devices; ++d) {
             if (per_device_batches[d].num_molecules == 0) continue;
             handles_out[d] = launch_gpu_pipeline(
-                device_ids[d], streams_host_to_device[d], streams_compute[d], streams_device_to_host[d],
-                solvers[d], metric_scratch[d], *launch_scratch[d], per_device_batches[d], launch_configs[d],
-                num_conformers, config.max_stereo_attempts, effective_max_atoms, config.random_seed, wave_base,
-                sort_perm_view, coordinates_out, energies_out, status_out, sink);
+                device_ids[d], streams[d], solvers[d], metric_scratch[d], *launch_scratch[d],
+                per_device_batches[d], launch_configs[d], num_conformers, config.max_stereo_attempts,
+                effective_max_atoms, config.random_seed, wave_base, sort_perm_view, coordinates_out,
+                energies_out, status_out, sink);
             handles_out[d].timings_out = &timings_out[d];
         }
     };

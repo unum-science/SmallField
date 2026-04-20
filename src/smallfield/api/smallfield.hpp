@@ -150,14 +150,9 @@ using smallfield::preprocess::scaffold_cache_t;
 
 struct context_t {
     std::vector<int> device_ids;
-    /** @brief Per-device CUDA streams, one each for host-to-device copies,
-     *  kernel compute, and device-to-host copies.  Blackwell has two copy
-     *  engines that can overlap with the compute engine, so splitting the
-     *  pipeline across three streams (chained with events) lets wave `N+1`'s
-     *  upload overlap wave `N`'s compute and wave `N-1`'s download. */
-    std::vector<cudaStream_t> streams_host_to_device;
-    std::vector<cudaStream_t> streams_compute;
-    std::vector<cudaStream_t> streams_device_to_host;
+    /** @brief One CUDA stream per device.  All per-wave work on a given
+     *  device (H2D, kernels, D2H) runs stream-ordered on its own stream. */
+    std::vector<cudaStream_t> streams;
     std::vector<cusolverDnHandle_t> solvers;
     std::vector<metric_scratch_t> metric_scratch;                  ///< one per device
     std::vector<std::unique_ptr<launch_scratch_t>> launch_scratch; ///< one per device
