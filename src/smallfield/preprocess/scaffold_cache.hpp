@@ -94,7 +94,7 @@ struct scaffold_cache_stats_t {
 class scaffold_cache_t {
   public:
     /** Number of shards.  Must be a power of two. */
-    static constexpr std::size_t kNumShards = 64;
+    static constexpr std::size_t scaffold_cache_shard_count_k = 64;
 
     scaffold_cache_t() = default;
 
@@ -105,7 +105,7 @@ class scaffold_cache_t {
     /** Return the entry for @p scaffold_hash if present, otherwise @c nullptr.
      *  Takes a shared lock on the hash's shard. */
     scaffold_cache_entry_t const *lookup(std::uint64_t scaffold_hash) const noexcept {
-        shard_t const &s = shards_[scaffold_hash & (kNumShards - 1)];
+        shard_t const &s = shards_[scaffold_hash & (scaffold_cache_shard_count_k - 1)];
         std::shared_lock<std::shared_mutex> lk(s.lock);
         auto it = s.entries.find(scaffold_hash);
         if (it == s.entries.end()) {
@@ -119,7 +119,7 @@ class scaffold_cache_t {
     /** Insert @p entry under @p scaffold_hash if absent.  Caller-provided
      *  entry is moved in.  Takes an exclusive lock on the hash's shard. */
     void insert(std::uint64_t scaffold_hash, scaffold_cache_entry_t entry) {
-        shard_t &s = shards_[scaffold_hash & (kNumShards - 1)];
+        shard_t &s = shards_[scaffold_hash & (scaffold_cache_shard_count_k - 1)];
         std::unique_lock<std::shared_mutex> lk(s.lock);
         s.entries.emplace(scaffold_hash, std::move(entry));
     }
@@ -156,7 +156,7 @@ class scaffold_cache_t {
     scaffold_cache_config_t config_ {};
     mutable std::atomic<std::uint64_t> hits_ {0};
     mutable std::atomic<std::uint64_t> misses_ {0};
-    shard_t shards_[kNumShards];
+    shard_t shards_[scaffold_cache_shard_count_k];
 };
 
 /**

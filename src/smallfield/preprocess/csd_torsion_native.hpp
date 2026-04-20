@@ -428,8 +428,8 @@ inline bool parse_atom_term(std::string_view token, atom_disjunct_t &disjunct) {
                 magnitude = static_cast<std::int8_t>(num);
             }
             std::int8_t const chg = static_cast<std::int8_t>(sign * magnitude);
-            std::int8_t constexpr kNoCharge = std::numeric_limits<std::int8_t>::min();
-            if (disjunct.formal_charge != kNoCharge && disjunct.formal_charge != chg) return false;
+            std::int8_t constexpr no_charge_k = std::numeric_limits<std::int8_t>::min();
+            if (disjunct.formal_charge != no_charge_k && disjunct.formal_charge != chg) return false;
             disjunct.formal_charge = chg;
             continue;
         }
@@ -1227,8 +1227,8 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
         if (rc != d.ring_count) return false;
     }
     if (d.hybridization != 0 && desc.hybridization[atom_idx] != d.hybridization) return false;
-    std::int8_t constexpr kNoCharge = std::numeric_limits<std::int8_t>::min();
-    if (d.formal_charge != kNoCharge && desc.formal_charge[atom_idx] != d.formal_charge) return false;
+    std::int8_t constexpr no_charge_k = std::numeric_limits<std::int8_t>::min();
+    if (d.formal_charge != no_charge_k && desc.formal_charge[atom_idx] != d.formal_charge) return false;
     std::uint8_t const flags = desc.atom_flags[atom_idx];
     if ((flags & d.require_flags) != d.require_flags) return false;
     if ((flags & d.forbid_flags) != 0) return false;

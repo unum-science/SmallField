@@ -157,6 +157,10 @@ struct logger_t {
         fmt::print(stream, "{} ", timestamp_prefix());
         fmt::print(stream, style, fmt_string, std::forward<args_types_>(args)...);
         std::fputc('\n', stream);
+        // `fflush` here so redirected-to-file log tails are live and long-running
+        // jobs expose progress mid-shard.  Cost is one syscall per line; with
+        // hundreds of lines over a multi-hour run this is negligible.
+        std::fflush(stream);
     }
 };
 

@@ -57,7 +57,7 @@ using smallfield::types::molecule_descriptor_t;
  *      @c RDKit::Chirality::assignAtomCIPRanks).
  */
 inline void compute_cip_ranks(molecule_descriptor_t const &desc, std::uint32_t *ranks) {
-    constexpr std::uint32_t kMaxIters = 16;
+    constexpr std::uint32_t max_iterations_k = 16;
     std::uint32_t const N = desc.num_atoms;
     if (N == 0) return;
 
@@ -105,7 +105,7 @@ inline void compute_cip_ranks(molecule_descriptor_t const &desc, std::uint32_t *
     std::array<std::array<std::uint32_t, 8>, max_atoms_k> neighbour_buf {}; // ≤ 6 effective entries
 
     std::uint32_t prev_n_classes = next_class;
-    for (std::uint32_t iter = 0; iter < kMaxIters; ++iter) {
+    for (std::uint32_t iter = 0; iter < max_iterations_k; ++iter) {
         // Build refined keys. std::pair<uint64_t,uint64_t> sortable via std::less.
         std::array<std::pair<std::uint64_t, std::uint64_t>, max_atoms_k> refined_key {};
         for (std::uint32_t a = 0; a < N; ++a) {

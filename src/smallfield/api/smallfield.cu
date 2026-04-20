@@ -48,8 +48,8 @@ static inline std::size_t align_up(std::size_t value, std::size_t alignment) {
 /**
  *  @brief Rough upper bound on the per-molecule pinned-host footprint in a wave.
  *
- *  Used to pre-size the persistent 2-slot @c batch_ring on @c context_t at call
- *  entry so the pinned host buffer never reallocates while a wave's H2D is in
+ *  Used by @ref generate_conformers to pre-size the per-call 2-slot batch-prep
+ *  ring so the pinned host buffer never reallocates while a wave's H2D is in
  *  flight.  Overestimates: at @c max_atoms=128 ~91 KB/molecule covers the
  *  bounds matrix, bond-distance byte matrix, MMFF per-atom vdw/charge, and the
  *  variable-length interaction lists plus slack.
@@ -143,6 +143,16 @@ context_t::context_t(std::span<int const> devices) {
     constexpr std::uint32_t kPrewarmAtoms = 128;
     constexpr std::size_t kPrewarmDevicePoolBytes = 256ULL << 20;  // 256 MB
     constexpr std::size_t kPrewarmHostStagingBytes = 256ULL << 20; // 256 MB
+    // Set the max-dynamic-shared-memory attribute on `embed_4d_power_iter_kernel`
+    // ONCE per device at context construction time.  At bin_n=128 the kernel
+    // needs ~67 KB shared memory, above the 48 KB hardware default.  Calling
+    // this per-wave per-device (the old path) interleaved a host-API call with
+    // in-flight async kernel launches on sibling devices, which correlated
+    // with a Blackwell SM 12.0 multi-GPU illegal-memory-access.
+    constexpr std::uint32_t max_bin_n = 128;
+    constexpr std::size_t max_shared_bytes =
+        static_cast<std::size_t>(max_bin_n * max_bin_n + max_bin_n + 1 + 4 * max_bin_n + max_bin_n + 4 + 1) *
+        sizeof(float);
     for (std::size_t i = 0; i < device_ids.size(); ++i) {
         cudaSetDevice(device_ids[i]);
         // Probes cusolver + allocates metric_scratch.pool. Sets max_group_size,
@@ -153,6 +163,11 @@ context_t::context_t(std::span<int const> devices) {
         // launch's cudaMalloc / cudaHostAlloc doesn't stall the hot path.
         launch_scratch[i]->device_pool.ensure_capacity(kPrewarmDevicePoolBytes);
         launch_scratch[i]->host_staging.ensure_capacity(kPrewarmHostStagingBytes);
+        // Set the shared-memory limit on this device's copy of
+        // `embed_4d_power_iter_kernel` — stays in effect for the context's
+        // lifetime so nothing in the hot path mutates it.
+        cudaFuncSetAttribute(smallfield::cuda::embed_4d_power_iter_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(max_shared_bytes));
     }
 }
 
@@ -530,10 +545,13 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
         std::uint32_t const bin_max_atoms = atom_limited_bin_caps[bin];
 
         // Kernel 1 — DG + stereo retry + fourth-dim crush + ETK torsion refinement.
+        // The per-bin dynamic shared-memory requirement is always ≤ 22.5 KB at
+        // bin_max_atoms=128 (16 KB int8 bounds + 6 KB FIRE scratch), well under
+        // the 48 KB default.  No `cudaFuncSetAttribute` call needed; skipping it
+        // eliminates a per-bin host-API round-trip that, when called mid-stream
+        // during the multi-wave async pipeline, correlated with an illegal
+        // memory access on Blackwell SM 12.0.
         std::uint32_t const shared_bytes_dg = compute_pipeline_shared_memory_bytes(bin_max_atoms, 0);
-        sink.check(cudaFuncSetAttribute(etkdg_pipeline_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        shared_bytes_dg),
-                   "cudaFuncSetAttribute(etkdg_pipeline_warp_kernel)");
 
         int blocks_per_sm_dg = 0;
         sink.check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_dg, etkdg_pipeline_warp_kernel, 32,
@@ -554,10 +572,11 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
 
         // Kernel 2 — MMFF94 polish in place on the per-conformer coordinates
         // produced by Kernel 1.  Skips slots whose status is non-zero.
+        // Shared-memory footprint is 3 × 3 × bin_max_atoms × sizeof(float) ≤
+        // 4.6 KB at bin_max_atoms=128 — under the 48 KB default, so no
+        // `cudaFuncSetAttribute` call is needed (same rationale as the etkdg
+        // kernel above).
         std::uint32_t const shared_bytes_mmff = compute_mmff_polish_shared_memory_bytes(bin_max_atoms);
-        sink.check(cudaFuncSetAttribute(mmff_polish_warp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        shared_bytes_mmff),
-                   "cudaFuncSetAttribute(mmff_polish_warp_kernel)");
 
         int blocks_per_sm_mmff = 0;
         sink.check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm_mmff, mmff_polish_warp_kernel, 32,
@@ -657,21 +676,6 @@ void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
                         coord_stride * sizeof(__half));
         }
     }
-}
-
-/** Backward-compatible synchronous wrapper that takes the context's solver + scratch. */
-void run_gpu_pipeline(int device_id, cudaStream_t stream, cusolverDnHandle_t solver_handle, metric_scratch_t &scratch,
-                      launch_scratch_t &launch_buffers, etkdg_molecule_batch_t const &batch,
-                      std::span<std::uint32_t const> local_indices, std::uint32_t num_conformers,
-                      std::uint32_t max_stereo_attempts, std::uint32_t max_atoms_per_molecule, std::uint64_t seed,
-                      std::span<__half> host_coords_out, std::span<float> host_energies_out,
-                      std::span<conformer_status_t> host_status_out) {
-    cuda_error_sink_t const sink {};
-    auto handle = launch_gpu_pipeline(device_id, stream, solver_handle, scratch, launch_buffers, batch, local_indices,
-                                      num_conformers, max_stereo_attempts, max_atoms_per_molecule, seed,
-                                      /*wave_base=*/0, /*sort_perm=*/ {}, host_coords_out, host_energies_out,
-                                      host_status_out, sink);
-    finalize_gpu_pipeline(std::move(handle));
 }
 
 /**
@@ -843,6 +847,45 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     // sized for max_atoms_per_molecule but the kernel wrote with a smaller stride.
     std::uint32_t const effective_max_atoms = max_atoms_per_molecule;
 
+    // Pre-grow every persistent per-device pool (launch_scratch.device_pool,
+    // launch_scratch.host_staging, metric_scratch.pool) to the worst-case wave
+    // footprint for this call BEFORE any wave launches.  Rationale: the
+    // grow-only `byte_buffer_t::ensure_capacity` frees the old allocation and
+    // cudaMallocs a new one on any size bump; in the pipelined multi-wave
+    // path, a later wave's prep can compute a slightly larger
+    // `batch.layout.bytes_total` (driven by the molecules in that wave) and
+    // trigger a mid-pipeline `cudaFree(old_pool) + cudaMalloc(new_pool)` on
+    // the SAME launch_scratch that the prior wave's stream still has async
+    // reads against.  Pre-sizing once per call collapses every later
+    // `ensure_capacity` to a no-op and closes this stream-use-after-free.
+    {
+        // Worst-case per-GPU slice = ceil(wave_size_target / num_devices) with slack
+        // so an uneven round-robin leaves no shortfall.
+        std::uint32_t const per_gpu_slack = (num_devices > 0) ? (num_devices - 1u) : 0u;
+        std::uint32_t const worst_case_local_count =
+            (wave_size_target + per_gpu_slack) / std::max<std::uint32_t>(num_devices, 1u) + 1u;
+        std::size_t const bytes_per_mol = estimate_per_molecule_batch_bytes(effective_max_atoms);
+        std::size_t const worst_case_batch_bytes = bytes_per_mol * worst_case_local_count;
+        pipeline_pool_layout_t const worst_case_layout = compute_pipeline_pool_layout_(
+            worst_case_batch_bytes, worst_case_local_count, num_conformers, effective_max_atoms);
+        // Round to the next metric-prepass bin boundary (must match launch_wave's bin_ceiling).
+        auto bin_ceiling = [](std::uint32_t n) -> std::uint32_t {
+            static constexpr std::uint32_t bin_ns[] = {16, 32, 48, 64, 80, 96, 112, 128};
+            for (auto b : bin_ns)
+                if (n <= b) return b;
+            return bin_ns[7];
+        };
+        std::uint32_t const metric_bin_atoms = bin_ceiling(effective_max_atoms);
+        for (std::size_t d = 0; d < device_ids.size(); ++d) {
+            sink.check(cudaSetDevice(device_ids[d]), "cudaSetDevice(pre-grow)");
+            (void)launch_scratch[d]->device_pool.ensure_capacity(worst_case_layout.device_pool_bytes);
+            (void)launch_scratch[d]->host_staging.ensure_capacity(worst_case_layout.host_pool_bytes);
+            // Pre-grow the cuSOLVER metric-prepass pool similarly — reuses the
+            // grow-only semantics, so subsequent wave-level calls are no-ops.
+            ensure_metric_scratch(*this, d, worst_case_local_count, metric_bin_atoms);
+        }
+    }
+
     std::vector<wave_record_t> wave_records;
     auto const t_call_start = std::chrono::high_resolution_clock::now();
     auto host_ms = [&](std::chrono::high_resolution_clock::time_point t) {
@@ -982,24 +1025,11 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         // a stable pointer into `batches[slot]` for the lifetime of one wave.
         // At most one wave is in flight (finalize_wave(i-1) runs before
         // launch_wave(i) overwrites the opposite slot), so two slots suffice.
-        //
-        // Use the persistent `context_t::batch_ring` so the pinned host allocations
-        // live across `generate_conformers` calls — no cudaHostAlloc/cudaFreeHost
-        // churn between batches.  ensure_capacity is grow-only inside each slot, so
-        // the peak size observed over a process's lifetime is retained.  We do NOT
-        // upfront-grow to the worst-case (estimate_per_molecule_batch_bytes × wave)
-        // because that hits 40+ GB of pinned memory per slot on drug-like workloads,
-        // and cudaHostAlloc of that size serializes at ~4 MB/s page-locking.  The
-        // 2-slot ordering (prep N → finalize N-1 → launch N) already ensures that
-        // any grow on slot (i % 2) happens after wave (i-2)'s stream has drained.
-        // Local 2-slot ring of batch prep buffers (NOT context_t::batch_ring).
-        // Persistent cross-call batch buffers were found to correlate with a
-        // multi-wave illegal-memory-access on the MMFF polish kernel that only
-        // triggered at ≥3 waves per generate_conformers call.  The exact cause
-        // inside CUDA's pinned-memory bookkeeping was not isolated; using local
-        // per-call pinned allocations (matching the v8 working configuration)
-        // eliminates the fault at the cost of one cudaHostAlloc/cudaFreeHost
-        // pair per generate_conformers call.
+        // Persistent cross-call batch buffers previously correlated with a
+        // multi-wave illegal-memory-access on the MMFF polish kernel; using
+        // local per-call pinned allocations (matching the v8 working
+        // configuration) eliminates that fault at the cost of one
+        // cudaHostAlloc/cudaFreeHost pair per generate_conformers call.
         std::array<batch_pool_t, 2> batches {};
         std::array<std::vector<gpu_pipeline_handle_t>, 2> in_flight {};
         std::array<std::vector<gpu_phase_ms_t>, 2> timing_slots {};

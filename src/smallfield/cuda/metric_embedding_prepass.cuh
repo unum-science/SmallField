@@ -500,6 +500,21 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
     constexpr std::uint32_t block_size_k = 128;
     bool success = true;
 
+    // `cudaFuncSetAttribute(embed_4d_power_iter_kernel, MaxDynSM)` is also set
+    // once per device in `context_t::context_t` at construction time, but we
+    // re-assert it here to be robust to any CUDA runtime path that drops the
+    // per-kernel attribute (e.g., JIT recompile on first launch). At bin_n=128
+    // the kernel needs ~67 KB shared memory, above the 48 KB hardware default.
+    constexpr std::uint32_t max_bin_n = 128;
+    constexpr std::size_t max_shared_bytes =
+        static_cast<std::size_t>(max_bin_n * max_bin_n + max_bin_n + 1 + 4 * max_bin_n + max_bin_n + 4 + 1) *
+        sizeof(float);
+    if (!sink.check(
+            cudaFuncSetAttribute(embed_4d_power_iter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(max_shared_bytes)),
+            "cudaFuncSetAttribute(embed_4d_power_iter_kernel, once-per-call)"))
+        return false;
+
     for (std::uint32_t b = 0; b < num_bins_k && success; ++b) {
         auto const &group = bin_groups[b];
         if (group.empty()) continue;
@@ -524,10 +539,6 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         success &= sink.check(cudaMemcpyAsync(device_group_indices, group.data(), group_size * sizeof(std::uint32_t),
                                               cudaMemcpyHostToDevice, stream),
                               "cudaMemcpyAsync(bin group indices)");
-        success &= sink.check(
-            cudaFuncSetAttribute(embed_4d_power_iter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(shared_bytes)),
-            "cudaFuncSetAttribute(embed_4d_power_iter_kernel)");
         if (!success) continue;
 
         // One kernel launch replaces the smooth-and-build-gram + cusolverDnXsyevBatched +

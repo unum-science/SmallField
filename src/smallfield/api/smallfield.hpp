@@ -121,16 +121,6 @@ struct context_t {
     std::vector<metric_scratch_t> metric_scratch;                  ///< one per device
     std::vector<std::unique_ptr<launch_scratch_t>> launch_scratch; ///< one per device
     /**
-     *  @brief Persistent 2-slot ring of batch prep buffers.
-     *
-     *  Moving the wave-prep buffers out of @c generate_conformers and onto the
-     *  context fixes a use-after-free: a later wave's @c prepare_molecule_batch_into
-     *  can trigger @c host.ensure_capacity, reallocating the pinned pointer while an
-     *  earlier wave still has H2D commands queued against the old address.  With the
-     *  ring persistent and pre-sized at call entry, no reallocation happens mid-call.
-     */
-    std::array<batch_pool_t, 2> batch_ring {};
-    /**
      *  @brief Optional scaffold cache, disabled by default.  When enabled,
      *  SubstructMatch calls for the CSD torsion patterns that remain RDKit
      *  fallback (patterns not yet handled natively) are amortised across
