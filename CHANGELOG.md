@@ -6,6 +6,50 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## Multi-GPU illegal-memory-access fix — `809dbcf`
+
+Dropped a per-wave `cudaFuncSetAttribute(embed_4d_power_iter_kernel, MaxDynSM, 67 KB)` from `build_metric_initial_coordinates_on_gpu` that was reached concurrently from every OMP per-device worker thread inside `launch_wave`.
+The call mutates driver-global per-kernel attribute state on a shared kernel symbol; at ≥ 2 GPUs the 8 worker threads raced on that state, producing a window during which `embed_4d_power_iter_kernel` launched with the 48 KB hardware-default dynamic shared instead of the 67 KB the kernel needs at bin 128.
+The out-of-bounds shared-memory access surfaced on a later kernel launch as `an illegal memory access was encountered`.
+The attribute is already set once per device in `context_t::context_t`; the per-wave re-assert was defensive overkill left over from `89b90fa`, where the ctor hoist landed but the per-wave copy was not removed.
+
+Symptom matching:
+
+- Fired only at ≥ 2 GPUs — a single OMP thread cannot race with itself.
+- Timing-random 30–120 s into a run — a small torn-state window that depends on thread interleaving, not on molecule shape.
+- `CUDA_LAUNCH_BLOCKING=1` masked it — blocking launches serialize the attribute update far enough that no kernel launches within the torn window.
+- `compute-sanitizer memcheck` never reproduced — the instrumentation overhead widens each `setAttribute`'s critical section enough to close the race.
+
+Verification — 10 M USearch K=3, 8 GPUs, post-fix:
+
+| Variant                             |    Wall |  mol/s | conformers/s | Crashes |
+| :---------------------------------- | ------: | -----: | -----------: | ------: |
+| Pre-fix non-blocking                |       — |      — |            — | crashed @ +9:49 s |
+| Pre-fix `CUDA_LAUNCH_BLOCKING=1`    | 1 063 s | 9 404 |      28 211 | 0 |
+| Post-fix non-blocking               |   662 s | 15 106 |      45 319 | 0 |
+
+## Multi-GPU pipeline refactor — `471bb06` + `89b90fa`
+
+Four architectural changes to the per-wave GPU dispatch path; together they land the host-scheduling items from the roadmap without altering any kernel code.
+
+- __Per-device pinned pools.__
+  `prepare_per_device_batches_into` produces one pinned batch pool per device (atom-count-descending stripe partition, each device's mols ending in ascending-atom-count order for the kernel bin dispatch).
+  Each GPU's `cudaMemcpyAsync H2D` reads from a buffer only that GPU touches.
+  Replaces the shared wave-wide pinned source whose 8-way concurrent DMA was the prime suspect behind the illegal-memory-access crash until the root cause was pinned down as the `cudaFuncSetAttribute` race above.
+- __3-stream chain per device.__
+  H2D / compute / D2H run on three streams chained by `cudaEvent` hand-offs so Blackwell's two copy engines can overlap H2D of wave N+1 with compute of wave N and D2H of wave N-1.
+- __Ctor pre-allocation.__
+  `context_t::context_t` pre-grows every per-device pool (`launch_scratch.device_pool`, `launch_scratch.host_staging`, `metric_scratch.pool`, `batch_slots_per_device`) to worst case using `cudaMemGetInfo` plus the cusolver workspace cap.
+  Hot-path `cudaMalloc` / `cudaHostAlloc` never fire.
+- __Launch-config cache.__
+  `cudaOccupancyMaxActiveBlocksPerMultiprocessor` probes run once per device at ctor (128 probes, ≈ 13 ms) and cache into a `device_launch_config_t` table.
+  Per-bin dispatch in `launch_gpu_pipeline` reads the table — no host API call on the hot path.
+
+Drive-by cleanup: dropped the dead `context_t::batch_ring` field, the unreferenced `run_gpu_pipeline` backward-compat wrapper, and legacy PascalCase constants `kNoCharge` / `kMaxIters` / `kNumShards` (now `no_charge_k` / `max_iterations_k` / `scaffold_cache_shard_count_k`).
+
+Scope: 2 files in `src/smallfield/api/`, ≈ 100 lines of pipeline wiring; preprocess adds the new per-device distribution helper; three renames in the preprocess headers.
+No kernel code changed.
+
 ## CSD Torsion Round 2 — `bc4e1af`
 
 Native pattern coverage 391/470 → __408/470__ (83.2 % → 86.8 %); throughput 23 371 → 23 735 mol/s (+1.55 % over round 1, +16.9 % cumulative).

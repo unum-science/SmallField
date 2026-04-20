@@ -68,16 +68,17 @@ On the GPU side, occupancy at production bin sizes (~ 23–32 % on the medium bi
 Ranked by measured-gain × risk-adjusted probability of delivery.
 Items that have already shipped are recorded in `CHANGELOG.md`.
 
-### 1. Inner-Pipeline Ring-Buffer Depth 3 + Async Finalize
+### 1. Inner-pipeline ring-buffer depth 3
 
 The 2-slot `batch_pool_t` ring in `generate_conformers` idles the GPU 20–30 ms per wave transition while the CPU preprocess of wave N+1 is still running and wave N+1's `launch_wave` has not fired.
-`finalize_gpu_pipeline` at `src/smallfield/api/smallfield.cu:623` calls `cudaStreamSynchronize` and blocks for 5–10 ms before next wave's `launch_wave` can start.
+The D2H-on-separate-stream half of this item already landed as part of the `471bb06` 3-stream chain (H2D / compute / D2H each on their own stream per device, chained by `cudaEvent` hand-offs), so wave N+1's launch now overlaps with wave N's finalize at the CUDA level.
+What remains is raising ring depth from 2 to 3 so the CPU preprocess of wave N+2 can begin while wave N+1 is still draining its D2H.
 
-Promote the 2-slot ring to 3 slots; issue the D2H + reorder of wave N on a separate stream so wave N+1's launch can overlap with wave N's finalize; pre-allocate the third slot's pinned buffer at `context_t` ctor so no `cudaHostAlloc` fires mid-run.
-Expected gain 4–6 % from the depth-3 ring plus 1–2 % from async finalize.
-Independent of kernel-level work; both are host-scheduling fixes.
-Effort medium (the ring state-machine needs careful invariants so slot `(i % 3)` is not overwritten while wave `(i - 3)` is still in flight).
-Risk medium — the 2-slot ring has been stable since the multi-wave illegal-memory-access debugging completed; changing depth re-opens that invariant.
+Pre-allocate the third slot's pinned buffer at `context_t` ctor alongside the existing two (the ctor pre-alloc path is already in place from `471bb06`).
+Expected gain 4–6 % from the depth-3 ring.
+Independent of kernel-level work; this is purely a host-scheduling fix.
+Effort medium — the ring state machine needs careful invariants so slot `(i % 3)` is not overwritten while wave `(i − 3)` is still in flight; the correct fence is the existing `finalize_gpu_pipeline`'s `cudaEventSynchronize` on the per-wave end event.
+Risk low — the multi-GPU illegal-memory-access class was fully closed by `809dbcf` (racy per-wave `cudaFuncSetAttribute` removal); the 2-slot ring itself is not implicated.
 
 ### 2. OpenMP Load-Imbalance Fix at `preprocess-step` Barrier
 
