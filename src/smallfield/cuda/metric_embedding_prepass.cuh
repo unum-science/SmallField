@@ -500,20 +500,13 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
     constexpr std::uint32_t block_size_k = 128;
     bool success = true;
 
-    // `cudaFuncSetAttribute(embed_4d_power_iter_kernel, MaxDynSM)` is also set
-    // once per device in `context_t::context_t` at construction time, but we
-    // re-assert it here to be robust to any CUDA runtime path that drops the
-    // per-kernel attribute (e.g., JIT recompile on first launch). At bin_n=128
-    // the kernel needs ~67 KB shared memory, above the 48 KB hardware default.
-    constexpr std::uint32_t max_bin_n = 128;
-    constexpr std::size_t max_shared_bytes =
-        static_cast<std::size_t>(max_bin_n * max_bin_n + max_bin_n + 1 + 4 * max_bin_n + max_bin_n + 4 + 1) *
-        sizeof(float);
-    if (!sink.check(
-            cudaFuncSetAttribute(embed_4d_power_iter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(max_shared_bytes)),
-            "cudaFuncSetAttribute(embed_4d_power_iter_kernel, once-per-call)"))
-        return false;
+    // The `cudaFuncAttributeMaxDynamicSharedMemorySize` attribute for
+    // `embed_4d_power_iter_kernel` is set once per device in
+    // `context_t::context_t` at construction. Re-asserting it here used to race
+    // when this function was reached concurrently from OMP per-device worker
+    // threads — each call mutates driver-global per-kernel attribute state on
+    // the same symbol, producing torn state that surfaced as an
+    // `illegal memory access` on a later kernel launch.
 
     for (std::uint32_t b = 0; b < num_bins_k && success; ++b) {
         auto const &group = bin_groups[b];
