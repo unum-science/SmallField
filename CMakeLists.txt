@@ -16,7 +16,9 @@ set(SMALLFIELD_DEFAULT_CUDA_ARCH "120" CACHE STRING "Fallback CUDA SM architectu
 if(NOT MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall>
                         $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
-                        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>)
+                        $<$<COMPILE_LANGUAGE:CXX>:-Wconversion>
+                        $<$<COMPILE_LANGUAGE:CXX>:-Wsign-conversion>
+                        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wconversion,-Wsign-conversion>)
 endif()
 
 # Default build type: Release with host-native vectorization and CUDA fast-math.
