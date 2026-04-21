@@ -430,7 +430,7 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
         }
         if (will_populate) fresh_entry.has_r_group_matches[pattern_index] = any_r_group ? 1 : 0;
     }
-    if (will_populate) cache->insert(scaffold_hash, std::move(fresh_entry));
+    if (will_populate) cache->insert_if_missing(scaffold_hash, std::move(fresh_entry));
 
     // Matches RDKit getExperimentalTorsions' useBasicKnowledge=true behavior.
     if (ring_info != nullptr && ring_info->isInitialized()) {

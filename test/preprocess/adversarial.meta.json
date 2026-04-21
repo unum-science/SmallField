@@ -1,0 +1,5710 @@
+{
+  "total_molecules": 1059,
+  "templates": [
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C1",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C2",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C3",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C4",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C15",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C16",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C17",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C31",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C32",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C33",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C47",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C48",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C49",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C63",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C64",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C65",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C79",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C80",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C81",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C95",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C96",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C97",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C111",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C112",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C113",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C126",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C127",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "atom_count_bin_edges",
+      "name": "linear_alkane_C128",
+      "target_code_path": "kernel grid sizing / per-bin shared-memory",
+      "multiplicity": 1
+    },
+    {
+      "axis": "per_atom_interaction_density",
+      "name": "adamantane",
+      "target_code_path": "MMFF term enumeration / per-atom offset struct",
+      "multiplicity": 1
+    },
+    {
+      "axis": "per_atom_interaction_density",
+      "name": "bridged_bicyclic",
+      "target_code_path": "MMFF term enumeration / per-atom offset struct",
+      "multiplicity": 1
+    },
+    {
+      "axis": "per_atom_interaction_density",
+      "name": "pentaerythritol",
+      "target_code_path": "MMFF term enumeration / per-atom offset struct",
+      "multiplicity": 1
+    },
+    {
+      "axis": "per_atom_interaction_density",
+      "name": "hexamethylbenzene",
+      "target_code_path": "MMFF term enumeration / per-atom offset struct",
+      "multiplicity": 1
+    },
+    {
+      "axis": "per_atom_interaction_density",
+      "name": "cubane",
+      "target_code_path": "MMFF term enumeration / per-atom offset struct",
+      "multiplicity": 1
+    },
+    {
+      "axis": "per_atom_interaction_density",
+      "name": "norbornane",
+      "target_code_path": "MMFF term enumeration / per-atom offset struct",
+      "multiplicity": 1
+    },
+    {
+      "axis": "per_atom_interaction_density",
+      "name": "cyclodecane",
+      "target_code_path": "MMFF term enumeration / per-atom offset struct",
+      "multiplicity": 1
+    },
+    {
+      "axis": "per_atom_interaction_density",
+      "name": "benzo_fused_tetracene",
+      "target_code_path": "MMFF term enumeration / per-atom offset struct",
+      "multiplicity": 1
+    },
+    {
+      "axis": "per_atom_interaction_density",
+      "name": "porphine_like",
+      "target_code_path": "MMFF term enumeration / per-atom offset struct",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "dimethyl_sulfone",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "phosphine_oxide",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "hypervalent_sulfur",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "ammonium",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "carboxylate",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "boronic_ester",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "guanidinium",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "sulfonate",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "nitro",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "mmff_typing_corners",
+      "name": "thiocarbonyl",
+      "target_code_path": "MMFF typer fallback / charged-atom parameters",
+      "multiplicity": 1
+    },
+    {
+      "axis": "stereo_boundaries",
+      "name": "achiral",
+      "target_code_path": "CSD-torsion stereo replay / chirality extraction",
+      "multiplicity": 1
+    },
+    {
+      "axis": "stereo_boundaries",
+      "name": "single_chiral",
+      "target_code_path": "CSD-torsion stereo replay / chirality extraction",
+      "multiplicity": 1
+    },
+    {
+      "axis": "stereo_boundaries",
+      "name": "two_chiral",
+      "target_code_path": "CSD-torsion stereo replay / chirality extraction",
+      "multiplicity": 1
+    },
+    {
+      "axis": "stereo_boundaries",
+      "name": "ez_double_bond",
+      "target_code_path": "CSD-torsion stereo replay / chirality extraction",
+      "multiplicity": 1
+    },
+    {
+      "axis": "stereo_boundaries",
+      "name": "atropisomer",
+      "target_code_path": "CSD-torsion stereo replay / chirality extraction",
+      "multiplicity": 1
+    },
+    {
+      "axis": "stereo_boundaries",
+      "name": "quad_chiral_steroid_lite",
+      "target_code_path": "CSD-torsion stereo replay / chirality extraction",
+      "multiplicity": 1
+    },
+    {
+      "axis": "stereo_boundaries",
+      "name": "cis_trans_ring",
+      "target_code_path": "CSD-torsion stereo replay / chirality extraction",
+      "multiplicity": 1
+    },
+    {
+      "axis": "degenerate_graphs",
+      "name": "C127_alkane",
+      "target_code_path": "atom-count sort / CPU prep load balance",
+      "multiplicity": 1
+    },
+    {
+      "axis": "degenerate_graphs",
+      "name": "star_quaternary",
+      "target_code_path": "atom-count sort / CPU prep load balance",
+      "multiplicity": 1
+    },
+    {
+      "axis": "degenerate_graphs",
+      "name": "wide_star",
+      "target_code_path": "atom-count sort / CPU prep load balance",
+      "multiplicity": 1
+    },
+    {
+      "axis": "degenerate_graphs",
+      "name": "very_branched",
+      "target_code_path": "atom-count sort / CPU prep load balance",
+      "multiplicity": 1
+    },
+    {
+      "axis": "rdkit_parse_corners",
+      "name": "explicit_h_methane",
+      "target_code_path": "SMILES parse latency / kekule fallback",
+      "multiplicity": 1
+    },
+    {
+      "axis": "rdkit_parse_corners",
+      "name": "nested_ring_closure",
+      "target_code_path": "SMILES parse latency / kekule fallback",
+      "multiplicity": 1
+    },
+    {
+      "axis": "rdkit_parse_corners",
+      "name": "kekulized_aromatic",
+      "target_code_path": "SMILES parse latency / kekule fallback",
+      "multiplicity": 1
+    },
+    {
+      "axis": "rdkit_parse_corners",
+      "name": "aromatic_lowercase",
+      "target_code_path": "SMILES parse latency / kekule fallback",
+      "multiplicity": 1
+    },
+    {
+      "axis": "rdkit_parse_corners",
+      "name": "long_polypeptide_motif",
+      "target_code_path": "SMILES parse latency / kekule fallback",
+      "multiplicity": 1
+    },
+    {
+      "axis": "dg_convergence_corners",
+      "name": "isocyanide",
+      "target_code_path": "FIRE max-iter exit / heavy-rescue branch",
+      "multiplicity": 1
+    },
+    {
+      "axis": "dg_convergence_corners",
+      "name": "many_rotatable",
+      "target_code_path": "FIRE max-iter exit / heavy-rescue branch",
+      "multiplicity": 1
+    },
+    {
+      "axis": "dg_convergence_corners",
+      "name": "highly_strained_spiro",
+      "target_code_path": "FIRE max-iter exit / heavy-rescue branch",
+      "multiplicity": 1
+    },
+    {
+      "axis": "dg_convergence_corners",
+      "name": "bicyclic_near_planar",
+      "target_code_path": "FIRE max-iter exit / heavy-rescue branch",
+      "multiplicity": 1
+    },
+    {
+      "axis": "scaffold_cache_stress",
+      "name": "aniline_decorated",
+      "target_code_path": "scaffold lookup hot path + insert-if-missing",
+      "multiplicity": 1
+    }
+  ],
+  "rows": [
+    {
+      "line_number": 0,
+      "smiles": "C",
+      "template": "atom_count_bin_edges:linear_alkane_C1"
+    },
+    {
+      "line_number": 1,
+      "smiles": "CC",
+      "template": "atom_count_bin_edges:linear_alkane_C2"
+    },
+    {
+      "line_number": 2,
+      "smiles": "CCC",
+      "template": "atom_count_bin_edges:linear_alkane_C3"
+    },
+    {
+      "line_number": 3,
+      "smiles": "CCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C4"
+    },
+    {
+      "line_number": 4,
+      "smiles": "CCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C15"
+    },
+    {
+      "line_number": 5,
+      "smiles": "CCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C16"
+    },
+    {
+      "line_number": 6,
+      "smiles": "CCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C17"
+    },
+    {
+      "line_number": 7,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C31"
+    },
+    {
+      "line_number": 8,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C32"
+    },
+    {
+      "line_number": 9,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C33"
+    },
+    {
+      "line_number": 10,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C47"
+    },
+    {
+      "line_number": 11,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C48"
+    },
+    {
+      "line_number": 12,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C49"
+    },
+    {
+      "line_number": 13,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C63"
+    },
+    {
+      "line_number": 14,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C64"
+    },
+    {
+      "line_number": 15,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C65"
+    },
+    {
+      "line_number": 16,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C79"
+    },
+    {
+      "line_number": 17,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C80"
+    },
+    {
+      "line_number": 18,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C81"
+    },
+    {
+      "line_number": 19,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C95"
+    },
+    {
+      "line_number": 20,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C96"
+    },
+    {
+      "line_number": 21,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C97"
+    },
+    {
+      "line_number": 22,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C111"
+    },
+    {
+      "line_number": 23,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C112"
+    },
+    {
+      "line_number": 24,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C113"
+    },
+    {
+      "line_number": 25,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C126"
+    },
+    {
+      "line_number": 26,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C127"
+    },
+    {
+      "line_number": 27,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "atom_count_bin_edges:linear_alkane_C128"
+    },
+    {
+      "line_number": 28,
+      "smiles": "C1C2CC3CC1CC(C2)C3",
+      "template": "per_atom_interaction_density:adamantane"
+    },
+    {
+      "line_number": 29,
+      "smiles": "C1CC2CCC1C2",
+      "template": "per_atom_interaction_density:bridged_bicyclic"
+    },
+    {
+      "line_number": 30,
+      "smiles": "OCC(CO)(CO)CO",
+      "template": "per_atom_interaction_density:pentaerythritol"
+    },
+    {
+      "line_number": 31,
+      "smiles": "Cc1c(C)c(C)c(C)c(C)c1C",
+      "template": "per_atom_interaction_density:hexamethylbenzene"
+    },
+    {
+      "line_number": 32,
+      "smiles": "C12C3C4C1C1C2C3C41",
+      "template": "per_atom_interaction_density:cubane"
+    },
+    {
+      "line_number": 33,
+      "smiles": "C1CCCCCCCCC1",
+      "template": "per_atom_interaction_density:cyclodecane"
+    },
+    {
+      "line_number": 34,
+      "smiles": "c1ccc2cc3cc4ccccc4cc3cc2c1",
+      "template": "per_atom_interaction_density:benzo_fused_tetracene"
+    },
+    {
+      "line_number": 35,
+      "smiles": "c1cc2cc3ccc(cc4ccc(cc5ccc(cc1[nH]2)[nH]5)n4)[nH]3",
+      "template": "per_atom_interaction_density:porphine_like"
+    },
+    {
+      "line_number": 36,
+      "smiles": "CS(C)(=O)=O",
+      "template": "mmff_typing_corners:dimethyl_sulfone"
+    },
+    {
+      "line_number": 37,
+      "smiles": "CP(C)(C)=O",
+      "template": "mmff_typing_corners:phosphine_oxide"
+    },
+    {
+      "line_number": 38,
+      "smiles": "O=S(=O)(O)O",
+      "template": "mmff_typing_corners:hypervalent_sulfur"
+    },
+    {
+      "line_number": 39,
+      "smiles": "C[N+](C)(C)C",
+      "template": "mmff_typing_corners:ammonium"
+    },
+    {
+      "line_number": 40,
+      "smiles": "CC(=O)[O-]",
+      "template": "mmff_typing_corners:carboxylate"
+    },
+    {
+      "line_number": 41,
+      "smiles": "COB(C)OC",
+      "template": "mmff_typing_corners:boronic_ester"
+    },
+    {
+      "line_number": 42,
+      "smiles": "N=C(N)N",
+      "template": "mmff_typing_corners:guanidinium"
+    },
+    {
+      "line_number": 43,
+      "smiles": "CS(=O)(=O)[O-]",
+      "template": "mmff_typing_corners:sulfonate"
+    },
+    {
+      "line_number": 44,
+      "smiles": "C[N+](=O)[O-]",
+      "template": "mmff_typing_corners:nitro"
+    },
+    {
+      "line_number": 45,
+      "smiles": "CC(C)=S",
+      "template": "mmff_typing_corners:thiocarbonyl"
+    },
+    {
+      "line_number": 46,
+      "smiles": "CC(C)O",
+      "template": "stereo_boundaries:single_chiral"
+    },
+    {
+      "line_number": 47,
+      "smiles": "C[C@H](O)[C@@H](C)O",
+      "template": "stereo_boundaries:two_chiral"
+    },
+    {
+      "line_number": 48,
+      "smiles": "C/C=C/C",
+      "template": "stereo_boundaries:ez_double_bond"
+    },
+    {
+      "line_number": 49,
+      "smiles": "Cc1ccc(-c2ccccc2Cl)cc1",
+      "template": "stereo_boundaries:atropisomer"
+    },
+    {
+      "line_number": 50,
+      "smiles": "C[C@H]1CC[C@@H]2CC[C@@H]3C(CC21)C[C@@H]1CC[C@H]13",
+      "template": "stereo_boundaries:quad_chiral_steroid_lite"
+    },
+    {
+      "line_number": 51,
+      "smiles": "C1C[C@@H]2CC[C@H](C1)C2",
+      "template": "stereo_boundaries:cis_trans_ring"
+    },
+    {
+      "line_number": 52,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC(CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC)(CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC)CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "degenerate_graphs:star_quaternary"
+    },
+    {
+      "line_number": 53,
+      "smiles": "CCCCCCCCCCC(CCCCCCCCCC)(CCCCCCCCCC)CCCCCCCCCC",
+      "template": "degenerate_graphs:wide_star"
+    },
+    {
+      "line_number": 54,
+      "smiles": "CC(C)(C)C(C)(C)CC(C)(C)C(C)(C)C",
+      "template": "degenerate_graphs:very_branched"
+    },
+    {
+      "line_number": 55,
+      "smiles": "C1CCC2CCCC2C1",
+      "template": "rdkit_parse_corners:nested_ring_closure"
+    },
+    {
+      "line_number": 56,
+      "smiles": "c1ccccc1",
+      "template": "rdkit_parse_corners:kekulized_aromatic"
+    },
+    {
+      "line_number": 57,
+      "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCNC(=O)CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "template": "rdkit_parse_corners:long_polypeptide_motif"
+    },
+    {
+      "line_number": 58,
+      "smiles": "[N+]#[C-]c1ccccc1",
+      "template": "dg_convergence_corners:isocyanide"
+    },
+    {
+      "line_number": 59,
+      "smiles": "CCCCCCCCCCC(C)(C)CCCCCCCCC",
+      "template": "dg_convergence_corners:many_rotatable"
+    },
+    {
+      "line_number": 60,
+      "smiles": "C1CCC2(CC1)CCCC2",
+      "template": "dg_convergence_corners:highly_strained_spiro"
+    },
+    {
+      "line_number": 61,
+      "smiles": "C1CC2CCC1CC2",
+      "template": "dg_convergence_corners:bicyclic_near_planar"
+    },
+    {
+      "line_number": 62,
+      "smiles": "Cc1ccc(N)c(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 63,
+      "smiles": "CCc1ccc(N)c(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 64,
+      "smiles": "CCCc1ccc(N)c(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 65,
+      "smiles": "Cc1c(N)ccc(O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 66,
+      "smiles": "COc1ccc(N)c(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 67,
+      "smiles": "CCOc1ccc(N)c(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 68,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 69,
+      "smiles": "Cc1c(N)ccc(F)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 70,
+      "smiles": "Cc1c(N)ccc(Cl)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 71,
+      "smiles": "Cc1c(N)ccc(Br)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 72,
+      "smiles": "Cc1c(N)ccc(C#N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 73,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 74,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 75,
+      "smiles": "Cc1c(N)ccc(S)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 76,
+      "smiles": "CSc1ccc(N)c(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 77,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 78,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 79,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 80,
+      "smiles": "Cc1c(N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 81,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 82,
+      "smiles": "CCc1c(C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 83,
+      "smiles": "CCc1ccc(N)c(C)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 84,
+      "smiles": "CCCc1ccc(N)c(C)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 85,
+      "smiles": "CCc1c(O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 86,
+      "smiles": "CCc1c(OC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 87,
+      "smiles": "CCOc1ccc(N)c(C)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 88,
+      "smiles": "CCc1c(N(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 89,
+      "smiles": "CCc1c(F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 90,
+      "smiles": "CCc1c(Cl)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 91,
+      "smiles": "CCc1c(Br)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 92,
+      "smiles": "CCc1c(C#N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 93,
+      "smiles": "CCc1c(C(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 94,
+      "smiles": "CCc1c(C(=O)O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 95,
+      "smiles": "CCc1c(S)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 96,
+      "smiles": "CCc1c(SC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 97,
+      "smiles": "CCc1c(C(F)(F)F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 98,
+      "smiles": "CCc1c(C(C)(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 99,
+      "smiles": "CCc1c(OC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 100,
+      "smiles": "CCc1c(N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 101,
+      "smiles": "CCc1c(NC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 102,
+      "smiles": "CCCc1c(C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 103,
+      "smiles": "CCCc1c(CC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 104,
+      "smiles": "CCCc1ccc(N)c(C)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 105,
+      "smiles": "CCCc1c(O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 106,
+      "smiles": "CCCc1c(OC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 107,
+      "smiles": "CCCc1c(OCC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 108,
+      "smiles": "CCCc1c(N(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 109,
+      "smiles": "CCCc1c(F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 110,
+      "smiles": "CCCc1c(Cl)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 111,
+      "smiles": "CCCc1c(Br)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 112,
+      "smiles": "CCCc1c(C#N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 113,
+      "smiles": "CCCc1c(C(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 114,
+      "smiles": "CCCc1c(C(=O)O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 115,
+      "smiles": "CCCc1c(S)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 116,
+      "smiles": "CCCc1c(SC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 117,
+      "smiles": "CCCc1c(C(F)(F)F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 118,
+      "smiles": "CCCc1c(C(C)(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 119,
+      "smiles": "CCCc1c(OC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 120,
+      "smiles": "CCCc1c(N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 121,
+      "smiles": "CCCc1c(NC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 122,
+      "smiles": "Cc1ccc(N)c(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 123,
+      "smiles": "CCc1ccc(N)c(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 124,
+      "smiles": "CCCc1ccc(N)c(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 125,
+      "smiles": "Cc1c(N)ccc(O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 126,
+      "smiles": "COc1ccc(N)c(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 127,
+      "smiles": "CCOc1ccc(N)c(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 128,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 129,
+      "smiles": "Cc1c(N)ccc(F)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 130,
+      "smiles": "Cc1c(N)ccc(Cl)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 131,
+      "smiles": "Cc1c(N)ccc(Br)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 132,
+      "smiles": "Cc1c(N)ccc(C#N)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 133,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 134,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 135,
+      "smiles": "Cc1c(N)ccc(S)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 136,
+      "smiles": "CSc1ccc(N)c(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 137,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 138,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 139,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 140,
+      "smiles": "Cc1c(N)ccc(N)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 141,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 142,
+      "smiles": "COc1c(C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 143,
+      "smiles": "CCc1ccc(N)c(C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 144,
+      "smiles": "CCCc1ccc(N)c(C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 145,
+      "smiles": "COc1c(O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 146,
+      "smiles": "COc1ccc(N)c(C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 147,
+      "smiles": "CCOc1ccc(N)c(C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 148,
+      "smiles": "COc1c(N(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 149,
+      "smiles": "COc1c(F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 150,
+      "smiles": "COc1c(Cl)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 151,
+      "smiles": "COc1c(Br)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 152,
+      "smiles": "COc1c(C#N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 153,
+      "smiles": "COc1c(C(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 154,
+      "smiles": "COc1c(C(=O)O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 155,
+      "smiles": "COc1c(S)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 156,
+      "smiles": "COc1c(SC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 157,
+      "smiles": "COc1c(C(F)(F)F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 158,
+      "smiles": "COc1c(C(C)(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 159,
+      "smiles": "COc1c(OC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 160,
+      "smiles": "COc1c(N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 161,
+      "smiles": "COc1c(NC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 162,
+      "smiles": "CCOc1c(C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 163,
+      "smiles": "CCOc1c(CC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 164,
+      "smiles": "CCCc1ccc(N)c(C)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 165,
+      "smiles": "CCOc1c(O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 166,
+      "smiles": "CCOc1c(OC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 167,
+      "smiles": "CCOc1ccc(N)c(C)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 168,
+      "smiles": "CCOc1c(N(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 169,
+      "smiles": "CCOc1c(F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 170,
+      "smiles": "CCOc1c(Cl)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 171,
+      "smiles": "CCOc1c(Br)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 172,
+      "smiles": "CCOc1c(C#N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 173,
+      "smiles": "CCOc1c(C(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 174,
+      "smiles": "CCOc1c(C(=O)O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 175,
+      "smiles": "CCOc1c(S)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 176,
+      "smiles": "CCOc1c(SC)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 177,
+      "smiles": "CCOc1c(C(F)(F)F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 178,
+      "smiles": "CCOc1c(C(C)(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 179,
+      "smiles": "CCOc1c(OC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 180,
+      "smiles": "CCOc1c(N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 181,
+      "smiles": "CCOc1c(NC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 182,
+      "smiles": "Cc1ccc(N)c(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 183,
+      "smiles": "CCc1ccc(N)c(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 184,
+      "smiles": "CCCc1ccc(N)c(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 185,
+      "smiles": "Cc1c(N)ccc(O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 186,
+      "smiles": "COc1ccc(N)c(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 187,
+      "smiles": "CCOc1ccc(N)c(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 188,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 189,
+      "smiles": "Cc1c(N)ccc(F)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 190,
+      "smiles": "Cc1c(N)ccc(Cl)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 191,
+      "smiles": "Cc1c(N)ccc(Br)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 192,
+      "smiles": "Cc1c(N)ccc(C#N)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 193,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 194,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 195,
+      "smiles": "Cc1c(N)ccc(S)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 196,
+      "smiles": "CSc1ccc(N)c(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 197,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 198,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 199,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 200,
+      "smiles": "Cc1c(N)ccc(N)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 201,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 202,
+      "smiles": "Cc1ccc(N)c(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 203,
+      "smiles": "CCc1ccc(N)c(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 204,
+      "smiles": "CCCc1ccc(N)c(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 205,
+      "smiles": "Cc1c(N)ccc(O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 206,
+      "smiles": "COc1ccc(N)c(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 207,
+      "smiles": "CCOc1ccc(N)c(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 208,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 209,
+      "smiles": "Cc1c(N)ccc(F)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 210,
+      "smiles": "Cc1c(N)ccc(Cl)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 211,
+      "smiles": "Cc1c(N)ccc(Br)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 212,
+      "smiles": "Cc1c(N)ccc(C#N)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 213,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 214,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 215,
+      "smiles": "Cc1c(N)ccc(S)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 216,
+      "smiles": "CSc1ccc(N)c(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 217,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 218,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 219,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 220,
+      "smiles": "Cc1c(N)ccc(N)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 221,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 222,
+      "smiles": "Cc1ccc(N)c(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 223,
+      "smiles": "CCc1ccc(N)c(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 224,
+      "smiles": "CCCc1ccc(N)c(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 225,
+      "smiles": "Cc1c(N)ccc(O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 226,
+      "smiles": "COc1ccc(N)c(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 227,
+      "smiles": "CCOc1ccc(N)c(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 228,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 229,
+      "smiles": "Cc1c(N)ccc(F)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 230,
+      "smiles": "Cc1c(N)ccc(Cl)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 231,
+      "smiles": "Cc1c(N)ccc(Br)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 232,
+      "smiles": "Cc1c(N)ccc(C#N)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 233,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 234,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 235,
+      "smiles": "Cc1c(N)ccc(S)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 236,
+      "smiles": "CSc1ccc(N)c(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 237,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 238,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 239,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 240,
+      "smiles": "Cc1c(N)ccc(N)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 241,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 242,
+      "smiles": "Cc1ccc(N)c(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 243,
+      "smiles": "CCc1ccc(N)c(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 244,
+      "smiles": "CCCc1ccc(N)c(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 245,
+      "smiles": "Cc1c(N)ccc(O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 246,
+      "smiles": "COc1ccc(N)c(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 247,
+      "smiles": "CCOc1ccc(N)c(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 248,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 249,
+      "smiles": "Cc1c(N)ccc(F)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 250,
+      "smiles": "Cc1c(N)ccc(Cl)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 251,
+      "smiles": "Cc1c(N)ccc(Br)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 252,
+      "smiles": "Cc1c(N)ccc(C#N)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 253,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 254,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 255,
+      "smiles": "Cc1c(N)ccc(S)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 256,
+      "smiles": "CSc1ccc(N)c(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 257,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 258,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 259,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 260,
+      "smiles": "Cc1c(N)ccc(N)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 261,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 262,
+      "smiles": "Cc1ccc(N)c(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 263,
+      "smiles": "CCc1ccc(N)c(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 264,
+      "smiles": "CCCc1ccc(N)c(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 265,
+      "smiles": "Cc1c(N)ccc(O)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 266,
+      "smiles": "COc1ccc(N)c(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 267,
+      "smiles": "CCOc1ccc(N)c(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 268,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 269,
+      "smiles": "Cc1c(N)ccc(F)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 270,
+      "smiles": "Cc1c(N)ccc(Cl)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 271,
+      "smiles": "Cc1c(N)ccc(Br)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 272,
+      "smiles": "Cc1c(N)ccc(C#N)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 273,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 274,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 275,
+      "smiles": "Cc1c(N)ccc(S)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 276,
+      "smiles": "CSc1ccc(N)c(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 277,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 278,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 279,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 280,
+      "smiles": "Cc1c(N)ccc(N)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 281,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 282,
+      "smiles": "CC(=O)c1c(C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 283,
+      "smiles": "CCc1ccc(N)c(C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 284,
+      "smiles": "CCCc1ccc(N)c(C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 285,
+      "smiles": "CC(=O)c1c(O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 286,
+      "smiles": "COc1ccc(N)c(C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 287,
+      "smiles": "CCOc1ccc(N)c(C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 288,
+      "smiles": "CC(=O)c1c(N(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 289,
+      "smiles": "CC(=O)c1c(F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 290,
+      "smiles": "CC(=O)c1c(Cl)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 291,
+      "smiles": "CC(=O)c1c(Br)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 292,
+      "smiles": "CC(=O)c1c(C#N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 293,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 294,
+      "smiles": "CC(=O)c1c(C(=O)O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 295,
+      "smiles": "CC(=O)c1c(S)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 296,
+      "smiles": "CSc1ccc(N)c(C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 297,
+      "smiles": "CC(=O)c1c(C(F)(F)F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 298,
+      "smiles": "CC(=O)c1c(C(C)(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 299,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 300,
+      "smiles": "CC(=O)c1c(N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 301,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 302,
+      "smiles": "Cc1ccc(N)c(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 303,
+      "smiles": "CCc1ccc(N)c(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 304,
+      "smiles": "CCCc1ccc(N)c(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 305,
+      "smiles": "Cc1c(N)ccc(O)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 306,
+      "smiles": "COc1ccc(N)c(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 307,
+      "smiles": "CCOc1ccc(N)c(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 308,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 309,
+      "smiles": "Cc1c(N)ccc(F)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 310,
+      "smiles": "Cc1c(N)ccc(Cl)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 311,
+      "smiles": "Cc1c(N)ccc(Br)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 312,
+      "smiles": "Cc1c(N)ccc(C#N)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 313,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 314,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 315,
+      "smiles": "Cc1c(N)ccc(S)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 316,
+      "smiles": "CSc1ccc(N)c(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 317,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 318,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 319,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 320,
+      "smiles": "Cc1c(N)ccc(N)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 321,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 322,
+      "smiles": "Cc1ccc(N)c(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 323,
+      "smiles": "CCc1ccc(N)c(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 324,
+      "smiles": "CCCc1ccc(N)c(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 325,
+      "smiles": "Cc1c(N)ccc(O)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 326,
+      "smiles": "COc1ccc(N)c(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 327,
+      "smiles": "CCOc1ccc(N)c(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 328,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 329,
+      "smiles": "Cc1c(N)ccc(F)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 330,
+      "smiles": "Cc1c(N)ccc(Cl)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 331,
+      "smiles": "Cc1c(N)ccc(Br)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 332,
+      "smiles": "Cc1c(N)ccc(C#N)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 333,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 334,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 335,
+      "smiles": "Cc1c(N)ccc(S)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 336,
+      "smiles": "CSc1ccc(N)c(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 337,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 338,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 339,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 340,
+      "smiles": "Cc1c(N)ccc(N)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 341,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 342,
+      "smiles": "CSc1c(C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 343,
+      "smiles": "CCc1ccc(N)c(C)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 344,
+      "smiles": "CCCc1ccc(N)c(C)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 345,
+      "smiles": "CSc1c(O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 346,
+      "smiles": "COc1ccc(N)c(C)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 347,
+      "smiles": "CCOc1ccc(N)c(C)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 348,
+      "smiles": "CSc1c(N(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 349,
+      "smiles": "CSc1c(F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 350,
+      "smiles": "CSc1c(Cl)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 351,
+      "smiles": "CSc1c(Br)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 352,
+      "smiles": "CSc1c(C#N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 353,
+      "smiles": "CSc1c(C(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 354,
+      "smiles": "CSc1c(C(=O)O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 355,
+      "smiles": "CSc1c(S)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 356,
+      "smiles": "CSc1ccc(N)c(C)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 357,
+      "smiles": "CSc1c(C(F)(F)F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 358,
+      "smiles": "CSc1c(C(C)(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 359,
+      "smiles": "CSc1c(OC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 360,
+      "smiles": "CSc1c(N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 361,
+      "smiles": "CSc1c(NC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 362,
+      "smiles": "Cc1ccc(N)c(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 363,
+      "smiles": "CCc1ccc(N)c(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 364,
+      "smiles": "CCCc1ccc(N)c(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 365,
+      "smiles": "Cc1c(N)ccc(O)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 366,
+      "smiles": "COc1ccc(N)c(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 367,
+      "smiles": "CCOc1ccc(N)c(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 368,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 369,
+      "smiles": "Cc1c(N)ccc(F)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 370,
+      "smiles": "Cc1c(N)ccc(Cl)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 371,
+      "smiles": "Cc1c(N)ccc(Br)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 372,
+      "smiles": "Cc1c(N)ccc(C#N)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 373,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 374,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 375,
+      "smiles": "Cc1c(N)ccc(S)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 376,
+      "smiles": "CSc1ccc(N)c(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 377,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 378,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 379,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 380,
+      "smiles": "Cc1c(N)ccc(N)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 381,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 382,
+      "smiles": "Cc1ccc(N)c(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 383,
+      "smiles": "CCc1ccc(N)c(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 384,
+      "smiles": "CCCc1ccc(N)c(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 385,
+      "smiles": "Cc1c(N)ccc(O)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 386,
+      "smiles": "COc1ccc(N)c(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 387,
+      "smiles": "CCOc1ccc(N)c(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 388,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 389,
+      "smiles": "Cc1c(N)ccc(F)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 390,
+      "smiles": "Cc1c(N)ccc(Cl)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 391,
+      "smiles": "Cc1c(N)ccc(Br)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 392,
+      "smiles": "Cc1c(N)ccc(C#N)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 393,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 394,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 395,
+      "smiles": "Cc1c(N)ccc(S)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 396,
+      "smiles": "CSc1ccc(N)c(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 397,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 398,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 399,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 400,
+      "smiles": "Cc1c(N)ccc(N)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 401,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 402,
+      "smiles": "CC(=O)Oc1c(C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 403,
+      "smiles": "CCc1ccc(N)c(C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 404,
+      "smiles": "CCCc1ccc(N)c(C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 405,
+      "smiles": "CC(=O)Oc1c(O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 406,
+      "smiles": "COc1ccc(N)c(C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 407,
+      "smiles": "CCOc1ccc(N)c(C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 408,
+      "smiles": "CC(=O)Oc1c(N(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 409,
+      "smiles": "CC(=O)Oc1c(F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 410,
+      "smiles": "CC(=O)Oc1c(Cl)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 411,
+      "smiles": "CC(=O)Oc1c(Br)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 412,
+      "smiles": "CC(=O)Oc1c(C#N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 413,
+      "smiles": "CC(=O)Oc1c(C(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 414,
+      "smiles": "CC(=O)Oc1c(C(=O)O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 415,
+      "smiles": "CC(=O)Oc1c(S)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 416,
+      "smiles": "CSc1ccc(N)c(C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 417,
+      "smiles": "CC(=O)Oc1c(C(F)(F)F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 418,
+      "smiles": "CC(=O)Oc1c(C(C)(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 419,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 420,
+      "smiles": "CC(=O)Oc1c(N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 421,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 422,
+      "smiles": "Cc1ccc(N)c(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 423,
+      "smiles": "CCc1ccc(N)c(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 424,
+      "smiles": "CCCc1ccc(N)c(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 425,
+      "smiles": "Cc1c(N)ccc(O)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 426,
+      "smiles": "COc1ccc(N)c(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 427,
+      "smiles": "CCOc1ccc(N)c(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 428,
+      "smiles": "Cc1c(N)ccc(N(C)C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 429,
+      "smiles": "Cc1c(N)ccc(F)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 430,
+      "smiles": "Cc1c(N)ccc(Cl)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 431,
+      "smiles": "Cc1c(N)ccc(Br)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 432,
+      "smiles": "Cc1c(N)ccc(C#N)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 433,
+      "smiles": "CC(=O)c1ccc(N)c(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 434,
+      "smiles": "Cc1c(N)ccc(C(=O)O)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 435,
+      "smiles": "Cc1c(N)ccc(S)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 436,
+      "smiles": "CSc1ccc(N)c(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 437,
+      "smiles": "Cc1c(N)ccc(C(F)(F)F)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 438,
+      "smiles": "Cc1c(N)ccc(C(C)(C)C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 439,
+      "smiles": "CC(=O)Oc1ccc(N)c(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 440,
+      "smiles": "Cc1c(N)ccc(N)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 441,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 442,
+      "smiles": "CC(=O)Nc1c(C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 443,
+      "smiles": "CCc1ccc(N)c(C)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 444,
+      "smiles": "CCCc1ccc(N)c(C)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 445,
+      "smiles": "CC(=O)Nc1c(O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 446,
+      "smiles": "COc1ccc(N)c(C)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 447,
+      "smiles": "CCOc1ccc(N)c(C)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 448,
+      "smiles": "CC(=O)Nc1c(N(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 449,
+      "smiles": "CC(=O)Nc1c(F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 450,
+      "smiles": "CC(=O)Nc1c(Cl)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 451,
+      "smiles": "CC(=O)Nc1c(Br)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 452,
+      "smiles": "CC(=O)Nc1c(C#N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 453,
+      "smiles": "CC(=O)Nc1c(C(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 454,
+      "smiles": "CC(=O)Nc1c(C(=O)O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 455,
+      "smiles": "CC(=O)Nc1c(S)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 456,
+      "smiles": "CSc1ccc(N)c(C)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 457,
+      "smiles": "CC(=O)Nc1c(C(F)(F)F)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 458,
+      "smiles": "CC(=O)Nc1c(C(C)(C)C)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 459,
+      "smiles": "CC(=O)Nc1c(OC(C)=O)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 460,
+      "smiles": "CC(=O)Nc1c(N)ccc(N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 461,
+      "smiles": "CC(=O)Nc1ccc(N)c(C)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 462,
+      "smiles": "CCc1c(N)ccc(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 463,
+      "smiles": "CCc1ccc(N)c(CC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 464,
+      "smiles": "CCCc1ccc(N)c(CC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 465,
+      "smiles": "CCc1c(N)ccc(O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 466,
+      "smiles": "CCc1c(N)ccc(OC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 467,
+      "smiles": "CCOc1ccc(N)c(CC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 468,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 469,
+      "smiles": "CCc1c(N)ccc(F)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 470,
+      "smiles": "CCc1c(N)ccc(Cl)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 471,
+      "smiles": "CCc1c(N)ccc(Br)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 472,
+      "smiles": "CCc1c(N)ccc(C#N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 473,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 474,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 475,
+      "smiles": "CCc1c(N)ccc(S)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 476,
+      "smiles": "CCc1c(N)ccc(SC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 477,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 478,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 479,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 480,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 481,
+      "smiles": "CCc1c(C)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 482,
+      "smiles": "CCc1ccc(N)c(CC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 483,
+      "smiles": "CCCc1ccc(N)c(CC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 484,
+      "smiles": "CCc1c(N)ccc(O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 485,
+      "smiles": "CCc1c(N)ccc(OC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 486,
+      "smiles": "CCOc1ccc(N)c(CC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 487,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 488,
+      "smiles": "CCc1c(N)ccc(F)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 489,
+      "smiles": "CCc1c(N)ccc(Cl)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 490,
+      "smiles": "CCc1c(N)ccc(Br)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 491,
+      "smiles": "CCc1c(N)ccc(C#N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 492,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 493,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 494,
+      "smiles": "CCc1c(N)ccc(S)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 495,
+      "smiles": "CCc1c(N)ccc(SC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 496,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 497,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 498,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 499,
+      "smiles": "CCc1c(N)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 500,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 501,
+      "smiles": "CCCc1c(C)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 502,
+      "smiles": "CCCc1c(CC)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 503,
+      "smiles": "CCCc1ccc(N)c(CC)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 504,
+      "smiles": "CCCc1c(O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 505,
+      "smiles": "CCCc1c(OC)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 506,
+      "smiles": "CCCc1c(OCC)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 507,
+      "smiles": "CCCc1c(N(C)C)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 508,
+      "smiles": "CCCc1c(F)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 509,
+      "smiles": "CCCc1c(Cl)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 510,
+      "smiles": "CCCc1c(Br)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 511,
+      "smiles": "CCCc1c(C#N)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 512,
+      "smiles": "CCCc1c(C(C)=O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 513,
+      "smiles": "CCCc1c(C(=O)O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 514,
+      "smiles": "CCCc1c(S)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 515,
+      "smiles": "CCCc1c(SC)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 516,
+      "smiles": "CCCc1c(C(F)(F)F)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 517,
+      "smiles": "CCCc1c(C(C)(C)C)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 518,
+      "smiles": "CCCc1c(OC(C)=O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 519,
+      "smiles": "CCCc1c(N)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 520,
+      "smiles": "CCCc1c(NC(C)=O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 521,
+      "smiles": "CCc1c(N)ccc(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 522,
+      "smiles": "CCc1ccc(N)c(CC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 523,
+      "smiles": "CCCc1ccc(N)c(CC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 524,
+      "smiles": "CCc1c(N)ccc(O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 525,
+      "smiles": "CCc1c(N)ccc(OC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 526,
+      "smiles": "CCOc1ccc(N)c(CC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 527,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 528,
+      "smiles": "CCc1c(N)ccc(F)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 529,
+      "smiles": "CCc1c(N)ccc(Cl)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 530,
+      "smiles": "CCc1c(N)ccc(Br)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 531,
+      "smiles": "CCc1c(N)ccc(C#N)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 532,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 533,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 534,
+      "smiles": "CCc1c(N)ccc(S)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 535,
+      "smiles": "CCc1c(N)ccc(SC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 536,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 537,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 538,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 539,
+      "smiles": "CCc1c(N)ccc(N)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 540,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 541,
+      "smiles": "CCc1c(N)ccc(C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 542,
+      "smiles": "CCc1ccc(N)c(CC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 543,
+      "smiles": "CCCc1ccc(N)c(CC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 544,
+      "smiles": "CCc1c(N)ccc(O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 545,
+      "smiles": "CCc1c(N)ccc(OC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 546,
+      "smiles": "CCOc1ccc(N)c(CC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 547,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 548,
+      "smiles": "CCc1c(N)ccc(F)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 549,
+      "smiles": "CCc1c(N)ccc(Cl)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 550,
+      "smiles": "CCc1c(N)ccc(Br)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 551,
+      "smiles": "CCc1c(N)ccc(C#N)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 552,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 553,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 554,
+      "smiles": "CCc1c(N)ccc(S)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 555,
+      "smiles": "CCc1c(N)ccc(SC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 556,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 557,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 558,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 559,
+      "smiles": "CCc1c(N)ccc(N)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 560,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 561,
+      "smiles": "CCOc1c(C)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 562,
+      "smiles": "CCOc1c(CC)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 563,
+      "smiles": "CCCc1ccc(N)c(CC)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 564,
+      "smiles": "CCOc1c(O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 565,
+      "smiles": "CCOc1c(OC)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 566,
+      "smiles": "CCOc1ccc(N)c(CC)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 567,
+      "smiles": "CCOc1c(N(C)C)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 568,
+      "smiles": "CCOc1c(F)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 569,
+      "smiles": "CCOc1c(Cl)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 570,
+      "smiles": "CCOc1c(Br)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 571,
+      "smiles": "CCOc1c(C#N)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 572,
+      "smiles": "CCOc1c(C(C)=O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 573,
+      "smiles": "CCOc1c(C(=O)O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 574,
+      "smiles": "CCOc1c(S)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 575,
+      "smiles": "CCOc1c(SC)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 576,
+      "smiles": "CCOc1c(C(F)(F)F)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 577,
+      "smiles": "CCOc1c(C(C)(C)C)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 578,
+      "smiles": "CCOc1c(OC(C)=O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 579,
+      "smiles": "CCOc1c(N)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 580,
+      "smiles": "CCOc1c(NC(C)=O)ccc(N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 581,
+      "smiles": "CCc1c(N)ccc(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 582,
+      "smiles": "CCc1ccc(N)c(CC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 583,
+      "smiles": "CCCc1ccc(N)c(CC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 584,
+      "smiles": "CCc1c(N)ccc(O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 585,
+      "smiles": "CCc1c(N)ccc(OC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 586,
+      "smiles": "CCOc1ccc(N)c(CC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 587,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 588,
+      "smiles": "CCc1c(N)ccc(F)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 589,
+      "smiles": "CCc1c(N)ccc(Cl)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 590,
+      "smiles": "CCc1c(N)ccc(Br)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 591,
+      "smiles": "CCc1c(N)ccc(C#N)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 592,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 593,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 594,
+      "smiles": "CCc1c(N)ccc(S)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 595,
+      "smiles": "CCc1c(N)ccc(SC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 596,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 597,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 598,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 599,
+      "smiles": "CCc1c(N)ccc(N)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 600,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 601,
+      "smiles": "CCc1c(N)ccc(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 602,
+      "smiles": "CCc1ccc(N)c(CC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 603,
+      "smiles": "CCCc1ccc(N)c(CC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 604,
+      "smiles": "CCc1c(N)ccc(O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 605,
+      "smiles": "CCc1c(N)ccc(OC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 606,
+      "smiles": "CCOc1ccc(N)c(CC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 607,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 608,
+      "smiles": "CCc1c(N)ccc(F)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 609,
+      "smiles": "CCc1c(N)ccc(Cl)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 610,
+      "smiles": "CCc1c(N)ccc(Br)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 611,
+      "smiles": "CCc1c(N)ccc(C#N)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 612,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 613,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 614,
+      "smiles": "CCc1c(N)ccc(S)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 615,
+      "smiles": "CCc1c(N)ccc(SC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 616,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 617,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 618,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 619,
+      "smiles": "CCc1c(N)ccc(N)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 620,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 621,
+      "smiles": "CCc1c(N)ccc(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 622,
+      "smiles": "CCc1ccc(N)c(CC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 623,
+      "smiles": "CCCc1ccc(N)c(CC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 624,
+      "smiles": "CCc1c(N)ccc(O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 625,
+      "smiles": "CCc1c(N)ccc(OC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 626,
+      "smiles": "CCOc1ccc(N)c(CC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 627,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 628,
+      "smiles": "CCc1c(N)ccc(F)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 629,
+      "smiles": "CCc1c(N)ccc(Cl)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 630,
+      "smiles": "CCc1c(N)ccc(Br)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 631,
+      "smiles": "CCc1c(N)ccc(C#N)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 632,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 633,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 634,
+      "smiles": "CCc1c(N)ccc(S)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 635,
+      "smiles": "CCc1c(N)ccc(SC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 636,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 637,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 638,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 639,
+      "smiles": "CCc1c(N)ccc(N)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 640,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 641,
+      "smiles": "CCc1c(N)ccc(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 642,
+      "smiles": "CCc1ccc(N)c(CC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 643,
+      "smiles": "CCCc1ccc(N)c(CC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 644,
+      "smiles": "CCc1c(N)ccc(O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 645,
+      "smiles": "CCc1c(N)ccc(OC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 646,
+      "smiles": "CCOc1ccc(N)c(CC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 647,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 648,
+      "smiles": "CCc1c(N)ccc(F)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 649,
+      "smiles": "CCc1c(N)ccc(Cl)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 650,
+      "smiles": "CCc1c(N)ccc(Br)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 651,
+      "smiles": "CCc1c(N)ccc(C#N)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 652,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 653,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 654,
+      "smiles": "CCc1c(N)ccc(S)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 655,
+      "smiles": "CCc1c(N)ccc(SC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 656,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 657,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 658,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 659,
+      "smiles": "CCc1c(N)ccc(N)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 660,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 661,
+      "smiles": "CCc1c(N)ccc(C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 662,
+      "smiles": "CCc1ccc(N)c(CC)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 663,
+      "smiles": "CCCc1ccc(N)c(CC)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 664,
+      "smiles": "CCc1c(N)ccc(O)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 665,
+      "smiles": "CCc1c(N)ccc(OC)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 666,
+      "smiles": "CCOc1ccc(N)c(CC)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 667,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 668,
+      "smiles": "CCc1c(N)ccc(F)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 669,
+      "smiles": "CCc1c(N)ccc(Cl)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 670,
+      "smiles": "CCc1c(N)ccc(Br)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 671,
+      "smiles": "CCc1c(N)ccc(C#N)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 672,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 673,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 674,
+      "smiles": "CCc1c(N)ccc(S)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 675,
+      "smiles": "CCc1c(N)ccc(SC)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 676,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 677,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 678,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 679,
+      "smiles": "CCc1c(N)ccc(N)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 680,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1C#N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 681,
+      "smiles": "CCc1c(N)ccc(C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 682,
+      "smiles": "CCc1ccc(N)c(CC)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 683,
+      "smiles": "CCCc1ccc(N)c(CC)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 684,
+      "smiles": "CCc1c(N)ccc(O)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 685,
+      "smiles": "CCc1c(N)ccc(OC)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 686,
+      "smiles": "CCOc1ccc(N)c(CC)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 687,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 688,
+      "smiles": "CCc1c(N)ccc(F)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 689,
+      "smiles": "CCc1c(N)ccc(Cl)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 690,
+      "smiles": "CCc1c(N)ccc(Br)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 691,
+      "smiles": "CCc1c(N)ccc(C#N)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 692,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 693,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 694,
+      "smiles": "CCc1c(N)ccc(S)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 695,
+      "smiles": "CCc1c(N)ccc(SC)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 696,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 697,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 698,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 699,
+      "smiles": "CCc1c(N)ccc(N)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 700,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1C(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 701,
+      "smiles": "CCc1c(N)ccc(C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 702,
+      "smiles": "CCc1ccc(N)c(CC)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 703,
+      "smiles": "CCCc1ccc(N)c(CC)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 704,
+      "smiles": "CCc1c(N)ccc(O)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 705,
+      "smiles": "CCc1c(N)ccc(OC)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 706,
+      "smiles": "CCOc1ccc(N)c(CC)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 707,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 708,
+      "smiles": "CCc1c(N)ccc(F)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 709,
+      "smiles": "CCc1c(N)ccc(Cl)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 710,
+      "smiles": "CCc1c(N)ccc(Br)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 711,
+      "smiles": "CCc1c(N)ccc(C#N)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 712,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 713,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 714,
+      "smiles": "CCc1c(N)ccc(S)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 715,
+      "smiles": "CCc1c(N)ccc(SC)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 716,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 717,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 718,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 719,
+      "smiles": "CCc1c(N)ccc(N)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 720,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1C(=O)O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 721,
+      "smiles": "CCc1c(N)ccc(C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 722,
+      "smiles": "CCc1ccc(N)c(CC)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 723,
+      "smiles": "CCCc1ccc(N)c(CC)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 724,
+      "smiles": "CCc1c(N)ccc(O)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 725,
+      "smiles": "CCc1c(N)ccc(OC)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 726,
+      "smiles": "CCOc1ccc(N)c(CC)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 727,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 728,
+      "smiles": "CCc1c(N)ccc(F)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 729,
+      "smiles": "CCc1c(N)ccc(Cl)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 730,
+      "smiles": "CCc1c(N)ccc(Br)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 731,
+      "smiles": "CCc1c(N)ccc(C#N)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 732,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 733,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 734,
+      "smiles": "CCc1c(N)ccc(S)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 735,
+      "smiles": "CCc1c(N)ccc(SC)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 736,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 737,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 738,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 739,
+      "smiles": "CCc1c(N)ccc(N)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 740,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1S",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 741,
+      "smiles": "CCc1c(N)ccc(C)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 742,
+      "smiles": "CCc1ccc(N)c(CC)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 743,
+      "smiles": "CCCc1ccc(N)c(CC)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 744,
+      "smiles": "CCc1c(N)ccc(O)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 745,
+      "smiles": "CCc1c(N)ccc(OC)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 746,
+      "smiles": "CCOc1ccc(N)c(CC)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 747,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 748,
+      "smiles": "CCc1c(N)ccc(F)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 749,
+      "smiles": "CCc1c(N)ccc(Cl)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 750,
+      "smiles": "CCc1c(N)ccc(Br)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 751,
+      "smiles": "CCc1c(N)ccc(C#N)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 752,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 753,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 754,
+      "smiles": "CCc1c(N)ccc(S)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 755,
+      "smiles": "CCc1c(N)ccc(SC)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 756,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 757,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 758,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 759,
+      "smiles": "CCc1c(N)ccc(N)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 760,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1SC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 761,
+      "smiles": "CCc1c(N)ccc(C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 762,
+      "smiles": "CCc1ccc(N)c(CC)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 763,
+      "smiles": "CCCc1ccc(N)c(CC)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 764,
+      "smiles": "CCc1c(N)ccc(O)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 765,
+      "smiles": "CCc1c(N)ccc(OC)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 766,
+      "smiles": "CCOc1ccc(N)c(CC)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 767,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 768,
+      "smiles": "CCc1c(N)ccc(F)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 769,
+      "smiles": "CCc1c(N)ccc(Cl)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 770,
+      "smiles": "CCc1c(N)ccc(Br)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 771,
+      "smiles": "CCc1c(N)ccc(C#N)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 772,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 773,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 774,
+      "smiles": "CCc1c(N)ccc(S)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 775,
+      "smiles": "CCc1c(N)ccc(SC)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 776,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 777,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 778,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 779,
+      "smiles": "CCc1c(N)ccc(N)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 780,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1C(F)(F)F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 781,
+      "smiles": "CCc1c(N)ccc(C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 782,
+      "smiles": "CCc1ccc(N)c(CC)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 783,
+      "smiles": "CCCc1ccc(N)c(CC)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 784,
+      "smiles": "CCc1c(N)ccc(O)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 785,
+      "smiles": "CCc1c(N)ccc(OC)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 786,
+      "smiles": "CCOc1ccc(N)c(CC)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 787,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 788,
+      "smiles": "CCc1c(N)ccc(F)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 789,
+      "smiles": "CCc1c(N)ccc(Cl)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 790,
+      "smiles": "CCc1c(N)ccc(Br)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 791,
+      "smiles": "CCc1c(N)ccc(C#N)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 792,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 793,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 794,
+      "smiles": "CCc1c(N)ccc(S)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 795,
+      "smiles": "CCc1c(N)ccc(SC)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 796,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 797,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 798,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 799,
+      "smiles": "CCc1c(N)ccc(N)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 800,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1C(C)(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 801,
+      "smiles": "CCc1c(N)ccc(C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 802,
+      "smiles": "CCc1ccc(N)c(CC)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 803,
+      "smiles": "CCCc1ccc(N)c(CC)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 804,
+      "smiles": "CCc1c(N)ccc(O)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 805,
+      "smiles": "CCc1c(N)ccc(OC)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 806,
+      "smiles": "CCOc1ccc(N)c(CC)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 807,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 808,
+      "smiles": "CCc1c(N)ccc(F)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 809,
+      "smiles": "CCc1c(N)ccc(Cl)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 810,
+      "smiles": "CCc1c(N)ccc(Br)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 811,
+      "smiles": "CCc1c(N)ccc(C#N)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 812,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 813,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 814,
+      "smiles": "CCc1c(N)ccc(S)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 815,
+      "smiles": "CCc1c(N)ccc(SC)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 816,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 817,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 818,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 819,
+      "smiles": "CCc1c(N)ccc(N)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 820,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1OC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 821,
+      "smiles": "CCc1c(N)ccc(C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 822,
+      "smiles": "CCc1ccc(N)c(CC)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 823,
+      "smiles": "CCCc1ccc(N)c(CC)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 824,
+      "smiles": "CCc1c(N)ccc(O)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 825,
+      "smiles": "CCc1c(N)ccc(OC)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 826,
+      "smiles": "CCOc1ccc(N)c(CC)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 827,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 828,
+      "smiles": "CCc1c(N)ccc(F)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 829,
+      "smiles": "CCc1c(N)ccc(Cl)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 830,
+      "smiles": "CCc1c(N)ccc(Br)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 831,
+      "smiles": "CCc1c(N)ccc(C#N)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 832,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 833,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 834,
+      "smiles": "CCc1c(N)ccc(S)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 835,
+      "smiles": "CCc1c(N)ccc(SC)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 836,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 837,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 838,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 839,
+      "smiles": "CCc1c(N)ccc(N)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 840,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1N",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 841,
+      "smiles": "CCc1c(N)ccc(C)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 842,
+      "smiles": "CCc1ccc(N)c(CC)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 843,
+      "smiles": "CCCc1ccc(N)c(CC)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 844,
+      "smiles": "CCc1c(N)ccc(O)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 845,
+      "smiles": "CCc1c(N)ccc(OC)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 846,
+      "smiles": "CCOc1ccc(N)c(CC)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 847,
+      "smiles": "CCc1c(N)ccc(N(C)C)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 848,
+      "smiles": "CCc1c(N)ccc(F)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 849,
+      "smiles": "CCc1c(N)ccc(Cl)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 850,
+      "smiles": "CCc1c(N)ccc(Br)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 851,
+      "smiles": "CCc1c(N)ccc(C#N)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 852,
+      "smiles": "CCc1c(N)ccc(C(C)=O)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 853,
+      "smiles": "CCc1c(N)ccc(C(=O)O)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 854,
+      "smiles": "CCc1c(N)ccc(S)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 855,
+      "smiles": "CCc1c(N)ccc(SC)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 856,
+      "smiles": "CCc1c(N)ccc(C(F)(F)F)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 857,
+      "smiles": "CCc1c(N)ccc(C(C)(C)C)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 858,
+      "smiles": "CCc1c(N)ccc(OC(C)=O)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 859,
+      "smiles": "CCc1c(N)ccc(N)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 860,
+      "smiles": "CCc1c(N)ccc(NC(C)=O)c1NC(C)=O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 861,
+      "smiles": "CCCc1c(N)ccc(C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 862,
+      "smiles": "CCCc1c(N)ccc(CC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 863,
+      "smiles": "CCCc1ccc(N)c(CCC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 864,
+      "smiles": "CCCc1c(N)ccc(O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 865,
+      "smiles": "CCCc1c(N)ccc(OC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 866,
+      "smiles": "CCCc1c(N)ccc(OCC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 867,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 868,
+      "smiles": "CCCc1c(N)ccc(F)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 869,
+      "smiles": "CCCc1c(N)ccc(Cl)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 870,
+      "smiles": "CCCc1c(N)ccc(Br)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 871,
+      "smiles": "CCCc1c(N)ccc(C#N)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 872,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 873,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 874,
+      "smiles": "CCCc1c(N)ccc(S)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 875,
+      "smiles": "CCCc1c(N)ccc(SC)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 876,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 877,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 878,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 879,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 880,
+      "smiles": "CCCc1c(N)ccc(C)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 881,
+      "smiles": "CCCc1c(N)ccc(CC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 882,
+      "smiles": "CCCc1ccc(N)c(CCC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 883,
+      "smiles": "CCCc1c(N)ccc(O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 884,
+      "smiles": "CCCc1c(N)ccc(OC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 885,
+      "smiles": "CCCc1c(N)ccc(OCC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 886,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 887,
+      "smiles": "CCCc1c(N)ccc(F)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 888,
+      "smiles": "CCCc1c(N)ccc(Cl)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 889,
+      "smiles": "CCCc1c(N)ccc(Br)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 890,
+      "smiles": "CCCc1c(N)ccc(C#N)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 891,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 892,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 893,
+      "smiles": "CCCc1c(N)ccc(S)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 894,
+      "smiles": "CCCc1c(N)ccc(SC)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 895,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 896,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 897,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 898,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1CC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 899,
+      "smiles": "CCCc1c(C)ccc(N)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 900,
+      "smiles": "CCCc1c(N)ccc(CC)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 901,
+      "smiles": "CCCc1ccc(N)c(CCC)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 902,
+      "smiles": "CCCc1c(N)ccc(O)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 903,
+      "smiles": "CCCc1c(N)ccc(OC)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 904,
+      "smiles": "CCCc1c(N)ccc(OCC)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 905,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 906,
+      "smiles": "CCCc1c(N)ccc(F)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 907,
+      "smiles": "CCCc1c(N)ccc(Cl)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 908,
+      "smiles": "CCCc1c(N)ccc(Br)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 909,
+      "smiles": "CCCc1c(N)ccc(C#N)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 910,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 911,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 912,
+      "smiles": "CCCc1c(N)ccc(S)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 913,
+      "smiles": "CCCc1c(N)ccc(SC)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 914,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 915,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 916,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 917,
+      "smiles": "CCCc1c(N)ccc(N)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 918,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1CCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 919,
+      "smiles": "CCCc1c(N)ccc(C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 920,
+      "smiles": "CCCc1c(N)ccc(CC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 921,
+      "smiles": "CCCc1ccc(N)c(CCC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 922,
+      "smiles": "CCCc1c(N)ccc(O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 923,
+      "smiles": "CCCc1c(N)ccc(OC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 924,
+      "smiles": "CCCc1c(N)ccc(OCC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 925,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 926,
+      "smiles": "CCCc1c(N)ccc(F)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 927,
+      "smiles": "CCCc1c(N)ccc(Cl)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 928,
+      "smiles": "CCCc1c(N)ccc(Br)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 929,
+      "smiles": "CCCc1c(N)ccc(C#N)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 930,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 931,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 932,
+      "smiles": "CCCc1c(N)ccc(S)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 933,
+      "smiles": "CCCc1c(N)ccc(SC)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 934,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 935,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 936,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 937,
+      "smiles": "CCCc1c(N)ccc(N)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 938,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1O",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 939,
+      "smiles": "CCCc1c(N)ccc(C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 940,
+      "smiles": "CCCc1c(N)ccc(CC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 941,
+      "smiles": "CCCc1ccc(N)c(CCC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 942,
+      "smiles": "CCCc1c(N)ccc(O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 943,
+      "smiles": "CCCc1c(N)ccc(OC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 944,
+      "smiles": "CCCc1c(N)ccc(OCC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 945,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 946,
+      "smiles": "CCCc1c(N)ccc(F)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 947,
+      "smiles": "CCCc1c(N)ccc(Cl)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 948,
+      "smiles": "CCCc1c(N)ccc(Br)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 949,
+      "smiles": "CCCc1c(N)ccc(C#N)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 950,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 951,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 952,
+      "smiles": "CCCc1c(N)ccc(S)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 953,
+      "smiles": "CCCc1c(N)ccc(SC)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 954,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 955,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 956,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 957,
+      "smiles": "CCCc1c(N)ccc(N)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 958,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1OC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 959,
+      "smiles": "CCCc1c(N)ccc(C)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 960,
+      "smiles": "CCCc1c(N)ccc(CC)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 961,
+      "smiles": "CCCc1ccc(N)c(CCC)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 962,
+      "smiles": "CCCc1c(N)ccc(O)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 963,
+      "smiles": "CCCc1c(N)ccc(OC)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 964,
+      "smiles": "CCCc1c(N)ccc(OCC)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 965,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 966,
+      "smiles": "CCCc1c(N)ccc(F)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 967,
+      "smiles": "CCCc1c(N)ccc(Cl)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 968,
+      "smiles": "CCCc1c(N)ccc(Br)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 969,
+      "smiles": "CCCc1c(N)ccc(C#N)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 970,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 971,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 972,
+      "smiles": "CCCc1c(N)ccc(S)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 973,
+      "smiles": "CCCc1c(N)ccc(SC)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 974,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 975,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 976,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 977,
+      "smiles": "CCCc1c(N)ccc(N)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 978,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1OCC",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 979,
+      "smiles": "CCCc1c(N)ccc(C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 980,
+      "smiles": "CCCc1c(N)ccc(CC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 981,
+      "smiles": "CCCc1ccc(N)c(CCC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 982,
+      "smiles": "CCCc1c(N)ccc(O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 983,
+      "smiles": "CCCc1c(N)ccc(OC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 984,
+      "smiles": "CCCc1c(N)ccc(OCC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 985,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 986,
+      "smiles": "CCCc1c(N)ccc(F)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 987,
+      "smiles": "CCCc1c(N)ccc(Cl)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 988,
+      "smiles": "CCCc1c(N)ccc(Br)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 989,
+      "smiles": "CCCc1c(N)ccc(C#N)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 990,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 991,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 992,
+      "smiles": "CCCc1c(N)ccc(S)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 993,
+      "smiles": "CCCc1c(N)ccc(SC)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 994,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 995,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 996,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 997,
+      "smiles": "CCCc1c(N)ccc(N)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 998,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1N(C)C",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 999,
+      "smiles": "CCCc1c(N)ccc(C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1000,
+      "smiles": "CCCc1c(N)ccc(CC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1001,
+      "smiles": "CCCc1ccc(N)c(CCC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1002,
+      "smiles": "CCCc1c(N)ccc(O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1003,
+      "smiles": "CCCc1c(N)ccc(OC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1004,
+      "smiles": "CCCc1c(N)ccc(OCC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1005,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1006,
+      "smiles": "CCCc1c(N)ccc(F)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1007,
+      "smiles": "CCCc1c(N)ccc(Cl)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1008,
+      "smiles": "CCCc1c(N)ccc(Br)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1009,
+      "smiles": "CCCc1c(N)ccc(C#N)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1010,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1011,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1012,
+      "smiles": "CCCc1c(N)ccc(S)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1013,
+      "smiles": "CCCc1c(N)ccc(SC)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1014,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1015,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1016,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1017,
+      "smiles": "CCCc1c(N)ccc(N)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1018,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1F",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1019,
+      "smiles": "CCCc1c(N)ccc(C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1020,
+      "smiles": "CCCc1c(N)ccc(CC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1021,
+      "smiles": "CCCc1ccc(N)c(CCC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1022,
+      "smiles": "CCCc1c(N)ccc(O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1023,
+      "smiles": "CCCc1c(N)ccc(OC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1024,
+      "smiles": "CCCc1c(N)ccc(OCC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1025,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1026,
+      "smiles": "CCCc1c(N)ccc(F)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1027,
+      "smiles": "CCCc1c(N)ccc(Cl)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1028,
+      "smiles": "CCCc1c(N)ccc(Br)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1029,
+      "smiles": "CCCc1c(N)ccc(C#N)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1030,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1031,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1032,
+      "smiles": "CCCc1c(N)ccc(S)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1033,
+      "smiles": "CCCc1c(N)ccc(SC)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1034,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1035,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1036,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1037,
+      "smiles": "CCCc1c(N)ccc(N)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1038,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1Cl",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1039,
+      "smiles": "CCCc1c(N)ccc(C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1040,
+      "smiles": "CCCc1c(N)ccc(CC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1041,
+      "smiles": "CCCc1ccc(N)c(CCC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1042,
+      "smiles": "CCCc1c(N)ccc(O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1043,
+      "smiles": "CCCc1c(N)ccc(OC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1044,
+      "smiles": "CCCc1c(N)ccc(OCC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1045,
+      "smiles": "CCCc1c(N)ccc(N(C)C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1046,
+      "smiles": "CCCc1c(N)ccc(F)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1047,
+      "smiles": "CCCc1c(N)ccc(Cl)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1048,
+      "smiles": "CCCc1c(N)ccc(Br)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1049,
+      "smiles": "CCCc1c(N)ccc(C#N)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1050,
+      "smiles": "CCCc1c(N)ccc(C(C)=O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1051,
+      "smiles": "CCCc1c(N)ccc(C(=O)O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1052,
+      "smiles": "CCCc1c(N)ccc(S)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1053,
+      "smiles": "CCCc1c(N)ccc(SC)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1054,
+      "smiles": "CCCc1c(N)ccc(C(F)(F)F)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1055,
+      "smiles": "CCCc1c(N)ccc(C(C)(C)C)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1056,
+      "smiles": "CCCc1c(N)ccc(OC(C)=O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1057,
+      "smiles": "CCCc1c(N)ccc(N)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    },
+    {
+      "line_number": 1058,
+      "smiles": "CCCc1c(N)ccc(NC(C)=O)c1Br",
+      "template": "scaffold_cache_stress:aniline_decorated"
+    }
+  ]
+}

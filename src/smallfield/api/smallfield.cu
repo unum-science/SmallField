@@ -642,7 +642,16 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream,
  */
 void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
     handle.sink.check(cudaSetDevice(handle.device_id), "cudaSetDevice(finalize_gpu_pipeline)");
-    handle.sink.check(cudaStreamSynchronize(handle.stream), "cudaStreamSynchronize(finalize)");
+    // Wait on the end-of-download event instead of draining the entire stream.
+    // `event_end` is recorded after the last D2H `cudaMemcpyAsync`; waiting on
+    // it captures the full H2D → kernels → D2H chain via the stream's implicit
+    // ordering but costs a single event check (~1 µs) instead of an entire
+    // stream drain (~5-10 ms).  Fall back to stream sync if for some reason
+    // the event is not available.
+    if (handle.event_end != nullptr)
+        handle.sink.check(cudaEventSynchronize(handle.event_end), "cudaEventSynchronize(finalize event_end)");
+    else
+        handle.sink.check(cudaStreamSynchronize(handle.stream), "cudaStreamSynchronize(finalize)");
 
     if (handle.timings_out != nullptr && handle.event_end != nullptr) {
         cudaEventElapsedTime(&handle.timings_out->upload_ms, handle.event_upload_start, handle.event_metric_start);

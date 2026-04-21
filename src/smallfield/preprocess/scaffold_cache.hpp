@@ -117,11 +117,19 @@ class scaffold_cache_t {
     }
 
     /** Insert @p entry under @p scaffold_hash if absent.  Caller-provided
-     *  entry is moved in.  Takes an exclusive lock on the hash's shard. */
-    void insert(std::uint64_t scaffold_hash, scaffold_cache_entry_t entry) {
+     *  entry is moved in.  Takes an exclusive lock on the hash's shard.
+     *
+     *  Uses `try_emplace` so that if two threads both lookup-miss the same
+     *  scaffold, race-compute their own entries, and race-insert, whichever
+     *  insert lands second is a no-op — the first winner is preserved.  The
+     *  previous `emplace` call silently dropped the second argument on a
+     *  duplicate key so behaviour is equivalent for this type, but
+     *  `try_emplace` makes the intent explicit and avoids constructing the
+     *  pair when the key already exists. */
+    void insert_if_missing(std::uint64_t scaffold_hash, scaffold_cache_entry_t entry) {
         shard_t &s = shards_[scaffold_hash & (scaffold_cache_shard_count_k - 1)];
         std::unique_lock<std::shared_mutex> lk(s.lock);
-        s.entries.emplace(scaffold_hash, std::move(entry));
+        s.entries.try_emplace(scaffold_hash, std::move(entry));
     }
 
     /** Aggregate snapshot across shards. */

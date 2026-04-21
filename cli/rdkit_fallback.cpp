@@ -4,10 +4,12 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <omp.h>
 
+#include <GraphMol/Chirality.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
 #include <GraphMol/GraphMol.h>
@@ -21,6 +23,29 @@ namespace smallfield::cli {
 
 namespace sfapi = smallfield::api;
 
+/** Single-threaded warm-up that forces every RDKit lazy-init singleton we
+ *  touch in the fallback OMP loop to populate its caches before the pool of
+ *  ~188 fallback threads starts racing on first access.  See matching
+ *  `warm_up_rdkit_globals_once_` in `etkdg_prepare_batch.hpp`. */
+static void warm_up_rdkit_globals_for_fallback_() {
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+        try {
+            auto warm = RDKit::SmilesToMol("C[C@H](O)[C@@H](Cl)c1ccccc1");
+            if (warm) {
+                RDKit::MolOps::addHs(*warm);
+                RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
+                                                    /*flagPossibleStereoCenters=*/true);
+                RDKit::MMFF::MMFFMolProperties props(*warm);
+                (void)props.isValid();
+            }
+        }
+        catch (...) {
+            // Best-effort.
+        }
+    });
+}
+
 std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallback_outputs_t &outputs) {
     std::uint32_t const num_conformers = inputs.num_conformers;
     std::uint32_t const max_atoms = inputs.max_atoms;
@@ -32,6 +57,8 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
     std::atomic<std::uint64_t> num_recovered {0};
 
     int const num_threads = inputs.num_threads > 0 ? inputs.num_threads : omp_get_max_threads();
+
+    warm_up_rdkit_globals_for_fallback_();
 
 #pragma omp parallel for schedule(dynamic, 16) num_threads(num_threads) if (num_threads > 1)
     for (std::uint64_t retry_entry = 0; retry_entry < num_retries; ++retry_entry) {

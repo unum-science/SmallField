@@ -26,6 +26,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -1291,9 +1292,43 @@ static inline std::size_t append_bytes_(std::vector<std::byte> &dst, void const 
  *  thread's contribution carries its share of the input molecules with
  *  thread-local metadata offsets.
  */
+/**
+ *  @brief Force every RDKit lazy-init singleton to initialise on the main
+ *  thread before an OMP parallel-for races on first access.
+ *
+ *  Touches the SMILES parser, addHs, `assignStereochemistry` (which pulls in
+ *  the CIP-rank global state), the MMFF94 parameter tables, and an
+ *  ETKDG-style substructure match path.  These all have process-wide
+ *  lazy-loaded caches that in some RDKit versions are not safe for
+ *  concurrent first-time access.  `std::call_once` guarantees the warm-up
+ *  runs exactly once per process regardless of how many call sites reach
+ *  here; subsequent calls on any thread are a relaxed-load no-op.
+ */
+inline void warm_up_rdkit_globals_once_() {
+    static std::once_flag flag;
+    std::call_once(flag, [] {
+        try {
+            auto warm = RDKit::SmilesToMol("C[C@H](O)[C@@H](Cl)c1ccccc1");
+            if (warm) {
+                RDKit::MolOps::addHs(*warm);
+                RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
+                                                    /*flagPossibleStereoCenters=*/true);
+                RDKit::MMFF::MMFFMolProperties props(*warm);
+                (void)props.isValid();
+            }
+        }
+        catch (...) {
+            // Warm-up is best-effort.  If it throws, the subsequent parallel-for
+            // call will hit the same cache miss path; it only costs us the
+            // race-protection benefit, not correctness.
+        }
+    });
+}
+
 static inline void prepare_per_thread_contribs_(std::span<std::string_view const> smiles_list,
                                                 scaffold_cache_t *cache,
                                                 std::vector<batch_prep_thread_contribution_t> &contribs) {
+    warm_up_rdkit_globals_once_();
     int const n_threads_max = omp_get_max_threads();
     if (static_cast<int>(contribs.size()) < n_threads_max) contribs.resize(n_threads_max);
     for (auto &type_counts : contribs) {
