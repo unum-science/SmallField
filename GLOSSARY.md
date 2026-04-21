@@ -16,6 +16,9 @@ A `parquet-shard` carries roughly a million molecules; a `coprocessed-batch` agg
 | __`atom-limited-bin`__  | Inside one `embedding-wave`, molecules are grouped into bins whose member atom counts fall under a fixed cap (16, 32, 48, 64, 80, 96, 112, 128). Each bin dispatches one kernel launch with shared memory sized for the cap. | 6–8 K molecules/bin               |
 | __`molecule`__          | One input SMILES → K output conformers.                                                                                                                                                                                      | —                                 |
 
+Within one `embedding-wave` the per-device stripe sorts molecules by `molecule_complexity_score_` (a pure function of `etkdg_molecule_metadata_t`; see `src/smallfield/preprocess/molecule_complexity.hpp`) descending and assigns sorted rank `k` to device `k % device_count`.
+The score combines atom-count² (bounds-matrix + nonbonded-pair scan), MMFF+ETK torsion count (FIRE iteration cost), and the `is_heavy_refinement_case_` multiplier, so the stripe balances estimated GPU wall time rather than atom count alone.
+
 Old names that have been retired: `gpus-batch` → `coprocessed-batch`, `chunk` → `embedding-wave`, `wave bin` → `atom-limited-bin`.
 The CLI flag `--gpus-batch-size` stays as an alias for `--batch-size`.
 
@@ -100,6 +103,8 @@ Everything in between is full overlap.
 - `logger_t` (`src/smallfield/log.hpp`) — owned per-`context_t` or per-tool; emits timestamp-prefixed log lines.
 - `cuda_error_sink_t` (`src/smallfield/cuda_error.hpp`) — routes CUDA / cuSOLVER errors through a `logger_t` and bumps an owner-supplied counter.
 - `batch_pool_t` (`src/smallfield/api/batch_pool.hpp`) — pinned host buffer packed with all per-molecule preprocess output for one `embedding-wave`.
+- `molecule_complexity_score_` (`src/smallfield/preprocess/molecule_complexity.hpp`) — pure per-molecule work-estimate function used to balance the per-device stripe inside one `embedding-wave`.
+- `distribute_scratch_t` (`src/smallfield/preprocess/etkdg_prepare_batch.hpp`) — grow-only CSR scratch (sort permutation + per-device flat buffer + per-device offsets) reused across every `embedding-wave` so the stripe partition never allocates on the hot path.
 - `metric_scratch_t` (`src/smallfield/api/smallfield.hpp`) — per-GPU device scratch for the metric-embedding prepass within an `embedding-step`.
 - `launch_scratch_t` (`src/smallfield/api/smallfield.cu`) — per-GPU persistent device pool + pinned host staging; one per GPU, reused across `embedding-waves`.
 

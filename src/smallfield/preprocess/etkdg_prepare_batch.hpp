@@ -59,6 +59,7 @@
 #include "smallfield/parameters/forcefield_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
+#include "smallfield/preprocess/molecule_complexity.hpp"
 #include "smallfield/mmff94/mmff94_param_cache.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
 using smallfield::types::max_mmff_interactions_per_mol_k;
@@ -1706,27 +1707,53 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
 }
 
 /**
+ *  @brief Grow-only scratch for `distribute_batch_to_per_device_pools_`.
+ *
+ *  Holds the sort permutation, the CSR-packed per-device assignment list,
+ *  the per-device CSR offset array, and the per-device per-molecule
+ *  interaction-count staging vectors the downstream per-device pack loop
+ *  consumes.  One instance per caller; reused across every
+ *  `embedding-wave` so the distribute hot path never allocates.  Sibling
+ *  to the pre-existing `static etkdg_molecule_batch_t shared_scratch` the
+ *  same caller holds.
+ */
+struct distribute_scratch_t {
+    std::vector<std::uint32_t> sort_permutation;                                         ///< length: total_mol_count
+    std::vector<std::uint32_t> per_device_flat;                                          ///< length: total_mol_count, CSR values
+    // `32` mirrors the old hardcoded per_device_mol_list array; compile-time-
+    // asserted against `smallfield::api::max_devices_k = 16` in smallfield.cu.
+    static constexpr std::uint32_t max_devices_k = 32u;
+    std::array<std::uint32_t, max_devices_k + 1u> per_device_offsets {}; ///< length: device_count + 1
+    std::array<std::vector<std::uint32_t>, max_devices_k> mmff_interactions_per_mol {};
+    std::array<std::vector<std::uint32_t>, max_devices_k> etk_interactions_per_mol {};
+};
+
+/**
  *  @brief Distribute an already-packed shared batch into `device_count`
- *  per-device pinned pools with atom-count-descending stripe partition.
+ *  per-device pinned pools with a complexity-descending stripe partition.
  *
  *  Each device ends up with a disjoint subset of the shared batch's
- *  molecules; the subset is chosen so that per-device num_atoms
- *  distributions are near-identical (stripe of the descending sort).
+ *  molecules; the subset is chosen so that per-device work distributions
+ *  are near-identical — sort all mols by `molecule_complexity_score_`
+ *  descending, stripe mol at sorted rank `k` to device `k % device_count`,
+ *  then reverse each device's range so the per-device order ends up
+ *  complexity-ascending (kernel `atom-limited-bin` dispatch wants smallest
+ *  first, and complexity is a monotonic proxy of atom count on average).
+ *
  *  Each mol's bytes are copied from the shared pool into the assigned
  *  device's pinned pool at per-device-relative offsets, and the mol's
  *  metadata is rebased to the per-device layout.
  *
- *  Within each device's pool the mols are laid out in atom-count ASCENDING
- *  order so `launch_gpu_pipeline` can bin-dispatch without a per-device
- *  sort at launch time.
+ *  `scratch` carries the sort permutation and CSR-packed per-device
+ *  assignment — grow-only, caller-owned; see `distribute_scratch_t`.
  *
  *  Caller ensures `per_device_out[d].host` is pre-sized (via
  *  `ensure_capacity`) to hold this device's slice of the shared batch;
  *  the ctor pre-sizing in `context_t` covers typical waves.
  */
-inline void distribute_batch_to_per_device_pools_(
-    etkdg_molecule_batch_t const &shared, std::uint32_t device_count,
-    std::span<etkdg_molecule_batch_t> per_device_out) {
+inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &shared, std::uint32_t device_count,
+                                                   std::span<etkdg_molecule_batch_t> per_device_out,
+                                                   distribute_scratch_t &scratch) {
 
     std::uint32_t const total_mol_count = shared.num_molecules;
     auto const shared_metadata = shared.molecule_metadata();
@@ -1739,24 +1766,40 @@ inline void distribute_batch_to_per_device_pools_(
     }
     if (total_mol_count == 0) return;
 
-    // Atom-count descending stripe partition.  Per-device mol lists end up
-    // in atom-count ASCENDING order (striping from descending positions
-    // spills the biggest first to each device; we reverse at the end to
-    // give each device the ascending order the kernel bin dispatch wants).
-    std::vector<std::uint32_t> shared_index_by_atom_count(total_mol_count);
-    std::iota(shared_index_by_atom_count.begin(), shared_index_by_atom_count.end(), 0u);
-    std::sort(shared_index_by_atom_count.begin(), shared_index_by_atom_count.end(),
+    // Sort permutation in place on grow-only scratch.
+    if (scratch.sort_permutation.size() < total_mol_count) scratch.sort_permutation.resize(total_mol_count);
+    if (scratch.per_device_flat.size() < total_mol_count) scratch.per_device_flat.resize(total_mol_count);
+    std::iota(scratch.sort_permutation.begin(), scratch.sort_permutation.begin() + total_mol_count, 0u);
+    std::sort(scratch.sort_permutation.begin(), scratch.sort_permutation.begin() + total_mol_count,
               [&](std::uint32_t a, std::uint32_t b) {
-                  return shared_metadata[a].num_atoms > shared_metadata[b].num_atoms;
+                  return molecule_complexity_score_(shared_metadata[a]) >
+                         molecule_complexity_score_(shared_metadata[b]);
               });
 
-    std::array<std::vector<std::uint32_t>, 32> per_device_mol_list {}; // indexed [0, device_count)
-    for (std::size_t sorted_index = 0; sorted_index < shared_index_by_atom_count.size(); ++sorted_index) {
-        std::uint32_t const device_index = static_cast<std::uint32_t>(sorted_index % device_count);
-        per_device_mol_list[device_index].push_back(shared_index_by_atom_count[sorted_index]);
+    // CSR offsets for the per-device assignment: device d gets
+    // `ceil((total_mol_count - d) / device_count)` mols from the stripe
+    // (device 0 may get one more than the last device).
+    scratch.per_device_offsets[0] = 0u;
+    for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
+        std::uint32_t const count_d = (total_mol_count + (device_count - 1u) - device_index) / device_count;
+        scratch.per_device_offsets[device_index + 1u] = scratch.per_device_offsets[device_index] + count_d;
     }
-    for (std::uint32_t device_index = 0; device_index < device_count; ++device_index)
-        std::reverse(per_device_mol_list[device_index].begin(), per_device_mol_list[device_index].end());
+
+    // Single scatter pass: sorted rank `k` maps to device `k % device_count`
+    // at position `k / device_count` within that device's CSR range.
+    for (std::uint32_t k = 0; k < total_mol_count; ++k) {
+        std::uint32_t const device_index = k % device_count;
+        std::uint32_t const position = k / device_count;
+        scratch.per_device_flat[scratch.per_device_offsets[device_index] + position] = scratch.sort_permutation[k];
+    }
+
+    // In-place reverse each per-device range so the kernel bin-dispatch
+    // sees complexity-ascending mols first (smallest `atom-limited-bin`).
+    for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
+        auto *begin = scratch.per_device_flat.data() + scratch.per_device_offsets[device_index];
+        auto *end = scratch.per_device_flat.data() + scratch.per_device_offsets[device_index + 1u];
+        std::reverse(begin, end);
+    }
 
     auto const shared_view_for_counts = shared.host_view();
     auto const shared_mmff_atom_offsets = shared_view_for_counts.mmff_atom_offsets();
@@ -1781,15 +1824,21 @@ inline void distribute_batch_to_per_device_pools_(
 
 #pragma omp parallel for num_threads(static_cast<int>(device_count)) schedule(static, 1)
     for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
-        auto const &mol_list = per_device_mol_list[device_index];
+        std::span<std::uint32_t const> const mol_list {
+            scratch.per_device_flat.data() + scratch.per_device_offsets[device_index],
+            scratch.per_device_offsets[device_index + 1u] - scratch.per_device_offsets[device_index],
+        };
         etkdg_molecule_batch_t &out = per_device_out[device_index];
         std::uint32_t const device_mol_count = static_cast<std::uint32_t>(mol_list.size());
+
+        auto &mmff_interactions_per_mol = scratch.mmff_interactions_per_mol[device_index];
+        auto &etk_interactions_per_mol = scratch.etk_interactions_per_mol[device_index];
+        if (mmff_interactions_per_mol.size() < device_mol_count) mmff_interactions_per_mol.resize(device_mol_count);
+        if (etk_interactions_per_mol.size() < device_mol_count) etk_interactions_per_mol.resize(device_mol_count);
 
         per_mol_sizes_t totals {};
         totals.valid = device_mol_count;
         std::uint32_t max_atoms_seen = 0;
-        std::vector<std::uint32_t> mmff_interactions_per_mol(device_mol_count, 0);
-        std::vector<std::uint32_t> etk_interactions_per_mol(device_mol_count, 0);
         for (std::uint32_t pos = 0; pos < device_mol_count; ++pos) {
             auto const &meta = shared_metadata[mol_list[pos]];
             std::uint32_t const atom_count = meta.num_atoms;
@@ -1978,21 +2027,23 @@ inline void distribute_batch_to_per_device_pools_(
 
 /**
  *  @brief Preprocess + distribute entry: produce `device_count` per-device
- *  pinned batch pools with atom-count-descending stripe partition.  Each
- *  device's pool holds only its assigned mols in atom-count ASCENDING order.
+ *  pinned batch pools with a complexity-descending stripe partition.  Each
+ *  device's pool holds only its assigned mols in complexity-ascending
+ *  (→ atom-count-ascending on average) order for kernel bin dispatch.
  *
  *  Internally reuses the three-phase preprocess (per-thread extract, serial
  *  prefix scan, parallel pack) against a reusable shared batch, then
- *  distributes to the per-device pools.  The shared batch's pinned buffer is
- *  kept as a file-scope `static` (analogous to `contribs`) so its pinned
- *  allocation is amortised across all calls.
+ *  distributes to the per-device pools.  Two file-scope `static` scratch
+ *  instances hold the pinned shared batch and the distribution CSR buffers
+ *  so neither allocation fires on the hot path.
  */
 inline void prepare_per_device_batches_into(std::span<std::string_view const> smiles_list, std::uint32_t device_count,
                                              std::span<etkdg_molecule_batch_t> per_device_out,
                                              scaffold_cache_t *cache = nullptr) {
     static etkdg_molecule_batch_t shared_scratch;
+    static distribute_scratch_t distribute_scratch;
     prepare_molecule_batch_into(smiles_list, shared_scratch, cache);
-    distribute_batch_to_per_device_pools_(shared_scratch, device_count, per_device_out);
+    distribute_batch_to_per_device_pools_(shared_scratch, device_count, per_device_out, distribute_scratch);
 }
 
 } // namespace smallfield::preprocess

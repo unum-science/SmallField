@@ -6,6 +6,25 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## Complexity-Aware Stripe and Partitioned CPU Budget — Pending
+
+Two changes target throughput on drug-like `coprocessed-batches` where the dominant pathologies are the per-device wave straggler and concurrent-role CPU over-subscription.
+
+- __Complexity-descending stripe__.
+  `distribute_batch_to_per_device_pools_` now sorts molecules by `molecule_complexity_score_` (atom-count² + 4·torsion-count + per-term cost, doubled on heavy-rescue cases — see `src/smallfield/preprocess/molecule_complexity.hpp`) descending and stripes sorted rank `k` onto device `k % device_count`.
+  Replaces the old `num_atoms`-only sort.
+  The sort permutation and per-device assignment are packed into a single CSR layout (one flat `std::vector<std::uint32_t>` + one `std::array<std::uint32_t, max_devices_k + 1>` offset array), both held on a new caller-owned `distribute_scratch_t` sibling of the existing `static etkdg_molecule_batch_t shared_scratch`.
+  No vector-of-vectors, no per-call allocation on the distribute hot path; the previous code built a `std::vector<std::uint32_t>` the size of the whole batch plus a 32-wide vector-of-vectors every `embedding-wave`.
+
+- __Partitioned CPU budget__.
+  `compute_thread_budget` divides the non-reserved cores 5 : 3 between `fallback-role` and `gpu-runner-role` by default (fallback is the pacer on drug-like input).
+  On 192 cores the default goes from `gpu_runner=188, fallback=188` (over-subscribed, OS context-switch thrash) to `gpu_runner=69, fallback=113` (sum fits within `num_procs − reader − writer − os_reserve`).
+  New CLI flag `--gpu-runner-threads N` alongside the existing `--rdkit-fallback-threads N`.
+
+Baseline measurements pre-change (PubChem shard 8, 8 GPUs, K=3, seed 42): `351 s wall, 2 845 mol/s, 0 CUDA errors`.
+Post-change first single-shard run: `349 s wall, 2 867 mol/s, 0 CUDA errors` — within noise on a single shard.
+The benefit is expected at steady state across many shards where `fallback-role` and `gpu-runner-role` previously stalled each other; follow-up campaign measurements will land here.
+
 ## 3-Stream Chain Reverted — `db25c9d`
 
 The 3-stream chain from `a791e54` was kept as an architectural improvement assuming the copy-engine overlap would show at production scale.

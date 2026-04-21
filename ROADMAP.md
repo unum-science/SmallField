@@ -91,6 +91,21 @@ Expected gain 4–6 % host prep.
 Effort small — one pragma change plus an optional sort.
 Risk low.
 
+### 2b. Partitioned CPU budget between `gpu-runner-role` and `fallback-role`
+
+Before this partition the `compute_thread_budget` heuristic gave both `gpu-runner-role` and `fallback-role` `num_procs - 4 = 188` OpenMP threads each, on a 192-core host.
+When both roles were mid-stage the OS scheduler saw 376 threads contending for 192 cores — `top -bn1 -H` showed one of them reduced to a single `R` thread while hundreds sat in `futex_wait`.
+The budget comment explicitly assumed "sections run at different times", which stopped being true on drug-like `coprocessed-batches` where the `fallback-role`'s RDKit embed is 3–6× slower than the GPU path.
+
+The current `compute_thread_budget` splits the non-reserved core count:
+
+- `reader-role` 1-2, `writer-role` 2-4, `os_reserve` 2-8 (unchanged).
+- Remaining cores are divided 5 : 3 between `fallback-role` and `gpu-runner-role` by default — fallback is the pacer on drug-like shards and gets the majority.
+- On 192 cores the default split is now `gpu_runner = 69`, `fallback = 113`, and the two roles co-exist concurrently without OS context-switch thrash.
+
+Two CLI flags tune the split: `--rdkit-fallback-threads N` and the new `--gpu-runner-threads N`.
+Set either to override the auto-computed default for workloads that skew the opposite direction (e.g. near-zero GPU failure rate → fallback can shrink, gpu_runner can grow).
+
 ### 3. SMILES Parse Overlap Across Waves
 
 `libRDKitSmilesParse` accounts for 4.87 % of CPU self-time at 10 M scale.
