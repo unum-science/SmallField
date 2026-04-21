@@ -91,20 +91,19 @@ Expected gain 4–6 % host prep.
 Effort small — one pragma change plus an optional sort.
 Risk low.
 
-### 2b. Partitioned CPU budget between `gpu-runner-role` and `fallback-role`
+### 2b. Multi-`parquet-shard` Invocation for Full 4-Role Overlap
 
-Before this partition the `compute_thread_budget` heuristic gave both `gpu-runner-role` and `fallback-role` `num_procs - 4 = 188` OpenMP threads each, on a 192-core host.
-When both roles were mid-stage the OS scheduler saw 376 threads contending for 192 cores — `top -bn1 -H` showed one of them reduced to a single `R` thread while hundreds sat in `futex_wait`.
-The budget comment explicitly assumed "sections run at different times", which stopped being true on drug-like `coprocessed-batches` where the `fallback-role`'s RDKit embed is 3–6× slower than the GPU path.
+The `smallfield_batch` CLI runs a persistent 4-role pipeline — `reader-role → gpu-runner-role → fallback-role → writer-role`, with depth-3 ring handoffs between them — but the historical wrapper (`/tmp/pubchem_per_shard_loop.sh`) invoked `smallfield_batch` once per `parquet-shard`.
+At 1 M molecules per `parquet-shard` and ~800 K target `coprocessed-batch` size on 8 GPUs, that means each invocation saw ~1.25 `coprocessed-batches` in flight, so the ring stayed near-empty and the role overlap never materialised.
+GPU aggregate utilisation measured 12.5 % across a wave's wall; `top -bn1 -H -p <pid>` showed one role burning 1–27 cores while the others sat in `futex_wait`.
 
-The current `compute_thread_budget` splits the non-reserved core count:
+The current wrapper (`/tmp/pubchem_multi_shard_loop.sh`) invokes `smallfield_batch` _once_ on the entire `parquet-shard` input directory.
+`--resume` (CLI default) auto-skips any `parquet-shard` whose `*_3D.parquet` output already exists, so relaunching on crash picks up exactly where the previous process left off.
+One process sees all pending `parquet-shards` as a stream, the ring genuinely fills, and `fallback-role` on `coprocessed-batch` N overlaps `gpu-runner-role` on `coprocessed-batch` N+1 as the glossary diagram always promised.
 
-- `reader-role` 1-2, `writer-role` 2-4, `os_reserve` 2-8 (unchanged).
-- Remaining cores are divided 5 : 3 between `fallback-role` and `gpu-runner-role` by default — fallback is the pacer on drug-like shards and gets the majority.
-- On 192 cores the default split is now `gpu_runner = 69`, `fallback = 113`, and the two roles co-exist concurrently without OS context-switch thrash.
-
-Two CLI flags tune the split: `--rdkit-fallback-threads N` and the new `--gpu-runner-threads N`.
-Set either to override the auto-computed default for workloads that skew the opposite direction (e.g. near-zero GPU failure rate → fallback can shrink, gpu_runner can grow).
+A previous attempt to solve the overlap by splitting the `compute_thread_budget` between `gpu-runner-role` and `fallback-role` (5 : 3 in favour of fallback) reduced single-invocation throughput by ~5 % — each role got fewer cores for its solo bursts and the "overlap" window that was supposed to compensate didn't exist in the per-shard wrapper mode.
+That split is reverted; both roles again default to `num_procs - 4` (the pre-existing design).
+The `--rdkit-fallback-threads N` and `--gpu-runner-threads N` flags remain for workloads where an operator wants to tune the mix by hand.
 
 ### 3. SMILES Parse Overlap Across Waves
 

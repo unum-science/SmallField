@@ -16,14 +16,16 @@ Two changes target throughput on drug-like `coprocessed-batches` where the domin
   The sort permutation and per-device assignment are packed into a single CSR layout (one flat `std::vector<std::uint32_t>` + one `std::array<std::uint32_t, max_devices_k + 1>` offset array), both held on a new caller-owned `distribute_scratch_t` sibling of the existing `static etkdg_molecule_batch_t shared_scratch`.
   No vector-of-vectors, no per-call allocation on the distribute hot path; the previous code built a `std::vector<std::uint32_t>` the size of the whole batch plus a 32-wide vector-of-vectors every `embedding-wave`.
 
-- __Partitioned CPU budget__.
-  `compute_thread_budget` divides the non-reserved cores 5 : 3 between `fallback-role` and `gpu-runner-role` by default (fallback is the pacer on drug-like input).
-  On 192 cores the default goes from `gpu_runner=188, fallback=188` (over-subscribed, OS context-switch thrash) to `gpu_runner=69, fallback=113` (sum fits within `num_procs − reader − writer − os_reserve`).
-  New CLI flag `--gpu-runner-threads N` alongside the existing `--rdkit-fallback-threads N`.
+- __Multi-`parquet-shard` invocation__.
+  The per-`parquet-shard` wrapper (`/tmp/pubchem_per_shard_loop.sh`) was replaced with a multi-`parquet-shard` wrapper (`/tmp/pubchem_multi_shard_loop.sh`) that points `smallfield_batch` at the entire input directory in one invocation.
+  `--resume` (CLI default) auto-skips `parquet-shards` already produced, so crash-retry picks up cleanly.
+  The 4-role ring (reader → gpu-runner → fallback → writer) only overlaps when multiple `coprocessed-batches` are in flight, which per-shard invocation never provided (1 M ÷ 800 K ≈ 1.25 `coprocessed-batches` per process).
+  An earlier attempt to partition the `compute_thread_budget` 5 : 3 between `fallback-role` and `gpu-runner-role` was reverted — it reduced single-shard throughput ~5 % in the per-shard-invocation mode, and the overlap window it depended on never existed.
+  Both roles default again to `num_procs - 4`; new flags `--gpu-runner-threads N` and `--rdkit-fallback-threads N` stay for manual tuning.
 
 Baseline measurements pre-change (PubChem shard 8, 8 GPUs, K=3, seed 42): `351 s wall, 2 845 mol/s, 0 CUDA errors`.
-Post-change first single-shard run: `349 s wall, 2 867 mol/s, 0 CUDA errors` — within noise on a single shard.
-The benefit is expected at steady state across many shards where `fallback-role` and `gpu-runner-role` previously stalled each other; follow-up campaign measurements will land here.
+Post-stripe-only single-shard: `349 s wall, 2 867 mol/s, 0 CUDA errors` — within noise.
+Post-multi-shard-invocation throughput: pending measurement on full PubChem tail.
 
 ## 3-Stream Chain Reverted — `db25c9d`
 

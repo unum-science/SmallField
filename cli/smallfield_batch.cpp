@@ -79,8 +79,8 @@ void print_usage() {
   --coprocessed-batch-size N         alias for --batch-size
   --chunk-size N              alias for --batch-size
   --gpus a,b,c                GPU device IDs (default: all visible)
-  --rdkit-fallback-threads N  OpenMP threads for fallback-role (default: ~62.5%% of available)
-  --gpu-runner-threads N      OpenMP threads for gpu-runner-role preprocess (default: ~37.5%% of available)
+  --rdkit-fallback-threads N  OpenMP threads for fallback-role (default: num_procs - 4)
+  --gpu-runner-threads N      OpenMP threads for gpu-runner-role preprocess (default: num_procs - 4)
   --restart                   overwrite already-complete output shards
   --seed N                    RNG seed for both GPU and RDKit fallback
   --verbose[=LEVEL]           library diagnostics: 1 = wave table, 2 = +per-device
@@ -353,26 +353,20 @@ thread_budget_t compute_thread_budget(int user_fallback_override, int user_gpu_r
     int const reader = std::clamp(num_procs / 128, 1, 2);
     // Writer is Arrow-serialize-bound, also mostly single-threaded inside Arrow.
     int const writer = std::clamp(num_procs / 64, 2, 4);
-    // OS reserve: keep a handful of cores free so kernel work (cuda driver,
-    // memory pressure daemons, tmux, log flush) doesn't preempt hot threads.
-    int const os_reserve = std::clamp(num_procs / 32, 2, 8);
     // `gpu-runner-role` and `fallback-role` run concurrently in separate
-    // OpenMP sections and each spawns its own inner parallel-for.  Historical
-    // budget gave both `num_procs - 4` threads, which over-subscribed the
-    // machine (376 threads on 192 cores) whenever both stages were active;
-    // `top -bn1 -H` showed one of them reduced to a single `R` thread while
-    // the others sat in `futex_wait`.  Split the remaining cores so the sum
-    // fits within `num_procs - reader - writer - os_reserve`.
+    // OpenMP sections.  On a healthy pipeline (multiple `parquet-shards` per
+    // `smallfield_batch` invocation so the depth-3 ring genuinely holds
+    // multiple `coprocessed-batches` in flight) at most one of the two
+    // roles is mid-parallel-for at any instant — fallback bursts on RDKit
+    // while gpu-runner is stream-syncing, and vice versa — so each gets
+    // the full `num_procs - 4` budget without mutual starvation.
     //
-    // Fallback-role is the pipeline pacer on drug-like coprocessed-batches
-    // (RDKit embed is 3-6× slower than the GPU path on typical mol-failure
-    // rates); give it the larger slice by default.  Override either slice
-    // via CLI flags if the workload skews the other direction.
-    int const available_for_inner_parallel_for = std::max(1, num_procs - reader - writer - os_reserve);
-    int const fallback_default = (available_for_inner_parallel_for * 5) / 8;          // ~62.5%
-    int const gpu_runner_default = std::max(1, available_for_inner_parallel_for - fallback_default); // ~37.5%
-    int const fallback = user_fallback_override > 0 ? user_fallback_override : fallback_default;
-    int const gpu_runner = user_gpu_runner_override > 0 ? user_gpu_runner_override : gpu_runner_default;
+    // An earlier commit split the budget 5:3 between fallback and gpu-runner
+    // on the assumption that the two roles overlap deeply in time; in the
+    // per-shard wrapper invocation mode that assumption was wrong and the
+    // split reduced single-shard throughput by ~5 %.
+    int const gpu_runner = user_gpu_runner_override > 0 ? user_gpu_runner_override : std::max(1, num_procs - 4);
+    int const fallback = user_fallback_override > 0 ? user_fallback_override : std::max(1, num_procs - 4);
     return {reader, writer, gpu_runner, fallback};
 }
 
