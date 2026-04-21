@@ -1863,28 +1863,22 @@ inline void distribute_batch_to_per_device_pools_(
             // atom_offsets contain per-atom interaction-start offsets that
             // point into `mmff_interactions`; rebase each entry by the delta
             // between the source and destination interaction bases.
-            // Use `int64_t` deltas — a batch of dense drug-like molecules can
-            // push running interaction totals close to INT32_MAX, and the
-            // int32 subtraction that was here would wrap silently.
             std::uint32_t const source_atom_offsets_base = src_meta.mmff_atom_offsets_start;
             std::uint32_t const source_interactions_base = aoff_src[source_atom_offsets_base].bond_start;
-            std::int64_t const mmff_interactions_rebase_delta =
-                static_cast<std::int64_t>(running.mmff_interactions) -
-                static_cast<std::int64_t>(source_interactions_base);
-            auto rebase_mmff = [mmff_interactions_rebase_delta](std::uint32_t start) -> std::uint32_t {
-                std::int64_t const rebased = static_cast<std::int64_t>(start) + mmff_interactions_rebase_delta;
-                assert(rebased >= 0 && "mmff rebase produced negative offset");
-                assert(rebased <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max()) &&
-                       "mmff rebase exceeded uint32_t offset range");
-                return static_cast<std::uint32_t>(rebased);
-            };
+            std::int32_t const mmff_interactions_rebase_delta =
+                static_cast<std::int32_t>(running.mmff_interactions) - static_cast<std::int32_t>(source_interactions_base);
             for (std::uint32_t atom = 0; atom < atom_count; ++atom) {
                 mmff94_atom_offsets_t entry = aoff_src[source_atom_offsets_base + atom];
-                entry.bond_start = rebase_mmff(entry.bond_start);
-                entry.angle_start = rebase_mmff(entry.angle_start);
-                entry.torsion_start = rebase_mmff(entry.torsion_start);
-                entry.oop_start = rebase_mmff(entry.oop_start);
-                entry.stretchbend_start = rebase_mmff(entry.stretchbend_start);
+                entry.bond_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.bond_start) +
+                                                              mmff_interactions_rebase_delta);
+                entry.angle_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.angle_start) +
+                                                               mmff_interactions_rebase_delta);
+                entry.torsion_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.torsion_start) +
+                                                                 mmff_interactions_rebase_delta);
+                entry.oop_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.oop_start) +
+                                                             mmff_interactions_rebase_delta);
+                entry.stretchbend_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.stretchbend_start) +
+                                                                     mmff_interactions_rebase_delta);
                 aoff_dst[running.mmff_atom_offsets + atom] = entry;
             }
             std::memcpy(interactions_dst.data() + running.mmff_interactions,
@@ -1895,17 +1889,13 @@ inline void distribute_batch_to_per_device_pools_(
             std::uint32_t const source_etk_atom_offsets_base = src_meta.etk_atom_offsets_start;
             std::uint32_t const source_etk_interactions_base =
                 etk_aoff_src[source_etk_atom_offsets_base].interaction_start;
-            std::int64_t const etk_interactions_rebase_delta =
-                static_cast<std::int64_t>(running.etk_interactions) -
-                static_cast<std::int64_t>(source_etk_interactions_base);
+            std::int32_t const etk_interactions_rebase_delta =
+                static_cast<std::int32_t>(running.etk_interactions) -
+                static_cast<std::int32_t>(source_etk_interactions_base);
             for (std::uint32_t atom = 0; atom < atom_count; ++atom) {
                 etk_atom_offsets_t entry = etk_aoff_src[source_etk_atom_offsets_base + atom];
-                std::int64_t const rebased =
-                    static_cast<std::int64_t>(entry.interaction_start) + etk_interactions_rebase_delta;
-                assert(rebased >= 0 && "etk rebase produced negative offset");
-                assert(rebased <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max()) &&
-                       "etk rebase exceeded uint32_t offset range");
-                entry.interaction_start = static_cast<std::uint32_t>(rebased);
+                entry.interaction_start = static_cast<std::uint32_t>(
+                    static_cast<std::int32_t>(entry.interaction_start) + etk_interactions_rebase_delta);
                 etk_aoff_dst[running.etk_atom_offsets + atom] = entry;
             }
             std::memcpy(etk_inter_dst.data() + running.etk_interactions,
