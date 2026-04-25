@@ -406,8 +406,8 @@ void reader_loop(std::vector<sfcli::shard_pair_t const *> const &pending, cli_co
 }
 
 void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, thread_budget_t const &budget,
-                     handoff_t<coprocessed_batch_accumulator_t> &in, handoff_t<coprocessed_batch_result_t> &out, buffer_pool_t &pool,
-                     progress_counters_t &counters) {
+                     handoff_t<coprocessed_batch_accumulator_t> &in, handoff_t<coprocessed_batch_result_t> &out,
+                     buffer_pool_t &pool, progress_counters_t &counters) {
     omp_set_num_threads(budget.gpu_runner);
     (void)counters;
 
@@ -437,11 +437,39 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
             std::span<std::string_view const>(accumulator.combined_smiles), generation_config, config.max_atoms,
             std::span<__half>(buf->coordinates.data(), total_conformers * config.max_atoms * 3u),
             std::span<float>(buf->energies.data(), total_conformers),
-            std::span<sfapi::conformer_status_t>(buf->status.data(), total_conformers));
+            std::span<sfapi::conformer_status_t>(buf->status.data(), total_conformers),
+            std::span<std::uint8_t>(buf->num_atoms_per_molecule.data(), num_molecules));
+
+        // Kernel-OOB guardrail: any CUDA error during this batch poisons the
+        // driver context on every device, and every subsequent shard would
+        // also silently produce garbage.  Park the shards that contributed to
+        // this batch into `{input_dir}/../{input_dir_name}_skip/` so the
+        // wrapper's next invocation skips them, and exit non-zero so the
+        // wrapper relaunches with a fresh CUDA context.  One bad shard out of
+        // N in the batch gets collateral-parked; in practice each batch has
+        // one shard because Enamine/PubChem shards exceed the 800 K target.
+        if (gpu_context.cuda_error_count.load() > 0) {
+            std::filesystem::path const input_dir = accumulator.input_file_pairs.front()->input_path.parent_path();
+            std::filesystem::path const skip_dir = input_dir.parent_path() / (input_dir.filename().string() + "_skip");
+            std::error_code ec;
+            std::filesystem::create_directories(skip_dir, ec);
+            for (auto const *pair : accumulator.input_file_pairs) {
+                std::filesystem::path const dest = skip_dir / pair->input_path.filename();
+                std::filesystem::rename(pair->input_path, dest, ec);
+                std::fprintf(stderr, "[smallfield_batch] CUDA error — parked shard %s -> %s (%s)\n",
+                             pair->input_path.string().c_str(), dest.string().c_str(),
+                             ec ? ec.message().c_str() : "ok");
+            }
+            std::fprintf(stderr,
+                         "[smallfield_batch] aborting invocation after %llu CUDA errors; wrapper will relaunch\n",
+                         static_cast<unsigned long long>(gpu_context.cuda_error_count.load()));
+            std::_Exit(2);
+        }
 
         std::fill_n(buf->solver_codes.data(), total_conformers, static_cast<std::uint8_t>(0));
         std::fill_n(buf->status_codes.data(), total_conformers, static_cast<std::uint8_t>(0));
-        std::fill_n(buf->num_atoms_per_molecule.data(), num_molecules, static_cast<std::uint8_t>(0));
+        // NOTE: `num_atoms_per_molecule` is now populated by `generate_conformers` above
+        // for every molecule that survived preprocess; no zero-fill here.
 
         buf->retry_indices.clear();
         for (std::uint64_t mol = 0; mol < num_molecules; ++mol) {
@@ -623,10 +651,9 @@ int main(int argc, char **argv) {
                                                           : static_cast<std::uint32_t>(config.gpu_ids.size());
     std::uint32_t const batch_target = config.batch_size > 0 ? config.batch_size : num_gpus * 100'000u;
 
-    thread_budget_t const budget =
-        compute_thread_budget(config.rdkit_fallback_threads, config.gpu_runner_threads);
-    logger.info("  {} GPUs, coprocessed-batch target {} mols, threads reader={} gpu_runner={} fallback={} writer={}", num_gpus,
-                thousands(batch_target), budget.reader, budget.gpu_runner, budget.fallback, budget.writer);
+    thread_budget_t const budget = compute_thread_budget(config.rdkit_fallback_threads, config.gpu_runner_threads);
+    logger.info("  {} GPUs, coprocessed-batch target {} mols, threads reader={} gpu_runner={} fallback={} writer={}",
+                num_gpus, thousands(batch_target), budget.reader, budget.gpu_runner, budget.fallback, budget.writer);
 
     omp_set_max_active_levels(2);
 
