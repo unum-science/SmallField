@@ -34,6 +34,7 @@
 #include <span>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -310,6 +311,11 @@ struct batch_pool_t {
     batch_layout_t layout;
     std::uint32_t num_molecules = 0;
     std::uint32_t max_atoms_per_molecule = 0;
+    /** @brief Slice-local indices whose `preprocess-step` exceeded the per-`molecule`
+     *  deadline (RDKit VF2 worst-case); populated by `prepare_molecule_batch_into`
+     *  and consumed by the caller to stamp `conformer_status_t::preprocess_timeout`
+     *  and route to the `fallback-role`.  Grow-only across calls. */
+    std::vector<std::uint32_t> timed_out_input_indices;
 
     batch_pool_view_t host_view() noexcept { return {host.data(), &layout}; }
     batch_pool_view_t host_view() const noexcept { return {const_cast<std::byte *>(host.data()), &layout}; }

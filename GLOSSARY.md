@@ -107,18 +107,36 @@ Everything in between is full overlap.
 - `distribute_scratch_t` (`src/smallfield/preprocess/etkdg_prepare_batch.hpp`) — grow-only CSR scratch (sort permutation + per-device flat buffer + per-device offsets) reused across every `embedding-wave` so the stripe partition never allocates on the hot path.
 - `metric_scratch_t` (`src/smallfield/api/smallfield.hpp`) — per-GPU device scratch for the metric-embedding prepass within an `embedding-step`.
 - `launch_scratch_t` (`src/smallfield/api/smallfield.cu`) — per-GPU persistent device pool + pinned host staging; one per GPU, reused across `embedding-waves`.
+- `preprocess_deadline_t` (`src/smallfield/preprocess/preprocess_deadline.hpp`) — stack-owned steady-clock deadline + latched tripped-flag, stamped 2 s ahead before each `molecule` in the `preprocess-step`.
+  The OMP-for body threads a pointer through `prepare_molecule_into` → `extract_etk_torsions_native` → an `extraAtomCheck` lambda wired into `RDKit::SubstructMatchParameters` (RDKit ≥ 2025.09.6).
+  Returning `false` from the callback unwinds VF2 in O(candidates) instead of its pathological worst case.
+  Each OMP worker owns its own stack-local instance — no `thread_local` or process-wide state.
+
+## Conformer Status Codes
+
+`conformer_status_t` (`src/smallfield/api/smallfield.hpp`) is written per conformer slot into the caller's `status_out` span.
+The Parquet writer persists the raw byte.
+
+| Value | Name                 | Meaning                                                                                                     |
+| ----: | :------------------- | :---------------------------------------------------------------------------------------------------------- |
+|     0 | `success`            | Conformer produced by the GPU `embedding-step` (or by the `fallback-role` re-embed).                        |
+|     1 | `stereo_failure`     | Stereochemistry assignment fell through all attempts.                                                       |
+|     2 | `mmff_unconverged`   | MMFF94 polish did not converge inside the iteration budget.                                                 |
+|     3 | `invalid_smiles`     | SMILES failed to parse or produced an empty `molecule`.                                                     |
+|     4 | `too_many_atoms`     | Atom count exceeds the compile-time kernel bound.                                                           |
+|     5 | `preprocess_timeout` | `preprocess-step` exceeded the per-`molecule` 2 s deadline (RDKit VF2 worst-case); `fallback-role` retries. |
 
 ## Code Map
 
 Glossary terms are vocabulary; the table below points at where each one is grounded in source so a new reader can grep from doc to code.
 
-| Glossary term       | Canonical location in source                                                                  |
-| :------------------ | :-------------------------------------------------------------------------------------------- |
-| `parquet-shard`     | `cli/smallfield_batch.cpp` — path-based iteration, no dedicated struct                        |
+| Glossary term       | Canonical location in source                                                                                                                  |
+| :------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------- |
+| `parquet-shard`     | `cli/smallfield_batch.cpp` — path-based iteration, no dedicated struct                                                                        |
 | `coprocessed-batch` | `batch_pool_t` in `src/smallfield/api/batch_pool.hpp` (alias `etkdg_molecule_batch_t` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`) |
-| `embedding-wave`    | `wave_record_t` in `src/smallfield/api/smallfield.cu`                                         |
-| `atom-limited-bin`  | `atom_limited_bin_caps[]` in `src/smallfield/api/smallfield.cu`                               |
-| pipeline roles      | `cli/smallfield_batch.cpp` — architectural comment blocks, no per-role struct                 |
-| `preprocess-step`   | `prepare_molecule_batch_into` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`          |
-| `embedding-step`    | `launch_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                   |
-| `finalize-step`     | `finalize_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                 |
+| `embedding-wave`    | `wave_record_t` in `src/smallfield/api/smallfield.cu`                                                                                         |
+| `atom-limited-bin`  | `atom_limited_bin_caps[]` in `src/smallfield/api/smallfield.cu`                                                                               |
+| pipeline roles      | `cli/smallfield_batch.cpp` — architectural comment blocks, no per-role struct                                                                 |
+| `preprocess-step`   | `prepare_molecule_batch_into` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`                                                          |
+| `embedding-step`    | `launch_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                                                                   |
+| `finalize-step`     | `finalize_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                                                                 |

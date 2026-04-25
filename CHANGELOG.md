@@ -6,6 +6,57 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## RDKit 2025.09.6 Bump, Per-Molecule Preprocess Deadline and `preprocess_timeout` Status — Pending
+
+Under the multi-`parquet-shard` invocation wrapper, a single pathological drug-like `molecule` could stall the entire 4-role pipeline for 15–20 minutes.
+`cuda-gdb` on the stuck thread placed the hang inside `boost::detail::VF2SubState::MatchAll`, reachable from `RDKit::SubstructMatch` on the CSD-torsion fallback path.
+RDKit 2024.03.6's `SubstructMatchParameters` exposed only `extraFinalCheck` — fires after a candidate match is found, useless for searches that never find one.
+
+- __RDKit upgraded__ 2024.03.6 → 2025.09.6 (conda-forge `librdkit-dev` / `libboost-devel=1.86`), installed into a dedicated conda-forge environment.
+  Build wiring unchanged — the `RDKIT_PREFIX` hand-rolled imported-target mechanism in `CMakeLists.txt:96-148` takes the new env as-is.
+  Two test translation units needed an explicit `#include <iostream>` because 2025.09.6's `ForceFieldHelpers/MMFF/AtomTyper.h` references `std::cout` without the backing include.
+- __Per-`molecule` soft deadline__.
+  New header `src/smallfield/preprocess/preprocess_deadline.hpp` defines `preprocess_deadline_t { deadline, tripped }` — a stack-owned struct, no `thread_local` or process-wide state.
+  Each OMP-for iteration in `prepare_per_thread_contribs_` stack-allocates one, calls `reset(2 s)` before each `molecule`, and passes a pointer through `prepare_molecule_into` → `extract_etk_torsions_native` → the `extraAtomCheck` lambda in `SubstructMatchParameters` (new in RDKit 2025.09.6).
+  The lambda returns `!exceeded_or_null(deadline)` on every VF2 atom comparison; once past the deadline, VF2 unwinds in O(candidates) without throwing through RDKit internals.
+  No singleton, no pimpl, no signal — a pointer threaded through 3 function signatures.
+- __New `conformer_status_t::preprocess_timeout = 5`__.
+  Stamped in `generate_conformers` for every conformer slot whose `molecule` was recorded in the new `timed_out_input_indices` list (on `batch_prep_thread_contribution_t` and on `batch_pool_t`).
+  Grow-only vectors across calls — zero hot-path allocation after warmup.
+  The `fallback-role` picks up timed-out molecules on its existing "any non-success status" retry path and re-embeds them via ETKDGv3, which does not use `SubstructMatch` and so cannot re-trigger the same VF2 worst case.
+- __Adversarial axis `vf2_hang_candidates`__.
+  Twenty polycyclic-aromatic / heavily-halogenated templates appended to `test/preprocess/adversarial_molecules.py` as a regression gate for the `extraAtomCheck` hook.
+- __Two pybind enum bindings__ (`src/smallfield/api/smallfield.cu:1018`, `python/smallfield/_binding.cpp:27`) gain `.value("preprocess_timeout", ...)`.
+- __New `num_atoms_out` output span on `generate_conformers`__.
+  Library now copies each `molecule`'s atom count (heavy + explicit H, post-`addHs`) from preprocess metadata into a caller-provided `std::span<std::uint8_t>`.
+  Default-empty span keeps the old API valid; the CLI passes it through to the writer to enable tight per-row coordinate emission.
+
+All 13 ctest targets green on the 2025.09.6 build.
+Validated by encoding all 978 GDB13 shards + 4000+ Enamine REAL shards on the new build with zero correctness issues.
+
+## Tight Per-Row Coordinate Parquet Output, Zstd Compression and Auto-Park CUDA-Error Guardrail — Pending
+
+Three independent CLI / writer changes that together drop output-shard size ~3× and make multi-shard runs self-recovering on a poisoned CUDA context:
+
+- __Tight `List<float16>` coordinates per row__.
+  `pack_coordinates_as_list` in `cli/parquet_writer.cpp` replaces the old `FixedSizeList<float16, max_atoms × 3>` with a variable-length `List<float16>` whose row length is exactly `num_atoms × 3` halves.
+  Drug-like Enamine REAL averages ~50 atoms per molecule against a 128-atom kernel stride, so 60 % of every row was trailing zero padding; tight rows cut the coordinate column by ~60 %.
+- __ZSTD-3 compression on every column__.
+  Parquet writer now passes `parquet::Compression::ZSTD` with level 3 (`cli/parquet_writer.cpp`).
+  Replaces the silent default of `UNCOMPRESSED` that had been inflating outputs ~2-3 ×; combined with the tight-coords fix, full-Enamine output projects from ~11 TB → ~2.7 TB.
+- __Always-populated `num_atoms` column__.
+  CLI now passes `buf->num_atoms_per_molecule.data()` into `generate_conformers`'s new `num_atoms_out` parameter (instead of zero-filling and only setting the column for fallback-rescued slots).
+  Writer treats the column as non-null going forward.
+  Old shards converted by a one-shot Python tool — `/tmp/convert_old_shards.py` regenerates `num_atoms` from re-parsed SMILES via RDKit.
+- __CUDA-error auto-park + abort__.
+  `gpu_runner_loop` in `cli/smallfield_batch.cpp` now checks `gpu_context.cuda_error_count` after every `generate_conformers` call.
+  On any CUDA error during a batch, the contributing input shards are atomically `mv`'d to `{input_dir}_skip/` and the process exits with status 2.
+  The wrapper-loop's `for attempt in $(seq 1 999)` catches the non-zero exit, sleeps 8 s, and relaunches with a fresh CUDA context — the now-skipped shard never re-poisons the new invocation.
+  Replaces the prior behaviour where one bad-data CUDA-OOB shard cascaded into thousands of garbage-output shards before the wrapper finally noticed.
+
+Per-shard size win measured on Enamine REAL shard 0 (3 M conformer rows): __1785 MB → 225 MB (12.6 %)__ via the bulk Python converter; __~656 MB__ for fresh-encoded drug-like shards including the writer-side compression.
+Combined the converter and the new writer reclaimed ~1.9 TB on the running disk while encoding continued without interruption.
+
 ## Complexity-Aware Stripe and Partitioned CPU Budget — Pending
 
 Two changes target throughput on drug-like `coprocessed-batches` where the dominant pathologies are the per-device wave straggler and concurrent-role CPU over-subscription.
@@ -59,11 +110,11 @@ Symptom matching:
 
 Verification — 10 M USearch K=3, 8 GPUs, post-fix:
 
-| Variant                             |    Wall |  mol/s | conformers/s | Crashes |
-| :---------------------------------- | ------: | -----: | -----------: | ------: |
-| Pre-fix non-blocking                |       — |      — |            — | crashed @ +9:49 s |
-| Pre-fix `CUDA_LAUNCH_BLOCKING=1`    | 1 063 s | 9 404 |      28 211 | 0 |
-| Post-fix non-blocking               |   662 s | 15 106 |      45 319 | 0 |
+| Variant                          |    Wall |  mol/s | conformers/s |           Crashes |
+| :------------------------------- | ------: | -----: | -----------: | ----------------: |
+| Pre-fix non-blocking             |       — |      — |            — | crashed @ +9:49 s |
+| Pre-fix `CUDA_LAUNCH_BLOCKING=1` | 1 063 s |  9 404 |       28 211 |                 0 |
+| Post-fix non-blocking            |   662 s | 15 106 |       45 319 |                 0 |
 
 ## Multi-GPU Pipeline Refactor — `a791e54` and `9cb82be`
 

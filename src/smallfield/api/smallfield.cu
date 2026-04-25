@@ -814,7 +814,8 @@ static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record
 conformer_status_t context_t::generate_conformers(std::span<std::string_view const> smiles, config_t const &config,
                                                   std::uint32_t max_atoms_per_molecule,
                                                   std::span<__half> coordinates_out, std::span<float> energies_out,
-                                                  std::span<conformer_status_t> status_out) {
+                                                  std::span<conformer_status_t> status_out,
+                                                  std::span<std::uint8_t> num_atoms_out) {
 
     cuda_error_sink_t const sink {&this->logger, &this->cuda_error_count};
 
@@ -830,6 +831,7 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         __half const zero = __float2half_rn(0.0f);
         std::fill_n(coordinates_out.begin(), coordinates_out.size(), zero);
     }
+    if (!num_atoms_out.empty()) std::fill_n(num_atoms_out.begin(), num_atoms_out.size(), std::uint8_t {0});
 
     // Sort SMILES by descending length so the last `embedding-wave` carries
     // the smallest molecules — shortens the unhidden tail wave.
@@ -921,10 +923,40 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     // atom-count descending and writes each device's pool in atom-count
     // ascending order, so kernels can use the batch metadata directly (no
     // per-device sort in launch).
+    //
+    // Molecules whose `preprocess-step` exceeded the per-`molecule` deadline
+    // never reach the GPU pools — they're recorded in `timed_out_buf` as
+    // slice-local indices and their status is stamped to
+    // `conformer_status_t::preprocess_timeout` here, so the `fallback-role`
+    // picks them up on the caller side and retries via ETKDGv3 (which does
+    // not use the VF2 matcher that triggered the timeout).
+    std::vector<std::uint32_t> timed_out_buf;
     auto prep_slice_into_slot = [&](std::size_t slot, std::uint32_t begin, std::uint32_t end) {
         std::span<batch_pool_t, max_devices_k> slot_span {batch_slots_per_device[slot].data(), max_devices_k};
         prepare_per_device_batches_into(smiles_view.subspan(begin, end - begin), num_devices, slot_span,
-                                        scaffold_cache.get());
+                                        scaffold_cache.get(), &timed_out_buf);
+        for (std::uint32_t slice_idx : timed_out_buf) {
+            std::uint32_t const sorted_idx = begin + slice_idx;
+            std::uint32_t const caller_idx = sort_perm_view[sorted_idx];
+            for (std::uint32_t k = 0; k < num_conformers; ++k)
+                status_out[static_cast<std::size_t>(caller_idx) * num_conformers + k] =
+                    conformer_status_t::preprocess_timeout;
+        }
+        // Fill caller's num_atoms_out for every molecule that survived preprocess.
+        // Sorted-slice → caller-unsorted via sort_perm.  Invalid / too_many / timeout
+        // mols keep the zero-init written at the top of generate_conformers.
+        if (!num_atoms_out.empty()) {
+            for (std::uint32_t d = 0; d < num_devices; ++d) {
+                auto const &batch = batch_slots_per_device[slot][d];
+                auto const metadata = batch.molecule_metadata();
+                auto const input_indices = batch.input_indices();
+                for (std::uint32_t k = 0; k < batch.num_molecules; ++k) {
+                    std::uint32_t const sorted_idx = begin + input_indices[k];
+                    std::uint32_t const caller_idx = sort_perm_view[sorted_idx];
+                    num_atoms_out[caller_idx] = static_cast<std::uint8_t>(metadata[k].num_atoms);
+                }
+            }
+        }
     };
 
     // View helper: first `num_devices` per-device batch pools in a slot.
@@ -1015,7 +1047,8 @@ PYBIND11_MODULE(_smallfield, m) {
         .value("stereo_failure", smallfield::api::conformer_status_t::stereo_failure)
         .value("mmff_unconverged", smallfield::api::conformer_status_t::mmff_unconverged)
         .value("invalid_smiles", smallfield::api::conformer_status_t::invalid_smiles)
-        .value("too_many_atoms", smallfield::api::conformer_status_t::too_many_atoms);
+        .value("too_many_atoms", smallfield::api::conformer_status_t::too_many_atoms)
+        .value("preprocess_timeout", smallfield::api::conformer_status_t::preprocess_timeout);
 
     py::class_<smallfield::api::context_t>(m, "Context", "GPU context managing CUDA streams and cuSOLVER handles.")
         .def(py::init([](std::vector<int> device_ids) {

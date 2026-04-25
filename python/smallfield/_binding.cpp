@@ -24,7 +24,8 @@ PYBIND11_MODULE(_smallfield, m) {
         .value("stereo_failure", smallfield::api::conformer_status_t::stereo_failure)
         .value("mmff_unconverged", smallfield::api::conformer_status_t::mmff_unconverged)
         .value("invalid_smiles", smallfield::api::conformer_status_t::invalid_smiles)
-        .value("too_many_atoms", smallfield::api::conformer_status_t::too_many_atoms);
+        .value("too_many_atoms", smallfield::api::conformer_status_t::too_many_atoms)
+        .value("preprocess_timeout", smallfield::api::conformer_status_t::preprocess_timeout);
 
     py::class_<smallfield::api::context_t>(m, "Context", "GPU context managing CUDA resources.")
         .def(py::init([](std::vector<int> device_ids) {

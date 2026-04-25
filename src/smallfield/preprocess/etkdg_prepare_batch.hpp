@@ -924,7 +924,7 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
  *  @c result.num_atoms = 0 on failure.
  */
 inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecule_t &result,
-                                  scaffold_cache_t *cache = nullptr) {
+                                  scaffold_cache_t *cache = nullptr, preprocess_deadline_t *deadline = nullptr) {
     result.num_atoms = 0;
     result.bounds_matrix.clear();
     result.chiral_centers.clear();
@@ -979,7 +979,7 @@ inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecu
         }
         build_bounds_matrix(desc, result.bounds_matrix);
         extract_chiral_centers(*mol, desc, result.chiral_centers);
-        extract_etk_torsions_native(*mol, desc, result.etk_torsions, cache);
+        extract_etk_torsions_native(*mol, desc, result.etk_torsions, cache, deadline);
         extract_distance_constraints(desc, result.bounds_matrix, result.distance_constraints);
         build_etk_interaction_lists(result);
         extract_mmff94_params(*mol, desc, result);
@@ -1261,6 +1261,10 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::vector<std::byte> etk_interactions_bytes;
     std::vector<std::byte> etk_atom_offsets_bytes;
     std::vector<batch_prep_per_mol_record_t> mols;
+    /** @brief Slice-local input indices whose `preprocess-step` exceeded the
+     *  per-`molecule` deadline; the caller stamps `conformer_status_t::preprocess_timeout`
+     *  and routes them to the `fallback-role` for ETKDGv3 retry. */
+    std::vector<std::uint32_t> timed_out_input_indices;
     std::uint32_t max_atoms_seen = 0;
 };
 
@@ -1313,7 +1317,7 @@ inline void warm_up_rdkit_globals_once_() {
             if (warm) {
                 RDKit::MolOps::addHs(*warm);
                 RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
-                                                    /*flagPossibleStereoCenters=*/true);
+                                                     /*flagPossibleStereoCenters=*/true);
                 RDKit::MMFF::MMFFMolProperties props(*warm);
                 (void)props.isValid();
             }
@@ -1326,8 +1330,7 @@ inline void warm_up_rdkit_globals_once_() {
     });
 }
 
-static inline void prepare_per_thread_contribs_(std::span<std::string_view const> smiles_list,
-                                                scaffold_cache_t *cache,
+static inline void prepare_per_thread_contribs_(std::span<std::string_view const> smiles_list, scaffold_cache_t *cache,
                                                 std::vector<batch_prep_thread_contribution_t> &contribs) {
     warm_up_rdkit_globals_once_();
     int const n_threads_max = omp_get_max_threads();
@@ -1350,6 +1353,7 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
         type_counts.etk_interactions_bytes.clear();
         type_counts.etk_atom_offsets_bytes.clear();
         type_counts.mols.clear();
+        type_counts.timed_out_input_indices.clear();
         type_counts.max_atoms_seen = 0;
     }
 
@@ -1362,9 +1366,25 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
     {
         int const tid = omp_get_thread_num();
         auto &type_counts = contribs[tid];
+        // Stack-owned per-`molecule` deadline; no thread_local state.  The
+        // pointer threads through `prepare_molecule_into` →
+        // `extract_etk_torsions_native` → the `extraAtomCheck` lambda
+        // captured in `SubstructMatchParameters`.  2 s is a safe upper
+        // bound — the p99 drug-like molecule preprocess finishes in <10 ms.
+        preprocess_deadline_t deadline;
 #pragma omp for schedule(dynamic, 64)
         for (std::size_t m = 0; m < n; ++m) {
-            prepare_molecule_into(smiles_list[m], type_counts.scratch, cache);
+            deadline.reset(std::chrono::milliseconds {2000});
+            prepare_molecule_into(smiles_list[m], type_counts.scratch, cache, &deadline);
+            if (deadline.tripped) {
+                // Partial scratch may be incoherent; drop it and record the
+                // input index so `generate_conformers` can stamp
+                // `conformer_status_t::preprocess_timeout` and route the
+                // molecule to the `fallback-role` for ETKDGv3 retry.
+                type_counts.scratch.num_atoms = 0;
+                type_counts.timed_out_input_indices.push_back(static_cast<std::uint32_t>(m));
+                continue;
+            }
             auto const &p = type_counts.scratch;
             if (p.num_atoms == 0) continue;
             if (p.num_atoms > type_counts.max_atoms_seen) type_counts.max_atoms_seen = p.num_atoms;
@@ -1373,68 +1393,69 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
             rec.original_idx = static_cast<std::uint32_t>(m);
             rec.metadata = p.metadata;
             rec.metadata.bounds_offset = static_cast<std::uint32_t>(
-                append_bytes_(type_counts.bounds_bytes, p.bounds_matrix.data(), p.bounds_matrix.size() * sizeof(float)) /
+                append_bytes_(type_counts.bounds_bytes, p.bounds_matrix.data(),
+                              p.bounds_matrix.size() * sizeof(float)) /
                 sizeof(float));
             rec.metadata.chiral_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.chirals_bytes, p.chiral_centers.data(),
-                             p.chiral_centers.size() * sizeof(chiral_center_descriptor_t)) /
+                              p.chiral_centers.size() * sizeof(chiral_center_descriptor_t)) /
                 sizeof(chiral_center_descriptor_t));
             rec.metadata.torsion_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.torsions_bytes, p.etk_torsions.data(),
-                             p.etk_torsions.size() * sizeof(etk_torsion_descriptor_t)) /
+                              p.etk_torsions.size() * sizeof(etk_torsion_descriptor_t)) /
                 sizeof(etk_torsion_descriptor_t));
             rec.metadata.constraint_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.dcons_bytes, p.distance_constraints.data(),
-                             p.distance_constraints.size() * sizeof(distance_constraint_t)) /
+                              p.distance_constraints.size() * sizeof(distance_constraint_t)) /
                 sizeof(distance_constraint_t));
             rec.metadata.mmff_atom_vdw_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.atom_vdw_bytes, p.mmff_atom_vdw.data(),
-                             p.mmff_atom_vdw.size() * sizeof(mmff94_atom_vdw_params_t)) /
+                              p.mmff_atom_vdw.size() * sizeof(mmff94_atom_vdw_params_t)) /
                 sizeof(mmff94_atom_vdw_params_t));
             rec.metadata.mmff_atom_charge_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.atom_charge_bytes, p.mmff_atom_charge.data(),
-                             p.mmff_atom_charge.size() * sizeof(float)) /
+                              p.mmff_atom_charge.size() * sizeof(float)) /
                 sizeof(float));
             rec.metadata.bond_distance_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.bond_distance_bytes, p.bond_distance.data(),
-                             p.bond_distance.size() * sizeof(std::uint8_t)) /
+                              p.bond_distance.size() * sizeof(std::uint8_t)) /
                 sizeof(std::uint8_t));
             rec.metadata.mmff_bond_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.mmff_bonds_bytes, p.mmff_bonds.data(),
-                             p.mmff_bonds.size() * sizeof(mmff94_bond_t)) /
+                              p.mmff_bonds.size() * sizeof(mmff94_bond_t)) /
                 sizeof(mmff94_bond_t));
             rec.metadata.mmff_angle_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.mmff_angles_bytes, p.mmff_angles.data(),
-                             p.mmff_angles.size() * sizeof(mmff94_angle_t)) /
+                              p.mmff_angles.size() * sizeof(mmff94_angle_t)) /
                 sizeof(mmff94_angle_t));
             rec.metadata.mmff_torsion_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.mmff_torsions_bytes, p.mmff_torsions.data(),
-                             p.mmff_torsions.size() * sizeof(mmff94_torsion_t)) /
+                              p.mmff_torsions.size() * sizeof(mmff94_torsion_t)) /
                 sizeof(mmff94_torsion_t));
             rec.metadata.mmff_oop_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.mmff_oops_bytes, p.mmff_oops.data(),
-                             p.mmff_oops.size() * sizeof(mmff94_oop_t)) /
+                              p.mmff_oops.size() * sizeof(mmff94_oop_t)) /
                 sizeof(mmff94_oop_t));
             rec.metadata.mmff_stretchbend_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.mmff_stretchbends_bytes, p.mmff_stretchbends.data(),
-                             p.mmff_stretchbends.size() * sizeof(mmff94_stretchbend_t)) /
+                              p.mmff_stretchbends.size() * sizeof(mmff94_stretchbend_t)) /
                 sizeof(mmff94_stretchbend_t));
             // Thread-local start of this mol's block inside mmff_interactions / etk_interactions.
             std::uint32_t const tl_mmff_inter_base = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.mmff_interactions_bytes, p.mmff_interactions.data(),
-                             p.mmff_interactions.size() * sizeof(mmff94_atom_interaction_t)) /
+                              p.mmff_interactions.size() * sizeof(mmff94_atom_interaction_t)) /
                 sizeof(mmff94_atom_interaction_t));
             rec.metadata.mmff_atom_offsets_start = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.mmff_atom_offsets_bytes, p.mmff_atom_offsets.data(),
-                             p.mmff_atom_offsets.size() * sizeof(mmff94_atom_offsets_t)) /
+                              p.mmff_atom_offsets.size() * sizeof(mmff94_atom_offsets_t)) /
                 sizeof(mmff94_atom_offsets_t));
             std::uint32_t const tl_etk_inter_base = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.etk_interactions_bytes, p.etk_interactions.data(),
-                             p.etk_interactions.size() * sizeof(etk_atom_interaction_t)) /
+                              p.etk_interactions.size() * sizeof(etk_atom_interaction_t)) /
                 sizeof(etk_atom_interaction_t));
             rec.metadata.etk_atom_offsets_start = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.etk_atom_offsets_bytes, p.etk_atom_offsets.data(),
-                             p.etk_atom_offsets.size() * sizeof(etk_atom_offsets_t)) /
+                              p.etk_atom_offsets.size() * sizeof(etk_atom_offsets_t)) /
                 sizeof(etk_atom_offsets_t));
             // Rebase the per-atom offsets from per-molecule-local to thread-local by adding this
             // molecule's thread-local base in the interactions array. The downstream pool-wide pass
@@ -1690,6 +1711,14 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
         return;
     }
 
+    // Merge every thread's timed-out input indices into the batch's flat list.
+    // Small in the common case (<100 per 1M molecules) but grow-only across calls.
+    batch.timed_out_input_indices.clear();
+    for (auto const &type_counts : contribs)
+        batch.timed_out_input_indices.insert(batch.timed_out_input_indices.end(),
+                                             type_counts.timed_out_input_indices.begin(),
+                                             type_counts.timed_out_input_indices.end());
+
     pack_into_batch_pool_(contribs, bases, batch);
 }
 
@@ -1718,8 +1747,8 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view 
  *  same caller holds.
  */
 struct distribute_scratch_t {
-    std::vector<std::uint32_t> sort_permutation;                                         ///< length: total_mol_count
-    std::vector<std::uint32_t> per_device_flat;                                          ///< length: total_mol_count, CSR values
+    std::vector<std::uint32_t> sort_permutation; ///< length: total_mol_count
+    std::vector<std::uint32_t> per_device_flat;  ///< length: total_mol_count, CSR values
     // `32` mirrors the old hardcoded per_device_mol_list array; compile-time-
     // asserted against `smallfield::api::max_devices_k = 16` in smallfield.cu.
     static constexpr std::uint32_t max_devices_k = 32u;
@@ -1752,8 +1781,8 @@ struct distribute_scratch_t {
  *  the ctor pre-sizing in `context_t` covers typical waves.
  */
 inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &shared, std::uint32_t device_count,
-                                                   std::span<etkdg_molecule_batch_t> per_device_out,
-                                                   distribute_scratch_t &scratch) {
+                                                  std::span<etkdg_molecule_batch_t> per_device_out,
+                                                  distribute_scratch_t &scratch) {
 
     std::uint32_t const total_mol_count = shared.num_molecules;
     auto const shared_metadata = shared.molecule_metadata();
@@ -1949,8 +1978,8 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
             // between the source and destination interaction bases.
             std::uint32_t const source_atom_offsets_base = src_meta.mmff_atom_offsets_start;
             std::uint32_t const source_interactions_base = aoff_src[source_atom_offsets_base].bond_start;
-            std::int32_t const mmff_interactions_rebase_delta =
-                static_cast<std::int32_t>(running.mmff_interactions) - static_cast<std::int32_t>(source_interactions_base);
+            std::int32_t const mmff_interactions_rebase_delta = static_cast<std::int32_t>(running.mmff_interactions) -
+                                                                static_cast<std::int32_t>(source_interactions_base);
             for (std::uint32_t atom = 0; atom < atom_count; ++atom) {
                 mmff94_atom_offsets_t entry = aoff_src[source_atom_offsets_base + atom];
                 entry.bond_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.bond_start) +
@@ -1961,8 +1990,8 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
                                                                  mmff_interactions_rebase_delta);
                 entry.oop_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.oop_start) +
                                                              mmff_interactions_rebase_delta);
-                entry.stretchbend_start = static_cast<std::uint32_t>(static_cast<std::int32_t>(entry.stretchbend_start) +
-                                                                     mmff_interactions_rebase_delta);
+                entry.stretchbend_start = static_cast<std::uint32_t>(
+                    static_cast<std::int32_t>(entry.stretchbend_start) + mmff_interactions_rebase_delta);
                 aoff_dst[running.mmff_atom_offsets + atom] = entry;
             }
             std::memcpy(interactions_dst.data() + running.mmff_interactions,
@@ -1973,9 +2002,8 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
             std::uint32_t const source_etk_atom_offsets_base = src_meta.etk_atom_offsets_start;
             std::uint32_t const source_etk_interactions_base =
                 etk_aoff_src[source_etk_atom_offsets_base].interaction_start;
-            std::int32_t const etk_interactions_rebase_delta =
-                static_cast<std::int32_t>(running.etk_interactions) -
-                static_cast<std::int32_t>(source_etk_interactions_base);
+            std::int32_t const etk_interactions_rebase_delta = static_cast<std::int32_t>(running.etk_interactions) -
+                                                               static_cast<std::int32_t>(source_etk_interactions_base);
             for (std::uint32_t atom = 0; atom < atom_count; ++atom) {
                 etk_atom_offsets_t entry = etk_aoff_src[source_etk_atom_offsets_base + atom];
                 entry.interaction_start = static_cast<std::uint32_t>(
@@ -2038,12 +2066,17 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
  *  so neither allocation fires on the hot path.
  */
 inline void prepare_per_device_batches_into(std::span<std::string_view const> smiles_list, std::uint32_t device_count,
-                                             std::span<etkdg_molecule_batch_t> per_device_out,
-                                             scaffold_cache_t *cache = nullptr) {
+                                            std::span<etkdg_molecule_batch_t> per_device_out,
+                                            scaffold_cache_t *cache = nullptr,
+                                            std::vector<std::uint32_t> *timed_out_input_indices_out = nullptr) {
     static etkdg_molecule_batch_t shared_scratch;
     static distribute_scratch_t distribute_scratch;
     prepare_molecule_batch_into(smiles_list, shared_scratch, cache);
     distribute_batch_to_per_device_pools_(shared_scratch, device_count, per_device_out, distribute_scratch);
+    if (timed_out_input_indices_out != nullptr) {
+        timed_out_input_indices_out->assign(shared_scratch.timed_out_input_indices.begin(),
+                                            shared_scratch.timed_out_input_indices.end());
+    }
 }
 
 } // namespace smallfield::preprocess

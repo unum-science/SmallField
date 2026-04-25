@@ -238,6 +238,44 @@ def build_templates() -> list[template_t]:
         multiplicity=1,  # generator yields all rows directly
     ))
 
+    # Axis 9: VF2 hang candidates — highly-substituted polycyclic aromatics and
+    # heavily fused cages whose symmetry blows up VF2's recursion depth in
+    # `RDKit::SubstructMatch`.  Without the `preprocess_deadline` +
+    # `extraAtomCheck` hook (RDKit 2025.09.6 feature), one of these can stall
+    # the OMP-for preprocess-step indefinitely and freeze the 4-role pipeline.
+    # The new per-molecule deadline caps each at ~2 s and stamps
+    # `conformer_status_t::preprocess_timeout`; the fallback-role then retries
+    # via ETKDGv3 (no SubstructMatch path).
+    vf2_hangers = [
+        ("tetracene",                       "c1ccc2cc3cc4ccccc4cc3cc2c1"),
+        ("pentacene",                       "c1ccc2cc3cc4cc5ccccc5cc4cc3cc2c1"),
+        ("anthanthrene",                    "c1cc2ccc3ccc4ccc5ccc6ccc1c7c2c3c4c5c67"),
+        ("coronene",                        "c1cc2ccc3ccc4ccc5ccc6ccc1c1c2c3c4c5c61"),
+        ("hexabromonaphthalene",            "Brc1c(Br)c(Br)c2c(Br)c(Br)c(Br)cc2c1"),
+        ("hexachloronaphthalene",           "Clc1c(Cl)c(Cl)c2c(Cl)c(Cl)c(Cl)cc2c1"),
+        ("perchloropentacene",              "Clc1c(Cl)c2c(Cl)c3c(Cl)c4c(Cl)c5c(Cl)c(Cl)c(Cl)c(Cl)c5c(Cl)c4c(Cl)c3c(Cl)c2c1Cl"),
+        ("pyrene_hexabromo",                "Brc1c2c(Br)c(Br)c3c(Br)c(Br)c4c(Br)c(Br)c1c2c34"),
+        ("decacyclene",                     "c1cc2ccc3ccc4ccc5ccc6ccc7ccc8ccc9ccc%10ccc1c1c2c3c4c5c6c7c8c9c%101"),
+        ("kekulene",                        "c1cc2ccc3ccc4ccc5ccc6ccc1c1c2c3c4c5c61"),
+        ("triptycene",                      "c1ccc2c(c1)C1c3ccccc3C2c2ccccc21"),
+        ("cubane_like_cage",                "C12C3C4C1C5C2C3C45"),
+        ("adamantane_fused",                "C1C2CC3CC1CC(C2)C3"),
+        ("iptycene_fragment",               "c1ccc2c(c1)C1c3ccccc3C2c2ccc3ccccc3c21"),
+        ("hexaphenylbenzene",               "c1ccc(-c2c(-c3ccccc3)c(-c3ccccc3)c(-c3ccccc3)c(-c3ccccc3)c2-c2ccccc2)cc1"),
+        ("dibenzothiophene_fused",          "c1ccc2c(c1)sc1c2cc2ccccc2c1"),
+        ("ovalene_fragment",                "c1cc2ccc3ccc4ccc5cc6ccc1c1c2c3c4c5c61"),
+        ("hexahelicene",                    "c1ccc2ccc3ccc4ccc5ccc6ccccc6c5c4c3c21"),
+        ("rubicene_like",                   "c1cc2ccc3c4cccc5ccc6ccc(c1)c2c3c4c56"),
+        ("diamantane",                      "C1C2CC3CC1C1CC2CC3C1"),
+    ]
+    for name, smi in vf2_hangers:
+        templates.append(template_t(
+            axis="vf2_hang_candidates",
+            name=name,
+            smiles_generator=lambda s=smi: [s],
+            target_code_path="RDKit::SubstructMatch VF2 worst-case / preprocess_deadline + extraAtomCheck",
+        ))
+
     return templates
 
 

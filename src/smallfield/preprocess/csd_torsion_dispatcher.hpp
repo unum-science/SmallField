@@ -53,6 +53,7 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/preprocess/csd_torsion_native.hpp"
 #include "smallfield/preprocess/native_murcko.hpp"
+#include "smallfield/preprocess/preprocess_deadline.hpp"
 #include "smallfield/preprocess/scaffold_cache.hpp"
 
 namespace smallfield::preprocess {
@@ -71,11 +72,12 @@ struct csd_compiled_pattern_t {
     std::unique_ptr<RDKit::ROMol const> pattern;
     std::vector<double> V;
     std::vector<std::int8_t> signs;
-    std::uint32_t idx[4];                 ///< atom indices in the pattern for labels :1 through :4
-    std::uint64_t required_elements;      ///< bitset: bit N = pattern requires element N
-    std::uint8_t required_hybridizations; ///< bitset: bit H = pattern requires hybridization H (see @ref hybridization_t)
-    bool requires_aromatic;               ///< true if any pattern atom is aromatic
-    bool native;                          ///< true if the pattern parsed cleanly into native form
+    std::uint32_t idx[4];            ///< atom indices in the pattern for labels :1 through :4
+    std::uint64_t required_elements; ///< bitset: bit N = pattern requires element N
+    std::uint8_t
+        required_hybridizations; ///< bitset: bit H = pattern requires hybridization H (see @ref hybridization_t)
+    bool requires_aromatic;      ///< true if any pattern atom is aromatic
+    bool native;                 ///< true if the pattern parsed cleanly into native form
     simple_torsion_pattern_t native_form; ///< valid only when native == true
 };
 
@@ -216,7 +218,7 @@ inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
 
 inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
                                         std::vector<etk_torsion_descriptor_t> &torsions,
-                                        scaffold_cache_t *cache = nullptr) {
+                                        scaffold_cache_t *cache = nullptr, preprocess_deadline_t *deadline = nullptr) {
     torsions.clear();
 
     std::uint32_t const num_atoms = desc.num_atoms;
@@ -334,6 +336,13 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
     };
 
     for (std::size_t pattern_index = 0; pattern_index < patterns.size(); ++pattern_index) {
+        // Once the per-molecule deadline has fired, every further `SubstructMatch`
+        // on this molecule would also short-circuit via `extraAtomCheck`, but
+        // the outer-loop bookkeeping (native matcher, scaffold-cache path) still
+        // runs unconditionally.  Bail out here so the caller records the
+        // timeout and the molecule falls through to the `fallback-role`.
+        if (deadline != nullptr && deadline->tripped) break;
+
         auto const &pat = patterns[pattern_index];
         // Element prefilter: skip patterns whose required elements are absent.
         if ((pat.required_elements & ~molecule_elements) != 0) continue;
@@ -389,12 +398,19 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
         }
 
         // Fallback: run RDKit SubstructMatch on the full molecule.
-        // Thread-local: capacity persists across calls on the same thread so
-        // repeated fallbacks don't re-allocate. `.clear()` keeps the
-        // reserved storage.
-        thread_local std::vector<RDKit::MatchVectType> matches;
-        matches.clear();
-        RDKit::SubstructMatch(molecule, *pat.pattern, matches, /*uniquify=*/false, /*recursionPossible=*/true);
+        // `extraAtomCheck` consults the caller-owned `deadline` on every VF2
+        // atom comparison; once the deadline is past, the callback returns
+        // `false` and VF2 unwinds in O(candidates) rather than hanging in
+        // its pathological worst case.  The lambda captures the pointer by
+        // value — when `deadline` is null, `exceeded_or_null` always
+        // returns false and the callback is a no-op.
+        RDKit::SubstructMatchParameters match_params;
+        match_params.uniquify = false;
+        match_params.recursionPossible = true;
+        match_params.extraAtomCheck = [deadline](RDKit::Atom const &, RDKit::Atom const &) noexcept {
+            return !exceeded_or_null(deadline);
+        };
+        auto const matches = RDKit::SubstructMatch(molecule, *pat.pattern, match_params);
 
         bool any_r_group = false;
         for (auto const &match : matches) {

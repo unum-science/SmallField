@@ -65,6 +65,9 @@ enum class conformer_status_t : std::uint8_t {
     mmff_unconverged = 2,
     invalid_smiles = 3,
     too_many_atoms = 4,
+    /** @brief `preprocess-step` exceeded the per-`molecule` deadline (RDKit VF2 worst-case).
+     *  Downstream `fallback-role` may still successfully produce ETKDGv3 conformers. */
+    preprocess_timeout = 5,
 };
 
 /**
@@ -225,13 +228,19 @@ struct context_t {
      *  @param[out] coordinates_out Output half-precision coordinates. Size: molecules * conformers * max_atoms * 3.
      *  @param[out] energies_out Output MMFF94 energies (kcal/mol). Size: molecules * conformers.
      *  @param[out] status_out Output per-conformer status. Size: molecules * conformers.
+     *  @param[out] num_atoms_out Optional. If non-empty, filled with each `molecule`'s
+     *      atom count (heavy + explicit H) post-preprocess.  Size: molecules (one per
+     *      input SMILES). 0 for molecules that failed preprocess (invalid_smiles /
+     *      too_many_atoms / preprocess_timeout). Lets downstream writers emit tight
+     *      per-row coordinate lists instead of padded fixed-size-list blocks.
      *  @return Batch-level status (success if at least one conformer succeeded).
      */
     [[nodiscard]] conformer_status_t generate_conformers(std::span<std::string_view const> smiles,
                                                          config_t const &config, std::uint32_t max_atoms_per_molecule,
                                                          std::span<__half> coordinates_out,
                                                          std::span<float> energies_out,
-                                                         std::span<conformer_status_t> status_out);
+                                                         std::span<conformer_status_t> status_out,
+                                                         std::span<std::uint8_t> num_atoms_out = {});
 };
 
 } // namespace smallfield::api
