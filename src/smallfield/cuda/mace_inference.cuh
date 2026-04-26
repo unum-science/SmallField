@@ -263,6 +263,14 @@ struct mace_scratch_t {
     __nv_bfloat16 *tk_node_features_post_linear_bf16 = nullptr;        // [n_atoms, n_channels, 16]
     __nv_bfloat16 *tk_node_features_post_residual_bf16 = nullptr;      // [n_atoms, n_channels, 16]
     __nv_bfloat16 *tk_node_features_l0_only_bf16 = nullptr;            // [n_atoms, n_channels]
+    // Per-layer pre-activation outputs from the TK fused radial MLP (Phase B6) —
+    // saves the fp32 forward rerun in the backward pass.  Shape [n_edges, 64]
+    // (64 = radial-MLP hidden dim).  Indexed by interaction layer because each
+    // layer has its own radial MLP weights; without per-layer saves the
+    // backward iteration would see the LAST layer's pre-acts in every iter.
+    __nv_bfloat16 *tk_radial_mlp_hidden_0_pre_bf16_layer[2] = {nullptr, nullptr};
+    __nv_bfloat16 *tk_radial_mlp_hidden_1_pre_bf16_layer[2] = {nullptr, nullptr};
+    __nv_bfloat16 *tk_radial_mlp_hidden_2_pre_bf16_layer[2] = {nullptr, nullptr};
 
     // Order-3 ACE precomputed weights, one device buffer per interaction layer:
     //   `W3_eff[Z, irrep_index_i, irrep_index_j, irrep_index_k, channel_index]
@@ -341,6 +349,12 @@ struct mace_scratch_t {
         alloc_bf16(&tk_node_features_post_linear_bf16,        max_atoms * arch.n_channels * irrep_dim);
         alloc_bf16(&tk_node_features_post_residual_bf16,      max_atoms * arch.n_channels * irrep_dim);
         alloc_bf16(&tk_node_features_l0_only_bf16,            max_atoms * arch.n_channels);
+        // Phase B6: per-layer pre-activation buffers from the TK fused radial MLP.
+        for (std::uint32_t layer_index = 0; layer_index < 2u; ++layer_index) {
+            alloc_bf16(&tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index], max_edges * radial_mlp_hidden_dim);
+            alloc_bf16(&tk_radial_mlp_hidden_1_pre_bf16_layer[layer_index], max_edges * radial_mlp_hidden_dim);
+            alloc_bf16(&tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index], max_edges * radial_mlp_hidden_dim);
+        }
         // W3_eff buffers are precomputed lazily on first forward (we need the
         // weight pointers to do the reduction); leave them nullptr here.
         tk_precompute_done = false;
@@ -385,6 +399,14 @@ struct mace_scratch_t {
                                    &tk_node_features_l0_only_bf16}) {
             if (*p) cudaFree(*p);
             *p = nullptr;
+        }
+        for (std::uint32_t layer_index = 0; layer_index < 2u; ++layer_index) {
+            for (__nv_bfloat16 **p : {&tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index],
+                                       &tk_radial_mlp_hidden_1_pre_bf16_layer[layer_index],
+                                       &tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index]}) {
+                if (*p) cudaFree(*p);
+                *p = nullptr;
+            }
         }
         for (float *&p : tk_precomputed_w3_effective_layer) {
             if (p) cudaFree(p);
@@ -560,11 +582,18 @@ inline void mace_inference_forward(
         // downstream conv_tp consumer (C2 fused TK or fp32 reference)
         // sees the same fp32 tp_weights buffer regardless of which radial
         // MLP path produced it.
+        // Phase B6: pass per-layer pre-activation buffers so the backward can
+        // skip the fp32 forward rerun.  Kernel writes bf16 [n_edges, 64] for
+        // each non-null layer slot; backward casts to fp32 once and consumes
+        // via the existing radial-MLP layer adjoint.
         launch_mace_tk_radial_mlp(batch.n_edges, arch.n_radial,
                                   S.radial_basis,
                                   L.radial_mlp_w0, L.radial_mlp_w1,
                                   L.radial_mlp_w2, L.radial_mlp_w3,
-                                  S.tk_tensor_product_weights_per_edge_bf16, stream);
+                                  S.tk_tensor_product_weights_per_edge_bf16, stream,
+                                  S.tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index],
+                                  S.tk_radial_mlp_hidden_1_pre_bf16_layer[layer_index],
+                                  S.tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index]);
         launch_mace_bf16_to_fp32(batch.n_edges * tp_dim,
                                  S.tk_tensor_product_weights_per_edge_bf16,
                                  S.tensor_product_weights_per_edge, stream);
@@ -1141,30 +1170,21 @@ inline void mace_inference_run_force_adjoint(
 
         // 3k. radial_mlp adjoint: grad_tp_weights → grad_radial_basis.
         //     Backward through the 4-layer MLP with normalize2mom(silu)
-        //     epilogues.  Each interaction layer has its OWN radial MLP weights,
-        //     so the forward post-activation buffers are layer-specific.  Re-run
-        //     the forward MLP here for THIS layer's weights and SAVE the pre-
-        //     activations directly (`*_pre` buffers) so the backward can compute
-        //     `silu_n2m'(pre_act)` without the Newton inversion that picks the
-        //     wrong branch when pre_act < x_critical = -1.278.
-        launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, arch.n_radial,
-                                    S.radial_basis, L.radial_mlp_w0,
-                                    1.0f / sqrtf(static_cast<float>(arch.n_radial)),
-                                    S.radial_mlp_hidden_0_pre, stream);
-        launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
-                                   S.radial_mlp_hidden_0_pre, S.radial_mlp_hidden_0, stream);
-        launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
-                                    S.radial_mlp_hidden_0, L.radial_mlp_w1,
-                                    1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
-                                    S.radial_mlp_hidden_1_pre, stream);
-        launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
-                                   S.radial_mlp_hidden_1_pre, S.radial_mlp_hidden_1, stream);
-        launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
-                                    S.radial_mlp_hidden_1, L.radial_mlp_w2,
-                                    1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
-                                    S.radial_mlp_hidden_2_pre, stream);
-        launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
-                                   S.radial_mlp_hidden_2_pre, S.radial_mlp_hidden_2, stream);
+        //     epilogues.  Each interaction layer has its OWN radial MLP weights.
+        //     Phase B6: instead of re-running the fp32 forward MLP to populate
+        //     `_pre` activations, the TK fused forward saved bf16 pre-acts on
+        //     `S.tk_radial_mlp_hidden_*_pre_bf16` per layer.  Cast to fp32 once
+        //     at this point (cheap: ~1.5 MB at batch=512 vs 4 fp32 matmuls + 3
+        //     elementwise silu·n2m kernels in the rerun).
+        launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
+                                  S.tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index],
+                                  S.radial_mlp_hidden_0_pre, stream);
+        launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
+                                  S.tk_radial_mlp_hidden_1_pre_bf16_layer[layer_index],
+                                  S.radial_mlp_hidden_1_pre, stream);
+        launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
+                                  S.tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index],
+                                  S.radial_mlp_hidden_2_pre, stream);
         // Layer 3 backward (no activation): grad_h2 = (1/sqrt(h)) * Σ_out W3[h, out] * grad_out.
         // Reuse `S.edge_messages` as scratch for grad_h2 (its forward content is no
         // longer needed here in the reverse pass).

@@ -276,6 +276,40 @@ __device__ __forceinline__ void store_output_tile_with_guard_(
 }
 
 /**
+ *  @brief Stage accumulator to bf16 via the supplied shared tile, then write
+ *  bf16 row-major to a `[n_edges, 64]` global pre-activation buffer with the
+ *  partial-tile edge guard.  The staging tile is reused across the per-layer
+ *  pre-act dumps; in this kernel we use `shared_layer_3_weight_column` as
+ *  the staging slot (it's loaded only inside the layer-3 column loop).
+ *
+ *  Used to expose layer 0/1/2 pre-activation values for the radial-MLP
+ *  backward chain (Phase B6) — saves the fp32 forward rerun previously
+ *  needed in `mace_inference_run_force_adjoint` (commit `7fc5b11`).
+ */
+__device__ __forceinline__ void store_pre_activation_bf16_(
+    __nv_bfloat16 *output_global,
+    shared_tile_w3_col_t &staging_shared_tile,
+    register_accumulator_t const &accumulator,
+    std::uint32_t n_edges,
+    std::uint32_t base_edge_index
+) {
+    kittens::warpgroup::store(staging_shared_tile, accumulator);
+    kittens::warpgroup::sync(0);
+
+    int const thread_id = threadIdx.x;
+    constexpr int tile_elements = edge_tile_rows_k * hidden_dim_k;
+    #pragma unroll
+    for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
+        int const row_in_tile = linear_index / hidden_dim_k;
+        int const col_in_tile = linear_index % hidden_dim_k;
+        std::uint32_t const edge_index = base_edge_index + static_cast<std::uint32_t>(row_in_tile);
+        if (edge_index >= n_edges) continue;
+        __nv_bfloat16 const value = staging_shared_tile[{row_in_tile, col_in_tile}];
+        output_global[static_cast<std::uint64_t>(edge_index) * hidden_dim_k + col_in_tile] = value;
+    }
+}
+
+/**
  *  @brief Persistent radial-MLP kernel body: 64 edges per CTA, 4 layers fused.
  *
  *  Grid: `dim3(n_edge_tiles, 1, 1)` where `n_edge_tiles = ceil(n_edges/64)`.
@@ -283,6 +317,11 @@ __device__ __forceinline__ void store_output_tile_with_guard_(
  *  the per-CTA workload is small enough that a single warpgroup keeps the
  *  shared memory and register footprint compact while removing 3 of 4 kernel
  *  launches relative to the fp32 reference.
+ *
+ *  When `pre_act_layer_*_bf16` are non-null, the kernel stores the per-layer
+ *  pre-activation values (post-scale, pre-silu·n2m) to bf16 global buffers
+ *  shaped `[n_edges, 64]`.  These are consumed by the radial-MLP backward
+ *  to skip the fp32 forward rerun (Phase B6 of MACE_OPTIMIZATION_ROADMAP.md).
  */
 __global__ void mace_tk_radial_mlp_kernel(
     std::uint32_t n_edges,
@@ -292,6 +331,9 @@ __global__ void mace_tk_radial_mlp_kernel(
     float const *__restrict__ layer_2_weight,
     float const *__restrict__ layer_3_weight,
     __nv_bfloat16 *__restrict__ tensor_product_weights_per_edge,
+    __nv_bfloat16 *__restrict__ pre_act_layer_0_bf16,   // [n_edges, 64] or nullptr
+    __nv_bfloat16 *__restrict__ pre_act_layer_1_bf16,   // [n_edges, 64] or nullptr
+    __nv_bfloat16 *__restrict__ pre_act_layer_2_bf16,   // [n_edges, 64] or nullptr
     layer_scale_factors_t scales
 ) {
     extern __shared__ kittens::alignment_dummy raw_shared_memory[];
@@ -328,6 +370,10 @@ __global__ void mace_tk_radial_mlp_kernel(
     kittens::warpgroup::mma_async_wait();
 
     scale_accumulator_in_place_(accumulator, scales.layer_0_scale);
+    if (pre_act_layer_0_bf16 != nullptr) {
+        store_pre_activation_bf16_(pre_act_layer_0_bf16, shared_layer_3_weight_column,
+                                    accumulator, n_edges, base_edge_index);
+    }
     apply_silu_normalize2mom_in_place_(accumulator);
 
     kittens::warpgroup::store(shared_hidden_tile, accumulator);
@@ -339,6 +385,10 @@ __global__ void mace_tk_radial_mlp_kernel(
     kittens::warpgroup::mma_async_wait();
 
     scale_accumulator_in_place_(accumulator, scales.layer_1_scale);
+    if (pre_act_layer_1_bf16 != nullptr) {
+        store_pre_activation_bf16_(pre_act_layer_1_bf16, shared_layer_3_weight_column,
+                                    accumulator, n_edges, base_edge_index);
+    }
     apply_silu_normalize2mom_in_place_(accumulator);
 
     kittens::warpgroup::store(shared_hidden_tile, accumulator);
@@ -350,6 +400,10 @@ __global__ void mace_tk_radial_mlp_kernel(
     kittens::warpgroup::mma_async_wait();
 
     scale_accumulator_in_place_(accumulator, scales.layer_2_scale);
+    if (pre_act_layer_2_bf16 != nullptr) {
+        store_pre_activation_bf16_(pre_act_layer_2_bf16, shared_layer_3_weight_column,
+                                    accumulator, n_edges, base_edge_index);
+    }
     apply_silu_normalize2mom_in_place_(accumulator);
 
     kittens::warpgroup::store(shared_hidden_tile, accumulator);
@@ -415,7 +469,10 @@ inline void launch_mace_tk_radial_mlp(
     float const *radial_mlp_weight_layer_2,
     float const *radial_mlp_weight_layer_3,
     __nv_bfloat16 *tensor_product_weights_per_edge,
-    cudaStream_t stream
+    cudaStream_t stream,
+    __nv_bfloat16 *pre_act_layer_0_bf16 = nullptr,
+    __nv_bfloat16 *pre_act_layer_1_bf16 = nullptr,
+    __nv_bfloat16 *pre_act_layer_2_bf16 = nullptr
 ) {
     if (n_edges == 0u) return;
     // The fused kernel template-bakes the MACE-OFF23 shapes; refuse other
@@ -463,6 +520,9 @@ inline void launch_mace_tk_radial_mlp(
         radial_mlp_weight_layer_2,
         radial_mlp_weight_layer_3,
         tensor_product_weights_per_edge,
+        pre_act_layer_0_bf16,
+        pre_act_layer_1_bf16,
+        pre_act_layer_2_bf16,
         scales);
 }
 
