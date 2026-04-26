@@ -235,12 +235,186 @@ void run_one(smallfield::parameters::mace_weights_t const &W,
                 "energy (eV)", ref_energy, static_cast<double>(h_energy),
                 std::abs(ref_energy - static_cast<double>(h_energy)));
 
+    // Diagnostic: dump early-stage forward intermediates to compare against MACE python.
+    if (std::getenv("SF_DUMP_PROD") != nullptr) {
+        std::vector<float> h_l0_layer0(n_atoms * arch.n_channels);
+        cudaMemcpy(h_l0_layer0.data(), S.node_features_l0_only_layer[0],
+                   h_l0_layer0.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        std::printf("  l0_only_layer0[atom 0, c 0..4]: %.4g %.4g %.4g %.4g %.4g (post linear_up)\n",
+                    h_l0_layer0[0], h_l0_layer0[1], h_l0_layer0[2], h_l0_layer0[3], h_l0_layer0[4]);
+
+        // Layer 0 tp_weights (pre-cutoff)
+        std::uint32_t const tp_dim_dbg = 4u * arch.n_channels;
+        std::vector<float> h_tpw_layer0(n_edges * tp_dim_dbg);
+        cudaMemcpy(h_tpw_layer0.data(), S.tensor_product_weights_pre_cutoff_layer[0],
+                   h_tpw_layer0.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        std::printf("  tp_weights_layer0_precutoff[edge 0, path 0, c 0..4]: %.4g %.4g %.4g %.4g %.4g\n",
+                    h_tpw_layer0[0], h_tpw_layer0[1], h_tpw_layer0[2], h_tpw_layer0[3], h_tpw_layer0[4]);
+
+        // Edge messages (when SF_PROBE_LAYER0_EDGE_MSGS set, grad_edge_messages holds layer 0's edge_messages)
+        std::vector<float> h_edge_msg(n_edges * arch.n_channels * 16u);
+        cudaMemcpy(h_edge_msg.data(), std::getenv("SF_PROBE_LAYER0_EDGE_MSGS") ? S.grad_edge_messages : S.edge_messages,
+                   h_edge_msg.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        if (n_edges > 25) {
+            std::printf("  edge_messages[edge 0, c 0, m 0]: %.6g\n",
+                        h_edge_msg[0*96*16 + 0*16 + 0]);
+            std::printf("  edge_messages[edge 11, c 0, m 0]: %.6g\n",
+                        h_edge_msg[11*96*16 + 0*16 + 0]);
+            std::printf("  edge_messages[edge 25, c 0, m 0]: %.6g\n",
+                        h_edge_msg[25*96*16 + 0*16 + 0]);
+            std::printf("  edge_messages[edge 42, c 0, m 0]: %.6g\n",
+                        h_edge_msg[42*96*16 + 0*16 + 0]);
+        }
+
+        // Pull post-skip_tp inter_0_out (= node_features_post_residual_layer[0])
+        // and look at the L=0 components: indices [c*16+0] for c=0..4.
+        std::vector<float> h_inter0(n_atoms * arch.n_channels * 16u);
+        cudaMemcpy(h_inter0.data(), S.node_features_post_residual_layer[0],
+                   h_inter0.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        std::printf("  inter_0_out L=0 [atom 0, c 0..4]: %.4g %.4g %.4g %.4g %.4g\n",
+                    h_inter0[0*16+0], h_inter0[1*16+0], h_inter0[2*16+0], h_inter0[3*16+0], h_inter0[4*16+0]);
+        std::printf("  inter_0_out L=1 m=0 [atom 0, c 0..4]: %.4g %.4g %.4g %.4g %.4g\n",
+                    h_inter0[0*16+1], h_inter0[1*16+1], h_inter0[2*16+1], h_inter0[3*16+1], h_inter0[4*16+1]);
+        std::printf("  inter_0_out [atom 0, c 0, m 0..15]:");
+        for (int m = 0; m < 16; ++m) std::printf(" %.4g", h_inter0[0*16+m]);
+        std::printf("\n");
+    }
+
+    // Diagnostic: forward intermediates that get fed into the backward chain.
+    // These need to match python `prod_k_out` and `inter_k_out` exactly so the
+    // backward kernels operate on the same forward tape that python autograd did.
+    {
+        std::vector<float> h_prod0(n_atoms * arch.n_channels), h_prod1(n_atoms * arch.n_channels);
+        cudaMemcpy(h_prod0.data(), S.node_features_l0_only_post_product_layer[0],
+                   h_prod0.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_prod1.data(), S.node_features_l0_only_post_product_layer[1],
+                   h_prod1.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        if (gt.tensors.count("prod_0_out")) diff_report("prod_0_out save", gt.tensors.at("prod_0_out").data(), h_prod0.data(), h_prod0.size());
+        if (gt.tensors.count("prod_1_out")) diff_report("prod_1_out save", gt.tensors.at("prod_1_out").data(), h_prod1.data(), h_prod1.size());
+
+        std::vector<float> h_inter0(n_atoms * arch.n_channels * 16u), h_inter1(n_atoms * arch.n_channels * 16u);
+        cudaMemcpy(h_inter0.data(), S.node_features_post_residual_layer[0],
+                   h_inter0.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_inter1.data(), S.node_features_post_residual_layer[1],
+                   h_inter1.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        if (gt.tensors.count("inter_0_out")) diff_report("inter_0_out save", gt.tensors.at("inter_0_out").data(), h_inter0.data(), h_inter0.size());
+        if (gt.tensors.count("inter_1_out")) diff_report("inter_1_out save", gt.tensors.at("inter_1_out").data(), h_inter1.data(), h_inter1.size());
+
+        // Optional dump for offline analysis.
+        if (std::getenv("SF_DUMP_PROD") != nullptr) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "/tmp/sf_prod_1_out_%s.bin", name);
+            FILE *fp = std::fopen(buf, "wb");
+            if (fp) { std::fwrite(h_prod1.data(), sizeof(float), h_prod1.size(), fp); std::fclose(fp); }
+            std::snprintf(buf, sizeof(buf), "/tmp/sf_prod_0_out_%s.bin", name);
+            fp = std::fopen(buf, "wb");
+            if (fp) { std::fwrite(h_prod0.data(), sizeof(float), h_prod0.size(), fp); std::fclose(fp); }
+            std::snprintf(buf, sizeof(buf), "/tmp/sf_inter_0_out_%s.bin", name);
+            fp = std::fopen(buf, "wb");
+            if (fp) { std::fwrite(h_inter0.data(), sizeof(float), h_inter0.size(), fp); std::fclose(fp); }
+            std::snprintf(buf, sizeof(buf), "/tmp/sf_inter_1_out_%s.bin", name);
+            fp = std::fopen(buf, "wb");
+            if (fp) { std::fwrite(h_inter1.data(), sizeof(float), h_inter1.size(), fp); std::fclose(fp); }
+        }
+    }
+
     // Force-adjoint validation against the grad_positions golden.
     //   forces[a, k]      = -grad_positions[a, k]
     //   ref grad_positions = MACE Python torch.autograd.grad(E, positions)
     //   We compare per-atom force RMS in eV/Å; ≤ 1 meV/Å is the plan target.
-    smallfield::cuda::mace_inference_run_force_adjoint(arch, W.device(), batch, S, /*stream*/0);
+    //
+    // ============================================================
+    // DIAGNOSTIC: walk the reverse chain step-by-step and snapshot
+    // each major checkpoint into device-side scratch buffers, then
+    // diff each against the corresponding python-autograd golden.
+    // The first checkpoint that disagrees with the golden localises
+    // the broken adjoint launcher (or the broken wiring around it).
+    // ============================================================
+    auto alloc_zero = [](std::size_t n_floats) -> float * {
+        float *p = nullptr;
+        cudaMalloc(reinterpret_cast<void **>(&p), n_floats * sizeof(float));
+        cudaMemset(p, 0, n_floats * sizeof(float));
+        return p;
+    };
+    smallfield::cuda::mace_force_adjoint_debug_snapshots_t snap{};
+    std::size_t const n_inv  = static_cast<std::size_t>(n_atoms) * arch.n_channels;
+    std::size_t const n_full = static_cast<std::size_t>(n_atoms) * arch.n_channels * 16u;
+    std::size_t const n_msg  = static_cast<std::size_t>(n_edges) * arch.n_channels * 16u;
+    snap.grad_node_scalar_invariants_after_readout_layer1 = alloc_zero(n_inv);
+    snap.grad_node_scalar_invariants_after_product_layer1 = alloc_zero(n_inv);
+    snap.grad_node_features_after_symcontraction_layer1   = alloc_zero(n_full);
+    snap.grad_node_features_after_skip_tp_layer1          = alloc_zero(n_full);
+    snap.grad_node_features_after_linear_post_tp_layer1   = alloc_zero(n_full);
+    snap.grad_edge_messages_after_tp_scatter_layer1       = alloc_zero(n_msg);
+    snap.grad_node_features_layer_input_layer1            = alloc_zero(n_full);
+    snap.grad_node_scalar_invariants_after_readout_layer0 = alloc_zero(n_inv);
+    snap.grad_node_scalar_invariants_after_product_layer0 = alloc_zero(n_inv);
+    snap.grad_node_features_after_symcontraction_layer0   = alloc_zero(n_full);
+    snap.grad_node_features_after_skip_tp_layer0          = alloc_zero(n_full);
+    snap.grad_node_features_after_linear_post_tp_layer0   = alloc_zero(n_full);
+    snap.grad_edge_messages_after_tp_scatter_layer0       = alloc_zero(n_msg);
+    snap.grad_node_features_layer_input_layer0            = alloc_zero(n_full);
+
+    smallfield::cuda::mace_inference_run_force_adjoint_debug(
+        arch, W.device(), batch, S, snap, /*stream*/0);
     cudaDeviceSynchronize();
+
+    // Helper: pull a snapshot off the GPU and diff against its golden tensor.
+    auto diff_snapshot = [&](char const *label, float const *d_buf, std::size_t n,
+                             char const *golden_key) {
+        std::vector<float> h(n);
+        cudaMemcpy(h.data(), d_buf, n * sizeof(float), cudaMemcpyDeviceToHost);
+        if (gt.tensors.count(golden_key) == 0) {
+            std::printf("    [%s : golden '%s' missing]\n", label, golden_key);
+            return;
+        }
+        diff_report(label, gt.tensors.at(golden_key).data(), h.data(), n);
+        // Print first 5 ref/got pairs for inspection.
+        auto const &gref = gt.tensors.at(golden_key);
+        std::printf("      ref :");
+        for (std::size_t i = 0; i < std::min<std::size_t>(n, 5); ++i) std::printf(" %+.4e", gref[i]);
+        std::printf("\n      got :");
+        for (std::size_t i = 0; i < std::min<std::size_t>(n, 5); ++i) std::printf(" %+.4e", h[i]);
+        std::printf("\n");
+    };
+
+    std::printf("  --- per-step adjoint checkpoint diffs (vs golden) ---\n");
+    // Layer 1 reverse chain (executes first):
+    diff_snapshot("L1 grad_inv_post_readout (=prod_1_grad)",
+                  snap.grad_node_scalar_invariants_after_readout_layer1, n_inv,
+                  "grad_node_scalar_invariants_layer_1");
+    diff_snapshot("L1 grad_features_post_symcontract (=inter_1_grad)",
+                  snap.grad_node_features_after_symcontraction_layer1, n_full,
+                  "grad_node_features_layer_1");
+    diff_snapshot("L1 grad_edge_msgs_post_scatter (=msg_1_grad)",
+                  snap.grad_edge_messages_after_tp_scatter_layer1, n_msg,
+                  "grad_edge_messages_layer_1");
+    // Layer 0 reverse chain (executes second):
+    diff_snapshot("L0 grad_inv_post_readout (=prod_0_grad)",
+                  snap.grad_node_scalar_invariants_after_readout_layer0, n_inv,
+                  "grad_node_scalar_invariants_layer_0");
+    diff_snapshot("L0 grad_features_post_symcontract (=inter_0_grad)",
+                  snap.grad_node_features_after_symcontraction_layer0, n_full,
+                  "grad_node_features_layer_0");
+    diff_snapshot("L0 grad_edge_msgs_post_scatter (=msg_0_grad)",
+                  snap.grad_edge_messages_after_tp_scatter_layer0, n_msg,
+                  "grad_edge_messages_layer_0");
+    std::printf("  -------------------------------------------------------\n");
+
+    cudaFree(snap.grad_node_scalar_invariants_after_readout_layer1);
+    cudaFree(snap.grad_node_scalar_invariants_after_product_layer1);
+    cudaFree(snap.grad_node_features_after_symcontraction_layer1);
+    cudaFree(snap.grad_node_features_after_skip_tp_layer1);
+    cudaFree(snap.grad_node_features_after_linear_post_tp_layer1);
+    cudaFree(snap.grad_edge_messages_after_tp_scatter_layer1);
+    cudaFree(snap.grad_node_features_layer_input_layer1);
+    cudaFree(snap.grad_node_scalar_invariants_after_readout_layer0);
+    cudaFree(snap.grad_node_scalar_invariants_after_product_layer0);
+    cudaFree(snap.grad_node_features_after_symcontraction_layer0);
+    cudaFree(snap.grad_node_features_after_skip_tp_layer0);
+    cudaFree(snap.grad_node_features_after_linear_post_tp_layer0);
+    cudaFree(snap.grad_edge_messages_after_tp_scatter_layer0);
+    cudaFree(snap.grad_node_features_layer_input_layer0);
     std::vector<float> h_forces(n_atoms * 3u);
     cudaMemcpy(h_forces.data(), S.forces, h_forces.size() * sizeof(float), cudaMemcpyDeviceToHost);
     if (gt.tensors.count("grad_positions")) {

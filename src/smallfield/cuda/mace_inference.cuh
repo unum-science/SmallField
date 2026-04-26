@@ -22,6 +22,7 @@
 #if defined(__CUDACC__)
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
 
@@ -51,6 +52,10 @@
 #  include "smallfield/cuda/mace_tk_element_conditioned_residual_kernel.cuh"
 #  include "smallfield/cuda/mace_tk_symmetric_contraction_kernel.cuh"
 #  include "smallfield/cuda/mace_tk_readout_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_per_irrep_linear_force_adjoint_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_conv_tp_scatter_fused_force_adjoint_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_element_conditioned_residual_force_adjoint_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_symmetric_contraction_force_adjoint_kernel.cuh"
 #endif
 
 namespace smallfield::cuda {
@@ -557,18 +562,15 @@ inline void mace_inference_forward(
                                     1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
                                     S.tensor_product_weights_per_edge, stream);
 #endif
-        // Save pre-cutoff tp_weights for the apply_cutoff backward (the apply_cutoff
-        // multiply contributes a Σ_k grad_tp[e,k] * tp_pre[e,k] term to dr/d_positions
-        // through dEnv(r); without the saved pre-cutoff buffer that path is lost).
-        if (S.tensor_product_weights_pre_cutoff_layer[layer_index] != nullptr) {
-            cudaMemcpyAsync(S.tensor_product_weights_pre_cutoff_layer[layer_index],
-                            S.tensor_product_weights_per_edge,
-                            batch.n_edges * tp_dim * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
-        }
-
-        // Multiply per-edge by the cutoff envelope (mirrors `tp_weights *= cutoff` in the live forward).
-        launch_mace_apply_cutoff(batch.n_edges, tp_dim, S.cutoff_envelope, S.tensor_product_weights_per_edge, stream);
+        // NOTE: MACE-OFF's RadialEmbeddingBlock returns `radial * cutoff, None` (no
+        // separate cutoff returned).  The cutoff envelope is therefore already
+        // baked into our `S.radial_basis` (kernel multiplies by `env` per edge).
+        // The interaction block then does `if cutoff is not None: tp_weights *=
+        // cutoff` — and cutoff IS None here, so the multiply is a no-op.  Earlier
+        // wiring incorrectly applied the cutoff again here, which double-counted
+        // it (forward off by `env` per edge, backward correspondingly off).  No
+        // re-multiply, no pre-cutoff save needed.
+        (void)tp_dim;
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // 3c+3d.  Two routes depending on whether the host has supplied
@@ -624,6 +626,7 @@ inline void mace_inference_forward(
                                     batch.edge_target_atom, S.edge_messages, S.node_features_scratch, stream);
 #endif
 
+
         // 3e. linear_post_tp: per-irrep channel mix on all 4 L blocks.
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // TK 4-block fused linear: one CTA per 4 atoms × 96 c_out, single
@@ -642,6 +645,7 @@ inline void mace_inference_forward(
                                       irrep_dim, /*active_irrep_block_count*/4u,
                                       L.linear_post_tp_w, S.node_features_scratch, S.node_features, stream);
 #endif
+
 
         // 3f. Divide by avg_num_neighbors (in-place scale of node_features).
         if (avg_num_neighbors != 1.0f) {
@@ -944,6 +948,29 @@ inline void mace_inference_run_force_adjoint(
         //     (L.weights_max, L.weights_lo_0, L.weights_lo_1) since `weights_lo_0`
         //     is the order-2 buffer and `weights_lo_1` the order-1 buffer (matches
         //     the forward launcher in `mace_symmetric_contraction_kernel.cuh`).
+        //
+        //     The kernel accumulates with `+=`; pre-zero so stale grad_node_features
+        //     from the previous layer's reverse pass (its layer-input gradient,
+        //     written at steps 3m/3o then handed to inject_l0 backward at 3n) does
+        //     NOT bleed into this layer's `grad inter_k_out`.  inter_k_out flows
+        //     only into symmetric_contractions; there is no other adjoint path
+        //     into this buffer at this point in the chain.
+        cudaMemsetAsync(S.grad_node_features, 0,
+                        batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // TK D4: takes the precomputed `W3_eff[Z, i, j, k, c]` from the forward
+        // (already populated lazily on first forward in TK build), so the
+        // backward doesn't pay the order-3 path-reduce cost.
+        launch_mace_tk_symmetric_contraction_force_adjoint(
+            batch.n_atoms, arch.n_channels, arch.n_elements,
+            batch.atom_element,
+            S.node_features_post_residual_layer[layer_index],
+            L.u_matrix_1, L.u_matrix_2,
+            L.weights_lo_0, L.weights_lo_1,
+            S.tk_precomputed_w3_effective_layer[layer_index],
+            S.grad_node_scalar_invariants,
+            S.grad_node_features, stream);
+#else
         launch_mace_symmetric_contraction_force_adjoint(
             batch.n_atoms, arch.n_channels, irrep_dim, arch.n_elements,
             batch.atom_element,
@@ -952,6 +979,7 @@ inline void mace_inference_run_force_adjoint(
             L.weights_max, L.weights_lo_0, L.weights_lo_1,
             S.grad_node_scalar_invariants,
             S.grad_node_features, stream);
+#endif
 
         // 3e. (layer 0) Element-conditioned residual on the message path:
         //     `node_features_post_skip_tp = skip_tp(node_features_post_avg, atom_element)`.
@@ -959,6 +987,20 @@ inline void mace_inference_run_force_adjoint(
         //     For layer-N (>= 1) skip_tp on the message path is identity, so
         //     just copy the gradient through.
         if (layer_index == 0u) {
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+            // TK D3: element-conditioned residual backward, bf16 WGMMA.
+            // Output is fp32 with += semantics — pre-zero the scratch since
+            // it may hold stale data from a previous iteration.
+            cudaMemsetAsync(S.grad_node_features_scratch, 0,
+                            batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
+            launch_mace_tk_element_conditioned_residual_force_adjoint(
+                batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
+                /*active_irrep_block_count*/4u,
+                batch.atom_element, L.skip_tp_w,
+                S.grad_node_features,                 // upstream (post-skip_tp grad)
+                S.grad_node_features_scratch,         // pre-skip_tp grad (fp32 +=)
+                stream);
+#else
             launch_mace_element_conditioned_residual_force_adjoint(
                 batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
                 irrep_dim, /*active_irrep_block_count*/4u,
@@ -966,6 +1008,7 @@ inline void mace_inference_run_force_adjoint(
                 S.grad_node_features,                 // upstream (post-skip_tp grad)
                 S.grad_node_features_scratch,         // pre-skip_tp grad
                 stream);
+#endif
         } else {
             cudaMemcpyAsync(S.grad_node_features_scratch, S.grad_node_features,
                             batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float),
@@ -1003,6 +1046,24 @@ inline void mace_inference_run_force_adjoint(
         //     (it was just consumed by product_linear backward, free to reuse).
         cudaMemsetAsync(S.grad_node_features_l0_only, 0,
                         batch.n_atoms * arch.n_channels * sizeof(float), stream);
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // TK D2: same three-output backward, bf16 inputs through the kernel,
+        // fp32 atomicAdd accumulators on the output side (per the f56ca64
+        // smoke-test report — bf16 atomics are non-commutative on Hopper).
+        launch_mace_tk_tensor_product_and_scatter_force_adjoint(
+            batch.n_atoms, batch.n_edges, arch.n_channels,
+            batch.edge_source_atom, batch.edge_target_atom,
+            batch.receiver_edge_segment_start,
+            batch.receiver_edge_segment_end,
+            S.node_features_l0_only_layer[layer_index],
+            S.sph_harm,
+            S.tensor_product_weights_per_edge,
+            S.grad_node_features,
+            S.grad_node_features_l0_only,
+            S.grad_tp_weights,
+            S.grad_sph_harm,
+            stream);
+#else
         launch_mace_tensor_product_and_scatter_force_adjoint(
             batch.n_atoms, batch.n_edges, arch.n_channels,
             batch.edge_source_atom, batch.edge_target_atom,
@@ -1014,64 +1075,17 @@ inline void mace_inference_run_force_adjoint(
             S.grad_tp_weights,                        // overwritten
             S.grad_sph_harm                           // atomicAdd accumulator
             , stream);
+#endif
 
-        // 3j. apply_cutoff adjoint: rescales grad_tp by cutoff_envelope, and
-        //     reduces a grad_env contribution per edge that we route through
-        //     dpositions via the env-derivative chain.
-        //     We reuse `S.grad_radial_basis` slot 0 as a scratch grad_env
-        //     accumulator?  No — grad_radial_basis is [n_edges, n_radial]
-        //     and grad_env is [n_edges].  Use `S.r_norm`'s shape — but
-        //     that's used in forward.  Allocate a temporary on the stream:
-        //     the scratch arena doesn't have a [n_edges] grad-env buffer, so
-        //     we route grad_env via grad_radial_basis's first column slot
-        //     temporarily and then atomic-add the dpositions update from a
-        //     short kernel.
-        //
-        //     Simpler: use a separate scratch.  We'll cudaMallocAsync for
-        //     `n_edges` floats only when this layer's reverse pass runs;
-        //     this allocation is small and rare (cudaMallocAsync is graph-
-        //     capture safe on Hopper).  But the work plan's graph-capture
-        //     constraint forbids per-call cudaMalloc — so instead reuse
-        //     `S.cutoff_envelope` AS the destination since by this point in
-        //     the forward+backward the forward has already consumed it
-        //     (both the radial-basis kernel and the apply_cutoff multiply
-        //     have already read it; the forward radial-geometry adjoint
-        //     doesn't read it again).  Caveat: the radial-basis adjoint
-        //     below DOES read env via recompute (not via cutoff_envelope
-        //     directly), so the cutoff_envelope buffer is free to repurpose
-        //     here.
-        //
-        //     IMPORTANT: this destroys S.cutoff_envelope, so callers must
-        //     not rely on it after run_force_adjoint.  Documented in the
-        //     scratch comment above.
-        //
-        //     But wait — in the layer loop we may need cutoff_envelope at
-        //     the start of layer 0's reverse pass too (we just consumed
-        //     layer 1's grad_tp; layer 0 will multiply its grad_tp by env
-        //     too).  So we cannot destroy cutoff_envelope in layer 1.
-        //
-        //     Fix: use a small per-layer scratch.  Add `grad_cutoff_envelope`
-        //     to scratch in a follow-up if profile shows this matters.  For
-        //     now, route grad_env into a transient device alloc — graph
-        //     capture isn't yet wired with the backward pass, so the
-        //     cudaMallocAsync is allowed.  When G1 lands we'll promote
-        //     this to a permanent scratch buffer.
-        float *grad_cutoff_envelope_scratch = nullptr;
-        cudaMallocAsync(reinterpret_cast<void **>(&grad_cutoff_envelope_scratch),
-                        batch.n_edges * sizeof(float), stream);
-        launch_mace_apply_cutoff_force_adjoint(
-            batch.n_edges, tp_dim,
-            S.cutoff_envelope,
-            S.tensor_product_weights_pre_cutoff_layer[layer_index],
-            S.grad_tp_weights,                        // in-place rescale
-            grad_cutoff_envelope_scratch,
-            stream);
-        // Route grad_env through dEnv/dr → atomic-add into grad_positions.
-        launch_mace_cutoff_grad_env_to_positions(
-            arch, batch.n_edges, S.r_norm, S.r_unit,
-            batch.edge_source_atom, batch.edge_target_atom,
-            grad_cutoff_envelope_scratch, S.grad_positions, stream);
-        cudaFreeAsync(grad_cutoff_envelope_scratch, stream);
+        // 3j. NO apply_cutoff backward — the forward folds the cutoff envelope
+        //   directly into `radial_basis = b_n(r) * env(r)` (matching MACE-OFF's
+        //   RadialEmbeddingBlock that returns `radial * cutoff, None`).  The
+        //   downstream radial-basis backward (step 5 below) computes
+        //   `d rb[n] / d r = dbn_dr * env + b_n * denv_dr` and routes both terms
+        //   into dpositions, so the cutoff-envelope derivative chain is already
+        //   complete.  Earlier wiring multiplied tp_weights by env again here
+        //   and added a separate apply_cutoff backward + grad_env_to_positions
+        //   step — both stale.
 
         // 3k. radial_mlp adjoint: grad_tp_weights → grad_radial_basis.
         //     Backward through the 4-layer MLP with normalize2mom(silu)
@@ -1199,6 +1213,347 @@ inline void mace_inference_run_force_adjoint(
         arch, batch.n_edges, W.bessel_weights,
         S.r_norm, S.r_unit, batch.edge_source_atom, batch.edge_target_atom,
         S.grad_radial_basis, S.grad_r_unit, S.grad_positions, stream);
+
+    // 6. forces[a, k] = -grad_positions[a, k].
+    launch_mace_force_negate(batch.n_atoms, S.grad_positions, S.forces, stream);
+}
+
+/**
+ *  @brief Diagnostic snapshot points captured during a debug run of
+ *         `mace_inference_run_force_adjoint`.  Each pointer, if non-null,
+ *         receives a per-step copy of the relevant grad buffer immediately
+ *         AFTER the corresponding step in the chain.  Two layer slots; if
+ *         a buffer for layer 1 is provided but the forward only ran one
+ *         interaction layer, the buffer is left untouched.
+ *
+ *  Naming follows the GOLDEN tensor names emitted by `mace_export.py`:
+ *    - `grad_node_scalar_invariants_layer_k`  (after step 3a, readout backward)
+ *      = grad of `prod_k_out` (post-product L=0 features).  Lives in
+ *      `S.grad_node_features_l0_only` at that point in the chain.
+ *    - `grad_node_features_layer_k`           (after step 3d, symcontraction backward)
+ *      = grad of `inter_k_out` (post-interaction full irreps).  Lives in
+ *      `S.grad_node_features` at that point.
+ *  Plus auxiliary checkpoints for downstream localisation.
+ */
+struct mace_force_adjoint_debug_snapshots_t {
+    // Layer-N first (reverse chain order):
+    float *grad_node_scalar_invariants_after_readout_layer1 = nullptr;  // [n_atoms, n_channels]
+    float *grad_node_scalar_invariants_after_product_layer1 = nullptr;  // [n_atoms, n_channels] — post 3c
+    float *grad_node_features_after_symcontraction_layer1   = nullptr;  // [n_atoms, n_channels, 16] — post 3d
+    float *grad_node_features_after_skip_tp_layer1          = nullptr;  // [n_atoms, n_channels, 16] — post 3e
+    float *grad_node_features_after_linear_post_tp_layer1   = nullptr;  // [n_atoms, n_channels, 16] — post 3g
+    float *grad_edge_messages_after_tp_scatter_layer1       = nullptr;  // [n_edges, n_channels, 16] — receiver-gathered
+    float *grad_node_features_layer_input_layer1            = nullptr;  // [n_atoms, n_channels, 16] — end-of-iteration
+
+    // Layer-0 (last to execute in reverse chain):
+    float *grad_node_scalar_invariants_after_readout_layer0 = nullptr;
+    float *grad_node_scalar_invariants_after_product_layer0 = nullptr;
+    float *grad_node_features_after_symcontraction_layer0   = nullptr;
+    float *grad_node_features_after_skip_tp_layer0          = nullptr;
+    float *grad_node_features_after_linear_post_tp_layer0   = nullptr;
+    float *grad_edge_messages_after_tp_scatter_layer0       = nullptr;
+    float *grad_node_features_layer_input_layer0            = nullptr;
+
+    // Final downstream gradients (already accessible via S.* but mirrored for parity):
+    float *grad_radial_basis = nullptr;  // [n_edges, n_radial]
+    float *grad_sph_harm     = nullptr;  // [n_edges, 16]
+};
+
+/**
+ *  @brief Debug variant of `mace_inference_run_force_adjoint` that copies
+ *         intermediate grad-buffer state into the caller-provided snapshot
+ *         pointers.  Chain logic is byte-identical to the production
+ *         function — this variant only adds optional `cudaMemcpyAsync`
+ *         calls at the documented checkpoints.  Use to localise which
+ *         step in the reverse chain first deviates from a numerical /
+ *         autograd reference.
+ */
+inline void mace_inference_run_force_adjoint_debug(
+    types::mace_arch_t const &arch,
+    types::mace_weights_device_t const &W,
+    types::mace_batch_t const &batch,
+    mace_scratch_t &S,
+    mace_force_adjoint_debug_snapshots_t const &snap,
+    cudaStream_t stream
+) {
+    constexpr std::uint32_t irrep_dim = 16u;
+    constexpr std::uint32_t readout_mlp_hidden_dim = 16u;
+    constexpr std::uint32_t radial_mlp_hidden_dim = 64u;
+    std::uint32_t const tp_dim = mace_tensor_product_path_count_k * arch.n_channels;
+    float const avg_num_neighbors = arch.avg_num_neighbors;
+
+    auto snap_copy = [&](float *dst, float const *src, std::size_t n_floats) {
+        if (dst == nullptr) return;
+        cudaMemcpyAsync(dst, src, n_floats * sizeof(float),
+                        cudaMemcpyDeviceToDevice, stream);
+    };
+
+    // 1. Initialise gradient buffers.
+    launch_mace_fill_constant(S.grad_per_graph_energy, batch.n_graphs, 1.0f, stream);
+    cudaMemsetAsync(S.grad_node_energy,             0, batch.n_atoms * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_node_scalar_invariants,  0, batch.n_atoms * arch.n_channels * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_node_features,           0, batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_node_features_scratch,   0, batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_node_features_l0_only,   0, batch.n_atoms * arch.n_channels * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_edge_messages,           0, batch.n_edges * arch.n_channels * irrep_dim * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_tp_weights,              0, batch.n_edges * tp_dim * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_sph_harm,                0, batch.n_edges * irrep_dim * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_r_unit,                  0, batch.n_edges * 3u * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_radial_basis,            0, batch.n_edges * arch.n_radial * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_positions,               0, batch.n_atoms * 3u * sizeof(float), stream);
+
+    launch_mace_per_graph_energy_force_adjoint(
+        batch.n_atoms, arch.scale, batch.graph_of_atom,
+        S.grad_per_graph_energy, S.grad_node_energy, stream);
+
+    std::uint32_t const num_layers = (arch.num_interactions < 2u) ? arch.num_interactions : 2u;
+    for (std::int32_t layer_signed = static_cast<std::int32_t>(num_layers) - 1; layer_signed >= 0; --layer_signed) {
+        std::uint32_t const layer_index = static_cast<std::uint32_t>(layer_signed);
+        auto const &L = W.layers[layer_index];
+
+        // 3a. Readout backward.
+        if (layer_index == 0u) {
+            float const ro_scale = 1.0f / sqrtf(static_cast<float>(arch.n_channels));
+            launch_mace_readout_linear_force_adjoint(
+                batch.n_atoms, arch.n_channels, ro_scale, W.readout_linear_w,
+                S.grad_node_energy, S.grad_node_features_l0_only, stream);
+        } else {
+            float const sc1 = 1.0f / sqrtf(static_cast<float>(arch.n_channels));
+            float const sc2 = 1.0f / sqrtf(static_cast<float>(readout_mlp_hidden_dim));
+            launch_mace_readout_nonlinear_mlp_force_adjoint(
+                batch.n_atoms, arch.n_channels, readout_mlp_hidden_dim, sc1, sc2,
+                S.node_features_l0_only_post_product_layer[layer_index],
+                W.readout_mlp_w0, W.readout_mlp_w1,
+                S.grad_node_energy, S.grad_node_features_l0_only, stream);
+        }
+        // SNAPSHOT: post-3a — grad_node_scalar_invariants_layer_k golden mate.
+        snap_copy(layer_index == 1u ? snap.grad_node_scalar_invariants_after_readout_layer1
+                                    : snap.grad_node_scalar_invariants_after_readout_layer0,
+                  S.grad_node_features_l0_only,
+                  static_cast<std::size_t>(batch.n_atoms) * arch.n_channels);
+
+        // 3b. layer-N residual backward.
+        if (layer_index >= 1u) {
+            cudaMemsetAsync(S.grad_layer_residual_l0_scratch, 0,
+                            batch.n_atoms * arch.n_channels * sizeof(float), stream);
+            launch_mace_element_conditioned_residual_force_adjoint(
+                batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
+                /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+                batch.atom_element, L.skip_tp_w,
+                S.grad_node_features_l0_only,
+                S.grad_layer_residual_l0_scratch,
+                stream);
+        }
+
+        // 3c. product_linear adjoint.
+        cudaMemsetAsync(S.grad_node_scalar_invariants, 0,
+                        batch.n_atoms * arch.n_channels * sizeof(float), stream);
+        launch_mace_linear_per_irrep_force_adjoint(
+            batch.n_atoms, arch.n_channels, arch.n_channels,
+            /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+            L.product_linear_w,
+            S.grad_node_features_l0_only,
+            S.grad_node_scalar_invariants, stream);
+        // SNAPSHOT: post-3c (pre-product-linear scalar grad).
+        snap_copy(layer_index == 1u ? snap.grad_node_scalar_invariants_after_product_layer1
+                                    : snap.grad_node_scalar_invariants_after_product_layer0,
+                  S.grad_node_scalar_invariants,
+                  static_cast<std::size_t>(batch.n_atoms) * arch.n_channels);
+
+        // 3d. Symmetric contraction adjoint.
+        cudaMemsetAsync(S.grad_node_features, 0,
+                        batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
+        launch_mace_symmetric_contraction_force_adjoint(
+            batch.n_atoms, arch.n_channels, irrep_dim, arch.n_elements,
+            batch.atom_element,
+            S.node_features_post_residual_layer[layer_index],
+            L.u_matrix_1, L.u_matrix_2, L.u_matrix_3,
+            L.weights_max, L.weights_lo_0, L.weights_lo_1,
+            S.grad_node_scalar_invariants,
+            S.grad_node_features, stream);
+        // SNAPSHOT: post-3d — grad_node_features_layer_k golden mate.
+        snap_copy(layer_index == 1u ? snap.grad_node_features_after_symcontraction_layer1
+                                    : snap.grad_node_features_after_symcontraction_layer0,
+                  S.grad_node_features,
+                  static_cast<std::size_t>(batch.n_atoms) * arch.n_channels * irrep_dim);
+
+        // 3e. message-path skip_tp backward.
+        if (layer_index == 0u) {
+            launch_mace_element_conditioned_residual_force_adjoint(
+                batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
+                irrep_dim, /*active_irrep_block_count*/4u,
+                batch.atom_element, L.skip_tp_w,
+                S.grad_node_features,
+                S.grad_node_features_scratch,
+                stream);
+        } else {
+            cudaMemcpyAsync(S.grad_node_features_scratch, S.grad_node_features,
+                            batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+        // SNAPSHOT: post-3e — pre-skip_tp grad (this is the message-path gradient).
+        snap_copy(layer_index == 1u ? snap.grad_node_features_after_skip_tp_layer1
+                                    : snap.grad_node_features_after_skip_tp_layer0,
+                  S.grad_node_features_scratch,
+                  static_cast<std::size_t>(batch.n_atoms) * arch.n_channels * irrep_dim);
+
+        // 3f. /avg_num_neighbors backward.
+        if (avg_num_neighbors != 1.0f) {
+            launch_mace_scale_force_adjoint(
+                batch.n_atoms * arch.n_channels * irrep_dim,
+                1.0f / avg_num_neighbors, S.grad_node_features_scratch, stream);
+        }
+
+        // 3g. linear_post_tp adjoint.
+        cudaMemsetAsync(S.grad_node_features, 0,
+                        batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
+        launch_mace_linear_per_irrep_force_adjoint(
+            batch.n_atoms, arch.n_channels, arch.n_channels,
+            irrep_dim, /*active_irrep_block_count*/4u,
+            L.linear_post_tp_w,
+            S.grad_node_features_scratch,
+            S.grad_node_features, stream);
+        // SNAPSHOT: post-3g — pre-linear_post_tp grad (= grad of post-scatter messages on the receiver atom).
+        snap_copy(layer_index == 1u ? snap.grad_node_features_after_linear_post_tp_layer1
+                                    : snap.grad_node_features_after_linear_post_tp_layer0,
+                  S.grad_node_features,
+                  static_cast<std::size_t>(batch.n_atoms) * arch.n_channels * irrep_dim);
+
+        // 3h. Fused tensor-product + scatter adjoint.
+        cudaMemsetAsync(S.grad_node_features_l0_only, 0,
+                        batch.n_atoms * arch.n_channels * sizeof(float), stream);
+        // SNAPSHOT: BEFORE the conv_tp+scatter backward, capture the per-atom
+        //   `grad_node_features` and gather it onto edges to compare against the
+        //   `grad_edge_messages_layer_k` golden (which is exactly that gather).
+        if (auto *dst = (layer_index == 1u ? snap.grad_edge_messages_after_tp_scatter_layer1
+                                           : snap.grad_edge_messages_after_tp_scatter_layer0)) {
+            launch_mace_scatter_force_adjoint(
+                batch.n_edges, arch.n_channels * irrep_dim,
+                batch.edge_target_atom, S.grad_node_features, dst, stream);
+        }
+        launch_mace_tensor_product_and_scatter_force_adjoint(
+            batch.n_atoms, batch.n_edges, arch.n_channels,
+            batch.edge_source_atom, batch.edge_target_atom,
+            S.node_features_l0_only_layer[layer_index],
+            S.sph_harm,
+            S.tensor_product_weights_per_edge,
+            S.grad_node_features,
+            S.grad_node_features_l0_only,
+            S.grad_tp_weights,
+            S.grad_sph_harm
+            , stream);
+
+        // 3j. NO apply_cutoff backward — see production-variant comment above.
+
+        // 3k. radial_mlp adjoint.
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, arch.n_radial,
+                                    S.radial_basis, L.radial_mlp_w0,
+                                    1.0f / sqrtf(static_cast<float>(arch.n_radial)),
+                                    S.radial_mlp_hidden_0, stream);
+        launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
+                                   S.radial_mlp_hidden_0, S.radial_mlp_hidden_0, stream);
+        launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
+                                    S.radial_mlp_hidden_0, L.radial_mlp_w1,
+                                    1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
+                                    S.radial_mlp_hidden_1, stream);
+        launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
+                                   S.radial_mlp_hidden_1, S.radial_mlp_hidden_1, stream);
+        launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
+                                    S.radial_mlp_hidden_1, L.radial_mlp_w2,
+                                    1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
+                                    S.radial_mlp_hidden_2, stream);
+        launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
+                                   S.radial_mlp_hidden_2, S.radial_mlp_hidden_2, stream);
+#endif
+        launch_mace_radial_mlp_layer_force_adjoint(
+            batch.n_edges, radial_mlp_hidden_dim, tp_dim,
+            1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
+            /*apply_silu_n2m_inverse*/false,
+            /*accumulate*/false,
+            /*post_activation*/nullptr,
+            L.radial_mlp_w3, S.grad_tp_weights,
+            S.edge_messages, stream);
+        launch_mace_radial_mlp_layer_force_adjoint(
+            batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
+            1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
+            /*apply_silu_n2m_inverse*/true,
+            /*accumulate*/false,
+            S.radial_mlp_hidden_2, L.radial_mlp_w2, S.edge_messages,
+            S.grad_node_features, stream);
+        launch_mace_radial_mlp_layer_force_adjoint(
+            batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
+            1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
+            /*apply_silu_n2m_inverse*/true,
+            /*accumulate*/false,
+            S.radial_mlp_hidden_1, L.radial_mlp_w1, S.grad_node_features,
+            S.edge_messages, stream);
+        launch_mace_radial_mlp_layer_force_adjoint(
+            batch.n_edges, arch.n_radial, radial_mlp_hidden_dim,
+            1.0f / sqrtf(static_cast<float>(arch.n_radial)),
+            /*apply_silu_n2m_inverse*/true,
+            /*accumulate*/true,
+            S.radial_mlp_hidden_0, L.radial_mlp_w0, S.edge_messages,
+            S.grad_radial_basis, stream);
+
+        // 3l. linear_up adjoint.
+        cudaMemsetAsync(S.grad_node_scalar_invariants, 0,
+                        batch.n_atoms * arch.n_channels * sizeof(float), stream);
+        launch_mace_linear_per_irrep_force_adjoint(
+            batch.n_atoms, arch.n_channels, arch.n_channels,
+            /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+            L.linear_up_w,
+            S.grad_node_features_l0_only,
+            S.grad_node_scalar_invariants, stream);
+
+        // 3m. extract_l0 adjoint.
+        cudaMemsetAsync(S.grad_node_features, 0,
+                        batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
+        launch_mace_extract_l0_irrep_block_force_adjoint(
+            batch.n_atoms, arch.n_channels, irrep_dim,
+            S.grad_node_scalar_invariants, S.grad_node_features, stream);
+
+        // 3o. layer-N residual merge.
+        if (layer_index >= 1u) {
+            launch_mace_extract_l0_irrep_block_force_adjoint(
+                batch.n_atoms, arch.n_channels, irrep_dim,
+                S.grad_layer_residual_l0_scratch, S.grad_node_features, stream);
+        }
+        // SNAPSHOT: end-of-iteration — `grad_node_features` is now the gradient
+        //   of the loss wrt the LAYER-INPUT `node_features_input_layer[k]`.
+        snap_copy(layer_index == 1u ? snap.grad_node_features_layer_input_layer1
+                                    : snap.grad_node_features_layer_input_layer0,
+                  S.grad_node_features,
+                  static_cast<std::size_t>(batch.n_atoms) * arch.n_channels * irrep_dim);
+
+        // 3n. inject_l0 adjoint hand-off to previous layer.
+        if (layer_index >= 1u) {
+            cudaMemsetAsync(S.grad_node_features_l0_only, 0,
+                            batch.n_atoms * arch.n_channels * sizeof(float), stream);
+            launch_mace_inject_l0_irrep_block_force_adjoint(
+                batch.n_atoms, arch.n_channels, irrep_dim,
+                S.grad_node_features, S.grad_node_features_l0_only, stream);
+        }
+    }
+
+    // 4. sph_harm adjoint.
+    launch_mace_sph_harm_force_adjoint(batch.n_edges, S.r_unit, S.grad_sph_harm,
+                                        S.grad_r_unit, stream);
+
+    // SNAPSHOT: grad_sph_harm just before consumed.  Captured AFTER step 4 so
+    // that the buffer reflects the value the production chain actually feeds
+    // forward — but step 4 only READS grad_sph_harm and writes grad_r_unit, so
+    // a copy here is identical to a copy before step 4.
+    snap_copy(snap.grad_sph_harm, S.grad_sph_harm,
+              static_cast<std::size_t>(batch.n_edges) * irrep_dim);
+
+    // 5. radial_basis × cutoff envelope + edge geometry adjoint.
+    launch_mace_radial_basis_and_edge_geometry_force_adjoint(
+        arch, batch.n_edges, W.bessel_weights,
+        S.r_norm, S.r_unit, batch.edge_source_atom, batch.edge_target_atom,
+        S.grad_radial_basis, S.grad_r_unit, S.grad_positions, stream);
+    snap_copy(snap.grad_radial_basis, S.grad_radial_basis,
+              static_cast<std::size_t>(batch.n_edges) * arch.n_radial);
 
     // 6. forces[a, k] = -grad_positions[a, k].
     launch_mace_force_negate(batch.n_atoms, S.grad_positions, S.forces, stream);
