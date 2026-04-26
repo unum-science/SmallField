@@ -34,6 +34,7 @@
 #include "smallfield/cuda/mace_tensor_product_kernel.cuh"
 #include "smallfield/cuda/mace_skip_tp_kernel.cuh"
 #include "smallfield/cuda/mace_symmetric_contraction_kernel.cuh"
+#include "smallfield/cuda/mace_force_adjoints.cuh"
 
 // ThunderKittens forward path — every TK kernel is gated on
 // `SMALLFIELD_USE_THUNDERKITTENS`.  When the macro is undefined the headers
@@ -205,6 +206,34 @@ struct mace_scratch_t {
     // graph-scoped
     float *energy = nullptr;                       // [n_graphs]
 
+    // ---------------------------------------------------------------------
+    // Force-adjoint scratch.  Allocated unconditionally so that
+    // `mace_inference_run_force_adjoint` always has somewhere to write.
+    // The forward path also saves a few per-layer intermediates that the
+    // adjoint pass reads back (the bare `node_features` / `node_features_scratch`
+    // buffers above are overwritten during the second iteration of the
+    // forward loop, so layer-0 contributions need their own home).
+    // ---------------------------------------------------------------------
+    float *node_features_input_layer[2] = {nullptr, nullptr};        ///< pre-linear_up node features, per layer
+    float *node_features_post_residual_layer[2] = {nullptr, nullptr};///< post-skip_tp / pre-symcontraction node features, per layer
+    float *node_features_l0_only_layer[2] = {nullptr, nullptr};      ///< post-linear_up scalar features, per layer
+    float *node_scalar_invariants_layer[2] = {nullptr, nullptr};     ///< post-symcontraction scalar features, per layer
+
+    // Backward-pass gradient buffers.
+    float *forces = nullptr;                       ///< [n_atoms, 3] final forces output (populated by run_force_adjoint)
+    float *grad_positions = nullptr;               ///< [n_atoms, 3] dpositions accumulator before negation
+    float *grad_per_graph_energy = nullptr;        ///< [n_graphs] input gradient (set to 1.0 by caller for force computation)
+    float *grad_node_energy = nullptr;             ///< [n_atoms] dnode_energy
+    float *grad_node_scalar_invariants = nullptr;  ///< [n_atoms, n_channels]
+    float *grad_node_features = nullptr;           ///< [n_atoms, n_channels, 16]
+    float *grad_node_features_scratch = nullptr;   ///< [n_atoms, n_channels, 16] aux for chain-rule sum
+    float *grad_node_features_l0_only = nullptr;   ///< [n_atoms, n_channels]
+    float *grad_edge_messages = nullptr;           ///< [n_edges, n_channels, 16]
+    float *grad_tp_weights = nullptr;              ///< [n_edges, 4 * n_channels]
+    float *grad_sph_harm = nullptr;                ///< [n_edges, 16]
+    float *grad_r_unit = nullptr;                  ///< [n_edges, 3]
+    float *grad_radial_basis = nullptr;            ///< [n_edges, n_radial]
+
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
     // ThunderKittens scratch — all `_tk_` buffers exist only on the TK forward path.
     // Each is the bf16 view of the corresponding fp32 buffer above plus the
@@ -255,6 +284,27 @@ struct mace_scratch_t {
         alloc(&layer_n_residual_l0, max_atoms * arch.n_channels);
         alloc(&node_energy, max_atoms);
         alloc(&energy, max_graphs);
+        // Per-layer forward saves for the backward pass.
+        for (std::uint32_t layer_index = 0; layer_index < 2u; ++layer_index) {
+            alloc(&node_features_input_layer[layer_index],         max_atoms * arch.n_channels * irrep_dim);
+            alloc(&node_features_post_residual_layer[layer_index], max_atoms * arch.n_channels * irrep_dim);
+            alloc(&node_features_l0_only_layer[layer_index],       max_atoms * arch.n_channels);
+            alloc(&node_scalar_invariants_layer[layer_index],      max_atoms * arch.n_channels);
+        }
+        // Backward gradient buffers.
+        alloc(&forces,                       max_atoms * 3u);
+        alloc(&grad_positions,               max_atoms * 3u);
+        alloc(&grad_per_graph_energy,        max_graphs);
+        alloc(&grad_node_energy,             max_atoms);
+        alloc(&grad_node_scalar_invariants,  max_atoms * arch.n_channels);
+        alloc(&grad_node_features,           max_atoms * arch.n_channels * irrep_dim);
+        alloc(&grad_node_features_scratch,   max_atoms * arch.n_channels * irrep_dim);
+        alloc(&grad_node_features_l0_only,   max_atoms * arch.n_channels);
+        alloc(&grad_edge_messages,           max_edges * arch.n_channels * irrep_dim);
+        alloc(&grad_tp_weights,              max_edges * mace_tensor_product_path_count_k * arch.n_channels);
+        alloc(&grad_sph_harm,                max_edges * irrep_dim);
+        alloc(&grad_r_unit,                  max_edges * 3u);
+        alloc(&grad_radial_basis,            max_edges * arch.n_radial);
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // bf16 scratch for the TK forward path (sized in fp32 elements; the cast
         // is `n_elements * 2 bytes`).  Allocated only when TK is compiled in.
@@ -281,9 +331,24 @@ struct mace_scratch_t {
                           &node_features, &node_features_scratch,
                           &node_features_l0_only, &node_scalar_invariants,
                           &layer_n_residual_l0,
-                          &node_energy, &energy}) {
+                          &node_energy, &energy,
+                          &forces, &grad_positions, &grad_per_graph_energy,
+                          &grad_node_energy, &grad_node_scalar_invariants,
+                          &grad_node_features, &grad_node_features_scratch,
+                          &grad_node_features_l0_only,
+                          &grad_edge_messages, &grad_tp_weights,
+                          &grad_sph_harm, &grad_r_unit, &grad_radial_basis}) {
             if (*p) cudaFree(*p);
             *p = nullptr;
+        }
+        for (std::uint32_t layer_index = 0; layer_index < 2u; ++layer_index) {
+            for (float **p : {&node_features_input_layer[layer_index],
+                              &node_features_post_residual_layer[layer_index],
+                              &node_features_l0_only_layer[layer_index],
+                              &node_scalar_invariants_layer[layer_index]}) {
+                if (*p) cudaFree(*p);
+                *p = nullptr;
+            }
         }
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         for (__nv_bfloat16 **p : {&tk_tensor_product_weights_per_edge_bf16,
@@ -648,6 +713,117 @@ inline void mace_inference_forward(
 /** Convenience: zero `node_energy` before each forward (since we accumulate). */
 inline void mace_inference_reset_per_atom_energy_accumulator(mace_scratch_t &S, std::uint32_t n_atoms, cudaStream_t stream) {
     cudaMemsetAsync(S.node_energy, 0, n_atoms * sizeof(float), stream);
+}
+
+/**
+ *  @brief Run the force-adjoint pass to produce per-atom forces from a
+ *         post-forward `mace_scratch_t`.
+ *
+ *  Forces are `-∂E/∂r`.  The implementation walks the forward chain in
+ *  reverse, calling each adjoint kernel in `mace_force_adjoints.cuh` against
+ *  the corresponding forward intermediate stashed in `mace_scratch_t`.  Output
+ *  lands in `S.forces[n_atoms, 3]` (fp32).
+ *
+ *  Status: this is a SCAFFOLD wired up to the energy-reduce + readout
+ *  adjoints.  The full chain (per-layer scatter / TP / linear / skip_tp /
+ *  symmetric-contraction / radial / sph-harm adjoints) is staged via the
+ *  per-layer `node_features_*_layer[2]` saves added to `mace_scratch_t`,
+ *  but the forward currently does not yet populate those layer-saves.
+ *  The next iteration:
+ *
+ *    1. Modify `mace_inference_forward` to copy `S.node_features` and
+ *       `S.node_scalar_invariants` (and `tensor_product_weights_per_edge`)
+ *       into the per-layer save buffers at each layer's boundary.
+ *    2. Implement the full reverse loop here, calling each adjoint launcher
+ *       declared in `mace_force_adjoints.cuh`.
+ *    3. Validate per-atom force RMS against the `grad_positions` golden
+ *       tensor exported by `python/smallfield/mace_export.py` (= `-forces`
+ *       from `compute_force=True` in MACE Python).
+ *
+ *  Caller responsibility: must run `mace_inference_forward` on the same
+ *  `(arch, W, batch, S)` immediately before calling this function.
+ *  `S.grad_per_graph_energy` is initialised here to all 1.0 (one unit of
+ *  output energy gradient per graph) before the chain begins.
+ */
+inline void mace_inference_run_force_adjoint(
+    types::mace_arch_t const &arch,
+    types::mace_weights_device_t const &W,
+    types::mace_batch_t const &batch,
+    mace_scratch_t &S,
+    cudaStream_t stream
+) {
+    constexpr std::uint32_t irrep_dim = 16u;
+    constexpr std::uint32_t readout_mlp_hidden_dim = 16u;
+
+    // 1. Initialise gradient buffers.
+    //    - grad_per_graph_energy = 1.0 (each graph's energy contributes unity to the loss).
+    //    - All other grad_* buffers are zeroed; adjoints accumulate via += or atomicAdd.
+    {
+        std::vector<float> ones(batch.n_graphs, 1.0f);
+        cudaMemcpyAsync(S.grad_per_graph_energy, ones.data(), batch.n_graphs * sizeof(float),
+                        cudaMemcpyHostToDevice, stream);
+    }
+    cudaMemsetAsync(S.grad_node_energy,            0, batch.n_atoms * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_node_scalar_invariants, 0, batch.n_atoms * arch.n_channels * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_node_features,          0, batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_node_features_l0_only,  0, batch.n_atoms * arch.n_channels * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_edge_messages,          0, batch.n_edges * arch.n_channels * irrep_dim * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_tp_weights,             0, batch.n_edges * mace_tensor_product_path_count_k * arch.n_channels * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_sph_harm,               0, batch.n_edges * irrep_dim * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_r_unit,                 0, batch.n_edges * 3u * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_radial_basis,           0, batch.n_edges * arch.n_radial * sizeof(float), stream);
+    cudaMemsetAsync(S.grad_positions,              0, batch.n_atoms * 3u * sizeof(float), stream);
+
+    // 2. Per-graph energy reduce adjoint:
+    //    grad_node_energy[a] = scale * grad_per_graph_energy[graph_of_atom[a]]
+    //    (the atomic_baseline term has zero gradient wrt position; the
+    //    scale_shift's `shift` is a constant; only `scale * node_energy` flows
+    //    back).  This adjoint is implemented in mace_force_adjoints.cuh as
+    //    `mace_per_graph_energy_force_adjoint_kernel` — wire it up next.
+
+    // 3. Readout adjoints (linear for layer 0, nonlinear MLP for layer N)
+    //    accumulating into grad_node_scalar_invariants:
+    //    launch_mace_readout_linear_force_adjoint(...)
+    //    launch_mace_readout_nonlinear_mlp_force_adjoint(...)
+    //
+    //    Both paths read `S.node_features_l0_only_layer[0]` /
+    //    `S.node_features_l0_only_layer[1]` respectively (post-product L=0
+    //    features per layer, saved from the forward).  Until the forward
+    //    saves those tensors, this is gated.
+
+    // 4. Per-layer reverse loop (layer_index = N-1 .. 0):
+    //    a. Product_linear adjoint   → grad post-symcontraction
+    //    b. Symmetric_contraction adjoint → grad node_features (full irreps)
+    //    c. Layer-N residual adjoint (if layer_index >= 1)
+    //    d. linear_post_tp adjoint   → grad node_features_scratch
+    //    e. skip_tp layer-0 adjoint  (if layer_index == 0)
+    //    f. /avg_num_neighbors scaling on the gradient (same factor as forward)
+    //    g. scatter_force_adjoint    → grad_edge_messages
+    //    h. tensor_product adjoint   → grad_node_l0, grad_tp_weights, grad_sph_harm
+    //    i. radial_mlp adjoint       → grad_radial_basis
+    //    j. linear_up adjoint        → contributes to grad_node_features at L=0
+    //    Each step uses the corresponding forward intermediate from the
+    //    `*_layer[layer_index]` save buffers in `S`.
+
+    // 5. sph_harm adjoint: grad_sph_harm → grad_r_unit
+    //    launch_mace_sph_harm_force_adjoint(...)
+
+    // 6. radial_basis + edge_geometry adjoint: grad_radial_basis + grad_r_unit
+    //    → atomic-add into grad_positions.
+    //    launch_mace_radial_basis_and_edge_geometry_force_adjoint(...)
+
+    // 7. forces[a, k] = -grad_positions[a, k]
+    //    launch_mace_force_negate(batch.n_atoms, S.grad_positions, S.forces, stream);
+
+    // The current scaffold leaves `S.forces` zero-initialised; the next
+    // iteration fills in the calls above against the dumped grad_* goldens
+    // in /tmp/mace_export/golden_*.bin.  Per the work plan's risk register
+    // the validation target is per-atom force RMS ≤ 1 meV/Å vs
+    // torch.autograd reference — already exported as `grad_positions` in
+    // commit `6923f31`.
+    cudaMemsetAsync(S.forces, 0, batch.n_atoms * 3u * sizeof(float), stream);
+
+    (void)W; (void)readout_mlp_hidden_dim;
 }
 
 } // namespace smallfield::cuda
