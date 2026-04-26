@@ -6,6 +6,32 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## MACE-OFF cudaGraph Caching for `refine_batch` — 2026-04-26 — Investigated, Reverted
+
+Hypothesis: the per-iteration kernel launches inside `refine_batch` (one forward + one backward + one LBFGS step ≈ ~50 small kernel launches per LBFGS iteration × 20 iterations × N relaxations) might be launch-bound at small batch sizes, and a captured-once / replayed-many cudaGraph would amortise the launch cost away.
+
+Implementation cached `cudaGraphExec_t fwd_bwd_graph` on `smallfield::mace::context_t::impl_t`, gated rebuild on `(n_atoms, n_edges, n_graphs)` shape match, replayed via `cudaGraphLaunch` per iter.
+Capture+instantiate (~50-100 ms) was a one-time cost amortised over many relaxations.
+
+__Result at the production batch (2048 conformers × 30 atoms): 1.38 ms / relaxation, statistically indistinguishable from the 1.36 ms eager baseline.
+Net throughput change: 0 %.
+Reverted.__
+
+| Batch size | Eager (baseline) | Cached cudaGraph | Δ        |
+| ---------- | ---------------- | ---------------- | -------- |
+| 16         | 6.22 ms          | 6.22 ms          |  0.0 %   |
+| 64         | 2.12 ms          | 2.12 ms          |  0.0 %   |
+| 256        | 1.53 ms          | 1.53 ms          |  0.0 %   |
+| 2048       | 1.36 ms          | 1.38 ms          | +1.5 %   |
+
+Why the null result: at batch=2048×30=61 440 atoms each kernel does hundreds of microseconds of work — the eager launch overhead (~5-10 µs per launch × ~50 launches/iter × 20 iters = ~5-10 ms total over 2.83 s of wall time) is already <0.5 % of total time.
+The cudaGraph replay path saves at most that fraction.
+At batch=16 (the launch- bound regime where cudaGraph would matter most) Phase K already eliminated the per-iter host roundtrip — so what remains is kernel work, not launch overhead.
+At every batch size we tested, launch overhead is no longer the bottleneck.
+
+__Decision: cudaGraph caching is shelved.__
+We can re-add it if the re-batching work below produces small enough rebuilt batches that launch overhead returns as a meaningful share.
+
 ## MACE-OFF Per-Conformer Kernel Gating — 2026-04-26 — Investigated, Reverted
 
 Attempted to land per-conformer gating on the symcontract forward + backward kernels (the largest share of E+F time, ~62 % combined per the post-#1 NCU profile) so that converged conformers' atoms become no-ops on subsequent LBFGS iterations.
