@@ -90,6 +90,47 @@ __global__ void mace_element_conditioned_residual_kernel(
     output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim + irrep_component_index] = scale * accumulator;
 }
 
+/**
+ *  @brief Specialized irrep_dim=1 (scalar-only L=0) skip-tp / element-conditioned residual.
+ *
+ *  Equivalent to the general kernel for the (irrep_dim=1, active=1) case.
+ *  Avoids the 1-thread-per-CTA shape that the general launcher picks when
+ *  irrep_dim=1 (block(1,1,1) × grid(n_atoms, n_channels_out, 1) =
+ *  5.9 M one-thread CTAs).
+ *
+ *  `out[a, c_out] = scale * Σ_{c_in} W[Z[a], c_in, c_out] * in[a, c_in]`
+ *
+ *  Weight layout: [n_in, n_elements, n_out] (matching the general kernel's
+ *  per-block layout, but irrep_block_index=0 collapses out the leading dim).
+ */
+__global__ void mace_skip_tp_irrep1_kernel(
+    std::uint32_t n_atoms,
+    std::uint32_t n_channels_in,
+    std::uint32_t n_elements,
+    std::uint32_t n_channels_out,
+    float scale,
+    std::int32_t const *__restrict__ atom_element,    // [n_atoms]
+    float const *__restrict__ weights,                // [n_in, n_elements, n_out]
+    float const *__restrict__ input,                  // [n_atoms, n_in]
+    float *__restrict__ output                        // [n_atoms, n_out]
+) {
+    std::uint32_t const atom_index   = blockIdx.x * blockDim.y + static_cast<std::uint32_t>(threadIdx.y);
+    std::uint32_t const channel_out  = blockIdx.y * blockDim.x + static_cast<std::uint32_t>(threadIdx.x);
+    if (atom_index >= n_atoms || channel_out >= n_channels_out) return;
+
+    int const element_index = atom_element[atom_index];
+    float const *input_row = input + static_cast<std::uint64_t>(atom_index) * n_channels_in;
+    float accumulator = 0.0f;
+    for (std::uint32_t channel_in_index = 0; channel_in_index < n_channels_in; ++channel_in_index) {
+        std::uint64_t const weight_offset =
+            (static_cast<std::uint64_t>(channel_in_index) * n_elements
+             + static_cast<std::uint64_t>(element_index)) * n_channels_out
+            + channel_out;
+        accumulator += weights[weight_offset] * input_row[channel_in_index];
+    }
+    output[static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out] = scale * accumulator;
+}
+
 inline void launch_mace_skip_tp(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
@@ -104,13 +145,28 @@ inline void launch_mace_skip_tp(
     cudaStream_t stream
 ) {
     if (n_atoms == 0) return;
-    dim3 const block(irrep_dim, 1, 1);
-    dim3 const grid(n_atoms, n_channels_out, 1);
     // For FullyConnectedTensorProduct(irreps_in_1, "n_elements x 0e", irreps_out)
     // with one instruction per matched (L_in, L_out) pair (input × 0e → output L = input L),
     // path normalisation 'element' gives alpha = mul_in_1 * mul_in_2 = c_in * n_elements
     // and weight scale = 1/sqrt(alpha).
     float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in) * static_cast<float>(n_elements));
+
+    // Fast path: scalar-only (L=0) skip-tp, e.g. layer 0's first-layer
+    // residual.  The general kernel's block(irrep_dim,1,1) collapses to a
+    // 1-thread CTA when irrep_dim=1.
+    if (irrep_dim == 1u && active_irrep_block_count == 1u) {
+        constexpr std::uint32_t block_dim_x = 16, block_dim_y = 16;
+        dim3 const block(block_dim_x, block_dim_y, 1);
+        dim3 const grid((n_atoms + block_dim_y - 1u) / block_dim_y,
+                        (n_channels_out + block_dim_x - 1u) / block_dim_x, 1);
+        mace_skip_tp_irrep1_kernel<<<grid, block, 0, stream>>>(
+            n_atoms, n_channels_in, n_elements, n_channels_out, scale,
+            atom_element, weights, input, output);
+        return;
+    }
+
+    dim3 const block(irrep_dim, 1, 1);
+    dim3 const grid(n_atoms, n_channels_out, 1);
     mace_element_conditioned_residual_kernel<<<grid, block, 0, stream>>>(
         n_atoms, n_channels_in, n_elements, n_channels_out, irrep_dim, active_irrep_block_count, scale,
         atom_element, weights, input, output);

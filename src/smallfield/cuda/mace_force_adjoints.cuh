@@ -938,6 +938,39 @@ __global__ void mace_element_conditioned_residual_force_adjoint_kernel(
     grad_input[grad_input_offset] += scale * accumulator;
 }
 
+/**
+ *  @brief Specialized irrep_dim=1 skip-tp adjoint, mirroring the irrep_dim=1
+ *         per-irrep linear adjoint fast path.  Avoids the 1-thread-per-CTA
+ *         shape of the general kernel for the (irrep_dim=1, active=1) case.
+ */
+__global__ void mace_skip_tp_irrep1_force_adjoint_kernel(
+    std::uint32_t n_atoms,
+    std::uint32_t n_channels_in,
+    std::uint32_t n_elements,
+    std::uint32_t n_channels_out,
+    float scale,
+    std::int32_t const *__restrict__ atom_element,
+    float const *__restrict__ weights,                 // [n_in, n_elements, n_out]
+    float const *__restrict__ upstream_grad,           // [n_atoms, n_out]
+    float *__restrict__ grad_input                     // [n_atoms, n_in]    accumulated +=
+) {
+    std::uint32_t const atom_index   = blockIdx.x * blockDim.y + static_cast<std::uint32_t>(threadIdx.y);
+    std::uint32_t const channel_in   = blockIdx.y * blockDim.x + static_cast<std::uint32_t>(threadIdx.x);
+    if (atom_index >= n_atoms || channel_in >= n_channels_in) return;
+
+    int const element_index = atom_element[atom_index];
+    float const *upstream_row = upstream_grad + static_cast<std::uint64_t>(atom_index) * n_channels_out;
+    std::uint64_t const weight_row_offset =
+        (static_cast<std::uint64_t>(channel_in) * n_elements + static_cast<std::uint64_t>(element_index))
+            * n_channels_out;
+    float accumulator = 0.0f;
+    for (std::uint32_t channel_out_index = 0; channel_out_index < n_channels_out; ++channel_out_index) {
+        accumulator += weights[weight_row_offset + channel_out_index] * upstream_row[channel_out_index];
+    }
+    std::uint64_t const out_offset = static_cast<std::uint64_t>(atom_index) * n_channels_in + channel_in;
+    grad_input[out_offset] += scale * accumulator;
+}
+
 inline void launch_mace_element_conditioned_residual_force_adjoint(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
@@ -952,9 +985,21 @@ inline void launch_mace_element_conditioned_residual_force_adjoint(
     cudaStream_t stream
 ) {
     if (n_atoms == 0) return;
+    float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in) * static_cast<float>(n_elements));
+
+    if (irrep_dim == 1u && active_irrep_block_count == 1u) {
+        constexpr std::uint32_t block_dim_x = 16, block_dim_y = 16;
+        dim3 const block(block_dim_x, block_dim_y, 1);
+        dim3 const grid((n_atoms + block_dim_y - 1u) / block_dim_y,
+                        (n_channels_in + block_dim_x - 1u) / block_dim_x, 1);
+        mace_skip_tp_irrep1_force_adjoint_kernel<<<grid, block, 0, stream>>>(
+            n_atoms, n_channels_in, n_elements, n_channels_out, scale,
+            atom_element, weights_fp32, upstream_grad_output_fp32, grad_input_fp32);
+        return;
+    }
+
     dim3 const block(irrep_dim, 1, 1);
     dim3 const grid(n_atoms, n_channels_in, 1);
-    float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in) * static_cast<float>(n_elements));
     mace_element_conditioned_residual_force_adjoint_kernel<<<grid, block, 0, stream>>>(
         n_atoms, n_channels_in, n_elements, n_channels_out, irrep_dim, active_irrep_block_count, scale,
         atom_element, weights_fp32, upstream_grad_output_fp32, grad_input_fp32);
