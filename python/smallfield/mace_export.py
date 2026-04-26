@@ -286,8 +286,17 @@ def _build_atoms_from_smiles(smi: str) -> Atoms:
     return Atoms(symbols=syms, positions=pos)
 
 
-def _run_with_trace(model: torch.nn.Module, calc, atoms: Atoms) -> Dict[str, np.ndarray]:
-    """Run one fp64 forward pass, attach hooks to capture every intermediate."""
+def _run_with_trace(model: torch.nn.Module, calc, atoms: Atoms) -> Tuple[Dict[str, np.ndarray], float]:
+    """Run one fp64 forward pass, attach hooks to capture every intermediate
+    plus per-layer-boundary gradients via torch.autograd.grad.
+
+    Returns
+    -------
+    (captured, grad_pos_vs_neg_forces_max_abs)
+        ``captured`` is the name->fp64 numpy dict (forward intermediates +
+        ``grad_*`` tensors).  The second value is the sanity-check delta so
+        the caller can echo it in the per-molecule summary.
+    """
     z_table = AtomicNumberTable([int(z) for z in calc.models[0].atomic_numbers])
     data_list = [AtomicData.from_config(config_from_atoms(atoms), z_table=z_table, cutoff=float(calc.r_max))]
     loader = torch_geometric.dataloader.DataLoader(dataset=data_list, batch_size=1, shuffle=False)
@@ -295,49 +304,143 @@ def _run_with_trace(model: torch.nn.Module, calc, atoms: Atoms) -> Dict[str, np.
     bd = batch.to_dict()
     bd["positions"].requires_grad_(True)
 
-    captured: Dict[str, torch.Tensor] = {}
+    # Two-tier capture.  The forward goldens we keep need to outlive the
+    # backward pass — hence ``forward_snapshots`` stores detached fp64 numpy.
+    # The autograd-live tensors we need for ``torch.autograd.grad`` are kept
+    # on the GPU graph in ``live`` so backward can walk them.
+    forward_snapshots: Dict[str, torch.Tensor] = {}
+    live: Dict[str, torch.Tensor] = {}
 
-    def grab(name):
+    def grab(name: str, *, also_live: bool = False):
         def hook(_module, _inp, out):
             t = out[0] if isinstance(out, tuple) else out
             if isinstance(t, torch.Tensor):
-                captured[name] = t.detach().clone()
+                forward_snapshots[name] = t.detach().clone()
+                if also_live and t.requires_grad:
+                    live[name] = t
 
         return hook
 
     handles = []
-    handles.append(model.radial_embedding.register_forward_hook(grab("radial")))
-    handles.append(model.spherical_harmonics.register_forward_hook(grab("sph_harm")))
+    handles.append(model.radial_embedding.register_forward_hook(grab("radial", also_live=True)))
+    handles.append(model.spherical_harmonics.register_forward_hook(grab("sph_harm", also_live=True)))
     handles.append(model.node_embedding.register_forward_hook(grab("node_embed")))
     for k in range(model.num_interactions.item()):
-        handles.append(model.interactions[k].register_forward_hook(grab(f"inter_{k}_out")))
-        handles.append(model.products[k].register_forward_hook(grab(f"prod_{k}_out")))
+        handles.append(model.interactions[k].register_forward_hook(grab(f"inter_{k}_out", also_live=True)))
+        handles.append(model.products[k].register_forward_hook(grab(f"prod_{k}_out", also_live=True)))
         if k < len(model.readouts):
             handles.append(model.readouts[k].register_forward_hook(grab(f"readout_{k}")))
 
     try:
-        out = model(bd, compute_force=True, training=False)
+        # ``training=True`` is the cheapest way to keep the autograd graph
+        # alive after forces are computed: get_outputs / compute_forces call
+        # torch.autograd.grad with retain_graph=training, so we need this
+        # flag set to walk the graph a second time below.  Energy and forces
+        # are bit-exact between training={False, True} (verified offline).
+        out = model(bd, compute_force=True, training=True)
     finally:
         for h in handles:
             h.remove()
 
-    captured["positions"] = bd["positions"].detach().clone()
-    captured["edge_index"] = bd["edge_index"].detach().clone()
-    captured["shifts"] = (
+    forward_snapshots["positions"] = bd["positions"].detach().clone()
+    forward_snapshots["edge_index"] = bd["edge_index"].detach().clone()
+    forward_snapshots["shifts"] = (
         bd.get("shifts", torch.zeros((bd["edge_index"].shape[1], 3), device=bd["positions"].device)).detach().clone()
     )
-    captured["node_attrs"] = bd["node_attrs"].detach().clone()
-    captured["energy"] = out["energy"].detach().clone()
-    captured["forces"] = out["forces"].detach().clone()
-    captured["node_energy"] = out["node_energy"].detach().clone()
-    return {k: v.cpu().double().numpy() for k, v in captured.items()}
+    forward_snapshots["node_attrs"] = bd["node_attrs"].detach().clone()
+    forward_snapshots["energy"] = out["energy"].detach().clone()
+    forward_snapshots["forces"] = out["forces"].detach().clone()
+    forward_snapshots["node_energy"] = out["node_energy"].detach().clone()
+
+    # ------------------------------------------------------------------
+    # Backward pass — gradients of the per-graph energy wrt every captured
+    # forward intermediate.  We assemble a single ``torch.autograd.grad`` call
+    # so the engine traverses the graph exactly once.
+    # ------------------------------------------------------------------
+    grad_inputs: List[torch.Tensor] = []
+    grad_input_names: List[str] = []
+
+    def add_input(local_name: str, t: torch.Tensor) -> None:
+        grad_inputs.append(t)
+        grad_input_names.append(local_name)
+
+    # Order is significant only insofar as we read the result by index below.
+    add_input("radial", live["radial"])
+    add_input("sph_harm", live["sph_harm"])
+    for k in range(model.num_interactions.item()):
+        add_input(f"inter_{k}_out", live[f"inter_{k}_out"])
+        add_input(f"prod_{k}_out", live[f"prod_{k}_out"])
+    add_input("positions", bd["positions"])
+
+    energy_total = out["energy"].sum()
+    grads = torch.autograd.grad(
+        outputs=energy_total,
+        inputs=grad_inputs,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    grad_by_name = dict(zip(grad_input_names, grads))
+
+    def grad_or_zero(name: str, like: torch.Tensor) -> torch.Tensor:
+        g = grad_by_name.get(name)
+        if g is None:
+            return torch.zeros_like(like)
+        return g
+
+    # Final naming: the tensors below match the schema the C++ adjoint side
+    # expects (see ``mace_force_adjoints.cuh``).
+    #
+    # ``grad_edge_messages_layer_k`` is the gather of ``grad_node_features_layer_k``
+    # along the receiver dimension of ``edge_index``.  This is exactly the
+    # output of the C++ ``mace_scatter_force_adjoint_kernel`` (see header):
+    # ``dmessages[e] = dnode_features_full[receiver_atom(e)]``.  Producing the
+    # tensor analytically here means the validation works for every model size
+    # (small / medium / large) regardless of e3nn's path-redundant conv_tp
+    # output dim — at L≥1 conv_tp emits more paths than ``n_channels * 16``,
+    # but the per-edge full-irrep message that the C++ kernel consumes is
+    # always ``[n_edges, n_channels, 16]`` because the linear that follows
+    # scatter projects to that fixed shape.
+    grad_dump: Dict[str, torch.Tensor] = {
+        "grad_radial_basis": grad_or_zero("radial", live["radial"]),
+        "grad_sph_harm": grad_or_zero("sph_harm", live["sph_harm"]),
+        "grad_positions": grad_or_zero("positions", bd["positions"]),
+    }
+    edge_index = forward_snapshots["edge_index"]  # [2, n_edges]; row 1 = receiver
+    receiver = edge_index[1].to(dtype=torch.long)
+    for k in range(model.num_interactions.item()):
+        g_node_full = grad_or_zero(f"inter_{k}_out", live[f"inter_{k}_out"])  # [n_atoms, n_channels, 16]
+        grad_dump[f"grad_node_features_layer_{k}"] = g_node_full
+        grad_dump[f"grad_node_scalar_invariants_layer_{k}"] = grad_or_zero(
+            f"prod_{k}_out", live[f"prod_{k}_out"]
+        )
+        # Gather receiver rows -> per-edge message gradient.  Detached because
+        # downstream we only need the values, not a second-order graph.
+        grad_dump[f"grad_edge_messages_layer_{k}"] = g_node_full.detach()[receiver]
+
+    # Sanity-check: grad_positions must equal -forces to fp64 noise.
+    grad_pos = grad_dump["grad_positions"]
+    forces = forward_snapshots["forces"]
+    sanity_diff = float((grad_pos.detach() - (-forces)).abs().max().item())
+
+    # Combine forward + gradient tensors into a single fp64 numpy dict.
+    combined: Dict[str, np.ndarray] = {k: v.cpu().double().numpy() for k, v in forward_snapshots.items()}
+    for k, v in grad_dump.items():
+        combined[k] = v.detach().cpu().double().numpy()
+    return combined, sanity_diff
 
 
 def export_golden(model: torch.nn.Module, calc, out_dir: Path, arch: Dict) -> None:
-    """Run + dump golden tensors for each reference molecule."""
+    """Run + dump golden tensors for each reference molecule.
+
+    Each golden file contains the forward intermediates the C++ side already
+    parsed (positions, edge_index, radial, sph_harm, inter_k_out, prod_k_out,
+    readout_k, energy, forces, node_energy) plus per-layer ``grad_*`` tensors
+    for the upcoming force-adjoint kernels to validate against (see the
+    docstring of ``_run_with_trace`` for the full list).
+    """
     for name, smi in REFERENCE_MOLECULES:
         atoms = _build_atoms_from_smiles(smi)
-        captured = _run_with_trace(model, calc, atoms)
+        captured, sanity_diff = _run_with_trace(model, calc, atoms)
         writer = BlobWriter(
             {
                 "molecule": name,
@@ -352,8 +455,16 @@ def export_golden(model: torch.nn.Module, calc, out_dir: Path, arch: Dict) -> No
         path = out_dir / f"golden_{arch['model_size']}_{name}.bin"
         writer.write(path)
         e = float(captured["energy"].item() if captured["energy"].size == 1 else captured["energy"].sum())
+        # Single-line per-molecule summary.  ``grads`` lists the new gradient
+        # tensors so a downstream ``grep grads`` shows at a glance which
+        # boundaries are covered; ``|gp+f|`` is the |grad_positions − (−forces)|
+        # sanity check that should sit at fp64 noise (< 1e-12).
+        grad_names = sorted(k for k in captured if k.startswith("grad_"))
+        grad_summary = ",".join(g.replace("grad_", "") for g in grad_names)
         print(
-            f"  {name:<14s} natoms={captured['positions'].shape[0]:3d}  nedges={captured['edge_index'].shape[1]:4d}  E={e:.6f} eV  -> {path.name}"
+            f"  {name:<14s} natoms={captured['positions'].shape[0]:3d}  "
+            f"nedges={captured['edge_index'].shape[1]:4d}  E={e:.6f} eV  "
+            f"|gp+f|={sanity_diff:.2e}  grads=[{grad_summary}]  -> {path.name}"
         )
 
 
