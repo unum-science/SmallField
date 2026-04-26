@@ -464,24 +464,48 @@ inline void mace_inference_forward(
         launch_mace_apply_cutoff(batch.n_edges, tp_dim, S.cutoff_envelope, S.tensor_product_weights_per_edge, stream);
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
-        // 3c+3d (fused).  TK conv_tp+scatter emits messages directly into the
-        // per-receiver bf16 accumulator — eliminates the [n_edges, c, 16]
-        // message buffer's DRAM round-trip (~28× bandwidth reduction
-        // measured in C2's smoke test).  The atomic-fallback path
-        // (used here, until Track B1-4's host-side bin sort wires up
-        // `receiver_edge_segment_start/end`) is correctness-only: it
-        // routes through the existing fp32 reference + cast.
-        launch_mace_tk_conv_tp_scatter_fused(batch.n_atoms, batch.n_edges,
-                                              arch.n_channels,
-                                              batch.edge_source_atom, batch.edge_target_atom,
-                                              batch.receiver_edge_segment_start,
-                                              batch.receiver_edge_segment_end,
-                                              S.node_features_l0_only, S.sph_harm,
-                                              S.tensor_product_weights_per_edge,
-                                              S.tk_node_messages_full_irrep_bf16, stream);
-        launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
-                                 S.tk_node_messages_full_irrep_bf16,
-                                 S.node_features_scratch, stream);
+        // 3c+3d.  Two routes depending on whether the host has supplied
+        // pre-sorted edge segments:
+        //
+        //   - Segments provided (`batch.receiver_edge_segment_start/end != nullptr`):
+        //     dispatch the TK fused conv_tp+scatter, which emits messages
+        //     directly into the per-receiver bf16 accumulator and saves the
+        //     `[n_edges, c, 16]` DRAM round-trip (~28× bandwidth measured
+        //     in the C2 smoke test).  Then cast bf16 → fp32 for downstream
+        //     fp32 consumers.
+        //
+        //   - Segments NOT provided: avoid `launch_mace_tk_conv_tp_scatter_fused`
+        //     entirely.  Its atomic fallback path does `cudaMalloc` /
+        //     `cudaStreamSynchronize` / `cudaFree` per call, which are not
+        //     legal inside `cudaStreamBeginCapture`/`cudaStreamEndCapture`
+        //     and would block the Track-E graph-capture replay.  Instead,
+        //     reuse the existing fp32 reference kernels (TP + atomic scatter)
+        //     into pre-allocated scratch buffers — no per-call allocations,
+        //     graph-capture-safe.  Same arithmetic; no bf16 round-off in
+        //     this path because we never cast.
+        if (batch.receiver_edge_segment_start != nullptr &&
+            batch.receiver_edge_segment_end != nullptr) {
+            launch_mace_tk_conv_tp_scatter_fused(batch.n_atoms, batch.n_edges,
+                                                  arch.n_channels,
+                                                  batch.edge_source_atom, batch.edge_target_atom,
+                                                  batch.receiver_edge_segment_start,
+                                                  batch.receiver_edge_segment_end,
+                                                  S.node_features_l0_only, S.sph_harm,
+                                                  S.tensor_product_weights_per_edge,
+                                                  S.tk_node_messages_full_irrep_bf16, stream);
+            launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
+                                     S.tk_node_messages_full_irrep_bf16,
+                                     S.node_features_scratch, stream);
+        } else {
+            launch_mace_tensor_product(arch, batch.n_edges, batch.edge_source_atom,
+                                        S.node_features_l0_only, S.sph_harm,
+                                        S.tensor_product_weights_per_edge,
+                                        S.edge_messages, stream);
+            launch_mace_scatter_atomic(batch.n_atoms, batch.n_edges,
+                                        arch.n_channels * irrep_dim,
+                                        batch.edge_target_atom, S.edge_messages,
+                                        S.node_features_scratch, stream);
+        }
 #else
         // 3c. Tensor product: per-edge messages.
         launch_mace_tensor_product(arch, batch.n_edges, batch.edge_source_atom,
