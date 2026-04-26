@@ -925,6 +925,11 @@ inline void mace_inference_run_force_adjoint(
         // 3c. product_linear adjoint: post-product l0 → grad_node_scalar_invariants.
         //     Forward: post_product[a, c_out] = (1/sqrt(c_in)) * Σ_{c_in} W[c_in, c_out] * sym[a, c_in].
         //     Backward: dsym[a, c_in] += (1/sqrt(c_in)) * Σ_{c_out} W[c_in, c_out] * dpost[a, c_out].
+        //     The kernel uses `+=`; zero the destination so we don't accumulate
+        //     onto stale data from the previous layer's reverse pass (the
+        //     linear_up backward writes here at step 3l).
+        cudaMemsetAsync(S.grad_node_scalar_invariants, 0,
+                        batch.n_atoms * arch.n_channels * sizeof(float), stream);
         launch_mace_linear_per_irrep_force_adjoint(
             batch.n_atoms, arch.n_channels, arch.n_channels,
             /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
@@ -935,12 +940,16 @@ inline void mace_inference_run_force_adjoint(
         // 3d. Symmetric contraction adjoint:
         //     grad_node_features (full irreps, post-skip_tp) gets the gradient
         //     w.r.t. the symcontraction's X input.  X = node_features_post_residual_layer[L].
+        //     Launcher signature is (weights_max, weights_2, weights_1).  Pass
+        //     (L.weights_max, L.weights_lo_0, L.weights_lo_1) since `weights_lo_0`
+        //     is the order-2 buffer and `weights_lo_1` the order-1 buffer (matches
+        //     the forward launcher in `mace_symmetric_contraction_kernel.cuh`).
         launch_mace_symmetric_contraction_force_adjoint(
             batch.n_atoms, arch.n_channels, irrep_dim, arch.n_elements,
             batch.atom_element,
             S.node_features_post_residual_layer[layer_index],
             L.u_matrix_1, L.u_matrix_2, L.u_matrix_3,
-            L.weights_max, L.weights_lo_1, L.weights_lo_0,
+            L.weights_max, L.weights_lo_0, L.weights_lo_1,
             S.grad_node_scalar_invariants,
             S.grad_node_features, stream);
 
