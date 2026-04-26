@@ -554,6 +554,12 @@ inline void mace_inference_forward(
         //     Output: tensor_product_weights_per_edge  [n_edges, 4*c=384].
         //     Each hidden layer scales by (1/sqrt(h_in)) and applies normalize2mom(silu).
         //     Final layer scales by (1/sqrt(h_in)) only.
+        std::uint32_t const tp_dim = mace_tensor_product_path_count_k * arch.n_channels;
+#if !defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // Fp32 reference path: 4 matmul + 3 SiLU launches.  Under the TK
+        // build all four layers are folded into one persistent kernel below;
+        // the fp32 layers 0/1/2 here would be writing dead data (the TK
+        // kernel reads radial_basis directly), so we skip them.
         // Layer 0: 8 → 64
         launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, arch.n_radial,
                                     S.radial_basis, L.radial_mlp_w0,
@@ -572,8 +578,8 @@ inline void mace_inference_forward(
                                     1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
                                     S.radial_mlp_hidden_2, stream);
         launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim, S.radial_mlp_hidden_2, S.radial_mlp_hidden_2, stream);
+#endif
         // Layer 3 (final, no act): 64 → 4*c
-        std::uint32_t const tp_dim = mace_tensor_product_path_count_k * arch.n_channels;
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // TK-fused radial MLP — one launch instead of 7 (4 matmul + 3 SiLU
         // norm2mom).  Reads radial_basis fp32 directly; the kernel handles
