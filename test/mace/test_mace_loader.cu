@@ -28,6 +28,9 @@
 #include "smallfield/parameters/mace_weights.hpp"
 #include "smallfield/types/mace_types.hpp"
 #include "smallfield/cuda/mace_inference.cuh"
+#include "smallfield/cuda/mace_fp16_io_kernel.cuh"
+
+#include <cuda_fp16.h>
 
 namespace {
 
@@ -226,6 +229,262 @@ void run_one(smallfield::parameters::mace_weights_t const &W,
     cudaFree(d_atom_el); cudaFree(d_graph_of_atom);
 }
 
+struct batched_sample_tensor_t {
+    std::string name;
+    std::string dtype;
+    std::vector<std::int64_t> shape;
+    std::uint64_t offset;
+    std::uint64_t nbytes;
+};
+
+/**
+ *  @brief Tiny manifest scanner for the fp16-batch artefact.
+ *
+ *  Cannot reuse `mace_detail_::parse_manifest_` because the batched-sample
+ *  manifest uses JSON arrays inside the header (e.g. graph_atom_offset),
+ *  which the weight-blob parser does not need to handle and currently
+ *  rejects with "expected string".  This local scanner is name-driven —
+ *  it walks the raw text looking for the keys we care about and stops
+ *  once it has located each `tensors` entry.  Sufficient because the
+ *  producer (`mace_export.py`) emits a known schema with one tensor per
+ *  object inside a single top-level array.
+ */
+inline std::vector<batched_sample_tensor_t> scan_batched_manifest_tensors_(std::string const &raw) {
+    std::vector<batched_sample_tensor_t> out;
+    std::size_t cursor = raw.find("\"tensors\"");
+    if (cursor == std::string::npos) return out;
+    cursor = raw.find('[', cursor);
+    if (cursor == std::string::npos) return out;
+    auto find_string_field = [&](std::size_t obj_start, std::size_t obj_end,
+                                 char const *key, std::string &dst) {
+        std::string needle = std::string("\"") + key + "\"";
+        std::size_t kp = raw.find(needle, obj_start);
+        if (kp == std::string::npos || kp >= obj_end) return false;
+        std::size_t qopen = raw.find('"', kp + needle.size());
+        if (qopen == std::string::npos || qopen >= obj_end) return false;
+        std::size_t qclose = raw.find('"', qopen + 1);
+        if (qclose == std::string::npos || qclose >= obj_end) return false;
+        dst = raw.substr(qopen + 1, qclose - qopen - 1);
+        return true;
+    };
+    auto find_uint_field = [&](std::size_t obj_start, std::size_t obj_end,
+                               char const *key, std::uint64_t &dst) {
+        std::string needle = std::string("\"") + key + "\"";
+        std::size_t kp = raw.find(needle, obj_start);
+        if (kp == std::string::npos || kp >= obj_end) return false;
+        std::size_t cp = raw.find(':', kp + needle.size());
+        if (cp == std::string::npos || cp >= obj_end) return false;
+        std::size_t pos = cp + 1;
+        while (pos < obj_end && (raw[pos] == ' ' || raw[pos] == '\n' || raw[pos] == '\t')) ++pos;
+        std::size_t start = pos;
+        while (pos < obj_end && (std::isdigit(static_cast<unsigned char>(raw[pos])) || raw[pos] == '-')) ++pos;
+        if (pos == start) return false;
+        dst = static_cast<std::uint64_t>(std::stoll(raw.substr(start, pos - start)));
+        return true;
+    };
+    auto find_shape = [&](std::size_t obj_start, std::size_t obj_end,
+                          std::vector<std::int64_t> &dst) {
+        std::size_t kp = raw.find("\"shape\"", obj_start);
+        if (kp == std::string::npos || kp >= obj_end) return false;
+        std::size_t lb = raw.find('[', kp);
+        if (lb == std::string::npos || lb >= obj_end) return false;
+        std::size_t rb = raw.find(']', lb);
+        if (rb == std::string::npos || rb > obj_end) return false;
+        std::size_t pos = lb + 1;
+        while (pos < rb) {
+            while (pos < rb && (raw[pos] == ' ' || raw[pos] == '\n' || raw[pos] == '\t' || raw[pos] == ',')) ++pos;
+            if (pos >= rb) break;
+            std::size_t start = pos;
+            while (pos < rb && (std::isdigit(static_cast<unsigned char>(raw[pos])) || raw[pos] == '-')) ++pos;
+            if (pos > start) dst.push_back(static_cast<std::int64_t>(std::stoll(raw.substr(start, pos - start))));
+            else break;
+        }
+        return true;
+    };
+
+    // Walk objects { ... } inside the tensors array.
+    std::size_t pos = cursor + 1;
+    while (pos < raw.size()) {
+        std::size_t ob = raw.find('{', pos);
+        std::size_t end_array = raw.find(']', pos);
+        if (ob == std::string::npos || (end_array != std::string::npos && ob > end_array)) break;
+        // Match closing brace at depth 0 from `ob`.
+        std::size_t scan = ob + 1;
+        int depth = 1;
+        while (scan < raw.size() && depth > 0) {
+            if (raw[scan] == '{') ++depth;
+            else if (raw[scan] == '}') --depth;
+            ++scan;
+        }
+        std::size_t oe = scan; // one past closing '}'
+        batched_sample_tensor_t entry{};
+        find_string_field(ob, oe, "name",   entry.name);
+        find_string_field(ob, oe, "dtype",  entry.dtype);
+        find_shape       (ob, oe,           entry.shape);
+        find_uint_field  (ob, oe, "offset", entry.offset);
+        find_uint_field  (ob, oe, "nbytes", entry.nbytes);
+        if (!entry.name.empty()) out.push_back(std::move(entry));
+        pos = oe;
+    }
+    return out;
+}
+
+inline std::uint64_t scan_batched_manifest_uint_(std::string const &raw, char const *key,
+                                                 std::uint64_t fallback) {
+    std::string needle = std::string("\"") + key + "\"";
+    std::size_t kp = raw.find(needle);
+    if (kp == std::string::npos) return fallback;
+    std::size_t cp = raw.find(':', kp + needle.size());
+    if (cp == std::string::npos) return fallback;
+    std::size_t pos = cp + 1;
+    while (pos < raw.size() && (raw[pos] == ' ' || raw[pos] == '\n' || raw[pos] == '\t')) ++pos;
+    std::size_t start = pos;
+    while (pos < raw.size() && (std::isdigit(static_cast<unsigned char>(raw[pos])) || raw[pos] == '-')) ++pos;
+    if (pos == start) return fallback;
+    return static_cast<std::uint64_t>(std::stoll(raw.substr(start, pos - start)));
+}
+
+/**
+ *  @brief Track B IO-cast round-trip: load the fp16 batched-sample artefact
+ *  produced by `python/smallfield/mace_export.py`, run the
+ *  `launch_mace_positions_fp16_to_fp32` kernel, and validate the result
+ *  against the fp32 reference tensor stored alongside in the same artefact.
+ *
+ *  This test does NOT yet run the full MACE forward on the batched input —
+ *  the driver swap to consume the new schema lands in a follow-up commit.
+ *  It exists to lock down the fp16 ⇄ fp32 cast layer ahead of that change.
+ */
+void run_batched(smallfield::parameters::mace_weights_t const & /*W*/,
+                 std::string const &export_dir) {
+    std::string const sample_path = export_dir + "/sample_fp16_batch.bin";
+    std::ifstream f(sample_path, std::ios::binary);
+    if (!f) {
+        std::printf("\n=== Track B batched IO-cast test ===\n");
+        std::printf("  skipping batched test (sample_fp16_batch.bin not present, run mace_export.py first)\n");
+        return;
+    }
+
+    std::printf("\n=== Track B batched IO-cast test ===\n");
+
+    // Same SF_MACE container layout used by the weights and golden files.
+    char magic[8];
+    std::uint32_t version;
+    std::uint64_t mo, ml;
+    f.read(magic, 8);
+    f.read(reinterpret_cast<char *>(&version), 4);
+    f.read(reinterpret_cast<char *>(&mo), 8);
+    f.read(reinterpret_cast<char *>(&ml), 8);
+    if (std::memcmp(magic, "SF_MACE\0", 8) != 0) {
+        std::printf("  bad magic in %s — aborting batched test\n", sample_path.c_str());
+        return;
+    }
+
+    std::string raw(ml, '\0');
+    f.seekg(static_cast<std::streamoff>(mo), std::ios::beg);
+    f.read(raw.data(), static_cast<std::streamsize>(ml));
+
+    std::uint32_t const n_atoms_total = static_cast<std::uint32_t>(
+        scan_batched_manifest_uint_(raw, "n_atoms_total", 0));
+    std::uint32_t const n_graphs = static_cast<std::uint32_t>(
+        scan_batched_manifest_uint_(raw, "n_graphs", 0));
+    std::printf("  manifest: n_atoms_total=%u  n_graphs=%u\n", n_atoms_total, n_graphs);
+
+    auto const tensors_meta = scan_batched_manifest_tensors_(raw);
+
+    // Pull the named tensors from the artefact.
+    std::vector<std::uint16_t> h_positions_fp16_raw;
+    std::vector<float>         h_positions_fp32_reference;
+    std::vector<std::int32_t>  h_graph_atom_offset;
+    bool found_fp16 = false;
+    bool found_ref  = false;
+    for (auto const &t : tensors_meta) {
+        std::uint64_t n = 1;
+        for (auto d : t.shape) n *= static_cast<std::uint64_t>(d);
+        f.seekg(static_cast<std::streamoff>(28 + t.offset), std::ios::beg);
+
+        if (t.name == "positions_fp16" && t.dtype == "float16") {
+            h_positions_fp16_raw.resize(n);
+            f.read(reinterpret_cast<char *>(h_positions_fp16_raw.data()),
+                   static_cast<std::streamsize>(n * sizeof(std::uint16_t)));
+            found_fp16 = true;
+        } else if (t.name == "positions_fp32_reference" &&
+                   (t.dtype == "float32" || t.dtype == "float64")) {
+            if (t.dtype == "float32") {
+                h_positions_fp32_reference.resize(n);
+                f.read(reinterpret_cast<char *>(h_positions_fp32_reference.data()),
+                       static_cast<std::streamsize>(n * sizeof(float)));
+            } else {
+                std::vector<double> tmp(n);
+                f.read(reinterpret_cast<char *>(tmp.data()),
+                       static_cast<std::streamsize>(n * sizeof(double)));
+                h_positions_fp32_reference.resize(n);
+                for (std::uint64_t i = 0; i < n; ++i)
+                    h_positions_fp32_reference[i] = static_cast<float>(tmp[i]);
+            }
+            found_ref = true;
+        } else if (t.name == "graph_atom_offset" &&
+                   (t.dtype == "int32" || t.dtype == "int64")) {
+            h_graph_atom_offset.resize(n);
+            if (t.dtype == "int32") {
+                f.read(reinterpret_cast<char *>(h_graph_atom_offset.data()),
+                       static_cast<std::streamsize>(n * sizeof(std::int32_t)));
+            } else {
+                std::vector<std::int64_t> tmp(n);
+                f.read(reinterpret_cast<char *>(tmp.data()),
+                       static_cast<std::streamsize>(n * sizeof(std::int64_t)));
+                for (std::uint64_t i = 0; i < n; ++i)
+                    h_graph_atom_offset[i] = static_cast<std::int32_t>(tmp[i]);
+            }
+        }
+    }
+
+    if (!found_fp16 || !found_ref) {
+        std::printf("  required tensors missing (fp16=%d, ref=%d) — aborting batched test\n",
+                    found_fp16 ? 1 : 0, found_ref ? 1 : 0);
+        return;
+    }
+
+    std::size_t const n_elements = h_positions_fp16_raw.size();
+    if (h_positions_fp32_reference.size() != n_elements) {
+        std::printf("  fp16/fp32 size mismatch (%zu vs %zu) — aborting batched test\n",
+                    n_elements, h_positions_fp32_reference.size());
+        return;
+    }
+
+    // Round-trip on device: H2D fp16 → cast → D2H fp32.
+    __half *d_positions_fp16 = nullptr;
+    float  *d_positions_fp32 = nullptr;
+    cudaMalloc(reinterpret_cast<void **>(&d_positions_fp16), n_elements * sizeof(__half));
+    cudaMalloc(reinterpret_cast<void **>(&d_positions_fp32), n_elements * sizeof(float));
+    cudaMemcpy(d_positions_fp16, h_positions_fp16_raw.data(),
+               n_elements * sizeof(__half), cudaMemcpyHostToDevice);
+
+    smallfield::cuda::launch_mace_positions_fp16_to_fp32(
+        static_cast<std::uint32_t>(n_elements), d_positions_fp16, d_positions_fp32, /*stream*/0);
+    cudaDeviceSynchronize();
+
+    std::vector<float> h_positions_fp32(n_elements);
+    cudaMemcpy(h_positions_fp32.data(), d_positions_fp32,
+               n_elements * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Compare against the fp32 reference.
+    double max_abs = 0.0;
+    double sum_sq  = 0.0;
+    for (std::size_t i = 0; i < n_elements; ++i) {
+        double const d = std::abs(static_cast<double>(h_positions_fp32[i]) -
+                                  static_cast<double>(h_positions_fp32_reference[i]));
+        if (d > max_abs) max_abs = d;
+        sum_sq += d * d;
+    }
+    double const rms = std::sqrt(sum_sq / static_cast<double>(n_elements));
+    char const *verdict = (max_abs <= 2e-3) ? "PASS" : "FAIL";
+    std::printf("  fp16 round-trip max_abs=%.3e  rms=%.3e  (n=%zu)  [%s, threshold 2e-3]\n",
+                max_abs, rms, n_elements, verdict);
+
+    cudaFree(d_positions_fp16);
+    cudaFree(d_positions_fp32);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -247,5 +506,7 @@ int main(int argc, char **argv) {
     for (char const *name : names) {
         run_one(W, export_dir + "/golden_small_" + name + ".bin", name);
     }
+
+    run_batched(W, export_dir);
     return 0;
 }

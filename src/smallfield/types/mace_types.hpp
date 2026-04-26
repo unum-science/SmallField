@@ -25,6 +25,8 @@
 
 #include <cstdint>
 
+#include <cuda_fp16.h>
+
 namespace smallfield::types {
 
 /** Maximum spherical-harmonic degree exposed by MACE-OFF23. */
@@ -117,6 +119,25 @@ struct mace_batch_t {
     std::int32_t const *edge_source_atom; ///< [n_edges] sender index
     std::int32_t const *edge_target_atom; ///< [n_edges] receiver index
     std::int32_t const *graph_of_atom;    ///< [n_atoms] which molecule each atom belongs to (for energy reduction)
+
+    // Optional fp16 view of the positions, populated when the batch comes from
+    // the upstream coprocessed-batch flow that stores geometries in fp16.
+    // nullptr means the fp32 `positions` field above is the canonical input.
+    __half const *positions_fp16 = nullptr;
+
+    // CSR-style per-graph layout — `graph_atom_offset[g]` = first atom index of
+    // graph g, `graph_atom_offset[n_graphs]` = total_atom_count = n_atoms.
+    // `graph_edge_offset` is the analogous for edges.  When these are nullptr
+    // the batch is a single contiguous run (graph 0 has all atoms / edges).
+    std::int32_t const *graph_atom_offset = nullptr;
+    std::int32_t const *graph_edge_offset = nullptr;
+
+    // Pre-sorted edge list (sorted ascending by edge_target_atom) plus the
+    // per-receiver segment ranges for the segmented-scatter kernel that
+    // already exists in `mace_scatter_kernel.cuh`.  When nullptr the driver
+    // falls back to the atomic-scatter path.
+    std::int32_t const *receiver_edge_segment_start = nullptr;
+    std::int32_t const *receiver_edge_segment_end   = nullptr;
 };
 
 /**
@@ -132,6 +153,21 @@ struct mace_edge_features_t {
     float *radial_basis;    ///< [n_edges, n_radial] Bessel basis × polynomial cutoff
     float *cutoff_envelope; ///< [n_edges] polynomial cutoff envelope (1 inside r_max, smooth → 0)
     float *sph_harm;        ///< [n_edges, mace_irrep_dim_k] spherical harmonics y_lm(r_unit)
+};
+
+/**
+ *  @brief Output bundle for one batched MACE inference call.
+ *
+ *  Energies live in fp32 (load-bearing for downstream ranking and free-energy
+ *  calculations); per-atom forces are quantised to fp16 to match SmallField's
+ *  geometry-storage convention — fp16 dynamic range is ample for forces
+ *  whose magnitudes are typically below 10 eV/Å for stable structures.
+ *  The fp32 energy buffer is required even when forces are not requested,
+ *  so callers do not have to special-case the energy-only path.
+ */
+struct mace_results_t {
+    float *graph_energy_fp32 = nullptr;       ///< [n_graphs] per-graph total energy in eV
+    __half *atom_force_fp16 = nullptr;        ///< [n_atoms, 3] per-atom forces in eV/Å, fp16
 };
 
 } // namespace smallfield::types
