@@ -6,6 +6,30 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## MACE-OFF Phase K — 2026-04-26 — `5183ebb`
+
+GPU-resident LBFGS / GD-with-early-exit, eliminating the host-side relaxation loop in `smallfield::mace::context_t::refine_batch` (previously 20 host launches per relaxation, ~25 % of end-to-end wall time at the current kernel speed).
+
+New kernel `mace_lbfgs_step_kernel`:
+- One CTA per conformer, __single warp__ — a deliberate departure from the atom/edge-tiled threading shape of the MACE forward+backward chain.
+  The forward+backward needs WGMMA tiles spanning many conformers (`mace_tk_per_irrep_linear` is 4 atoms × 96 channels per CTA = mixes conformers; `mace_tk_radial_mlp` is 64 edges per CTA, etc.) to fill the WGMMA tile and keep SM utilisation at ~99 %.
+  The LBFGS update is embarrassingly parallel across conformers and the per-conformer fmax reduction is a natural 32-thread warp-shuffle — that's the natural threading shape for THIS kernel even though it doesn't fit the rest of the chain.
+- Per-conformer fmax via `__shfl_xor_sync` butterfly.
+- Adaptive early exit: when `fmax ≤ config.fmax_eV_per_A` the kernel sets a converged flag and skips position writeback on subsequent iterations, pinning the conformer at its converged geometry.
+
+`mace_scratch_t` gains `lbfgs_graph_atom_offsets`, `lbfgs_fmax_per_conformer`, `lbfgs_converged_flags` (sized for max_graphs).
+
+The forward + backward kernels still re-run for converged conformers (per-kernel gating against `converged_flags` would require touching every TK kernel — substantial; deferred).
+Net wins this commit:
+- Eliminate D2H/H2D ping-pong on positions across the N steps.
+- Eliminate one host-side kernel launch (the per-element GD step) per iteration → N-1 host launches saved.
+- Per-conformer convergence detection so callers can rebatch only unconverged conformers after a fixed K iterations.
+
+Bench: forward+backward path unchanged at 0.0593 ms/config (the bench times the captured fwd+bwd graph, not refine_batch).
+The end-to-end LBFGS-relaxation gain lands at `refine_batch` callers; the standalone CLI `smallfield_mace_refine` and the Python `MaceContext.refine` pick this up automatically.
+
+Closes Phase K of the optimisation roadmap.
+
 ## MACE-OFF Algebraic Transforms — 2026-04-26
 
 A planned sequence of algebraic transformations that move work onto tensor cores or reduce FMA count via exact identities.

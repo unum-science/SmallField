@@ -247,6 +247,11 @@ struct mace_scratch_t {
     float *grad_layer_residual_l0_scratch = nullptr; ///< [n_atoms, n_channels] — staging for layer-N residual contribution to the layer-input gradient
     float *grad_edge_messages = nullptr;           ///< [n_edges, n_channels, 16]
     float *grad_tp_weights = nullptr;              ///< [n_edges, 4 * n_channels]
+
+    // Phase K — GPU-resident LBFGS state (built once per refine_batch call).
+    std::int32_t *lbfgs_graph_atom_offsets = nullptr; ///< [n_graphs + 1] inclusive prefix-sum of atom counts per conformer
+    float *lbfgs_fmax_per_conformer = nullptr;        ///< [n_graphs] latest per-conformer max-abs force (eV/Å)
+    std::uint8_t *lbfgs_converged_flags = nullptr;    ///< [n_graphs] 0 = relaxing, 1 = converged (skip position update)
     float *grad_sph_harm = nullptr;                ///< [n_edges, 16]
     float *grad_r_unit = nullptr;                  ///< [n_edges, 3]
     float *grad_radial_basis = nullptr;            ///< [n_edges, n_radial]
@@ -346,6 +351,17 @@ struct mace_scratch_t {
         alloc(&grad_sph_harm,                max_edges * irrep_dim);
         alloc(&grad_r_unit,                  max_edges * 3u);
         alloc(&grad_radial_basis,            max_edges * arch.n_radial);
+
+        // Phase K — GPU-resident LBFGS state (sized for max_graphs).
+        cudaMalloc(reinterpret_cast<void **>(&lbfgs_graph_atom_offsets),
+                   (max_graphs + 1) * sizeof(std::int32_t));
+        cudaMalloc(reinterpret_cast<void **>(&lbfgs_fmax_per_conformer),
+                   max_graphs * sizeof(float));
+        cudaMalloc(reinterpret_cast<void **>(&lbfgs_converged_flags),
+                   max_graphs * sizeof(std::uint8_t));
+        total_bytes += (max_graphs + 1) * sizeof(std::int32_t)
+                     + max_graphs * sizeof(float)
+                     + max_graphs * sizeof(std::uint8_t);
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // bf16 scratch for the TK forward path (sized in fp32 elements; the cast
         // is `n_elements * 2 bytes`).  Allocated only when TK is compiled in.
@@ -386,9 +402,18 @@ struct mace_scratch_t {
                           &grad_node_features_l0_only,
                           &grad_layer_residual_l0_scratch,
                           &grad_edge_messages, &grad_tp_weights,
-                          &grad_sph_harm, &grad_r_unit, &grad_radial_basis}) {
+                          &grad_sph_harm, &grad_r_unit, &grad_radial_basis,
+                          &lbfgs_fmax_per_conformer}) {
             if (*p) cudaFree(*p);
             *p = nullptr;
+        }
+        if (lbfgs_graph_atom_offsets) {
+            cudaFree(lbfgs_graph_atom_offsets);
+            lbfgs_graph_atom_offsets = nullptr;
+        }
+        if (lbfgs_converged_flags) {
+            cudaFree(lbfgs_converged_flags);
+            lbfgs_converged_flags = nullptr;
         }
         for (std::uint32_t layer_index = 0; layer_index < 2u; ++layer_index) {
             for (float **p : {&node_features_input_layer[layer_index],

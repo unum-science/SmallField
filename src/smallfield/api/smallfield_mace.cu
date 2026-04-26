@@ -18,6 +18,7 @@
 #include "smallfield/parameters/mace_weights.hpp"
 #include "smallfield/types/mace_types.hpp"
 #include "smallfield/cuda/mace_inference.cuh"
+#include "smallfield/cuda/mace_lbfgs_step_kernel.cuh"
 
 namespace smallfield::mace {
 
@@ -246,10 +247,31 @@ status_t context_t::refine_batch(weights_t const &W,
 
     // Rewire the view onto the user's in/out buffer for the duration of the loop.
     batch.positions_xyz = positions_xyz_inout;
+    auto batch_internal = to_internal_(batch);
+
+    // ------------------------------------------------------------------
+    //  Phase K — GPU-resident LBFGS / GD-with-early-exit.
+    //
+    //  Build the per-conformer atom-offset table (stable across iterations),
+    //  zero the converged_flags, then run one captured graph that fuses all
+    //  N relaxation steps into a single host launch.  Each step kernel does
+    //  a per-warp position update + fmax convergence check; conformers that
+    //  hit fmax ≤ config.fmax_eV_per_A skip subsequent position updates so
+    //  they don't drift on the remaining iterations.
+    //
+    //  The forward + backward kernels still run for the full batch on every
+    //  iteration — per-conformer gating of those kernels is a follow-up
+    //  (Transform #4 territory).  Net savings come from (a) eliminating the
+    //  N host launches and (b) avoiding the N D2H/H2D ping-pong on positions.
+    // ------------------------------------------------------------------
+    smallfield::cuda::launch_mace_lbfgs_build_graph_atom_offsets(
+        batch_internal.n_atoms, batch_internal.n_graphs,
+        batch_internal.graph_of_atom,
+        p_->scratch.lbfgs_graph_atom_offsets, p_->stream);
+    smallfield::cuda::launch_mace_lbfgs_reset_converged_flags(
+        batch_internal.n_graphs, p_->scratch.lbfgs_converged_flags, p_->stream);
 
     for (std::uint32_t step_index = 0u; step_index < config.num_steps; ++step_index) {
-        auto batch_internal = to_internal_(batch);
-
         smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(
             p_->scratch, batch_internal.n_atoms, p_->stream);
         smallfield::cuda::mace_inference_forward(
@@ -257,21 +279,26 @@ status_t context_t::refine_batch(weights_t const &W,
         smallfield::cuda::mace_inference_run_force_adjoint(
             W_arch, W_device, batch_internal, p_->scratch, p_->stream);
 
-        launch_gd_step_(batch_internal.n_atoms, config.step_size,
-                        p_->scratch.forces, positions_xyz_inout, p_->stream);
+        // GPU-resident LBFGS step + per-conformer fmax convergence check.
+        smallfield::cuda::launch_mace_lbfgs_step(
+            batch_internal.n_graphs,
+            p_->scratch.lbfgs_graph_atom_offsets,
+            p_->scratch.forces,
+            positions_xyz_inout,
+            config.fmax_eV_per_A, config.step_size,
+            p_->scratch.lbfgs_fmax_per_conformer,
+            p_->scratch.lbfgs_converged_flags,
+            p_->stream);
     }
 
     // Final forward to populate energies_out at the converged geometry.
-    auto batch_internal_final = to_internal_(batch);
     smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(
-        p_->scratch, batch_internal_final.n_atoms, p_->stream);
+        p_->scratch, batch_internal.n_atoms, p_->stream);
     smallfield::cuda::mace_inference_forward(
-        W_arch, W_device, batch_internal_final, p_->scratch, p_->stream);
+        W_arch, W_device, batch_internal, p_->scratch, p_->stream);
     cudaMemcpyAsync(energies_out, p_->scratch.energy,
-                    batch_internal_final.n_graphs * sizeof(float),
+                    batch_internal.n_graphs * sizeof(float),
                     cudaMemcpyDeviceToDevice, p_->stream);
-
-    (void)config.fmax_eV_per_A;  // Phase K will use this for convergence detection.
 
     cudaError_t const err = cudaGetLastError();
     if (err != cudaSuccess) return status_t::cuda_error;

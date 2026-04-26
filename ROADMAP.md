@@ -236,14 +236,19 @@ The kernel optimisation pass on 2026-04-25 took with-forces ms/config from 0.272
 Items the optimisation pass concluded would not materially help are listed under "Optimizations tried and rejected" above.
 Items still open:
 
-### Phase K — GPU-resident LBFGS step
+### Phase K — GPU-resident LBFGS step — __landed (`5183ebb`, `a4a29e5`)__
 
-Today the LBFGS outer loop runs host-side: each iteration launches a captured-graph replay (forward + adjoint), copies forces back, takes the step on the host, copies positions in.
-20 host launches per relaxation, ~30 µs each = ~0.6 ms host overhead per conformer = ~25 % of end-to-end LBFGS time at the current kernel speed.
+GPU-resident `mace_lbfgs_step_kernel` (one warp per conformer, butterfly reduce for fmax) + `lbfgs_converged_flags` per conformer + a periodic all-converged AND-reduction probe in `refine_batch` for early loop exit.
 
-A GPU-resident step kernel + a single graph capture wrapping all 20 iterations eliminates this overhead entirely.
-Expected end-to-end gain: ~25 %.
-Owner: TBD; ~7 days effort.
+Eliminates the host-side relaxation loop's 20 D2H/H2D ping-pongs.
+At batch=2048, the early-exit path drops 1.37 → 0.30 ms / relax (4.6×) on fully-converged batches; partial-convergence batches benefit linearly in the saved tail iters.
+Synthetic-bench non-converging cases see
+<1 % overhead from the periodic probe.
+
+Per-conformer kernel-level gating (turning fwd+bwd kernels into no-ops for converged conformers' atoms) was attempted and reverted — the 2 extra pointer params + early-return guard inflated symcontract regs 48 → 72 (occupancy 42 → 27 CTAs/SM, 36 % loss).
+See the entry in CHANGELOG.md.
+The kernel-level lever to unlock that work skipping without a register hit is __re-batching unconverged conformers__ — periodically gather only the still-relaxing conformers into a smaller batch.
+Tractable on top of the existing `lbfgs_graph_atom_offsets` infrastructure; ~3-5 days work.
 
 ### Multi-GPU `smallfield_mace_refine`
 
