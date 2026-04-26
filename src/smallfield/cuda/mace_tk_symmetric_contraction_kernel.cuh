@@ -233,10 +233,15 @@ __global__ void mace_tk_symmetric_contraction_kernel(
         // for a fixed (i, j, k) the channel axis is contiguous, so the
         // per-thread access pattern (channel_index = thread_id, +32, +64, ...)
         // is coalesced across the warp.
-        #pragma unroll
+        //
+        // Unroll factor 4 on i × 16 on j gives 4 independent (i-stride) FMA
+        // chains per body — same trick that gave the adjoint kernel a 36%
+        // speedup in d494800.  Forward has only 1 accumulator so the win is
+        // smaller, but exposing more in-flight FMAs still helps.
+        #pragma unroll 4
         for (int irrep_index_i = 0; irrep_index_i < irrep_dim_k; ++irrep_index_i) {
             float const x_i = atom_irrep_row[irrep_index_i];
-            #pragma unroll
+            #pragma unroll 16
             for (int irrep_index_j = 0; irrep_index_j < irrep_dim_k; ++irrep_index_j) {
                 float const x_j = atom_irrep_row[irrep_index_j];
                 float const x_ij = x_i * x_j;
