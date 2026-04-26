@@ -755,20 +755,33 @@ inline void mace_inference_forward(
         }
 
         // 3k. Apply the readout for this layer to S.node_features_l0_only (the per-channel L=0 features).
+        //     TK build dispatches to the WGMMA readout kernels (commit 0b998e6); the
+        //     fp32 reference build keeps the warp-reduce kernels in `mace_detail_`.
         if (layer_index == 0u) {
-            // Linear readout for the first layer (alpha = n_channels).
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+            launch_mace_tk_readout_linear(batch.n_atoms, arch.n_channels,
+                                          S.node_features_l0_only, W.readout_linear_w,
+                                          S.node_energy, stream);
+#else
             float const ro_scale = 1.0f / sqrtf(static_cast<float>(arch.n_channels));
             mace_detail_::mace_readout_linear_kernel<<<batch.n_atoms, 32u, 0, stream>>>(
                 batch.n_atoms, arch.n_channels, ro_scale, S.node_features_l0_only, W.readout_linear_w, S.node_energy);
+#endif
         } else {
-            // Nonlinear MLP readout for the last layer.
             constexpr std::uint32_t hidden_dim = 16u;
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+            launch_mace_tk_readout_nonlinear_mlp(batch.n_atoms, arch.n_channels, hidden_dim,
+                                                 S.node_features_l0_only,
+                                                 W.readout_mlp_w0, W.readout_mlp_w1,
+                                                 S.node_energy, stream);
+#else
             float const sc1 = 1.0f / sqrtf(static_cast<float>(arch.n_channels));
             float const sc2 = 1.0f / sqrtf(static_cast<float>(hidden_dim));
             mace_detail_::mace_readout_nonlinear_mlp_kernel<<<batch.n_atoms, 32u,
                                                           hidden_dim * sizeof(float), stream>>>(
                 batch.n_atoms, arch.n_channels, hidden_dim, sc1, sc2, S.node_features_l0_only,
                 W.readout_mlp_w0, W.readout_mlp_w1, S.node_energy);
+#endif
         }
     }
 
