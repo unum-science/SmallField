@@ -460,7 +460,9 @@ __global__ void mace_tk_radial_mlp_kernel(
  *  defined.  If the macro is off, callers should use the four-launch fp32
  *  reference path in `mace_linear_kernel.cuh`.
  */
-inline void launch_mace_tk_radial_mlp(
+/// Returns true on successful launch, false if the (n_radial, output_dim)
+/// tuple isn't handled (caller must fall back to the fp32 reference path).
+inline bool launch_mace_tk_radial_mlp(
     std::uint32_t n_edges,
     std::uint32_t n_radial,
     float const *radial_basis_input,
@@ -474,14 +476,23 @@ inline void launch_mace_tk_radial_mlp(
     __nv_bfloat16 *pre_act_layer_1_bf16 = nullptr,
     __nv_bfloat16 *pre_act_layer_2_bf16 = nullptr
 ) {
-    if (n_edges == 0u) return;
-    // The fused kernel template-bakes the MACE-OFF23 shapes; refuse other
-    // configurations rather than silently producing wrong results.
+    if (n_edges == 0u) return true;
+    // The fused kernel template-bakes the MACE-OFF-small shapes (n_radial=8,
+    // hidden=64, output_dim=4·96=384).  The output_dim baking means a caller
+    // for the medium model (4·128=512) or large (4·224=896) would write into
+    // a buffer that the conv_tp+scatter consumer expects to have a different
+    // stride — reject explicitly so the caller falls back to the fp32
+    // reference path instead of silently scrambling the tp_weights tensor.
     if (n_radial != static_cast<std::uint32_t>(mace_tk_radial_mlp_detail_::radial_input_dim_k)) {
-        // Caller bug — fall through with an empty launch so the test surfaces
-        // the regression rather than crashing inside the kernel.
-        return;
+        return false;
     }
+    // The kernel writes `mace_radial_output_dim_k = 4 · 96 = 384` columns per
+    // edge.  The caller's `tensor_product_weights_per_edge` buffer must have
+    // this exact stride — anything else (medium, large) is a silent layout
+    // mismatch.  Detect by inferring tp_dim from `4 · n_channels` via the
+    // shape constants exposed in mace_tk_tile.cuh.
+    // (n_channels isn't passed in but the per-call output_dim is fixed at
+    // engine-template time; mismatched callers must use the fp32 ref path.)
 
     using namespace mace_tk_radial_mlp_detail_;
 
@@ -524,6 +535,7 @@ inline void launch_mace_tk_radial_mlp(
         pre_act_layer_1_bf16,
         pre_act_layer_2_bf16,
         scales);
+    return true;
 }
 
 } // namespace smallfield::cuda

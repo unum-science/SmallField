@@ -383,7 +383,9 @@ __global__ void mace_tk_element_conditioned_residual_kernel(
  *  Gated on `SMALLFIELD_USE_THUNDERKITTENS`; only compiled when the macro is
  *  defined.
  */
-inline void launch_mace_tk_element_conditioned_residual(
+/// Returns true on successful launch, false if the channel-count tuple
+/// isn't handled (caller must fall back to the fp32 reference path).
+inline bool launch_mace_tk_element_conditioned_residual(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_elements,
@@ -395,13 +397,13 @@ inline void launch_mace_tk_element_conditioned_residual(
     __nv_bfloat16 *output_bf16,
     cudaStream_t stream
 ) {
-    if (n_atoms == 0u) return;
-    if (active_irrep_block_count == 0u) return;
-    if (active_irrep_block_count > 4u) return;
+    if (n_atoms == 0u) return true;
+    if (active_irrep_block_count == 0u) return false;
+    if (active_irrep_block_count > 4u) return false;
     if (n_channels_in != static_cast<std::uint32_t>(
-            mace_tk_element_conditioned_residual_detail_::channels_in_k)) return;
+            mace_tk_element_conditioned_residual_detail_::channels_in_k)) return false;
     if (n_channels_out != static_cast<std::uint32_t>(
-            mace_tk_element_conditioned_residual_detail_::channels_out_k)) return;
+            mace_tk_element_conditioned_residual_detail_::channels_out_k)) return false;
 
     using namespace mace_tk_element_conditioned_residual_detail_;
 
@@ -435,6 +437,7 @@ inline void launch_mace_tk_element_conditioned_residual(
         weights_fp32,
         input_fp32,
         output_bf16);
+    return true;
 }
 
 } // namespace smallfield::cuda

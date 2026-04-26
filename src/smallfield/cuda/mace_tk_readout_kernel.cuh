@@ -387,7 +387,9 @@ __global__ void mace_tk_readout_nonlinear_mlp_kernel(
  *  Gated on `SMALLFIELD_USE_THUNDERKITTENS`.  When the macro is off,
  *  callers must use the fp32 reference path in `mace_inference.cuh`.
  */
-inline void launch_mace_tk_readout_linear(
+/// Returns true on successful launch, false if the channel count isn't
+/// handled (caller must fall back to the fp32 reference path).
+inline bool launch_mace_tk_readout_linear(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     float const *node_scalar_invariants_fp32,
@@ -395,11 +397,9 @@ inline void launch_mace_tk_readout_linear(
     float *node_energy_out_fp32,
     cudaStream_t stream
 ) {
-    if (n_atoms == 0u) return;
+    if (n_atoms == 0u) return true;
     if (n_channels != static_cast<std::uint32_t>(mace_tk_readout_detail_::n_channels_small_k)) {
-        // Caller bug — fall through with no launch so the test surfaces the
-        // regression rather than crashing inside the kernel.
-        return;
+        return false;
     }
 
     using namespace mace_tk_readout_detail_;
@@ -430,6 +430,7 @@ inline void launch_mace_tk_readout_linear(
         readout_weight_fp32,
         node_energy_out_fp32,
         readout_path_scale);
+    return true;
 }
 
 /**
@@ -447,7 +448,9 @@ inline void launch_mace_tk_readout_linear(
  *
  *  Gated on `SMALLFIELD_USE_THUNDERKITTENS`.
  */
-inline void launch_mace_tk_readout_nonlinear_mlp(
+/// Returns true on successful launch, false if the channel/hidden tuple
+/// isn't handled (caller must fall back to the fp32 reference path).
+inline bool launch_mace_tk_readout_nonlinear_mlp(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t hidden_dim,
@@ -457,9 +460,9 @@ inline void launch_mace_tk_readout_nonlinear_mlp(
     float *node_energy_out_fp32,
     cudaStream_t stream
 ) {
-    if (n_atoms == 0u) return;
-    if (n_channels != static_cast<std::uint32_t>(mace_tk_readout_detail_::n_channels_small_k)) return;
-    if (hidden_dim != static_cast<std::uint32_t>(mace_tk_readout_detail_::nonlinear_hidden_dim_k)) return;
+    if (n_atoms == 0u) return true;
+    if (n_channels != static_cast<std::uint32_t>(mace_tk_readout_detail_::n_channels_small_k)) return false;
+    if (hidden_dim != static_cast<std::uint32_t>(mace_tk_readout_detail_::nonlinear_hidden_dim_k)) return false;
 
     using namespace mace_tk_readout_detail_;
 
@@ -494,6 +497,7 @@ inline void launch_mace_tk_readout_nonlinear_mlp(
         node_energy_out_fp32,
         pre_activation_scale,
         output_scale);
+    return true;
 }
 
 } // namespace smallfield::cuda

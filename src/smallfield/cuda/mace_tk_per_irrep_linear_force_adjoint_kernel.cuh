@@ -422,7 +422,11 @@ __global__ void mace_tk_per_irrep_linear_force_adjoint_kernel(
  *  driver falls back to `launch_mace_linear_per_irrep_force_adjoint` in
  *  `mace_force_adjoints.cuh`.
  */
-inline void launch_mace_tk_per_irrep_linear_force_adjoint(
+/// Returns true on successful launch, false if the channel-count tuple
+/// isn't handled.  Caller MUST check the return and fall back to the fp32
+/// reference path otherwise — the previous void return silently left the
+/// bf16 grad_input buffer with stale data on medium/large models.
+inline bool launch_mace_tk_per_irrep_linear_force_adjoint(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_channels_out,
@@ -432,21 +436,20 @@ inline void launch_mace_tk_per_irrep_linear_force_adjoint(
     __nv_bfloat16 *grad_input_bf16,
     cudaStream_t stream
 ) {
-    if (n_atoms == 0u) return;
+    if (n_atoms == 0u) return true;
 
     using namespace mace_tk_per_irrep_linear_force_adjoint_detail_;
 
-    // The fused adjoint templates the small/medium MACE-OFF shape
-    // (c_in = c_out = 96) into the WGMMA tile.  Other configurations need a
-    // separate specialization; refuse rather than silently producing
-    // truncated output.
+    // The fused adjoint templates the MACE-OFF-small shape (c_in = c_out = 96).
+    // Reject explicit so the caller can route to the fp32 reference path
+    // for medium (128) and large (224) channel counts.
     if (n_channels_in  != static_cast<std::uint32_t>(channels_in_k) ||
         n_channels_out != static_cast<std::uint32_t>(channels_out_k)) {
-        return;
+        return false;
     }
     if (active_irrep_block_count == 0u ||
         active_irrep_block_count > static_cast<std::uint32_t>(irrep_block_count_k)) {
-        return;
+        return false;
     }
 
     per_irrep_linear_force_adjoint_scales_t scales;
@@ -490,6 +493,7 @@ inline void launch_mace_tk_per_irrep_linear_force_adjoint(
         upstream_grad_output_fp32,
         grad_input_bf16,
         scales);
+    return true;
 }
 
 } // namespace smallfield::cuda

@@ -18,9 +18,22 @@ Findings from the experimental campaign:
 | #3 bf16x2 packed FFMA on Stage 2 | not pursued | precision risk on the order-3 accumulator (already at the fp32 noise floor at 10–15 meV/Å); needs a golden regression suite to gate, which would also surface the medium-model latent issue noted below before any precision-trade landed. |
 | #4 Extend TK kernels to 224 channels | not pursued | Refactor across `mace_tk_per_irrep_linear_*`, `mace_tk_element_conditioned_residual_*`, `mace_tk_readout_*` to template the channel width, then dispatch by `arch.n_channels`.  Mechanical but extensive (~5–7 days).  Worth landing only if the production decision picks the OFF23-large model. |
 
-__Latent issue surfaced during this campaign__: `launch_mace_tk_per_irrep_linear` silently `return`s when `n_channels != channels_in_k` (= 96 hardcoded).
-For MACE-OFF-medium (128 ch) and MACE-OFF-large (224 ch) the TK forward of the per-irrep linear is therefore a no-op; the bf16 output buffer keeps its prior content and the chain produces numerically meaningless energies under the TK build (the bench has been measuring this without flagging it because there's no medium/large golden regression suite).
-Filed as: extend or guard the launcher (must either land Transform #4 proper, or fall back to the fp32 reference path when channels don't match — until #4, the cleanest fix is the latter).
+__Latent issue surfaced and fixed during this campaign__ (commits `40c0937` and `444c379`): six TK launchers were silently `return`-ing on `n_channels != 96` instead of signalling failure to the caller.
+The bf16 output buffers kept their prior content and the chain produced numerically meaningless energies under the TK build for MACE-OFF-medium (128 ch) and MACE-OFF-large (224 ch).
+All six are now `bool`-returning and the inference driver falls back to the fp32 reference path on channel-count mismatch.
+Affected:
+
+- `launch_mace_tk_per_irrep_linear` (forward)
+- `launch_mace_tk_per_irrep_linear_force_adjoint` (backward)
+- `launch_mace_tk_element_conditioned_residual` (forward)
+- `launch_mace_tk_element_conditioned_residual_force_adjoint` (backward)
+- `launch_mace_tk_readout_linear`
+- `launch_mace_tk_readout_nonlinear_mlp`
+- `launch_mace_tk_radial_mlp` (forward)
+
+Pre-fix medium bench numbers in earlier reports never measured a working pipeline — the "0.0807 ms/config" headline was running on stale buffers across every TK kernel.
+Post-fix medium runs correctly at 0.6097 ms/config; closing that perf regression is Transform #4 (templating each TK kernel over channel width).
+Small model (96 ch) is unaffected — all TK paths still run, the bool-return wiring is no-op for it.
 
 ### Transform #1 — X-Commutativity Partsym Fold, Commit `895bfa4`
 
