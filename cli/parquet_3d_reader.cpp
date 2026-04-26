@@ -38,12 +38,13 @@ bool read_conformer_shard(std::filesystem::path const &path, conformer_shard_dat
     }
 
     std::unique_ptr<parquet::arrow::FileReader> reader;
-    auto pq_status = parquet::arrow::OpenFile(open_result.ValueUnsafe(), arrow::default_memory_pool(), &reader);
-    if (!pq_status.ok()) {
+    auto pq_result = parquet::arrow::OpenFile(open_result.ValueUnsafe(), arrow::default_memory_pool());
+    if (!pq_result.ok()) {
         std::fprintf(stderr, "[smallfield_mace_refine] parquet open failed: %s: %s\n", path.string().c_str(),
-                     pq_status.message().c_str());
+                     pq_result.status().message().c_str());
         return false;
     }
+    reader = std::move(pq_result).ValueOrDie();
 
     std::shared_ptr<arrow::Table> table;
     auto read_status = reader->ReadTable(&table);

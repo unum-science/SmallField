@@ -39,4 +39,14 @@ std::vector<shard_pair_t> inventory_shards(std::filesystem::path const &input_di
                                            std::filesystem::path const &output_dir, std::uint32_t num_conformers,
                                            bool resume);
 
+/**
+ *  @brief List every `*.parquet` file in @p input_dir, sorted lexicographically.
+ *
+ *  Lighter-weight alternative to `inventory_shards` for callers that only need
+ *  the input paths (no output-pairing, no row-count probe, no resume bookkeeping).
+ *  Used by `smallfield_mace_refine` where the output naming convention differs
+ *  from the conformer-generation pass.
+ */
+std::vector<std::filesystem::path> list_input_shards(std::filesystem::path const &input_dir);
+
 } // namespace smallfield::cli

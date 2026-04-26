@@ -58,4 +58,20 @@ std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path c
     return shards;
 }
 
+std::vector<fs::path> list_input_shards(fs::path const &input_dir) {
+    std::vector<fs::path> paths;
+    std::error_code ec;
+    if (!fs::is_directory(input_dir, ec)) {
+        std::fprintf(stderr, "[shard_inventory] input dir does not exist: %s\n", input_dir.string().c_str());
+        return paths;
+    }
+    for (auto const &entry : fs::directory_iterator(input_dir, ec)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".parquet") continue;
+        paths.push_back(entry.path());
+    }
+    std::sort(paths.begin(), paths.end());
+    return paths;
+}
+
 } // namespace smallfield::cli
