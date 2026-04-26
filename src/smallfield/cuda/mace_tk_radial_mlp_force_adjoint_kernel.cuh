@@ -43,6 +43,7 @@
 #pragma once
 
 #include "smallfield/cuda/mace_tk_tile.cuh"
+#include "smallfield/cuda/mace_tk_blackwell.cuh"
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS) && defined(__CUDACC__)
 
@@ -208,6 +209,9 @@ inline __global__ void mace_tk_radial_mlp_layer_force_adjoint_kernel(
     auto &shared_weight_tile   = shared_alloc.allocate<kittens::st_bf<N_dim, K_dim>>();
     auto &shared_staging_tile  = shared_alloc.allocate<kittens::st_fl<edge_tile_rows_k, N_dim>>();
 
+    mace_tk::mma_ctx_t<kittens::rt_fl<16, N_dim>> mma_ctx;
+    mma_ctx.init(shared_alloc);
+
     std::uint32_t const base_edge_index = blockIdx.x * static_cast<std::uint32_t>(edge_tile_rows_k);
     if (base_edge_index >= n_edges) return;
 
@@ -217,9 +221,7 @@ inline __global__ void mace_tk_radial_mlp_layer_force_adjoint_kernel(
     kittens::warpgroup::sync(0);
 
     kittens::rt_fl<16, N_dim> accumulator;
-    kittens::warp::zero(accumulator);
-    kittens::warpgroup::mm_ABt(accumulator, shared_grad_pre_tile, shared_weight_tile);
-    kittens::warpgroup::mma_async_wait();
+    mace_tk::mma_ABt_overwrite_sync(accumulator, shared_grad_pre_tile, shared_weight_tile, mma_ctx);
 
     scale_accumulator_in_place_<N_dim>(accumulator, scale);
 

@@ -43,6 +43,7 @@
 #pragma once
 
 #include "smallfield/cuda/mace_tk_tile.cuh"
+#include "smallfield/cuda/mace_tk_blackwell.cuh"
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS) && defined(__CUDACC__)
 
@@ -348,6 +349,11 @@ inline __global__ void mace_tk_radial_mlp_kernel(
     shared_tile_input_t  &shared_input_tile     = shared_alloc.allocate<shared_tile_input_t>();
     shared_tile_hidden_t &shared_hidden_tile    = shared_alloc.allocate<shared_tile_hidden_t>();
 
+    // All 4 layer MMAs share the same `register_accumulator_t` shape, so
+    // a single context (one TT slot + one pair of semaphores) suffices.
+    mace_tk::mma_ctx_t<register_accumulator_t> mma_ctx;
+    mma_ctx.init(shared_alloc);
+
     std::uint32_t const base_edge_index = blockIdx.x * static_cast<std::uint32_t>(edge_tile_rows_k);
     if (base_edge_index >= n_edges) return;
 
@@ -365,9 +371,7 @@ inline __global__ void mace_tk_radial_mlp_kernel(
 
     // ---- Layer 0: [64x16] @ [16x64] -> [64x64] + silu*normalize2mom ----
     register_accumulator_t accumulator;
-    kittens::warp::zero(accumulator);
-    kittens::warpgroup::mm_AB(accumulator, shared_input_tile, shared_layer_0_weight);
-    kittens::warpgroup::mma_async_wait();
+    mace_tk::mma_AB_overwrite_sync(accumulator, shared_input_tile, shared_layer_0_weight, mma_ctx);
 
     scale_accumulator_in_place_(accumulator, scales.layer_0_scale);
     if (pre_act_layer_0_bf16 != nullptr) {
@@ -380,9 +384,7 @@ inline __global__ void mace_tk_radial_mlp_kernel(
     kittens::warpgroup::sync(0);
 
     // ---- Layer 1: [64x64] @ [64x64] -> [64x64] + silu*normalize2mom ----
-    kittens::warp::zero(accumulator);
-    kittens::warpgroup::mm_AB(accumulator, shared_hidden_tile, shared_layer_1_weight);
-    kittens::warpgroup::mma_async_wait();
+    mace_tk::mma_AB_overwrite_sync(accumulator, shared_hidden_tile, shared_layer_1_weight, mma_ctx);
 
     scale_accumulator_in_place_(accumulator, scales.layer_1_scale);
     if (pre_act_layer_1_bf16 != nullptr) {
@@ -395,9 +397,7 @@ inline __global__ void mace_tk_radial_mlp_kernel(
     kittens::warpgroup::sync(0);
 
     // ---- Layer 2: [64x64] @ [64x64] -> [64x64] + silu*normalize2mom ----
-    kittens::warp::zero(accumulator);
-    kittens::warpgroup::mm_AB(accumulator, shared_hidden_tile, shared_layer_2_weight);
-    kittens::warpgroup::mma_async_wait();
+    mace_tk::mma_AB_overwrite_sync(accumulator, shared_hidden_tile, shared_layer_2_weight, mma_ctx);
 
     scale_accumulator_in_place_(accumulator, scales.layer_2_scale);
     if (pre_act_layer_2_bf16 != nullptr) {
@@ -416,9 +416,7 @@ inline __global__ void mace_tk_radial_mlp_kernel(
         load_layer_3_weight_column_tile_(shared_layer_3_weight_column, layer_3_weight, output_column_tile_index);
         kittens::warpgroup::sync(0);
 
-        kittens::warp::zero(accumulator);
-        kittens::warpgroup::mm_AB(accumulator, shared_hidden_tile, shared_layer_3_weight_column);
-        kittens::warpgroup::mma_async_wait();
+        mace_tk::mma_AB_overwrite_sync(accumulator, shared_hidden_tile, shared_layer_3_weight_column, mma_ctx);
 
         scale_accumulator_in_place_(accumulator, scales.layer_3_scale);
 

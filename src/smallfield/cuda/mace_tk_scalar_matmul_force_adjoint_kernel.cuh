@@ -36,6 +36,7 @@
 #pragma once
 
 #include "smallfield/cuda/mace_tk_tile.cuh"
+#include "smallfield/cuda/mace_tk_blackwell.cuh"
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS) && defined(__CUDACC__)
 
@@ -165,6 +166,9 @@ inline __global__ void mace_tk_scalar_matmul_force_adjoint_kernel(
     shared_weight_tile_t   &shared_weight_tile   = shared_alloc.allocate<shared_weight_tile_t>();
     shared_delta_tile_t    &shared_delta_tile    = shared_alloc.allocate<shared_delta_tile_t>();
 
+    mace_tk::mma_ctx_t<register_accumulator_t> mma_ctx;
+    mma_ctx.init(shared_alloc);
+
     std::uint32_t const base_atom_index = blockIdx.x * static_cast<std::uint32_t>(wgmma_m_rows_k);
     if (base_atom_index >= n_atoms) return;
 
@@ -173,10 +177,8 @@ inline __global__ void mace_tk_scalar_matmul_force_adjoint_kernel(
     kittens::warpgroup::sync(0);
 
     register_accumulator_t accumulator;
-    kittens::warp::zero(accumulator);
     // D[M=64, N=c_in] = A[M=64, K=c_out] @ B[N=c_in, K=c_out]^T
-    kittens::warpgroup::mm_ABt(accumulator, shared_upstream_tile, shared_weight_tile);
-    kittens::warpgroup::mma_async_wait();
+    mace_tk::mma_ABt_overwrite_sync(accumulator, shared_upstream_tile, shared_weight_tile, mma_ctx);
 
     scale_accumulator_in_place_(accumulator, scaled_path_weight);
 

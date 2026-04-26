@@ -67,6 +67,7 @@
 #pragma once
 
 #include "smallfield/cuda/mace_tk_tile.cuh"
+#include "smallfield/cuda/mace_tk_blackwell.cuh"
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS) && defined(__CUDACC__)
 
@@ -299,6 +300,9 @@ inline __global__ void mace_tk_element_conditioned_residual_force_adjoint_kernel
     shared_tile_weight_slab_t     &shared_weight_slab       = shared_alloc.allocate<shared_tile_weight_slab_t>();
     shared_tile_grad_input_stage_t &shared_grad_input_stage = shared_alloc.allocate<shared_tile_grad_input_stage_t>();
 
+    mace_tk::mma_ctx_t<register_accumulator_t> mma_ctx;
+    mma_ctx.init(shared_alloc);
+
     std::uint32_t const atom_index = blockIdx.x;
     if (atom_index >= n_atoms) return;
     if (n_channels_in  != static_cast<std::uint32_t>(channels_in_k))  return;
@@ -330,9 +334,7 @@ inline __global__ void mace_tk_element_conditioned_residual_force_adjoint_kernel
 
             // D[c_in_tile=64, m=16] = W[c_in_tile=64, c_out=96]
             //                        @ dout[c_out=96, m=16]
-            kittens::warp::zero(accumulator);
-            kittens::warpgroup::mm_AB(accumulator, shared_weight_slab, shared_upstream_tile);
-            kittens::warpgroup::mma_async_wait();
+            mace_tk::mma_AB_overwrite_sync(accumulator, shared_weight_slab, shared_upstream_tile, mma_ctx);
 
             scale_accumulator_in_place_(accumulator, path_weight_scale);
 

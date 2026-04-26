@@ -59,6 +59,7 @@
 #pragma once
 
 #include "smallfield/cuda/mace_tk_tile.cuh"
+#include "smallfield/cuda/mace_tk_blackwell.cuh"
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS) && defined(__CUDACC__)
 
@@ -356,6 +357,11 @@ inline __global__ void mace_tk_per_irrep_linear_kernel(
     shared_weight_tile_t &shared_weight_tile = shared_alloc.allocate<shared_weight_tile_t>();
     shared_output_tile_t &shared_output_tile = shared_alloc.allocate<shared_output_tile_t>();
 
+    // Hopper: empty struct, init is a no-op.  Blackwell: pulls 2 semaphore
+    // slots off `shared_alloc` and reserves one TT slot for the accumulator.
+    mace_tk::mma_ctx_t<register_accumulator_t> mma_ctx;
+    mma_ctx.init(shared_alloc);
+
     std::uint32_t const base_atom_index = blockIdx.x * static_cast<std::uint32_t>(atoms_per_cta_k);
     if (base_atom_index >= n_atoms) return;
 
@@ -394,9 +400,11 @@ inline __global__ void mace_tk_per_irrep_linear_kernel(
         // c_out]` (weights), C = `[64, c_out]` accumulator (atom-major
         // m-rows × c_out cols).  All M=64 rows are computed; the per-block
         // store path below masks the m-rows that don't belong to L = block.
-        kittens::warp::zero(accumulator);
-        kittens::warpgroup::mm_AB(accumulator, shared_input_tile, shared_weight_tile);
-        kittens::warpgroup::mma_async_wait();
+        // Helper expands to `warpgroup::mm_AB + mma_async_wait` on Hopper,
+        // or to the full `tcgen05::mm_AB + commit + wait + load_async +
+        // tensor_load_wait` sequence on Blackwell.  In both cases the
+        // accumulator is freshly overwritten (no zero needed first).
+        mace_tk::mma_AB_overwrite_sync(accumulator, shared_input_tile, shared_weight_tile, mma_ctx);
 
         scale_accumulator_in_place_(accumulator, scales.path_weight);
 

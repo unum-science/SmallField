@@ -52,6 +52,7 @@
 #pragma once
 
 #include "smallfield/cuda/mace_tk_tile.cuh"
+#include "smallfield/cuda/mace_tk_blackwell.cuh"
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS) && defined(__CUDACC__)
 
@@ -290,14 +291,15 @@ inline __global__ void mace_tk_readout_linear_kernel(
     std::uint32_t const base_atom_index = blockIdx.x * static_cast<std::uint32_t>(atom_tile_rows_k);
     if (base_atom_index >= n_atoms) return;
 
+    mace_tk::mma_ctx_t<register_accumulator_t> mma_ctx;
+    mma_ctx.init(shared_alloc);
+
     load_invariants_tile_(shared_invariants_tile, node_scalar_invariants, n_atoms, base_atom_index);
     load_linear_readout_weight_padded_(shared_weight_tile, readout_weight);
     kittens::warpgroup::sync(0);
 
     register_accumulator_t accumulator;
-    kittens::warp::zero(accumulator);
-    kittens::warpgroup::mm_AB(accumulator, shared_invariants_tile, shared_weight_tile);
-    kittens::warpgroup::mma_async_wait();
+    mace_tk::mma_AB_overwrite_sync(accumulator, shared_invariants_tile, shared_weight_tile, mma_ctx);
 
     scale_accumulator_in_place_(accumulator, readout_path_scale);
 
@@ -340,6 +342,9 @@ inline __global__ void mace_tk_readout_nonlinear_mlp_kernel(
     std::uint32_t const base_atom_index = blockIdx.x * static_cast<std::uint32_t>(atom_tile_rows_k);
     if (base_atom_index >= n_atoms) return;
 
+    mace_tk::mma_ctx_t<register_accumulator_t> mma_ctx;
+    mma_ctx.init(shared_alloc);
+
     load_invariants_tile_(shared_invariants_tile, node_scalar_invariants, n_atoms, base_atom_index);
     load_nonlinear_w1_weight_(shared_w1_tile, mlp_w1_weight);
     load_nonlinear_w2_weight_padded_(shared_w2_tile, mlp_w2_weight);
@@ -347,9 +352,7 @@ inline __global__ void mace_tk_readout_nonlinear_mlp_kernel(
 
     // Stage 1: invariants @ W1 -> hidden, with silu_normalize2mom(pre * sc1).
     register_accumulator_t accumulator;
-    kittens::warp::zero(accumulator);
-    kittens::warpgroup::mm_AB(accumulator, shared_invariants_tile, shared_w1_tile);
-    kittens::warpgroup::mma_async_wait();
+    mace_tk::mma_AB_overwrite_sync(accumulator, shared_invariants_tile, shared_w1_tile, mma_ctx);
 
     apply_silu_normalize2mom_with_scale_in_place_(accumulator, pre_activation_scale);
 
@@ -358,9 +361,7 @@ inline __global__ void mace_tk_readout_nonlinear_mlp_kernel(
     kittens::warpgroup::sync(0);
 
     // Stage 2: hidden @ W2 -> energy contribution, with outer 1/sqrt(hidden).
-    kittens::warp::zero(accumulator);
-    kittens::warpgroup::mm_AB(accumulator, shared_hidden_tile, shared_w2_tile);
-    kittens::warpgroup::mma_async_wait();
+    mace_tk::mma_AB_overwrite_sync(accumulator, shared_hidden_tile, shared_w2_tile, mma_ctx);
 
     scale_accumulator_in_place_(accumulator, output_scale);
 
