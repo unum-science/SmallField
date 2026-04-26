@@ -1050,8 +1050,26 @@ inline void mace_inference_run_force_adjoint(
 
         // 3g. linear_post_tp adjoint: grad_node_features_scratch (post-linear)
         //     → grad_node_features (pre-linear, = post-scatter gradient).
-        //     We must zero grad_node_features first since the launcher uses +=
-        //     and the buffer holds the symmetric-contraction gradient already.
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // TK D1 path: kernel emits bf16 with overwrite semantics, so the
+        // explicit memset is unnecessary.  Reuse `tk_node_features_post_linear_bf16`
+        // as the bf16 staging slot (same shape, unused during the backward
+        // pass after its forward write was already cast to fp32).  The cast
+        // back to fp32 also writes with overwrite semantics, so step 3h's
+        // consumer sees a clean grad_node_features.
+        launch_mace_tk_per_irrep_linear_force_adjoint(
+            batch.n_atoms, arch.n_channels, arch.n_channels,
+            /*active_irrep_block_count*/4u,
+            L.linear_post_tp_w,
+            S.grad_node_features_scratch,
+            S.tk_node_features_post_linear_bf16,
+            stream);
+        launch_mace_bf16_to_fp32(
+            batch.n_atoms * arch.n_channels * irrep_dim,
+            S.tk_node_features_post_linear_bf16,
+            S.grad_node_features, stream);
+#else
+        // fp32 reference path uses += semantics; zero the destination first.
         cudaMemsetAsync(S.grad_node_features, 0,
                         batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
         launch_mace_linear_per_irrep_force_adjoint(
@@ -1060,6 +1078,7 @@ inline void mace_inference_run_force_adjoint(
             L.linear_post_tp_w,
             S.grad_node_features_scratch,
             S.grad_node_features, stream);
+#endif
 
         // 3h. Fused tensor-product + scatter adjoint: takes the post-scatter
         //     receiver-grad `grad_node_features [n_atoms, n_channels, 16]`
