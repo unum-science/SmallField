@@ -177,6 +177,59 @@ endif()
 # 13.1 → 14.x) do not require CMakeLists edits.
 find_package(CUDAToolkit REQUIRED)
 
+# ThunderKittens — header-only tile-based MMA library used by the MACE-OFF
+# inference module.  Default OFF: the existing fp32 reference path stays
+# buildable without TK (regression target).  Turn ON for the bf16 / WGMMA
+# production build.  Pass `-DTHUNDERKITTENS_DIR=/path/to/ThunderKittens`
+# pointing to a clone of https://github.com/HazyResearch/ThunderKittens
+# (validated against commit 0b55588d2769dde0c7a9a606ffc015b0ca7a9551).
+#
+# When TK is on, MACE kernels need `-arch=sm_90a` (Hopper, with the `a`
+# suffix that enables WGMMA / TMA features) or `-arch=sm_100a` / `sm_120a`
+# on Blackwell.  The build appends `-DSMALLFIELD_USE_THUNDERKITTENS=1` and
+# the right arch suffix automatically when TK is requested.
+option(SMALLFIELD_USE_THUNDERKITTENS
+       "Enable ThunderKittens for the MACE-OFF inference module"
+       OFF)
+
+if(SMALLFIELD_USE_THUNDERKITTENS)
+    if(NOT DEFINED THUNDERKITTENS_DIR)
+        message(FATAL_ERROR
+                "SMALLFIELD_USE_THUNDERKITTENS=ON but THUNDERKITTENS_DIR is not set. "
+                "Pass -DTHUNDERKITTENS_DIR=/path/to/ThunderKittens.")
+    endif()
+    if(NOT EXISTS "${THUNDERKITTENS_DIR}/include/kittens.cuh")
+        message(FATAL_ERROR
+                "ThunderKittens not found at ${THUNDERKITTENS_DIR}/include/kittens.cuh. "
+                "Clone https://github.com/HazyResearch/ThunderKittens and pass its "
+                "absolute path via -DTHUNDERKITTENS_DIR=...")
+    endif()
+    add_library(smallfield_thunderkittens INTERFACE)
+    target_include_directories(smallfield_thunderkittens INTERFACE "${THUNDERKITTENS_DIR}/include")
+    target_compile_definitions(smallfield_thunderkittens INTERFACE SMALLFIELD_USE_THUNDERKITTENS=1)
+    message(STATUS "ThunderKittens enabled (include path: ${THUNDERKITTENS_DIR}/include)")
+
+    # Promote the auto-detected Hopper / Blackwell arch to the `a` variant
+    # so WGMMA / TMA intrinsics are available.  TK's persistent-kernel
+    # patterns rely on these features; without the `a` suffix the build
+    # falls back to non-async loads and the throughput win disappears.
+    if(CMAKE_CUDA_ARCHITECTURES)
+        set(_archs_with_a "")
+        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            if(NOT "${_arch}" MATCHES "a$")
+                list(APPEND _archs_with_a "${_arch}a")
+            else()
+                list(APPEND _archs_with_a "${_arch}")
+            endif()
+        endforeach()
+        set(CMAKE_CUDA_ARCHITECTURES "${_archs_with_a}" CACHE STRING "" FORCE)
+        message(STATUS "ThunderKittens: promoted CUDA archs to ${CMAKE_CUDA_ARCHITECTURES}")
+    endif()
+else()
+    message(STATUS "ThunderKittens disabled — MACE-OFF inference uses the fp32 reference path. "
+                   "Pass -DSMALLFIELD_USE_THUNDERKITTENS=ON -DTHUNDERKITTENS_DIR=... to opt in.")
+endif()
+
 if(RDKit_FOUND)
     # RDKit targets needed by the library
     set(RDKIT_LIBS
