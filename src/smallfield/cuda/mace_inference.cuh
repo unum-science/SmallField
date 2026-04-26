@@ -145,8 +145,11 @@ __global__ void mace_readout_nonlinear_mlp_kernel(
                  * w1[static_cast<std::uint64_t>(channel_index) * hidden_dim + hidden_index];
         }
         float const pre_act = scale1 * accumulator;
-        float const s = 1.0f / (1.0f + __expf(-pre_act));
-        h_shared[hidden_index] = pre_act * s;
+        float const sigmoid_value = 1.0f / (1.0f + __expf(-pre_act));
+        // e3nn `nn.Activation` wraps its activation in `normalize2mom`, so the SiLU
+        // here is `silu(x) * normalize2mom_constant` — same scaling the radial MLP
+        // applies via mace_silu_normalize_to_unit_second_moment_kernel.
+        h_shared[hidden_index] = pre_act * sigmoid_value * mace_silu_normalize_to_unit_second_moment_constant_k;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
