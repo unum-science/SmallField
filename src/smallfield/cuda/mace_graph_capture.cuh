@@ -131,17 +131,46 @@ inline void mace_capture_forward(
     mace_inference_reset_per_atom_energy_accumulator(scratch, batch.n_atoms, capture_stream);
     mace_inference_forward(arch, W, batch, scratch, capture_stream);
     cudaStreamSynchronize(capture_stream);
+    cudaError_t const warmup_err = cudaGetLastError();
+    if (warmup_err != cudaSuccess) {
+        std::fprintf(stderr, "mace_capture_forward: warmup failed (%s)\n",
+                     cudaGetErrorString(warmup_err));
+        return;
+    }
 
     // 2. Begin capture and re-issue the same kernel sequence.
-    cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
+    cudaError_t const begin_err = cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
+    if (begin_err != cudaSuccess) {
+        std::fprintf(stderr, "cudaStreamBeginCapture failed: %s\n",
+                     cudaGetErrorString(begin_err));
+        return;
+    }
     mace_inference_reset_per_atom_energy_accumulator(scratch, batch.n_atoms, capture_stream);
     mace_inference_forward(arch, W, batch, scratch, capture_stream);
     cudaGraph_t graph = nullptr;
-    cudaStreamEndCapture(capture_stream, &graph);
+    cudaError_t const end_err = cudaStreamEndCapture(capture_stream, &graph);
+    if (end_err != cudaSuccess) {
+        std::fprintf(stderr, "cudaStreamEndCapture failed: %s\n",
+                     cudaGetErrorString(end_err));
+        return;
+    }
 
-    // 3. Instantiate the executable graph.
+    // 3. Instantiate the executable graph.  Use the with-flags form so we get
+    //    the failing-node identifier and a log buffer back when something
+    //    inside the captured region cannot be replayed.
     cudaGraphExec_t graph_exec = nullptr;
-    cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0);
+    char log_buffer[1024] = {0};
+    cudaGraphNode_t error_node = nullptr;
+    cudaError_t const inst_err = cudaGraphInstantiate(
+        &graph_exec, graph, &error_node, log_buffer, sizeof(log_buffer));
+    if (inst_err != cudaSuccess) {
+        std::fprintf(stderr,
+                     "mace_capture_forward: cudaGraphInstantiate failed (%s) "
+                     "— error_node=%p log=\"%s\"\n",
+                     cudaGetErrorString(inst_err),
+                     static_cast<void *>(error_node), log_buffer);
+        return;
+    }
 
     // 4. Populate the out struct (move-friendly, releases any prior graph).
     if (out.graph_exec) cudaGraphExecDestroy(out.graph_exec);
