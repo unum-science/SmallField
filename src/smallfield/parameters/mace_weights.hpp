@@ -144,6 +144,27 @@ inline void parse_manifest_(std::string const &raw,
                 } else if (j.peek_('n')) {
                     // null
                     j.p_ += 4;
+                } else if (j.peek_('[')) {
+                    // Array value — skip with bracket-depth tracking.  Header arrays
+                    // are tolerated but not captured by the simple num/str maps;
+                    // when a caller needs the array values it should mirror them as
+                    // explicit tensors in the blob (see `mace_export.py`'s
+                    // `graph_atom_offset` which is emitted both as a header array
+                    // and as an int64 tensor).
+                    int bracket_depth = 0;
+                    do {
+                        if (j.s_[j.p_] == '[') ++bracket_depth;
+                        else if (j.s_[j.p_] == ']') --bracket_depth;
+                        ++j.p_;
+                    } while (bracket_depth > 0 && j.p_ < j.s_.size());
+                } else if (j.peek_('{')) {
+                    // Nested object value — skip the same way.
+                    int brace_depth = 0;
+                    do {
+                        if (j.s_[j.p_] == '{') ++brace_depth;
+                        else if (j.s_[j.p_] == '}') --brace_depth;
+                        ++j.p_;
+                    } while (brace_depth > 0 && j.p_ < j.s_.size());
                 }
                 if (j.peek_(',')) { ++j.p_; }
             }
