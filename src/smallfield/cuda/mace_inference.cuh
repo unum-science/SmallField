@@ -230,6 +230,7 @@ struct mace_scratch_t {
     float *grad_node_features = nullptr;           ///< [n_atoms, n_channels, 16]
     float *grad_node_features_scratch = nullptr;   ///< [n_atoms, n_channels, 16] aux for chain-rule sum
     float *grad_node_features_l0_only = nullptr;   ///< [n_atoms, n_channels]
+    float *grad_layer_residual_l0_scratch = nullptr; ///< [n_atoms, n_channels] — staging for layer-N residual contribution to the layer-input gradient
     float *grad_edge_messages = nullptr;           ///< [n_edges, n_channels, 16]
     float *grad_tp_weights = nullptr;              ///< [n_edges, 4 * n_channels]
     float *grad_sph_harm = nullptr;                ///< [n_edges, 16]
@@ -305,6 +306,7 @@ struct mace_scratch_t {
         alloc(&grad_node_features,           max_atoms * arch.n_channels * irrep_dim);
         alloc(&grad_node_features_scratch,   max_atoms * arch.n_channels * irrep_dim);
         alloc(&grad_node_features_l0_only,   max_atoms * arch.n_channels);
+        alloc(&grad_layer_residual_l0_scratch, max_atoms * arch.n_channels);
         alloc(&grad_edge_messages,           max_edges * arch.n_channels * irrep_dim);
         alloc(&grad_tp_weights,              max_edges * mace_tensor_product_path_count_k * arch.n_channels);
         alloc(&grad_sph_harm,                max_edges * irrep_dim);
@@ -341,6 +343,7 @@ struct mace_scratch_t {
                           &grad_node_energy, &grad_node_scalar_invariants,
                           &grad_node_features, &grad_node_features_scratch,
                           &grad_node_features_l0_only,
+                          &grad_layer_residual_l0_scratch,
                           &grad_edge_messages, &grad_tp_weights,
                           &grad_sph_harm, &grad_r_unit, &grad_radial_basis}) {
             if (*p) cudaFree(*p);
@@ -885,55 +888,25 @@ inline void mace_inference_run_force_adjoint(
         }
 
         // 3b. (layer-N >= 1) Residual addition `post_product_l0 += layer_n_residual_l0`
-        //     has identity gradient — both incoming and residual paths get the
-        //     same upstream.  We back-propagate the residual path: the layer-N
-        //     skip_tp's input is the L=0 slab of `node_features_input_layer[L]`,
-        //     so apply the element-conditioned residual adjoint with
-        //     irrep_dim=1 (its forward used irrep_dim=1).  This adds into
-        //     a temporary "grad_node_scalar_at_input" buffer that we later
-        //     splat onto the L=0 slot of grad_node_features_input.
-        //
-        //     We reuse `S.grad_node_scalar_invariants` for this temporary:
-        //     it's zeroed at the start, gets overwritten by product_linear
-        //     adjoint below, but the residual contribution must be staged
-        //     into a *separate* scalar-shaped buffer.  Use
-        //     `S.grad_node_features_l0_only` again — it already holds the
-        //     post-product gradient, and after we use it for the residual
-        //     path it's no longer needed at scalar shape (we'll be in
-        //     full-irrep land for the rest of this layer's reverse pass).
-        //
-        //     But we still need a separate buffer to hold the residual
-        //     contribution back into the layer-input scalar gradient.  We
-        //     repurpose the L=0 column of `grad_node_features` (which is
-        //     zeroed at this point of the reverse loop) as the staging
-        //     destination — accumulate into the L=0 slot.
+        //     has identity gradient — both incoming and residual paths see the
+        //     same upstream.  The residual path back-propagates via:
+        //         skip_tp_layerN_backward → grad_layer_residual_l0_scratch (scalar)
+        //     storing the layer-input scalar (L=0) residual contribution that
+        //     we'll merge with the message-path layer-input gradient at the
+        //     end of this layer's reverse pass (step 3o).  Using a dedicated
+        //     scratch keeps the residual contribution out of the
+        //     `grad_node_features` buffer that the symmetric-contraction and
+        //     downstream adjoints reuse.
         if (layer_index >= 1u) {
-            // Allocate a scalar-shaped scratch on the fly via reuse:
-            // `grad_node_features_l0_only` is currently the
-            // post-product-l0 gradient; we still need it in full as the
-            // gradient flowing through product_linear, so don't clobber.
-            // Use `grad_node_scalar_invariants` (already zeroed) as a
-            // pre-residual scalar gradient accumulator.  After the residual
-            // adjoint we extract its contribution onto the L=0 slot of
-            // grad_node_features (= the layer-input gradient).
+            cudaMemsetAsync(S.grad_layer_residual_l0_scratch, 0,
+                            batch.n_atoms * arch.n_channels * sizeof(float), stream);
             launch_mace_element_conditioned_residual_force_adjoint(
                 batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
                 /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
                 batch.atom_element, L.skip_tp_w,
                 S.grad_node_features_l0_only,         // upstream (post-product l0 gradient)
-                S.grad_node_scalar_invariants,        // accumulated grad of skip_tp INPUT (scalar)
+                S.grad_layer_residual_l0_scratch,     // grad of skip_tp INPUT (scalar)
                 stream);
-            // The skip_tp_layerN input was the L=0 slab of node_features_input_layer[L];
-            // accumulate this scalar gradient onto the L=0 slot of
-            // grad_node_features (which is the layer-input gradient
-            // accumulator for this iteration).
-            launch_mace_extract_l0_irrep_block_force_adjoint(
-                batch.n_atoms, arch.n_channels, irrep_dim,
-                S.grad_node_scalar_invariants, S.grad_node_features, stream);
-            // Re-zero the scalar-invariants gradient before product_linear
-            // overwrites it (the next adjoint expects to write, not accumulate).
-            cudaMemsetAsync(S.grad_node_scalar_invariants, 0,
-                            batch.n_atoms * arch.n_channels * sizeof(float), stream);
         }
 
         // 3c. product_linear adjoint: post-product l0 → grad_node_scalar_invariants.
@@ -997,16 +970,11 @@ inline void mace_inference_run_force_adjoint(
             S.grad_node_features_scratch,
             S.grad_node_features, stream);
 
-        // 3h. scatter adjoint (gather): grad_node_features (post-scatter)
-        //     → grad_edge_messages.
-        launch_mace_scatter_force_adjoint(
-            batch.n_edges, arch.n_channels * irrep_dim,
-            batch.edge_target_atom,
-            S.grad_node_features,
-            S.grad_edge_messages, stream);
-
-        // 3i. tensor product adjoint: grad_edge_messages
-        //     → grad_node_l0 (atomicAdd via source atom),
+        // 3h. Fused tensor-product + scatter adjoint: takes the post-scatter
+        //     receiver-grad `grad_node_features [n_atoms, n_channels, 16]`
+        //     directly (the kernel performs the gather internally), and emits
+        //     gradients for the three forward inputs:
+        //       grad_node_l0 (atomicAdd via source atom),
         //       grad_tp_weights (per-edge non-atomic),
         //       grad_sph_harm (atomicAdd accumulating).
         //     Use grad_node_features_l0_only as the grad_node_l0 destination
@@ -1019,7 +987,7 @@ inline void mace_inference_run_force_adjoint(
             S.node_features_l0_only_layer[layer_index],
             S.sph_harm,
             S.tensor_product_weights_per_edge,        // post-cutoff (matches forward state)
-            S.grad_edge_messages,
+            S.grad_node_features,                     // upstream: per-atom (target-indexed)
             S.grad_node_features_l0_only,             // atomicAdd accumulator
             S.grad_tp_weights,                        // overwritten
             S.grad_sph_harm                           // atomicAdd accumulator
@@ -1122,6 +1090,7 @@ inline void mace_inference_run_force_adjoint(
             batch.n_edges, radial_mlp_hidden_dim, tp_dim,
             1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
             /*apply_silu_n2m_inverse*/false,
+            /*accumulate*/false,
             /*post_activation*/nullptr,    // unused when no epilogue
             L.radial_mlp_w3, S.grad_tp_weights,
             S.edge_messages, stream);
@@ -1130,20 +1099,25 @@ inline void mace_inference_run_force_adjoint(
             batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
             1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
             /*apply_silu_n2m_inverse*/true,
+            /*accumulate*/false,
             S.radial_mlp_hidden_2, L.radial_mlp_w2, S.edge_messages,
-            S.grad_node_features, stream);  // reuse S.grad_node_features as scratch (already zeroed below)
+            S.grad_node_features, stream);  // reuse S.grad_node_features as scratch
         // Layer 1 backward (with epilogue):
         launch_mace_radial_mlp_layer_force_adjoint(
             batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
             1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
             /*apply_silu_n2m_inverse*/true,
+            /*accumulate*/false,
             S.radial_mlp_hidden_1, L.radial_mlp_w1, S.grad_node_features,
             S.edge_messages, stream);
-        // Layer 0 backward (with epilogue): outputs into grad_radial_basis (overwrite).
+        // Layer 0 backward (with epilogue): grad_radial_basis += contribution.
+        // Both interaction layers' radial MLPs share the same radial_basis input,
+        // so we ACCUMULATE to preserve the previous layer's contribution.
         launch_mace_radial_mlp_layer_force_adjoint(
             batch.n_edges, arch.n_radial, radial_mlp_hidden_dim,
             1.0f / sqrtf(static_cast<float>(arch.n_radial)),
             /*apply_silu_n2m_inverse*/true,
+            /*accumulate*/true,
             S.radial_mlp_hidden_0, L.radial_mlp_w0, S.edge_messages,
             S.grad_radial_basis, stream);
 
@@ -1169,6 +1143,15 @@ inline void mace_inference_run_force_adjoint(
         launch_mace_extract_l0_irrep_block_force_adjoint(
             batch.n_atoms, arch.n_channels, irrep_dim,
             S.grad_node_scalar_invariants, S.grad_node_features, stream);
+
+        // 3o. (layer-N >= 1) Merge in the residual contribution we staged at
+        //     step 3b: add the scalar `grad_layer_residual_l0_scratch` onto
+        //     the L=0 slot of `grad_node_features` (the layer-input gradient).
+        if (layer_index >= 1u) {
+            launch_mace_extract_l0_irrep_block_force_adjoint(
+                batch.n_atoms, arch.n_channels, irrep_dim,
+                S.grad_layer_residual_l0_scratch, S.grad_node_features, stream);
+        }
 
         // 3n. Hand off to the previous layer:
         //     The output of the previous layer (or the embedding for layer 0)

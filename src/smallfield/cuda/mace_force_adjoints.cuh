@@ -1479,6 +1479,7 @@ __global__ void mace_radial_mlp_layer_force_adjoint_kernel(
     std::uint32_t n_out,
     float scale,
     bool apply_silu_n2m_inverse,
+    bool accumulate,                 // true: grad_in += result; false: grad_in = result
     float const *post_activation,    // [n_rows, n_out]   (post-silu_n2m if epilogue)
     float const *weight,             // [n_in, n_out]
     float const *grad_out,           // [n_rows, n_out]
@@ -1498,7 +1499,9 @@ __global__ void mace_radial_mlp_layer_force_adjoint_kernel(
         }
         accumulator += du * weight[static_cast<std::uint64_t>(input_index) * n_out + out_index];
     }
-    grad_in[static_cast<std::uint64_t>(row_index) * n_in + input_index] = scale * accumulator;
+    std::uint64_t const out_offset = static_cast<std::uint64_t>(row_index) * n_in + input_index;
+    float const result = scale * accumulator;
+    grad_in[out_offset] = accumulate ? (grad_in[out_offset] + result) : result;
 }
 
 inline void launch_mace_radial_mlp_layer_force_adjoint(
@@ -1507,6 +1510,7 @@ inline void launch_mace_radial_mlp_layer_force_adjoint(
     std::uint32_t n_out,
     float scale,
     bool apply_silu_n2m_inverse,
+    bool accumulate,
     float const *post_activation,
     float const *weight,
     float const *grad_out,
@@ -1518,7 +1522,7 @@ inline void launch_mace_radial_mlp_layer_force_adjoint(
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_rows, (n_in + block_dim_x - 1u) / block_dim_x, 1);
     mace_radial_mlp_layer_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_rows, n_in, n_out, scale, apply_silu_n2m_inverse,
+        n_rows, n_in, n_out, scale, apply_silu_n2m_inverse, accumulate,
         post_activation, weight, grad_out, grad_in);
 }
 

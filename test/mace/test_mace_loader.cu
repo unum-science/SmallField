@@ -82,16 +82,25 @@ struct golden_trace_t {
 
 void diff_report(char const *label, double const *ref, float const *got, std::size_t n) {
     double max_abs = 0.0, ss = 0.0, mean_abs = 0.0;
+    double ref_max = 0.0, ref_ss = 0.0;
+    double got_max = 0.0, got_ss = 0.0;
     for (std::size_t i = 0; i < n; ++i) {
         double const d = std::abs(ref[i] - static_cast<double>(got[i]));
         max_abs = std::max(max_abs, d);
         ss += d * d;
         mean_abs += d;
+        ref_max = std::max(ref_max, std::abs(ref[i]));
+        ref_ss += ref[i] * ref[i];
+        got_max = std::max(got_max, std::abs(static_cast<double>(got[i])));
+        got_ss += static_cast<double>(got[i]) * static_cast<double>(got[i]);
     }
     double const rms = std::sqrt(ss / static_cast<double>(n));
+    double const ref_rms = std::sqrt(ref_ss / static_cast<double>(n));
+    double const got_rms = std::sqrt(got_ss / static_cast<double>(n));
     mean_abs /= static_cast<double>(n);
-    std::printf("  %-32s  max_abs=%.3e  rms=%.3e  mean_abs=%.3e  (n=%zu)\n",
-                label, max_abs, rms, mean_abs, n);
+    std::printf("  %-32s  max_abs=%.3e  rms=%.3e  mean_abs=%.3e  ref_rms=%.3e  got_rms=%.3e  (n=%zu)\n",
+                label, max_abs, rms, mean_abs, ref_rms, got_rms, n);
+    (void)ref_max; (void)got_max;
 }
 
 void run_one(smallfield::parameters::mace_weights_t const &W,
@@ -225,6 +234,69 @@ void run_one(smallfield::parameters::mace_weights_t const &W,
     std::printf("  %-32s  ref=%14.6f  got=%14.6f  diff=%.3e\n",
                 "energy (eV)", ref_energy, static_cast<double>(h_energy),
                 std::abs(ref_energy - static_cast<double>(h_energy)));
+
+    // Force-adjoint validation against the grad_positions golden.
+    //   forces[a, k]      = -grad_positions[a, k]
+    //   ref grad_positions = MACE Python torch.autograd.grad(E, positions)
+    //   We compare per-atom force RMS in eV/Å; ≤ 1 meV/Å is the plan target.
+    smallfield::cuda::mace_inference_run_force_adjoint(arch, W.device(), batch, S, /*stream*/0);
+    cudaDeviceSynchronize();
+    std::vector<float> h_forces(n_atoms * 3u);
+    cudaMemcpy(h_forces.data(), S.forces, h_forces.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    if (gt.tensors.count("grad_positions")) {
+        // forces = -grad_positions in the Python golden.
+        auto const &grad_pos = gt.tensors.at("grad_positions");
+        std::vector<double> ref_forces(grad_pos.size());
+        for (std::size_t i = 0; i < grad_pos.size(); ++i) ref_forces[i] = -grad_pos[i];
+        diff_report("forces (vs -grad_positions)", ref_forces.data(), h_forces.data(), n_atoms * 3u);
+        // Per-atom RMS: sqrt(mean over atoms of |f - f_ref|^2 summed over xyz).
+        double accumulator_sq = 0.0;
+        for (std::uint32_t a = 0; a < n_atoms; ++a) {
+            double const dxv = h_forces[3 * a + 0] - ref_forces[3 * a + 0];
+            double const dyv = h_forces[3 * a + 1] - ref_forces[3 * a + 1];
+            double const dzv = h_forces[3 * a + 2] - ref_forces[3 * a + 2];
+            accumulator_sq += dxv * dxv + dyv * dyv + dzv * dzv;
+        }
+        double const rms_per_atom_eV_per_A = std::sqrt(accumulator_sq / static_cast<double>(n_atoms));
+        std::printf("  %-32s  per-atom force RMS = %.3e eV/Å (target ≤ 1e-3)\n",
+                    "force adjoint", rms_per_atom_eV_per_A);
+        // First few atoms: print ref vs got side-by-side to expose sign/scale errors.
+        std::printf("    ref[0..3]:");
+        for (std::uint32_t a = 0; a < std::min<std::uint32_t>(3u, n_atoms); ++a)
+            std::printf(" (%.4f,%.4f,%.4f)", ref_forces[3*a+0], ref_forces[3*a+1], ref_forces[3*a+2]);
+        std::printf("\n    got[0..3]:");
+        for (std::uint32_t a = 0; a < std::min<std::uint32_t>(3u, n_atoms); ++a)
+            std::printf(" (%.4f,%.4f,%.4f)", h_forces[3*a+0], h_forces[3*a+1], h_forces[3*a+2]);
+        std::printf("\n");
+
+        // Dump intermediate gradients to compare against the golden — helps
+        // localise which path is broken when the final forces don't match.
+        if (gt.tensors.count("grad_radial_basis")) {
+            std::vector<float> h_grad_rb(n_edges * arch.n_radial);
+            cudaMemcpy(h_grad_rb.data(), S.grad_radial_basis,
+                       h_grad_rb.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            diff_report("grad_radial_basis", gt.tensors.at("grad_radial_basis").data(),
+                        h_grad_rb.data(), n_edges * arch.n_radial);
+        }
+        if (gt.tensors.count("grad_sph_harm")) {
+            std::vector<float> h_grad_sph(n_edges * 16u);
+            cudaMemcpy(h_grad_sph.data(), S.grad_sph_harm,
+                       h_grad_sph.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            diff_report("grad_sph_harm", gt.tensors.at("grad_sph_harm").data(),
+                        h_grad_sph.data(), n_edges * 16u);
+        }
+        for (std::uint32_t k = 0; k < arch.num_interactions && k < 2u; ++k) {
+            std::string key = "grad_node_features_layer_" + std::to_string(k);
+            if (gt.tensors.count(key)) {
+                // Our internal grad_node_features mid-loop is overwritten between
+                // layers, so we can only easily compare the final layer's value
+                // captured at end of the reverse pass — not implemented here yet.
+                (void)key;
+            }
+        }
+    } else {
+        std::printf("  (no grad_positions golden — skipping force adjoint diff)\n");
+    }
 
     cudaFree(d_pos); cudaFree(d_src); cudaFree(d_dst);
     cudaFree(d_atom_el); cudaFree(d_graph_of_atom);
