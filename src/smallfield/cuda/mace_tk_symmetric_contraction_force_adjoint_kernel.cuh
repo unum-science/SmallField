@@ -230,8 +230,13 @@ __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
         // compiler in charge keeps the live-range short and avoids spills.
         // Only the innermost k loop is unrolled — that fits in registers and
         // exposes 16 independent FMA chains via dx_local[k]/dx_local[i]/dx_local[j].
+        // A modest #pragma unroll 4 on the j loop gives 4 independent (j-stride)
+        // FMA chains per i iteration without exhausting registers (kernel stays
+        // around 64 regs, no spill).
+        #pragma unroll 4
         for (int irrep_index_i = 0; irrep_index_i < irrep_dim_k; ++irrep_index_i) {
             float const x_i = atom_irrep_row[irrep_index_i];
+            #pragma unroll 16
             for (int irrep_index_j = 0; irrep_index_j < irrep_dim_k; ++irrep_index_j) {
                 float const x_j = atom_irrep_row[irrep_index_j];
                 float const x_ij = x_i * x_j;
