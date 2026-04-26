@@ -108,16 +108,28 @@ __device__ __forceinline__ unsigned int irrep_block_index_for_component_(unsigne
     return 3u;
 }
 
+/// Identity / type-converting bf16 cast — used inside the templated input
+/// loader so the bf16 path skips the `__float2bfloat16_rn` round-trip.
+__device__ __forceinline__ __nv_bfloat16 input_to_bf16_(float v) {
+    return __float2bfloat16_rn(v);
+}
+__device__ __forceinline__ __nv_bfloat16 input_to_bf16_(__nv_bfloat16 v) {
+    return v;
+}
+
 /**
  *  @brief Stage the per-atom input slab `[c_in, irrep_dim] = [96, 16]`
- *         from fp32 global into bf16 shared memory.
+ *         into bf16 shared memory.  Templated on the input element type
+ *         (`float` or `__nv_bfloat16`); the bf16 specialisation skips the
+ *         `__float2bfloat16_rn` conversion.
  *
  *  Out-of-bounds atoms (`atom_index >= n_atoms`) are caught at kernel entry
  *  so this loader assumes a valid `atom_index`.
  */
+template <typename input_t>
 __device__ __forceinline__ void load_atom_input_slab_(
     shared_tile_input_t &dst_input_tile,
-    float const *input_global,
+    input_t const *input_global,
     std::uint32_t atom_index
 ) {
     int const thread_id = threadIdx.x;
@@ -128,10 +140,10 @@ __device__ __forceinline__ void load_atom_input_slab_(
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / irrep_dim_total_k;  // c_in
         int const col_in_tile = linear_index % irrep_dim_total_k;  // m
-        float const value = input_global[atom_input_offset
+        input_t const value = input_global[atom_input_offset
                                           + static_cast<std::uint64_t>(row_in_tile) * irrep_dim_total_k
                                           + col_in_tile];
-        dst_input_tile[{row_in_tile, col_in_tile}] = __float2bfloat16_rn(value);
+        dst_input_tile[{row_in_tile, col_in_tile}] = input_to_bf16_(value);
     }
 }
 
@@ -265,16 +277,18 @@ __device__ __forceinline__ void store_irrep_block_with_guard_(
  *        load the Z-indirect weight slab → mma_AtB → scale → guarded bf16
  *        store with m-block masking.
  */
+template <typename input_t>
 __global__ void mace_tk_element_conditioned_residual_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,                // == 96 for MACE-OFF-small
     std::uint32_t n_elements,                   // == 10 for MACE-OFF23
     std::uint32_t n_channels_out,               // == 96 for MACE-OFF-small
     std::uint32_t active_irrep_block_count,     // 1 (L=0 only) or 4
-    float path_weight_scale,                    // 1 / sqrt(c_in * n_elements)
+    float path_weight_scale,                    // 1 / sqrt(c_in * n_elements) [optionally premultiplied
+                                                //                              by 1/avg_num_neighbors]
     std::int32_t const *__restrict__ atom_element,
     float const *__restrict__ weights_fp32,
-    float const *__restrict__ input_fp32,
+    input_t const *__restrict__ input_global,   // float OR __nv_bfloat16
     __nv_bfloat16 *__restrict__ output_bf16
 ) {
     extern __shared__ kittens::alignment_dummy raw_shared_memory[];
@@ -292,7 +306,7 @@ __global__ void mace_tk_element_conditioned_residual_kernel(
     int const atom_element_index = atom_element[atom_index];
 
     // Stage the per-atom input slab once.
-    load_atom_input_slab_(shared_input_tile, input_fp32, atom_index);
+    load_atom_input_slab_<input_t>(shared_input_tile, input_global, atom_index);
     kittens::warpgroup::sync(0);
 
     register_accumulator_t accumulator;
@@ -419,14 +433,14 @@ inline bool launch_mace_tk_element_conditioned_residual(
     constexpr std::size_t shared_memory_bytes_k = 32 * 1024;
 
     cudaFuncSetAttribute(
-        mace_tk_element_conditioned_residual_kernel,
+        mace_tk_element_conditioned_residual_kernel<float>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(shared_memory_bytes_k));
 
     dim3 const grid(n_atoms, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
-    mace_tk_element_conditioned_residual_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
+    mace_tk_element_conditioned_residual_kernel<float><<<grid, block, shared_memory_bytes_k, stream>>>(
         n_atoms,
         n_channels_in,
         n_elements,
@@ -436,6 +450,80 @@ inline bool launch_mace_tk_element_conditioned_residual(
         atom_element,
         weights_fp32,
         input_fp32,
+        output_bf16);
+    return true;
+}
+
+/**
+ *  @brief Bf16-input variant of `launch_mace_tk_element_conditioned_residual` —
+ *         Megakernel B Phase β-1.
+ *
+ *  Reads input directly from a bf16 buffer (typically the output of
+ *  `launch_mace_tk_per_irrep_linear`, which already emits bf16) instead of
+ *  going through an fp32 cast bridge.  Folds an additional uniform
+ *  `pre_scale_multiplier` into the path-weight so the upstream
+ *  `1 / avg_num_neighbors` scale step can also be skipped.  The fused
+ *  effective scale is `pre_scale_multiplier / sqrt(c_in * n_elements)`.
+ *
+ *  Wins relative to the fp32 path:
+ *    - no `bf16 → fp32` cast on the input (`n_atoms × c_in × 16` element
+ *      bandwidth = ~96 MB at the small/medium production shape),
+ *    - no `scale_in_place` on the fp32 buffer (~192 MB read+write),
+ *    - the bf16 input slab still gets converted to bf16 in the shared
+ *      tile, but the conversion is a no-op identity at the hardware
+ *      level — the per-thread `__float2bfloat16_rn` becomes a register
+ *      move.
+ *
+ *  Same shape constraints as the fp32 launcher: `c_in == c_out == 96`
+ *  for MACE-OFF-small (returns false otherwise so the caller falls back
+ *  to the fp32 chain).
+ */
+inline bool launch_mace_tk_element_conditioned_residual_bf16_input(
+    std::uint32_t n_atoms,
+    std::uint32_t n_channels_in,
+    std::uint32_t n_elements,
+    std::uint32_t n_channels_out,
+    std::uint32_t active_irrep_block_count,
+    std::int32_t const *atom_element,
+    float const *weights_fp32,
+    __nv_bfloat16 const *input_bf16,
+    float pre_scale_multiplier,        // typically 1 / avg_num_neighbors
+    __nv_bfloat16 *output_bf16,
+    cudaStream_t stream
+) {
+    if (n_atoms == 0u) return true;
+    if (active_irrep_block_count == 0u) return false;
+    if (active_irrep_block_count > 4u) return false;
+    if (n_channels_in != static_cast<std::uint32_t>(
+            mace_tk_element_conditioned_residual_detail_::channels_in_k)) return false;
+    if (n_channels_out != static_cast<std::uint32_t>(
+            mace_tk_element_conditioned_residual_detail_::channels_out_k)) return false;
+
+    using namespace mace_tk_element_conditioned_residual_detail_;
+
+    float const path_weight_scale = pre_scale_multiplier
+        / sqrtf(static_cast<float>(n_channels_in) * static_cast<float>(n_elements));
+
+    constexpr std::size_t shared_memory_bytes_k = 32 * 1024;
+
+    cudaFuncSetAttribute(
+        mace_tk_element_conditioned_residual_kernel<__nv_bfloat16>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shared_memory_bytes_k));
+
+    dim3 const grid(n_atoms, 1, 1);
+    dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
+
+    mace_tk_element_conditioned_residual_kernel<__nv_bfloat16><<<grid, block, shared_memory_bytes_k, stream>>>(
+        n_atoms,
+        n_channels_in,
+        n_elements,
+        n_channels_out,
+        active_irrep_block_count,
+        path_weight_scale,
+        atom_element,
+        weights_fp32,
+        input_bf16,
         output_bf16);
     return true;
 }

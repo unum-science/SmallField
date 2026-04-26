@@ -782,79 +782,103 @@ inline void mace_inference_forward(
 
         // 3e. linear_post_tp: per-irrep channel mix on all 4 L blocks.
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
-        // TK 4-block fused linear: one CTA per 4 atoms × 96 c_out, single
-        // shared input tile, four WGMMA passes (one per L block).  Output
-        // bf16 → cast back to fp32 in the existing node_features buffer.
-        // Returns false if the channel count doesn't match the templated
-        // kernel — in that case fall back to the fp32 reference path
-        // (medium 128 ch and large 224 ch fall here until Transform #4 lands).
+        // TK 4-block fused linear writes bf16 into
+        // `S.tk_node_features_post_linear_bf16`.  Returns false if the channel
+        // count doesn't match the templated kernel; in that case fall back to
+        // the fp32 reference path.
         bool const tk_post_tp_ok = launch_mace_tk_per_irrep_linear(
             batch.n_atoms, arch.n_channels, arch.n_channels,
             /*active_irrep_block_count*/4u,
             L.linear_post_tp_w,
             S.node_features_scratch,
             S.tk_node_features_post_linear_bf16, stream);
-        if (tk_post_tp_ok) {
-            launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
-                                     S.tk_node_features_post_linear_bf16,
-                                     S.node_features, stream);
-        } else {
-            launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
-                                          irrep_dim, /*active_irrep_block_count*/4u,
-                                          L.linear_post_tp_w, S.node_features_scratch,
-                                          S.node_features, stream);
-        }
 #else
+        bool const tk_post_tp_ok = false;
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
                                       irrep_dim, /*active_irrep_block_count*/4u,
                                       L.linear_post_tp_w, S.node_features_scratch, S.node_features, stream);
 #endif
 
-
-        // 3f. Divide by avg_num_neighbors (in-place scale of node_features).
-        if (avg_num_neighbors != 1.0f) {
-            launch_mace_scale(batch.n_atoms * arch.n_channels * irrep_dim,
-                              S.node_features, 1.0f / avg_num_neighbors, S.node_features, stream);
-        }
-
-        // 3g. skip_tp: layer-0 form is applied to the message AFTER linear_post_tp;
-        //     layer-1 form is applied to the ORIGINAL node features (residual style).
-        //     For Phase 1 we wire only the layer-0 form (in-place message conditioning).
-        //     The layer-1 residual is a one-line additional kernel — a follow-up.
-        if (layer_index == 0u) {
-            std::uint32_t const active_irrep_block_count = 4u;
+        // ------------------------------------------------------------------
+        //  Megakernel B — Phase β-1: fused bf16-input element-conditioned
+        //  residual for layer 0.  Replaces the {bf16→fp32 cast} + {scale by
+        //  1/avg_num_neighbors} + {fp32 element_residual} chain with a single
+        //  bf16-input launch that folds the scale into its path_weight.
+        //
+        //  Saves: 1 cast (input bridge) + 1 scale launch ≈ 100-200 µs / inference.
+        //  When the launcher returns false (channel-count mismatch, or
+        //  tk_post_tp_ok=false), falls through to the legacy chain below.
+        // ------------------------------------------------------------------
+        bool fused_phase_beta_1_done = false;
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
-            // TK element-conditioned residual: same algebra as
-            // `mace_element_conditioned_residual_kernel` but using the
-            // Z-indirect WGMMA path.  Returns false on non-96 channels;
-            // fall back to the fp32 reference path in that case.
-            bool tk_skip_tp_ok = launch_mace_tk_element_conditioned_residual(
+        if (layer_index == 0u && tk_post_tp_ok) {
+            float const pre_scale = (avg_num_neighbors != 1.0f && avg_num_neighbors != 0.0f)
+                                  ? (1.0f / avg_num_neighbors) : 1.0f;
+            bool const tk_residual_bf16_ok = launch_mace_tk_element_conditioned_residual_bf16_input(
                 batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
                 /*active_irrep_block_count*/4u,
                 batch.atom_element, L.skip_tp_w,
-                S.node_features,
+                S.tk_node_features_post_linear_bf16,
+                pre_scale,
                 S.tk_node_features_post_residual_bf16, stream);
-            if (tk_skip_tp_ok) {
+            if (tk_residual_bf16_ok) {
                 launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
                                          S.tk_node_features_post_residual_bf16,
                                          S.node_features, stream);
-            } else {
+                fused_phase_beta_1_done = true;
+            }
+        }
+#endif
+
+        // Legacy chain (runs whenever the fused phase β-1 didn't fire — layer
+        // index >= 1, fp32 fallback, or shape mismatch on element_residual).
+        if (!fused_phase_beta_1_done) {
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+            if (tk_post_tp_ok) {
+                launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
+                                         S.tk_node_features_post_linear_bf16,
+                                         S.node_features, stream);
+            }
+#endif
+            // 3f. Divide by avg_num_neighbors (in-place scale of node_features).
+            if (avg_num_neighbors != 1.0f) {
+                launch_mace_scale(batch.n_atoms * arch.n_channels * irrep_dim,
+                                  S.node_features, 1.0f / avg_num_neighbors, S.node_features, stream);
+            }
+
+            // 3g. skip_tp: layer-0 form only.  Layer-N residual is a separate
+            // kernel applied later (see step 3i-bis).
+            if (layer_index == 0u) {
+                std::uint32_t const active_irrep_block_count = 4u;
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+                // Try TK fp32-input element_residual; fall back to fp32 ref on shape mismatch.
+                bool tk_skip_tp_ok = launch_mace_tk_element_conditioned_residual(
+                    batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
+                    /*active_irrep_block_count*/4u,
+                    batch.atom_element, L.skip_tp_w,
+                    S.node_features,
+                    S.tk_node_features_post_residual_bf16, stream);
+                if (tk_skip_tp_ok) {
+                    launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
+                                             S.tk_node_features_post_residual_bf16,
+                                             S.node_features, stream);
+                } else {
+                    launch_mace_skip_tp(batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
+                                         irrep_dim, active_irrep_block_count, batch.atom_element,
+                                         L.skip_tp_w, S.node_features, S.node_features_scratch, stream);
+                    cudaMemcpyAsync(S.node_features, S.node_features_scratch,
+                                    batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, stream);
+                }
+#else
                 launch_mace_skip_tp(batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
                                      irrep_dim, active_irrep_block_count, batch.atom_element,
                                      L.skip_tp_w, S.node_features, S.node_features_scratch, stream);
                 cudaMemcpyAsync(S.node_features, S.node_features_scratch,
                                 batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float),
                                 cudaMemcpyDeviceToDevice, stream);
-            }
-#else
-            launch_mace_skip_tp(batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
-                                 irrep_dim, active_irrep_block_count, batch.atom_element,
-                                 L.skip_tp_w, S.node_features, S.node_features_scratch, stream);
-            // Copy back to node_features (or just use scratch as the "current" buffer next).
-            cudaMemcpyAsync(S.node_features, S.node_features_scratch,
-                            batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
 #endif
+            }
         }
 
         // Save the pre-symmetric-contraction node_features (post-skip_tp /
