@@ -58,6 +58,7 @@
 #  include "smallfield/cuda/mace_tk_symmetric_contraction_force_adjoint_kernel.cuh"
 #  include "smallfield/cuda/mace_tk_radial_mlp_force_adjoint_kernel.cuh"
 #  include "smallfield/cuda/mace_tk_scalar_matmul_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_scalar_matmul_force_adjoint_kernel.cuh"
 #endif
 
 namespace smallfield::cuda {
@@ -1182,12 +1183,26 @@ inline void mace_inference_run_force_adjoint(
         //     linear_up backward writes here at step 3l).
         cudaMemsetAsync(S.grad_node_scalar_invariants, 0,
                         batch.n_atoms * arch.n_channels * sizeof(float), stream);
-        launch_mace_linear_per_irrep_force_adjoint(
+        // Megakernel B Phase δ: TK backward scalar matmul.  The kernel's
+        // `+= scaled @` semantics match the fp32 reference contract; the
+        // memset above zero-inits grad_node_scalar_invariants, so this first
+        // call effectively writes (rather than accumulates).
+        bool product_linear_bwd_via_tk = false;
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        product_linear_bwd_via_tk = launch_mace_tk_scalar_matmul_force_adjoint(
             batch.n_atoms, arch.n_channels, arch.n_channels,
-            /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
             L.product_linear_w,
             S.grad_node_features_l0_only,
             S.grad_node_scalar_invariants, stream);
+#endif
+        if (!product_linear_bwd_via_tk) {
+            launch_mace_linear_per_irrep_force_adjoint(
+                batch.n_atoms, arch.n_channels, arch.n_channels,
+                /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+                L.product_linear_w,
+                S.grad_node_features_l0_only,
+                S.grad_node_scalar_invariants, stream);
+        }
 
         // 3d. Symmetric contraction adjoint:
         //     grad_node_features (full irreps, post-skip_tp) gets the gradient
@@ -1463,12 +1478,23 @@ inline void mace_inference_run_force_adjoint(
         //     (overwrite — re-zero first).
         cudaMemsetAsync(S.grad_node_scalar_invariants, 0,
                         batch.n_atoms * arch.n_channels * sizeof(float), stream);
-        launch_mace_linear_per_irrep_force_adjoint(
+        // Megakernel B Phase δ: TK backward scalar matmul.
+        bool linear_up_bwd_via_tk = false;
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        linear_up_bwd_via_tk = launch_mace_tk_scalar_matmul_force_adjoint(
             batch.n_atoms, arch.n_channels, arch.n_channels,
-            /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
             L.linear_up_w,
             S.grad_node_features_l0_only,
             S.grad_node_scalar_invariants, stream);
+#endif
+        if (!linear_up_bwd_via_tk) {
+            launch_mace_linear_per_irrep_force_adjoint(
+                batch.n_atoms, arch.n_channels, arch.n_channels,
+                /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+                L.linear_up_w,
+                S.grad_node_features_l0_only,
+                S.grad_node_scalar_invariants, stream);
+        }
 
         // 3m. extract_l0 adjoint: scalar gradient → L=0 slot of
         //     grad_node_features (which is the layer-input gradient
