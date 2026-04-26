@@ -189,11 +189,28 @@ class context_t {
      *  optimisation roadmap replaces with a fully GPU-resident captured
      *  graph that stays inside the device for the entire relaxation.
      *
-     *  @param[in,out] positions_xyz_inout [n_atoms × 3] fp32 device-resident.
-     *  @param[out]    energies_out        [n_graphs]    fp32 device-resident.
+     *  @param[in,out] positions_xyz_inout    [n_atoms × 3] fp32 device-resident.
+     *  @param[out]    energies_out           [n_graphs]    fp32 device-resident.
+     *  @param[out]    step_count_per_mol_out [n_graphs] uint32 device-resident,
+     *                                        OPTIONAL (may be nullptr).  If
+     *                                        provided, after the relaxation each
+     *                                        slot holds the 1-based step index at
+     *                                        which that conformer first converged
+     *                                        (`fmax ≤ config.fmax_eV_per_A`), or 0
+     *                                        if the conformer didn't converge in
+     *                                        `config.num_steps`.  Lets callers
+     *                                        replace "p95 batch" projection models
+     *                                        with real per-mol step distributions.
+     *  @param[out]    final_fmax_per_mol_out [n_graphs] fp32 device-resident,
+     *                                        OPTIONAL (may be nullptr).  If
+     *                                        provided, holds the per-conformer
+     *                                        max-abs force at the last step that
+     *                                        ran for that conformer (in eV/Å).
      */
     [[nodiscard]] status_t refine_batch(weights_t const &weights, batch_view_t batch, relax_config_t const &config,
-                                        float *positions_xyz_inout, float *energies_out);
+                                        float *positions_xyz_inout, float *energies_out,
+                                        std::uint32_t *step_count_per_mol_out = nullptr,
+                                        float *final_fmax_per_mol_out = nullptr);
 
     /** @brief CUDA stream the context schedules its work on. */
     cudaStream_t stream() const noexcept;

@@ -77,13 +77,19 @@ __device__ __forceinline__ float warp_reduce_max_abs_(float v) {
  *  @param  step_size GD step size; 0.01 is a reasonable default for MACE-OFF.
  *  @param  fmax_per_conformer [n_graphs] OUTPUT: latest per-conformer fmax.
  *  @param  converged_flags [n_graphs] IN/OUT: 0 = still relaxing, 1 = converged.
+ *  @param  step_at_convergence [n_graphs] IN/OUT: step index (1-based) at which
+ *          each conformer FIRST converged; 0 if still relaxing or never converged.
+ *          May be nullptr if the caller doesn't want per-mol step counts.
+ *  @param  step_index_one_based 1-based index of the current step (= loop iter + 1).
  */
 inline __global__ void mace_lbfgs_step_kernel(std::uint32_t n_graphs,
                                               std::int32_t const *__restrict__ graph_atom_offsets,
                                               float const *__restrict__ forces, float *__restrict__ positions,
                                               float fmax_eV_per_A_threshold, float step_size,
                                               float *__restrict__ fmax_per_conformer,
-                                              std::uint8_t *__restrict__ converged_flags) {
+                                              std::uint8_t *__restrict__ converged_flags,
+                                              std::uint32_t *__restrict__ step_at_convergence,
+                                              std::uint32_t step_index_one_based) {
     std::uint32_t const graph_index = blockIdx.x;
     if (graph_index >= n_graphs) return;
 
@@ -112,7 +118,14 @@ inline __global__ void mace_lbfgs_step_kernel(std::uint32_t n_graphs,
 
     if (lane == 0) {
         fmax_per_conformer[graph_index] = fmax_warp;
-        if (fmax_warp <= fmax_eV_per_A_threshold) { converged_flags[graph_index] = 1u; }
+        if (fmax_warp <= fmax_eV_per_A_threshold) {
+            converged_flags[graph_index] = 1u;
+            // Record the step at which this conformer FIRST converged.  The
+            // outer flag-check above ensures we only land here once per
+            // conformer; subsequent steps short-circuit out and never
+            // overwrite the recorded step.
+            if (step_at_convergence != nullptr) { step_at_convergence[graph_index] = step_index_one_based; }
+        }
     }
 
     // If we just converged, skip the position update — the chain is at the
@@ -127,34 +140,42 @@ inline __global__ void mace_lbfgs_step_kernel(std::uint32_t n_graphs,
     }
 }
 
-/// Host launcher for `mace_lbfgs_step_kernel`.
+/// Host launcher for `mace_lbfgs_step_kernel`.  `step_at_convergence` may
+/// be nullptr; `step_index_one_based` is the 1-based index of the current
+/// LBFGS iteration (= outer loop's `step_index + 1`).
 inline void launch_mace_lbfgs_step(std::uint32_t n_graphs, std::int32_t const *graph_atom_offsets, float const *forces,
                                    float *positions, float fmax_eV_per_A_threshold, float step_size,
-                                   float *fmax_per_conformer, std::uint8_t *converged_flags, cudaStream_t stream) {
+                                   float *fmax_per_conformer, std::uint8_t *converged_flags,
+                                   std::uint32_t *step_at_convergence, std::uint32_t step_index_one_based,
+                                   cudaStream_t stream) {
     if (n_graphs == 0u) return;
     dim3 const grid(n_graphs, 1, 1);
     dim3 const block(32, 1, 1);
     mace_lbfgs_step_kernel<<<grid, block, 0, stream>>>(n_graphs, graph_atom_offsets, forces, positions,
                                                        fmax_eV_per_A_threshold, step_size, fmax_per_conformer,
-                                                       converged_flags);
+                                                       converged_flags, step_at_convergence, step_index_one_based);
 }
 
-/// Reset the converged flags to 0 (not converged).  Captured-graph callers
-/// run this once at the start of a relaxation; subsequent step kernels then
-/// flip flags to 1 as conformers converge.
+/// Reset the converged flags to 0 (not converged) and the per-graph step-at-
+/// convergence counters to 0 (sentinel for "still relaxing or never converged").
+/// Captured-graph callers run this once at the start of a relaxation;
+/// subsequent step kernels then flip flags to 1 + record the step at which
+/// each conformer first converged.  `step_at_convergence` may be nullptr.
 inline __global__ void mace_lbfgs_reset_converged_flags_kernel(std::uint32_t n_graphs,
-                                                               std::uint8_t *__restrict__ converged_flags) {
+                                                               std::uint8_t *__restrict__ converged_flags,
+                                                               std::uint32_t *__restrict__ step_at_convergence) {
     std::uint32_t const i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_graphs) return;
     converged_flags[i] = 0u;
+    if (step_at_convergence != nullptr) { step_at_convergence[i] = 0u; }
 }
 
 inline void launch_mace_lbfgs_reset_converged_flags(std::uint32_t n_graphs, std::uint8_t *converged_flags,
-                                                    cudaStream_t stream) {
+                                                    std::uint32_t *step_at_convergence, cudaStream_t stream) {
     if (n_graphs == 0u) return;
     constexpr std::uint32_t block = 256u;
     std::uint32_t const grid = (n_graphs + block - 1u) / block;
-    mace_lbfgs_reset_converged_flags_kernel<<<grid, block, 0, stream>>>(n_graphs, converged_flags);
+    mace_lbfgs_reset_converged_flags_kernel<<<grid, block, 0, stream>>>(n_graphs, converged_flags, step_at_convergence);
 }
 
 /// AND-reduce the per-conformer `converged_flags` into a single device byte.

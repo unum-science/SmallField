@@ -66,6 +66,13 @@
 
 namespace fs = std::filesystem;
 
+/// Defined in `smallfield_mace_refine_rdkit.cpp` (RDKit-backed).  Lives at the
+/// translation-unit's global namespace so the symbol mangles consistently
+/// across the two TUs that get linked into `smallfield_mace_refine`.  A test
+/// harness can stub this by linking a different TU that defines the same
+/// symbol.
+extern std::vector<int> resolve_atomic_numbers_from_smiles(std::string const &smiles, std::uint8_t expected_num_atoms);
+
 namespace {
 
 constexpr int MACE_OFF_SUPPORTED_Z[] = {1, 6, 7, 8, 9, 15, 16, 17, 35, 53};
@@ -191,12 +198,9 @@ struct row_pack_t {
 
 /// Resolve atomic numbers for one row's SMILES via RDKit.  Filters out atoms
 /// outside MACE-OFF's 10-element table and atomistically zeros the row's
-/// `refinable` flag.
-///
-/// In the production binary this would call into RDKit; we forward-declare
-/// the function here so the test harness can stub it without pulling RDKit.
-extern std::vector<int> resolve_atomic_numbers_from_smiles(std::string const &smiles, std::uint8_t expected_num_atoms);
-
+/// `refinable` flag.  The RDKit-backed implementation lives in
+/// `smallfield_mace_refine_rdkit.cpp`; the forward declaration is at the
+/// top of this TU (outside the anonymous namespace) so the symbol resolves.
 void prepare_row_pack_(std::string const &smiles, std::uint8_t num_atoms, std::span<__half const> coordinates_for_row,
                        row_pack_t &out) {
     out.num_atoms = num_atoms;
@@ -271,6 +275,14 @@ struct device_buffers_t {
     }
 };
 
+/// Helper to recover the row_pack_t array base from the shard for index math
+/// in the in-place writeback inside refine_one_batch_.  Set in process_shard_().
+thread_local row_pack_t const *current_row_pack_base_ = nullptr;
+row_pack_t const *shard_row_pack_base_(smallfield::cli::conformer_shard_data_t const &shard) {
+    (void)shard;
+    return current_row_pack_base_;
+}
+
 bool refine_one_batch_(smallfield::mace::context_t &mace_ctx, smallfield::mace::weights_t const &weights,
                        smallfield::mace::relax_config_t const &relax, std::span<row_pack_t> rows_in_batch,
                        smallfield::cli::conformer_shard_data_t &shard, std::vector<float> &per_row_eV_out,
@@ -314,6 +326,11 @@ bool refine_one_batch_(smallfield::mace::context_t &mace_ctx, smallfield::mace::
     cuda_alloc_copy(dev.edge_dst, edge_dst_flat);
     cuda_alloc_copy(dev.graph_of_atom, graph_of_atom_flat);
     cudaMalloc(reinterpret_cast<void **>(&dev.energies), rows_in_batch.size() * sizeof(float));
+    // Per-mol stats: step count at convergence (1-based; 0 = never) + final fmax.
+    std::uint32_t *dev_step_count = nullptr;
+    float *dev_final_fmax = nullptr;
+    cudaMalloc(reinterpret_cast<void **>(&dev_step_count), rows_in_batch.size() * sizeof(std::uint32_t));
+    cudaMalloc(reinterpret_cast<void **>(&dev_final_fmax), rows_in_batch.size() * sizeof(float));
 
     smallfield::mace::batch_view_t view {};
     view.n_atoms = total_atoms;
@@ -325,16 +342,46 @@ bool refine_one_batch_(smallfield::mace::context_t &mace_ctx, smallfield::mace::
     view.edge_target_atom = dev.edge_dst;
     view.graph_of_atom = dev.graph_of_atom;
 
-    [[maybe_unused]] auto const status = mace_ctx.refine_batch(weights, view, relax, dev.positions, dev.energies);
+    [[maybe_unused]] auto const status =
+        mace_ctx.refine_batch(weights, view, relax, dev.positions, dev.energies, dev_step_count, dev_final_fmax);
     if (status != smallfield::mace::status_t::success) {
         std::fprintf(stderr, "[smallfield_mace_refine] refine_batch failed (status=%u)\n",
                      static_cast<unsigned>(status));
+        cudaFree(dev_step_count);
+        cudaFree(dev_final_fmax);
         return false;
     }
 
     cudaMemcpy(positions_flat.data(), dev.positions, positions_flat.size() * sizeof(float), cudaMemcpyDeviceToHost);
     std::vector<float> energies_eV(rows_in_batch.size());
     cudaMemcpy(energies_eV.data(), dev.energies, energies_eV.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    // Per-mol convergence stats (D2H).  step_count[g] == 0 means the conformer
+    // didn't converge in `relax.num_steps`; otherwise it's the 1-based step at
+    // which `fmax ≤ relax.fmax_eV_per_A` was first observed.
+    std::vector<std::uint32_t> step_counts(rows_in_batch.size());
+    std::vector<float> final_fmax(rows_in_batch.size());
+    cudaMemcpy(step_counts.data(), dev_step_count, step_counts.size() * sizeof(std::uint32_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(final_fmax.data(), dev_final_fmax, final_fmax.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dev_step_count);
+    cudaFree(dev_final_fmax);
+    // Per-batch summary: step-count histogram + convergence rate.  Logged for
+    // throughput projection; writing to a per-shard sidecar JSON is a follow-up.
+    {
+        std::uint32_t n_converged = 0, max_steps_used = 0;
+        std::uint64_t sum_steps = 0;
+        for (auto sc : step_counts) {
+            if (sc > 0u) ++n_converged;
+            sum_steps += sc;
+            if (sc > max_steps_used) max_steps_used = sc;
+        }
+        std::fprintf(stdout, "[smallfield_mace_refine] batch=%zu converged=%u/%zu (%.1f%%) "
+                             "mean_steps=%.1f max_steps=%u\n",
+                     rows_in_batch.size(), n_converged, rows_in_batch.size(),
+                     100.0 * n_converged / static_cast<double>(rows_in_batch.size()),
+                     n_converged > 0u ? sum_steps / static_cast<double>(n_converged) : 0.0,
+                     max_steps_used);
+    }
 
     // Cast refined positions back to fp16 for the output parquet, write into
     // the shard's flat coordinate buffer at the right per-row offset.
@@ -355,18 +402,6 @@ bool refine_one_batch_(smallfield::mace::context_t &mace_ctx, smallfield::mace::
         atom_offset += row.num_atoms;
     }
     return true;
-}
-
-/// Helper to recover the row_pack_t array base from the shard for index math
-/// in the in-place writeback above.  Implementation in process_shard_().
-row_pack_t const *shard_row_pack_base_(smallfield::cli::conformer_shard_data_t const &) {
-    return nullptr; // overridden by a thread_local pointer set by process_shard_
-}
-
-thread_local row_pack_t const *current_row_pack_base_ = nullptr;
-row_pack_t const *shard_row_pack_base_(smallfield::cli::conformer_shard_data_t const &shard) {
-    (void)shard;
-    return current_row_pack_base_;
 }
 
 void process_shard_(fs::path const &input_path, fs::path const &output_path, smallfield::mace::context_t &mace_ctx,

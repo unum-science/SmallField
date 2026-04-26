@@ -212,7 +212,8 @@ inline void launch_gd_step_(std::uint32_t n_atoms, float step_size, float const 
 } // namespace
 
 status_t context_t::refine_batch(weights_t const &W, batch_view_t batch, relax_config_t const &config,
-                                 float *positions_xyz_inout, float *energies_out) {
+                                 float *positions_xyz_inout, float *energies_out,
+                                 std::uint32_t *step_count_per_mol_out, float *final_fmax_per_mol_out) {
     if (!W.is_loaded()) return status_t::weights_load_failed;
     if (!batch_fits_(p_->max_atoms, p_->max_edges, p_->max_graphs, batch)) return status_t::invalid_input;
     if (positions_xyz_inout == nullptr) return status_t::invalid_input;
@@ -246,7 +247,8 @@ status_t context_t::refine_batch(weights_t const &W, batch_view_t batch, relax_c
                                                                  batch_internal.graph_of_atom,
                                                                  p_->scratch.lbfgs_graph_atom_offsets, p_->stream);
     smallfield::cuda::launch_mace_lbfgs_reset_converged_flags(batch_internal.n_graphs,
-                                                              p_->scratch.lbfgs_converged_flags, p_->stream);
+                                                              p_->scratch.lbfgs_converged_flags,
+                                                              p_->scratch.lbfgs_step_at_convergence, p_->stream);
 
     // All-converged early-exit cadence.  Every `kCheckEvery` iterations we
     // AND-reduce `converged_flags` on the device, copy the byte to pinned
@@ -264,10 +266,14 @@ status_t context_t::refine_batch(weights_t const &W, batch_view_t batch, relax_c
         smallfield::cuda::mace_inference_run_force_adjoint(W_arch, W_device, batch_internal, p_->scratch, p_->stream);
 
         // GPU-resident LBFGS step + per-conformer fmax convergence check.
+        // `step_index_one_based = step_index + 1` so the recorded step count
+        // matches the human-readable "took N steps" semantics (1, 2, ...,
+        // num_steps; 0 = never converged).
         smallfield::cuda::launch_mace_lbfgs_step(batch_internal.n_graphs, p_->scratch.lbfgs_graph_atom_offsets,
                                                  p_->scratch.forces, positions_xyz_inout, config.fmax_eV_per_A,
                                                  config.step_size, p_->scratch.lbfgs_fmax_per_conformer,
-                                                 p_->scratch.lbfgs_converged_flags, p_->stream);
+                                                 p_->scratch.lbfgs_converged_flags,
+                                                 p_->scratch.lbfgs_step_at_convergence, step_index + 1u, p_->stream);
 
         // Periodic device-side AND-reduction of converged_flags + D2H probe.
         // Skip the final iter (we always do the trailing forward anyway).
@@ -288,6 +294,18 @@ status_t context_t::refine_batch(weights_t const &W, batch_view_t batch, relax_c
     smallfield::cuda::mace_inference_forward(W_arch, W_device, batch_internal, p_->scratch, p_->stream);
     cudaMemcpyAsync(energies_out, p_->scratch.energy, batch_internal.n_graphs * sizeof(float), cudaMemcpyDeviceToDevice,
                     p_->stream);
+
+    // Optional per-mol stats outputs.  Both copies are device-to-device, so
+    // the caller is responsible for the D2H step if they want host-readable
+    // values.  step_count = 0 means "did not converge in num_steps".
+    if (step_count_per_mol_out != nullptr) {
+        cudaMemcpyAsync(step_count_per_mol_out, p_->scratch.lbfgs_step_at_convergence,
+                        batch_internal.n_graphs * sizeof(std::uint32_t), cudaMemcpyDeviceToDevice, p_->stream);
+    }
+    if (final_fmax_per_mol_out != nullptr) {
+        cudaMemcpyAsync(final_fmax_per_mol_out, p_->scratch.lbfgs_fmax_per_conformer,
+                        batch_internal.n_graphs * sizeof(float), cudaMemcpyDeviceToDevice, p_->stream);
+    }
 
     cudaError_t const err = cudaGetLastError();
     if (err != cudaSuccess) return status_t::cuda_error;
