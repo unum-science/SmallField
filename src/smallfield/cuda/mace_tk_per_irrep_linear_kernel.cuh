@@ -133,9 +133,19 @@ struct per_irrep_linear_scales_t {
  *  their 16 rows so downstream WGMMA produces zero contributions which
  *  the per-atom store path then ignores via the same atom-index guard.
  */
+/// Identity / type-converting bf16 cast — used inside the templated input
+/// loader so the bf16 path skips the `__float2bfloat16_rn` round-trip.
+__device__ __forceinline__ __nv_bfloat16 input_to_bf16_(float v) {
+    return __float2bfloat16_rn(v);
+}
+__device__ __forceinline__ __nv_bfloat16 input_to_bf16_(__nv_bfloat16 v) {
+    return v;
+}
+
+template <typename input_t>
 __device__ __forceinline__ void load_input_tile_transposed_(
     shared_input_tile_t &dst_input_tile,
-    float const *input_global,
+    input_t const *input_global,
     std::uint32_t n_atoms,
     std::uint32_t base_atom_index,
     std::uint32_t n_channels_in_runtime,
@@ -151,7 +161,7 @@ __device__ __forceinline__ void load_input_tile_transposed_(
         int const m_in_atom      = m_row_in_tile % irrep_dim_total_k;
         std::uint32_t const atom_index = base_atom_index + static_cast<std::uint32_t>(atom_in_cta);
 
-        float value = 0.0f;
+        input_t value = input_t{};  // default zero (fp32 0.0 or bf16 0)
         // The caller's input is `[n_atoms, c_in, input_irrep_dim_runtime]`:
         //   - linear_up / product_linear pass `input_irrep_dim_runtime = 1`
         //     (a scalar feature stack — only m = 0 lives in DRAM),
@@ -168,7 +178,7 @@ __device__ __forceinline__ void load_input_tile_transposed_(
                 + static_cast<std::uint32_t>(m_in_atom);
             value = input_global[offset];
         }
-        dst_input_tile[{m_row_in_tile, channel_in_col}] = __float2bfloat16_rn(value);
+        dst_input_tile[{m_row_in_tile, channel_in_col}] = input_to_bf16_(value);
     }
 }
 
@@ -323,6 +333,7 @@ __device__ __forceinline__ void zero_inactive_block_m_rows_(
  *  blocks.  Inactive blocks (when `active_irrep_block_count < 4`) have
  *  their m-rows zeroed in the output instead.
  */
+template <typename input_t>
 __global__ void mace_tk_per_irrep_linear_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
@@ -331,7 +342,7 @@ __global__ void mace_tk_per_irrep_linear_kernel(
     std::uint32_t output_irrep_dim_runtime,
     std::uint32_t active_irrep_block_count,
     float const *__restrict__ weight_blocks_global,
-    float const *__restrict__ input_global,
+    input_t const *__restrict__ input_global,        // float OR __nv_bfloat16
     __nv_bfloat16 *__restrict__ output_global,
     per_irrep_linear_scales_t scales
 ) {
@@ -349,7 +360,7 @@ __global__ void mace_tk_per_irrep_linear_kernel(
     if (base_atom_index >= n_atoms) return;
 
     // Stage the per-CTA input slab once; reused across all L blocks below.
-    load_input_tile_transposed_(
+    load_input_tile_transposed_<input_t>(
         shared_input_tile,
         input_global,
         n_atoms, base_atom_index,
@@ -479,7 +490,7 @@ inline bool launch_mace_tk_per_irrep_linear(
     constexpr std::size_t shared_memory_bytes_k = 64 * 1024;  // generous, well under H100's 228 KB cap
 
     cudaFuncSetAttribute(
-        mace_tk_per_irrep_linear_kernel,
+        mace_tk_per_irrep_linear_kernel<float>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(shared_memory_bytes_k));
 
@@ -498,7 +509,7 @@ inline bool launch_mace_tk_per_irrep_linear(
     dim3 const grid(n_atom_tiles, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
-    mace_tk_per_irrep_linear_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
+    mace_tk_per_irrep_linear_kernel<float><<<grid, block, shared_memory_bytes_k, stream>>>(
         n_atoms,
         n_channels_in,
         n_channels_out,
@@ -507,6 +518,73 @@ inline bool launch_mace_tk_per_irrep_linear(
         active_irrep_block_count,
         weight_blocks_fp32,
         input_fp32,
+        output_bf16,
+        scales);
+    return true;
+}
+
+/**
+ *  @brief Bf16-input variant of `launch_mace_tk_per_irrep_linear` —
+ *         Megakernel B Phase β-3.  Reads input directly from a bf16 buffer
+ *         (typically the `S.tk_node_messages_full_irrep_bf16` produced by
+ *         the conv_tp_scatter fused kernel) instead of going through an
+ *         fp32 cast bridge.
+ *
+ *  Same `pre_scale_multiplier` semantics as the fp32 launcher (Phase β-2).
+ *  Same shape constraints (c_in == c_out == 96; non-96 returns false so
+ *  the caller falls back to the fp32 chain).
+ */
+inline bool launch_mace_tk_per_irrep_linear_bf16_input(
+    std::uint32_t n_atoms,
+    std::uint32_t n_channels_in,
+    std::uint32_t n_channels_out,
+    std::uint32_t active_irrep_block_count,
+    float const *weight_blocks_fp32,
+    __nv_bfloat16 const *input_bf16,
+    __nv_bfloat16 *output_bf16,
+    cudaStream_t stream,
+    float pre_scale_multiplier = 1.0f
+) {
+    if (n_atoms == 0u) return true;
+
+    using namespace mace_tk_per_irrep_linear_detail_;
+
+    if (n_channels_in  != static_cast<std::uint32_t>(channels_in_k) ||
+        n_channels_out != static_cast<std::uint32_t>(channels_out_k)) {
+        return false;
+    }
+    if (active_irrep_block_count == 0u || active_irrep_block_count > static_cast<std::uint32_t>(irrep_block_count_k)) {
+        return false;
+    }
+
+    per_irrep_linear_scales_t scales;
+    scales.path_weight = pre_scale_multiplier / sqrtf(static_cast<float>(n_channels_in));
+
+    constexpr std::size_t shared_memory_bytes_k = 64 * 1024;
+
+    cudaFuncSetAttribute(
+        mace_tk_per_irrep_linear_kernel<__nv_bfloat16>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shared_memory_bytes_k));
+
+    std::uint32_t const input_irrep_dim_runtime  =
+        (active_irrep_block_count == 1u) ? 1u : static_cast<std::uint32_t>(irrep_dim_total_k);
+    std::uint32_t const output_irrep_dim_runtime = static_cast<std::uint32_t>(irrep_dim_total_k);
+
+    std::uint32_t const n_atom_tiles = (n_atoms + static_cast<std::uint32_t>(atoms_per_cta_k) - 1u)
+                                       / static_cast<std::uint32_t>(atoms_per_cta_k);
+    dim3 const grid(n_atom_tiles, 1, 1);
+    dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
+
+    mace_tk_per_irrep_linear_kernel<__nv_bfloat16><<<grid, block, shared_memory_bytes_k, stream>>>(
+        n_atoms,
+        n_channels_in,
+        n_channels_out,
+        input_irrep_dim_runtime,
+        output_irrep_dim_runtime,
+        active_irrep_block_count,
+        weight_blocks_fp32,
+        input_bf16,
         output_bf16,
         scales);
     return true;

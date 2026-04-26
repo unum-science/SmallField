@@ -6,6 +6,79 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## MACE-OFF Megakernel B α–β-3 — 2026-04-26 — Full Chain Landed
+
+Megakernel B is the per-atom downstream-chain fusion sketched in the file header of `mace_tk_atom_chain_fused_kernel.cuh`.
+Six landed phases plus the scaffolding committed in α, in increasing order of kernel-time impact:
+
+| Phase | Commit       | What                                                          |
+| :---: | :----------- | :------------------------------------------------------------ |
+| α     | `9d1b53b`    | Scaffolding + design doc + no-op stub launcher                |
+| β-1   | `1e78b30`    | Bf16-input element_residual + fold scale into path_weight    |
+| β-2   | `683ed04`    | Pre-scale param on linear_post_tp; skip `launch_mace_scale` |
+| __γ__ | `f3b6611`    | __TK scalar matmul (M = 64 atoms) for L=0 linears (linear_up + product_linear) — replaces matmul_rowmajor brute force__ |
+| __δ__ | `3fca275`    | __TK backward scalar matmul (mm_ABt) — replaces fp32-ref `linear_per_irrep_irrep1_force_adjoint`__ |
+| ε     | `9648bf3`    | Wire existing TK element_residual backward at active=1 for layer-N residual chain |
+| β-3   | `814dbc2`    | Bf16-input linear_post_tp; skip cast bridge between conv_tp_scatter and linear |
+
+Cumulative measurement at batch=2048 × n_atoms=30 + forces + capture:
+
+| Stage             | ms/config | confs/sec | Δ vs prior | Δ vs multi-warp |
+| :---------------- | --------: | --------: | ---------: | --------------: |
+| Multi-warp (`15a04c2`)|   0.0473 |       891 |       —    |          —     |
+| + β-1             |   0.0471 |       896 |     +0.5 % |        +0.5 %  |
+| + β-2             |   0.0470 |       898 |     +0.2 % |        +0.8 %  |
+| + γ               |   0.0448 |       939 |     +4.6 % |        +5.4 %  |
+| + δ               |   0.0425 |       978 |     +4.2 % |        +9.8 %  |
+| + ε               |   0.0424 |       980 |     +0.2 % |       +10.0 %  |
+| __+ β-3__         |  __0.0421__ |   __~982__ |   +0.2 %   |     __+10.2 %__|
+
+The two load-bearing commits are γ and δ (the TK L=0 linear forward and backward) — together about 9 % of the cumulative gain.
+The cubic fp32 reference (`mace_matmul_rowmajor` + `linear_per_irrep_irrep1_force_adjoint`) that they replace was running at ~0.75 % of fp32 peak; a properly tiled WGMMA over `M = 64 atoms × K = c_in × N = c_out` reaches the expected 5-10× per-call speedup, even though each call only needs 1/16 of the m-rows (the L=0-only output) — the kernel reinterprets M as 64 atoms (not 4 atoms × 16 m-rows like the older `mace_tk_per_irrep_linear_kernel`), so every output row is real.
+
+### Symmetric-Contraction Stage-1 Segmented Polynomial — Investigated, Not Viable In-Session
+
+The roadmap's "mega-fusion / cueq parity" line names a Stage-1 segmented-polynomial decomposition as the path to closing the remaining gap.
+Spent time on this in-session and concluded it isn't buildable within a single working session.
+The blockers:
+
+- The order-3 ACE contraction `B[a, c] = Σ_{i,j,k} W3[Z, i, j, k, c] · X[a, c, i] · X[a, c, j] · X[a, c, k]` has the channel axis `c` as the __outer__ axis of every operand — all three X factors and W3 index it.
+  There is no shared K / N dimension that a WGMMA can amortise across; each (a, c) pair is an independent cubic form.
+- The natural decomposition into a polynomial monomial vector `m[a, c, idx ∈ [0, 816)]` × coefficient `W_poly[Z, c, idx]` → `B[a, c]` is a per-(a, c) inner product.
+  Tensor-core gains would require batching over an axis where the operand is shared — atoms share W3 only when they share `Z`, which means atom-binning by element first, which is multi-day infrastructure work.
+- cueq's actual implementation uses an internal `SegmentedPolynomial` primitive in `cuequivariance`; we can't replicate it directly without porting that primitive's runtime (which has its own dependencies on cuTe / WGMMA layout boilerplate).
+
+Short version: closing the cueq parity gap on symcontract requires either (a) atom-binning by element + per-Z batched WGMMA on grouped atoms, or (b) a port of the SegmentedPolynomial primitive.
+Both are multi-week, not single-session.
+
+### Where Time Goes Now — Post-β-3 NCU Breakdown
+
+| Kernel                                          | %      | Bottleneck |
+| ----------------------------------------------- | -----: | ---------- |
+| `mace_tk_symmetric_contraction` (forward)       | 24.4 % | FMA pipe (compute-saturated) |
+| `mace_tk_symmetric_contraction_force_adjoint`   | 14.8 % | TK multi-warp |
+| `mace_tk_element_conditioned_residual_force_adjoint` | 11.3 % | TK |
+| `mace_tk_conv_tp_scatter_force_adjoint`         |  8.9 % | 18 % barrier stalls |
+| `mace_tk_element_conditioned_residual` (forward, bf16-in) | 7.6 % | TK |
+| `mace_tk_conv_tp_scatter_segmented` (forward)   |  5.9 % | TK |
+| `mace_tk_per_irrep_linear` (forward)            |  5.1 % | TK |
+| `mace_tk_per_irrep_linear_force_adjoint`        |  4.6 % | TK |
+| `mace_radial_mlp_layer_force_adjoint` (n_in=8)  |  3.0 % | fp32 ref — tractable but needs a custom WGMMA-padded kernel |
+| `mace_inject_l0_irrep_block`                    |  2.6 % | bandwidth-bound utility |
+
+The top 8 are all on TK already.
+Remaining levers are:
+- __Symcontract restructure__ (~39 % of total): multi-week algorithmic rewrite as above.
+- __conv_tp_scatter barrier reduction__ (~9 %): the 18 % barrier stall on the backward is internal sync between the segment-reduction phases.
+  Restructuring is multi-day.
+- __n_in=8 radial_mlp backward TK port__ (3 %): the fp32 reference's one-thread-per-(row, c_in) launcher with `block_dim_x = 64` only populates 8 of 64 threads at n_in=8.
+  A WGMMA port with N_dim padded to 16 (with zero-fill for rows 8-15) would still beat the brute-force reference even with half the FMA throughput wasted on zeros.
+  Tractable as ~1 day of work.
+
+End of in-session optimisation cycle.
+Trajectory from session start (pre-multi-warp 724 c/s, 1.36 ms/relax) to end (982 c/s, 0.0421 ms/config kernel-only): __+35.6 % throughput__.
+Gap to cueq's 0.0307 ms/config is now __1.37×__ (was 1.95× pre-session).
+
 ## MACE-OFF Saturation Sweep at Large Batch — 2026-04-26
 
 After multi-warp landed and brought single-H100 throughput to ~890 c/s at the canonical batch=2048 × n_atoms=30 shape, the obvious follow-up was "do larger batches push higher".

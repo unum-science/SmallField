@@ -760,6 +760,12 @@ inline void mace_inference_forward(
         //     into pre-allocated scratch buffers — no per-call allocations,
         //     graph-capture-safe.  Same arithmetic; no bf16 round-off in
         //     this path because we never cast.
+        // Track whether `S.tk_node_messages_full_irrep_bf16` holds the
+        // post-scatter messages in bf16 (set when the TK fused conv_tp+scatter
+        // ran).  Megakernel B β-3 reads this directly into the next
+        // linear_post_tp via the bf16-input launcher, skipping the cast bridge
+        // that previously materialised `S.node_features_scratch` in fp32.
+        bool tk_messages_bf16_live = false;
         if (batch.receiver_edge_segment_start != nullptr &&
             batch.receiver_edge_segment_end != nullptr) {
             launch_mace_tk_conv_tp_scatter_fused(batch.n_atoms, batch.n_edges,
@@ -770,9 +776,9 @@ inline void mace_inference_forward(
                                                   S.node_features_l0_only, S.sph_harm,
                                                   S.tensor_product_weights_per_edge,
                                                   S.tk_node_messages_full_irrep_bf16, stream);
-            launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
-                                     S.tk_node_messages_full_irrep_bf16,
-                                     S.node_features_scratch, stream);
+            tk_messages_bf16_live = true;
+            // Cast deferred to fall-through path below; β-3 fast path reads
+            // bf16 directly into linear_post_tp.
         } else {
             launch_mace_tensor_product(arch, batch.n_edges, batch.edge_source_atom,
                                         S.node_features_l0_only, S.sph_harm,
@@ -812,14 +818,41 @@ inline void mace_inference_forward(
         // `S.tk_node_features_post_linear_bf16`.  Returns false if the channel
         // count doesn't match the templated kernel; in that case fall back to
         // the fp32 reference path.
-        bool const tk_post_tp_ok = launch_mace_tk_per_irrep_linear(
-            batch.n_atoms, arch.n_channels, arch.n_channels,
-            /*active_irrep_block_count*/4u,
-            L.linear_post_tp_w,
-            S.node_features_scratch,
-            S.tk_node_features_post_linear_bf16, stream,
-            linear_post_tp_pre_scale);
+        //
+        // Megakernel B Phase β-3: when the TK conv_tp_scatter just produced
+        // bf16 messages (`tk_messages_bf16_live`), feed them directly into
+        // the linear via the bf16-input launcher — skipping the
+        // `launch_mace_bf16_to_fp32` cast bridge that previously
+        // materialised `S.node_features_scratch` (~96 MB cast on the
+        // production shape).
+        bool tk_post_tp_ok = false;
+        if (tk_messages_bf16_live) {
+            tk_post_tp_ok = launch_mace_tk_per_irrep_linear_bf16_input(
+                batch.n_atoms, arch.n_channels, arch.n_channels,
+                /*active_irrep_block_count*/4u,
+                L.linear_post_tp_w,
+                S.tk_node_messages_full_irrep_bf16,            // direct bf16 input
+                S.tk_node_features_post_linear_bf16, stream,
+                linear_post_tp_pre_scale);
+        }
+        if (!tk_post_tp_ok) {
+            // bf16 path didn't fire (or wasn't applicable) — materialise the
+            // fp32 messages buffer and run the fp32-input launcher.
+            if (tk_messages_bf16_live) {
+                launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
+                                         S.tk_node_messages_full_irrep_bf16,
+                                         S.node_features_scratch, stream);
+            }
+            tk_post_tp_ok = launch_mace_tk_per_irrep_linear(
+                batch.n_atoms, arch.n_channels, arch.n_channels,
+                /*active_irrep_block_count*/4u,
+                L.linear_post_tp_w,
+                S.node_features_scratch,
+                S.tk_node_features_post_linear_bf16, stream,
+                linear_post_tp_pre_scale);
+        }
 #else
+        // fp32 reference build needs the messages materialised either way.
         bool const tk_post_tp_ok = false;
         (void)linear_post_tp_pre_scale;  // fp32 reference path doesn't pre-scale
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
