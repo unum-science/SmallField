@@ -6,7 +6,81 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
-## MACE-OFF all-converged early exit for `refine_batch` — 2026-04-26 — `a4a29e5`
+## MACE-OFF NCU Profiling — 2026-04-26 — TMA Pipelining Is Not the Right Next Lever
+
+End-to-end refine_batch throughput on H100 SXM5 (one card, MACE-OFF23-small, fp32 reference fallback for the medium model's non-96-channel kernels — i.e. the post-`444c379` honest baseline).
+Captured-graph + Phase K GPU-resident LBFGS + 20-step early-exit:
+
+| n_atoms | batch=1024 | batch=2048 | batch=4096 |
+| ------: | ---------: | ---------: | ---------: |
+|      25 |    883 c/s |    895 c/s |    901 c/s |
+|      50 |    443 c/s |    446 c/s |    447 c/s |
+|      80 |    277 c/s |    278 c/s |    279 c/s |
+
+Saturates at batch ≥ 1024.
+At n_atoms=30 (drug-like median) and batch=2048, kernel-only forward+backward = __0.0586 ms / config__.
+
+NCU 2025.2.1 hot-kernel breakdown (200-launch sample, captured graph replay) — share of __total kernel time__ at batch=2048×30:
+
+| Kernel                                                    | Share | TC %  | DRAM % | Long-SB stall | Notes |
+| --------------------------------------------------------- | ----: | ----: | -----: | ------------: | --------------------------------- |
+| `mace_tk_symmetric_contraction_force_adjoint`             | __32.5 %__ |  0.0 % |  1.95 % |     __33.9 %__ | single-warp CTA, L1-bound |
+| `mace_tk_symmetric_contraction` (fwd)                     | __15.3 %__ |  0.0 % |  1.69 % |       13.1 %  | single-warp CTA, L1-bound |
+| `mace_tk_conv_tp_scatter_force_adjoint`                   |   7.2 % |  0.1 % |  9.00 % |        7.1 %  | 18.5 % barrier stalls |
+| `mace_tk_element_conditioned_residual_force_adjoint`      |   7.1 % |  1.5 % |  3.92 % |        0.9 %  | 32 % FMA pipe |
+| `mace_linear_per_irrep_irrep1_force_adjoint` (fp32 ref)   |   5.1 % | —     | —      | —             | TK-able (Phase E) |
+| `mace_matmul_rowmajor` (fp32 ref)                          |   4.1 % | —     | —      | —             | TK-able (Phase E) |
+| `mace_tk_per_irrep_linear_force_adjoint`                  |   3.7 % |  4.3 % |  7.59 % |        0.6 %  | 28 % FMA pipe |
+| `mace_tk_element_conditioned_residual` (fwd)              |   3.6 % |  1.9 % |  2.58 % |        0.8 %  |       |
+| `mace_tk_conv_tp_scatter_segmented` (fwd)                 |   3.5 % |  0.0 % | 11.30 % |        6.8 %  | 6.5 % barrier |
+| `mace_tk_per_irrep_linear` (fwd)                          |   3.1 % |  4.3 % |  7.56 % |        0.5 %  |       |
+| `mace_skip_tp_irrep1_force_adjoint` (fp32 ref)            |   2.3 % | —     | —      | —             | TK-able (Phase E) |
+| `mace_radial_mlp_layer_force_adjoint` (fp32 ref)          |   2.3 % | —     | —      | —             | TK-able (Phase E) |
+| `mace_bf16_to_fp32` (cast bridges)                        |   2.1 % | —     | —      | —             | bridges TK↔fp32 |
+| `mace_tk_radial_mlp_layer_force_adjoint<64,384,0>`        |   1.3 % |  ~6 % | —      | —             |       |
+| `mace_tk_radial_mlp` (fwd)                                |   1.3 % |  2.7 % | 10.21 % |        0.7 %  |       |
+| Other ~25 kernels                                          |  ~5 %  |       |        |              |       |
+
+### What TMA Can Yield
+
+TMA pipelining (Phase A) overlaps `tma::load_async(W_{i+1})` with `WGMMA(W_i)`.
+It addresses __DRAM→smem load latency__.
+But across every kernel where TMA could even apply (the 5 WGMMA kernels at the bottom of the table — radial_mlp, per_irrep_linear×2, element_conditioned_residual×2):
+
+- __DRAM utilisation: 1.7-11.3 %__ of peak.
+  We are not bandwidth-bound on any kernel.
+  HBM has substantial headroom.
+- __Long-scoreboard stalls: 0.5-1.0 %__ on those WGMMA kernels.
+  TMA pipelining can save at most that fraction of stall cycles per kernel.
+
+Combined share of those WGMMA kernels: ~24 % of total kernel time.
+Maximum theoretical TMA gain: 0.5-1.0 % of 24 % = __~0.15-0.25 % global speedup__.
+Phase A is __not the right next lever__.
+
+### What the NCU Data Actually Says
+
+The 47.8 % time share owned by symcontract forward + backward is:
+- __L1-throughput-bound__, not DRAM-bound (`L1/TEX Throughput = 44 %` on the forward; `Compute SM Throughput = 17 %` on the backward).
+- __Warp-eligibility-starved__: the kernels use __one warp per CTA__ (block size = 32 threads, grid = n_atoms).
+  Schedulers see 6.84 active warps and 0.31 eligible warps on average; 83 % of cycles have no eligible warp.
+  NCU estimates __73 % local speedup__ is on the table for these two kernels alone.
+- Stall composition: __84.5 % of warp-stall cycles are L1TEX scoreboard waits__ — the cubic loop's repeated reads of `W3_partsym_sym` are hitting L1 (which itself hits L2 at 87 %), but the single-warp CTA has no other warp to issue while one waits.
+
+The two structural fixes the data points to:
+1. __Multi-warp CTAs__ (4-8 warps/CTA) so scheduler can hide L1 stalls with other warps' independent FMAs.  ~3.7× theoretical kernel speedup per NCU's "73 % local speedup" estimate.
+2. __Bring `W3_partsym_sym` fully into shared memory__ to convert the L1TEX waits into ~10× faster smem reads.
+
+The TK-able fp32-reference fallbacks (`linear_per_irrep_irrep1`, `matmul_rowmajor`, `skip_tp_irrep1`, `radial_mlp_layer` = __13.7 % combined__) are an orthogonal Phase E lever — mechanical TK port, expected ~30 % reduction on that share = ~4 % global gain.
+Smaller than the symcontract restructure but much smaller scope (1-2 days).
+
+### Tooling Notes
+
+NCU 2026.1.0 fails on driver 570 ("Cuda driver is not compatible"); 2025.2.1 works.
+Source-line attribution requires `-lineinfo` at compile time and a separate run without `--capture` (cudaGraph replay isn't compatible with NCU kernel-replay).
+PC-sampling (`smsp__pcsamp_sample_count`) was unavailable in this run — would identify the exact instruction line where the L1TEX waits land.
+nsys timeline confirms no host idle gaps in the captured-graph chain (cudaGraphLaunch ≈ 14 µs/call, vs ~50 eager kernel launches saved).
+
+
 
 The Phase K converged-flags infrastructure provided the per-conformer "this conformer is done" signal but `refine_batch` still ran every iteration to completion.
 This change adds a single-block AND-reduction of the converged flags into a device byte, copied to pinned host memory every 4 LBFGS iterations.
