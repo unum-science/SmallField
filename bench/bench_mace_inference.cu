@@ -49,6 +49,7 @@
 #include "smallfield/parameters/mace_weights.hpp"
 #include "smallfield/types/mace_types.hpp"
 #include "smallfield/cuda/mace_inference.cuh"
+#include "smallfield/cuda/mace_graph_capture.cuh"
 
 namespace {
 
@@ -72,6 +73,8 @@ constexpr char const *bench_build_label_k = "fp32";
 struct bench_config_t {
     std::uint32_t batch_size;
     std::uint32_t n_atoms_per_mol;
+    bool with_force_adjoint = false;     ///< if true, the timed loop runs forward + force adjoint
+    bool with_graph_capture = false;     ///< if true, captures the (forward [+ adjoint]) into a cudaGraph and replays
 };
 
 /** Output of one timing run. */
@@ -86,6 +89,8 @@ struct bench_result_t {
     double min_energy_eV;
     double max_energy_eV;
     bool segmented_path_active;
+    bool with_force_adjoint;
+    bool with_graph_capture;
 };
 
 /**
@@ -335,8 +340,30 @@ bench_result_t run_one_config(
     for (int iter = 0; iter < n_warmup_iters_k; ++iter) {
         smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(scratch, n_total_atoms, stream);
         smallfield::cuda::mace_inference_forward(arch, weights.device(), batch, scratch, stream);
+        if (config.with_force_adjoint) {
+            smallfield::cuda::mace_inference_run_force_adjoint(arch, weights.device(), batch, scratch, stream);
+        }
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Optional one-shot graph capture.  If on, the timed loop is just N
+    // cudaGraphLaunch calls instead of running the eager kernels each iter.
+    smallfield::cuda::mace_captured_graph_t captured_graph;
+    if (config.with_graph_capture) {
+        if (config.with_force_adjoint) {
+            smallfield::cuda::mace_capture_forward_with_force_adjoint(
+                arch, weights.device(), batch, scratch, stream, captured_graph);
+        } else {
+            smallfield::cuda::mace_capture_forward(
+                arch, weights.device(), batch, scratch, stream, captured_graph);
+        }
+        if (captured_graph.graph_exec == nullptr) {
+            std::fprintf(stderr,
+                         "bench: graph capture failed at batch=%u n_atoms=%u — falling back to eager\n",
+                         config.batch_size, config.n_atoms_per_mol);
+        }
+    }
+    bool const replay_active = (captured_graph.graph_exec != nullptr);
 
     // Timed loop.
     cudaEvent_t event_start = nullptr, event_end = nullptr;
@@ -344,8 +371,15 @@ bench_result_t run_one_config(
     CUDA_CHECK(cudaEventCreate(&event_end));
     CUDA_CHECK(cudaEventRecord(event_start, stream));
     for (int iter = 0; iter < n_timed_iters_k; ++iter) {
-        smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(scratch, n_total_atoms, stream);
-        smallfield::cuda::mace_inference_forward(arch, weights.device(), batch, scratch, stream);
+        if (replay_active) {
+            captured_graph.replay(stream);
+        } else {
+            smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(scratch, n_total_atoms, stream);
+            smallfield::cuda::mace_inference_forward(arch, weights.device(), batch, scratch, stream);
+            if (config.with_force_adjoint) {
+                smallfield::cuda::mace_inference_run_force_adjoint(arch, weights.device(), batch, scratch, stream);
+            }
+        }
     }
     CUDA_CHECK(cudaEventRecord(event_end, stream));
     CUDA_CHECK(cudaEventSynchronize(event_end));
@@ -379,6 +413,8 @@ bench_result_t run_one_config(
     result.min_energy_eV = min_energy;
     result.max_energy_eV = max_energy;
     result.segmented_path_active = segmented_path_active;
+    result.with_force_adjoint = config.with_force_adjoint;
+    result.with_graph_capture = config.with_graph_capture && replay_active;
 
     cudaEventDestroy(event_start);
     cudaEventDestroy(event_end);
@@ -412,7 +448,9 @@ void emit_jsonl(std::vector<bench_result_t> const &results, std::string const &o
             << "\"ms_per_iter\":" << r.ms_per_iter << ","
             << "\"ms_per_config\":" << r.ms_per_config << ","
             << "\"mean_energy_eV\":" << r.mean_energy_eV << ","
-            << "\"segmented_path_active\":" << (r.segmented_path_active ? "true" : "false")
+            << "\"segmented_path_active\":" << (r.segmented_path_active ? "true" : "false") << ","
+            << "\"with_force_adjoint\":" << (r.with_force_adjoint ? "true" : "false") << ","
+            << "\"with_graph_capture\":" << (r.with_graph_capture ? "true" : "false")
             << "}\n";
     }
 }
@@ -461,11 +499,42 @@ void print_summary_table(std::vector<bench_result_t> const &results,
 } // namespace
 
 int main(int argc, char **argv) {
-    std::string const export_dir = (argc > 1) ? argv[1] : "/tmp/mace_export";
+    // CLI:
+    //   bench_mace_inference [export_dir] [--with-forces] [--capture] [--saturating]
+    //   bench_mace_inference [export_dir] --batches 256,512,1024 --n-atoms 15,30,50,80
+    std::string export_dir = "/tmp/mace_export";
+    bool with_forces = false;
+    bool capture = false;
+    bool saturating = false;
+    std::vector<std::uint32_t> batch_sizes_override;
+    std::vector<std::uint32_t> atom_counts_override;
+    auto parse_uint_list = [](char const *s) {
+        std::vector<std::uint32_t> out;
+        std::string buf;
+        for (char const *p = s; *p; ++p) {
+            if (*p == ',') { if (!buf.empty()) { out.push_back(static_cast<std::uint32_t>(std::stoul(buf))); buf.clear(); } }
+            else buf.push_back(*p);
+        }
+        if (!buf.empty()) out.push_back(static_cast<std::uint32_t>(std::stoul(buf)));
+        return out;
+    };
+    for (int i = 1; i < argc; ++i) {
+        std::string const arg = argv[i];
+        if (arg == "--with-forces") with_forces = true;
+        else if (arg == "--capture") capture = true;
+        else if (arg == "--saturating") saturating = true;
+        else if (arg == "--batches" && i + 1 < argc) batch_sizes_override = parse_uint_list(argv[++i]);
+        else if (arg == "--n-atoms" && i + 1 < argc) atom_counts_override = parse_uint_list(argv[++i]);
+        else if (!arg.empty() && arg[0] != '-') export_dir = arg;
+    }
     std::string const weights_path = export_dir + "/MACE-OFF23-small.weights.bin";
 
     std::printf("bench_mace_inference: build=%s\n", bench_build_label_k);
     std::printf("bench_mace_inference: weights = %s\n", weights_path.c_str());
+    std::printf("bench_mace_inference: with_forces=%s capture=%s saturating=%s\n",
+                with_forces ? "yes" : "no",
+                capture ? "yes" : "no",
+                saturating ? "yes" : "no");
 
     smallfield::parameters::mace_weights_t weights;
     weights.load(weights_path);
@@ -473,23 +542,34 @@ int main(int argc, char **argv) {
     std::printf("bench_mace_inference: arch n_elements=%u n_radial=%u n_channels=%u r_max=%.3f avg_num_neighbors=%.3f\n",
                 arch.n_elements, arch.n_radial, arch.n_channels, arch.r_max, arch.avg_num_neighbors);
 
-    std::vector<std::uint32_t> const batch_sizes  = {64u, 128u, 256u, 512u};
-    std::vector<std::uint32_t> const atom_counts  = {15u, 30u, 50u, 80u};
+    std::vector<std::uint32_t> batch_sizes = {64u, 128u, 256u, 512u};
+    std::vector<std::uint32_t> atom_counts = {15u, 30u, 50u, 80u};
+    if (saturating) {
+        batch_sizes = {256u, 512u, 1024u, 2048u};
+        atom_counts = {15u, 30u, 50u, 80u};
+    }
+    if (!batch_sizes_override.empty()) batch_sizes = batch_sizes_override;
+    if (!atom_counts_override.empty()) atom_counts = atom_counts_override;
 
     std::vector<bench_result_t> results;
     results.reserve(batch_sizes.size() * atom_counts.size());
     std::uint64_t seed_counter = 0xC0FFEEull;
     for (auto na : atom_counts) {
         for (auto bs : batch_sizes) {
-            std::printf("\n--- running batch=%u n_atoms=%u ---\n", bs, na);
+            std::printf("\n--- running batch=%u n_atoms=%u%s%s ---\n", bs, na,
+                        with_forces ? " +forces" : "", capture ? " +capture" : "");
             bench_config_t cfg{};
             cfg.batch_size = bs;
             cfg.n_atoms_per_mol = na;
+            cfg.with_force_adjoint = with_forces;
+            cfg.with_graph_capture = capture;
             bench_result_t r = run_one_config(weights, cfg, seed_counter++);
-            std::printf("    n_total_atoms=%u n_total_edges=%u  ms/iter=%.3f  ms/config=%.4f  mean_E=%.3f eV  segmented=%s\n",
+            std::printf("    n_total_atoms=%u n_total_edges=%u  ms/iter=%.3f  ms/config=%.4f  mean_E=%.3f eV  "
+                        "segmented=%s force=%s capture=%s\n",
                         r.n_total_atoms, r.n_total_edges, r.ms_per_iter, r.ms_per_config,
-                        r.mean_energy_eV, r.segmented_path_active ? "yes" : "no");
-            // Sanity: energy must be finite.
+                        r.mean_energy_eV, r.segmented_path_active ? "yes" : "no",
+                        r.with_force_adjoint ? "yes" : "no",
+                        r.with_graph_capture ? "yes" : "no");
             if (!std::isfinite(r.mean_energy_eV)) {
                 std::fprintf(stderr, "bench: mean energy is NaN / infinity at batch=%u n_atoms=%u\n", bs, na);
             }
