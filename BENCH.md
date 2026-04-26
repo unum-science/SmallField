@@ -1,7 +1,10 @@
 # SmallField Benchmarks
 
 Throughput, scaling, and quality measurements on the current build.
-Last refreshed 2026-04-16.
+Last refreshed 2026-04-16 (ETKDG/MMFF) and 2026-04-25 (MACE-OFF).
+
+This file covers the __ETKDG + MMFF94 conformer generation__ path.
+For __MACE-OFF refinement__ kernel + end-to-end LBFGS numbers across model sizes (small / medium / large), batch sizes, atom counts, and the 8× RTX PRO 6000 Blackwell extrapolation, see [`MACE_BENCH_REPORT.md`](MACE_BENCH_REPORT.md).
 
 See [`GLOSSARY.md`](GLOSSARY.md) for the canonical vocabulary used below (`parquet-shard`, `coprocessed-batch`, `embedding-wave`, `atom-limited-bin`, `pipeline-role`, `wave-step`).
 

@@ -27,12 +27,13 @@ The CLI flag `--gpus-batch-size` stays as an alias for `--batch-size`.
 Four persistent worker threads, each an OpenMP section, with depth-3 ring-buffer handoffs between them.
 A _role_ is a persistent thread actor; never substitute "section" or "phase".
 
-| Role                  | Responsibility                                                                                   |
-| --------------------- | ------------------------------------------------------------------------------------------------ |
-| __`reader-role`__     | Reads a `parquet-shard` off disk, extracts SMILES views, accumulates into a `coprocessed-batch`. |
-| __`gpu-runner-role`__ | Calls `context_t::generate_conformers` on each `coprocessed-batch` (inner pipeline runs here).   |
-| __`fallback-role`__   | Runs RDKit CPU for the conformer slots the GPU could not fill (≤5 % on drug-like inputs).        |
-| __`writer-role`__     | Writes one output `parquet-shard` per consumed input `parquet-shard`.                            |
+| Role                  | Binary                  | Responsibility                                                                                       |
+| --------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------- |
+| __`reader-role`__     | both                    | Reads a `parquet-shard` off disk, extracts SMILES + (refiner only) 3D coords into a `coprocessed-batch`. |
+| __`gpu-runner-role`__ | `smallfield_batch`      | Calls `context_t::generate_conformers` on each `coprocessed-batch` (inner pipeline runs here).       |
+| __`fallback-role`__   | `smallfield_batch`      | Runs RDKit CPU for the conformer slots the GPU could not fill (≤5 % on drug-like inputs).            |
+| __`refiner-runner-role`__ | `smallfield_mace_refine` | Calls `mace::context_t::refine_batch` on each `coprocessed-batch` of pre-generated 3D conformers. |
+| __`writer-role`__     | both                    | Writes one output `parquet-shard` per consumed input `parquet-shard`.                                |
 
 ## Wave Steps, Library Inner
 
@@ -140,3 +141,14 @@ Glossary terms are vocabulary; the table below points at where each one is groun
 | `preprocess-step`   | `prepare_molecule_batch_into` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`                                                          |
 | `embedding-step`    | `launch_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                                                                   |
 | `finalize-step`     | `finalize_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                                                                 |
+
+## MACE-OFF refinement vocabulary
+
+| Term                 | Canonical location in source                                                                                                  |
+| :------------------- | :---------------------------------------------------------------------------------------------------------------------------- |
+| `mace::weights_t`    | `src/smallfield/api/smallfield_mace.hpp` — RAII handle around the device-resident weights blob (output of `mace_export.py`). |
+| `mace::context_t`    | `src/smallfield/api/smallfield_mace.hpp` — pre-allocated scratch + stream + capture cache; persistent across batches.        |
+| `mace::batch_view_t` | `src/smallfield/api/smallfield_mace.hpp` — flat per-batch packing of `(positions, atom_element, edges, graph_of_atom)`.       |
+| `relax_config_t`     | `src/smallfield/api/smallfield_mace.hpp` — LBFGS-style refinement parameters (`num_steps`, `fmax_eV_per_A`, `step_size`).    |
+| `refiner-runner-role`| `cli/smallfield_mace_refine.cpp` — pipeline-role spawned by the standalone refiner binary.                                    |
+| captured-graph replay| `src/smallfield/cuda/mace_graph_capture.cuh` — the production fast-path: forward + adjoint chain replayed in one launch. |

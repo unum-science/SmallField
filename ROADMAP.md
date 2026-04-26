@@ -229,3 +229,35 @@ Projected wall time at the current 10K mol/s host-prep ceiling, no further optim
 Scaffold cache internals: a 64-shard `tsl::robin_map<uint64_t, scaffold_cache_entry_t>` at ~5 KB per entry, keyed by Bemis-Murcko hash.
 On curated ChEMBL (4 698 unique scaffolds across 237 600 cyclic molecules, 98 % reuse) it adds +44 % throughput.
 Long-tail libraries show lower hit rates — that is what the adaptive-eviction + scaffold-aware-sharding gaps in the Dataset roadmap address.
+
+## MACE-OFF refinement roadmap
+
+The kernel optimisation pass on 2026-04-25 took with-forces ms/config from 0.272 → 0.060 (4.5× kernel-only speedup, 1.95× from cueq small).
+Items the optimisation pass concluded would not materially help are listed under "Optimizations tried and rejected" above.
+Items still open:
+
+### Phase K — GPU-resident LBFGS step
+
+Today the LBFGS outer loop runs host-side: each iteration launches a captured-graph replay (forward + adjoint), copies forces back, takes the step on the host, copies positions in.
+20 host launches per relaxation, ~30 µs each = ~0.6 ms host overhead per conformer = ~25 % of end-to-end LBFGS time at the current kernel speed.
+
+A GPU-resident step kernel + a single graph capture wrapping all 20 iterations eliminates this overhead entirely.
+Expected end-to-end gain: ~25 %.
+Owner: TBD; ~7 days effort.
+
+### Multi-GPU `smallfield_mace_refine`
+
+The refiner CLI is single-GPU today.
+The fan-out pattern is the same shard-inventory queue that `smallfield_batch` already uses (one `gpu-runner-role` thread per device).
+Estimated 1–2 days to copy the pattern across.
+
+### Production goldens regression
+
+`test_mace_loader` covers 5 small-molecule goldens (caffeine, paracetamol, ibuprofen, propranolol, aspirin) — regression-grade for single-conformer accuracy but not for batched-production drift.
+A scheduled regression run on a 1 K-molecule golden corpus, comparing energy + force RMS against the cueq Python reference, would catch silent precision regressions on real inputs.
+
+### Mega-fusion (cueq parity)
+
+Closing the remaining 1.95× gap to cueq's per-config kernel time requires a fully-fused per-layer kernel on the cueq pattern (one kernel per interaction layer covering tensor-product + linear + residual + readout fold).
+A 1–2 week structural rewrite, not tuning.
+Whether it's worth the effort depends on whether the production workload is bound by kernel time or by surrounding pipeline / I/O — the 28 B target on 8× Blackwell is currently estimated at ~56 days without this change and ~25 days with it.

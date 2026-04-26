@@ -2,6 +2,7 @@
 
 __SmallField__ generates 3D conformers from SMILES strings using [ETKDG](https://doi.org/10.1021/acs.jcim.5b00654) distance geometry with experimental torsion preferences followed by [MMFF94](https://doi.org/10.1006/jcat.1996.0027) force field optimization, entirely on the GPU.
 One CUDA warp processes one molecule and runs all pipeline stages in shared memory with no global-memory atomics.
+An optional final stage runs [MACE-OFF23](https://arxiv.org/abs/2312.15211) machine-learning-force-field refinement on the same GPU via SmallField's native CUDA + ThunderKittens kernels — no PyTorch / cueq dependency at inference time.
 CPU preprocessing uses [RDKit](https://github.com/rdkit/rdkit) for SMILES parsing, bounds matrices, CSD torsion lookup, and MMFF94 parameter extraction.
 
 ## Project Goals & FAQ
@@ -87,6 +88,7 @@ GPU side, one warp per molecule, all data resident in shared memory:
 | 7   | ETK torsion refine   | FIRE, 3D, 6-term Fourier + distance constraints           |
 | 8   | Final validation     | Repeat stereo check                                       |
 | 9   | MMFF94 polish        | FIRE, 3D, full force field (VdW + electrostatic + bonded) |
+| 10  | MACE-OFF refinement  | Optional — equivariant message-passing potential, captured-graph LBFGS, native CUDA + ThunderKittens kernels |
 
 ## Architecture
 
@@ -104,15 +106,28 @@ Wave N+1's preprocess overlaps wave N's embedding via a depth-2 batch-pool ring.
 Measured on the current 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host with jemalloc preloaded.
 See [`BENCH.md`](BENCH.md) for the full methodology and per-bin kernel profile.
 
+__ETKDG + MMFF94__ (conformer generation):
+
 | Dataset        | Workload                | RDKit CPU (192 thr) | SmallField 1 GPU | SmallField 8 GPU | Notes                                                     |
 | :------------- | :---------------------- | ------------------: | ---------------: | ---------------: | :-------------------------------------------------------- |
 | ChEMBL 8,948   | 3 conformers / molecule |         588.3 mol/s |    1,032.9 mol/s |    1,342.6 mol/s | 2.28x faster than RDKit at 8 GPU; 96.7% conformer success |
 | ChEMBL 241,596 | 1 conformer / molecule  |       1,734.8 mol/s |    4,900.7 mol/s |   16,826.6 mol/s | 9.70x faster than RDKit at 8 GPU; 96.6% conformer success |
 
+__MACE-OFF refinement__ (kernel-only, captured-graph LBFGS, batch=2048, n_atoms=30, H100 SXM5):
+
+| Model                  | Energy + forces, ms/config | LBFGS @ 20 steps (confs/sec, 1 GPU) | vs cueq Python |
+| :--------------------- | -------------------------: | ----------------------------------: | -------------: |
+| MACE-OFF23-small (96 ch)  |                  __0.060__ |                                ~835 | __1.95× slower__ |
+| MACE-OFF23-medium (128 ch)|                  __0.078__ |                                ~640 | n/a            |
+
+See [`MACE_BENCH_REPORT.md`](MACE_BENCH_REPORT.md) for the full sweep across model sizes, batch sizes, atom counts, and the 8× Blackwell extrapolation.
+
 NVIDIA's [nvMolKit](https://docs.nvidia.com/bionemo/) also targets GPU conformer generation, but it requires the BioNeMo proprietary stack.
-SmallField is open-source, runs on any CUDA 12+ GPU, and uses a single persistent warp-loop kernel.
+SmallField is open-source, runs on any CUDA 12+ GPU, and integrates ETKDG + MMFF94 + MACE-OFF in a single persistent-context kernel chain.
 
 ## Python
+
+ETKDG + MMFF94 conformer generation:
 
 ```python
 import smallfield.api as sf
@@ -121,34 +136,75 @@ coordinates = sf.generate_conformers("c1ccc(CC(=O)O)cc1", num_conformers=10)
 print(coordinates.shape)  # (K, N, 3) where K = successful conformers
 ```
 
-Requires RDKit for preprocessing.
-Install it with `pip install rdkit`.
 The GPU pipeline context is also available directly:
 
 ```python
 context = sf.Context()
 coordinates_flat, energies, status = context.generate_conformers(
-    ["CCO", "c1ccccc1"],
-    num_conformers=3,
-    max_atoms_per_molecule=128,
-    max_stereo_attempts=10,
-    random_seed=42,
+    ["CCO", "c1ccccc1"], num_conformers=3, max_atoms_per_molecule=128,
+    max_stereo_attempts=10, random_seed=42,
 )
 ```
 
-## C++ Benchmark
+MACE-OFF refinement on top of generated conformers:
 
-```bash
-cd build
-cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc) bench_conformers
+```python
+# High-level: derives elements + edges from RDKit.
+refined, energies = sf.refine_with_mace(
+    coordinates, smiles_list=["c1ccc(CC(=O)O)cc1"],
+    weights_path="/path/MACE-OFF23-small.weights.bin",
+    num_steps=20, fmax=0.05,
+)
 
-LD_LIBRARY_PATH=/path/to/conda/env/lib:$LD_LIBRARY_PATH \
-    ./bench/bench_conformers --smi /path/to/chembl.smi
+# Low-level: explicit batch — no RDKit dependency, useful at inference time.
+weights = sf.MaceWeights.load("/path/MACE-OFF23-small.weights.bin")
+ctx = sf.MaceContext(device_id=0, weights=weights,
+                     max_atoms=4096, max_edges=128 * 1024, max_graphs=128)
+energies, forces = ctx.infer_energy_and_forces(
+    weights, positions, atom_element, edge_source, edge_target,
+    graph_of_atom, n_graphs)
 ```
 
-Default mode reports RDKit CPU vs SmallField 1-GPU throughput plus an RDKit MMFF94 quality check.
-Use `--multi-gpu-only` for isolated 1/2/4/8-GPU scaling runs.
+Requires RDKit for preprocessing — `pip install rdkit`.
+MACE weights ship as a binary blob produced by `python/smallfield/mace_export.py`.
+
+## C++ API
+
+Both pipelines compose through small RAII headers:
+
+```cpp
+#include "smallfield/api/smallfield.hpp"        // ETKDG + MMFF94
+#include "smallfield/api/smallfield_mace.hpp"   // MACE-OFF refinement
+
+// Stage 1 — ETKDG + MMFF94.
+smallfield::api::context_t etkdg_ctx;
+etkdg_ctx.generate_conformers(smiles, config, max_atoms,
+                              coords_half, energies, status);
+
+// Stage 2 — MACE-OFF refinement on the same GPU.
+auto W = smallfield::mace::weights_t::load("MACE-OFF23-small.weights.bin");
+smallfield::mace::context_t mace_ctx(device_id, W.arch(),
+                                      max_atoms, max_edges, max_graphs);
+mace_ctx.refine_batch(W, batch_view,
+                       /* relax_config */ {.num_steps = 20, .fmax_eV_per_A = 0.05f},
+                       positions_xyz_inout, energies_out);
+```
+
+## CLI
+
+Two restartable parquet → parquet binaries.
+Both stream shards through pipeline-roles (reader → runner → writer); both resume from a partially-completed output folder.
+
+```bash
+# Stage 1 — ETKDG + MMFF94 conformers from SMILES.
+smallfield_batch --input chembl_smi/ --output chembl_3d_mmff/ \
+    --num-conformers 1 --gpus 0,1,2,3,4,5,6,7
+
+# Stage 2 (optional) — MACE-OFF refinement on the conformers from Stage 1.
+smallfield_mace_refine --input chembl_3d_mmff/ --output chembl_3d_mace/ \
+    --weights /path/MACE-OFF23-small.weights.bin \
+    --steps 20 --fmax 0.05 --gpus 0,1,2,3,4,5,6,7
+```
 
 ## Installation
 
@@ -167,23 +223,40 @@ make -j$(nproc)
 ctest --output-on-failure
 ```
 
+## C++ Benchmarks
+
+```bash
+cd build
+cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc) bench_conformers bench_mace_inference
+
+# ETKDG + MMFF94 throughput (RDKit CPU vs SmallField GPU)
+./bench/bench_conformers --smi /path/to/chembl.smi
+# MACE-OFF saturating-batch sweep (kernel-only, captured-graph replay)
+./bench/bench_mace_inference --batches 256,512,1024,2048 --n-atoms 30 --with-forces --capture
+```
+
+`--multi-gpu-only` on `bench_conformers` reports isolated 1/2/4/8-GPU scaling.
+`bench_mace_inference` writes JSONL to `/tmp/mace_inference_bench_<flavour>.jsonl`.
+
 ## Project Layout
 
 ```
-src/smallfield/api/         public C++ API
+src/smallfield/api/         public C++ API (smallfield.hpp + smallfield_mace.hpp)
 src/smallfield/types/       plain data structures shared host + device
-src/smallfield/parameters/  MMFF94 parameter tables (host extraction, device upload)
+src/smallfield/parameters/  MMFF94 parameter tables + MACE-OFF weights loader
 src/smallfield/preprocess/  CPU preprocessing: SMILES parse, bounds, CIP, CSD torsions, scaffold cache
 src/smallfield/mmff94/      native MMFF94 typer, charge, term extractor (CPU + GPU)
-src/smallfield/cuda/        CUDA kernels: metric embedding, DG, ETK, MMFF, FIRE, pipeline driver
-cli/                        smallfield_batch — restartable CLI over Parquet shards
-test/                       C++ and Python tests cross-validated against RDKit
-bench/                      C++ benchmarks: throughput + isolated MMFF kernels
-python/smallfield/          Python package including tools/smi_to_parquet.py
+src/smallfield/cuda/        CUDA kernels: metric embedding, DG, ETK, MMFF, FIRE, MACE inference + adjoints
+cli/                        smallfield_batch (gen) + smallfield_mace_refine (refine) — both Parquet → Parquet
+test/                       C++ and Python tests cross-validated against RDKit and MACE-OFF golden traces
+bench/                      bench_conformers + bench_mace_inference
+python/smallfield/          Python package: api.py (generate + refine_with_mace), mace_export.py (weights blob)
 ```
 
 There are no dependencies beyond CUDA 12+ and RDKit for preprocessing.
-Apache Arrow + Parquet are optional and only needed for the batch CLI binary.
+Apache Arrow + Parquet are optional and only needed for the batch CLI binaries.
+MACE-OFF refinement additionally requires ThunderKittens at build time (header-only, vendored under `${THUNDERKITTENS_ROOT}` by default; pass `-DTHUNDERKITTENS_DIR=...`).
 
 ## License
 

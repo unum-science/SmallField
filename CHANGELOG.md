@@ -6,6 +6,28 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## MACE-OFF refinement integration — 2026-04-25
+
+End-to-end MACE-OFF refinement landed alongside the existing ETKDG + MMFF94 path.
+Symmetric C++ / Python / CLI surface; full numbers in [`MACE_BENCH_REPORT.md`](MACE_BENCH_REPORT.md).
+
+- __Public C++ API__ (`src/smallfield/api/smallfield_mace.hpp` — commit `11f691b`): RAII `mace::weights_t::load(path)` + persistent `mace::context_t` with `infer_energy`, `infer_energy_and_forces`, and `refine_batch`.
+- __Kernel optimisation pass__ — 0.272 → 0.060 ms/config (4.5× kernel-only, with-forces, batch=2048, n_atoms=30, captured-graph replay).
+  Closes the with-forces gap to cueq small from 9.83× → 1.95×.
+  Top commits:
+  - `a4a75e9` symcontract adjoint over-unroll spill fix (eliminate 30 KB/thread spill, -25%)
+  - `d494800` symcontract adjoint i×4 / j×16 ILP unroll (-37%)
+  - `27177f6`, `a89ae08` irrep_dim=1 fast paths for linear-per-irrep + skip-tp
+  - `2112b9d` E1 — TK-WGMMA radial-MLP layer backward (-36%)
+  - `b1e0781` skip dead fp32 reference radial-MLP fwd under TK build (-8%)
+  - `8b26c49` extend TK layer-3 backward to MACE-OFF-medium (n_out=512) and -large (n_out=768)
+- __Python binding + standalone CLI__ (commit `e05fcc7`): `smallfield.api.refine_with_mace(...)` plus `smallfield_mace_refine` — a parquet → parquet refinement binary decoupled from `smallfield_batch`, letting the refinement workload scale independently of generation.
+- __Sweep__: small / medium models, batch 256–8192, n_atoms 15–80 — small saturates at batch=2048 (0.060 ms/config energy+forces); medium at batch=512 (0.078 ms/config).
+- __8× Blackwell extrapolation__: ~56 days for 28 B small-model LBFGS relaxations end-to-end at the current kernel speed; ~43 days with Phase K (GPU-resident LBFGS), ~25 days with cueq-parity mega-fusion.
+
+Doc cleanup: retired `MACE.md`, `MACE_INFERENCE.md`, `MACE_INTEGRATION_PLAN.md`, `MACE_OPTIMIZATION_ROADMAP.md` (planning docs whose work has landed).
+Living MACE docs are now `MACE_BENCH_REPORT.md` (numbers) and the relevant sections in `README.md`, `BENCH.md`, `GLOSSARY.md`, `ROADMAP.md`.
+
 ## RDKit 2025.09.6 Bump, Per-Molecule Preprocess Deadline and `preprocess_timeout` Status — Pending
 
 Under the multi-`parquet-shard` invocation wrapper, a single pathological drug-like `molecule` could stall the entire 4-role pipeline for 15–20 minutes.
