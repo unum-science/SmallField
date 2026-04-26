@@ -63,6 +63,28 @@ inline void launch_mace_fp32_to_bf16(std::uint32_t n, float const *src, __nv_bfl
 }
 
 /**
+ *  @brief Upcast a bf16 tensor to fp32 in-place on device.
+ *
+ *  Inverse of `mace_fp32_to_bf16_kernel`.  Used at the bf16↔fp32 boundary
+ *  inside the TK forward path: TK kernels emit bf16 (matching the precision
+ *  ladder), and the fp32-only kernels downstream (symmetric contraction
+ *  fp32 path, energy reduce, scale_shift) consume fp32.  One thread per
+ *  element; 4-byte aligned output store.
+ */
+__global__ void mace_bf16_to_fp32_kernel(std::uint32_t n, __nv_bfloat16 const *src, float *dst) {
+    std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (element_index >= n) return;
+    dst[element_index] = __bfloat162float(src[element_index]);
+}
+
+inline void launch_mace_bf16_to_fp32(std::uint32_t n, __nv_bfloat16 const *src, float *dst, cudaStream_t stream) {
+    if (n == 0) return;
+    constexpr std::uint32_t block = 256;
+    std::uint32_t const grid = (n + block - 1u) / block;
+    mace_bf16_to_fp32_kernel<<<grid, block, 0, stream>>>(n, src, dst);
+}
+
+/**
  *  @brief bf16 cublasLt linear apply (Phase 2 stub).
  *
  *  Phase 2 implementation:

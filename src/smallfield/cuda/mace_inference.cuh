@@ -35,6 +35,23 @@
 #include "smallfield/cuda/mace_skip_tp_kernel.cuh"
 #include "smallfield/cuda/mace_symmetric_contraction_kernel.cuh"
 
+// ThunderKittens forward path — every TK kernel is gated on
+// `SMALLFIELD_USE_THUNDERKITTENS`.  When the macro is undefined the headers
+// below are still included (they self-gate) but no TK code is emitted; the
+// driver below uses the fp32 reference launchers exclusively.  When the
+// macro is defined, the driver branches to the TK launchers at each call
+// site.  Keeping the fp32 path in tree as the regression target is
+// deliberate.
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+#  include "smallfield/cuda/mace_bf16.cuh"
+#  include "smallfield/cuda/mace_tk_radial_mlp_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_per_irrep_linear_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_conv_tp_scatter_fused_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_element_conditioned_residual_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_symmetric_contraction_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_readout_kernel.cuh"
+#endif
+
 namespace smallfield::cuda {
 
 namespace mace_detail_ {
@@ -188,6 +205,28 @@ struct mace_scratch_t {
     // graph-scoped
     float *energy = nullptr;                       // [n_graphs]
 
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+    // ThunderKittens scratch — all `_tk_` buffers exist only on the TK forward path.
+    // Each is the bf16 view of the corresponding fp32 buffer above plus the
+    // `cast back to fp32` round-trip needed to bridge from a TK kernel's bf16
+    // output to the next stage's fp32 input.  We could collapse these by
+    // having the TK kernels read/write bf16 directly, but for this first
+    // integration we keep activations canonically fp32 between stages — the
+    // bf16 buffers are local to each TK kernel + cast pair.
+    __nv_bfloat16 *tk_tensor_product_weights_per_edge_bf16 = nullptr;  // [n_edges, 4 * n_channels]
+    __nv_bfloat16 *tk_node_messages_full_irrep_bf16 = nullptr;         // [n_atoms, n_channels, 16]
+    __nv_bfloat16 *tk_node_features_post_linear_bf16 = nullptr;        // [n_atoms, n_channels, 16]
+    __nv_bfloat16 *tk_node_features_post_residual_bf16 = nullptr;      // [n_atoms, n_channels, 16]
+    __nv_bfloat16 *tk_node_features_l0_only_bf16 = nullptr;            // [n_atoms, n_channels]
+
+    // Order-3 ACE precomputed weights, one device buffer per interaction layer:
+    //   `W3_eff[Z, irrep_index_i, irrep_index_j, irrep_index_k, channel_index]
+    //         = sum over path of U_3[i,j,k,path] * weights_max[Z, path, c]`
+    // Allocated lazily on first forward and freed in `mace_scratch_t::free`.
+    float *tk_precomputed_w3_effective_layer[2] = {nullptr, nullptr};
+    bool tk_precompute_done = false;
+#endif
+
     std::size_t total_bytes = 0;
 
     void allocate(types::mace_arch_t const &arch,
@@ -216,6 +255,23 @@ struct mace_scratch_t {
         alloc(&layer_n_residual_l0, max_atoms * arch.n_channels);
         alloc(&node_energy, max_atoms);
         alloc(&energy, max_graphs);
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // bf16 scratch for the TK forward path (sized in fp32 elements; the cast
+        // is `n_elements * 2 bytes`).  Allocated only when TK is compiled in.
+        auto alloc_bf16 = [&](__nv_bfloat16 **p, std::size_t n) {
+            cudaMalloc(reinterpret_cast<void **>(p), n * sizeof(__nv_bfloat16));
+            total_bytes += n * sizeof(__nv_bfloat16);
+        };
+        alloc_bf16(&tk_tensor_product_weights_per_edge_bf16,
+                   max_edges * mace_tensor_product_path_count_k * arch.n_channels);
+        alloc_bf16(&tk_node_messages_full_irrep_bf16,        max_atoms * arch.n_channels * irrep_dim);
+        alloc_bf16(&tk_node_features_post_linear_bf16,        max_atoms * arch.n_channels * irrep_dim);
+        alloc_bf16(&tk_node_features_post_residual_bf16,      max_atoms * arch.n_channels * irrep_dim);
+        alloc_bf16(&tk_node_features_l0_only_bf16,            max_atoms * arch.n_channels);
+        // W3_eff buffers are precomputed lazily on first forward (we need the
+        // weight pointers to do the reduction); leave them nullptr here.
+        tk_precompute_done = false;
+#endif
     }
 
     void free() noexcept {
@@ -229,6 +285,21 @@ struct mace_scratch_t {
             if (*p) cudaFree(*p);
             *p = nullptr;
         }
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        for (__nv_bfloat16 **p : {&tk_tensor_product_weights_per_edge_bf16,
+                                   &tk_node_messages_full_irrep_bf16,
+                                   &tk_node_features_post_linear_bf16,
+                                   &tk_node_features_post_residual_bf16,
+                                   &tk_node_features_l0_only_bf16}) {
+            if (*p) cudaFree(*p);
+            *p = nullptr;
+        }
+        for (float *&p : tk_precomputed_w3_effective_layer) {
+            if (p) cudaFree(p);
+            p = nullptr;
+        }
+        tk_precompute_done = false;
+#endif
         total_bytes = 0;
     }
 
@@ -264,6 +335,25 @@ inline void mace_inference_forward(
     constexpr std::uint32_t mlp_out_dim = 4u * /*n_channels*/96u;  // verified at run via arch.n_channels assertion below
     (void)mlp_out_dim;
     float const avg_num_neighbors = arch.avg_num_neighbors;
+
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+    // Lazy one-shot precompute of `W3_eff[Z, i, j, k, c]` per interaction layer.
+    // The reduction (over the path index against `weights_max[Z, path, c]`)
+    // depends only on weights and U_3 — both fixed once `mace_weights_t` is
+    // constructed.  We do it on first forward rather than at scratch alloc
+    // so the driver can stay decoupled from the weight constructor; subsequent
+    // forwards just reuse the cached buffers.
+    constexpr std::uint32_t symmetric_contraction_path_count_max = 23u;
+    if (!S.tk_precompute_done) {
+        for (std::uint32_t layer_index = 0; layer_index < arch.num_interactions && layer_index < 2u; ++layer_index) {
+            auto const &L = W.layers[layer_index];
+            S.tk_precomputed_w3_effective_layer[layer_index] = mace_tk_precompute_w3_effective(
+                arch.n_elements, arch.n_channels, symmetric_contraction_path_count_max,
+                L.u_matrix_3, L.weights_max, stream);
+        }
+        S.tk_precompute_done = true;
+    }
+#endif
 
     // 1. Edge preamble: geometry → Bessel × cutoff → spherical harmonics.
     launch_mace_edge_geometry(batch.n_edges, batch.positions, batch.edge_source_atom, batch.edge_target_atom,
@@ -347,13 +437,52 @@ inline void mace_inference_forward(
         launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim, S.radial_mlp_hidden_2, S.radial_mlp_hidden_2, stream);
         // Layer 3 (final, no act): 64 → 4*c
         std::uint32_t const tp_dim = mace_tensor_product_path_count_k * arch.n_channels;
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // TK-fused radial MLP — one launch instead of 7 (4 matmul + 3 SiLU
+        // norm2mom).  Reads radial_basis fp32 directly; the kernel handles
+        // the per-layer (1/sqrt(h_in)) scale + normalize2mom(silu) epilogue
+        // internally and emits bf16 tp_weights.  We then cast bf16→fp32 and
+        // apply the cutoff multiply in fp32 on the existing buffer so the
+        // downstream conv_tp consumer (C2 fused TK or fp32 reference)
+        // sees the same fp32 tp_weights buffer regardless of which radial
+        // MLP path produced it.
+        launch_mace_tk_radial_mlp(batch.n_edges, arch.n_radial,
+                                  S.radial_basis,
+                                  L.radial_mlp_w0, L.radial_mlp_w1,
+                                  L.radial_mlp_w2, L.radial_mlp_w3,
+                                  S.tk_tensor_product_weights_per_edge_bf16, stream);
+        launch_mace_bf16_to_fp32(batch.n_edges * tp_dim,
+                                 S.tk_tensor_product_weights_per_edge_bf16,
+                                 S.tensor_product_weights_per_edge, stream);
+#else
         launch_mace_matmul_rowmajor(batch.n_edges, tp_dim, radial_mlp_hidden_dim,
                                     S.radial_mlp_hidden_2, L.radial_mlp_w3,
                                     1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
                                     S.tensor_product_weights_per_edge, stream);
+#endif
         // Multiply per-edge by the cutoff envelope (mirrors `tp_weights *= cutoff` in the live forward).
         launch_mace_apply_cutoff(batch.n_edges, tp_dim, S.cutoff_envelope, S.tensor_product_weights_per_edge, stream);
 
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // 3c+3d (fused).  TK conv_tp+scatter emits messages directly into the
+        // per-receiver bf16 accumulator — eliminates the [n_edges, c, 16]
+        // message buffer's DRAM round-trip (~28× bandwidth reduction
+        // measured in C2's smoke test).  The atomic-fallback path
+        // (used here, until Track B1-4's host-side bin sort wires up
+        // `receiver_edge_segment_start/end`) is correctness-only: it
+        // routes through the existing fp32 reference + cast.
+        launch_mace_tk_conv_tp_scatter_fused(batch.n_atoms, batch.n_edges,
+                                              arch.n_channels,
+                                              batch.edge_source_atom, batch.edge_target_atom,
+                                              batch.receiver_edge_segment_start,
+                                              batch.receiver_edge_segment_end,
+                                              S.node_features_l0_only, S.sph_harm,
+                                              S.tensor_product_weights_per_edge,
+                                              S.tk_node_messages_full_irrep_bf16, stream);
+        launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
+                                 S.tk_node_messages_full_irrep_bf16,
+                                 S.node_features_scratch, stream);
+#else
         // 3c. Tensor product: per-edge messages.
         launch_mace_tensor_product(arch, batch.n_edges, batch.edge_source_atom,
                                     S.node_features_l0_only, S.sph_harm, S.tensor_product_weights_per_edge, S.edge_messages, stream);
@@ -362,11 +491,26 @@ inline void mace_inference_forward(
         launch_mace_scatter_atomic(batch.n_atoms, batch.n_edges,
                                     arch.n_channels * irrep_dim,
                                     batch.edge_target_atom, S.edge_messages, S.node_features_scratch, stream);
+#endif
 
         // 3e. linear_post_tp: per-irrep channel mix on all 4 L blocks.
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // TK 4-block fused linear: one CTA per 4 atoms × 96 c_out, single
+        // shared input tile, four WGMMA passes (one per L block).  Output
+        // bf16 → cast back to fp32 in the existing node_features buffer.
+        launch_mace_tk_per_irrep_linear(batch.n_atoms, arch.n_channels, arch.n_channels,
+                                         /*active_irrep_block_count*/4u,
+                                         L.linear_post_tp_w,
+                                         S.node_features_scratch,
+                                         S.tk_node_features_post_linear_bf16, stream);
+        launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
+                                 S.tk_node_features_post_linear_bf16,
+                                 S.node_features, stream);
+#else
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
                                       irrep_dim, /*active_irrep_block_count*/4u,
                                       L.linear_post_tp_w, S.node_features_scratch, S.node_features, stream);
+#endif
 
         // 3f. Divide by avg_num_neighbors (in-place scale of node_features).
         if (avg_num_neighbors != 1.0f) {
@@ -380,6 +524,21 @@ inline void mace_inference_forward(
         //     The layer-1 residual is a one-line additional kernel — a follow-up.
         if (layer_index == 0u) {
             std::uint32_t const active_irrep_block_count = 4u;
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+            // TK element-conditioned residual: same algebra as
+            // `mace_element_conditioned_residual_kernel` but using the
+            // Z-indirect WGMMA path (96×96 weight slab per atom, two passes
+            // because c_out=96 doesn't divide WGMMA M=64 cleanly).
+            launch_mace_tk_element_conditioned_residual(
+                batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
+                /*active_irrep_block_count*/4u,
+                batch.atom_element, L.skip_tp_w,
+                S.node_features,
+                S.tk_node_features_post_residual_bf16, stream);
+            launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
+                                     S.tk_node_features_post_residual_bf16,
+                                     S.node_features, stream);
+#else
             launch_mace_skip_tp(batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
                                  irrep_dim, active_irrep_block_count, batch.atom_element,
                                  L.skip_tp_w, S.node_features, S.node_features_scratch, stream);
@@ -387,11 +546,27 @@ inline void mace_inference_forward(
             cudaMemcpyAsync(S.node_features, S.node_features_scratch,
                             batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float),
                             cudaMemcpyDeviceToDevice, stream);
+#endif
         }
 
         // 3h. Symmetric contraction: produce per-channel scalar invariants.
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // TK path uses precomputed `W3_eff[Z, i, j, k, c]` so the order-3
+        // contraction becomes a sum-of-cubic-products with `c` as the
+        // pointwise axis.  Output is fp32 (the order-3 accumulator's
+        // precision is load-bearing); no bf16 cast bridge here.
+        launch_mace_tk_symmetric_contraction(
+            batch.n_atoms, arch.n_channels, arch.n_elements,
+            batch.atom_element,
+            S.node_features,
+            L.u_matrix_1, L.u_matrix_2,
+            L.weights_lo_0, L.weights_lo_1,
+            S.tk_precomputed_w3_effective_layer[layer_index],
+            S.node_scalar_invariants, stream);
+#else
         launch_mace_symmetric_contraction(arch, L, batch.n_atoms, batch.atom_element,
                                            S.node_features, S.node_scalar_invariants, stream);
+#endif
 
         // 3i. product_linear: channel mix on the scalar invariants (96 → 96).
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
