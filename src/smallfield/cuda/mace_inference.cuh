@@ -1166,13 +1166,31 @@ inline void mace_inference_run_force_adjoint(
         if (layer_index >= 1u) {
             cudaMemsetAsync(S.grad_layer_residual_l0_scratch, 0,
                             batch.n_atoms * arch.n_channels * sizeof(float), stream);
-            launch_mace_element_conditioned_residual_force_adjoint(
+            // Megakernel B Phase ε: try the TK element-conditioned-residual
+            // backward (already wired for active=4 at the layer-0 path); the
+            // launcher accepts active=1 too.  The fp32 reference fast-path
+            // (`mace_skip_tp_irrep1_force_adjoint_kernel`) was 2.91 % of total
+            // kernel time on the post-Phase-δ NCU profile, the largest
+            // remaining fp32 fallback in the chain.
+            bool layer_n_skip_tp_bwd_via_tk = false;
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+            layer_n_skip_tp_bwd_via_tk = launch_mace_tk_element_conditioned_residual_force_adjoint(
                 batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
-                /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+                /*active_irrep_block_count*/1u,
                 batch.atom_element, L.skip_tp_w,
-                S.grad_node_features_l0_only,         // upstream (post-product l0 gradient)
-                S.grad_layer_residual_l0_scratch,     // grad of skip_tp INPUT (scalar)
+                S.grad_node_features_l0_only,
+                S.grad_layer_residual_l0_scratch,
                 stream);
+#endif
+            if (!layer_n_skip_tp_bwd_via_tk) {
+                launch_mace_element_conditioned_residual_force_adjoint(
+                    batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
+                    /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+                    batch.atom_element, L.skip_tp_w,
+                    S.grad_node_features_l0_only,
+                    S.grad_layer_residual_l0_scratch,
+                    stream);
+            }
         }
 
         // 3c. product_linear adjoint: post-product l0 → grad_node_scalar_invariants.
