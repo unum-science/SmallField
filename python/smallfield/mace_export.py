@@ -175,6 +175,18 @@ def _infer_architecture(model: torch.nn.Module) -> Dict:
     bessel_prefactor = float(sd["radial_embedding.bessel_fn.prefactor"].item())
     # avg_num_neighbors — hyperparameter divided into messages post-scatter
     avg_num_neighbors = float(model.interactions[0].avg_num_neighbors)
+    # conv_tp path-normalisation factor — e3nn applies 1/sqrt(num_paths) per
+    # output irrep inside its TensorProduct.  We pull the *actual* multiplier
+    # out of the first instruction's `path_weight`; for MACE-OFF the values
+    # are uniform across the 4 paths so first-element is sufficient.  If the
+    # attribute layout shifts in a future e3nn we fall back to 1.0 (matches
+    # the current hard-coded value in launch_mace_tensor_product).
+    try:
+        conv_tp = model.interactions[0].conv_tp
+        conv_tp_path_weight = float(conv_tp.instructions[0].path_weight)
+    except Exception as exc:
+        print(f"warning: could not extract conv_tp path_weight ({exc!r}); defaulting to 1.0")
+        conv_tp_path_weight = 1.0
     return {
         "n_elements": n_elements,
         "n_radial": n_radial,
@@ -189,6 +201,7 @@ def _infer_architecture(model: torch.nn.Module) -> Dict:
         "r_max": r_max,
         "bessel_prefactor": bessel_prefactor,
         "avg_num_neighbors": avg_num_neighbors,
+        "conv_tp_path_weight": conv_tp_path_weight,
     }
 
 
@@ -344,6 +357,53 @@ def export_golden(model: torch.nn.Module, calc, out_dir: Path, arch: Dict) -> No
         )
 
 
+# ----------------------------------------------------------------------------
+# Sample fp16 batch — concatenate the 5 reference molecules into one CSR-style
+# graph batch and dump fp16 positions alongside the original fp64 positions
+# so downstream batched / fp16 work can validate round-trip error.
+# ----------------------------------------------------------------------------
+
+
+def export_sample_fp16_batch(model: torch.nn.Module, out_path: Path) -> None:
+    atomic_numbers = model.state_dict()["atomic_numbers"].cpu().to(torch.int64).numpy()
+    z_to_index = {int(z): i for i, z in enumerate(atomic_numbers)}
+    from ase.data import atomic_numbers as ase_z
+
+    positions_list: List[np.ndarray] = []
+    elements_list: List[np.ndarray] = []
+    offsets: List[int] = [0]
+    for name, smi in REFERENCE_MOLECULES:
+        atoms = _build_atoms_from_smiles(smi)
+        pos = np.asarray(atoms.get_positions(), dtype=np.float64)
+        zs = [int(ase_z[s]) for s in atoms.get_chemical_symbols()]
+        idx = np.asarray([z_to_index[z] for z in zs], dtype=np.int64)
+        positions_list.append(pos)
+        elements_list.append(idx)
+        offsets.append(offsets[-1] + pos.shape[0])
+        print(f"  {name:<14s} natoms={pos.shape[0]:3d}  offset={offsets[-2]}")
+
+    positions_fp64 = np.concatenate(positions_list, axis=0).astype(np.float64)
+    positions_fp16 = positions_fp64.astype(np.float16)
+    atom_element = np.concatenate(elements_list, axis=0).astype(np.int64)
+    graph_atom_offset = np.asarray(offsets, dtype=np.int64)
+
+    header = {
+        "n_atoms_total": int(positions_fp64.shape[0]),
+        "n_graphs": len(REFERENCE_MOLECULES),
+        "graph_atom_offset": [int(x) for x in offsets],
+    }
+    writer = BlobWriter(header)
+    writer.add("positions_fp16", positions_fp16)
+    writer.add("positions_fp32_reference", positions_fp64)
+    writer.add("atom_element", atom_element)
+    writer.add("graph_atom_offset", graph_atom_offset)
+    writer.write(out_path)
+    print(
+        f"  wrote sample fp16 batch: {writer.n_tensors()} tensors / "
+        f"{writer.n_bytes()/1e3:.2f} KB / n_atoms_total={header['n_atoms_total']} -> {out_path.name}"
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="small", choices=["small", "medium", "large"])
@@ -369,6 +429,10 @@ def main() -> None:
     if not args.skip_golden:
         print("\ndumping golden traces:")
         export_golden(model, calc, out_dir, arch)
+
+    fp16_batch_path = out_dir / "sample_fp16_batch.bin"
+    print(f"\nbuilding sample fp16 batch -> {fp16_batch_path}")
+    export_sample_fp16_batch(model, fp16_batch_path)
 
 
 if __name__ == "__main__":
