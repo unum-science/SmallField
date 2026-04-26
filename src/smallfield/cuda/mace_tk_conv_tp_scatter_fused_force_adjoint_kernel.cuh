@@ -148,7 +148,7 @@ __device__ __forceinline__ int irrep_block_index_for_component_(int irrep_compon
  *  that thread.  The shared-memory reduction collects the per-(channel,
  *  L-block) sum back together for the per-edge per-path per-channel write.
  */
-__global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
+inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
     std::uint32_t n_edges,
     std::uint32_t n_channels,
     float scale,

@@ -278,7 +278,7 @@ __device__ __forceinline__ void store_irrep_block_with_guard_(
  *        store with m-block masking.
  */
 template <typename input_t>
-__global__ void mace_tk_element_conditioned_residual_kernel(
+inline __global__ void mace_tk_element_conditioned_residual_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,                // == 96 for MACE-OFF-small
     std::uint32_t n_elements,                   // == 10 for MACE-OFF23

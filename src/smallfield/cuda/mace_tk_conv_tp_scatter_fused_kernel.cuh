@@ -144,7 +144,7 @@ __device__ __forceinline__ int irrep_block_index_for_component_(int irrep_compon
  *  Total ≈ 384 B per CTA — comfortably below shared-memory budget at any
  *  occupancy.
  */
-__global__ void mace_tk_conv_tp_scatter_segmented_kernel(
+inline __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_edges,
     std::uint32_t n_channels,
@@ -259,7 +259,7 @@ __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
  *  @brief Cast a fp32 buffer into a bf16 buffer of the same length.  Used by
  *         the atomic-mode fallback.
  */
-__global__ void mace_tk_fp32_to_bf16_cast_kernel_(
+inline __global__ void mace_tk_fp32_to_bf16_cast_kernel_(
     std::uint64_t element_count,
     float const *__restrict__ source_fp32,
     __nv_bfloat16 *__restrict__ destination_bf16

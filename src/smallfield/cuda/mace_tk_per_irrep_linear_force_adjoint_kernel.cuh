@@ -316,7 +316,7 @@ __device__ __forceinline__ void zero_inactive_block_m_rows_(
  *  `active_irrep_block_count < 4`) have their m-rows zeroed in the output
  *  rather than computed.
  */
-__global__ void mace_tk_per_irrep_linear_force_adjoint_kernel(
+inline __global__ void mace_tk_per_irrep_linear_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_channels_out,

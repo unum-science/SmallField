@@ -50,7 +50,7 @@ namespace smallfield::cuda {
  *  for every atom a in graph g (plus the MLP path's contribution for
  *  the last layer).  Output: `dnode_invariants` [n_atoms, n_channels].
  */
-__global__ void mace_energy_reduce_force_adjoint_kernel(
+inline __global__ void mace_energy_reduce_force_adjoint_kernel(
     std::uint32_t n_atoms, std::uint32_t n_channels, float scale, float const *readout_linear_w,
     float const *grad_energy, // [n_graphs] = 1.0 if computing forces
     std::int32_t const *graph_of_atom,
@@ -73,7 +73,7 @@ __global__ void mace_energy_reduce_force_adjoint_kernel(
  *  This is just a gather — for each edge, copy the gradient from its
  *  receiver row of `dnode_features_full` into `dmessages`.  No atomics.
  */
-__global__ void mace_scatter_force_adjoint_kernel(std::uint32_t n_edges, std::uint32_t feature_dim,
+inline __global__ void mace_scatter_force_adjoint_kernel(std::uint32_t n_edges, std::uint32_t feature_dim,
                                                   std::int32_t const *edge_target_atom,
                                                   float const *dnode_features_full, // [n_atoms, feature_dim]
                                                   float *dmessages                  // [n_edges, feature_dim]
@@ -229,7 +229,7 @@ __device__ __forceinline__ void sph_harm_l0123_derivative_(
  *
  *  Threading: one thread per edge; 128 threads per block.  No shared memory.
  */
-__global__ void mace_sph_harm_force_adjoint_kernel(
+inline __global__ void mace_sph_harm_force_adjoint_kernel(
     std::uint32_t n_edges,
     float const *r_unit,        // [n_edges, 3]
     float const *dsph_harm,     // [n_edges, 16]
@@ -305,7 +305,7 @@ inline void launch_mace_sph_harm_force_adjoint(
  *
  *  All math fp32; envelope clamped to zero outside r_max (matches forward).
  */
-__global__ void mace_radial_basis_and_edge_geometry_force_adjoint_kernel(
+inline __global__ void mace_radial_basis_and_edge_geometry_force_adjoint_kernel(
     std::uint32_t n_edges,
     std::uint32_t n_radial,
     float r_max,
@@ -425,7 +425,7 @@ inline void launch_mace_radial_basis_and_edge_geometry_force_adjoint(
  *  final negation.  Threading: 256 threads per block, one thread per
  *  scalar component (n_atoms * 3).
  */
-__global__ void mace_force_negate_kernel(
+inline __global__ void mace_force_negate_kernel(
     std::uint32_t n_atoms,
     float const *dpositions,    // [n_atoms, 3]
     float *forces               // [n_atoms, 3]
@@ -467,7 +467,7 @@ inline void launch_mace_position_force_adjoint(std::uint32_t /*n_edges*/, cudaSt
  *  pre-broadcast).  Here we accumulate (atomicAdd-free since each thread
  *  owns its own (atom, channel)).
  */
-__global__ void mace_readout_linear_force_adjoint_kernel(
+inline __global__ void mace_readout_linear_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     float scale,                            // 1/sqrt(n_channels)
@@ -531,7 +531,7 @@ inline void launch_mace_readout_linear_force_adjoint(
  *  or already populated it from another readout (the linear path); we add
  *  on top.
  */
-__global__ void mace_readout_nonlinear_mlp_force_adjoint_kernel(
+inline __global__ void mace_readout_nonlinear_mlp_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t hidden_dim,
@@ -616,7 +616,7 @@ inline void launch_mace_readout_nonlinear_mlp_force_adjoint(
  *
  *  Threading: one thread per (atom, c_in, m).  Inner: n_channels_out multiplies.
  */
-__global__ void mace_linear_per_irrep_force_adjoint_kernel(
+inline __global__ void mace_linear_per_irrep_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_channels_out,
@@ -664,7 +664,7 @@ __global__ void mace_linear_per_irrep_force_adjoint_kernel(
  *
  *  Output is accumulated with `+=`, matching the general kernel's contract.
  */
-__global__ void mace_linear_per_irrep_irrep1_force_adjoint_kernel(
+inline __global__ void mace_linear_per_irrep_irrep1_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_channels_out,
@@ -765,7 +765,7 @@ inline void launch_mace_linear_per_irrep_force_adjoint(
  *      `atomicAdd`-accumulated across channels.
  *  Pass `nullptr` for any of the three output buffers to skip its computation.
  */
-__global__ void mace_tensor_product_and_scatter_force_adjoint_kernel(
+inline __global__ void mace_tensor_product_and_scatter_force_adjoint_kernel(
     std::uint32_t n_edges,
     std::uint32_t n_channels,
     float scale,
@@ -900,7 +900,7 @@ inline void launch_mace_tensor_product_and_scatter_force_adjoint(
  *
  *  Threading: one thread per (atom, c_in, m).  Inner: n_channels_out multiplies.
  */
-__global__ void mace_element_conditioned_residual_force_adjoint_kernel(
+inline __global__ void mace_element_conditioned_residual_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_elements,
@@ -943,7 +943,7 @@ __global__ void mace_element_conditioned_residual_force_adjoint_kernel(
  *         per-irrep linear adjoint fast path.  Avoids the 1-thread-per-CTA
  *         shape of the general kernel for the (irrep_dim=1, active=1) case.
  */
-__global__ void mace_skip_tp_irrep1_force_adjoint_kernel(
+inline __global__ void mace_skip_tp_irrep1_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_elements,
@@ -1038,7 +1038,7 @@ inline void launch_mace_element_conditioned_residual_force_adjoint(
  *  shortcut would be incorrect for ν=3.  U_2 is symmetric in (i, j), but
  *  we use the same emit-both-slots form for uniformity.
  */
-__global__ void mace_symmetric_contraction_force_adjoint_kernel(
+inline __global__ void mace_symmetric_contraction_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t irrep_dim,            // 16
@@ -1175,7 +1175,7 @@ inline void launch_mace_symmetric_contraction_force_adjoint(
  *  with 1.0 — host->device memcpy is unsafe inside captured graphs because
  *  the source buffer must survive until graph replay.
  */
-__global__ void mace_fill_constant_kernel(float *dst, std::uint32_t n_elements, float value) {
+inline __global__ void mace_fill_constant_kernel(float *dst, std::uint32_t n_elements, float value) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n_elements) return;
     dst[element_index] = value;
@@ -1196,7 +1196,7 @@ inline void launch_mace_fill_constant(float *dst, std::uint32_t n_elements, floa
  *  Reverse: `dnode_energy[a] = scale * grad_per_graph_energy[graph_of_atom[a]]`.
  *  The atomic-energy and shift terms have no dependence on positions.
  */
-__global__ void mace_per_graph_energy_force_adjoint_kernel(
+inline __global__ void mace_per_graph_energy_force_adjoint_kernel(
     std::uint32_t n_atoms,
     float scale,
     std::int32_t const *graph_of_atom,
@@ -1247,7 +1247,7 @@ inline void launch_mace_scatter_force_adjoint(
  *  Reverse: `grad_x = grad_y * s`.  In-place; we just multiply the gradient
  *  buffer.  Used for the `/avg_num_neighbors` rescale in the forward.
  */
-__global__ void mace_scale_force_adjoint_kernel(
+inline __global__ void mace_scale_force_adjoint_kernel(
     std::uint32_t n_elements,
     float scale,
     float *grad_x_inplace
@@ -1284,7 +1284,7 @@ inline void launch_mace_scale_force_adjoint(
  *  per-edge pattern with warp shuffle reduction, identical to the readout
  *  linear kernel.
  */
-__global__ void mace_apply_cutoff_force_adjoint_grad_tp_kernel(
+inline __global__ void mace_apply_cutoff_force_adjoint_grad_tp_kernel(
     std::uint32_t n_edges,
     std::uint32_t feature_dim,                // 4 * n_channels
     float const *cutoff_envelope,             // [n_edges]
@@ -1298,7 +1298,7 @@ __global__ void mace_apply_cutoff_force_adjoint_grad_tp_kernel(
     grad_tp_inplace[offset] = grad_tp_inplace[offset] * env;
 }
 
-__global__ void mace_apply_cutoff_force_adjoint_grad_env_kernel(
+inline __global__ void mace_apply_cutoff_force_adjoint_grad_env_kernel(
     std::uint32_t n_edges,
     std::uint32_t feature_dim,
     float const *grad_tp_post,                // [n_edges, feature_dim] — caller's grad_tp BEFORE the in-place rescale
@@ -1351,7 +1351,7 @@ inline void launch_mace_apply_cutoff_force_adjoint(
  *
  *  d r / d positions[target/source] = ± r_unit.  Atomic-add into dpositions.
  */
-__global__ void mace_cutoff_grad_env_to_positions_kernel(
+inline __global__ void mace_cutoff_grad_env_to_positions_kernel(
     std::uint32_t n_edges,
     float r_max,
     float cutoff_p,
@@ -1426,7 +1426,7 @@ inline void launch_mace_cutoff_grad_env_to_positions(
  *  upstream is shape `[n_atoms, c, 16]`; only the L=0 slot has non-zero
  *  forward sensitivity, so we extract that into a `[n_atoms, c]` accumulator.
  */
-__global__ void mace_extract_l0_irrep_block_force_adjoint_kernel(
+inline __global__ void mace_extract_l0_irrep_block_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t irrep_dim,
@@ -1456,7 +1456,7 @@ inline void launch_mace_extract_l0_irrep_block_force_adjoint(
         n_atoms, n_channels, irrep_dim, grad_l0_only, grad_node_features_full);
 }
 
-__global__ void mace_inject_l0_irrep_block_force_adjoint_kernel(
+inline __global__ void mace_inject_l0_irrep_block_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t irrep_dim,
@@ -1568,7 +1568,7 @@ __device__ __forceinline__ float mace_silu_norm2mom_derivative_(float pre_act) {
  *
  *  Threading: one thread per (row, c_in).  Inner loop over c_out.
  */
-__global__ void mace_radial_mlp_layer_force_adjoint_kernel(
+inline __global__ void mace_radial_mlp_layer_force_adjoint_kernel(
     std::uint32_t n_rows,
     std::uint32_t n_in,
     std::uint32_t n_out,

@@ -31,7 +31,7 @@ namespace smallfield::cuda {
  *  `n` is `total_atom_count * 3` — the kernel does not care about per-atom
  *  layout, just the flat element count.  One thread per element.
  */
-__global__ void mace_positions_fp16_to_fp32_kernel(
+inline __global__ void mace_positions_fp16_to_fp32_kernel(
     std::uint32_t n,
     __half const *positions_fp16,
     float *positions_fp32
@@ -46,7 +46,7 @@ __global__ void mace_positions_fp16_to_fp32_kernel(
  *
  *  `n` is `total_atom_count * 3`.  One thread per element.
  */
-__global__ void mace_forces_fp32_to_fp16_kernel(
+inline __global__ void mace_forces_fp32_to_fp16_kernel(
     std::uint32_t n,
     float const *forces_fp32,
     __half *forces_fp16

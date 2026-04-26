@@ -44,7 +44,7 @@
 
 namespace smallfield::cuda {
 
-__global__ void mace_symmetric_contraction_kernel(
+inline __global__ void mace_symmetric_contraction_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t irrep_dim,            // 16

@@ -153,7 +153,7 @@ __device__ __forceinline__ void load_atom_feature_slab_(
  *    4. Add order-1 contribution (1 path × 16 FFMA / channel).
  *    5. Store the per-channel accumulator out to `output_node_scalar_invariants_fp32`.
  */
-__global__ void mace_tk_symmetric_contraction_kernel(
+inline __global__ void mace_tk_symmetric_contraction_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t n_elements,
@@ -301,7 +301,7 @@ __global__ void mace_tk_symmetric_contraction_kernel(
  *  Block: same as `mace_tk_precompute_w3_effective_kernel` so we can share
  *  the launch shape without further tuning.
  */
-__global__ void mace_tk_precompute_w3_sym_total_kernel(
+inline __global__ void mace_tk_precompute_w3_sym_total_kernel(
     std::uint32_t n_channels,
     float const *__restrict__ w3_effective_fp32,    // [n_elements, 16, 16, 16, n_channels]
     float *__restrict__ w3_sym_total_fp32           // [n_elements, 16, 16, 16, n_channels] canonical-only
@@ -391,7 +391,7 @@ __global__ void mace_tk_precompute_w3_sym_total_kernel(
  *  as W3_eff for layout simplicity; only the canonical `(α ≤ β)` cells of
  *  the inner two axes are populated.
  */
-__global__ void mace_tk_precompute_w3_partsym_kernel(
+inline __global__ void mace_tk_precompute_w3_partsym_kernel(
     std::uint32_t n_channels,
     float const *__restrict__ w3_effective_fp32,
     float *__restrict__ w3_partsym_sym_fp32
@@ -449,7 +449,7 @@ __global__ void mace_tk_precompute_w3_partsym_kernel(
  *  once per engine init so the simple-and-correct form here trumps an MMA
  *  fusion.
  */
-__global__ void mace_tk_precompute_w3_effective_kernel(
+inline __global__ void mace_tk_precompute_w3_effective_kernel(
     std::uint32_t n_channels,
     std::uint32_t path_count_max,
     float const *__restrict__ u_matrix_3_fp32,        // [16, 16, 16, path_count_max]

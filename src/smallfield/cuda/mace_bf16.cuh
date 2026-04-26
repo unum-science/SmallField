@@ -49,7 +49,7 @@ namespace smallfield::cuda {
  *  inference).  After the cast, the bf16 view of the buffer is valid for
  *  the first `n` elements.
  */
-__global__ void mace_fp32_to_bf16_kernel(std::uint32_t n, float const *src, __nv_bfloat16 *dst) {
+inline __global__ void mace_fp32_to_bf16_kernel(std::uint32_t n, float const *src, __nv_bfloat16 *dst) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n) return;
     dst[element_index] = __float2bfloat16(src[element_index]);
@@ -71,7 +71,7 @@ inline void launch_mace_fp32_to_bf16(std::uint32_t n, float const *src, __nv_bfl
  *  fp32 path, energy reduce, scale_shift) consume fp32.  One thread per
  *  element; 4-byte aligned output store.
  */
-__global__ void mace_bf16_to_fp32_kernel(std::uint32_t n, __nv_bfloat16 const *src, float *dst) {
+inline __global__ void mace_bf16_to_fp32_kernel(std::uint32_t n, __nv_bfloat16 const *src, float *dst) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n) return;
     dst[element_index] = __bfloat162float(src[element_index]);

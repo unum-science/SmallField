@@ -272,7 +272,7 @@ __device__ __forceinline__ void accumulate_column_zero_into_global_(
  *  Block: 128 threads (one warpgroup, 4 warps).  Mirrors the radial-MLP
  *  kernel's single-warpgroup persistent shape.
  */
-__global__ void mace_tk_readout_linear_kernel(
+inline __global__ void mace_tk_readout_linear_kernel(
     std::uint32_t n_atoms,
     float const *__restrict__ node_scalar_invariants,
     float const *__restrict__ readout_weight,
@@ -318,7 +318,7 @@ __global__ void mace_tk_readout_linear_kernel(
  *  then re-fed as the A tile of the second matmul.  No DRAM round-trip on
  *  the hidden vector.
  */
-__global__ void mace_tk_readout_nonlinear_mlp_kernel(
+inline __global__ void mace_tk_readout_nonlinear_mlp_kernel(
     std::uint32_t n_atoms,
     float const *__restrict__ node_scalar_invariants,
     float const *__restrict__ mlp_w1_weight,

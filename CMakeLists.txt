@@ -193,16 +193,28 @@ option(SMALLFIELD_USE_THUNDERKITTENS
        OFF)
 
 if(SMALLFIELD_USE_THUNDERKITTENS)
+    # If THUNDERKITTENS_DIR is not provided, fetch upstream automatically.
+    # Pinning to the same commit hash that the kernel sources were validated
+    # against (per the comment block above this option declaration) keeps
+    # the captured-graph numerics stable across reproductions.
     if(NOT DEFINED THUNDERKITTENS_DIR)
-        message(FATAL_ERROR
-                "SMALLFIELD_USE_THUNDERKITTENS=ON but THUNDERKITTENS_DIR is not set. "
-                "Pass -DTHUNDERKITTENS_DIR=/path/to/ThunderKittens.")
+        include(FetchContent)
+        set(SMALLFIELD_THUNDERKITTENS_TAG "0b55588d2769dde0c7a9a606ffc015b0ca7a9551"
+            CACHE STRING "ThunderKittens git ref to fetch when THUNDERKITTENS_DIR is unset")
+        FetchContent_Declare(thunderkittens
+            GIT_REPOSITORY https://github.com/HazyResearch/ThunderKittens.git
+            GIT_TAG        "${SMALLFIELD_THUNDERKITTENS_TAG}"
+            GIT_SHALLOW    OFF) # tag is a hash, shallow doesn't help
+        FetchContent_MakeAvailable(thunderkittens)
+        set(THUNDERKITTENS_DIR "${thunderkittens_SOURCE_DIR}" CACHE PATH "" FORCE)
+        message(STATUS "ThunderKittens fetched to ${THUNDERKITTENS_DIR}")
     endif()
     if(NOT EXISTS "${THUNDERKITTENS_DIR}/include/kittens.cuh")
         message(FATAL_ERROR
                 "ThunderKittens not found at ${THUNDERKITTENS_DIR}/include/kittens.cuh. "
                 "Clone https://github.com/HazyResearch/ThunderKittens and pass its "
-                "absolute path via -DTHUNDERKITTENS_DIR=...")
+                "absolute path via -DTHUNDERKITTENS_DIR=..., or omit the variable "
+                "to let CMake FetchContent pull the pinned commit.")
     endif()
     add_library(smallfield_thunderkittens INTERFACE)
     target_include_directories(smallfield_thunderkittens INTERFACE "${THUNDERKITTENS_DIR}/include")

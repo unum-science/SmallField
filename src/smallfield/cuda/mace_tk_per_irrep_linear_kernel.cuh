@@ -334,7 +334,7 @@ __device__ __forceinline__ void zero_inactive_block_m_rows_(
  *  their m-rows zeroed in the output instead.
  */
 template <typename input_t>
-__global__ void mace_tk_per_irrep_linear_kernel(
+inline __global__ void mace_tk_per_irrep_linear_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_channels_out,

@@ -193,7 +193,7 @@ __device__ __forceinline__ void store_grad_in_with_guard_(
  *    5. Stage to fp32 shared tile, write to global `[n_edges, N]` with mask.
  */
 template <int N_dim, int K_dim, bool apply_silu>
-__global__ void mace_tk_radial_mlp_layer_force_adjoint_kernel(
+inline __global__ void mace_tk_radial_mlp_layer_force_adjoint_kernel(
     std::uint32_t n_edges,
     float scale,
     float const *__restrict__ grad_out_fp32,         // [n_edges, K_dim]

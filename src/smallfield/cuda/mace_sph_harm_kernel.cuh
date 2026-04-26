@@ -88,7 +88,7 @@ __device__ __forceinline__ void sph_harm_l0123_(
 
 } // namespace mace_sph_detail_
 
-__global__ void mace_sph_harm_kernel(
+inline __global__ void mace_sph_harm_kernel(
     std::uint32_t n_edges,
     float const *r_unit,
     float *sph_harm

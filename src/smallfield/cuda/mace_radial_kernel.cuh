@@ -42,7 +42,7 @@ using smallfield::types::mace_arch_t;
  *  because the LBFGS step writes new positions and we want to recompute only
  *  this; weights and edge index do not change.
  */
-__global__ void mace_edge_geometry_kernel(
+inline __global__ void mace_edge_geometry_kernel(
     std::uint32_t n_edges,
     float const *positions,            // [n_atoms, 3] (x, y, z) per atom
     std::int32_t const *edge_source_atom,
@@ -76,7 +76,7 @@ __global__ void mace_edge_geometry_kernel(
  *  `bessel_weights[n]` already encodes `π * (n+1) / r_max` so we multiply
  *  raw `r` (not the normalised distance) by the weight.
  */
-__global__ void mace_radial_basis_kernel(
+inline __global__ void mace_radial_basis_kernel(
     std::uint32_t n_edges,
     std::uint32_t n_radial,
     float r_max,
@@ -117,7 +117,7 @@ __global__ void mace_radial_basis_kernel(
 }
 
 /** SiLU activation, x * sigmoid(x). One thread per element. */
-__global__ void mace_silu_activation_kernel(std::uint32_t n, float const *src, float *dst) {
+inline __global__ void mace_silu_activation_kernel(std::uint32_t n, float const *src, float *dst) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n) return;
     float const x = src[element_index];

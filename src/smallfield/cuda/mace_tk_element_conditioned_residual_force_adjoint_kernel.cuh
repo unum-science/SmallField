@@ -280,7 +280,7 @@ __device__ __forceinline__ void add_irrep_block_into_grad_input_(
  *        load the Z-indirect weight slab → mm_AB → scale → masked global
  *        `+=` epilogue.
  */
-__global__ void mace_tk_element_conditioned_residual_force_adjoint_kernel(
+inline __global__ void mace_tk_element_conditioned_residual_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,                // == 96 for MACE-OFF-small
     std::uint32_t n_elements,                   // == 10 for MACE-OFF23

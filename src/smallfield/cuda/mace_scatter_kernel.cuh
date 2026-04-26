@@ -43,7 +43,7 @@ namespace smallfield::cuda {
  *  H100 SXM5 we observe ~1.5 TB/s effective DRAM BW for `feature_dim = 1536`
  *  and `n_edges ≈ 90k` (drug-like batch 256), well within the workload's needs.
  */
-__global__ void mace_scatter_atomic_kernel(
+inline __global__ void mace_scatter_atomic_kernel(
     std::uint32_t n_edges,
     std::uint32_t feature_dim,         // n_channels * n_irreps_msg
     std::int32_t const *edge_target_atom,
@@ -65,7 +65,7 @@ __global__ void mace_scatter_atomic_kernel(
  *  `receiver_edge_segment_end[d]` = one past last.  This is what we
  *  pre-compute at bin-construction time.  No atomics.
  */
-__global__ void mace_scatter_segmented_kernel(
+inline __global__ void mace_scatter_segmented_kernel(
     std::uint32_t n_atoms,
     std::uint32_t feature_dim,
     std::int32_t const *receiver_edge_segment_start,    // [n_atoms]

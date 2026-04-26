@@ -78,7 +78,7 @@ __device__ __forceinline__ float warp_reduce_max_abs_(float v) {
  *  @param  fmax_per_conformer [n_graphs] OUTPUT: latest per-conformer fmax.
  *  @param  converged_flags [n_graphs] IN/OUT: 0 = still relaxing, 1 = converged.
  */
-__global__ void mace_lbfgs_step_kernel(
+inline __global__ void mace_lbfgs_step_kernel(
     std::uint32_t n_graphs,
     std::int32_t const *__restrict__ graph_atom_offsets,
     float const *__restrict__ forces,
@@ -158,7 +158,7 @@ inline void launch_mace_lbfgs_step(
 /// Reset the converged flags to 0 (not converged).  Captured-graph callers
 /// run this once at the start of a relaxation; subsequent step kernels then
 /// flip flags to 1 as conformers converge.
-__global__ void mace_lbfgs_reset_converged_flags_kernel(
+inline __global__ void mace_lbfgs_reset_converged_flags_kernel(
     std::uint32_t n_graphs,
     std::uint8_t *__restrict__ converged_flags
 ) {
@@ -184,7 +184,7 @@ inline void launch_mace_lbfgs_reset_converged_flags(
 /// so the result is consistent on a single in-stream sync.
 ///
 /// Output `all_converged_out[0]` is 1 when every flag is non-zero, 0 otherwise.
-__global__ void mace_lbfgs_all_converged_kernel(
+inline __global__ void mace_lbfgs_all_converged_kernel(
     std::uint32_t n_graphs,
     std::uint8_t const *__restrict__ converged_flags,
     std::uint8_t *__restrict__ all_converged_out
@@ -235,7 +235,7 @@ inline void launch_mace_lbfgs_all_converged(
 /// Assumes the batch is sorted by `graph_of_atom` (atoms of conformer g are
 /// contiguous, in order of g).  This is the case for the synthetic bench
 /// batches and for `pack_mace_batch` in `cli/smallfield_mace_refine.cpp`.
-__global__ void mace_lbfgs_build_graph_atom_offsets_kernel(
+inline __global__ void mace_lbfgs_build_graph_atom_offsets_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_graphs,
     std::int32_t const *__restrict__ graph_of_atom,

@@ -323,7 +323,7 @@ __device__ __forceinline__ void store_pre_activation_bf16_(
  *  shaped `[n_edges, 64]`.  These are consumed by the radial-MLP backward
  *  to skip the fp32 forward rerun (Phase B6 of MACE_OPTIMIZATION_ROADMAP.md).
  */
-__global__ void mace_tk_radial_mlp_kernel(
+inline __global__ void mace_tk_radial_mlp_kernel(
     std::uint32_t n_edges,
     float const *__restrict__ radial_basis_input,
     float const *__restrict__ layer_0_weight,

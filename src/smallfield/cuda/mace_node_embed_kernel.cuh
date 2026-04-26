@@ -39,7 +39,7 @@ namespace smallfield::cuda {
  *  weight as `(n_elements * n_channels)` flat, with elements outer.  We
  *  read `node_embedding[Z * n_channels + c]`, matching the export tool.
  */
-__global__ void mace_node_embed_kernel(
+inline __global__ void mace_node_embed_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t irrep_dim,                   // 16 for MACE-OFF L_max=3

@@ -62,7 +62,7 @@ __device__ __forceinline__ std::uint32_t mace_irrep_block_index_for_component_(s
  *  for every active L-block.  m indices in inactive blocks (m >= active
  *  blocks' m_total) get 0.
  */
-__global__ void mace_linear_per_irrep_kernel(
+inline __global__ void mace_linear_per_irrep_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_channels_out,
@@ -98,7 +98,7 @@ __global__ void mace_linear_per_irrep_kernel(
 
 /// Forward-declare the row-major matmul launcher so the irrep_dim=1 fast path
 /// below can dispatch to it without reordering the file.
-__global__ void mace_matmul_rowmajor_kernel(
+inline __global__ void mace_matmul_rowmajor_kernel(
     std::uint32_t dim_m, std::uint32_t dim_n, std::uint32_t dim_k,
     float const *A, float const *B, float scale, float *C);
 
@@ -153,7 +153,7 @@ inline void launch_mace_linear_per_irrep(
  *  cuBLAS launch overhead dominates on these shapes.  Threading: one thread
  *  per (i, j_tile) accumulating across `dim_k`.
  */
-__global__ void mace_matmul_rowmajor_kernel(
+inline __global__ void mace_matmul_rowmajor_kernel(
     std::uint32_t dim_m, std::uint32_t dim_n, std::uint32_t dim_k,
     float const *A,        // [dim_m, dim_k]
     float const *B,        // [dim_k, dim_n]
@@ -194,7 +194,7 @@ inline void launch_mace_matmul_rowmajor(
  */
 constexpr float mace_silu_normalize_to_unit_second_moment_constant_k = 1.6787818690495806f;
 
-__global__ void mace_silu_normalize_to_unit_second_moment_kernel(std::uint32_t n, float const *src, float *dst) {
+inline __global__ void mace_silu_normalize_to_unit_second_moment_kernel(std::uint32_t n, float const *src, float *dst) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n) return;
     float const x = src[element_index];

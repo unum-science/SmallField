@@ -48,7 +48,7 @@ constexpr std::uint32_t mace_tensor_product_path_count_k = 4u;
  *  `(path_idx, channel_idx)` — path outer, channel inner.  This matches
  *  e3nn's `TensorProduct.weight` packing for "uvu" mode.
  */
-__global__ void mace_tensor_product_kernel(
+inline __global__ void mace_tensor_product_kernel(
     std::uint32_t n_edges,
     std::uint32_t n_channels,
     float scale,                                       // e3nn TP path normalisation = 1/sqrt(c_in * 1)
@@ -129,7 +129,7 @@ inline void launch_mace_tensor_product(
  *  Output dim per edge = `n_paths * n_channels`.  Threading: one thread per
  *  (edge, channel-tile).
  */
-__global__ void mace_apply_cutoff_envelope_kernel(
+inline __global__ void mace_apply_cutoff_envelope_kernel(
     std::uint32_t n_edges,
     std::uint32_t feature_dim,                          // n_paths * n_channels
     float const *cutoff_envelope,                       // [n_edges]

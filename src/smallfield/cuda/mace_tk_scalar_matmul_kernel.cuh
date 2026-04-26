@@ -190,7 +190,7 @@ __device__ __forceinline__ void store_output_atoms_fp32_(
  *  Per CTA: load 64 atoms' input slab + the full c_in × c_out weight, run
  *  one WGMMA, scale, store fp32 directly.
  */
-__global__ void mace_tk_scalar_matmul_kernel(
+inline __global__ void mace_tk_scalar_matmul_kernel(
     std::uint32_t n_atoms,
     float const *__restrict__ input_global,            // [n_atoms, c_in]
     float const *__restrict__ weight_global,           // [c_in, c_out]

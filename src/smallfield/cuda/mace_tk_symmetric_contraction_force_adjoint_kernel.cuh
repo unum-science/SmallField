@@ -132,7 +132,7 @@ __device__ __forceinline__ void load_atom_feature_slab_(
  *       e. Multiply each `dx_local[i]` by `upstream_grad_output[a, c]` and
  *          `+=`-accumulate into `grad_node_features_full_fp32[a, c, :]`.
  */
-__global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
+inline __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t n_elements,

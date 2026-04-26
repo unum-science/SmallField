@@ -52,7 +52,7 @@ namespace smallfield::cuda {
  *  flat.  `active_irrep_block_count` is 1 (only L=0 path) for the
  *  residual-style layer and 4 for the layer-0 selector form.
  */
-__global__ void mace_element_conditioned_residual_kernel(
+inline __global__ void mace_element_conditioned_residual_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_elements,
@@ -103,7 +103,7 @@ __global__ void mace_element_conditioned_residual_kernel(
  *  Weight layout: [n_in, n_elements, n_out] (matching the general kernel's
  *  per-block layout, but irrep_block_index=0 collapses out the leading dim).
  */
-__global__ void mace_skip_tp_irrep1_kernel(
+inline __global__ void mace_skip_tp_irrep1_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_elements,
@@ -173,7 +173,7 @@ inline void launch_mace_skip_tp(
 }
 
 /** Element-wise add: `dst += src` for the residual sum. */
-__global__ void mace_add_in_place_kernel(std::uint32_t n, float const *src, float *dst) {
+inline __global__ void mace_add_in_place_kernel(std::uint32_t n, float const *src, float *dst) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n) return;
     dst[element_index] += src[element_index];
@@ -187,7 +187,7 @@ inline void launch_mace_add_inplace(std::uint32_t n, float const *src, float *ds
 }
 
 /** Element-wise scale `dst = src * alpha`. */
-__global__ void mace_scale_in_place_kernel(std::uint32_t n, float const *src, float alpha, float *dst) {
+inline __global__ void mace_scale_in_place_kernel(std::uint32_t n, float const *src, float alpha, float *dst) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n) return;
     dst[element_index] = src[element_index] * alpha;

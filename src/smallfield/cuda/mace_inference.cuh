@@ -66,7 +66,7 @@ namespace smallfield::cuda {
 namespace mace_detail_ {
 
 /** Project the L=0 component of a [n_atoms, c, 16] tensor to a [n_atoms, c] tensor. */
-__global__ void mace_extract_l0_irrep_block_kernel(
+inline __global__ void mace_extract_l0_irrep_block_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t irrep_dim,
@@ -81,7 +81,7 @@ __global__ void mace_extract_l0_irrep_block_kernel(
 }
 
 /** Place a [n_atoms, c] tensor into the L=0 slot of a [n_atoms, c, 16] tensor (zero rest). */
-__global__ void mace_inject_l0_irrep_block_kernel(
+inline __global__ void mace_inject_l0_irrep_block_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t irrep_dim,
@@ -97,7 +97,7 @@ __global__ void mace_inject_l0_irrep_block_kernel(
 }
 
 /** Per-graph reduce: sum atomic baseline + scale_shift(node_energy) into energy[g]. */
-__global__ void mace_per_graph_energy_reduce_kernel(
+inline __global__ void mace_per_graph_energy_reduce_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     float scale,
@@ -119,7 +119,7 @@ __global__ void mace_per_graph_energy_reduce_kernel(
 /** Linear readout: e[a] = (1/sqrt(c)) * Σ_c W[c] * inv[a, c]. One block per atom; warp-reduces.
  *  The 1/sqrt(c) is the e3nn `o3.Linear` path-weight normalisation
  *  (irreps_in = `c x 0e`, irreps_out = `1 x 0e`, alpha = c). */
-__global__ void mace_readout_linear_kernel(
+inline __global__ void mace_readout_linear_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     float scale,                            // 1/sqrt(n_channels)
@@ -147,7 +147,7 @@ __global__ void mace_readout_linear_kernel(
  *  Hidden dim is 16 for MACE-OFF (the second-to-last `_Layer.weight` shape
  *  is `[n_channels, hidden_dim=16]`).
  */
-__global__ void mace_readout_nonlinear_mlp_kernel(
+inline __global__ void mace_readout_nonlinear_mlp_kernel(
     std::uint32_t n_atoms,
     std::uint32_t n_channels,
     std::uint32_t hidden_dim,
@@ -1358,10 +1358,14 @@ inline void mace_inference_run_force_adjoint(
             stream);
 #endif
         if (tk_d1_ok) {
+#       if defined(SMALLFIELD_USE_THUNDERKITTENS)
+            // Cast bridge — only valid when TK is on (the bf16 storage and the
+            // launch helper both live behind the TK include guard above).
             launch_mace_bf16_to_fp32(
                 batch.n_atoms * arch.n_channels * irrep_dim,
                 S.tk_node_features_post_linear_bf16,
                 S.grad_node_features, stream);
+#       endif
         } else {
             // fp32 reference path uses += semantics; zero the destination first.
             cudaMemsetAsync(S.grad_node_features, 0,
@@ -1468,9 +1472,13 @@ inline void mace_inference_run_force_adjoint(
         }
 #       endif
         if (!tk_radial_backward_ok) {
-            // Fallback: fp32 reference path needs the pre-acts as fp32, so cast
-            // first.  This branch only fires under SMALLFIELD_USE_THUNDERKITTENS=OFF
-            // or for shapes the TK kernel doesn't cover.
+            // Fallback: when TK is on but the kernel didn't cover this shape,
+            // the forward stored pre-acts as bf16 — cast back to fp32 here.
+            // Under SMALLFIELD_USE_THUNDERKITTENS=OFF the forward already wrote
+            // fp32 directly into `S.radial_mlp_hidden_*_pre`, so the casts are
+            // not needed and reference fields that don't exist in the non-TK
+            // scratch struct.
+#       if defined(SMALLFIELD_USE_THUNDERKITTENS)
             launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
                                       S.tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index],
                                       S.radial_mlp_hidden_0_pre, stream);
@@ -1480,6 +1488,7 @@ inline void mace_inference_run_force_adjoint(
             launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
                                       S.tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index],
                                       S.radial_mlp_hidden_2_pre, stream);
+#       endif
             launch_mace_radial_mlp_layer_force_adjoint(
                 batch.n_edges, radial_mlp_hidden_dim, tp_dim,
                 1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
@@ -1510,10 +1519,13 @@ inline void mace_inference_run_force_adjoint(
         // so we ACCUMULATE to preserve the previous layer's contribution.  The
         // n_in=8 shape doesn't fit the TK WGMMA N=64 tile cleanly, so this stays
         // on the fp32 reference path — but we only need the layer-0 pre-act as
-        // fp32, not all three.
+        // fp32, not all three.  Under TK-off the fp32 storage was written
+        // directly during the forward pass, so the cast is unnecessary.
+#       if defined(SMALLFIELD_USE_THUNDERKITTENS)
         launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
                                   S.tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index],
                                   S.radial_mlp_hidden_0_pre, stream);
+#       endif
         launch_mace_radial_mlp_layer_force_adjoint(
             batch.n_edges, arch.n_radial, radial_mlp_hidden_dim,
             1.0f / sqrtf(static_cast<float>(arch.n_radial)),

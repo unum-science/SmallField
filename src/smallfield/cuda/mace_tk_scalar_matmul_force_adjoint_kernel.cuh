@@ -151,7 +151,7 @@ __device__ __forceinline__ void accumulate_into_grad_input_(
  *    - one WGMMA `mm_ABt` produces `[64, c_in]` register accumulator,
  *    - scale by path-weight, accumulate (+= ) into `grad_input` global.
  */
-__global__ void mace_tk_scalar_matmul_force_adjoint_kernel(
+inline __global__ void mace_tk_scalar_matmul_force_adjoint_kernel(
     std::uint32_t n_atoms,
     float const *__restrict__ upstream_grad_global,    // [n_atoms, c_out]
     float const *__restrict__ weight_global,           // [c_in, c_out]
