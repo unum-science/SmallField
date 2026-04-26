@@ -6,6 +6,35 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## MACE-OFF Saturation Sweep at Large Batch — 2026-04-26
+
+After multi-warp landed and brought single-H100 throughput to ~890 c/s at the canonical batch=2048 × n_atoms=30 shape, the obvious follow-up was "do larger batches push higher".
+They do not.
+
+End-to-end refine_batch (20 LBFGS steps, MACE-OFF23-small, fp32 cast-bridge fallbacks, captured graph + Phase K + early-exit), single H100:
+
+|         | bs=512 / 1024 | bs=2048 | bs=4096 | bs=8192 |
+| ------: | :------------ | :------ | :------ | :------ |
+| n_atoms=25 |       1068 c/s |  1076 c/s |  1078 c/s |  1081 c/s |
+| n_atoms=30 |        884 c/s |   891 c/s |   892 c/s |   895 c/s |
+| n_atoms=50 |        532 c/s |   533 c/s |   533 c/s |   (skip)  |
+| n_atoms=80 |        329 c/s |   331 c/s |   332 c/s |   (skip)  |
+
+Throughput is essentially flat across bs=1024 → bs=8192 (0.5–1 % gain across the entire range).
+NCU at bs=8192 confirms the hot kernels (symcontract, conv_tp_scatter, element_residual) sit at 99 %+ SM activity — they're already at the SM ceiling.
+The handful of small bookkeeping kernels (`fill_constant`, `per_graph_energy_*`, `edge_geometry`) remain sub-saturating (0.03–4 waves, 12–80 % SM activity) but contribute <1 % of total time at every batch size, so their saturation profile doesn't matter.
+
+__The saturation knee is at ~25–80 K atoms total per batch.__
+Once the GPU sees that many atoms, every kernel's work is fully spread across all 132 SMs and adding more atoms just stretches wall time proportionally.
+
+__Practical batch-size guidance__:
+- n_atoms ≤ 30 (median drug-like): bs=1024-2048 saturates; bs=4096 fits comfortably in 80 GB and gives a tiny edge.
+- n_atoms 50: bs=1024 saturates; bs=2048 still fits; bs=4096 is the largest tested.
+- n_atoms 80: bs=512-1024 saturates.
+- bs=16384 × n_atoms=50 OOMs (allocates ~10 M edges of fp32 scratch before launch); bs=8192 × n_atoms=50 is the practical headroom limit.
+
+The way to push past 891 c/s on a single H100 is __not__ larger batches (saturated) but kernel-level work (TK ports of the residual fp32 fallbacks, conv_tp_scatter barrier reduction, etc.) or multi-GPU fan-out (8× cards estimated 5.1× of one H100 on the production hardware).
+
 ## MACE-OFF Symcontract Multi-Warp CTAs — 2026-04-26 — `15a04c2`, Follow-Up Smem-W3 Prefetch Reverted
 
 NCU's "73% local speedup from fixing warp-eligibility starvation" estimate on the symcontract backward (84% L1TEX scoreboard stalls, 0.31 eligible warps/scheduler with single-warp CTAs) translated almost 1:1 to wall-time:
