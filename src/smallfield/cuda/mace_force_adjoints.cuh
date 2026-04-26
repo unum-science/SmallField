@@ -1069,13 +1069,457 @@ inline void launch_mace_symmetric_contraction_force_adjoint(
         upstream_grad_output_fp32, grad_node_features_full_fp32);
 }
 
+// =========================================================================
+// Driver-side helper adjoints (small structural ops with closed-form backwards).
+// =========================================================================
+
 /**
- *  @brief Top-level launcher — Phase-3 stub.  Returns immediately.  Real
- *  implementation calls each adjoint above in reverse forward order.
+ *  @brief Fill a fp32 buffer with a constant value (graph-capture safe).
+ *
+ *  Used by `mace_inference_run_force_adjoint` to seed `grad_per_graph_energy`
+ *  with 1.0 — host->device memcpy is unsafe inside captured graphs because
+ *  the source buffer must survive until graph replay.
  */
-inline void mace_inference_run_force_adjoint(cudaStream_t stream) {
-    (void)stream;
-    // No-op until Phase 2 forward is bit-exact.
+__global__ void mace_fill_constant_kernel(float *dst, std::uint32_t n_elements, float value) {
+    std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (element_index >= n_elements) return;
+    dst[element_index] = value;
+}
+
+inline void launch_mace_fill_constant(float *dst, std::uint32_t n_elements, float value, cudaStream_t stream) {
+    if (n_elements == 0) return;
+    constexpr std::uint32_t block = 128;
+    std::uint32_t const grid = (n_elements + block - 1u) / block;
+    mace_fill_constant_kernel<<<grid, block, 0, stream>>>(dst, n_elements, value);
+}
+
+
+/**
+ *  @brief Adjoint of `mace_per_graph_energy_reduce_kernel`.
+ *
+ *  Forward: `e_g = Σ_{a ∈ g} (atomic_energies[Z_a] + scale * node_energy[a] + shift)`.
+ *  Reverse: `dnode_energy[a] = scale * grad_per_graph_energy[graph_of_atom[a]]`.
+ *  The atomic-energy and shift terms have no dependence on positions.
+ */
+__global__ void mace_per_graph_energy_force_adjoint_kernel(
+    std::uint32_t n_atoms,
+    float scale,
+    std::int32_t const *graph_of_atom,
+    float const *grad_per_graph_energy,
+    float *grad_node_energy
+) {
+    std::uint32_t atom_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (atom_index >= n_atoms) return;
+    int const graph_index = graph_of_atom[atom_index];
+    grad_node_energy[atom_index] = scale * grad_per_graph_energy[graph_index];
+}
+
+inline void launch_mace_per_graph_energy_force_adjoint(
+    std::uint32_t n_atoms,
+    float scale,
+    std::int32_t const *graph_of_atom,
+    float const *grad_per_graph_energy,
+    float *grad_node_energy,
+    cudaStream_t stream
+) {
+    if (n_atoms == 0) return;
+    constexpr std::uint32_t block = 128;
+    std::uint32_t const grid = (n_atoms + block - 1u) / block;
+    mace_per_graph_energy_force_adjoint_kernel<<<grid, block, 0, stream>>>(
+        n_atoms, scale, graph_of_atom, grad_per_graph_energy, grad_node_energy);
+}
+
+/** Launcher for `mace_scatter_force_adjoint_kernel` declared above. */
+inline void launch_mace_scatter_force_adjoint(
+    std::uint32_t n_edges,
+    std::uint32_t feature_dim,
+    std::int32_t const *edge_target_atom,
+    float const *grad_node_features_full,
+    float *grad_edge_messages,
+    cudaStream_t stream
+) {
+    if (n_edges == 0) return;
+    constexpr std::uint32_t block_dim_x = 128;
+    dim3 const block(block_dim_x, 1, 1);
+    dim3 const grid(n_edges, (feature_dim + block_dim_x - 1u) / block_dim_x, 1);
+    mace_scatter_force_adjoint_kernel<<<grid, block, 0, stream>>>(
+        n_edges, feature_dim, edge_target_atom, grad_node_features_full, grad_edge_messages);
+}
+
+/**
+ *  @brief Adjoint of in-place scalar scale (`x *= s`).
+ *
+ *  Reverse: `grad_x = grad_y * s`.  In-place; we just multiply the gradient
+ *  buffer.  Used for the `/avg_num_neighbors` rescale in the forward.
+ */
+__global__ void mace_scale_force_adjoint_kernel(
+    std::uint32_t n_elements,
+    float scale,
+    float *grad_x_inplace
+) {
+    std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (element_index >= n_elements) return;
+    grad_x_inplace[element_index] *= scale;
+}
+
+inline void launch_mace_scale_force_adjoint(
+    std::uint32_t n_elements,
+    float scale,
+    float *grad_x_inplace,
+    cudaStream_t stream
+) {
+    if (n_elements == 0) return;
+    constexpr std::uint32_t block = 256;
+    std::uint32_t const grid = (n_elements + block - 1u) / block;
+    mace_scale_force_adjoint_kernel<<<grid, block, 0, stream>>>(n_elements, scale, grad_x_inplace);
+}
+
+/**
+ *  @brief Adjoint of `apply_cutoff` (per-edge multiply by env(r)).
+ *
+ *  Forward: `tp_post[e, k] = tp_pre[e, k] * env(r[e])`.
+ *  Reverse:
+ *    - `grad_tp_pre[e, k] = grad_tp_post[e, k] * env(r[e])`  (in-place rescale)
+ *    - `grad_env[e] = Σ_k grad_tp_post[e, k] * tp_pre[e, k]` (saved for the
+ *       env-derivative path back to dr; folded into the radial-basis +
+ *       edge-geometry adjoint via a separate dr accumulator).
+ *
+ *  We split into two kernels: one rescales `grad_tp` in-place; the other
+ *  reduces `grad_env` per edge.  The second kernel uses a 32-thread block-
+ *  per-edge pattern with warp shuffle reduction, identical to the readout
+ *  linear kernel.
+ */
+__global__ void mace_apply_cutoff_force_adjoint_grad_tp_kernel(
+    std::uint32_t n_edges,
+    std::uint32_t feature_dim,                // 4 * n_channels
+    float const *cutoff_envelope,             // [n_edges]
+    float *grad_tp_inplace                    // [n_edges, feature_dim]
+) {
+    std::uint32_t edge_index = blockIdx.x;
+    std::uint32_t feature_index = blockIdx.y * blockDim.x + threadIdx.x;
+    if (edge_index >= n_edges || feature_index >= feature_dim) return;
+    float const env = cutoff_envelope[edge_index];
+    std::uint64_t const offset = static_cast<std::uint64_t>(edge_index) * feature_dim + feature_index;
+    grad_tp_inplace[offset] = grad_tp_inplace[offset] * env;
+}
+
+__global__ void mace_apply_cutoff_force_adjoint_grad_env_kernel(
+    std::uint32_t n_edges,
+    std::uint32_t feature_dim,
+    float const *grad_tp_post,                // [n_edges, feature_dim] — caller's grad_tp BEFORE the in-place rescale
+    float const *tp_pre,                      // [n_edges, feature_dim] — saved pre-cutoff tp_weights
+    float *grad_env                           // [n_edges] — written
+) {
+    std::uint32_t edge_index = blockIdx.x;
+    if (edge_index >= n_edges) return;
+    std::uint64_t const row_offset = static_cast<std::uint64_t>(edge_index) * feature_dim;
+    float accumulator = 0.0f;
+    for (std::uint32_t feature_index = threadIdx.x; feature_index < feature_dim; feature_index += blockDim.x) {
+        accumulator += grad_tp_post[row_offset + feature_index] * tp_pre[row_offset + feature_index];
+    }
+    for (int shfl_offset = 16; shfl_offset > 0; shfl_offset /= 2) {
+        accumulator += __shfl_xor_sync(0xFFFFFFFF, accumulator, shfl_offset);
+    }
+    if (threadIdx.x == 0) grad_env[edge_index] = accumulator;
+}
+
+inline void launch_mace_apply_cutoff_force_adjoint(
+    std::uint32_t n_edges,
+    std::uint32_t feature_dim,
+    float const *cutoff_envelope,
+    float const *tp_pre,
+    float *grad_tp_inplace,
+    float *grad_env,
+    cudaStream_t stream
+) {
+    if (n_edges == 0) return;
+    // First reduce grad_env using grad_tp_post BEFORE we rescale grad_tp.
+    if (grad_env != nullptr) {
+        constexpr std::uint32_t block_env = 32;
+        mace_apply_cutoff_force_adjoint_grad_env_kernel<<<n_edges, block_env, 0, stream>>>(
+            n_edges, feature_dim, grad_tp_inplace, tp_pre, grad_env);
+    }
+    constexpr std::uint32_t block_dim_x = 128;
+    dim3 const block(block_dim_x, 1, 1);
+    dim3 const grid(n_edges, (feature_dim + block_dim_x - 1u) / block_dim_x, 1);
+    mace_apply_cutoff_force_adjoint_grad_tp_kernel<<<grid, block, 0, stream>>>(
+        n_edges, feature_dim, cutoff_envelope, grad_tp_inplace);
+}
+
+/**
+ *  @brief env(r) derivative folded into dpositions.
+ *
+ *  `grad_env[e]` is the cutoff envelope's accumulated gradient from the
+ *  apply_cutoff adjoint.  d env / d r is already computed inside the radial
+ *  geometry adjoint as `denv_dr`; here we replicate that math standalone so
+ *  the apply_cutoff path can route into dpositions independently.
+ *
+ *  d r / d positions[target/source] = ± r_unit.  Atomic-add into dpositions.
+ */
+__global__ void mace_cutoff_grad_env_to_positions_kernel(
+    std::uint32_t n_edges,
+    float r_max,
+    float cutoff_p,
+    float const *r_norm,
+    float const *r_unit,
+    std::int32_t const *edge_source_atom,
+    std::int32_t const *edge_target_atom,
+    float const *grad_env,
+    float *dpositions
+) {
+    std::uint32_t edge_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (edge_index >= n_edges) return;
+    float const r = r_norm[edge_index];
+    if (r >= r_max) return;
+    float const u = r / r_max;
+    float const p = cutoff_p;
+    float const a = -(p + 1.0f) * (p + 2.0f) * 0.5f;
+    float const b = p * (p + 2.0f);
+    float const c = -p * (p + 1.0f) * 0.5f;
+    float const up_minus1 = powf(u, p - 1.0f);
+    float const up        = up_minus1 * u;
+    float const up1       = up * u;
+    float const inv_r_max = 1.0f / r_max;
+    float const denv_dr = inv_r_max * (a * p * up_minus1 + b * (p + 1.0f) * up + c * (p + 2.0f) * up1);
+    float const ge = grad_env[edge_index];
+    float const dr_contribution = ge * denv_dr;
+    float const ux = r_unit[3 * edge_index + 0];
+    float const uy = r_unit[3 * edge_index + 1];
+    float const uz = r_unit[3 * edge_index + 2];
+    int const src = edge_source_atom[edge_index];
+    int const dst = edge_target_atom[edge_index];
+    atomicAdd(dpositions + 3 * dst + 0,  dr_contribution * ux);
+    atomicAdd(dpositions + 3 * dst + 1,  dr_contribution * uy);
+    atomicAdd(dpositions + 3 * dst + 2,  dr_contribution * uz);
+    atomicAdd(dpositions + 3 * src + 0, -dr_contribution * ux);
+    atomicAdd(dpositions + 3 * src + 1, -dr_contribution * uy);
+    atomicAdd(dpositions + 3 * src + 2, -dr_contribution * uz);
+}
+
+inline void launch_mace_cutoff_grad_env_to_positions(
+    types::mace_arch_t const &arch,
+    std::uint32_t n_edges,
+    float const *r_norm,
+    float const *r_unit,
+    std::int32_t const *edge_source_atom,
+    std::int32_t const *edge_target_atom,
+    float const *grad_env,
+    float *dpositions,
+    cudaStream_t stream
+) {
+    if (n_edges == 0) return;
+    constexpr std::uint32_t block = 128;
+    std::uint32_t const grid = (n_edges + block - 1u) / block;
+    mace_cutoff_grad_env_to_positions_kernel<<<grid, block, 0, stream>>>(
+        n_edges, arch.r_max, arch.cutoff_p, r_norm, r_unit,
+        edge_source_atom, edge_target_atom, grad_env, dpositions);
+}
+
+/**
+ *  @brief Adjoint of `mace_extract_l0_irrep_block_kernel` and
+ *         `mace_inject_l0_irrep_block_kernel`.
+ *
+ *  These two ops are duals of each other.  `extract_l0` reads the L=0
+ *  component of `[n_atoms, c, 16]` into `[n_atoms, c]`.  `inject_l0` does
+ *  the reverse but ZEROS the upper L slots.
+ *
+ *  Adjoint of `extract_l0` (forward L=0 → scalar): the upstream is shape
+ *  `[n_atoms, c]`; we add it to the L=0 slot of an irrep tensor (no zeroing
+ *  the rest, since they may already hold gradient from another path).
+ *
+ *  Adjoint of `inject_l0` (forward scalar → L=0; zeros upper Ls): the
+ *  upstream is shape `[n_atoms, c, 16]`; only the L=0 slot has non-zero
+ *  forward sensitivity, so we extract that into a `[n_atoms, c]` accumulator.
+ */
+__global__ void mace_extract_l0_irrep_block_force_adjoint_kernel(
+    std::uint32_t n_atoms,
+    std::uint32_t n_channels,
+    std::uint32_t irrep_dim,
+    float const *grad_l0_only,                // [n_atoms, n_channels]
+    float *grad_node_features_full            // [n_atoms, n_channels, irrep_dim]   accumulated +=
+) {
+    std::uint32_t atom_index = blockIdx.x;
+    std::uint32_t channel_index = blockIdx.y * blockDim.x + threadIdx.x;
+    if (atom_index >= n_atoms || channel_index >= n_channels) return;
+    grad_node_features_full[(static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim + 0]
+        += grad_l0_only[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index];
+}
+
+inline void launch_mace_extract_l0_irrep_block_force_adjoint(
+    std::uint32_t n_atoms,
+    std::uint32_t n_channels,
+    std::uint32_t irrep_dim,
+    float const *grad_l0_only,
+    float *grad_node_features_full,
+    cudaStream_t stream
+) {
+    if (n_atoms == 0) return;
+    constexpr std::uint32_t block_dim_x = 64;
+    dim3 const block(block_dim_x, 1, 1);
+    dim3 const grid(n_atoms, (n_channels + block_dim_x - 1u) / block_dim_x, 1);
+    mace_extract_l0_irrep_block_force_adjoint_kernel<<<grid, block, 0, stream>>>(
+        n_atoms, n_channels, irrep_dim, grad_l0_only, grad_node_features_full);
+}
+
+__global__ void mace_inject_l0_irrep_block_force_adjoint_kernel(
+    std::uint32_t n_atoms,
+    std::uint32_t n_channels,
+    std::uint32_t irrep_dim,
+    float const *grad_node_features_full,     // [n_atoms, n_channels, irrep_dim]
+    float *grad_l0_only                       // [n_atoms, n_channels]   accumulated +=
+) {
+    std::uint32_t atom_index = blockIdx.x;
+    std::uint32_t channel_index = blockIdx.y * blockDim.x + threadIdx.x;
+    if (atom_index >= n_atoms || channel_index >= n_channels) return;
+    grad_l0_only[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index]
+        += grad_node_features_full[(static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim + 0];
+}
+
+inline void launch_mace_inject_l0_irrep_block_force_adjoint(
+    std::uint32_t n_atoms,
+    std::uint32_t n_channels,
+    std::uint32_t irrep_dim,
+    float const *grad_node_features_full,
+    float *grad_l0_only,
+    cudaStream_t stream
+) {
+    if (n_atoms == 0) return;
+    constexpr std::uint32_t block_dim_x = 64;
+    dim3 const block(block_dim_x, 1, 1);
+    dim3 const grid(n_atoms, (n_channels + block_dim_x - 1u) / block_dim_x, 1);
+    mace_inject_l0_irrep_block_force_adjoint_kernel<<<grid, block, 0, stream>>>(
+        n_atoms, n_channels, irrep_dim, grad_node_features_full, grad_l0_only);
+}
+
+/**
+ *  @brief Adjoint of the radial MLP — 4 fp32 fully-connected layers with
+ *         normalize2mom(silu) between layers 0..2.
+ *
+ *  Forward (per edge):
+ *    h0 = silu·n2m(scale0 * radial_basis @ W0)              ; W0:[n_radial, h]
+ *    h1 = silu·n2m(scale1 * h0 @ W1)                        ; W1:[h, h]
+ *    h2 = silu·n2m(scale2 * h1 @ W2)                        ; W2:[h, h]
+ *    out = scale3 * h2 @ W3                                 ; W3:[h, 4*c]
+ *  where each scale_i = 1/sqrt(in_dim_i).
+ *
+ *  We need the saved pre-activations h0_pre, h1_pre, h2_pre (= scale * (in @ W))
+ *  to recompute d silu·n2m / dx.  The forward currently saves only the
+ *  POST-activation buffers `S.radial_mlp_hidden_{0,1,2}` (the silu output
+ *  is written in-place into the same buffer that held the linear output).
+ *  For the backward we re-derive pre_act from post_act:  silu(x) = x * sigmoid(x),
+ *  invert numerically?  Cheaper: re-run the four forward matmuls and stage
+ *  pre_act buffers in the kernel via a fp32 scratch; or save pre_act in the
+ *  forward (small, ~edges * h floats * 3).
+ *
+ *  We choose the scratch-recompute path: the backward kernel re-runs the
+ *  three pre-act linears on the fly using the saved post-activations from
+ *  the previous step.  Simpler than allocating new save buffers, and the
+ *  cost is dominated by the matmul backward anyway.
+ *
+ *  Since saving post-activations means the silu input is lost, we instead
+ *  recover pre_act by undoing silu·n2m.  silu·n2m(x) = N * x * sigmoid(x);
+ *  this is monotonic and well-conditioned outside the saturation regime, so
+ *  Newton iteration converges in ~3 steps.  Implemented inline.
+ *
+ *  --- Simpler approach taken below: the forward saves the post-silu·n2m
+ *      activations, and the backward iteratively inverts silu·n2m to
+ *      recover pre_act.  6 Newton iterations gives ~1e-7 precision.  Then
+ *      d silu·n2m / d pre_act is computed analytically.
+ */
+__device__ __forceinline__ float mace_invert_silu_norm2mom_(float y) {
+    // Forward: y = N * x * sigmoid(x)  with N = mace_silu_normalize_to_unit_second_moment_constant_k.
+    // f(x) = N * x * sigmoid(x) - y, f'(x) = N * (sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))).
+    // Newton's method, starting from x0 = y / N (good for small y, since silu(x) ~ x/2 + x^2/4 - ...
+    // and N ~ 1.679 — y/N is a slight overestimate around zero but stable).
+    constexpr float N = mace_silu_normalize_to_unit_second_moment_constant_k;
+    float x = y / N;
+    // For very negative y, silu·n2m is bounded below ≈ -0.557 * N ~ -0.935; clamp the
+    // initial guess to avoid divergent iterates.
+    if (x < -3.0f) x = -3.0f;
+    if (x >  6.0f) x =  6.0f;
+    for (int iter = 0; iter < 8; ++iter) {
+        float const sig = 1.0f / (1.0f + __expf(-x));
+        float const f   = N * x * sig - y;
+        float const fp  = N * (sig + x * sig * (1.0f - sig));
+        // Guard against fp ~ 0 (shouldn't happen in our regime).
+        float const step = (fabsf(fp) > 1e-8f) ? (f / fp) : 0.0f;
+        x -= step;
+    }
+    return x;
+}
+
+/** d silu·n2m / d pre_act, given pre_act. */
+__device__ __forceinline__ float mace_silu_norm2mom_derivative_(float pre_act) {
+    constexpr float N = mace_silu_normalize_to_unit_second_moment_constant_k;
+    float const sig = 1.0f / (1.0f + __expf(-pre_act));
+    return N * sig * (1.0f + pre_act * (1.0f - sig));
+}
+
+/**
+ *  Backward of one fully-connected layer with optional silu·n2m epilogue.
+ *
+ *    forward:  out = silu_n2m(scale * (in @ W))   (or just scale * (in @ W) for the final layer)
+ *    backward: d_in[a, c_in]  = scale * Σ_{c_out} d_pre[a, c_out] * W[c_in, c_out]
+ *  where d_pre = d_out * silu_n2m'(pre_act) (or just d_out if no epilogue).
+ *
+ *  Inputs:
+ *    `post_activation`: forward output (post-silu_n2m if applicable) — shape [N, c_out]
+ *    `weight`:          [c_in, c_out]
+ *    `grad_out`:        [N, c_out]
+ *    `scale`:           1/sqrt(c_in)
+ *    `apply_silu_n2m_inverse`: true for layers 0..2, false for layer 3 (final, no activation)
+ *  Output:
+ *    `grad_in`:         [N, c_in]   (overwritten)
+ *
+ *  Threading: one thread per (row, c_in).  Inner loop over c_out.
+ */
+__global__ void mace_radial_mlp_layer_force_adjoint_kernel(
+    std::uint32_t n_rows,
+    std::uint32_t n_in,
+    std::uint32_t n_out,
+    float scale,
+    bool apply_silu_n2m_inverse,
+    float const *post_activation,    // [n_rows, n_out]   (post-silu_n2m if epilogue)
+    float const *weight,             // [n_in, n_out]
+    float const *grad_out,           // [n_rows, n_out]
+    float *grad_in                   // [n_rows, n_in]
+) {
+    std::uint32_t row_index = blockIdx.x;
+    std::uint32_t input_index = blockIdx.y * blockDim.x + threadIdx.x;
+    if (row_index >= n_rows || input_index >= n_in) return;
+    float accumulator = 0.0f;
+    for (std::uint32_t out_index = 0; out_index < n_out; ++out_index) {
+        float du = grad_out[static_cast<std::uint64_t>(row_index) * n_out + out_index];
+        if (apply_silu_n2m_inverse) {
+            float const post = post_activation[static_cast<std::uint64_t>(row_index) * n_out + out_index];
+            float const pre  = mace_invert_silu_norm2mom_(post);
+            float const dact = mace_silu_norm2mom_derivative_(pre);
+            du *= dact;
+        }
+        accumulator += du * weight[static_cast<std::uint64_t>(input_index) * n_out + out_index];
+    }
+    grad_in[static_cast<std::uint64_t>(row_index) * n_in + input_index] = scale * accumulator;
+}
+
+inline void launch_mace_radial_mlp_layer_force_adjoint(
+    std::uint32_t n_rows,
+    std::uint32_t n_in,
+    std::uint32_t n_out,
+    float scale,
+    bool apply_silu_n2m_inverse,
+    float const *post_activation,
+    float const *weight,
+    float const *grad_out,
+    float *grad_in,
+    cudaStream_t stream
+) {
+    if (n_rows == 0) return;
+    constexpr std::uint32_t block_dim_x = 64;
+    dim3 const block(block_dim_x, 1, 1);
+    dim3 const grid(n_rows, (n_in + block_dim_x - 1u) / block_dim_x, 1);
+    mace_radial_mlp_layer_force_adjoint_kernel<<<grid, block, 0, stream>>>(
+        n_rows, n_in, n_out, scale, apply_silu_n2m_inverse,
+        post_activation, weight, grad_out, grad_in);
 }
 
 } // namespace smallfield::cuda
