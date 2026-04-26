@@ -781,6 +781,17 @@ inline void mace_inference_forward(
 
 
         // 3e. linear_post_tp: per-irrep channel mix on all 4 L blocks.
+        //
+        // Megakernel B β-2: when layer >= 1, fold the downstream
+        // `1 / avg_num_neighbors` scale into the linear kernel's path-weight.
+        // This eliminates the standalone `launch_mace_scale` step on the TK
+        // path.  Layer 0 keeps `pre_scale = 1.0` here because its
+        // `1 / avg_num_neighbors` factor is folded into the bf16-input
+        // element_residual launcher in the β-1 fused path below; double-folding
+        // would scale twice.
+        float const linear_post_tp_pre_scale =
+            (layer_index >= 1u && avg_num_neighbors != 1.0f && avg_num_neighbors != 0.0f)
+            ? (1.0f / avg_num_neighbors) : 1.0f;
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // TK 4-block fused linear writes bf16 into
         // `S.tk_node_features_post_linear_bf16`.  Returns false if the channel
@@ -791,13 +802,18 @@ inline void mace_inference_forward(
             /*active_irrep_block_count*/4u,
             L.linear_post_tp_w,
             S.node_features_scratch,
-            S.tk_node_features_post_linear_bf16, stream);
+            S.tk_node_features_post_linear_bf16, stream,
+            linear_post_tp_pre_scale);
 #else
         bool const tk_post_tp_ok = false;
+        (void)linear_post_tp_pre_scale;  // fp32 reference path doesn't pre-scale
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
                                       irrep_dim, /*active_irrep_block_count*/4u,
                                       L.linear_post_tp_w, S.node_features_scratch, S.node_features, stream);
 #endif
+        // Whether the standalone scale step still needs to run (the legacy
+        // path below).  When the TK linear pre-scaled, we can skip it.
+        bool const scale_already_folded_into_linear = (tk_post_tp_ok && linear_post_tp_pre_scale != 1.0f);
 
         // ------------------------------------------------------------------
         //  Megakernel B — Phase β-1: fused bf16-input element-conditioned
@@ -841,7 +857,9 @@ inline void mace_inference_forward(
             }
 #endif
             // 3f. Divide by avg_num_neighbors (in-place scale of node_features).
-            if (avg_num_neighbors != 1.0f) {
+            // Skip when β-2 already folded the scale into the TK linear's
+            // path_weight (`scale_already_folded_into_linear`).
+            if (avg_num_neighbors != 1.0f && !scale_already_folded_into_linear) {
                 launch_mace_scale(batch.n_atoms * arch.n_channels * irrep_dim,
                                   S.node_features, 1.0f / avg_num_neighbors, S.node_features, stream);
             }

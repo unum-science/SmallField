@@ -444,7 +444,11 @@ inline bool launch_mace_tk_per_irrep_linear(
     float const *weight_blocks_fp32,
     float const *input_fp32,
     __nv_bfloat16 *output_bf16,
-    cudaStream_t stream
+    cudaStream_t stream,
+    float pre_scale_multiplier = 1.0f                    // Megakernel B β-2: fold an extra
+                                                          // uniform scale (typically 1/avg_num_neighbors)
+                                                          // into path_weight so the caller can skip
+                                                          // a downstream scale_in_place launch.
 ) {
     if (n_atoms == 0u) return true;
 
@@ -464,7 +468,7 @@ inline bool launch_mace_tk_per_irrep_linear(
     }
 
     per_irrep_linear_scales_t scales;
-    scales.path_weight = 1.0f / sqrtf(static_cast<float>(n_channels_in));
+    scales.path_weight = pre_scale_multiplier / sqrtf(static_cast<float>(n_channels_in));
 
     // Shared-mem footprint, one of each tile type:
     //   shared_input_tile     64 x 96 bf16 = 12 KB
