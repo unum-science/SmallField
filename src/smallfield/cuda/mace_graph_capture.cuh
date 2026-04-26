@@ -196,17 +196,14 @@ inline void mace_capture_forward(
  *  in one `cudaGraphLaunch`.
  *
  *  The capture warmup runs both forward AND adjoint once eagerly so any
- *  first-call lazy allocation in either pass (e.g. the TK W3_eff precompute,
- *  or the apply_cutoff backward's transient `cudaMallocAsync` for grad_env)
+ *  first-call lazy allocation in either pass (e.g. the TK W3_eff precompute)
  *  is amortised before capture begins.
  *
- *  Note: the current force-adjoint chain uses `cudaMallocAsync` /
- *  `cudaFreeAsync` once per layer for the per-edge `grad_cutoff_envelope`
- *  scratch.  That is graph-capture-safe on Hopper (CUDA 12+) but each
- *  capture replay re-runs the malloc/free, slightly increasing replay
- *  overhead.  Promote `grad_cutoff_envelope` to a permanent scratch slot
- *  in `mace_scratch_t` if profiling shows the per-replay malloc to be
- *  significant.
+ *  The earlier separate `apply_cutoff` backward step (with its transient
+ *  per-layer `grad_cutoff_envelope` scratch) was removed once the forward
+ *  was changed to fold the cutoff envelope directly into `radial_basis`
+ *  (see `mace_inference.cuh` step 3j).  No `cudaMallocAsync` /
+ *  `cudaFreeAsync` calls remain on the captured chain.
  */
 inline void mace_capture_forward_with_force_adjoint(
     types::mace_arch_t const &arch,
