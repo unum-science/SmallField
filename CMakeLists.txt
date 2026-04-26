@@ -241,8 +241,13 @@ if(RDKit_FOUND)
         RDKit::ChemTransforms)
 
     function(configure_smallfield_library target_name library_type)
-        add_library(${target_name} ${library_type} src/smallfield/api/smallfield.cu)
-        set_source_files_properties(src/smallfield/api/smallfield.cu PROPERTIES LANGUAGE CUDA)
+        add_library(${target_name} ${library_type}
+            src/smallfield/api/smallfield.cu
+            src/smallfield/api/smallfield_mace.cu)
+        set_source_files_properties(
+            src/smallfield/api/smallfield.cu
+            src/smallfield/api/smallfield_mace.cu
+            PROPERTIES LANGUAGE CUDA)
         target_include_directories(${target_name} PUBLIC ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(${target_name} PUBLIC
             ${RDKIT_LIBS}
@@ -251,6 +256,13 @@ if(RDKit_FOUND)
             CUDA::cudart
             OpenMP::OpenMP_CXX
             fmt::fmt)
+        # When ThunderKittens is enabled, the MACE-OFF inference TU pulls in
+        # TK headers transitively via mace_inference.cuh.  Link the interface
+        # target so the include path and SMALLFIELD_USE_THUNDERKITTENS define
+        # are visible.
+        if(TARGET smallfield_thunderkittens)
+            target_link_libraries(${target_name} PUBLIC smallfield_thunderkittens)
+        endif()
         # Pass -fopenmp to the host compiler through nvcc so #pragma omp inside
         # etkdg_prepare_batch.hpp (included by smallfield.cu) actually parallelizes.
         # Without this the OpenMP pragma is silently ignored by nvcc's host pass
