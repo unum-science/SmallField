@@ -29,6 +29,7 @@
 #include "smallfield/types/mace_types.hpp"
 #include "smallfield/cuda/mace_inference.cuh"
 #include "smallfield/cuda/mace_fp16_io_kernel.cuh"
+#include "smallfield/cuda/mace_graph_capture.cuh"
 
 #include <cuda_fp16.h>
 
@@ -485,6 +486,173 @@ void run_batched(smallfield::parameters::mace_weights_t const & /*W*/,
     cudaFree(d_positions_fp32);
 }
 
+/**
+ *  @brief Track E1 validation: capture the MACE forward pass into a
+ *  `cudaGraph_t` and confirm replays produce the same energy as the
+ *  eager driver.  Reports wall-time eager vs graph-replay across 50
+ *  timed iterations to make the per-launch-overhead win measurable.
+ *
+ *  Picks one molecule (caffeine).  Captured graph references the device
+ *  pointers in `batch` and `scratch` at capture time, so we keep the same
+ *  buffers around for the eager-vs-replay comparison.
+ */
+void run_with_graph_capture(smallfield::parameters::mace_weights_t const &W,
+                            std::string const &golden_path,
+                            char const *name) {
+    auto const &arch = W.arch();
+
+    golden_trace_t gt;
+    gt.load(golden_path);
+    auto const &positions = gt.tensors.at("positions");
+    auto const &edge_index = gt.tensors.at("edge_index");
+    auto const &node_attrs = gt.tensors.at("node_attrs");
+
+    std::uint32_t const n_atoms = static_cast<std::uint32_t>(positions.size() / 3);
+    std::uint32_t const n_edges = static_cast<std::uint32_t>(edge_index.size() / 2);
+    std::printf("\n--- graph-capture: %s: %u atoms, %u edges ---\n", name, n_atoms, n_edges);
+
+    std::vector<std::int32_t> h_atom_element(n_atoms);
+    for (std::uint32_t a = 0; a < n_atoms; ++a) {
+        for (std::uint32_t z = 0; z < arch.n_elements; ++z) {
+            if (node_attrs[a * arch.n_elements + z] > 0.5) { h_atom_element[a] = static_cast<std::int32_t>(z); break; }
+        }
+    }
+    std::vector<std::int32_t> h_graph_of_atom(n_atoms, 0);
+
+    float *d_pos = nullptr;
+    std::int32_t *d_src = nullptr, *d_dst = nullptr, *d_atom_el = nullptr, *d_graph_of_atom = nullptr;
+    cudaMalloc(reinterpret_cast<void **>(&d_pos), n_atoms * 3 * sizeof(float));
+    cudaMalloc(reinterpret_cast<void **>(&d_src), n_edges * sizeof(std::int32_t));
+    cudaMalloc(reinterpret_cast<void **>(&d_dst), n_edges * sizeof(std::int32_t));
+    cudaMalloc(reinterpret_cast<void **>(&d_atom_el), n_atoms * sizeof(std::int32_t));
+    cudaMalloc(reinterpret_cast<void **>(&d_graph_of_atom), n_atoms * sizeof(std::int32_t));
+    {
+        std::vector<float> h_pos(n_atoms * 3);
+        for (std::size_t i = 0; i < positions.size(); ++i) h_pos[i] = static_cast<float>(positions[i]);
+        std::vector<std::int32_t> h_src(n_edges), h_dst(n_edges);
+        for (std::uint32_t e = 0; e < n_edges; ++e) {
+            h_src[e] = static_cast<std::int32_t>(edge_index[0 * n_edges + e]);
+            h_dst[e] = static_cast<std::int32_t>(edge_index[1 * n_edges + e]);
+        }
+        cudaMemcpy(d_pos,    h_pos.data(),            h_pos.size() * sizeof(float),  cudaMemcpyHostToDevice);
+        cudaMemcpy(d_src,    h_src.data(),            h_src.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_dst,    h_dst.data(),            h_dst.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_atom_el,h_atom_element.data(),   n_atoms * sizeof(std::int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_graph_of_atom, h_graph_of_atom.data(), n_atoms * sizeof(std::int32_t), cudaMemcpyHostToDevice);
+    }
+
+    smallfield::cuda::mace_scratch_t S;
+    S.allocate(arch, n_atoms, n_edges, /*max_graphs*/1u);
+
+    smallfield::types::mace_batch_t batch{};
+    batch.n_atoms = n_atoms;
+    batch.n_edges = n_edges;
+    batch.n_graphs = 1u;
+    batch.positions = d_pos;
+    batch.atom_element = d_atom_el;
+    batch.edge_source_atom = d_src;
+    batch.edge_target_atom = d_dst;
+    batch.graph_of_atom = d_graph_of_atom;
+
+    // Use a non-default stream so capture is unambiguous (capture on legacy
+    // stream 0 is technically allowed in `cudaStreamCaptureModeGlobal` but
+    // a created stream is the recommended pattern).
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+
+    // 2. Eager reference.
+    smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(S, n_atoms, stream);
+    smallfield::cuda::mace_inference_forward(arch, W.device(), batch, S, stream);
+    cudaStreamSynchronize(stream);
+    float eager_energy = 0.0f;
+    cudaMemcpy(&eager_energy, S.energy, sizeof(float), cudaMemcpyDeviceToHost);
+    double const ref_energy = gt.tensors.at("energy").size() == 1
+                              ? gt.tensors.at("energy")[0]
+                              : 0.0;
+    std::printf("  eager energy  ref=%14.6f  got=%14.6f  diff=%.3e\n",
+                ref_energy, static_cast<double>(eager_energy),
+                std::abs(ref_energy - static_cast<double>(eager_energy)));
+
+    // 3. Capture the graph.  Any pending CUDA error is surfaced so that the
+    //    failure mode is clear (the most common cause is a stray
+    //    `cudaMalloc` inside the captured region — e.g. the TK atomic-fallback
+    //    conv_tp_scatter path, which is incompatible with stream capture
+    //    until Track B's segmented sort lands).
+    cudaGetLastError();
+    smallfield::cuda::mace_captured_graph_t captured;
+    smallfield::cuda::mace_capture_forward(arch, W.device(), batch, S, stream, captured);
+    cudaError_t const capture_err = cudaGetLastError();
+    if (captured.graph_exec == nullptr) {
+        std::printf("  graph instantiation FAILED (last cuda err: %s) — bailing out\n",
+                    cudaGetErrorString(capture_err));
+        cudaStreamDestroy(stream);
+        cudaFree(d_pos); cudaFree(d_src); cudaFree(d_dst);
+        cudaFree(d_atom_el); cudaFree(d_graph_of_atom);
+        return;
+    }
+    std::printf("  graph instantiated  (n_atoms=%u n_edges=%u n_graphs=%u)\n",
+                captured.n_atoms, captured.n_edges, captured.n_graphs);
+
+    // 4. Replay 10 times and confirm bit-stability vs eager.
+    double max_replay_diff = 0.0;
+    for (int i = 0; i < 10; ++i) {
+        captured.replay(stream);
+        cudaStreamSynchronize(stream);
+        float replay_energy = 0.0f;
+        cudaMemcpy(&replay_energy, S.energy, sizeof(float), cudaMemcpyDeviceToHost);
+        double const d = std::abs(static_cast<double>(replay_energy) -
+                                  static_cast<double>(eager_energy));
+        if (d > max_replay_diff) max_replay_diff = d;
+    }
+    char const *replay_verdict = (max_replay_diff <= 1e-3) ? "PASS" : "FAIL";
+    std::printf("  replay vs eager max_abs=%.3e  [%s, threshold 1e-3]\n",
+                max_replay_diff, replay_verdict);
+
+    // 5. Wall-time comparison: 5 warmup + 50 timed iterations each.
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0); cudaEventCreate(&t1);
+    constexpr int N_WARMUP = 5;
+    constexpr int N_ITERS = 50;
+
+    // Eager.
+    for (int i = 0; i < N_WARMUP; ++i) {
+        smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(S, n_atoms, stream);
+        smallfield::cuda::mace_inference_forward(arch, W.device(), batch, S, stream);
+    }
+    cudaStreamSynchronize(stream);
+    cudaEventRecord(t0, stream);
+    for (int i = 0; i < N_ITERS; ++i) {
+        smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(S, n_atoms, stream);
+        smallfield::cuda::mace_inference_forward(arch, W.device(), batch, S, stream);
+    }
+    cudaEventRecord(t1, stream);
+    cudaEventSynchronize(t1);
+    float ms_eager = 0.0f;
+    cudaEventElapsedTime(&ms_eager, t0, t1);
+
+    // Graph replay.
+    for (int i = 0; i < N_WARMUP; ++i) captured.replay(stream);
+    cudaStreamSynchronize(stream);
+    cudaEventRecord(t0, stream);
+    for (int i = 0; i < N_ITERS; ++i) captured.replay(stream);
+    cudaEventRecord(t1, stream);
+    cudaEventSynchronize(t1);
+    float ms_replay = 0.0f;
+    cudaEventElapsedTime(&ms_replay, t0, t1);
+
+    std::printf("  eager  %d iters total %.3f ms  (%.4f ms/forward)\n",
+                N_ITERS, ms_eager, ms_eager / N_ITERS);
+    std::printf("  graph  %d iters total %.3f ms  (%.4f ms/replay)\n",
+                N_ITERS, ms_replay, ms_replay / N_ITERS);
+    std::printf("  speedup %.2fx (per-launch overhead saved)\n",
+                ms_eager / std::max(ms_replay, 1e-6f));
+
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    cudaStreamDestroy(stream);
+    cudaFree(d_pos); cudaFree(d_src); cudaFree(d_dst);
+    cudaFree(d_atom_el); cudaFree(d_graph_of_atom);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -508,5 +676,9 @@ int main(int argc, char **argv) {
     }
 
     run_batched(W, export_dir);
+
+    std::printf("\n=== Track E1: CUDA Graph capture validation ===\n");
+    run_with_graph_capture(W, export_dir + "/golden_small_caffeine.bin", "caffeine");
+
     return 0;
 }
