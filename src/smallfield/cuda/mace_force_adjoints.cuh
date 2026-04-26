@@ -651,6 +651,42 @@ __global__ void mace_linear_per_irrep_force_adjoint_kernel(
     grad_input[grad_input_offset] += scale * accumulator;
 }
 
+/**
+ *  @brief Specialized irrep_dim=1 (scalar-only L=0) per-irrep linear adjoint.
+ *
+ *  Equivalent to the general kernel above for the (irrep_dim=1, active=1)
+ *  case but launched as a 16×16 = 256-thread CTA covering 16 atoms × 16 c_in
+ *  per CTA.  The general launcher would pick `block(1,1,1)` = one thread per
+ *  CTA, leaving warps mostly empty and burning scheduler overhead on
+ *  n_atoms × n_in CTAs.
+ *
+ *  `din[a, c_in] += scale * Σ_{c_out} W[c_in, c_out] * dout[a, c_out]`
+ *
+ *  Output is accumulated with `+=`, matching the general kernel's contract.
+ */
+__global__ void mace_linear_per_irrep_irrep1_force_adjoint_kernel(
+    std::uint32_t n_atoms,
+    std::uint32_t n_channels_in,
+    std::uint32_t n_channels_out,
+    float scale,
+    float const *__restrict__ weight,           // [c_in, c_out]
+    float const *__restrict__ upstream_grad,    // [n_atoms, c_out]
+    float *__restrict__ grad_input              // [n_atoms, c_in]   accumulated +=
+) {
+    std::uint32_t const atom_index   = blockIdx.x * blockDim.y + static_cast<std::uint32_t>(threadIdx.y);
+    std::uint32_t const channel_in   = blockIdx.y * blockDim.x + static_cast<std::uint32_t>(threadIdx.x);
+    if (atom_index >= n_atoms || channel_in >= n_channels_in) return;
+
+    float const *weight_row = weight + static_cast<std::uint64_t>(channel_in) * n_channels_out;
+    float const *upstream_row = upstream_grad + static_cast<std::uint64_t>(atom_index) * n_channels_out;
+    float accumulator = 0.0f;
+    for (std::uint32_t channel_out_index = 0; channel_out_index < n_channels_out; ++channel_out_index) {
+        accumulator += upstream_row[channel_out_index] * weight_row[channel_out_index];
+    }
+    std::uint64_t const out_offset = static_cast<std::uint64_t>(atom_index) * n_channels_in + channel_in;
+    grad_input[out_offset] += scale * accumulator;
+}
+
 inline void launch_mace_linear_per_irrep_force_adjoint(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
@@ -663,9 +699,23 @@ inline void launch_mace_linear_per_irrep_force_adjoint(
     cudaStream_t stream
 ) {
     if (n_atoms == 0) return;
+    float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in));
+
+    // Fast path: scalar-only (L=0) backward avoids the 1-thread-per-CTA shape
+    // of the general kernel for irrep_dim=1.
+    if (irrep_dim == 1u && active_irrep_block_count == 1u) {
+        constexpr std::uint32_t block_dim_x = 16, block_dim_y = 16;
+        dim3 const block(block_dim_x, block_dim_y, 1);
+        dim3 const grid((n_atoms + block_dim_y - 1u) / block_dim_y,
+                        (n_channels_in + block_dim_x - 1u) / block_dim_x, 1);
+        mace_linear_per_irrep_irrep1_force_adjoint_kernel<<<grid, block, 0, stream>>>(
+            n_atoms, n_channels_in, n_channels_out, scale,
+            weight_blocks_fp32, upstream_grad_output_fp32, grad_input_fp32);
+        return;
+    }
+
     dim3 const block(irrep_dim, 1, 1);
     dim3 const grid(n_atoms, n_channels_in, 1);
-    float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in));
     mace_linear_per_irrep_force_adjoint_kernel<<<grid, block, 0, stream>>>(
         n_atoms, n_channels_in, n_channels_out, irrep_dim, active_irrep_block_count, scale,
         weight_blocks_fp32, upstream_grad_output_fp32, grad_input_fp32);

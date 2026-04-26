@@ -96,6 +96,12 @@ __global__ void mace_linear_per_irrep_kernel(
     output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim + irrep_component_index] = scale * accumulator;
 }
 
+/// Forward-declare the row-major matmul launcher so the irrep_dim=1 fast path
+/// below can dispatch to it without reordering the file.
+__global__ void mace_matmul_rowmajor_kernel(
+    std::uint32_t dim_m, std::uint32_t dim_n, std::uint32_t dim_k,
+    float const *A, float const *B, float scale, float *C);
+
 inline void launch_mace_linear_per_irrep(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
@@ -108,9 +114,28 @@ inline void launch_mace_linear_per_irrep(
     cudaStream_t stream
 ) {
     if (n_atoms == 0) return;
+    float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in));
+
+    // Fast path: scalar-only (L=0) per-irrep linear is a plain row-major matmul
+    // `[n_atoms, n_in] @ [n_in, n_out] -> [n_atoms, n_out]`.  The general
+    // kernel launches `dim_block = irrep_dim` threads per CTA, which collapses
+    // to a 1-thread CTA when irrep_dim=1 — n_atoms*n_channels_out CTAs each
+    // with one active warp lane wastes ~97% of warp slots and burns scheduler
+    // overhead.  The matmul kernel uses 16×16=256 threads per CTA and gets
+    // good occupancy.
+    if (irrep_dim == 1u && active_irrep_block_count == 1u) {
+        constexpr std::uint32_t block_dim_x = 16, block_dim_y = 16;
+        dim3 const mm_block(block_dim_x, block_dim_y, 1);
+        dim3 const mm_grid((n_atoms + block_dim_x - 1u) / block_dim_x,
+                           (n_channels_out + block_dim_y - 1u) / block_dim_y, 1);
+        mace_matmul_rowmajor_kernel<<<mm_grid, mm_block, 0, stream>>>(
+            n_atoms, n_channels_out, n_channels_in,
+            input, weight_blocks, scale, output);
+        return;
+    }
+
     dim3 const block(irrep_dim, 1, 1);
     dim3 const grid(n_atoms, n_channels_out, 1);
-    float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in));
     mace_linear_per_irrep_kernel<<<grid, block, 0, stream>>>(
         n_atoms, n_channels_in, n_channels_out, irrep_dim, active_irrep_block_count, scale,
         weight_blocks, input, output);
