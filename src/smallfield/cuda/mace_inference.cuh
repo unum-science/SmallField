@@ -56,6 +56,7 @@
 #  include "smallfield/cuda/mace_tk_conv_tp_scatter_fused_force_adjoint_kernel.cuh"
 #  include "smallfield/cuda/mace_tk_element_conditioned_residual_force_adjoint_kernel.cuh"
 #  include "smallfield/cuda/mace_tk_symmetric_contraction_force_adjoint_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_radial_mlp_force_adjoint_kernel.cuh"
 #endif
 
 namespace smallfield::cuda {
@@ -1172,51 +1173,83 @@ inline void mace_inference_run_force_adjoint(
         //     Backward through the 4-layer MLP with normalize2mom(silu)
         //     epilogues.  Each interaction layer has its OWN radial MLP weights.
         //     Phase B6: instead of re-running the fp32 forward MLP to populate
-        //     `_pre` activations, the TK fused forward saved bf16 pre-acts on
-        //     `S.tk_radial_mlp_hidden_*_pre_bf16` per layer.  Cast to fp32 once
-        //     at this point (cheap: ~1.5 MB at batch=512 vs 4 fp32 matmuls + 3
-        //     elementwise silu·n2m kernels in the rerun).
+        //     `_pre` activations.  When the TK backward path is enabled we feed
+        //     the saved bf16 pre-acts directly into the TK kernel, avoiding the
+        //     three bf16→fp32 cast launches that the fp32 reference path
+        //     required (Phase E1).  Layer 0 backward stays on the fp32 path
+        //     because n_in=8 doesn't tile well to WGMMA N=64.
+        bool tk_radial_backward_ok = false;
+#       if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        {
+            float const scale_h = 1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim));
+            // Layer 3 backward (no activation): grad_h2[N, 64] = scale * grad_out[N, 384] @ W3[64, 384]^T.
+            bool ok3 = launch_mace_tk_radial_mlp_layer_force_adjoint(
+                batch.n_edges, radial_mlp_hidden_dim, tp_dim, scale_h,
+                /*apply_silu*/false,
+                S.grad_tp_weights, /*pre_act_bf16*/nullptr, L.radial_mlp_w3,
+                S.edge_messages, stream);
+            // Layer 2 backward (with silu): folds silu·n2m'(pre_act_2) on the way in.
+            bool ok2 = launch_mace_tk_radial_mlp_layer_force_adjoint(
+                batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim, scale_h,
+                /*apply_silu*/true,
+                S.edge_messages, S.tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index],
+                L.radial_mlp_w2, S.grad_node_features, stream);
+            // Layer 1 backward (with silu).
+            bool ok1 = launch_mace_tk_radial_mlp_layer_force_adjoint(
+                batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim, scale_h,
+                /*apply_silu*/true,
+                S.grad_node_features, S.tk_radial_mlp_hidden_1_pre_bf16_layer[layer_index],
+                L.radial_mlp_w1, S.edge_messages, stream);
+            tk_radial_backward_ok = ok1 && ok2 && ok3;
+        }
+#       endif
+        if (!tk_radial_backward_ok) {
+            // Fallback: fp32 reference path needs the pre-acts as fp32, so cast
+            // first.  This branch only fires under SMALLFIELD_USE_THUNDERKITTENS=OFF
+            // or for shapes the TK kernel doesn't cover.
+            launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
+                                      S.tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index],
+                                      S.radial_mlp_hidden_0_pre, stream);
+            launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
+                                      S.tk_radial_mlp_hidden_1_pre_bf16_layer[layer_index],
+                                      S.radial_mlp_hidden_1_pre, stream);
+            launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
+                                      S.tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index],
+                                      S.radial_mlp_hidden_2_pre, stream);
+            launch_mace_radial_mlp_layer_force_adjoint(
+                batch.n_edges, radial_mlp_hidden_dim, tp_dim,
+                1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
+                /*apply_silu_n2m_inverse*/false,
+                /*accumulate*/false,
+                /*activation*/nullptr,
+                L.radial_mlp_w3, S.grad_tp_weights,
+                S.edge_messages, stream);
+            launch_mace_radial_mlp_layer_force_adjoint(
+                batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
+                1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
+                /*apply_silu_n2m_inverse*/true,
+                /*accumulate*/false,
+                S.radial_mlp_hidden_2_pre, L.radial_mlp_w2, S.edge_messages,
+                S.grad_node_features, stream,
+                /*activation_is_pre_act*/true);
+            launch_mace_radial_mlp_layer_force_adjoint(
+                batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
+                1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
+                /*apply_silu_n2m_inverse*/true,
+                /*accumulate*/false,
+                S.radial_mlp_hidden_1_pre, L.radial_mlp_w1, S.grad_node_features,
+                S.edge_messages, stream,
+                /*activation_is_pre_act*/true);
+        }
+        // Layer 0 backward (with epilogue): grad_radial_basis += contribution.
+        // Both interaction layers' radial MLPs share the same radial_basis input,
+        // so we ACCUMULATE to preserve the previous layer's contribution.  The
+        // n_in=8 shape doesn't fit the TK WGMMA N=64 tile cleanly, so this stays
+        // on the fp32 reference path — but we only need the layer-0 pre-act as
+        // fp32, not all three.
         launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
                                   S.tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index],
                                   S.radial_mlp_hidden_0_pre, stream);
-        launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
-                                  S.tk_radial_mlp_hidden_1_pre_bf16_layer[layer_index],
-                                  S.radial_mlp_hidden_1_pre, stream);
-        launch_mace_bf16_to_fp32(batch.n_edges * radial_mlp_hidden_dim,
-                                  S.tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index],
-                                  S.radial_mlp_hidden_2_pre, stream);
-        // Layer 3 backward (no activation): grad_h2 = (1/sqrt(h)) * Σ_out W3[h, out] * grad_out.
-        // Reuse `S.edge_messages` as scratch for grad_h2 (its forward content is no
-        // longer needed here in the reverse pass).
-        launch_mace_radial_mlp_layer_force_adjoint(
-            batch.n_edges, radial_mlp_hidden_dim, tp_dim,
-            1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
-            /*apply_silu_n2m_inverse*/false,
-            /*accumulate*/false,
-            /*activation*/nullptr,    // unused when no epilogue
-            L.radial_mlp_w3, S.grad_tp_weights,
-            S.edge_messages, stream);
-        // Layer 2 backward (with epilogue):
-        launch_mace_radial_mlp_layer_force_adjoint(
-            batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
-            1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
-            /*apply_silu_n2m_inverse*/true,
-            /*accumulate*/false,
-            S.radial_mlp_hidden_2_pre, L.radial_mlp_w2, S.edge_messages,
-            S.grad_node_features, stream,  // reuse S.grad_node_features as scratch
-            /*activation_is_pre_act*/true);
-        // Layer 1 backward (with epilogue):
-        launch_mace_radial_mlp_layer_force_adjoint(
-            batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
-            1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
-            /*apply_silu_n2m_inverse*/true,
-            /*accumulate*/false,
-            S.radial_mlp_hidden_1_pre, L.radial_mlp_w1, S.grad_node_features,
-            S.edge_messages, stream,
-            /*activation_is_pre_act*/true);
-        // Layer 0 backward (with epilogue): grad_radial_basis += contribution.
-        // Both interaction layers' radial MLPs share the same radial_basis input,
-        // so we ACCUMULATE to preserve the previous layer's contribution.
         launch_mace_radial_mlp_layer_force_adjoint(
             batch.n_edges, arch.n_radial, radial_mlp_hidden_dim,
             1.0f / sqrtf(static_cast<float>(arch.n_radial)),
