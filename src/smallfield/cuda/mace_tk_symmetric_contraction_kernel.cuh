@@ -229,15 +229,14 @@ __global__ void mace_tk_symmetric_contraction_kernel(
         // ---- Order 3 (path-folded via precomputed W3_eff) ----
         // Σ_{i, j, k} W3_eff[Z, i, j, k, c] * X[i] * X[j] * X[k]
         // Hoist X[i] across (j, k); inside the j-loop hoist X[j] across k.
-        // The W3_eff layout is [n_elements, irrep_dim, irrep_dim, irrep_dim, n_channels];
-        // for a fixed (i, j, k) the channel axis is contiguous, so the
-        // per-thread access pattern (channel_index = thread_id, +32, +64, ...)
-        // is coalesced across the warp.
+        // i × 4 / j × 16 unroll (commit `e347639`) gives 4 independent FMA chains.
         //
-        // Unroll factor 4 on i × 16 on j gives 4 independent (i-stride) FMA
-        // chains per body — same trick that gave the adjoint kernel a 36%
-        // speedup in d494800.  Forward has only 1 accumulator so the win is
-        // smaller, but exposing more in-flight FMAs still helps.
+        // NOTE: Transform #1 (X-commutativity → canonical triples) does NOT help
+        // this forward kernel — it has only one fp32 accumulator, the dependency
+        // chain on `accumulator` was already broken into 4 chains by the i unroll,
+        // and the kernel runs at ~99% SM / ~7% FMA-pipe with the existing layout.
+        // The backward kernel (16 dx_local accumulators, much longer chain) is
+        // where Transform #1 lands a real gain.
         #pragma unroll 4
         for (int irrep_index_i = 0; irrep_index_i < irrep_dim_k; ++irrep_index_i) {
             float const x_i = atom_irrep_row[irrep_index_i];
@@ -260,6 +259,162 @@ __global__ void mace_tk_symmetric_contraction_kernel(
 
         output_node_scalar_invariants_fp32[
             static_cast<std::uint64_t>(atom_index) * n_channels + channel_index] = accumulator;
+    }
+}
+
+/**
+ *  @brief Transform #1 — symmetrise W3_eff by summing all 6 (i, j, k) permutations
+ *         into the CANONICAL `(i ≤ j ≤ k)` representative cell.
+ *
+ *  Mathematical identity (X-commutativity):
+ *      Σ_{i,j,k all} W3[i,j,k,c] · X[i] X[j] X[k]
+ *    = Σ_{(i ≤ j ≤ k)} W3_sym_total[i,j,k,c] · X[i] X[j] X[k]
+ *  where
+ *      W3_sym_total[i,j,k,c] = Σ_{σ ∈ distinct perms of (i,j,k)} W3[σ(i,j,k), c]
+ *
+ *  Distinct-perm count is 1 (i=j=k), 3 (i=j<k or i<j=k), or 6 (i<j<k).
+ *  Output is exactly equivalent to the original cubic sum but evaluated over
+ *  C(n+2, 3) = 816 canonical triples instead of n³ = 4096 ordered triples
+ *  (n = irrep_dim_k = 16) — a ~5× FMA-count reduction on the order-3 path.
+ *
+ *  Non-canonical entries of `w3_sym_total` (cells where NOT i ≤ j ≤ k) are
+ *  left undefined and should never be read by the consumer kernel.
+ *
+ *  Grid: `dim3(n_elements, irrep_dim³, 1)` — one CTA per (Z, ordered-triple).
+ *  Block: same as `mace_tk_precompute_w3_effective_kernel` so we can share
+ *  the launch shape without further tuning.
+ */
+__global__ void mace_tk_precompute_w3_sym_total_kernel(
+    std::uint32_t n_channels,
+    float const *__restrict__ w3_effective_fp32,    // [n_elements, 16, 16, 16, n_channels]
+    float *__restrict__ w3_sym_total_fp32           // [n_elements, 16, 16, 16, n_channels] canonical-only
+) {
+    int const element_index = blockIdx.x;
+    int const linear_ijk    = blockIdx.y;
+
+    int const i = linear_ijk / (irrep_dim_k * irrep_dim_k);
+    int const j = (linear_ijk / irrep_dim_k) % irrep_dim_k;
+    int const k = linear_ijk % irrep_dim_k;
+    if (!(i <= j && j <= k)) return;  // only canonical cells
+
+    std::uint64_t const stride_per_element = static_cast<std::uint64_t>(irrep_dim_k)
+                                              * static_cast<std::uint64_t>(irrep_dim_k)
+                                              * static_cast<std::uint64_t>(irrep_dim_k)
+                                              * static_cast<std::uint64_t>(n_channels);
+    float const *w3_for_element = w3_effective_fp32
+        + static_cast<std::uint64_t>(element_index) * stride_per_element;
+
+    auto offset = [&](int a, int b, int c) {
+        return ((static_cast<std::uint64_t>(a) * irrep_dim_k + b) * irrep_dim_k + c)
+               * static_cast<std::uint64_t>(n_channels);
+    };
+
+    // Permutation set depends on equality structure.
+    int perm_count = (i == k) ? 1 : (i == j || j == k) ? 3 : 6;
+    int perms[6][3];
+    int n_perms;
+    if (i == j && j == k) {
+        perms[0][0] = i; perms[0][1] = j; perms[0][2] = k;
+        n_perms = 1;
+    } else if (i == j) {  // i = j < k
+        perms[0][0] = i; perms[0][1] = j; perms[0][2] = k;
+        perms[1][0] = i; perms[1][1] = k; perms[1][2] = j;
+        perms[2][0] = k; perms[2][1] = i; perms[2][2] = j;
+        n_perms = 3;
+    } else if (j == k) {  // i < j = k
+        perms[0][0] = i; perms[0][1] = j; perms[0][2] = k;
+        perms[1][0] = j; perms[1][1] = i; perms[1][2] = k;
+        perms[2][0] = j; perms[2][1] = k; perms[2][2] = i;
+        n_perms = 3;
+    } else {              // i < j < k, all distinct → 6 perms
+        perms[0][0] = i; perms[0][1] = j; perms[0][2] = k;
+        perms[1][0] = i; perms[1][1] = k; perms[1][2] = j;
+        perms[2][0] = j; perms[2][1] = i; perms[2][2] = k;
+        perms[3][0] = j; perms[3][1] = k; perms[3][2] = i;
+        perms[4][0] = k; perms[4][1] = i; perms[4][2] = j;
+        perms[5][0] = k; perms[5][1] = j; perms[5][2] = i;
+        n_perms = 6;
+    }
+    (void)perm_count;
+
+    float *w3_sym_out = w3_sym_total_fp32 + static_cast<std::uint64_t>(element_index) * stride_per_element
+                                          + offset(i, j, k);
+    for (std::uint32_t channel = static_cast<std::uint32_t>(threadIdx.x);
+         channel < n_channels;
+         channel += static_cast<std::uint32_t>(blockDim.x)) {
+        float accumulator = 0.0f;
+        #pragma unroll
+        for (int p = 0; p < 6; ++p) {
+            if (p >= n_perms) break;
+            float const v = w3_for_element[offset(perms[p][0], perms[p][1], perms[p][2]) + channel];
+            accumulator += v;
+        }
+        w3_sym_out[channel] = accumulator;
+    }
+}
+
+/**
+ *  @brief Transform #1 — precompute `W3_partsym_sym[Z, m, a, b, c]` for the
+ *         BACKWARD's quadratic form.
+ *
+ *  Closed-form derivative of the order-3 forward:
+ *      ∂B[a, c] / ∂X[m] = Σ_{α,β} (W3[m,α,β,c] + W3[α,m,β,c] + W3[α,β,m,c]) · X[α] · X[β]
+ *                       = Σ_{α,β} W3_partsym[m, α, β, c] · X[α] · X[β]
+ *
+ *  Since X[α]·X[β] is symmetric in (α, β) and W3_partsym is not, we further
+ *  fold:
+ *      W3_partsym_sym[m, α, β, c] = W3_partsym[m, α, β, c] + W3_partsym[m, β, α, c]   (α < β)
+ *                                 = W3_partsym[m, α, α, c]                            (α = β)
+ *
+ *  The backward then runs as 16 *independent* length-136 quadratic forms
+ *  (one per m), with a shared 136-entry X·X pair cache.  Net: ~5.6× FMA-count
+ *  reduction with no precision loss.
+ *
+ *  Output buffer has the same `[n_elements, 16, 16, 16, n_channels]` shape
+ *  as W3_eff for layout simplicity; only the canonical `(α ≤ β)` cells of
+ *  the inner two axes are populated.
+ */
+__global__ void mace_tk_precompute_w3_partsym_kernel(
+    std::uint32_t n_channels,
+    float const *__restrict__ w3_effective_fp32,
+    float *__restrict__ w3_partsym_sym_fp32
+) {
+    int const element_index = blockIdx.x;
+    int const linear_mab    = blockIdx.y;
+    int const m = linear_mab / (irrep_dim_k * irrep_dim_k);
+    int const a = (linear_mab / irrep_dim_k) % irrep_dim_k;
+    int const b = linear_mab % irrep_dim_k;
+    if (a > b) return;  // only canonical (α ≤ β) cells
+
+    std::uint64_t const stride_per_element = static_cast<std::uint64_t>(irrep_dim_k)
+                                              * static_cast<std::uint64_t>(irrep_dim_k)
+                                              * static_cast<std::uint64_t>(irrep_dim_k)
+                                              * static_cast<std::uint64_t>(n_channels);
+    float const *w3_for_element = w3_effective_fp32
+        + static_cast<std::uint64_t>(element_index) * stride_per_element;
+    auto offset = [&](int x, int y, int z) {
+        return ((static_cast<std::uint64_t>(x) * irrep_dim_k + y) * irrep_dim_k + z)
+               * static_cast<std::uint64_t>(n_channels);
+    };
+    float *out = w3_partsym_sym_fp32 + static_cast<std::uint64_t>(element_index) * stride_per_element
+                                     + offset(m, a, b);
+
+    for (std::uint32_t channel = static_cast<std::uint32_t>(threadIdx.x);
+         channel < n_channels;
+         channel += static_cast<std::uint32_t>(blockDim.x)) {
+        // 3 partsym permutations for (m, a, b):
+        float partsym_ab = w3_for_element[offset(m, a, b) + channel]
+                         + w3_for_element[offset(a, m, b) + channel]
+                         + w3_for_element[offset(a, b, m) + channel];
+        if (a == b) {
+            out[channel] = partsym_ab;
+        } else {
+            // (α, β)-symmetry fold: also add the partsym of the (m, b, a) swap.
+            float partsym_ba = w3_for_element[offset(m, b, a) + channel]
+                             + w3_for_element[offset(b, m, a) + channel]
+                             + w3_for_element[offset(b, a, m) + channel];
+            out[channel] = partsym_ab + partsym_ba;
+        }
     }
 }
 
@@ -364,6 +519,86 @@ inline float *mace_tk_precompute_w3_effective(
 
     cudaError_t launch_err = cudaGetLastError();
     if (launch_err != cudaSuccess) {
+        cudaFree(device_buffer);
+        return nullptr;
+    }
+    return device_buffer;
+}
+
+/**
+ *  @brief Transform #1 host-side helper — produce `W3_partsym_sym` for the
+ *  symmetric-contraction backward.  See the kernel's docstring for the
+ *  precise algebraic identity.  Caller owns the buffer; release with `cudaFree`.
+ */
+inline float *mace_tk_precompute_w3_partsym(
+    std::uint32_t n_elements,
+    std::uint32_t n_channels,
+    float const *w3_effective_fp32,
+    cudaStream_t stream
+) {
+    using namespace mace_tk_symmetric_contraction_detail_;
+    if (n_elements == 0u || n_channels == 0u || w3_effective_fp32 == nullptr) return nullptr;
+
+    std::size_t const n_floats = static_cast<std::size_t>(n_elements)
+                                 * static_cast<std::size_t>(irrep_dim_k)
+                                 * static_cast<std::size_t>(irrep_dim_k)
+                                 * static_cast<std::size_t>(irrep_dim_k)
+                                 * static_cast<std::size_t>(n_channels);
+    float *device_buffer = nullptr;
+    if (cudaMalloc(reinterpret_cast<void **>(&device_buffer), n_floats * sizeof(float)) != cudaSuccess) {
+        return nullptr;
+    }
+    int const block_dim_x = (n_channels >= 256u) ? 256 : static_cast<int>(n_channels);
+    dim3 const grid(n_elements,
+                    static_cast<std::uint32_t>(irrep_dim_k * irrep_dim_k * irrep_dim_k),
+                    1);
+    dim3 const block(block_dim_x, 1, 1);
+    mace_tk_precompute_w3_partsym_kernel<<<grid, block, 0, stream>>>(
+        n_channels, w3_effective_fp32, device_buffer);
+    if (cudaGetLastError() != cudaSuccess) {
+        cudaFree(device_buffer);
+        return nullptr;
+    }
+    return device_buffer;
+}
+
+/**
+ *  @brief Transform #1 host-side helper — produce the canonically-folded W3
+ *  buffer that the v2 forward kernel iterates over.  Allocates a fresh device
+ *  buffer of the same shape as W3_eff (`[n_elements, 16, 16, 16, n_channels]`)
+ *  and fills the canonical `(i ≤ j ≤ k)` cells with the all-permutations sum.
+ *
+ *  Caller owns the buffer; release with `cudaFree`.
+ */
+inline float *mace_tk_precompute_w3_sym_total(
+    std::uint32_t n_elements,
+    std::uint32_t n_channels,
+    float const *w3_effective_fp32,
+    cudaStream_t stream
+) {
+    using namespace mace_tk_symmetric_contraction_detail_;
+    if (n_elements == 0u || n_channels == 0u || w3_effective_fp32 == nullptr) return nullptr;
+
+    std::size_t const n_floats = static_cast<std::size_t>(n_elements)
+                                 * static_cast<std::size_t>(irrep_dim_k)
+                                 * static_cast<std::size_t>(irrep_dim_k)
+                                 * static_cast<std::size_t>(irrep_dim_k)
+                                 * static_cast<std::size_t>(n_channels);
+    float *device_buffer = nullptr;
+    if (cudaMalloc(reinterpret_cast<void **>(&device_buffer), n_floats * sizeof(float)) != cudaSuccess) {
+        return nullptr;
+    }
+    // Non-canonical cells are never read; we don't bother zeroing them.
+
+    int const block_dim_x = (n_channels >= 256u) ? 256 : static_cast<int>(n_channels);
+    dim3 const grid(n_elements,
+                    static_cast<std::uint32_t>(irrep_dim_k * irrep_dim_k * irrep_dim_k),
+                    1);
+    dim3 const block(block_dim_x, 1, 1);
+    mace_tk_precompute_w3_sym_total_kernel<<<grid, block, 0, stream>>>(
+        n_channels, w3_effective_fp32, device_buffer);
+
+    if (cudaGetLastError() != cudaSuccess) {
         cudaFree(device_buffer);
         return nullptr;
     }

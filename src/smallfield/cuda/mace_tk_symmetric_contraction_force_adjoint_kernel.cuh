@@ -128,10 +128,12 @@ __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
     float const *__restrict__ u_matrix_2_fp32,
     float const *__restrict__ weights_2_fp32,
     float const *__restrict__ weights_1_fp32,
-    float const *__restrict__ precomputed_w3_effective_fp32,
+    float const *__restrict__ precomputed_w3_effective_fp32,    // unused under Transform #1; kept for ABI compat
+    float const *__restrict__ precomputed_w3_partsym_fp32,      // Transform #1: order-3 partsym-symmetric tensor
     float const *__restrict__ upstream_grad_output_fp32,
     float *__restrict__ grad_node_features_full_fp32
 ) {
+    (void)precomputed_w3_effective_fp32;
     extern __shared__ float raw_shared_memory_for_features[];
     float *shared_features_atom = raw_shared_memory_for_features;
 
@@ -149,8 +151,11 @@ __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
                                                 * static_cast<std::uint64_t>(irrep_dim_k)
                                                 * static_cast<std::uint64_t>(irrep_dim_k)
                                                 * static_cast<std::uint64_t>(n_channels);
-    float const *w3_for_element = precomputed_w3_effective_fp32
-                                  + static_cast<std::uint64_t>(element_index) * w3_per_element_stride;
+    // Transform #1: read from W3_partsym_sym (canonical α ≤ β cells) instead
+    // of W3_eff.  The partsym tensor encodes the closed-form quadratic adjoint
+    // already symmetrised over the (α, β) input axes.
+    float const *w3_partsym_for_element = precomputed_w3_partsym_fp32
+                                          + static_cast<std::uint64_t>(element_index) * w3_per_element_stride;
 
     // Walk the channel axis in strided chunks of `warp_thread_count_k = 32`.
     // Each thread owns one channel per chunk and keeps the 16-wide gradient
@@ -212,45 +217,39 @@ __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
             }
         }
 
-        // ---- Order 3 (path-folded via precomputed W3_eff) ----
-        // Forward: B += W3_eff[Z, i, j, k, c] * X[i] * X[j] * X[k].
-        // Reverse: emit three additive writes per inner iteration —
-        //   dx[i] += u_w * X[j] * X[k]
-        //   dx[j] += u_w * X[i] * X[k]
-        //   dx[k] += u_w * X[i] * X[j]
-        // because U_3 (and therefore W3_eff) is not symmetric across (i, j, k).
-        // The W3_eff layout is [n_elements, 16, 16, 16, n_channels]; for fixed
-        // (i, j, k) the channel axis is contiguous, so the per-thread access
-        // pattern (channel_index = thread_id, +32, ...) is coalesced across
-        // the warp.
+        // ---- Order 3 (Transform #1: partsym + X·X cache) ----
+        // Closed-form derivative: dx[m] = Σ_{α,β} W3_partsym[m, α, β, c] · X[α] · X[β]
+        // with the α-β symmetry folded into W3_partsym_sym at engine-init time:
+        //     dx[m] = Σ_{α=β}        W3_partsym_sym[m,α,α,c] · X[α]²
+        //           + Σ_{α<β}        W3_partsym_sym[m,α,β,c] · X[α] · X[β]
+        // Total ops per (a, c): 136 muls (X·X cache) + 16 × 136 = 2 176 FMAs
+        // vs original 16³ × 3 + 16³ × 2 = 20 480 ops — ~5.6× FMA reduction
+        // and 16 INDEPENDENT length-136 FMA chains (one per dx[m]) instead of
+        // a single ~4096-deep chain on three accumulators.
         //
-        // We deliberately do NOT `#pragma unroll` the (i, j, k) triple loop:
-        // unrolled it expands to 4096 inner statements that blow past the 255
-        // register budget and spill 30 KB/thread to local memory.  Leaving the
-        // compiler in charge keeps the live-range short and avoids spills.
-        // Only the innermost k loop is unrolled — that fits in registers and
-        // exposes 16 independent FMA chains via dx_local[k]/dx_local[i]/dx_local[j].
-        // A modest #pragma unroll 4 on the j loop gives 4 independent (j-stride)
-        // FMA chains per i iteration without exhausting registers (kernel stays
-        // around 64 regs, no spill).
-        #pragma unroll 4
-        for (int irrep_index_i = 0; irrep_index_i < irrep_dim_k; ++irrep_index_i) {
-            float const x_i = atom_irrep_row[irrep_index_i];
-            #pragma unroll 16
-            for (int irrep_index_j = 0; irrep_index_j < irrep_dim_k; ++irrep_index_j) {
-                float const x_j = atom_irrep_row[irrep_index_j];
-                float const x_ij = x_i * x_j;
-                float const *w3_at_ij_base = w3_for_element
-                    + ((static_cast<std::uint64_t>(irrep_index_i) * irrep_dim_k + irrep_index_j) * irrep_dim_k)
-                          * static_cast<std::uint64_t>(n_channels);
+        // Precision: exact identity (folds permutations of W3, exploits X·X
+        // symmetry); no precision loss vs the original cubic-write form.
+        //
+        // Loop ordering: (α, β) outer, m inner unrolled.  This gives 16
+        // INDEPENDENT FMAs per (α, β) iteration (one per dx_local[m]) — the
+        // compiler can keep all 16 in flight, exposing massive ILP and shorter
+        // per-register dependency chains than the old single-accumulator form.
+        for (int alpha = 0; alpha < irrep_dim_k; ++alpha) {
+            float const x_alpha = atom_irrep_row[alpha];
+            #pragma unroll
+            for (int beta = alpha; beta < irrep_dim_k; ++beta) {
+                float const x_alpha_beta = x_alpha * atom_irrep_row[beta];
+                std::uint64_t const w_base =
+                    (static_cast<std::uint64_t>(alpha) * irrep_dim_k + beta)
+                    * static_cast<std::uint64_t>(n_channels) + channel_index;
+                std::uint64_t const w_per_m_stride = static_cast<std::uint64_t>(irrep_dim_k)
+                                                     * static_cast<std::uint64_t>(irrep_dim_k)
+                                                     * static_cast<std::uint64_t>(n_channels);
                 #pragma unroll
-                for (int irrep_index_k = 0; irrep_index_k < irrep_dim_k; ++irrep_index_k) {
-                    float const x_k = atom_irrep_row[irrep_index_k];
-                    float const u_w = w3_at_ij_base[
-                        static_cast<std::uint64_t>(irrep_index_k) * n_channels + channel_index];
-                    dx_local[irrep_index_i] += u_w * x_j * x_k;
-                    dx_local[irrep_index_j] += u_w * x_i * x_k;
-                    dx_local[irrep_index_k] += u_w * x_ij;
+                for (int m = 0; m < irrep_dim_k; ++m) {
+                    float const w = w3_partsym_for_element[
+                        static_cast<std::uint64_t>(m) * w_per_m_stride + w_base];
+                    dx_local[m] += w * x_alpha_beta;
                 }
             }
         }
@@ -305,13 +304,14 @@ inline void launch_mace_tk_symmetric_contraction_force_adjoint(
     float const *u_matrix_2_fp32,
     float const *weights_2_fp32,
     float const *weights_1_fp32,
-    float const *precomputed_w3_effective_fp32,
+    float const *precomputed_w3_effective_fp32,           // unused under Transform #1; kept for ABI parity
+    float const *precomputed_w3_partsym_fp32,             // Transform #1: order-3 partsym tensor
     float const *upstream_grad_output_fp32,
     float *grad_node_features_full_fp32,
     cudaStream_t stream
 ) {
     if (n_atoms == 0u) return;
-    if (precomputed_w3_effective_fp32 == nullptr) return;
+    if (precomputed_w3_partsym_fp32 == nullptr) return;
 
     using namespace mace_tk_symmetric_contraction_force_adjoint_detail_;
 
@@ -330,6 +330,7 @@ inline void launch_mace_tk_symmetric_contraction_force_adjoint(
         u_matrix_1_fp32, u_matrix_2_fp32,
         weights_2_fp32, weights_1_fp32,
         precomputed_w3_effective_fp32,
+        precomputed_w3_partsym_fp32,
         upstream_grad_output_fp32,
         grad_node_features_full_fp32);
 }

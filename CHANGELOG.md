@@ -6,6 +6,29 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## MACE-OFF algebraic transforms — 2026-04-26 — series start (`895bfa4`)
+
+A planned sequence of algebraic transformations that move work onto tensor cores or reduce FMA count via exact identities.
+Each lands as its own commit with a CHANGELOG entry; full rationale + projections in `ROADMAP.md` ("MACE-OFF refinement roadmap").
+
+### Transform #1 — X-Commutativity Partsym Fold, Commit `895bfa4`
+
+Backward kernel rewritten from a cubic-write structure (`dx[i]+=W3·X[j]·X[k]` plus two siblings) into a quadratic form whose two input axes are pre-symmetrised at engine init: ∂B/∂X[m] = Σ_{α≤β} W3_partsym_sym[m, α, β, c] · X[α]·X[β] where W3_partsym_sym absorbs the 3-permutation partsym sum AND the (α, β) symmetry of X·X.
+Inner loop now does 16 INDEPENDENT FMAs per (α, β) iteration into 16 dx_local accumulators, vs the old 3 FMAs.
+
+Modest wall-time gain (kernel was already near its memory ceiling) but exact identity, no precision risk.
+Lays the algebraic foundation for Transform #2 — the partsym tensor is what Stage 1 of the two-step matmul decomposition consumes.
+
+| metric            |  prev   |  after  | delta  | cumulative vs B6 |
+| :---------------- | ------: | ------: | -----: | ---------------: |
+| ms/config (E+F)   | 0.0601  | 0.0593  | -1.3 % |          -78.2 % |
+| ms/iter           |  123.2  |  121.5  | -1.4 % |          -78.2 % |
+
+Force RMS on the 5 reference goldens unchanged from the pre-transform binary (1.94 / 1.34 / 1.26 / 1.08 / 1.76 meV/Å).
+
+Also lands `mace_tk_precompute_w3_sym_total` (the canonical-triple W3 fold for the FORWARD) — staged but not yet wired, since the forward kernel's single accumulator is already saturated.
+Will be consumed by Transform #2.
+
 ## MACE-OFF Refinement Scaffolding — 2026-04-25 — `e05fcc7`, `6bf94a0`
 
 End-to-end MACE-OFF refinement now has a stable C++ / Python / CLI surface alongside the existing ETKDG + MMFF94 path.

@@ -278,6 +278,15 @@ struct mace_scratch_t {
     //         = sum over path of U_3[i,j,k,path] * weights_max[Z, path, c]`
     // Allocated lazily on first forward and freed in `mace_scratch_t::free`.
     float *tk_precomputed_w3_effective_layer[2] = {nullptr, nullptr};
+    // Transform #1 — symmetrise W3_eff over (i, j, k) permutations into the
+    // canonical `(i ≤ j ≤ k)` cell.  Forward kernel iterates 816 canonical
+    // triples instead of 4096 ordered triples.  Same shape as W3_eff.
+    float *tk_precomputed_w3_sym_total_layer[2] = {nullptr, nullptr};
+    // Transform #1 (backward) — precomputed W3_partsym_sym[Z, m, a, b, c] for
+    // a ≤ b.  The backward kernel evaluates ∂B/∂X[m] = Σ_{a≤b} W3_partsym_sym
+    // [m,a,b,c] · X[a]·X[b] using a 136-entry X·X cache.  ~5.6× FMA-count
+    // reduction vs the original 16³ × 3 cubic-write structure.
+    float *tk_precomputed_w3_partsym_layer[2] = {nullptr, nullptr};
     bool tk_precompute_done = false;
 #endif
 
@@ -413,6 +422,14 @@ struct mace_scratch_t {
             if (p) cudaFree(p);
             p = nullptr;
         }
+        for (float *&p : tk_precomputed_w3_sym_total_layer) {
+            if (p) cudaFree(p);
+            p = nullptr;
+        }
+        for (float *&p : tk_precomputed_w3_partsym_layer) {
+            if (p) cudaFree(p);
+            p = nullptr;
+        }
         tk_precompute_done = false;
 #endif
         total_bytes = 0;
@@ -462,9 +479,21 @@ inline void mace_inference_forward(
     if (!S.tk_precompute_done) {
         for (std::uint32_t layer_index = 0; layer_index < arch.num_interactions && layer_index < 2u; ++layer_index) {
             auto const &L = W.layers[layer_index];
-            S.tk_precomputed_w3_effective_layer[layer_index] = mace_tk_precompute_w3_effective(
+            float *w3_eff = mace_tk_precompute_w3_effective(
                 arch.n_elements, arch.n_channels, symmetric_contraction_path_count_max,
                 L.u_matrix_3, L.weights_max, stream);
+            S.tk_precomputed_w3_effective_layer[layer_index] = w3_eff;
+            // Transform #1 — fold all 6 (i, j, k) permutations of W3_eff into
+            // the canonical `(i ≤ j ≤ k)` representative cell.  The forward
+            // kernel reads from this buffer and iterates 816 canonical triples
+            // instead of 4096 ordered triples.
+            S.tk_precomputed_w3_sym_total_layer[layer_index] = mace_tk_precompute_w3_sym_total(
+                arch.n_elements, arch.n_channels, w3_eff, stream);
+            // Transform #1 backward — precompute W3_partsym_sym[Z, m, a, b, c]
+            // (canonical a ≤ b) so the adjoint kernel runs as 16 length-136
+            // quadratic forms instead of a 16³ × 3 cubic-write structure.
+            S.tk_precomputed_w3_partsym_layer[layer_index] = mace_tk_precompute_w3_partsym(
+                arch.n_elements, arch.n_channels, w3_eff, stream);
         }
         S.tk_precompute_done = true;
     }
@@ -763,6 +792,10 @@ inline void mace_inference_forward(
         // contraction becomes a sum-of-cubic-products with `c` as the
         // pointwise axis.  Output is fp32 (the order-3 accumulator's
         // precision is load-bearing); no bf16 cast bridge here.
+        // Forward kernel reads the original ordered W3_eff — Transform #1
+        // (canonical triples) was found NOT to help this kernel because the
+        // single-accumulator dependency chain was already decoupled into 4
+        // chains by the i-unroll, and the kernel is not FMA-count-bound.
         launch_mace_tk_symmetric_contraction(
             batch.n_atoms, arch.n_channels, arch.n_elements,
             batch.atom_element,
@@ -1018,9 +1051,10 @@ inline void mace_inference_run_force_adjoint(
         cudaMemsetAsync(S.grad_node_features, 0,
                         batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
-        // TK D4: takes the precomputed `W3_eff[Z, i, j, k, c]` from the forward
-        // (already populated lazily on first forward in TK build), so the
-        // backward doesn't pay the order-3 path-reduce cost.
+        // TK D4 — Transform #1: consumes `W3_partsym_sym[Z, m, α, β, c]` (canonical
+        // α ≤ β cells) so the kernel runs as 16 length-136 quadratic forms with
+        // a shared 136-entry X·X cache.  The legacy W3_eff buffer is still passed
+        // for ABI parity but the kernel ignores it under Transform #1.
         launch_mace_tk_symmetric_contraction_force_adjoint(
             batch.n_atoms, arch.n_channels, arch.n_elements,
             batch.atom_element,
@@ -1028,6 +1062,7 @@ inline void mace_inference_run_force_adjoint(
             L.u_matrix_1, L.u_matrix_2,
             L.weights_lo_0, L.weights_lo_1,
             S.tk_precomputed_w3_effective_layer[layer_index],
+            S.tk_precomputed_w3_partsym_layer[layer_index],
             S.grad_node_scalar_invariants,
             S.grad_node_features, stream);
 #else
