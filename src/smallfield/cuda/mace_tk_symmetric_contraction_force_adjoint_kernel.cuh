@@ -223,10 +223,15 @@ __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
         // (i, j, k) the channel axis is contiguous, so the per-thread access
         // pattern (channel_index = thread_id, +32, ...) is coalesced across
         // the warp.
-        #pragma unroll
+        //
+        // We deliberately do NOT `#pragma unroll` the (i, j, k) triple loop:
+        // unrolled it expands to 4096 inner statements that blow past the 255
+        // register budget and spill 30 KB/thread to local memory.  Leaving the
+        // compiler in charge keeps the live-range short and avoids spills.
+        // Only the innermost k loop is unrolled — that fits in registers and
+        // exposes 16 independent FMA chains via dx_local[k]/dx_local[i]/dx_local[j].
         for (int irrep_index_i = 0; irrep_index_i < irrep_dim_k; ++irrep_index_i) {
             float const x_i = atom_irrep_row[irrep_index_i];
-            #pragma unroll
             for (int irrep_index_j = 0; irrep_index_j < irrep_dim_k; ++irrep_index_j) {
                 float const x_j = atom_irrep_row[irrep_index_j];
                 float const x_ij = x_i * x_j;
