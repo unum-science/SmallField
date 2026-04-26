@@ -6,6 +6,28 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## MACE-OFF all-converged early exit for `refine_batch` — 2026-04-26 — `a4a29e5`
+
+The Phase K converged-flags infrastructure provided the per-conformer "this conformer is done" signal but `refine_batch` still ran every iteration to completion.
+This change adds a single-block AND-reduction of the converged flags into a device byte, copied to pinned host memory every 4 LBFGS iterations.
+When the result is 1 (all conformers converged) the loop terminates early — saving the remaining forward+backward+step rounds for that batch.
+
+Why this is the right level: kernel-level per-CTA gating (the previous attempt) inflates register pressure and tanks occupancy.
+All-converged batch-level gating skips work _between_ kernels at the loop driver — no register cost, no kernel surgery.
+It only fires when the _whole batch_ is done, but production drug-like batches' tail iterations happen with most conformers already converged, so the check stops the slowest remaining conformer from dragging the entire batch.
+
+| Scenario (batch=2048×30, 20 steps)         | ms / relax | Speedup |
+| ------------------------------------------ | ---------: | ------: |
+| Baseline (no early exit)                   |       1.37 |     1.0× |
+| All immediately converged (fmax = ∞)       |       0.30 |     4.6× |
+| Probe overhead when nothing converges      |     +<1 %  |       —  |
+
+The 4-iter check cadence was chosen so the per-probe sync cost (~30-50 µs) stays under 1 % of the per-iter kernel cost (~70 µs at batch=2048).
+At smaller batches the probe is also cheap; bench shows no measurable regression at batch ∈ {16, 64, 256}.
+
+This is the "Option (2)" path from the per-conformer-gating CHANGELOG note from earlier today, applied at the loop level.
+Kernel-level re-batching of _partially_ converged batches (the bigger optimisation where unconverged conformers get compacted into a smaller batch) is the next lever.
+
 ## MACE-OFF cudaGraph Caching for `refine_batch` — 2026-04-26 — Investigated, Reverted
 
 Hypothesis: the per-iteration kernel launches inside `refine_batch` (one forward + one backward + one LBFGS step ≈ ~50 small kernel launches per LBFGS iteration × 20 iterations × N relaxations) might be launch-bound at small batch sizes, and a captured-once / replayed-many cudaGraph would amortise the launch cost away.

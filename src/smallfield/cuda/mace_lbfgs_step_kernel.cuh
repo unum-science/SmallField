@@ -177,6 +177,58 @@ inline void launch_mace_lbfgs_reset_converged_flags(
         n_graphs, converged_flags);
 }
 
+/// AND-reduce the per-conformer `converged_flags` into a single device byte.
+/// Used by `refine_batch` to decide whether all conformers in the batch have
+/// converged and the relaxation loop can terminate early.  The reduction
+/// runs in a single block (n_graphs is small — at most ~16 K in production)
+/// so the result is consistent on a single in-stream sync.
+///
+/// Output `all_converged_out[0]` is 1 when every flag is non-zero, 0 otherwise.
+__global__ void mace_lbfgs_all_converged_kernel(
+    std::uint32_t n_graphs,
+    std::uint8_t const *__restrict__ converged_flags,
+    std::uint8_t *__restrict__ all_converged_out
+) {
+    __shared__ std::uint32_t s_partial[32];
+    std::uint32_t const lane = threadIdx.x & 31u;
+    std::uint32_t const warp = threadIdx.x >> 5;
+    std::uint32_t local = 1u;
+    for (std::uint32_t i = threadIdx.x; i < n_graphs; i += blockDim.x) {
+        if (converged_flags[i] == 0u) { local = 0u; }
+    }
+    // Warp AND-reduce.
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local &= __shfl_xor_sync(0xffffffffu, local, offset);
+    }
+    if (lane == 0u) s_partial[warp] = local;
+    __syncthreads();
+    if (warp == 0u) {
+        std::uint32_t v = (threadIdx.x < (blockDim.x >> 5)) ? s_partial[lane] : 1u;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            v &= __shfl_xor_sync(0xffffffffu, v, offset);
+        }
+        if (lane == 0u) all_converged_out[0] = static_cast<std::uint8_t>(v & 1u);
+    }
+}
+
+inline void launch_mace_lbfgs_all_converged(
+    std::uint32_t n_graphs,
+    std::uint8_t const *converged_flags,
+    std::uint8_t *all_converged_out,
+    cudaStream_t stream
+) {
+    if (n_graphs == 0u) {
+        // Vacuously all-converged.
+        std::uint8_t const one = 1u;
+        cudaMemcpyAsync(all_converged_out, &one, sizeof(std::uint8_t),
+                        cudaMemcpyHostToDevice, stream);
+        return;
+    }
+    constexpr std::uint32_t block = 256u;
+    mace_lbfgs_all_converged_kernel<<<1u, block, 0, stream>>>(
+        n_graphs, converged_flags, all_converged_out);
+}
+
 /// Build `graph_atom_offsets[n_graphs + 1]` from a `graph_of_atom[n_atoms]`
 /// labelling.  Called once when staging a batch — stable across LBFGS iterations.
 ///

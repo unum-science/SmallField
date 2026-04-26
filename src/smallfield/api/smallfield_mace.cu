@@ -271,6 +271,15 @@ status_t context_t::refine_batch(weights_t const &W,
     smallfield::cuda::launch_mace_lbfgs_reset_converged_flags(
         batch_internal.n_graphs, p_->scratch.lbfgs_converged_flags, p_->stream);
 
+    // All-converged early-exit cadence.  Every `kCheckEvery` iterations we
+    // AND-reduce `converged_flags` on the device, copy the byte to pinned
+    // host memory and synchronise the stream so we can branch.  Each check
+    // costs ~20-50 µs of host wait — small relative to per-iter kernel cost
+    // (~70 µs at batch=2048) — so the breakeven is "1 saved iter every
+    // ~kCheckEvery checks".  Real production batches converge in 8-15 of
+    // 20 iters; saving the tail iters is the entire point of Phase K.
+    constexpr std::uint32_t kCheckEvery = 4u;
+
     for (std::uint32_t step_index = 0u; step_index < config.num_steps; ++step_index) {
         smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(
             p_->scratch, batch_internal.n_atoms, p_->stream);
@@ -289,6 +298,25 @@ status_t context_t::refine_batch(weights_t const &W,
             p_->scratch.lbfgs_fmax_per_conformer,
             p_->scratch.lbfgs_converged_flags,
             p_->stream);
+
+        // Periodic device-side AND-reduction of converged_flags + D2H probe.
+        // Skip the final iter (we always do the trailing forward anyway).
+        bool const should_check =
+            ((step_index + 1u) % kCheckEvery == 0u) &&
+            ((step_index + 1u) < config.num_steps);
+        if (should_check) {
+            smallfield::cuda::launch_mace_lbfgs_all_converged(
+                batch_internal.n_graphs,
+                p_->scratch.lbfgs_converged_flags,
+                p_->scratch.lbfgs_all_converged,
+                p_->stream);
+            cudaMemcpyAsync(p_->scratch.lbfgs_all_converged_pinned,
+                            p_->scratch.lbfgs_all_converged,
+                            sizeof(std::uint8_t),
+                            cudaMemcpyDeviceToHost, p_->stream);
+            cudaStreamSynchronize(p_->stream);
+            if (p_->scratch.lbfgs_all_converged_pinned[0] != 0u) break;
+        }
     }
 
     // Final forward to populate energies_out at the converged geometry.

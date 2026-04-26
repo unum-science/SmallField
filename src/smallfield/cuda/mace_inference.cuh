@@ -252,6 +252,8 @@ struct mace_scratch_t {
     std::int32_t *lbfgs_graph_atom_offsets = nullptr; ///< [n_graphs + 1] inclusive prefix-sum of atom counts per conformer
     float *lbfgs_fmax_per_conformer = nullptr;        ///< [n_graphs] latest per-conformer max-abs force (eV/Å)
     std::uint8_t *lbfgs_converged_flags = nullptr;    ///< [n_graphs] 0 = relaxing, 1 = converged (skip position update)
+    std::uint8_t *lbfgs_all_converged = nullptr;      ///< [1] 1 when every conformer in the batch has converged
+    std::uint8_t *lbfgs_all_converged_pinned = nullptr; ///< [1] page-locked staging for the periodic D2H read in `refine_batch`
     float *grad_sph_harm = nullptr;                ///< [n_edges, 16]
     float *grad_r_unit = nullptr;                  ///< [n_edges, 3]
     float *grad_radial_basis = nullptr;            ///< [n_edges, n_radial]
@@ -359,9 +361,14 @@ struct mace_scratch_t {
                    max_graphs * sizeof(float));
         cudaMalloc(reinterpret_cast<void **>(&lbfgs_converged_flags),
                    max_graphs * sizeof(std::uint8_t));
+        cudaMalloc(reinterpret_cast<void **>(&lbfgs_all_converged),
+                   sizeof(std::uint8_t));
+        cudaMallocHost(reinterpret_cast<void **>(&lbfgs_all_converged_pinned),
+                       sizeof(std::uint8_t));
         total_bytes += (max_graphs + 1) * sizeof(std::int32_t)
                      + max_graphs * sizeof(float)
-                     + max_graphs * sizeof(std::uint8_t);
+                     + max_graphs * sizeof(std::uint8_t)
+                     + sizeof(std::uint8_t);
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // bf16 scratch for the TK forward path (sized in fp32 elements; the cast
         // is `n_elements * 2 bytes`).  Allocated only when TK is compiled in.
@@ -414,6 +421,14 @@ struct mace_scratch_t {
         if (lbfgs_converged_flags) {
             cudaFree(lbfgs_converged_flags);
             lbfgs_converged_flags = nullptr;
+        }
+        if (lbfgs_all_converged) {
+            cudaFree(lbfgs_all_converged);
+            lbfgs_all_converged = nullptr;
+        }
+        if (lbfgs_all_converged_pinned) {
+            cudaFreeHost(lbfgs_all_converged_pinned);
+            lbfgs_all_converged_pinned = nullptr;
         }
         for (std::uint32_t layer_index = 0; layer_index < 2u; ++layer_index) {
             for (float **p : {&node_features_input_layer[layer_index],
