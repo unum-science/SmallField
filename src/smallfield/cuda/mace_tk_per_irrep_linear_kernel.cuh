@@ -430,7 +430,13 @@ __global__ void mace_tk_per_irrep_linear_kernel(
  *  driver should fall back to `launch_mace_linear_per_irrep` in
  *  `mace_linear_kernel.cuh`.
  */
-inline void launch_mace_tk_per_irrep_linear(
+/// Returns true on successful launch, false if the (n_channels_in,
+/// n_channels_out, active_irrep_block_count) tuple is not handled by this
+/// kernel.  The caller MUST check the return and fall back to the fp32
+/// reference path otherwise — the previous version silently `return`-ed
+/// and left the output buffer with stale data, which silently broke the
+/// medium (128 ch) and large (224 ch) MACE-OFF models under the TK build.
+inline bool launch_mace_tk_per_irrep_linear(
     std::uint32_t n_atoms,
     std::uint32_t n_channels_in,
     std::uint32_t n_channels_out,
@@ -440,20 +446,21 @@ inline void launch_mace_tk_per_irrep_linear(
     __nv_bfloat16 *output_bf16,
     cudaStream_t stream
 ) {
-    if (n_atoms == 0u) return;
+    if (n_atoms == 0u) return true;
 
     using namespace mace_tk_per_irrep_linear_detail_;
 
-    // The fused kernel templates the small/medium MACE-OFF shape
-    // (c_in = c_out = 96) into the WGMMA tile.  Other configurations need
-    // a separate specialization; refuse rather than silently producing
-    // truncated output.
+    // The fused kernel templates the MACE-OFF-small shape (c_in = c_out = 96)
+    // into the WGMMA tile.  Other configurations (medium 128, large 224)
+    // need a separate specialization (Transform #4 in the algebraic-transforms
+    // roadmap); we reject explicitly here so the caller can route to the fp32
+    // reference path instead of silently producing zeros.
     if (n_channels_in  != static_cast<std::uint32_t>(channels_in_k) ||
         n_channels_out != static_cast<std::uint32_t>(channels_out_k)) {
-        return;
+        return false;
     }
     if (active_irrep_block_count == 0u || active_irrep_block_count > static_cast<std::uint32_t>(irrep_block_count_k)) {
-        return;
+        return false;
     }
 
     per_irrep_linear_scales_t scales;
@@ -498,6 +505,7 @@ inline void launch_mace_tk_per_irrep_linear(
         input_fp32,
         output_bf16,
         scales);
+    return true;
 }
 
 } // namespace smallfield::cuda

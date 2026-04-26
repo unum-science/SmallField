@@ -721,14 +721,25 @@ inline void mace_inference_forward(
         // TK 4-block fused linear: one CTA per 4 atoms × 96 c_out, single
         // shared input tile, four WGMMA passes (one per L block).  Output
         // bf16 → cast back to fp32 in the existing node_features buffer.
-        launch_mace_tk_per_irrep_linear(batch.n_atoms, arch.n_channels, arch.n_channels,
-                                         /*active_irrep_block_count*/4u,
-                                         L.linear_post_tp_w,
-                                         S.node_features_scratch,
-                                         S.tk_node_features_post_linear_bf16, stream);
-        launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
-                                 S.tk_node_features_post_linear_bf16,
-                                 S.node_features, stream);
+        // Returns false if the channel count doesn't match the templated
+        // kernel — in that case fall back to the fp32 reference path
+        // (medium 128 ch and large 224 ch fall here until Transform #4 lands).
+        bool const tk_post_tp_ok = launch_mace_tk_per_irrep_linear(
+            batch.n_atoms, arch.n_channels, arch.n_channels,
+            /*active_irrep_block_count*/4u,
+            L.linear_post_tp_w,
+            S.node_features_scratch,
+            S.tk_node_features_post_linear_bf16, stream);
+        if (tk_post_tp_ok) {
+            launch_mace_bf16_to_fp32(batch.n_atoms * arch.n_channels * irrep_dim,
+                                     S.tk_node_features_post_linear_bf16,
+                                     S.node_features, stream);
+        } else {
+            launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
+                                          irrep_dim, /*active_irrep_block_count*/4u,
+                                          L.linear_post_tp_w, S.node_features_scratch,
+                                          S.node_features, stream);
+        }
 #else
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
                                       irrep_dim, /*active_irrep_block_count*/4u,

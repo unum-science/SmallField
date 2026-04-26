@@ -6,10 +6,21 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
-## MACE-OFF algebraic transforms — 2026-04-26 — series start (`895bfa4`)
+## MACE-OFF Algebraic Transforms — 2026-04-26
 
 A planned sequence of algebraic transformations that move work onto tensor cores or reduce FMA count via exact identities.
-Each lands as its own commit with a CHANGELOG entry; full rationale + projections in `ROADMAP.md` ("MACE-OFF refinement roadmap").
+Findings from the experimental campaign:
+
+| Transform | Status | Realised gain |
+|-----------|:------:|--------------:|
+| #1 X-commutativity partsym fold (commit `895bfa4`) | __landed__ | -1.3 % ms/config |
+| #2 Two-stage decomposition with Stage 1 on TC | not pursued | NCU shows post-#1 kernel is memory-latency-bound (7 % FMA pipe, 99.97 % SM); TC compute-density win lands on a small share of remaining time.  Substantial implementation effort (new TK WGMMA kernel + Stage 2 quadratic-form launcher) with unclear net win at the current bottleneck mix. |
+| #3 bf16x2 packed FFMA on Stage 2 | not pursued | precision risk on the order-3 accumulator (already at the fp32 noise floor at 10–15 meV/Å); needs a golden regression suite to gate, which would also surface the medium-model latent issue noted below before any precision-trade landed. |
+| #4 Extend TK kernels to 224 channels | not pursued | Refactor across `mace_tk_per_irrep_linear_*`, `mace_tk_element_conditioned_residual_*`, `mace_tk_readout_*` to template the channel width, then dispatch by `arch.n_channels`.  Mechanical but extensive (~5–7 days).  Worth landing only if the production decision picks the OFF23-large model. |
+
+__Latent issue surfaced during this campaign__: `launch_mace_tk_per_irrep_linear` silently `return`s when `n_channels != channels_in_k` (= 96 hardcoded).
+For MACE-OFF-medium (128 ch) and MACE-OFF-large (224 ch) the TK forward of the per-irrep linear is therefore a no-op; the bf16 output buffer keeps its prior content and the chain produces numerically meaningless energies under the TK build (the bench has been measuring this without flagging it because there's no medium/large golden regression suite).
+Filed as: extend or guard the launcher (must either land Transform #4 proper, or fall back to the fp32 reference path when channels don't match — until #4, the cleanest fix is the latter).
 
 ### Transform #1 — X-Commutativity Partsym Fold, Commit `895bfa4`
 
