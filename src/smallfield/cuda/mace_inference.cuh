@@ -177,6 +177,9 @@ struct mace_scratch_t {
     float *node_features_scratch = nullptr;        // [n_atoms, n_channels, 16] — scratch
     float *node_features_l0_only = nullptr;        // [n_atoms, n_channels]
     float *node_scalar_invariants = nullptr;       // [n_atoms, n_channels]
+    float *layer_n_residual_l0 = nullptr;          // [n_atoms, n_channels] — layer-N skip_tp residual,
+                                                   // computed at the start of the iteration and added
+                                                   // back to node_features_l0_only after product_linear
     float *node_energy = nullptr;                  // [n_atoms]
 
     // graph-scoped
@@ -207,6 +210,7 @@ struct mace_scratch_t {
         alloc(&node_features_scratch, max_atoms * arch.n_channels * irrep_dim);
         alloc(&node_features_l0_only, max_atoms * arch.n_channels);
         alloc(&node_scalar_invariants, max_atoms * arch.n_channels);
+        alloc(&layer_n_residual_l0, max_atoms * arch.n_channels);
         alloc(&node_energy, max_atoms);
         alloc(&energy, max_graphs);
     }
@@ -216,7 +220,9 @@ struct mace_scratch_t {
                           &radial_mlp_hidden_0, &radial_mlp_hidden_1, &radial_mlp_hidden_2,
                           &tensor_product_weights_per_edge, &edge_messages,
                           &node_features, &node_features_scratch,
-                          &node_features_l0_only, &node_scalar_invariants, &node_energy, &energy}) {
+                          &node_features_l0_only, &node_scalar_invariants,
+                          &layer_n_residual_l0,
+                          &node_energy, &energy}) {
             if (*p) cudaFree(*p);
             *p = nullptr;
         }
@@ -288,6 +294,30 @@ inline void mace_inference_forward(
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
                                       /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
                                       L.linear_up_w, S.node_scalar_invariants, S.node_features_l0_only, stream);
+
+        // 3a-bis. Layer-N (N >= 1) residual: in MACE the
+        //   `RealAgnosticResidualInteractionBlock` computes
+        //     sc = skip_tp(input_node_feats, atom_one_hot)        [shape n_atoms x n_channels]
+        //   BEFORE linear_up overwrites things, then the
+        //   `EquivariantProductBasisBlock` adds it AFTER product_linear:
+        //     post_product_l0 += sc.
+        //   Layer-0 (`RealAgnosticInteractionBlock`) doesn't have this — its skip_tp
+        //   is applied to the post-linear message instead (handled in step 3g below).
+        //
+        //   The input to layer-N's skip_tp is the layer's input node features
+        //   `S.node_features`, which after step 3j of the previous iteration has
+        //   only the L=0 component populated (post-product features).  We've already
+        //   extracted that L=0 slab into `S.node_scalar_invariants` above, so we
+        //   reuse it here as the skip_tp input with `irrep_dim=1`.
+        //
+        //   Weight `L.skip_tp_w` for layer-N is sized for one irrep-block
+        //   (96x0e × 10x0e → 96x0e ≡ 92160 floats).  active_irrep_block_count=1.
+        if (layer_index >= 1u) {
+            launch_mace_skip_tp(batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
+                                 /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+                                 batch.atom_element, L.skip_tp_w,
+                                 S.node_scalar_invariants, S.layer_n_residual_l0, stream);
+        }
 
         // 3b. Radial MLP: 4-layer FullyConnectedNet with SiLU between.
         //     Input: radial_basis [n_edges, n_radial=8].
@@ -364,6 +394,15 @@ inline void mace_inference_forward(
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
                                       /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
                                       L.product_linear_w, S.node_scalar_invariants, S.node_features_l0_only, stream);
+
+        // 3i-bis. Add the layer-N skip_tp residual back into the post-product L=0 features.
+        //   Mirrors `EquivariantProductBasisBlock.forward`:
+        //     return self.linear(symmetric_contractions(...)) + sc_residual.
+        //   Layer-0 has no residual (sc is None there).
+        if (layer_index >= 1u) {
+            launch_mace_add_inplace(batch.n_atoms * arch.n_channels,
+                                     S.layer_n_residual_l0, S.node_features_l0_only, stream);
+        }
 
         // 3j. Inject the post-product L=0 features back into node_features for the next iteration's input.
         {
