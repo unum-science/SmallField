@@ -99,7 +99,7 @@ using register_tile_fp32 = kittens::rt_fl<rows_in_tiles, cols_in_tiles, layout>;
 // in a single place.
 constexpr int mace_channels_small_k    = 96;
 constexpr int mace_channels_medium_k   = 128;
-constexpr int mace_channels_large_k    = 192;
+constexpr int mace_channels_large_k    = 224;   // MACE-OFF23 large is 224 channels (verified at export time)
 constexpr int mace_irrep_dim_total_k   = 16;   // 1 + 3 + 5 + 7
 constexpr int mace_radial_hidden_dim_k = 64;
 constexpr int mace_radial_input_dim_k  = 8;    // n_radial Bessel basis functions

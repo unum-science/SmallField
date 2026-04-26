@@ -517,7 +517,13 @@ def export_sample_fp16_batch(model: torch.nn.Module, out_path: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="small", choices=["small", "medium", "large"])
+    ap.add_argument("--model", default="small",
+                    help="Either a built-in MACE-OFF23 size (small/medium/large) or a path "
+                         "to a `.model` file (used for MACE-OFF24_medium, MACE-OFF23b_medium, "
+                         "and any future snapshots).")
+    ap.add_argument("--tag", default=None,
+                    help="Filename tag.  Default 'MACE-OFF23-<model>' for built-in sizes, "
+                         "or the basename (sans .model) when --model is a path.")
     ap.add_argument("--out", default="/tmp/mace_export")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--skip-golden", action="store_true")
@@ -526,14 +532,23 @@ def main() -> None:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"loading MACE-OFF-{args.model} on {args.device} (fp64)...")
+    is_builtin = args.model in ("small", "medium", "large")
+    if args.tag is not None:
+        tag = args.tag
+    elif is_builtin:
+        tag = f"MACE-OFF23-{args.model}"
+    else:
+        tag = Path(args.model).stem
+
+    print(f"loading {args.model} on {args.device} (fp64)...")
     calc = mace_off(model=args.model, device=args.device, default_dtype="float64", enable_cueq=False)
     model = calc.models[0]
     model.eval()
 
-    weights_path = out_dir / f"MACE-OFF23-{args.model}.weights.bin"
+    weights_path = out_dir / f"{tag}.weights.bin"
     print(f"\nexporting weights to {weights_path}")
-    arch = export_weights(model, weights_path, args.model)
+    arch = export_weights(model, weights_path,
+                          args.model if is_builtin else "custom")
 
     print(f"\narchitecture: {json.dumps(arch, indent=2)}")
 

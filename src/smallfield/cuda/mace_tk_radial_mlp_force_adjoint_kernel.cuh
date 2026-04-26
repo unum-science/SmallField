@@ -301,9 +301,15 @@ inline bool launch_mace_tk_radial_mlp_layer_force_adjoint(
         return true;
     }
     if (n_in == 64u && n_out == 768u && !apply_silu_n2m_inverse) {
-        // MACE-OFF-large: n_channels = 192 → tp_dim = 4 * 192 = 768.
+        // MACE-OFF (hypothetical 192-channel variant): tp_dim = 4 * 192 = 768.
         launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 768, false>,
                shared_bytes_for(64, 768));
+        return true;
+    }
+    if (n_in == 64u && n_out == 896u && !apply_silu_n2m_inverse) {
+        // MACE-OFF23-large: n_channels = 224 → tp_dim = 4 * 224 = 896.
+        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 896, false>,
+               shared_bytes_for(64, 896));
         return true;
     }
     return false;
