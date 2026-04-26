@@ -57,6 +57,7 @@
 #  include "smallfield/cuda/mace_tk_element_conditioned_residual_force_adjoint_kernel.cuh"
 #  include "smallfield/cuda/mace_tk_symmetric_contraction_force_adjoint_kernel.cuh"
 #  include "smallfield/cuda/mace_tk_radial_mlp_force_adjoint_kernel.cuh"
+#  include "smallfield/cuda/mace_tk_scalar_matmul_kernel.cuh"
 #endif
 
 namespace smallfield::cuda {
@@ -581,9 +582,22 @@ inline void mace_inference_forward(
         // The linear_up weight is stored as [c_out, c_in] flat (n_channels=96 → 9216 floats).
         // Apply as a single "per-irrep" linear with active_irrep_block_count=1.  Reinterpret the
         // scalar input/output as `[n_atoms, c, 1]`.
-        launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
-                                      /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
-                                      L.linear_up_w, S.node_scalar_invariants, S.node_features_l0_only, stream);
+        //
+        // Megakernel B Phase γ: TK scalar matmul replaces the brute-force
+        // `mace_matmul_rowmajor_kernel` fast-path inside
+        // `launch_mace_linear_per_irrep`.  Falls back to fp32 reference on
+        // shape mismatch.
+        bool linear_up_done_via_tk = false;
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        linear_up_done_via_tk = launch_mace_tk_scalar_matmul(
+            batch.n_atoms, arch.n_channels, arch.n_channels,
+            L.linear_up_w, S.node_scalar_invariants, S.node_features_l0_only, stream);
+#endif
+        if (!linear_up_done_via_tk) {
+            launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
+                                          /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+                                          L.linear_up_w, S.node_scalar_invariants, S.node_features_l0_only, stream);
+        }
 
         // Save the post-linear_up scalar features for the force-adjoint
         // (input to conv_tp; the conv_tp adjoint reads it back as `node_l0`).
@@ -946,9 +960,18 @@ inline void mace_inference_forward(
         }
 
         // 3i. product_linear: channel mix on the scalar invariants (96 → 96).
-        launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
-                                      /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
-                                      L.product_linear_w, S.node_scalar_invariants, S.node_features_l0_only, stream);
+        // Megakernel B Phase γ: TK scalar matmul (see linear_up call site above).
+        bool product_linear_done_via_tk = false;
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        product_linear_done_via_tk = launch_mace_tk_scalar_matmul(
+            batch.n_atoms, arch.n_channels, arch.n_channels,
+            L.product_linear_w, S.node_scalar_invariants, S.node_features_l0_only, stream);
+#endif
+        if (!product_linear_done_via_tk) {
+            launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
+                                          /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
+                                          L.product_linear_w, S.node_scalar_invariants, S.node_features_l0_only, stream);
+        }
 
         // 3i-bis. Add the layer-N skip_tp residual back into the post-product L=0 features.
         //   Mirrors `EquivariantProductBasisBlock.forward`:
