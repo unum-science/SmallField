@@ -42,13 +42,12 @@ using smallfield::types::mace_arch_t;
  *  because the LBFGS step writes new positions and we want to recompute only
  *  this; weights and edge index do not change.
  */
-inline __global__ void mace_edge_geometry_kernel(
-    std::uint32_t n_edges,
-    float const *positions,            // [n_atoms, 3] (x, y, z) per atom
-    std::int32_t const *edge_source_atom,
-    std::int32_t const *edge_target_atom,
-    float *r_norm,                     // [n_edges]
-    float *r_unit                      // [n_edges, 3]
+inline __global__ void mace_edge_geometry_kernel(std::uint32_t n_edges,
+                                                 float const *positions, // [n_atoms, 3] (x, y, z) per atom
+                                                 std::int32_t const *edge_source_atom,
+                                                 std::int32_t const *edge_target_atom,
+                                                 float *r_norm, // [n_edges]
+                                                 float *r_unit  // [n_edges, 3]
 ) {
     std::uint32_t edge_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (edge_index >= n_edges) return;
@@ -61,7 +60,7 @@ inline __global__ void mace_edge_geometry_kernel(
     float const dy = positions[3 * dst + 1] - sy;
     float const dz = positions[3 * dst + 2] - sz;
     float const r2 = dx * dx + dy * dy + dz * dz;
-    float const r  = sqrtf(fmaxf(r2, 1e-20f));
+    float const r = sqrtf(fmaxf(r2, 1e-20f));
     float const inv = 1.0f / r;
     r_norm[edge_index] = r;
     r_unit[3 * edge_index + 0] = dx * inv;
@@ -76,16 +75,12 @@ inline __global__ void mace_edge_geometry_kernel(
  *  `bessel_weights[n]` already encodes `π * (n+1) / r_max` so we multiply
  *  raw `r` (not the normalised distance) by the weight.
  */
-inline __global__ void mace_radial_basis_kernel(
-    std::uint32_t n_edges,
-    std::uint32_t n_radial,
-    float r_max,
-    float bessel_prefactor,
-    float cutoff_p,
-    float const *bessel_weights,       // [n_radial], = π * (n+1) / r_max
-    float const *r_norm,               // [n_edges]
-    float *radial_basis,               // [n_edges, n_radial]
-    float *cutoff_envelope             // [n_edges]
+inline __global__ void mace_radial_basis_kernel(std::uint32_t n_edges, std::uint32_t n_radial, float r_max,
+                                                float bessel_prefactor, float cutoff_p,
+                                                float const *bessel_weights, // [n_radial], = π * (n+1) / r_max
+                                                float const *r_norm,         // [n_edges]
+                                                float *radial_basis,         // [n_edges, n_radial]
+                                                float *cutoff_envelope       // [n_edges]
 ) {
     std::uint32_t edge_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (edge_index >= n_edges) return;
@@ -95,12 +90,12 @@ inline __global__ void mace_radial_basis_kernel(
     // Polynomial cutoff envelope, mirrors PolynomialCutoff.calculate_envelope.
     float env = 0.0f;
     if (r < r_max) {
-        float const u   = r / r_max;
-        float const p   = cutoff_p;
-        float const a   = -(p + 1.0f) * (p + 2.0f) * 0.5f;
-        float const b   =  p * (p + 2.0f);
-        float const c   = -p * (p + 1.0f) * 0.5f;
-        float const up  = powf(u, p);
+        float const u = r / r_max;
+        float const p = cutoff_p;
+        float const a = -(p + 1.0f) * (p + 2.0f) * 0.5f;
+        float const b = p * (p + 2.0f);
+        float const c = -p * (p + 1.0f) * 0.5f;
+        float const up = powf(u, p);
         float const up1 = up * u;
         float const up2 = up1 * u;
         env = 1.0f + a * up + b * up1 + c * up2;
@@ -109,8 +104,8 @@ inline __global__ void mace_radial_basis_kernel(
 
     float const inv_r = 1.0f / r;
     for (std::uint32_t n = 0; n < n_radial; ++n) {
-        float const w   = bessel_weights[n];           // π (n+1) / r_max
-        float const arg = w * r;                       // raw r, not normalised
+        float const w = bessel_weights[n]; // π (n+1) / r_max
+        float const arg = w * r;           // raw r, not normalised
         float const b_n = bessel_prefactor * sinf(arg) * inv_r;
         radial_basis[edge_index * n_radial + n] = b_n * env;
     }
@@ -125,36 +120,25 @@ inline __global__ void mace_silu_activation_kernel(std::uint32_t n, float const 
     dst[element_index] = x * s;
 }
 
-inline void launch_mace_edge_geometry(
-    std::uint32_t n_edges,
-    float const *positions,
-    std::int32_t const *edge_source_atom,
-    std::int32_t const *edge_target_atom,
-    float *r_norm,
-    float *r_unit,
-    cudaStream_t stream
-) {
+inline void launch_mace_edge_geometry(std::uint32_t n_edges, float const *positions,
+                                      std::int32_t const *edge_source_atom, std::int32_t const *edge_target_atom,
+                                      float *r_norm, float *r_unit, cudaStream_t stream) {
     if (n_edges == 0) return;
     constexpr std::uint32_t block = 128;
     std::uint32_t const grid = (n_edges + block - 1u) / block;
-    mace_edge_geometry_kernel<<<grid, block, 0, stream>>>(n_edges, positions, edge_source_atom, edge_target_atom, r_norm, r_unit);
+    mace_edge_geometry_kernel<<<grid, block, 0, stream>>>(n_edges, positions, edge_source_atom, edge_target_atom,
+                                                          r_norm, r_unit);
 }
 
-inline void launch_mace_radial_basis(
-    mace_arch_t const &arch,
-    std::uint32_t n_edges,
-    float const *bessel_weights,
-    float const *r_norm,
-    float *radial_basis,
-    float *cutoff_envelope,
-    cudaStream_t stream
-) {
+inline void launch_mace_radial_basis(mace_arch_t const &arch, std::uint32_t n_edges, float const *bessel_weights,
+                                     float const *r_norm, float *radial_basis, float *cutoff_envelope,
+                                     cudaStream_t stream) {
     if (n_edges == 0) return;
     constexpr std::uint32_t block = 128;
     std::uint32_t const grid = (n_edges + block - 1u) / block;
-    mace_radial_basis_kernel<<<grid, block, 0, stream>>>(
-        n_edges, arch.n_radial, arch.r_max, arch.bessel_prefactor, arch.cutoff_p,
-        bessel_weights, r_norm, radial_basis, cutoff_envelope);
+    mace_radial_basis_kernel<<<grid, block, 0, stream>>>(n_edges, arch.n_radial, arch.r_max, arch.bessel_prefactor,
+                                                         arch.cutoff_p, bessel_weights, r_norm, radial_basis,
+                                                         cutoff_envelope);
 }
 
 inline void launch_mace_silu(std::uint32_t n, float const *src, float *dst, cudaStream_t stream) {

@@ -154,8 +154,8 @@ static pipeline_pool_layout_t compute_pipeline_pool_layout_(std::size_t batch_by
     layout.device_off_status = device_offset;
     device_offset += align_up(total_conformer_slots * sizeof(std::uint8_t), 256);
     layout.device_off_initial = device_offset;
-    device_offset +=
-        align_up(static_cast<std::size_t>(per_device_molecule_count) * max_atoms_per_molecule * 4 * sizeof(float), 256);
+    device_offset += align_up(
+        static_cast<std::size_t>(per_device_molecule_count) * max_atoms_per_molecule * 4 * sizeof(float), 256);
     layout.device_pool_bytes = device_offset;
 
     std::size_t host_offset = 0;
@@ -270,26 +270,26 @@ context_t::context_t(std::span<int const> devices) {
     // in effect for the lifetime of each device's primary context.  At bin 128
     // the kernel needs ~67 KB shared, above the 48 KB default.
     constexpr std::uint32_t max_bin_n = 128;
-    constexpr std::size_t max_embed_shared_bytes =
-        static_cast<std::size_t>(max_bin_n * max_bin_n + max_bin_n + 1 + 4 * max_bin_n + max_bin_n + 4 + 1) *
-        sizeof(float);
+    constexpr std::size_t max_embed_shared_bytes = static_cast<std::size_t>(max_bin_n * max_bin_n + max_bin_n + 1 +
+                                                                            4 * max_bin_n + max_bin_n + 4 + 1) *
+                                                   sizeof(float);
     for (int const device_id : device_ids) {
         cudaSetDevice(device_id);
-        cudaFuncSetAttribute(smallfield::cuda::embed_4d_power_iter_kernel,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(max_embed_shared_bytes));
+        cudaFuncSetAttribute(smallfield::cuda::embed_4d_power_iter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(max_embed_shared_bytes));
     }
 
     // Pre-allocate every per-device pool to a worst-case wave so the hot path
     // never grows (no mid-pipeline cudaMalloc / cudaHostAlloc, no driver-lock
     // contention from eight OMP worker threads hitting ensure_capacity at once).
-    std::uint32_t const worst_case_wave_size =
-        compute_worst_case_wave_size_(device_ids, max_atoms_per_molecule_k, max_conformer_count_k);
-    std::uint32_t const per_device_worst_case_count =
-        std::max<std::uint32_t>(1u, (worst_case_wave_size + static_cast<std::uint32_t>(device_count) - 1u) /
-                                            std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(device_count)) +
-                                        1u);
-    std::size_t const per_device_batch_bytes =
-        estimate_per_molecule_batch_bytes(max_atoms_per_molecule_k) * per_device_worst_case_count;
+    std::uint32_t const worst_case_wave_size = compute_worst_case_wave_size_(device_ids, max_atoms_per_molecule_k,
+                                                                             max_conformer_count_k);
+    std::uint32_t const per_device_worst_case_count = std::max<std::uint32_t>(
+        1u, (worst_case_wave_size + static_cast<std::uint32_t>(device_count) - 1u) /
+                    std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(device_count)) +
+                1u);
+    std::size_t const per_device_batch_bytes = estimate_per_molecule_batch_bytes(max_atoms_per_molecule_k) *
+                                               per_device_worst_case_count;
     pipeline_pool_layout_t const worst_case_layout = compute_pipeline_pool_layout_(
         per_device_batch_bytes, per_device_worst_case_count, max_conformer_count_k, max_atoms_per_molecule_k);
 
@@ -471,9 +471,9 @@ struct gpu_pipeline_handle_t {
  *  device's three-stream pipeline.  Returns immediately; caller eventually
  *  calls `finalize_gpu_pipeline` with the returned handle.
  */
-gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream,
-                                          cusolverDnHandle_t solver_handle, metric_scratch_t &scratch,
-                                          launch_scratch_t &launch_buffers, batch_pool_t const &per_device_batch,
+gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cusolverDnHandle_t solver_handle,
+                                          metric_scratch_t &scratch, launch_scratch_t &launch_buffers,
+                                          batch_pool_t const &per_device_batch,
                                           device_launch_config_t const &launch_config, std::uint32_t conformer_count,
                                           std::uint32_t stereo_retry_limit, std::uint32_t max_atoms_per_molecule,
                                           std::uint64_t seed, std::uint32_t wave_base,
@@ -524,8 +524,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream,
 
     batch_pool_dev_view_t device_view {device_base + layout.device_off_batch, &per_device_batch.layout};
     handle.device_coords_fp32 = {reinterpret_cast<float *>(device_base + layout.device_off_coords_fp32), total_coords};
-    handle.device_coords_fp16 = {reinterpret_cast<__half *>(device_base + layout.device_off_coords_fp16),
-                                 total_coords};
+    handle.device_coords_fp16 = {reinterpret_cast<__half *>(device_base + layout.device_off_coords_fp16), total_coords};
     handle.device_energies_out = {reinterpret_cast<float *>(device_base + layout.device_off_energies),
                                   total_conformer_slots};
     handle.device_status_out = {reinterpret_cast<std::uint8_t *>(device_base + layout.device_off_status),
@@ -553,16 +552,16 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream,
     // slicing below can index the batch's metadata region with `bin_start`.
     auto *device_metadata_sorted = device_view.molecule_metadata().data();
 
-    build_metric_initial_coordinates_on_gpu(device_view.bounds_matrices().data(), device_metadata_sorted,
-                                            host_metadata, max_atoms_per_molecule, device_initial_coordinates,
-                                            solver_handle, scratch, sink, stream);
+    build_metric_initial_coordinates_on_gpu(device_view.bounds_matrices().data(), device_metadata_sorted, host_metadata,
+                                            max_atoms_per_molecule, device_initial_coordinates, solver_handle, scratch,
+                                            sink, stream);
     cudaEventRecord(handle.event_kernels_start, stream);
 
     int const streaming_multiprocessor_count = launch_config.streaming_multiprocessor_count;
 
     std::uint32_t bin_start = 0;
-    for (std::size_t bin_index = 0;
-         bin_index < atom_limited_bin_count_k && bin_start < per_device_molecule_count; ++bin_index) {
+    for (std::size_t bin_index = 0; bin_index < atom_limited_bin_count_k && bin_start < per_device_molecule_count;
+         ++bin_index) {
         std::uint32_t bin_end = bin_start;
         while (bin_end < per_device_molecule_count &&
                host_metadata[bin_end].num_atoms <= atom_limited_bin_caps_k[bin_index])
@@ -576,11 +575,9 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream,
         int const blocks_per_multiprocessor_etkdg = launch_config.blocks_per_multiprocessor_etkdg[bin_index];
         int const blocks_per_multiprocessor_mmff = launch_config.blocks_per_multiprocessor_mmff[bin_index];
         std::uint32_t const grid_size_etkdg = std::min(
-            bin_size,
-            static_cast<std::uint32_t>(blocks_per_multiprocessor_etkdg * streaming_multiprocessor_count));
+            bin_size, static_cast<std::uint32_t>(blocks_per_multiprocessor_etkdg * streaming_multiprocessor_count));
         std::uint32_t const grid_size_mmff = std::min(
-            bin_size,
-            static_cast<std::uint32_t>(blocks_per_multiprocessor_mmff * streaming_multiprocessor_count));
+            bin_size, static_cast<std::uint32_t>(blocks_per_multiprocessor_mmff * streaming_multiprocessor_count));
 
         etkdg_pipeline_warp_kernel<<<grid_size_etkdg, 32, shared_bytes_etkdg, stream>>>(
             device_view.bounds_matrices().data(), device_initial_coordinates + bin_start * max_atoms_per_molecule * 4,
@@ -731,9 +728,9 @@ static std::uint32_t compute_wave_size_(context_t const &ctx, config_t const &co
     std::size_t const budget_bytes = have_any ? smallest_free * 3u / 4u
                                               : (smallest_total > 0 ? smallest_total / 2u : 0u);
 
-    std::size_t const bytes_per_molecule =
-        estimate_per_molecule_batch_bytes(max_atoms_per_molecule) +
-        static_cast<std::size_t>(max_atoms_per_molecule) * num_conformers * 3u * sizeof(float) * 6u;
+    std::size_t const bytes_per_molecule = estimate_per_molecule_batch_bytes(max_atoms_per_molecule) +
+                                           static_cast<std::size_t>(max_atoms_per_molecule) * num_conformers * 3u *
+                                               sizeof(float) * 6u;
 
     std::uint64_t auto_wave = 50'000;
     if (bytes_per_molecule > 0 && budget_bytes > 0) auto_wave = budget_bytes / bytes_per_molecule;
@@ -778,8 +775,8 @@ static void sort_input_by_smiles_length_(std::span<std::string_view const> smile
 static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record_t> const &wave_records,
                                  double total_wall_ms) {
     if (logger.verbose_level < 1) return;
-    logger.trace("wave   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / "
-                 "download");
+    logger.trace(
+        "wave   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / " "download");
     for (auto const &cr : wave_records) {
         float gpu_max = 0.f, gpu_sum = 0.f, upload = 0.f, metric = 0.f, kernels = 0.f, download = 0.f;
         std::uint32_t n_active = 0;
@@ -794,11 +791,12 @@ static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record
             ++n_active;
         }
         float const inv = n_active > 0 ? 1.f / static_cast<float>(n_active) : 0.f;
-        logger.trace("{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / "
-                     "{:>6.1f} / {:>6.1f}",
-                     cr.wave_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms,
-                     cr.launch_end_ms - cr.launch_start_ms, cr.finalize_end_ms - cr.finalize_start_ms,
-                     gpu_sum * inv, gpu_max, upload * inv, metric * inv, kernels * inv, download * inv);
+        logger.trace(
+            "{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / " "{:>6.1f} / "
+                                                                                                      "{:>6.1f}",
+            cr.wave_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms, cr.launch_end_ms - cr.launch_start_ms,
+            cr.finalize_end_ms - cr.finalize_start_ms, gpu_sum * inv, gpu_max, upload * inv, metric * inv,
+            kernels * inv, download * inv);
     }
     logger.trace("wall {:.1f} ms", total_wall_ms);
     for (auto const &cr : wave_records) {
@@ -872,11 +870,13 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
     // per-device pinned batch pool, so concurrent launches across devices no
     // longer share a pinned source or a driver-lock contention window.
     auto launch_wave = [&](std::span<batch_pool_t const> per_device_batches, std::uint32_t wave_base,
-                           std::vector<gpu_pipeline_handle_t> &handles_out,
-                           std::vector<gpu_phase_ms_t> &timings_out) {
+                           std::vector<gpu_pipeline_handle_t> &handles_out, std::vector<gpu_phase_ms_t> &timings_out) {
         bool any_molecules = false;
         for (std::uint32_t d = 0; d < num_devices; ++d)
-            if (per_device_batches[d].num_molecules > 0) { any_molecules = true; break; }
+            if (per_device_batches[d].num_molecules > 0) {
+                any_molecules = true;
+                break;
+            }
         if (!any_molecules) return;
 
         handles_out.resize(num_devices);
@@ -885,10 +885,9 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         for (std::uint32_t d = 0; d < num_devices; ++d) {
             if (per_device_batches[d].num_molecules == 0) continue;
             handles_out[d] = launch_gpu_pipeline(
-                device_ids[d], streams[d], solvers[d], metric_scratch[d], *launch_scratch[d],
-                per_device_batches[d], launch_configs[d], num_conformers, config.max_stereo_attempts,
-                effective_max_atoms, config.random_seed, wave_base, sort_perm_view, coordinates_out,
-                energies_out, status_out, sink);
+                device_ids[d], streams[d], solvers[d], metric_scratch[d], *launch_scratch[d], per_device_batches[d],
+                launch_configs[d], num_conformers, config.max_stereo_attempts, effective_max_atoms, config.random_seed,
+                wave_base, sort_perm_view, coordinates_out, energies_out, status_out, sink);
             handles_out[d].timings_out = &timings_out[d];
         }
     };

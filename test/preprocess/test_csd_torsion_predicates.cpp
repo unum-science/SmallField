@@ -99,13 +99,16 @@ void validate_predicate_for_molecule(predicate_case_t const &pc, RDKit::ROMol co
         bool const native_hit = sfp::csd_predicate_check(descriptor, a, pc.id);
         bool const rdkit_hit = (rdkit_roots.count(a) != 0);
         if (native_hit != rdkit_hit) {
-            std::fprintf(stderr,
-                         "Predicate mismatch: %s (SMARTS \"%s\") atom=%u native=%d rdkit=%d\n"
-                         "  element=%u aromatic=%d degree=%u nH=%u hyb=%u\n"
-                         "  SMILES: %s\n",
-                         pc.name, pc.smarts, a, native_hit ? 1 : 0, rdkit_hit ? 1 : 0, descriptor.element[a],
-                         sft::atom_has_flag(descriptor, a, sft::atom_flag_aromatic_k) ? 1 : 0, descriptor.degree[a],
-                         descriptor.num_hydrogens[a], descriptor.hybridization[a], smiles.c_str());
+            std::fprintf(
+                stderr,
+                "Predicate mismatch: %s (SMARTS \"%s\") atom=%u native=%d rdkit=%d\n" "  element=%u aromatic=%d "
+                                                                                      "degree=%u nH=%u hyb=%u\n" "  "
+                                                                                                                 "SMILE"
+                                                                                                                 "S: "
+                                                                                                                 "%s\n",
+                pc.name, pc.smarts, a, native_hit ? 1 : 0, rdkit_hit ? 1 : 0, descriptor.element[a],
+                sft::atom_has_flag(descriptor, a, sft::atom_flag_aromatic_k) ? 1 : 0, descriptor.degree[a],
+                descriptor.num_hydrogens[a], descriptor.hybridization[a], smiles.c_str());
             SF_TEST_ASSERT(false, "predicate mismatch vs RDKit");
         }
     }
@@ -118,8 +121,8 @@ void validate_predicate_for_molecule(predicate_case_t const &pc, RDKit::ROMol co
  *  form — the native matcher and RDKit may emit the two orientations in
  *  different order, but the torsion semantics is symmetric.
  */
-std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>>
-rdkit_torsion_tuples(RDKit::ROMol const &mol, sfp::csd_compiled_pattern_t const &pat) {
+std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>> rdkit_torsion_tuples(
+    RDKit::ROMol const &mol, sfp::csd_compiled_pattern_t const &pat) {
     std::vector<RDKit::MatchVectType> matches;
     RDKit::SubstructMatch(mol, *pat.pattern, matches, /*uniquify=*/false, /*recursionPossible=*/true);
     std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>> out;
@@ -284,8 +287,7 @@ int main() {
         // rarely encounters them, and the preprocess rejects them upstream
         // via the 128-atom cap for everything except spiro cages.
         auto const *ri_check = mol->getRingInfo();
-        if (ri_check != nullptr && ri_check->isInitialized() &&
-            ri_check->atomRings().size() > sft::max_rings_k) {
+        if (ri_check != nullptr && ri_check->isInitialized() && ri_check->atomRings().size() > sft::max_rings_k) {
             ++skipped;
             continue;
         }

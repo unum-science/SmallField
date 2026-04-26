@@ -66,8 +66,8 @@ __constant__ mmff94_bndk_entry_t c_mmff94_bndk[mmff94_bndk_const_cap_k];
  *  `__constant__` symbols when the small-table capacities were sufficient;
  *  otherwise they fall back to device-global slots inside this arena. */
 struct mmff94_tables_device_t {
-    device_byte_buffer_t arena;   ///< single grow-only device allocation, RAII-managed
-    mmff94_tables_view_t view;    ///< spans point into arena / __constant__
+    device_byte_buffer_t arena; ///< single grow-only device allocation, RAII-managed
+    mmff94_tables_view_t view;  ///< spans point into arena / __constant__
     int device_id = -1;
 
     mmff94_tables_device_t() = default;
@@ -201,8 +201,7 @@ inline void upload_mmff94_tables_to_device(mmff94_tables_host_t const &host, mmf
     // Small tables → __constant__ (with global fallback).
     out.view.prop = detail_mmff94::place_const_or_global_(arena_base, offset, host.prop, prop_dev,
                                                           mmff94_prop_const_cap_k);
-    out.view.def = detail_mmff94::place_const_or_global_(arena_base, offset, host.def, def_dev,
-                                                         mmff94_def_const_cap_k);
+    out.view.def = detail_mmff94::place_const_or_global_(arena_base, offset, host.def, def_dev, mmff94_def_const_cap_k);
     out.view.covrad = detail_mmff94::place_const_or_global_(arena_base, offset, host.covrad, covrad_dev,
                                                             mmff94_covrad_const_cap_k);
     out.view.hl = detail_mmff94::place_const_or_global_(arena_base, offset, host.hl, hl_dev, mmff94_hl_const_cap_k);

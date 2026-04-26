@@ -63,15 +63,13 @@ __device__ __forceinline__ std::uint32_t mace_irrep_block_index_for_component_(s
  *  blocks' m_total) get 0.
  */
 inline __global__ void mace_linear_per_irrep_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_channels_out,
-    std::uint32_t irrep_dim,                  // 16
-    std::uint32_t active_irrep_block_count,   // 1 (0e only) or 4 (all)
-    float scale,                              // e3nn path_weight = 1/sqrt(c_in) for one-instruction-per-output Linear
-    float const *weight_blocks,               // [n_blocks, c_out, c_in]
-    float const *input,                       // [n_atoms, c_in, irrep_dim]
-    float *output                             // [n_atoms, c_out, irrep_dim]
+    std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_channels_out,
+    std::uint32_t irrep_dim,                // 16
+    std::uint32_t active_irrep_block_count, // 1 (0e only) or 4 (all)
+    float scale,                            // e3nn path_weight = 1/sqrt(c_in) for one-instruction-per-output Linear
+    float const *weight_blocks,             // [n_blocks, c_out, c_in]
+    float const *input,                     // [n_atoms, c_in, irrep_dim]
+    float *output                           // [n_atoms, c_out, irrep_dim]
 ) {
     std::uint32_t atom_index = blockIdx.x;
     std::uint32_t channel_out_index = blockIdx.y;
@@ -80,39 +78,36 @@ inline __global__ void mace_linear_per_irrep_kernel(
 
     std::uint32_t const irrep_block_index = mace_irrep_block_index_for_component_(irrep_component_index);
     if (irrep_block_index >= active_irrep_block_count) {
-        output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim + irrep_component_index] = 0.0f;
+        output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim +
+               irrep_component_index] = 0.0f;
         return;
     }
     float accumulator = 0.0f;
     // e3nn `o3.Linear` stores per-block weights as `(c_in, c_out)` row-major:
     //   weight_blocks[irrep_block_index, c_in, c_out].  The element offset is
     //   irrep_block_index*c_in*c_out + c_in*c_out + c_out.
-    std::uint64_t const weight_block_offset = static_cast<std::uint64_t>(irrep_block_index) * n_channels_in * n_channels_out;
+    std::uint64_t const weight_block_offset = static_cast<std::uint64_t>(irrep_block_index) * n_channels_in *
+                                              n_channels_out;
     float const *input_atom_row = input + static_cast<std::uint64_t>(atom_index) * n_channels_in * irrep_dim;
     for (std::uint32_t channel_in_index = 0; channel_in_index < n_channels_in; ++channel_in_index) {
-        float const w = weight_blocks[weight_block_offset + static_cast<std::uint64_t>(channel_in_index) * n_channels_out + channel_out_index];
+        float const w =
+            weight_blocks[weight_block_offset + static_cast<std::uint64_t>(channel_in_index) * n_channels_out +
+                          channel_out_index];
         accumulator += w * input_atom_row[channel_in_index * irrep_dim + irrep_component_index];
     }
-    output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim + irrep_component_index] = scale * accumulator;
+    output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim +
+           irrep_component_index] = scale * accumulator;
 }
 
 /// Forward-declare the row-major matmul launcher so the irrep_dim=1 fast path
 /// below can dispatch to it without reordering the file.
-inline __global__ void mace_matmul_rowmajor_kernel(
-    std::uint32_t dim_m, std::uint32_t dim_n, std::uint32_t dim_k,
-    float const *A, float const *B, float scale, float *C);
+inline __global__ void mace_matmul_rowmajor_kernel(std::uint32_t dim_m, std::uint32_t dim_n, std::uint32_t dim_k,
+                                                   float const *A, float const *B, float scale, float *C);
 
-inline void launch_mace_linear_per_irrep(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_channels_out,
-    std::uint32_t irrep_dim,
-    std::uint32_t active_irrep_block_count,
-    float const *weight_blocks,
-    float const *input,
-    float *output,
-    cudaStream_t stream
-) {
+inline void launch_mace_linear_per_irrep(std::uint32_t n_atoms, std::uint32_t n_channels_in,
+                                         std::uint32_t n_channels_out, std::uint32_t irrep_dim,
+                                         std::uint32_t active_irrep_block_count, float const *weight_blocks,
+                                         float const *input, float *output, cudaStream_t stream) {
     if (n_atoms == 0) return;
     float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in));
 
@@ -128,17 +123,16 @@ inline void launch_mace_linear_per_irrep(
         dim3 const mm_block(block_dim_x, block_dim_y, 1);
         dim3 const mm_grid((n_atoms + block_dim_x - 1u) / block_dim_x,
                            (n_channels_out + block_dim_y - 1u) / block_dim_y, 1);
-        mace_matmul_rowmajor_kernel<<<mm_grid, mm_block, 0, stream>>>(
-            n_atoms, n_channels_out, n_channels_in,
-            input, weight_blocks, scale, output);
+        mace_matmul_rowmajor_kernel<<<mm_grid, mm_block, 0, stream>>>(n_atoms, n_channels_out, n_channels_in, input,
+                                                                      weight_blocks, scale, output);
         return;
     }
 
     dim3 const block(irrep_dim, 1, 1);
     dim3 const grid(n_atoms, n_channels_out, 1);
-    mace_linear_per_irrep_kernel<<<grid, block, 0, stream>>>(
-        n_atoms, n_channels_in, n_channels_out, irrep_dim, active_irrep_block_count, scale,
-        weight_blocks, input, output);
+    mace_linear_per_irrep_kernel<<<grid, block, 0, stream>>>(n_atoms, n_channels_in, n_channels_out, irrep_dim,
+                                                             active_irrep_block_count, scale, weight_blocks, input,
+                                                             output);
 }
 
 /**
@@ -155,26 +149,24 @@ inline void launch_mace_linear_per_irrep(
  */
 inline __global__ void mace_matmul_rowmajor_kernel(
     std::uint32_t dim_m, std::uint32_t dim_n, std::uint32_t dim_k,
-    float const *A,        // [dim_m, dim_k]
-    float const *B,        // [dim_k, dim_n]
-    float scale,           // multiplied into C; typically 1/sqrt(dim_k) for e3nn _Layer
-    float *C               // [dim_m, dim_n]
+    float const *A, // [dim_m, dim_k]
+    float const *B, // [dim_k, dim_n]
+    float scale,    // multiplied into C; typically 1/sqrt(dim_k) for e3nn _Layer
+    float *C        // [dim_m, dim_n]
 ) {
     std::uint32_t row_index = blockIdx.x * blockDim.x + threadIdx.x;
     std::uint32_t col_index = blockIdx.y * blockDim.y + threadIdx.y;
     if (row_index >= dim_m || col_index >= dim_n) return;
     float accumulator = 0.0f;
     for (std::uint32_t inner_index = 0; inner_index < dim_k; ++inner_index) {
-        accumulator += A[static_cast<std::uint64_t>(row_index) * dim_k + inner_index] * B[static_cast<std::uint64_t>(inner_index) * dim_n + col_index];
+        accumulator += A[static_cast<std::uint64_t>(row_index) * dim_k + inner_index] *
+                       B[static_cast<std::uint64_t>(inner_index) * dim_n + col_index];
     }
     C[static_cast<std::uint64_t>(row_index) * dim_n + col_index] = accumulator * scale;
 }
 
-inline void launch_mace_matmul_rowmajor(
-    std::uint32_t dim_m, std::uint32_t dim_n, std::uint32_t dim_k,
-    float const *A, float const *B, float scale, float *C,
-    cudaStream_t stream
-) {
+inline void launch_mace_matmul_rowmajor(std::uint32_t dim_m, std::uint32_t dim_n, std::uint32_t dim_k, float const *A,
+                                        float const *B, float scale, float *C, cudaStream_t stream) {
     if (dim_m == 0 || dim_n == 0) return;
     constexpr std::uint32_t block_dim_x = 16, block_dim_y = 16;
     dim3 const block(block_dim_x, block_dim_y, 1);

@@ -92,10 +92,9 @@ constexpr int channel_tile_width_k = 16;
 /// Threads per CTA: one thread per (channel_local, irrep_component_index)
 /// pair.  Mirrors the forward kernel.
 constexpr int channel_threads_per_warp_k = 16;
-constexpr int irrep_threads_per_warp_k   = 16;
-constexpr int threads_per_cta_k          = channel_threads_per_warp_k * irrep_threads_per_warp_k; // 256
-static_assert(threads_per_cta_k == channel_tile_width_k * irrep_dim_total_k,
-              "thread layout matches tile shape");
+constexpr int irrep_threads_per_warp_k = 16;
+constexpr int threads_per_cta_k = channel_threads_per_warp_k * irrep_threads_per_warp_k; // 256
+static_assert(threads_per_cta_k == channel_tile_width_k * irrep_dim_total_k, "thread layout matches tile shape");
 
 /**
  *  @brief Map an irrep-component index `m \in [0, 16)` to its irrep-block
@@ -149,29 +148,21 @@ __device__ __forceinline__ int irrep_block_index_for_component_(int irrep_compon
  *  L-block) sum back together for the per-edge per-path per-channel write.
  */
 inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
-    std::uint32_t n_edges,
-    std::uint32_t n_channels,
-    float scale,
-    std::int32_t const *__restrict__ edge_source_atom,
-    std::int32_t const *__restrict__ edge_target_atom,
-    float const *__restrict__ node_l0_feature_global,
-    float const *__restrict__ sph_harm_global,
-    float const *__restrict__ tensor_product_weights_per_edge_global,
-    float const *__restrict__ upstream_grad_node_messages_full_global,
-    float *__restrict__ grad_node_l0_feature_global,
-    float *__restrict__ grad_tensor_product_weights_per_edge_global,
-    float *__restrict__ grad_sph_harm_global
-) {
-    std::uint32_t const edge_index         = blockIdx.x;
+    std::uint32_t n_edges, std::uint32_t n_channels, float scale, std::int32_t const *__restrict__ edge_source_atom,
+    std::int32_t const *__restrict__ edge_target_atom, float const *__restrict__ node_l0_feature_global,
+    float const *__restrict__ sph_harm_global, float const *__restrict__ tensor_product_weights_per_edge_global,
+    float const *__restrict__ upstream_grad_node_messages_full_global, float *__restrict__ grad_node_l0_feature_global,
+    float *__restrict__ grad_tensor_product_weights_per_edge_global, float *__restrict__ grad_sph_harm_global) {
+    std::uint32_t const edge_index = blockIdx.x;
     std::uint32_t const channel_tile_index = blockIdx.y;
     if (edge_index >= n_edges) return;
 
-    int const channel_local         = static_cast<int>(threadIdx.x);
+    int const channel_local = static_cast<int>(threadIdx.x);
     int const irrep_component_index = static_cast<int>(threadIdx.y);
-    int const linear_thread_index   = irrep_component_index * channel_tile_width_k + channel_local;
+    int const linear_thread_index = irrep_component_index * channel_tile_width_k + channel_local;
 
-    std::uint32_t const channel_index = channel_tile_index * static_cast<std::uint32_t>(channel_tile_width_k)
-                                        + static_cast<std::uint32_t>(channel_local);
+    std::uint32_t const channel_index = channel_tile_index * static_cast<std::uint32_t>(channel_tile_width_k) +
+                                        static_cast<std::uint32_t>(channel_local);
     bool const channel_in_range = (channel_index < n_channels);
 
     int const source_atom_index = edge_source_atom[edge_index];
@@ -184,20 +175,20 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
     //    per-region pointer types here.  The fp32 region is placed AFTER
     //    the bf16 tiles to ensure 4-byte alignment regardless of bf16 tile
     //    parity.
-    constexpr int node_l0_tile_size_k    = channel_tile_width_k;
+    constexpr int node_l0_tile_size_k = channel_tile_width_k;
     constexpr int tp_weights_tile_size_k = tensor_product_path_count_k * channel_tile_width_k;
-    constexpr int sph_harm_tile_size_k   = irrep_dim_total_k;
-    constexpr int upstream_tile_size_k   = channel_tile_width_k * irrep_dim_total_k;
-    constexpr int bf16_total_size_k      = node_l0_tile_size_k + tp_weights_tile_size_k
-                                         + sph_harm_tile_size_k + upstream_tile_size_k;
+    constexpr int sph_harm_tile_size_k = irrep_dim_total_k;
+    constexpr int upstream_tile_size_k = channel_tile_width_k * irrep_dim_total_k;
+    constexpr int bf16_total_size_k = node_l0_tile_size_k + tp_weights_tile_size_k + sph_harm_tile_size_k +
+                                      upstream_tile_size_k;
     // bf16_total_size_k = 16 + 64 + 16 + 256 = 352 (even ⇒ 4-byte aligned tail).
 
     extern __shared__ __nv_bfloat16 shared_buffer_[];
-    __nv_bfloat16 *node_l0_tile    = shared_buffer_;
+    __nv_bfloat16 *node_l0_tile = shared_buffer_;
     __nv_bfloat16 *tp_weights_tile = node_l0_tile + node_l0_tile_size_k;
-    __nv_bfloat16 *sph_harm_tile   = tp_weights_tile + tp_weights_tile_size_k;
-    __nv_bfloat16 *upstream_tile   = sph_harm_tile + sph_harm_tile_size_k;
-    float *fp32_reduction_scratch  = reinterpret_cast<float *>(shared_buffer_ + bf16_total_size_k);
+    __nv_bfloat16 *sph_harm_tile = tp_weights_tile + tp_weights_tile_size_k;
+    __nv_bfloat16 *upstream_tile = sph_harm_tile + sph_harm_tile_size_k;
+    float *fp32_reduction_scratch = reinterpret_cast<float *>(shared_buffer_ + bf16_total_size_k);
     // fp32_reduction_scratch holds 16 m × 16 channels = 256 fp32 entries
     // (1 KB), reused across the path-weight reduction and the d_node_l0
     // reduction (the two are sequenced by `__syncthreads()`).
@@ -214,8 +205,8 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
         std::uint32_t const channel_to_load = channel_tile_base + static_cast<std::uint32_t>(linear_thread_index);
         float value = 0.0f;
         if (channel_to_load < n_channels) {
-            value = node_l0_feature_global[
-                static_cast<std::uint64_t>(source_atom_index) * n_channels + channel_to_load];
+            value =
+                node_l0_feature_global[static_cast<std::uint64_t>(source_atom_index) * n_channels + channel_to_load];
         }
         node_l0_tile[linear_thread_index] = __float2bfloat16_rn(value);
     }
@@ -223,14 +214,14 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
     // 1b. tp_weights[edge, path, channel_tile_base .. + C) for path 0..3.
     //     Source layout: [n_edges, 4 paths, n_channels] (path outer, channel inner).
     if (linear_thread_index < tp_weights_tile_size_k) {
-        int const path_index           = linear_thread_index / channel_tile_width_k;
-        int const channel_local_inner  = linear_thread_index % channel_tile_width_k;
+        int const path_index = linear_thread_index / channel_tile_width_k;
+        int const channel_local_inner = linear_thread_index % channel_tile_width_k;
         std::uint32_t const channel_to_load = channel_tile_base + static_cast<std::uint32_t>(channel_local_inner);
         float value = 0.0f;
         if (channel_to_load < n_channels) {
-            std::uint64_t const tp_offset =
-                static_cast<std::uint64_t>(edge_index) * (tensor_product_path_count_k * n_channels)
-                + static_cast<std::uint64_t>(path_index) * n_channels + channel_to_load;
+            std::uint64_t const tp_offset = static_cast<std::uint64_t>(edge_index) *
+                                                (tensor_product_path_count_k * n_channels) +
+                                            static_cast<std::uint64_t>(path_index) * n_channels + channel_to_load;
             value = tensor_product_weights_per_edge_global[tp_offset];
         }
         tp_weights_tile[linear_thread_index] = __float2bfloat16_rn(value);
@@ -252,13 +243,13 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
         int const upstream_thread_index = linear_thread_index;
         if (upstream_thread_index < upstream_tile_size_k) {
             int const tile_channel_local = upstream_thread_index / irrep_dim_total_k;
-            int const tile_m_index       = upstream_thread_index % irrep_dim_total_k;
+            int const tile_m_index = upstream_thread_index % irrep_dim_total_k;
             std::uint32_t const channel_to_load = channel_tile_base + static_cast<std::uint32_t>(tile_channel_local);
             float value = 0.0f;
             if (channel_to_load < n_channels) {
                 std::uint64_t const upstream_offset =
-                    (static_cast<std::uint64_t>(target_atom_index) * n_channels + channel_to_load)
-                    * irrep_dim_total_k + static_cast<std::uint32_t>(tile_m_index);
+                    (static_cast<std::uint64_t>(target_atom_index) * n_channels + channel_to_load) * irrep_dim_total_k +
+                    static_cast<std::uint32_t>(tile_m_index);
                 value = upstream_grad_node_messages_full_global[upstream_offset];
             }
             upstream_tile[upstream_thread_index] = __float2bfloat16_rn(value);
@@ -271,11 +262,11 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
     //       cell.  The path index for this thread is fixed (determined by m).
     int const path_index_for_thread = irrep_block_index_for_component_(irrep_component_index);
 
-    float const node_l0_value   = __bfloat162float(node_l0_tile[channel_local]);
-    float const sph_harm_value  = __bfloat162float(sph_harm_tile[irrep_component_index]);
+    float const node_l0_value = __bfloat162float(node_l0_tile[channel_local]);
+    float const sph_harm_value = __bfloat162float(sph_harm_tile[irrep_component_index]);
     float const tp_weight_value = __bfloat162float(
         tp_weights_tile[path_index_for_thread * channel_tile_width_k + channel_local]);
-    float const upstream_value  = __bfloat162float(
+    float const upstream_value = __bfloat162float(
         upstream_tile[channel_local * irrep_dim_total_k + irrep_component_index]);
 
     // d_node_l0[s, c] += scale * tp_w[L(m), c] * sph_harm[m] * du[c, m]
@@ -295,10 +286,12 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
     __syncthreads();
 
     if (channel_in_range && grad_tensor_product_weights_per_edge_global != nullptr) {
-        struct path_block_t { int m_start; int m_count; int path_index; };
-        path_block_t const blocks[tensor_product_path_count_k] = {
-            {0, 1, 0}, {1, 3, 1}, {4, 5, 2}, {9, 7, 3}
+        struct path_block_t {
+            int m_start;
+            int m_count;
+            int path_index;
         };
+        path_block_t const blocks[tensor_product_path_count_k] = {{0, 1, 0}, {1, 3, 1}, {4, 5, 2}, {9, 7, 3}};
         for (int block_index = 0; block_index < tensor_product_path_count_k; ++block_index) {
             path_block_t const blk = blocks[block_index];
             // Designate the first m-row of each block as the writer for that
@@ -307,12 +300,11 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
             if (irrep_component_index != blk.m_start) continue;
             float accumulator = 0.0f;
             for (int m_within = 0; m_within < blk.m_count; ++m_within) {
-                accumulator += fp32_reduction_scratch[
-                    (blk.m_start + m_within) * channel_tile_width_k + channel_local];
+                accumulator += fp32_reduction_scratch[(blk.m_start + m_within) * channel_tile_width_k + channel_local];
             }
-            std::uint64_t const out_offset =
-                static_cast<std::uint64_t>(edge_index) * (tensor_product_path_count_k * n_channels)
-                + static_cast<std::uint64_t>(blk.path_index) * n_channels + channel_index;
+            std::uint64_t const out_offset = static_cast<std::uint64_t>(edge_index) *
+                                                 (tensor_product_path_count_k * n_channels) +
+                                             static_cast<std::uint64_t>(blk.path_index) * n_channels + channel_index;
             grad_tensor_product_weights_per_edge_global[out_offset] = accumulator;
         }
     }
@@ -327,14 +319,13 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
         unsigned const full_mask = 0xFFFFFFFFu;
         float channel_reduced = dsph_harm_contribution;
         if (!channel_in_range) channel_reduced = 0.0f;
-        #pragma unroll
+#pragma unroll
         for (int xor_offset = 8; xor_offset > 0; xor_offset >>= 1) {
             channel_reduced += __shfl_xor_sync(full_mask, channel_reduced, xor_offset);
         }
         if (channel_local == 0 && grad_sph_harm_global != nullptr) {
-            atomicAdd(grad_sph_harm_global +
-                      static_cast<std::uint64_t>(edge_index) * irrep_dim_total_k +
-                      static_cast<std::uint32_t>(irrep_component_index),
+            atomicAdd(grad_sph_harm_global + static_cast<std::uint64_t>(edge_index) * irrep_dim_total_k +
+                          static_cast<std::uint32_t>(irrep_component_index),
                       channel_reduced);
         }
     }
@@ -349,13 +340,13 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
 
     if (irrep_component_index == 0 && channel_in_range && grad_node_l0_feature_global != nullptr) {
         float accumulator = 0.0f;
-        #pragma unroll
+#pragma unroll
         for (int m_index = 0; m_index < irrep_dim_total_k; ++m_index) {
             accumulator += fp32_reduction_scratch[m_index * channel_tile_width_k + channel_local];
         }
-        atomicAdd(grad_node_l0_feature_global +
-                  static_cast<std::uint64_t>(source_atom_index) * n_channels + channel_index,
-                  accumulator);
+        atomicAdd(
+            grad_node_l0_feature_global + static_cast<std::uint64_t>(source_atom_index) * n_channels + channel_index,
+            accumulator);
     }
 }
 
@@ -398,10 +389,7 @@ inline __global__ void mace_tk_conv_tp_scatter_force_adjoint_kernel(
  *  `mace_force_adjoints.cuh`.
  */
 inline void launch_mace_tk_tensor_product_and_scatter_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_edges,
-    std::uint32_t n_channels,
-    std::int32_t const *edge_source_atom,
+    std::uint32_t n_atoms, std::uint32_t n_edges, std::uint32_t n_channels, std::int32_t const *edge_source_atom,
     std::int32_t const *edge_target_atom,
     std::int32_t const *receiver_edge_segment_start,    // [n_atoms] or nullptr
     std::int32_t const *receiver_edge_segment_end,      // [n_atoms] or nullptr
@@ -412,8 +400,7 @@ inline void launch_mace_tk_tensor_product_and_scatter_force_adjoint(
     float *grad_node_l0_feature_fp32,                   // [n_atoms, n_channels]      atomicAdd
     float *grad_tensor_product_weights_per_edge_fp32,   // [n_edges, 4 * n_channels]   non-atomic
     float *grad_sph_harm_fp32,                          // [n_edges, 16]              atomicAdd
-    cudaStream_t stream
-) {
+    cudaStream_t stream) {
     using namespace mace_tk_conv_tp_scatter_force_adjoint_detail_;
     (void)n_atoms;
     (void)receiver_edge_segment_start;
@@ -424,35 +411,27 @@ inline void launch_mace_tk_tensor_product_and_scatter_force_adjoint(
     // already absorb the e3nn TP path-weight factor, so scale = 1.
     float const scale = 1.0f;
 
-    std::uint32_t const channel_tile_count =
-        (n_channels + static_cast<std::uint32_t>(channel_tile_width_k) - 1u)
-        / static_cast<std::uint32_t>(channel_tile_width_k);
+    std::uint32_t const channel_tile_count = (n_channels + static_cast<std::uint32_t>(channel_tile_width_k) - 1u) /
+                                             static_cast<std::uint32_t>(channel_tile_width_k);
 
     dim3 const grid(n_edges, channel_tile_count, 1);
-    dim3 const block(static_cast<std::uint32_t>(channel_tile_width_k),
-                     static_cast<std::uint32_t>(irrep_dim_total_k), 1);
+    dim3 const block(static_cast<std::uint32_t>(channel_tile_width_k), static_cast<std::uint32_t>(irrep_dim_total_k),
+                     1);
 
     // Shared-memory budget:
     //   bf16 tiles    : (C + 4*C + 16 + C*16) bf16 = 352 bf16 = 704 bytes
     //   fp32 scratch  : 16 m × 16 channels = 256 fp32 = 1024 bytes
-    constexpr std::size_t bf16_total_size_k =
-        channel_tile_width_k
-      + tensor_product_path_count_k * channel_tile_width_k
-      + irrep_dim_total_k
-      + channel_tile_width_k * irrep_dim_total_k;
-    constexpr std::size_t bf16_tile_bytes_k    = sizeof(__nv_bfloat16) * bf16_total_size_k;
+    constexpr std::size_t bf16_total_size_k = channel_tile_width_k +
+                                              tensor_product_path_count_k * channel_tile_width_k + irrep_dim_total_k +
+                                              channel_tile_width_k * irrep_dim_total_k;
+    constexpr std::size_t bf16_tile_bytes_k = sizeof(__nv_bfloat16) * bf16_total_size_k;
     constexpr std::size_t fp32_scratch_bytes_k = sizeof(float) * channel_tile_width_k * irrep_dim_total_k;
     constexpr std::size_t shared_memory_bytes_k = bf16_tile_bytes_k + fp32_scratch_bytes_k;
 
     mace_tk_conv_tp_scatter_force_adjoint_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
-        n_edges, n_channels, scale,
-        edge_source_atom, edge_target_atom,
-        node_l0_feature_fp32, sph_harm_fp32,
-        tensor_product_weights_per_edge_fp32,
-        upstream_grad_node_messages_full_fp32,
-        grad_node_l0_feature_fp32,
-        grad_tensor_product_weights_per_edge_fp32,
-        grad_sph_harm_fp32);
+        n_edges, n_channels, scale, edge_source_atom, edge_target_atom, node_l0_feature_fp32, sph_harm_fp32,
+        tensor_product_weights_per_edge_fp32, upstream_grad_node_messages_full_fp32, grad_node_l0_feature_fp32,
+        grad_tensor_product_weights_per_edge_fp32, grad_sph_harm_fp32);
 }
 
 } // namespace smallfield::cuda

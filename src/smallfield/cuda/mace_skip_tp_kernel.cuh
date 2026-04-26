@@ -41,7 +41,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#include "smallfield/cuda/mace_linear_kernel.cuh"  // mace_irrep_block_index_for_component_
+#include "smallfield/cuda/mace_linear_kernel.cuh" // mace_irrep_block_index_for_component_
 
 namespace smallfield::cuda {
 
@@ -53,17 +53,15 @@ namespace smallfield::cuda {
  *  residual-style layer and 4 for the layer-0 selector form.
  */
 inline __global__ void mace_element_conditioned_residual_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_elements,
-    std::uint32_t n_channels_out,
-    std::uint32_t irrep_dim,                  // 16
-    std::uint32_t active_irrep_block_count,   // 1 or 4
-    float scale,                              // e3nn path_weight = 1/sqrt(c_in * n_elements) for one-instruction-per-output FullyConnectedTensorProduct
-    std::int32_t const *atom_element,         // [n_atoms]
-    float const *weights,                     // [active_irrep_block_count, c_in, n_elements, c_out]
-    float const *input,                       // [n_atoms, c_in, irrep_dim]
-    float *output                             // [n_atoms, c_out, irrep_dim]
+    std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_elements, std::uint32_t n_channels_out,
+    std::uint32_t irrep_dim,                // 16
+    std::uint32_t active_irrep_block_count, // 1 or 4
+    float scale,                      // e3nn path_weight = 1/sqrt(c_in * n_elements) for one-instruction-per-output
+                                      // FullyConnectedTensorProduct
+    std::int32_t const *atom_element, // [n_atoms]
+    float const *weights,             // [active_irrep_block_count, c_in, n_elements, c_out]
+    float const *input,               // [n_atoms, c_in, irrep_dim]
+    float *output                     // [n_atoms, c_out, irrep_dim]
 ) {
     std::uint32_t atom_index = blockIdx.x;
     std::uint32_t channel_out_index = blockIdx.y;
@@ -72,22 +70,25 @@ inline __global__ void mace_element_conditioned_residual_kernel(
 
     std::uint32_t const irrep_block_index = mace_irrep_block_index_for_component_(irrep_component_index);
     if (irrep_block_index >= active_irrep_block_count) {
-        output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim + irrep_component_index] = 0.0f;
+        output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim +
+               irrep_component_index] = 0.0f;
         return;
     }
     int const element_index = atom_element[atom_index];
-    std::uint64_t const weight_block_offset = static_cast<std::uint64_t>(irrep_block_index) * n_channels_in * n_elements * n_channels_out;
-    std::uint64_t const input_offset        = static_cast<std::uint64_t>(atom_index) * n_channels_in * irrep_dim;
+    std::uint64_t const weight_block_offset = static_cast<std::uint64_t>(irrep_block_index) * n_channels_in *
+                                              n_elements * n_channels_out;
+    std::uint64_t const input_offset = static_cast<std::uint64_t>(atom_index) * n_channels_in * irrep_dim;
     float accumulator = 0.0f;
     for (std::uint32_t channel_in_index = 0; channel_in_index < n_channels_in; ++channel_in_index) {
-        float const w = weights[weight_block_offset
-                                + static_cast<std::uint64_t>(channel_in_index) * n_elements * n_channels_out
-                                + static_cast<std::uint64_t>(element_index) * n_channels_out
-                                + channel_out_index];
-        float const x = input[input_offset + static_cast<std::uint64_t>(channel_in_index) * irrep_dim + irrep_component_index];
+        float const w =
+            weights[weight_block_offset + static_cast<std::uint64_t>(channel_in_index) * n_elements * n_channels_out +
+                    static_cast<std::uint64_t>(element_index) * n_channels_out + channel_out_index];
+        float const x =
+            input[input_offset + static_cast<std::uint64_t>(channel_in_index) * irrep_dim + irrep_component_index];
         accumulator += w * x;
     }
-    output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim + irrep_component_index] = scale * accumulator;
+    output[(static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out_index) * irrep_dim +
+           irrep_component_index] = scale * accumulator;
 }
 
 /**
@@ -103,47 +104,34 @@ inline __global__ void mace_element_conditioned_residual_kernel(
  *  Weight layout: [n_in, n_elements, n_out] (matching the general kernel's
  *  per-block layout, but irrep_block_index=0 collapses out the leading dim).
  */
-inline __global__ void mace_skip_tp_irrep1_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_elements,
-    std::uint32_t n_channels_out,
-    float scale,
-    std::int32_t const *__restrict__ atom_element,    // [n_atoms]
-    float const *__restrict__ weights,                // [n_in, n_elements, n_out]
-    float const *__restrict__ input,                  // [n_atoms, n_in]
-    float *__restrict__ output                        // [n_atoms, n_out]
+inline __global__ void mace_skip_tp_irrep1_kernel(std::uint32_t n_atoms, std::uint32_t n_channels_in,
+                                                  std::uint32_t n_elements, std::uint32_t n_channels_out, float scale,
+                                                  std::int32_t const *__restrict__ atom_element, // [n_atoms]
+                                                  float const *__restrict__ weights, // [n_in, n_elements, n_out]
+                                                  float const *__restrict__ input,   // [n_atoms, n_in]
+                                                  float *__restrict__ output         // [n_atoms, n_out]
 ) {
-    std::uint32_t const atom_index   = blockIdx.x * blockDim.y + static_cast<std::uint32_t>(threadIdx.y);
-    std::uint32_t const channel_out  = blockIdx.y * blockDim.x + static_cast<std::uint32_t>(threadIdx.x);
+    std::uint32_t const atom_index = blockIdx.x * blockDim.y + static_cast<std::uint32_t>(threadIdx.y);
+    std::uint32_t const channel_out = blockIdx.y * blockDim.x + static_cast<std::uint32_t>(threadIdx.x);
     if (atom_index >= n_atoms || channel_out >= n_channels_out) return;
 
     int const element_index = atom_element[atom_index];
     float const *input_row = input + static_cast<std::uint64_t>(atom_index) * n_channels_in;
     float accumulator = 0.0f;
     for (std::uint32_t channel_in_index = 0; channel_in_index < n_channels_in; ++channel_in_index) {
-        std::uint64_t const weight_offset =
-            (static_cast<std::uint64_t>(channel_in_index) * n_elements
-             + static_cast<std::uint64_t>(element_index)) * n_channels_out
-            + channel_out;
+        std::uint64_t const weight_offset = (static_cast<std::uint64_t>(channel_in_index) * n_elements +
+                                             static_cast<std::uint64_t>(element_index)) *
+                                                n_channels_out +
+                                            channel_out;
         accumulator += weights[weight_offset] * input_row[channel_in_index];
     }
     output[static_cast<std::uint64_t>(atom_index) * n_channels_out + channel_out] = scale * accumulator;
 }
 
-inline void launch_mace_skip_tp(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_elements,
-    std::uint32_t n_channels_out,
-    std::uint32_t irrep_dim,
-    std::uint32_t active_irrep_block_count,
-    std::int32_t const *atom_element,
-    float const *weights,
-    float const *input,
-    float *output,
-    cudaStream_t stream
-) {
+inline void launch_mace_skip_tp(std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_elements,
+                                std::uint32_t n_channels_out, std::uint32_t irrep_dim,
+                                std::uint32_t active_irrep_block_count, std::int32_t const *atom_element,
+                                float const *weights, float const *input, float *output, cudaStream_t stream) {
     if (n_atoms == 0) return;
     // For FullyConnectedTensorProduct(irreps_in_1, "n_elements x 0e", irreps_out)
     // with one instruction per matched (L_in, L_out) pair (input × 0e → output L = input L),
@@ -157,19 +145,18 @@ inline void launch_mace_skip_tp(
     if (irrep_dim == 1u && active_irrep_block_count == 1u) {
         constexpr std::uint32_t block_dim_x = 16, block_dim_y = 16;
         dim3 const block(block_dim_x, block_dim_y, 1);
-        dim3 const grid((n_atoms + block_dim_y - 1u) / block_dim_y,
-                        (n_channels_out + block_dim_x - 1u) / block_dim_x, 1);
-        mace_skip_tp_irrep1_kernel<<<grid, block, 0, stream>>>(
-            n_atoms, n_channels_in, n_elements, n_channels_out, scale,
-            atom_element, weights, input, output);
+        dim3 const grid((n_atoms + block_dim_y - 1u) / block_dim_y, (n_channels_out + block_dim_x - 1u) / block_dim_x,
+                        1);
+        mace_skip_tp_irrep1_kernel<<<grid, block, 0, stream>>>(n_atoms, n_channels_in, n_elements, n_channels_out,
+                                                               scale, atom_element, weights, input, output);
         return;
     }
 
     dim3 const block(irrep_dim, 1, 1);
     dim3 const grid(n_atoms, n_channels_out, 1);
     mace_element_conditioned_residual_kernel<<<grid, block, 0, stream>>>(
-        n_atoms, n_channels_in, n_elements, n_channels_out, irrep_dim, active_irrep_block_count, scale,
-        atom_element, weights, input, output);
+        n_atoms, n_channels_in, n_elements, n_channels_out, irrep_dim, active_irrep_block_count, scale, atom_element,
+        weights, input, output);
 }
 
 /** Element-wise add: `dst += src` for the residual sum. */

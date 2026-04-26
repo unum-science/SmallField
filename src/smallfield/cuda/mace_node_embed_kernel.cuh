@@ -39,14 +39,12 @@ namespace smallfield::cuda {
  *  weight as `(n_elements * n_channels)` flat, with elements outer.  We
  *  read `node_embedding[Z * n_channels + c]`, matching the export tool.
  */
-inline __global__ void mace_node_embed_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t irrep_dim,                   // 16 for MACE-OFF L_max=3
-    float scale,                                // e3nn path_weight = 1/sqrt(n_elements)
-    std::int32_t const *atom_element,          // [n_atoms]
-    float const *node_embedding_weight,        // [n_elements, n_channels]
-    float *node_features                       // [n_atoms, n_channels, irrep_dim]
+inline __global__ void mace_node_embed_kernel(std::uint32_t n_atoms, std::uint32_t n_channels,
+                                              std::uint32_t irrep_dim,          // 16 for MACE-OFF L_max=3
+                                              float scale,                      // e3nn path_weight = 1/sqrt(n_elements)
+                                              std::int32_t const *atom_element, // [n_atoms]
+                                              float const *node_embedding_weight, // [n_elements, n_channels]
+                                              float *node_features                // [n_atoms, n_channels, irrep_dim]
 ) {
     std::uint32_t atom_index = blockIdx.x;
     std::uint32_t channel_index = blockIdx.y * blockDim.x + threadIdx.x;
@@ -54,7 +52,8 @@ inline __global__ void mace_node_embed_kernel(
     int const element_index = atom_element[atom_index];
     // Zero out the full irrep slab first (write strided fp32; cheap).
     for (std::uint32_t irrep_component_index = 0; irrep_component_index < irrep_dim; ++irrep_component_index) {
-        node_features[(static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim + irrep_component_index] = 0.0f;
+        node_features[(static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim +
+                      irrep_component_index] = 0.0f;
     }
     // L=0 is m=0; write the embedding weight for this element, scaled by the e3nn
     // path normalisation factor (= 1/sqrt(num_input_irreps_paths_to_this_output)
@@ -63,23 +62,16 @@ inline __global__ void mace_node_embed_kernel(
         scale * node_embedding_weight[static_cast<std::uint64_t>(element_index) * n_channels + channel_index];
 }
 
-inline void launch_mace_node_embed(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t n_elements,
-    std::uint32_t irrep_dim,
-    std::int32_t const *atom_element,
-    float const *node_embedding_weight,
-    float *node_features,
-    cudaStream_t stream
-) {
+inline void launch_mace_node_embed(std::uint32_t n_atoms, std::uint32_t n_channels, std::uint32_t n_elements,
+                                   std::uint32_t irrep_dim, std::int32_t const *atom_element,
+                                   float const *node_embedding_weight, float *node_features, cudaStream_t stream) {
     if (n_atoms == 0 || n_channels == 0) return;
     constexpr std::uint32_t block_dim_x = 64;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_atoms, (n_channels + block_dim_x - 1u) / block_dim_x, 1);
     float const scale = 1.0f / sqrtf(static_cast<float>(n_elements));
-    mace_node_embed_kernel<<<grid, block, 0, stream>>>(
-        n_atoms, n_channels, irrep_dim, scale, atom_element, node_embedding_weight, node_features);
+    mace_node_embed_kernel<<<grid, block, 0, stream>>>(n_atoms, n_channels, irrep_dim, scale, atom_element,
+                                                       node_embedding_weight, node_features);
 }
 
 } // namespace smallfield::cuda

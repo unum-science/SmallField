@@ -28,32 +28,28 @@
 
 namespace {
 
-#define CUDA_CHECK(stmt)                                                    \
-    do {                                                                    \
-        cudaError_t const e = (stmt);                                       \
-        if (e != cudaSuccess) {                                             \
-            std::fprintf(stderr, "CUDA error %s at %s:%d\n",                \
-                         cudaGetErrorString(e), __FILE__, __LINE__);        \
-            std::exit(1);                                                   \
-        }                                                                   \
+#define CUDA_CHECK(stmt)                                                                                 \
+    do {                                                                                                 \
+        cudaError_t const e = (stmt);                                                                    \
+        if (e != cudaSuccess) {                                                                          \
+            std::fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); \
+            std::exit(1);                                                                                \
+        }                                                                                                \
     } while (0)
 
 struct synthetic_batch_t {
     std::uint32_t n_conformers;
     std::uint32_t n_atoms_per_conformer;
 
-    std::vector<float> host_positions_xyz;          // [n_atoms × 3]
-    std::vector<std::int32_t> host_atom_element;    // [n_atoms]
-    std::vector<std::int32_t> host_graph_of_atom;   // [n_atoms]
-    std::vector<std::int32_t> host_edge_source;     // [n_edges]
-    std::vector<std::int32_t> host_edge_target;     // [n_edges]
+    std::vector<float> host_positions_xyz;        // [n_atoms × 3]
+    std::vector<std::int32_t> host_atom_element;  // [n_atoms]
+    std::vector<std::int32_t> host_graph_of_atom; // [n_atoms]
+    std::vector<std::int32_t> host_edge_source;   // [n_edges]
+    std::vector<std::int32_t> host_edge_target;   // [n_edges]
 };
 
-synthetic_batch_t build_synthetic_batch(std::uint32_t n_conformers,
-                                         std::uint32_t n_atoms_per_conformer,
-                                         std::uint32_t n_elements,
-                                         float r_max,
-                                         std::uint64_t seed) {
+synthetic_batch_t build_synthetic_batch(std::uint32_t n_conformers, std::uint32_t n_atoms_per_conformer,
+                                        std::uint32_t n_elements, float r_max, std::uint64_t seed) {
     synthetic_batch_t out;
     out.n_conformers = n_conformers;
     out.n_atoms_per_conformer = n_atoms_per_conformer;
@@ -98,7 +94,7 @@ synthetic_batch_t build_synthetic_batch(std::uint32_t n_conformers,
     return out;
 }
 
-}  // namespace
+} // namespace
 
 int main(int argc, char **argv) {
     std::string const export_dir = (argc > 1) ? argv[1] : "/tmp/mace_export";
@@ -110,13 +106,14 @@ int main(int argc, char **argv) {
     smallfield::mace::weights_t W;
     try {
         W = smallfield::mace::weights_t::load(weights_path);
-    } catch (std::exception const &e) {
+    }
+    catch (std::exception const &e) {
         std::fprintf(stderr, "weights load failed: %s\n", e.what());
         return 1;
     }
     auto const &arch = W.arch();
-    std::printf("  arch: n_elements=%u n_radial=%u n_channels=%u r_max=%.2f num_interactions=%u\n",
-                arch.n_elements, arch.n_radial, arch.n_channels, arch.r_max, arch.num_interactions);
+    std::printf("  arch: n_elements=%u n_radial=%u n_channels=%u r_max=%.2f num_interactions=%u\n", arch.n_elements,
+                arch.n_radial, arch.n_channels, arch.r_max, arch.num_interactions);
 
     // 2.  Build a synthetic batch (4 conformers × 30 atoms each).
     constexpr std::uint32_t n_conformers = 4u;
@@ -125,8 +122,8 @@ int main(int argc, char **argv) {
 
     std::uint32_t const n_atoms_total = static_cast<std::uint32_t>(sb.host_positions_xyz.size() / 3);
     std::uint32_t const n_edges_total = static_cast<std::uint32_t>(sb.host_edge_source.size());
-    std::printf("  synthetic batch: n_conformers=%u n_atoms=%u n_edges=%u\n",
-                n_conformers, n_atoms_total, n_edges_total);
+    std::printf("  synthetic batch: n_conformers=%u n_atoms=%u n_edges=%u\n", n_conformers, n_atoms_total,
+                n_edges_total);
 
     // 3.  Upload to the GPU.
     float *device_positions = nullptr;
@@ -136,27 +133,32 @@ int main(int argc, char **argv) {
     std::int32_t *device_edge_target = nullptr;
     float *device_energies = nullptr;
     float *device_forces = nullptr;
-    CUDA_CHECK(cudaMalloc(&device_positions,    sb.host_positions_xyz.size() * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&device_atom_element, sb.host_atom_element.size()  * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_positions, sb.host_positions_xyz.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&device_atom_element, sb.host_atom_element.size() * sizeof(std::int32_t)));
     CUDA_CHECK(cudaMalloc(&device_graph_of_atom, sb.host_graph_of_atom.size() * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaMalloc(&device_edge_source,  sb.host_edge_source.size()   * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaMalloc(&device_edge_target,  sb.host_edge_target.size()   * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaMalloc(&device_energies,     n_conformers * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&device_forces,       n_atoms_total * 3u * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&device_edge_source, sb.host_edge_source.size() * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_edge_target, sb.host_edge_target.size() * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_energies, n_conformers * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&device_forces, n_atoms_total * 3u * sizeof(float)));
 
-    CUDA_CHECK(cudaMemcpy(device_positions,    sb.host_positions_xyz.data(), sb.host_positions_xyz.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_atom_element, sb.host_atom_element.data(),  sb.host_atom_element.size()  * sizeof(std::int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_graph_of_atom, sb.host_graph_of_atom.data(), sb.host_graph_of_atom.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_edge_source,  sb.host_edge_source.data(),   sb.host_edge_source.size()   * sizeof(std::int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_edge_target,  sb.host_edge_target.data(),   sb.host_edge_target.size()   * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_positions, sb.host_positions_xyz.data(), sb.host_positions_xyz.size() * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_atom_element, sb.host_atom_element.data(),
+                          sb.host_atom_element.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_graph_of_atom, sb.host_graph_of_atom.data(),
+                          sb.host_graph_of_atom.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_edge_source, sb.host_edge_source.data(),
+                          sb.host_edge_source.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_edge_target, sb.host_edge_target.data(),
+                          sb.host_edge_target.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
 
     // 4.  Construct the inference context.
     smallfield::mace::context_t ctx(/*device_id=*/0, arch,
-                                     /*max_atoms=*/n_atoms_total,
-                                     /*max_edges=*/n_edges_total,
-                                     /*max_graphs=*/n_conformers);
+                                    /*max_atoms=*/n_atoms_total,
+                                    /*max_edges=*/n_edges_total,
+                                    /*max_graphs=*/n_conformers);
 
-    smallfield::mace::batch_view_t batch{};
+    smallfield::mace::batch_view_t batch {};
     batch.n_atoms = n_atoms_total;
     batch.n_edges = n_edges_total;
     batch.n_graphs = n_conformers;
@@ -195,12 +197,16 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
 
     std::vector<float> host_forces(n_atoms_total * 3u);
-    CUDA_CHECK(cudaMemcpy(host_forces.data(), device_forces, host_forces.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        cudaMemcpy(host_forces.data(), device_forces, host_forces.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
     double force_max = 0.0;
     bool forces_finite = true;
     for (auto f : host_forces) {
-        if (!std::isfinite(f)) { forces_finite = false; break; }
+        if (!std::isfinite(f)) {
+            forces_finite = false;
+            break;
+        }
         force_max = std::max<double>(force_max, std::abs(static_cast<double>(f)));
     }
     if (!forces_finite) {
@@ -210,7 +216,7 @@ int main(int argc, char **argv) {
     std::printf("  infer_energy_and_forces: |F|_max = %.4f eV/Å\n", force_max);
 
     // 7.  Test refine_batch (5 GD-style steps; just check it doesn't blow up).
-    smallfield::mace::relax_config_t config{};
+    smallfield::mace::relax_config_t config {};
     config.num_steps = 5;
     config.step_size = 0.001f;
     status = ctx.refine_batch(W, batch, config, device_positions, device_energies);

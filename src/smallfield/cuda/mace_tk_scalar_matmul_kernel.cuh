@@ -78,11 +78,11 @@ namespace smallfield::cuda {
 
 namespace mace_tk_scalar_matmul_detail_ {
 
-constexpr int channels_k               = mace_tk::mace_channels_small_k;       // 96
-constexpr int wgmma_m_rows_k           = 64;                                    // atoms per CTA
-constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS;            // 128
+constexpr int channels_k = mace_tk::mace_channels_small_k;           // 96
+constexpr int wgmma_m_rows_k = 64;                                   // atoms per CTA
+constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS; // 128
 
-using shared_input_tile_t  = mace_tk::shared_tile_bf16<wgmma_m_rows_k, channels_k>;
+using shared_input_tile_t = mace_tk::shared_tile_bf16<wgmma_m_rows_k, channels_k>;
 using shared_weight_tile_t = mace_tk::shared_tile_bf16<channels_k, channels_k>;
 using shared_output_tile_t = mace_tk::shared_tile_fp32<wgmma_m_rows_k, channels_k>;
 
@@ -95,18 +95,14 @@ using register_accumulator_t = kittens::rt_fl<16, channels_k>;
  *  WGMMA produces zero contributions on those rows; the per-thread store
  *  guard at the epilogue then drops them.
  */
-__device__ __forceinline__ void load_input_slab_(
-    shared_input_tile_t &dst_tile,
-    float const *input_global,
-    std::uint32_t n_atoms,
-    std::uint32_t base_atom_index
-) {
+__device__ __forceinline__ void load_input_slab_(shared_input_tile_t &dst_tile, float const *input_global,
+                                                 std::uint32_t n_atoms, std::uint32_t base_atom_index) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = wgmma_m_rows_k * channels_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const atom_in_cta = linear_index / channels_k;
-        int const channel     = linear_index % channels_k;
+        int const channel = linear_index % channels_k;
         std::uint32_t const atom_index = base_atom_index + static_cast<std::uint32_t>(atom_in_cta);
         float value = 0.0f;
         if (atom_index < n_atoms) {
@@ -121,18 +117,14 @@ __device__ __forceinline__ void load_input_slab_(
  *  e3nn `o3.Linear` weights for an `irrep_dim=1, active_block=1` linear are
  *  exactly `[c_in, c_out]` row-major (no per-block axis to skip).
  */
-__device__ __forceinline__ void load_weight_slab_(
-    shared_weight_tile_t &dst_tile,
-    float const *weight_global
-) {
+__device__ __forceinline__ void load_weight_slab_(shared_weight_tile_t &dst_tile, float const *weight_global) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_k * channels_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
-        int const c_in_row  = linear_index / channels_k;
+        int const c_in_row = linear_index / channels_k;
         int const c_out_col = linear_index % channels_k;
-        float const value = weight_global[
-            static_cast<std::uint64_t>(c_in_row) * channels_k + c_out_col];
+        float const value = weight_global[static_cast<std::uint64_t>(c_in_row) * channels_k + c_out_col];
         dst_tile[{c_in_row, c_out_col}] = __float2bfloat16_rn(value);
     }
 }
@@ -141,16 +133,11 @@ __device__ __forceinline__ void load_weight_slab_(
  *  @brief Apply the e3nn `1 / sqrt(c_in)` (× optional pre-scale) path
  *         weight to every fp32 register-tile lane in place.
  */
-__device__ __forceinline__ void scale_accumulator_in_place_(
-    register_accumulator_t &accumulator,
-    float scaled_path_weight
-) {
+__device__ __forceinline__ void scale_accumulator_in_place_(register_accumulator_t &accumulator,
+                                                            float scaled_path_weight) {
     kittens::warpgroup::apply(
-        accumulator,
-        accumulator,
-        [scaled_path_weight] __device__ (int /*row*/, int /*col*/, float pre) {
-            return pre * scaled_path_weight;
-        });
+        accumulator, accumulator,
+        [scaled_path_weight] __device__(int /*row*/, int /*col*/, float pre) { return pre * scaled_path_weight; });
 }
 
 /**
@@ -161,26 +148,22 @@ __device__ __forceinline__ void scale_accumulator_in_place_(
  *  Output layout: `[n_atoms, c_out]` row-major fp32.  Out-of-range atoms
  *  (`base_atom + atom_in_cta >= n_atoms`) skip their row.
  */
-__device__ __forceinline__ void store_output_atoms_fp32_(
-    float *output_global,
-    shared_output_tile_t &staging_tile,
-    register_accumulator_t const &accumulator,
-    std::uint32_t n_atoms,
-    std::uint32_t base_atom_index
-) {
+__device__ __forceinline__ void store_output_atoms_fp32_(float *output_global, shared_output_tile_t &staging_tile,
+                                                         register_accumulator_t const &accumulator,
+                                                         std::uint32_t n_atoms, std::uint32_t base_atom_index) {
     kittens::warpgroup::store(staging_tile, accumulator);
     kittens::warpgroup::sync(0);
 
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = wgmma_m_rows_k * channels_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const atom_in_cta = linear_index / channels_k;
-        int const channel     = linear_index % channels_k;
+        int const channel = linear_index % channels_k;
         std::uint32_t const atom_index = base_atom_index + static_cast<std::uint32_t>(atom_in_cta);
         if (atom_index >= n_atoms) continue;
-        output_global[static_cast<std::uint64_t>(atom_index) * channels_k + channel]
-            = staging_tile[{atom_in_cta, channel}];
+        output_global[static_cast<std::uint64_t>(atom_index) * channels_k + channel] =
+            staging_tile[{atom_in_cta, channel}];
     }
 }
 
@@ -191,17 +174,16 @@ __device__ __forceinline__ void store_output_atoms_fp32_(
  *  Per CTA: load 64 atoms' input slab + the full c_in × c_out weight, run
  *  one WGMMA, scale, store fp32 directly.
  */
-inline __global__ void mace_tk_scalar_matmul_kernel(
-    std::uint32_t n_atoms,
-    float const *__restrict__ input_global,            // [n_atoms, c_in]
-    float const *__restrict__ weight_global,           // [c_in, c_out]
-    float scaled_path_weight,                           // 1 / sqrt(c_in) [× pre_scale]
-    float *__restrict__ output_global                   // [n_atoms, c_out]
+inline __global__ void mace_tk_scalar_matmul_kernel(std::uint32_t n_atoms,
+                                                    float const *__restrict__ input_global,  // [n_atoms, c_in]
+                                                    float const *__restrict__ weight_global, // [c_in, c_out]
+                                                    float scaled_path_weight,         // 1 / sqrt(c_in) [× pre_scale]
+                                                    float *__restrict__ output_global // [n_atoms, c_out]
 ) {
     extern __shared__ kittens::alignment_dummy raw_shared_memory[];
     kittens::shared_allocator shared_alloc(reinterpret_cast<int *>(&raw_shared_memory[0]));
 
-    shared_input_tile_t  &shared_input_tile  = shared_alloc.allocate<shared_input_tile_t>();
+    shared_input_tile_t &shared_input_tile = shared_alloc.allocate<shared_input_tile_t>();
     shared_weight_tile_t &shared_weight_tile = shared_alloc.allocate<shared_weight_tile_t>();
     shared_output_tile_t &shared_output_tile = shared_alloc.allocate<shared_output_tile_t>();
 
@@ -220,13 +202,10 @@ inline __global__ void mace_tk_scalar_matmul_kernel(
 
     scale_accumulator_in_place_(accumulator, scaled_path_weight);
 
-    store_output_atoms_fp32_(output_global,
-                              shared_output_tile,
-                              accumulator,
-                              n_atoms, base_atom_index);
+    store_output_atoms_fp32_(output_global, shared_output_tile, accumulator, n_atoms, base_atom_index);
 }
 
-}  // namespace mace_tk_scalar_matmul_detail_
+} // namespace mace_tk_scalar_matmul_detail_
 
 /**
  *  @brief Launch the TK-fused scalar-feature matmul.
@@ -246,49 +225,36 @@ inline __global__ void mace_tk_scalar_matmul_kernel(
  *  must fall back to `launch_mace_linear_per_irrep` (which dispatches to
  *  `mace_matmul_rowmajor_kernel` on the irrep_dim=1 fast path).
  */
-inline bool launch_mace_tk_scalar_matmul(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_channels_out,
-    float const *weight_fp32,
-    float const *input_fp32,
-    float *output_fp32,
-    cudaStream_t stream,
-    float pre_scale_multiplier = 1.0f
-) {
+inline bool launch_mace_tk_scalar_matmul(std::uint32_t n_atoms, std::uint32_t n_channels_in,
+                                         std::uint32_t n_channels_out, float const *weight_fp32,
+                                         float const *input_fp32, float *output_fp32, cudaStream_t stream,
+                                         float pre_scale_multiplier = 1.0f) {
     if (n_atoms == 0u) return true;
 
     using namespace mace_tk_scalar_matmul_detail_;
 
-    if (n_channels_in  != static_cast<std::uint32_t>(channels_k) ||
+    if (n_channels_in != static_cast<std::uint32_t>(channels_k) ||
         n_channels_out != static_cast<std::uint32_t>(channels_k)) {
         return false;
     }
 
-    float const scaled_path_weight = pre_scale_multiplier
-        / sqrtf(static_cast<float>(n_channels_in));
+    float const scaled_path_weight = pre_scale_multiplier / sqrtf(static_cast<float>(n_channels_in));
 
-    constexpr std::size_t shared_memory_bytes_k = 64 * 1024;  // generous; well under H100's 228 KB cap
+    constexpr std::size_t shared_memory_bytes_k = 64 * 1024; // generous; well under H100's 228 KB cap
 
-    cudaFuncSetAttribute(
-        mace_tk_scalar_matmul_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_memory_bytes_k));
+    cudaFuncSetAttribute(mace_tk_scalar_matmul_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shared_memory_bytes_k));
 
-    std::uint32_t const n_atom_tiles = (n_atoms + static_cast<std::uint32_t>(wgmma_m_rows_k) - 1u)
-                                       / static_cast<std::uint32_t>(wgmma_m_rows_k);
+    std::uint32_t const n_atom_tiles = (n_atoms + static_cast<std::uint32_t>(wgmma_m_rows_k) - 1u) /
+                                       static_cast<std::uint32_t>(wgmma_m_rows_k);
     dim3 const grid(n_atom_tiles, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
-    mace_tk_scalar_matmul_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
-        n_atoms,
-        input_fp32,
-        weight_fp32,
-        scaled_path_weight,
-        output_fp32);
+    mace_tk_scalar_matmul_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(n_atoms, input_fp32, weight_fp32,
+                                                                                 scaled_path_weight, output_fp32);
     return true;
 }
 
-}  // namespace smallfield::cuda
+} // namespace smallfield::cuda
 
-#endif  // SMALLFIELD_USE_THUNDERKITTENS && __CUDACC__
+#endif // SMALLFIELD_USE_THUNDERKITTENS && __CUDACC__

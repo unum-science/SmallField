@@ -43,12 +43,11 @@ namespace smallfield::cuda {
  *  H100 SXM5 we observe ~1.5 TB/s effective DRAM BW for `feature_dim = 1536`
  *  and `n_edges ≈ 90k` (drug-like batch 256), well within the workload's needs.
  */
-inline __global__ void mace_scatter_atomic_kernel(
-    std::uint32_t n_edges,
-    std::uint32_t feature_dim,         // n_channels * n_irreps_msg
-    std::int32_t const *edge_target_atom,
-    float const *edge_messages,        // [n_edges, feature_dim]
-    float *node_features               // [n_atoms, feature_dim] — caller pre-zeros
+inline __global__ void mace_scatter_atomic_kernel(std::uint32_t n_edges,
+                                                  std::uint32_t feature_dim, // n_channels * n_irreps_msg
+                                                  std::int32_t const *edge_target_atom,
+                                                  float const *edge_messages, // [n_edges, feature_dim]
+                                                  float *node_features // [n_atoms, feature_dim] — caller pre-zeros
 ) {
     std::uint32_t edge_index = blockIdx.x;
     std::uint32_t feature_column_index = blockIdx.y * blockDim.x + threadIdx.x;
@@ -65,19 +64,17 @@ inline __global__ void mace_scatter_atomic_kernel(
  *  `receiver_edge_segment_end[d]` = one past last.  This is what we
  *  pre-compute at bin-construction time.  No atomics.
  */
-inline __global__ void mace_scatter_segmented_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t feature_dim,
-    std::int32_t const *receiver_edge_segment_start,    // [n_atoms]
-    std::int32_t const *receiver_edge_segment_end,      // [n_atoms]
-    float const *edge_messages,                         // [n_edges, feature_dim]
-    float *node_features                                // [n_atoms, feature_dim]
+inline __global__ void mace_scatter_segmented_kernel(std::uint32_t n_atoms, std::uint32_t feature_dim,
+                                                     std::int32_t const *receiver_edge_segment_start, // [n_atoms]
+                                                     std::int32_t const *receiver_edge_segment_end,   // [n_atoms]
+                                                     float const *edge_messages, // [n_edges, feature_dim]
+                                                     float *node_features        // [n_atoms, feature_dim]
 ) {
     std::uint32_t receiver_atom_index = blockIdx.x;
     std::uint32_t feature_column_index = blockIdx.y * blockDim.x + threadIdx.x;
     if (receiver_atom_index >= n_atoms || feature_column_index >= feature_dim) return;
     int const segment_start_edge = receiver_edge_segment_start[receiver_atom_index];
-    int const segment_end_edge   = receiver_edge_segment_end[receiver_atom_index];
+    int const segment_end_edge = receiver_edge_segment_end[receiver_atom_index];
     float accumulator = 0.0f;
     for (int edge_index = segment_start_edge; edge_index < segment_end_edge; ++edge_index) {
         accumulator += edge_messages[static_cast<std::uint64_t>(edge_index) * feature_dim + feature_column_index];
@@ -85,21 +82,16 @@ inline __global__ void mace_scatter_segmented_kernel(
     node_features[static_cast<std::uint64_t>(receiver_atom_index) * feature_dim + feature_column_index] = accumulator;
 }
 
-inline void launch_mace_scatter_atomic(
-    std::uint32_t n_atoms,
-    std::uint32_t n_edges,
-    std::uint32_t feature_dim,
-    std::int32_t const *edge_target_atom,
-    float const *edge_messages,
-    float *node_features,
-    cudaStream_t stream
-) {
+inline void launch_mace_scatter_atomic(std::uint32_t n_atoms, std::uint32_t n_edges, std::uint32_t feature_dim,
+                                       std::int32_t const *edge_target_atom, float const *edge_messages,
+                                       float *node_features, cudaStream_t stream) {
     cudaMemsetAsync(node_features, 0, static_cast<std::size_t>(n_atoms) * feature_dim * sizeof(float), stream);
     if (n_edges == 0) return;
     constexpr std::uint32_t block_dim_x = 64;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_edges, (feature_dim + block_dim_x - 1u) / block_dim_x, 1);
-    mace_scatter_atomic_kernel<<<grid, block, 0, stream>>>(n_edges, feature_dim, edge_target_atom, edge_messages, node_features);
+    mace_scatter_atomic_kernel<<<grid, block, 0, stream>>>(n_edges, feature_dim, edge_target_atom, edge_messages,
+                                                           node_features);
 }
 
 } // namespace smallfield::cuda

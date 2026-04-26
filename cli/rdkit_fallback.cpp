@@ -35,7 +35,7 @@ static void warm_up_rdkit_globals_for_fallback_() {
             if (warm) {
                 RDKit::MolOps::addHs(*warm);
                 RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
-                                                    /*flagPossibleStereoCenters=*/true);
+                                                     /*flagPossibleStereoCenters=*/true);
                 RDKit::MMFF::MMFFMolProperties props(*warm);
                 (void)props.isValid();
             }

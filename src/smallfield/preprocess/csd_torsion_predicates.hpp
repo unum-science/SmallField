@@ -75,23 +75,25 @@ enum csd_predicate_t : std::uint8_t {
     csd_predicate_cx3_eq_non_o_k,      ///< $([CX3](=[!O])) — aliphatic sp² C (degree 3) with a double bond to a non-O
     csd_predicate_c_trifluoro_k,       ///< $(C([F])([F])[F]) — aliphatic C with ≥3 F neighbours (CF3)
     csd_predicate_cx3_nb_c_h_k,        ///< $([CX3]([C])([H])) — aliphatic sp² C with both a C neighbour and ≥1 H
-    csd_predicate_c_nx3_and_aliph_n_k, ///< $(C([NX3])N) — aliphatic C with NX3 and aliphatic N (two distinct) neighbours
+    csd_predicate_c_nx3_and_aliph_n_k, ///< $(C([NX3])N) — aliphatic C with NX3 and aliphatic N (two distinct)
+                                       ///< neighbours
     csd_predicate_c_nx3_and_arom_n_k,  ///< $(C([NX3])n) — aliphatic C with NX3 and aromatic n (two distinct) neighbours
     csd_predicate_n_nb_cx4_k,          ///< $([N][CX4]) / $(N[CX4]) / $([NH0][CX4]) — aliphatic N with a CX4 neighbour
     csd_predicate_cH0_nb_F_k,          ///< $([cH0]F) / $([cH0](F)) — aromatic C with 0 H and a F neighbour
     csd_predicate_cH0_nb_OH1_k,        ///< $([cH0][OH1]) — aromatic C with 0 H and a hydroxyl O neighbour
-    csd_predicate_cH0_nb_OH0_k,        ///< $([cH0][OH0]) — aromatic C with 0 H and an O-with-no-H (ether/carbonyl) neighbour
-    csd_predicate_cH0_nb_cx3_k,        ///< $([cH0]([CX3])) — aromatic C with 0 H and an aliphatic sp² C neighbour
-    csd_predicate_c_nb_aliph_O_k,      ///< $(cO) — aromatic C with an aliphatic O neighbour
-    csd_predicate_a_nb_OH1_k,          ///< $(a[OH1]) — aromatic atom with a hydroxyl O neighbour
-    csd_predicate_a_nb_NH12_k,         ///< $(a[NH1,NH2]) — aromatic atom with an aliphatic NH1/NH2 neighbour
-    csd_predicate_c_nb_NH12_k,         ///< $(c([NH1,NH2])) / $([c]([NH1,NH2])) — aromatic C with an aliphatic NH1/NH2 neighbour
+    csd_predicate_cH0_nb_OH0_k,   ///< $([cH0][OH0]) — aromatic C with 0 H and an O-with-no-H (ether/carbonyl) neighbour
+    csd_predicate_cH0_nb_cx3_k,   ///< $([cH0]([CX3])) — aromatic C with 0 H and an aliphatic sp² C neighbour
+    csd_predicate_c_nb_aliph_O_k, ///< $(cO) — aromatic C with an aliphatic O neighbour
+    csd_predicate_a_nb_OH1_k,     ///< $(a[OH1]) — aromatic atom with a hydroxyl O neighbour
+    csd_predicate_a_nb_NH12_k,    ///< $(a[NH1,NH2]) — aromatic atom with an aliphatic NH1/NH2 neighbour
+    csd_predicate_c_nb_NH12_k, ///< $(c([NH1,NH2])) / $([c]([NH1,NH2])) — aromatic C with an aliphatic NH1/NH2 neighbour
     /** @} */
     /** @name Round-2 additions (2026-04-19).  Cover the last simple single-hop bodies in the residual fallback. @{ */
-    csd_predicate_cH0_eq_o_k,          ///< $([cH0](=O)) — aromatic C with 0 H and a double bond to aliphatic O
-    csd_predicate_c_not_ring_c_k,      ///< $(c!@c) — aromatic C with an aromatic-C neighbour via a non-ring bond
-    csd_predicate_nN_nb_aromatic_k,    ///< $([n,N](-a)) — aromatic n OR aliphatic N with an aromatic-atom neighbour via a single bond
-    csd_predicate_a_nb_nH0_or_o_k,     ///< $([a]([nH0,o])) — aromatic atom with an aromatic-N-0H or aromatic-O neighbour
+    csd_predicate_cH0_eq_o_k,       ///< $([cH0](=O)) — aromatic C with 0 H and a double bond to aliphatic O
+    csd_predicate_c_not_ring_c_k,   ///< $(c!@c) — aromatic C with an aromatic-C neighbour via a non-ring bond
+    csd_predicate_nN_nb_aromatic_k, ///< $([n,N](-a)) — aromatic n OR aliphatic N with an aromatic-atom neighbour via a
+                                    ///< single bond
+    csd_predicate_a_nb_nH0_or_o_k, ///< $([a]([nH0,o])) — aromatic atom with an aromatic-N-0H or aromatic-O neighbour
     /** @} */
     csd_predicate_count_k, ///< number of defined predicates (keep last)
 };
@@ -315,7 +317,7 @@ inline bool predicate_c_two_cH_or_nX2H0(molecule_descriptor_t const &desc, std::
         std::uint8_t const element = desc.element[nb];
         std::uint8_t const h = desc.num_hydrogens[nb];
         std::uint8_t const dg = desc.degree[nb];
-        if (element == 6 && h == 1) return true;         // cH
+        if (element == 6 && h == 1) return true;            // cH
         if (element == 7 && dg == 2 && h == 0) return true; // nX2H0
         return false;
     };

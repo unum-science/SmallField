@@ -100,8 +100,8 @@ constexpr int channel_tile_width_k = 16;
 /// Threads per CTA.  One warp per (16-channel × 16-m) thread block; one
 /// thread per (channel, m).  Two warps if `channel_tile_width_k > 16`.
 constexpr int channel_threads_per_warp_k = 16;
-constexpr int irrep_threads_per_warp_k   = 16;
-constexpr int threads_per_warp_k         = channel_threads_per_warp_k * irrep_threads_per_warp_k; // 256
+constexpr int irrep_threads_per_warp_k = 16;
+constexpr int threads_per_warp_k = channel_threads_per_warp_k * irrep_threads_per_warp_k; // 256
 static_assert(threads_per_warp_k == channel_tile_width_k * irrep_dim_total_k, "thread layout matches tile shape");
 
 /**
@@ -145,27 +145,21 @@ __device__ __forceinline__ int irrep_block_index_for_component_(int irrep_compon
  *  occupancy.
  */
 inline __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_edges,
-    std::uint32_t n_channels,
-    std::int32_t const *__restrict__ edge_source_atom,
-    std::int32_t const *__restrict__ receiver_edge_segment_start,
-    std::int32_t const *__restrict__ receiver_edge_segment_end,
-    float const *__restrict__ node_features_l0_only,
-    float const *__restrict__ sph_harm,
-    float const *__restrict__ tensor_product_weights_per_edge,
-    __nv_bfloat16 *__restrict__ node_messages_full_irrep_bf16
-) {
+    std::uint32_t n_atoms, std::uint32_t n_edges, std::uint32_t n_channels,
+    std::int32_t const *__restrict__ edge_source_atom, std::int32_t const *__restrict__ receiver_edge_segment_start,
+    std::int32_t const *__restrict__ receiver_edge_segment_end, float const *__restrict__ node_features_l0_only,
+    float const *__restrict__ sph_harm, float const *__restrict__ tensor_product_weights_per_edge,
+    __nv_bfloat16 *__restrict__ node_messages_full_irrep_bf16) {
     std::uint32_t const receiver_atom_index = blockIdx.x;
-    std::uint32_t const channel_tile_index  = blockIdx.y;
+    std::uint32_t const channel_tile_index = blockIdx.y;
     if (receiver_atom_index >= n_atoms) return;
 
-    int const channel_local         = static_cast<int>(threadIdx.x);
+    int const channel_local = static_cast<int>(threadIdx.x);
     int const irrep_component_index = static_cast<int>(threadIdx.y);
-    int const linear_thread_index   = irrep_component_index * channel_tile_width_k + channel_local;
+    int const linear_thread_index = irrep_component_index * channel_tile_width_k + channel_local;
 
-    std::uint32_t const channel_index = channel_tile_index * static_cast<std::uint32_t>(channel_tile_width_k)
-                                        + static_cast<std::uint32_t>(channel_local);
+    std::uint32_t const channel_index = channel_tile_index * static_cast<std::uint32_t>(channel_tile_width_k) +
+                                        static_cast<std::uint32_t>(channel_local);
     bool const channel_in_range = (channel_index < n_channels);
 
     // Per-thread fp32 accumulator for (channel, m).  Drives the bf16 store
@@ -179,15 +173,15 @@ inline __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
     //   [C + 4*C .. C + 4*C + 16)                   sph_harm_tile
     // where C = channel_tile_width_k.  Total = 5*C + 16 floats per edge.
     extern __shared__ float shared_buffer_[];
-    constexpr int node_l0_tile_size_k    = channel_tile_width_k;
+    constexpr int node_l0_tile_size_k = channel_tile_width_k;
     constexpr int tp_weights_tile_size_k = tensor_product_path_count_k * channel_tile_width_k;
-    constexpr int sph_harm_tile_size_k   = irrep_dim_total_k;
-    float *node_l0_tile    = shared_buffer_;
+    constexpr int sph_harm_tile_size_k = irrep_dim_total_k;
+    float *node_l0_tile = shared_buffer_;
     float *tp_weights_tile = node_l0_tile + node_l0_tile_size_k;
-    float *sph_harm_tile   = tp_weights_tile + tp_weights_tile_size_k;
+    float *sph_harm_tile = tp_weights_tile + tp_weights_tile_size_k;
 
     int const segment_start_edge = receiver_edge_segment_start[receiver_atom_index];
-    int const segment_end_edge   = receiver_edge_segment_end[receiver_atom_index];
+    int const segment_end_edge = receiver_edge_segment_end[receiver_atom_index];
 
     std::uint32_t const channel_tile_base = channel_tile_index * static_cast<std::uint32_t>(channel_tile_width_k);
 
@@ -202,8 +196,8 @@ inline __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
             std::uint32_t const channel_to_load = channel_tile_base + static_cast<std::uint32_t>(linear_thread_index);
             float value = 0.0f;
             if (channel_to_load < n_channels) {
-                value = node_features_l0_only[
-                    static_cast<std::uint64_t>(source_atom_index) * n_channels + channel_to_load];
+                value =
+                    node_features_l0_only[static_cast<std::uint64_t>(source_atom_index) * n_channels + channel_to_load];
             }
             node_l0_tile[linear_thread_index] = value;
         }
@@ -211,14 +205,14 @@ inline __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
         // 2. tp_weights[edge, path, channel_tile_base .. + C) for path 0..3.
         //    Source layout: [n_edges, 4 paths, n_channels] (path outer, channel inner).
         if (linear_thread_index < tp_weights_tile_size_k) {
-            int const path_index           = linear_thread_index / channel_tile_width_k;
-            int const channel_local_inner  = linear_thread_index % channel_tile_width_k;
+            int const path_index = linear_thread_index / channel_tile_width_k;
+            int const channel_local_inner = linear_thread_index % channel_tile_width_k;
             std::uint32_t const channel_to_load = channel_tile_base + static_cast<std::uint32_t>(channel_local_inner);
             float value = 0.0f;
             if (channel_to_load < n_channels) {
-                std::uint64_t const tp_offset =
-                    static_cast<std::uint64_t>(edge_index) * (tensor_product_path_count_k * n_channels)
-                    + static_cast<std::uint64_t>(path_index) * n_channels + channel_to_load;
+                std::uint64_t const tp_offset = static_cast<std::uint64_t>(edge_index) *
+                                                    (tensor_product_path_count_k * n_channels) +
+                                                static_cast<std::uint64_t>(path_index) * n_channels + channel_to_load;
                 value = tensor_product_weights_per_edge[tp_offset];
             }
             tp_weights_tile[linear_thread_index] = value;
@@ -227,8 +221,8 @@ inline __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
         // 3. sph_harm[edge, 0..16).
         int const sph_load_index = linear_thread_index - (node_l0_tile_size_k + tp_weights_tile_size_k);
         if (sph_load_index >= 0 && sph_load_index < sph_harm_tile_size_k) {
-            sph_harm_tile[sph_load_index] = sph_harm[
-                static_cast<std::uint64_t>(edge_index) * irrep_dim_total_k + sph_load_index];
+            sph_harm_tile[sph_load_index] =
+                sph_harm[static_cast<std::uint64_t>(edge_index) * irrep_dim_total_k + sph_load_index];
         }
 
         __syncthreads();
@@ -236,9 +230,9 @@ inline __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
         // Per-thread fold.  Path index is determined by the thread's
         // irrep-component index (constant across the inner loop).
         int const path_index = irrep_block_index_for_component_(irrep_component_index);
-        float const node_l0_value    = node_l0_tile[channel_local];
-        float const sph_harm_value   = sph_harm_tile[irrep_component_index];
-        float const tp_weight_value  = tp_weights_tile[path_index * channel_tile_width_k + channel_local];
+        float const node_l0_value = node_l0_tile[channel_local];
+        float const sph_harm_value = sph_harm_tile[irrep_component_index];
+        float const tp_weight_value = tp_weights_tile[path_index * channel_tile_width_k + channel_local];
         accumulator += tp_weight_value * sph_harm_value * node_l0_value;
 
         __syncthreads();
@@ -249,8 +243,8 @@ inline __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
     // `S.node_features_scratch` in the fp32 reference path).
     if (channel_in_range) {
         std::uint64_t const output_offset =
-            (static_cast<std::uint64_t>(receiver_atom_index) * n_channels + channel_index) * irrep_dim_total_k
-            + static_cast<std::uint32_t>(irrep_component_index);
+            (static_cast<std::uint64_t>(receiver_atom_index) * n_channels + channel_index) * irrep_dim_total_k +
+            static_cast<std::uint32_t>(irrep_component_index);
         node_messages_full_irrep_bf16[output_offset] = __float2bfloat16_rn(accumulator);
     }
 }
@@ -259,11 +253,9 @@ inline __global__ void mace_tk_conv_tp_scatter_segmented_kernel(
  *  @brief Cast a fp32 buffer into a bf16 buffer of the same length.  Used by
  *         the atomic-mode fallback.
  */
-inline __global__ void mace_tk_fp32_to_bf16_cast_kernel_(
-    std::uint64_t element_count,
-    float const *__restrict__ source_fp32,
-    __nv_bfloat16 *__restrict__ destination_bf16
-) {
+inline __global__ void mace_tk_fp32_to_bf16_cast_kernel_(std::uint64_t element_count,
+                                                         float const *__restrict__ source_fp32,
+                                                         __nv_bfloat16 *__restrict__ destination_bf16) {
     std::uint64_t const element_index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (element_index >= element_count) return;
     destination_bf16[element_index] = __float2bfloat16_rn(source_fp32[element_index]);
@@ -304,20 +296,14 @@ inline __global__ void mace_tk_fp32_to_bf16_cast_kernel_(
  *  path; the atomic fallback compiles unconditionally because it routes
  *  through the existing fp32 kernels.
  */
-inline void launch_mace_tk_conv_tp_scatter_fused(
-    std::uint32_t n_atoms,
-    std::uint32_t n_edges,
-    std::uint32_t n_channels,
-    std::int32_t const *edge_source_atom,
-    std::int32_t const *edge_target_atom,
-    std::int32_t const *receiver_edge_segment_start,
-    std::int32_t const *receiver_edge_segment_end,
-    float const *node_features_l0_only_fp32,
-    float const *sph_harm_fp32,
-    float const *tensor_product_weights_per_edge_fp32,
-    __nv_bfloat16 *node_messages_full_irrep_bf16,
-    cudaStream_t stream
-) {
+inline void launch_mace_tk_conv_tp_scatter_fused(std::uint32_t n_atoms, std::uint32_t n_edges, std::uint32_t n_channels,
+                                                 std::int32_t const *edge_source_atom,
+                                                 std::int32_t const *edge_target_atom,
+                                                 std::int32_t const *receiver_edge_segment_start,
+                                                 std::int32_t const *receiver_edge_segment_end,
+                                                 float const *node_features_l0_only_fp32, float const *sph_harm_fp32,
+                                                 float const *tensor_product_weights_per_edge_fp32,
+                                                 __nv_bfloat16 *node_messages_full_irrep_bf16, cudaStream_t stream) {
     using namespace mace_tk_conv_tp_scatter_detail_;
     if (n_atoms == 0u) return;
 
@@ -325,10 +311,8 @@ inline void launch_mace_tk_conv_tp_scatter_fused(
     // every (receiver, channel, m) exactly once; the atomic fallback writes
     // through a fp32 staging buffer and the cast kernel covers every element
     // — but we still want a clean slate for receivers with empty segments.
-    std::uint64_t const output_element_count =
-        static_cast<std::uint64_t>(n_atoms) * n_channels * irrep_dim_total_k;
-    cudaMemsetAsync(node_messages_full_irrep_bf16, 0,
-                    output_element_count * sizeof(__nv_bfloat16), stream);
+    std::uint64_t const output_element_count = static_cast<std::uint64_t>(n_atoms) * n_channels * irrep_dim_total_k;
+    cudaMemsetAsync(node_messages_full_irrep_bf16, 0, output_element_count * sizeof(__nv_bfloat16), stream);
 
     if (receiver_edge_segment_start == nullptr || receiver_edge_segment_end == nullptr) {
         // Atomic fallback: the unfused fp32 reference + cast.  We don't have
@@ -342,19 +326,17 @@ inline void launch_mace_tk_conv_tp_scatter_fused(
 
         // Per-edge messages buffer for the unfused path.
         float *temporary_fp32_edge_messages = nullptr;
-        std::size_t const edge_message_byte_count =
-            static_cast<std::size_t>(n_edges) * n_channels * irrep_dim_total_k * sizeof(float);
+        std::size_t const edge_message_byte_count = static_cast<std::size_t>(n_edges) * n_channels * irrep_dim_total_k *
+                                                    sizeof(float);
         cudaMalloc(reinterpret_cast<void **>(&temporary_fp32_edge_messages), edge_message_byte_count);
 
-        types::mace_arch_t synthesised_arch{};
+        types::mace_arch_t synthesised_arch {};
         synthesised_arch.n_channels = n_channels;
-        launch_mace_tensor_product(
-            synthesised_arch, n_edges, edge_source_atom,
-            node_features_l0_only_fp32, sph_harm_fp32,
-            tensor_product_weights_per_edge_fp32, temporary_fp32_edge_messages, stream);
-        launch_mace_scatter_atomic(
-            n_atoms, n_edges, n_channels * irrep_dim_total_k,
-            edge_target_atom, temporary_fp32_edge_messages, temporary_fp32_messages, stream);
+        launch_mace_tensor_product(synthesised_arch, n_edges, edge_source_atom, node_features_l0_only_fp32,
+                                   sph_harm_fp32, tensor_product_weights_per_edge_fp32, temporary_fp32_edge_messages,
+                                   stream);
+        launch_mace_scatter_atomic(n_atoms, n_edges, n_channels * irrep_dim_total_k, edge_target_atom,
+                                   temporary_fp32_edge_messages, temporary_fp32_messages, stream);
 
         constexpr std::uint32_t cast_block_dim_x = 256;
         std::uint32_t const cast_grid_dim_x = static_cast<std::uint32_t>(
@@ -371,26 +353,19 @@ inline void launch_mace_tk_conv_tp_scatter_fused(
     }
 
     // Segmented fused path — the production target.
-    std::uint32_t const channel_tile_count =
-        (n_channels + static_cast<std::uint32_t>(channel_tile_width_k) - 1u)
-        / static_cast<std::uint32_t>(channel_tile_width_k);
+    std::uint32_t const channel_tile_count = (n_channels + static_cast<std::uint32_t>(channel_tile_width_k) - 1u) /
+                                             static_cast<std::uint32_t>(channel_tile_width_k);
 
     dim3 const grid(n_atoms, channel_tile_count, 1);
-    dim3 const block(static_cast<std::uint32_t>(channel_tile_width_k),
-                     static_cast<std::uint32_t>(irrep_dim_total_k), 1);
+    dim3 const block(static_cast<std::uint32_t>(channel_tile_width_k), static_cast<std::uint32_t>(irrep_dim_total_k),
+                     1);
 
     constexpr std::size_t shared_memory_bytes_k =
-        sizeof(float) * (channel_tile_width_k
-                         + tensor_product_path_count_k * channel_tile_width_k
-                         + irrep_dim_total_k);
+        sizeof(float) * (channel_tile_width_k + tensor_product_path_count_k * channel_tile_width_k + irrep_dim_total_k);
 
     mace_tk_conv_tp_scatter_segmented_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
-        n_atoms, n_edges, n_channels,
-        edge_source_atom,
-        receiver_edge_segment_start, receiver_edge_segment_end,
-        node_features_l0_only_fp32, sph_harm_fp32,
-        tensor_product_weights_per_edge_fp32,
-        node_messages_full_irrep_bf16);
+        n_atoms, n_edges, n_channels, edge_source_atom, receiver_edge_segment_start, receiver_edge_segment_end,
+        node_features_l0_only_fp32, sph_harm_fp32, tensor_product_weights_per_edge_fp32, node_messages_full_irrep_bf16);
 }
 
 } // namespace smallfield::cuda

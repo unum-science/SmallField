@@ -137,7 +137,7 @@ struct mace_batch_t {
     // already exists in `mace_scatter_kernel.cuh`.  When nullptr the driver
     // falls back to the atomic-scatter path.
     std::int32_t const *receiver_edge_segment_start = nullptr;
-    std::int32_t const *receiver_edge_segment_end   = nullptr;
+    std::int32_t const *receiver_edge_segment_end = nullptr;
 };
 
 /**
@@ -166,8 +166,8 @@ struct mace_edge_features_t {
  *  so callers do not have to special-case the energy-only path.
  */
 struct mace_results_t {
-    float *graph_energy_fp32 = nullptr;       ///< [n_graphs] per-graph total energy in eV
-    __half *atom_force_fp16 = nullptr;        ///< [n_atoms, 3] per-atom forces in eV/Å, fp16
+    float *graph_energy_fp32 = nullptr; ///< [n_graphs] per-graph total energy in eV
+    __half *atom_force_fp16 = nullptr;  ///< [n_atoms, 3] per-atom forces in eV/Å, fp16
 };
 
 } // namespace smallfield::types

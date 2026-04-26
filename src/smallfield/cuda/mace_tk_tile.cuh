@@ -39,17 +39,17 @@
 // the command line — the arch is a property of the compile target, not a
 // switch.
 #if !defined(KITTENS_HOPPER) && !defined(KITTENS_BLACKWELL)
-#  if defined(__CUDA_ARCH__)
-#    if __CUDA_ARCH__ >= 1000
-#      define KITTENS_BLACKWELL 1
-#    elif __CUDA_ARCH__ >= 900
-#      define KITTENS_HOPPER 1
-#    endif
-#  else
+#if defined(__CUDA_ARCH__)
+#if __CUDA_ARCH__ >= 1000
+#define KITTENS_BLACKWELL 1
+#elif __CUDA_ARCH__ >= 900
+#define KITTENS_HOPPER 1
+#endif
+#else
 // Host-side translation unit: define KITTENS_HOPPER as the default so the TK
 // host helpers compile cleanly when this header is pulled in by a .cpp file.
-#    define KITTENS_HOPPER 1
-#  endif
+#define KITTENS_HOPPER 1
+#endif
 #endif
 
 #include <kittens.cuh>
@@ -86,24 +86,22 @@ using shared_tile_fp32 = kittens::st_fl<rows_in_elements, cols_in_elements>;
 // Register tiles.  TK's `rt_bf<H, W, layout>` expresses (H, W) in tile
 // units of 16 (i.e. `rt_bf<2, 4>` is 32 rows × 64 cols), opposite to the
 // shared-tile convention.  We keep that as-is to match TK directly.
-template <int rows_in_tiles, int cols_in_tiles,
-          typename layout = kittens::ducks::rt_layout::row>
+template <int rows_in_tiles, int cols_in_tiles, typename layout = kittens::ducks::rt_layout::row>
 using register_tile_bf16 = kittens::rt_bf<rows_in_tiles, cols_in_tiles, layout>;
 
-template <int rows_in_tiles, int cols_in_tiles,
-          typename layout = kittens::ducks::rt_layout::row>
+template <int rows_in_tiles, int cols_in_tiles, typename layout = kittens::ducks::rt_layout::row>
 using register_tile_fp32 = kittens::rt_fl<rows_in_tiles, cols_in_tiles, layout>;
 
 // Compile-time constants for our static MACE-OFF shapes.  These are used
 // as template parameters at the call sites to spell out tile sizes
 // in a single place.
-constexpr int mace_channels_small_k    = 96;
-constexpr int mace_channels_medium_k   = 128;
-constexpr int mace_channels_large_k    = 224;   // MACE-OFF23 large is 224 channels (verified at export time)
-constexpr int mace_irrep_dim_total_k   = 16;   // 1 + 3 + 5 + 7
+constexpr int mace_channels_small_k = 96;
+constexpr int mace_channels_medium_k = 128;
+constexpr int mace_channels_large_k = 224; // MACE-OFF23 large is 224 channels (verified at export time)
+constexpr int mace_irrep_dim_total_k = 16; // 1 + 3 + 5 + 7
 constexpr int mace_radial_hidden_dim_k = 64;
-constexpr int mace_radial_input_dim_k  = 8;    // n_radial Bessel basis functions
-constexpr int mace_n_paths_k           = 4;    // tensor-product output paths
+constexpr int mace_radial_input_dim_k = 8;                                       // n_radial Bessel basis functions
+constexpr int mace_n_paths_k = 4;                                                // tensor-product output paths
 constexpr int mace_radial_output_dim_k = mace_n_paths_k * mace_channels_small_k; // = 384
 
 // Activation epilogue helpers — one entry per non-linear epilogue we emit

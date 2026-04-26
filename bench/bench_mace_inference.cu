@@ -53,14 +53,13 @@
 
 namespace {
 
-#define CUDA_CHECK(stmt)                                                                              \
-    do {                                                                                              \
-        cudaError_t const err__ = (stmt);                                                             \
-        if (err__ != cudaSuccess) {                                                                   \
-            std::fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,                     \
-                         cudaGetErrorString(err__));                                                  \
-            std::exit(1);                                                                             \
-        }                                                                                             \
+#define CUDA_CHECK(stmt)                                                                                      \
+    do {                                                                                                      \
+        cudaError_t const err__ = (stmt);                                                                     \
+        if (err__ != cudaSuccess) {                                                                           \
+            std::fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
+            std::exit(1);                                                                                     \
+        }                                                                                                     \
     } while (0)
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
@@ -73,8 +72,8 @@ constexpr char const *bench_build_label_k = "fp32";
 struct bench_config_t {
     std::uint32_t batch_size;
     std::uint32_t n_atoms_per_mol;
-    bool with_force_adjoint = false;     ///< if true, the timed loop runs forward + force adjoint
-    bool with_graph_capture = false;     ///< if true, captures the (forward [+ adjoint]) into a cudaGraph and replays
+    bool with_force_adjoint = false; ///< if true, the timed loop runs forward + force adjoint
+    bool with_graph_capture = false; ///< if true, captures the (forward [+ adjoint]) into a cudaGraph and replays
 };
 
 /** Output of one timing run. */
@@ -100,22 +99,13 @@ struct bench_result_t {
  *  All host-side outputs are sized for the whole batch so the upload to
  *  device is one cudaMemcpy per array.
  */
-void build_synthetic_batch(
-    std::uint32_t batch_size,
-    std::uint32_t n_atoms_per_mol,
-    std::uint32_t n_elements,
-    float r_max,
-    std::uint64_t seed,
-    std::vector<float> &positions_xyz,
-    std::vector<std::int32_t> &atom_element,
-    std::vector<std::int32_t> &graph_of_atom,
-    std::vector<std::int32_t> &edge_source_atom,
-    std::vector<std::int32_t> &edge_target_atom,
-    std::vector<std::int32_t> &graph_atom_offset,
-    std::vector<std::int32_t> &graph_edge_offset,
-    std::vector<std::int32_t> &receiver_edge_segment_start,
-    std::vector<std::int32_t> &receiver_edge_segment_end
-) {
+void build_synthetic_batch(std::uint32_t batch_size, std::uint32_t n_atoms_per_mol, std::uint32_t n_elements,
+                           float r_max, std::uint64_t seed, std::vector<float> &positions_xyz,
+                           std::vector<std::int32_t> &atom_element, std::vector<std::int32_t> &graph_of_atom,
+                           std::vector<std::int32_t> &edge_source_atom, std::vector<std::int32_t> &edge_target_atom,
+                           std::vector<std::int32_t> &graph_atom_offset, std::vector<std::int32_t> &graph_edge_offset,
+                           std::vector<std::int32_t> &receiver_edge_segment_start,
+                           std::vector<std::int32_t> &receiver_edge_segment_end) {
     std::mt19937_64 random_engine(seed);
     std::normal_distribution<float> gaussian_distribution(0.0f, 0.4f);
     std::uniform_int_distribution<std::int32_t> element_distribution(0, static_cast<std::int32_t>(n_elements) - 1);
@@ -139,12 +129,10 @@ void build_synthetic_batch(
         for (std::uint32_t atom_within_mol = 0; atom_within_mol < n_atoms_per_mol; ++atom_within_mol) {
             std::uint32_t const flat_atom_index = base_atom_index + atom_within_mol;
             float const linear_x = 1.5f * static_cast<float>(atom_within_mol);
-            positions_xyz[static_cast<std::size_t>(flat_atom_index) * 3u + 0u] =
-                linear_x + gaussian_distribution(random_engine);
-            positions_xyz[static_cast<std::size_t>(flat_atom_index) * 3u + 1u] =
-                gaussian_distribution(random_engine);
-            positions_xyz[static_cast<std::size_t>(flat_atom_index) * 3u + 2u] =
-                gaussian_distribution(random_engine);
+            positions_xyz[static_cast<std::size_t>(flat_atom_index) * 3u + 0u] = linear_x +
+                                                                                 gaussian_distribution(random_engine);
+            positions_xyz[static_cast<std::size_t>(flat_atom_index) * 3u + 1u] = gaussian_distribution(random_engine);
+            positions_xyz[static_cast<std::size_t>(flat_atom_index) * 3u + 2u] = gaussian_distribution(random_engine);
             atom_element[flat_atom_index] = element_distribution(random_engine);
             graph_of_atom[flat_atom_index] = static_cast<std::int32_t>(graph_index);
         }
@@ -192,13 +180,11 @@ void build_synthetic_batch(
         std::vector<std::uint32_t> permutation_per_graph;
         for (std::uint32_t graph_index = 0; graph_index < batch_size; ++graph_index) {
             std::uint32_t const begin_edge = static_cast<std::uint32_t>(graph_edge_offset[graph_index]);
-            std::uint32_t const end_edge   = static_cast<std::uint32_t>(graph_edge_offset[graph_index + 1u]);
+            std::uint32_t const end_edge = static_cast<std::uint32_t>(graph_edge_offset[graph_index + 1u]);
             permutation_per_graph.resize(end_edge - begin_edge);
             for (std::uint32_t i = 0; i < end_edge - begin_edge; ++i) permutation_per_graph[i] = begin_edge + i;
             std::sort(permutation_per_graph.begin(), permutation_per_graph.end(),
-                      [&](std::uint32_t a, std::uint32_t b) {
-                          return edge_target_atom[a] < edge_target_atom[b];
-                      });
+                      [&](std::uint32_t a, std::uint32_t b) { return edge_target_atom[a] < edge_target_atom[b]; });
             for (std::uint32_t i = 0; i < end_edge - begin_edge; ++i) {
                 sorted_source[begin_edge + i] = edge_source_atom[permutation_per_graph[i]];
                 sorted_target[begin_edge + i] = edge_target_atom[permutation_per_graph[i]];
@@ -221,11 +207,10 @@ void build_synthetic_batch(
                 ++edge_cursor;
             }
             receiver_edge_segment_start[atom_index] = static_cast<std::int32_t>(segment_begin);
-            receiver_edge_segment_end[atom_index]   = static_cast<std::int32_t>(edge_cursor);
+            receiver_edge_segment_end[atom_index] = static_cast<std::int32_t>(edge_cursor);
         }
         if (edge_cursor != total_edges) {
-            std::fprintf(stderr,
-                         "bench: edge sort produced unsorted output (cursor=%u total=%u) — sort key violated\n",
+            std::fprintf(stderr, "bench: edge sort produced unsorted output (cursor=%u total=%u) — sort key violated\n",
                          edge_cursor, total_edges);
             std::exit(1);
         }
@@ -233,11 +218,8 @@ void build_synthetic_batch(
 }
 
 /** Run one config end-to-end: H2D upload, warmup, timed loop, D2H of energy. */
-bench_result_t run_one_config(
-    smallfield::parameters::mace_weights_t const &weights,
-    bench_config_t const &config,
-    std::uint64_t base_seed
-) {
+bench_result_t run_one_config(smallfield::parameters::mace_weights_t const &weights, bench_config_t const &config,
+                              std::uint64_t base_seed) {
     auto const &arch = weights.arch();
 
     std::vector<float> host_positions_xyz;
@@ -250,13 +232,10 @@ bench_result_t run_one_config(
     std::vector<std::int32_t> host_receiver_segment_start;
     std::vector<std::int32_t> host_receiver_segment_end;
 
-    build_synthetic_batch(
-        config.batch_size, config.n_atoms_per_mol, arch.n_elements,
-        arch.r_max, base_seed,
-        host_positions_xyz, host_atom_element, host_graph_of_atom,
-        host_edge_source_atom, host_edge_target_atom,
-        host_graph_atom_offset, host_graph_edge_offset,
-        host_receiver_segment_start, host_receiver_segment_end);
+    build_synthetic_batch(config.batch_size, config.n_atoms_per_mol, arch.n_elements, arch.r_max, base_seed,
+                          host_positions_xyz, host_atom_element, host_graph_of_atom, host_edge_source_atom,
+                          host_edge_target_atom, host_graph_atom_offset, host_graph_edge_offset,
+                          host_receiver_segment_start, host_receiver_segment_end);
 
     std::uint32_t const n_total_atoms = config.batch_size * config.n_atoms_per_mol;
     std::uint32_t const n_total_edges = static_cast<std::uint32_t>(host_edge_source_atom.size());
@@ -273,39 +252,39 @@ bench_result_t run_one_config(
     std::int32_t *device_receiver_segment_start = nullptr;
     std::int32_t *device_receiver_segment_end = nullptr;
 
-    CUDA_CHECK(cudaMalloc(&device_positions_xyz,         host_positions_xyz.size() * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&device_atom_element,          host_atom_element.size() * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaMalloc(&device_graph_of_atom,         host_graph_of_atom.size() * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaMalloc(&device_edge_source_atom,      host_edge_source_atom.size() * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaMalloc(&device_edge_target_atom,      host_edge_target_atom.size() * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaMalloc(&device_graph_atom_offset,     host_graph_atom_offset.size() * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaMalloc(&device_graph_edge_offset,     host_graph_edge_offset.size() * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_positions_xyz, host_positions_xyz.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&device_atom_element, host_atom_element.size() * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_graph_of_atom, host_graph_of_atom.size() * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_edge_source_atom, host_edge_source_atom.size() * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_edge_target_atom, host_edge_target_atom.size() * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_graph_atom_offset, host_graph_atom_offset.size() * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_graph_edge_offset, host_graph_edge_offset.size() * sizeof(std::int32_t)));
     CUDA_CHECK(cudaMalloc(&device_receiver_segment_start, host_receiver_segment_start.size() * sizeof(std::int32_t)));
-    CUDA_CHECK(cudaMalloc(&device_receiver_segment_end,   host_receiver_segment_end.size() * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&device_receiver_segment_end, host_receiver_segment_end.size() * sizeof(std::int32_t)));
 
-    CUDA_CHECK(cudaMemcpy(device_positions_xyz,         host_positions_xyz.data(),
-                          host_positions_xyz.size() * sizeof(float),               cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_atom_element,          host_atom_element.data(),
-                          host_atom_element.size() * sizeof(std::int32_t),         cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_graph_of_atom,         host_graph_of_atom.data(),
-                          host_graph_of_atom.size() * sizeof(std::int32_t),        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_edge_source_atom,      host_edge_source_atom.data(),
-                          host_edge_source_atom.size() * sizeof(std::int32_t),     cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_edge_target_atom,      host_edge_target_atom.data(),
-                          host_edge_target_atom.size() * sizeof(std::int32_t),     cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_graph_atom_offset,     host_graph_atom_offset.data(),
-                          host_graph_atom_offset.size() * sizeof(std::int32_t),    cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_graph_edge_offset,     host_graph_edge_offset.data(),
-                          host_graph_edge_offset.size() * sizeof(std::int32_t),    cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_positions_xyz, host_positions_xyz.data(), host_positions_xyz.size() * sizeof(float),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_atom_element, host_atom_element.data(),
+                          host_atom_element.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_graph_of_atom, host_graph_of_atom.data(),
+                          host_graph_of_atom.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_edge_source_atom, host_edge_source_atom.data(),
+                          host_edge_source_atom.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_edge_target_atom, host_edge_target_atom.data(),
+                          host_edge_target_atom.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_graph_atom_offset, host_graph_atom_offset.data(),
+                          host_graph_atom_offset.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_graph_edge_offset, host_graph_edge_offset.data(),
+                          host_graph_edge_offset.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(device_receiver_segment_start, host_receiver_segment_start.data(),
                           host_receiver_segment_start.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(device_receiver_segment_end,   host_receiver_segment_end.data(),
-                          host_receiver_segment_end.size() * sizeof(std::int32_t),   cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(device_receiver_segment_end, host_receiver_segment_end.data(),
+                          host_receiver_segment_end.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
 
     smallfield::cuda::mace_scratch_t scratch;
     scratch.allocate(arch, n_total_atoms, n_total_edges, n_total_graphs);
 
-    smallfield::types::mace_batch_t batch{};
+    smallfield::types::mace_batch_t batch {};
     batch.n_atoms = n_total_atoms;
     batch.n_edges = n_total_edges;
     batch.n_graphs = n_total_graphs;
@@ -317,16 +296,15 @@ bench_result_t run_one_config(
     batch.graph_atom_offset = device_graph_atom_offset;
     batch.graph_edge_offset = device_graph_edge_offset;
     batch.receiver_edge_segment_start = device_receiver_segment_start;
-    batch.receiver_edge_segment_end   = device_receiver_segment_end;
+    batch.receiver_edge_segment_end = device_receiver_segment_end;
 
     // Sanity assertion: the segment pointers are non-null, so the TK build
     // should pick its segmented conv_tp+scatter (not the cudaMalloc-bearing
     // atomic fallback).  This only matters at compile time when TK is in,
     // but the assert is unconditional because the wiring is the same in
     // both builds.
-    bool const segmented_path_active =
-        (batch.receiver_edge_segment_start != nullptr) &&
-        (batch.receiver_edge_segment_end   != nullptr);
+    bool const segmented_path_active = (batch.receiver_edge_segment_start != nullptr) &&
+                                       (batch.receiver_edge_segment_end != nullptr);
     if (!segmented_path_active) {
         std::fprintf(stderr, "bench: segment pointers are null — TK fused path will fall back to atomic\n");
     }
@@ -336,7 +314,7 @@ bench_result_t run_one_config(
 
     // Warm up: 5 iterations.  Includes any one-shot precompute (W3_eff in TK build).
     constexpr int n_warmup_iters_k = 5;
-    constexpr int n_timed_iters_k  = 20;
+    constexpr int n_timed_iters_k = 20;
     for (int iter = 0; iter < n_warmup_iters_k; ++iter) {
         smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(scratch, n_total_atoms, stream);
         smallfield::cuda::mace_inference_forward(arch, weights.device(), batch, scratch, stream);
@@ -351,15 +329,12 @@ bench_result_t run_one_config(
     smallfield::cuda::mace_captured_graph_t captured_graph;
     if (config.with_graph_capture) {
         if (config.with_force_adjoint) {
-            smallfield::cuda::mace_capture_forward_with_force_adjoint(
-                arch, weights.device(), batch, scratch, stream, captured_graph);
-        } else {
-            smallfield::cuda::mace_capture_forward(
-                arch, weights.device(), batch, scratch, stream, captured_graph);
+            smallfield::cuda::mace_capture_forward_with_force_adjoint(arch, weights.device(), batch, scratch, stream,
+                                                                      captured_graph);
         }
+        else { smallfield::cuda::mace_capture_forward(arch, weights.device(), batch, scratch, stream, captured_graph); }
         if (captured_graph.graph_exec == nullptr) {
-            std::fprintf(stderr,
-                         "bench: graph capture failed at batch=%u n_atoms=%u — falling back to eager\n",
+            std::fprintf(stderr, "bench: graph capture failed at batch=%u n_atoms=%u — falling back to eager\n",
                          config.batch_size, config.n_atoms_per_mol);
         }
     }
@@ -371,9 +346,8 @@ bench_result_t run_one_config(
     CUDA_CHECK(cudaEventCreate(&event_end));
     CUDA_CHECK(cudaEventRecord(event_start, stream));
     for (int iter = 0; iter < n_timed_iters_k; ++iter) {
-        if (replay_active) {
-            captured_graph.replay(stream);
-        } else {
+        if (replay_active) { captured_graph.replay(stream); }
+        else {
             smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(scratch, n_total_atoms, stream);
             smallfield::cuda::mace_inference_forward(arch, weights.device(), batch, scratch, stream);
             if (config.with_force_adjoint) {
@@ -388,8 +362,7 @@ bench_result_t run_one_config(
 
     // Pull energy back for the sanity check.
     std::vector<float> host_energy(n_total_graphs);
-    CUDA_CHECK(cudaMemcpy(host_energy.data(), scratch.energy,
-                          n_total_graphs * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(host_energy.data(), scratch.energy, n_total_graphs * sizeof(float), cudaMemcpyDeviceToHost));
 
     double sum_energy = 0.0;
     double min_energy = static_cast<double>(host_energy.front());
@@ -402,7 +375,7 @@ bench_result_t run_one_config(
     }
     double const mean_energy = sum_energy / static_cast<double>(n_total_graphs);
 
-    bench_result_t result{};
+    bench_result_t result {};
     result.batch_size = config.batch_size;
     result.n_atoms_per_mol = config.n_atoms_per_mol;
     result.n_total_atoms = n_total_atoms;
@@ -450,13 +423,11 @@ void emit_jsonl(std::vector<bench_result_t> const &results, std::string const &o
             << "\"mean_energy_eV\":" << r.mean_energy_eV << ","
             << "\"segmented_path_active\":" << (r.segmented_path_active ? "true" : "false") << ","
             << "\"with_force_adjoint\":" << (r.with_force_adjoint ? "true" : "false") << ","
-            << "\"with_graph_capture\":" << (r.with_graph_capture ? "true" : "false")
-            << "}\n";
+            << "\"with_graph_capture\":" << (r.with_graph_capture ? "true" : "false") << "}\n";
     }
 }
 
-void print_summary_table(std::vector<bench_result_t> const &results,
-                         std::vector<std::uint32_t> const &batch_sizes,
+void print_summary_table(std::vector<bench_result_t> const &results, std::vector<std::uint32_t> const &batch_sizes,
                          std::vector<std::uint32_t> const &atom_counts) {
     std::printf("\n=== Summary: ms / config (build = %s) ===\n", bench_build_label_k);
     std::printf("\n");
@@ -488,9 +459,8 @@ void print_summary_table(std::vector<bench_result_t> const &results,
     std::printf("| batch | n_atoms | n_total_edges | ms/iter | ms/config | mean E (eV) | segmented |\n");
     std::printf("| ----: | ------: | ------------: | ------: | --------: | ----------: | :-------: |\n");
     for (auto const &r : results) {
-        std::printf("| %5u | %7u | %13u | %7.3f | %9.4f | %11.2f | %9s |\n",
-                    r.batch_size, r.n_atoms_per_mol, r.n_total_edges,
-                    r.ms_per_iter, r.ms_per_config, r.mean_energy_eV,
+        std::printf("| %5u | %7u | %13u | %7.3f | %9.4f | %11.2f | %9s |\n", r.batch_size, r.n_atoms_per_mol,
+                    r.n_total_edges, r.ms_per_iter, r.ms_per_config, r.mean_energy_eV,
                     r.segmented_path_active ? "yes" : "no");
     }
     std::printf("\n");
@@ -512,7 +482,12 @@ int main(int argc, char **argv) {
         std::vector<std::uint32_t> out;
         std::string buf;
         for (char const *p = s; *p; ++p) {
-            if (*p == ',') { if (!buf.empty()) { out.push_back(static_cast<std::uint32_t>(std::stoul(buf))); buf.clear(); } }
+            if (*p == ',') {
+                if (!buf.empty()) {
+                    out.push_back(static_cast<std::uint32_t>(std::stoul(buf)));
+                    buf.clear();
+                }
+            }
             else buf.push_back(*p);
         }
         if (!buf.empty()) out.push_back(static_cast<std::uint32_t>(std::stoul(buf)));
@@ -531,16 +506,15 @@ int main(int argc, char **argv) {
 
     std::printf("bench_mace_inference: build=%s\n", bench_build_label_k);
     std::printf("bench_mace_inference: weights = %s\n", weights_path.c_str());
-    std::printf("bench_mace_inference: with_forces=%s capture=%s saturating=%s\n",
-                with_forces ? "yes" : "no",
-                capture ? "yes" : "no",
-                saturating ? "yes" : "no");
+    std::printf("bench_mace_inference: with_forces=%s capture=%s saturating=%s\n", with_forces ? "yes" : "no",
+                capture ? "yes" : "no", saturating ? "yes" : "no");
 
     smallfield::parameters::mace_weights_t weights;
     weights.load(weights_path);
     auto const &arch = weights.arch();
-    std::printf("bench_mace_inference: arch n_elements=%u n_radial=%u n_channels=%u r_max=%.3f avg_num_neighbors=%.3f\n",
-                arch.n_elements, arch.n_radial, arch.n_channels, arch.r_max, arch.avg_num_neighbors);
+    std::printf(
+        "bench_mace_inference: arch n_elements=%u n_radial=%u n_channels=%u r_max=%.3f avg_num_neighbors=%.3f\n",
+        arch.n_elements, arch.n_radial, arch.n_channels, arch.r_max, arch.avg_num_neighbors);
 
     std::vector<std::uint32_t> batch_sizes = {64u, 128u, 256u, 512u};
     std::vector<std::uint32_t> atom_counts = {15u, 30u, 50u, 80u};
@@ -556,20 +530,21 @@ int main(int argc, char **argv) {
     std::uint64_t seed_counter = 0xC0FFEEull;
     for (auto na : atom_counts) {
         for (auto bs : batch_sizes) {
-            std::printf("\n--- running batch=%u n_atoms=%u%s%s ---\n", bs, na,
-                        with_forces ? " +forces" : "", capture ? " +capture" : "");
-            bench_config_t cfg{};
+            std::printf("\n--- running batch=%u n_atoms=%u%s%s ---\n", bs, na, with_forces ? " +forces" : "",
+                        capture ? " +capture" : "");
+            bench_config_t cfg {};
             cfg.batch_size = bs;
             cfg.n_atoms_per_mol = na;
             cfg.with_force_adjoint = with_forces;
             cfg.with_graph_capture = capture;
             bench_result_t r = run_one_config(weights, cfg, seed_counter++);
-            std::printf("    n_total_atoms=%u n_total_edges=%u  ms/iter=%.3f  ms/config=%.4f  mean_E=%.3f eV  "
-                        "segmented=%s force=%s capture=%s\n",
-                        r.n_total_atoms, r.n_total_edges, r.ms_per_iter, r.ms_per_config,
-                        r.mean_energy_eV, r.segmented_path_active ? "yes" : "no",
-                        r.with_force_adjoint ? "yes" : "no",
-                        r.with_graph_capture ? "yes" : "no");
+            std::printf(
+                "    n_total_atoms=%u n_total_edges=%u  ms/iter=%.3f  ms/config=%.4f  mean_E=%.3f eV  " "segmented=%s "
+                                                                                                        "force=%s "
+                                                                                                        "capture=%s\n",
+                r.n_total_atoms, r.n_total_edges, r.ms_per_iter, r.ms_per_config, r.mean_energy_eV,
+                r.segmented_path_active ? "yes" : "no", r.with_force_adjoint ? "yes" : "no",
+                r.with_graph_capture ? "yes" : "no");
             if (!std::isfinite(r.mean_energy_eV)) {
                 std::fprintf(stderr, "bench: mean energy is NaN / infinity at batch=%u n_atoms=%u\n", bs, na);
             }
@@ -585,9 +560,10 @@ int main(int argc, char **argv) {
         bool monotone = true;
         for (auto bs : batch_sizes) {
             double ms = -1.0;
-            for (auto const &r : results) if (r.batch_size == bs && r.n_atoms_per_mol == na) ms = r.ms_per_config;
+            for (auto const &r : results)
+                if (r.batch_size == bs && r.n_atoms_per_mol == na) ms = r.ms_per_config;
             std::printf("bs=%u %.4f  ", bs, ms);
-            if (ms > previous_ms * 1.05) monotone = false;  // 5% slack for noise
+            if (ms > previous_ms * 1.05) monotone = false; // 5% slack for noise
             previous_ms = ms;
         }
         std::printf(" %s\n", monotone ? "[monotone]" : "[NOT monotone]");

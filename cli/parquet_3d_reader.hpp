@@ -61,13 +61,12 @@ struct conformer_shard_data_t {
      *         `N_total = sum(num_atoms_per_row)`.  Use `row_atom_offsets[i]` to
      *         find row `i`'s slice. */
     std::vector<__half> coordinates_flat;
-    std::vector<std::uint64_t> row_atom_offsets;  ///< [num_rows + 1]; offsets in atoms (not halves)
+    std::vector<std::uint64_t> row_atom_offsets; ///< [num_rows + 1]; offsets in atoms (not halves)
 
     std::uint64_t num_rows() const noexcept { return smiles.size(); }
     std::uint64_t total_atoms() const noexcept { return row_atom_offsets.empty() ? 0 : row_atom_offsets.back(); }
 };
 
-[[nodiscard]] bool read_conformer_shard(std::filesystem::path const &path,
-                                        conformer_shard_data_t &out);
+[[nodiscard]] bool read_conformer_shard(std::filesystem::path const &path, conformer_shard_data_t &out);
 
 } // namespace smallfield::cli

@@ -69,7 +69,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr int MACE_OFF_SUPPORTED_Z[] = {1, 6, 7, 8, 9, 15, 16, 17, 35, 53};
-constexpr int MACE_OFF_N_ELEMENTS    = 10;
+constexpr int MACE_OFF_N_ELEMENTS = 10;
 
 /// Map RDKit atomic number → MACE element index.  Returns -1 if Z isn't in the
 /// supported set; caller skips the conformer in that case.
@@ -88,8 +88,8 @@ struct cli_config_t {
     std::uint32_t num_steps = 20;
     float fmax = 0.05f;
     float step_size = 0.01f;
-    bool restart = true;        // skip already-complete output shards
-    std::uint32_t batch_size = 2048;  // conformers per refinement call
+    bool restart = true;             // skip already-complete output shards
+    std::uint32_t batch_size = 2048; // conformers per refinement call
     std::uint32_t max_atoms_per_molecule = 128;
 };
 
@@ -127,18 +127,51 @@ bool parse_args(int argc, char **argv, cli_config_t &config) {
     for (int i = 1; i < argc; ++i) {
         std::string const flag = argv[i];
         char const *value = (i + 1 < argc) ? argv[i + 1] : "";
-        if (flag == "--input"      && i + 1 < argc) { config.input_dir = value; ++i; }
-        else if (flag == "--output"     && i + 1 < argc) { config.output_dir = value; ++i; }
-        else if (flag == "--weights"    && i + 1 < argc) { config.weights_path = value; ++i; }
-        else if (flag == "--gpus"       && i + 1 < argc) { parse_int_list(value, config.gpu_ids); ++i; }
-        else if (flag == "--steps"      && i + 1 < argc) { config.num_steps = std::strtoul(value, nullptr, 10); ++i; }
-        else if (flag == "--fmax"       && i + 1 < argc) { config.fmax = std::strtof(value, nullptr); ++i; }
-        else if (flag == "--step-size"  && i + 1 < argc) { config.step_size = std::strtof(value, nullptr); ++i; }
-        else if (flag == "--batch-size" && i + 1 < argc) { config.batch_size = std::strtoul(value, nullptr, 10); ++i; }
-        else if (flag == "--max-atoms"  && i + 1 < argc) { config.max_atoms_per_molecule = std::strtoul(value, nullptr, 10); ++i; }
+        if (flag == "--input" && i + 1 < argc) {
+            config.input_dir = value;
+            ++i;
+        }
+        else if (flag == "--output" && i + 1 < argc) {
+            config.output_dir = value;
+            ++i;
+        }
+        else if (flag == "--weights" && i + 1 < argc) {
+            config.weights_path = value;
+            ++i;
+        }
+        else if (flag == "--gpus" && i + 1 < argc) {
+            parse_int_list(value, config.gpu_ids);
+            ++i;
+        }
+        else if (flag == "--steps" && i + 1 < argc) {
+            config.num_steps = std::strtoul(value, nullptr, 10);
+            ++i;
+        }
+        else if (flag == "--fmax" && i + 1 < argc) {
+            config.fmax = std::strtof(value, nullptr);
+            ++i;
+        }
+        else if (flag == "--step-size" && i + 1 < argc) {
+            config.step_size = std::strtof(value, nullptr);
+            ++i;
+        }
+        else if (flag == "--batch-size" && i + 1 < argc) {
+            config.batch_size = std::strtoul(value, nullptr, 10);
+            ++i;
+        }
+        else if (flag == "--max-atoms" && i + 1 < argc) {
+            config.max_atoms_per_molecule = std::strtoul(value, nullptr, 10);
+            ++i;
+        }
         else if (flag == "--restart") { config.restart = true; }
-        else if (flag == "--help" || flag == "-h") { print_usage(); return false; }
-        else { std::fprintf(stderr, "unknown flag: %s\n", flag.c_str()); return false; }
+        else if (flag == "--help" || flag == "-h") {
+            print_usage();
+            return false;
+        }
+        else {
+            std::fprintf(stderr, "unknown flag: %s\n", flag.c_str());
+            return false;
+        }
     }
     if (config.input_dir.empty() || config.output_dir.empty() || config.weights_path.empty()) {
         print_usage();
@@ -150,10 +183,10 @@ bool parse_args(int argc, char **argv, cli_config_t &config) {
 
 /// Per-row work pack: SMILES → atomic-number sequence + position xyz floats.
 struct row_pack_t {
-    std::vector<std::int32_t> element_indices;     // size = num_atoms
-    std::vector<float> positions_xyz;              // size = num_atoms * 3
+    std::vector<std::int32_t> element_indices; // size = num_atoms
+    std::vector<float> positions_xyz;          // size = num_atoms * 3
     std::uint8_t num_atoms = 0;
-    bool refinable = true;                         // false ⇒ pass through unchanged
+    bool refinable = true; // false ⇒ pass through unchanged
 };
 
 /// Resolve atomic numbers for one row's SMILES via RDKit.  Filters out atoms
@@ -164,12 +197,8 @@ struct row_pack_t {
 /// the function here so the test harness can stub it without pulling RDKit.
 extern std::vector<int> resolve_atomic_numbers_from_smiles(std::string const &smiles, std::uint8_t expected_num_atoms);
 
-void prepare_row_pack_(
-    std::string const &smiles,
-    std::uint8_t num_atoms,
-    std::span<__half const> coordinates_for_row,
-    row_pack_t &out
-) {
+void prepare_row_pack_(std::string const &smiles, std::uint8_t num_atoms, std::span<__half const> coordinates_for_row,
+                       row_pack_t &out) {
     out.num_atoms = num_atoms;
     out.refinable = true;
     out.positions_xyz.resize(static_cast<std::size_t>(num_atoms) * 3u);
@@ -185,7 +214,10 @@ void prepare_row_pack_(
     out.element_indices.resize(num_atoms);
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
         int const idx = element_index_for_atomic_number_(atomic_numbers[a]);
-        if (idx < 0) { out.refinable = false; return; }
+        if (idx < 0) {
+            out.refinable = false;
+            return;
+        }
         out.element_indices[a] = idx;
     }
 }
@@ -193,14 +225,10 @@ void prepare_row_pack_(
 /// Build the cross-row edge list using O(n²) per-molecule pair distance check.
 /// Edges are intra-molecule only; the global indices are stitched up via
 /// `atom_offset`.  Returns total edges added.
-std::uint32_t build_edges_for_molecule_(
-    std::span<float const> positions,    // [num_atoms × 3]
-    std::uint8_t num_atoms,
-    float r_max,
-    std::uint32_t atom_offset,
-    std::vector<std::int32_t> &edge_src_out,
-    std::vector<std::int32_t> &edge_dst_out
-) {
+std::uint32_t build_edges_for_molecule_(std::span<float const> positions, // [num_atoms × 3]
+                                        std::uint8_t num_atoms, float r_max, std::uint32_t atom_offset,
+                                        std::vector<std::int32_t> &edge_src_out,
+                                        std::vector<std::int32_t> &edge_dst_out) {
     float const r_max_sq = r_max * r_max;
     std::uint32_t added = 0;
     for (std::uint8_t i = 0; i < num_atoms; ++i) {
@@ -234,24 +262,19 @@ struct device_buffers_t {
     std::int32_t *graph_of_atom = nullptr;
     float *energies = nullptr;
     ~device_buffers_t() {
-        if (positions)     cudaFree(positions);
-        if (atom_element)  cudaFree(atom_element);
-        if (edge_src)      cudaFree(edge_src);
-        if (edge_dst)      cudaFree(edge_dst);
+        if (positions) cudaFree(positions);
+        if (atom_element) cudaFree(atom_element);
+        if (edge_src) cudaFree(edge_src);
+        if (edge_dst) cudaFree(edge_dst);
         if (graph_of_atom) cudaFree(graph_of_atom);
-        if (energies)      cudaFree(energies);
+        if (energies) cudaFree(energies);
     }
 };
 
-bool refine_one_batch_(
-    smallfield::mace::context_t &mace_ctx,
-    smallfield::mace::weights_t const &weights,
-    smallfield::mace::relax_config_t const &relax,
-    std::span<row_pack_t> rows_in_batch,
-    smallfield::cli::conformer_shard_data_t &shard,
-    std::vector<float> &per_row_eV_out,
-    std::vector<std::uint8_t> &per_row_solver_codes_out
-) {
+bool refine_one_batch_(smallfield::mace::context_t &mace_ctx, smallfield::mace::weights_t const &weights,
+                       smallfield::mace::relax_config_t const &relax, std::span<row_pack_t> rows_in_batch,
+                       smallfield::cli::conformer_shard_data_t &shard, std::vector<float> &per_row_eV_out,
+                       std::vector<std::uint8_t> &per_row_solver_codes_out) {
     std::uint32_t total_atoms = 0, total_edges = 0;
     for (auto const &row : rows_in_batch) total_atoms += row.num_atoms;
 
@@ -267,17 +290,14 @@ bool refine_one_batch_(
     std::uint32_t atom_offset = 0;
     for (std::uint32_t graph_index = 0; graph_index < rows_in_batch.size(); ++graph_index) {
         auto const &row = rows_in_batch[graph_index];
-        std::memcpy(positions_flat.data() + static_cast<std::size_t>(atom_offset) * 3u,
-                    row.positions_xyz.data(),
+        std::memcpy(positions_flat.data() + static_cast<std::size_t>(atom_offset) * 3u, row.positions_xyz.data(),
                     row.positions_xyz.size() * sizeof(float));
         for (std::uint8_t a = 0; a < row.num_atoms; ++a) {
             elements_flat[atom_offset + a] = row.element_indices[a];
             graph_of_atom_flat[atom_offset + a] = static_cast<std::int32_t>(graph_index);
         }
-        total_edges += build_edges_for_molecule_(
-            std::span<float const>(row.positions_xyz),
-            row.num_atoms, arch.r_max, atom_offset,
-            edge_src_flat, edge_dst_flat);
+        total_edges += build_edges_for_molecule_(std::span<float const>(row.positions_xyz), row.num_atoms, arch.r_max,
+                                                 atom_offset, edge_src_flat, edge_dst_flat);
         atom_offset += row.num_atoms;
     }
 
@@ -288,37 +308,33 @@ bool refine_one_batch_(
         cudaMalloc(reinterpret_cast<void **>(&dst), bytes);
         cudaMemcpy(dst, src.data(), bytes, cudaMemcpyHostToDevice);
     };
-    cuda_alloc_copy(dev.positions,     positions_flat);
-    cuda_alloc_copy(dev.atom_element,  elements_flat);
-    cuda_alloc_copy(dev.edge_src,      edge_src_flat);
-    cuda_alloc_copy(dev.edge_dst,      edge_dst_flat);
+    cuda_alloc_copy(dev.positions, positions_flat);
+    cuda_alloc_copy(dev.atom_element, elements_flat);
+    cuda_alloc_copy(dev.edge_src, edge_src_flat);
+    cuda_alloc_copy(dev.edge_dst, edge_dst_flat);
     cuda_alloc_copy(dev.graph_of_atom, graph_of_atom_flat);
-    cudaMalloc(reinterpret_cast<void **>(&dev.energies),
-               rows_in_batch.size() * sizeof(float));
+    cudaMalloc(reinterpret_cast<void **>(&dev.energies), rows_in_batch.size() * sizeof(float));
 
-    smallfield::mace::batch_view_t view{};
-    view.n_atoms  = total_atoms;
-    view.n_edges  = total_edges;
+    smallfield::mace::batch_view_t view {};
+    view.n_atoms = total_atoms;
+    view.n_edges = total_edges;
     view.n_graphs = static_cast<std::uint32_t>(rows_in_batch.size());
-    view.positions_xyz     = dev.positions;
-    view.atom_element      = dev.atom_element;
-    view.edge_source_atom  = dev.edge_src;
-    view.edge_target_atom  = dev.edge_dst;
-    view.graph_of_atom     = dev.graph_of_atom;
+    view.positions_xyz = dev.positions;
+    view.atom_element = dev.atom_element;
+    view.edge_source_atom = dev.edge_src;
+    view.edge_target_atom = dev.edge_dst;
+    view.graph_of_atom = dev.graph_of_atom;
 
-    [[maybe_unused]] auto const status = mace_ctx.refine_batch(
-        weights, view, relax, dev.positions, dev.energies);
+    [[maybe_unused]] auto const status = mace_ctx.refine_batch(weights, view, relax, dev.positions, dev.energies);
     if (status != smallfield::mace::status_t::success) {
         std::fprintf(stderr, "[smallfield_mace_refine] refine_batch failed (status=%u)\n",
                      static_cast<unsigned>(status));
         return false;
     }
 
-    cudaMemcpy(positions_flat.data(), dev.positions,
-               positions_flat.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(positions_flat.data(), dev.positions, positions_flat.size() * sizeof(float), cudaMemcpyDeviceToHost);
     std::vector<float> energies_eV(rows_in_batch.size());
-    cudaMemcpy(energies_eV.data(), dev.energies,
-               energies_eV.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(energies_eV.data(), dev.energies, energies_eV.size() * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Cast refined positions back to fp16 for the output parquet, write into
     // the shard's flat coordinate buffer at the right per-row offset.
@@ -335,7 +351,7 @@ bool refine_one_batch_(
             }
         }
         per_row_eV_out[static_cast<std::size_t>(abs_row_index)] = energies_eV[graph_index];
-        per_row_solver_codes_out[static_cast<std::size_t>(abs_row_index)] = 3;  // 3 = MACE refined
+        per_row_solver_codes_out[static_cast<std::size_t>(abs_row_index)] = 3; // 3 = MACE refined
         atom_offset += row.num_atoms;
     }
     return true;
@@ -344,7 +360,7 @@ bool refine_one_batch_(
 /// Helper to recover the row_pack_t array base from the shard for index math
 /// in the in-place writeback above.  Implementation in process_shard_().
 row_pack_t const *shard_row_pack_base_(smallfield::cli::conformer_shard_data_t const &) {
-    return nullptr;  // overridden by a thread_local pointer set by process_shard_
+    return nullptr; // overridden by a thread_local pointer set by process_shard_
 }
 
 thread_local row_pack_t const *current_row_pack_base_ = nullptr;
@@ -353,17 +369,11 @@ row_pack_t const *shard_row_pack_base_(smallfield::cli::conformer_shard_data_t c
     return current_row_pack_base_;
 }
 
-void process_shard_(
-    fs::path const &input_path,
-    fs::path const &output_path,
-    smallfield::mace::context_t &mace_ctx,
-    smallfield::mace::weights_t const &weights,
-    cli_config_t const &config
-) {
+void process_shard_(fs::path const &input_path, fs::path const &output_path, smallfield::mace::context_t &mace_ctx,
+                    smallfield::mace::weights_t const &weights, cli_config_t const &config) {
     smallfield::cli::conformer_shard_data_t shard;
     if (!smallfield::cli::read_conformer_shard(input_path, shard)) {
-        std::fprintf(stderr, "[smallfield_mace_refine] skip %s (read failed)\n",
-                     input_path.string().c_str());
+        std::fprintf(stderr, "[smallfield_mace_refine] skip %s (read failed)\n", input_path.string().c_str());
         return;
     }
 
@@ -374,22 +384,21 @@ void process_shard_(
     std::vector<std::uint8_t> solver_codes(shard.num_rows(), 0u);
     for (std::uint64_t i = 0; i < shard.num_rows(); ++i) {
         // Skip non-success rows — leave them as pass-through copy.
-        if (shard.status_per_row[i] != /*success*/0u || shard.num_atoms_per_row[i] == 0u) {
+        if (shard.status_per_row[i] != /*success*/ 0u || shard.num_atoms_per_row[i] == 0u) {
             row_packs[i].refinable = false;
             solver_codes[i] = shard.solver_per_row[i];
             continue;
         }
-        std::span<__half const> coords_span(
-            shard.coordinates_flat.data() + shard.row_atom_offsets[i] * 3u,
-            static_cast<std::size_t>(shard.num_atoms_per_row[i]) * 3u);
+        std::span<__half const> coords_span(shard.coordinates_flat.data() + shard.row_atom_offsets[i] * 3u,
+                                            static_cast<std::size_t>(shard.num_atoms_per_row[i]) * 3u);
         prepare_row_pack_(shard.smiles[i], shard.num_atoms_per_row[i], coords_span, row_packs[i]);
         if (!row_packs[i].refinable) solver_codes[i] = shard.solver_per_row[i];
     }
 
-    smallfield::mace::relax_config_t relax{};
-    relax.num_steps     = config.num_steps;
+    smallfield::mace::relax_config_t relax {};
+    relax.num_steps = config.num_steps;
     relax.fmax_eV_per_A = config.fmax;
-    relax.step_size     = config.step_size;
+    relax.step_size = config.step_size;
 
     // Process refinable rows in chunks of `batch_size`.
     std::vector<std::uint64_t> refinable_rows;
@@ -404,9 +413,8 @@ void process_shard_(
         for (std::size_t k = cursor; k < end; ++k) batch_views.push_back(row_packs[refinable_rows[k]]);
         // refine_one_batch_ uses thread_local current_row_pack_base_ to find
         // the destination index in `shard.coordinates_flat`.
-        if (!refine_one_batch_(mace_ctx, weights, relax,
-                                std::span<row_pack_t>(batch_views),
-                                shard, per_row_eV, solver_codes)) {
+        if (!refine_one_batch_(mace_ctx, weights, relax, std::span<row_pack_t>(batch_views), shard, per_row_eV,
+                               solver_codes)) {
             // Fail-soft: leave this batch's coords/solver_code unchanged.
             std::fprintf(stderr, "[smallfield_mace_refine] batch failed on shard %s rows %zu..%zu — pass-through\n",
                          input_path.string().c_str(), cursor, end);
@@ -417,7 +425,7 @@ void process_shard_(
     // num_atoms, status, solver, smiles, coordinates_xyz, energy_kcal_per_mol.
     // The energy column carries eV here (not kcal/mol); a metadata key
     // distinguishes it.
-    smallfield::cli::writer_inputs_t writer{};
+    smallfield::cli::writer_inputs_t writer {};
     writer.input_shard_stem = input_path.stem().string();
     writer.base_row_index = 0;
     writer.num_molecules = shard.num_rows();
@@ -434,8 +442,7 @@ void process_shard_(
     writer.energies = per_row_eV;
 
     if (!smallfield::cli::write_shard(output_path, writer)) {
-        std::fprintf(stderr, "[smallfield_mace_refine] write failed: %s\n",
-                     output_path.string().c_str());
+        std::fprintf(stderr, "[smallfield_mace_refine] write failed: %s\n", output_path.string().c_str());
     }
 
     current_row_pack_base_ = nullptr;
@@ -449,8 +456,7 @@ int main(int argc, char **argv) {
 
     auto weights = smallfield::mace::weights_t::load(config.weights_path.string());
     if (!weights.is_loaded()) {
-        std::fprintf(stderr, "[smallfield_mace_refine] failed to load %s\n",
-                     config.weights_path.string().c_str());
+        std::fprintf(stderr, "[smallfield_mace_refine] failed to load %s\n", config.weights_path.string().c_str());
         return 1;
     }
 
@@ -460,11 +466,10 @@ int main(int argc, char **argv) {
     int const device_id = config.gpu_ids.front();
     cudaSetDevice(device_id);
 
-    smallfield::mace::context_t mace_ctx(
-        device_id, weights.arch(),
-        /*max_atoms*/ config.batch_size * config.max_atoms_per_molecule,
-        /*max_edges*/ config.batch_size * config.max_atoms_per_molecule * 32u,
-        /*max_graphs*/ config.batch_size);
+    smallfield::mace::context_t mace_ctx(device_id, weights.arch(),
+                                         /*max_atoms*/ config.batch_size * config.max_atoms_per_molecule,
+                                         /*max_edges*/ config.batch_size * config.max_atoms_per_molecule * 32u,
+                                         /*max_graphs*/ config.batch_size);
 
     fs::create_directories(config.output_dir);
     auto const input_shards = smallfield::cli::list_input_shards(config.input_dir);
@@ -476,11 +481,10 @@ int main(int argc, char **argv) {
         process_shard_(shard_path, out_path, mace_ctx, weights, config);
         ++shards_done;
     }
-    auto const elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::steady_clock::now() - start).count();
+    auto const elapsed =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
     std::printf("[smallfield_mace_refine] done: %llu shards, %llu rows, %llds\n",
-                static_cast<unsigned long long>(shards_done),
-                static_cast<unsigned long long>(rows_done),
+                static_cast<unsigned long long>(shards_done), static_cast<unsigned long long>(rows_done),
                 static_cast<long long>(elapsed));
     return 0;
 }

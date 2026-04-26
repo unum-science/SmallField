@@ -40,8 +40,8 @@ inline constexpr std::uint64_t molecule_complexity_score_(
     smallfield::types::etkdg_molecule_metadata_t const &meta) noexcept {
     std::uint64_t const num_atoms = meta.num_atoms;
     std::uint64_t const bounds_cost = num_atoms * num_atoms;
-    std::uint64_t const torsion_cost =
-        static_cast<std::uint64_t>(meta.num_mmff_torsions) + static_cast<std::uint64_t>(meta.num_etk_torsions);
+    std::uint64_t const torsion_cost = static_cast<std::uint64_t>(meta.num_mmff_torsions) +
+                                       static_cast<std::uint64_t>(meta.num_etk_torsions);
     std::uint64_t const term_cost = static_cast<std::uint64_t>(meta.num_mmff_bonds) +
                                     static_cast<std::uint64_t>(meta.num_mmff_angles) +
                                     static_cast<std::uint64_t>(meta.num_mmff_oops) +

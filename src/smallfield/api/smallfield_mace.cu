@@ -43,13 +43,9 @@ weights_t weights_t::load(std::string const &path) {
     return out;
 }
 
-smallfield::types::mace_arch_t const &weights_t::arch() const noexcept {
-    return p_->inner.arch();
-}
+smallfield::types::mace_arch_t const &weights_t::arch() const noexcept { return p_->inner.arch(); }
 
-bool weights_t::is_loaded() const noexcept {
-    return p_->loaded;
-}
+bool weights_t::is_loaded() const noexcept { return p_->loaded; }
 
 void const *weights_t::device_weights() const noexcept {
     if (!p_->loaded) return nullptr;
@@ -61,11 +57,10 @@ void const *weights_t::device_weights() const noexcept {
 // accessor; the device_weights() accessor returns a pointer to the
 // mace_weights_device_t the kernel driver consumes.
 namespace detail_ {
-inline smallfield::types::mace_weights_device_t const &
-device_weights_ref(weights_t const &W) {
+inline smallfield::types::mace_weights_device_t const &device_weights_ref(weights_t const &W) {
     return *static_cast<smallfield::types::mace_weights_device_t const *>(W.device_weights());
 }
-}  // namespace detail_
+} // namespace detail_
 
 // ---------------------------------------------------------------------------
 //  context_t — owns scratch + stream
@@ -78,11 +73,9 @@ struct context_t::impl_t {
     std::uint32_t max_atoms = 0;
     std::uint32_t max_edges = 0;
     std::uint32_t max_graphs = 0;
-    smallfield::types::mace_arch_t arch{};
+    smallfield::types::mace_arch_t arch {};
 
-    impl_t(int dev,
-           smallfield::types::mace_arch_t const &a,
-           std::uint32_t na, std::uint32_t ne, std::uint32_t ng)
+    impl_t(int dev, smallfield::types::mace_arch_t const &a, std::uint32_t na, std::uint32_t ne, std::uint32_t ng)
         : device_id(dev), max_atoms(na), max_edges(ne), max_graphs(ng), arch(a) {
         cudaSetDevice(device_id);
         cudaStreamCreate(&stream);
@@ -99,8 +92,8 @@ struct context_t::impl_t {
     }
 };
 
-context_t::context_t(int device_id, smallfield::types::mace_arch_t const &arch,
-                     std::uint32_t max_atoms, std::uint32_t max_edges, std::uint32_t max_graphs)
+context_t::context_t(int device_id, smallfield::types::mace_arch_t const &arch, std::uint32_t max_atoms,
+                     std::uint32_t max_edges, std::uint32_t max_graphs)
     : p_(std::make_unique<impl_t>(device_id, arch, max_atoms, max_edges, max_graphs)) {}
 context_t::~context_t() = default;
 context_t::context_t(context_t &&) noexcept = default;
@@ -115,7 +108,7 @@ cudaStream_t context_t::stream() const noexcept { return p_->stream; }
 namespace {
 
 inline smallfield::types::mace_batch_t to_internal_(batch_view_t const &B) {
-    smallfield::types::mace_batch_t out{};
+    smallfield::types::mace_batch_t out {};
     out.n_atoms = B.n_atoms;
     out.n_edges = B.n_edges;
     out.n_graphs = B.n_graphs;
@@ -130,11 +123,11 @@ inline smallfield::types::mace_batch_t to_internal_(batch_view_t const &B) {
 }
 
 inline bool batch_fits_(std::uint32_t max_atoms, std::uint32_t max_edges, std::uint32_t max_graphs,
-                         batch_view_t const &B) {
+                        batch_view_t const &B) {
     return B.n_atoms <= max_atoms && B.n_edges <= max_edges && B.n_graphs <= max_graphs;
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 //  Inference entry points
@@ -152,24 +145,19 @@ status_t context_t::infer_energy(weights_t const &W, batch_view_t const &B, floa
     auto const &W_device = detail_::device_weights_ref(W);
     auto batch_internal = to_internal_(B);
 
-    smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(
-        p_->scratch, batch_internal.n_atoms, p_->stream);
-    smallfield::cuda::mace_inference_forward(
-        W_arch, W_device, batch_internal, p_->scratch, p_->stream);
+    smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(p_->scratch, batch_internal.n_atoms, p_->stream);
+    smallfield::cuda::mace_inference_forward(W_arch, W_device, batch_internal, p_->scratch, p_->stream);
 
-    cudaMemcpyAsync(energies_out, p_->scratch.energy,
-                    batch_internal.n_graphs * sizeof(float),
-                    cudaMemcpyDeviceToDevice, p_->stream);
+    cudaMemcpyAsync(energies_out, p_->scratch.energy, batch_internal.n_graphs * sizeof(float), cudaMemcpyDeviceToDevice,
+                    p_->stream);
 
     cudaError_t const err = cudaGetLastError();
     if (err != cudaSuccess) return status_t::cuda_error;
     return status_t::success;
 }
 
-status_t context_t::infer_energy_and_forces(weights_t const &W,
-                                              batch_view_t const &B,
-                                              float *energies_out,
-                                              float *forces_out) {
+status_t context_t::infer_energy_and_forces(weights_t const &W, batch_view_t const &B, float *energies_out,
+                                            float *forces_out) {
     if (!W.is_loaded()) return status_t::weights_load_failed;
     if (!batch_fits_(p_->max_atoms, p_->max_edges, p_->max_graphs, B)) return status_t::invalid_input;
     if (energies_out == nullptr) return status_t::invalid_input;
@@ -179,20 +167,15 @@ status_t context_t::infer_energy_and_forces(weights_t const &W,
     auto const &W_device = detail_::device_weights_ref(W);
     auto batch_internal = to_internal_(B);
 
-    smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(
-        p_->scratch, batch_internal.n_atoms, p_->stream);
-    smallfield::cuda::mace_inference_forward(
-        W_arch, W_device, batch_internal, p_->scratch, p_->stream);
+    smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(p_->scratch, batch_internal.n_atoms, p_->stream);
+    smallfield::cuda::mace_inference_forward(W_arch, W_device, batch_internal, p_->scratch, p_->stream);
 
-    cudaMemcpyAsync(energies_out, p_->scratch.energy,
-                    batch_internal.n_graphs * sizeof(float),
-                    cudaMemcpyDeviceToDevice, p_->stream);
+    cudaMemcpyAsync(energies_out, p_->scratch.energy, batch_internal.n_graphs * sizeof(float), cudaMemcpyDeviceToDevice,
+                    p_->stream);
 
     if (forces_out != nullptr) {
-        smallfield::cuda::mace_inference_run_force_adjoint(
-            W_arch, W_device, batch_internal, p_->scratch, p_->stream);
-        cudaMemcpyAsync(forces_out, p_->scratch.forces,
-                        batch_internal.n_atoms * 3u * sizeof(float),
+        smallfield::cuda::mace_inference_run_force_adjoint(W_arch, W_device, batch_internal, p_->scratch, p_->stream);
+        cudaMemcpyAsync(forces_out, p_->scratch.forces, batch_internal.n_atoms * 3u * sizeof(float),
                         cudaMemcpyDeviceToDevice, p_->stream);
     }
 
@@ -210,17 +193,15 @@ namespace {
 /** In-place GD step: positions[i] -= step_size * (-forces[i]) === += step * forces.
  *  Forces in MACE-OFF inference are -∂E/∂r, so positions move in the direction
  *  of decreasing energy when we add `step_size * forces`. */
-__global__ void mace_api_gd_step_kernel_(std::uint32_t n_components,
-                                          float step_size,
-                                          float const *forces,
-                                          float *positions) {
+__global__ void mace_api_gd_step_kernel_(std::uint32_t n_components, float step_size, float const *forces,
+                                         float *positions) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n_components) return;
     positions[element_index] += step_size * forces[element_index];
 }
 
-inline void launch_gd_step_(std::uint32_t n_atoms, float step_size,
-                             float const *forces, float *positions, cudaStream_t stream) {
+inline void launch_gd_step_(std::uint32_t n_atoms, float step_size, float const *forces, float *positions,
+                            cudaStream_t stream) {
     if (n_atoms == 0u) return;
     std::uint32_t const n_components = n_atoms * 3u;
     constexpr std::uint32_t block = 256u;
@@ -228,13 +209,10 @@ inline void launch_gd_step_(std::uint32_t n_atoms, float step_size,
     mace_api_gd_step_kernel_<<<grid, block, 0, stream>>>(n_components, step_size, forces, positions);
 }
 
-}  // namespace
+} // namespace
 
-status_t context_t::refine_batch(weights_t const &W,
-                                  batch_view_t batch,
-                                  relax_config_t const &config,
-                                  float *positions_xyz_inout,
-                                  float *energies_out) {
+status_t context_t::refine_batch(weights_t const &W, batch_view_t batch, relax_config_t const &config,
+                                 float *positions_xyz_inout, float *energies_out) {
     if (!W.is_loaded()) return status_t::weights_load_failed;
     if (!batch_fits_(p_->max_atoms, p_->max_edges, p_->max_graphs, batch)) return status_t::invalid_input;
     if (positions_xyz_inout == nullptr) return status_t::invalid_input;
@@ -264,12 +242,11 @@ status_t context_t::refine_batch(weights_t const &W,
     //  (Transform #4 territory).  Net savings come from (a) eliminating the
     //  N host launches and (b) avoiding the N D2H/H2D ping-pong on positions.
     // ------------------------------------------------------------------
-    smallfield::cuda::launch_mace_lbfgs_build_graph_atom_offsets(
-        batch_internal.n_atoms, batch_internal.n_graphs,
-        batch_internal.graph_of_atom,
-        p_->scratch.lbfgs_graph_atom_offsets, p_->stream);
-    smallfield::cuda::launch_mace_lbfgs_reset_converged_flags(
-        batch_internal.n_graphs, p_->scratch.lbfgs_converged_flags, p_->stream);
+    smallfield::cuda::launch_mace_lbfgs_build_graph_atom_offsets(batch_internal.n_atoms, batch_internal.n_graphs,
+                                                                 batch_internal.graph_of_atom,
+                                                                 p_->scratch.lbfgs_graph_atom_offsets, p_->stream);
+    smallfield::cuda::launch_mace_lbfgs_reset_converged_flags(batch_internal.n_graphs,
+                                                              p_->scratch.lbfgs_converged_flags, p_->stream);
 
     // All-converged early-exit cadence.  Every `kCheckEvery` iterations we
     // AND-reduce `converged_flags` on the device, copy the byte to pinned
@@ -281,56 +258,40 @@ status_t context_t::refine_batch(weights_t const &W,
     constexpr std::uint32_t kCheckEvery = 4u;
 
     for (std::uint32_t step_index = 0u; step_index < config.num_steps; ++step_index) {
-        smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(
-            p_->scratch, batch_internal.n_atoms, p_->stream);
-        smallfield::cuda::mace_inference_forward(
-            W_arch, W_device, batch_internal, p_->scratch, p_->stream);
-        smallfield::cuda::mace_inference_run_force_adjoint(
-            W_arch, W_device, batch_internal, p_->scratch, p_->stream);
+        smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(p_->scratch, batch_internal.n_atoms,
+                                                                           p_->stream);
+        smallfield::cuda::mace_inference_forward(W_arch, W_device, batch_internal, p_->scratch, p_->stream);
+        smallfield::cuda::mace_inference_run_force_adjoint(W_arch, W_device, batch_internal, p_->scratch, p_->stream);
 
         // GPU-resident LBFGS step + per-conformer fmax convergence check.
-        smallfield::cuda::launch_mace_lbfgs_step(
-            batch_internal.n_graphs,
-            p_->scratch.lbfgs_graph_atom_offsets,
-            p_->scratch.forces,
-            positions_xyz_inout,
-            config.fmax_eV_per_A, config.step_size,
-            p_->scratch.lbfgs_fmax_per_conformer,
-            p_->scratch.lbfgs_converged_flags,
-            p_->stream);
+        smallfield::cuda::launch_mace_lbfgs_step(batch_internal.n_graphs, p_->scratch.lbfgs_graph_atom_offsets,
+                                                 p_->scratch.forces, positions_xyz_inout, config.fmax_eV_per_A,
+                                                 config.step_size, p_->scratch.lbfgs_fmax_per_conformer,
+                                                 p_->scratch.lbfgs_converged_flags, p_->stream);
 
         // Periodic device-side AND-reduction of converged_flags + D2H probe.
         // Skip the final iter (we always do the trailing forward anyway).
-        bool const should_check =
-            ((step_index + 1u) % kCheckEvery == 0u) &&
-            ((step_index + 1u) < config.num_steps);
+        bool const should_check = ((step_index + 1u) % kCheckEvery == 0u) && ((step_index + 1u) < config.num_steps);
         if (should_check) {
-            smallfield::cuda::launch_mace_lbfgs_all_converged(
-                batch_internal.n_graphs,
-                p_->scratch.lbfgs_converged_flags,
-                p_->scratch.lbfgs_all_converged,
-                p_->stream);
-            cudaMemcpyAsync(p_->scratch.lbfgs_all_converged_pinned,
-                            p_->scratch.lbfgs_all_converged,
-                            sizeof(std::uint8_t),
-                            cudaMemcpyDeviceToHost, p_->stream);
+            smallfield::cuda::launch_mace_lbfgs_all_converged(batch_internal.n_graphs,
+                                                              p_->scratch.lbfgs_converged_flags,
+                                                              p_->scratch.lbfgs_all_converged, p_->stream);
+            cudaMemcpyAsync(p_->scratch.lbfgs_all_converged_pinned, p_->scratch.lbfgs_all_converged,
+                            sizeof(std::uint8_t), cudaMemcpyDeviceToHost, p_->stream);
             cudaStreamSynchronize(p_->stream);
             if (p_->scratch.lbfgs_all_converged_pinned[0] != 0u) break;
         }
     }
 
     // Final forward to populate energies_out at the converged geometry.
-    smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(
-        p_->scratch, batch_internal.n_atoms, p_->stream);
-    smallfield::cuda::mace_inference_forward(
-        W_arch, W_device, batch_internal, p_->scratch, p_->stream);
-    cudaMemcpyAsync(energies_out, p_->scratch.energy,
-                    batch_internal.n_graphs * sizeof(float),
-                    cudaMemcpyDeviceToDevice, p_->stream);
+    smallfield::cuda::mace_inference_reset_per_atom_energy_accumulator(p_->scratch, batch_internal.n_atoms, p_->stream);
+    smallfield::cuda::mace_inference_forward(W_arch, W_device, batch_internal, p_->scratch, p_->stream);
+    cudaMemcpyAsync(energies_out, p_->scratch.energy, batch_internal.n_graphs * sizeof(float), cudaMemcpyDeviceToDevice,
+                    p_->stream);
 
     cudaError_t const err = cudaGetLastError();
     if (err != cudaSuccess) return status_t::cuda_error;
     return status_t::success;
 }
 
-}  // namespace smallfield::mace
+} // namespace smallfield::mace

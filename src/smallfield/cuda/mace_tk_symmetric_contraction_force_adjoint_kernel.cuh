@@ -70,10 +70,10 @@ namespace smallfield::cuda {
 namespace mace_tk_symmetric_contraction_force_adjoint_detail_ {
 
 // Compile-time shape constants, matching the forward TK kernel.
-constexpr int irrep_dim_k             = mace_tk::mace_irrep_dim_total_k; // 16
-constexpr int path_count_order_2_k    = 4;
-constexpr int path_count_order_1_k    = 1;
-constexpr int warp_thread_count_k     = 32;
+constexpr int irrep_dim_k = mace_tk::mace_irrep_dim_total_k; // 16
+constexpr int path_count_order_2_k = 4;
+constexpr int path_count_order_1_k = 1;
+constexpr int warp_thread_count_k = 32;
 
 /// Block size selector — sized so each thread owns exactly one channel
 /// (or one channel per stride round, for n_channels not a multiple of 32).
@@ -84,8 +84,7 @@ constexpr int warp_thread_count_k     = 32;
 __host__ __device__ inline std::uint32_t choose_block_threads_(std::uint32_t n_channels) {
     std::uint32_t const rounded = ((n_channels + warp_thread_count_k - 1u) / warp_thread_count_k) * warp_thread_count_k;
     std::uint32_t const cap = 256u;
-    return rounded < warp_thread_count_k ? warp_thread_count_k
-         : (rounded > cap ? cap : rounded);
+    return rounded < warp_thread_count_k ? warp_thread_count_k : (rounded > cap ? cap : rounded);
 }
 
 /**
@@ -97,16 +96,13 @@ __host__ __device__ inline std::uint32_t choose_block_threads_(std::uint32_t n_c
  *  read it from shared, not from HBM, and so the order-3 (i, j, k) loop can
  *  read X[i], X[j], X[k] without re-issuing global loads per inner iteration.
  */
-__device__ __forceinline__ void load_atom_feature_slab_(
-    float *shared_features_atom,
-    float const *node_features_full_fp32,
-    std::uint32_t atom_index,
-    std::uint32_t n_channels
-) {
+__device__ __forceinline__ void load_atom_feature_slab_(float *shared_features_atom,
+                                                        float const *node_features_full_fp32, std::uint32_t atom_index,
+                                                        std::uint32_t n_channels) {
     int const thread_id = threadIdx.x;
     int const tile_elements = static_cast<int>(n_channels) * irrep_dim_k;
-    float const *atom_slab = node_features_full_fp32
-                             + static_cast<std::uint64_t>(atom_index) * static_cast<std::uint64_t>(tile_elements);
+    float const *atom_slab = node_features_full_fp32 +
+                             static_cast<std::uint64_t>(atom_index) * static_cast<std::uint64_t>(tile_elements);
     int const stride = static_cast<int>(blockDim.x);
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += stride) {
         shared_features_atom[linear_index] = atom_slab[linear_index];
@@ -133,20 +129,13 @@ __device__ __forceinline__ void load_atom_feature_slab_(
  *          `+=`-accumulate into `grad_node_features_full_fp32[a, c, :]`.
  */
 inline __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t n_elements,
-    std::int32_t const *__restrict__ atom_element,
-    float const *__restrict__ node_features_full_fp32,
-    float const *__restrict__ u_matrix_1_fp32,
-    float const *__restrict__ u_matrix_2_fp32,
-    float const *__restrict__ weights_2_fp32,
-    float const *__restrict__ weights_1_fp32,
-    float const *__restrict__ precomputed_w3_effective_fp32,    // unused under Transform #1; kept for ABI compat
-    float const *__restrict__ precomputed_w3_partsym_fp32,      // Transform #1: order-3 partsym-symmetric tensor
-    float const *__restrict__ upstream_grad_output_fp32,
-    float *__restrict__ grad_node_features_full_fp32
-) {
+    std::uint32_t n_atoms, std::uint32_t n_channels, std::uint32_t n_elements,
+    std::int32_t const *__restrict__ atom_element, float const *__restrict__ node_features_full_fp32,
+    float const *__restrict__ u_matrix_1_fp32, float const *__restrict__ u_matrix_2_fp32,
+    float const *__restrict__ weights_2_fp32, float const *__restrict__ weights_1_fp32,
+    float const *__restrict__ precomputed_w3_effective_fp32, // unused under Transform #1; kept for ABI compat
+    float const *__restrict__ precomputed_w3_partsym_fp32,   // Transform #1: order-3 partsym-symmetric tensor
+    float const *__restrict__ upstream_grad_output_fp32, float *__restrict__ grad_node_features_full_fp32) {
     (void)precomputed_w3_effective_fp32;
     extern __shared__ float raw_shared_memory_for_features[];
     float *shared_features_atom = raw_shared_memory_for_features;
@@ -162,15 +151,15 @@ inline __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
 
     int const thread_id = threadIdx.x;
     std::uint32_t const block_threads = blockDim.x;
-    std::uint64_t const w3_per_element_stride = static_cast<std::uint64_t>(irrep_dim_k)
-                                                * static_cast<std::uint64_t>(irrep_dim_k)
-                                                * static_cast<std::uint64_t>(irrep_dim_k)
-                                                * static_cast<std::uint64_t>(n_channels);
+    std::uint64_t const w3_per_element_stride = static_cast<std::uint64_t>(irrep_dim_k) *
+                                                static_cast<std::uint64_t>(irrep_dim_k) *
+                                                static_cast<std::uint64_t>(irrep_dim_k) *
+                                                static_cast<std::uint64_t>(n_channels);
     // Transform #1: read from W3_partsym_sym (canonical α ≤ β cells) instead
     // of W3_eff.  The partsym tensor encodes the closed-form quadratic adjoint
     // already symmetrised over the (α, β) input axes.
-    float const *w3_partsym_for_element = precomputed_w3_partsym_fp32
-                                          + static_cast<std::uint64_t>(element_index) * w3_per_element_stride;
+    float const *w3_partsym_for_element = precomputed_w3_partsym_fp32 +
+                                          static_cast<std::uint64_t>(element_index) * w3_per_element_stride;
 
     // Walk the channel axis in strided chunks of `blockDim.x` (multi-warp
     // CTA — bumped up from the original 1-warp/CTA design so the scheduler
@@ -178,9 +167,7 @@ inline __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
     // same CTA).  When n_channels ≤ blockDim.x (the common case post-bump:
     // 96-channel small model with 96-thread CTAs), the loop runs exactly
     // once per thread.
-    for (std::uint32_t channel_base = 0u;
-         channel_base < n_channels;
-         channel_base += block_threads) {
+    for (std::uint32_t channel_base = 0u; channel_base < n_channels; channel_base += block_threads) {
 
         std::uint32_t const channel_index = channel_base + static_cast<std::uint32_t>(thread_id);
         if (channel_index >= n_channels) break;
@@ -191,42 +178,45 @@ inline __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
         // 16-wide local gradient accumulator for this (atom, channel).
         float dx_local[irrep_dim_k] = {0.0f};
 
-        // ---- Order 1 ----
-        // Forward: B += w_1[Z, p, c] * U_1[i, p] * X[i].
-        // Reverse: dx[i] += w_1[Z, p, c] * U_1[i, p].
-        #pragma unroll
+// ---- Order 1 ----
+// Forward: B += w_1[Z, p, c] * U_1[i, p] * X[i].
+// Reverse: dx[i] += w_1[Z, p, c] * U_1[i, p].
+#pragma unroll
         for (int path_index = 0; path_index < path_count_order_1_k; ++path_index) {
-            float const weighted_path_coefficient = weights_1_fp32[
-                (static_cast<std::uint64_t>(element_index) * path_count_order_1_k + path_index) * n_channels
-                + channel_index];
-            #pragma unroll
+            float const weighted_path_coefficient =
+                weights_1_fp32[(static_cast<std::uint64_t>(element_index) * path_count_order_1_k + path_index) *
+                                   n_channels +
+                               channel_index];
+#pragma unroll
             for (int irrep_index_i = 0; irrep_index_i < irrep_dim_k; ++irrep_index_i) {
-                float const u = u_matrix_1_fp32[
-                    static_cast<std::uint64_t>(irrep_index_i) * path_count_order_1_k + path_index];
+                float const u =
+                    u_matrix_1_fp32[static_cast<std::uint64_t>(irrep_index_i) * path_count_order_1_k + path_index];
                 dx_local[irrep_index_i] += weighted_path_coefficient * u;
             }
         }
 
-        // ---- Order 2 ----
-        // Forward: B += w_2[Z, p, c] * U_2[i, j, p] * X[i] * X[j].
-        // Reverse: dx[i] += u_w * X[j];  dx[j] += u_w * X[i].
-        // We emit both writes inside the loop so we are correct without
-        // assuming any U_2 symmetry — even though U_2 is in fact symmetric
-        // in MACE-OFF23 the cost difference is negligible against the
-        // order-3 path.
-        #pragma unroll
+// ---- Order 2 ----
+// Forward: B += w_2[Z, p, c] * U_2[i, j, p] * X[i] * X[j].
+// Reverse: dx[i] += u_w * X[j];  dx[j] += u_w * X[i].
+// We emit both writes inside the loop so we are correct without
+// assuming any U_2 symmetry — even though U_2 is in fact symmetric
+// in MACE-OFF23 the cost difference is negligible against the
+// order-3 path.
+#pragma unroll
         for (int path_index = 0; path_index < path_count_order_2_k; ++path_index) {
-            float const weighted_path_coefficient = weights_2_fp32[
-                (static_cast<std::uint64_t>(element_index) * path_count_order_2_k + path_index) * n_channels
-                + channel_index];
-            #pragma unroll
+            float const weighted_path_coefficient =
+                weights_2_fp32[(static_cast<std::uint64_t>(element_index) * path_count_order_2_k + path_index) *
+                                   n_channels +
+                               channel_index];
+#pragma unroll
             for (int irrep_index_i = 0; irrep_index_i < irrep_dim_k; ++irrep_index_i) {
                 float const x_i = atom_irrep_row[irrep_index_i];
-                #pragma unroll
+#pragma unroll
                 for (int irrep_index_j = 0; irrep_index_j < irrep_dim_k; ++irrep_index_j) {
-                    float const u = u_matrix_2_fp32[
-                        ((static_cast<std::uint64_t>(irrep_index_i) * irrep_dim_k) + irrep_index_j)
-                            * path_count_order_2_k + path_index];
+                    float const u =
+                        u_matrix_2_fp32[((static_cast<std::uint64_t>(irrep_index_i) * irrep_dim_k) + irrep_index_j) *
+                                            path_count_order_2_k +
+                                        path_index];
                     float const u_w = weighted_path_coefficient * u;
                     float const x_j = atom_irrep_row[irrep_index_j];
                     dx_local[irrep_index_i] += u_w * x_j;
@@ -254,30 +244,30 @@ inline __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
         // per-register dependency chains than the old single-accumulator form.
         for (int alpha = 0; alpha < irrep_dim_k; ++alpha) {
             float const x_alpha = atom_irrep_row[alpha];
-            #pragma unroll
+#pragma unroll
             for (int beta = alpha; beta < irrep_dim_k; ++beta) {
                 float const x_alpha_beta = x_alpha * atom_irrep_row[beta];
-                std::uint64_t const w_base =
-                    (static_cast<std::uint64_t>(alpha) * irrep_dim_k + beta)
-                    * static_cast<std::uint64_t>(n_channels) + channel_index;
-                std::uint64_t const w_per_m_stride = static_cast<std::uint64_t>(irrep_dim_k)
-                                                     * static_cast<std::uint64_t>(irrep_dim_k)
-                                                     * static_cast<std::uint64_t>(n_channels);
-                #pragma unroll
+                std::uint64_t const w_base = (static_cast<std::uint64_t>(alpha) * irrep_dim_k + beta) *
+                                                 static_cast<std::uint64_t>(n_channels) +
+                                             channel_index;
+                std::uint64_t const w_per_m_stride = static_cast<std::uint64_t>(irrep_dim_k) *
+                                                     static_cast<std::uint64_t>(irrep_dim_k) *
+                                                     static_cast<std::uint64_t>(n_channels);
+#pragma unroll
                 for (int m = 0; m < irrep_dim_k; ++m) {
-                    float const w = w3_partsym_for_element[
-                        static_cast<std::uint64_t>(m) * w_per_m_stride + w_base];
+                    float const w = w3_partsym_for_element[static_cast<std::uint64_t>(m) * w_per_m_stride + w_base];
                     dx_local[m] += w * x_alpha_beta;
                 }
             }
         }
 
         // Multiply by upstream and `+=`-accumulate into the global grad buffer.
-        float const upstream = upstream_grad_output_fp32[
-            static_cast<std::uint64_t>(atom_index) * n_channels + channel_index];
-        float *grad_atom_irrep_row = grad_node_features_full_fp32
-            + (static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim_k;
-        #pragma unroll
+        float const upstream =
+            upstream_grad_output_fp32[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index];
+        float *grad_atom_irrep_row = grad_node_features_full_fp32 +
+                                     (static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) *
+                                         irrep_dim_k;
+#pragma unroll
         for (int irrep_index_i = 0; irrep_index_i < irrep_dim_k; ++irrep_index_i) {
             grad_atom_irrep_row[irrep_index_i] += upstream * dx_local[irrep_index_i];
         }
@@ -313,21 +303,12 @@ inline __global__ void mace_tk_symmetric_contraction_force_adjoint_kernel(
  *  load-bearing per the work plan's risk register.
  */
 inline void launch_mace_tk_symmetric_contraction_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t n_elements,
-    std::int32_t const *atom_element,
-    float const *node_features_full_fp32,
-    float const *u_matrix_1_fp32,
-    float const *u_matrix_2_fp32,
-    float const *weights_2_fp32,
-    float const *weights_1_fp32,
-    float const *precomputed_w3_effective_fp32,           // unused under Transform #1; kept for ABI parity
-    float const *precomputed_w3_partsym_fp32,             // Transform #1: order-3 partsym tensor
-    float const *upstream_grad_output_fp32,
-    float *grad_node_features_full_fp32,
-    cudaStream_t stream
-) {
+    std::uint32_t n_atoms, std::uint32_t n_channels, std::uint32_t n_elements, std::int32_t const *atom_element,
+    float const *node_features_full_fp32, float const *u_matrix_1_fp32, float const *u_matrix_2_fp32,
+    float const *weights_2_fp32, float const *weights_1_fp32,
+    float const *precomputed_w3_effective_fp32, // unused under Transform #1; kept for ABI parity
+    float const *precomputed_w3_partsym_fp32,   // Transform #1: order-3 partsym tensor
+    float const *upstream_grad_output_fp32, float *grad_node_features_full_fp32, cudaStream_t stream) {
     if (n_atoms == 0u) return;
     if (precomputed_w3_partsym_fp32 == nullptr) return;
 
@@ -336,21 +317,16 @@ inline void launch_mace_tk_symmetric_contraction_force_adjoint(
     // Shared-memory budget: per-atom feature slab `n_channels × 16` fp32.  For
     // the largest MACE-OFF setting (n_channels = 192) this is 12 KB; under
     // the 48 KB default per-block limit so no opt-in attribute is required.
-    std::size_t const shared_memory_bytes =
-        static_cast<std::size_t>(n_channels) * static_cast<std::size_t>(irrep_dim_k) * sizeof(float);
+    std::size_t const shared_memory_bytes = static_cast<std::size_t>(n_channels) *
+                                            static_cast<std::size_t>(irrep_dim_k) * sizeof(float);
 
     dim3 const grid(n_atoms, 1, 1);
     dim3 const block(choose_block_threads_(n_channels), 1, 1);
 
     mace_tk_symmetric_contraction_force_adjoint_kernel<<<grid, block, shared_memory_bytes, stream>>>(
-        n_atoms, n_channels, n_elements,
-        atom_element, node_features_full_fp32,
-        u_matrix_1_fp32, u_matrix_2_fp32,
-        weights_2_fp32, weights_1_fp32,
-        precomputed_w3_effective_fp32,
-        precomputed_w3_partsym_fp32,
-        upstream_grad_output_fp32,
-        grad_node_features_full_fp32);
+        n_atoms, n_channels, n_elements, atom_element, node_features_full_fp32, u_matrix_1_fp32, u_matrix_2_fp32,
+        weights_2_fp32, weights_1_fp32, precomputed_w3_effective_fp32, precomputed_w3_partsym_fp32,
+        upstream_grad_output_fp32, grad_node_features_full_fp32);
 }
 
 } // namespace smallfield::cuda

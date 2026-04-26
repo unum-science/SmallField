@@ -31,11 +31,8 @@ namespace smallfield::cuda {
  *  `n` is `total_atom_count * 3` — the kernel does not care about per-atom
  *  layout, just the flat element count.  One thread per element.
  */
-inline __global__ void mace_positions_fp16_to_fp32_kernel(
-    std::uint32_t n,
-    __half const *positions_fp16,
-    float *positions_fp32
-) {
+inline __global__ void mace_positions_fp16_to_fp32_kernel(std::uint32_t n, __half const *positions_fp16,
+                                                          float *positions_fp32) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n) return;
     positions_fp32[element_index] = __half2float(positions_fp16[element_index]);
@@ -46,34 +43,22 @@ inline __global__ void mace_positions_fp16_to_fp32_kernel(
  *
  *  `n` is `total_atom_count * 3`.  One thread per element.
  */
-inline __global__ void mace_forces_fp32_to_fp16_kernel(
-    std::uint32_t n,
-    float const *forces_fp32,
-    __half *forces_fp16
-) {
+inline __global__ void mace_forces_fp32_to_fp16_kernel(std::uint32_t n, float const *forces_fp32, __half *forces_fp16) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n) return;
     forces_fp16[element_index] = __float2half(forces_fp32[element_index]);
 }
 
-inline void launch_mace_positions_fp16_to_fp32(
-    std::uint32_t n,
-    __half const *positions_fp16,
-    float *positions_fp32,
-    cudaStream_t stream
-) {
+inline void launch_mace_positions_fp16_to_fp32(std::uint32_t n, __half const *positions_fp16, float *positions_fp32,
+                                               cudaStream_t stream) {
     if (n == 0) return;
     constexpr std::uint32_t block = 256;
     std::uint32_t const grid = (n + block - 1u) / block;
     mace_positions_fp16_to_fp32_kernel<<<grid, block, 0, stream>>>(n, positions_fp16, positions_fp32);
 }
 
-inline void launch_mace_forces_fp32_to_fp16(
-    std::uint32_t n,
-    float const *forces_fp32,
-    __half *forces_fp16,
-    cudaStream_t stream
-) {
+inline void launch_mace_forces_fp32_to_fp16(std::uint32_t n, float const *forces_fp32, __half *forces_fp16,
+                                            cudaStream_t stream) {
     if (n == 0) return;
     constexpr std::uint32_t block = 256;
     std::uint32_t const grid = (n + block - 1u) / block;

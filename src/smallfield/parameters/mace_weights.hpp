@@ -73,16 +73,18 @@ struct manifest_entry_t {
  *  Python with a known schema.  Throws std::runtime_error on bad input.
  */
 class json_parser_t {
-public:
+  public:
     explicit json_parser_t(std::string const &s) : s_(s), p_(0) {}
 
     void skip_ws_() {
-        while (p_ < s_.size() && (s_[p_] == ' ' || s_[p_] == '\t' || s_[p_] == '\n' || s_[p_] == '\r' || s_[p_] == ',')) ++p_;
+        while (p_ < s_.size() && (s_[p_] == ' ' || s_[p_] == '\t' || s_[p_] == '\n' || s_[p_] == '\r' || s_[p_] == ','))
+            ++p_;
     }
 
     void expect_(char c) {
         skip_ws_();
-        if (p_ >= s_.size() || s_[p_] != c) throw std::runtime_error("manifest JSON: expected '" + std::string(1, c) + "'");
+        if (p_ >= s_.size() || s_[p_] != c)
+            throw std::runtime_error("manifest JSON: expected '" + std::string(1, c) + "'");
         ++p_;
     }
 
@@ -92,8 +94,14 @@ public:
         ++p_;
         std::string out;
         while (p_ < s_.size() && s_[p_] != '"') {
-            if (s_[p_] == '\\' && p_ + 1 < s_.size()) { out.push_back(s_[p_ + 1]); p_ += 2; }
-            else { out.push_back(s_[p_]); ++p_; }
+            if (s_[p_] == '\\' && p_ + 1 < s_.size()) {
+                out.push_back(s_[p_ + 1]);
+                p_ += 2;
+            }
+            else {
+                out.push_back(s_[p_]);
+                ++p_;
+            }
         }
         if (p_ >= s_.size()) throw std::runtime_error("manifest JSON: unterminated string");
         ++p_;
@@ -104,13 +112,24 @@ public:
         skip_ws_();
         std::size_t start = p_;
         if (p_ < s_.size() && (s_[p_] == '-' || s_[p_] == '+')) ++p_;
-        while (p_ < s_.size() && (std::isdigit(static_cast<unsigned char>(s_[p_])) || s_[p_] == '.' || s_[p_] == 'e' || s_[p_] == 'E' || s_[p_] == '-' || s_[p_] == '+')) ++p_;
+        while (p_ < s_.size() && (std::isdigit(static_cast<unsigned char>(s_[p_])) || s_[p_] == '.' || s_[p_] == 'e' ||
+                                  s_[p_] == 'E' || s_[p_] == '-' || s_[p_] == '+'))
+            ++p_;
         return std::stod(s_.substr(start, p_ - start));
     }
 
-    bool peek_(char c) { skip_ws_(); return p_ < s_.size() && s_[p_] == c; }
-    char peek_() { skip_ws_(); return p_ < s_.size() ? s_[p_] : '\0'; }
-    bool eof_() { skip_ws_(); return p_ >= s_.size(); }
+    bool peek_(char c) {
+        skip_ws_();
+        return p_ < s_.size() && s_[p_] == c;
+    }
+    char peek_() {
+        skip_ws_();
+        return p_ < s_.size() ? s_[p_] : '\0';
+    }
+    bool eof_() {
+        skip_ws_();
+        return p_ >= s_.size();
+    }
 
     // Members are public so the (recursive) value-skip in `parse_manifest_`
     // can advance `p_` without going through accessors.  The parser is
@@ -120,10 +139,9 @@ public:
 };
 
 /** Parse the full manifest into `(header_kv, tensors)`. */
-inline void parse_manifest_(std::string const &raw,
-                             std::unordered_map<std::string, double> &header_num,
-                             std::unordered_map<std::string, std::string> &header_str,
-                             std::vector<manifest_entry_t> &tensors) {
+inline void parse_manifest_(std::string const &raw, std::unordered_map<std::string, double> &header_num,
+                            std::unordered_map<std::string, std::string> &header_str,
+                            std::vector<manifest_entry_t> &tensors) {
     json_parser_t j(raw);
     j.expect_('{');
     while (!j.peek_('}')) {
@@ -135,16 +153,19 @@ inline void parse_manifest_(std::string const &raw,
                 std::string hk = j.parse_string_();
                 j.expect_(':');
                 if (j.peek_('"')) header_str[hk] = j.parse_string_();
-                else if (j.peek_('-') || std::isdigit(static_cast<unsigned char>(j.peek_()))) header_num[hk] = j.parse_number_();
+                else if (j.peek_('-') || std::isdigit(static_cast<unsigned char>(j.peek_())))
+                    header_num[hk] = j.parse_number_();
                 else if (j.peek_('t') || j.peek_('f')) {
                     // bool — read alpha
                     std::size_t st = j.p_;
                     while (j.p_ < raw.size() && std::isalpha(static_cast<unsigned char>(raw[j.p_]))) ++j.p_;
                     header_num[hk] = (raw.substr(st, j.p_ - st) == "true") ? 1.0 : 0.0;
-                } else if (j.peek_('n')) {
+                }
+                else if (j.peek_('n')) {
                     // null
                     j.p_ += 4;
-                } else if (j.peek_('[')) {
+                }
+                else if (j.peek_('[')) {
                     // Array value — skip with bracket-depth tracking.  Header arrays
                     // are tolerated but not captured by the simple num/str maps;
                     // when a caller needs the array values it should mirror them as
@@ -157,7 +178,8 @@ inline void parse_manifest_(std::string const &raw,
                         else if (j.s_[j.p_] == ']') --bracket_depth;
                         ++j.p_;
                     } while (bracket_depth > 0 && j.p_ < j.s_.size());
-                } else if (j.peek_('{')) {
+                }
+                else if (j.peek_('{')) {
                     // Nested object value — skip the same way.
                     int brace_depth = 0;
                     do {
@@ -169,7 +191,8 @@ inline void parse_manifest_(std::string const &raw,
                 if (j.peek_(',')) { ++j.p_; }
             }
             j.expect_('}');
-        } else if (key == "tensors") {
+        }
+        else if (key == "tensors") {
             j.expect_('[');
             while (!j.peek_(']')) {
                 j.expect_('{');
@@ -196,7 +219,8 @@ inline void parse_manifest_(std::string const &raw,
                 if (j.peek_(',')) { ++j.p_; }
             }
             j.expect_(']');
-        } else {
+        }
+        else {
             // unknown top-level key — skip a value (best-effort)
             if (j.peek_('"')) (void)j.parse_string_();
             else if (j.peek_('{')) {
@@ -224,12 +248,18 @@ inline void parse_manifest_(std::string const &raw,
  *  allocation.  Throws std::runtime_error on any I/O or format error.
  */
 class mace_weights_t {
-public:
+  public:
     mace_weights_t() = default;
     mace_weights_t(mace_weights_t const &) = delete;
     mace_weights_t &operator=(mace_weights_t const &) = delete;
     mace_weights_t(mace_weights_t &&other) noexcept { swap_(other); }
-    mace_weights_t &operator=(mace_weights_t &&other) noexcept { if (&other != this) { free_(); swap_(other); } return *this; }
+    mace_weights_t &operator=(mace_weights_t &&other) noexcept {
+        if (&other != this) {
+            free_();
+            swap_(other);
+        }
+        return *this;
+    }
     ~mace_weights_t() { free_(); }
 
     /** Load weights and resolve @ref mace_weights_device_t pointers. */
@@ -238,7 +268,7 @@ public:
         std::ifstream f(path, std::ios::binary);
         if (!f) throw std::runtime_error("mace_weights: cannot open " + path);
 
-        mace_detail_::preamble_t pre{};
+        mace_detail_::preamble_t pre {};
         f.read(reinterpret_cast<char *>(&pre), sizeof(pre));
         if (std::memcmp(pre.magic, "SF_MACE\0", 8) != 0) throw std::runtime_error("mace_weights: bad magic in " + path);
         if (pre.version != 1u) throw std::runtime_error("mace_weights: unsupported version");
@@ -254,22 +284,21 @@ public:
         std::vector<mace_detail_::manifest_entry_t> tensors;
         mace_detail_::parse_manifest_(manifest_raw, hnum, hstr, tensors);
 
-        arch_.n_elements        = static_cast<std::uint32_t>(hnum.at("n_elements"));
-        arch_.n_radial          = static_cast<std::uint32_t>(hnum.at("n_radial"));
-        arch_.n_channels        = static_cast<std::uint32_t>(hnum.at("n_channels"));
-        arch_.n_irreps_msg      = static_cast<std::uint32_t>(hnum.at("n_irreps_msg"));
-        arch_.l_max             = static_cast<std::uint32_t>(hnum.at("L_max"));
+        arch_.n_elements = static_cast<std::uint32_t>(hnum.at("n_elements"));
+        arch_.n_radial = static_cast<std::uint32_t>(hnum.at("n_radial"));
+        arch_.n_channels = static_cast<std::uint32_t>(hnum.at("n_channels"));
+        arch_.n_irreps_msg = static_cast<std::uint32_t>(hnum.at("n_irreps_msg"));
+        arch_.l_max = static_cast<std::uint32_t>(hnum.at("L_max"));
         arch_.correlation_order = static_cast<std::uint32_t>(hnum.at("correlation_order"));
-        arch_.num_interactions  = static_cast<std::uint32_t>(hnum.at("num_interactions"));
-        arch_.scale             = static_cast<float>(hnum.at("scale"));
-        arch_.shift             = static_cast<float>(hnum.at("shift"));
-        arch_.cutoff_p          = static_cast<float>(hnum.at("cutoff_p"));
-        arch_.r_max             = static_cast<float>(hnum.at("r_max"));
-        arch_.bessel_prefactor  = static_cast<float>(hnum.at("bessel_prefactor"));
+        arch_.num_interactions = static_cast<std::uint32_t>(hnum.at("num_interactions"));
+        arch_.scale = static_cast<float>(hnum.at("scale"));
+        arch_.shift = static_cast<float>(hnum.at("shift"));
+        arch_.cutoff_p = static_cast<float>(hnum.at("cutoff_p"));
+        arch_.r_max = static_cast<float>(hnum.at("r_max"));
+        arch_.bessel_prefactor = static_cast<float>(hnum.at("bessel_prefactor"));
         // avg_num_neighbors was added in v1 schema; fall back to 1.0 for older blobs.
-        arch_.avg_num_neighbors = hnum.count("avg_num_neighbors")
-                                  ? static_cast<float>(hnum.at("avg_num_neighbors"))
-                                  : 1.0f;
+        arch_.avg_num_neighbors = hnum.count("avg_num_neighbors") ? static_cast<float>(hnum.at("avg_num_neighbors"))
+                                                                  : 1.0f;
 
         // Read every tensor as fp64 from the file, downcast to fp32 in a host scratch buffer.
         // Build a map from tensor name to (host_offset, n_elements).
@@ -291,7 +320,8 @@ public:
                 if (t.name == "atomic_numbers") host_atomic_numbers = std::move(tmp);
                 continue;
             }
-            if (t.dtype != "float64") throw std::runtime_error("mace_weights: unexpected dtype " + t.dtype + " for " + t.name);
+            if (t.dtype != "float64")
+                throw std::runtime_error("mace_weights: unexpected dtype " + t.dtype + " for " + t.name);
             std::vector<double> tmp(n);
             f.read(reinterpret_cast<char *>(tmp.data()), static_cast<std::streamsize>(n * sizeof(double)));
             std::uint64_t host_offset = host_blob.size();
@@ -302,8 +332,10 @@ public:
 
         // Allocate device blobs and copy
         if (!host_atomic_numbers.empty()) {
-            cudaMalloc(reinterpret_cast<void **>(&d_atomic_numbers_), host_atomic_numbers.size() * sizeof(std::int64_t));
-            cudaMemcpy(d_atomic_numbers_, host_atomic_numbers.data(), host_atomic_numbers.size() * sizeof(std::int64_t), cudaMemcpyHostToDevice);
+            cudaMalloc(reinterpret_cast<void **>(&d_atomic_numbers_),
+                       host_atomic_numbers.size() * sizeof(std::int64_t));
+            cudaMemcpy(d_atomic_numbers_, host_atomic_numbers.data(), host_atomic_numbers.size() * sizeof(std::int64_t),
+                       cudaMemcpyHostToDevice);
         }
         cudaMalloc(reinterpret_cast<void **>(&d_blob_), host_blob.size() * sizeof(float));
         cudaMemcpy(d_blob_, host_blob.data(), host_blob.size() * sizeof(float), cudaMemcpyHostToDevice);
@@ -315,27 +347,27 @@ public:
             if (it == name_to_offset_count.end()) return nullptr;
             return d_blob_ + it->second.first;
         };
-        wd_.atomic_numbers   = d_atomic_numbers_;
-        wd_.atomic_energies  = pos("atomic_energies");
-        wd_.bessel_weights   = pos("bessel_weights");
-        wd_.node_embedding   = pos("node_embedding.weight");
+        wd_.atomic_numbers = d_atomic_numbers_;
+        wd_.atomic_energies = pos("atomic_energies");
+        wd_.bessel_weights = pos("bessel_weights");
+        wd_.node_embedding = pos("node_embedding.weight");
         for (std::uint32_t k = 0; k < arch_.num_interactions && k < 2u; ++k) {
             auto &L = wd_.layers[k];
             std::string base = "interactions." + std::to_string(k);
-            L.linear_up_w     = pos((base + ".linear_up.weight").c_str());
-            L.radial_mlp_w0   = pos((base + ".conv_tp_weights.layer0.weight").c_str());
-            L.radial_mlp_w1   = pos((base + ".conv_tp_weights.layer1.weight").c_str());
-            L.radial_mlp_w2   = pos((base + ".conv_tp_weights.layer2.weight").c_str());
-            L.radial_mlp_w3   = pos((base + ".conv_tp_weights.layer3.weight").c_str());
+            L.linear_up_w = pos((base + ".linear_up.weight").c_str());
+            L.radial_mlp_w0 = pos((base + ".conv_tp_weights.layer0.weight").c_str());
+            L.radial_mlp_w1 = pos((base + ".conv_tp_weights.layer1.weight").c_str());
+            L.radial_mlp_w2 = pos((base + ".conv_tp_weights.layer2.weight").c_str());
+            L.radial_mlp_w3 = pos((base + ".conv_tp_weights.layer3.weight").c_str());
             L.linear_post_tp_w = pos((base + ".linear.weight").c_str());
-            L.skip_tp_w       = pos((base + ".skip_tp.weight").c_str());
+            L.skip_tp_w = pos((base + ".skip_tp.weight").c_str());
             std::string pbase = "products." + std::to_string(k);
-            L.u_matrix_1      = pos((pbase + ".U_matrix_1").c_str());
-            L.u_matrix_2      = pos((pbase + ".U_matrix_2").c_str());
-            L.u_matrix_3      = pos((pbase + ".U_matrix_3").c_str());
-            L.weights_max     = pos((pbase + ".weights_max").c_str());
-            L.weights_lo_0    = pos((pbase + ".weights.0").c_str());
-            L.weights_lo_1    = pos((pbase + ".weights.1").c_str());
+            L.u_matrix_1 = pos((pbase + ".U_matrix_1").c_str());
+            L.u_matrix_2 = pos((pbase + ".U_matrix_2").c_str());
+            L.u_matrix_3 = pos((pbase + ".U_matrix_3").c_str());
+            L.weights_max = pos((pbase + ".weights_max").c_str());
+            L.weights_lo_0 = pos((pbase + ".weights.0").c_str());
+            L.weights_lo_1 = pos((pbase + ".weights.1").c_str());
             L.product_linear_w = pos((pbase + ".linear.weight").c_str());
         }
         wd_.readout_linear_w = pos("readouts.0.linear.weight");
@@ -349,7 +381,7 @@ public:
     types::mace_weights_device_t const &device() const noexcept { return wd_; }
     std::size_t device_bytes() const noexcept { return d_blob_count_ * sizeof(float); }
 
-private:
+  private:
     void swap_(mace_weights_t &o) noexcept {
         std::swap(arch_, o.arch_);
         std::swap(wd_, o.wd_);
@@ -367,8 +399,8 @@ private:
         arch_ = {};
     }
 
-    types::mace_arch_t arch_{};
-    types::mace_weights_device_t wd_{};
+    types::mace_arch_t arch_ {};
+    types::mace_weights_device_t wd_ {};
     float *d_blob_ = nullptr;
     std::int64_t *d_atomic_numbers_ = nullptr;
     std::size_t d_blob_count_ = 0;

@@ -72,7 +72,7 @@ struct relax_config_t {
  *  call.
  */
 class weights_t {
-public:
+  public:
     weights_t();
     ~weights_t();
     weights_t(weights_t &&) noexcept;
@@ -95,7 +95,7 @@ public:
     /** @brief Internal device-side weights handle for the kernel driver. */
     void const *device_weights() const noexcept;
 
-private:
+  private:
     struct impl_t;
     std::unique_ptr<impl_t> p_;
 };
@@ -112,15 +112,15 @@ private:
  *  is the caller's responsibility.
  */
 struct batch_view_t {
-    std::uint32_t n_atoms;       ///< Total atoms across all conformers.
-    std::uint32_t n_edges;       ///< Total edges across all conformers.
-    std::uint32_t n_graphs;      ///< Number of conformers in this batch.
+    std::uint32_t n_atoms;  ///< Total atoms across all conformers.
+    std::uint32_t n_edges;  ///< Total edges across all conformers.
+    std::uint32_t n_graphs; ///< Number of conformers in this batch.
 
-    float const *positions_xyz;            ///< [n_atoms × 3], fp32
-    std::int32_t const *atom_element;      ///< [n_atoms], element index in [0, n_elements)
-    std::int32_t const *edge_source_atom;  ///< [n_edges]
-    std::int32_t const *edge_target_atom;  ///< [n_edges]
-    std::int32_t const *graph_of_atom;     ///< [n_atoms], conformer index in [0, n_graphs)
+    float const *positions_xyz;           ///< [n_atoms × 3], fp32
+    std::int32_t const *atom_element;     ///< [n_atoms], element index in [0, n_elements)
+    std::int32_t const *edge_source_atom; ///< [n_edges]
+    std::int32_t const *edge_target_atom; ///< [n_edges]
+    std::int32_t const *graph_of_atom;    ///< [n_atoms], conformer index in [0, n_graphs)
 
     /** @brief Optional pre-sorted segment ranges enabling the segmented
      *  conv_tp+scatter fast path.  When non-null, `receiver_edge_segment_start[a]`
@@ -150,15 +150,15 @@ using cudaStream_t = void *;
  *  many inference calls.
  */
 class context_t {
-public:
+  public:
     /**
      *  @param[in] device_id GPU to run on (default 0).
      *  @param[in] max_atoms Upper bound on `batch_view_t::n_atoms` for any call.
      *  @param[in] max_edges Upper bound on `batch_view_t::n_edges`.
      *  @param[in] max_graphs Upper bound on `batch_view_t::n_graphs`.
      */
-    context_t(int device_id, smallfield::types::mace_arch_t const &arch,
-              std::uint32_t max_atoms, std::uint32_t max_edges, std::uint32_t max_graphs);
+    context_t(int device_id, smallfield::types::mace_arch_t const &arch, std::uint32_t max_atoms,
+              std::uint32_t max_edges, std::uint32_t max_graphs);
     ~context_t();
     context_t(context_t &&) noexcept;
     context_t &operator=(context_t &&) noexcept;
@@ -170,9 +170,7 @@ public:
      *
      *  @param[out] energies_out Device-resident output buffer, [n_graphs] fp32.
      */
-    [[nodiscard]] status_t infer_energy(weights_t const &weights,
-                                         batch_view_t const &batch,
-                                         float *energies_out);
+    [[nodiscard]] status_t infer_energy(weights_t const &weights, batch_view_t const &batch, float *energies_out);
 
     /**
      *  @brief Forward + analytic-adjoint backward — energies and per-atom forces.
@@ -181,10 +179,8 @@ public:
      *  @param[out] forces_out [n_atoms × 3] fp32, device-resident.  May be
      *                        nullptr to skip the backward pass.
      */
-    [[nodiscard]] status_t infer_energy_and_forces(weights_t const &weights,
-                                                    batch_view_t const &batch,
-                                                    float *energies_out,
-                                                    float *forces_out);
+    [[nodiscard]] status_t infer_energy_and_forces(weights_t const &weights, batch_view_t const &batch,
+                                                   float *energies_out, float *forces_out);
 
     /**
      *  @brief Batched LBFGS relaxation: N steps in place on the position
@@ -196,16 +192,13 @@ public:
      *  @param[in,out] positions_xyz_inout [n_atoms × 3] fp32 device-resident.
      *  @param[out]    energies_out        [n_graphs]    fp32 device-resident.
      */
-    [[nodiscard]] status_t refine_batch(weights_t const &weights,
-                                         batch_view_t batch,
-                                         relax_config_t const &config,
-                                         float *positions_xyz_inout,
-                                         float *energies_out);
+    [[nodiscard]] status_t refine_batch(weights_t const &weights, batch_view_t batch, relax_config_t const &config,
+                                        float *positions_xyz_inout, float *energies_out);
 
     /** @brief CUDA stream the context schedules its work on. */
     cudaStream_t stream() const noexcept;
 
-private:
+  private:
     struct impl_t;
     std::unique_ptr<impl_t> p_;
 };

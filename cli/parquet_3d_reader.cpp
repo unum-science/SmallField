@@ -29,29 +29,27 @@ std::shared_ptr<ArrowArrayT> resolve_column_(arrow::Table const &table, std::str
 
 } // namespace
 
-bool read_conformer_shard(std::filesystem::path const &path,
-                          conformer_shard_data_t &out) {
+bool read_conformer_shard(std::filesystem::path const &path, conformer_shard_data_t &out) {
     auto open_result = arrow::io::ReadableFile::Open(path.string());
     if (!open_result.ok()) {
-        std::fprintf(stderr, "[smallfield_mace_refine] open failed: %s: %s\n",
-                     path.string().c_str(), open_result.status().message().c_str());
+        std::fprintf(stderr, "[smallfield_mace_refine] open failed: %s: %s\n", path.string().c_str(),
+                     open_result.status().message().c_str());
         return false;
     }
 
     std::unique_ptr<parquet::arrow::FileReader> reader;
-    auto pq_status = parquet::arrow::OpenFile(open_result.ValueUnsafe(),
-                                              arrow::default_memory_pool(), &reader);
+    auto pq_status = parquet::arrow::OpenFile(open_result.ValueUnsafe(), arrow::default_memory_pool(), &reader);
     if (!pq_status.ok()) {
-        std::fprintf(stderr, "[smallfield_mace_refine] parquet open failed: %s: %s\n",
-                     path.string().c_str(), pq_status.message().c_str());
+        std::fprintf(stderr, "[smallfield_mace_refine] parquet open failed: %s: %s\n", path.string().c_str(),
+                     pq_status.message().c_str());
         return false;
     }
 
     std::shared_ptr<arrow::Table> table;
     auto read_status = reader->ReadTable(&table);
     if (!read_status.ok() || !table) {
-        std::fprintf(stderr, "[smallfield_mace_refine] read failed: %s: %s\n",
-                     path.string().c_str(), read_status.message().c_str());
+        std::fprintf(stderr, "[smallfield_mace_refine] read failed: %s: %s\n", path.string().c_str(),
+                     read_status.message().c_str());
         return false;
     }
 
@@ -74,21 +72,22 @@ bool read_conformer_shard(std::filesystem::path const &path,
     out.row_atom_offsets.reserve(num_rows + 1);
     out.row_atom_offsets.push_back(0);
 
-    auto smiles_arr   = resolve_column_<arrow::StringArray>(*table, "smiles");
+    auto smiles_arr = resolve_column_<arrow::StringArray>(*table, "smiles");
     auto num_atoms_arr = resolve_column_<arrow::UInt8Array>(*table, "num_atoms");
-    auto status_arr   = resolve_column_<arrow::UInt8Array>(*table, "status");
-    auto solver_arr   = resolve_column_<arrow::UInt8Array>(*table, "solver");
+    auto status_arr = resolve_column_<arrow::UInt8Array>(*table, "status");
+    auto solver_arr = resolve_column_<arrow::UInt8Array>(*table, "solver");
     auto conf_idx_arr = resolve_column_<arrow::UInt8Array>(*table, "conformer_index");
     auto input_shard_arr = resolve_column_<arrow::StringArray>(*table, "input_shard");
-    auto input_row_arr   = resolve_column_<arrow::UInt64Array>(*table, "input_row");
-    auto energy_arr      = resolve_column_<arrow::FloatArray>(*table, "energy_kcal_per_mol");
-    auto coord_list_arr  = resolve_column_<arrow::ListArray>(*table, "coordinates_xyz");
+    auto input_row_arr = resolve_column_<arrow::UInt64Array>(*table, "input_row");
+    auto energy_arr = resolve_column_<arrow::FloatArray>(*table, "energy_kcal_per_mol");
+    auto coord_list_arr = resolve_column_<arrow::ListArray>(*table, "coordinates_xyz");
 
-    bool const minimum_columns_present =
-        smiles_arr && num_atoms_arr && status_arr && coord_list_arr;
+    bool const minimum_columns_present = smiles_arr && num_atoms_arr && status_arr && coord_list_arr;
     if (!minimum_columns_present) {
-        std::fprintf(stderr, "[smallfield_mace_refine] %s missing required columns "
-                     "(smiles / num_atoms / status / coordinates_xyz)\n", path.string().c_str());
+        std::fprintf(
+            stderr,
+            "[smallfield_mace_refine] %s missing required columns " "(smiles / num_atoms / status / coordinates_xyz)\n",
+            path.string().c_str());
         return false;
     }
 
@@ -117,16 +116,15 @@ bool read_conformer_shard(std::filesystem::path const &path,
         out.num_atoms_per_row.push_back(n_atoms);
         out.status_per_row.push_back(status_arr->Value(static_cast<std::int64_t>(i)));
         out.solver_per_row.push_back(solver_arr ? solver_arr->Value(static_cast<std::int64_t>(i)) : 0u);
-        out.conformer_index_per_row.push_back(
-            conf_idx_arr ? conf_idx_arr->Value(static_cast<std::int64_t>(i)) : 0u);
+        out.conformer_index_per_row.push_back(conf_idx_arr ? conf_idx_arr->Value(static_cast<std::int64_t>(i)) : 0u);
         out.input_shard_per_row.emplace_back(
             input_shard_arr ? std::string(input_shard_arr->Value(static_cast<std::int64_t>(i))) : "");
-        out.input_row_per_row.push_back(
-            input_row_arr ? input_row_arr->Value(static_cast<std::int64_t>(i)) : 0ull);
+        out.input_row_per_row.push_back(input_row_arr ? input_row_arr->Value(static_cast<std::int64_t>(i)) : 0ull);
         if (energy_arr && !energy_arr->IsNull(static_cast<std::int64_t>(i))) {
             out.baseline_energy_per_row.push_back(energy_arr->Value(static_cast<std::int64_t>(i)));
             out.baseline_energy_null_per_row.push_back(false);
-        } else {
+        }
+        else {
             out.baseline_energy_per_row.push_back(0.0f);
             out.baseline_energy_null_per_row.push_back(true);
         }

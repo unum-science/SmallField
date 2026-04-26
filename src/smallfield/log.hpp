@@ -62,8 +62,7 @@ template <typename integer_>
 inline std::string thousands(integer_ v) {
     if constexpr (std::is_signed_v<integer_>)
         return fmt::format(grouping_locale(), "{:L}", static_cast<std::int64_t>(v));
-    else
-        return fmt::format(grouping_locale(), "{:L}", static_cast<std::uint64_t>(v));
+    else return fmt::format(grouping_locale(), "{:L}", static_cast<std::uint64_t>(v));
 }
 
 /** @brief Wall-clock `time_point` formatted as "YYYY-MM-DD HH:MM:SS" in local time. */

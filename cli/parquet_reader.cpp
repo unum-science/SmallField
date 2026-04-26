@@ -26,7 +26,8 @@ bool read_shard(fs::path const &path, std::string const &smiles_column, shard_da
     auto infile = open_result.ValueOrDie();
 
     // Build the Arrow reader through the Builder pattern so we can attach ArrowReaderProperties.
-    // Leaving pre_buffer at its default value keeps behavior unchanged; enabling it is deferred until the async-IO path is validated.
+    // Leaving pre_buffer at its default value keeps behavior unchanged; enabling it is deferred until the async-IO path
+    // is validated.
     parquet::arrow::FileReaderBuilder builder;
     auto builder_open_status = builder.Open(infile);
     if (!builder_open_status.ok()) {

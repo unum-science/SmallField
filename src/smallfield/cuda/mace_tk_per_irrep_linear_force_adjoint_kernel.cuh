@@ -70,13 +70,13 @@ namespace mace_tk_per_irrep_linear_force_adjoint_detail_ {
 // adjoint matmul) are 96 for MACE-OFF-small.  We bake the small/medium shapes
 // in here because the production deployment only uses these widths; larger
 // configurations (c = 192) need a separate specialization.
-constexpr int atoms_per_cta_k          = 4;
-constexpr int irrep_dim_total_k        = mace_tk::mace_irrep_dim_total_k;     // 16
-constexpr int wgmma_m_rows_k           = atoms_per_cta_k * irrep_dim_total_k; // 64
-constexpr int channels_in_k            = mace_tk::mace_channels_small_k;      // 96
-constexpr int channels_out_k           = mace_tk::mace_channels_small_k;      // 96
-constexpr int irrep_block_count_k      = 4;                                    // L = 0, 1, 2, 3
-constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS;           // 128
+constexpr int atoms_per_cta_k = 4;
+constexpr int irrep_dim_total_k = mace_tk::mace_irrep_dim_total_k;   // 16
+constexpr int wgmma_m_rows_k = atoms_per_cta_k * irrep_dim_total_k;  // 64
+constexpr int channels_in_k = mace_tk::mace_channels_small_k;        // 96
+constexpr int channels_out_k = mace_tk::mace_channels_small_k;       // 96
+constexpr int irrep_block_count_k = 4;                               // L = 0, 1, 2, 3
+constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS; // 128
 
 // Per-block m-range.  Indices into the irrep_dim_total = 16 axis that
 // correspond to L = `irrep_block_index`.  Same canonical L mapping as the
@@ -96,9 +96,9 @@ __device__ __forceinline__ int irrep_block_m_count_(int irrep_block_index) {
 // `[c_in, c_out]` per block (same as the forward kernel).  The output
 // staging tile holds the per-block adjoint accumulator after fp32 → bf16
 // conversion, before we transpose-write back to global.
-using shared_upstream_tile_t      = mace_tk::shared_tile_bf16<wgmma_m_rows_k, channels_out_k>;
-using shared_weight_tile_t        = mace_tk::shared_tile_bf16<channels_in_k, channels_out_k>;
-using shared_grad_input_stage_t   = mace_tk::shared_tile_bf16<wgmma_m_rows_k, channels_in_k>;
+using shared_upstream_tile_t = mace_tk::shared_tile_bf16<wgmma_m_rows_k, channels_out_k>;
+using shared_weight_tile_t = mace_tk::shared_tile_bf16<channels_in_k, channels_out_k>;
+using shared_grad_input_stage_t = mace_tk::shared_tile_bf16<wgmma_m_rows_k, channels_in_k>;
 
 // Per-warpgroup register accumulator for the adjoint.  D = `[64, c_in]` fp32,
 // distributed across 4 warps × 16 rows each → `rt_fl<16, c_in>`.
@@ -129,37 +129,32 @@ struct per_irrep_linear_force_adjoint_scales_t {
  *  defined only on active m-rows; defensively zeroing the tile keeps any
  *  caller-supplied garbage out of the WGMMA accumulator.
  */
-__device__ __forceinline__ void load_upstream_tile_transposed_(
-    shared_upstream_tile_t &dst_upstream_tile,
-    float const *upstream_grad_output_global,
-    std::uint32_t n_atoms,
-    std::uint32_t base_atom_index,
-    std::uint32_t n_channels_out_runtime,
-    std::uint32_t output_irrep_dim_runtime,
-    std::uint32_t active_irrep_block_count
-) {
+__device__ __forceinline__ void load_upstream_tile_transposed_(shared_upstream_tile_t &dst_upstream_tile,
+                                                               float const *upstream_grad_output_global,
+                                                               std::uint32_t n_atoms, std::uint32_t base_atom_index,
+                                                               std::uint32_t n_channels_out_runtime,
+                                                               std::uint32_t output_irrep_dim_runtime,
+                                                               std::uint32_t active_irrep_block_count) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = wgmma_m_rows_k * channels_out_k;
-    int const m_active_max = irrep_block_m_start_(static_cast<int>(active_irrep_block_count) - 1)
-                             + irrep_block_m_count_(static_cast<int>(active_irrep_block_count) - 1);
+    int const m_active_max = irrep_block_m_start_(static_cast<int>(active_irrep_block_count) - 1) +
+                             irrep_block_m_count_(static_cast<int>(active_irrep_block_count) - 1);
 
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
-        int const m_row_in_tile  = linear_index / channels_out_k;
+        int const m_row_in_tile = linear_index / channels_out_k;
         int const channel_out_col = linear_index % channels_out_k;
-        int const atom_in_cta    = m_row_in_tile / irrep_dim_total_k;
-        int const m_in_atom      = m_row_in_tile % irrep_dim_total_k;
+        int const atom_in_cta = m_row_in_tile / irrep_dim_total_k;
+        int const m_in_atom = m_row_in_tile % irrep_dim_total_k;
         std::uint32_t const atom_index = base_atom_index + static_cast<std::uint32_t>(atom_in_cta);
 
         float value = 0.0f;
-        if (atom_index < n_atoms &&
-            static_cast<std::uint32_t>(channel_out_col) < n_channels_out_runtime &&
-            static_cast<std::uint32_t>(m_in_atom)       < output_irrep_dim_runtime &&
-            m_in_atom < m_active_max) {
-            std::uint64_t const offset =
-                (static_cast<std::uint64_t>(atom_index) * n_channels_out_runtime
-                 + static_cast<std::uint32_t>(channel_out_col)) * output_irrep_dim_runtime
-                + static_cast<std::uint32_t>(m_in_atom);
+        if (atom_index < n_atoms && static_cast<std::uint32_t>(channel_out_col) < n_channels_out_runtime &&
+            static_cast<std::uint32_t>(m_in_atom) < output_irrep_dim_runtime && m_in_atom < m_active_max) {
+            std::uint64_t const offset = (static_cast<std::uint64_t>(atom_index) * n_channels_out_runtime +
+                                          static_cast<std::uint32_t>(channel_out_col)) *
+                                             output_irrep_dim_runtime +
+                                         static_cast<std::uint32_t>(m_in_atom);
             value = upstream_grad_output_global[offset];
         }
         dst_upstream_tile[{m_row_in_tile, channel_out_col}] = __float2bfloat16_rn(value);
@@ -173,27 +168,24 @@ __device__ __forceinline__ void load_upstream_tile_transposed_(
  *  same `[n_blocks, c_in, c_out]` blob.  Mirrored here as a private helper to
  *  avoid a cross-include of the forward kernel's anonymous detail namespace.
  */
-__device__ __forceinline__ void load_block_weight_(
-    shared_weight_tile_t &dst_weight_tile,
-    float const *weight_blocks_global,
-    std::uint32_t irrep_block_index,
-    std::uint32_t n_channels_in_runtime,
-    std::uint32_t n_channels_out_runtime
-) {
+__device__ __forceinline__ void load_block_weight_(shared_weight_tile_t &dst_weight_tile,
+                                                   float const *weight_blocks_global, std::uint32_t irrep_block_index,
+                                                   std::uint32_t n_channels_in_runtime,
+                                                   std::uint32_t n_channels_out_runtime) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_in_k * channels_out_k;
-    std::uint64_t const block_base = static_cast<std::uint64_t>(irrep_block_index)
-                                     * n_channels_in_runtime * n_channels_out_runtime;
-    #pragma unroll
+    std::uint64_t const block_base = static_cast<std::uint64_t>(irrep_block_index) * n_channels_in_runtime *
+                                     n_channels_out_runtime;
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
-        int const channel_in_row  = linear_index / channels_out_k;
+        int const channel_in_row = linear_index / channels_out_k;
         int const channel_out_col = linear_index % channels_out_k;
         float value = 0.0f;
-        if (static_cast<std::uint32_t>(channel_in_row)  < n_channels_in_runtime &&
+        if (static_cast<std::uint32_t>(channel_in_row) < n_channels_in_runtime &&
             static_cast<std::uint32_t>(channel_out_col) < n_channels_out_runtime) {
-            std::uint64_t const offset = block_base
-                + static_cast<std::uint64_t>(channel_in_row) * n_channels_out_runtime
-                + static_cast<std::uint32_t>(channel_out_col);
+            std::uint64_t const offset = block_base +
+                                         static_cast<std::uint64_t>(channel_in_row) * n_channels_out_runtime +
+                                         static_cast<std::uint32_t>(channel_out_col);
             value = weight_blocks_global[offset];
         }
         dst_weight_tile[{channel_in_row, channel_out_col}] = __float2bfloat16_rn(value);
@@ -207,16 +199,10 @@ __device__ __forceinline__ void load_block_weight_(
  *  fp32 register tile.  Same scale as the forward — comes from the e3nn
  *  one-instruction-per-output `o3.Linear` path-weight convention.
  */
-__device__ __forceinline__ void scale_accumulator_in_place_(
-    register_accumulator_t &accumulator,
-    float path_weight
-) {
-    kittens::warpgroup::apply(
-        accumulator,
-        accumulator,
-        [path_weight] __device__ (int /*row*/, int /*col*/, float pre) {
-            return pre * path_weight;
-        });
+__device__ __forceinline__ void scale_accumulator_in_place_(register_accumulator_t &accumulator, float path_weight) {
+    kittens::warpgroup::apply(accumulator, accumulator, [path_weight] __device__(int /*row*/, int /*col*/, float pre) {
+        return pre * path_weight;
+    });
 }
 
 /**
@@ -232,36 +218,31 @@ __device__ __forceinline__ void scale_accumulator_in_place_(
  *  Output is overwritten (not accumulated) to match the public ABI.
  */
 __device__ __forceinline__ void store_block_grad_input_transposed_(
-    __nv_bfloat16 *grad_input_global,
-    shared_grad_input_stage_t const &staged_grad_input_tile,
-    std::uint32_t n_atoms,
-    std::uint32_t base_atom_index,
-    std::uint32_t n_channels_in_runtime,
-    std::uint32_t irrep_dim_runtime,
-    int irrep_block_index
-) {
+    __nv_bfloat16 *grad_input_global, shared_grad_input_stage_t const &staged_grad_input_tile, std::uint32_t n_atoms,
+    std::uint32_t base_atom_index, std::uint32_t n_channels_in_runtime, std::uint32_t irrep_dim_runtime,
+    int irrep_block_index) {
     int const thread_id = threadIdx.x;
-    int const m_start   = irrep_block_m_start_(irrep_block_index);
-    int const m_count   = irrep_block_m_count_(irrep_block_index);
+    int const m_start = irrep_block_m_start_(irrep_block_index);
+    int const m_count = irrep_block_m_count_(irrep_block_index);
     int const total_elements = atoms_per_cta_k * static_cast<int>(n_channels_in_runtime) * m_count;
 
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < total_elements; linear_index += warpgroup_thread_count_k) {
         int const atom_in_cta = linear_index / (static_cast<int>(n_channels_in_runtime) * m_count);
         int const within_atom = linear_index % (static_cast<int>(n_channels_in_runtime) * m_count);
-        int const channel_in  = within_atom / m_count;
-        int const m_in_block  = within_atom % m_count;
-        int const m_in_atom   = m_start + m_in_block;
+        int const channel_in = within_atom / m_count;
+        int const m_in_block = within_atom % m_count;
+        int const m_in_atom = m_start + m_in_block;
         std::uint32_t const atom_index = base_atom_index + static_cast<std::uint32_t>(atom_in_cta);
         if (atom_index >= n_atoms) continue;
 
         int const m_row_in_tile = atom_in_cta * irrep_dim_total_k + m_in_atom;
         __nv_bfloat16 const value = staged_grad_input_tile[{m_row_in_tile, channel_in}];
 
-        std::uint64_t const out_offset =
-            (static_cast<std::uint64_t>(atom_index) * n_channels_in_runtime
-             + static_cast<std::uint32_t>(channel_in)) * irrep_dim_runtime
-            + static_cast<std::uint32_t>(m_in_atom);
+        std::uint64_t const out_offset = (static_cast<std::uint64_t>(atom_index) * n_channels_in_runtime +
+                                          static_cast<std::uint32_t>(channel_in)) *
+                                             irrep_dim_runtime +
+                                         static_cast<std::uint32_t>(m_in_atom);
         grad_input_global[out_offset] = value;
     }
 }
@@ -273,14 +254,11 @@ __device__ __forceinline__ void store_block_grad_input_transposed_(
  *  must be zero so downstream consumers see a clean tensor, mirroring the
  *  forward kernel's `output[...] = 0.0f` early-return for inactive blocks.
  */
-__device__ __forceinline__ void zero_inactive_block_m_rows_(
-    __nv_bfloat16 *grad_input_global,
-    std::uint32_t n_atoms,
-    std::uint32_t base_atom_index,
-    std::uint32_t n_channels_in_runtime,
-    std::uint32_t irrep_dim_runtime,
-    std::uint32_t active_irrep_block_count
-) {
+__device__ __forceinline__ void zero_inactive_block_m_rows_(__nv_bfloat16 *grad_input_global, std::uint32_t n_atoms,
+                                                            std::uint32_t base_atom_index,
+                                                            std::uint32_t n_channels_in_runtime,
+                                                            std::uint32_t irrep_dim_runtime,
+                                                            std::uint32_t active_irrep_block_count) {
     int const thread_id = threadIdx.x;
     int const inactive_block_index = static_cast<int>(active_irrep_block_count);
     if (inactive_block_index >= irrep_block_count_k) return;
@@ -290,19 +268,19 @@ __device__ __forceinline__ void zero_inactive_block_m_rows_(
     if (m_inactive_count <= 0) return;
 
     int const total_elements = atoms_per_cta_k * static_cast<int>(n_channels_in_runtime) * m_inactive_count;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < total_elements; linear_index += warpgroup_thread_count_k) {
         int const atom_in_cta = linear_index / (static_cast<int>(n_channels_in_runtime) * m_inactive_count);
         int const within_atom = linear_index % (static_cast<int>(n_channels_in_runtime) * m_inactive_count);
-        int const channel_in  = within_atom / m_inactive_count;
-        int const m_offset    = within_atom % m_inactive_count;
-        int const m_in_atom   = m_inactive_start + m_offset;
+        int const channel_in = within_atom / m_inactive_count;
+        int const m_offset = within_atom % m_inactive_count;
+        int const m_in_atom = m_inactive_start + m_offset;
         std::uint32_t const atom_index = base_atom_index + static_cast<std::uint32_t>(atom_in_cta);
         if (atom_index >= n_atoms) continue;
-        std::uint64_t const out_offset =
-            (static_cast<std::uint64_t>(atom_index) * n_channels_in_runtime
-             + static_cast<std::uint32_t>(channel_in)) * irrep_dim_runtime
-            + static_cast<std::uint32_t>(m_in_atom);
+        std::uint64_t const out_offset = (static_cast<std::uint64_t>(atom_index) * n_channels_in_runtime +
+                                          static_cast<std::uint32_t>(channel_in)) *
+                                             irrep_dim_runtime +
+                                         static_cast<std::uint32_t>(m_in_atom);
         grad_input_global[out_offset] = __float2bfloat16_rn(0.0f);
     }
 }
@@ -318,17 +296,11 @@ __device__ __forceinline__ void zero_inactive_block_m_rows_(
  *  rather than computed.
  */
 inline __global__ void mace_tk_per_irrep_linear_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_channels_out,
-    std::uint32_t output_irrep_dim_runtime,
-    std::uint32_t grad_input_irrep_dim_runtime,
-    std::uint32_t active_irrep_block_count,
-    float const *__restrict__ weight_blocks_global,
-    float const *__restrict__ upstream_grad_output_global,
-    __nv_bfloat16 *__restrict__ grad_input_global,
-    per_irrep_linear_force_adjoint_scales_t scales
-) {
+    std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_channels_out,
+    std::uint32_t output_irrep_dim_runtime, std::uint32_t grad_input_irrep_dim_runtime,
+    std::uint32_t active_irrep_block_count, float const *__restrict__ weight_blocks_global,
+    float const *__restrict__ upstream_grad_output_global, __nv_bfloat16 *__restrict__ grad_input_global,
+    per_irrep_linear_force_adjoint_scales_t scales) {
     extern __shared__ kittens::alignment_dummy raw_shared_memory[];
     kittens::shared_allocator shared_alloc(reinterpret_cast<int *>(&raw_shared_memory[0]));
 
@@ -336,9 +308,9 @@ inline __global__ void mace_tk_per_irrep_linear_force_adjoint_kernel(
     // blocks (loaded once per CTA, reused per block); weight tile is refilled
     // per block; grad-input staging tile is reused per block as the bf16
     // conversion target before the transposed store.
-    shared_upstream_tile_t    &shared_upstream_tile = shared_alloc.allocate<shared_upstream_tile_t>();
-    shared_weight_tile_t      &shared_weight_tile   = shared_alloc.allocate<shared_weight_tile_t>();
-    shared_grad_input_stage_t &shared_stage_tile    = shared_alloc.allocate<shared_grad_input_stage_t>();
+    shared_upstream_tile_t &shared_upstream_tile = shared_alloc.allocate<shared_upstream_tile_t>();
+    shared_weight_tile_t &shared_weight_tile = shared_alloc.allocate<shared_weight_tile_t>();
+    shared_grad_input_stage_t &shared_stage_tile = shared_alloc.allocate<shared_grad_input_stage_t>();
 
     mace_tk::mma_ctx_t<register_accumulator_t> mma_ctx;
     mma_ctx.init(shared_alloc);
@@ -347,35 +319,25 @@ inline __global__ void mace_tk_per_irrep_linear_force_adjoint_kernel(
     if (base_atom_index >= n_atoms) return;
 
     // Stage the per-CTA upstream gradient slab once; reused across all L blocks.
-    load_upstream_tile_transposed_(
-        shared_upstream_tile,
-        upstream_grad_output_global,
-        n_atoms, base_atom_index,
-        n_channels_out, output_irrep_dim_runtime,
-        active_irrep_block_count);
+    load_upstream_tile_transposed_(shared_upstream_tile, upstream_grad_output_global, n_atoms, base_atom_index,
+                                   n_channels_out, output_irrep_dim_runtime, active_irrep_block_count);
     kittens::warpgroup::sync(0);
 
     // Zero inactive-block m-rows up front so subsequent active-block stores
     // overwrite cleanly without a dependency on the previous block's launch.
-    zero_inactive_block_m_rows_(
-        grad_input_global,
-        n_atoms, base_atom_index,
-        n_channels_in, grad_input_irrep_dim_runtime,
-        active_irrep_block_count);
+    zero_inactive_block_m_rows_(grad_input_global, n_atoms, base_atom_index, n_channels_in,
+                                grad_input_irrep_dim_runtime, active_irrep_block_count);
 
     register_accumulator_t accumulator;
 
-    // ---- One WGMMA-with-B-transposed per active L block ----
-    #pragma unroll
+// ---- One WGMMA-with-B-transposed per active L block ----
+#pragma unroll
     for (int irrep_block_index = 0; irrep_block_index < irrep_block_count_k; ++irrep_block_index) {
         if (static_cast<std::uint32_t>(irrep_block_index) >= active_irrep_block_count) break;
 
         // Stage this block's `[c_in, c_out]` weight tile (same layout as forward).
-        load_block_weight_(
-            shared_weight_tile,
-            weight_blocks_global,
-            static_cast<std::uint32_t>(irrep_block_index),
-            n_channels_in, n_channels_out);
+        load_block_weight_(shared_weight_tile, weight_blocks_global, static_cast<std::uint32_t>(irrep_block_index),
+                           n_channels_in, n_channels_out);
         kittens::warpgroup::sync(0);
 
         // D = A * B^T with A = `[64, c_out]` (transposed upstream), B =
@@ -392,12 +354,8 @@ inline __global__ void mace_tk_per_irrep_linear_force_adjoint_kernel(
         kittens::warpgroup::store(shared_stage_tile, accumulator);
         kittens::warpgroup::sync(0);
 
-        store_block_grad_input_transposed_(
-            grad_input_global,
-            shared_stage_tile,
-            n_atoms, base_atom_index,
-            n_channels_in, grad_input_irrep_dim_runtime,
-            irrep_block_index);
+        store_block_grad_input_transposed_(grad_input_global, shared_stage_tile, n_atoms, base_atom_index,
+                                           n_channels_in, grad_input_irrep_dim_runtime, irrep_block_index);
         kittens::warpgroup::sync(0);
     }
 }
@@ -428,16 +386,12 @@ inline __global__ void mace_tk_per_irrep_linear_force_adjoint_kernel(
 /// isn't handled.  Caller MUST check the return and fall back to the fp32
 /// reference path otherwise — the previous void return silently left the
 /// bf16 grad_input buffer with stale data on medium/large models.
-inline bool launch_mace_tk_per_irrep_linear_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_channels_out,
-    std::uint32_t active_irrep_block_count,
-    float const *weight_blocks_fp32,
-    float const *upstream_grad_output_fp32,
-    __nv_bfloat16 *grad_input_bf16,
-    cudaStream_t stream
-) {
+inline bool launch_mace_tk_per_irrep_linear_force_adjoint(std::uint32_t n_atoms, std::uint32_t n_channels_in,
+                                                          std::uint32_t n_channels_out,
+                                                          std::uint32_t active_irrep_block_count,
+                                                          float const *weight_blocks_fp32,
+                                                          float const *upstream_grad_output_fp32,
+                                                          __nv_bfloat16 *grad_input_bf16, cudaStream_t stream) {
     if (n_atoms == 0u) return true;
 
     using namespace mace_tk_per_irrep_linear_force_adjoint_detail_;
@@ -445,12 +399,11 @@ inline bool launch_mace_tk_per_irrep_linear_force_adjoint(
     // The fused adjoint templates the MACE-OFF-small shape (c_in = c_out = 96).
     // Reject explicit so the caller can route to the fp32 reference path
     // for medium (128) and large (224) channel counts.
-    if (n_channels_in  != static_cast<std::uint32_t>(channels_in_k) ||
+    if (n_channels_in != static_cast<std::uint32_t>(channels_in_k) ||
         n_channels_out != static_cast<std::uint32_t>(channels_out_k)) {
         return false;
     }
-    if (active_irrep_block_count == 0u ||
-        active_irrep_block_count > static_cast<std::uint32_t>(irrep_block_count_k)) {
+    if (active_irrep_block_count == 0u || active_irrep_block_count > static_cast<std::uint32_t>(irrep_block_count_k)) {
         return false;
     }
 
@@ -463,12 +416,10 @@ inline bool launch_mace_tk_per_irrep_linear_force_adjoint(
     //   shared_stage_tile      64 x 96 bf16 = 12 KB
     //   ----                                 ------
     //                                        ~42 KB + alignment slack
-    constexpr std::size_t shared_memory_bytes_k = 64 * 1024;  // matches forward's budget
+    constexpr std::size_t shared_memory_bytes_k = 64 * 1024; // matches forward's budget
 
-    cudaFuncSetAttribute(
-        mace_tk_per_irrep_linear_force_adjoint_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_memory_bytes_k));
+    cudaFuncSetAttribute(mace_tk_per_irrep_linear_force_adjoint_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shared_memory_bytes_k));
 
     // The upstream gradient and grad-input both live on the full
     // `[n_atoms, c, 16]` layout — the per-irrep adjoint never operates on a
@@ -476,25 +427,17 @@ inline bool launch_mace_tk_per_irrep_linear_force_adjoint(
     // `product_linear` callers do, because the upstream gradient flowing into
     // `linear_up` from the symmetric contraction is already 16-wide and the
     // grad-input on the input side likewise lives in the 16-wide layout.
-    constexpr std::uint32_t output_irrep_dim_runtime     = static_cast<std::uint32_t>(irrep_dim_total_k);
+    constexpr std::uint32_t output_irrep_dim_runtime = static_cast<std::uint32_t>(irrep_dim_total_k);
     constexpr std::uint32_t grad_input_irrep_dim_runtime = static_cast<std::uint32_t>(irrep_dim_total_k);
 
-    std::uint32_t const n_atom_tiles = (n_atoms + static_cast<std::uint32_t>(atoms_per_cta_k) - 1u)
-                                       / static_cast<std::uint32_t>(atoms_per_cta_k);
+    std::uint32_t const n_atom_tiles = (n_atoms + static_cast<std::uint32_t>(atoms_per_cta_k) - 1u) /
+                                       static_cast<std::uint32_t>(atoms_per_cta_k);
     dim3 const grid(n_atom_tiles, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
     mace_tk_per_irrep_linear_force_adjoint_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
-        n_atoms,
-        n_channels_in,
-        n_channels_out,
-        output_irrep_dim_runtime,
-        grad_input_irrep_dim_runtime,
-        active_irrep_block_count,
-        weight_blocks_fp32,
-        upstream_grad_output_fp32,
-        grad_input_bf16,
-        scales);
+        n_atoms, n_channels_in, n_channels_out, output_irrep_dim_runtime, grad_input_irrep_dim_runtime,
+        active_irrep_block_count, weight_blocks_fp32, upstream_grad_output_fp32, grad_input_bf16, scales);
     return true;
 }
 

@@ -70,9 +70,9 @@ namespace mace_tk_readout_detail_ {
 // 1-wide output dim to 16, and for the nonlinear readout we use the natural
 // hidden_dim = 16.  bf16 WGMMA also requires K to be a multiple of 16 — the
 // MACE-OFF n_channels = 96 satisfies this directly with no padding.
-constexpr int atom_tile_rows_k         = 64;
-constexpr int output_tile_cols_k       = 16;     // 1 (linear) or hidden=16 (nonlinear) padded to 16
-constexpr int nonlinear_hidden_dim_k   = 16;     // MACE-OFF hidden dim of the nonlinear MLP readout
+constexpr int atom_tile_rows_k = 64;
+constexpr int output_tile_cols_k = 16;                               // 1 (linear) or hidden=16 (nonlinear) padded to 16
+constexpr int nonlinear_hidden_dim_k = 16;                           // MACE-OFF hidden dim of the nonlinear MLP readout
 constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS; // 128
 
 // Maximum supported channel count.  MACE-OFF small/medium/large = {96, 128,
@@ -81,15 +81,15 @@ constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS; // 128
 // here (n_channels = 96) — that is the variant Track C5 validates against.
 // Extending to 128 / 192 amounts to instantiating the kernel template with
 // the new constant; the body is shape-agnostic past the WGMMA static checks.
-constexpr int n_channels_small_k       = mace_tk::mace_channels_small_k; // 96
+constexpr int n_channels_small_k = mace_tk::mace_channels_small_k; // 96
 
 // Shared-tile aliases.  All activations and weights live as bf16 in shared
 // memory; accumulators are fp32 in registers.
 using shared_tile_invariants_t = mace_tk::shared_tile_bf16<atom_tile_rows_k, n_channels_small_k>;
-using shared_tile_w_linear_t   = mace_tk::shared_tile_bf16<n_channels_small_k, output_tile_cols_k>;
-using shared_tile_w_mlp_1_t    = mace_tk::shared_tile_bf16<n_channels_small_k, nonlinear_hidden_dim_k>;
-using shared_tile_hidden_t     = mace_tk::shared_tile_bf16<atom_tile_rows_k, nonlinear_hidden_dim_k>;
-using shared_tile_w_mlp_2_t    = mace_tk::shared_tile_bf16<nonlinear_hidden_dim_k, output_tile_cols_k>;
+using shared_tile_w_linear_t = mace_tk::shared_tile_bf16<n_channels_small_k, output_tile_cols_k>;
+using shared_tile_w_mlp_1_t = mace_tk::shared_tile_bf16<n_channels_small_k, nonlinear_hidden_dim_k>;
+using shared_tile_hidden_t = mace_tk::shared_tile_bf16<atom_tile_rows_k, nonlinear_hidden_dim_k>;
+using shared_tile_w_mlp_2_t = mace_tk::shared_tile_bf16<nonlinear_hidden_dim_k, output_tile_cols_k>;
 
 // Per-warpgroup register accumulator.  rt_fl<16, 16> is the canonical
 // 64x16 warpgroup output (each of 4 warps owns 16 rows).
@@ -103,15 +103,12 @@ using register_accumulator_t = kittens::rt_fl<16, output_tile_cols_k>;
  *  rows hold a defined value (zero) we can ignore at the global-store
  *  boundary, mirroring the radial-MLP kernel's approach.
  */
-__device__ __forceinline__ void load_invariants_tile_(
-    shared_tile_invariants_t &dst_invariants_tile,
-    float const *node_scalar_invariants,
-    std::uint32_t n_atoms,
-    std::uint32_t base_atom_index
-) {
+__device__ __forceinline__ void load_invariants_tile_(shared_tile_invariants_t &dst_invariants_tile,
+                                                      float const *node_scalar_invariants, std::uint32_t n_atoms,
+                                                      std::uint32_t base_atom_index) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = atom_tile_rows_k * n_channels_small_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / n_channels_small_k;
         int const col_in_tile = linear_index % n_channels_small_k;
@@ -135,13 +132,11 @@ __device__ __forceinline__ void load_invariants_tile_(
  *  readout is nano-tiny (one per atom-tile per launch) and lets us reuse
  *  the canonical warpgroup matmul plumbing without a hand-rolled matvec.
  */
-__device__ __forceinline__ void load_linear_readout_weight_padded_(
-    shared_tile_w_linear_t &dst_weight_tile,
-    float const *readout_weight
-) {
+__device__ __forceinline__ void load_linear_readout_weight_padded_(shared_tile_w_linear_t &dst_weight_tile,
+                                                                   float const *readout_weight) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = n_channels_small_k * output_tile_cols_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / output_tile_cols_k;
         int const col_in_tile = linear_index % output_tile_cols_k;
@@ -156,13 +151,11 @@ __device__ __forceinline__ void load_linear_readout_weight_padded_(
  *         (full bf16, no padding — hidden_dim = 16 already matches the WGMMA
  *         tile column granularity).
  */
-__device__ __forceinline__ void load_nonlinear_w1_weight_(
-    shared_tile_w_mlp_1_t &dst_weight_tile,
-    float const *mlp_w1_weight
-) {
+__device__ __forceinline__ void load_nonlinear_w1_weight_(shared_tile_w_mlp_1_t &dst_weight_tile,
+                                                          float const *mlp_w1_weight) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = n_channels_small_k * nonlinear_hidden_dim_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / nonlinear_hidden_dim_k;
         int const col_in_tile = linear_index % nonlinear_hidden_dim_k;
@@ -180,13 +173,11 @@ __device__ __forceinline__ void load_nonlinear_w1_weight_(
  *  matvec; we pack it into `[64, 16] @ [16, 16] -> [64, 16]` for the same
  *  reason: column 0 carries the answer, the rest are wasted but cheap.
  */
-__device__ __forceinline__ void load_nonlinear_w2_weight_padded_(
-    shared_tile_w_mlp_2_t &dst_weight_tile,
-    float const *mlp_w2_weight
-) {
+__device__ __forceinline__ void load_nonlinear_w2_weight_padded_(shared_tile_w_mlp_2_t &dst_weight_tile,
+                                                                 float const *mlp_w2_weight) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = nonlinear_hidden_dim_k * output_tile_cols_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / output_tile_cols_k;
         int const col_in_tile = linear_index % output_tile_cols_k;
@@ -204,17 +195,13 @@ __device__ __forceinline__ void load_nonlinear_w2_weight_padded_(
  *  Mirrors the radial-MLP kernel's epilogue but takes the scale as an
  *  argument so the readout's 1/sqrt(c) does not need a separate apply pass.
  */
-__device__ __forceinline__ void apply_silu_normalize2mom_with_scale_in_place_(
-    register_accumulator_t &accumulator,
-    float pre_activation_scale
-) {
+__device__ __forceinline__ void apply_silu_normalize2mom_with_scale_in_place_(register_accumulator_t &accumulator,
+                                                                              float pre_activation_scale) {
     mace_tk::silu_normalize2mom_epilogue_t silu_op;
-    kittens::warpgroup::apply(
-        accumulator,
-        accumulator,
-        [silu_op, pre_activation_scale] __device__ (int /*row*/, int /*col*/, float pre) {
-            return silu_op(pre * pre_activation_scale);
-        });
+    kittens::warpgroup::apply(accumulator, accumulator,
+                              [silu_op, pre_activation_scale] __device__(int /*row*/, int /*col*/, float pre) {
+                                  return silu_op(pre * pre_activation_scale);
+                              });
 }
 
 /**
@@ -223,14 +210,9 @@ __device__ __forceinline__ void apply_silu_normalize2mom_with_scale_in_place_(
  *  Used to fold the linear readout's 1/sqrt(c) and the nonlinear readout's
  *  outer 1/sqrt(hidden) into the post-MMA path before the final atomic-add.
  */
-__device__ __forceinline__ void scale_accumulator_in_place_(
-    register_accumulator_t &accumulator,
-    float scale
-) {
-    kittens::warpgroup::apply(
-        accumulator,
-        accumulator,
-        [scale] __device__ (int /*row*/, int /*col*/, float pre) { return pre * scale; });
+__device__ __forceinline__ void scale_accumulator_in_place_(register_accumulator_t &accumulator, float scale) {
+    kittens::warpgroup::apply(accumulator, accumulator,
+                              [scale] __device__(int /*row*/, int /*col*/, float pre) { return pre * scale; });
 }
 
 /**
@@ -247,12 +229,8 @@ __device__ __forceinline__ void scale_accumulator_in_place_(
  *  add, which compounds across both readouts and the energy reduce.
  */
 __device__ __forceinline__ void accumulate_column_zero_into_global_(
-    float *node_energy_out,
-    mace_tk::shared_tile_fp32<atom_tile_rows_k, output_tile_cols_k> &staging_shared_tile,
-    register_accumulator_t const &accumulator,
-    std::uint32_t n_atoms,
-    std::uint32_t base_atom_index
-) {
+    float *node_energy_out, mace_tk::shared_tile_fp32<atom_tile_rows_k, output_tile_cols_k> &staging_shared_tile,
+    register_accumulator_t const &accumulator, std::uint32_t n_atoms, std::uint32_t base_atom_index) {
     kittens::warpgroup::store(staging_shared_tile, accumulator);
     kittens::warpgroup::sync(0);
 
@@ -273,20 +251,17 @@ __device__ __forceinline__ void accumulate_column_zero_into_global_(
  *  Block: 128 threads (one warpgroup, 4 warps).  Mirrors the radial-MLP
  *  kernel's single-warpgroup persistent shape.
  */
-inline __global__ void mace_tk_readout_linear_kernel(
-    std::uint32_t n_atoms,
-    float const *__restrict__ node_scalar_invariants,
-    float const *__restrict__ readout_weight,
-    float *__restrict__ node_energy_out,
-    float readout_path_scale
-) {
+inline __global__ void mace_tk_readout_linear_kernel(std::uint32_t n_atoms,
+                                                     float const *__restrict__ node_scalar_invariants,
+                                                     float const *__restrict__ readout_weight,
+                                                     float *__restrict__ node_energy_out, float readout_path_scale) {
     extern __shared__ kittens::alignment_dummy raw_shared_memory[];
     kittens::shared_allocator shared_alloc(reinterpret_cast<int *>(&raw_shared_memory[0]));
 
     shared_tile_invariants_t &shared_invariants_tile = shared_alloc.allocate<shared_tile_invariants_t>();
-    shared_tile_w_linear_t   &shared_weight_tile    = shared_alloc.allocate<shared_tile_w_linear_t>();
-    auto                     &shared_staging_tile_fp32 = shared_alloc.allocate<
-        mace_tk::shared_tile_fp32<atom_tile_rows_k, output_tile_cols_k>>();
+    shared_tile_w_linear_t &shared_weight_tile = shared_alloc.allocate<shared_tile_w_linear_t>();
+    auto &shared_staging_tile_fp32 =
+        shared_alloc.allocate<mace_tk::shared_tile_fp32<atom_tile_rows_k, output_tile_cols_k>>();
 
     std::uint32_t const base_atom_index = blockIdx.x * static_cast<std::uint32_t>(atom_tile_rows_k);
     if (base_atom_index >= n_atoms) return;
@@ -303,8 +278,8 @@ inline __global__ void mace_tk_readout_linear_kernel(
 
     scale_accumulator_in_place_(accumulator, readout_path_scale);
 
-    accumulate_column_zero_into_global_(
-        node_energy_out, shared_staging_tile_fp32, accumulator, n_atoms, base_atom_index);
+    accumulate_column_zero_into_global_(node_energy_out, shared_staging_tile_fp32, accumulator, n_atoms,
+                                        base_atom_index);
 }
 
 /**
@@ -320,24 +295,23 @@ inline __global__ void mace_tk_readout_linear_kernel(
  *  then re-fed as the A tile of the second matmul.  No DRAM round-trip on
  *  the hidden vector.
  */
-inline __global__ void mace_tk_readout_nonlinear_mlp_kernel(
-    std::uint32_t n_atoms,
-    float const *__restrict__ node_scalar_invariants,
-    float const *__restrict__ mlp_w1_weight,
-    float const *__restrict__ mlp_w2_weight,
-    float *__restrict__ node_energy_out,
-    float pre_activation_scale,    // 1 / sqrt(n_channels)
-    float output_scale             // 1 / sqrt(hidden_dim)
+inline __global__ void mace_tk_readout_nonlinear_mlp_kernel(std::uint32_t n_atoms,
+                                                            float const *__restrict__ node_scalar_invariants,
+                                                            float const *__restrict__ mlp_w1_weight,
+                                                            float const *__restrict__ mlp_w2_weight,
+                                                            float *__restrict__ node_energy_out,
+                                                            float pre_activation_scale, // 1 / sqrt(n_channels)
+                                                            float output_scale          // 1 / sqrt(hidden_dim)
 ) {
     extern __shared__ kittens::alignment_dummy raw_shared_memory[];
     kittens::shared_allocator shared_alloc(reinterpret_cast<int *>(&raw_shared_memory[0]));
 
     shared_tile_invariants_t &shared_invariants_tile = shared_alloc.allocate<shared_tile_invariants_t>();
-    shared_tile_w_mlp_1_t    &shared_w1_tile         = shared_alloc.allocate<shared_tile_w_mlp_1_t>();
-    shared_tile_hidden_t     &shared_hidden_tile     = shared_alloc.allocate<shared_tile_hidden_t>();
-    shared_tile_w_mlp_2_t    &shared_w2_tile         = shared_alloc.allocate<shared_tile_w_mlp_2_t>();
-    auto                     &shared_staging_tile_fp32 = shared_alloc.allocate<
-        mace_tk::shared_tile_fp32<atom_tile_rows_k, output_tile_cols_k>>();
+    shared_tile_w_mlp_1_t &shared_w1_tile = shared_alloc.allocate<shared_tile_w_mlp_1_t>();
+    shared_tile_hidden_t &shared_hidden_tile = shared_alloc.allocate<shared_tile_hidden_t>();
+    shared_tile_w_mlp_2_t &shared_w2_tile = shared_alloc.allocate<shared_tile_w_mlp_2_t>();
+    auto &shared_staging_tile_fp32 =
+        shared_alloc.allocate<mace_tk::shared_tile_fp32<atom_tile_rows_k, output_tile_cols_k>>();
 
     std::uint32_t const base_atom_index = blockIdx.x * static_cast<std::uint32_t>(atom_tile_rows_k);
     if (base_atom_index >= n_atoms) return;
@@ -365,8 +339,8 @@ inline __global__ void mace_tk_readout_nonlinear_mlp_kernel(
 
     scale_accumulator_in_place_(accumulator, output_scale);
 
-    accumulate_column_zero_into_global_(
-        node_energy_out, shared_staging_tile_fp32, accumulator, n_atoms, base_atom_index);
+    accumulate_column_zero_into_global_(node_energy_out, shared_staging_tile_fp32, accumulator, n_atoms,
+                                        base_atom_index);
 }
 
 } // namespace mace_tk_readout_detail_
@@ -390,18 +364,11 @@ inline __global__ void mace_tk_readout_nonlinear_mlp_kernel(
  */
 /// Returns true on successful launch, false if the channel count isn't
 /// handled (caller must fall back to the fp32 reference path).
-inline bool launch_mace_tk_readout_linear(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    float const *node_scalar_invariants_fp32,
-    float const *readout_weight_fp32,
-    float *node_energy_out_fp32,
-    cudaStream_t stream
-) {
+inline bool launch_mace_tk_readout_linear(std::uint32_t n_atoms, std::uint32_t n_channels,
+                                          float const *node_scalar_invariants_fp32, float const *readout_weight_fp32,
+                                          float *node_energy_out_fp32, cudaStream_t stream) {
     if (n_atoms == 0u) return true;
-    if (n_channels != static_cast<std::uint32_t>(mace_tk_readout_detail_::n_channels_small_k)) {
-        return false;
-    }
+    if (n_channels != static_cast<std::uint32_t>(mace_tk_readout_detail_::n_channels_small_k)) { return false; }
 
     using namespace mace_tk_readout_detail_;
 
@@ -415,22 +382,16 @@ inline bool launch_mace_tk_readout_linear(
     //                                       ~19 KB + alignment slack
     constexpr std::size_t shared_memory_bytes_k = 32 * 1024;
 
-    cudaFuncSetAttribute(
-        mace_tk_readout_linear_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_memory_bytes_k));
+    cudaFuncSetAttribute(mace_tk_readout_linear_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shared_memory_bytes_k));
 
-    std::uint32_t const n_atom_tiles = (n_atoms + static_cast<std::uint32_t>(atom_tile_rows_k) - 1u)
-                                       / static_cast<std::uint32_t>(atom_tile_rows_k);
+    std::uint32_t const n_atom_tiles = (n_atoms + static_cast<std::uint32_t>(atom_tile_rows_k) - 1u) /
+                                       static_cast<std::uint32_t>(atom_tile_rows_k);
     dim3 const grid(n_atom_tiles, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
     mace_tk_readout_linear_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
-        n_atoms,
-        node_scalar_invariants_fp32,
-        readout_weight_fp32,
-        node_energy_out_fp32,
-        readout_path_scale);
+        n_atoms, node_scalar_invariants_fp32, readout_weight_fp32, node_energy_out_fp32, readout_path_scale);
     return true;
 }
 
@@ -451,16 +412,10 @@ inline bool launch_mace_tk_readout_linear(
  */
 /// Returns true on successful launch, false if the channel/hidden tuple
 /// isn't handled (caller must fall back to the fp32 reference path).
-inline bool launch_mace_tk_readout_nonlinear_mlp(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t hidden_dim,
-    float const *node_scalar_invariants_fp32,
-    float const *mlp_w1_fp32,
-    float const *mlp_w2_fp32,
-    float *node_energy_out_fp32,
-    cudaStream_t stream
-) {
+inline bool launch_mace_tk_readout_nonlinear_mlp(std::uint32_t n_atoms, std::uint32_t n_channels,
+                                                 std::uint32_t hidden_dim, float const *node_scalar_invariants_fp32,
+                                                 float const *mlp_w1_fp32, float const *mlp_w2_fp32,
+                                                 float *node_energy_out_fp32, cudaStream_t stream) {
     if (n_atoms == 0u) return true;
     if (n_channels != static_cast<std::uint32_t>(mace_tk_readout_detail_::n_channels_small_k)) return false;
     if (hidden_dim != static_cast<std::uint32_t>(mace_tk_readout_detail_::nonlinear_hidden_dim_k)) return false;
@@ -468,7 +423,7 @@ inline bool launch_mace_tk_readout_nonlinear_mlp(
     using namespace mace_tk_readout_detail_;
 
     float const pre_activation_scale = 1.0f / sqrtf(static_cast<float>(n_channels));
-    float const output_scale         = 1.0f / sqrtf(static_cast<float>(hidden_dim));
+    float const output_scale = 1.0f / sqrtf(static_cast<float>(hidden_dim));
 
     // Shared-mem footprint:
     //   invariants_tile     64 x 96  bf16 = 12 KB
@@ -480,23 +435,16 @@ inline bool launch_mace_tk_readout_nonlinear_mlp(
     //                                         ~22 KB + alignment slack
     constexpr std::size_t shared_memory_bytes_k = 48 * 1024;
 
-    cudaFuncSetAttribute(
-        mace_tk_readout_nonlinear_mlp_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_memory_bytes_k));
+    cudaFuncSetAttribute(mace_tk_readout_nonlinear_mlp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shared_memory_bytes_k));
 
-    std::uint32_t const n_atom_tiles = (n_atoms + static_cast<std::uint32_t>(atom_tile_rows_k) - 1u)
-                                       / static_cast<std::uint32_t>(atom_tile_rows_k);
+    std::uint32_t const n_atom_tiles = (n_atoms + static_cast<std::uint32_t>(atom_tile_rows_k) - 1u) /
+                                       static_cast<std::uint32_t>(atom_tile_rows_k);
     dim3 const grid(n_atom_tiles, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
     mace_tk_readout_nonlinear_mlp_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
-        n_atoms,
-        node_scalar_invariants_fp32,
-        mlp_w1_fp32,
-        mlp_w2_fp32,
-        node_energy_out_fp32,
-        pre_activation_scale,
+        n_atoms, node_scalar_invariants_fp32, mlp_w1_fp32, mlp_w2_fp32, node_energy_out_fp32, pre_activation_scale,
         output_scale);
     return true;
 }

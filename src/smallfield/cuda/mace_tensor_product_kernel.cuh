@@ -49,14 +49,13 @@ constexpr std::uint32_t mace_tensor_product_path_count_k = 4u;
  *  e3nn's `TensorProduct.weight` packing for "uvu" mode.
  */
 inline __global__ void mace_tensor_product_kernel(
-    std::uint32_t n_edges,
-    std::uint32_t n_channels,
-    float scale,                                       // e3nn TP path normalisation = 1/sqrt(c_in * 1)
+    std::uint32_t n_edges, std::uint32_t n_channels,
+    float scale, // e3nn TP path normalisation = 1/sqrt(c_in * 1)
     std::int32_t const *edge_source_atom,
-    float const *node_l0_feature,                      // [n_atoms, n_channels]
-    float const *sph_harm,                             // [n_edges, 16]
-    float const *tensor_product_weights_per_edge,     // [n_edges, 4 * n_channels]
-    float *edge_messages                               // [n_edges, n_channels, 16]
+    float const *node_l0_feature,                 // [n_atoms, n_channels]
+    float const *sph_harm,                        // [n_edges, 16]
+    float const *tensor_product_weights_per_edge, // [n_edges, 4 * n_channels]
+    float *edge_messages                          // [n_edges, n_channels, 16]
 ) {
     std::uint32_t edge_index = blockIdx.x;
     std::uint32_t channel_index = blockIdx.y * blockDim.x + threadIdx.x;
@@ -66,10 +65,18 @@ inline __global__ void mace_tensor_product_kernel(
     float const node_l0_feature_value = node_l0_feature[static_cast<std::uint64_t>(src) * n_channels + channel_index];
 
     // Pre-load per-path weights for this (edge, channel).
-    float const path_weight_l0 = tensor_product_weights_per_edge[static_cast<std::uint64_t>(edge_index) * (mace_tensor_product_path_count_k * n_channels) + 0u * n_channels + channel_index];
-    float const path_weight_l1 = tensor_product_weights_per_edge[static_cast<std::uint64_t>(edge_index) * (mace_tensor_product_path_count_k * n_channels) + 1u * n_channels + channel_index];
-    float const path_weight_l2 = tensor_product_weights_per_edge[static_cast<std::uint64_t>(edge_index) * (mace_tensor_product_path_count_k * n_channels) + 2u * n_channels + channel_index];
-    float const path_weight_l3 = tensor_product_weights_per_edge[static_cast<std::uint64_t>(edge_index) * (mace_tensor_product_path_count_k * n_channels) + 3u * n_channels + channel_index];
+    float const path_weight_l0 = tensor_product_weights_per_edge[static_cast<std::uint64_t>(edge_index) *
+                                                                     (mace_tensor_product_path_count_k * n_channels) +
+                                                                 0u * n_channels + channel_index];
+    float const path_weight_l1 = tensor_product_weights_per_edge[static_cast<std::uint64_t>(edge_index) *
+                                                                     (mace_tensor_product_path_count_k * n_channels) +
+                                                                 1u * n_channels + channel_index];
+    float const path_weight_l2 = tensor_product_weights_per_edge[static_cast<std::uint64_t>(edge_index) *
+                                                                     (mace_tensor_product_path_count_k * n_channels) +
+                                                                 2u * n_channels + channel_index];
+    float const path_weight_l3 = tensor_product_weights_per_edge[static_cast<std::uint64_t>(edge_index) *
+                                                                     (mace_tensor_product_path_count_k * n_channels) +
+                                                                 3u * n_channels + channel_index];
 
     std::uint64_t const sph_harm_offset = static_cast<std::uint64_t>(edge_index) * 16u;
     std::uint64_t const output_offset = (static_cast<std::uint64_t>(edge_index) * n_channels + channel_index) * 16u;
@@ -83,7 +90,7 @@ inline __global__ void mace_tensor_product_kernel(
     edge_messages[output_offset + 6] = path_weight_l2 * sph_harm[sph_harm_offset + 6] * scaled_node_l0_feature;
     edge_messages[output_offset + 7] = path_weight_l2 * sph_harm[sph_harm_offset + 7] * scaled_node_l0_feature;
     edge_messages[output_offset + 8] = path_weight_l2 * sph_harm[sph_harm_offset + 8] * scaled_node_l0_feature;
-    edge_messages[output_offset + 9]  = path_weight_l3 * sph_harm[sph_harm_offset + 9]  * scaled_node_l0_feature;
+    edge_messages[output_offset + 9] = path_weight_l3 * sph_harm[sph_harm_offset + 9] * scaled_node_l0_feature;
     edge_messages[output_offset + 10] = path_weight_l3 * sph_harm[sph_harm_offset + 10] * scaled_node_l0_feature;
     edge_messages[output_offset + 11] = path_weight_l3 * sph_harm[sph_harm_offset + 11] * scaled_node_l0_feature;
     edge_messages[output_offset + 12] = path_weight_l3 * sph_harm[sph_harm_offset + 12] * scaled_node_l0_feature;
@@ -92,16 +99,10 @@ inline __global__ void mace_tensor_product_kernel(
     edge_messages[output_offset + 15] = path_weight_l3 * sph_harm[sph_harm_offset + 15] * scaled_node_l0_feature;
 }
 
-inline void launch_mace_tensor_product(
-    types::mace_arch_t const &arch,
-    std::uint32_t n_edges,
-    std::int32_t const *edge_source_atom,
-    float const *node_l0_feature,
-    float const *sph_harm,
-    float const *tensor_product_weights_per_edge,
-    float *edge_messages,
-    cudaStream_t stream
-) {
+inline void launch_mace_tensor_product(types::mace_arch_t const &arch, std::uint32_t n_edges,
+                                       std::int32_t const *edge_source_atom, float const *node_l0_feature,
+                                       float const *sph_harm, float const *tensor_product_weights_per_edge,
+                                       float *edge_messages, cudaStream_t stream) {
     if (n_edges == 0) return;
     constexpr std::uint32_t block_dim_x = 32;
     dim3 const block(block_dim_x, 1, 1);
@@ -112,8 +113,9 @@ inline void launch_mace_tensor_product(
     // overshoot in the opposite direction.  This is one of the two remaining
     // ~0.2 % gaps logged in `MACE_INFERENCE.md`'s Phase-1-followup section.
     float const scale = 1.0f;
-    mace_tensor_product_kernel<<<grid, block, 0, stream>>>(
-        n_edges, arch.n_channels, scale, edge_source_atom, node_l0_feature, sph_harm, tensor_product_weights_per_edge, edge_messages);
+    mace_tensor_product_kernel<<<grid, block, 0, stream>>>(n_edges, arch.n_channels, scale, edge_source_atom,
+                                                           node_l0_feature, sph_harm, tensor_product_weights_per_edge,
+                                                           edge_messages);
 }
 
 /**
@@ -131,9 +133,9 @@ inline void launch_mace_tensor_product(
  */
 inline __global__ void mace_apply_cutoff_envelope_kernel(
     std::uint32_t n_edges,
-    std::uint32_t feature_dim,                          // n_paths * n_channels
-    float const *cutoff_envelope,                       // [n_edges]
-    float *tensor_product_weights_per_edge              // [n_edges, feature_dim] — modified in place
+    std::uint32_t feature_dim,             // n_paths * n_channels
+    float const *cutoff_envelope,          // [n_edges]
+    float *tensor_product_weights_per_edge // [n_edges, feature_dim] — modified in place
 ) {
     std::uint32_t edge_index = blockIdx.x;
     std::uint32_t feature_column_index = blockIdx.y * blockDim.x + threadIdx.x;
@@ -142,18 +144,14 @@ inline __global__ void mace_apply_cutoff_envelope_kernel(
     tensor_product_weights_per_edge[static_cast<std::uint64_t>(edge_index) * feature_dim + feature_column_index] *= cut;
 }
 
-inline void launch_mace_apply_cutoff(
-    std::uint32_t n_edges,
-    std::uint32_t feature_dim,
-    float const *cutoff_envelope,
-    float *tensor_product_weights_per_edge,
-    cudaStream_t stream
-) {
+inline void launch_mace_apply_cutoff(std::uint32_t n_edges, std::uint32_t feature_dim, float const *cutoff_envelope,
+                                     float *tensor_product_weights_per_edge, cudaStream_t stream) {
     if (n_edges == 0) return;
     constexpr std::uint32_t block_dim_x = 64;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_edges, (feature_dim + block_dim_x - 1u) / block_dim_x, 1);
-    mace_apply_cutoff_envelope_kernel<<<grid, block, 0, stream>>>(n_edges, feature_dim, cutoff_envelope, tensor_product_weights_per_edge);
+    mace_apply_cutoff_envelope_kernel<<<grid, block, 0, stream>>>(n_edges, feature_dim, cutoff_envelope,
+                                                                  tensor_product_weights_per_edge);
 }
 
 } // namespace smallfield::cuda

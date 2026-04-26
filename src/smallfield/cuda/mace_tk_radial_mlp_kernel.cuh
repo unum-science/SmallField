@@ -60,38 +60,38 @@ namespace mace_tk_radial_mlp_detail_ {
 // `padded_input_dim_k` = 16 to match the bf16 WGMMA K granularity.  The
 // output dim 384 is emitted as `output_n_tile_count_k` = 6 column tiles of
 // width `mace_radial_hidden_dim_k` = 64 each.
-constexpr int edge_tile_rows_k         = 64;
-constexpr int hidden_dim_k             = mace_tk::mace_radial_hidden_dim_k;          // 64
-constexpr int radial_input_dim_k       = mace_tk::mace_radial_input_dim_k;           // 8
-constexpr int padded_input_dim_k       = 16;                                         // bf16 WGMMA K granularity
-constexpr int output_dim_k             = mace_tk::mace_radial_output_dim_k;          // 384
-constexpr int output_n_tile_count_k    = output_dim_k / hidden_dim_k;                // 6
-constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS;                  // 128
+constexpr int edge_tile_rows_k = 64;
+constexpr int hidden_dim_k = mace_tk::mace_radial_hidden_dim_k;      // 64
+constexpr int radial_input_dim_k = mace_tk::mace_radial_input_dim_k; // 8
+constexpr int padded_input_dim_k = 16;                               // bf16 WGMMA K granularity
+constexpr int output_dim_k = mace_tk::mace_radial_output_dim_k;      // 384
+constexpr int output_n_tile_count_k = output_dim_k / hidden_dim_k;   // 6
+constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS; // 128
 
 // Shared-tile aliases.  All activations and weights live as bf16 in shared
 // memory; the WGMMA accumulator is fp32 in registers (rt_fl).
-using shared_tile_input_t  = mace_tk::shared_tile_bf16<edge_tile_rows_k, padded_input_dim_k>;
+using shared_tile_input_t = mace_tk::shared_tile_bf16<edge_tile_rows_k, padded_input_dim_k>;
 using shared_tile_hidden_t = mace_tk::shared_tile_bf16<edge_tile_rows_k, hidden_dim_k>;
-using shared_tile_w0_t     = mace_tk::shared_tile_bf16<padded_input_dim_k, hidden_dim_k>;
-using shared_tile_w_hh_t   = mace_tk::shared_tile_bf16<hidden_dim_k, hidden_dim_k>;
+using shared_tile_w0_t = mace_tk::shared_tile_bf16<padded_input_dim_k, hidden_dim_k>;
+using shared_tile_w_hh_t = mace_tk::shared_tile_bf16<hidden_dim_k, hidden_dim_k>;
 using shared_tile_w3_col_t = mace_tk::shared_tile_bf16<hidden_dim_k, hidden_dim_k>;
 
 // Per-warpgroup register accumulator.  The warpgroup of 4 warps owns 64 rows
 // (16 each) by `hidden_dim_k` columns of fp32.  rt_bf is used to stage bf16
 // register data when copying weights from global into shared memory.
 using register_accumulator_t = kittens::rt_fl<16, hidden_dim_k>;
-using register_weight_w0_t   = kittens::rt_bf<16, hidden_dim_k>;     // 64x64 across warpgroup, K-padded
-using register_weight_hh_t   = kittens::rt_bf<16, hidden_dim_k>;     // 64x64 across warpgroup
-using register_input_t       = kittens::rt_bf<16, padded_input_dim_k>; // 64x16 across warpgroup
+using register_weight_w0_t = kittens::rt_bf<16, hidden_dim_k>;   // 64x64 across warpgroup, K-padded
+using register_weight_hh_t = kittens::rt_bf<16, hidden_dim_k>;   // 64x64 across warpgroup
+using register_input_t = kittens::rt_bf<16, padded_input_dim_k>; // 64x16 across warpgroup
 
 // Global layouts.  Inputs and weights arrive in fp32; output is bf16.  We
 // expose the "row count" axis as dynamic so the same kernel template handles
 // any edge count; column sizes are static to fold into the swizzle.
-using gl_input_fp32_t   = kittens::gl<float, 1, 1, -1, radial_input_dim_k>;
-using gl_w0_fp32_t      = kittens::gl<float, 1, 1, radial_input_dim_k, hidden_dim_k>;
-using gl_w_hh_fp32_t    = kittens::gl<float, 1, 1, hidden_dim_k, hidden_dim_k>;
-using gl_w3_fp32_t      = kittens::gl<float, 1, 1, hidden_dim_k, output_dim_k>;
-using gl_output_bf16_t  = kittens::gl<__nv_bfloat16, 1, 1, -1, output_dim_k>;
+using gl_input_fp32_t = kittens::gl<float, 1, 1, -1, radial_input_dim_k>;
+using gl_w0_fp32_t = kittens::gl<float, 1, 1, radial_input_dim_k, hidden_dim_k>;
+using gl_w_hh_fp32_t = kittens::gl<float, 1, 1, hidden_dim_k, hidden_dim_k>;
+using gl_w3_fp32_t = kittens::gl<float, 1, 1, hidden_dim_k, output_dim_k>;
+using gl_output_bf16_t = kittens::gl<__nv_bfloat16, 1, 1, -1, output_dim_k>;
 
 /**
  *  @brief Layer-N residual scale factor — `1.0f / sqrtf(in_dim)`.
@@ -117,15 +117,12 @@ struct layer_scale_factors_t {
  *  n_edges`) are also zeroed so the matmul produces zeros that the caller
  *  can ignore at the global-store boundary.
  */
-__device__ __forceinline__ void load_input_tile_padded_(
-    shared_tile_input_t &dst_input_tile,
-    float const *radial_basis_input,
-    std::uint32_t n_edges,
-    std::uint32_t base_edge_index
-) {
+__device__ __forceinline__ void load_input_tile_padded_(shared_tile_input_t &dst_input_tile,
+                                                        float const *radial_basis_input, std::uint32_t n_edges,
+                                                        std::uint32_t base_edge_index) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = edge_tile_rows_k * padded_input_dim_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / padded_input_dim_k;
         int const col_in_tile = linear_index % padded_input_dim_k;
@@ -144,20 +141,16 @@ __device__ __forceinline__ void load_input_tile_padded_(
  *  Pads rows 8..15 with zeros to match `padded_input_dim_k` so the WGMMA
  *  K dimension is a multiple of 16.  Run once per CTA at kernel entry.
  */
-__device__ __forceinline__ void load_layer_0_weight_padded_(
-    shared_tile_w0_t &dst_weight_tile,
-    float const *layer_0_weight
-) {
+__device__ __forceinline__ void load_layer_0_weight_padded_(shared_tile_w0_t &dst_weight_tile,
+                                                            float const *layer_0_weight) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = padded_input_dim_k * hidden_dim_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / hidden_dim_k;
         int const col_in_tile = linear_index % hidden_dim_k;
         float value = 0.0f;
-        if (row_in_tile < radial_input_dim_k) {
-            value = layer_0_weight[row_in_tile * hidden_dim_k + col_in_tile];
-        }
+        if (row_in_tile < radial_input_dim_k) { value = layer_0_weight[row_in_tile * hidden_dim_k + col_in_tile]; }
         dst_weight_tile[{row_in_tile, col_in_tile}] = __float2bfloat16_rn(value);
     }
 }
@@ -166,13 +159,11 @@ __device__ __forceinline__ void load_layer_0_weight_padded_(
  *  @brief Stage a hidden-to-hidden weight `[64, 64]` from fp32 global into
  *         bf16 shared.  Used for layers 1 and 2.
  */
-__device__ __forceinline__ void load_hidden_to_hidden_weight_(
-    shared_tile_w_hh_t &dst_weight_tile,
-    float const *hidden_weight
-) {
+__device__ __forceinline__ void load_hidden_to_hidden_weight_(shared_tile_w_hh_t &dst_weight_tile,
+                                                              float const *hidden_weight) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = hidden_dim_k * hidden_dim_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / hidden_dim_k;
         int const col_in_tile = linear_index % hidden_dim_k;
@@ -188,15 +179,13 @@ __device__ __forceinline__ void load_hidden_to_hidden_weight_(
  *  `output_column_tile_index` selects the 64-wide column slab of the 384-wide
  *  output dimension to load.  Called six times per CTA, once per output tile.
  */
-__device__ __forceinline__ void load_layer_3_weight_column_tile_(
-    shared_tile_w3_col_t &dst_weight_tile,
-    float const *layer_3_weight,
-    int output_column_tile_index
-) {
+__device__ __forceinline__ void load_layer_3_weight_column_tile_(shared_tile_w3_col_t &dst_weight_tile,
+                                                                 float const *layer_3_weight,
+                                                                 int output_column_tile_index) {
     int const thread_id = threadIdx.x;
     int const base_output_col = output_column_tile_index * hidden_dim_k;
     constexpr int tile_elements = hidden_dim_k * hidden_dim_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / hidden_dim_k;
         int const col_in_tile = linear_index % hidden_dim_k;
@@ -213,16 +202,11 @@ __device__ __forceinline__ void load_layer_3_weight_column_tile_(
  *  declared in `mace_tk_tile.cuh`.  Pre-activation values are passed in;
  *  post-activation values are written back into the same register tile.
  */
-__device__ __forceinline__ void apply_silu_normalize2mom_in_place_(
-    register_accumulator_t &accumulator
-) {
+__device__ __forceinline__ void apply_silu_normalize2mom_in_place_(register_accumulator_t &accumulator) {
     mace_tk::silu_normalize2mom_epilogue_t silu_op;
     kittens::warpgroup::apply(
-        accumulator,
-        accumulator,
-        [silu_op] __device__ (int /*row*/, int /*col*/, float pre_activation) {
-            return silu_op(pre_activation);
-        });
+        accumulator, accumulator,
+        [silu_op] __device__(int /*row*/, int /*col*/, float pre_activation) { return silu_op(pre_activation); });
 }
 
 /**
@@ -231,14 +215,9 @@ __device__ __forceinline__ void apply_silu_normalize2mom_in_place_(
  *  Folded into the post-MMA path so we apply the e3nn `_Layer.path_weight`
  *  before silu (matches the fp32 reference path in `mace_linear_kernel.cuh`).
  */
-__device__ __forceinline__ void scale_accumulator_in_place_(
-    register_accumulator_t &accumulator,
-    float scale
-) {
-    kittens::warpgroup::apply(
-        accumulator,
-        accumulator,
-        [scale] __device__ (int /*row*/, int /*col*/, float pre) { return pre * scale; });
+__device__ __forceinline__ void scale_accumulator_in_place_(register_accumulator_t &accumulator, float scale) {
+    kittens::warpgroup::apply(accumulator, accumulator,
+                              [scale] __device__(int /*row*/, int /*col*/, float pre) { return pre * scale; });
 }
 
 /**
@@ -250,14 +229,11 @@ __device__ __forceinline__ void scale_accumulator_in_place_(
  *  tiles.  Instead we stage to a shared bf16 tile and then iterate manually
  *  over rows with an `edge_index < n_edges` guard.
  */
-__device__ __forceinline__ void store_output_tile_with_guard_(
-    __nv_bfloat16 *output_global,
-    shared_tile_hidden_t &staging_shared_tile,
-    register_accumulator_t const &accumulator,
-    std::uint32_t n_edges,
-    std::uint32_t base_edge_index,
-    int output_column_tile_index
-) {
+__device__ __forceinline__ void store_output_tile_with_guard_(__nv_bfloat16 *output_global,
+                                                              shared_tile_hidden_t &staging_shared_tile,
+                                                              register_accumulator_t const &accumulator,
+                                                              std::uint32_t n_edges, std::uint32_t base_edge_index,
+                                                              int output_column_tile_index) {
     // Convert fp32 register tile to bf16 in shared memory (with conversion).
     kittens::warpgroup::store(staging_shared_tile, accumulator);
     kittens::warpgroup::sync(0);
@@ -265,7 +241,7 @@ __device__ __forceinline__ void store_output_tile_with_guard_(
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = edge_tile_rows_k * hidden_dim_k;
     int const base_output_col = output_column_tile_index * hidden_dim_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / hidden_dim_k;
         int const col_in_tile = linear_index % hidden_dim_k;
@@ -287,19 +263,16 @@ __device__ __forceinline__ void store_output_tile_with_guard_(
  *  backward chain (Phase B6) — saves the fp32 forward rerun previously
  *  needed in `mace_inference_run_force_adjoint` (commit `7fc5b11`).
  */
-__device__ __forceinline__ void store_pre_activation_bf16_(
-    __nv_bfloat16 *output_global,
-    shared_tile_w3_col_t &staging_shared_tile,
-    register_accumulator_t const &accumulator,
-    std::uint32_t n_edges,
-    std::uint32_t base_edge_index
-) {
+__device__ __forceinline__ void store_pre_activation_bf16_(__nv_bfloat16 *output_global,
+                                                           shared_tile_w3_col_t &staging_shared_tile,
+                                                           register_accumulator_t const &accumulator,
+                                                           std::uint32_t n_edges, std::uint32_t base_edge_index) {
     kittens::warpgroup::store(staging_shared_tile, accumulator);
     kittens::warpgroup::sync(0);
 
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = edge_tile_rows_k * hidden_dim_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / hidden_dim_k;
         int const col_in_tile = linear_index % hidden_dim_k;
@@ -325,29 +298,24 @@ __device__ __forceinline__ void store_pre_activation_bf16_(
  *  to skip the fp32 forward rerun (Phase B6 of MACE_OPTIMIZATION_ROADMAP.md).
  */
 inline __global__ void mace_tk_radial_mlp_kernel(
-    std::uint32_t n_edges,
-    float const *__restrict__ radial_basis_input,
-    float const *__restrict__ layer_0_weight,
-    float const *__restrict__ layer_1_weight,
-    float const *__restrict__ layer_2_weight,
-    float const *__restrict__ layer_3_weight,
-    __nv_bfloat16 *__restrict__ tensor_product_weights_per_edge,
-    __nv_bfloat16 *__restrict__ pre_act_layer_0_bf16,   // [n_edges, 64] or nullptr
-    __nv_bfloat16 *__restrict__ pre_act_layer_1_bf16,   // [n_edges, 64] or nullptr
-    __nv_bfloat16 *__restrict__ pre_act_layer_2_bf16,   // [n_edges, 64] or nullptr
-    layer_scale_factors_t scales
-) {
+    std::uint32_t n_edges, float const *__restrict__ radial_basis_input, float const *__restrict__ layer_0_weight,
+    float const *__restrict__ layer_1_weight, float const *__restrict__ layer_2_weight,
+    float const *__restrict__ layer_3_weight, __nv_bfloat16 *__restrict__ tensor_product_weights_per_edge,
+    __nv_bfloat16 *__restrict__ pre_act_layer_0_bf16, // [n_edges, 64] or nullptr
+    __nv_bfloat16 *__restrict__ pre_act_layer_1_bf16, // [n_edges, 64] or nullptr
+    __nv_bfloat16 *__restrict__ pre_act_layer_2_bf16, // [n_edges, 64] or nullptr
+    layer_scale_factors_t scales) {
     extern __shared__ kittens::alignment_dummy raw_shared_memory[];
     kittens::shared_allocator shared_alloc(reinterpret_cast<int *>(&raw_shared_memory[0]));
 
     // Persistent per-CTA shared memory: weights for layers 0,1,2,3-column-tile,
     // plus an input tile and a single hidden tile that ping-pongs across layers.
-    shared_tile_w0_t     &shared_layer_0_weight = shared_alloc.allocate<shared_tile_w0_t>();
-    shared_tile_w_hh_t   &shared_layer_1_weight = shared_alloc.allocate<shared_tile_w_hh_t>();
-    shared_tile_w_hh_t   &shared_layer_2_weight = shared_alloc.allocate<shared_tile_w_hh_t>();
+    shared_tile_w0_t &shared_layer_0_weight = shared_alloc.allocate<shared_tile_w0_t>();
+    shared_tile_w_hh_t &shared_layer_1_weight = shared_alloc.allocate<shared_tile_w_hh_t>();
+    shared_tile_w_hh_t &shared_layer_2_weight = shared_alloc.allocate<shared_tile_w_hh_t>();
     shared_tile_w3_col_t &shared_layer_3_weight_column = shared_alloc.allocate<shared_tile_w3_col_t>();
-    shared_tile_input_t  &shared_input_tile     = shared_alloc.allocate<shared_tile_input_t>();
-    shared_tile_hidden_t &shared_hidden_tile    = shared_alloc.allocate<shared_tile_hidden_t>();
+    shared_tile_input_t &shared_input_tile = shared_alloc.allocate<shared_tile_input_t>();
+    shared_tile_hidden_t &shared_hidden_tile = shared_alloc.allocate<shared_tile_hidden_t>();
 
     // All 4 layer MMAs share the same `register_accumulator_t` shape, so
     // a single context (one TT slot + one pair of semaphores) suffices.
@@ -375,8 +343,8 @@ inline __global__ void mace_tk_radial_mlp_kernel(
 
     scale_accumulator_in_place_(accumulator, scales.layer_0_scale);
     if (pre_act_layer_0_bf16 != nullptr) {
-        store_pre_activation_bf16_(pre_act_layer_0_bf16, shared_layer_3_weight_column,
-                                    accumulator, n_edges, base_edge_index);
+        store_pre_activation_bf16_(pre_act_layer_0_bf16, shared_layer_3_weight_column, accumulator, n_edges,
+                                   base_edge_index);
     }
     apply_silu_normalize2mom_in_place_(accumulator);
 
@@ -388,8 +356,8 @@ inline __global__ void mace_tk_radial_mlp_kernel(
 
     scale_accumulator_in_place_(accumulator, scales.layer_1_scale);
     if (pre_act_layer_1_bf16 != nullptr) {
-        store_pre_activation_bf16_(pre_act_layer_1_bf16, shared_layer_3_weight_column,
-                                    accumulator, n_edges, base_edge_index);
+        store_pre_activation_bf16_(pre_act_layer_1_bf16, shared_layer_3_weight_column, accumulator, n_edges,
+                                   base_edge_index);
     }
     apply_silu_normalize2mom_in_place_(accumulator);
 
@@ -401,18 +369,19 @@ inline __global__ void mace_tk_radial_mlp_kernel(
 
     scale_accumulator_in_place_(accumulator, scales.layer_2_scale);
     if (pre_act_layer_2_bf16 != nullptr) {
-        store_pre_activation_bf16_(pre_act_layer_2_bf16, shared_layer_3_weight_column,
-                                    accumulator, n_edges, base_edge_index);
+        store_pre_activation_bf16_(pre_act_layer_2_bf16, shared_layer_3_weight_column, accumulator, n_edges,
+                                   base_edge_index);
     }
     apply_silu_normalize2mom_in_place_(accumulator);
 
     kittens::warpgroup::store(shared_hidden_tile, accumulator);
     kittens::warpgroup::sync(0);
 
-    // ---- Layer 3: [64x64] @ [64x64] -> [64x64] per output column tile,
-    //               6 column tiles total, no activation.  Final store is bf16.
-    #pragma unroll
-    for (int output_column_tile_index = 0; output_column_tile_index < output_n_tile_count_k; ++output_column_tile_index) {
+// ---- Layer 3: [64x64] @ [64x64] -> [64x64] per output column tile,
+//               6 column tiles total, no activation.  Final store is bf16.
+#pragma unroll
+    for (int output_column_tile_index = 0; output_column_tile_index < output_n_tile_count_k;
+         ++output_column_tile_index) {
         load_layer_3_weight_column_tile_(shared_layer_3_weight_column, layer_3_weight, output_column_tile_index);
         kittens::warpgroup::sync(0);
 
@@ -424,13 +393,8 @@ inline __global__ void mace_tk_radial_mlp_kernel(
         // bf16 conversion — its lifetime is bounded by the next iteration.
         // Re-use of `shared_hidden_tile` (the layer-3 input) would corrupt
         // the input on the next column-tile iteration.
-        store_output_tile_with_guard_(
-            tensor_product_weights_per_edge,
-            shared_layer_3_weight_column,
-            accumulator,
-            n_edges,
-            base_edge_index,
-            output_column_tile_index);
+        store_output_tile_with_guard_(tensor_product_weights_per_edge, shared_layer_3_weight_column, accumulator,
+                                      n_edges, base_edge_index, output_column_tile_index);
         kittens::warpgroup::sync(0);
     }
 }
@@ -460,20 +424,13 @@ inline __global__ void mace_tk_radial_mlp_kernel(
  */
 /// Returns true on successful launch, false if the (n_radial, output_dim)
 /// tuple isn't handled (caller must fall back to the fp32 reference path).
-inline bool launch_mace_tk_radial_mlp(
-    std::uint32_t n_edges,
-    std::uint32_t n_radial,
-    float const *radial_basis_input,
-    float const *radial_mlp_weight_layer_0,
-    float const *radial_mlp_weight_layer_1,
-    float const *radial_mlp_weight_layer_2,
-    float const *radial_mlp_weight_layer_3,
-    __nv_bfloat16 *tensor_product_weights_per_edge,
-    cudaStream_t stream,
-    __nv_bfloat16 *pre_act_layer_0_bf16 = nullptr,
-    __nv_bfloat16 *pre_act_layer_1_bf16 = nullptr,
-    __nv_bfloat16 *pre_act_layer_2_bf16 = nullptr
-) {
+inline bool launch_mace_tk_radial_mlp(std::uint32_t n_edges, std::uint32_t n_radial, float const *radial_basis_input,
+                                      float const *radial_mlp_weight_layer_0, float const *radial_mlp_weight_layer_1,
+                                      float const *radial_mlp_weight_layer_2, float const *radial_mlp_weight_layer_3,
+                                      __nv_bfloat16 *tensor_product_weights_per_edge, cudaStream_t stream,
+                                      __nv_bfloat16 *pre_act_layer_0_bf16 = nullptr,
+                                      __nv_bfloat16 *pre_act_layer_1_bf16 = nullptr,
+                                      __nv_bfloat16 *pre_act_layer_2_bf16 = nullptr) {
     if (n_edges == 0u) return true;
     // The fused kernel template-bakes the MACE-OFF-small shapes (n_radial=8,
     // hidden=64, output_dim=4·96=384).  The output_dim baking means a caller
@@ -481,9 +438,7 @@ inline bool launch_mace_tk_radial_mlp(
     // a buffer that the conv_tp+scatter consumer expects to have a different
     // stride — reject explicitly so the caller falls back to the fp32
     // reference path instead of silently scrambling the tp_weights tensor.
-    if (n_radial != static_cast<std::uint32_t>(mace_tk_radial_mlp_detail_::radial_input_dim_k)) {
-        return false;
-    }
+    if (n_radial != static_cast<std::uint32_t>(mace_tk_radial_mlp_detail_::radial_input_dim_k)) { return false; }
     // The kernel writes `mace_radial_output_dim_k = 4 · 96 = 384` columns per
     // edge.  The caller's `tensor_product_weights_per_edge` buffer must have
     // this exact stride — anything else (medium, large) is a silent layout
@@ -509,30 +464,20 @@ inline bool launch_mace_tk_radial_mlp(
     //   hidden_tile          64 x 64 bf16 =  8 KB
     //   ----                                ------
     //                                       ~36 KB + alignment slack
-    constexpr std::size_t shared_memory_bytes_k = 64 * 1024;  // generous, well under H100's 228 KB cap
+    constexpr std::size_t shared_memory_bytes_k = 64 * 1024; // generous, well under H100's 228 KB cap
 
-    cudaFuncSetAttribute(
-        mace_tk_radial_mlp_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_memory_bytes_k));
+    cudaFuncSetAttribute(mace_tk_radial_mlp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shared_memory_bytes_k));
 
-    std::uint32_t const n_edge_tiles = (n_edges + static_cast<std::uint32_t>(edge_tile_rows_k) - 1u)
-                                       / static_cast<std::uint32_t>(edge_tile_rows_k);
+    std::uint32_t const n_edge_tiles = (n_edges + static_cast<std::uint32_t>(edge_tile_rows_k) - 1u) /
+                                       static_cast<std::uint32_t>(edge_tile_rows_k);
     dim3 const grid(n_edge_tiles, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
     mace_tk_radial_mlp_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
-        n_edges,
-        radial_basis_input,
-        radial_mlp_weight_layer_0,
-        radial_mlp_weight_layer_1,
-        radial_mlp_weight_layer_2,
-        radial_mlp_weight_layer_3,
-        tensor_product_weights_per_edge,
-        pre_act_layer_0_bf16,
-        pre_act_layer_1_bf16,
-        pre_act_layer_2_bf16,
-        scales);
+        n_edges, radial_basis_input, radial_mlp_weight_layer_0, radial_mlp_weight_layer_1, radial_mlp_weight_layer_2,
+        radial_mlp_weight_layer_3, tensor_product_weights_per_edge, pre_act_layer_0_bf16, pre_act_layer_1_bf16,
+        pre_act_layer_2_bf16, scales);
     return true;
 }
 

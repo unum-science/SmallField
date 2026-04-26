@@ -84,13 +84,10 @@ struct mma_ctx_t {
  *  consumer Blackwell has no warpgroup-async path at all.
  */
 template <typename register_tile_, typename a_smem_t_, typename b_smem_t_>
-__device__ inline void mma_AB_overwrite_sync(register_tile_ &D_per_warp,
-                                             a_smem_t_ const &A_full,
-                                             b_smem_t_ const &B_full,
-                                             mma_ctx_t<register_tile_> & /*unused*/) {
+__device__ inline void mma_AB_overwrite_sync(register_tile_ &D_per_warp, a_smem_t_ const &A_full,
+                                             b_smem_t_ const &B_full, mma_ctx_t<register_tile_> & /*unused*/) {
     using a_reg_t = kittens::rt_bf<register_tile_::rows, a_smem_t_::cols>;
-    using b_reg_t = kittens::rt_bf<b_smem_t_::rows, b_smem_t_::cols,
-                                   kittens::ducks::rt_layout::col>;
+    using b_reg_t = kittens::rt_bf<b_smem_t_::rows, b_smem_t_::cols, kittens::ducks::rt_layout::col>;
     a_reg_t A_reg;
     b_reg_t B_reg;
     kittens::warpgroup::load(A_reg, A_full);
@@ -101,13 +98,10 @@ __device__ inline void mma_AB_overwrite_sync(register_tile_ &D_per_warp,
 
 /** D = A * Bᵀ (overwrite) — same per-warp pattern, transposed-B variant. */
 template <typename register_tile_, typename a_smem_t_, typename b_smem_t_>
-__device__ inline void mma_ABt_overwrite_sync(register_tile_ &D_per_warp,
-                                              a_smem_t_ const &A_full,
-                                              b_smem_t_ const &B_full,
-                                              mma_ctx_t<register_tile_> & /*unused*/) {
+__device__ inline void mma_ABt_overwrite_sync(register_tile_ &D_per_warp, a_smem_t_ const &A_full,
+                                              b_smem_t_ const &B_full, mma_ctx_t<register_tile_> & /*unused*/) {
     using a_reg_t = kittens::rt_bf<register_tile_::rows, a_smem_t_::cols>;
-    using b_reg_t = kittens::rt_bf<b_smem_t_::rows, b_smem_t_::cols,
-                                   kittens::ducks::rt_layout::row>;
+    using b_reg_t = kittens::rt_bf<b_smem_t_::rows, b_smem_t_::cols, kittens::ducks::rt_layout::row>;
     a_reg_t A_reg;
     b_reg_t B_reg;
     kittens::warpgroup::load(A_reg, A_full);
@@ -127,21 +121,15 @@ __device__ inline void mma_ABt_overwrite_sync(register_tile_ &D_per_warp,
  *  is needed in full by every warp, so each loads it independently.
  */
 template <typename register_tile_, typename a_smem_t_, typename b_smem_t_>
-__device__ inline void mma_AtB_overwrite_sync(register_tile_ &D_per_warp,
-                                              a_smem_t_ const &A_full,
-                                              b_smem_t_ const &B_full,
-                                              mma_ctx_t<register_tile_> & /*unused*/) {
-    using a_reg_t = kittens::rt_bf<a_smem_t_::rows, register_tile_::rows,
-                                   kittens::ducks::rt_layout::col>;
-    using b_reg_t = kittens::rt_bf<b_smem_t_::rows, b_smem_t_::cols,
-                                   kittens::ducks::rt_layout::col>;
+__device__ inline void mma_AtB_overwrite_sync(register_tile_ &D_per_warp, a_smem_t_ const &A_full,
+                                              b_smem_t_ const &B_full, mma_ctx_t<register_tile_> & /*unused*/) {
+    using a_reg_t = kittens::rt_bf<a_smem_t_::rows, register_tile_::rows, kittens::ducks::rt_layout::col>;
+    using b_reg_t = kittens::rt_bf<b_smem_t_::rows, b_smem_t_::cols, kittens::ducks::rt_layout::col>;
     a_reg_t A_reg;
     b_reg_t B_reg;
     int const warp_id_in_wg = kittens::warpgroup::warpid();
-    auto const &A_subtile =
-        const_cast<a_smem_t_ &>(A_full)
-            .template subtile<a_smem_t_::rows, register_tile_::rows>(
-                {0, warp_id_in_wg * static_cast<int>(register_tile_::rows)});
+    auto const &A_subtile = const_cast<a_smem_t_ &>(A_full).template subtile<a_smem_t_::rows, register_tile_::rows>(
+        {0, warp_id_in_wg * static_cast<int>(register_tile_::rows)});
     kittens::warp::load(A_reg, A_subtile);
     kittens::warp::load(B_reg, B_full);
     kittens::warp::zero(D_per_warp);
@@ -164,9 +152,7 @@ struct mma_ctx_t {
  *         portable across arches.
  */
 template <typename register_tile_, typename a_smem_t_, typename b_smem_t_>
-__device__ inline void mma_AB_overwrite_sync(register_tile_ &D_reg,
-                                             a_smem_t_ const &A,
-                                             b_smem_t_ const &B,
+__device__ inline void mma_AB_overwrite_sync(register_tile_ &D_reg, a_smem_t_ const &A, b_smem_t_ const &B,
                                              mma_ctx_t<register_tile_> & /*unused*/) {
     kittens::warpgroup::mm_AB(D_reg, A, B);
     kittens::warpgroup::mma_async_wait();
@@ -174,9 +160,7 @@ __device__ inline void mma_AB_overwrite_sync(register_tile_ &D_reg,
 
 /** D = A * Bᵀ (overwrite) — Hopper warpgroup MMA, B transposed. */
 template <typename register_tile_, typename a_smem_t_, typename b_smem_t_>
-__device__ inline void mma_ABt_overwrite_sync(register_tile_ &D_reg,
-                                              a_smem_t_ const &A,
-                                              b_smem_t_ const &B,
+__device__ inline void mma_ABt_overwrite_sync(register_tile_ &D_reg, a_smem_t_ const &A, b_smem_t_ const &B,
                                               mma_ctx_t<register_tile_> & /*unused*/) {
     kittens::warpgroup::mm_ABt(D_reg, A, B);
     kittens::warpgroup::mma_async_wait();
@@ -184,9 +168,7 @@ __device__ inline void mma_ABt_overwrite_sync(register_tile_ &D_reg,
 
 /** D = Aᵀ * B (overwrite) — Hopper warpgroup MMA, A transposed. */
 template <typename register_tile_, typename a_smem_t_, typename b_smem_t_>
-__device__ inline void mma_AtB_overwrite_sync(register_tile_ &D_reg,
-                                              a_smem_t_ const &A,
-                                              b_smem_t_ const &B,
+__device__ inline void mma_AtB_overwrite_sync(register_tile_ &D_reg, a_smem_t_ const &A, b_smem_t_ const &B,
                                               mma_ctx_t<register_tile_> & /*unused*/) {
     kittens::warpgroup::mm_AtB(D_reg, A, B);
     kittens::warpgroup::mma_async_wait();

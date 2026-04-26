@@ -28,27 +28,28 @@ std::vector<int> resolve_(std::string const &smiles, std::uint8_t expected_num_a
     std::unique_ptr<RDKit::ROMol> molecule;
     try {
         molecule.reset(RDKit::SmilesToMol(smiles));
-    } catch (...) {
+    }
+    catch (...) {
         return {};
     }
     if (!molecule) return {};
     auto rwmol = std::unique_ptr<RDKit::RWMol>(new RDKit::RWMol(*molecule));
     try {
         RDKit::MolOps::addHs(*rwmol);
-    } catch (...) {
+    }
+    catch (...) {
         return {};
     }
     auto const n = static_cast<std::uint32_t>(rwmol->getNumAtoms());
     if (n != expected_num_atoms) {
-        std::fprintf(stderr, "[smallfield_mace_refine] atom-count mismatch: SMILES %s has %u atoms, "
-                     "parquet says %u — skipping row\n",
-                     smiles.c_str(), n, static_cast<unsigned>(expected_num_atoms));
+        std::fprintf(
+            stderr,
+            "[smallfield_mace_refine] atom-count mismatch: SMILES %s has %u atoms, " "parquet says %u — skipping row\n",
+            smiles.c_str(), n, static_cast<unsigned>(expected_num_atoms));
         return {};
     }
     std::vector<int> out(n);
-    for (std::uint32_t i = 0; i < n; ++i) {
-        out[i] = static_cast<int>(rwmol->getAtomWithIdx(i)->getAtomicNum());
-    }
+    for (std::uint32_t i = 0; i < n; ++i) { out[i] = static_cast<int>(rwmol->getAtomWithIdx(i)->getAtomicNum()); }
     return out;
 }
 

@@ -38,8 +38,8 @@
 #include <cuda_runtime.h>
 
 #include "smallfield/types/mace_types.hpp"
-#include "smallfield/cuda/mace_linear_kernel.cuh"  // mace_silu_normalize_to_unit_second_moment_constant_k, mace_irrep_block_index_for_component_
-#include "smallfield/cuda/mace_tensor_product_kernel.cuh"  // mace_tensor_product_path_count_k
+#include "smallfield/cuda/mace_linear_kernel.cuh" // mace_silu_normalize_to_unit_second_moment_constant_k, mace_irrep_block_index_for_component_
+#include "smallfield/cuda/mace_tensor_product_kernel.cuh" // mace_tensor_product_path_count_k
 
 namespace smallfield::cuda {
 
@@ -74,9 +74,9 @@ inline __global__ void mace_energy_reduce_force_adjoint_kernel(
  *  receiver row of `dnode_features_full` into `dmessages`.  No atomics.
  */
 inline __global__ void mace_scatter_force_adjoint_kernel(std::uint32_t n_edges, std::uint32_t feature_dim,
-                                                  std::int32_t const *edge_target_atom,
-                                                  float const *dnode_features_full, // [n_atoms, feature_dim]
-                                                  float *dmessages                  // [n_edges, feature_dim]
+                                                         std::int32_t const *edge_target_atom,
+                                                         float const *dnode_features_full, // [n_atoms, feature_dim]
+                                                         float *dmessages                  // [n_edges, feature_dim]
 ) {
     std::uint32_t edge_index = blockIdx.x;
     std::uint32_t feature_column_index = blockIdx.y * blockDim.x + threadIdx.x;
@@ -107,18 +107,18 @@ namespace mace_sph_adjoint_detail_ {
  */
 __device__ __forceinline__ void sph_harm_l0123_derivative_(
     float x, float y, float z,
-    float *dy_dxyz_out  // [16, 3] flattened: dy_dxyz_out[3*lm + k]
+    float *dy_dxyz_out // [16, 3] flattened: dy_dxyz_out[3*lm + k]
 ) {
-    constexpr float kSqrt3   = 1.7320508075688772f;
-    constexpr float kSqrt5o6 = 0.9128709291752769f;   // sqrt(5/6)
-    constexpr float kSqrt15  = 3.872983346207417f;    // sqrt(15)
-    constexpr float kSqrt3o8 = 0.6123724356957945f;   // sqrt(3/8)
+    constexpr float kSqrt3 = 1.7320508075688772f;
+    constexpr float kSqrt5o6 = 0.9128709291752769f; // sqrt(5/6)
+    constexpr float kSqrt15 = 3.872983346207417f;   // sqrt(15)
+    constexpr float kSqrt3o8 = 0.6123724356957945f; // sqrt(3/8)
 
     // Component normalisation, per L block (matches forward).
     // L=0 factor is sqrt(1) = 1 — its derivatives are all zero so we elide it.
-    constexpr float kC1 = 1.7320508075688772f;        // sqrt(3)
-    constexpr float kC2 = 2.2360679774997896f;        // sqrt(5)
-    constexpr float kC3 = 2.6457513110645907f;        // sqrt(7)
+    constexpr float kC1 = 1.7320508075688772f; // sqrt(3)
+    constexpr float kC2 = 2.2360679774997896f; // sqrt(5)
+    constexpr float kC3 = 2.6457513110645907f; // sqrt(7)
 
     auto write = [&](int lm, float dx, float dy, float dz) {
         dy_dxyz_out[3 * lm + 0] = dx;
@@ -132,21 +132,21 @@ __device__ __forceinline__ void sph_harm_l0123_derivative_(
 
     // ------- L = 1 -------
     // sh_1_0 = x; sh_1_1 = y; sh_1_2 = z
-    write(1, kC1 * 1.0f, 0.0f,        0.0f);
-    write(2, 0.0f,        kC1 * 1.0f, 0.0f);
-    write(3, 0.0f,        0.0f,        kC1 * 1.0f);
+    write(1, kC1 * 1.0f, 0.0f, 0.0f);
+    write(2, 0.0f, kC1 * 1.0f, 0.0f);
+    write(3, 0.0f, 0.0f, kC1 * 1.0f);
 
     // ------- L = 2 -------
     // sh_2_0 = sqrt3 * x * z
-    write(4, kC2 * kSqrt3 * z, 0.0f,                kC2 * kSqrt3 * x);
+    write(4, kC2 * kSqrt3 * z, 0.0f, kC2 * kSqrt3 * x);
     // sh_2_1 = sqrt3 * x * y
-    write(5, kC2 * kSqrt3 * y, kC2 * kSqrt3 * x,  0.0f);
+    write(5, kC2 * kSqrt3 * y, kC2 * kSqrt3 * x, 0.0f);
     // sh_2_2 = y^2 - 0.5 * (x^2 + z^2)  =>  d/dx = -x, d/dy = 2y, d/dz = -z
-    write(6, kC2 * (-x),        kC2 * (2.0f * y),  kC2 * (-z));
+    write(6, kC2 * (-x), kC2 * (2.0f * y), kC2 * (-z));
     // sh_2_3 = sqrt3 * y * z
-    write(7, 0.0f,               kC2 * kSqrt3 * z, kC2 * kSqrt3 * y);
+    write(7, 0.0f, kC2 * kSqrt3 * z, kC2 * kSqrt3 * y);
     // sh_2_4 = (sqrt3/2) * (z^2 - x^2)  =>  d/dx = -sqrt3 * x, d/dz = sqrt3 * z
-    write(8, kC2 * (-kSqrt3 * x), 0.0f,            kC2 * (kSqrt3 * z));
+    write(8, kC2 * (-kSqrt3 * x), 0.0f, kC2 * (kSqrt3 * z));
 
     // ------- L = 3 -------
     // sh_3_0 = sqrt(5/6) * (sh_2_0 * z + sh_2_4 * x)
@@ -229,11 +229,10 @@ __device__ __forceinline__ void sph_harm_l0123_derivative_(
  *
  *  Threading: one thread per edge; 128 threads per block.  No shared memory.
  */
-inline __global__ void mace_sph_harm_force_adjoint_kernel(
-    std::uint32_t n_edges,
-    float const *r_unit,        // [n_edges, 3]
-    float const *dsph_harm,     // [n_edges, 16]
-    float *dr_unit              // [n_edges, 3]   — overwritten
+inline __global__ void mace_sph_harm_force_adjoint_kernel(std::uint32_t n_edges,
+                                                          float const *r_unit,    // [n_edges, 3]
+                                                          float const *dsph_harm, // [n_edges, 16]
+                                                          float *dr_unit          // [n_edges, 3]   — overwritten
 ) {
     std::uint32_t edge_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (edge_index >= n_edges) return;
@@ -257,13 +256,8 @@ inline __global__ void mace_sph_harm_force_adjoint_kernel(
     dr_unit[3 * edge_index + 2] = accumulator_z;
 }
 
-inline void launch_mace_sph_harm_force_adjoint(
-    std::uint32_t n_edges,
-    float const *r_unit,
-    float const *dsph_harm,
-    float *dr_unit,
-    cudaStream_t stream
-) {
+inline void launch_mace_sph_harm_force_adjoint(std::uint32_t n_edges, float const *r_unit, float const *dsph_harm,
+                                               float *dr_unit, cudaStream_t stream) {
     if (n_edges == 0) return;
     constexpr std::uint32_t block = 128;
     std::uint32_t const grid = (n_edges + block - 1u) / block;
@@ -306,19 +300,14 @@ inline void launch_mace_sph_harm_force_adjoint(
  *  All math fp32; envelope clamped to zero outside r_max (matches forward).
  */
 inline __global__ void mace_radial_basis_and_edge_geometry_force_adjoint_kernel(
-    std::uint32_t n_edges,
-    std::uint32_t n_radial,
-    float r_max,
-    float bessel_prefactor,
-    float cutoff_p,
-    float const *bessel_weights,    // [n_radial]
-    float const *r_norm,            // [n_edges]
-    float const *r_unit,            // [n_edges, 3]
-    std::int32_t const *edge_source_atom,
-    std::int32_t const *edge_target_atom,
-    float const *dradial_basis,     // [n_edges, n_radial]
-    float const *dr_unit,           // [n_edges, 3]      (from D5)
-    float *dpositions               // [n_atoms, 3]      (atomic-accumulated)
+    std::uint32_t n_edges, std::uint32_t n_radial, float r_max, float bessel_prefactor, float cutoff_p,
+    float const *bessel_weights, // [n_radial]
+    float const *r_norm,         // [n_edges]
+    float const *r_unit,         // [n_edges, 3]
+    std::int32_t const *edge_source_atom, std::int32_t const *edge_target_atom,
+    float const *dradial_basis, // [n_edges, n_radial]
+    float const *dr_unit,       // [n_edges, 3]      (from D5)
+    float *dpositions           // [n_atoms, 3]      (atomic-accumulated)
 ) {
     std::uint32_t edge_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (edge_index >= n_edges) return;
@@ -332,33 +321,31 @@ inline __global__ void mace_radial_basis_and_edge_geometry_force_adjoint_kernel(
     float env = 0.0f;
     float denv_dr = 0.0f;
     if (r < r_max) {
-        float const u   = r / r_max;
-        float const p   = cutoff_p;
-        float const a   = -(p + 1.0f) * (p + 2.0f) * 0.5f;
-        float const b_  =  p * (p + 2.0f);
-        float const c   = -p * (p + 1.0f) * 0.5f;
-        float const up_minus1 = powf(u, p - 1.0f);    // u^(p-1)
-        float const up        = up_minus1 * u;        // u^p
-        float const up1       = up * u;               // u^(p+1)
-        float const up2       = up1 * u;              // u^(p+2)
+        float const u = r / r_max;
+        float const p = cutoff_p;
+        float const a = -(p + 1.0f) * (p + 2.0f) * 0.5f;
+        float const b_ = p * (p + 2.0f);
+        float const c = -p * (p + 1.0f) * 0.5f;
+        float const up_minus1 = powf(u, p - 1.0f); // u^(p-1)
+        float const up = up_minus1 * u;            // u^p
+        float const up1 = up * u;                  // u^(p+1)
+        float const up2 = up1 * u;                 // u^(p+2)
         env = 1.0f + a * up + b_ * up1 + c * up2;
         // d/dr (u^k) = (k / r_max) * u^(k-1)
         float const inv_r_max = 1.0f / r_max;
-        denv_dr = inv_r_max * (a * p * up_minus1
-                              + b_ * (p + 1.0f) * up
-                              + c   * (p + 2.0f) * up1);
+        denv_dr = inv_r_max * (a * p * up_minus1 + b_ * (p + 1.0f) * up + c * (p + 2.0f) * up1);
     }
 
     // -- Bessel chain: accumulate dr_from_basis = Σ_n d rb[n] * d rb[n] / d r.
-    float const inv_r  = 1.0f / r;
+    float const inv_r = 1.0f / r;
     float const inv_r2 = inv_r * inv_r;
     float dr_from_basis = 0.0f;
     for (std::uint32_t n = 0; n < n_radial; ++n) {
-        float const w_n  = bessel_weights[n];
-        float const arg  = w_n * r;
-        float       sin_arg, cos_arg;
+        float const w_n = bessel_weights[n];
+        float const arg = w_n * r;
+        float sin_arg, cos_arg;
         __sincosf(arg, &sin_arg, &cos_arg);
-        float const b_n  = bessel_prefactor * sin_arg * inv_r;
+        float const b_n = bessel_prefactor * sin_arg * inv_r;
         // d b_n / d r = prefactor * (w_n * r * cos(w_n r) - sin(w_n r)) / r^2
         float const dbn_dr = bessel_prefactor * (w_n * r * cos_arg - sin_arg) * inv_r2;
         // d rb[n] / d r = dbn_dr * env + b_n * denv_dr
@@ -387,34 +374,24 @@ inline __global__ void mace_radial_basis_and_edge_geometry_force_adjoint_kernel(
     int const src = edge_source_atom[edge_index];
     int const dst = edge_target_atom[edge_index];
 
-    atomicAdd(dpositions + 3 * dst + 0,  drvec_x);
-    atomicAdd(dpositions + 3 * dst + 1,  drvec_y);
-    atomicAdd(dpositions + 3 * dst + 2,  drvec_z);
+    atomicAdd(dpositions + 3 * dst + 0, drvec_x);
+    atomicAdd(dpositions + 3 * dst + 1, drvec_y);
+    atomicAdd(dpositions + 3 * dst + 2, drvec_z);
     atomicAdd(dpositions + 3 * src + 0, -drvec_x);
     atomicAdd(dpositions + 3 * src + 1, -drvec_y);
     atomicAdd(dpositions + 3 * src + 2, -drvec_z);
 }
 
 inline void launch_mace_radial_basis_and_edge_geometry_force_adjoint(
-    types::mace_arch_t const &arch,
-    std::uint32_t n_edges,
-    float const *bessel_weights,
-    float const *r_norm,
-    float const *r_unit,
-    std::int32_t const *edge_source_atom,
-    std::int32_t const *edge_target_atom,
-    float const *dradial_basis,
-    float const *dr_unit,
-    float *dpositions,
-    cudaStream_t stream
-) {
+    types::mace_arch_t const &arch, std::uint32_t n_edges, float const *bessel_weights, float const *r_norm,
+    float const *r_unit, std::int32_t const *edge_source_atom, std::int32_t const *edge_target_atom,
+    float const *dradial_basis, float const *dr_unit, float *dpositions, cudaStream_t stream) {
     if (n_edges == 0) return;
     constexpr std::uint32_t block = 128;
     std::uint32_t const grid = (n_edges + block - 1u) / block;
     mace_radial_basis_and_edge_geometry_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_edges, arch.n_radial, arch.r_max, arch.bessel_prefactor, arch.cutoff_p,
-        bessel_weights, r_norm, r_unit, edge_source_atom, edge_target_atom,
-        dradial_basis, dr_unit, dpositions);
+        n_edges, arch.n_radial, arch.r_max, arch.bessel_prefactor, arch.cutoff_p, bessel_weights, r_norm, r_unit,
+        edge_source_atom, edge_target_atom, dradial_basis, dr_unit, dpositions);
 }
 
 /**
@@ -425,10 +402,9 @@ inline void launch_mace_radial_basis_and_edge_geometry_force_adjoint(
  *  final negation.  Threading: 256 threads per block, one thread per
  *  scalar component (n_atoms * 3).
  */
-inline __global__ void mace_force_negate_kernel(
-    std::uint32_t n_atoms,
-    float const *dpositions,    // [n_atoms, 3]
-    float *forces               // [n_atoms, 3]
+inline __global__ void mace_force_negate_kernel(std::uint32_t n_atoms,
+                                                float const *dpositions, // [n_atoms, 3]
+                                                float *forces            // [n_atoms, 3]
 ) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     std::uint32_t total = n_atoms * 3u;
@@ -436,7 +412,8 @@ inline __global__ void mace_force_negate_kernel(
     forces[element_index] = -dpositions[element_index];
 }
 
-inline void launch_mace_force_negate(std::uint32_t n_atoms, float const *dpositions, float *forces, cudaStream_t stream) {
+inline void launch_mace_force_negate(std::uint32_t n_atoms, float const *dpositions, float *forces,
+                                     cudaStream_t stream) {
     if (n_atoms == 0) return;
     constexpr std::uint32_t block = 256;
     std::uint32_t const grid = (n_atoms * 3u + block - 1u) / block;
@@ -468,12 +445,11 @@ inline void launch_mace_position_force_adjoint(std::uint32_t /*n_edges*/, cudaSt
  *  owns its own (atom, channel)).
  */
 inline __global__ void mace_readout_linear_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    float scale,                            // 1/sqrt(n_channels)
-    float const *readout_w,                 // [n_channels]
-    float const *grad_node_energy,          // [n_atoms]   d e[a]
-    float *dnode_scalar_invariants          // [n_atoms, n_channels]   accumulated
+    std::uint32_t n_atoms, std::uint32_t n_channels,
+    float scale,                   // 1/sqrt(n_channels)
+    float const *readout_w,        // [n_channels]
+    float const *grad_node_energy, // [n_atoms]   d e[a]
+    float *dnode_scalar_invariants // [n_atoms, n_channels]   accumulated
 ) {
     std::uint32_t atom_index = blockIdx.x;
     if (atom_index >= n_atoms) return;
@@ -487,19 +463,13 @@ inline __global__ void mace_readout_linear_force_adjoint_kernel(
     }
 }
 
-inline void launch_mace_readout_linear_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    float scale,
-    float const *readout_w,
-    float const *grad_node_energy,
-    float *dnode_scalar_invariants,
-    cudaStream_t stream
-) {
+inline void launch_mace_readout_linear_force_adjoint(std::uint32_t n_atoms, std::uint32_t n_channels, float scale,
+                                                     float const *readout_w, float const *grad_node_energy,
+                                                     float *dnode_scalar_invariants, cudaStream_t stream) {
     if (n_atoms == 0) return;
     constexpr std::uint32_t block = 32;
-    mace_readout_linear_force_adjoint_kernel<<<n_atoms, block, 0, stream>>>(
-        n_atoms, n_channels, scale, readout_w, grad_node_energy, dnode_scalar_invariants);
+    mace_readout_linear_force_adjoint_kernel<<<n_atoms, block, 0, stream>>>(n_atoms, n_channels, scale, readout_w,
+                                                                            grad_node_energy, dnode_scalar_invariants);
 }
 
 /**
@@ -532,27 +502,25 @@ inline void launch_mace_readout_linear_force_adjoint(
  *  on top.
  */
 inline __global__ void mace_readout_nonlinear_mlp_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t hidden_dim,
-    float scale1,                           // 1/sqrt(n_channels)
-    float scale2,                           // 1/sqrt(hidden_dim)
-    float const *node_scalar_invariants,    // [n_atoms, n_channels]    forward input
-    float const *w1,                        // [n_channels, hidden_dim]
-    float const *w2,                        // [hidden_dim]
-    float const *grad_node_energy,          // [n_atoms]   d e[a]
-    float *dnode_scalar_invariants          // [n_atoms, n_channels]    accumulated
+    std::uint32_t n_atoms, std::uint32_t n_channels, std::uint32_t hidden_dim,
+    float scale1,                        // 1/sqrt(n_channels)
+    float scale2,                        // 1/sqrt(hidden_dim)
+    float const *node_scalar_invariants, // [n_atoms, n_channels]    forward input
+    float const *w1,                     // [n_channels, hidden_dim]
+    float const *w2,                     // [hidden_dim]
+    float const *grad_node_energy,       // [n_atoms]   d e[a]
+    float *dnode_scalar_invariants       // [n_atoms, n_channels]    accumulated
 ) {
     std::uint32_t atom_index = blockIdx.x;
     if (atom_index >= n_atoms) return;
-    extern __shared__ float dpre_act_shared[];   // [hidden_dim]
+    extern __shared__ float dpre_act_shared[]; // [hidden_dim]
     if (threadIdx.x < hidden_dim) {
         std::uint32_t hidden_index = threadIdx.x;
         // Recompute pre_act[a, k].
         float accumulator = 0.0f;
         for (std::uint32_t channel_index = 0; channel_index < n_channels; ++channel_index) {
-            accumulator += node_scalar_invariants[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index]
-                 * w1[static_cast<std::uint64_t>(channel_index) * hidden_dim + hidden_index];
+            accumulator += node_scalar_invariants[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index] *
+                           w1[static_cast<std::uint64_t>(channel_index) * hidden_dim + hidden_index];
         }
         float const pre_act = scale1 * accumulator;
         float const sigmoid_value = 1.0f / (1.0f + __expf(-pre_act));
@@ -570,32 +538,25 @@ inline __global__ void mace_readout_nonlinear_mlp_force_adjoint_kernel(
     for (std::uint32_t channel_index = threadIdx.x; channel_index < n_channels; channel_index += blockDim.x) {
         float accumulator = 0.0f;
         for (std::uint32_t hidden_index = 0; hidden_index < hidden_dim; ++hidden_index) {
-            accumulator += w1[static_cast<std::uint64_t>(channel_index) * hidden_dim + hidden_index]
-                 * dpre_act_shared[hidden_index];
+            accumulator += w1[static_cast<std::uint64_t>(channel_index) * hidden_dim + hidden_index] *
+                           dpre_act_shared[hidden_index];
         }
-        dnode_scalar_invariants[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index] += scale1 * accumulator;
+        dnode_scalar_invariants[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index] += scale1 *
+                                                                                                        accumulator;
     }
 }
 
-inline void launch_mace_readout_nonlinear_mlp_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t hidden_dim,
-    float scale1,
-    float scale2,
-    float const *node_scalar_invariants,
-    float const *w1,
-    float const *w2,
-    float const *grad_node_energy,
-    float *dnode_scalar_invariants,
-    cudaStream_t stream
-) {
+inline void launch_mace_readout_nonlinear_mlp_force_adjoint(std::uint32_t n_atoms, std::uint32_t n_channels,
+                                                            std::uint32_t hidden_dim, float scale1, float scale2,
+                                                            float const *node_scalar_invariants, float const *w1,
+                                                            float const *w2, float const *grad_node_energy,
+                                                            float *dnode_scalar_invariants, cudaStream_t stream) {
     if (n_atoms == 0) return;
     constexpr std::uint32_t block = 32;
     std::uint32_t const shared_bytes = hidden_dim * sizeof(float);
     mace_readout_nonlinear_mlp_force_adjoint_kernel<<<n_atoms, block, shared_bytes, stream>>>(
-        n_atoms, n_channels, hidden_dim, scale1, scale2,
-        node_scalar_invariants, w1, w2, grad_node_energy, dnode_scalar_invariants);
+        n_atoms, n_channels, hidden_dim, scale1, scale2, node_scalar_invariants, w1, w2, grad_node_energy,
+        dnode_scalar_invariants);
 }
 
 // =========================================================================
@@ -617,15 +578,13 @@ inline void launch_mace_readout_nonlinear_mlp_force_adjoint(
  *  Threading: one thread per (atom, c_in, m).  Inner: n_channels_out multiplies.
  */
 inline __global__ void mace_linear_per_irrep_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_channels_out,
-    std::uint32_t irrep_dim,                   // 16
+    std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_channels_out,
+    std::uint32_t irrep_dim, // 16
     std::uint32_t active_irrep_block_count,
-    float scale,                               // 1/sqrt(c_in)
-    float const *weight_blocks,                // [n_blocks, c_in, c_out] — same as forward
-    float const *upstream_grad_output,         // [n_atoms, c_out, irrep_dim]
-    float *grad_input                          // [n_atoms, c_in, irrep_dim]   accumulated +=
+    float scale,                       // 1/sqrt(c_in)
+    float const *weight_blocks,        // [n_blocks, c_in, c_out] — same as forward
+    float const *upstream_grad_output, // [n_atoms, c_out, irrep_dim]
+    float *grad_input                  // [n_atoms, c_in, irrep_dim]   accumulated +=
 ) {
     std::uint32_t atom_index = blockIdx.x;
     std::uint32_t channel_in_index = blockIdx.y;
@@ -637,12 +596,15 @@ inline __global__ void mace_linear_per_irrep_force_adjoint_kernel(
         // Inactive m-block contributes zero to the input gradient.
         return;
     }
-    std::uint64_t const weight_block_offset = static_cast<std::uint64_t>(irrep_block_index) * n_channels_in * n_channels_out;
-    std::uint64_t const weight_row_offset   = weight_block_offset + static_cast<std::uint64_t>(channel_in_index) * n_channels_out;
-    float const *upstream_atom_row = upstream_grad_output + static_cast<std::uint64_t>(atom_index) * n_channels_out * irrep_dim;
+    std::uint64_t const weight_block_offset = static_cast<std::uint64_t>(irrep_block_index) * n_channels_in *
+                                              n_channels_out;
+    std::uint64_t const weight_row_offset = weight_block_offset +
+                                            static_cast<std::uint64_t>(channel_in_index) * n_channels_out;
+    float const *upstream_atom_row = upstream_grad_output +
+                                     static_cast<std::uint64_t>(atom_index) * n_channels_out * irrep_dim;
     float accumulator = 0.0f;
     for (std::uint32_t channel_out_index = 0; channel_out_index < n_channels_out; ++channel_out_index) {
-        float const w  = weight_blocks[weight_row_offset + channel_out_index];
+        float const w = weight_blocks[weight_row_offset + channel_out_index];
         float const du = upstream_atom_row[channel_out_index * irrep_dim + irrep_component_index];
         accumulator += w * du;
     }
@@ -665,16 +627,13 @@ inline __global__ void mace_linear_per_irrep_force_adjoint_kernel(
  *  Output is accumulated with `+=`, matching the general kernel's contract.
  */
 inline __global__ void mace_linear_per_irrep_irrep1_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_channels_out,
-    float scale,
-    float const *__restrict__ weight,           // [c_in, c_out]
-    float const *__restrict__ upstream_grad,    // [n_atoms, c_out]
-    float *__restrict__ grad_input              // [n_atoms, c_in]   accumulated +=
+    std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_channels_out, float scale,
+    float const *__restrict__ weight,        // [c_in, c_out]
+    float const *__restrict__ upstream_grad, // [n_atoms, c_out]
+    float *__restrict__ grad_input           // [n_atoms, c_in]   accumulated +=
 ) {
-    std::uint32_t const atom_index   = blockIdx.x * blockDim.y + static_cast<std::uint32_t>(threadIdx.y);
-    std::uint32_t const channel_in   = blockIdx.y * blockDim.x + static_cast<std::uint32_t>(threadIdx.x);
+    std::uint32_t const atom_index = blockIdx.x * blockDim.y + static_cast<std::uint32_t>(threadIdx.y);
+    std::uint32_t const channel_in = blockIdx.y * blockDim.x + static_cast<std::uint32_t>(threadIdx.x);
     if (atom_index >= n_atoms || channel_in >= n_channels_in) return;
 
     float const *weight_row = weight + static_cast<std::uint64_t>(channel_in) * n_channels_out;
@@ -687,17 +646,12 @@ inline __global__ void mace_linear_per_irrep_irrep1_force_adjoint_kernel(
     grad_input[out_offset] += scale * accumulator;
 }
 
-inline void launch_mace_linear_per_irrep_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_channels_out,
-    std::uint32_t irrep_dim,
-    std::uint32_t active_irrep_block_count,
-    float const *weight_blocks_fp32,
-    float const *upstream_grad_output_fp32,
-    float *grad_input_fp32,
-    cudaStream_t stream
-) {
+inline void launch_mace_linear_per_irrep_force_adjoint(std::uint32_t n_atoms, std::uint32_t n_channels_in,
+                                                       std::uint32_t n_channels_out, std::uint32_t irrep_dim,
+                                                       std::uint32_t active_irrep_block_count,
+                                                       float const *weight_blocks_fp32,
+                                                       float const *upstream_grad_output_fp32, float *grad_input_fp32,
+                                                       cudaStream_t stream) {
     if (n_atoms == 0) return;
     float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in));
 
@@ -706,19 +660,19 @@ inline void launch_mace_linear_per_irrep_force_adjoint(
     if (irrep_dim == 1u && active_irrep_block_count == 1u) {
         constexpr std::uint32_t block_dim_x = 16, block_dim_y = 16;
         dim3 const block(block_dim_x, block_dim_y, 1);
-        dim3 const grid((n_atoms + block_dim_y - 1u) / block_dim_y,
-                        (n_channels_in + block_dim_x - 1u) / block_dim_x, 1);
+        dim3 const grid((n_atoms + block_dim_y - 1u) / block_dim_y, (n_channels_in + block_dim_x - 1u) / block_dim_x,
+                        1);
         mace_linear_per_irrep_irrep1_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-            n_atoms, n_channels_in, n_channels_out, scale,
-            weight_blocks_fp32, upstream_grad_output_fp32, grad_input_fp32);
+            n_atoms, n_channels_in, n_channels_out, scale, weight_blocks_fp32, upstream_grad_output_fp32,
+            grad_input_fp32);
         return;
     }
 
     dim3 const block(irrep_dim, 1, 1);
     dim3 const grid(n_atoms, n_channels_in, 1);
     mace_linear_per_irrep_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_atoms, n_channels_in, n_channels_out, irrep_dim, active_irrep_block_count, scale,
-        weight_blocks_fp32, upstream_grad_output_fp32, grad_input_fp32);
+        n_atoms, n_channels_in, n_channels_out, irrep_dim, active_irrep_block_count, scale, weight_blocks_fp32,
+        upstream_grad_output_fp32, grad_input_fp32);
 }
 
 // =========================================================================
@@ -766,18 +720,15 @@ inline void launch_mace_linear_per_irrep_force_adjoint(
  *  Pass `nullptr` for any of the three output buffers to skip its computation.
  */
 inline __global__ void mace_tensor_product_and_scatter_force_adjoint_kernel(
-    std::uint32_t n_edges,
-    std::uint32_t n_channels,
-    float scale,
-    std::int32_t const *edge_source_atom,
+    std::uint32_t n_edges, std::uint32_t n_channels, float scale, std::int32_t const *edge_source_atom,
     std::int32_t const *edge_target_atom,
-    float const *node_l0_feature,                         // [n_atoms, n_channels]
-    float const *sph_harm,                                // [n_edges, 16]
-    float const *tensor_product_weights_per_edge,         // [n_edges, 4 * n_channels]
-    float const *upstream_grad_node_messages_full,        // [n_atoms, n_channels, 16]
-    float *grad_node_l0_feature,                          // [n_atoms, n_channels]   — atomicAdd, may be nullptr
-    float *grad_tensor_product_weights_per_edge,          // [n_edges, 4 * n_channels] — non-atomic, may be nullptr
-    float *grad_sph_harm                                  // [n_edges, 16]            — atomicAdd, may be nullptr
+    float const *node_l0_feature,                  // [n_atoms, n_channels]
+    float const *sph_harm,                         // [n_edges, 16]
+    float const *tensor_product_weights_per_edge,  // [n_edges, 4 * n_channels]
+    float const *upstream_grad_node_messages_full, // [n_atoms, n_channels, 16]
+    float *grad_node_l0_feature,                   // [n_atoms, n_channels]   — atomicAdd, may be nullptr
+    float *grad_tensor_product_weights_per_edge,   // [n_edges, 4 * n_channels] — non-atomic, may be nullptr
+    float *grad_sph_harm                           // [n_edges, 16]            — atomicAdd, may be nullptr
 ) {
     std::uint32_t edge_index = blockIdx.x;
     std::uint32_t channel_index = blockIdx.y * blockDim.x + threadIdx.x;
@@ -790,27 +741,28 @@ inline __global__ void mace_tensor_product_and_scatter_force_adjoint_kernel(
         node_l0_feature[static_cast<std::uint64_t>(source_atom_index) * n_channels + channel_index];
 
     // Pre-load this (edge, channel)'s 4 path weights.
-    std::uint64_t const path_weight_base = static_cast<std::uint64_t>(edge_index) * (mace_tensor_product_path_count_k * n_channels);
+    std::uint64_t const path_weight_base = static_cast<std::uint64_t>(edge_index) *
+                                           (mace_tensor_product_path_count_k * n_channels);
     float const path_weight_l0 = tensor_product_weights_per_edge[path_weight_base + 0u * n_channels + channel_index];
     float const path_weight_l1 = tensor_product_weights_per_edge[path_weight_base + 1u * n_channels + channel_index];
     float const path_weight_l2 = tensor_product_weights_per_edge[path_weight_base + 2u * n_channels + channel_index];
     float const path_weight_l3 = tensor_product_weights_per_edge[path_weight_base + 3u * n_channels + channel_index];
 
     std::uint64_t const sph_harm_offset = static_cast<std::uint64_t>(edge_index) * 16u;
-    std::uint64_t const grad_msg_offset = (static_cast<std::uint64_t>(target_atom_index) * n_channels + channel_index) * 16u;
+    std::uint64_t const grad_msg_offset = (static_cast<std::uint64_t>(target_atom_index) * n_channels + channel_index) *
+                                          16u;
 
     // Per-path partial sums for `dpath_weights` (shape: 4) and `dnode_l0` (scalar).
     float dpath_weight_accumulator_l0 = 0.0f;
     float dpath_weight_accumulator_l1 = 0.0f;
     float dpath_weight_accumulator_l2 = 0.0f;
     float dpath_weight_accumulator_l3 = 0.0f;
-    float dnode_l0_accumulator        = 0.0f;
+    float dnode_l0_accumulator = 0.0f;
 
     // Single 16-wide pass: m=0 (L=0), m=1..3 (L=1), m=4..8 (L=2), m=9..15 (L=3).
     // For each m we read the upstream gradient and the spherical-harmonic
     // value, then accumulate into the three output buffers.
-    auto accumulate_m = [&](std::uint32_t m_index, float path_weight_for_block,
-                            float &dpath_weight_block_accumulator) {
+    auto accumulate_m = [&](std::uint32_t m_index, float path_weight_for_block, float &dpath_weight_block_accumulator) {
         float const sh = sph_harm[sph_harm_offset + m_index];
         float const du = upstream_grad_node_messages_full[grad_msg_offset + m_index];
 
@@ -834,7 +786,7 @@ inline __global__ void mace_tensor_product_and_scatter_force_adjoint_kernel(
     accumulate_m(6u, path_weight_l2, dpath_weight_accumulator_l2);
     accumulate_m(7u, path_weight_l2, dpath_weight_accumulator_l2);
     accumulate_m(8u, path_weight_l2, dpath_weight_accumulator_l2);
-    accumulate_m(9u,  path_weight_l3, dpath_weight_accumulator_l3);
+    accumulate_m(9u, path_weight_l3, dpath_weight_accumulator_l3);
     accumulate_m(10u, path_weight_l3, dpath_weight_accumulator_l3);
     accumulate_m(11u, path_weight_l3, dpath_weight_accumulator_l3);
     accumulate_m(12u, path_weight_l3, dpath_weight_accumulator_l3);
@@ -847,28 +799,23 @@ inline __global__ void mace_tensor_product_and_scatter_force_adjoint_kernel(
                   scale * dnode_l0_accumulator);
     }
     if (grad_tensor_product_weights_per_edge != nullptr) {
-        grad_tensor_product_weights_per_edge[path_weight_base + 0u * n_channels + channel_index] = scale * dpath_weight_accumulator_l0;
-        grad_tensor_product_weights_per_edge[path_weight_base + 1u * n_channels + channel_index] = scale * dpath_weight_accumulator_l1;
-        grad_tensor_product_weights_per_edge[path_weight_base + 2u * n_channels + channel_index] = scale * dpath_weight_accumulator_l2;
-        grad_tensor_product_weights_per_edge[path_weight_base + 3u * n_channels + channel_index] = scale * dpath_weight_accumulator_l3;
+        grad_tensor_product_weights_per_edge[path_weight_base + 0u * n_channels + channel_index] =
+            scale * dpath_weight_accumulator_l0;
+        grad_tensor_product_weights_per_edge[path_weight_base + 1u * n_channels + channel_index] =
+            scale * dpath_weight_accumulator_l1;
+        grad_tensor_product_weights_per_edge[path_weight_base + 2u * n_channels + channel_index] =
+            scale * dpath_weight_accumulator_l2;
+        grad_tensor_product_weights_per_edge[path_weight_base + 3u * n_channels + channel_index] =
+            scale * dpath_weight_accumulator_l3;
     }
 }
 
 inline void launch_mace_tensor_product_and_scatter_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_edges,
-    std::uint32_t n_channels,
-    std::int32_t const *edge_source_atom,
-    std::int32_t const *edge_target_atom,
-    float const *node_l0_feature_fp32,
-    float const *sph_harm_fp32,
-    float const *tensor_product_weights_per_edge_fp32,
-    float const *upstream_grad_node_messages_full_fp32,
-    float *grad_node_l0_feature_fp32,
-    float *grad_tensor_product_weights_per_edge_fp32,
-    float *grad_sph_harm_fp32,
-    cudaStream_t stream
-) {
+    std::uint32_t n_atoms, std::uint32_t n_edges, std::uint32_t n_channels, std::int32_t const *edge_source_atom,
+    std::int32_t const *edge_target_atom, float const *node_l0_feature_fp32, float const *sph_harm_fp32,
+    float const *tensor_product_weights_per_edge_fp32, float const *upstream_grad_node_messages_full_fp32,
+    float *grad_node_l0_feature_fp32, float *grad_tensor_product_weights_per_edge_fp32, float *grad_sph_harm_fp32,
+    cudaStream_t stream) {
     (void)n_atoms;
     if (n_edges == 0) return;
     constexpr std::uint32_t block_dim_x = 32;
@@ -878,10 +825,9 @@ inline void launch_mace_tensor_product_and_scatter_force_adjoint(
     // the e3nn TP path-weight factor, so scale = 1.
     float const scale = 1.0f;
     mace_tensor_product_and_scatter_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_edges, n_channels, scale, edge_source_atom, edge_target_atom,
-        node_l0_feature_fp32, sph_harm_fp32, tensor_product_weights_per_edge_fp32,
-        upstream_grad_node_messages_full_fp32,
-        grad_node_l0_feature_fp32, grad_tensor_product_weights_per_edge_fp32, grad_sph_harm_fp32);
+        n_edges, n_channels, scale, edge_source_atom, edge_target_atom, node_l0_feature_fp32, sph_harm_fp32,
+        tensor_product_weights_per_edge_fp32, upstream_grad_node_messages_full_fp32, grad_node_l0_feature_fp32,
+        grad_tensor_product_weights_per_edge_fp32, grad_sph_harm_fp32);
 }
 
 // =========================================================================
@@ -901,17 +847,13 @@ inline void launch_mace_tensor_product_and_scatter_force_adjoint(
  *  Threading: one thread per (atom, c_in, m).  Inner: n_channels_out multiplies.
  */
 inline __global__ void mace_element_conditioned_residual_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_elements,
-    std::uint32_t n_channels_out,
-    std::uint32_t irrep_dim,
-    std::uint32_t active_irrep_block_count,
-    float scale,                                // 1/sqrt(c_in * n_elements)
-    std::int32_t const *atom_element,           // [n_atoms]
-    float const *weights,                       // [active_irrep_block_count, c_in, n_elements, c_out]
-    float const *upstream_grad_output,          // [n_atoms, c_out, irrep_dim]
-    float *grad_input                           // [n_atoms, c_in, irrep_dim]    accumulated +=
+    std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_elements, std::uint32_t n_channels_out,
+    std::uint32_t irrep_dim, std::uint32_t active_irrep_block_count,
+    float scale,                       // 1/sqrt(c_in * n_elements)
+    std::int32_t const *atom_element,  // [n_atoms]
+    float const *weights,              // [active_irrep_block_count, c_in, n_elements, c_out]
+    float const *upstream_grad_output, // [n_atoms, c_out, irrep_dim]
+    float *grad_input                  // [n_atoms, c_in, irrep_dim]    accumulated +=
 ) {
     std::uint32_t atom_index = blockIdx.x;
     std::uint32_t channel_in_index = blockIdx.y;
@@ -922,14 +864,16 @@ inline __global__ void mace_element_conditioned_residual_force_adjoint_kernel(
     if (irrep_block_index >= active_irrep_block_count) return;
 
     int const element_index = atom_element[atom_index];
-    std::uint64_t const weight_block_offset = static_cast<std::uint64_t>(irrep_block_index) * n_channels_in * n_elements * n_channels_out;
-    std::uint64_t const weight_row_offset   = weight_block_offset
-                                            + static_cast<std::uint64_t>(channel_in_index) * n_elements * n_channels_out
-                                            + static_cast<std::uint64_t>(element_index)   * n_channels_out;
-    float const *upstream_atom_row = upstream_grad_output + static_cast<std::uint64_t>(atom_index) * n_channels_out * irrep_dim;
+    std::uint64_t const weight_block_offset = static_cast<std::uint64_t>(irrep_block_index) * n_channels_in *
+                                              n_elements * n_channels_out;
+    std::uint64_t const weight_row_offset = weight_block_offset +
+                                            static_cast<std::uint64_t>(channel_in_index) * n_elements * n_channels_out +
+                                            static_cast<std::uint64_t>(element_index) * n_channels_out;
+    float const *upstream_atom_row = upstream_grad_output +
+                                     static_cast<std::uint64_t>(atom_index) * n_channels_out * irrep_dim;
     float accumulator = 0.0f;
     for (std::uint32_t channel_out_index = 0; channel_out_index < n_channels_out; ++channel_out_index) {
-        float const w  = weights[weight_row_offset + channel_out_index];
+        float const w = weights[weight_row_offset + channel_out_index];
         float const du = upstream_atom_row[channel_out_index * irrep_dim + irrep_component_index];
         accumulator += w * du;
     }
@@ -944,25 +888,21 @@ inline __global__ void mace_element_conditioned_residual_force_adjoint_kernel(
  *         shape of the general kernel for the (irrep_dim=1, active=1) case.
  */
 inline __global__ void mace_skip_tp_irrep1_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_elements,
-    std::uint32_t n_channels_out,
-    float scale,
-    std::int32_t const *__restrict__ atom_element,
-    float const *__restrict__ weights,                 // [n_in, n_elements, n_out]
-    float const *__restrict__ upstream_grad,           // [n_atoms, n_out]
-    float *__restrict__ grad_input                     // [n_atoms, n_in]    accumulated +=
+    std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_elements, std::uint32_t n_channels_out,
+    float scale, std::int32_t const *__restrict__ atom_element,
+    float const *__restrict__ weights,       // [n_in, n_elements, n_out]
+    float const *__restrict__ upstream_grad, // [n_atoms, n_out]
+    float *__restrict__ grad_input           // [n_atoms, n_in]    accumulated +=
 ) {
-    std::uint32_t const atom_index   = blockIdx.x * blockDim.y + static_cast<std::uint32_t>(threadIdx.y);
-    std::uint32_t const channel_in   = blockIdx.y * blockDim.x + static_cast<std::uint32_t>(threadIdx.x);
+    std::uint32_t const atom_index = blockIdx.x * blockDim.y + static_cast<std::uint32_t>(threadIdx.y);
+    std::uint32_t const channel_in = blockIdx.y * blockDim.x + static_cast<std::uint32_t>(threadIdx.x);
     if (atom_index >= n_atoms || channel_in >= n_channels_in) return;
 
     int const element_index = atom_element[atom_index];
     float const *upstream_row = upstream_grad + static_cast<std::uint64_t>(atom_index) * n_channels_out;
-    std::uint64_t const weight_row_offset =
-        (static_cast<std::uint64_t>(channel_in) * n_elements + static_cast<std::uint64_t>(element_index))
-            * n_channels_out;
+    std::uint64_t const weight_row_offset = (static_cast<std::uint64_t>(channel_in) * n_elements +
+                                             static_cast<std::uint64_t>(element_index)) *
+                                            n_channels_out;
     float accumulator = 0.0f;
     for (std::uint32_t channel_out_index = 0; channel_out_index < n_channels_out; ++channel_out_index) {
         accumulator += weights[weight_row_offset + channel_out_index] * upstream_row[channel_out_index];
@@ -972,37 +912,28 @@ inline __global__ void mace_skip_tp_irrep1_force_adjoint_kernel(
 }
 
 inline void launch_mace_element_conditioned_residual_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_elements,
-    std::uint32_t n_channels_out,
-    std::uint32_t irrep_dim,
-    std::uint32_t active_irrep_block_count,
-    std::int32_t const *atom_element,
-    float const *weights_fp32,
-    float const *upstream_grad_output_fp32,
-    float *grad_input_fp32,
-    cudaStream_t stream
-) {
+    std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_elements, std::uint32_t n_channels_out,
+    std::uint32_t irrep_dim, std::uint32_t active_irrep_block_count, std::int32_t const *atom_element,
+    float const *weights_fp32, float const *upstream_grad_output_fp32, float *grad_input_fp32, cudaStream_t stream) {
     if (n_atoms == 0) return;
     float const scale = 1.0f / sqrtf(static_cast<float>(n_channels_in) * static_cast<float>(n_elements));
 
     if (irrep_dim == 1u && active_irrep_block_count == 1u) {
         constexpr std::uint32_t block_dim_x = 16, block_dim_y = 16;
         dim3 const block(block_dim_x, block_dim_y, 1);
-        dim3 const grid((n_atoms + block_dim_y - 1u) / block_dim_y,
-                        (n_channels_in + block_dim_x - 1u) / block_dim_x, 1);
+        dim3 const grid((n_atoms + block_dim_y - 1u) / block_dim_y, (n_channels_in + block_dim_x - 1u) / block_dim_x,
+                        1);
         mace_skip_tp_irrep1_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-            n_atoms, n_channels_in, n_elements, n_channels_out, scale,
-            atom_element, weights_fp32, upstream_grad_output_fp32, grad_input_fp32);
+            n_atoms, n_channels_in, n_elements, n_channels_out, scale, atom_element, weights_fp32,
+            upstream_grad_output_fp32, grad_input_fp32);
         return;
     }
 
     dim3 const block(irrep_dim, 1, 1);
     dim3 const grid(n_atoms, n_channels_in, 1);
     mace_element_conditioned_residual_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_atoms, n_channels_in, n_elements, n_channels_out, irrep_dim, active_irrep_block_count, scale,
-        atom_element, weights_fp32, upstream_grad_output_fp32, grad_input_fp32);
+        n_atoms, n_channels_in, n_elements, n_channels_out, irrep_dim, active_irrep_block_count, scale, atom_element,
+        weights_fp32, upstream_grad_output_fp32, grad_input_fp32);
 }
 
 // =========================================================================
@@ -1039,23 +970,18 @@ inline void launch_mace_element_conditioned_residual_force_adjoint(
  *  we use the same emit-both-slots form for uniformity.
  */
 inline __global__ void mace_symmetric_contraction_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t irrep_dim,            // 16
-    std::uint32_t path_count_max,       // 23
-    std::uint32_t path_count_order_2,   // 4
-    std::uint32_t path_count_order_1,   // 1
-    std::uint32_t n_elements,           // 10
+    std::uint32_t n_atoms, std::uint32_t n_channels,
+    std::uint32_t irrep_dim,          // 16
+    std::uint32_t path_count_max,     // 23
+    std::uint32_t path_count_order_2, // 4
+    std::uint32_t path_count_order_1, // 1
+    std::uint32_t n_elements,         // 10
     std::int32_t const *atom_element,
-    float const *X,                     // [n_atoms, n_channels, irrep_dim]
-    float const *u_matrix_1,
-    float const *u_matrix_2,
-    float const *u_matrix_3,
-    float const *weights_max,
-    float const *weights_2,
-    float const *weights_1,
-    float const *upstream_grad_output,  // [n_atoms, n_channels]
-    float *grad_X                       // [n_atoms, n_channels, irrep_dim]   accumulated +=
+    float const *X, // [n_atoms, n_channels, irrep_dim]
+    float const *u_matrix_1, float const *u_matrix_2, float const *u_matrix_3, float const *weights_max,
+    float const *weights_2, float const *weights_1,
+    float const *upstream_grad_output, // [n_atoms, n_channels]
+    float *grad_X                      // [n_atoms, n_channels, irrep_dim]   accumulated +=
 ) {
     std::uint32_t atom_index = blockIdx.x;
     std::uint32_t channel_index = blockIdx.y * blockDim.x + threadIdx.x;
@@ -1064,7 +990,8 @@ inline __global__ void mace_symmetric_contraction_force_adjoint_kernel(
     int const element_index = atom_element[atom_index];
 
     float const *atom_irrep_row = X + (static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim;
-    float *grad_atom_irrep_row = grad_X + (static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim;
+    float *grad_atom_irrep_row = grad_X +
+                                 (static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim;
     float const upstream = upstream_grad_output[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index];
 
     // Local accumulator for this (atom, channel)'s 16 gradient slots.
@@ -1073,7 +1000,9 @@ inline __global__ void mace_symmetric_contraction_force_adjoint_kernel(
     // ν = 1: forward term is `U_1[i, p] * w_1 * X[i]`, single X factor → simple write.
     //   ∂B/∂X[i] = Σ_p w_1[Z, p, c] * U_1[i, p]
     for (std::uint32_t path_index = 0; path_index < path_count_order_1; ++path_index) {
-        float const weighted_path_coefficient = weights_1[(static_cast<std::uint64_t>(element_index) * path_count_order_1 + path_index) * n_channels + channel_index];
+        float const weighted_path_coefficient =
+            weights_1[(static_cast<std::uint64_t>(element_index) * path_count_order_1 + path_index) * n_channels +
+                      channel_index];
         for (std::uint32_t irrep_index_i = 0; irrep_index_i < irrep_dim; ++irrep_index_i) {
             float const u = u_matrix_1[static_cast<std::uint64_t>(irrep_index_i) * path_count_order_1 + path_index];
             dx_local[irrep_index_i] += weighted_path_coefficient * u;
@@ -1085,11 +1014,15 @@ inline __global__ void mace_symmetric_contraction_force_adjoint_kernel(
     //   Walk all ordered (i, j) pairs; emit both writes inside the loop so we
     //   are correct even if U_2 is not symmetric.
     for (std::uint32_t path_index = 0; path_index < path_count_order_2; ++path_index) {
-        float const weighted_path_coefficient = weights_2[(static_cast<std::uint64_t>(element_index) * path_count_order_2 + path_index) * n_channels + channel_index];
+        float const weighted_path_coefficient =
+            weights_2[(static_cast<std::uint64_t>(element_index) * path_count_order_2 + path_index) * n_channels +
+                      channel_index];
         for (std::uint32_t irrep_index_i = 0; irrep_index_i < irrep_dim; ++irrep_index_i) {
             float const x_i = atom_irrep_row[irrep_index_i];
             for (std::uint32_t irrep_index_j = 0; irrep_index_j < irrep_dim; ++irrep_index_j) {
-                float const u = u_matrix_2[((static_cast<std::uint64_t>(irrep_index_i) * irrep_dim) + irrep_index_j) * path_count_order_2 + path_index];
+                float const u = u_matrix_2[((static_cast<std::uint64_t>(irrep_index_i) * irrep_dim) + irrep_index_j) *
+                                               path_count_order_2 +
+                                           path_index];
                 float const u_w = weighted_path_coefficient * u;
                 float const x_j = atom_irrep_row[irrep_index_j];
                 dx_local[irrep_index_i] += u_w * x_j;
@@ -1108,14 +1041,21 @@ inline __global__ void mace_symmetric_contraction_force_adjoint_kernel(
     //   conjugate slots inside the loop makes us correct without assuming
     //   any U_3 symmetry.
     for (std::uint32_t path_index = 0; path_index < path_count_max; ++path_index) {
-        float const weighted_path_coefficient = weights_max[(static_cast<std::uint64_t>(element_index) * path_count_max + path_index) * n_channels + channel_index];
+        float const weighted_path_coefficient =
+            weights_max[(static_cast<std::uint64_t>(element_index) * path_count_max + path_index) * n_channels +
+                        channel_index];
         for (std::uint32_t irrep_index_i = 0; irrep_index_i < irrep_dim; ++irrep_index_i) {
             float const x_i = atom_irrep_row[irrep_index_i];
             for (std::uint32_t irrep_index_j = 0; irrep_index_j < irrep_dim; ++irrep_index_j) {
                 float const x_j = atom_irrep_row[irrep_index_j];
                 float const x_ij = x_i * x_j;
                 for (std::uint32_t irrep_index_k = 0; irrep_index_k < irrep_dim; ++irrep_index_k) {
-                    float const u = u_matrix_3[(((static_cast<std::uint64_t>(irrep_index_i) * irrep_dim) + irrep_index_j) * irrep_dim + irrep_index_k) * path_count_max + path_index];
+                    float const u =
+                        u_matrix_3[(((static_cast<std::uint64_t>(irrep_index_i) * irrep_dim) + irrep_index_j) *
+                                        irrep_dim +
+                                    irrep_index_k) *
+                                       path_count_max +
+                                   path_index];
                     float const u_w = weighted_path_coefficient * u;
                     float const x_k = atom_irrep_row[irrep_index_k];
                     dx_local[irrep_index_i] += u_w * x_j * x_k;
@@ -1133,35 +1073,22 @@ inline __global__ void mace_symmetric_contraction_force_adjoint_kernel(
 }
 
 inline void launch_mace_symmetric_contraction_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t irrep_dim,
-    std::uint32_t n_elements,
-    std::int32_t const *atom_element,
-    float const *node_features_full_fp32,
-    float const *u_matrix_1_fp32,
-    float const *u_matrix_2_fp32,
-    float const *u_matrix_3_fp32,
-    float const *weights_max_fp32,
-    float const *weights_2_fp32,
-    float const *weights_1_fp32,
-    float const *upstream_grad_output_fp32,
-    float *grad_node_features_full_fp32,
-    cudaStream_t stream
-) {
+    std::uint32_t n_atoms, std::uint32_t n_channels, std::uint32_t irrep_dim, std::uint32_t n_elements,
+    std::int32_t const *atom_element, float const *node_features_full_fp32, float const *u_matrix_1_fp32,
+    float const *u_matrix_2_fp32, float const *u_matrix_3_fp32, float const *weights_max_fp32,
+    float const *weights_2_fp32, float const *weights_1_fp32, float const *upstream_grad_output_fp32,
+    float *grad_node_features_full_fp32, cudaStream_t stream) {
     if (n_atoms == 0) return;
     constexpr std::uint32_t block_dim_x = 32;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_atoms, (n_channels + block_dim_x - 1u) / block_dim_x, 1);
-    constexpr std::uint32_t path_count_max     = 23u;
+    constexpr std::uint32_t path_count_max = 23u;
     constexpr std::uint32_t path_count_order_2 = 4u;
     constexpr std::uint32_t path_count_order_1 = 1u;
     mace_symmetric_contraction_force_adjoint_kernel<<<grid, block, 0, stream>>>(
         n_atoms, n_channels, irrep_dim, path_count_max, path_count_order_2, path_count_order_1, n_elements,
-        atom_element, node_features_full_fp32,
-        u_matrix_1_fp32, u_matrix_2_fp32, u_matrix_3_fp32,
-        weights_max_fp32, weights_2_fp32, weights_1_fp32,
-        upstream_grad_output_fp32, grad_node_features_full_fp32);
+        atom_element, node_features_full_fp32, u_matrix_1_fp32, u_matrix_2_fp32, u_matrix_3_fp32, weights_max_fp32,
+        weights_2_fp32, weights_1_fp32, upstream_grad_output_fp32, grad_node_features_full_fp32);
 }
 
 // =========================================================================
@@ -1188,7 +1115,6 @@ inline void launch_mace_fill_constant(float *dst, std::uint32_t n_elements, floa
     mace_fill_constant_kernel<<<grid, block, 0, stream>>>(dst, n_elements, value);
 }
 
-
 /**
  *  @brief Adjoint of `mace_per_graph_energy_reduce_kernel`.
  *
@@ -1196,49 +1122,38 @@ inline void launch_mace_fill_constant(float *dst, std::uint32_t n_elements, floa
  *  Reverse: `dnode_energy[a] = scale * grad_per_graph_energy[graph_of_atom[a]]`.
  *  The atomic-energy and shift terms have no dependence on positions.
  */
-inline __global__ void mace_per_graph_energy_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    float scale,
-    std::int32_t const *graph_of_atom,
-    float const *grad_per_graph_energy,
-    float *grad_node_energy
-) {
+inline __global__ void mace_per_graph_energy_force_adjoint_kernel(std::uint32_t n_atoms, float scale,
+                                                                  std::int32_t const *graph_of_atom,
+                                                                  float const *grad_per_graph_energy,
+                                                                  float *grad_node_energy) {
     std::uint32_t atom_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (atom_index >= n_atoms) return;
     int const graph_index = graph_of_atom[atom_index];
     grad_node_energy[atom_index] = scale * grad_per_graph_energy[graph_index];
 }
 
-inline void launch_mace_per_graph_energy_force_adjoint(
-    std::uint32_t n_atoms,
-    float scale,
-    std::int32_t const *graph_of_atom,
-    float const *grad_per_graph_energy,
-    float *grad_node_energy,
-    cudaStream_t stream
-) {
+inline void launch_mace_per_graph_energy_force_adjoint(std::uint32_t n_atoms, float scale,
+                                                       std::int32_t const *graph_of_atom,
+                                                       float const *grad_per_graph_energy, float *grad_node_energy,
+                                                       cudaStream_t stream) {
     if (n_atoms == 0) return;
     constexpr std::uint32_t block = 128;
     std::uint32_t const grid = (n_atoms + block - 1u) / block;
-    mace_per_graph_energy_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_atoms, scale, graph_of_atom, grad_per_graph_energy, grad_node_energy);
+    mace_per_graph_energy_force_adjoint_kernel<<<grid, block, 0, stream>>>(n_atoms, scale, graph_of_atom,
+                                                                           grad_per_graph_energy, grad_node_energy);
 }
 
 /** Launcher for `mace_scatter_force_adjoint_kernel` declared above. */
-inline void launch_mace_scatter_force_adjoint(
-    std::uint32_t n_edges,
-    std::uint32_t feature_dim,
-    std::int32_t const *edge_target_atom,
-    float const *grad_node_features_full,
-    float *grad_edge_messages,
-    cudaStream_t stream
-) {
+inline void launch_mace_scatter_force_adjoint(std::uint32_t n_edges, std::uint32_t feature_dim,
+                                              std::int32_t const *edge_target_atom,
+                                              float const *grad_node_features_full, float *grad_edge_messages,
+                                              cudaStream_t stream) {
     if (n_edges == 0) return;
     constexpr std::uint32_t block_dim_x = 128;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_edges, (feature_dim + block_dim_x - 1u) / block_dim_x, 1);
-    mace_scatter_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_edges, feature_dim, edge_target_atom, grad_node_features_full, grad_edge_messages);
+    mace_scatter_force_adjoint_kernel<<<grid, block, 0, stream>>>(n_edges, feature_dim, edge_target_atom,
+                                                                  grad_node_features_full, grad_edge_messages);
 }
 
 /**
@@ -1247,22 +1162,14 @@ inline void launch_mace_scatter_force_adjoint(
  *  Reverse: `grad_x = grad_y * s`.  In-place; we just multiply the gradient
  *  buffer.  Used for the `/avg_num_neighbors` rescale in the forward.
  */
-inline __global__ void mace_scale_force_adjoint_kernel(
-    std::uint32_t n_elements,
-    float scale,
-    float *grad_x_inplace
-) {
+inline __global__ void mace_scale_force_adjoint_kernel(std::uint32_t n_elements, float scale, float *grad_x_inplace) {
     std::uint32_t element_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (element_index >= n_elements) return;
     grad_x_inplace[element_index] *= scale;
 }
 
-inline void launch_mace_scale_force_adjoint(
-    std::uint32_t n_elements,
-    float scale,
-    float *grad_x_inplace,
-    cudaStream_t stream
-) {
+inline void launch_mace_scale_force_adjoint(std::uint32_t n_elements, float scale, float *grad_x_inplace,
+                                            cudaStream_t stream) {
     if (n_elements == 0) return;
     constexpr std::uint32_t block = 256;
     std::uint32_t const grid = (n_elements + block - 1u) / block;
@@ -1284,11 +1191,10 @@ inline void launch_mace_scale_force_adjoint(
  *  per-edge pattern with warp shuffle reduction, identical to the readout
  *  linear kernel.
  */
-inline __global__ void mace_apply_cutoff_force_adjoint_grad_tp_kernel(
-    std::uint32_t n_edges,
-    std::uint32_t feature_dim,                // 4 * n_channels
-    float const *cutoff_envelope,             // [n_edges]
-    float *grad_tp_inplace                    // [n_edges, feature_dim]
+inline __global__ void mace_apply_cutoff_force_adjoint_grad_tp_kernel(std::uint32_t n_edges,
+                                                                      std::uint32_t feature_dim,    // 4 * n_channels
+                                                                      float const *cutoff_envelope, // [n_edges]
+                                                                      float *grad_tp_inplace // [n_edges, feature_dim]
 ) {
     std::uint32_t edge_index = blockIdx.x;
     std::uint32_t feature_index = blockIdx.y * blockDim.x + threadIdx.x;
@@ -1299,11 +1205,10 @@ inline __global__ void mace_apply_cutoff_force_adjoint_grad_tp_kernel(
 }
 
 inline __global__ void mace_apply_cutoff_force_adjoint_grad_env_kernel(
-    std::uint32_t n_edges,
-    std::uint32_t feature_dim,
-    float const *grad_tp_post,                // [n_edges, feature_dim] — caller's grad_tp BEFORE the in-place rescale
-    float const *tp_pre,                      // [n_edges, feature_dim] — saved pre-cutoff tp_weights
-    float *grad_env                           // [n_edges] — written
+    std::uint32_t n_edges, std::uint32_t feature_dim,
+    float const *grad_tp_post, // [n_edges, feature_dim] — caller's grad_tp BEFORE the in-place rescale
+    float const *tp_pre,       // [n_edges, feature_dim] — saved pre-cutoff tp_weights
+    float *grad_env            // [n_edges] — written
 ) {
     std::uint32_t edge_index = blockIdx.x;
     if (edge_index >= n_edges) return;
@@ -1318,15 +1223,9 @@ inline __global__ void mace_apply_cutoff_force_adjoint_grad_env_kernel(
     if (threadIdx.x == 0) grad_env[edge_index] = accumulator;
 }
 
-inline void launch_mace_apply_cutoff_force_adjoint(
-    std::uint32_t n_edges,
-    std::uint32_t feature_dim,
-    float const *cutoff_envelope,
-    float const *tp_pre,
-    float *grad_tp_inplace,
-    float *grad_env,
-    cudaStream_t stream
-) {
+inline void launch_mace_apply_cutoff_force_adjoint(std::uint32_t n_edges, std::uint32_t feature_dim,
+                                                   float const *cutoff_envelope, float const *tp_pre,
+                                                   float *grad_tp_inplace, float *grad_env, cudaStream_t stream) {
     if (n_edges == 0) return;
     // First reduce grad_env using grad_tp_post BEFORE we rescale grad_tp.
     if (grad_env != nullptr) {
@@ -1337,8 +1236,8 @@ inline void launch_mace_apply_cutoff_force_adjoint(
     constexpr std::uint32_t block_dim_x = 128;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_edges, (feature_dim + block_dim_x - 1u) / block_dim_x, 1);
-    mace_apply_cutoff_force_adjoint_grad_tp_kernel<<<grid, block, 0, stream>>>(
-        n_edges, feature_dim, cutoff_envelope, grad_tp_inplace);
+    mace_apply_cutoff_force_adjoint_grad_tp_kernel<<<grid, block, 0, stream>>>(n_edges, feature_dim, cutoff_envelope,
+                                                                               grad_tp_inplace);
 }
 
 /**
@@ -1351,17 +1250,11 @@ inline void launch_mace_apply_cutoff_force_adjoint(
  *
  *  d r / d positions[target/source] = ± r_unit.  Atomic-add into dpositions.
  */
-inline __global__ void mace_cutoff_grad_env_to_positions_kernel(
-    std::uint32_t n_edges,
-    float r_max,
-    float cutoff_p,
-    float const *r_norm,
-    float const *r_unit,
-    std::int32_t const *edge_source_atom,
-    std::int32_t const *edge_target_atom,
-    float const *grad_env,
-    float *dpositions
-) {
+inline __global__ void mace_cutoff_grad_env_to_positions_kernel(std::uint32_t n_edges, float r_max, float cutoff_p,
+                                                                float const *r_norm, float const *r_unit,
+                                                                std::int32_t const *edge_source_atom,
+                                                                std::int32_t const *edge_target_atom,
+                                                                float const *grad_env, float *dpositions) {
     std::uint32_t edge_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (edge_index >= n_edges) return;
     float const r = r_norm[edge_index];
@@ -1372,8 +1265,8 @@ inline __global__ void mace_cutoff_grad_env_to_positions_kernel(
     float const b = p * (p + 2.0f);
     float const c = -p * (p + 1.0f) * 0.5f;
     float const up_minus1 = powf(u, p - 1.0f);
-    float const up        = up_minus1 * u;
-    float const up1       = up * u;
+    float const up = up_minus1 * u;
+    float const up1 = up * u;
     float const inv_r_max = 1.0f / r_max;
     float const denv_dr = inv_r_max * (a * p * up_minus1 + b * (p + 1.0f) * up + c * (p + 2.0f) * up1);
     float const ge = grad_env[edge_index];
@@ -1383,31 +1276,24 @@ inline __global__ void mace_cutoff_grad_env_to_positions_kernel(
     float const uz = r_unit[3 * edge_index + 2];
     int const src = edge_source_atom[edge_index];
     int const dst = edge_target_atom[edge_index];
-    atomicAdd(dpositions + 3 * dst + 0,  dr_contribution * ux);
-    atomicAdd(dpositions + 3 * dst + 1,  dr_contribution * uy);
-    atomicAdd(dpositions + 3 * dst + 2,  dr_contribution * uz);
+    atomicAdd(dpositions + 3 * dst + 0, dr_contribution * ux);
+    atomicAdd(dpositions + 3 * dst + 1, dr_contribution * uy);
+    atomicAdd(dpositions + 3 * dst + 2, dr_contribution * uz);
     atomicAdd(dpositions + 3 * src + 0, -dr_contribution * ux);
     atomicAdd(dpositions + 3 * src + 1, -dr_contribution * uy);
     atomicAdd(dpositions + 3 * src + 2, -dr_contribution * uz);
 }
 
-inline void launch_mace_cutoff_grad_env_to_positions(
-    types::mace_arch_t const &arch,
-    std::uint32_t n_edges,
-    float const *r_norm,
-    float const *r_unit,
-    std::int32_t const *edge_source_atom,
-    std::int32_t const *edge_target_atom,
-    float const *grad_env,
-    float *dpositions,
-    cudaStream_t stream
-) {
+inline void launch_mace_cutoff_grad_env_to_positions(types::mace_arch_t const &arch, std::uint32_t n_edges,
+                                                     float const *r_norm, float const *r_unit,
+                                                     std::int32_t const *edge_source_atom,
+                                                     std::int32_t const *edge_target_atom, float const *grad_env,
+                                                     float *dpositions, cudaStream_t stream) {
     if (n_edges == 0) return;
     constexpr std::uint32_t block = 128;
     std::uint32_t const grid = (n_edges + block - 1u) / block;
     mace_cutoff_grad_env_to_positions_kernel<<<grid, block, 0, stream>>>(
-        n_edges, arch.r_max, arch.cutoff_p, r_norm, r_unit,
-        edge_source_atom, edge_target_atom, grad_env, dpositions);
+        n_edges, arch.r_max, arch.cutoff_p, r_norm, r_unit, edge_source_atom, edge_target_atom, grad_env, dpositions);
 }
 
 /**
@@ -1427,63 +1313,50 @@ inline void launch_mace_cutoff_grad_env_to_positions(
  *  forward sensitivity, so we extract that into a `[n_atoms, c]` accumulator.
  */
 inline __global__ void mace_extract_l0_irrep_block_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t irrep_dim,
-    float const *grad_l0_only,                // [n_atoms, n_channels]
-    float *grad_node_features_full            // [n_atoms, n_channels, irrep_dim]   accumulated +=
+    std::uint32_t n_atoms, std::uint32_t n_channels, std::uint32_t irrep_dim,
+    float const *grad_l0_only,     // [n_atoms, n_channels]
+    float *grad_node_features_full // [n_atoms, n_channels, irrep_dim]   accumulated +=
 ) {
     std::uint32_t atom_index = blockIdx.x;
     std::uint32_t channel_index = blockIdx.y * blockDim.x + threadIdx.x;
     if (atom_index >= n_atoms || channel_index >= n_channels) return;
-    grad_node_features_full[(static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim + 0]
-        += grad_l0_only[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index];
+    grad_node_features_full[(static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim + 0] +=
+        grad_l0_only[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index];
 }
 
-inline void launch_mace_extract_l0_irrep_block_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t irrep_dim,
-    float const *grad_l0_only,
-    float *grad_node_features_full,
-    cudaStream_t stream
-) {
+inline void launch_mace_extract_l0_irrep_block_force_adjoint(std::uint32_t n_atoms, std::uint32_t n_channels,
+                                                             std::uint32_t irrep_dim, float const *grad_l0_only,
+                                                             float *grad_node_features_full, cudaStream_t stream) {
     if (n_atoms == 0) return;
     constexpr std::uint32_t block_dim_x = 64;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_atoms, (n_channels + block_dim_x - 1u) / block_dim_x, 1);
-    mace_extract_l0_irrep_block_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_atoms, n_channels, irrep_dim, grad_l0_only, grad_node_features_full);
+    mace_extract_l0_irrep_block_force_adjoint_kernel<<<grid, block, 0, stream>>>(n_atoms, n_channels, irrep_dim,
+                                                                                 grad_l0_only, grad_node_features_full);
 }
 
 inline __global__ void mace_inject_l0_irrep_block_force_adjoint_kernel(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t irrep_dim,
-    float const *grad_node_features_full,     // [n_atoms, n_channels, irrep_dim]
-    float *grad_l0_only                       // [n_atoms, n_channels]   accumulated +=
+    std::uint32_t n_atoms, std::uint32_t n_channels, std::uint32_t irrep_dim,
+    float const *grad_node_features_full, // [n_atoms, n_channels, irrep_dim]
+    float *grad_l0_only                   // [n_atoms, n_channels]   accumulated +=
 ) {
     std::uint32_t atom_index = blockIdx.x;
     std::uint32_t channel_index = blockIdx.y * blockDim.x + threadIdx.x;
     if (atom_index >= n_atoms || channel_index >= n_channels) return;
-    grad_l0_only[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index]
-        += grad_node_features_full[(static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim + 0];
+    grad_l0_only[static_cast<std::uint64_t>(atom_index) * n_channels + channel_index] +=
+        grad_node_features_full[(static_cast<std::uint64_t>(atom_index) * n_channels + channel_index) * irrep_dim + 0];
 }
 
-inline void launch_mace_inject_l0_irrep_block_force_adjoint(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels,
-    std::uint32_t irrep_dim,
-    float const *grad_node_features_full,
-    float *grad_l0_only,
-    cudaStream_t stream
-) {
+inline void launch_mace_inject_l0_irrep_block_force_adjoint(std::uint32_t n_atoms, std::uint32_t n_channels,
+                                                            std::uint32_t irrep_dim,
+                                                            float const *grad_node_features_full, float *grad_l0_only,
+                                                            cudaStream_t stream) {
     if (n_atoms == 0) return;
     constexpr std::uint32_t block_dim_x = 64;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_atoms, (n_channels + block_dim_x - 1u) / block_dim_x, 1);
-    mace_inject_l0_irrep_block_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_atoms, n_channels, irrep_dim, grad_node_features_full, grad_l0_only);
+    mace_inject_l0_irrep_block_force_adjoint_kernel<<<grid, block, 0, stream>>>(n_atoms, n_channels, irrep_dim,
+                                                                                grad_node_features_full, grad_l0_only);
 }
 
 /**
@@ -1531,11 +1404,11 @@ __device__ __forceinline__ float mace_invert_silu_norm2mom_(float y) {
     // For very negative y, silu·n2m is bounded below ≈ -0.557 * N ~ -0.935; clamp the
     // initial guess to avoid divergent iterates.
     if (x < -3.0f) x = -3.0f;
-    if (x >  6.0f) x =  6.0f;
+    if (x > 6.0f) x = 6.0f;
     for (int iter = 0; iter < 8; ++iter) {
         float const sig = 1.0f / (1.0f + __expf(-x));
-        float const f   = N * x * sig - y;
-        float const fp  = N * (sig + x * sig * (1.0f - sig));
+        float const f = N * x * sig - y;
+        float const fp = N * (sig + x * sig * (1.0f - sig));
         // Guard against fp ~ 0 (shouldn't happen in our regime).
         float const step = (fabsf(fp) > 1e-8f) ? (f / fp) : 0.0f;
         x -= step;
@@ -1569,17 +1442,13 @@ __device__ __forceinline__ float mace_silu_norm2mom_derivative_(float pre_act) {
  *  Threading: one thread per (row, c_in).  Inner loop over c_out.
  */
 inline __global__ void mace_radial_mlp_layer_force_adjoint_kernel(
-    std::uint32_t n_rows,
-    std::uint32_t n_in,
-    std::uint32_t n_out,
-    float scale,
-    bool apply_silu_n2m_inverse,
-    bool accumulate,                 // true: grad_in += result; false: grad_in = result
-    bool activation_is_pre_act,      // true: `activation` holds pre-activation directly (skip Newton inversion)
-    float const *activation,         // [n_rows, n_out]   (pre- OR post-silu_n2m, see flag)
-    float const *weight,             // [n_in, n_out]
-    float const *grad_out,           // [n_rows, n_out]
-    float *grad_in                   // [n_rows, n_in]
+    std::uint32_t n_rows, std::uint32_t n_in, std::uint32_t n_out, float scale, bool apply_silu_n2m_inverse,
+    bool accumulate,            // true: grad_in += result; false: grad_in = result
+    bool activation_is_pre_act, // true: `activation` holds pre-activation directly (skip Newton inversion)
+    float const *activation,    // [n_rows, n_out]   (pre- OR post-silu_n2m, see flag)
+    float const *weight,        // [n_in, n_out]
+    float const *grad_out,      // [n_rows, n_out]
+    float *grad_in              // [n_rows, n_in]
 ) {
     std::uint32_t row_index = blockIdx.x;
     std::uint32_t input_index = blockIdx.y * blockDim.x + threadIdx.x;
@@ -1605,27 +1474,18 @@ inline __global__ void mace_radial_mlp_layer_force_adjoint_kernel(
     grad_in[out_offset] = accumulate ? (grad_in[out_offset] + result) : result;
 }
 
-inline void launch_mace_radial_mlp_layer_force_adjoint(
-    std::uint32_t n_rows,
-    std::uint32_t n_in,
-    std::uint32_t n_out,
-    float scale,
-    bool apply_silu_n2m_inverse,
-    bool accumulate,
-    float const *activation,
-    float const *weight,
-    float const *grad_out,
-    float *grad_in,
-    cudaStream_t stream,
-    bool activation_is_pre_act = false
-) {
+inline void launch_mace_radial_mlp_layer_force_adjoint(std::uint32_t n_rows, std::uint32_t n_in, std::uint32_t n_out,
+                                                       float scale, bool apply_silu_n2m_inverse, bool accumulate,
+                                                       float const *activation, float const *weight,
+                                                       float const *grad_out, float *grad_in, cudaStream_t stream,
+                                                       bool activation_is_pre_act = false) {
     if (n_rows == 0) return;
     constexpr std::uint32_t block_dim_x = 64;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_rows, (n_in + block_dim_x - 1u) / block_dim_x, 1);
     mace_radial_mlp_layer_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_rows, n_in, n_out, scale, apply_silu_n2m_inverse, accumulate, activation_is_pre_act,
-        activation, weight, grad_out, grad_in);
+        n_rows, n_in, n_out, scale, apply_silu_n2m_inverse, accumulate, activation_is_pre_act, activation, weight,
+        grad_out, grad_in);
 }
 
 } // namespace smallfield::cuda

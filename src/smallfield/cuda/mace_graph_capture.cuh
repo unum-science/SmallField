@@ -63,7 +63,7 @@ namespace smallfield::cuda {
 struct mace_captured_graph_t {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
-    types::mace_arch_t arch{};
+    types::mace_arch_t arch {};
     std::uint32_t n_atoms = 0;
     std::uint32_t n_edges = 0;
     std::uint32_t n_graphs = 0;
@@ -84,8 +84,8 @@ struct mace_captured_graph_t {
     mace_captured_graph_t(mace_captured_graph_t const &) = delete;
     mace_captured_graph_t &operator=(mace_captured_graph_t const &) = delete;
     mace_captured_graph_t(mace_captured_graph_t &&other) noexcept
-        : graph(other.graph), graph_exec(other.graph_exec), arch(other.arch),
-          n_atoms(other.n_atoms), n_edges(other.n_edges), n_graphs(other.n_graphs) {
+        : graph(other.graph), graph_exec(other.graph_exec), arch(other.arch), n_atoms(other.n_atoms),
+          n_edges(other.n_edges), n_graphs(other.n_graphs) {
         other.graph = nullptr;
         other.graph_exec = nullptr;
     }
@@ -120,14 +120,9 @@ struct mace_captured_graph_t {
  *  `SMALLFIELD_USE_THUNDERKITTENS`, which would otherwise call `cudaMalloc`
  *  inside the captured region and abort capture).
  */
-inline void mace_capture_forward(
-    types::mace_arch_t const &arch,
-    types::mace_weights_device_t const &W,
-    types::mace_batch_t const &batch,
-    mace_scratch_t &scratch,
-    cudaStream_t capture_stream,
-    mace_captured_graph_t &out
-) {
+inline void mace_capture_forward(types::mace_arch_t const &arch, types::mace_weights_device_t const &W,
+                                 types::mace_batch_t const &batch, mace_scratch_t &scratch, cudaStream_t capture_stream,
+                                 mace_captured_graph_t &out) {
     // 1. Warm up the driver path once so any first-call lazy allocation
     //    (e.g. `tk_precomputed_w3_effective_layer` under
     //    SMALLFIELD_USE_THUNDERKITTENS) happens BEFORE we start capture.
@@ -137,16 +132,14 @@ inline void mace_capture_forward(
     cudaStreamSynchronize(capture_stream);
     cudaError_t const warmup_err = cudaGetLastError();
     if (warmup_err != cudaSuccess) {
-        std::fprintf(stderr, "mace_capture_forward: warmup failed (%s)\n",
-                     cudaGetErrorString(warmup_err));
+        std::fprintf(stderr, "mace_capture_forward: warmup failed (%s)\n", cudaGetErrorString(warmup_err));
         return;
     }
 
     // 2. Begin capture and re-issue the same kernel sequence.
     cudaError_t const begin_err = cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
     if (begin_err != cudaSuccess) {
-        std::fprintf(stderr, "cudaStreamBeginCapture failed: %s\n",
-                     cudaGetErrorString(begin_err));
+        std::fprintf(stderr, "cudaStreamBeginCapture failed: %s\n", cudaGetErrorString(begin_err));
         return;
     }
     mace_inference_reset_per_atom_energy_accumulator(scratch, batch.n_atoms, capture_stream);
@@ -154,8 +147,7 @@ inline void mace_capture_forward(
     cudaGraph_t graph = nullptr;
     cudaError_t const end_err = cudaStreamEndCapture(capture_stream, &graph);
     if (end_err != cudaSuccess) {
-        std::fprintf(stderr, "cudaStreamEndCapture failed: %s\n",
-                     cudaGetErrorString(end_err));
+        std::fprintf(stderr, "cudaStreamEndCapture failed: %s\n", cudaGetErrorString(end_err));
         return;
     }
 
@@ -165,14 +157,10 @@ inline void mace_capture_forward(
     cudaGraphExec_t graph_exec = nullptr;
     char log_buffer[1024] = {0};
     cudaGraphNode_t error_node = nullptr;
-    cudaError_t const inst_err = cudaGraphInstantiate(
-        &graph_exec, graph, &error_node, log_buffer, sizeof(log_buffer));
+    cudaError_t const inst_err = cudaGraphInstantiate(&graph_exec, graph, &error_node, log_buffer, sizeof(log_buffer));
     if (inst_err != cudaSuccess) {
-        std::fprintf(stderr,
-                     "mace_capture_forward: cudaGraphInstantiate failed (%s) "
-                     "— error_node=%p log=\"%s\"\n",
-                     cudaGetErrorString(inst_err),
-                     static_cast<void *>(error_node), log_buffer);
+        std::fprintf(stderr, "mace_capture_forward: cudaGraphInstantiate failed (%s) " "— error_node=%p log=\"%s\"\n",
+                     cudaGetErrorString(inst_err), static_cast<void *>(error_node), log_buffer);
         return;
     }
 
@@ -205,14 +193,10 @@ inline void mace_capture_forward(
  *  (see `mace_inference.cuh` step 3j).  No `cudaMallocAsync` /
  *  `cudaFreeAsync` calls remain on the captured chain.
  */
-inline void mace_capture_forward_with_force_adjoint(
-    types::mace_arch_t const &arch,
-    types::mace_weights_device_t const &W,
-    types::mace_batch_t const &batch,
-    mace_scratch_t &scratch,
-    cudaStream_t capture_stream,
-    mace_captured_graph_t &out
-) {
+inline void mace_capture_forward_with_force_adjoint(types::mace_arch_t const &arch,
+                                                    types::mace_weights_device_t const &W,
+                                                    types::mace_batch_t const &batch, mace_scratch_t &scratch,
+                                                    cudaStream_t capture_stream, mace_captured_graph_t &out) {
     // 1. Warmup: run forward + adjoint once eagerly so all first-call lazy
     //    allocations land before capture begins.
     mace_inference_reset_per_atom_energy_accumulator(scratch, batch.n_atoms, capture_stream);
@@ -229,8 +213,7 @@ inline void mace_capture_forward_with_force_adjoint(
     // 2. Begin capture and re-issue forward + adjoint.
     cudaError_t const begin_err = cudaStreamBeginCapture(capture_stream, cudaStreamCaptureModeGlobal);
     if (begin_err != cudaSuccess) {
-        std::fprintf(stderr, "cudaStreamBeginCapture failed: %s\n",
-                     cudaGetErrorString(begin_err));
+        std::fprintf(stderr, "cudaStreamBeginCapture failed: %s\n", cudaGetErrorString(begin_err));
         return;
     }
     mace_inference_reset_per_atom_energy_accumulator(scratch, batch.n_atoms, capture_stream);
@@ -239,8 +222,7 @@ inline void mace_capture_forward_with_force_adjoint(
     cudaGraph_t graph = nullptr;
     cudaError_t const end_err = cudaStreamEndCapture(capture_stream, &graph);
     if (end_err != cudaSuccess) {
-        std::fprintf(stderr, "cudaStreamEndCapture failed: %s\n",
-                     cudaGetErrorString(end_err));
+        std::fprintf(stderr, "cudaStreamEndCapture failed: %s\n", cudaGetErrorString(end_err));
         return;
     }
 
@@ -248,14 +230,12 @@ inline void mace_capture_forward_with_force_adjoint(
     cudaGraphExec_t graph_exec = nullptr;
     char log_buffer[1024] = {0};
     cudaGraphNode_t error_node = nullptr;
-    cudaError_t const inst_err = cudaGraphInstantiate(
-        &graph_exec, graph, &error_node, log_buffer, sizeof(log_buffer));
+    cudaError_t const inst_err = cudaGraphInstantiate(&graph_exec, graph, &error_node, log_buffer, sizeof(log_buffer));
     if (inst_err != cudaSuccess) {
-        std::fprintf(stderr,
-                     "mace_capture_forward_with_force_adjoint: cudaGraphInstantiate failed (%s) "
-                     "— error_node=%p log=\"%s\"\n",
-                     cudaGetErrorString(inst_err),
-                     static_cast<void *>(error_node), log_buffer);
+        std::fprintf(
+            stderr,
+            "mace_capture_forward_with_force_adjoint: cudaGraphInstantiate failed (%s) " "— error_node=%p log=\"%s\"\n",
+            cudaGetErrorString(inst_err), static_cast<void *>(error_node), log_buffer);
         return;
     }
 
@@ -308,28 +288,20 @@ struct mace_captured_graph_cache_t {
      *  Pointer ownership: returned graph is owned by the cache.  Caller
      *  invokes `replay()` on it; the cache destroys it on destruction.
      */
-    mace_captured_graph_t const *get_or_capture(
-        types::mace_arch_t const &arch,
-        types::mace_weights_device_t const &W,
-        types::mace_batch_t const &batch,
-        mace_scratch_t &S,
-        cudaStream_t capture_stream,
-        bool with_force_adjoint
-    ) {
-        bin_key_t const key{batch.n_atoms, batch.n_edges, batch.n_graphs};
+    mace_captured_graph_t const *get_or_capture(types::mace_arch_t const &arch, types::mace_weights_device_t const &W,
+                                                types::mace_batch_t const &batch, mace_scratch_t &S,
+                                                cudaStream_t capture_stream, bool with_force_adjoint) {
+        bin_key_t const key {batch.n_atoms, batch.n_edges, batch.n_graphs};
         auto it = std::lower_bound(entries_.begin(), entries_.end(), key,
-                                    [](entry_t const &e, bin_key_t const &k) { return e.key < k; });
-        if (it != entries_.end() && it->key == key) {
-            return &it->graph;
-        }
+                                   [](entry_t const &e, bin_key_t const &k) { return e.key < k; });
+        if (it != entries_.end() && it->key == key) { return &it->graph; }
         // Miss: capture a new graph and insert.
-        entry_t fresh{};
+        entry_t fresh {};
         fresh.key = key;
         if (with_force_adjoint) {
             mace_capture_forward_with_force_adjoint(arch, W, batch, S, capture_stream, fresh.graph);
-        } else {
-            mace_capture_forward(arch, W, batch, S, capture_stream, fresh.graph);
         }
+        else { mace_capture_forward(arch, W, batch, S, capture_stream, fresh.graph); }
         if (fresh.graph.graph_exec == nullptr) {
             // Capture failed — don't poison the cache.
             return nullptr;
@@ -344,9 +316,9 @@ struct mace_captured_graph_cache_t {
     /** Clear all entries — destroys their underlying graphs. */
     void clear() { entries_.clear(); }
 
-private:
+  private:
     struct entry_t {
-        bin_key_t key{};
+        bin_key_t key {};
         mace_captured_graph_t graph;
     };
     std::vector<entry_t> entries_;

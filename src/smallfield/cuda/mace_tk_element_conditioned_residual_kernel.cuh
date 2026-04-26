@@ -71,19 +71,19 @@ namespace mace_tk_element_conditioned_residual_detail_ {
 // requires the output `M` axis to be exactly 64, so we tile `c_out = 96`
 // as two 64-wide column tiles of 64 (the second tile zero-pads cols
 // 32..63 and we drop those rows during the bf16 store).
-constexpr int channels_in_k             = mace_tk::mace_channels_small_k;        // 96
-constexpr int channels_out_k            = mace_tk::mace_channels_small_k;        // 96
-constexpr int irrep_dim_total_k         = mace_tk::mace_irrep_dim_total_k;       // 16
-constexpr int channels_out_tile_size_k  = 64;                                    // WGMMA M
-constexpr int channels_out_tile_count_k = (channels_out_k + channels_out_tile_size_k - 1)
-                                          / channels_out_tile_size_k;            // 2
+constexpr int channels_in_k = mace_tk::mace_channels_small_k;      // 96
+constexpr int channels_out_k = mace_tk::mace_channels_small_k;     // 96
+constexpr int irrep_dim_total_k = mace_tk::mace_irrep_dim_total_k; // 16
+constexpr int channels_out_tile_size_k = 64;                       // WGMMA M
+constexpr int channels_out_tile_count_k = (channels_out_k + channels_out_tile_size_k - 1) /
+                                          channels_out_tile_size_k; // 2
 constexpr int max_active_irrep_block_count_k = 4;
-constexpr int warpgroup_thread_count_k  = kittens::WARPGROUP_THREADS;             // 128
+constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS; // 128
 
 // Shared-tile aliases.  Activations and weights live as bf16 in shared
 // memory; the WGMMA accumulator stays fp32 in registers.
-using shared_tile_input_t        = mace_tk::shared_tile_bf16<channels_in_k, irrep_dim_total_k>;
-using shared_tile_weight_slab_t  = mace_tk::shared_tile_bf16<channels_in_k, channels_out_tile_size_k>;
+using shared_tile_input_t = mace_tk::shared_tile_bf16<channels_in_k, irrep_dim_total_k>;
+using shared_tile_weight_slab_t = mace_tk::shared_tile_bf16<channels_in_k, channels_out_tile_size_k>;
 using shared_tile_output_stage_t = mace_tk::shared_tile_bf16<channels_out_tile_size_k, irrep_dim_total_k>;
 
 // Per-warpgroup register accumulator: 64 rows × 16 cols (one warp per 16
@@ -111,12 +111,8 @@ __device__ __forceinline__ unsigned int irrep_block_index_for_component_(unsigne
 
 /// Identity / type-converting bf16 cast — used inside the templated input
 /// loader so the bf16 path skips the `__float2bfloat16_rn` round-trip.
-__device__ __forceinline__ __nv_bfloat16 input_to_bf16_(float v) {
-    return __float2bfloat16_rn(v);
-}
-__device__ __forceinline__ __nv_bfloat16 input_to_bf16_(__nv_bfloat16 v) {
-    return v;
-}
+__device__ __forceinline__ __nv_bfloat16 input_to_bf16_(float v) { return __float2bfloat16_rn(v); }
+__device__ __forceinline__ __nv_bfloat16 input_to_bf16_(__nv_bfloat16 v) { return v; }
 
 /**
  *  @brief Stage the per-atom input slab `[c_in, irrep_dim] = [96, 16]`
@@ -128,22 +124,17 @@ __device__ __forceinline__ __nv_bfloat16 input_to_bf16_(__nv_bfloat16 v) {
  *  so this loader assumes a valid `atom_index`.
  */
 template <typename input_t>
-__device__ __forceinline__ void load_atom_input_slab_(
-    shared_tile_input_t &dst_input_tile,
-    input_t const *input_global,
-    std::uint32_t atom_index
-) {
+__device__ __forceinline__ void load_atom_input_slab_(shared_tile_input_t &dst_input_tile, input_t const *input_global,
+                                                      std::uint32_t atom_index) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_in_k * irrep_dim_total_k;
-    std::uint64_t const atom_input_offset =
-        static_cast<std::uint64_t>(atom_index) * channels_in_k * irrep_dim_total_k;
-    #pragma unroll
+    std::uint64_t const atom_input_offset = static_cast<std::uint64_t>(atom_index) * channels_in_k * irrep_dim_total_k;
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
-        int const row_in_tile = linear_index / irrep_dim_total_k;  // c_in
-        int const col_in_tile = linear_index % irrep_dim_total_k;  // m
-        input_t const value = input_global[atom_input_offset
-                                          + static_cast<std::uint64_t>(row_in_tile) * irrep_dim_total_k
-                                          + col_in_tile];
+        int const row_in_tile = linear_index / irrep_dim_total_k; // c_in
+        int const col_in_tile = linear_index % irrep_dim_total_k; // m
+        input_t const value =
+            input_global[atom_input_offset + static_cast<std::uint64_t>(row_in_tile) * irrep_dim_total_k + col_in_tile];
         dst_input_tile[{row_in_tile, col_in_tile}] = input_to_bf16_(value);
     }
 }
@@ -159,34 +150,27 @@ __device__ __forceinline__ void load_atom_input_slab_(
  *  so the WGMMA picks up zeros there and the bf16 store path drops the
  *  corresponding output rows.
  */
-__device__ __forceinline__ void load_z_indirect_weight_slab_(
-    shared_tile_weight_slab_t &dst_weight_tile,
-    float const *weights_global,
-    std::uint32_t n_elements,
-    std::uint32_t n_channels_out,
-    unsigned int irrep_block_index,
-    int atom_element_index,
-    int channels_out_tile_index
-) {
+__device__ __forceinline__ void load_z_indirect_weight_slab_(shared_tile_weight_slab_t &dst_weight_tile,
+                                                             float const *weights_global, std::uint32_t n_elements,
+                                                             std::uint32_t n_channels_out,
+                                                             unsigned int irrep_block_index, int atom_element_index,
+                                                             int channels_out_tile_index) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_in_k * channels_out_tile_size_k;
-    std::uint64_t const block_stride =
-        static_cast<std::uint64_t>(channels_in_k) * n_elements * n_channels_out;
+    std::uint64_t const block_stride = static_cast<std::uint64_t>(channels_in_k) * n_elements * n_channels_out;
     std::uint64_t const channel_in_stride = static_cast<std::uint64_t>(n_elements) * n_channels_out;
-    std::uint64_t const block_base =
-        static_cast<std::uint64_t>(irrep_block_index) * block_stride
-        + static_cast<std::uint64_t>(atom_element_index) * n_channels_out;
+    std::uint64_t const block_base = static_cast<std::uint64_t>(irrep_block_index) * block_stride +
+                                     static_cast<std::uint64_t>(atom_element_index) * n_channels_out;
     int const channels_out_tile_base = channels_out_tile_index * channels_out_tile_size_k;
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
-        int const row_in_tile = linear_index / channels_out_tile_size_k;  // c_in
-        int const col_in_tile = linear_index % channels_out_tile_size_k;  // local c_out
+        int const row_in_tile = linear_index / channels_out_tile_size_k; // c_in
+        int const col_in_tile = linear_index % channels_out_tile_size_k; // local c_out
         int const channel_out_global = channels_out_tile_base + col_in_tile;
         float value = 0.0f;
         if (channel_out_global < static_cast<int>(n_channels_out)) {
-            value = weights_global[block_base
-                                    + static_cast<std::uint64_t>(row_in_tile) * channel_in_stride
-                                    + static_cast<std::uint64_t>(channel_out_global)];
+            value = weights_global[block_base + static_cast<std::uint64_t>(row_in_tile) * channel_in_stride +
+                                   static_cast<std::uint64_t>(channel_out_global)];
         }
         dst_weight_tile[{row_in_tile, col_in_tile}] = __float2bfloat16_rn(value);
     }
@@ -196,14 +180,10 @@ __device__ __forceinline__ void load_z_indirect_weight_slab_(
  *  @brief Apply the e3nn `path_weight = 1/sqrt(c_in * n_elements)` scale
  *         to a fp32 register tile in place.
  */
-__device__ __forceinline__ void scale_accumulator_in_place_(
-    register_accumulator_t &accumulator,
-    float scale
-) {
-    kittens::warpgroup::apply(
-        accumulator,
-        accumulator,
-        [scale] __device__ (int /*row*/, int /*col*/, float pre_value) { return pre_value * scale; });
+__device__ __forceinline__ void scale_accumulator_in_place_(register_accumulator_t &accumulator, float scale) {
+    kittens::warpgroup::apply(accumulator, accumulator, [scale] __device__(int /*row*/, int /*col*/, float pre_value) {
+        return pre_value * scale;
+    });
 }
 
 /**
@@ -224,16 +204,12 @@ __device__ __forceinline__ void scale_accumulator_in_place_(
  *  irrep-block invocation.  The zero-init is folded into the first call
  *  via `is_first_irrep_block` below.
  */
-__device__ __forceinline__ void store_irrep_block_with_guard_(
-    __nv_bfloat16 *output_global,
-    shared_tile_output_stage_t &staging_shared_tile,
-    register_accumulator_t const &accumulator,
-    std::uint32_t atom_index,
-    std::uint32_t n_channels_out,
-    unsigned int irrep_block_index,
-    int channels_out_tile_index,
-    bool is_first_irrep_block
-) {
+__device__ __forceinline__ void store_irrep_block_with_guard_(__nv_bfloat16 *output_global,
+                                                              shared_tile_output_stage_t &staging_shared_tile,
+                                                              register_accumulator_t const &accumulator,
+                                                              std::uint32_t atom_index, std::uint32_t n_channels_out,
+                                                              unsigned int irrep_block_index,
+                                                              int channels_out_tile_index, bool is_first_irrep_block) {
     // Convert fp32 register tile to bf16 in shared memory.
     kittens::warpgroup::store(staging_shared_tile, accumulator);
     kittens::warpgroup::sync(0);
@@ -241,23 +217,24 @@ __device__ __forceinline__ void store_irrep_block_with_guard_(
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_out_tile_size_k * irrep_dim_total_k;
     int const channels_out_tile_base = channels_out_tile_index * channels_out_tile_size_k;
-    std::uint64_t const atom_output_offset =
-        static_cast<std::uint64_t>(atom_index) * n_channels_out * irrep_dim_total_k;
+    std::uint64_t const atom_output_offset = static_cast<std::uint64_t>(atom_index) * n_channels_out *
+                                             irrep_dim_total_k;
     __nv_bfloat16 const zero_bf16 = __float2bfloat16_rn(0.0f);
-    #pragma unroll
+#pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
-        int const row_in_tile = linear_index / irrep_dim_total_k;       // local c_out
-        int const col_in_tile = linear_index % irrep_dim_total_k;       // m
+        int const row_in_tile = linear_index / irrep_dim_total_k; // local c_out
+        int const col_in_tile = linear_index % irrep_dim_total_k; // m
         int const channel_out_global = channels_out_tile_base + row_in_tile;
         if (channel_out_global >= static_cast<int>(n_channels_out)) continue;
 
         unsigned int const m_block_index = irrep_block_index_for_component_(static_cast<unsigned int>(col_in_tile));
-        std::uint64_t const out_addr = atom_output_offset
-                                       + static_cast<std::uint64_t>(channel_out_global) * irrep_dim_total_k
-                                       + static_cast<std::uint64_t>(col_in_tile);
+        std::uint64_t const out_addr = atom_output_offset +
+                                       static_cast<std::uint64_t>(channel_out_global) * irrep_dim_total_k +
+                                       static_cast<std::uint64_t>(col_in_tile);
         if (m_block_index == irrep_block_index) {
             output_global[out_addr] = staging_shared_tile[{row_in_tile, col_in_tile}];
-        } else if (is_first_irrep_block) {
+        }
+        else if (is_first_irrep_block) {
             // Zero-init lanes that this irrep block doesn't write — only on
             // the first irrep-block pass per atom so subsequent blocks don't
             // clobber each other's m components.
@@ -281,22 +258,20 @@ __device__ __forceinline__ void store_irrep_block_with_guard_(
 template <typename input_t>
 inline __global__ void mace_tk_element_conditioned_residual_kernel(
     std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,                // == 96 for MACE-OFF-small
-    std::uint32_t n_elements,                   // == 10 for MACE-OFF23
-    std::uint32_t n_channels_out,               // == 96 for MACE-OFF-small
-    std::uint32_t active_irrep_block_count,     // 1 (L=0 only) or 4
-    float path_weight_scale,                    // 1 / sqrt(c_in * n_elements) [optionally premultiplied
-                                                //                              by 1/avg_num_neighbors]
-    std::int32_t const *__restrict__ atom_element,
-    float const *__restrict__ weights_fp32,
-    input_t const *__restrict__ input_global,   // float OR __nv_bfloat16
-    __nv_bfloat16 *__restrict__ output_bf16
-) {
+    std::uint32_t n_channels_in,            // == 96 for MACE-OFF-small
+    std::uint32_t n_elements,               // == 10 for MACE-OFF23
+    std::uint32_t n_channels_out,           // == 96 for MACE-OFF-small
+    std::uint32_t active_irrep_block_count, // 1 (L=0 only) or 4
+    float path_weight_scale,                // 1 / sqrt(c_in * n_elements) [optionally premultiplied
+                                            //                              by 1/avg_num_neighbors]
+    std::int32_t const *__restrict__ atom_element, float const *__restrict__ weights_fp32,
+    input_t const *__restrict__ input_global, // float OR __nv_bfloat16
+    __nv_bfloat16 *__restrict__ output_bf16) {
     extern __shared__ kittens::alignment_dummy raw_shared_memory[];
     kittens::shared_allocator shared_alloc(reinterpret_cast<int *>(&raw_shared_memory[0]));
 
-    shared_tile_input_t        &shared_input_tile        = shared_alloc.allocate<shared_tile_input_t>();
-    shared_tile_weight_slab_t  &shared_weight_slab       = shared_alloc.allocate<shared_tile_weight_slab_t>();
+    shared_tile_input_t &shared_input_tile = shared_alloc.allocate<shared_tile_input_t>();
+    shared_tile_weight_slab_t &shared_weight_slab = shared_alloc.allocate<shared_tile_weight_slab_t>();
     shared_tile_output_stage_t &shared_output_stage_tile = shared_alloc.allocate<shared_tile_output_stage_t>();
 
     mace_tk::mma_ctx_t<register_accumulator_t> mma_ctx;
@@ -304,7 +279,7 @@ inline __global__ void mace_tk_element_conditioned_residual_kernel(
 
     std::uint32_t const atom_index = blockIdx.x;
     if (atom_index >= n_atoms) return;
-    if (n_channels_in  != static_cast<std::uint32_t>(channels_in_k))  return;
+    if (n_channels_in != static_cast<std::uint32_t>(channels_in_k)) return;
     if (n_channels_out != static_cast<std::uint32_t>(channels_out_k)) return;
 
     int const atom_element_index = atom_element[atom_index];
@@ -318,18 +293,12 @@ inline __global__ void mace_tk_element_conditioned_residual_kernel(
     for (unsigned int irrep_block_index = 0u; irrep_block_index < active_irrep_block_count; ++irrep_block_index) {
         bool const is_first_irrep_block = (irrep_block_index == 0u);
 
-        #pragma unroll
-        for (int channels_out_tile_index = 0;
-             channels_out_tile_index < channels_out_tile_count_k;
+#pragma unroll
+        for (int channels_out_tile_index = 0; channels_out_tile_index < channels_out_tile_count_k;
              ++channels_out_tile_index) {
 
-            load_z_indirect_weight_slab_(shared_weight_slab,
-                                         weights_fp32,
-                                         n_elements,
-                                         n_channels_out,
-                                         irrep_block_index,
-                                         atom_element_index,
-                                         channels_out_tile_index);
+            load_z_indirect_weight_slab_(shared_weight_slab, weights_fp32, n_elements, n_channels_out,
+                                         irrep_block_index, atom_element_index, channels_out_tile_index);
             kittens::warpgroup::sync(0);
 
             // D[c_out=64, m=16] = W[K=c_in, M=c_out_tile=64]^T @ In[K=c_in, N=m=16]
@@ -337,13 +306,8 @@ inline __global__ void mace_tk_element_conditioned_residual_kernel(
 
             scale_accumulator_in_place_(accumulator, path_weight_scale);
 
-            store_irrep_block_with_guard_(output_bf16,
-                                          shared_output_stage_tile,
-                                          accumulator,
-                                          atom_index,
-                                          n_channels_out,
-                                          irrep_block_index,
-                                          channels_out_tile_index,
+            store_irrep_block_with_guard_(output_bf16, shared_output_stage_tile, accumulator, atom_index,
+                                          n_channels_out, irrep_block_index, channels_out_tile_index,
                                           is_first_irrep_block);
             kittens::warpgroup::sync(0);
         }
@@ -356,8 +320,8 @@ inline __global__ void mace_tk_element_conditioned_residual_kernel(
     // We still need to clear any m for which the block index >= active count.
     if (active_irrep_block_count < static_cast<std::uint32_t>(max_active_irrep_block_count_k)) {
         int const thread_id = threadIdx.x;
-        std::uint64_t const atom_output_offset =
-            static_cast<std::uint64_t>(atom_index) * n_channels_out * irrep_dim_total_k;
+        std::uint64_t const atom_output_offset = static_cast<std::uint64_t>(atom_index) * n_channels_out *
+                                                 irrep_dim_total_k;
         int const total_lanes = static_cast<int>(n_channels_out) * irrep_dim_total_k;
         __nv_bfloat16 const zero_bf16 = __float2bfloat16_rn(0.0f);
         for (int linear_index = thread_id; linear_index < total_lanes; linear_index += warpgroup_thread_count_k) {
@@ -366,9 +330,8 @@ inline __global__ void mace_tk_element_conditioned_residual_kernel(
             unsigned int const m_block_index = irrep_block_index_for_component_(
                 static_cast<unsigned int>(irrep_component_index));
             if (m_block_index >= active_irrep_block_count) {
-                output_bf16[atom_output_offset
-                            + static_cast<std::uint64_t>(channel_out_index) * irrep_dim_total_k
-                            + static_cast<std::uint64_t>(irrep_component_index)] = zero_bf16;
+                output_bf16[atom_output_offset + static_cast<std::uint64_t>(channel_out_index) * irrep_dim_total_k +
+                            static_cast<std::uint64_t>(irrep_component_index)] = zero_bf16;
             }
         }
     }
@@ -401,30 +364,23 @@ inline __global__ void mace_tk_element_conditioned_residual_kernel(
  */
 /// Returns true on successful launch, false if the channel-count tuple
 /// isn't handled (caller must fall back to the fp32 reference path).
-inline bool launch_mace_tk_element_conditioned_residual(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_elements,
-    std::uint32_t n_channels_out,
-    std::uint32_t active_irrep_block_count,
-    std::int32_t const *atom_element,
-    float const *weights_fp32,
-    float const *input_fp32,
-    __nv_bfloat16 *output_bf16,
-    cudaStream_t stream
-) {
+inline bool launch_mace_tk_element_conditioned_residual(std::uint32_t n_atoms, std::uint32_t n_channels_in,
+                                                        std::uint32_t n_elements, std::uint32_t n_channels_out,
+                                                        std::uint32_t active_irrep_block_count,
+                                                        std::int32_t const *atom_element, float const *weights_fp32,
+                                                        float const *input_fp32, __nv_bfloat16 *output_bf16,
+                                                        cudaStream_t stream) {
     if (n_atoms == 0u) return true;
     if (active_irrep_block_count == 0u) return false;
     if (active_irrep_block_count > 4u) return false;
-    if (n_channels_in != static_cast<std::uint32_t>(
-            mace_tk_element_conditioned_residual_detail_::channels_in_k)) return false;
-    if (n_channels_out != static_cast<std::uint32_t>(
-            mace_tk_element_conditioned_residual_detail_::channels_out_k)) return false;
+    if (n_channels_in != static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_in_k))
+        return false;
+    if (n_channels_out != static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_out_k))
+        return false;
 
     using namespace mace_tk_element_conditioned_residual_detail_;
 
-    float const path_weight_scale = 1.0f
-        / sqrtf(static_cast<float>(n_channels_in) * static_cast<float>(n_elements));
+    float const path_weight_scale = 1.0f / sqrtf(static_cast<float>(n_channels_in) * static_cast<float>(n_elements));
 
     // Shared-mem footprint:
     //   input_tile          96 x 16 bf16 = 3 KB
@@ -434,25 +390,15 @@ inline bool launch_mace_tk_element_conditioned_residual(
     //                                      ~17 KB + alignment slack
     constexpr std::size_t shared_memory_bytes_k = 32 * 1024;
 
-    cudaFuncSetAttribute(
-        mace_tk_element_conditioned_residual_kernel<float>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_memory_bytes_k));
+    cudaFuncSetAttribute(mace_tk_element_conditioned_residual_kernel<float>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared_memory_bytes_k));
 
     dim3 const grid(n_atoms, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
     mace_tk_element_conditioned_residual_kernel<float><<<grid, block, shared_memory_bytes_k, stream>>>(
-        n_atoms,
-        n_channels_in,
-        n_elements,
-        n_channels_out,
-        active_irrep_block_count,
-        path_weight_scale,
-        atom_element,
-        weights_fp32,
-        input_fp32,
-        output_bf16);
+        n_atoms, n_channels_in, n_elements, n_channels_out, active_irrep_block_count, path_weight_scale, atom_element,
+        weights_fp32, input_fp32, output_bf16);
     return true;
 }
 
@@ -481,52 +427,35 @@ inline bool launch_mace_tk_element_conditioned_residual(
  *  to the fp32 chain).
  */
 inline bool launch_mace_tk_element_conditioned_residual_bf16_input(
-    std::uint32_t n_atoms,
-    std::uint32_t n_channels_in,
-    std::uint32_t n_elements,
-    std::uint32_t n_channels_out,
-    std::uint32_t active_irrep_block_count,
-    std::int32_t const *atom_element,
-    float const *weights_fp32,
+    std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_elements, std::uint32_t n_channels_out,
+    std::uint32_t active_irrep_block_count, std::int32_t const *atom_element, float const *weights_fp32,
     __nv_bfloat16 const *input_bf16,
-    float pre_scale_multiplier,        // typically 1 / avg_num_neighbors
-    __nv_bfloat16 *output_bf16,
-    cudaStream_t stream
-) {
+    float pre_scale_multiplier, // typically 1 / avg_num_neighbors
+    __nv_bfloat16 *output_bf16, cudaStream_t stream) {
     if (n_atoms == 0u) return true;
     if (active_irrep_block_count == 0u) return false;
     if (active_irrep_block_count > 4u) return false;
-    if (n_channels_in != static_cast<std::uint32_t>(
-            mace_tk_element_conditioned_residual_detail_::channels_in_k)) return false;
-    if (n_channels_out != static_cast<std::uint32_t>(
-            mace_tk_element_conditioned_residual_detail_::channels_out_k)) return false;
+    if (n_channels_in != static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_in_k))
+        return false;
+    if (n_channels_out != static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_out_k))
+        return false;
 
     using namespace mace_tk_element_conditioned_residual_detail_;
 
-    float const path_weight_scale = pre_scale_multiplier
-        / sqrtf(static_cast<float>(n_channels_in) * static_cast<float>(n_elements));
+    float const path_weight_scale = pre_scale_multiplier /
+                                    sqrtf(static_cast<float>(n_channels_in) * static_cast<float>(n_elements));
 
     constexpr std::size_t shared_memory_bytes_k = 32 * 1024;
 
-    cudaFuncSetAttribute(
-        mace_tk_element_conditioned_residual_kernel<__nv_bfloat16>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_memory_bytes_k));
+    cudaFuncSetAttribute(mace_tk_element_conditioned_residual_kernel<__nv_bfloat16>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared_memory_bytes_k));
 
     dim3 const grid(n_atoms, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
     mace_tk_element_conditioned_residual_kernel<__nv_bfloat16><<<grid, block, shared_memory_bytes_k, stream>>>(
-        n_atoms,
-        n_channels_in,
-        n_elements,
-        n_channels_out,
-        active_irrep_block_count,
-        path_weight_scale,
-        atom_element,
-        weights_fp32,
-        input_bf16,
-        output_bf16);
+        n_atoms, n_channels_in, n_elements, n_channels_out, active_irrep_block_count, path_weight_scale, atom_element,
+        weights_fp32, input_bf16, output_bf16);
     return true;
 }
 

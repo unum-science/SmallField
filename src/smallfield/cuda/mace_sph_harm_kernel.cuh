@@ -32,9 +32,8 @@ namespace mace_sph_detail_ {
 //   L=1: [1, 2, 3]
 //   L=2: [4, 5, 6, 7, 8]
 //   L=3: [9, 10, 11, 12, 13, 14, 15]
-__device__ __forceinline__ void sph_harm_l0123_(
-    float x, float y, float z,
-    float *y_out  // [16]
+__device__ __forceinline__ void sph_harm_l0123_(float x, float y, float z,
+                                                float *y_out // [16]
 ) {
     // Unscaled e3nn values, exactly as in `_spherical_harmonics(lmax=3, ...)`.
     float const sh_0_0 = 1.0f;
@@ -43,7 +42,7 @@ __device__ __forceinline__ void sph_harm_l0123_(
     float const sh_1_2 = z;
 
     constexpr float kSqrt3 = 1.7320508075688772f;
-    float const y2   = y * y;
+    float const y2 = y * y;
     float const x2z2 = x * x + z * z;
     float const sh_2_0 = kSqrt3 * x * z;
     float const sh_2_1 = kSqrt3 * x * y;
@@ -51,33 +50,33 @@ __device__ __forceinline__ void sph_harm_l0123_(
     float const sh_2_3 = kSqrt3 * y * z;
     float const sh_2_4 = (kSqrt3 * 0.5f) * (z * z - x * x);
 
-    constexpr float kSqrt5o6 = 0.9128709291752769f;   // sqrt(5/6)
-    constexpr float kSqrt5   = 2.2360679774997896f;   // sqrt(5)
-    constexpr float kSqrt3o8 = 0.6123724356957945f;   // sqrt(3/8)
+    constexpr float kSqrt5o6 = 0.9128709291752769f; // sqrt(5/6)
+    constexpr float kSqrt5 = 2.2360679774997896f;   // sqrt(5)
+    constexpr float kSqrt3o8 = 0.6123724356957945f; // sqrt(3/8)
     float const sh_3_0 = kSqrt5o6 * (sh_2_0 * z + sh_2_4 * x);
-    float const sh_3_1 = kSqrt5   * sh_2_0 * y;
+    float const sh_3_1 = kSqrt5 * sh_2_0 * y;
     float const sh_3_2 = kSqrt3o8 * (4.0f * y2 - x2z2) * x;
     float const sh_3_3 = 0.5f * y * (2.0f * y2 - 3.0f * x2z2);
     float const sh_3_4 = kSqrt3o8 * z * (4.0f * y2 - x2z2);
-    float const sh_3_5 = kSqrt5   * sh_2_4 * y;
+    float const sh_3_5 = kSqrt5 * sh_2_4 * y;
     float const sh_3_6 = kSqrt5o6 * (sh_2_4 * z - sh_2_0 * x);
 
     // Component normalisation: multiply each L block by sqrt(2L+1).
-    constexpr float kC0 = 1.0f;                       // sqrt(1)
-    constexpr float kC1 = 1.7320508075688772f;        // sqrt(3)
-    constexpr float kC2 = 2.2360679774997896f;        // sqrt(5)
-    constexpr float kC3 = 2.6457513110645907f;        // sqrt(7)
+    constexpr float kC0 = 1.0f;                // sqrt(1)
+    constexpr float kC1 = 1.7320508075688772f; // sqrt(3)
+    constexpr float kC2 = 2.2360679774997896f; // sqrt(5)
+    constexpr float kC3 = 2.6457513110645907f; // sqrt(7)
 
-    y_out[ 0] = kC0 * sh_0_0;
-    y_out[ 1] = kC1 * sh_1_0;
-    y_out[ 2] = kC1 * sh_1_1;
-    y_out[ 3] = kC1 * sh_1_2;
-    y_out[ 4] = kC2 * sh_2_0;
-    y_out[ 5] = kC2 * sh_2_1;
-    y_out[ 6] = kC2 * sh_2_2;
-    y_out[ 7] = kC2 * sh_2_3;
-    y_out[ 8] = kC2 * sh_2_4;
-    y_out[ 9] = kC3 * sh_3_0;
+    y_out[0] = kC0 * sh_0_0;
+    y_out[1] = kC1 * sh_1_0;
+    y_out[2] = kC1 * sh_1_1;
+    y_out[3] = kC1 * sh_1_2;
+    y_out[4] = kC2 * sh_2_0;
+    y_out[5] = kC2 * sh_2_1;
+    y_out[6] = kC2 * sh_2_2;
+    y_out[7] = kC2 * sh_2_3;
+    y_out[8] = kC2 * sh_2_4;
+    y_out[9] = kC3 * sh_3_0;
     y_out[10] = kC3 * sh_3_1;
     y_out[11] = kC3 * sh_3_2;
     y_out[12] = kC3 * sh_3_3;
@@ -88,11 +87,7 @@ __device__ __forceinline__ void sph_harm_l0123_(
 
 } // namespace mace_sph_detail_
 
-inline __global__ void mace_sph_harm_kernel(
-    std::uint32_t n_edges,
-    float const *r_unit,
-    float *sph_harm
-) {
+inline __global__ void mace_sph_harm_kernel(std::uint32_t n_edges, float const *r_unit, float *sph_harm) {
     std::uint32_t edge_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (edge_index >= n_edges) return;
     float const x = r_unit[3 * edge_index + 0];
@@ -101,12 +96,7 @@ inline __global__ void mace_sph_harm_kernel(
     mace_sph_detail_::sph_harm_l0123_(x, y, z, sph_harm + 16 * edge_index);
 }
 
-inline void launch_mace_sph_harm(
-    std::uint32_t n_edges,
-    float const *r_unit,
-    float *sph_harm,
-    cudaStream_t stream
-) {
+inline void launch_mace_sph_harm(std::uint32_t n_edges, float const *r_unit, float *sph_harm, cudaStream_t stream) {
     if (n_edges == 0) return;
     constexpr std::uint32_t block = 128;
     std::uint32_t const grid = (n_edges + block - 1u) / block;
