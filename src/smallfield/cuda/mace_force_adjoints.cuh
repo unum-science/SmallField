@@ -1480,7 +1480,8 @@ __global__ void mace_radial_mlp_layer_force_adjoint_kernel(
     float scale,
     bool apply_silu_n2m_inverse,
     bool accumulate,                 // true: grad_in += result; false: grad_in = result
-    float const *post_activation,    // [n_rows, n_out]   (post-silu_n2m if epilogue)
+    bool activation_is_pre_act,      // true: `activation` holds pre-activation directly (skip Newton inversion)
+    float const *activation,         // [n_rows, n_out]   (pre- OR post-silu_n2m, see flag)
     float const *weight,             // [n_in, n_out]
     float const *grad_out,           // [n_rows, n_out]
     float *grad_in                   // [n_rows, n_in]
@@ -1492,8 +1493,13 @@ __global__ void mace_radial_mlp_layer_force_adjoint_kernel(
     for (std::uint32_t out_index = 0; out_index < n_out; ++out_index) {
         float du = grad_out[static_cast<std::uint64_t>(row_index) * n_out + out_index];
         if (apply_silu_n2m_inverse) {
-            float const post = post_activation[static_cast<std::uint64_t>(row_index) * n_out + out_index];
-            float const pre  = mace_invert_silu_norm2mom_(post);
+            float const a = activation[static_cast<std::uint64_t>(row_index) * n_out + out_index];
+            // silu_n2m is non-monotonic (has a min near x = -1.278 with min value ≈ -0.467 * N).
+            // Inverting from the post-activation by Newton picks the WRONG branch when the
+            // forward pre_act sat below the critical point — sign of the derivative flips,
+            // ruining the chain rule.  Prefer the pre-activation direct path when the caller
+            // can supply it (re-run forward + skip the in-place silu).
+            float const pre = activation_is_pre_act ? a : mace_invert_silu_norm2mom_(a);
             float const dact = mace_silu_norm2mom_derivative_(pre);
             du *= dact;
         }
@@ -1511,19 +1517,20 @@ inline void launch_mace_radial_mlp_layer_force_adjoint(
     float scale,
     bool apply_silu_n2m_inverse,
     bool accumulate,
-    float const *post_activation,
+    float const *activation,
     float const *weight,
     float const *grad_out,
     float *grad_in,
-    cudaStream_t stream
+    cudaStream_t stream,
+    bool activation_is_pre_act = false
 ) {
     if (n_rows == 0) return;
     constexpr std::uint32_t block_dim_x = 64;
     dim3 const block(block_dim_x, 1, 1);
     dim3 const grid(n_rows, (n_in + block_dim_x - 1u) / block_dim_x, 1);
     mace_radial_mlp_layer_force_adjoint_kernel<<<grid, block, 0, stream>>>(
-        n_rows, n_in, n_out, scale, apply_silu_n2m_inverse, accumulate,
-        post_activation, weight, grad_out, grad_in);
+        n_rows, n_in, n_out, scale, apply_silu_n2m_inverse, accumulate, activation_is_pre_act,
+        activation, weight, grad_out, grad_in);
 }
 
 } // namespace smallfield::cuda

@@ -192,9 +192,17 @@ struct mace_scratch_t {
     float *radial_basis = nullptr;
     float *cutoff_envelope = nullptr;
     float *sph_harm = nullptr;
-    float *radial_mlp_hidden_0 = nullptr;          // [n_edges, hidden_dim]
+    float *radial_mlp_hidden_0 = nullptr;          // [n_edges, hidden_dim] — POST-silu_n2m
     float *radial_mlp_hidden_1 = nullptr;
     float *radial_mlp_hidden_2 = nullptr;
+    // Pre-activation tape, populated by the backward chain's per-layer rerun.
+    // silu_n2m is non-monotonic (min ≈ -0.467 * N at x ≈ -1.278), so inverting
+    // from post-activation via Newton picks the wrong branch when the forward
+    // sat below x = -1.278 — kills sign of the chain rule for those elements.
+    // Saving the pre-activation directly avoids the inversion.
+    float *radial_mlp_hidden_0_pre = nullptr;
+    float *radial_mlp_hidden_1_pre = nullptr;
+    float *radial_mlp_hidden_2_pre = nullptr;
     float *tensor_product_weights_per_edge = nullptr;  // [n_edges, n_paths * n_channels]
     float *edge_messages = nullptr;                // [n_edges, n_channels * 16]
 
@@ -283,6 +291,9 @@ struct mace_scratch_t {
         alloc(&radial_mlp_hidden_0, max_edges * radial_mlp_hidden_dim);
         alloc(&radial_mlp_hidden_1, max_edges * radial_mlp_hidden_dim);
         alloc(&radial_mlp_hidden_2, max_edges * radial_mlp_hidden_dim);
+        alloc(&radial_mlp_hidden_0_pre, max_edges * radial_mlp_hidden_dim);
+        alloc(&radial_mlp_hidden_1_pre, max_edges * radial_mlp_hidden_dim);
+        alloc(&radial_mlp_hidden_2_pre, max_edges * radial_mlp_hidden_dim);
         alloc(&tensor_product_weights_per_edge, max_edges * mace_tensor_product_path_count_k * arch.n_channels);
         alloc(&edge_messages, max_edges * arch.n_channels * irrep_dim);
         alloc(&node_features,         max_atoms * arch.n_channels * irrep_dim);
@@ -339,6 +350,7 @@ struct mace_scratch_t {
     void free() noexcept {
         for (float **p : {&r_norm, &r_unit, &radial_basis, &cutoff_envelope, &sph_harm,
                           &radial_mlp_hidden_0, &radial_mlp_hidden_1, &radial_mlp_hidden_2,
+                          &radial_mlp_hidden_0_pre, &radial_mlp_hidden_1_pre, &radial_mlp_hidden_2_pre,
                           &tensor_product_weights_per_edge, &edge_messages,
                           &node_features, &node_features_scratch,
                           &node_features_l0_only, &node_scalar_invariants,
@@ -568,9 +580,21 @@ inline void mace_inference_forward(
         // The interaction block then does `if cutoff is not None: tp_weights *=
         // cutoff` — and cutoff IS None here, so the multiply is a no-op.  Earlier
         // wiring incorrectly applied the cutoff again here, which double-counted
-        // it (forward off by `env` per edge, backward correspondingly off).  No
-        // re-multiply, no pre-cutoff save needed.
-        (void)tp_dim;
+        // it (forward off by `env` per edge, backward correspondingly off).
+        //
+        // Per-layer save: the conv_tp+scatter backward needs THIS layer's tp_weights
+        // to compute grad_sph_harm and grad_node_l0 (formula uses tp_weights × node_l0
+        // × upstream); the shared `S.tensor_product_weights_per_edge` buffer gets
+        // overwritten by the next forward layer, so layer-0's reverse pass must read
+        // back its own snapshot.  We reuse the legacy `pre_cutoff_layer` slot — with
+        // cutoff folded into `radial_basis` upstream, the post-MLP value IS the
+        // tp_weights value used by conv_tp.
+        if (S.tensor_product_weights_pre_cutoff_layer[layer_index] != nullptr) {
+            cudaMemcpyAsync(S.tensor_product_weights_pre_cutoff_layer[layer_index],
+                            S.tensor_product_weights_per_edge,
+                            batch.n_edges * tp_dim * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
 
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // 3c+3d.  Two routes depending on whether the host has supplied
@@ -986,13 +1010,15 @@ inline void mace_inference_run_force_adjoint(
         //     Reverse: grad_node_features_scratch = skip_tp_backward(grad_node_features).
         //     For layer-N (>= 1) skip_tp on the message path is identity, so
         //     just copy the gradient through.
+        //     The kernel uses `+=`; pre-zero so layer-1 iteration's leftovers
+        //     in grad_node_features_scratch (linear_post_tp_bwd output, written
+        //     by the preceding L1 step 3g) do NOT bleed into this layer's
+        //     skip_tp pre-image gradient.
         if (layer_index == 0u) {
-#if defined(SMALLFIELD_USE_THUNDERKITTENS)
-            // TK D3: element-conditioned residual backward, bf16 WGMMA.
-            // Output is fp32 with += semantics — pre-zero the scratch since
-            // it may hold stale data from a previous iteration.
             cudaMemsetAsync(S.grad_node_features_scratch, 0,
                             batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float), stream);
+#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+            // TK D3: element-conditioned residual backward, bf16 WGMMA.
             launch_mace_tk_element_conditioned_residual_force_adjoint(
                 batch.n_atoms, arch.n_channels, arch.n_elements, arch.n_channels,
                 /*active_irrep_block_count*/4u,
@@ -1046,6 +1072,13 @@ inline void mace_inference_run_force_adjoint(
         //     (it was just consumed by product_linear backward, free to reuse).
         cudaMemsetAsync(S.grad_node_features_l0_only, 0,
                         batch.n_atoms * arch.n_channels * sizeof(float), stream);
+        // Use the per-layer tp_weights snapshot — `S.tensor_product_weights_per_edge`
+        // is overwritten by layer 1's forward, so layer 0's reverse pass needs its own
+        // saved tp_weights from the forward pass.
+        float const *tp_weights_for_this_layer =
+            S.tensor_product_weights_pre_cutoff_layer[layer_index] != nullptr
+            ? S.tensor_product_weights_pre_cutoff_layer[layer_index]
+            : S.tensor_product_weights_per_edge;
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // TK D2: same three-output backward, bf16 inputs through the kernel,
         // fp32 atomicAdd accumulators on the output side (per the f56ca64
@@ -1057,7 +1090,7 @@ inline void mace_inference_run_force_adjoint(
             batch.receiver_edge_segment_end,
             S.node_features_l0_only_layer[layer_index],
             S.sph_harm,
-            S.tensor_product_weights_per_edge,
+            tp_weights_for_this_layer,
             S.grad_node_features,
             S.grad_node_features_l0_only,
             S.grad_tp_weights,
@@ -1069,7 +1102,7 @@ inline void mace_inference_run_force_adjoint(
             batch.edge_source_atom, batch.edge_target_atom,
             S.node_features_l0_only_layer[layer_index],
             S.sph_harm,
-            S.tensor_product_weights_per_edge,        // post-cutoff (matches forward state)
+            tp_weights_for_this_layer,                // per-layer tp_weights (post-MLP, no double-cutoff)
             S.grad_node_features,                     // upstream: per-atom (target-indexed)
             S.grad_node_features_l0_only,             // atomicAdd accumulator
             S.grad_tp_weights,                        // overwritten
@@ -1089,36 +1122,30 @@ inline void mace_inference_run_force_adjoint(
 
         // 3k. radial_mlp adjoint: grad_tp_weights → grad_radial_basis.
         //     Backward through the 4-layer MLP with normalize2mom(silu)
-        //     epilogues.  We need the post-activation buffers for layers
-        //     0/1/2 to recover pre-activation via Newton inversion.
-        //
-        //     Note: in the TK build the forward radial MLP is fused — the
-        //     post-activation buffers `S.radial_mlp_hidden_*` are NOT
-        //     populated by the TK kernel.  In that case we re-run the
-        //     fp32 forward radial MLP as a precondition for the backward
-        //     (cheap: 4 small matmuls × 8 atoms-bin worth of edges).
-#if defined(SMALLFIELD_USE_THUNDERKITTENS)
-        // Re-run the fp32 radial MLP forward to populate hidden buffers so
-        // the backward kernel can recover pre-activations.
+        //     epilogues.  Each interaction layer has its OWN radial MLP weights,
+        //     so the forward post-activation buffers are layer-specific.  Re-run
+        //     the forward MLP here for THIS layer's weights and SAVE the pre-
+        //     activations directly (`*_pre` buffers) so the backward can compute
+        //     `silu_n2m'(pre_act)` without the Newton inversion that picks the
+        //     wrong branch when pre_act < x_critical = -1.278.
         launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, arch.n_radial,
                                     S.radial_basis, L.radial_mlp_w0,
                                     1.0f / sqrtf(static_cast<float>(arch.n_radial)),
-                                    S.radial_mlp_hidden_0, stream);
+                                    S.radial_mlp_hidden_0_pre, stream);
         launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
-                                   S.radial_mlp_hidden_0, S.radial_mlp_hidden_0, stream);
+                                   S.radial_mlp_hidden_0_pre, S.radial_mlp_hidden_0, stream);
         launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
                                     S.radial_mlp_hidden_0, L.radial_mlp_w1,
                                     1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
-                                    S.radial_mlp_hidden_1, stream);
+                                    S.radial_mlp_hidden_1_pre, stream);
         launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
-                                   S.radial_mlp_hidden_1, S.radial_mlp_hidden_1, stream);
+                                   S.radial_mlp_hidden_1_pre, S.radial_mlp_hidden_1, stream);
         launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
                                     S.radial_mlp_hidden_1, L.radial_mlp_w2,
                                     1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
-                                    S.radial_mlp_hidden_2, stream);
+                                    S.radial_mlp_hidden_2_pre, stream);
         launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
-                                   S.radial_mlp_hidden_2, S.radial_mlp_hidden_2, stream);
-#endif
+                                   S.radial_mlp_hidden_2_pre, S.radial_mlp_hidden_2, stream);
         // Layer 3 backward (no activation): grad_h2 = (1/sqrt(h)) * Σ_out W3[h, out] * grad_out.
         // Reuse `S.edge_messages` as scratch for grad_h2 (its forward content is no
         // longer needed here in the reverse pass).
@@ -1127,7 +1154,7 @@ inline void mace_inference_run_force_adjoint(
             1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
             /*apply_silu_n2m_inverse*/false,
             /*accumulate*/false,
-            /*post_activation*/nullptr,    // unused when no epilogue
+            /*activation*/nullptr,    // unused when no epilogue
             L.radial_mlp_w3, S.grad_tp_weights,
             S.edge_messages, stream);
         // Layer 2 backward (with epilogue):
@@ -1136,16 +1163,18 @@ inline void mace_inference_run_force_adjoint(
             1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
             /*apply_silu_n2m_inverse*/true,
             /*accumulate*/false,
-            S.radial_mlp_hidden_2, L.radial_mlp_w2, S.edge_messages,
-            S.grad_node_features, stream);  // reuse S.grad_node_features as scratch
+            S.radial_mlp_hidden_2_pre, L.radial_mlp_w2, S.edge_messages,
+            S.grad_node_features, stream,  // reuse S.grad_node_features as scratch
+            /*activation_is_pre_act*/true);
         // Layer 1 backward (with epilogue):
         launch_mace_radial_mlp_layer_force_adjoint(
             batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
             1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
             /*apply_silu_n2m_inverse*/true,
             /*accumulate*/false,
-            S.radial_mlp_hidden_1, L.radial_mlp_w1, S.grad_node_features,
-            S.edge_messages, stream);
+            S.radial_mlp_hidden_1_pre, L.radial_mlp_w1, S.grad_node_features,
+            S.edge_messages, stream,
+            /*activation_is_pre_act*/true);
         // Layer 0 backward (with epilogue): grad_radial_basis += contribution.
         // Both interaction layers' radial MLPs share the same radial_basis input,
         // so we ACCUMULATE to preserve the previous layer's contribution.
@@ -1154,8 +1183,9 @@ inline void mace_inference_run_force_adjoint(
             1.0f / sqrtf(static_cast<float>(arch.n_radial)),
             /*apply_silu_n2m_inverse*/true,
             /*accumulate*/true,
-            S.radial_mlp_hidden_0, L.radial_mlp_w0, S.edge_messages,
-            S.grad_radial_basis, stream);
+            S.radial_mlp_hidden_0_pre, L.radial_mlp_w0, S.edge_messages,
+            S.grad_radial_basis, stream,
+            /*activation_is_pre_act*/true);
 
         // 3l. linear_up adjoint: grad_node_l0 (post-linear scalar, in
         //     `grad_node_features_l0_only`) → scalar gradient on
@@ -1431,12 +1461,17 @@ inline void mace_inference_run_force_adjoint_debug(
                 batch.n_edges, arch.n_channels * irrep_dim,
                 batch.edge_target_atom, S.grad_node_features, dst, stream);
         }
+        // Use the per-layer tp_weights snapshot.
+        float const *tp_weights_for_this_layer_dbg =
+            S.tensor_product_weights_pre_cutoff_layer[layer_index] != nullptr
+            ? S.tensor_product_weights_pre_cutoff_layer[layer_index]
+            : S.tensor_product_weights_per_edge;
         launch_mace_tensor_product_and_scatter_force_adjoint(
             batch.n_atoms, batch.n_edges, arch.n_channels,
             batch.edge_source_atom, batch.edge_target_atom,
             S.node_features_l0_only_layer[layer_index],
             S.sph_harm,
-            S.tensor_product_weights_per_edge,
+            tp_weights_for_this_layer_dbg,
             S.grad_node_features,
             S.grad_node_features_l0_only,
             S.grad_tp_weights,
@@ -1445,33 +1480,31 @@ inline void mace_inference_run_force_adjoint_debug(
 
         // 3j. NO apply_cutoff backward — see production-variant comment above.
 
-        // 3k. radial_mlp adjoint.
-#if defined(SMALLFIELD_USE_THUNDERKITTENS)
+        // 3k. radial_mlp adjoint — see production-variant comment.
         launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, arch.n_radial,
                                     S.radial_basis, L.radial_mlp_w0,
                                     1.0f / sqrtf(static_cast<float>(arch.n_radial)),
-                                    S.radial_mlp_hidden_0, stream);
+                                    S.radial_mlp_hidden_0_pre, stream);
         launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
-                                   S.radial_mlp_hidden_0, S.radial_mlp_hidden_0, stream);
+                                   S.radial_mlp_hidden_0_pre, S.radial_mlp_hidden_0, stream);
         launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
                                     S.radial_mlp_hidden_0, L.radial_mlp_w1,
                                     1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
-                                    S.radial_mlp_hidden_1, stream);
+                                    S.radial_mlp_hidden_1_pre, stream);
         launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
-                                   S.radial_mlp_hidden_1, S.radial_mlp_hidden_1, stream);
+                                   S.radial_mlp_hidden_1_pre, S.radial_mlp_hidden_1, stream);
         launch_mace_matmul_rowmajor(batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
                                     S.radial_mlp_hidden_1, L.radial_mlp_w2,
                                     1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
-                                    S.radial_mlp_hidden_2, stream);
+                                    S.radial_mlp_hidden_2_pre, stream);
         launch_mace_silu_norm2mom(batch.n_edges * radial_mlp_hidden_dim,
-                                   S.radial_mlp_hidden_2, S.radial_mlp_hidden_2, stream);
-#endif
+                                   S.radial_mlp_hidden_2_pre, S.radial_mlp_hidden_2, stream);
         launch_mace_radial_mlp_layer_force_adjoint(
             batch.n_edges, radial_mlp_hidden_dim, tp_dim,
             1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
             /*apply_silu_n2m_inverse*/false,
             /*accumulate*/false,
-            /*post_activation*/nullptr,
+            /*activation*/nullptr,
             L.radial_mlp_w3, S.grad_tp_weights,
             S.edge_messages, stream);
         launch_mace_radial_mlp_layer_force_adjoint(
@@ -1479,22 +1512,25 @@ inline void mace_inference_run_force_adjoint_debug(
             1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
             /*apply_silu_n2m_inverse*/true,
             /*accumulate*/false,
-            S.radial_mlp_hidden_2, L.radial_mlp_w2, S.edge_messages,
-            S.grad_node_features, stream);
+            S.radial_mlp_hidden_2_pre, L.radial_mlp_w2, S.edge_messages,
+            S.grad_node_features, stream,
+            /*activation_is_pre_act*/true);
         launch_mace_radial_mlp_layer_force_adjoint(
             batch.n_edges, radial_mlp_hidden_dim, radial_mlp_hidden_dim,
             1.0f / sqrtf(static_cast<float>(radial_mlp_hidden_dim)),
             /*apply_silu_n2m_inverse*/true,
             /*accumulate*/false,
-            S.radial_mlp_hidden_1, L.radial_mlp_w1, S.grad_node_features,
-            S.edge_messages, stream);
+            S.radial_mlp_hidden_1_pre, L.radial_mlp_w1, S.grad_node_features,
+            S.edge_messages, stream,
+            /*activation_is_pre_act*/true);
         launch_mace_radial_mlp_layer_force_adjoint(
             batch.n_edges, arch.n_radial, radial_mlp_hidden_dim,
             1.0f / sqrtf(static_cast<float>(arch.n_radial)),
             /*apply_silu_n2m_inverse*/true,
             /*accumulate*/true,
-            S.radial_mlp_hidden_0, L.radial_mlp_w0, S.edge_messages,
-            S.grad_radial_basis, stream);
+            S.radial_mlp_hidden_0_pre, L.radial_mlp_w0, S.edge_messages,
+            S.grad_radial_basis, stream,
+            /*activation_is_pre_act*/true);
 
         // 3l. linear_up adjoint.
         cudaMemsetAsync(S.grad_node_scalar_invariants, 0,
