@@ -6,6 +6,81 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## MACE-OFF Symcontract Multi-Warp CTAs — 2026-04-26 — `15a04c2`, Follow-Up Smem-W3 Prefetch Reverted
+
+NCU's "73% local speedup from fixing warp-eligibility starvation" estimate on the symcontract backward (84% L1TEX scoreboard stalls, 0.31 eligible warps/scheduler with single-warp CTAs) translated almost 1:1 to wall-time:
+
+| Change                                                  | Backward  | Forward   | ms/config | refine_batch |
+| ------------------------------------------------------- | --------: | --------: | --------: | -----------: |
+| Multi-warp baseline (1 warp/CTA, 32 threads)            | 19.69 ms  | 11.14 ms  | 0.0586    | 1.36 ms      |
+| Multi-warp 96 threads (3 warps/CTA, 1 ch/thread)        |  7.19 ms  | 11.07 ms  | 0.0473    | 1.12 ms      |
+| Δ                                                       | __-63.5 %__ | -0.6 %  | __-19.3 %__ | __-17.6 %__ |
+
+Long-scoreboard stalls on the backward dropped 33.89 % → 7.33 %; the forward was never warp-eligibility-starved (its 13.05 % long_sb is from fp32-ALU-pipe latency, not memory).
+Bit-identical to the single-warp baseline on all 5 reference goldens.
+
+End-to-end refine_batch throughput at batch=2048 × n_atoms=30 × 20 LBFGS steps:  724 → __891 confs/sec/GPU__ = __+23 %__.
+
+### Smem-Resident W3_partsym Tile — Investigated, Reverted
+
+Followed the multi-warp commit with a per-(α, β) cooperative prefetch of the 16-element W3 m-row into a shared-memory tile, hoping to claw back the residual 7.33 % long_sb stalls on the backward.
+The plan: each thread reads its 16 m-values from smem (zero latency) instead of issuing 16 strided global reads per (α, β) iteration.
+
+__Result: 0.0473 → 0.0627 ms / config = +33 % regression.
+Reverted.__
+
+Why it loses: the 7.33 % residual stall budget was already small.
+The prefetch added 136 `__syncthreads()` per CTA (one per (α, β) iteration) plus the cooperative-load instruction count.
+Together those exceeded the L1-latency savings the smem reads bought.
+
+The user-requested "move W3_partsym_sym fully into shared memory" plan also doesn't fit:
+- Full slab per element: 16 m × 136 (α ≤ β) × 96 ch × 4 B = __786 KB per element__, ~5× the 100 KB default per-CTA smem and 3.5× the 228 KB opt-in maximum.
+- Channel-partitioned variant (8 CTAs per atom × 12 ch each → 105 KB smem/CTA) would fit with `cudaFuncSetAttribute(MaxDynamicSharedMemSize)`, but smem-bound occupancy drops from 8 CTAs/SM (post-multi-warp) to 1 CTA/SM — the very issue NCU said multi-warp fixed.
+- Per-row tile (the variant we benched) avoids the occupancy cliff but loses to sync overhead.
+
+The post-multi-warp NCU shows 99.76 % SM activity on the backward at 46 % issue rate — the backward is now compute-throughput bound, not memory-stall-bound.
+Smem caching helps when load latency dominates the issue queue; here multi-warp already filled the queue.
+
+### Transform #1 Forward, Canonical-Triple Iteration — Investigated, Reverted
+
+Followed the multi-warp commit with a Transform #1-style canonical-triple forward: iterate only the 816 canonical (i ≤ j ≤ k) cells against the already-precomputed `tk_precomputed_w3_sym_total_layer` slab, instead of the cubic 16³ = 4 096 ordered triples against `W3_eff`.
+The W3_sym_total tensor was added in commit `895bfa4` precisely for this and noted in the CHANGELOG as "staged but not yet wired".
+
+__Result: 0.0473 → 0.0473 ms/config — at best a wash on the bench, and the kernel itself ran 11.07 → 13.5 ms/call (slower).
+Reverted.__
+
+NCU on the canonical kernel:
+| Metric                              | cubic forward | canonical forward |
+| ----------------------------------- | ------------: | ----------------: |
+| FMA pipe utilisation                |      18.87 %  |          6.45 %   |
+| Long-scoreboard stalls              |      13.05 %  |         46.17 %   |
+| Per-call duration                   |      11.07 ms |         13.50 ms  |
+
+The variable inner-loop bounds (`j ≥ i`, `k ≥ j`) prevent the compiler from applying the fixed unroll factors that the cubic kernel relies on (`#pragma unroll 4` on i, `#pragma unroll 16` on j, full unroll on k).
+The W3_sym_total reads also follow a non-uniform stride pattern that defeats the L1 prefetcher's linear-stride heuristic.
+Net: the 5× FMA- count reduction is more than offset by 3.5× higher long-scoreboard stalls and a collapsed FMA pipe utilisation.
+
+The original CHANGELOG note for Transform #1 ("does NOT help this forward kernel — it has only one fp32 accumulator, the dependency chain on `accumulator` was already broken into 4 chains by the i unroll, and the kernel runs at ~99% SM / ~7% FMA-pipe with the existing layout") was correct; this experiment confirmed it on the post-multi-warp baseline.
+The forward symcontract on H100 is L1-throughput-bound on linear stride access, not FMA-count-bound.
+
+`mace_tk_precompute_w3_sym_total` and the kernel + launcher remain available in-tree (commit `895bfa4`) for future Transform #2 work.
+
+### What the Post-Phase-1 NCU Now Flags
+
+Kernel time breakdown (288 ms total over 30 launches at batch=2048×30):
+
+| Kernel                                        | Was   | Now   | %    | Bottleneck                      |
+| --------------------------------------------- | ----: | ----: | ---: | ------------------------------- |
+| `mace_tk_symmetric_contraction` (forward)     | 11.14 ms | 11.09 ms | __19.3 %__ | fp32 FMA pipe (compute) |
+| `mace_tk_symmetric_contraction_force_adjoint` | 19.69 ms |  7.20 ms | 15.0 % | balanced (post-multi-warp) |
+| `mace_tk_conv_tp_scatter_force_adjoint`       |  4.36 ms |  4.35 ms |  9.1 % | 18.5 % barrier stalls |
+| `mace_tk_element_conditioned_residual_force_adjoint` | 8.58 ms | 8.55 ms |  8.9 % | 32 % FMA pipe |
+| Phase-E TK-able fp32 fallbacks (4 kernels)    | 16.0 ms | 16.0 ms | ~14 % | mechanical TK port |
+
+The new biggest hotspot is the symcontract __forward__, which the multi-warp change didn't move because it's compute-bound.
+The forward's inner loop iterates over all 16³ = 4 096 (i, j, k) cells; the __X-commutativity Transform #1 W3_sym_total tensor__ is already precomputed and would let the forward iterate over canonical (i ≤ j ≤ k) only — 816 cells, __5× FMA reduction__.
+The CHANGELOG note on Transform #1 noted W3_sym_total was "staged but not yet wired" — it is the next lever for the forward.
+
 ## MACE-OFF NCU Profiling — 2026-04-26 — TMA Pipelining Is Not the Right Next Lever
 
 End-to-end refine_batch throughput on H100 SXM5 (one card, MACE-OFF23-small, fp32 reference fallback for the medium model's non-96-channel kernels — i.e. the post-`444c379` honest baseline).

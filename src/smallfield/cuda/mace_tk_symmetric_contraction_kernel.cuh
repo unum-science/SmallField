@@ -96,6 +96,19 @@ constexpr int path_count_order_2_k    = 4;
 constexpr int path_count_order_1_k    = 1;
 constexpr int warp_thread_count_k     = 32;
 
+/// Block size selector — sized so each thread owns exactly one channel
+/// (or one channel per stride round, for n_channels not a multiple of 32).
+/// NCU showed the prior 1-warp-per-CTA design starved the scheduler at
+/// 0.31 eligible warps per cycle.  Multi-warp CTAs let the scheduler hide
+/// L1TEX scoreboard waits by issuing from sibling warps within the same
+/// CTA.  Capped at 256 (8 warps) so registers + smem stay in budget.
+__host__ __device__ inline std::uint32_t choose_block_threads_(std::uint32_t n_channels) {
+    std::uint32_t const rounded = ((n_channels + warp_thread_count_k - 1u) / warp_thread_count_k) * warp_thread_count_k;
+    std::uint32_t const cap = 256u;
+    return rounded < warp_thread_count_k ? warp_thread_count_k
+         : (rounded > cap ? cap : rounded);
+}
+
 /**
  *  @brief Stage the per-atom feature slab `X[atom, :, :]` into shared.
  *
@@ -119,7 +132,8 @@ __device__ __forceinline__ void load_atom_feature_slab_(
     int const tile_elements = static_cast<int>(n_channels) * irrep_dim_k;
     float const *atom_slab = node_features_full_fp32
                              + static_cast<std::uint64_t>(atom_index) * static_cast<std::uint64_t>(tile_elements);
-    for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warp_thread_count_k) {
+    int const stride = static_cast<int>(blockDim.x);
+    for (int linear_index = thread_id; linear_index < tile_elements; linear_index += stride) {
         shared_features_atom[linear_index] = atom_slab[linear_index];
     }
 }
@@ -162,9 +176,10 @@ __global__ void mace_tk_symmetric_contraction_kernel(
 
     // Stage the per-atom feature slab `X[atom, :, :]` into shared memory once.
     load_atom_feature_slab_(shared_features_atom, node_features_full_fp32, atom_index, n_channels);
-    __syncwarp();
+    __syncthreads();
 
     int const thread_id = threadIdx.x;
+    std::uint32_t const block_threads = blockDim.x;
     std::uint64_t const w3_per_element_stride = static_cast<std::uint64_t>(irrep_dim_k)
                                                 * static_cast<std::uint64_t>(irrep_dim_k)
                                                 * static_cast<std::uint64_t>(irrep_dim_k)
@@ -172,12 +187,14 @@ __global__ void mace_tk_symmetric_contraction_kernel(
     float const *w3_for_element = precomputed_w3_effective_fp32
                                   + static_cast<std::uint64_t>(element_index) * w3_per_element_stride;
 
-    // Walk the channel axis in strided chunks of `warp_thread_count_k = 32`.
-    // Per-thread channel work is independent — we can hold the per-channel
-    // accumulator in a single register and emit one global store at the end.
+    // Walk the channel axis in strided chunks of `blockDim.x` (multi-warp
+    // CTA — bumped from 1 warp to N warps so the scheduler can hide L1TEX
+    // scoreboard waits via sibling-warp issue.  See the choose_block_threads_
+    // helper above for sizing).  When n_channels ≤ blockDim.x (the common
+    // case post-bump), the loop runs exactly once per thread.
     for (std::uint32_t channel_base = 0u;
          channel_base < n_channels;
-         channel_base += static_cast<std::uint32_t>(warp_thread_count_k)) {
+         channel_base += block_threads) {
 
         std::uint32_t const channel_index = channel_base + static_cast<std::uint32_t>(thread_id);
         if (channel_index >= n_channels) break;
@@ -653,7 +670,7 @@ inline void launch_mace_tk_symmetric_contraction(
         static_cast<std::size_t>(n_channels) * static_cast<std::size_t>(irrep_dim_k) * sizeof(float);
 
     dim3 const grid(n_atoms, 1, 1);
-    dim3 const block(static_cast<std::uint32_t>(warp_thread_count_k), 1, 1);
+    dim3 const block(choose_block_threads_(n_channels), 1, 1);
 
     mace_tk_symmetric_contraction_kernel<<<grid, block, shared_memory_bytes, stream>>>(
         n_atoms, n_channels, n_elements,
