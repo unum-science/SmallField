@@ -261,3 +261,39 @@ A scheduled regression run on a 1 K-molecule golden corpus, comparing energy + f
 Closing the remaining 1.95× gap to cueq's per-config kernel time requires a fully-fused per-layer kernel on the cueq pattern (one kernel per interaction layer covering tensor-product + linear + residual + readout fold).
 A 1–2 week structural rewrite, not tuning.
 Whether it's worth the effort depends on whether the production workload is bound by kernel time or by surrounding pipeline / I/O — the 28 B target on 8× Blackwell is currently estimated at ~56 days without this change and ~25 days with it.
+
+### Production-target extrapolation — 28 B conformers on 8× RTX PRO 6000 Blackwell
+
+Working assumptions (RTX PRO 6000 Blackwell vs H100 SXM5):
+
+- BF16 / TF32 dense throughput: ~0.80× of one H100 SXM5 per card (Blackwell wins on FP4 / MXFP4 paths but those don't apply to this workload).
+- HBM bandwidth: ~1.79 TB/s vs ~3.35 TB/s on H100 SXM5 — memory-bound paths run slower; the cueq-style segmented-polynomial path is compute-bound at batch ≥ 256.
+- Per-card factor: __0.80×__ (range 0.70–0.90×); 8 cards aggregate __6.4× of one H100__ (range 5.6–7.2×).
+
+Per-card factor is the largest uncertainty — at least one Blackwell smoke run is needed to pin the realised number.
+If RTX PRO 6000 Blackwell lands at 0.65× of H100 SXM5 on this workload (memory-bound dominates), the timelines below stretch by ~25 %; at 0.95× they shorten by ~15 %.
+
+Wall time for 28 B configurations (drug-like, n_atoms ≈ 30 median):
+
+|                                              Avg LBFGS steps | Wall-time on 8× Blackwell |
+| -----------------------------------------------------------: | ------------------------: |
+|                       1 (single-point energy + forces only) |                  ~1.8 days |
+|                                10 (loose, single-point + a few touches) |        ~28 days  |
+|                            __20 (typical drug-like, fmax=0.05 eV/Å)__     |    __~56 days__ |
+|                                       50 (conservative, hard cases) |          ~140 days  |
+|                                                  100 (worst case)  |          ~280 days  |
+
+For the typical-drug-like 20-step case, Phase K (GPU-resident LBFGS) brings the 56-day estimate down to ~43 days; closing the kernel gap to cueq small via mega-fusion brings it to ~25 days.
+
+Single-point pass on already-relaxed coordinates (no LBFGS) is the most realistic "couple of weeks" headline: __28 B × 0.060 ms/config / (8 × 0.80)__ = __~36 hours__ — fits comfortably in a day.
+
+__Caveats__ that swing the headline number:
+
+- Batched LBFGS is mandatory.
+  ASE's `LBFGS(atoms)` is per-molecule and would push the 56-day number to ~70 weeks.
+  SmallField's `mace::context_t::refine_batch` runs all 2048 conformers stepping together; this is the load-bearing assumption.
+- Variable atom counts cause batching loss — pad-to-largest wastes compute.
+  Bin by atom count or use ragged batching to recover the per-atom-count throughput numbers above.
+- LBFGS step count is empirical.
+  Run a 1 K-molecule golden corpus through `smallfield_mace_refine` to measure the actual distribution of step counts before committing to any number above.
+- __License__: MACE-OFF is ASL — re-verify the redistribution profile before producing public artefacts from a 28 B run.

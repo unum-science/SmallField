@@ -6,27 +6,98 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
-## MACE-OFF refinement integration — 2026-04-25
+## MACE-OFF Refinement Scaffolding — 2026-04-25 — `e05fcc7`, `6bf94a0`
 
-End-to-end MACE-OFF refinement landed alongside the existing ETKDG + MMFF94 path.
-Symmetric C++ / Python / CLI surface; full numbers in [`MACE_BENCH_REPORT.md`](MACE_BENCH_REPORT.md).
+End-to-end MACE-OFF refinement now has a stable C++ / Python / CLI surface alongside the existing ETKDG + MMFF94 path.
 
-- __Public C++ API__ (`src/smallfield/api/smallfield_mace.hpp` — commit `11f691b`): RAII `mace::weights_t::load(path)` + persistent `mace::context_t` with `infer_energy`, `infer_energy_and_forces`, and `refine_batch`.
-- __Kernel optimisation pass__ — 0.272 → 0.060 ms/config (4.5× kernel-only, with-forces, batch=2048, n_atoms=30, captured-graph replay).
-  Closes the with-forces gap to cueq small from 9.83× → 1.95×.
-  Top commits:
-  - `a4a75e9` symcontract adjoint over-unroll spill fix (eliminate 30 KB/thread spill, -25%)
-  - `d494800` symcontract adjoint i×4 / j×16 ILP unroll (-37%)
-  - `27177f6`, `a89ae08` irrep_dim=1 fast paths for linear-per-irrep + skip-tp
-  - `2112b9d` E1 — TK-WGMMA radial-MLP layer backward (-36%)
-  - `b1e0781` skip dead fp32 reference radial-MLP fwd under TK build (-8%)
-  - `8b26c49` extend TK layer-3 backward to MACE-OFF-medium (n_out=512) and -large (n_out=768)
-- __Python binding + standalone CLI__ (commit `e05fcc7`): `smallfield.api.refine_with_mace(...)` plus `smallfield_mace_refine` — a parquet → parquet refinement binary decoupled from `smallfield_batch`, letting the refinement workload scale independently of generation.
-- __Sweep__: small / medium models, batch 256–8192, n_atoms 15–80 — small saturates at batch=2048 (0.060 ms/config energy+forces); medium at batch=512 (0.078 ms/config).
-- __8× Blackwell extrapolation__: ~56 days for 28 B small-model LBFGS relaxations end-to-end at the current kernel speed; ~43 days with Phase K (GPU-resident LBFGS), ~25 days with cueq-parity mega-fusion.
+- __Python binding__ (`python/smallfield/_binding.cpp`, `api.py`): `MaceArch`, `MaceWeights.load(path)`, `MaceContext` with `infer_energy`, `infer_energy_and_forces`, and `refine`.
+  High-level wrapper `sf.refine_with_mace(coords, smiles_list, weights_path)` derives elements via RDKit and builds edges from `arch.r_max`.
+  All numpy I/O; H2D + D2H copies handled inside the binding.
+- __Standalone CLI__ `smallfield_mace_refine` (`cli/smallfield_mace_refine.cpp`, `cli/parquet_3d_reader.{hpp,cpp}`): Reads SmallField output parquet shards (smiles + 3D coords + num_atoms), refines per-conformer via `mace::context_t::refine_batch`, writes refined parquet shards.
+  Decoupled from `smallfield_batch` so refinement can scale independently of generation.
+  Single-GPU today; multi-GPU is a thread-per- device fan-out plus the existing `shard_inventory` queue.
+- __Doc cleanup__: retired `MACE.md`, `MACE_INFERENCE.md`, `MACE_INTEGRATION_PLAN.md`, `MACE_OPTIMIZATION_ROADMAP.md`, `MACE_BENCH_REPORT.md` — planning + measurement docs whose load-bearing content has been absorbed into `README.md`, `BENCH.md`, `GLOSSARY.md`, `ROADMAP.md`, and the entries below.
 
-Doc cleanup: retired `MACE.md`, `MACE_INFERENCE.md`, `MACE_INTEGRATION_PLAN.md`, `MACE_OPTIMIZATION_ROADMAP.md` (planning docs whose work has landed).
-Living MACE docs are now `MACE_BENCH_REPORT.md` (numbers) and the relevant sections in `README.md`, `BENCH.md`, `GLOSSARY.md`, `ROADMAP.md`.
+## MACE-OFF Kernel Optimisation Pass — 2026-04-25
+
+Kernel-only ms/config at the saturating shape (batch=2048, n_atoms=30, energy+forces, captured-graph replay, MACE-OFF23-small, H100 SXM5): __0.272 → 0.0600__ = __4.5× speedup__, closing the with-forces gap to cueq small from 9.83× → 1.95×.
+At this rate one H100 relaxes ~835 confs/sec end-to-end LBFGS @ 20 steps.
+
+Cumulative progression (each row = one commit):
+
+| Step                                                                                     | ms/config |     Δ |
+| :--------------------------------------------------------------------------------------- | --------: | ----: |
+| Initial fp32 reference adjoint chain                                                     |     2.103 |    —  |
+| TK D2/D3/D4 force-adjoint wiring (`012de17`)                                             |     0.334 | -84 % |
+| Chain numerical fixes — `apply_cutoff` + silu·n2m inversion (`7fc5b11`, `3b887ac`)       |     0.305 |  -9 % |
+| __B5__ TK D1 per-irrep linear adjoint (`5087cf0`)                                        |     0.293 |  -4 % |
+| __B6__ bf16 radial-MLP hidden saves, skip backward rerun (`90595a7`)                     |     0.272 |  -7 % |
+| Drop over-unroll on symcontract adjoint — eliminate 30 KB/thread spill (`a4a75e9`)       |     0.205 | -25 % |
+| `irrep_dim=1` fast path: linear-per-irrep fwd + bwd (`27177f6`)                          |     0.178 | -13 % |
+| ILP unroll i×4/j×16 on symcontract adjoint (`d494800`)                                   |     0.112 | -37 % |
+| `irrep_dim=1` fast path: skip-tp fwd + bwd (`a89ae08`)                                   |     0.106 |  -6 % |
+| ILP unroll on symcontract forward (`e347639`)                                            |     0.101 |  -5 % |
+| __E1__ TK-WGMMA radial-MLP layer backward (`2112b9d`)                                    |     0.065 | -36 % |
+| Skip dead fp32 reference radial-MLP fwd under TK build (`b1e0781`)                       |     0.060 |  -8 % |
+| Extend TK layer-3 backward to MACE-OFF-medium / -large (`8b26c49`)                       |     0.060 |    —  |
+
+Top kernels by NCU-measured share of E+F time, post-pass:
+
+| Kernel                                                | %    |
+| ----------------------------------------------------- | ---: |
+| `mace_tk_symmetric_contraction_force_adjoint_kernel`  | 46 % |
+| `mace_tk_symmetric_contraction_kernel` (forward)      | 16 % |
+| `mace_tk_element_conditioned_residual_force_adjoint`  | 11 % |
+| `mace_tk_conv_tp_scatter_force_adjoint`               |  9 % |
+| Everything else (~30 kernels)                         | 18 % |
+
+__F1 not pursued__: the projected savings (50% off E+F) were premised on the symcontract backward being 140 M NCU units (28 % of E+F).
+After `a4a75e9` + `d494800` it dropped to 39 M units, capturing those savings via different mechanism.
+True fwd+bwd fusion is also structurally infeasible — B (forward output) and the upstream gradient (backward input) are needed at different points in the execution chain, so a fused kernel would have to run twice with different input modes.
+
+Saturating-batch sweep at this commit (energy + forces, captured replay):
+
+| Model      | n_atoms=15 | n_atoms=30  | n_atoms=50 | n_atoms=80 |
+| :--------- | ---------: | ----------: | ---------: | ---------: |
+| small (96 ch)  |  0.0299  |  __0.0599__ |   0.1005   |   0.1627   |
+| medium (128 ch)|  0.0386  |  __0.0781__ |   0.1322   |   0.2143   |
+
+Energy-only saturates at batch ≈ 256 (~0.024 ms/config small, ~0.032 medium); energy+forces saturates at batch ≈ 1024–2048 (slight slowdown past 4096 from L2 pressure on the W3_eff slab).
+
+## MACE-OFF Native CUDA Module Bring-Up — 2026-04-25 — `b50d186` … `90595a7`
+
+Initial native MACE-OFF inference module covering the full forward + analytic- adjoint chain.
+Exists because the cueq + PyTorch reference path is host-pipeline-bound (only ~14.6 % of production wall time is the actual GPU model — the rest is `AtomicData.from_config` + DataLoader collate); a fully GPU-resident path can win end-to-end even at slower per-kernel speed.
+
+- __Phase 0__ — weights export from `mace_off` HuggingFace checkpoint to a flat `.bin` consumable from C++ (`python/smallfield/mace_export.py`).
+- __Forward path, fp32 reference__ — implements every block of MACE-OFF: radial basis + Bessel + cutoff, spherical harmonics, conv_tp + scatter, per-irrep linear, element-conditioned residual, symmetric contraction (orders 1, 2, 3), readouts, energy reduce.
+  Validated against `torch.autograd` golden traces on 5 reference molecules.
+- __TK forward path__ — every heavy kernel ported to ThunderKittens / WGMMA (radial-MLP fused 4-layer, conv_tp + scatter segmented, element-conditioned residual, per-irrep linear, symmetric contraction, both readouts).
+  Energy-only, batch 256, n_atoms=30: TK build is __22× faster__ than the fp32 reference build.
+- __Force-adjoint chain (D1–D7)__ — wired in `mace_inference_run_force_adjoint`; forward + backward run inside one `cudaGraphLaunch` via `mace_capture_forward_with_force_adjoint`.
+
+Force-adjoint validation, per-atom force RMS vs `-torch.autograd.grad` on the 5 reference goldens:
+
+| Molecule    | n_atoms | Initial force RMS | After validation pass | Reduction |
+| ----------- | ------: | ----------------: | --------------------: | --------: |
+| caffeine    |      24 |          1.96 eV/Å |            0.0148 eV/Å |     132×  |
+| paracetamol |      20 |          ~2.16    |            0.0144     |     ~150× |
+| ibuprofen   |      33 |          ~1.48    |            0.0102     |     ~145× |
+| propranolol |      40 |          ~2.01    |            0.0083     |     ~240× |
+| aspirin     |      21 |          ~2.32    |            0.0140     |     ~165× |
+
+Principal bugs that landed in this phase (each with a 5–80× force-RMS reduction on its own):
+
+1. `b50d186` — symmetric-contraction-backward weight argument-order swap (was passing `(weights_max, weights_lo_1, weights_lo_0)` instead of `(weights_max, weights_lo_0, weights_lo_1)`).
+2. `012de17` — removed the duplicate `apply_cutoff` multiply on tp_weights (MACE-OFF's `RadialEmbeddingBlock` returns `radial * cutoff` already, so the second multiply double-counted `env(r)`).
+3. `3b887ac` — per-layer save of `tensor_product_weights` (was being overwritten by the next forward layer), per-layer rerun of the radial MLP forward, and several missing `cudaMemsetAsync(0)` before adjoint kernels with `+=` semantics.
+4. `7fc5b11` — `silu·n2m(x) = N · x · sigmoid(x)` is __non-monotonic__ (min at x ≈ -1.278), so the Newton inversion `silu_n2m^{-1}(y)` could pick the wrong branch and flip the chain-rule derivative sign (caffeine's `mlp_h2` lands in the ambiguous region [-0.45, -0.467]).
+   Fix: save pre-activations directly during the backward forward-rerun.
+
+Residual ~10–15 meV/Å gap to the 1 meV/Å plan target sits at the fp32 noise floor of 4 chained radial-MLP layers; reaching ≤ 1 meV/Å in fp32 likely needs an fp64 accumulator path.
+The chain is production-usable as-is — 0.01 eV/Å is well inside the convergence tolerance of every common LBFGS / FIRE optimiser (`fmax = 0.05 eV/Å`).
+
+- __Phase H__ — public C++ API `smallfield::mace::context_t` (commit `11f691b`): RAII `weights_t::load(path)` + persistent context with `infer_energy`, `infer_energy_and_forces`, `refine_batch`.
 
 ## RDKit 2025.09.6 Bump, Per-Molecule Preprocess Deadline and `preprocess_timeout` Status — Pending
 

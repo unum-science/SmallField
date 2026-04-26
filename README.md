@@ -120,7 +120,8 @@ __MACE-OFF refinement__ (kernel-only, captured-graph LBFGS, batch=2048, n_atoms=
 | MACE-OFF23-small (96 ch)  |                  __0.060__ |                                ~835 | __1.95× slower__ |
 | MACE-OFF23-medium (128 ch)|                  __0.078__ |                                ~640 | n/a            |
 
-See [`MACE_BENCH_REPORT.md`](MACE_BENCH_REPORT.md) for the full sweep across model sizes, batch sizes, atom counts, and the 8× Blackwell extrapolation.
+See [`BENCH.md`](BENCH.md) for the full SmallField TK vs cueq Python head-to-head, the n_atoms sweep, and the LBFGS end-to-end numbers.
+[`ROADMAP.md`](ROADMAP.md) carries the 8× Blackwell production-target extrapolation.
 
 NVIDIA's [nvMolKit](https://docs.nvidia.com/bionemo/) also targets GPU conformer generation, but it requires the BioNeMo proprietary stack.
 SmallField is open-source, runs on any CUDA 12+ GPU, and integrates ETKDG + MMFF94 + MACE-OFF in a single persistent-context kernel chain.
