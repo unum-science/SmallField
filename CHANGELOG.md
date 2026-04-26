@@ -6,6 +6,32 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## MACE-OFF Per-Conformer Kernel Gating — 2026-04-26 — Investigated, Reverted
+
+Attempted to land per-conformer gating on the symcontract forward + backward kernels (the largest share of E+F time, ~62 % combined per the post-#1 NCU profile) so that converged conformers' atoms become no-ops on subsequent LBFGS iterations.
+The plan was: add `(graph_of_atom, converged_flags)` as optional kernel parameters and a CTA-entry early-return on `converged_flags[graph_of_atom[atom_index]] != 0`.
+
+__Result: -1.7× regression (1.36 → 1.83 ms / relaxation in the best-case all-converged synthetic test, 1.36 → 3.02 ms in the steady-state no-convergence case).
+Reverted.__
+
+Root cause via ptxas inspection: adding 2 pointer parameters and the early- return guard inflated the symcontract backward register usage from __48 → 72 registers__ even though the per-CTA latency cost of the new memory loads was ~60 cycles (negligible vs the kernel's 390 µs runtime).
+The 50 % register bump dropped CTAs/SM from 42 → 27 — a ~36 % occupancy loss → the kernel runs in 1.6× more waves.
+The compiler's register schedule across the body got materially worse despite the new code paths being tiny — likely because the constant-pointer-as-runtime-conditional in the no-convergence case prevents some of the same scheduling decisions the simpler kernel allowed.
+
+Approaches that would actually work:
+1. __Compile-time-templated kernels__ — separate `<bool gated>` instantiations (one with the early-return, one without).
+   Caller picks at launch.
+   Avoids forcing the compiler to handle both paths in a single function body.
+2. __Re-batching unconverged conformers periodically__ (the simpler structural approach) — every K=10 LBFGS steps, gather only the unconverged conformers into a smaller batch and continue with no kernel changes.
+   Saves all the work for converged conformers exactly, no kernel surgery.
+   Handles its own correctness issues via clean batch-rebuild (no stale accumulator buffers to worry about).
+3. __Conditional-graph nodes__ (CUDA 12.3+) wrapping a per-iteration check that re-launches a smaller batch.
+
+Option (2) is the practical right answer for this code base — the existing batch-staging plumbing in `cli/smallfield_mace_refine.cpp` already does shard-by-shard rebuilds and can be extended to do iter-by-iter rebuilds within a single relaxation.
+Option (1) is feasible if we want to keep the single-batch model but is a substantial refactor of every gated kernel.
+
+This finding is now in the kernel comments as a TODO note alongside the Phase K converged-flags infrastructure (commit `5183ebb`), which still provides the per-conformer fmax + flag tracking that re-batching would read at K-step boundaries.
+
 ## MACE-OFF Phase K — 2026-04-26 — `5183ebb`
 
 GPU-resident LBFGS / GD-with-early-exit, eliminating the host-side relaxation loop in `smallfield::mace::context_t::refine_batch` (previously 20 host launches per relaxation, ~25 % of end-to-end wall time at the current kernel speed).
