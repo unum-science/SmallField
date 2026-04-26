@@ -435,6 +435,19 @@ inline void mace_inference_forward(
     for (std::uint32_t layer_index = 0; layer_index < arch.num_interactions && layer_index < 2u; ++layer_index) {
         auto const &L = W.layers[layer_index];
 
+        // Save the layer's input node features for the force-adjoint pass.
+        // The forward overwrites `S.node_features` mid-iteration (inject_l0
+        // step 3j), so without this snapshot the layer-0 backward has no
+        // way to recover the original input.  Cheap: ~5-50 KB per save on
+        // drug-like molecules, ordered on the same stream so it lands
+        // before any downstream kernel reads it.
+        if (S.node_features_input_layer[layer_index] != nullptr) {
+            cudaMemcpyAsync(S.node_features_input_layer[layer_index],
+                            S.node_features,
+                            batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+
         // 3a. linear_up: scalar-only channel mix.  Output goes into S.node_features_l0_only via the
         //     L=0 extract → linear → reinject path.
         // For the first iteration node_features has only L=0 populated by the embedding,
@@ -452,6 +465,15 @@ inline void mace_inference_forward(
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
                                       /*irrep_dim*/1u, /*active_irrep_block_count*/1u,
                                       L.linear_up_w, S.node_scalar_invariants, S.node_features_l0_only, stream);
+
+        // Save the post-linear_up scalar features for the force-adjoint
+        // (input to conv_tp; the conv_tp adjoint reads it back as `node_l0`).
+        if (S.node_features_l0_only_layer[layer_index] != nullptr) {
+            cudaMemcpyAsync(S.node_features_l0_only_layer[layer_index],
+                            S.node_features_l0_only,
+                            batch.n_atoms * arch.n_channels * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
 
         // 3a-bis. Layer-N (N >= 1) residual: in MACE the
         //   `RealAgnosticResidualInteractionBlock` computes
@@ -638,6 +660,19 @@ inline void mace_inference_forward(
 #endif
         }
 
+        // Save the pre-symmetric-contraction node_features (post-skip_tp /
+        // post-residual / post-/avg_num_neighbors) for the force-adjoint:
+        // the symmetric-contraction adjoint takes this exact tensor as its
+        // `X` input.  Layer-0 form rolls in skip_tp; layer-N residual is
+        // applied AFTER product_linear, so the post_residual save here is
+        // pre-residual for layer >= 1.
+        if (S.node_features_post_residual_layer[layer_index] != nullptr) {
+            cudaMemcpyAsync(S.node_features_post_residual_layer[layer_index],
+                            S.node_features,
+                            batch.n_atoms * arch.n_channels * irrep_dim * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
+
         // 3h. Symmetric contraction: produce per-channel scalar invariants.
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
         // TK path uses precomputed `W3_eff[Z, i, j, k, c]` so the order-3
@@ -656,6 +691,16 @@ inline void mace_inference_forward(
         launch_mace_symmetric_contraction(arch, L, batch.n_atoms, batch.atom_element,
                                            S.node_features, S.node_scalar_invariants, stream);
 #endif
+
+        // Save the post-symmetric-contraction invariants for the
+        // force-adjoint (input to product_linear; the product_linear
+        // adjoint reads it back).
+        if (S.node_scalar_invariants_layer[layer_index] != nullptr) {
+            cudaMemcpyAsync(S.node_scalar_invariants_layer[layer_index],
+                            S.node_scalar_invariants,
+                            batch.n_atoms * arch.n_channels * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+        }
 
         // 3i. product_linear: channel mix on the scalar invariants (96 → 96).
         launch_mace_linear_per_irrep(batch.n_atoms, arch.n_channels, arch.n_channels,
