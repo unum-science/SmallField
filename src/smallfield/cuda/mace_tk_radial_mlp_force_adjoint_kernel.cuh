@@ -90,7 +90,8 @@ __device__ __forceinline__ void load_grad_pre_tile_with_silu_fold_(
     kittens::st_bf<edge_tile_rows_k, K_dim> &dst_grad_pre_tile,
     float const *grad_out_global,             // [n_edges, K]  fp32
     __nv_bfloat16 const *pre_act_bf16_global, // [n_edges, K]  bf16, only read when apply_silu
-    std::uint32_t n_edges, std::uint32_t base_edge_index) {
+    std::uint32_t n_edges, std::uint32_t base_edge_index, std::uint32_t grad_out_stride,
+    std::uint32_t k_col_base = 0u) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = edge_tile_rows_k * K_dim;
 #pragma unroll
@@ -100,7 +101,8 @@ __device__ __forceinline__ void load_grad_pre_tile_with_silu_fold_(
         std::uint32_t const edge_index = base_edge_index + static_cast<std::uint32_t>(row_in_tile);
         float value = 0.0f;
         if (edge_index < n_edges) {
-            std::uint64_t const offset = static_cast<std::uint64_t>(edge_index) * K_dim + col_in_tile;
+            std::uint64_t const offset =
+                static_cast<std::uint64_t>(edge_index) * grad_out_stride + k_col_base + col_in_tile;
             value = grad_out_global[offset];
             if constexpr (apply_silu) {
                 float const pre = __bfloat162float(pre_act_bf16_global[offset]);
@@ -118,14 +120,15 @@ __device__ __forceinline__ void load_grad_pre_tile_with_silu_fold_(
  */
 template <int N_dim, int K_dim>
 __device__ __forceinline__ void load_weight_tile_(kittens::st_bf<N_dim, K_dim> &dst_weight_tile,
-                                                  float const *weight_global) {
+                                                  float const *weight_global, std::uint32_t weight_k_stride,
+                                                  std::uint32_t k_col_base = 0u) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = N_dim * K_dim;
 #pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / K_dim;
         int const col_in_tile = linear_index % K_dim;
-        float const value = weight_global[row_in_tile * K_dim + col_in_tile];
+        float const value = weight_global[row_in_tile * weight_k_stride + k_col_base + col_in_tile];
         dst_weight_tile[{row_in_tile, col_in_tile}] = __float2bfloat16_rn(value);
     }
 }
@@ -147,7 +150,7 @@ __device__ __forceinline__ void scale_accumulator_in_place_(kittens::rt_fl<16, N
  *  trailing partial tile, so we stage to a fp32 shared tile then iterate
  *  manually with an `edge_index < n_edges` guard.
  */
-template <int N_dim>
+template <int N_dim, bool accumulate_output>
 __device__ __forceinline__ void store_grad_in_with_guard_(float *grad_in_global,
                                                           kittens::st_fl<edge_tile_rows_k, N_dim> &staging_shared_tile,
                                                           kittens::rt_fl<16, N_dim> const &accumulator,
@@ -164,7 +167,13 @@ __device__ __forceinline__ void store_grad_in_with_guard_(float *grad_in_global,
         std::uint32_t const edge_index = base_edge_index + static_cast<std::uint32_t>(row_in_tile);
         if (edge_index >= n_edges) continue;
         float const value = staging_shared_tile[{row_in_tile, col_in_tile}];
-        grad_in_global[static_cast<std::uint64_t>(edge_index) * N_dim + col_in_tile] = value;
+        std::uint64_t const offset = static_cast<std::uint64_t>(edge_index) * N_dim + col_in_tile;
+        if constexpr (accumulate_output) {
+            grad_in_global[offset] += value;
+        }
+        else {
+            grad_in_global[offset] = value;
+        }
     }
 }
 
@@ -181,13 +190,15 @@ __device__ __forceinline__ void store_grad_in_with_guard_(float *grad_in_global,
  *    4. Scale by `1/sqrt(n_in)` (e3nn `_Layer.path_weight`).
  *    5. Stage to fp32 shared tile, write to global `[n_edges, N]` with mask.
  */
-template <int N_dim, int K_dim, bool apply_silu>
+template <int N_dim, int K_dim, bool apply_silu, bool accumulate_output = false>
 inline __global__ void mace_tk_radial_mlp_layer_force_adjoint_kernel(
     std::uint32_t n_edges, float scale,
     float const *__restrict__ grad_out_fp32,        // [n_edges, K_dim]
     __nv_bfloat16 const *__restrict__ pre_act_bf16, // [n_edges, K_dim] (only read when apply_silu)
     float const *__restrict__ weight_fp32,          // [N_dim, K_dim]
-    float *__restrict__ grad_in_fp32                // [n_edges, N_dim]
+    float *__restrict__ grad_in_fp32,               // [n_edges, N_dim]
+    std::uint32_t grad_out_stride = K_dim, std::uint32_t weight_k_stride = K_dim,
+    std::uint32_t k_col_base = 0u
 ) {
     extern __shared__ kittens::alignment_dummy raw_shared_memory[];
     kittens::shared_allocator shared_alloc(reinterpret_cast<int *>(&raw_shared_memory[0]));
@@ -203,8 +214,8 @@ inline __global__ void mace_tk_radial_mlp_layer_force_adjoint_kernel(
     if (base_edge_index >= n_edges) return;
 
     load_grad_pre_tile_with_silu_fold_<K_dim, apply_silu>(shared_grad_pre_tile, grad_out_fp32, pre_act_bf16, n_edges,
-                                                          base_edge_index);
-    load_weight_tile_<N_dim, K_dim>(shared_weight_tile, weight_fp32);
+                                                          base_edge_index, grad_out_stride, k_col_base);
+    load_weight_tile_<N_dim, K_dim>(shared_weight_tile, weight_fp32, weight_k_stride, k_col_base);
     kittens::warpgroup::sync(0);
 
     kittens::rt_fl<16, N_dim> accumulator;
@@ -212,7 +223,8 @@ inline __global__ void mace_tk_radial_mlp_layer_force_adjoint_kernel(
 
     scale_accumulator_in_place_<N_dim>(accumulator, scale);
 
-    store_grad_in_with_guard_<N_dim>(grad_in_fp32, shared_staging_tile, accumulator, n_edges, base_edge_index);
+    store_grad_in_with_guard_<N_dim, accumulate_output>(grad_in_fp32, shared_staging_tile, accumulator, n_edges,
+                                                        base_edge_index);
 }
 
 } // namespace mace_tk_radial_mlp_force_adjoint_detail_
@@ -240,7 +252,8 @@ inline bool launch_mace_tk_radial_mlp_layer_force_adjoint(std::uint32_t n_edges,
     using namespace mace_tk_radial_mlp_force_adjoint_detail_;
     if (n_edges == 0) return true;
 
-    auto launch = [&](auto kernel_ptr, std::size_t shared_bytes) {
+    auto launch = [&](auto kernel_ptr, std::size_t shared_bytes, std::uint32_t grad_out_stride,
+                      std::uint32_t weight_k_stride) {
         // Opt-in to >48 KB shared memory for the K=384 path.  ~63 KB per CTA
         // (48 KB grad_pre + 48 KB weight + 16 KB staging) so we need to
         // request the dynamic-allocation cap.
@@ -252,7 +265,20 @@ inline bool launch_mace_tk_radial_mlp_layer_force_adjoint(std::uint32_t n_edges,
         dim3 const grid(grid_dim, 1, 1);
         dim3 const block(warpgroup_thread_count_k, 1, 1);
         kernel_ptr<<<grid, block, shared_bytes, stream>>>(n_edges, scale, grad_out_fp32, pre_act_bf16, weight_fp32,
-                                                          grad_in_fp32);
+                                                          grad_in_fp32, grad_out_stride, weight_k_stride,
+                                                          /*k_col_base=*/0u);
+    };
+    auto launch_chunked = [&](auto kernel_ptr, std::size_t shared_bytes, std::uint32_t grad_out_stride,
+                              std::uint32_t weight_k_stride, std::uint32_t k_col_base) {
+        if (shared_bytes > 48u * 1024u) {
+            cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(shared_bytes));
+        }
+        std::uint32_t const grid_dim = (n_edges + edge_tile_rows_k - 1u) / edge_tile_rows_k;
+        dim3 const grid(grid_dim, 1, 1);
+        dim3 const block(warpgroup_thread_count_k, 1, 1);
+        kernel_ptr<<<grid, block, shared_bytes, stream>>>(n_edges, scale, grad_out_fp32, pre_act_bf16, weight_fp32,
+                                                          grad_in_fp32, grad_out_stride, weight_k_stride, k_col_base);
     };
 
     // Compute shared-memory size from the template tile shapes.
@@ -264,27 +290,42 @@ inline bool launch_mace_tk_radial_mlp_layer_force_adjoint(std::uint32_t n_edges,
     };
 
     if (n_in == 64u && n_out == 64u && apply_silu_n2m_inverse) {
-        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 64, true>, shared_bytes_for(64, 64));
+        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 64, true>, shared_bytes_for(64, 64), 64u, 64u);
         return true;
     }
     if (n_in == 64u && n_out == 384u && !apply_silu_n2m_inverse) {
         // MACE-OFF-small: n_channels = 96 → tp_dim = 4 * 96 = 384.
-        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 384, false>, shared_bytes_for(64, 384));
+        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 384, false>, shared_bytes_for(64, 384), 384u,
+               384u);
         return true;
     }
     if (n_in == 64u && n_out == 512u && !apply_silu_n2m_inverse) {
         // MACE-OFF-medium: n_channels = 128 → tp_dim = 4 * 128 = 512.
-        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 512, false>, shared_bytes_for(64, 512));
+        // Consumer Blackwell cannot fit the naive 64x512 backward tile in
+        // shared memory, so accumulate four 64x128 K-slices instead.
+        cudaMemsetAsync(grad_in_fp32, 0, static_cast<std::size_t>(n_edges) * 64u * sizeof(float), stream);
+        constexpr std::uint32_t k_tile = 128u;
+        std::size_t const chunk_shared_bytes = shared_bytes_for(64, static_cast<int>(k_tile));
+        launch_chunked(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 128, false, true>, chunk_shared_bytes,
+                       /*grad_out_stride=*/512u, /*weight_k_stride=*/512u, /*k_col_base=*/0u);
+        launch_chunked(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 128, false, true>, chunk_shared_bytes,
+                       /*grad_out_stride=*/512u, /*weight_k_stride=*/512u, /*k_col_base=*/128u);
+        launch_chunked(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 128, false, true>, chunk_shared_bytes,
+                       /*grad_out_stride=*/512u, /*weight_k_stride=*/512u, /*k_col_base=*/256u);
+        launch_chunked(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 128, false, true>, chunk_shared_bytes,
+                       /*grad_out_stride=*/512u, /*weight_k_stride=*/512u, /*k_col_base=*/384u);
         return true;
     }
     if (n_in == 64u && n_out == 768u && !apply_silu_n2m_inverse) {
         // MACE-OFF (hypothetical 192-channel variant): tp_dim = 4 * 192 = 768.
-        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 768, false>, shared_bytes_for(64, 768));
+        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 768, false>, shared_bytes_for(64, 768), 768u,
+               768u);
         return true;
     }
     if (n_in == 64u && n_out == 896u && !apply_silu_n2m_inverse) {
         // MACE-OFF23-large: n_channels = 224 → tp_dim = 4 * 224 = 896.
-        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 896, false>, shared_bytes_for(64, 896));
+        launch(&mace_tk_radial_mlp_layer_force_adjoint_kernel<64, 896, false>, shared_bytes_for(64, 896), 896u,
+               896u);
         return true;
     }
     return false;

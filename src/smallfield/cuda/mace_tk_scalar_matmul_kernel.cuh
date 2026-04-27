@@ -96,7 +96,8 @@ using register_accumulator_t = kittens::rt_fl<16, channels_k>;
  *  guard at the epilogue then drops them.
  */
 __device__ __forceinline__ void load_input_slab_(shared_input_tile_t &dst_tile, float const *input_global,
-                                                 std::uint32_t n_atoms, std::uint32_t base_atom_index) {
+                                                 std::uint32_t n_atoms, std::uint32_t base_atom_index,
+                                                 std::uint32_t n_channels_runtime) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = wgmma_m_rows_k * channels_k;
 #pragma unroll
@@ -105,8 +106,8 @@ __device__ __forceinline__ void load_input_slab_(shared_input_tile_t &dst_tile, 
         int const channel = linear_index % channels_k;
         std::uint32_t const atom_index = base_atom_index + static_cast<std::uint32_t>(atom_in_cta);
         float value = 0.0f;
-        if (atom_index < n_atoms) {
-            value = input_global[static_cast<std::uint64_t>(atom_index) * channels_k + channel];
+        if (atom_index < n_atoms && static_cast<std::uint32_t>(channel) < n_channels_runtime) {
+            value = input_global[static_cast<std::uint64_t>(atom_index) * n_channels_runtime + channel];
         }
         dst_tile[{atom_in_cta, channel}] = __float2bfloat16_rn(value);
     }
@@ -117,14 +118,20 @@ __device__ __forceinline__ void load_input_slab_(shared_input_tile_t &dst_tile, 
  *  e3nn `o3.Linear` weights for an `irrep_dim=1, active_block=1` linear are
  *  exactly `[c_in, c_out]` row-major (no per-block axis to skip).
  */
-__device__ __forceinline__ void load_weight_slab_(shared_weight_tile_t &dst_tile, float const *weight_global) {
+__device__ __forceinline__ void load_weight_slab_(shared_weight_tile_t &dst_tile, float const *weight_global,
+                                                  std::uint32_t n_channels_in_runtime,
+                                                  std::uint32_t n_channels_out_runtime) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_k * channels_k;
 #pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const c_in_row = linear_index / channels_k;
         int const c_out_col = linear_index % channels_k;
-        float const value = weight_global[static_cast<std::uint64_t>(c_in_row) * channels_k + c_out_col];
+        float value = 0.0f;
+        if (static_cast<std::uint32_t>(c_in_row) < n_channels_in_runtime &&
+            static_cast<std::uint32_t>(c_out_col) < n_channels_out_runtime) {
+            value = weight_global[static_cast<std::uint64_t>(c_in_row) * n_channels_out_runtime + c_out_col];
+        }
         dst_tile[{c_in_row, c_out_col}] = __float2bfloat16_rn(value);
     }
 }
@@ -150,7 +157,8 @@ __device__ __forceinline__ void scale_accumulator_in_place_(register_accumulator
  */
 __device__ __forceinline__ void store_output_atoms_fp32_(float *output_global, shared_output_tile_t &staging_tile,
                                                          register_accumulator_t const &accumulator,
-                                                         std::uint32_t n_atoms, std::uint32_t base_atom_index) {
+                                                         std::uint32_t n_atoms, std::uint32_t base_atom_index,
+                                                         std::uint32_t n_channels_out_runtime) {
     kittens::warpgroup::store(staging_tile, accumulator);
     kittens::warpgroup::sync(0);
 
@@ -161,8 +169,8 @@ __device__ __forceinline__ void store_output_atoms_fp32_(float *output_global, s
         int const atom_in_cta = linear_index / channels_k;
         int const channel = linear_index % channels_k;
         std::uint32_t const atom_index = base_atom_index + static_cast<std::uint32_t>(atom_in_cta);
-        if (atom_index >= n_atoms) continue;
-        output_global[static_cast<std::uint64_t>(atom_index) * channels_k + channel] =
+        if (atom_index >= n_atoms || static_cast<std::uint32_t>(channel) >= n_channels_out_runtime) continue;
+        output_global[static_cast<std::uint64_t>(atom_index) * n_channels_out_runtime + channel] =
             staging_tile[{atom_in_cta, channel}];
     }
 }
@@ -174,7 +182,8 @@ __device__ __forceinline__ void store_output_atoms_fp32_(float *output_global, s
  *  Per CTA: load 64 atoms' input slab + the full c_in × c_out weight, run
  *  one WGMMA, scale, store fp32 directly.
  */
-inline __global__ void mace_tk_scalar_matmul_kernel(std::uint32_t n_atoms,
+inline __global__ void mace_tk_scalar_matmul_kernel(std::uint32_t n_atoms, std::uint32_t n_channels_in_runtime,
+                                                    std::uint32_t n_channels_out_runtime,
                                                     float const *__restrict__ input_global,  // [n_atoms, c_in]
                                                     float const *__restrict__ weight_global, // [c_in, c_out]
                                                     float scaled_path_weight,         // 1 / sqrt(c_in) [× pre_scale]
@@ -193,8 +202,8 @@ inline __global__ void mace_tk_scalar_matmul_kernel(std::uint32_t n_atoms,
     std::uint32_t const base_atom_index = blockIdx.x * static_cast<std::uint32_t>(wgmma_m_rows_k);
     if (base_atom_index >= n_atoms) return;
 
-    load_input_slab_(shared_input_tile, input_global, n_atoms, base_atom_index);
-    load_weight_slab_(shared_weight_tile, weight_global);
+    load_input_slab_(shared_input_tile, input_global, n_atoms, base_atom_index, n_channels_in_runtime);
+    load_weight_slab_(shared_weight_tile, weight_global, n_channels_in_runtime, n_channels_out_runtime);
     kittens::warpgroup::sync(0);
 
     register_accumulator_t accumulator;
@@ -202,7 +211,8 @@ inline __global__ void mace_tk_scalar_matmul_kernel(std::uint32_t n_atoms,
 
     scale_accumulator_in_place_(accumulator, scaled_path_weight);
 
-    store_output_atoms_fp32_(output_global, shared_output_tile, accumulator, n_atoms, base_atom_index);
+    store_output_atoms_fp32_(output_global, shared_output_tile, accumulator, n_atoms, base_atom_index,
+                             n_channels_out_runtime);
 }
 
 } // namespace mace_tk_scalar_matmul_detail_
@@ -220,9 +230,8 @@ inline __global__ void mace_tk_scalar_matmul_kernel(std::uint32_t n_atoms,
  *  `pre_scale_multiplier` (typically `1 / avg_num_neighbors`) is multiplied
  *  in alongside, mirroring `launch_mace_tk_per_irrep_linear`'s convention.
  *
- *  Returns `false` when the channel-count tuple isn't handled (the kernel
- *  templates the small-model 96-channel shape into the WGMMA tile); caller
- *  must fall back to `launch_mace_linear_per_irrep` (which dispatches to
+ *  Returns `false` when the channel-count tuple isn't handled; caller must
+ *  fall back to `launch_mace_linear_per_irrep` (which dispatches to
  *  `mace_matmul_rowmajor_kernel` on the irrep_dim=1 fast path).
  */
 inline bool launch_mace_tk_scalar_matmul(std::uint32_t n_atoms, std::uint32_t n_channels_in,
@@ -233,8 +242,8 @@ inline bool launch_mace_tk_scalar_matmul(std::uint32_t n_atoms, std::uint32_t n_
 
     using namespace mace_tk_scalar_matmul_detail_;
 
-    if (n_channels_in != static_cast<std::uint32_t>(channels_k) ||
-        n_channels_out != static_cast<std::uint32_t>(channels_k)) {
+    if (n_channels_in != static_cast<std::uint32_t>(mace_tk::mace_channels_small_k) ||
+        n_channels_out != static_cast<std::uint32_t>(mace_tk::mace_channels_small_k)) {
         return false;
     }
 
@@ -250,8 +259,8 @@ inline bool launch_mace_tk_scalar_matmul(std::uint32_t n_atoms, std::uint32_t n_
     dim3 const grid(n_atom_tiles, 1, 1);
     dim3 const block(static_cast<std::uint32_t>(warpgroup_thread_count_k), 1, 1);
 
-    mace_tk_scalar_matmul_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(n_atoms, input_fp32, weight_fp32,
-                                                                                 scaled_path_weight, output_fp32);
+    mace_tk_scalar_matmul_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
+        n_atoms, n_channels_in, n_channels_out, input_fp32, weight_fp32, scaled_path_weight, output_fp32);
     return true;
 }
 

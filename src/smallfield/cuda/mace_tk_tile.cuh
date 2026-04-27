@@ -98,11 +98,14 @@ using register_tile_fp32 = kittens::rt_fl<rows_in_tiles, cols_in_tiles, layout>;
 constexpr int mace_channels_small_k = 96;
 constexpr int mace_channels_medium_k = 128;
 constexpr int mace_channels_large_k = 224; // MACE-OFF23 large is 224 channels (verified at export time)
+constexpr int mace_channels_tk_max_k = mace_channels_medium_k; // current TK path targets small+medium
 constexpr int mace_irrep_dim_total_k = 16; // 1 + 3 + 5 + 7
 constexpr int mace_radial_hidden_dim_k = 64;
 constexpr int mace_radial_input_dim_k = 8;                                       // n_radial Bessel basis functions
 constexpr int mace_n_paths_k = 4;                                                // tensor-product output paths
 constexpr int mace_radial_output_dim_k = mace_n_paths_k * mace_channels_small_k; // = 384
+constexpr int mace_radial_output_dim_medium_k = mace_n_paths_k * mace_channels_medium_k; // = 512
+constexpr int mace_radial_output_dim_tk_max_k = mace_radial_output_dim_medium_k;
 
 // Activation epilogue helpers — one entry per non-linear epilogue we emit
 // from a TK persistent kernel.  Defined as functors so they can be folded

@@ -646,14 +646,15 @@ inline void mace_inference_forward(types::mace_arch_t const &arch, types::mace_w
         //     Each hidden layer scales by (1/sqrt(h_in)) and applies normalize2mom(silu).
         //     Final layer scales by (1/sqrt(h_in)) only.
         std::uint32_t const tp_dim = mace_tensor_product_path_count_k * arch.n_channels;
-        // Under the TK build for the SMALL model (n_channels=96), layers 0/1/2
+        // Under the TK build for the SMALL/MEDIUM models (n_channels=96/128), layers 0/1/2
         // are folded into the TK fused kernel below; skip the fp32 ref layers
-        // here so we don't write dead intermediates.  For medium/large or the
+        // here so we don't write dead intermediates.  For larger models or the
         // fp32-only build, we MUST run all four fp32 layers so the layer-3
         // fallback below has valid `S.radial_mlp_hidden_2` to consume.
         bool const use_tk_radial_mlp_forward = false
 #if defined(SMALLFIELD_USE_THUNDERKITTENS)
-                                               || (arch.n_channels == mace_tk::mace_channels_small_k)
+                                               || (arch.n_channels == mace_tk::mace_channels_small_k) ||
+                                                  (arch.n_channels == mace_tk::mace_channels_medium_k)
 #endif
             ;
         if (!use_tk_radial_mlp_forward) {
@@ -691,18 +692,17 @@ inline void mace_inference_forward(types::mace_arch_t const &arch, types::mace_w
         // skip the fp32 forward rerun.  Kernel writes bf16 [n_edges, 64] for
         // each non-null layer slot; backward casts to fp32 once and consumes
         // via the existing radial-MLP layer adjoint.
-        // The TK fused radial MLP bakes the small-model output dim
-        // (4*96=384) into the kernel; medium (4*128=512) and large (4*224=896)
-        // would silently scramble the tp_weights buffer, so gate explicitly
-        // and fall back to the fp32-reference 4-matmul + 3-silu chain.
+        // The TK fused radial MLP now covers the small and medium output
+        // widths (4*96=384 and 4*128=512).  Larger widths still fall back
+        // to the fp32-reference 4-matmul + 3-silu chain.
         bool tk_radial_mlp_ok = false;
-        if (arch.n_channels == mace_tk::mace_channels_small_k) {
-            tk_radial_mlp_ok = launch_mace_tk_radial_mlp(batch.n_edges, arch.n_radial, S.radial_basis, L.radial_mlp_w0,
-                                                         L.radial_mlp_w1, L.radial_mlp_w2, L.radial_mlp_w3,
-                                                         S.tk_tensor_product_weights_per_edge_bf16, stream,
-                                                         S.tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index],
-                                                         S.tk_radial_mlp_hidden_1_pre_bf16_layer[layer_index],
-                                                         S.tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index]);
+        if (arch.n_channels == mace_tk::mace_channels_small_k || arch.n_channels == mace_tk::mace_channels_medium_k) {
+            tk_radial_mlp_ok = launch_mace_tk_radial_mlp(
+                batch.n_edges, arch.n_radial, tp_dim, S.radial_basis, L.radial_mlp_w0, L.radial_mlp_w1,
+                L.radial_mlp_w2, L.radial_mlp_w3, S.tk_tensor_product_weights_per_edge_bf16, stream,
+                S.tk_radial_mlp_hidden_0_pre_bf16_layer[layer_index],
+                S.tk_radial_mlp_hidden_1_pre_bf16_layer[layer_index],
+                S.tk_radial_mlp_hidden_2_pre_bf16_layer[layer_index]);
         }
         if (tk_radial_mlp_ok) {
             launch_mace_bf16_to_fp32(batch.n_edges * tp_dim, S.tk_tensor_product_weights_per_edge_bf16,

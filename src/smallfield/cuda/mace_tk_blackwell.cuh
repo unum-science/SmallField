@@ -128,8 +128,16 @@ __device__ inline void mma_AtB_overwrite_sync(register_tile_ &D_per_warp, a_smem
     a_reg_t A_reg;
     b_reg_t B_reg;
     int const warp_id_in_wg = kittens::warpgroup::warpid();
+    // TK `subtile<R, C>(rowcol)` treats `rowcol` as a SUB-BLOCK INDEX (the
+    // constructor multiplies by `cols` internally).  Pass the warp id directly
+    // — multiplying by `register_tile_::rows` here would double-stride the
+    // column offset (e.g. warp 3 → col_offset = 3·16·16 = 768 in a parent
+    // with 64 or 128 cols → OOB).  Manifested as an illegal __shared__ read
+    // in compute-sanitizer on sm_120a once the element-conditioned-residual
+    // forward kernel was first exercised under Option A (c=128) — see
+    // `mace_tk_element_conditioned_residual_kernel.cuh`.
     auto const &A_subtile = const_cast<a_smem_t_ &>(A_full).template subtile<a_smem_t_::rows, register_tile_::rows>(
-        {0, warp_id_in_wg * static_cast<int>(register_tile_::rows)});
+        {0, warp_id_in_wg});
     kittens::warp::load(A_reg, A_subtile);
     kittens::warp::load(B_reg, B_full);
     kittens::warp::zero(D_per_warp);

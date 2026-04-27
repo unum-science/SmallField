@@ -64,7 +64,7 @@ constexpr int edge_tile_rows_k = 64;
 constexpr int hidden_dim_k = mace_tk::mace_radial_hidden_dim_k;      // 64
 constexpr int radial_input_dim_k = mace_tk::mace_radial_input_dim_k; // 8
 constexpr int padded_input_dim_k = 16;                               // bf16 WGMMA K granularity
-constexpr int output_dim_k = mace_tk::mace_radial_output_dim_k;      // 384
+constexpr int output_dim_k = mace_tk::mace_radial_output_dim_tk_max_k; // 512 (covers 384 via runtime guards)
 constexpr int output_n_tile_count_k = output_dim_k / hidden_dim_k;   // 6
 constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS; // 128
 
@@ -181,6 +181,7 @@ __device__ __forceinline__ void load_hidden_to_hidden_weight_(shared_tile_w_hh_t
  */
 __device__ __forceinline__ void load_layer_3_weight_column_tile_(shared_tile_w3_col_t &dst_weight_tile,
                                                                  float const *layer_3_weight,
+                                                                 std::uint32_t runtime_output_dim,
                                                                  int output_column_tile_index) {
     int const thread_id = threadIdx.x;
     int const base_output_col = output_column_tile_index * hidden_dim_k;
@@ -189,7 +190,11 @@ __device__ __forceinline__ void load_layer_3_weight_column_tile_(shared_tile_w3_
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / hidden_dim_k;
         int const col_in_tile = linear_index % hidden_dim_k;
-        float const value = layer_3_weight[row_in_tile * output_dim_k + (base_output_col + col_in_tile)];
+        float value = 0.0f;
+        int const output_col = base_output_col + col_in_tile;
+        if (output_col < static_cast<int>(runtime_output_dim)) {
+            value = layer_3_weight[row_in_tile * runtime_output_dim + output_col];
+        }
         dst_weight_tile[{row_in_tile, col_in_tile}] = __float2bfloat16_rn(value);
     }
 }
@@ -233,6 +238,7 @@ __device__ __forceinline__ void store_output_tile_with_guard_(__nv_bfloat16 *out
                                                               shared_tile_hidden_t &staging_shared_tile,
                                                               register_accumulator_t const &accumulator,
                                                               std::uint32_t n_edges, std::uint32_t base_edge_index,
+                                                              std::uint32_t runtime_output_dim,
                                                               int output_column_tile_index) {
     // Convert fp32 register tile to bf16 in shared memory (with conversion).
     kittens::warpgroup::store(staging_shared_tile, accumulator);
@@ -247,8 +253,10 @@ __device__ __forceinline__ void store_output_tile_with_guard_(__nv_bfloat16 *out
         int const col_in_tile = linear_index % hidden_dim_k;
         std::uint32_t const edge_index = base_edge_index + static_cast<std::uint32_t>(row_in_tile);
         if (edge_index >= n_edges) continue;
+        int const output_col = base_output_col + col_in_tile;
+        if (output_col >= static_cast<int>(runtime_output_dim)) continue;
         __nv_bfloat16 const value = staging_shared_tile[{row_in_tile, col_in_tile}];
-        output_global[static_cast<std::uint64_t>(edge_index) * output_dim_k + (base_output_col + col_in_tile)] = value;
+        output_global[static_cast<std::uint64_t>(edge_index) * runtime_output_dim + output_col] = value;
     }
 }
 
@@ -301,6 +309,7 @@ inline __global__ void mace_tk_radial_mlp_kernel(
     std::uint32_t n_edges, float const *__restrict__ radial_basis_input, float const *__restrict__ layer_0_weight,
     float const *__restrict__ layer_1_weight, float const *__restrict__ layer_2_weight,
     float const *__restrict__ layer_3_weight, __nv_bfloat16 *__restrict__ tensor_product_weights_per_edge,
+    std::uint32_t runtime_output_dim,
     __nv_bfloat16 *__restrict__ pre_act_layer_0_bf16, // [n_edges, 64] or nullptr
     __nv_bfloat16 *__restrict__ pre_act_layer_1_bf16, // [n_edges, 64] or nullptr
     __nv_bfloat16 *__restrict__ pre_act_layer_2_bf16, // [n_edges, 64] or nullptr
@@ -382,7 +391,8 @@ inline __global__ void mace_tk_radial_mlp_kernel(
 #pragma unroll
     for (int output_column_tile_index = 0; output_column_tile_index < output_n_tile_count_k;
          ++output_column_tile_index) {
-        load_layer_3_weight_column_tile_(shared_layer_3_weight_column, layer_3_weight, output_column_tile_index);
+        load_layer_3_weight_column_tile_(shared_layer_3_weight_column, layer_3_weight, runtime_output_dim,
+                                         output_column_tile_index);
         kittens::warpgroup::sync(0);
 
         mace_tk::mma_AB_overwrite_sync(accumulator, shared_hidden_tile, shared_layer_3_weight_column, mma_ctx);
@@ -394,7 +404,7 @@ inline __global__ void mace_tk_radial_mlp_kernel(
         // Re-use of `shared_hidden_tile` (the layer-3 input) would corrupt
         // the input on the next column-tile iteration.
         store_output_tile_with_guard_(tensor_product_weights_per_edge, shared_layer_3_weight_column, accumulator,
-                                      n_edges, base_edge_index, output_column_tile_index);
+                                      n_edges, base_edge_index, runtime_output_dim, output_column_tile_index);
         kittens::warpgroup::sync(0);
     }
 }
@@ -405,7 +415,7 @@ inline __global__ void mace_tk_radial_mlp_kernel(
  *  @brief Launch the TK-fused radial MLP for MACE-OFF.
  *
  *  Reads `radial_basis_input[n_edges, n_radial=8]` in fp32, applies the four
- *  MACE-OFF radial-MLP layers (8 -> 64 -> 64 -> 64 -> 384) with
+ *  MACE-OFF radial-MLP layers (8 -> 64 -> 64 -> 64 -> {384,512}) with
  *  `normalize2mom(silu)` between activated layers and a `1/sqrt(in_dim)` scale
  *  per layer (e3nn `_Layer` convention), and writes
  *  `tensor_product_weights_per_edge[n_edges, 384]` in bf16.
@@ -424,7 +434,8 @@ inline __global__ void mace_tk_radial_mlp_kernel(
  */
 /// Returns true on successful launch, false if the (n_radial, output_dim)
 /// tuple isn't handled (caller must fall back to the fp32 reference path).
-inline bool launch_mace_tk_radial_mlp(std::uint32_t n_edges, std::uint32_t n_radial, float const *radial_basis_input,
+inline bool launch_mace_tk_radial_mlp(std::uint32_t n_edges, std::uint32_t n_radial,
+                                      std::uint32_t runtime_output_dim, float const *radial_basis_input,
                                       float const *radial_mlp_weight_layer_0, float const *radial_mlp_weight_layer_1,
                                       float const *radial_mlp_weight_layer_2, float const *radial_mlp_weight_layer_3,
                                       __nv_bfloat16 *tensor_product_weights_per_edge, cudaStream_t stream,
@@ -432,20 +443,14 @@ inline bool launch_mace_tk_radial_mlp(std::uint32_t n_edges, std::uint32_t n_rad
                                       __nv_bfloat16 *pre_act_layer_1_bf16 = nullptr,
                                       __nv_bfloat16 *pre_act_layer_2_bf16 = nullptr) {
     if (n_edges == 0u) return true;
-    // The fused kernel template-bakes the MACE-OFF-small shapes (n_radial=8,
-    // hidden=64, output_dim=4·96=384).  The output_dim baking means a caller
-    // for the medium model (4·128=512) or large (4·224=896) would write into
-    // a buffer that the conv_tp+scatter consumer expects to have a different
-    // stride — reject explicitly so the caller falls back to the fp32
-    // reference path instead of silently scrambling the tp_weights tensor.
+    // The fused kernel template-bakes the small-or-medium max shape
+    // (n_radial=8, hidden=64, output_dim up to 4·128=512).  Larger output
+    // widths still need the fp32 reference path.
     if (n_radial != static_cast<std::uint32_t>(mace_tk_radial_mlp_detail_::radial_input_dim_k)) { return false; }
-    // The kernel writes `mace_radial_output_dim_k = 4 · 96 = 384` columns per
-    // edge.  The caller's `tensor_product_weights_per_edge` buffer must have
-    // this exact stride — anything else (medium, large) is a silent layout
-    // mismatch.  Detect by inferring tp_dim from `4 · n_channels` via the
-    // shape constants exposed in mace_tk_tile.cuh.
-    // (n_channels isn't passed in but the per-call output_dim is fixed at
-    // engine-template time; mismatched callers must use the fp32 ref path.)
+    if (runtime_output_dim != static_cast<std::uint32_t>(mace_tk::mace_radial_output_dim_k) &&
+        runtime_output_dim != static_cast<std::uint32_t>(mace_tk::mace_radial_output_dim_medium_k)) {
+        return false;
+    }
 
     using namespace mace_tk_radial_mlp_detail_;
 
@@ -476,8 +481,8 @@ inline bool launch_mace_tk_radial_mlp(std::uint32_t n_edges, std::uint32_t n_rad
 
     mace_tk_radial_mlp_kernel<<<grid, block, shared_memory_bytes_k, stream>>>(
         n_edges, radial_basis_input, radial_mlp_weight_layer_0, radial_mlp_weight_layer_1, radial_mlp_weight_layer_2,
-        radial_mlp_weight_layer_3, tensor_product_weights_per_edge, pre_act_layer_0_bf16, pre_act_layer_1_bf16,
-        pre_act_layer_2_bf16, scales);
+        radial_mlp_weight_layer_3, tensor_product_weights_per_edge, runtime_output_dim, pre_act_layer_0_bf16,
+        pre_act_layer_1_bf16, pre_act_layer_2_bf16, scales);
     return true;
 }
 

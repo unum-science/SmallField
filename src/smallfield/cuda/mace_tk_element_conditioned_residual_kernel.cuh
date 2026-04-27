@@ -71,8 +71,8 @@ namespace mace_tk_element_conditioned_residual_detail_ {
 // requires the output `M` axis to be exactly 64, so we tile `c_out = 96`
 // as two 64-wide column tiles of 64 (the second tile zero-pads cols
 // 32..63 and we drop those rows during the bf16 store).
-constexpr int channels_in_k = mace_tk::mace_channels_small_k;      // 96
-constexpr int channels_out_k = mace_tk::mace_channels_small_k;     // 96
+constexpr int channels_in_k = mace_tk::mace_channels_tk_max_k;     // 128 (covers 96 via runtime guards)
+constexpr int channels_out_k = mace_tk::mace_channels_tk_max_k;    // 128 (covers 96 via runtime guards)
 constexpr int irrep_dim_total_k = mace_tk::mace_irrep_dim_total_k; // 16
 constexpr int channels_out_tile_size_k = 64;                       // WGMMA M
 constexpr int channels_out_tile_count_k = (channels_out_k + channels_out_tile_size_k - 1) /
@@ -125,16 +125,21 @@ __device__ __forceinline__ __nv_bfloat16 input_to_bf16_(__nv_bfloat16 v) { retur
  */
 template <typename input_t>
 __device__ __forceinline__ void load_atom_input_slab_(shared_tile_input_t &dst_input_tile, input_t const *input_global,
-                                                      std::uint32_t atom_index) {
+                                                      std::uint32_t atom_index,
+                                                      std::uint32_t n_channels_in_runtime) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_in_k * irrep_dim_total_k;
-    std::uint64_t const atom_input_offset = static_cast<std::uint64_t>(atom_index) * channels_in_k * irrep_dim_total_k;
+    std::uint64_t const atom_input_offset =
+        static_cast<std::uint64_t>(atom_index) * n_channels_in_runtime * irrep_dim_total_k;
 #pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
         int const row_in_tile = linear_index / irrep_dim_total_k; // c_in
         int const col_in_tile = linear_index % irrep_dim_total_k; // m
-        input_t const value =
-            input_global[atom_input_offset + static_cast<std::uint64_t>(row_in_tile) * irrep_dim_total_k + col_in_tile];
+        input_t value = input_t {};
+        if (static_cast<std::uint32_t>(row_in_tile) < n_channels_in_runtime) {
+            value = input_global[atom_input_offset + static_cast<std::uint64_t>(row_in_tile) * irrep_dim_total_k +
+                                 col_in_tile];
+        }
         dst_input_tile[{row_in_tile, col_in_tile}] = input_to_bf16_(value);
     }
 }
@@ -151,13 +156,14 @@ __device__ __forceinline__ void load_atom_input_slab_(shared_tile_input_t &dst_i
  *  corresponding output rows.
  */
 __device__ __forceinline__ void load_z_indirect_weight_slab_(shared_tile_weight_slab_t &dst_weight_tile,
-                                                             float const *weights_global, std::uint32_t n_elements,
+                                                             float const *weights_global, std::uint32_t n_channels_in,
+                                                             std::uint32_t n_elements,
                                                              std::uint32_t n_channels_out,
                                                              unsigned int irrep_block_index, int atom_element_index,
                                                              int channels_out_tile_index) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_in_k * channels_out_tile_size_k;
-    std::uint64_t const block_stride = static_cast<std::uint64_t>(channels_in_k) * n_elements * n_channels_out;
+    std::uint64_t const block_stride = static_cast<std::uint64_t>(n_channels_in) * n_elements * n_channels_out;
     std::uint64_t const channel_in_stride = static_cast<std::uint64_t>(n_elements) * n_channels_out;
     std::uint64_t const block_base = static_cast<std::uint64_t>(irrep_block_index) * block_stride +
                                      static_cast<std::uint64_t>(atom_element_index) * n_channels_out;
@@ -279,13 +285,13 @@ inline __global__ void mace_tk_element_conditioned_residual_kernel(
 
     std::uint32_t const atom_index = blockIdx.x;
     if (atom_index >= n_atoms) return;
-    if (n_channels_in != static_cast<std::uint32_t>(channels_in_k)) return;
-    if (n_channels_out != static_cast<std::uint32_t>(channels_out_k)) return;
+    if (n_channels_in > static_cast<std::uint32_t>(channels_in_k)) return;
+    if (n_channels_out > static_cast<std::uint32_t>(channels_out_k)) return;
 
     int const atom_element_index = atom_element[atom_index];
 
     // Stage the per-atom input slab once.
-    load_atom_input_slab_<input_t>(shared_input_tile, input_global, atom_index);
+    load_atom_input_slab_<input_t>(shared_input_tile, input_global, atom_index, n_channels_in);
     kittens::warpgroup::sync(0);
 
     register_accumulator_t accumulator;
@@ -297,7 +303,7 @@ inline __global__ void mace_tk_element_conditioned_residual_kernel(
         for (int channels_out_tile_index = 0; channels_out_tile_index < channels_out_tile_count_k;
              ++channels_out_tile_index) {
 
-            load_z_indirect_weight_slab_(shared_weight_slab, weights_fp32, n_elements, n_channels_out,
+            load_z_indirect_weight_slab_(shared_weight_slab, weights_fp32, n_channels_in, n_elements, n_channels_out,
                                          irrep_block_index, atom_element_index, channels_out_tile_index);
             kittens::warpgroup::sync(0);
 
@@ -355,9 +361,9 @@ inline __global__ void mace_tk_element_conditioned_residual_kernel(
  *      (caller is expected to consume bf16; if fp32 is needed, follow with a
  *       bf16 → fp32 cast).
  *
- *  This kernel template-bakes the MACE-OFF-small shape (`c_in == c_out == 96`,
- *  `irrep_dim_total == 16`).  Other shapes silently fall through and emit
- *  no work — callers should fall back to the fp32 reference path for those.
+ *  This kernel template-bakes a small-or-medium width cap (`c_in == c_out ≤ 128`,
+ *  `irrep_dim_total == 16`).  Larger shapes must fall back to the fp32
+ *  reference path.
  *
  *  Gated on `SMALLFIELD_USE_THUNDERKITTENS`; only compiled when the macro is
  *  defined.
@@ -373,9 +379,12 @@ inline bool launch_mace_tk_element_conditioned_residual(std::uint32_t n_atoms, s
     if (n_atoms == 0u) return true;
     if (active_irrep_block_count == 0u) return false;
     if (active_irrep_block_count > 4u) return false;
-    if (n_channels_in != static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_in_k))
-        return false;
-    if (n_channels_out != static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_out_k))
+    bool const small_or_medium =
+        (n_channels_in == mace_tk::mace_channels_small_k || n_channels_in == mace_tk::mace_channels_medium_k) &&
+        (n_channels_out == mace_tk::mace_channels_small_k || n_channels_out == mace_tk::mace_channels_medium_k);
+    if (!small_or_medium || n_channels_in != n_channels_out ||
+        n_channels_in > static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_in_k) ||
+        n_channels_out > static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_out_k))
         return false;
 
     using namespace mace_tk_element_conditioned_residual_detail_;
@@ -422,9 +431,9 @@ inline bool launch_mace_tk_element_conditioned_residual(std::uint32_t n_atoms, s
  *      level — the per-thread `__float2bfloat16_rn` becomes a register
  *      move.
  *
- *  Same shape constraints as the fp32 launcher: `c_in == c_out == 96`
- *  for MACE-OFF-small (returns false otherwise so the caller falls back
- *  to the fp32 chain).
+ *  Same shape constraints as the fp32 launcher: small-or-medium widths
+ *  (`c_in == c_out ∈ {96, 128}`), returning false otherwise so the caller
+ *  falls back to the fp32 chain.
  */
 inline bool launch_mace_tk_element_conditioned_residual_bf16_input(
     std::uint32_t n_atoms, std::uint32_t n_channels_in, std::uint32_t n_elements, std::uint32_t n_channels_out,
@@ -435,9 +444,12 @@ inline bool launch_mace_tk_element_conditioned_residual_bf16_input(
     if (n_atoms == 0u) return true;
     if (active_irrep_block_count == 0u) return false;
     if (active_irrep_block_count > 4u) return false;
-    if (n_channels_in != static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_in_k))
-        return false;
-    if (n_channels_out != static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_out_k))
+    bool const small_or_medium =
+        (n_channels_in == mace_tk::mace_channels_small_k || n_channels_in == mace_tk::mace_channels_medium_k) &&
+        (n_channels_out == mace_tk::mace_channels_small_k || n_channels_out == mace_tk::mace_channels_medium_k);
+    if (!small_or_medium || n_channels_in != n_channels_out ||
+        n_channels_in > static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_in_k) ||
+        n_channels_out > static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_detail_::channels_out_k))
         return false;
 
     using namespace mace_tk_element_conditioned_residual_detail_;

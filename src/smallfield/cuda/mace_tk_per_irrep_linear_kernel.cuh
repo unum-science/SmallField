@@ -81,8 +81,8 @@ namespace mace_tk_per_irrep_linear_detail_ {
 constexpr int atoms_per_cta_k = 4;
 constexpr int irrep_dim_total_k = mace_tk::mace_irrep_dim_total_k;   // 16
 constexpr int wgmma_m_rows_k = atoms_per_cta_k * irrep_dim_total_k;  // 64
-constexpr int channels_in_k = mace_tk::mace_channels_small_k;        // 96
-constexpr int channels_out_k = mace_tk::mace_channels_small_k;       // 96
+constexpr int channels_in_k = mace_tk::mace_channels_tk_max_k;       // 128 (covers 96 via runtime guards)
+constexpr int channels_out_k = mace_tk::mace_channels_tk_max_k;      // 128 (covers 96 via runtime guards)
 constexpr int irrep_block_count_k = 4;                               // L = 0, 1, 2, 3
 constexpr int warpgroup_thread_count_k = kittens::WARPGROUP_THREADS; // 128
 
@@ -425,13 +425,12 @@ inline bool launch_mace_tk_per_irrep_linear(
 
     using namespace mace_tk_per_irrep_linear_detail_;
 
-    // The fused kernel templates the MACE-OFF-small shape (c_in = c_out = 96)
-    // into the WGMMA tile.  Other configurations (medium 128, large 224)
-    // need a separate specialization (Transform #4 in the algebraic-transforms
-    // roadmap); we reject explicitly here so the caller can route to the fp32
-    // reference path instead of silently producing zeros.
-    if (n_channels_in != static_cast<std::uint32_t>(channels_in_k) ||
-        n_channels_out != static_cast<std::uint32_t>(channels_out_k)) {
+    bool const small_or_medium =
+        (n_channels_in == mace_tk::mace_channels_small_k || n_channels_in == mace_tk::mace_channels_medium_k) &&
+        (n_channels_out == mace_tk::mace_channels_small_k || n_channels_out == mace_tk::mace_channels_medium_k);
+    if (!small_or_medium || n_channels_in != n_channels_out ||
+        n_channels_in > static_cast<std::uint32_t>(channels_in_k) ||
+        n_channels_out > static_cast<std::uint32_t>(channels_out_k)) {
         return false;
     }
     if (active_irrep_block_count == 0u || active_irrep_block_count > static_cast<std::uint32_t>(irrep_block_count_k)) {
@@ -495,8 +494,12 @@ inline bool launch_mace_tk_per_irrep_linear_bf16_input(std::uint32_t n_atoms, st
 
     using namespace mace_tk_per_irrep_linear_detail_;
 
-    if (n_channels_in != static_cast<std::uint32_t>(channels_in_k) ||
-        n_channels_out != static_cast<std::uint32_t>(channels_out_k)) {
+    bool const small_or_medium =
+        (n_channels_in == mace_tk::mace_channels_small_k || n_channels_in == mace_tk::mace_channels_medium_k) &&
+        (n_channels_out == mace_tk::mace_channels_small_k || n_channels_out == mace_tk::mace_channels_medium_k);
+    if (!small_or_medium || n_channels_in != n_channels_out ||
+        n_channels_in > static_cast<std::uint32_t>(channels_in_k) ||
+        n_channels_out > static_cast<std::uint32_t>(channels_out_k)) {
         return false;
     }
     if (active_irrep_block_count == 0u || active_irrep_block_count > static_cast<std::uint32_t>(irrep_block_count_k)) {

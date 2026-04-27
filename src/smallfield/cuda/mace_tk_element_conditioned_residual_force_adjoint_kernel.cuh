@@ -84,8 +84,8 @@ namespace mace_tk_element_conditioned_residual_force_adjoint_detail_ {
 // requires the output `M` axis to be exactly 64; we tile `c_in = 96` as two
 // 64-wide row tiles (the second tile zero-pads the bottom 32 rows and the
 // per-thread global store drops them).
-constexpr int channels_in_k = mace_tk::mace_channels_small_k;      // 96
-constexpr int channels_out_k = mace_tk::mace_channels_small_k;     // 96
+constexpr int channels_in_k = mace_tk::mace_channels_tk_max_k;     // 128 (covers 96 via runtime guards)
+constexpr int channels_out_k = mace_tk::mace_channels_tk_max_k;    // 128 (covers 96 via runtime guards)
 constexpr int irrep_dim_total_k = mace_tk::mace_irrep_dim_total_k; // 16
 constexpr int channels_in_tile_size_k = 64;                        // WGMMA M
 constexpr int channels_in_tile_count_k = (channels_in_k + channels_in_tile_size_k - 1) / channels_in_tile_size_k; // 2
@@ -133,11 +133,11 @@ __device__ __forceinline__ unsigned int irrep_block_index_for_component_(unsigne
  */
 __device__ __forceinline__ void load_atom_upstream_slab_(shared_tile_upstream_t &dst_upstream_tile,
                                                          float const *upstream_grad_output_global,
-                                                         std::uint32_t atom_index,
+                                                         std::uint32_t atom_index, std::uint32_t n_channels_out,
                                                          std::uint32_t active_irrep_block_count) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_out_k * irrep_dim_total_k;
-    std::uint64_t const atom_upstream_offset = static_cast<std::uint64_t>(atom_index) * channels_out_k *
+    std::uint64_t const atom_upstream_offset = static_cast<std::uint64_t>(atom_index) * n_channels_out *
                                                irrep_dim_total_k;
 #pragma unroll
     for (int linear_index = thread_id; linear_index < tile_elements; linear_index += warpgroup_thread_count_k) {
@@ -146,7 +146,8 @@ __device__ __forceinline__ void load_atom_upstream_slab_(shared_tile_upstream_t 
         unsigned int const irrep_block_index = irrep_block_index_for_component_(
             static_cast<unsigned int>(irrep_component_index));
         float value = 0.0f;
-        if (irrep_block_index < active_irrep_block_count) {
+        if (irrep_block_index < active_irrep_block_count &&
+            static_cast<std::uint32_t>(channel_out_index) < n_channels_out) {
             value = upstream_grad_output_global[atom_upstream_offset +
                                                 static_cast<std::uint64_t>(channel_out_index) * irrep_dim_total_k +
                                                 irrep_component_index];
@@ -167,13 +168,14 @@ __device__ __forceinline__ void load_atom_upstream_slab_(shared_tile_upstream_t 
  *  zeros there and the per-thread global `+=` skips those rows entirely.
  */
 __device__ __forceinline__ void load_z_indirect_weight_slab_(shared_tile_weight_slab_t &dst_weight_tile,
-                                                             float const *weights_global, std::uint32_t n_elements,
+                                                             float const *weights_global, std::uint32_t n_channels_in,
+                                                             std::uint32_t n_elements,
                                                              std::uint32_t n_channels_out,
                                                              unsigned int irrep_block_index, int atom_element_index,
                                                              int channels_in_tile_index) {
     int const thread_id = threadIdx.x;
     constexpr int tile_elements = channels_in_tile_size_k * channels_out_k;
-    std::uint64_t const block_stride = static_cast<std::uint64_t>(channels_in_k) * n_elements * n_channels_out;
+    std::uint64_t const block_stride = static_cast<std::uint64_t>(n_channels_in) * n_elements * n_channels_out;
     std::uint64_t const channel_in_stride = static_cast<std::uint64_t>(n_elements) * n_channels_out;
     std::uint64_t const block_base = static_cast<std::uint64_t>(irrep_block_index) * block_stride +
                                      static_cast<std::uint64_t>(atom_element_index) * n_channels_out;
@@ -184,7 +186,8 @@ __device__ __forceinline__ void load_z_indirect_weight_slab_(shared_tile_weight_
         int const col_in_tile = linear_index % channels_out_k; // c_out
         int const channel_in_global = channels_in_tile_base + row_in_tile;
         float value = 0.0f;
-        if (channel_in_global < channels_in_k && static_cast<std::uint32_t>(col_in_tile) < n_channels_out) {
+        if (channel_in_global < static_cast<int>(n_channels_in) &&
+            static_cast<std::uint32_t>(col_in_tile) < n_channels_out) {
             value = weights_global[block_base + static_cast<std::uint64_t>(channel_in_global) * channel_in_stride +
                                    static_cast<std::uint64_t>(col_in_tile)];
         }
@@ -283,13 +286,14 @@ inline __global__ void mace_tk_element_conditioned_residual_force_adjoint_kernel
 
     std::uint32_t const atom_index = blockIdx.x;
     if (atom_index >= n_atoms) return;
-    if (n_channels_in != static_cast<std::uint32_t>(channels_in_k)) return;
-    if (n_channels_out != static_cast<std::uint32_t>(channels_out_k)) return;
+    if (n_channels_in > static_cast<std::uint32_t>(channels_in_k)) return;
+    if (n_channels_out > static_cast<std::uint32_t>(channels_out_k)) return;
 
     int const atom_element_index = atom_element[atom_index];
 
     // Stage the per-atom upstream gradient slab once; reused across all blocks.
-    load_atom_upstream_slab_(shared_upstream_tile, upstream_grad_output_fp32, atom_index, active_irrep_block_count);
+    load_atom_upstream_slab_(shared_upstream_tile, upstream_grad_output_fp32, atom_index, n_channels_out,
+                             active_irrep_block_count);
     kittens::warpgroup::sync(0);
 
     register_accumulator_t accumulator;
@@ -299,7 +303,7 @@ inline __global__ void mace_tk_element_conditioned_residual_force_adjoint_kernel
         for (int channels_in_tile_index = 0; channels_in_tile_index < channels_in_tile_count_k;
              ++channels_in_tile_index) {
 
-            load_z_indirect_weight_slab_(shared_weight_slab, weights_fp32, n_elements, n_channels_out,
+            load_z_indirect_weight_slab_(shared_weight_slab, weights_fp32, n_channels_in, n_elements, n_channels_out,
                                          irrep_block_index, atom_element_index, channels_in_tile_index);
             kittens::warpgroup::sync(0);
 
@@ -322,14 +326,12 @@ inline __global__ void mace_tk_element_conditioned_residual_force_adjoint_kernel
  *  @brief Launch the TK-fused element-conditioned residual force adjoint (D3) for MACE-OFF.
  *
  *  Replaces `launch_mace_element_conditioned_residual_force_adjoint`
- *  (`mace_force_adjoints.cuh`) for the MACE-OFF-small/medium shape
- *  (`c_in == c_out == 96`).  Two forms:
+ *  (`mace_force_adjoints.cuh`) for the small-or-medium, full-irrep message-path
+ *  case (`c_in == c_out ∈ {96, 128}`, `active_irrep_block_count == 4`).
  *
- *    - `active_irrep_block_count = 4`: layer-0 `RealAgnosticInteractionBlock`
- *      skip path — adjoint contributes to all four irrep blocks of the input
- *      gradient.
- *    - `active_irrep_block_count = 1`: layer-N `RealAgnosticResidualInteractionBlock`
- *      residual path — adjoint contributes to the L=0 m-component only.
+ *  The scalar residual-path adjoint (`active_irrep_block_count == 1`) uses
+ *  `[n_atoms, n_channels]` buffers at the call site, not `[n_atoms, n_channels, 16]`,
+ *  so it continues to fall back to the fp32 `irrep_dim == 1` reference path.
  *
  *  Inputs / outputs:
  *    - `atom_element[n_atoms]`                                        : int32 species indices `Z[a] ∈ [0, n_elements)`,
@@ -343,9 +345,8 @@ inline __global__ void mace_tk_element_conditioned_residual_force_adjoint_kernel
  *  exceeds `active_irrep_block_count - 1`) are NOT touched, so the caller's
  *  zero-init survives.
  *
- *  This kernel template-bakes the MACE-OFF-small shape (`c_in == c_out == 96`,
- *  `irrep_dim_total == 16`).  Other shapes silently fall through and emit no
- *  work — callers must use the fp32 reference for those.
+ *  This kernel template-bakes a small-or-medium width cap (`c_in == c_out ≤ 128`,
+ *  `irrep_dim_total == 16`).  Larger shapes must use the fp32 reference path.
  *
  *  Gated on `SMALLFIELD_USE_THUNDERKITTENS`; only compiled when the macro is
  *  defined.
@@ -357,13 +358,15 @@ inline bool launch_mace_tk_element_conditioned_residual_force_adjoint(
     std::uint32_t active_irrep_block_count, std::int32_t const *atom_element, float const *weights_fp32,
     float const *upstream_grad_output_fp32, float *grad_input_fp32, cudaStream_t stream) {
     if (n_atoms == 0u) return true;
-    if (active_irrep_block_count == 0u) return false;
-    if (active_irrep_block_count > 4u) return false;
-    if (n_channels_in !=
-        static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_force_adjoint_detail_::channels_in_k))
-        return false;
-    if (n_channels_out !=
-        static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_force_adjoint_detail_::channels_out_k))
+    if (active_irrep_block_count != 4u) return false;
+    bool const small_or_medium =
+        (n_channels_in == mace_tk::mace_channels_small_k || n_channels_in == mace_tk::mace_channels_medium_k) &&
+        (n_channels_out == mace_tk::mace_channels_small_k || n_channels_out == mace_tk::mace_channels_medium_k);
+    if (!small_or_medium || n_channels_in != n_channels_out ||
+        n_channels_in >
+            static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_force_adjoint_detail_::channels_in_k) ||
+        n_channels_out >
+            static_cast<std::uint32_t>(mace_tk_element_conditioned_residual_force_adjoint_detail_::channels_out_k))
         return false;
 
     using namespace mace_tk_element_conditioned_residual_force_adjoint_detail_;
