@@ -58,9 +58,12 @@ struct conformer_shard_data_t {
     std::vector<bool> baseline_energy_null_per_row;
 
     /** @brief Flat list of coordinate halves with `[N_total × 3]` layout where
-     *         `N_total = sum(num_atoms_per_row)`.  Use `row_atom_offsets[i]` to
-     *         find row `i`'s slice. */
+     *         `N_total = sum(stored_atoms_per_row)`.  The input parquet stores a
+     *         raw per-row coordinate slab that may be padded beyond the true atom
+     *         count; use `num_atoms_per_row[i]` for the logical count and
+     *         `stored_atoms_per_row[i]` / `row_atom_offsets[i]` for the raw slice. */
     std::vector<__half> coordinates_flat;
+    std::vector<std::uint16_t> stored_atoms_per_row;
     std::vector<std::uint64_t> row_atom_offsets; ///< [num_rows + 1]; offsets in atoms (not halves)
 
     std::uint64_t num_rows() const noexcept { return smiles.size(); }

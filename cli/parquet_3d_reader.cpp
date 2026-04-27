@@ -70,6 +70,7 @@ bool read_conformer_shard(std::filesystem::path const &path, conformer_shard_dat
     out.input_row_per_row.reserve(num_rows);
     out.baseline_energy_per_row.reserve(num_rows);
     out.baseline_energy_null_per_row.reserve(num_rows);
+    out.stored_atoms_per_row.reserve(num_rows);
     out.row_atom_offsets.reserve(num_rows + 1);
     out.row_atom_offsets.push_back(0);
 
@@ -101,28 +102,42 @@ bool read_conformer_shard(std::filesystem::path const &path, conformer_shard_dat
     }
     std::uint16_t const *flat_halves = coord_half_arr->raw_values();
 
-    // First pass: validate and reserve flat capacity.
-    std::uint64_t total_atoms = 0;
+    // First pass: validate and reserve the raw padded coordinate storage.
+    std::uint64_t total_stored_atoms = 0;
     for (std::uint64_t i = 0; i < num_rows; ++i) {
-        std::uint8_t const n_atoms = num_atoms_arr->Value(static_cast<std::int64_t>(i));
-        total_atoms += n_atoms;
+        std::int64_t const row_index = static_cast<std::int64_t>(i);
+        auto const list_start = coord_list_arr->value_offset(row_index);
+        auto const list_end = coord_list_arr->value_offset(row_index + 1);
+        auto const coord_count = list_end - list_start;
+        if (coord_count < 0 || (coord_count % 3) != 0) {
+            std::fprintf(stderr, "[smallfield_mace_refine] malformed coordinates_xyz length at row %llu in %s\n",
+                         static_cast<unsigned long long>(i), path.string().c_str());
+            return false;
+        }
+        total_stored_atoms += static_cast<std::uint64_t>(coord_count / 3);
     }
-    out.coordinates_flat.resize(static_cast<std::size_t>(total_atoms) * 3u);
+    out.coordinates_flat.resize(static_cast<std::size_t>(total_stored_atoms) * 3u);
 
     // Second pass: copy per-row data into the flat layouts.
     std::uint64_t atom_cursor = 0;
     for (std::uint64_t i = 0; i < num_rows; ++i) {
+        std::int64_t const row_index = static_cast<std::int64_t>(i);
         out.smiles.emplace_back(smiles_arr->Value(static_cast<std::int64_t>(i)));
-        std::uint8_t const n_atoms = num_atoms_arr->Value(static_cast<std::int64_t>(i));
+        auto const list_start = coord_list_arr->value_offset(row_index);
+        auto const list_end = coord_list_arr->value_offset(row_index + 1);
+        auto const coord_count = list_end - list_start;
+        std::uint8_t const n_atoms = (num_atoms_arr->IsNull(row_index) ? 0u : num_atoms_arr->Value(row_index));
+        std::uint16_t const stored_atoms = static_cast<std::uint16_t>(coord_count / 3);
         out.num_atoms_per_row.push_back(n_atoms);
-        out.status_per_row.push_back(status_arr->Value(static_cast<std::int64_t>(i)));
-        out.solver_per_row.push_back(solver_arr ? solver_arr->Value(static_cast<std::int64_t>(i)) : 0u);
-        out.conformer_index_per_row.push_back(conf_idx_arr ? conf_idx_arr->Value(static_cast<std::int64_t>(i)) : 0u);
+        out.stored_atoms_per_row.push_back(stored_atoms);
+        out.status_per_row.push_back(status_arr->Value(row_index));
+        out.solver_per_row.push_back(solver_arr ? solver_arr->Value(row_index) : 0u);
+        out.conformer_index_per_row.push_back(conf_idx_arr ? conf_idx_arr->Value(row_index) : 0u);
         out.input_shard_per_row.emplace_back(
-            input_shard_arr ? std::string(input_shard_arr->Value(static_cast<std::int64_t>(i))) : "");
-        out.input_row_per_row.push_back(input_row_arr ? input_row_arr->Value(static_cast<std::int64_t>(i)) : 0ull);
-        if (energy_arr && !energy_arr->IsNull(static_cast<std::int64_t>(i))) {
-            out.baseline_energy_per_row.push_back(energy_arr->Value(static_cast<std::int64_t>(i)));
+            input_shard_arr ? std::string(input_shard_arr->Value(row_index)) : "");
+        out.input_row_per_row.push_back(input_row_arr ? input_row_arr->Value(row_index) : 0ull);
+        if (energy_arr && !energy_arr->IsNull(row_index)) {
+            out.baseline_energy_per_row.push_back(energy_arr->Value(row_index));
             out.baseline_energy_null_per_row.push_back(false);
         }
         else {
@@ -130,18 +145,23 @@ bool read_conformer_shard(std::filesystem::path const &path, conformer_shard_dat
             out.baseline_energy_null_per_row.push_back(true);
         }
 
-        // Coordinates: list<float16> with num_atoms*3 entries when the row is a
-        // success; ListArray gives us the offset into the inner half-float array.
-        auto const list_start = coord_list_arr->value_offset(static_cast<std::int64_t>(i));
-        std::uint32_t const expected = static_cast<std::uint32_t>(n_atoms) * 3u;
-        // We trust `num_atoms`; the list length should equal `expected` for non-failures.
-        for (std::uint32_t k = 0; k < expected; ++k) {
+        if (n_atoms != 0u) {
+            std::uint32_t const expected = static_cast<std::uint32_t>(n_atoms) * 3u;
+            if (coord_count < static_cast<std::int64_t>(expected)) {
+                std::fprintf(stderr,
+                             "[smallfield_mace_refine] row %llu in %s has num_atoms=%u but only %lld coordinates\n",
+                             static_cast<unsigned long long>(i), path.string().c_str(), static_cast<unsigned>(n_atoms),
+                             static_cast<long long>(coord_count));
+                return false;
+            }
+        }
+        for (std::int64_t k = 0; k < coord_count; ++k) {
             std::uint16_t const bits = flat_halves[static_cast<std::int64_t>(list_start) + k];
             __half h;
             std::memcpy(&h, &bits, sizeof(__half));
-            out.coordinates_flat[(atom_cursor * 3u) + k] = h;
+            out.coordinates_flat[(atom_cursor * 3u) + static_cast<std::uint64_t>(k)] = h;
         }
-        atom_cursor += n_atoms;
+        atom_cursor += stored_atoms;
         out.row_atom_offsets.push_back(atom_cursor);
     }
     return true;

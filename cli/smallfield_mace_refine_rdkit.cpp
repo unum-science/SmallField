@@ -20,10 +20,11 @@
 
 namespace {
 
-/// Resolve atomic numbers in the order RDKit emits them (post-`AddHs`).  The
-/// caller's `expected_num_atoms` should match the SmallField output parquet's
-/// `num_atoms` column.  On any RDKit failure or count mismatch we return an
-/// empty vector to signal "skip this row".
+/// Resolve atomic numbers in the order RDKit emits them (post-`AddHs`).  When
+/// `expected_num_atoms != 0`, it should match the SmallField parquet's
+/// `num_atoms` column; `0` means "derive the count from RDKit and don't enforce
+/// a parquet-side expectation".  On any RDKit failure or count mismatch we
+/// return an empty vector to signal "skip this row".
 std::vector<int> resolve_(std::string const &smiles, std::uint8_t expected_num_atoms) {
     std::unique_ptr<RDKit::ROMol> molecule;
     try {
@@ -41,7 +42,7 @@ std::vector<int> resolve_(std::string const &smiles, std::uint8_t expected_num_a
         return {};
     }
     auto const n = static_cast<std::uint32_t>(rwmol->getNumAtoms());
-    if (n != expected_num_atoms) {
+    if (expected_num_atoms != 0u && n != expected_num_atoms) {
         std::fprintf(
             stderr,
             "[smallfield_mace_refine] atom-count mismatch: SMILES %s has %u atoms, " "parquet says %u — skipping row\n",

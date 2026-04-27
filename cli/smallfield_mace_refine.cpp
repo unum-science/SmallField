@@ -201,19 +201,26 @@ struct row_pack_t {
 /// `refinable` flag.  The RDKit-backed implementation lives in
 /// `smallfield_mace_refine_rdkit.cpp`; the forward declaration is at the
 /// top of this TU (outside the anonymous namespace) so the symbol resolves.
-void prepare_row_pack_(std::string const &smiles, std::uint8_t num_atoms, std::span<__half const> coordinates_for_row,
-                       row_pack_t &out) {
+void prepare_row_pack_(std::string const &smiles, std::uint8_t num_atoms_from_parquet,
+                       std::span<__half const> coordinates_for_row, row_pack_t &out) {
+    auto const atomic_numbers = resolve_atomic_numbers_from_smiles(smiles, num_atoms_from_parquet);
+    if (atomic_numbers.empty()) {
+        out.refinable = false;
+        return;
+    }
+
+    std::uint8_t const num_atoms =
+        (num_atoms_from_parquet != 0u ? num_atoms_from_parquet : static_cast<std::uint8_t>(atomic_numbers.size()));
+    if (coordinates_for_row.size() < static_cast<std::size_t>(num_atoms) * 3u) {
+        out.refinable = false;
+        return;
+    }
+
     out.num_atoms = num_atoms;
     out.refinable = true;
     out.positions_xyz.resize(static_cast<std::size_t>(num_atoms) * 3u);
     for (std::size_t i = 0; i < static_cast<std::size_t>(num_atoms) * 3u; ++i) {
         out.positions_xyz[i] = __half2float(coordinates_for_row[i]);
-    }
-
-    auto const atomic_numbers = resolve_atomic_numbers_from_smiles(smiles, num_atoms);
-    if (atomic_numbers.size() != num_atoms) {
-        out.refinable = false;
-        return;
     }
     out.element_indices.resize(num_atoms);
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
@@ -275,18 +282,12 @@ struct device_buffers_t {
     }
 };
 
-/// Helper to recover the row_pack_t array base from the shard for index math
-/// in the in-place writeback inside refine_one_batch_.  Set in process_shard_().
-thread_local row_pack_t const *current_row_pack_base_ = nullptr;
-row_pack_t const *shard_row_pack_base_(smallfield::cli::conformer_shard_data_t const &shard) {
-    (void)shard;
-    return current_row_pack_base_;
-}
-
 bool refine_one_batch_(smallfield::mace::context_t &mace_ctx, smallfield::mace::weights_t const &weights,
-                       smallfield::mace::relax_config_t const &relax, std::span<row_pack_t> rows_in_batch,
+                       smallfield::mace::relax_config_t const &relax, std::span<row_pack_t const> rows_in_batch,
+                       std::span<std::uint64_t const> row_indices_in_shard,
                        smallfield::cli::conformer_shard_data_t &shard, std::vector<float> &per_row_eV_out,
                        std::vector<std::uint8_t> &per_row_solver_codes_out) {
+    if (rows_in_batch.size() != row_indices_in_shard.size()) return false;
     std::uint32_t total_atoms = 0, total_edges = 0;
     for (auto const &row : rows_in_batch) total_atoms += row.num_atoms;
 
@@ -388,8 +389,7 @@ bool refine_one_batch_(smallfield::mace::context_t &mace_ctx, smallfield::mace::
     atom_offset = 0;
     for (std::uint32_t graph_index = 0; graph_index < rows_in_batch.size(); ++graph_index) {
         auto const &row = rows_in_batch[graph_index];
-        // Find the absolute row index inside the shard via address arithmetic.
-        std::ptrdiff_t const abs_row_index = &row - shard_row_pack_base_(shard);
+        std::uint64_t const abs_row_index = row_indices_in_shard[graph_index];
         std::uint64_t const row_atom_offset = shard.row_atom_offsets[static_cast<std::size_t>(abs_row_index)];
         for (std::uint32_t a = 0; a < row.num_atoms; ++a) {
             for (int axis = 0; axis < 3; ++axis) {
@@ -404,29 +404,37 @@ bool refine_one_batch_(smallfield::mace::context_t &mace_ctx, smallfield::mace::
     return true;
 }
 
-void process_shard_(fs::path const &input_path, fs::path const &output_path, smallfield::mace::context_t &mace_ctx,
-                    smallfield::mace::weights_t const &weights, cli_config_t const &config) {
+std::uint64_t process_shard_(fs::path const &input_path, fs::path const &output_path,
+                             smallfield::mace::context_t &mace_ctx, smallfield::mace::weights_t const &weights,
+                             cli_config_t const &config) {
     smallfield::cli::conformer_shard_data_t shard;
     if (!smallfield::cli::read_conformer_shard(input_path, shard)) {
         std::fprintf(stderr, "[smallfield_mace_refine] skip %s (read failed)\n", input_path.string().c_str());
-        return;
+        return 0;
     }
 
     std::vector<row_pack_t> row_packs(shard.num_rows());
-    current_row_pack_base_ = row_packs.data();
 
     std::vector<float> per_row_eV(shard.num_rows(), 0.0f);
     std::vector<std::uint8_t> solver_codes(shard.num_rows(), 0u);
     for (std::uint64_t i = 0; i < shard.num_rows(); ++i) {
+        if (shard.num_atoms_per_row[i] == 0u) {
+            auto const atomic_numbers = resolve_atomic_numbers_from_smiles(shard.smiles[i], 0u);
+            if (!atomic_numbers.empty()) {
+                shard.num_atoms_per_row[i] = static_cast<std::uint8_t>(atomic_numbers.size());
+            }
+        }
         // Skip non-success rows — leave them as pass-through copy.
         if (shard.status_per_row[i] != /*success*/ 0u || shard.num_atoms_per_row[i] == 0u) {
             row_packs[i].refinable = false;
             solver_codes[i] = shard.solver_per_row[i];
             continue;
         }
-        std::span<__half const> coords_span(shard.coordinates_flat.data() + shard.row_atom_offsets[i] * 3u,
-                                            static_cast<std::size_t>(shard.num_atoms_per_row[i]) * 3u);
+        std::span<__half const> coords_span(
+            shard.coordinates_flat.data() + shard.row_atom_offsets[i] * 3u,
+            static_cast<std::size_t>(shard.stored_atoms_per_row[i]) * 3u);
         prepare_row_pack_(shard.smiles[i], shard.num_atoms_per_row[i], coords_span, row_packs[i]);
+        shard.num_atoms_per_row[i] = row_packs[i].num_atoms;
         if (!row_packs[i].refinable) solver_codes[i] = shard.solver_per_row[i];
     }
 
@@ -444,12 +452,15 @@ void process_shard_(fs::path const &input_path, fs::path const &output_path, sma
     for (std::size_t cursor = 0; cursor < refinable_rows.size(); cursor += config.batch_size) {
         std::size_t const end = std::min(cursor + config.batch_size, refinable_rows.size());
         std::vector<row_pack_t> batch_views;
+        std::vector<std::uint64_t> batch_row_indices;
         batch_views.reserve(end - cursor);
-        for (std::size_t k = cursor; k < end; ++k) batch_views.push_back(row_packs[refinable_rows[k]]);
-        // refine_one_batch_ uses thread_local current_row_pack_base_ to find
-        // the destination index in `shard.coordinates_flat`.
-        if (!refine_one_batch_(mace_ctx, weights, relax, std::span<row_pack_t>(batch_views), shard, per_row_eV,
-                               solver_codes)) {
+        batch_row_indices.reserve(end - cursor);
+        for (std::size_t k = cursor; k < end; ++k) {
+            batch_views.push_back(row_packs[refinable_rows[k]]);
+            batch_row_indices.push_back(refinable_rows[k]);
+        }
+        if (!refine_one_batch_(mace_ctx, weights, relax, std::span<row_pack_t const>(batch_views),
+                               std::span<std::uint64_t const>(batch_row_indices), shard, per_row_eV, solver_codes)) {
             // Fail-soft: leave this batch's coords/solver_code unchanged.
             std::fprintf(stderr, "[smallfield_mace_refine] batch failed on shard %s rows %zu..%zu — pass-through\n",
                          input_path.string().c_str(), cursor, end);
@@ -469,18 +480,30 @@ void process_shard_(fs::path const &input_path, fs::path const &output_path, sma
     std::vector<std::string_view> smiles_views;
     smiles_views.reserve(shard.smiles.size());
     for (auto const &s : shard.smiles) smiles_views.emplace_back(s);
+    std::vector<__half> compact_coordinates;
+    compact_coordinates.reserve([&]() {
+        std::size_t total = 0;
+        for (auto n_atoms : shard.num_atoms_per_row) total += static_cast<std::size_t>(n_atoms) * 3u;
+        return total;
+    }());
+    for (std::uint64_t i = 0; i < shard.num_rows(); ++i) {
+        std::size_t const value_count = static_cast<std::size_t>(shard.num_atoms_per_row[i]) * 3u;
+        auto const *src = shard.coordinates_flat.data() + shard.row_atom_offsets[i] * 3u;
+        compact_coordinates.insert(compact_coordinates.end(), src, src + value_count);
+    }
     writer.smiles = smiles_views;
     writer.num_atoms_per_molecule = shard.num_atoms_per_row;
     writer.status = shard.status_per_row;
     writer.solver = solver_codes;
-    writer.coordinates = shard.coordinates_flat;
+    writer.coordinates = compact_coordinates;
     writer.energies = per_row_eV;
 
     if (!smallfield::cli::write_shard(output_path, writer)) {
         std::fprintf(stderr, "[smallfield_mace_refine] write failed: %s\n", output_path.string().c_str());
+        return 0;
     }
 
-    current_row_pack_base_ = nullptr;
+    return shard.num_rows();
 }
 
 } // namespace
@@ -489,37 +512,44 @@ int main(int argc, char **argv) {
     cli_config_t config;
     if (!parse_args(argc, argv, config)) return 1;
 
-    auto weights = smallfield::mace::weights_t::load(config.weights_path.string());
-    if (!weights.is_loaded()) {
-        std::fprintf(stderr, "[smallfield_mace_refine] failed to load %s\n", config.weights_path.string().c_str());
-        return 1;
-    }
-
-    // Single-GPU implementation for now; multi-GPU is a thread-per-device
-    // fan-out plus the existing shard-inventory queue (see smallfield_batch.cpp
-    // for the established pattern).
-    int const device_id = config.gpu_ids.front();
-    cudaSetDevice(device_id);
-
-    smallfield::mace::context_t mace_ctx(device_id, weights.arch(),
-                                         /*max_atoms*/ config.batch_size * config.max_atoms_per_molecule,
-                                         /*max_edges*/ config.batch_size * config.max_atoms_per_molecule * 32u,
-                                         /*max_graphs*/ config.batch_size);
-
     fs::create_directories(config.output_dir);
     auto const input_shards = smallfield::cli::list_input_shards(config.input_dir);
     auto const start = std::chrono::steady_clock::now();
-    std::uint64_t shards_done = 0, rows_done = 0;
-    for (auto const &shard_path : input_shards) {
-        fs::path const out_path = config.output_dir / (shard_path.stem().string() + "_mace.parquet");
-        if (config.restart && fs::exists(out_path)) continue;
-        process_shard_(shard_path, out_path, mace_ctx, weights, config);
-        ++shards_done;
+    std::atomic<std::size_t> next_shard_index {0};
+    std::atomic<std::uint64_t> shards_done {0};
+    std::atomic<std::uint64_t> rows_done {0};
+    std::vector<std::thread> workers;
+    workers.reserve(config.gpu_ids.size());
+
+    for (int const device_id : config.gpu_ids) {
+        workers.emplace_back([&, device_id]() {
+            cudaSetDevice(device_id);
+            auto weights = smallfield::mace::weights_t::load(config.weights_path.string());
+            if (!weights.is_loaded()) {
+                std::fprintf(stderr, "[smallfield_mace_refine] failed to load %s on gpu %d\n",
+                             config.weights_path.string().c_str(), device_id);
+                return;
+            }
+            smallfield::mace::context_t mace_ctx(device_id, weights.arch(),
+                                                 /*max_atoms*/ config.batch_size * config.max_atoms_per_molecule,
+                                                 /*max_edges*/ config.batch_size * config.max_atoms_per_molecule * 32u,
+                                                 /*max_graphs*/ config.batch_size);
+            while (true) {
+                std::size_t const shard_index = next_shard_index.fetch_add(1);
+                if (shard_index >= input_shards.size()) break;
+                auto const &shard_path = input_shards[shard_index];
+                fs::path const out_path = config.output_dir / (shard_path.stem().string() + "_mace.parquet");
+                if (config.restart && fs::exists(out_path)) continue;
+                rows_done.fetch_add(process_shard_(shard_path, out_path, mace_ctx, weights, config));
+                shards_done.fetch_add(1);
+            }
+        });
     }
+    for (auto &worker : workers) worker.join();
     auto const elapsed =
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
     std::printf("[smallfield_mace_refine] done: %llu shards, %llu rows, %llds\n",
-                static_cast<unsigned long long>(shards_done), static_cast<unsigned long long>(rows_done),
+                static_cast<unsigned long long>(shards_done.load()), static_cast<unsigned long long>(rows_done.load()),
                 static_cast<long long>(elapsed));
     return 0;
 }
