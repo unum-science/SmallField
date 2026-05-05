@@ -37,16 +37,13 @@ using namespace smallfield::types;
  *  @param[in] num_atoms Number of atoms in the molecule.
  *  @param[in] torsion Torsion descriptor with atom indices and Fourier coefficients.
  *  @param[in] atom_role Which atom this thread is accumulating for (first through fourth).
- *  @param[out] grad_x Accumulated x-gradient for the atom.
- *  @param[out] grad_y Accumulated y-gradient for the atom.
- *  @param[out] grad_z Accumulated z-gradient for the atom.
+ *  @param[inout] gradient Accumulated gradient for the atom.
  *  @return Torsion energy contribution (kcal/mol).
  */
 template <bool write_gradient>
 __device__ __forceinline__ float compute_torsion_contribution_(float const *positions, std::uint32_t num_atoms,
                                                                etk_torsion_descriptor_t const &torsion,
-                                                               std::uint32_t atom_role, float *grad_x, float *grad_y,
-                                                               float *grad_z) {
+                                                               std::uint32_t atom_role, float3 *gradient) {
     std::uint8_t const atom_i = torsion.atom_indices[0];
     std::uint8_t const atom_j = torsion.atom_indices[1];
     std::uint8_t const atom_k = torsion.atom_indices[2];
@@ -135,9 +132,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
         break;
     }
     force = scale_float3_(force, sin_term);
-    *grad_x += force.x;
-    *grad_y += force.y;
-    *grad_z += force.z;
+    accumulate_gradient_(gradient, force);
     return energy;
 }
 
@@ -175,7 +170,7 @@ __device__ __forceinline__ float evaluate_etk_torsion_energy(
     float total_energy = 0.0f;
 
     for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
-        float gradient_x = 0.0f, gradient_y = 0.0f, gradient_z = 0.0f;
+        float3 gradient_acc {0.0f, 0.0f, 0.0f};
 
         std::uint32_t const interaction_start = atom_offsets[atom].interaction_start;
         std::uint32_t const interaction_count = atom_offsets[atom].interaction_count;
@@ -186,8 +181,7 @@ __device__ __forceinline__ float evaluate_etk_torsion_energy(
             if (entry.interaction_type == etk_torsion_k) {
                 // torsion term
                 float torsion_energy = compute_torsion_contribution_<write_gradient>(
-                    positions, num_atoms, torsion_terms[entry.term_index], entry.role, &gradient_x, &gradient_y,
-                    &gradient_z);
+                    positions, num_atoms, torsion_terms[entry.term_index], entry.role, &gradient_acc);
                 if (entry.role == atom_role_first_k) total_energy += torsion_energy;
             }
             else {
@@ -212,9 +206,7 @@ __device__ __forceinline__ float evaluate_etk_torsion_energy(
                         total_energy += weight * (distance - upper_bound) * (distance - upper_bound);
                     if constexpr (write_gradient) {
                         float const scale = 2.0f * weight * (distance - upper_bound) * inverse_distance;
-                        gradient_x += direction * scale * delta.x;
-                        gradient_y += direction * scale * delta.y;
-                        gradient_z += direction * scale * delta.z;
+                        accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
                     }
                 }
                 else if (distance < lower_bound) {
@@ -222,19 +214,13 @@ __device__ __forceinline__ float evaluate_etk_torsion_energy(
                         total_energy += weight * (lower_bound - distance) * (lower_bound - distance);
                     if constexpr (write_gradient) {
                         float const scale = -2.0f * weight * (lower_bound - distance) * inverse_distance;
-                        gradient_x += direction * scale * delta.x;
-                        gradient_y += direction * scale * delta.y;
-                        gradient_z += direction * scale * delta.z;
+                        accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
                     }
                 }
             }
         }
 
-        if constexpr (write_gradient) {
-            gradient[atom] = gradient_x;
-            gradient[num_atoms + atom] = gradient_y;
-            gradient[2 * num_atoms + atom] = gradient_z;
-        }
+        if constexpr (write_gradient) store_gradient_(gradient, num_atoms, atom, gradient_acc);
     }
 
     return warp_reduce_sum_f32_(total_energy);

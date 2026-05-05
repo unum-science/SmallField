@@ -43,6 +43,19 @@ __device__ __forceinline__ float3 load_position_(float const *positions, std::ui
     return {positions[atom], positions[num_atoms + atom], positions[2u * num_atoms + atom]};
 }
 
+/** Store @p value into a SoA gradient array [x0..xN, y0..yN, z0..zN] at @p atom (mirrors load_position_). */
+__device__ __forceinline__ void store_gradient_(float *gradient, std::uint32_t num_atoms, std::uint32_t atom,
+                                                float3 const &value) {
+    gradient[atom] = value.x;
+    gradient[num_atoms + atom] = value.y;
+    gradient[2u * num_atoms + atom] = value.z;
+}
+
+/** Add @p delta into a per-atom float3 accumulator held in registers. */
+__device__ __forceinline__ void accumulate_gradient_(float3 *gradient, float3 const &delta) {
+    *gradient = add_float3_(*gradient, delta);
+}
+
 /**
  *  @brief Partial derivative of cos(θ) with respect to the @p this_atom position.
  *

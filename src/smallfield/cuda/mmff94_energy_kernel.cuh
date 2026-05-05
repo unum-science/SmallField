@@ -61,7 +61,7 @@ constexpr float mmff_radians_to_degrees_k = 180.0f / 3.14159265f;
 __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const *positions, std::uint32_t num_atoms, std::uint32_t atom, std::uint32_t other,
     mmff94_atom_vdw_params_t const &p_atom, mmff94_atom_vdw_params_t const &p_other, float charge_product, bool is_1_4,
-    bool first_endpoint, float *energy, float *gradient_x, float *gradient_y, float *gradient_z) {
+    bool first_endpoint, float *energy, float3 *gradient) {
 
     // Halgren R* combining rule with donor-suppression clause, plus Slater-Kirkwood epsilon.
     float const vdw_radius_i = p_atom.r_star;
@@ -121,9 +121,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     if (first_endpoint) *energy += energy_vdw + energy_electrostatic;
 
     float const energy_gradient_distance = energy_gradient_vdw + energy_gradient_electrostatic;
-    *gradient_x -= energy_gradient_distance * delta.x * inverse_distance;
-    *gradient_y -= energy_gradient_distance * delta.y * inverse_distance;
-    *gradient_z -= energy_gradient_distance * delta.z * inverse_distance;
+    accumulate_gradient_(gradient, scale_float3_(delta, -energy_gradient_distance * inverse_distance));
 }
 
 /**
@@ -135,14 +133,11 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
  *  @param[in] bond Bond stretching descriptor with force constant and equilibrium distance.
  *  @param[in] role This atom's role in the bond (atom_role_first_k, atom_role_second_k).
  *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
- *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
- *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] gradient Accumulated gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_bond_contribution_(float const *positions, std::uint32_t num_atoms,
                                                         std::uint32_t atom, mmff94_bond_t const &bond, atom_role_t role,
-                                                        float *energy, float *gradient_x, float *gradient_y,
-                                                        float *gradient_z) {
+                                                        float *energy, float3 *gradient) {
 
     std::uint32_t const other = (role == atom_role_first_k) ? bond.atom_j : bond.atom_i;
     float3 const delta = sub_float3_(load_position_(positions, num_atoms, other),
@@ -160,10 +155,8 @@ __device__ __forceinline__ void mmff_bond_contribution_(float const *positions, 
     float const energy_gradient_distance = mmff_bond_prefactor_k * bond.force_constant * stretch *
                                            (1.0f + 1.5f * cubic * stretch +
                                             (7.0f / 6.0f) * cubic * cubic * stretch * stretch);
-    // bond gradient: same sign convention
-    *gradient_x -= energy_gradient_distance * delta.x * inverse_distance;
-    *gradient_y -= energy_gradient_distance * delta.y * inverse_distance;
-    *gradient_z -= energy_gradient_distance * delta.z * inverse_distance;
+    // bond gradient: same sign convention as nonbonded
+    accumulate_gradient_(gradient, scale_float3_(delta, -energy_gradient_distance * inverse_distance));
 }
 
 /**
@@ -175,14 +168,11 @@ __device__ __forceinline__ void mmff_bond_contribution_(float const *positions, 
  *  @param[in] angle Angle bending descriptor with force constant and equilibrium angle.
  *  @param[in] role This atom's role in the angle (first atom, second atom (center), third atom).
  *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
- *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
- *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] gradient Accumulated gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_angle_contribution_(float const *positions, std::uint32_t num_atoms,
                                                          std::uint32_t atom, mmff94_angle_t const &angle,
-                                                         atom_role_t role, float *energy, float *gradient_x,
-                                                         float *gradient_y, float *gradient_z) {
+                                                         atom_role_t role, float *energy, float3 *gradient) {
 
     float3 const position_i = load_position_(positions, num_atoms, angle.atom_i);
     float3 const position_j = load_position_(positions, num_atoms, angle.atom_j);
@@ -227,9 +217,7 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
             angle_cosine_gradient_(unit_kj, unit_ij, cos_theta, inverse_distance_kj), factor);
         grad = scale_float3_(add_float3_(grad_first, grad_third), -1.0f);
     }
-    *gradient_x += grad.x;
-    *gradient_y += grad.y;
-    *gradient_z += grad.z;
+    accumulate_gradient_(gradient, grad);
 }
 
 /**
@@ -241,14 +229,11 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
  *  @param[in] tor Torsion descriptor with barrier heights V1, V2, V3.
  *  @param[in] role This atom's role in the torsion (first through fourth in atom-list order).
  *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
- *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
- *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] gradient Accumulated gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_torsion_contribution_(float const *positions, std::uint32_t num_atoms,
                                                            std::uint32_t atom, mmff94_torsion_t const &tor,
-                                                           atom_role_t role, float *energy, float *gradient_x,
-                                                           float *gradient_y, float *gradient_z) {
+                                                           atom_role_t role, float *energy, float3 *gradient) {
 
     // bond vectors; bond_vec_2 = -bond_vec_1 by construction
     float3 const bond_vec_0 = sub_float3_(load_position_(positions, num_atoms, tor.atom_i),
@@ -318,9 +303,7 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
         break;
     }
     force = scale_float3_(force, sin_term);
-    *gradient_x += force.x;
-    *gradient_y += force.y;
-    *gradient_z += force.z;
+    accumulate_gradient_(gradient, force);
 }
 
 /**
@@ -335,14 +318,11 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
  *  @param[in] oop OOP bending descriptor with atom indices and force constant.
  *  @param[in] role This atom's role (first=out-of-plane, second=center, third/fourth=in-plane).
  *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
- *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
- *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] gradient Accumulated gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, std::uint32_t num_atoms,
                                                        std::uint32_t /*atom*/, mmff94_oop_t const &oop,
-                                                       atom_role_t role, float *energy, float *gradient_x,
-                                                       float *gradient_y, float *gradient_z) {
+                                                       atom_role_t role, float *energy, float3 *gradient) {
     float3 const atom_i_position = load_position_(positions, num_atoms, oop.atom_i);
     float3 const atom_j_position = load_position_(positions, num_atoms, oop.atom_j);
     float3 const atom_k_position = load_position_(positions, num_atoms, oop.atom_k);
@@ -384,26 +364,10 @@ __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, s
         -energy_gradient_sin_chi);
 
     switch (role) {
-    case atom_role_first_k:
-        *gradient_x += gradient_i.x;
-        *gradient_y += gradient_i.y;
-        *gradient_z += gradient_i.z;
-        break;
-    case atom_role_second_k:
-        *gradient_x += gradient_j.x;
-        *gradient_y += gradient_j.y;
-        *gradient_z += gradient_j.z;
-        break;
-    case atom_role_third_k:
-        *gradient_x += gradient_k.x;
-        *gradient_y += gradient_k.y;
-        *gradient_z += gradient_k.z;
-        break;
-    case atom_role_fourth_k:
-        *gradient_x += gradient_l.x;
-        *gradient_y += gradient_l.y;
-        *gradient_z += gradient_l.z;
-        break;
+    case atom_role_first_k: accumulate_gradient_(gradient, gradient_i); break;
+    case atom_role_second_k: accumulate_gradient_(gradient, gradient_j); break;
+    case atom_role_third_k: accumulate_gradient_(gradient, gradient_k); break;
+    case atom_role_fourth_k: accumulate_gradient_(gradient, gradient_l); break;
     default: break;
     }
 }
@@ -417,14 +381,11 @@ __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, s
  *  @param[in] sb Stretch-bend descriptor with coupling constants and equilibrium geometry.
  *  @param[in] role This atom's role (first atom end, second atom (center), third atom end).
  *  @param[inout] energy Accumulated energy (incremented when @p role is 0).
- *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
- *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
- *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] gradient Accumulated gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *positions, std::uint32_t num_atoms,
                                                                std::uint32_t atom, mmff94_stretchbend_t const &sb,
-                                                               atom_role_t role, float *energy, float *gradient_x,
-                                                               float *gradient_y, float *gradient_z) {
+                                                               atom_role_t role, float *energy, float3 *gradient) {
     // vectors from central atom j
     float3 const position_j = load_position_(positions, num_atoms, sb.atom_j);
     float3 const bond_ij = sub_float3_(load_position_(positions, num_atoms, sb.atom_i), position_j);
@@ -481,9 +442,7 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
     else { // second atom (center): -(grad_first + grad_third)
         grad = scale_float3_(add_float3_(stretch_plus_bend_first_(), stretch_plus_bend_third_()), -1.0f);
     }
-    *gradient_x += grad.x;
-    *gradient_y += grad.y;
-    *gradient_z += grad.z;
+    accumulate_gradient_(gradient, grad);
 }
 
 /**
@@ -514,7 +473,7 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
     float total_energy = 0.0f;
 
     for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
-        float gradient_x = 0.0f, gradient_y = 0.0f, gradient_z = 0.0f;
+        float3 gradient_acc {0.0f, 0.0f, 0.0f};
         auto const &offsets = atom_offsets[atom];
         mmff94_atom_vdw_params_t const p_atom = atom_vdw_params[atom];
         float const q_atom = atom_charge[atom];
@@ -531,37 +490,33 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
             if (bd < 3 || bd == 255) continue;
             mmff_nonbonded_contribution_(positions, num_atoms, atom, j, p_atom, atom_vdw_params[j],
                                          q_atom * atom_charge[j], bd == 3, /*first_endpoint=*/atom < j,
-                                         &total_energy, &gradient_x, &gradient_y, &gradient_z);
+                                         &total_energy, &gradient_acc);
         }
 
         for (std::uint32_t index = offsets.bond_start; index < offsets.bond_start + offsets.bond_count; ++index)
             mmff_bond_contribution_(positions, num_atoms, atom, bond_params[interactions[index].term_index],
-                                    interactions[index].role, &total_energy, &gradient_x, &gradient_y, &gradient_z);
+                                    interactions[index].role, &total_energy, &gradient_acc);
 
         for (std::uint32_t index = offsets.angle_start; index < offsets.angle_start + offsets.angle_count; ++index)
             mmff_angle_contribution_(positions, num_atoms, atom, angle_params[interactions[index].term_index],
-                                     interactions[index].role, &total_energy, &gradient_x, &gradient_y, &gradient_z);
+                                     interactions[index].role, &total_energy, &gradient_acc);
 
         for (std::uint32_t index = offsets.torsion_start; index < offsets.torsion_start + offsets.torsion_count;
              ++index)
             mmff_torsion_contribution_(positions, num_atoms, atom, torsion_params[interactions[index].term_index],
-                                       interactions[index].role, &total_energy, &gradient_x, &gradient_y, &gradient_z);
+                                       interactions[index].role, &total_energy, &gradient_acc);
 
         for (std::uint32_t index = offsets.oop_start; index < offsets.oop_start + offsets.oop_count; ++index)
             mmff_oop_contribution_(positions, num_atoms, atom, oop_params[interactions[index].term_index],
-                                   interactions[index].role, &total_energy, &gradient_x, &gradient_y, &gradient_z);
+                                   interactions[index].role, &total_energy, &gradient_acc);
 
         for (std::uint32_t index = offsets.stretchbend_start;
              index < offsets.stretchbend_start + offsets.stretchbend_count; ++index)
             mmff_stretchbend_contribution_(positions, num_atoms, atom,
                                            stretchbend_params[interactions[index].term_index], interactions[index].role,
-                                           &total_energy, &gradient_x, &gradient_y, &gradient_z);
+                                           &total_energy, &gradient_acc);
 
-        if constexpr (write_gradient) {
-            gradient[atom] = gradient_x;
-            gradient[num_atoms + atom] = gradient_y;
-            gradient[2 * num_atoms + atom] = gradient_z;
-        }
+        if constexpr (write_gradient) store_gradient_(gradient, num_atoms, atom, gradient_acc);
     }
 
     return warp_reduce_sum_f32_(total_energy);
