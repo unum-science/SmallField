@@ -40,7 +40,6 @@
 
 #include <boost/shared_array.hpp>
 
-// clang-format off
 #include <DistGeom/BoundsMatrix.h>
 #include <ForceField/MMFF/Nonbonded.h>
 #include <ForceField/MMFF/Params.h>
@@ -52,7 +51,7 @@
 #include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
-// clang-format on
+#include <GraphMol/Descriptors/MolDescriptors.h>
 
 #include "smallfield/api/batch_pool.hpp"
 #include "smallfield/types/etkdg_types.hpp"
@@ -62,8 +61,9 @@
 #include "smallfield/preprocess/molecule_complexity.hpp"
 #include "smallfield/mmff94/mmff94_param_cache.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
-using smallfield::types::max_mmff_interactions_per_mol_k;
 #include "smallfield/preprocess/cip_ranks.hpp"
+
+using smallfield::types::max_mmff_interactions_per_mol_k;
 
 namespace smallfield::preprocess {
 using smallfield::api::batch_layout_t;
@@ -970,6 +970,18 @@ inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecu
     std::uint32_t const num_atoms = mol->getNumAtoms();
     if (num_atoms > 128) return; // too large for the single-warp pipeline
     result.num_atoms = num_atoms;
+
+    // Optional host-side readback fields — read once from the post-AddHs RDKit
+    // mol so callers can populate `n_heavy_atoms`, `n_bonds`, `molecular_weight`
+    // columns without a duplicate parse on the Python side.
+    result.metadata.num_heavy_atoms = static_cast<std::uint32_t>(mol->getNumHeavyAtoms());
+    result.metadata.num_bonds = static_cast<std::uint32_t>(mol->getNumBonds());
+    try {
+        result.metadata.molecular_weight = static_cast<float>(RDKit::Descriptors::calcExactMW(*mol));
+    }
+    catch (...) {
+        result.metadata.molecular_weight = 0.0f;
+    }
 
     try {
         molecule_descriptor_t desc;

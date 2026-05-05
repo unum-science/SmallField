@@ -233,14 +233,22 @@ struct context_t {
      *      input SMILES). 0 for molecules that failed preprocess (invalid_smiles /
      *      too_many_atoms / preprocess_timeout). Lets downstream writers emit tight
      *      per-row coordinate lists instead of padded fixed-size-list blocks.
+     *  @param[out] num_heavy_atoms_out Optional. If non-empty, filled with each
+     *      `molecule`'s heavy (non-H) atom count post-preprocess. Size: molecules.
+     *      0 for molecules that failed preprocess.
+     *  @param[out] num_bonds_out Optional. If non-empty, filled with each `molecule`'s
+     *      bond count (including H bonds, AddHs-applied) post-preprocess. Size: molecules.
+     *      0 for molecules that failed preprocess.
+     *  @param[out] molecular_weight_out Optional. If non-empty, filled with each
+     *      `molecule`'s exact molecular weight in Daltons. Size: molecules.
+     *      0.0 for molecules that failed preprocess.
      *  @return Batch-level status (success if at least one conformer succeeded).
      */
-    [[nodiscard]] conformer_status_t generate_conformers(std::span<std::string_view const> smiles,
-                                                         config_t const &config, std::uint32_t max_atoms_per_molecule,
-                                                         std::span<__half> coordinates_out,
-                                                         std::span<float> energies_out,
-                                                         std::span<conformer_status_t> status_out,
-                                                         std::span<std::uint8_t> num_atoms_out = {});
+    [[nodiscard]] conformer_status_t generate_conformers(
+        std::span<std::string_view const> smiles, config_t const &config, std::uint32_t max_atoms_per_molecule,
+        std::span<__half> coordinates_out, std::span<float> energies_out, std::span<conformer_status_t> status_out,
+        std::span<std::uint8_t> num_atoms_out = {}, std::span<std::uint16_t> num_heavy_atoms_out = {},
+        std::span<std::uint16_t> num_bonds_out = {}, std::span<float> molecular_weight_out = {});
 };
 
 } // namespace smallfield::api

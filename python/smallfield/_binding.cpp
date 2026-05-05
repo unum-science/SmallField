@@ -1,4 +1,7 @@
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -125,6 +128,10 @@ PYBIND11_MODULE(_smallfield, m) {
                 auto coordinates_array = py::array_t<float>(static_cast<py::ssize_t>(total_coordinates));
                 auto energies_array = py::array_t<float>(static_cast<py::ssize_t>(total_conformers));
                 auto status_array = py::array_t<std::uint8_t>(static_cast<py::ssize_t>(total_conformers));
+                auto num_atoms_array = py::array_t<std::uint8_t>(static_cast<py::ssize_t>(num_molecules));
+                auto num_heavy_atoms_array = py::array_t<std::uint16_t>(static_cast<py::ssize_t>(num_molecules));
+                auto num_bonds_array = py::array_t<std::uint16_t>(static_cast<py::ssize_t>(num_molecules));
+                auto molecular_weight_array = py::array_t<float>(static_cast<py::ssize_t>(num_molecules));
 
                 std::vector<std::string_view> smiles_views(smiles_list.begin(), smiles_list.end());
                 std::span<std::string_view const> smiles_span(smiles_views);
@@ -134,9 +141,70 @@ PYBIND11_MODULE(_smallfield, m) {
                 std::span<float> energies_span(energies_array.mutable_data(), total_conformers);
                 std::vector<smallfield::api::conformer_status_t> status_buffer(total_conformers);
                 std::span<smallfield::api::conformer_status_t> status_span(status_buffer);
+                std::span<std::uint8_t> num_atoms_span(num_atoms_array.mutable_data(), num_molecules);
+                std::span<std::uint16_t> num_heavy_atoms_span(num_heavy_atoms_array.mutable_data(), num_molecules);
+                std::span<std::uint16_t> num_bonds_span(num_bonds_array.mutable_data(), num_molecules);
+                std::span<float> molecular_weight_span(molecular_weight_array.mutable_data(), num_molecules);
 
                 gpu_context.generate_conformers(smiles_span, config, max_atoms_per_molecule, coordinates_span,
-                                                energies_span, status_span);
+                                                energies_span, status_span, num_atoms_span, num_heavy_atoms_span,
+                                                num_bonds_span, molecular_weight_span);
+
+                // Per-molecule sort by energy ascending. Failed conformers (status != success)
+                // sort last so that successful conformers fill the lowest indices. Tie-break on
+                // original index for stability. K is small (3 typical, 16 max) so an N²-style
+                // permutation pass is cheap; coords are temp-buffered to avoid in-place swap
+                // hazards with the SoA layout.
+                float *energies_ptr = energies_array.mutable_data();
+                if (num_conformers > 1 && num_molecules > 0) {
+                    std::vector<std::uint32_t> permutation(num_conformers);
+                    std::vector<__half> coord_temp(static_cast<std::size_t>(num_conformers) * coordinate_stride);
+                    std::vector<float> energy_temp(num_conformers);
+                    std::vector<smallfield::api::conformer_status_t> status_temp(num_conformers);
+                    constexpr float failed_sentinel = std::numeric_limits<float>::infinity();
+
+                    for (std::uint32_t m = 0; m < num_molecules; ++m) {
+                        std::uint32_t const base_conf = m * num_conformers;
+                        std::size_t const base_coord = static_cast<std::size_t>(base_conf) * coordinate_stride;
+                        for (std::uint32_t k = 0; k < num_conformers; ++k) permutation[k] = k;
+                        std::stable_sort(permutation.begin(), permutation.end(), [&](std::uint32_t a, std::uint32_t b) {
+                            float const ea = (status_buffer[base_conf + a] ==
+                                              smallfield::api::conformer_status_t::success)
+                                                 ? energies_ptr[base_conf + a]
+                                                 : failed_sentinel;
+                            float const eb = (status_buffer[base_conf + b] ==
+                                              smallfield::api::conformer_status_t::success)
+                                                 ? energies_ptr[base_conf + b]
+                                                 : failed_sentinel;
+                            return ea < eb;
+                        });
+
+                        bool identity = true;
+                        for (std::uint32_t k = 0; k < num_conformers; ++k) {
+                            if (permutation[k] != k) {
+                                identity = false;
+                                break;
+                            }
+                        }
+                        if (identity) continue;
+
+                        for (std::uint32_t k = 0; k < num_conformers; ++k) {
+                            std::uint32_t const src = permutation[k];
+                            std::memcpy(
+                                &coord_temp[static_cast<std::size_t>(k) * coordinate_stride],
+                                &half_coordinates[base_coord + static_cast<std::size_t>(src) * coordinate_stride],
+                                coordinate_stride * sizeof(__half));
+                            energy_temp[k] = energies_ptr[base_conf + src];
+                            status_temp[k] = status_buffer[base_conf + src];
+                        }
+                        std::memcpy(&half_coordinates[base_coord], coord_temp.data(),
+                                    static_cast<std::size_t>(num_conformers) * coordinate_stride * sizeof(__half));
+                        for (std::uint32_t k = 0; k < num_conformers; ++k) {
+                            energies_ptr[base_conf + k] = energy_temp[k];
+                            status_buffer[base_conf + k] = status_temp[k];
+                        }
+                    }
+                }
 
                 float *coordinates_ptr = coordinates_array.mutable_data();
                 for (std::size_t index = 0; index < total_coordinates; ++index) {
@@ -148,7 +216,8 @@ PYBIND11_MODULE(_smallfield, m) {
                     status_ptr[index] = static_cast<std::uint8_t>(status_buffer[index]);
                 }
 
-                return py::make_tuple(coordinates_array, energies_array, status_array);
+                return py::make_tuple(coordinates_array, energies_array, status_array, num_atoms_array,
+                                      num_heavy_atoms_array, num_bonds_array, molecular_weight_array);
             },
             py::arg("smiles"), py::arg("num_conformers") = 3, py::arg("max_atoms_per_molecule") = 128,
             py::arg("max_stereo_attempts") = 10, py::arg("random_seed") = 42);
@@ -206,181 +275,176 @@ PYBIND11_MODULE(_smallfield, m) {
              "Architecture metadata read from the weights blob.")
         .def("is_loaded", &smallfield::mace::weights_t::is_loaded);
 
-    py::
-        class_<smallfield::mace::context_t>(m, "MaceContext", "Pre-allocated MACE-OFF inference + refinement context.")
-            .def(
-                py::init([](int device_id, smallfield::mace::weights_t const &weights, std::uint32_t max_atoms,
-                            std::uint32_t max_edges, std::uint32_t max_graphs) {
-                    return std::make_unique<smallfield::mace::context_t>(device_id, weights.arch(), max_atoms,
-                                                                         max_edges, max_graphs);
-                }),
-                py::arg("device_id"), py::arg("weights"), py::arg("max_atoms"), py::arg("max_edges"),
-                py::arg("max_graphs"),
-                "Construct a context dimensioned for `(max_atoms, max_edges, max_graphs)`.  " "Pass `weights` for the "
-                                                                                              "architecture metadata "
-                                                                                              "only — the context does "
-                                                                                              "NOT " "retain a "
-                                                                                                     "reference; you "
-                                                                                                     "still pass "
-                                                                                                     "`weights` per "
-                                                                                                     "call.")
-            .def(
-                "infer_energy",
-                [](smallfield::mace::context_t &self, smallfield::mace::weights_t const &weights,
-                   py::array_t<float, py::array::c_style | py::array::forcecast> positions,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> atom_element,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_source,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_target,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> graph_of_atom,
-                   std::uint32_t n_graphs) {
-                    mace_device_batch_t batch;
-                    batch.n_atoms = static_cast<std::uint32_t>(atom_element.size());
-                    batch.n_edges = static_cast<std::uint32_t>(edge_source.size());
-                    batch.n_graphs = n_graphs;
-                    if (positions.shape(0) != static_cast<py::ssize_t>(batch.n_atoms) || positions.shape(1) != 3) {
-                        throw std::invalid_argument("positions must be shape (n_atoms, 3)");
-                    }
-                    batch.positions = device_alloc_copy_from_host_<float>(positions);
-                    batch.atom_element = device_alloc_copy_from_host_<std::int32_t>(atom_element);
-                    batch.edge_source = device_alloc_copy_from_host_<std::int32_t>(edge_source);
-                    batch.edge_target = device_alloc_copy_from_host_<std::int32_t>(edge_target);
-                    batch.graph_of_atom = device_alloc_copy_from_host_<std::int32_t>(graph_of_atom);
-                    batch.energies = device_alloc_zeroed_<float>(n_graphs);
+    py::class_<smallfield::mace::context_t>(m, "MaceContext", "Pre-allocated MACE-OFF inference + refinement context.")
+        .def(
+            py::init([](int device_id, smallfield::mace::weights_t const &weights, std::uint32_t max_atoms,
+                        std::uint32_t max_edges, std::uint32_t max_graphs) {
+                return std::make_unique<smallfield::mace::context_t>(device_id, weights.arch(), max_atoms, max_edges,
+                                                                     max_graphs);
+            }),
+            py::arg("device_id"), py::arg("weights"), py::arg("max_atoms"), py::arg("max_edges"), py::arg("max_graphs"),
+            "Construct a context dimensioned for `(max_atoms, max_edges, max_graphs)`.  " "Pass `weights` for the " "ar"
+                                                                                                                    "ch"
+                                                                                                                    "it"
+                                                                                                                    "ec"
+                                                                                                                    "tu"
+                                                                                                                    "re"
+                                                                                                                    " m"
+                                                                                                                    "et"
+                                                                                                                    "ad"
+                                                                                                                    "at"
+                                                                                                                    "a " "only — the context does " "NOT " "retain a " "reference; you " "still pass " "`weights` per " "call.")
+        .def(
+            "infer_energy",
+            [](smallfield::mace::context_t &self, smallfield::mace::weights_t const &weights,
+               py::array_t<float, py::array::c_style | py::array::forcecast> positions,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> atom_element,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_source,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_target,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> graph_of_atom,
+               std::uint32_t n_graphs) {
+                mace_device_batch_t batch;
+                batch.n_atoms = static_cast<std::uint32_t>(atom_element.size());
+                batch.n_edges = static_cast<std::uint32_t>(edge_source.size());
+                batch.n_graphs = n_graphs;
+                if (positions.shape(0) != static_cast<py::ssize_t>(batch.n_atoms) || positions.shape(1) != 3) {
+                    throw std::invalid_argument("positions must be shape (n_atoms, 3)");
+                }
+                batch.positions = device_alloc_copy_from_host_<float>(positions);
+                batch.atom_element = device_alloc_copy_from_host_<std::int32_t>(atom_element);
+                batch.edge_source = device_alloc_copy_from_host_<std::int32_t>(edge_source);
+                batch.edge_target = device_alloc_copy_from_host_<std::int32_t>(edge_target);
+                batch.graph_of_atom = device_alloc_copy_from_host_<std::int32_t>(graph_of_atom);
+                batch.energies = device_alloc_zeroed_<float>(n_graphs);
 
-                    smallfield::mace::batch_view_t view {};
-                    view.n_atoms = batch.n_atoms;
-                    view.n_edges = batch.n_edges;
-                    view.n_graphs = batch.n_graphs;
-                    view.positions_xyz = batch.positions;
-                    view.atom_element = batch.atom_element;
-                    view.edge_source_atom = batch.edge_source;
-                    view.edge_target_atom = batch.edge_target;
-                    view.graph_of_atom = batch.graph_of_atom;
+                smallfield::mace::batch_view_t view {};
+                view.n_atoms = batch.n_atoms;
+                view.n_edges = batch.n_edges;
+                view.n_graphs = batch.n_graphs;
+                view.positions_xyz = batch.positions;
+                view.atom_element = batch.atom_element;
+                view.edge_source_atom = batch.edge_source;
+                view.edge_target_atom = batch.edge_target;
+                view.graph_of_atom = batch.graph_of_atom;
 
-                    [[maybe_unused]] auto const status = self.infer_energy(weights, view, batch.energies);
-                    if (status != smallfield::mace::status_t::success) {
-                        throw std::runtime_error("MaceContext.infer_energy failed");
-                    }
-                    auto energies_array = py::array_t<float>(static_cast<py::ssize_t>(n_graphs));
-                    device_to_host_copy_<float>(energies_array, batch.energies);
-                    return energies_array;
-                },
-                py::arg("weights"), py::arg("positions"), py::arg("atom_element"), py::arg("edge_source"),
-                py::arg("edge_target"), py::arg("graph_of_atom"), py::arg("n_graphs"),
-                "Forward pass — returns per-graph energies in eV (numpy float32, shape (n_graphs,)).")
-            .def(
-                "infer_energy_and_forces",
-                [](smallfield::mace::context_t &self, smallfield::mace::weights_t const &weights,
-                   py::array_t<float, py::array::c_style | py::array::forcecast> positions,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> atom_element,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_source,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_target,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> graph_of_atom,
-                   std::uint32_t n_graphs) {
-                    mace_device_batch_t batch;
-                    batch.n_atoms = static_cast<std::uint32_t>(atom_element.size());
-                    batch.n_edges = static_cast<std::uint32_t>(edge_source.size());
-                    batch.n_graphs = n_graphs;
-                    if (positions.shape(0) != static_cast<py::ssize_t>(batch.n_atoms) || positions.shape(1) != 3) {
-                        throw std::invalid_argument("positions must be shape (n_atoms, 3)");
-                    }
-                    batch.positions = device_alloc_copy_from_host_<float>(positions);
-                    batch.atom_element = device_alloc_copy_from_host_<std::int32_t>(atom_element);
-                    batch.edge_source = device_alloc_copy_from_host_<std::int32_t>(edge_source);
-                    batch.edge_target = device_alloc_copy_from_host_<std::int32_t>(edge_target);
-                    batch.graph_of_atom = device_alloc_copy_from_host_<std::int32_t>(graph_of_atom);
-                    batch.energies = device_alloc_zeroed_<float>(n_graphs);
-                    batch.forces = device_alloc_zeroed_<float>(static_cast<std::size_t>(batch.n_atoms) * 3u);
+                [[maybe_unused]] auto const status = self.infer_energy(weights, view, batch.energies);
+                if (status != smallfield::mace::status_t::success) {
+                    throw std::runtime_error("MaceContext.infer_energy failed");
+                }
+                auto energies_array = py::array_t<float>(static_cast<py::ssize_t>(n_graphs));
+                device_to_host_copy_<float>(energies_array, batch.energies);
+                return energies_array;
+            },
+            py::arg("weights"), py::arg("positions"), py::arg("atom_element"), py::arg("edge_source"),
+            py::arg("edge_target"), py::arg("graph_of_atom"), py::arg("n_graphs"),
+            "Forward pass — returns per-graph energies in eV (numpy float32, shape (n_graphs,)).")
+        .def(
+            "infer_energy_and_forces",
+            [](smallfield::mace::context_t &self, smallfield::mace::weights_t const &weights,
+               py::array_t<float, py::array::c_style | py::array::forcecast> positions,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> atom_element,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_source,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_target,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> graph_of_atom,
+               std::uint32_t n_graphs) {
+                mace_device_batch_t batch;
+                batch.n_atoms = static_cast<std::uint32_t>(atom_element.size());
+                batch.n_edges = static_cast<std::uint32_t>(edge_source.size());
+                batch.n_graphs = n_graphs;
+                if (positions.shape(0) != static_cast<py::ssize_t>(batch.n_atoms) || positions.shape(1) != 3) {
+                    throw std::invalid_argument("positions must be shape (n_atoms, 3)");
+                }
+                batch.positions = device_alloc_copy_from_host_<float>(positions);
+                batch.atom_element = device_alloc_copy_from_host_<std::int32_t>(atom_element);
+                batch.edge_source = device_alloc_copy_from_host_<std::int32_t>(edge_source);
+                batch.edge_target = device_alloc_copy_from_host_<std::int32_t>(edge_target);
+                batch.graph_of_atom = device_alloc_copy_from_host_<std::int32_t>(graph_of_atom);
+                batch.energies = device_alloc_zeroed_<float>(n_graphs);
+                batch.forces = device_alloc_zeroed_<float>(static_cast<std::size_t>(batch.n_atoms) * 3u);
 
-                    smallfield::mace::batch_view_t view {};
-                    view.n_atoms = batch.n_atoms;
-                    view.n_edges = batch.n_edges;
-                    view.n_graphs = batch.n_graphs;
-                    view.positions_xyz = batch.positions;
-                    view.atom_element = batch.atom_element;
-                    view.edge_source_atom = batch.edge_source;
-                    view.edge_target_atom = batch.edge_target;
-                    view.graph_of_atom = batch.graph_of_atom;
+                smallfield::mace::batch_view_t view {};
+                view.n_atoms = batch.n_atoms;
+                view.n_edges = batch.n_edges;
+                view.n_graphs = batch.n_graphs;
+                view.positions_xyz = batch.positions;
+                view.atom_element = batch.atom_element;
+                view.edge_source_atom = batch.edge_source;
+                view.edge_target_atom = batch.edge_target;
+                view.graph_of_atom = batch.graph_of_atom;
 
-                    [[maybe_unused]] auto const status = self.infer_energy_and_forces(weights, view, batch.energies,
-                                                                                      batch.forces);
-                    if (status != smallfield::mace::status_t::success) {
-                        throw std::runtime_error("MaceContext.infer_energy_and_forces failed");
-                    }
+                [[maybe_unused]] auto const status = self.infer_energy_and_forces(weights, view, batch.energies,
+                                                                                  batch.forces);
+                if (status != smallfield::mace::status_t::success) {
+                    throw std::runtime_error("MaceContext.infer_energy_and_forces failed");
+                }
 
-                    auto energies_array = py::array_t<float>(static_cast<py::ssize_t>(n_graphs));
-                    auto forces_array = py::array_t<float>(
-                        {static_cast<py::ssize_t>(batch.n_atoms), static_cast<py::ssize_t>(3)});
-                    device_to_host_copy_<float>(energies_array, batch.energies);
-                    device_to_host_copy_<float>(forces_array, batch.forces);
-                    return py::make_tuple(energies_array, forces_array);
-                },
-                py::arg("weights"), py::arg("positions"), py::arg("atom_element"), py::arg("edge_source"),
-                py::arg("edge_target"), py::arg("graph_of_atom"), py::arg("n_graphs"),
-                "Forward + adjoint backward — returns `(energies, forces)` numpy arrays.  " "`energies` is shape "
-                                                                                            "`(n_graphs,)` in eV; "
-                                                                                            "`forces` is shape "
-                                                                                            "`(n_atoms, 3)` in eV/Å.")
-            .def(
-                "refine",
-                [](smallfield::mace::context_t &self, smallfield::mace::weights_t const &weights,
-                   py::array_t<float, py::array::c_style | py::array::forcecast> positions,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> atom_element,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_source,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_target,
-                   py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> graph_of_atom,
-                   std::uint32_t n_graphs, std::uint32_t num_steps, float fmax, float step_size) {
-                    mace_device_batch_t batch;
-                    batch.n_atoms = static_cast<std::uint32_t>(atom_element.size());
-                    batch.n_edges = static_cast<std::uint32_t>(edge_source.size());
-                    batch.n_graphs = n_graphs;
-                    if (positions.shape(0) != static_cast<py::ssize_t>(batch.n_atoms) || positions.shape(1) != 3) {
-                        throw std::invalid_argument("positions must be shape (n_atoms, 3)");
-                    }
-                    batch.positions = device_alloc_copy_from_host_<float>(positions);
-                    batch.atom_element = device_alloc_copy_from_host_<std::int32_t>(atom_element);
-                    batch.edge_source = device_alloc_copy_from_host_<std::int32_t>(edge_source);
-                    batch.edge_target = device_alloc_copy_from_host_<std::int32_t>(edge_target);
-                    batch.graph_of_atom = device_alloc_copy_from_host_<std::int32_t>(graph_of_atom);
-                    batch.energies = device_alloc_zeroed_<float>(n_graphs);
+                auto energies_array = py::array_t<float>(static_cast<py::ssize_t>(n_graphs));
+                auto forces_array = py::array_t<float>(
+                    {static_cast<py::ssize_t>(batch.n_atoms), static_cast<py::ssize_t>(3)});
+                device_to_host_copy_<float>(energies_array, batch.energies);
+                device_to_host_copy_<float>(forces_array, batch.forces);
+                return py::make_tuple(energies_array, forces_array);
+            },
+            py::arg("weights"), py::arg("positions"), py::arg("atom_element"), py::arg("edge_source"),
+            py::arg("edge_target"), py::arg("graph_of_atom"), py::arg("n_graphs"),
+            "Forward + adjoint backward — returns `(energies, forces)` numpy arrays.  " "`energies` is shape " "`(n_"
+                                                                                                               "graphs,"
+                                                                                                               ")` in "
+                                                                                                               "eV; " "`forces` is shape " "`(n_atoms, 3)` in eV/Å.")
+        .def(
+            "refine",
+            [](smallfield::mace::context_t &self, smallfield::mace::weights_t const &weights,
+               py::array_t<float, py::array::c_style | py::array::forcecast> positions,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> atom_element,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_source,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> edge_target,
+               py::array_t<std::int32_t, py::array::c_style | py::array::forcecast> graph_of_atom,
+               std::uint32_t n_graphs, std::uint32_t num_steps, float fmax, float step_size) {
+                mace_device_batch_t batch;
+                batch.n_atoms = static_cast<std::uint32_t>(atom_element.size());
+                batch.n_edges = static_cast<std::uint32_t>(edge_source.size());
+                batch.n_graphs = n_graphs;
+                if (positions.shape(0) != static_cast<py::ssize_t>(batch.n_atoms) || positions.shape(1) != 3) {
+                    throw std::invalid_argument("positions must be shape (n_atoms, 3)");
+                }
+                batch.positions = device_alloc_copy_from_host_<float>(positions);
+                batch.atom_element = device_alloc_copy_from_host_<std::int32_t>(atom_element);
+                batch.edge_source = device_alloc_copy_from_host_<std::int32_t>(edge_source);
+                batch.edge_target = device_alloc_copy_from_host_<std::int32_t>(edge_target);
+                batch.graph_of_atom = device_alloc_copy_from_host_<std::int32_t>(graph_of_atom);
+                batch.energies = device_alloc_zeroed_<float>(n_graphs);
 
-                    smallfield::mace::batch_view_t view {};
-                    view.n_atoms = batch.n_atoms;
-                    view.n_edges = batch.n_edges;
-                    view.n_graphs = batch.n_graphs;
-                    view.positions_xyz = batch.positions;
-                    view.atom_element = batch.atom_element;
-                    view.edge_source_atom = batch.edge_source;
-                    view.edge_target_atom = batch.edge_target;
-                    view.graph_of_atom = batch.graph_of_atom;
+                smallfield::mace::batch_view_t view {};
+                view.n_atoms = batch.n_atoms;
+                view.n_edges = batch.n_edges;
+                view.n_graphs = batch.n_graphs;
+                view.positions_xyz = batch.positions;
+                view.atom_element = batch.atom_element;
+                view.edge_source_atom = batch.edge_source;
+                view.edge_target_atom = batch.edge_target;
+                view.graph_of_atom = batch.graph_of_atom;
 
-                    smallfield::mace::relax_config_t config {};
-                    config.num_steps = num_steps;
-                    config.fmax_eV_per_A = fmax;
-                    config.step_size = step_size;
+                smallfield::mace::relax_config_t config {};
+                config.num_steps = num_steps;
+                config.fmax_eV_per_A = fmax;
+                config.step_size = step_size;
 
-                    [[maybe_unused]] auto const status = self.refine_batch(weights, view, config, batch.positions,
-                                                                           batch.energies);
-                    if (status != smallfield::mace::status_t::success) {
-                        throw std::runtime_error("MaceContext.refine failed");
-                    }
+                [[maybe_unused]] auto const status = self.refine_batch(weights, view, config, batch.positions,
+                                                                       batch.energies);
+                if (status != smallfield::mace::status_t::success) {
+                    throw std::runtime_error("MaceContext.refine failed");
+                }
 
-                    auto refined_positions = py::array_t<float>(
-                        {static_cast<py::ssize_t>(batch.n_atoms), static_cast<py::ssize_t>(3)});
-                    auto energies_array = py::array_t<float>(static_cast<py::ssize_t>(n_graphs));
-                    device_to_host_copy_<float>(refined_positions, batch.positions);
-                    device_to_host_copy_<float>(energies_array, batch.energies);
-                    return py::make_tuple(refined_positions, energies_array);
-                },
-                py::arg("weights"), py::arg("positions"), py::arg("atom_element"), py::arg("edge_source"),
-                py::arg("edge_target"), py::arg("graph_of_atom"), py::arg("n_graphs"), py::arg("num_steps") = 20,
-                py::arg("fmax") = 0.05f, py::arg("step_size") = 0.01f,
-                "Batched LBFGS-style relaxation.  Returns `(refined_positions, energies)` " "numpy arrays.  "
-                                                                                            "`num_steps` caps the "
-                                                                                            "iteration count, `fmax` "
-                                                                                            "is the " "per-atom "
-                                                                                                      "force-magnitude "
-                                                                                                      "convergence "
-                                                                                                      "threshold "
-                                                                                                      "(eV/Å).");
+                auto refined_positions = py::array_t<float>(
+                    {static_cast<py::ssize_t>(batch.n_atoms), static_cast<py::ssize_t>(3)});
+                auto energies_array = py::array_t<float>(static_cast<py::ssize_t>(n_graphs));
+                device_to_host_copy_<float>(refined_positions, batch.positions);
+                device_to_host_copy_<float>(energies_array, batch.energies);
+                return py::make_tuple(refined_positions, energies_array);
+            },
+            py::arg("weights"), py::arg("positions"), py::arg("atom_element"), py::arg("edge_source"),
+            py::arg("edge_target"), py::arg("graph_of_atom"), py::arg("n_graphs"), py::arg("num_steps") = 20,
+            py::arg("fmax") = 0.05f, py::arg("step_size") = 0.01f,
+            "Batched LBFGS-style relaxation.  Returns `(refined_positions, energies)` " "numpy arrays.  " "`num_steps` "
+                                                                                                          "caps the " "iteration count, `fmax` " "is the " "per-atom " "force-magnitude " "convergence " "threshold " "(eV/Å).");
 }

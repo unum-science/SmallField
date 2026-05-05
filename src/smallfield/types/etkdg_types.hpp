@@ -76,7 +76,15 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t mmff_atom_offsets_start;
     std::uint32_t etk_interaction_offset; ///< offset into batched ETK interaction list
     std::uint32_t etk_atom_offsets_start; ///< offset into batched ETK atom offsets
-    std::uint32_t padding[1];
+    /**
+     *  @brief Optional readback fields, populated by preprocess and bubbled to the
+     *  caller via the corresponding output spans on @ref context_t::generate_conformers.
+     *  GPU kernels do NOT read these — they are pure host-side passthroughs computed
+     *  once per molecule from the post-`AddHs` RDKit `RWMol`.
+     */
+    std::uint32_t num_heavy_atoms;        ///< heavy (non-H) atom count
+    std::uint32_t num_bonds;              ///< total bond count, including H bonds
+    float molecular_weight;               ///< exact molecular weight in Daltons
 };
 
 /**

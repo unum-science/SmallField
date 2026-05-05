@@ -25,19 +25,6 @@ def has_cuda() -> bool:
     return supports_cuda()
 
 
-def _rdkit_num_atoms(smiles: str) -> int:
-    try:
-        from rdkit import Chem
-    except ImportError as exc:  # pragma: no cover - depends on local env
-        raise ImportError("RDKit is required for `smallfield.api.generate_conformers`.") from exc
-
-    molecule = Chem.MolFromSmiles(smiles)
-    if molecule is None:
-        raise ValueError(f"Invalid SMILES: {smiles}")
-    molecule = Chem.AddHs(molecule)
-    return molecule.GetNumAtoms()
-
-
 def _reshape_single_molecule(
     coordinates_flat: np.ndarray,
     status_codes: np.ndarray,
@@ -74,22 +61,32 @@ def generate_conformers(
     """Generate conformers through the SmallField Python API.
 
     For a single SMILES string, returns a `(K, N, 3)` float32 array of successful conformers
-    or `None` when none succeed.
+    or `None` when none succeed. Conformers are sorted by MMFF energy ascending; failed
+    conformers are dropped.
 
-    For a sequence of SMILES strings, returns the raw `(coordinates, energies, status)` tuple
-    from `smallfield.api.Context.generate_conformers`.
+    For a sequence of SMILES strings, returns the raw
+    `(coordinates, energies, status, num_atoms, num_heavy_atoms, num_bonds, molecular_weight)`
+    tuple from `smallfield.api.Context.generate_conformers`. Conformers within each molecule
+    are pre-sorted by energy ascending (failed conformers last); `num_atoms[i]` is the
+    post-preprocess atom count (with H) for molecule `i`, or `0` if preprocess rejected it.
+    The remaining three readback arrays (`num_heavy_atoms`, `num_bonds`, `molecular_weight`)
+    come from the same post-AddHs RDKit mol used by SmallField's preprocess, so callers can
+    populate the canonical parquet schema columns without a duplicate parse.
     """
 
     gpu_context = Context(list(device_ids or []))
     if isinstance(smiles, str):
-        num_atoms = _rdkit_num_atoms(smiles)
-        coordinates, _energies, status = gpu_context.generate_conformers(
+        result = gpu_context.generate_conformers(
             [smiles],
             num_conformers,
             max_atoms_per_molecule,
             max_stereo_attempts,
             random_seed,
         )
+        coordinates, _energies, status, num_atoms_arr = result[0], result[1], result[2], result[3]
+        num_atoms = int(np.asarray(num_atoms_arr, dtype=np.uint8)[0])
+        if num_atoms == 0:
+            return None
         return _reshape_single_molecule(
             np.asarray(coordinates, dtype=np.float32),
             np.asarray(status, dtype=np.uint8),

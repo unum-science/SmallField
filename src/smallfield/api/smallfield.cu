@@ -792,8 +792,7 @@ static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record
         }
         float const inv = n_active > 0 ? 1.f / static_cast<float>(n_active) : 0.f;
         logger.trace(
-            "{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / " "{:>6.1f} / "
-                                                                                                      "{:>6.1f}",
+            "{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / " "{:>6.1f} " "/ " "{:>" "6." "1f}",
             cr.wave_idx, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms, cr.launch_end_ms - cr.launch_start_ms,
             cr.finalize_end_ms - cr.finalize_start_ms, gpu_sum * inv, gpu_max, upload * inv, metric * inv,
             kernels * inv, download * inv);
@@ -809,11 +808,11 @@ static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record
     }
 }
 
-conformer_status_t context_t::generate_conformers(std::span<std::string_view const> smiles, config_t const &config,
-                                                  std::uint32_t max_atoms_per_molecule,
-                                                  std::span<__half> coordinates_out, std::span<float> energies_out,
-                                                  std::span<conformer_status_t> status_out,
-                                                  std::span<std::uint8_t> num_atoms_out) {
+conformer_status_t context_t::generate_conformers(
+    std::span<std::string_view const> smiles, config_t const &config, std::uint32_t max_atoms_per_molecule,
+    std::span<__half> coordinates_out, std::span<float> energies_out, std::span<conformer_status_t> status_out,
+    std::span<std::uint8_t> num_atoms_out, std::span<std::uint16_t> num_heavy_atoms_out,
+    std::span<std::uint16_t> num_bonds_out, std::span<float> molecular_weight_out) {
 
     cuda_error_sink_t const sink {&this->logger, &this->cuda_error_count};
 
@@ -830,6 +829,10 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         std::fill_n(coordinates_out.begin(), coordinates_out.size(), zero);
     }
     if (!num_atoms_out.empty()) std::fill_n(num_atoms_out.begin(), num_atoms_out.size(), std::uint8_t {0});
+    if (!num_heavy_atoms_out.empty())
+        std::fill_n(num_heavy_atoms_out.begin(), num_heavy_atoms_out.size(), std::uint16_t {0});
+    if (!num_bonds_out.empty()) std::fill_n(num_bonds_out.begin(), num_bonds_out.size(), std::uint16_t {0});
+    if (!molecular_weight_out.empty()) std::fill_n(molecular_weight_out.begin(), molecular_weight_out.size(), 0.0f);
 
     // Sort SMILES by descending length so the last `embedding-wave` carries
     // the smallest molecules — shortens the unhidden tail wave.
@@ -944,7 +947,9 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
         // Fill caller's num_atoms_out for every molecule that survived preprocess.
         // Sorted-slice → caller-unsorted via sort_perm.  Invalid / too_many / timeout
         // mols keep the zero-init written at the top of generate_conformers.
-        if (!num_atoms_out.empty()) {
+        bool const want_extras = !num_atoms_out.empty() || !num_heavy_atoms_out.empty() || !num_bonds_out.empty() ||
+                                 !molecular_weight_out.empty();
+        if (want_extras) {
             for (std::uint32_t d = 0; d < num_devices; ++d) {
                 auto const &batch = batch_slots_per_device[slot][d];
                 auto const metadata = batch.molecule_metadata();
@@ -952,7 +957,13 @@ conformer_status_t context_t::generate_conformers(std::span<std::string_view con
                 for (std::uint32_t k = 0; k < batch.num_molecules; ++k) {
                     std::uint32_t const sorted_idx = begin + input_indices[k];
                     std::uint32_t const caller_idx = sort_perm_view[sorted_idx];
-                    num_atoms_out[caller_idx] = static_cast<std::uint8_t>(metadata[k].num_atoms);
+                    if (!num_atoms_out.empty())
+                        num_atoms_out[caller_idx] = static_cast<std::uint8_t>(metadata[k].num_atoms);
+                    if (!num_heavy_atoms_out.empty())
+                        num_heavy_atoms_out[caller_idx] = static_cast<std::uint16_t>(metadata[k].num_heavy_atoms);
+                    if (!num_bonds_out.empty())
+                        num_bonds_out[caller_idx] = static_cast<std::uint16_t>(metadata[k].num_bonds);
+                    if (!molecular_weight_out.empty()) molecular_weight_out[caller_idx] = metadata[k].molecular_weight;
                 }
             }
         }

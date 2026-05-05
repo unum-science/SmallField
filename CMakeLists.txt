@@ -136,6 +136,7 @@ if(DEFINED RDKIT_PREFIX)
         rdkit_add_lib(RDKit::Alignment        RDKitAlignment)
         rdkit_add_lib(RDKit::EigenSolvers     RDKitEigenSolvers)
         rdkit_add_lib(RDKit::ChemTransforms   RDKitChemTransforms)
+        rdkit_add_lib(RDKit::Descriptors      RDKitDescriptors)
 
     else()
         message(WARNING "RDKit headers not found at ${_rdkit_inc}. "
@@ -250,7 +251,7 @@ if(RDKit_FOUND)
         RDKit::DistGeomHelpers RDKit::DistGeometry
         RDKit::Depictor RDKit::SubstructMatch
         RDKit::Alignment RDKit::EigenSolvers RDKit::MolTransforms
-        RDKit::ChemTransforms)
+        RDKit::ChemTransforms RDKit::Descriptors)
 
     function(configure_smallfield_library target_name library_type)
         add_library(${target_name} ${library_type}
