@@ -214,7 +214,6 @@ if(RDKit_FOUND)
         target_link_libraries(${target_name} PUBLIC
             ${RDKIT_LIBS}
             CUDA::curand
-            CUDA::cusolver
             CUDA::cudart
             OpenMP::OpenMP_CXX
             fmt::fmt)

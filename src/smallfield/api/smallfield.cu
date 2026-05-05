@@ -241,17 +241,12 @@ context_t::context_t(std::span<int const> devices) {
 
     std::size_t const device_count = device_ids.size();
     streams.resize(device_count);
-    solvers.resize(device_count);
     metric_scratch.resize(device_count);
     launch_scratch.resize(device_count);
 
     for (std::size_t device_index = 0; device_index < device_count; ++device_index) {
         cudaSetDevice(device_ids[device_index]);
         cudaStreamCreate(&streams[device_index]);
-        cusolverDnCreate(&solvers[device_index]);
-        cusolverDnSetStream(solvers[device_index], streams[device_index]);
-        // Reuse one cusolverDnParams_t per device across all calls.
-        cusolverDnCreateParams(&metric_scratch[device_index].xsyev_params);
         launch_scratch[device_index] = std::make_unique<launch_scratch_t>();
         auto &scratch = *launch_scratch[device_index];
         // Persistent timing events; `cudaEventBlockingSync` keeps host-side
@@ -309,8 +304,6 @@ context_t::context_t(std::span<int const> devices) {
 context_t::~context_t() {
     for (std::size_t device_index = 0; device_index < device_ids.size(); ++device_index) {
         cudaSetDevice(device_ids[device_index]);
-        if (metric_scratch[device_index].xsyev_params)
-            cusolverDnDestroyParams(metric_scratch[device_index].xsyev_params);
         if (launch_scratch[device_index]) {
             auto &scratch = *launch_scratch[device_index];
             if (scratch.event_upload_start) cudaEventDestroy(scratch.event_upload_start);
@@ -320,7 +313,6 @@ context_t::~context_t() {
             if (scratch.event_end) cudaEventDestroy(scratch.event_end);
         }
         launch_scratch[device_index].reset();
-        cusolverDnDestroy(solvers[device_index]);
         cudaStreamDestroy(streams[device_index]);
     }
     scaffold_cache.reset(); // no-op if null
@@ -343,7 +335,6 @@ scaffold_cache_stats_t context_t::get_scaffold_cache_stats() const {
  */
 void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t max_group_size,
                            std::uint32_t max_atoms) {
-    cuda_error_sink_t const sink {&ctx.logger, &ctx.cuda_error_count};
     auto &s = ctx.metric_scratch[device_idx];
     if (max_group_size <= s.max_group_size && max_atoms <= s.max_atoms && s.pool.data() != nullptr) return;
 
@@ -354,57 +345,21 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
 
     cudaSetDevice(ctx.device_ids[device_idx]);
 
-    // Probe cusolver for the worst-case workspace size at the new dimensions.
-    // Probe cusolverDnXsyevBatched for the worst-case device + host workspace sizes.
-    // Once per growth, not per wave.
-    std::size_t new_dev_ws_bytes = 0;
-    std::size_t new_host_ws_bytes = 0;
-    {
-        float *probe_gram = nullptr;
-        float *probe_eig = nullptr;
-        sink.check(cudaMalloc(&probe_gram, sizeof(float)), "cudaMalloc(probe_gram)");
-        sink.check(cudaMalloc(&probe_eig, sizeof(float)), "cudaMalloc(probe_eig)");
-        cusolverDnXsyevBatched_bufferSize(
-            ctx.solvers[device_idx], s.xsyev_params, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER,
-            static_cast<int64_t>(new_atoms), CUDA_R_32F, probe_gram, static_cast<int64_t>(new_atoms), CUDA_R_32F,
-            probe_eig, CUDA_R_32F, &new_dev_ws_bytes, &new_host_ws_bytes, static_cast<int64_t>(new_group));
-        sink.check(cudaFree(probe_gram), "cudaFree(probe_gram)");
-        sink.check(cudaFree(probe_eig), "cudaFree(probe_eig)");
-    }
-
-    // Compute pool layout with 256-byte alignment.
+    // The fused embed_4d_power_iter_kernel runs entirely on shared memory
+    // (gram + means + eigenvectors + scratch all live in shmem for the
+    // kernel's lifetime), so the only persistent device scratch is the
+    // group_indices uint32 list — which-mol-goes-into-which-bin.  ~640 MB of
+    // gram_matrices / eigenvalues / cusolver workspace per device, sized for
+    // the pre-fused-kernel chain, is no longer needed.
     std::size_t const group_bytes = align_up(new_group * sizeof(std::uint32_t), 256);
-    std::size_t const gram_bytes = align_up(new_group * static_cast<std::size_t>(new_atoms) * new_atoms * sizeof(float),
-                                            256);
-    std::size_t const eig_bytes = align_up(new_group * new_atoms * sizeof(float), 256);
-    std::size_t const info_bytes = align_up(new_group * sizeof(int), 256);
-    std::size_t const ws_bytes = align_up(new_dev_ws_bytes, 256);
-    std::size_t const total = group_bytes + gram_bytes + eig_bytes + info_bytes + ws_bytes;
-
-    if (!s.pool.ensure_capacity(total)) {
-        ctx.logger.error("ensure_metric_scratch: device allocation ({} bytes) failed", total);
+    if (!s.pool.ensure_capacity(group_bytes)) {
+        ctx.logger.error("ensure_metric_scratch: device allocation ({} bytes) failed", group_bytes);
         return;
     }
-    std::size_t off = 0;
     auto *base = reinterpret_cast<char *>(s.pool.data());
-    s.group_indices = {reinterpret_cast<std::uint32_t *>(base + off), new_group};
-    off += group_bytes;
-    s.gram_matrices = {reinterpret_cast<float *>(base + off),
-                       new_group * static_cast<std::size_t>(new_atoms) * new_atoms};
-    off += gram_bytes;
-    s.eigenvalues = {reinterpret_cast<float *>(base + off), new_group * new_atoms};
-    off += eig_bytes;
-    s.info = {reinterpret_cast<int *>(base + off), new_group};
-    off += info_bytes;
-    // Device workspace as a std::span<float> over raw bytes — cusolver just needs a
-    // pointer + bytes, so we store the float pointer but the true capacity is
-    // @c max_device_workspace_bytes.
-    s.workspace = {reinterpret_cast<float *>(base + off), new_dev_ws_bytes / sizeof(float)};
-    s.host_workspace.resize(new_host_ws_bytes);
+    s.group_indices = {reinterpret_cast<std::uint32_t *>(base), new_group};
     s.max_group_size = new_group;
     s.max_atoms = new_atoms;
-    s.max_device_workspace_bytes = new_dev_ws_bytes;
-    s.max_host_workspace_bytes = new_host_ws_bytes;
 }
 
 /**
@@ -471,9 +426,8 @@ struct gpu_pipeline_handle_t {
  *  device's three-stream pipeline.  Returns immediately; caller eventually
  *  calls `finalize_gpu_pipeline` with the returned handle.
  */
-gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cusolverDnHandle_t solver_handle,
-                                          metric_scratch_t &scratch, launch_scratch_t &launch_buffers,
-                                          batch_pool_t const &per_device_batch,
+gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, metric_scratch_t &scratch,
+                                          launch_scratch_t &launch_buffers, batch_pool_t const &per_device_batch,
                                           device_launch_config_t const &launch_config, std::uint32_t conformer_count,
                                           std::uint32_t stereo_retry_limit, std::uint32_t max_atoms_per_molecule,
                                           std::uint64_t seed, std::uint32_t wave_base,
@@ -565,8 +519,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
     auto *device_metadata_sorted = device_view.molecule_metadata().data();
 
     build_metric_initial_coordinates_on_gpu(device_view.bounds_matrices().data(), device_metadata_sorted, host_metadata,
-                                            max_atoms_per_molecule, device_initial_coordinates, solver_handle, scratch,
-                                            sink, stream);
+                                            max_atoms_per_molecule, device_initial_coordinates, scratch, sink, stream);
     cudaEventRecord(handle.event_kernels_start, stream);
 
     int const streaming_multiprocessor_count = launch_config.streaming_multiprocessor_count;
@@ -900,7 +853,7 @@ conformer_status_t context_t::generate_conformers(
         for (std::uint32_t d = 0; d < num_devices; ++d) {
             if (per_device_batches[d].num_molecules == 0) continue;
             handles_out[d] = launch_gpu_pipeline(
-                device_ids[d], streams[d], solvers[d], metric_scratch[d], *launch_scratch[d], per_device_batches[d],
+                device_ids[d], streams[d], metric_scratch[d], *launch_scratch[d], per_device_batches[d],
                 launch_configs[d], num_conformers, config.max_stereo_attempts, effective_max_atoms, config.random_seed,
                 wave_base, sort_perm_view, coordinates_out, energies_out, status_out, sink);
             handles_out[d].timings_out = &timings_out[d];

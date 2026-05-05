@@ -30,7 +30,6 @@
 #include <vector>
 
 #include <cuda_runtime.h>
-#include <cusolverDn.h>
 
 #include "smallfield/cuda_error.hpp"
 #include "smallfield/types/etkdg_types.hpp"
@@ -322,9 +321,8 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
                                                     etkdg_molecule_metadata_t const *device_metadata,
                                                     std::span<etkdg_molecule_metadata_t const> host_metadata,
                                                     std::uint32_t max_atoms_per_molecule,
-                                                    float *device_initial_coordinates, cusolverDnHandle_t solver_handle,
-                                                    scratch_ &scratch, cuda_error_sink_t sink,
-                                                    cudaStream_t stream = nullptr) {
+                                                    float *device_initial_coordinates, scratch_ &scratch,
+                                                    cuda_error_sink_t sink, cudaStream_t stream = nullptr) {
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(host_metadata.size());
     if (num_molecules == 0 || max_atoms_per_molecule == 0) return true;
 
@@ -357,10 +355,6 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         if (bin < 0) continue;
         bin_groups[bin].push_back(mol);
     }
-
-    // The caller already called cusolverDnSetStream(solver_handle, stream) at context
-    // creation, but the stream may have been re-set since; cheap to re-set here.
-    if (!sink.check(cusolverDnSetStream(solver_handle, stream), "cusolverDnSetStream")) return false;
 
     constexpr std::uint32_t block_size_k = 128;
     bool success = true;
@@ -406,11 +400,6 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         success &= sink.check(cudaGetLastError(), "embed_4d_power_iter_kernel launch");
     }
 
-    // The solver handle is no longer used inside this function but we keep the
-    // parameter for API compatibility; caller still owns the handle.
-    (void)solver_handle;
-
-    // Solver handle is owned by the caller (context_t) — do NOT destroy it here.
     // No final stream sync: the prepass is stream-ordered with whatever work the
     // caller launches next on the same stream. Caller's `finalize_gpu_pipeline`
     // syncs the stream once per chunk, which is enough.

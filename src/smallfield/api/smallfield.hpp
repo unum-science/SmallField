@@ -27,14 +27,10 @@
 #if defined(__CUDACC__) || defined(__CUDA_RUNTIME_H__) || defined(__CUDA_RUNTIME_API_H__)
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cusolverDn.h>
 #else
 // forward-declare for non-CUDA translation units
 struct __half;
 using cudaStream_t = void *;
-using cusolverDnHandle_t = void *;
-using syevjInfo_t = void *;
-using cusolverDnParams_t = void *;
 #endif
 
 #include <array>
@@ -129,19 +125,17 @@ struct device_launch_config_t {
  *  the maximum supported atom count.
  */
 struct metric_scratch_t {
-    device_byte_buffer_t pool; ///< owning grow-only device buffer, carved below
-    // Non-owning spans into @c pool. Rebind in @c ensure_metric_scratch on growth.
+    device_byte_buffer_t pool; ///< owning grow-only device buffer
+    // Non-owning span into @c pool — rebound in @c ensure_metric_scratch on growth.
     std::span<std::uint32_t> group_indices {}; ///< [max_group_size]
-    std::span<float> gram_matrices {};         ///< [max_group_size × max_atoms²]
-    std::span<float> eigenvalues {};           ///< [max_group_size × max_atoms]
-    std::span<int> info {};                    ///< [max_group_size]
-    std::span<float> workspace {};             ///< device workspace for cusolverDnXsyevBatched
-    std::vector<std::byte> host_workspace;     ///< host workspace for cusolverDnXsyevBatched
     std::size_t max_group_size = 0;
     std::uint32_t max_atoms = 0;
-    std::size_t max_device_workspace_bytes = 0;
-    std::size_t max_host_workspace_bytes = 0;
-    cusolverDnParams_t xsyev_params = nullptr; ///< shared across calls — reused
+    // The previous chain (smooth_and_build_gram_kernel → cusolverDnXsyevBatched →
+    // project_metric_coordinates_kernel) needed gram / eigenvalue / cusolver
+    // workspace allocations sized for the worst-case wave (~640 MB/device at
+    // 10K mols × 128² floats).  embed_4d_power_iter_kernel folds all of that
+    // into one fused launch, so the only surviving scratch is group_indices —
+    // a per-bin uint32 list of which-molecule-goes-into-which-bin.
 };
 
 // Forward-declare persistent per-device launch scratch. Defined in smallfield.cu
@@ -156,7 +150,6 @@ struct context_t {
     /** @brief One CUDA stream per device.  All per-wave work on a given
      *  device (H2D, kernels, D2H) runs stream-ordered on its own stream. */
     std::vector<cudaStream_t> streams;
-    std::vector<cusolverDnHandle_t> solvers;
     std::vector<metric_scratch_t> metric_scratch;                  ///< one per device
     std::vector<std::unique_ptr<launch_scratch_t>> launch_scratch; ///< one per device
     std::vector<device_launch_config_t> launch_configs;            ///< one per device
