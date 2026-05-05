@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <string_view>
 #include <system_error>
 
 #include <arrow/io/file.h>
@@ -24,8 +25,15 @@ static std::uint64_t parquet_row_count(fs::path const &path) {
     }
 }
 
-std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path const &output_dir,
-                                           std::uint32_t num_conformers, bool resume) {
+/// @brief A *.parquet whose name ends with ".3D.parquet" is one of our own outputs.
+static bool is_output_shard(fs::path const &path) {
+    std::string const filename = path.filename().string();
+    constexpr std::string_view suffix = ".3D.parquet";
+    return filename.size() >= suffix.size() &&
+           filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path const &output_dir, bool resume) {
     std::vector<shard_pair_t> shards;
 
     std::error_code ec;
@@ -38,17 +46,18 @@ std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path c
     for (auto const &entry : fs::directory_iterator(input_dir, ec)) {
         if (!entry.is_regular_file()) continue;
         if (entry.path().extension() != ".parquet") continue;
+        if (is_output_shard(entry.path())) continue; // skip our own outputs when --output == --input
         shard_pair_t pair {};
         pair.input_path = entry.path();
-        // Deterministic output name: replace ".parquet" with "_3D.parquet".
-        auto out_stem = entry.path().stem().string() + "_3D";
+        // Deterministic output name: "<name>.parquet" → "<name>.3D.parquet".
+        auto out_stem = entry.path().stem().string() + ".3D";
         pair.output_path = output_dir / (out_stem + ".parquet");
         pair.input_num_rows = parquet_row_count(pair.input_path);
         pair.already_complete = false;
-        if (resume && fs::exists(pair.output_path)) {
-            std::uint64_t const expected = pair.input_num_rows * static_cast<std::uint64_t>(num_conformers);
-            std::uint64_t const actual = parquet_row_count(pair.output_path);
-            pair.already_complete = (actual == expected && expected > 0);
+        if (resume) {
+            fs::path const sentinel = pair.output_path;
+            std::string sentinel_str = sentinel.string() + ".encoded";
+            pair.already_complete = fs::exists(fs::path(sentinel_str), ec);
         }
         shards.push_back(std::move(pair));
     }
@@ -68,6 +77,7 @@ std::vector<fs::path> list_input_shards(fs::path const &input_dir) {
     for (auto const &entry : fs::directory_iterator(input_dir, ec)) {
         if (!entry.is_regular_file()) continue;
         if (entry.path().extension() != ".parquet") continue;
+        if (is_output_shard(entry.path())) continue;
         paths.push_back(entry.path());
     }
     std::sort(paths.begin(), paths.end());

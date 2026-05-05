@@ -69,9 +69,10 @@ struct cli_config_t {
 };
 
 void print_usage() {
-    fmt::print(stderr, R"(Usage: smallfield_batch --input DIR --output DIR [options]
+    fmt::print(stderr, R"(Usage: smallfield_batch --input DIR [--output DIR] [options]
   --input DIR                 folder of input parquet-shards (*.parquet)
-  --output DIR                folder for output parquet-shards (*_3D.parquet)
+  --output DIR                folder for output parquet-shards (*.3D.parquet)
+                              (default: same as --input — sister files alongside)
   --smiles-column NAME        input column name (default: smiles)
   --num-conformers K          conformers per molecule (default: 3)
   --max-atoms N               per-molecule atom cap (default: 128)
@@ -180,10 +181,13 @@ bool parse_cli(int argc, char **argv, cli_config_t &config) {
             return false;
         }
     }
-    if (config.input_dir.empty() || config.output_dir.empty()) {
+    if (config.input_dir.empty()) {
         print_usage();
         return false;
     }
+    // --output defaults to --input: the *.3D.parquet sister files live next to the
+    // sources unless the caller explicitly redirects them elsewhere.
+    if (config.output_dir.empty()) config.output_dir = config.input_dir;
     return true;
 }
 
@@ -194,8 +198,12 @@ struct output_buffers_t {
     std::vector<float> energies;
     std::vector<sfapi::conformer_status_t> status;
     std::vector<std::uint8_t> status_codes;
-    std::vector<std::uint8_t> solver_codes;
+    std::vector<std::uint8_t> solver_codes; ///< 0 = GPU success, 1 = RDKit fallback success, 2 = failed
     std::vector<std::uint8_t> num_atoms_per_molecule;
+    std::vector<std::uint16_t> num_heavy_atoms_per_molecule;
+    std::vector<std::uint16_t> num_bonds_per_molecule;
+    std::vector<float> molecular_weight_per_molecule;
+    std::vector<std::uint8_t> n_conformers_per_molecule; ///< M, post-Kabsch dedup (0 if mol failed)
     std::vector<std::uint32_t> retry_indices;
 
     void resize_for(std::uint64_t num_molecules, std::uint32_t num_conformers, std::uint32_t max_atoms) {
@@ -207,6 +215,10 @@ struct output_buffers_t {
         if (status_codes.size() < total_conformers) status_codes.resize(total_conformers);
         if (solver_codes.size() < total_conformers) solver_codes.resize(total_conformers);
         if (num_atoms_per_molecule.size() < num_molecules) num_atoms_per_molecule.resize(num_molecules);
+        if (num_heavy_atoms_per_molecule.size() < num_molecules) num_heavy_atoms_per_molecule.resize(num_molecules);
+        if (num_bonds_per_molecule.size() < num_molecules) num_bonds_per_molecule.resize(num_molecules);
+        if (molecular_weight_per_molecule.size() < num_molecules) molecular_weight_per_molecule.resize(num_molecules);
+        if (n_conformers_per_molecule.size() < num_molecules) n_conformers_per_molecule.resize(num_molecules);
     }
 };
 
@@ -438,7 +450,10 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
             std::span<__half>(buf->coordinates.data(), total_conformers * config.max_atoms * 3u),
             std::span<float>(buf->energies.data(), total_conformers),
             std::span<sfapi::conformer_status_t>(buf->status.data(), total_conformers),
-            std::span<std::uint8_t>(buf->num_atoms_per_molecule.data(), num_molecules));
+            std::span<std::uint8_t>(buf->num_atoms_per_molecule.data(), num_molecules),
+            std::span<std::uint16_t>(buf->num_heavy_atoms_per_molecule.data(), num_molecules),
+            std::span<std::uint16_t>(buf->num_bonds_per_molecule.data(), num_molecules),
+            std::span<float>(buf->molecular_weight_per_molecule.data(), num_molecules));
 
         // Kernel-OOB guardrail: any CUDA error during this batch poisons the
         // driver context on every device, and every subsequent shard would
@@ -551,6 +566,15 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
         auto &acc = result.accumulator;
         std::uint64_t const num_molecules = acc.total_molecules;
 
+        // Populate n_conformers_per_molecule. Without Kabsch dedup (task #23 will plug it in
+        // here), surviving molecules emit all K candidate slots; failed mols emit zero.
+        // The writer translates 0 into a single all-null row for provenance.
+        for (std::uint64_t m = 0; m < num_molecules; ++m) {
+            buf->n_conformers_per_molecule[m] = buf->num_atoms_per_molecule[m] != 0
+                                                    ? static_cast<std::uint8_t>(config.num_conformers)
+                                                    : 0u;
+        }
+
         acc.input_file_boundaries.push_back(num_molecules);
         for (std::size_t file_idx = 0; file_idx < acc.input_file_pairs.size(); ++file_idx) {
             std::uint64_t const mol_begin = acc.input_file_boundaries[file_idx];
@@ -568,15 +592,32 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
                 config.max_atoms,
                 std::span<std::string_view const>(acc.combined_smiles.data() + mol_begin, file_molecules),
                 std::span<std::uint8_t const>(buf->num_atoms_per_molecule.data() + mol_begin, file_molecules),
+                std::span<std::uint16_t const>(buf->num_heavy_atoms_per_molecule.data() + mol_begin, file_molecules),
+                std::span<std::uint16_t const>(buf->num_bonds_per_molecule.data() + mol_begin, file_molecules),
+                std::span<float const>(buf->molecular_weight_per_molecule.data() + mol_begin, file_molecules),
+                std::span<std::uint8_t const>(buf->n_conformers_per_molecule.data() + mol_begin, file_molecules),
                 std::span<std::uint8_t const>(buf->status_codes.data() + conf_begin, file_conformers),
-                std::span<std::uint8_t const>(buf->solver_codes.data() + conf_begin, file_conformers),
                 std::span<__half const>(buf->coordinates.data() + conf_begin * coord_stride,
                                         file_conformers * coord_stride),
                 std::span<float const>(buf->energies.data() + conf_begin, file_conformers),
             };
 
-            if (!sfcli::write_shard(acc.input_file_pairs[file_idx]->output_path, writer_inputs)) {
-                logger.error("write failed: {}", acc.input_file_pairs[file_idx]->output_path.string());
+            auto const &output_path = acc.input_file_pairs[file_idx]->output_path;
+            if (!sfcli::write_shard(output_path, writer_inputs)) {
+                logger.error("write failed: {}", output_path.string());
+            }
+            else {
+                // Touch a 3-byte ".encoded" sentinel so resume runs can skip without
+                // re-opening the parquet to count rows.
+                std::error_code sentinel_ec;
+                std::filesystem::path sentinel = output_path;
+                sentinel += ".encoded";
+                FILE *fp = std::fopen(sentinel.string().c_str(), "wb");
+                if (fp) {
+                    (void)std::fwrite("v1\n", 1, 3, fp);
+                    std::fclose(fp);
+                }
+                else { logger.error("sentinel write failed: {}", sentinel.string()); }
             }
 
             counters.molecules_completed.fetch_add(file_molecules);
@@ -620,8 +661,7 @@ int main(int argc, char **argv) {
     logger_t logger;
     logger.verbose_level = config.verbose_level;
 
-    auto shard_pairs = sfcli::inventory_shards(config.input_dir, config.output_dir, config.num_conformers,
-                                               config.resume);
+    auto shard_pairs = sfcli::inventory_shards(config.input_dir, config.output_dir, config.resume);
     if (shard_pairs.empty()) {
         logger.error("no input-files found in {}", config.input_dir.string());
         return 1;
