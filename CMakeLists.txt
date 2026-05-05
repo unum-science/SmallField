@@ -206,8 +206,16 @@ if(RDKit_FOUND)
         # etkdg_prepare_batch.hpp (included by smallfield.cu) actually parallelizes.
         # Without this the OpenMP pragma is silently ignored by nvcc's host pass
         # and prepare_molecule_batch runs single-threaded.
+        #
+        # --expt-relaxed-constexpr lets `constexpr` host functions be called from
+        # `__device__` code, which is what NumKong's tensor_view / vector_view
+        # accessors rely on.  --extended-lambda permits __host__ __device__ lambdas
+        # to cross the same boundary.  Both are required to consume NumKong from
+        # any .cuh that runs on the GPU.
         target_compile_options(${target_name} PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>)
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+            $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
         set_target_properties(${target_name} PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
             POSITION_INDEPENDENT_CODE ON)

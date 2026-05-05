@@ -47,26 +47,6 @@ constexpr float mmff_stretch_bend_prefactor_k = 2.51210f;
 constexpr float mmff_degrees_to_radians_k = 3.14159265f / 180.0f;
 constexpr float mmff_radians_to_degrees_k = 180.0f / 3.14159265f;
 
-__device__ __forceinline__ float dot_float3_(float3 const &lhs, float3 const &rhs) {
-    return fmaf(lhs.x, rhs.x, fmaf(lhs.y, rhs.y, lhs.z * rhs.z));
-}
-
-__device__ __forceinline__ float3 cross_float3_(float3 const &lhs, float3 const &rhs) {
-    return {lhs.y * rhs.z - lhs.z * rhs.y, lhs.z * rhs.x - lhs.x * rhs.z, lhs.x * rhs.y - lhs.y * rhs.x};
-}
-
-__device__ __forceinline__ float3 add_float3_(float3 const &lhs, float3 const &rhs) {
-    return {lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z};
-}
-
-__device__ __forceinline__ float3 sub_float3_(float3 const &lhs, float3 const &rhs) {
-    return {lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z};
-}
-
-__device__ __forceinline__ float3 scale_float3_(float3 const &value, float scale) {
-    return {value.x * scale, value.y * scale, value.z * scale};
-}
-
 /**
  *  @brief Compute nonbonded (VdW + electrostatic) energy and gradient contribution for one atom.
  *
