@@ -19,19 +19,7 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::cuda {
-using smallfield::types::atom_role_first_k;
-using smallfield::types::atom_role_fourth_k;
-using smallfield::types::atom_role_second_k;
-using smallfield::types::atom_role_t;
-using smallfield::types::atom_role_third_k;
-using smallfield::types::mmff94_angle_t;
-using smallfield::types::mmff94_atom_interaction_t;
-using smallfield::types::mmff94_atom_offsets_t;
-using smallfield::types::mmff94_atom_vdw_params_t;
-using smallfield::types::mmff94_bond_t;
-using smallfield::types::mmff94_oop_t;
-using smallfield::types::mmff94_stretchbend_t;
-using smallfield::types::mmff94_torsion_t;
+using namespace smallfield::types;
 
 constexpr float mmff_coulomb_k = 332.0716f;
 constexpr float mmff_electrostatic_buffer_k = 0.05f;
@@ -81,21 +69,21 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const gamma = (vdw_radius_i - vdw_radius_j) * __frcp_rn(vdw_radius_i + vdw_radius_j);
     bool const has_donor = (p_atom.donor_acceptor == 2) || (p_other.donor_acceptor == 2);
     float const factor = has_donor ? 0.0f : 0.2f * (1.0f - expf(-12.0f * gamma * gamma));
-    float R_star_ij = 0.5f * (vdw_radius_i + vdw_radius_j) * (1.0f + factor);
+    float vdw_radius_combined = 0.5f * (vdw_radius_i + vdw_radius_j) * (1.0f + factor);
 
-    float const R2 = R_star_ij * R_star_ij;
-    float const R6 = R2 * R2 * R2;
-    float eps_ij = 181.16f * p_atom.g_factor * p_other.g_factor * p_atom.alpha * p_other.alpha *
-                   __frcp_rn((sqrtf(p_atom.alpha * __frcp_rn(p_atom.n_effective)) +
-                              sqrtf(p_other.alpha * __frcp_rn(p_other.n_effective))) *
-                             R6);
+    float const vdw_radius_squared = vdw_radius_combined * vdw_radius_combined;
+    float const vdw_radius_pow6 = vdw_radius_squared * vdw_radius_squared * vdw_radius_squared;
+    float vdw_epsilon = 181.16f * p_atom.g_factor * p_other.g_factor * p_atom.alpha * p_other.alpha *
+                        __frcp_rn((sqrtf(p_atom.alpha * __frcp_rn(p_atom.n_effective)) +
+                                   sqrtf(p_other.alpha * __frcp_rn(p_other.n_effective))) *
+                                  vdw_radius_pow6);
 
     // Donor-acceptor scaling (RDKit's scaleVdWParams when DA pairing is detected).
-    bool const is_DA = (p_atom.donor_acceptor == 2 && p_other.donor_acceptor == 1) ||
-                       (p_atom.donor_acceptor == 1 && p_other.donor_acceptor == 2);
-    if (is_DA) {
-        R_star_ij *= 0.8f;
-        eps_ij *= 0.5f;
+    bool const is_donor_acceptor_pair = (p_atom.donor_acceptor == 2 && p_other.donor_acceptor == 1) ||
+                                        (p_atom.donor_acceptor == 1 && p_other.donor_acceptor == 2);
+    if (is_donor_acceptor_pair) {
+        vdw_radius_combined *= 0.8f;
+        vdw_epsilon *= 0.5f;
     }
 
     // Pair geometry.
@@ -106,7 +94,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const distance = distance_squared * inverse_distance;
 
     // VdW buffered 14-7 energy and gradient.
-    float const density_ratio = distance * __frcp_rn(R_star_ij); // ρ = r / R*
+    float const density_ratio = distance * __frcp_rn(vdw_radius_combined); // ρ = r / R*
     float const density_ratio_pow7 = density_ratio * density_ratio * density_ratio * density_ratio * density_ratio *
                                      density_ratio * density_ratio;
     float const repulsion_denominator = density_ratio + mmff_vdw_delta_k; // ρ + δ
@@ -114,13 +102,13 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const repulsion_pow7 = repulsion_base * repulsion_base * repulsion_base * repulsion_base * repulsion_base *
                                  repulsion_base * repulsion_base;
     float const attractive_term = (1.0f + mmff_vdw_gamma_k) * __frcp_rn(density_ratio_pow7 + mmff_vdw_gamma_k) - 2.0f;
-    float const energy_vdw = eps_ij * repulsion_pow7 * attractive_term;
+    float const energy_vdw = vdw_epsilon * repulsion_pow7 * attractive_term;
     float const d_repulsion = -7.0f * repulsion_pow7 * __frcp_rn(repulsion_denominator);
     float const d_attractive = -7.0f * (1.0f + mmff_vdw_gamma_k) * density_ratio_pow7 *
                                __frcp_rn(density_ratio * (density_ratio_pow7 + mmff_vdw_gamma_k) *
                                          (density_ratio_pow7 + mmff_vdw_gamma_k));
-    float const energy_gradient_vdw = eps_ij * (d_repulsion * attractive_term + repulsion_pow7 * d_attractive) *
-                                      __frcp_rn(R_star_ij);
+    float const energy_gradient_vdw = vdw_epsilon * (d_repulsion * attractive_term + repulsion_pow7 * d_attractive) *
+                                      __frcp_rn(vdw_radius_combined);
 
     // Electrostatic energy and gradient.
     float const scale = is_1_4 ? mmff_1_4_scale_k : 1.0f;
@@ -298,18 +286,19 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
     float const sin_phi = dot_float3_(cross_float3_(normal_0, normal_1), bond_vec_1) * inv_bond_vec_1_len;
 
     // energy (uses cos_phi only, sign-independent)
-    float const cos2 = 2.0f * cos_phi * cos_phi - 1.0f;
-    float const cos3 = cos_phi * (4.0f * cos_phi * cos_phi - 3.0f);
+    float const cos_2phi = 2.0f * cos_phi * cos_phi - 1.0f;
+    float const cos_3phi = cos_phi * (4.0f * cos_phi * cos_phi - 3.0f);
     float const tor_energy = mmff_torsion_prefactor_k *
-                             (tor.v1 * (1.0f + cos_phi) + tor.v2 * (1.0f - cos2) + tor.v3 * (1.0f + cos3));
+                             (tor.v1 * (1.0f + cos_phi) + tor.v2 * (1.0f - cos_2phi) + tor.v3 * (1.0f + cos_3phi));
 
     if (role == atom_role_first_k) *energy += tor_energy;
 
     // ∂E/∂φ = 0.5 * (-V1·sin(φ) + 2V2·sin(2φ) - 3V3·sin(3φ)) using SIGNED sin
-    float const sin2 = 2.0f * sin_phi * cos_phi;
-    float const sin3 = sin_phi * (3.0f - 4.0f * sin_phi * sin_phi);
+    float const sin_2phi = 2.0f * sin_phi * cos_phi;
+    float const sin_3phi = sin_phi * (3.0f - 4.0f * sin_phi * sin_phi);
     float const energy_gradient_dihedral = mmff_torsion_prefactor_k *
-                                           (-tor.v1 * sin_phi + 2.0f * tor.v2 * sin2 - 3.0f * tor.v3 * sin3);
+                                           (-tor.v1 * sin_phi + 2.0f * tor.v2 * sin_2phi -
+                                            3.0f * tor.v3 * sin_3phi);
 
     float const abs_sin = fabsf(sin_phi);
     if (fabsf(cos_phi) < 1e-8f && abs_sin < 1e-8f) return;

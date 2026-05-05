@@ -54,20 +54,7 @@
 #include "smallfield/cuda/mmff94_energy_kernel.cuh"
 
 namespace smallfield::cuda {
-using smallfield::types::chiral_center_descriptor_t;
-using smallfield::types::distance_constraint_t;
-using smallfield::types::etk_atom_interaction_t;
-using smallfield::types::etk_atom_offsets_t;
-using smallfield::types::etk_torsion_descriptor_t;
-using smallfield::types::etkdg_molecule_metadata_t;
-using smallfield::types::mmff94_angle_t;
-using smallfield::types::mmff94_atom_interaction_t;
-using smallfield::types::mmff94_atom_offsets_t;
-using smallfield::types::mmff94_atom_vdw_params_t;
-using smallfield::types::mmff94_bond_t;
-using smallfield::types::mmff94_oop_t;
-using smallfield::types::mmff94_stretchbend_t;
-using smallfield::types::mmff94_torsion_t;
+using namespace smallfield::types;
 
 /** @brief Per-molecule FIRE iteration budgets for ETK torsion refinement and MMFF94 polish. */
 struct refinement_policy_t {
@@ -145,10 +132,10 @@ __device__ __forceinline__ fire_result_t run_fire_stage_(float *positions, float
  *  @see compute_mmff_polish_shared_memory_bytes
  */
 __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory_bytes(std::uint32_t max_atoms) {
-    std::uint32_t const dim4 = 4 * max_atoms;
+    std::uint32_t const dimensions_4d = 4 * max_atoms;
     std::uint32_t const bounds_bytes = max_atoms * max_atoms * sizeof(std::uint8_t);
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
-    std::uint32_t const fire_arrays = 3 * dim4 * sizeof(float);
+    std::uint32_t const fire_arrays = 3 * dimensions_4d * sizeof(float);
     return aligned_bounds_bytes + fire_arrays;
 }
 
@@ -163,8 +150,8 @@ __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory
  *  @see compute_pipeline_shared_memory_bytes
  */
 __host__ __device__ __forceinline__ std::uint32_t compute_mmff_polish_shared_memory_bytes(std::uint32_t max_atoms) {
-    std::uint32_t const dim3 = 3 * max_atoms;
-    return 3 * dim3 * sizeof(float);
+    std::uint32_t const dimensions_3d = 3 * max_atoms;
+    return 3 * dimensions_3d * sizeof(float);
 }
 
 /**
@@ -291,15 +278,15 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         auto const meta = molecule_metadata[mol];
         auto const refinement_policy = select_refinement_policy_(meta);
         std::uint32_t const num_atoms = meta.num_atoms;
-        std::uint32_t const dim4 = 4 * num_atoms;
-        std::uint32_t const dim3 = 3 * num_atoms;
+        std::uint32_t const dimensions_4d = 4 * num_atoms;
+        std::uint32_t const dimensions_3d = 3 * num_atoms;
 
         // FIRE shared memory: positions + velocities + gradient (3 arrays).
         std::uint32_t off = 0;
         float *positions = shared_float + off;
-        off += dim4;
+        off += dimensions_4d;
         float *velocities = shared_float + off;
-        off += dim4;
+        off += dimensions_4d;
         float *gradient = shared_float + off;
 
         // Bounds quantization: Load pre-smoothed bounds, find per-molecule [min, max],
@@ -357,7 +344,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                     shared_bounds, mol_chirals, mol_min, inv_scale, num_atoms, meta.num_chiral_centers, 4,
                     1.0f,          1.0f,        100.0f,  0.0f};
 
-                fire_result_t const dg_result = fire_minimize_(positions, velocities, gradient, dim4, 100, 1e-4f, lane,
+                fire_result_t const dg_result = fire_minimize_(positions, velocities, gradient, dimensions_4d, 100, 1e-4f, lane,
                                                                dg_functor);
                 (void)dg_result;
 
@@ -369,7 +356,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
 
                 // Fourth-dimension crush: Crush the fourth dimension with 50 FIRE iterations.
                 dg_functor.fourth_dimension_penalty_weight = 10.0f;
-                fire_result_t const crush_result = fire_minimize_(positions, velocities, gradient, dim4, 50, 1e-4f,
+                fire_result_t const crush_result = fire_minimize_(positions, velocities, gradient, dimensions_4d, 50, 1e-4f,
                                                                   lane, dg_functor);
 
                 // Torsion refinement: Run ETK torsion refinement in 3D with 100 FIRE iterations.
@@ -379,7 +366,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                                                               num_atoms};
 
                     fire_result_t const etk_result = run_fire_stage_(
-                        positions, velocities, gradient, dim3, refinement_policy.etk_initial_iterations,
+                        positions, velocities, gradient, dimensions_3d, refinement_policy.etk_initial_iterations,
                         refinement_policy.etk_continuation_iterations, refinement_policy.etk_gradient_threshold, lane,
                         etk_functor);
                     final_energy = etk_result.energy;
@@ -446,7 +433,7 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
     for (std::uint32_t mol = warp_id; mol < total_molecules; mol += grid_stride) {
         auto const meta = molecule_metadata[mol];
         std::uint32_t const num_atoms = meta.num_atoms;
-        std::uint32_t const dim3 = 3 * num_atoms;
+        std::uint32_t const dimensions_3d = 3 * num_atoms;
 
         std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
         if (total_mmff_terms == 0 || mmff_interactions == nullptr) continue;
@@ -466,8 +453,8 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
                                               num_atoms};
 
         float *positions = shared_float;
-        float *velocities = shared_float + dim3;
-        float *gradient = shared_float + 2 * dim3;
+        float *velocities = shared_float + dimensions_3d;
+        float *gradient = shared_float + 2 * dimensions_3d;
 
         for (std::uint32_t conf = 0; conf < num_conformers_per_molecule; ++conf) {
             std::uint32_t const slot = mol * num_conformers_per_molecule + conf;
@@ -482,7 +469,7 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
                         conformer_coordinates_out[coord_offset + d * output_atoms_stride + i];
             __syncwarp(full_mask_k);
 
-            fire_result_t mmff_result = run_fire_stage_(positions, velocities, gradient, dim3,
+            fire_result_t mmff_result = run_fire_stage_(positions, velocities, gradient, dimensions_3d,
                                                         refinement_policy.mmff_initial_iterations,
                                                         refinement_policy.mmff_continuation_iterations,
                                                         refinement_policy.mmff_gradient_threshold, lane, mmff_functor);
@@ -491,7 +478,7 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
                                           (mmff_result.status != 0 ||
                                            mmff_result.energy > heavy_mmff_rescue_threshold_(meta));
             if (run_heavy_rescue) {
-                mmff_result = run_fire_stage_(positions, velocities, gradient, dim3, 160, 160, 2.5e-5f, lane,
+                mmff_result = run_fire_stage_(positions, velocities, gradient, dimensions_3d, 160, 160, 2.5e-5f, lane,
                                               mmff_functor);
             }
             float const mmff_energy = mmff_result.energy;

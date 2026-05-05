@@ -23,15 +23,7 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::cuda {
-using smallfield::types::atom_role_first_k;
-using smallfield::types::atom_role_fourth_k;
-using smallfield::types::atom_role_second_k;
-using smallfield::types::atom_role_third_k;
-using smallfield::types::distance_constraint_t;
-using smallfield::types::etk_atom_interaction_t;
-using smallfield::types::etk_atom_offsets_t;
-using smallfield::types::etk_torsion_descriptor_t;
-using smallfield::types::etk_torsion_k;
+using namespace smallfield::types;
 
 /** Compute dihedral angle φ for atoms i-j-k-l. Returns radians in [-π, π]. */
 __device__ __forceinline__ float compute_dihedral_angle_(float const *positions, std::uint32_t num_atoms,
@@ -117,10 +109,10 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     for (std::uint32_t n = 1; n <= 6; ++n) {
         float const coeff = torsion.fourier_coefficients[n - 1];
         if (coeff != 0.0f) {
-            float const nf = static_cast<float>(n);
+            float const n_as_float = static_cast<float>(n);
             energy += coeff * cos_curr;
-            energy_gradient_dihedral -= nf * coeff * sin_curr;
-            energy_second_gradient_dihedral -= nf * nf * coeff * cos_curr;
+            energy_gradient_dihedral -= n_as_float * coeff * sin_curr;
+            energy_second_gradient_dihedral -= n_as_float * n_as_float * coeff * cos_curr;
         }
         // Chebyshev: sin((n+1)phi) = 2cos(φ)sin(nφ) - sin((n-1)phi)
         float const sin_next = 2.0f * cos_phi * sin_curr - sin_prev;
