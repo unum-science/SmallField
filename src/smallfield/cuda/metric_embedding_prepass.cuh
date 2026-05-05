@@ -85,7 +85,7 @@ __device__ __forceinline__ float read_lower_bound_float_(float const *bounds, st
  * @param[in] atom_i First atom index.
  * @param[in] atom_j Second atom index.
  * @return Squared midpoint distance between atom_i and atom_j.
- * @see smooth_and_build_gram_kernel
+ * @see embed_4d_power_iter_kernel
  */
 __device__ __forceinline__ float midpoint_distance_squared_(float const *bounds, std::uint32_t num_atoms,
                                                             std::uint32_t atom_i, std::uint32_t atom_j) {
@@ -94,104 +94,6 @@ __device__ __forceinline__ float midpoint_distance_squared_(float const *bounds,
     float const lower = read_lower_bound_float_(bounds, num_atoms, atom_i, atom_j);
     float const distance = 0.5f * (fmaxf(lower, 0.0f) + fmaxf(upper, lower));
     return distance * distance;
-}
-
-/**
- *  @brief Triangle-smooth the per-molecule bounds, build a zero-padded Gram
- *  matrix at a uniform @p bin_n × @p bin_n stride, and write it to @p gram_matrices.
- *
- *  The actual per-molecule size is @c meta.num_atoms, always ≤ @p bin_n.  The
- *  kernel smooths only the real N×N sub-block, zeros the Gram padding region,
- *  and writes into the bin-sized slot.  cusolverDnSsyevjBatched can then
- *  operate on a single uniform N across all molecules in the bin.
- *
- *  @see embed_4d_power_iter_kernel
- */
-__global__ void smooth_and_build_gram_kernel(float *__restrict__ bounds_matrices,
-                                             etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
-                                             std::uint32_t const *__restrict__ molecule_indices,
-                                             float *__restrict__ gram_matrices, std::uint32_t bin_n) {
-    std::uint32_t const group_index = blockIdx.x;
-    std::uint32_t const lane = threadIdx.x;
-    std::uint32_t const molecule_index = molecule_indices[group_index];
-    auto const meta = molecule_metadata[molecule_index];
-    std::uint32_t const num_atoms = meta.num_atoms;
-
-    // Shared layout: shared_bounds[num_atoms × num_atoms] + row_means[num_atoms] + grand_mean.
-    // Sized by the host launcher for bin_n (the worst case in this bin).
-    extern __shared__ float gram_shared_raw[];
-    float *shared_bounds = gram_shared_raw;
-    float *row_means = shared_bounds + num_atoms * num_atoms;
-    float *grand_mean_ptr = row_means + num_atoms;
-
-    float *global_bounds = bounds_matrices + meta.bounds_offset;
-    float *gram = gram_matrices + group_index * bin_n * bin_n;
-    std::uint32_t const total_entries = num_atoms * num_atoms;
-    std::uint32_t const gram_total = bin_n * bin_n;
-
-    // Load per-molecule bounds (at actual stride num_atoms) into shared memory.
-    for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += blockDim.x)
-        shared_bounds[linear_index] = global_bounds[linear_index];
-    __syncthreads();
-
-    // Floyd-Warshall on the real N×N block only.
-    for (std::uint32_t pivot = 0; pivot < num_atoms; ++pivot) {
-        for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += blockDim.x) {
-            std::uint32_t const i = linear_index / num_atoms;
-            std::uint32_t const j = linear_index % num_atoms;
-            if (i == j || i == pivot || j == pivot) continue;
-
-            float const upper_ip = read_upper_bound_float_(shared_bounds, num_atoms, i, pivot);
-            float const upper_pj = read_upper_bound_float_(shared_bounds, num_atoms, pivot, j);
-
-            if (i < j) {
-                float const candidate = upper_ip + upper_pj;
-                float &current = shared_bounds[i * num_atoms + j];
-                if (candidate < current) current = candidate;
-            }
-            else {
-                float const lower_ip = read_lower_bound_float_(shared_bounds, num_atoms, i, pivot);
-                float const lower_pj = read_lower_bound_float_(shared_bounds, num_atoms, pivot, j);
-                float &current = shared_bounds[i * num_atoms + j];
-                current = fmaxf(current, fmaxf(lower_ip - upper_pj, lower_pj - upper_ip));
-            }
-        }
-        __syncthreads();
-    }
-
-    // Persist the smoothed bounds back to global memory (at the molecule's own stride).
-    for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += blockDim.x)
-        global_bounds[linear_index] = shared_bounds[linear_index];
-
-    for (std::uint32_t atom = lane; atom < num_atoms; atom += blockDim.x) {
-        float row_sum = 0.0f;
-        for (std::uint32_t other = 0; other < num_atoms; ++other)
-            row_sum += midpoint_distance_squared_(shared_bounds, num_atoms, atom, other);
-        row_means[atom] = row_sum / static_cast<float>(num_atoms);
-    }
-    __syncthreads();
-
-    if (lane == 0) {
-        float grand_mean = 0.0f;
-        for (std::uint32_t atom = 0; atom < num_atoms; ++atom) grand_mean += row_means[atom];
-        grand_mean_ptr[0] = grand_mean / static_cast<float>(num_atoms);
-    }
-    __syncthreads();
-
-    float const grand_mean = grand_mean_ptr[0];
-    // Fill the whole bin-sized Gram block: real values inside [0, num_atoms)², zeros
-    // outside. The zero-pad rows/cols contribute zero eigenvalues that sort below the
-    // real ones, so the top-4 eigenvectors reconstruct the same 4D embedding.
-    for (std::uint32_t linear_index = lane; linear_index < gram_total; linear_index += blockDim.x) {
-        std::uint32_t const i = linear_index / bin_n;
-        std::uint32_t const j = linear_index % bin_n;
-        float value = 0.0f;
-        if (i < num_atoms && j < num_atoms) {
-            float const squared_distance = midpoint_distance_squared_(shared_bounds, num_atoms, i, j);
-            value = -0.5f * (squared_distance - row_means[i] - row_means[j] + grand_mean);
-        }
-        gram[j * bin_n + i] = value;
-    }
 }
 
 /**
@@ -393,43 +295,6 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
         for (std::uint32_t dim = 0; dim < 4; ++dim) {
             float const lam = fmaxf(lambda_ptr[dim], 0.0f);
             float const value = (lam > 1e-8f) ? sqrtf(lam) * eigenvector_ptrs[dim][atom] : 0.0f;
-            molecule_coordinates[dim * max_atoms_per_molecule + atom] = value;
-        }
-    }
-}
-
-/**
- *  @brief Project the top-4 eigenvectors into 4D coordinates.
- *
- *  The eigenproblem was solved at a uniform @p bin_n; each molecule's actual size is
- *  @c meta.num_atoms ≤ @p bin_n.  Eigenvectors are stored with stride @p bin_n; we read
- *  only the first @c meta.num_atoms components.  The last 4 eigenvalues (largest under
- *  cusolver's ascending sort) carry the real 4D embedding — zero-padded rows produced
- *  trailing zero eigenvalues that sort below.
- */
-__global__ void project_metric_coordinates_kernel(float const *__restrict__ eigenvectors,
-                                                  float const *__restrict__ eigenvalues,
-                                                  etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
-                                                  std::uint32_t const *__restrict__ molecule_indices,
-                                                  float *__restrict__ initial_coordinates,
-                                                  std::uint32_t max_atoms_per_molecule, std::uint32_t bin_n) {
-    std::uint32_t const group_index = blockIdx.x;
-    std::uint32_t const lane = threadIdx.x;
-    std::uint32_t const molecule_index = molecule_indices[group_index];
-    std::uint32_t const num_atoms = molecule_metadata[molecule_index].num_atoms;
-
-    float const *molecule_eigenvectors = eigenvectors + group_index * bin_n * bin_n;
-    float const *molecule_eigenvalues = eigenvalues + group_index * bin_n;
-    float *molecule_coordinates = initial_coordinates + molecule_index * max_atoms_per_molecule * 4;
-
-    for (std::uint32_t atom = lane; atom < num_atoms; atom += blockDim.x) {
-        for (std::uint32_t dim = 0; dim < 4; ++dim) {
-            std::int32_t const eigen_index = static_cast<std::int32_t>(bin_n) - 1 - static_cast<std::int32_t>(dim);
-            float value = 0.0f;
-            if (eigen_index >= 0) {
-                float const eigenvalue = fmaxf(molecule_eigenvalues[eigen_index], 0.0f);
-                if (eigenvalue > 1.0e-8f) value = sqrtf(eigenvalue) * molecule_eigenvectors[atom + eigen_index * bin_n];
-            }
             molecule_coordinates[dim * max_atoms_per_molecule + atom] = value;
         }
     }
