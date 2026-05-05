@@ -15,10 +15,10 @@ set(SMALLFIELD_DEFAULT_CUDA_ARCH "120" CACHE STRING "Fallback CUDA SM architectu
 # We intentionally avoid -Werror: warnings should surface but not block builds.
 if(NOT MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall>
-                        $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
-                        $<$<COMPILE_LANGUAGE:CXX>:-Wconversion>
-                        $<$<COMPILE_LANGUAGE:CXX>:-Wsign-conversion>
-                        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wconversion,-Wsign-conversion>)
+        $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wconversion>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wsign-conversion>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wconversion,-Wsign-conversion>)
 endif()
 
 # Default build type: Release with host-native vectorization and CUDA fast-math.
@@ -123,29 +123,29 @@ if(DEFINED RDKIT_PREFIX)
             endif()
         endmacro()
 
-        rdkit_add_lib(RDKit::SmilesParse      RDKitSmilesParse)
-        rdkit_add_lib(RDKit::GraphMol         RDKitGraphMol)
-        rdkit_add_lib(RDKit::RDGeneral        RDKitRDGeneral)
-        rdkit_add_lib(RDKit::ForceField       RDKitForceField)
+        rdkit_add_lib(RDKit::SmilesParse RDKitSmilesParse)
+        rdkit_add_lib(RDKit::GraphMol RDKitGraphMol)
+        rdkit_add_lib(RDKit::RDGeneral RDKitRDGeneral)
+        rdkit_add_lib(RDKit::ForceField RDKitForceField)
         rdkit_add_lib(RDKit::ForceFieldHelpers RDKitForceFieldHelpers)
-        rdkit_add_lib(RDKit::DistGeomHelpers  RDKitDistGeomHelpers)
-        rdkit_add_lib(RDKit::DistGeometry     RDKitDistGeometry)
-        rdkit_add_lib(RDKit::Depictor         RDKitDepictor)
-        rdkit_add_lib(RDKit::MolTransforms    RDKitMolTransforms)
-        rdkit_add_lib(RDKit::SubstructMatch   RDKitSubstructMatch)
-        rdkit_add_lib(RDKit::Alignment        RDKitAlignment)
-        rdkit_add_lib(RDKit::EigenSolvers     RDKitEigenSolvers)
-        rdkit_add_lib(RDKit::ChemTransforms   RDKitChemTransforms)
-        rdkit_add_lib(RDKit::Descriptors      RDKitDescriptors)
+        rdkit_add_lib(RDKit::DistGeomHelpers RDKitDistGeomHelpers)
+        rdkit_add_lib(RDKit::DistGeometry RDKitDistGeometry)
+        rdkit_add_lib(RDKit::Depictor RDKitDepictor)
+        rdkit_add_lib(RDKit::MolTransforms RDKitMolTransforms)
+        rdkit_add_lib(RDKit::SubstructMatch RDKitSubstructMatch)
+        rdkit_add_lib(RDKit::Alignment RDKitAlignment)
+        rdkit_add_lib(RDKit::EigenSolvers RDKitEigenSolvers)
+        rdkit_add_lib(RDKit::ChemTransforms RDKitChemTransforms)
+        rdkit_add_lib(RDKit::Descriptors RDKitDescriptors)
 
     else()
         message(WARNING "RDKit headers not found at ${_rdkit_inc}. "
-                        "Install rdkit-dev: micromamba install -c conda-forge rdkit-dev")
+            "Install rdkit-dev: micromamba install -c conda-forge rdkit-dev")
     endif()
 endif()
 if(NOT RDKit_FOUND)
     message(WARNING "RDKit not found. C++ tests will not be built. "
-                    "Pass -DRDKIT_PREFIX=/path/to/conda/env")
+        "Pass -DRDKIT_PREFIX=/path/to/conda/env")
 endif()
 
 # `{fmt}` — used everywhere for formatted and colored logging.  Conda-forge
@@ -178,71 +178,6 @@ endif()
 # 13.1 → 14.x) do not require CMakeLists edits.
 find_package(CUDAToolkit REQUIRED)
 
-# ThunderKittens — header-only tile-based MMA library used by the MACE-OFF
-# inference module.  Default OFF: the existing fp32 reference path stays
-# buildable without TK (regression target).  Turn ON for the bf16 / WGMMA
-# production build.  Pass `-DTHUNDERKITTENS_DIR=/path/to/ThunderKittens`
-# pointing to a clone of https://github.com/HazyResearch/ThunderKittens
-# (validated against commit 0b55588d2769dde0c7a9a606ffc015b0ca7a9551).
-#
-# When TK is on, MACE kernels need `-arch=sm_90a` (Hopper, with the `a`
-# suffix that enables WGMMA / TMA features) or `-arch=sm_100a` / `sm_120a`
-# on Blackwell.  The build appends `-DSMALLFIELD_USE_THUNDERKITTENS=1` and
-# the right arch suffix automatically when TK is requested.
-option(SMALLFIELD_USE_THUNDERKITTENS
-       "Enable ThunderKittens for the MACE-OFF inference module"
-       OFF)
-
-if(SMALLFIELD_USE_THUNDERKITTENS)
-    # If THUNDERKITTENS_DIR is not provided, fetch upstream automatically.
-    # Pinning to the same commit hash that the kernel sources were validated
-    # against (per the comment block above this option declaration) keeps
-    # the captured-graph numerics stable across reproductions.
-    if(NOT DEFINED THUNDERKITTENS_DIR)
-        include(FetchContent)
-        set(SMALLFIELD_THUNDERKITTENS_TAG "0b55588d2769dde0c7a9a606ffc015b0ca7a9551"
-            CACHE STRING "ThunderKittens git ref to fetch when THUNDERKITTENS_DIR is unset")
-        FetchContent_Declare(thunderkittens
-            GIT_REPOSITORY https://github.com/HazyResearch/ThunderKittens.git
-            GIT_TAG        "${SMALLFIELD_THUNDERKITTENS_TAG}"
-            GIT_SHALLOW    OFF) # tag is a hash, shallow doesn't help
-        FetchContent_MakeAvailable(thunderkittens)
-        set(THUNDERKITTENS_DIR "${thunderkittens_SOURCE_DIR}" CACHE PATH "" FORCE)
-        message(STATUS "ThunderKittens fetched to ${THUNDERKITTENS_DIR}")
-    endif()
-    if(NOT EXISTS "${THUNDERKITTENS_DIR}/include/kittens.cuh")
-        message(FATAL_ERROR
-                "ThunderKittens not found at ${THUNDERKITTENS_DIR}/include/kittens.cuh. "
-                "Clone https://github.com/HazyResearch/ThunderKittens and pass its "
-                "absolute path via -DTHUNDERKITTENS_DIR=..., or omit the variable "
-                "to let CMake FetchContent pull the pinned commit.")
-    endif()
-    add_library(smallfield_thunderkittens INTERFACE)
-    target_include_directories(smallfield_thunderkittens INTERFACE "${THUNDERKITTENS_DIR}/include")
-    target_compile_definitions(smallfield_thunderkittens INTERFACE SMALLFIELD_USE_THUNDERKITTENS=1)
-    message(STATUS "ThunderKittens enabled (include path: ${THUNDERKITTENS_DIR}/include)")
-
-    # Promote the auto-detected Hopper / Blackwell arch to the `a` variant
-    # so WGMMA / TMA intrinsics are available.  TK's persistent-kernel
-    # patterns rely on these features; without the `a` suffix the build
-    # falls back to non-async loads and the throughput win disappears.
-    if(CMAKE_CUDA_ARCHITECTURES)
-        set(_archs_with_a "")
-        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
-            if(NOT "${_arch}" MATCHES "a$")
-                list(APPEND _archs_with_a "${_arch}a")
-            else()
-                list(APPEND _archs_with_a "${_arch}")
-            endif()
-        endforeach()
-        set(CMAKE_CUDA_ARCHITECTURES "${_archs_with_a}" CACHE STRING "" FORCE)
-        message(STATUS "ThunderKittens: promoted CUDA archs to ${CMAKE_CUDA_ARCHITECTURES}")
-    endif()
-else()
-    message(STATUS "ThunderKittens disabled — MACE-OFF inference uses the fp32 reference path. "
-                   "Pass -DSMALLFIELD_USE_THUNDERKITTENS=ON -DTHUNDERKITTENS_DIR=... to opt in.")
-endif()
-
 if(RDKit_FOUND)
     # RDKit targets needed by the library
     set(RDKIT_LIBS
@@ -255,11 +190,9 @@ if(RDKit_FOUND)
 
     function(configure_smallfield_library target_name library_type)
         add_library(${target_name} ${library_type}
-            src/smallfield/api/smallfield.cu
-            src/smallfield/api/smallfield_mace.cu)
+            src/smallfield/api/smallfield.cu)
         set_source_files_properties(
             src/smallfield/api/smallfield.cu
-            src/smallfield/api/smallfield_mace.cu
             PROPERTIES LANGUAGE CUDA)
         target_include_directories(${target_name} PUBLIC ${CMAKE_SOURCE_DIR}/src)
         target_link_libraries(${target_name} PUBLIC
@@ -269,13 +202,6 @@ if(RDKit_FOUND)
             CUDA::cudart
             OpenMP::OpenMP_CXX
             fmt::fmt)
-        # When ThunderKittens is enabled, the MACE-OFF inference TU pulls in
-        # TK headers transitively via mace_inference.cuh.  Link the interface
-        # target so the include path and SMALLFIELD_USE_THUNDERKITTENS define
-        # are visible.
-        if(TARGET smallfield_thunderkittens)
-            target_link_libraries(${target_name} PUBLIC smallfield_thunderkittens)
-        endif()
         # Pass -fopenmp to the host compiler through nvcc so #pragma omp inside
         # etkdg_prepare_batch.hpp (included by smallfield.cu) actually parallelizes.
         # Without this the OpenMP pragma is silently ignored by nvcc's host pass

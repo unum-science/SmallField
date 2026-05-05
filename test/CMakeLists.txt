@@ -61,47 +61,6 @@ add_mixed_test(mmff94 mmff_gpu_extract)
 add_cpp_test(mmff94 mmff_cpu_port)
 add_cpp_test(mmff94 mmff_typer)
 
-# --- mace/ ---
-# Standalone test for the MACE inference module.  Does not depend on RDKit or
-# smallfield_lib — it links directly to the cuda runtime and validates the
-# weight loader + the Phase-1 kernels (radial, sph harm) against the golden
-# trace produced by python/smallfield/mace_export.py.
-#
-# To run: first export the weights/goldens with python3
-# python/smallfield/mace_export.py --model small --out /tmp/mace_export then run
-# `ctest -R test_mace_loader` (the test takes the export dir as argv[1],
-# defaulting to /tmp/mace_export).
-add_executable(test_mace_loader mace/test_mace_loader.cu)
-target_link_libraries(test_mace_loader PRIVATE test_helpers CUDA::cudart)
-target_include_directories(
-  test_mace_loader PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src
-                           ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_mace_loader PROPERTIES CUDA_SEPARABLE_COMPILATION ON
-                                                  LINKER_LANGUAGE CUDA)
-# When ThunderKittens is enabled, the MACE inference headers pull TK in
-# transitively via mace_tk_tile.cuh.  Link the interface target so the
-# include path and SMALLFIELD_USE_THUNDERKITTENS define are visible.
-if(TARGET smallfield_thunderkittens)
-  target_link_libraries(test_mace_loader PRIVATE smallfield_thunderkittens)
-endif()
-add_test(NAME test_mace_loader COMMAND test_mace_loader /tmp/mace_export)
-
-# Public C++ API smoke test for smallfield::mace::context_t.  Links the
-# smallfield_lib so the test exercises the same shared library a downstream
-# user would link.  Verifies weights_t::load, infer_energy, infer_energy_and_forces,
-# and refine_batch on a synthetic batch.
-add_executable(test_mace_api mace/test_mace_api.cu)
-target_link_libraries(test_mace_api PRIVATE test_helpers smallfield_lib CUDA::cudart)
-target_include_directories(
-  test_mace_api PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src
-                         ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_mace_api PROPERTIES CUDA_SEPARABLE_COMPILATION ON
-                                                LINKER_LANGUAGE CUDA)
-if(TARGET smallfield_thunderkittens)
-  target_link_libraries(test_mace_api PRIVATE smallfield_thunderkittens)
-endif()
-add_test(NAME test_mace_api COMMAND test_mace_api /tmp/mace_export)
-
 # --- api/ ---
 add_executable(test_pipeline api/test_pipeline.cpp)
 set_source_files_properties(api/test_pipeline.cpp PROPERTIES LANGUAGE CXX)
