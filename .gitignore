@@ -6,8 +6,8 @@ __pycache__/
 # Local benchmark artifacts — scripts, captures, stratified samples, run
 # logs.  Profiling captures are large (20-30 MB each) and regenerable;
 # keep this whole tree out of version control.
-benchmark/profiling/
-benchmark/results/
+bench/profiling/
+bench/results/
 
 # C extensions
 *.so
