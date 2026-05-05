@@ -545,6 +545,18 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
                                    per_device_batch.layout.bytes_total, cudaMemcpyHostToDevice, stream),
                    "H2D per-device batch pool");
 
+    // Zero the fp32 coordinate buffer before kernel launches.  write_conformer_output_
+    // only writes the first num_atoms slots per dim, leaving [num_atoms, output_stride)
+    // uninitialized when the molecule is shorter than max_atoms_per_molecule.  The
+    // downstream convert_coords_fp32_to_fp16_kernel processes the full stride
+    // unconditionally — without zero-init here, those slots are read uninitialized
+    // (compute-sanitizer initcheck flags ~16K reads on the 50-conformer test corpus).
+    // Reading uninit memory is UB and risks NaN/Inf propagation; the per-launch
+    // memset is bandwidth-trivial vs the FIRE compute that follows.
+    if (total_coords > 0)
+        sink.check(cudaMemsetAsync(handle.device_coords_fp32.data(), 0, total_coords * sizeof(float), stream),
+                   "memset device_coords_fp32 zero");
+
     cudaEventRecord(handle.event_metric_start, stream);
 
     // Kernels read metadata directly from the H2D'd batch mirror; preprocess
