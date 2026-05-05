@@ -77,11 +77,6 @@ inline constexpr std::array<std::uint32_t, atom_limited_bin_count_k> atom_limite
     16, 32, 48, 64, 80, 96, 112, 128,
 };
 
-/** @brief Per-device cap on a single wave's molecule count.  Dominated by the
- *  cusolver batched-eigen workspace footprint at `max_atoms_per_molecule = 128`
- *  (roughly 1 MB of workspace per molecule in the group). */
-inline constexpr std::uint32_t per_device_wave_cap_k = 10'000;
-
 /** @brief Maximum atom count the kernels support per molecule.  Matches
  *  `molecule_descriptor_t::max_atoms_k`; larger molecules are rejected by
  *  preprocess with `conformer_status_t::too_many_atoms`. */

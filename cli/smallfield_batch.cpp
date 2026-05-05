@@ -702,10 +702,13 @@ int main(int argc, char **argv) {
     counters.start_time = logger.start_time;
 
     // Pipeline depth picks how many coprocessed-batches the upstream may stage before
-    // back-pressuring.  Depth 3 lets reader stay 2 ahead of GPU and GPU stay 1
-    // ahead of fallback while writer drains; pool sized to depth+1 so no stage
-    // ever blocks waiting for a free output buffer.
-    constexpr std::size_t kPipelineDepth = 3;
+    // back-pressuring.  Depth 5 lets reader stay 4 ahead of GPU (smooths over slow
+    // RDKit-prep batches) and GPU stay 3 ahead of fallback while writer drains;
+    // pool sized to depth+1 so no stage ever blocks waiting for a free output
+    // buffer.  Bumped from 3 to 5 to hide H2D/D2H tails better on multi-GPU runs;
+    // costs ~70 GB pinned host per extra slot at batch_target = 700K mols.  See
+    // GPU-utilisation roadmap for sizing rationale.
+    constexpr std::size_t kPipelineDepth = 5;
     buffer_pool_t pool {kPipelineDepth + 1};
     handoff_t<coprocessed_batch_accumulator_t> reader_to_gpu {kPipelineDepth};
     handoff_t<coprocessed_batch_result_t> gpu_to_fallback {kPipelineDepth};

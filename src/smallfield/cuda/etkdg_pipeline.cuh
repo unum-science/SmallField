@@ -251,6 +251,19 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
  *  kernel, the remaining inlined state (DG + ETK functors + stereo retry
  *  loop) lands in ~90 regs/thread vs the 145 the monolithic predecessor
  *  paid, which lifts the register-cap occupancy headroom materially.
+ *
+ *  **Register pressure audit (2026-05-05, nvcc 13.0, post-bin-stratified-coord-stride):**
+ *    sm_80=79, sm_90=80, **sm_100=128**, sm_120=127 regs/thread.  No spills
+ *    reported (STACK=0, LOCAL=0) but sm_100 is exactly at nvcc's no-spill
+ *    ceiling — fragile.  At 32 threads × 4 blocks/SM × 128 regs that's only
+ *    4 warps/SM = 6.25 % warp occupancy on B200's 64-warp SMs.  Reducing
+ *    sm_100 register count would let `__launch_bounds__` bump from (32, 4)
+ *    to (32, 8) or (32, 12), doubling/tripling warp occupancy.  Refactor
+ *    targets: shrink stereo-retry-loop captured state, audit DG + ETK
+ *    functor lambda captures, look for per-thread temporaries promotable
+ *    to shmem.  Tracked as a follow-up; verified above 2026-05-05 via
+ *    `cuobjdump --dump-resource-usage libsmallfield_python_lib.so`.
+ *
  *  Writes ETK-refined 3D positions into @c conformer_coordinates_out;
  *  @c mmff_polish_warp_kernel runs next on the same buffer.
  *
@@ -420,6 +433,16 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
  *  matrix is needed here).  Reg cap is the binding occupancy constraint —
  *  the kernel lands around 90 regs vs the 145 the old monolithic form paid,
  *  ~22 blocks/SM from registers.
+ *
+ *  **Register pressure audit (2026-05-05, nvcc 13.0):**
+ *    sm_80=69, sm_90=72, sm_100=103, sm_120=106 regs/thread.  sm_100/sm_120
+ *    are well above the original ~90 estimate; same fragility pattern as
+ *    `etkdg_pipeline_warp_kernel`.  Reducing reg pressure on Blackwell
+ *    would lift `__launch_bounds__(32, 4)` to (32, 6+), improving warp
+ *    occupancy proportionally.  bond_distance is read from global memory
+ *    (line 482) — a triangle-pack of the symmetric BFS hop count would
+ *    halve global-bandwidth pressure for the nonbonded inner loop, but
+ *    it's not in shmem so SRAM is unaffected.  Tracked as follow-up.
  *
  *  @see etkdg_pipeline_warp_kernel
  */
