@@ -50,10 +50,20 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
     std::int64_t const num_rows = static_cast<std::int64_t>(row_outcomes.size());
 
     // Prefix-scan total halves needed (only success rows contribute > 0).
+    // Caller (write_shard) is responsible for the size invariants on
+    // num_atoms_per_molecule and coordinates; the parallel index sidecars
+    // (mol_per_row, slot_per_row) are populated locally so their lengths
+    // match num_rows by construction.  The two range checks below catch
+    // the case where the caller passed mismatched per-row sidecars (e.g. a
+    // future refactor) and bail before OOB.
+    if (molecule_index_per_row.size() < static_cast<std::size_t>(num_rows) ||
+        conformer_slot_per_row.size() < static_cast<std::size_t>(num_rows))
+        return nullptr;
     std::int64_t total_halves = 0;
     for (std::int64_t r = 0; r < num_rows; ++r) {
         if (row_outcomes[r] != 1) continue;
         std::uint64_t const m = molecule_index_per_row[r];
+        if (m >= num_atoms_per_molecule.size()) return nullptr; // caller-contract violation
         total_halves += static_cast<std::int64_t>(num_atoms_per_molecule[m]) * 3;
     }
 
@@ -82,10 +92,15 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
         if (row_outcomes[r] == 1) {
             std::uint64_t const m = molecule_index_per_row[r];
             std::uint32_t const c = conformer_slot_per_row[r];
-            std::uint32_t const row_halves = static_cast<std::uint32_t>(num_atoms_per_molecule[m]) * 3u;
+            std::uint32_t row_halves = static_cast<std::uint32_t>(num_atoms_per_molecule[m]) * 3u;
+            // Defence against a contract-violating caller: per-mol num_atoms must
+            // fit in the stride.  Clamp rather than OOB; the slot's coords beyond
+            // stride_halves don't exist in `coordinates` regardless.
+            if (row_halves > stride_halves) row_halves = stride_halves;
             if (row_halves > 0) {
-                std::uint16_t const *src = reinterpret_cast<std::uint16_t const *>(coordinates.data()) +
-                                           (m * max_conformers + c) * stride_halves;
+                std::size_t const src_offset = (static_cast<std::size_t>(m) * max_conformers + c) * stride_halves;
+                if (src_offset + row_halves > coordinates.size()) return nullptr;
+                std::uint16_t const *src = reinterpret_cast<std::uint16_t const *>(coordinates.data()) + src_offset;
                 std::memcpy(values + running, src, row_halves * sizeof(std::uint16_t));
                 running += static_cast<std::int32_t>(row_halves);
             }
@@ -114,6 +129,38 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
         std::fprintf(stderr, "[smallfield_batch] write_shard: per-molecule arrays missing\n");
         return false;
     }
+
+    // Document the size invariants enforced by callers (see writer_inputs_t in
+    // parquet_writer.hpp).  Every code path below indexes these spans
+    // unguarded; if a caller violates the contract, a single early failure
+    // here is preferable to OOB memory reads inside Arrow builders or the
+    // coordinate packer.
+    std::size_t const total_slots = static_cast<std::size_t>(num_molecules) * max_conformers;
+    auto fail_size_ = [&](char const *what, std::size_t got, std::size_t want) {
+        std::fprintf(stderr, "[smallfield_batch] write_shard: %s size %zu < expected %zu (num_molecules=%llu, "
+                             "max_conformers=%u, max_atoms=%u)\n",
+                     what, got, want, static_cast<unsigned long long>(num_molecules), max_conformers, inputs.max_atoms);
+        return false;
+    };
+    if (inputs.num_atoms_per_molecule.size() < num_molecules)
+        return fail_size_("num_atoms_per_molecule", inputs.num_atoms_per_molecule.size(), num_molecules);
+    if (inputs.n_conformers_per_molecule.size() < num_molecules)
+        return fail_size_("n_conformers_per_molecule", inputs.n_conformers_per_molecule.size(), num_molecules);
+    if (inputs.smiles.size() < num_molecules) return fail_size_("smiles", inputs.smiles.size(), num_molecules);
+    if (inputs.status.size() < total_slots) return fail_size_("status", inputs.status.size(), total_slots);
+    if (inputs.energies.size() < total_slots) return fail_size_("energies", inputs.energies.size(), total_slots);
+    if (inputs.coordinates.size() < total_slots * coord_stride_halves)
+        return fail_size_("coordinates", inputs.coordinates.size(), total_slots * coord_stride_halves);
+    // Optional per-molecule columns: callers may pass an empty span to opt out;
+    // otherwise the size must cover every molecule.
+    if (!inputs.num_heavy_atoms_per_molecule.empty() &&
+        inputs.num_heavy_atoms_per_molecule.size() < num_molecules)
+        return fail_size_("num_heavy_atoms_per_molecule", inputs.num_heavy_atoms_per_molecule.size(), num_molecules);
+    if (!inputs.num_bonds_per_molecule.empty() && inputs.num_bonds_per_molecule.size() < num_molecules)
+        return fail_size_("num_bonds_per_molecule", inputs.num_bonds_per_molecule.size(), num_molecules);
+    if (!inputs.molecular_weight_per_molecule.empty() &&
+        inputs.molecular_weight_per_molecule.size() < num_molecules)
+        return fail_size_("molecular_weight_per_molecule", inputs.molecular_weight_per_molecule.size(), num_molecules);
 
     // Determine total output rows. For each molecule, M = n_conformers_per_molecule[m] surviving
     // conformers (post-Kabsch). M = 0 indicates the molecule failed preprocess entirely; we still
