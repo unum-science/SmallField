@@ -324,31 +324,10 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
 }
 
 /**
- *  @brief OOP energy helper for explicit coordinates.
- *
- *  @param[in] position_i Out-of-plane atom i.
- *  @param[in] position_j Central sp2 atom j.
- *  @param[in] position_k In-plane neighbor k.
- *  @param[in] position_l In-plane neighbor l.
- *  @param[in] oop OOP bending descriptor with force constant.
- *  @return OOP bending energy (kcal/mol).
- */
-__device__ __forceinline__ float mmff_oop_energy_(float3 const &position_i, float3 const &position_j,
-                                                  float3 const &position_k, float3 const &position_l,
-                                                  mmff94_oop_t const &oop) {
-    float3 const bond_ji = sub_float3_(position_i, position_j);
-    float3 const bond_jk = sub_float3_(position_k, position_j);
-    float3 const bond_jl = sub_float3_(position_l, position_j);
-    float3 const plane_normal = cross_float3_(bond_jk, bond_jl);
-    float const inv_plane_len = rsqrtf(fmaxf(dot_float3_(plane_normal, plane_normal), 1e-12f));
-    float const inv_bond_ji_len = rsqrtf(fmaxf(dot_float3_(bond_ji, bond_ji), 1e-12f));
-    float const sin_chi = fmaxf(-1.0f, fminf(1.0f, dot_float3_(bond_ji, plane_normal) * inv_bond_ji_len * inv_plane_len));
-    float const chi_deg = asinf(sin_chi) * mmff_radians_to_degrees_k;
-    return 0.5f * mmff_angle_prefactor_k * oop.force_constant * chi_deg * chi_deg;
-}
-
-/**
  *  @brief OOP bending energy and gradient for one atom.
+ *
+ *  Energy and gradient share sin_chi / inverse-length intermediates — both
+ *  paths run together and the energy increment is gated on the @p role.
  *
  *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
  *  @param[in] num_atoms Number of atoms in the molecule.
@@ -369,9 +348,6 @@ __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, s
     float3 const atom_k_position = load_position_(positions, num_atoms, oop.atom_k);
     float3 const atom_l_position = load_position_(positions, num_atoms, oop.atom_l);
 
-    float const base_energy = mmff_oop_energy_(atom_i_position, atom_j_position, atom_k_position, atom_l_position, oop);
-    if (role == atom_role_first_k) *energy += base_energy;
-
     float3 const bond_ji = sub_float3_(atom_i_position, atom_j_position);
     float3 const bond_jk = sub_float3_(atom_k_position, atom_j_position);
     float3 const bond_jl = sub_float3_(atom_l_position, atom_j_position);
@@ -385,6 +361,10 @@ __device__ __forceinline__ void mmff_oop_contribution_(float const *positions, s
 
     float const sin_chi = fmaxf(-1.0f, fminf(1.0f, dot_float3_(bond_ji_unit, plane_normal_unit)));
     float const chi_deg = asinf(sin_chi) * mmff_radians_to_degrees_k;
+
+    if (role == atom_role_first_k)
+        *energy += 0.5f * mmff_angle_prefactor_k * oop.force_constant * chi_deg * chi_deg;
+
     float const inverse_cos_chi = rsqrtf(fmaxf(1.0f - sin_chi * sin_chi, 1e-10f));
     float const energy_gradient_sin_chi = mmff_angle_prefactor_k * oop.force_constant * chi_deg *
                                           mmff_radians_to_degrees_k * inverse_cos_chi;
