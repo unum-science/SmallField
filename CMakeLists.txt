@@ -1,4 +1,46 @@
 cmake_minimum_required(VERSION 3.18)
+
+# Default CUDA architectures.  The fatbin shipped to deployment covers
+# Ampere (sm_80), Hopper (sm_90), and Blackwell consumer / RTX PRO
+# (sm_120) so feature-gated paths in the kernels (e.g. cooperative_groups
+# TMA copies on sm_90+, DPX on sm_90+) actually emit per-arch SASS.
+# `120` (vs `120-real`) emits both SASS and PTX so the binary can JIT on
+# future hardware that hasn't shipped yet.
+#
+# For fast dev-iteration on a single known GPU, pass
+# -DSMALLFIELD_NATIVE_CUDA_ARCH=ON or an explicit
+# -DCMAKE_CUDA_ARCHITECTURES=... — then the build collapses to a
+# single-arch native compile.  Multi-arch fatbin compile is ~3× longer.
+#
+# These two settings must run BEFORE project() so the CUDA toolkit
+# auto-detect at project-time doesn't override us with sm_75 default.
+set(SMALLFIELD_DEFAULT_CUDA_ARCH "80-real;90-real;100-real;120"
+    CACHE STRING "Default fatbin CUDA architectures")
+option(SMALLFIELD_NATIVE_CUDA_ARCH
+    "Detect a single native CUDA arch via nvidia-smi instead of the multi-arch fatbin"
+    OFF)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    if(SMALLFIELD_NATIVE_CUDA_ARCH)
+        execute_process(
+            COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+            OUTPUT_VARIABLE _gpu_caps OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET RESULT_VARIABLE _smi_result)
+        if(_smi_result EQUAL 0 AND _gpu_caps)
+            string(REGEX MATCH "[0-9]+\\.[0-9]+" _cap_match "${_gpu_caps}")
+            if(_cap_match)
+                string(REPLACE "." "" _arch_code "${_cap_match}")
+                set(CMAKE_CUDA_ARCHITECTURES "${_arch_code}")
+            else()
+                set(CMAKE_CUDA_ARCHITECTURES "120")
+            endif()
+        else()
+            set(CMAKE_CUDA_ARCHITECTURES "120")
+        endif()
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES "${SMALLFIELD_DEFAULT_CUDA_ARCH}")
+    endif()
+endif()
+
 project(SmallField LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -6,9 +48,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Named fallback for the CUDA architecture used when nvidia-smi probing fails.
-# SM 12.0 targets Blackwell RTX PRO, the primary dev/test GPU for SmallField.
-set(SMALLFIELD_DEFAULT_CUDA_ARCH "120" CACHE STRING "Fallback CUDA SM architecture if auto-detection fails")
+message(STATUS "CMAKE_CUDA_ARCHITECTURES = ${CMAKE_CUDA_ARCHITECTURES}")
 
 # Enable -Wall -Wextra globally on non-MSVC toolchains.
 # CUDA device code gets the host warnings forwarded through -Xcompiler.
@@ -66,30 +106,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     if(NOT CMAKE_CUDA_FLAGS MATCHES "expt-relaxed-constexpr")
         set(CMAKE_CUDA_FLAGS
             "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr --extended-lambda")
-    endif()
-endif()
-
-# detect GPU architecture at build time
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    # detect highest GPU compute capability via nvidia-smi
-    execute_process(
-        COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
-        OUTPUT_VARIABLE _gpu_caps OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET RESULT_VARIABLE _smi_result)
-    if(_smi_result EQUAL 0 AND _gpu_caps)
-        # take the first line (first GPU)
-        string(REGEX MATCH "[0-9]+\\.[0-9]+" _cap_match "${_gpu_caps}")
-        if(_cap_match)
-            string(REPLACE "." "" _arch_code "${_cap_match}")
-            set(CMAKE_CUDA_ARCHITECTURES "${_arch_code}")
-            message(STATUS "Detected GPU compute capability: ${_cap_match} (SM ${_arch_code})")
-        else()
-            set(CMAKE_CUDA_ARCHITECTURES "${SMALLFIELD_DEFAULT_CUDA_ARCH}")
-            message(STATUS "Could not parse GPU capability, defaulting to SM ${SMALLFIELD_DEFAULT_CUDA_ARCH}")
-        endif()
-    else()
-        set(CMAKE_CUDA_ARCHITECTURES "${SMALLFIELD_DEFAULT_CUDA_ARCH}")
-        message(STATUS "nvidia-smi not found, defaulting to SM ${SMALLFIELD_DEFAULT_CUDA_ARCH}")
     endif()
 endif()
 
