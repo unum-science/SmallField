@@ -77,13 +77,20 @@ void gpu_mmff_energy(float const *host_positions, std::uint32_t num_atoms,
     cudaMalloc(&device_atom_offsets, std::max(num_atom_offsets, 1u) * sizeof(sft::mmff94_atom_offsets_t));
 
     cudaMemcpy(device_positions, host_positions, num_elements * sizeof(float), cudaMemcpyHostToDevice);
-    if (num_atoms > 0) {
+    // Guards check both num_atoms and the host pointer: build_single_oop_prepared
+    // and similar synthetic test fixtures construct a molecule with num_atoms > 0
+    // but empty mmff_atom_vdw / atom_charge / bond_distance vectors (the harness
+    // wrapper substitutes nullptr for empty().data()).  Without the pointer
+    // check the cudaMemcpy hits cudaErrorInvalidValue per slot per FD probe and
+    // emits ~75 sanitizer-flagged API errors per test_single_oop run.
+    if (num_atoms > 0 && host_atom_vdw != nullptr)
         cudaMemcpy(device_atom_vdw, host_atom_vdw, num_atoms * sizeof(sft::mmff94_atom_vdw_params_t),
                    cudaMemcpyHostToDevice);
+    if (num_atoms > 0 && host_atom_charge != nullptr)
         cudaMemcpy(device_atom_charge, host_atom_charge, num_atoms * sizeof(float), cudaMemcpyHostToDevice);
+    if (num_atoms > 0 && host_bond_distance != nullptr)
         cudaMemcpy(device_bond_distance, host_bond_distance, num_atoms * num_atoms * sizeof(std::uint8_t),
                    cudaMemcpyHostToDevice);
-    }
     if (num_bond_params > 0)
         cudaMemcpy(device_bond_params, host_bond_params, num_bond_params * sizeof(sft::mmff94_bond_t),
                    cudaMemcpyHostToDevice);
