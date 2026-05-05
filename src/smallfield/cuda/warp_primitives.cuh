@@ -43,6 +43,23 @@ __device__ __forceinline__ float3 load_position_(float const *positions, std::ui
     return {positions[atom], positions[num_atoms + atom], positions[2u * num_atoms + atom]};
 }
 
+/**
+ *  @brief Partial derivative of cos(θ) with respect to the @p this_atom position.
+ *
+ *  For an angle θ formed at a center j by neighbors @p this_atom and @p other_atom, where
+ *  `this_unit` and `other_unit` are the corresponding bond unit vectors *from* j and
+ *  `inverse_distance_this` is `1 / |r_{this,j}|`:
+ *
+ *      ∂cosθ/∂r_this = (other_unit − cosθ · this_unit) / |r_{this,j}|
+ *
+ *  Used by mmff_angle_contribution_ and mmff_stretchbend_contribution_; the
+ *  center-atom gradient is just `−(grad_first + grad_third)` from this formula.
+ */
+__device__ __forceinline__ float3 angle_cosine_gradient_(float3 const &this_unit, float3 const &other_unit,
+                                                         float cos_theta, float inverse_distance_this) {
+    return scale_float3_(sub_float3_(other_unit, scale_float3_(this_unit, cos_theta)), inverse_distance_this);
+}
+
 /** Warp reduction via butterfly XOR shuffles. All lanes get the result. */
 __device__ __forceinline__ float warp_reduce_sum_f32_(float value) {
     value += __shfl_xor_sync(full_mask_k, value, 16);

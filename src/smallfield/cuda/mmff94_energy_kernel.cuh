@@ -193,14 +193,10 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
     float3 const bond_kj = sub_float3_(position_k, position_j);
     float const inverse_distance_ij = rsqrtf(fmaxf(dot_float3_(bond_ij, bond_ij), 1e-8f));
     float const inverse_distance_kj = rsqrtf(fmaxf(dot_float3_(bond_kj, bond_kj), 1e-8f));
+    float3 const unit_ij = scale_float3_(bond_ij, inverse_distance_ij);
+    float3 const unit_kj = scale_float3_(bond_kj, inverse_distance_kj);
 
-    // unit vectors
-    float const p12_x = bond_ij.x * inverse_distance_ij, p12_y = bond_ij.y * inverse_distance_ij,
-                p12_z = bond_ij.z * inverse_distance_ij;
-    float const p32_x = bond_kj.x * inverse_distance_kj, p32_y = bond_kj.y * inverse_distance_kj,
-                p32_z = bond_kj.z * inverse_distance_kj;
-
-    float const cos_theta = fmaxf(-1.0f, fminf(1.0f, p12_x * p32_x + p12_y * p32_y + p12_z * p32_z));
+    float const cos_theta = fmaxf(-1.0f, fminf(1.0f, dot_float3_(unit_ij, unit_kj)));
     float const sin_theta_sq = 1.0f - cos_theta * cos_theta;
     float const sin_theta = (sin_theta_sq > 1e-12f) ? sqrtf(sin_theta_sq) : 1e-6f;
     float const theta = acosf(cos_theta);
@@ -211,37 +207,29 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
         *energy += 0.5f * mmff_angle_prefactor_k * angle.force_constant * dtheta_deg * dtheta_deg *
                    (1.0f + mmff_angle_cubic_bend_k * dtheta_deg);
 
-    // ∂E/∂θ
-    // the extra rad2deg converts the derivative to work with the -1/sinθ chain rule
+    // ∂E/∂rᵢ = ∂E/∂θ · ∂cosθ/∂rᵢ · (−1/sinθ); rad2deg converts the derivative
+    // to work with the -1/sinθ chain rule.
     float const energy_gradient_angle = mmff_radians_to_degrees_k * mmff_angle_prefactor_k * angle.force_constant *
                                         dtheta_deg * (1.0f + 1.5f * mmff_angle_cubic_bend_k * dtheta_deg);
-    float const inverse_sine = __frcp_rn(sin_theta);
+    float const factor = energy_gradient_angle * (-__frcp_rn(sin_theta));
 
-    // ∂E/∂rᵢ = ∂E/∂θ · ∂cosθ/∂rᵢ · (−1/sinθ)
-    // ∂cosθ/∂rᵢ = (p̂₃₂ − cosθ·p̂₁₂) / |r₁₂|
-    float const factor = energy_gradient_angle * (-inverse_sine);
-
-    if (role == atom_role_first_k) { // first atom: ∂cosθ/∂rᵢ = (p̂₃₂ − cosθ·p̂₁₂) / |r₁₂|
-        *gradient_x += factor * (p32_x - cos_theta * p12_x) * inverse_distance_ij;
-        *gradient_y += factor * (p32_y - cos_theta * p12_y) * inverse_distance_ij;
-        *gradient_z += factor * (p32_z - cos_theta * p12_z) * inverse_distance_ij;
+    float3 grad {0.0f, 0.0f, 0.0f};
+    if (role == atom_role_first_k) {
+        grad = scale_float3_(angle_cosine_gradient_(unit_ij, unit_kj, cos_theta, inverse_distance_ij), factor);
     }
-    else if (role == atom_role_third_k) { // third atom: ∂cosθ/∂rₖ = (p̂₁₂ − cosθ·p̂₃₂) / |r₃₂|
-        *gradient_x += factor * (p12_x - cos_theta * p32_x) * inverse_distance_kj;
-        *gradient_y += factor * (p12_y - cos_theta * p32_y) * inverse_distance_kj;
-        *gradient_z += factor * (p12_z - cos_theta * p32_z) * inverse_distance_kj;
+    else if (role == atom_role_third_k) {
+        grad = scale_float3_(angle_cosine_gradient_(unit_kj, unit_ij, cos_theta, inverse_distance_kj), factor);
     }
-    else { // role == atom_role_second_k, center atom (center): -(grad_i + grad_k)
-        float const gi_x = factor * (p32_x - cos_theta * p12_x) * inverse_distance_ij;
-        float const gi_y = factor * (p32_y - cos_theta * p12_y) * inverse_distance_ij;
-        float const gi_z = factor * (p32_z - cos_theta * p12_z) * inverse_distance_ij;
-        float const gk_x = factor * (p12_x - cos_theta * p32_x) * inverse_distance_kj;
-        float const gk_y = factor * (p12_y - cos_theta * p32_y) * inverse_distance_kj;
-        float const gk_z = factor * (p12_z - cos_theta * p32_z) * inverse_distance_kj;
-        *gradient_x -= gi_x + gk_x;
-        *gradient_y -= gi_y + gk_y;
-        *gradient_z -= gi_z + gk_z;
+    else { // atom_role_second_k, center: -(grad_first + grad_third)
+        float3 const grad_first = scale_float3_(
+            angle_cosine_gradient_(unit_ij, unit_kj, cos_theta, inverse_distance_ij), factor);
+        float3 const grad_third = scale_float3_(
+            angle_cosine_gradient_(unit_kj, unit_ij, cos_theta, inverse_distance_kj), factor);
+        grad = scale_float3_(add_float3_(grad_first, grad_third), -1.0f);
     }
+    *gradient_x += grad.x;
+    *gradient_y += grad.y;
+    *gradient_z += grad.z;
 }
 
 /**
@@ -485,53 +473,37 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
     // gradient has two parts: ∂E/∂r (stretch) and ∂E/∂θ (bend)
     // ∂E/∂r_ij = 2.5121 * kba_ijk * Δθ * (r_ij_hat)
     // ∂E/∂θ = 2.5121 * stretch_term * rad2deg * (-1/sin(theta)) * ∂cos/∂r
-    float const inverse_sine = __frcp_rn(fmaxf(sin_theta, 1e-6f));
-    float const p12_x = bond_ij.x * inverse_distance_ij, p12_y = bond_ij.y * inverse_distance_ij,
-                p12_z = bond_ij.z * inverse_distance_ij;
-    float const p32_x = bond_kj.x * inverse_distance_kj, p32_y = bond_kj.y * inverse_distance_kj,
-                p32_z = bond_kj.z * inverse_distance_kj;
+    float3 const unit_ij = scale_float3_(bond_ij, inverse_distance_ij);
+    float3 const unit_kj = scale_float3_(bond_kj, inverse_distance_kj);
 
-    // stretch gradient component
+    // stretch gradient component (along the unit vector pointing away from j)
     float const energy_gradient_distance_ij = mmff_stretch_bend_prefactor_k * sb.kba_ijk * delta_theta;
     float const energy_gradient_distance_kj = mmff_stretch_bend_prefactor_k * sb.kba_kji * delta_theta;
 
     // bend gradient component: ∂E/∂θ * dtheta/dr
     float const energy_gradient_angle = mmff_stretch_bend_prefactor_k * stretch_term * mmff_radians_to_degrees_k;
-    float const bend_factor = energy_gradient_angle * (-inverse_sine);
+    float const bend_factor = energy_gradient_angle * (-__frcp_rn(fmaxf(sin_theta, 1e-6f)));
 
-    if (role == atom_role_first_k) { // first atom:
-        *gradient_x += energy_gradient_distance_ij * p12_x +
-                       bend_factor * (p32_x - cos_theta * p12_x) * inverse_distance_ij;
-        *gradient_y += energy_gradient_distance_ij * p12_y +
-                       bend_factor * (p32_y - cos_theta * p12_y) * inverse_distance_ij;
-        *gradient_z += energy_gradient_distance_ij * p12_z +
-                       bend_factor * (p32_z - cos_theta * p12_z) * inverse_distance_ij;
+    auto stretch_plus_bend_first_ = [&]() {
+        return add_float3_(scale_float3_(unit_ij, energy_gradient_distance_ij),
+                           scale_float3_(angle_cosine_gradient_(unit_ij, unit_kj, cos_theta, inverse_distance_ij),
+                                         bend_factor));
+    };
+    auto stretch_plus_bend_third_ = [&]() {
+        return add_float3_(scale_float3_(unit_kj, energy_gradient_distance_kj),
+                           scale_float3_(angle_cosine_gradient_(unit_kj, unit_ij, cos_theta, inverse_distance_kj),
+                                         bend_factor));
+    };
+
+    float3 grad {0.0f, 0.0f, 0.0f};
+    if (role == atom_role_first_k) { grad = stretch_plus_bend_first_(); }
+    else if (role == atom_role_third_k) { grad = stretch_plus_bend_third_(); }
+    else { // second atom (center): -(grad_first + grad_third)
+        grad = scale_float3_(add_float3_(stretch_plus_bend_first_(), stretch_plus_bend_third_()), -1.0f);
     }
-    else if (role == atom_role_third_k) { // third atom:
-        *gradient_x += energy_gradient_distance_kj * p32_x +
-                       bend_factor * (p12_x - cos_theta * p32_x) * inverse_distance_kj;
-        *gradient_y += energy_gradient_distance_kj * p32_y +
-                       bend_factor * (p12_y - cos_theta * p32_y) * inverse_distance_kj;
-        *gradient_z += energy_gradient_distance_kj * p32_z +
-                       bend_factor * (p12_z - cos_theta * p32_z) * inverse_distance_kj;
-    }
-    else { // second atom (center): -(grad_i + grad_k)
-        float const gi_x = energy_gradient_distance_ij * p12_x +
-                           bend_factor * (p32_x - cos_theta * p12_x) * inverse_distance_ij;
-        float const gi_y = energy_gradient_distance_ij * p12_y +
-                           bend_factor * (p32_y - cos_theta * p12_y) * inverse_distance_ij;
-        float const gi_z = energy_gradient_distance_ij * p12_z +
-                           bend_factor * (p32_z - cos_theta * p12_z) * inverse_distance_ij;
-        float const gk_x = energy_gradient_distance_kj * p32_x +
-                           bend_factor * (p12_x - cos_theta * p32_x) * inverse_distance_kj;
-        float const gk_y = energy_gradient_distance_kj * p32_y +
-                           bend_factor * (p12_y - cos_theta * p32_y) * inverse_distance_kj;
-        float const gk_z = energy_gradient_distance_kj * p32_z +
-                           bend_factor * (p12_z - cos_theta * p32_z) * inverse_distance_kj;
-        *gradient_x -= gi_x + gk_x;
-        *gradient_y -= gi_y + gk_y;
-        *gradient_z -= gi_z + gk_z;
-    }
+    *gradient_x += grad.x;
+    *gradient_y += grad.y;
+    *gradient_z += grad.z;
 }
 
 /**
