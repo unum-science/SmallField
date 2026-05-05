@@ -553,9 +553,16 @@ inline void build_etk_interaction_lists(etkdg_prepared_molecule_t &result) {
  *
  *  @param[in] molecule RDKit molecule with explicit hydrogens.
  *  @param[inout] result Prepared molecule; MMFF94 arrays are filled in place.
+ *  @return `conformer_status_t::success` on success;
+ *          `conformer_status_t::unsupported_element` if any atom's
+ *          MMFF94 atom type is 0 (element outside the MMFF94 parameter
+ *          set — transition metals, lanthanides, etc.) or if the
+ *          `MMFFMolProperties` constructor otherwise reports the
+ *          molecule as not parametrizable.
  */
-inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
-                                  etkdg_prepared_molecule_t &result) {
+inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol const &molecule,
+                                                                 molecule_descriptor_t const &desc,
+                                                                 etkdg_prepared_molecule_t &result) {
     result.mmff_atom_vdw.clear();
     result.mmff_atom_charge.clear();
     result.bond_distance.clear();
@@ -569,7 +576,6 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
         mol.setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
     }
     RDKit::MMFF::MMFFMolProperties mmff_props(mol);
-    if (!mmff_props.isValid()) return;
 
     std::uint32_t const num_atoms = desc.num_atoms;
 
@@ -577,9 +583,24 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
     // src/mmff94/mmff94_param_cache.hpp. Atom types are cheap array reads from mmff_props and
     // bond signatures come straight from `desc`. These feed the cache-key packers so we can short-circuit
     // RDKit's per-term std::map lookups.
+    //
+    // `getMMFFAtomType` returns 0 for atoms outside the MMFF94 parameter set
+    // (Y, lanthanides, transition metals, etc.).  Detect that here on the
+    // host so the molecule never reaches the GPU pipeline — without this
+    // gate, `etkdg_pipeline_warp_kernel` does an OOB write through
+    // element-keyed parameter LUTs in `forcefield_tables.hpp` and poisons
+    // every subsequent CUDA call on every device.
     std::uint8_t atom_type[max_atoms_k];
-    for (std::uint32_t a = 0; a < num_atoms; ++a)
+    for (std::uint32_t a = 0; a < num_atoms; ++a) {
         atom_type[a] = static_cast<std::uint8_t>(mmff_props.getMMFFAtomType(a));
+        if (atom_type[a] == 0) return smallfield::api::conformer_status_t::unsupported_element;
+    }
+
+    // Defence in depth: catch the rare case of all-typed atoms but
+    // unparametrized interactions (e.g. missing torsion params).  Same
+    // routing as the per-atom case — the molecule can't be MMFF-optimised
+    // on-device and must fall back to CPU ETKDGv3.
+    if (!mmff_props.isValid()) return smallfield::api::conformer_status_t::unsupported_element;
     std::uint8_t bond_signature[max_bonds_k];
     for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
         bool const arom = (desc.bond_flags[b] & bond_flag_aromatic_k) != 0;
@@ -912,6 +933,7 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
         result.mmff_interactions[cursors[stretchbends[term].atom_k].stretchbend++] = {term, mmff94_stretch_bend_k,
                                                                                       atom_role_third_k};
     }
+    return smallfield::api::conformer_status_t::success;
 }
 
 /**
@@ -921,10 +943,15 @@ inline void extract_mmff94_params(RDKit::ROMol const &molecule, molecule_descrip
  *  reused across every molecule the thread processes — each molecule's vectors
  *  keep their capacity from the previous call, so push_back stays on the hot
  *  path without heap allocation after the first few molecules.  Sets
- *  @c result.num_atoms = 0 on failure.
+ *  @c result.num_atoms = 0 on failure and returns the rejection reason; on
+ *  success returns @c conformer_status_t::success.  Callers that don't need
+ *  the per-molecule reason code can still test @c result.num_atoms == 0 as
+ *  the in-band drop signal.
  */
-inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecule_t &result,
-                                  scaffold_cache_t *cache = nullptr, preprocess_deadline_t *deadline = nullptr) {
+inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_view smiles,
+                                                                 etkdg_prepared_molecule_t &result,
+                                                                 scaffold_cache_t *cache = nullptr,
+                                                                 preprocess_deadline_t *deadline = nullptr) {
     result.num_atoms = 0;
     result.bounds_matrix.clear();
     result.chiral_centers.clear();
@@ -943,6 +970,8 @@ inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecu
     result.etk_interactions.clear();
     result.etk_atom_offsets.clear();
 
+    using smallfield::api::conformer_status_t;
+
     std::unique_ptr<RDKit::RWMol> mol;
     try {
         // RDKit::SmilesToMol takes std::string const& — one unavoidable std::string
@@ -957,18 +986,18 @@ inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecu
         mol.reset(RDKit::SmilesToMol(smiles_str, params));
     }
     catch (...) {
-        return;
+        return conformer_status_t::invalid_smiles;
     }
-    if (!mol) return;
+    if (!mol) return conformer_status_t::invalid_smiles;
 
     try {
         RDKit::MolOps::addHs(*mol);
     }
     catch (...) {
-        return;
+        return conformer_status_t::invalid_smiles;
     }
     std::uint32_t const num_atoms = mol->getNumAtoms();
-    if (num_atoms > 128) return; // too large for the single-warp pipeline
+    if (num_atoms > 128) return conformer_status_t::too_many_atoms; // single-warp pipeline cap
     result.num_atoms = num_atoms;
 
     // Optional host-side readback fields — read once from the post-AddHs RDKit
@@ -983,22 +1012,31 @@ inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecu
         result.metadata.molecular_weight = 0.0f;
     }
 
+    conformer_status_t mmff_status = conformer_status_t::success;
     try {
         molecule_descriptor_t desc;
         if (!build_descriptor(*mol, desc)) {
             result.num_atoms = 0;
-            return;
+            return conformer_status_t::invalid_smiles;
         }
         build_bounds_matrix(desc, result.bounds_matrix);
         extract_chiral_centers(*mol, desc, result.chiral_centers);
         extract_etk_torsions_native(*mol, desc, result.etk_torsions, cache, deadline);
         extract_distance_constraints(desc, result.bounds_matrix, result.distance_constraints);
         build_etk_interaction_lists(result);
-        extract_mmff94_params(*mol, desc, result);
+        mmff_status = extract_mmff94_params(*mol, desc, result);
     }
     catch (...) {
         result.num_atoms = 0;
-        return;
+        return conformer_status_t::invalid_smiles;
+    }
+    if (mmff_status != conformer_status_t::success) {
+        // MMFF could not parametrise this molecule (e.g. atomic number outside
+        // the MMFF94 set).  The mmff_* result vectors are empty after the
+        // early return inside `extract_mmff94_params`, but ETK fields above
+        // are populated; clear num_atoms so downstream packing skips this mol.
+        result.num_atoms = 0;
+        return mmff_status;
     }
 
     result.metadata.num_atoms = result.num_atoms;
@@ -1027,6 +1065,7 @@ inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecu
     result.metadata.etk_atom_offsets_start = 0;
     result.metadata.bounds_min = 0.0f;
     result.metadata.bounds_inv_scale = 1.0f;
+    return conformer_status_t::success;
 }
 
 /**
@@ -1275,10 +1314,12 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::vector<std::byte> etk_interactions_bytes;
     std::vector<std::byte> etk_atom_offsets_bytes;
     std::vector<batch_prep_per_mol_record_t> mols;
-    /** @brief Slice-local input indices whose `preprocess-step` exceeded the
-     *  per-`molecule` deadline; the caller stamps `conformer_status_t::preprocess_timeout`
-     *  and routes them to the `fallback-role` for ETKDGv3 retry. */
-    std::vector<std::uint32_t> timed_out_input_indices;
+    /** @brief Slice-local input indices for every molecule rejected by this
+     *  thread's slice of `prepare_per_thread_contribs_`, each tagged with
+     *  the rejection reason (`invalid_smiles`, `too_many_atoms`,
+     *  `unsupported_element`, `preprocess_timeout`).  Aggregated upstream
+     *  into `batch_pool_t::rejected_input_indices`. */
+    std::vector<smallfield::api::rejected_mol_t> rejected_input_indices;
     std::uint32_t max_atoms_seen = 0;
 };
 
@@ -1367,7 +1408,7 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
         type_counts.etk_interactions_bytes.clear();
         type_counts.etk_atom_offsets_bytes.clear();
         type_counts.mols.clear();
-        type_counts.timed_out_input_indices.clear();
+        type_counts.rejected_input_indices.clear();
         type_counts.max_atoms_seen = 0;
     }
 
@@ -1389,18 +1430,28 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
 #pragma omp for schedule(dynamic, 64)
         for (std::size_t m = 0; m < n; ++m) {
             deadline.reset(std::chrono::milliseconds {2000});
-            prepare_molecule_into(smiles_list[m], type_counts.scratch, cache, &deadline);
+            auto const status = prepare_molecule_into(smiles_list[m], type_counts.scratch, cache, &deadline);
             if (deadline.tripped) {
                 // Partial scratch may be incoherent; drop it and record the
                 // input index so `generate_conformers` can stamp
                 // `conformer_status_t::preprocess_timeout` and route the
-                // molecule to the `fallback-role` for ETKDGv3 retry.
+                // molecule to the `fallback-role` for ETKDGv3 retry.  The
+                // deadline path bypasses `status` because the partial
+                // result may have any reason code stale from earlier work.
                 type_counts.scratch.num_atoms = 0;
-                type_counts.timed_out_input_indices.push_back(static_cast<std::uint32_t>(m));
+                type_counts.rejected_input_indices.push_back(
+                    {static_cast<std::uint32_t>(m), smallfield::api::conformer_status_t::preprocess_timeout});
                 continue;
             }
             auto const &p = type_counts.scratch;
-            if (p.num_atoms == 0) continue;
+            if (p.num_atoms == 0) {
+                // `prepare_molecule_into` reports a precise rejection reason
+                // (invalid_smiles, too_many_atoms, unsupported_element, ...)
+                // — propagate it so `generate_conformers` stamps the right
+                // status instead of the default-init `invalid_smiles`.
+                type_counts.rejected_input_indices.push_back({static_cast<std::uint32_t>(m), status});
+                continue;
+            }
             if (p.num_atoms > type_counts.max_atoms_seen) type_counts.max_atoms_seen = p.num_atoms;
 
             batch_prep_per_mol_record_t rec;
@@ -1725,13 +1776,16 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
         return;
     }
 
-    // Merge every thread's timed-out input indices into the batch's flat list.
-    // Small in the common case (<100 per 1M molecules) but grow-only across calls.
-    batch.timed_out_input_indices.clear();
+    // Merge every thread's rejected-input indices into the batch's flat list.
+    // Each entry carries the slice-local index plus the `conformer_status_t`
+    // reason code; the caller stamps `entry.reason` directly into
+    // `status_out`.  Small in the common case (<100 per 1M molecules) but
+    // grow-only across calls.
+    batch.rejected_input_indices.clear();
     for (auto const &type_counts : contribs)
-        batch.timed_out_input_indices.insert(batch.timed_out_input_indices.end(),
-                                             type_counts.timed_out_input_indices.begin(),
-                                             type_counts.timed_out_input_indices.end());
+        batch.rejected_input_indices.insert(batch.rejected_input_indices.end(),
+                                            type_counts.rejected_input_indices.begin(),
+                                            type_counts.rejected_input_indices.end());
 
     pack_into_batch_pool_(contribs, bases, batch);
 }
@@ -2079,17 +2133,17 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
  *  instances hold the pinned shared batch and the distribution CSR buffers
  *  so neither allocation fires on the hot path.
  */
-inline void prepare_per_device_batches_into(std::span<std::string_view const> smiles_list, std::uint32_t device_count,
-                                            std::span<etkdg_molecule_batch_t> per_device_out,
-                                            scaffold_cache_t *cache = nullptr,
-                                            std::vector<std::uint32_t> *timed_out_input_indices_out = nullptr) {
+inline void prepare_per_device_batches_into(
+    std::span<std::string_view const> smiles_list, std::uint32_t device_count,
+    std::span<etkdg_molecule_batch_t> per_device_out, scaffold_cache_t *cache = nullptr,
+    std::vector<smallfield::api::rejected_mol_t> *rejected_input_indices_out = nullptr) {
     static etkdg_molecule_batch_t shared_scratch;
     static distribute_scratch_t distribute_scratch;
     prepare_molecule_batch_into(smiles_list, shared_scratch, cache);
     distribute_batch_to_per_device_pools_(shared_scratch, device_count, per_device_out, distribute_scratch);
-    if (timed_out_input_indices_out != nullptr) {
-        timed_out_input_indices_out->assign(shared_scratch.timed_out_input_indices.begin(),
-                                            shared_scratch.timed_out_input_indices.end());
+    if (rejected_input_indices_out != nullptr) {
+        rejected_input_indices_out->assign(shared_scratch.rejected_input_indices.begin(),
+                                           shared_scratch.rejected_input_indices.end());
     }
 }
 

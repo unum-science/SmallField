@@ -38,9 +38,26 @@
 
 #include <cuda_runtime.h>
 
+#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::api {
+
+/**
+ *  @brief Tagged rejection record: which slice-local input was dropped, and why.
+ *
+ *  Replaces the prior parallel-vector design (one vector per rejection
+ *  reason).  Every preprocess-step rejection — `invalid_smiles` (parse fail,
+ *  addHs fail, descriptor build fail), `too_many_atoms`, `unsupported_element`
+ *  (no MMFF94 atom type), `preprocess_timeout` (deadline tripped) — flows
+ *  through one `std::vector<rejected_mol_t>` and the caller stamps
+ *  `entry.reason` directly into `status_out`.  Packs to 8 bytes
+ *  (4-byte index + 1-byte reason + 3 bytes padding).
+ */
+struct rejected_mol_t {
+    std::uint32_t slice_local_index;
+    conformer_status_t reason;
+};
 using smallfield::types::chiral_center_descriptor_t;
 using smallfield::types::distance_constraint_t;
 using smallfield::types::etk_atom_interaction_t;
@@ -311,11 +328,12 @@ struct batch_pool_t {
     batch_layout_t layout;
     std::uint32_t num_molecules = 0;
     std::uint32_t max_atoms_per_molecule = 0;
-    /** @brief Slice-local indices whose `preprocess-step` exceeded the per-`molecule`
-     *  deadline (RDKit VF2 worst-case); populated by `prepare_molecule_batch_into`
-     *  and consumed by the caller to stamp `conformer_status_t::preprocess_timeout`
-     *  and route to the `fallback-role`.  Grow-only across calls. */
-    std::vector<std::uint32_t> timed_out_input_indices;
+    /** @brief Slice-local indices for every molecule rejected by the
+     *  `preprocess-step`, tagged with the rejection reason.  Populated by
+     *  `prepare_molecule_batch_into`; consumed by the caller to stamp
+     *  `conformer_status_t` per molecule and route rejected mols to the
+     *  `fallback-role`.  Grow-only across calls. */
+    std::vector<rejected_mol_t> rejected_input_indices;
 
     batch_pool_view_t host_view() noexcept { return {host.data(), &layout}; }
     batch_pool_view_t host_view() const noexcept { return {const_cast<std::byte *>(host.data()), &layout}; }
