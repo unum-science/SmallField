@@ -115,50 +115,24 @@ select_refinement_policy_(etkdg_molecule_metadata_t const &meta) {
 }
 
 template <typename energy_gradient_functor_>
-__device__ __forceinline__ void run_fire_stage_(float *positions, float *velocities, float *gradient,
-                                                std::uint32_t num_elements, std::int32_t initial_iterations,
-                                                std::int32_t continuation_iterations, float gradient_threshold,
-                                                std::uint32_t lane, energy_gradient_functor_ &&compute_energy_gradient,
-                                                float *out_final_energy, std::int32_t *out_iterations,
-                                                std::int32_t *out_status, float *out_final_rms_gradient) {
-    float stage_energy = 0.0f;
-    float stage_rms_gradient = 0.0f;
-    std::int32_t stage_iterations = 0;
-    std::int32_t stage_status = 0;
+__device__ __forceinline__ fire_result_t run_fire_stage_(float *positions, float *velocities, float *gradient,
+                                                         std::uint32_t num_elements,
+                                                         std::int32_t initial_iterations,
+                                                         std::int32_t continuation_iterations,
+                                                         float gradient_threshold, std::uint32_t lane,
+                                                         energy_gradient_functor_ &&compute_energy_gradient) {
+    fire_result_t result = fire_minimize_(positions, velocities, gradient, num_elements, initial_iterations,
+                                          gradient_threshold, lane, compute_energy_gradient);
 
-    fire_minimize_(positions, velocities, gradient, num_elements, initial_iterations, gradient_threshold, lane,
-                   compute_energy_gradient, &stage_energy, &stage_iterations, &stage_status, &stage_rms_gradient);
-
-    std::int32_t total_iterations = stage_iterations;
-
-    bool needs_continuation = false;
-    if (lane == 0)
-        needs_continuation = continuation_iterations > 0 &&
-                             (stage_status != 0 || stage_rms_gradient > gradient_threshold);
-    needs_continuation = __shfl_sync(full_mask_k, needs_continuation ? 1 : 0, 0) != 0;
-
+    bool const needs_continuation = continuation_iterations > 0 &&
+                                    (result.status != 0 || result.rms_gradient > gradient_threshold);
     if (needs_continuation) {
-        float continuation_energy = 0.0f;
-        float continuation_rms_gradient = 0.0f;
-        std::int32_t continuation_iterations_used = 0;
-        std::int32_t continuation_status = 0;
-
-        fire_minimize_(positions, velocities, gradient, num_elements, continuation_iterations, gradient_threshold, lane,
-                       compute_energy_gradient, &continuation_energy, &continuation_iterations_used,
-                       &continuation_status, &continuation_rms_gradient);
-
-        stage_energy = continuation_energy;
-        stage_rms_gradient = continuation_rms_gradient;
-        stage_status = continuation_status;
-        total_iterations += continuation_iterations_used;
+        std::int32_t const initial_iterations_done = result.iterations;
+        result = fire_minimize_(positions, velocities, gradient, num_elements, continuation_iterations,
+                                gradient_threshold, lane, compute_energy_gradient);
+        result.iterations += initial_iterations_done;
     }
-
-    if (lane == 0) {
-        *out_final_energy = stage_energy;
-        *out_iterations = total_iterations;
-        *out_status = stage_status;
-        if (out_final_rms_gradient != nullptr) *out_final_rms_gradient = stage_rms_gradient;
-    }
+    return result;
 }
 
 /** Compute shared memory bytes for the DG+ETK pipeline kernel.
@@ -170,8 +144,7 @@ __device__ __forceinline__ void run_fire_stage_(float *positions, float *velocit
  *
  *  @see compute_mmff_polish_shared_memory_bytes
  */
-__host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory_bytes(std::uint32_t max_atoms,
-                                                                                       std::uint32_t /*unused*/) {
+__host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory_bytes(std::uint32_t max_atoms) {
     std::uint32_t const dim4 = 4 * max_atoms;
     std::uint32_t const bounds_bytes = max_atoms * max_atoms * sizeof(std::uint8_t);
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
@@ -384,11 +357,9 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                     shared_bounds, mol_chirals, mol_min, inv_scale, num_atoms, meta.num_chiral_centers, 4,
                     1.0f,          1.0f,        100.0f,  0.0f};
 
-                float dg_energy = 0.0f;
-                float dg_rms_gradient = 0.0f;
-                std::int32_t dg_iterations = 0, dg_status = 0;
-                fire_minimize_(positions, velocities, gradient, dim4, 100, 1e-4f, lane, dg_functor, &dg_energy,
-                               &dg_iterations, &dg_status, &dg_rms_gradient);
+                fire_result_t const dg_result = fire_minimize_(positions, velocities, gradient, dim4, 100, 1e-4f, lane,
+                                                               dg_functor);
+                (void)dg_result;
 
                 // Stereochemistry validation: Check stereochemistry.
                 if (meta.num_chiral_centers > 0) {
@@ -398,11 +369,8 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
 
                 // Fourth-dimension crush: Crush the fourth dimension with 50 FIRE iterations.
                 dg_functor.fourth_dimension_penalty_weight = 10.0f;
-                float crush_energy = 0.0f;
-                float crush_rms_gradient = 0.0f;
-                std::int32_t crush_iterations = 0, crush_status = 0;
-                fire_minimize_(positions, velocities, gradient, dim4, 50, 1e-4f, lane, dg_functor, &crush_energy,
-                               &crush_iterations, &crush_status, &crush_rms_gradient);
+                fire_result_t const crush_result = fire_minimize_(positions, velocities, gradient, dim4, 50, 1e-4f,
+                                                                  lane, dg_functor);
 
                 // Torsion refinement: Run ETK torsion refinement in 3D with 100 FIRE iterations.
                 if (meta.num_etk_torsions > 0) {
@@ -410,16 +378,13 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                                                               etk_atom_offsets + meta.etk_atom_offsets_start,
                                                               num_atoms};
 
-                    float etk_energy = 0.0f;
-                    float etk_rms_gradient = 0.0f;
-                    std::int32_t etk_iterations = 0, etk_status = 0;
-                    run_fire_stage_(positions, velocities, gradient, dim3, refinement_policy.etk_initial_iterations,
-                                    refinement_policy.etk_continuation_iterations,
-                                    refinement_policy.etk_gradient_threshold, lane, etk_functor, &etk_energy,
-                                    &etk_iterations, &etk_status, &etk_rms_gradient);
-                    final_energy = etk_energy;
+                    fire_result_t const etk_result = run_fire_stage_(
+                        positions, velocities, gradient, dim3, refinement_policy.etk_initial_iterations,
+                        refinement_policy.etk_continuation_iterations, refinement_policy.etk_gradient_threshold, lane,
+                        etk_functor);
+                    final_energy = etk_result.energy;
                 }
-                else { final_energy = crush_energy; }
+                else { final_energy = crush_result.energy; }
 
                 // Final validation: Run final validation.
                 bool valid = true;
@@ -517,29 +482,19 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
                         conformer_coordinates_out[coord_offset + d * output_atoms_stride + i];
             __syncwarp(full_mask_k);
 
-            float mmff_energy = 0.0f;
-            float mmff_rms_gradient = 0.0f;
-            std::int32_t mmff_iterations = 0, mmff_status = 0;
-            run_fire_stage_(positions, velocities, gradient, dim3, refinement_policy.mmff_initial_iterations,
-                            refinement_policy.mmff_continuation_iterations, refinement_policy.mmff_gradient_threshold,
-                            lane, mmff_functor, &mmff_energy, &mmff_iterations, &mmff_status, &mmff_rms_gradient);
+            fire_result_t mmff_result = run_fire_stage_(positions, velocities, gradient, dim3,
+                                                        refinement_policy.mmff_initial_iterations,
+                                                        refinement_policy.mmff_continuation_iterations,
+                                                        refinement_policy.mmff_gradient_threshold, lane, mmff_functor);
 
-            bool run_heavy_rescue = false;
-            if (lane == 0) {
-                run_heavy_rescue = is_heavy_refinement_case_(meta) &&
-                                   (mmff_status != 0 || mmff_energy > heavy_mmff_rescue_threshold_(meta));
-            }
-            run_heavy_rescue = __shfl_sync(full_mask_k, run_heavy_rescue ? 1 : 0, 0) != 0;
-
+            bool const run_heavy_rescue = is_heavy_refinement_case_(meta) &&
+                                          (mmff_result.status != 0 ||
+                                           mmff_result.energy > heavy_mmff_rescue_threshold_(meta));
             if (run_heavy_rescue) {
-                float rescue_energy = 0.0f;
-                float rescue_rms_gradient = 0.0f;
-                std::int32_t rescue_iterations = 0;
-                std::int32_t rescue_status = 0;
-                run_fire_stage_(positions, velocities, gradient, dim3, 160, 160, 2.5e-5f, lane, mmff_functor,
-                                &rescue_energy, &rescue_iterations, &rescue_status, &rescue_rms_gradient);
-                mmff_energy = rescue_energy;
+                mmff_result = run_fire_stage_(positions, velocities, gradient, dim3, 160, 160, 2.5e-5f, lane,
+                                              mmff_functor);
             }
+            float const mmff_energy = mmff_result.energy;
 
             // Write polished positions + updated energy back.  Status is left
             // untouched: MMFF non-convergence does not mark the conformer failed.

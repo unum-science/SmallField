@@ -145,45 +145,31 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     float3 const cos_grad_1 = scale_float3_(sub_float3_(normal_0, scale_float3_(normal_1, cos_phi)),
                                             inverse_normal_length_1);
 
-    // Wilson B-matrix chain rule for the atom at atom_role
-    float force_x = 0.0f, force_y = 0.0f, force_z = 0.0f;
+    // Wilson B-matrix chain rule for the atom at @p atom_role.  Each role's
+    // gradient is a sum of one or two cross products of the cosine gradients
+    // and bond vectors (or differences of bond vectors at the central atoms
+    // j and k).  The four force expressions sum to zero by Newton's 3rd law.
+    float3 force {0.0f, 0.0f, 0.0f};
     switch (atom_role) {
     case atom_role_first_k:
-        force_x = sin_term * (cos_grad_0.z * bond_vec_1.y - cos_grad_0.y * bond_vec_1.z);
-        force_y = sin_term * (cos_grad_0.x * bond_vec_1.z - cos_grad_0.z * bond_vec_1.x);
-        force_z = sin_term * (cos_grad_0.y * bond_vec_1.x - cos_grad_0.x * bond_vec_1.y);
+        force = cross_float3_(bond_vec_1, cos_grad_0);
         break;
     case atom_role_second_k:
-        force_x = sin_term * (cos_grad_0.y * (bond_vec_1.z - bond_vec_0.z) +
-                              cos_grad_0.z * (bond_vec_0.y - bond_vec_1.y) + cos_grad_1.y * (-bond_vec_3.z) +
-                              cos_grad_1.z * bond_vec_3.y);
-        force_y = sin_term * (cos_grad_0.x * (bond_vec_0.z - bond_vec_1.z) +
-                              cos_grad_0.z * (bond_vec_1.x - bond_vec_0.x) + cos_grad_1.x * bond_vec_3.z +
-                              cos_grad_1.z * (-bond_vec_3.x));
-        force_z = sin_term * (cos_grad_0.x * (bond_vec_1.y - bond_vec_0.y) +
-                              cos_grad_0.y * (bond_vec_0.x - bond_vec_1.x) + cos_grad_1.x * (-bond_vec_3.y) +
-                              cos_grad_1.y * bond_vec_3.x);
+        force = sub_float3_(cross_float3_(cos_grad_0, sub_float3_(bond_vec_1, bond_vec_0)),
+                            cross_float3_(cos_grad_1, bond_vec_3));
         break;
     case atom_role_third_k:
-        force_x = sin_term * (cos_grad_0.y * bond_vec_0.z + cos_grad_0.z * (-bond_vec_0.y) +
-                              cos_grad_1.y * (bond_vec_3.z - bond_vec_2.z) +
-                              cos_grad_1.z * (bond_vec_2.y - bond_vec_3.y));
-        force_y = sin_term * (cos_grad_0.x * (-bond_vec_0.z) + cos_grad_0.z * bond_vec_0.x +
-                              cos_grad_1.x * (bond_vec_2.z - bond_vec_3.z) +
-                              cos_grad_1.z * (bond_vec_3.x - bond_vec_2.x));
-        force_z = sin_term * (cos_grad_0.x * bond_vec_0.y + cos_grad_0.y * (-bond_vec_0.x) +
-                              cos_grad_1.x * (bond_vec_3.y - bond_vec_2.y) +
-                              cos_grad_1.y * (bond_vec_2.x - bond_vec_3.x));
+        force = add_float3_(cross_float3_(cos_grad_0, bond_vec_0),
+                            cross_float3_(cos_grad_1, sub_float3_(bond_vec_3, bond_vec_2)));
         break;
     case atom_role_fourth_k:
-        force_x = sin_term * (cos_grad_1.y * bond_vec_2.z - cos_grad_1.z * bond_vec_2.y);
-        force_y = sin_term * (cos_grad_1.z * bond_vec_2.x - cos_grad_1.x * bond_vec_2.z);
-        force_z = sin_term * (cos_grad_1.x * bond_vec_2.y - cos_grad_1.y * bond_vec_2.x);
+        force = cross_float3_(cos_grad_1, bond_vec_2);
         break;
     }
-    *grad_x += force_x;
-    *grad_y += force_y;
-    *grad_z += force_z;
+    force = scale_float3_(force, sin_term);
+    *grad_x += force.x;
+    *grad_y += force.y;
+    *grad_z += force.z;
     return energy;
 }
 

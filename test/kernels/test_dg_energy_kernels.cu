@@ -91,8 +91,13 @@ __global__ void dg_minimize_kernel(float *positions, float const *bounds_float, 
                                                      num_atoms,     0,       spatial_dimension, upper_weight,
                                                      lower_weight,  0.0f,    fourth_dim_weight};
 
-    sfc::fire_minimize_(positions, velocities, gradient, num_elements, max_iterations, gradient_threshold, lane,
-                        functor, out_energy, out_iterations, out_status);
+    sfc::fire_result_t const result = sfc::fire_minimize_(positions, velocities, gradient, num_elements,
+                                                          max_iterations, gradient_threshold, lane, functor);
+    if (lane == 0) {
+        *out_energy = result.energy;
+        *out_iterations = result.iterations;
+        *out_status = result.status;
+    }
 }
 
 extern "C" {

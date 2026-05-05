@@ -22,6 +22,20 @@
 namespace smallfield::cuda {
 
 /**
+ *  @brief Outcome of a FIRE minimization stage.
+ *
+ *  All fields are warp-uniform: every lane returns the same struct value
+ *  because energy / rms_gradient are warp-reduced inside the loop and
+ *  iterations / status are derived from the (uniform) loop counter.
+ */
+struct fire_result_t {
+    float energy;
+    float rms_gradient;
+    std::int32_t iterations;
+    std::int32_t status; ///< 0 = converged below @p gradient_threshold, 1 = hit max_iterations.
+};
+
+/**
  *  @brief FIRE minimization driver.
  *
  *  @tparam energy_gradient_functor_ Callable: float(positions, gradient, num_elements, lane)
@@ -34,19 +48,14 @@ namespace smallfield::cuda {
  *  @param[in] gradient_threshold Convergence when rms(gradient) < threshold.
  *  @param[in] lane Warp lane index (threadIdx.x % 32).
  *  @param[in] compute_energy_gradient The energy/gradient functor.
- *  @param[out] out_final_energy Final energy (lane 0).
- *  @param[out] out_iterations Iteration count (lane 0).
- *  @param[out] out_status 0=converged, 1=max_iterations (lane 0).
- *  @param[out] out_final_rms_gradient Final RMS gradient (lane 0, optional).
+ *  @return Warp-uniform @ref fire_result_t with energy, RMS gradient, iteration count, and status.
  *  @see distance_geometry_energy_functor_t, etk_torsion_energy_functor_t, mmff94_energy_functor_t
  */
 template <typename energy_gradient_functor_>
-__device__ __forceinline__ void fire_minimize_(float *positions, float *velocities, float *gradient,
-                                               std::uint32_t num_elements, std::int32_t max_iterations,
-                                               float gradient_threshold, std::uint32_t lane,
-                                               energy_gradient_functor_ &&compute_energy_gradient,
-                                               float *out_final_energy, std::int32_t *out_iterations,
-                                               std::int32_t *out_status, float *out_final_rms_gradient = nullptr) {
+__device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float *velocities, float *gradient,
+                                                        std::uint32_t num_elements, std::int32_t max_iterations,
+                                                        float gradient_threshold, std::uint32_t lane,
+                                                        energy_gradient_functor_ &&compute_energy_gradient) {
     // FIRE parameters (Bitzek et al., PRL 2006)
     constexpr float initial_timestep_k = 0.05f;
     constexpr float max_timestep_k = 0.5f;
@@ -91,13 +100,7 @@ __device__ __forceinline__ void fire_minimize_(float *positions, float *velociti
         float const rms_gradient = sqrtf(gradient_dot_gradient * __frcp_rn(static_cast<float>(num_elements)));
         last_rms_gradient = rms_gradient;
         if (rms_gradient < gradient_threshold) {
-            if (lane == 0) {
-                *out_status = 0;
-                *out_iterations = iteration;
-                *out_final_energy = energy;
-                if (out_final_rms_gradient != nullptr) *out_final_rms_gradient = rms_gradient;
-            }
-            return;
+            return {energy, rms_gradient, iteration, 0};
         }
 
         float const power = -gradient_dot_velocity; // P = F·v = -∇E·v
@@ -139,12 +142,7 @@ __device__ __forceinline__ void fire_minimize_(float *positions, float *velociti
 
     // max iterations reached — report the last computed energy
     float const final_energy = compute_energy_gradient.energy_only(positions, num_elements, lane);
-    if (lane == 0) {
-        *out_status = 1;
-        *out_iterations = max_iterations;
-        *out_final_energy = final_energy;
-        if (out_final_rms_gradient != nullptr) *out_final_rms_gradient = last_rms_gradient;
-    }
+    return {final_energy, last_rms_gradient, max_iterations, 1};
 }
 
 } // namespace smallfield::cuda

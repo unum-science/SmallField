@@ -221,7 +221,7 @@ static void populate_device_launch_configs_(std::span<int const> device_ids,
         cudaDeviceGetAttribute(&config.streaming_multiprocessor_count, cudaDevAttrMultiProcessorCount, device_id);
         for (std::size_t bin_index = 0; bin_index < atom_limited_bin_count_k; ++bin_index) {
             std::uint32_t const bin_max_atoms = atom_limited_bin_caps_k[bin_index];
-            std::uint32_t const shared_bytes_etkdg = compute_pipeline_shared_memory_bytes(bin_max_atoms, 0);
+            std::uint32_t const shared_bytes_etkdg = compute_pipeline_shared_memory_bytes(bin_max_atoms);
             std::uint32_t const shared_bytes_mmff = compute_mmff_polish_shared_memory_bytes(bin_max_atoms);
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&config.blocks_per_multiprocessor_etkdg[bin_index],
                                                           etkdg_pipeline_warp_kernel, 32, shared_bytes_etkdg);
@@ -570,7 +570,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
 
         std::uint32_t const bin_size = bin_end - bin_start;
         std::uint32_t const bin_max_atoms = atom_limited_bin_caps_k[bin_index];
-        std::uint32_t const shared_bytes_etkdg = compute_pipeline_shared_memory_bytes(bin_max_atoms, 0);
+        std::uint32_t const shared_bytes_etkdg = compute_pipeline_shared_memory_bytes(bin_max_atoms);
         std::uint32_t const shared_bytes_mmff = compute_mmff_polish_shared_memory_bytes(bin_max_atoms);
         int const blocks_per_multiprocessor_etkdg = launch_config.blocks_per_multiprocessor_etkdg[bin_index];
         int const blocks_per_multiprocessor_mmff = launch_config.blocks_per_multiprocessor_mmff[bin_index];
