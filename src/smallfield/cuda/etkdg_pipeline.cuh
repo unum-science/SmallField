@@ -141,17 +141,25 @@ __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory
 
 /** Compute shared memory bytes for the MMFF polish kernel.
  *
- *  Layout: [positions, velocities, gradient: 3 × 3N × float].
+ *  Layout: [positions, velocities, gradient: 3 × 3N × float]
+ *          [atom_vdw cache: N × mmff94_atom_vdw_params_t]
+ *          [atom_charge cache: N × float].
  *  No bounds matrix — MMFF94 uses explicit bonded + nonbonded term lists rather
- *  than a pair-distance matrix, so the full shmem budget collapses to the FIRE scratch.
- *  At N=128 this is 4.5 KB vs the 22.5 KB the DG+ETK kernel needs, giving the
- *  scheduler far more occupancy headroom — typically reg-cap-bound rather than shmem-bound.
+ *  than a pair-distance matrix.
+ *  At N=128: 4.5 KB FIRE + 3.5 KB caches = ~8 KB; still leaves comfortable
+ *  occupancy headroom on Hopper / Blackwell (typically reg-cap-bound rather
+ *  than shmem-bound).  The caches eliminate ~2N² duplicate global reads of
+ *  atom_vdw_params[j] / atom_charge[j] per FIRE step.
  *
  *  @see compute_pipeline_shared_memory_bytes
  */
 __host__ __device__ __forceinline__ std::uint32_t compute_mmff_polish_shared_memory_bytes(std::uint32_t max_atoms) {
     std::uint32_t const dimensions_3d = 3 * max_atoms;
-    return 3 * dimensions_3d * sizeof(float);
+    std::uint32_t const fire_bytes = 3 * dimensions_3d * sizeof(float);
+    std::uint32_t const atom_vdw_bytes = max_atoms * static_cast<std::uint32_t>(
+                                                          sizeof(smallfield::types::mmff94_atom_vdw_params_t));
+    std::uint32_t const atom_charge_bytes = max_atoms * static_cast<std::uint32_t>(sizeof(float));
+    return fire_bytes + atom_vdw_bytes + atom_charge_bytes;
 }
 
 /**
@@ -421,14 +429,24 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
     mmff94_atom_offsets_t const *__restrict__ mmff_atom_offsets,
     etkdg_molecule_metadata_t const *__restrict__ molecule_metadata, float *__restrict__ conformer_coordinates_out,
     float *__restrict__ conformer_energies_out, std::uint8_t const *__restrict__ conformer_status_in,
-    std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t output_atoms_stride) {
+    std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t output_atoms_stride,
+    std::uint32_t bin_max_atoms) {
 
     std::uint32_t const warp_id = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const grid_stride = gridDim.x;
 
-    // Shared layout: [positions, velocities, gradient: 3 × 3N × float].
+    // Shared layout (sized at launch by compute_mmff_polish_shared_memory_bytes(bin_max_atoms)):
+    //   [positions, velocities, gradient: 3 × 3·bin_max_atoms × float]
+    //   [atom_vdw cache: bin_max_atoms × mmff94_atom_vdw_params_t]
+    //   [atom_charge cache: bin_max_atoms × float]
+    // The caches are loaded ONCE per molecule and reused across every FIRE
+    // step of every conformer, eliminating ~2N² duplicate global reads of
+    // atom_vdw_params[j] / atom_charge[j] inside the nonbonded inner loop.
     extern __shared__ float shared_float[];
+    auto *shared_atom_vdw =
+        reinterpret_cast<mmff94_atom_vdw_params_t *>(shared_float + 9u * bin_max_atoms);
+    float *shared_atom_charge = reinterpret_cast<float *>(shared_atom_vdw + bin_max_atoms);
 
     for (std::uint32_t mol = warp_id; mol < total_molecules; mol += grid_stride) {
         auto const meta = molecule_metadata[mol];
@@ -440,8 +458,24 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
 
         auto const refinement_policy = select_refinement_policy_(meta);
 
-        mmff94_energy_functor_t mmff_functor {mmff_atom_vdw + meta.mmff_atom_vdw_offset,
-                                              mmff_atom_charge + meta.mmff_atom_charge_offset,
+        // Stage per-atom params into shmem for this molecule.  6 float-words
+        // per atom_vdw entry (24 bytes, aligned 8) + 1 word per atom_charge.
+        // Iterate as a flat float-words sweep so all lanes participate.
+        {
+            mmff94_atom_vdw_params_t const *global_vdw = mmff_atom_vdw + meta.mmff_atom_vdw_offset;
+            float const *global_vdw_words = reinterpret_cast<float const *>(global_vdw);
+            float *shared_vdw_words = reinterpret_cast<float *>(shared_atom_vdw);
+            std::uint32_t const vdw_words = num_atoms * (sizeof(mmff94_atom_vdw_params_t) / sizeof(float));
+            for (std::uint32_t i = lane; i < vdw_words; i += warp_size_k)
+                shared_vdw_words[i] = global_vdw_words[i];
+            float const *global_charge = mmff_atom_charge + meta.mmff_atom_charge_offset;
+            for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
+                shared_atom_charge[i] = global_charge[i];
+        }
+        __syncwarp(full_mask_k);
+
+        mmff94_energy_functor_t mmff_functor {shared_atom_vdw,
+                                              shared_atom_charge,
                                               bond_distance + meta.bond_distance_offset,
                                               mmff_bond_terms + meta.mmff_bond_offset,
                                               mmff_angle_terms + meta.mmff_angle_offset,

@@ -611,7 +611,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, cu
             handle.device_coords_fp32.data() + bin_start * conformer_count * max_atoms_per_molecule * 3,
             handle.device_energies_out.data() + bin_start * conformer_count,
             handle.device_status_out.data() + bin_start * conformer_count, bin_size, conformer_count,
-            max_atoms_per_molecule);
+            max_atoms_per_molecule, bin_max_atoms);
         sink.check(cudaPeekAtLastError(), "mmff_polish_warp_kernel launch");
 
         bin_start = bin_end;
