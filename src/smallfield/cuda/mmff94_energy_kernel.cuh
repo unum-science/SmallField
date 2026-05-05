@@ -519,23 +519,19 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
         mmff94_atom_vdw_params_t const p_atom = atom_vdw_params[atom];
         float const q_atom = atom_charge[atom];
 
-        // Nonbonded pairs, enumerated from bond_distance. Two passes: "j > atom" owns
-        // the pair's energy + adds this atom's gradient contribution as the first
-        // endpoint; "j < atom" adds this atom's gradient contribution as the second
-        // endpoint (no energy — already counted by the other thread when atom < j).
-        for (std::uint32_t j = atom + 1; j < num_atoms; ++j) {
+        // Nonbonded pairs, enumerated from bond_distance.  bond_distance is built
+        // by BFS over the undirected bond graph (molecule_descriptor.hpp::build),
+        // so it is symmetric — bond_distance[atom*N+j] == bond_distance[j*N+atom].
+        // We sweep j in a single contiguous row read; whichever endpoint has the
+        // lower index owns the pair's energy, the other endpoint contributes its
+        // gradient with first_endpoint=false.
+        for (std::uint32_t j = 0; j < num_atoms; ++j) {
+            if (j == atom) continue;
             std::uint8_t const bd = bond_distance[atom * num_atoms + j];
             if (bd < 3 || bd == 255) continue;
             mmff_nonbonded_contribution_(positions, num_atoms, atom, j, p_atom, atom_vdw_params[j],
-                                         q_atom * atom_charge[j], bd == 3, /*first_endpoint=*/true, &total_energy,
-                                         &gradient_x, &gradient_y, &gradient_z);
-        }
-        for (std::uint32_t j = 0; j < atom; ++j) {
-            std::uint8_t const bd = bond_distance[j * num_atoms + atom];
-            if (bd < 3 || bd == 255) continue;
-            mmff_nonbonded_contribution_(positions, num_atoms, atom, j, p_atom, atom_vdw_params[j],
-                                         q_atom * atom_charge[j], bd == 3, /*first_endpoint=*/false, &total_energy,
-                                         &gradient_x, &gradient_y, &gradient_z);
+                                         q_atom * atom_charge[j], bd == 3, /*first_endpoint=*/atom < j,
+                                         &total_energy, &gradient_x, &gradient_y, &gradient_z);
         }
 
         for (std::uint32_t index = offsets.bond_start; index < offsets.bond_start + offsets.bond_count; ++index)
