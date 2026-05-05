@@ -1,6 +1,7 @@
 /**
  *  @file warp_primitives.cuh
- *  @brief Shared warp-level constants, reduction primitives, and float3 vector helpers.
+ *  @brief Shared warp-level constants, reduction primitives, float3 vector helpers,
+ *         and tiny tensor-view types with debug-mode bounds checking.
  */
 
 #pragma once
@@ -16,6 +17,75 @@ namespace smallfield::cuda {
 
 constexpr std::uint32_t warp_size_k = 32;
 constexpr unsigned int full_mask_k = 0xFFFFFFFF;
+
+// Debug-only assertion that compiles to nothing in Release.  Use this to
+// guard pointer-math accesses (e.g. matrix_view_2d::operator()) so OOB
+// derefs trap immediately under compute-sanitizer / a debugger instead of
+// silently corrupting memory and crashing later somewhere unrelated.
+//
+//  - Device path: __trap() so compute-sanitizer captures the kernel
+//    offender with full thread/block coordinates.
+//  - Host path: __builtin_trap() so gdb / a core dump points at the bad
+//    caller.
+//  - Release (NDEBUG): no-op; same SASS as raw pointer math.
+#if defined(NDEBUG)
+#define sf_assert_(cond) ((void)0)
+#elif defined(__CUDA_ARCH__)
+#define sf_assert_(cond)                                                                                               \
+    do {                                                                                                               \
+        if (!(cond)) { __trap(); }                                                                                     \
+    } while (0)
+#else
+#define sf_assert_(cond)                                                                                               \
+    do {                                                                                                               \
+        if (!(cond)) { __builtin_trap(); }                                                                             \
+    } while (0)
+#endif
+
+/**
+ *  @brief Type-safe view of a row-major N×N matrix.
+ *
+ *  12 bytes (pointer + uint32 stride).  Trivially copyable so it passes
+ *  through `__global__` kernel arguments without a dance.  In Release
+ *  the @ref operator() compiles to the same SASS as raw `data[i*n+j]`.
+ *  In Debug (`!NDEBUG`) it asserts `i < n && j < n` and traps on OOB —
+ *  this is the guardrail that catches stride / offset bugs before they
+ *  silently corrupt neighbouring memory.
+ */
+template <typename value_type_>
+struct matrix_view_2d {
+    value_type_ *data = nullptr;
+    std::uint32_t n = 0;
+
+    constexpr matrix_view_2d() noexcept = default;
+    __host__ __device__ constexpr matrix_view_2d(value_type_ *data_, std::uint32_t n_) noexcept
+        : data(data_), n(n_) {}
+
+    __host__ __device__ __forceinline__ value_type_ &operator()(std::uint32_t i, std::uint32_t j) const noexcept {
+        sf_assert_(i < n && j < n);
+        return data[i * n + j];
+    }
+};
+
+/**
+ *  @brief Type-safe view of a SoA `[x0..xN, y0..yN, z0..zN]` 3-component
+ *  buffer.  Mirrors @ref load_position_ / @ref store_gradient_ semantics
+ *  with the same Debug-mode bounds check as @ref matrix_view_2d.
+ */
+template <typename value_type_>
+struct soa_view_3d {
+    value_type_ *data = nullptr;
+    std::uint32_t num_atoms = 0;
+
+    constexpr soa_view_3d() noexcept = default;
+    __host__ __device__ constexpr soa_view_3d(value_type_ *data_, std::uint32_t num_atoms_) noexcept
+        : data(data_), num_atoms(num_atoms_) {}
+
+    __host__ __device__ __forceinline__ value_type_ &component(std::uint32_t dim, std::uint32_t atom) const noexcept {
+        sf_assert_(dim < 3u && atom < num_atoms);
+        return data[dim * num_atoms + atom];
+    }
+};
 
 __device__ __forceinline__ float dot_float3_(float3 const &lhs, float3 const &rhs) {
     return fmaf(lhs.x, rhs.x, fmaf(lhs.y, rhs.y, lhs.z * rhs.z));
