@@ -222,52 +222,52 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
             }
         }
 
-        // chiral volume contributions for this atom
+        // chiral volume contributions for this atom; volume and gradient share
+        // the same edge_b/c/d and the cross(edge_c, edge_d) intermediate.
         if (atom_valid) {
             for (std::uint32_t c = 0; c < num_chiral_centers; ++c) {
                 auto const &center = chiral_centers[c];
-                float const volume = compute_signed_tetrahedral_volume_(
-                    positions, num_atoms, center.center_atom, center.neighbor_atoms[0], center.neighbor_atoms[1],
-                    center.neighbor_atoms[2]);
+                std::uint8_t const chiral_center_atom = center.center_atom;
+                std::uint8_t const chiral_neighbor_a = center.neighbor_atoms[0];
+                std::uint8_t const chiral_neighbor_b = center.neighbor_atoms[1];
+                std::uint8_t const chiral_neighbor_c = center.neighbor_atoms[2];
+
+                float3 const center_position = load_position_(positions, num_atoms, chiral_center_atom);
+                float3 const edge_b = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_a),
+                                                  center_position);
+                float3 const edge_c = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_b),
+                                                  center_position);
+                float3 const edge_d = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_c),
+                                                  center_position);
+                float3 const cross_cd = cross_float3_(edge_c, edge_d);
+                float const volume = dot_float3_(edge_b, cross_cd);
 
                 float const target_sign = static_cast<float>(center.target_sign);
                 if (volume * target_sign >= 0.0f) continue;
 
                 // only one thread per chiral center counts the energy
-                if (atom == center.center_atom) total_energy += chiral_volume_weight * volume * volume;
+                if (atom == chiral_center_atom) total_energy += chiral_volume_weight * volume * volume;
 
                 if constexpr (write_gradient) {
-                    // V = edge_b · (edge_c × edge_d) where edges are from the central atom.
-                    // Chain rule gives dV/dr_b = edge_c × edge_d, dV/dr_c = edge_d × edge_b,
-                    // dV/dr_d = edge_b × edge_c, and dV/dr_center = -(sum of the other three).
-                    std::uint8_t const chiral_center_atom = center.center_atom;
-                    std::uint8_t const chiral_neighbor_a = center.neighbor_atoms[0];
-                    std::uint8_t const chiral_neighbor_b = center.neighbor_atoms[1];
-                    std::uint8_t const chiral_neighbor_c = center.neighbor_atoms[2];
+                    // V = edge_b · (edge_c × edge_d).  Chain rule:
+                    //   dV/dr_b = edge_c × edge_d  (= cross_cd, already computed)
+                    //   dV/dr_c = edge_d × edge_b
+                    //   dV/dr_d = edge_b × edge_c
+                    //   dV/dr_center = -(dV/dr_b + dV/dr_c + dV/dr_d)
                     float const scale = 2.0f * chiral_volume_weight * volume;
-
-                    float3 const center_position = load_position_(positions, num_atoms, chiral_center_atom);
-                    float3 const edge_b = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_a),
-                                                      center_position);
-                    float3 const edge_c = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_b),
-                                                      center_position);
-                    float3 const edge_d = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_c),
-                                                      center_position);
-
                     auto add_scaled_to_grad_a_ = [&](float3 const &delta) {
                         grad_a[0] += scale * delta.x;
                         grad_a[1] += scale * delta.y;
                         grad_a[2] += scale * delta.z;
                     };
 
-                    if (atom == chiral_neighbor_a) { add_scaled_to_grad_a_(cross_float3_(edge_c, edge_d)); }
+                    if (atom == chiral_neighbor_a) { add_scaled_to_grad_a_(cross_cd); }
                     else if (atom == chiral_neighbor_b) { add_scaled_to_grad_a_(cross_float3_(edge_d, edge_b)); }
                     else if (atom == chiral_neighbor_c) { add_scaled_to_grad_a_(cross_float3_(edge_b, edge_c)); }
                     else if (atom == chiral_center_atom) {
-                        float3 const dvdb = cross_float3_(edge_c, edge_d);
                         float3 const dvdc = cross_float3_(edge_d, edge_b);
                         float3 const dvdd = cross_float3_(edge_b, edge_c);
-                        add_scaled_to_grad_a_(scale_float3_(add_float3_(add_float3_(dvdb, dvdc), dvdd), -1.0f));
+                        add_scaled_to_grad_a_(scale_float3_(add_float3_(add_float3_(cross_cd, dvdc), dvdd), -1.0f));
                     }
                 }
             }

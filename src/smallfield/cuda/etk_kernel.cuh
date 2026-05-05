@@ -25,30 +25,6 @@
 namespace smallfield::cuda {
 using namespace smallfield::types;
 
-/** Compute dihedral angle φ for atoms i-j-k-l. Returns radians in [-π, π]. */
-__device__ __forceinline__ float compute_dihedral_angle_(float const *positions, std::uint32_t num_atoms,
-                                                         std::uint8_t atom_i, std::uint8_t atom_j, std::uint8_t atom_k,
-                                                         std::uint8_t atom_l) {
-    float3 const position_i = load_position_(positions, num_atoms, atom_i);
-    float3 const position_j = load_position_(positions, num_atoms, atom_j);
-    float3 const position_k = load_position_(positions, num_atoms, atom_k);
-    float3 const position_l = load_position_(positions, num_atoms, atom_l);
-
-    float3 const bond_ij = sub_float3_(position_j, position_i);
-    float3 const bond_jk = sub_float3_(position_k, position_j);
-    float3 const bond_kl = sub_float3_(position_l, position_k);
-
-    float3 const normal_ijk = cross_float3_(bond_ij, bond_jk);
-    float3 const normal_jkl = cross_float3_(bond_jk, bond_kl);
-
-    float const dot_normals = dot_float3_(normal_ijk, normal_jkl);
-    float const triple_product = dot_float3_(cross_float3_(normal_ijk, normal_jkl), bond_jk);
-
-    float const inverse_bond_jk_length = rsqrtf(fmaxf(dot_float3_(bond_jk, bond_jk), 1e-10f));
-
-    return atan2f(triple_product * inverse_bond_jk_length, dot_normals);
-}
-
 /**
  *  @brief Compute torsion energy and per-atom gradient using the Wilson B-matrix approach.
  *
