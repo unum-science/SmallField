@@ -1025,6 +1025,8 @@ inline void prepare_molecule_into(std::string_view smiles, etkdg_prepared_molecu
     result.metadata.mmff_atom_offsets_start = 0;
     result.metadata.etk_interaction_offset = 0;
     result.metadata.etk_atom_offsets_start = 0;
+    result.metadata.bounds_min = 0.0f;
+    result.metadata.bounds_inv_scale = 1.0f;
 }
 
 /**

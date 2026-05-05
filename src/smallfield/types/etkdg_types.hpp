@@ -77,6 +77,18 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t etk_interaction_offset; ///< offset into batched ETK interaction list
     std::uint32_t etk_atom_offsets_start; ///< offset into batched ETK atom offsets
     /**
+     *  @brief Reserved for a future host-side bounds quantisation step.
+     *
+     *  The current pipeline computes per-molecule (mol_min, inv_scale) inside
+     *  etkdg_pipeline_warp_kernel because the metric prepass smooths bounds in
+     *  global memory and the quantise step must scan the *post-smoothed*
+     *  values.  If smoothing ever moves host-side these slots can carry the
+     *  pre-quantised range — until then they are unused (set to {0, 1} by
+     *  prepare_molecule_into) and the kernel ignores them.
+     */
+    float bounds_min;
+    float bounds_inv_scale;
+    /**
      *  @brief Optional readback fields, populated by preprocess and bubbled to the
      *  caller via the corresponding output spans on @ref context_t::generate_conformers.
      *  GPU kernels do NOT read these — they are pure host-side passthroughs computed

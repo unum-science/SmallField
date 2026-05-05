@@ -297,12 +297,15 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         off += dimensions_4d;
         float *gradient = shared_float + off;
 
-        // Bounds quantization: Load pre-smoothed bounds, find per-molecule [min, max],
-        // and int8-quantize into shared memory.  Linear quantization:
-        // `q = round((x − mol_min) · scale_quantize)`,
-        // `x ≈ q · inv_scale + mol_min` at read.  Halves bounds storage vs the
-        // old __half layout (N² bytes vs 2 N²) and keeps the per-molecule
-        // dequant pair (mol_min, inv_scale) in registers — broadcast across lanes.
+        // Bounds quantization: Load post-smoothed bounds (the metric prepass
+        // wrote smoothed bounds back into global memory at meta.bounds_offset),
+        // find per-molecule [min, max] across the warp, and int8-quantize into
+        // shared memory.  Linear quantization:
+        //   q = round((x − mol_min) · scale_quantize),
+        //   x ≈ q · inv_scale + mol_min at read.
+        // The min/max scan must run on the *post-smoothed* values — host-side
+        // precompute in prepare_molecule_into would be over the un-smoothed
+        // matrix and produces a different range, breaking the dequantisation.
         std::uint32_t const bounds_size = num_atoms * num_atoms;
         float const *global_bounds = bounds_matrices + meta.bounds_offset;
 
