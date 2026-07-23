@@ -4,6 +4,9 @@
 # per molecule.  Three-tier fallback: GPU → RDKit → NULL.
 
 option(SMALLFIELD_BUILD_BATCH_BINARY "Build smallfield_batch CLI (requires Apache Arrow)" OFF)
+# Opt-in host-side NVTX ranges for `nsys` timelines.  Header-only (NVTX3 ships with
+# the CUDA toolkit); compiles to nothing when OFF, so shipping builds are unaffected.
+option(SMALLFIELD_ENABLE_NVTX "Annotate batch pipeline roles with NVTX ranges" OFF)
 
 if(NOT SMALLFIELD_BUILD_BATCH_BINARY)
     return()
@@ -45,3 +48,7 @@ set_target_properties(smallfield_batch PROPERTIES
     LINKER_LANGUAGE CUDA)
 
 message(STATUS "SmallField batch binary: ENABLED")
+
+if(SMALLFIELD_ENABLE_NVTX)
+    target_compile_definitions(smallfield_batch PRIVATE SMALLFIELD_ENABLE_NVTX)
+endif()

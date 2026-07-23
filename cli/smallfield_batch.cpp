@@ -38,6 +38,7 @@
 
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/log.hpp"
+#include "smallfield/nvtx.hpp"
 
 #include "parquet_reader.hpp"
 #include "parquet_writer.hpp"
@@ -430,6 +431,7 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
     for (;;) {
         auto accumulator = in.receive();
         if (accumulator.done) break;
+        SMALLFIELD_NVTX_RANGE_COLORED("gpu_runner: preprocess+launch", 0x2E86C1);
 
         std::uint64_t const num_molecules = accumulator.total_molecules;
         std::uint64_t const total_conformers = num_molecules * config.num_conformers;
@@ -528,6 +530,7 @@ void fallback_loop(cli_config_t const &config, thread_budget_t const &budget, ha
         auto &acc = result.accumulator;
         std::uint64_t const num_molecules = acc.total_molecules;
         std::uint64_t const total_conformers = num_molecules * config.num_conformers;
+        SMALLFIELD_NVTX_RANGE_COLORED("fallback: rdkit recovery", 0xE67E22);
 
         if (!buf->retry_indices.empty()) {
             sfcli::rdkit_fallback_inputs_t fallback_inputs {
@@ -565,6 +568,7 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
         output_buffers_t *buf = result.buffers;
         auto &acc = result.accumulator;
         std::uint64_t const num_molecules = acc.total_molecules;
+        SMALLFIELD_NVTX_RANGE_COLORED("writer: parquet", 0x27AE60);
 
         // Populate n_conformers_per_molecule. Without Kabsch dedup (task #23 will plug it in
         // here), surviving molecules emit all K candidate slots; failed mols emit zero.

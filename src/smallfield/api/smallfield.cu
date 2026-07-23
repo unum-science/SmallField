@@ -32,6 +32,7 @@ namespace py = pybind11;
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/cuda/metric_embedding_prepass.cuh"
 #include "smallfield/api/smallfield.hpp"
+#include "smallfield/nvtx.hpp"
 
 namespace smallfield::api {
 using namespace smallfield::cuda;
@@ -914,6 +915,7 @@ conformer_status_t context_t::generate_conformers(
     // longer share a pinned source or a driver-lock contention window.
     auto launch_wave = [&](std::span<batch_pool_t const> per_device_batches, std::uint32_t wave_base,
                            std::vector<gpu_pipeline_handle_t> &handles_out, std::vector<gpu_phase_ms_t> &timings_out) {
+        SMALLFIELD_NVTX_RANGE_COLORED("launch: gpu dispatch", 0x2E86C1);
         bool any_molecules = false;
         for (std::uint32_t d = 0; d < num_devices; ++d)
             if (per_device_batches[d].num_molecules > 0) {
@@ -974,6 +976,7 @@ conformer_status_t context_t::generate_conformers(
     // and retries via ETKDGv3 where appropriate.
     std::vector<rejected_mol_t> rejected_buf;
     auto prep_slice_into_slot = [&](std::size_t slot, std::uint32_t begin, std::uint32_t end) {
+        SMALLFIELD_NVTX_RANGE_COLORED("prep: rdkit preprocess", 0x8E44AD);
         std::span<batch_pool_t, max_devices_k> slot_span {batch_slots_per_device[slot].data(), max_devices_k};
         prepare_per_device_batches_into(smiles_view.subspan(begin, end - begin), num_devices, slot_span,
                                         scaffold_cache.get(), &rejected_buf);
