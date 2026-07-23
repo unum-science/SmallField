@@ -66,7 +66,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     // Halgren R* combining rule with donor-suppression clause, plus Slater-Kirkwood epsilon.
     float const vdw_radius_i = p_atom.r_star;
     float const vdw_radius_j = p_other.r_star;
-    float const gamma = (vdw_radius_i - vdw_radius_j) * __frcp_rn(vdw_radius_i + vdw_radius_j);
+    float const gamma = (vdw_radius_i - vdw_radius_j) * (1.0f / (vdw_radius_i + vdw_radius_j));
     bool const has_donor = (p_atom.donor_acceptor == 2) || (p_other.donor_acceptor == 2);
     float const factor = has_donor ? 0.0f : 0.2f * (1.0f - expf(-12.0f * gamma * gamma));
     float vdw_radius_combined = 0.5f * (vdw_radius_i + vdw_radius_j) * (1.0f + factor);
@@ -74,9 +74,9 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const vdw_radius_squared = vdw_radius_combined * vdw_radius_combined;
     float const vdw_radius_pow6 = vdw_radius_squared * vdw_radius_squared * vdw_radius_squared;
     float vdw_epsilon = 181.16f * p_atom.g_factor * p_other.g_factor * p_atom.alpha * p_other.alpha *
-                        __frcp_rn((sqrtf(p_atom.alpha * __frcp_rn(p_atom.n_effective)) +
-                                   sqrtf(p_other.alpha * __frcp_rn(p_other.n_effective))) *
-                                  vdw_radius_pow6);
+                        (1.0f / ((sqrtf(p_atom.alpha * (1.0f / (p_atom.n_effective))) +
+                                   sqrtf(p_other.alpha * (1.0f / (p_other.n_effective)))) *
+                                  vdw_radius_pow6));
 
     // Donor-acceptor scaling (RDKit's scaleVdWParams when DA pairing is detected).
     bool const is_donor_acceptor_pair = (p_atom.donor_acceptor == 2 && p_other.donor_acceptor == 1) ||
@@ -94,28 +94,28 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const distance = distance_squared * inverse_distance;
 
     // VdW buffered 14-7 energy and gradient.
-    float const density_ratio = distance * __frcp_rn(vdw_radius_combined); // ρ = r / R*
+    float const density_ratio = distance * (1.0f / (vdw_radius_combined)); // ρ = r / R*
     float const density_ratio_pow7 = density_ratio * density_ratio * density_ratio * density_ratio * density_ratio *
                                      density_ratio * density_ratio;
     float const repulsion_denominator = density_ratio + mmff_vdw_delta_k; // ρ + δ
-    float const repulsion_base = (1.0f + mmff_vdw_delta_k) * __frcp_rn(repulsion_denominator);
+    float const repulsion_base = (1.0f + mmff_vdw_delta_k) * (1.0f / (repulsion_denominator));
     float const repulsion_pow7 = repulsion_base * repulsion_base * repulsion_base * repulsion_base * repulsion_base *
                                  repulsion_base * repulsion_base;
-    float const attractive_term = (1.0f + mmff_vdw_gamma_k) * __frcp_rn(density_ratio_pow7 + mmff_vdw_gamma_k) - 2.0f;
+    float const attractive_term = (1.0f + mmff_vdw_gamma_k) * (1.0f / (density_ratio_pow7 + mmff_vdw_gamma_k)) - 2.0f;
     float const energy_vdw = vdw_epsilon * repulsion_pow7 * attractive_term;
-    float const d_repulsion = -7.0f * repulsion_pow7 * __frcp_rn(repulsion_denominator);
+    float const d_repulsion = -7.0f * repulsion_pow7 * (1.0f / (repulsion_denominator));
     float const d_attractive = -7.0f * (1.0f + mmff_vdw_gamma_k) * density_ratio_pow7 *
-                               __frcp_rn(density_ratio * (density_ratio_pow7 + mmff_vdw_gamma_k) *
-                                         (density_ratio_pow7 + mmff_vdw_gamma_k));
+                               (1.0f / (density_ratio * (density_ratio_pow7 + mmff_vdw_gamma_k) *
+                                         (density_ratio_pow7 + mmff_vdw_gamma_k)));
     float const energy_gradient_vdw = vdw_epsilon * (d_repulsion * attractive_term + repulsion_pow7 * d_attractive) *
-                                      __frcp_rn(vdw_radius_combined);
+                                      (1.0f / (vdw_radius_combined));
 
     // Electrostatic energy and gradient.
     float const scale = is_1_4 ? mmff_1_4_scale_k : 1.0f;
     float const buffered_distance = distance + mmff_electrostatic_buffer_k;
-    float const energy_electrostatic = mmff_coulomb_k * charge_product * __frcp_rn(buffered_distance) * scale;
+    float const energy_electrostatic = mmff_coulomb_k * charge_product * (1.0f / (buffered_distance)) * scale;
     float const energy_gradient_electrostatic = -mmff_coulomb_k * charge_product *
-                                                __frcp_rn(buffered_distance * buffered_distance) * scale;
+                                                (1.0f / (buffered_distance * buffered_distance)) * scale;
 
     // Only the lower-index endpoint adds to total energy.
     if (first_endpoint) *energy += energy_vdw + energy_electrostatic;
@@ -201,7 +201,7 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
     // to work with the -1/sinθ chain rule.
     float const energy_gradient_angle = mmff_radians_to_degrees_k * mmff_angle_prefactor_k * angle.force_constant *
                                         dtheta_deg * (1.0f + 1.5f * mmff_angle_cubic_bend_k * dtheta_deg);
-    float const factor = energy_gradient_angle * (-__frcp_rn(sin_theta));
+    float const factor = energy_gradient_angle * (-(1.0f / (sin_theta)));
 
     float3 grad {0.0f, 0.0f, 0.0f};
     if (role == atom_role_first_k) {
@@ -423,7 +423,7 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
 
     // bend gradient component: ∂E/∂θ * dtheta/dr
     float const energy_gradient_angle = mmff_stretch_bend_prefactor_k * stretch_term * mmff_radians_to_degrees_k;
-    float const bend_factor = energy_gradient_angle * (-__frcp_rn(fmaxf(sin_theta, 1e-6f)));
+    float const bend_factor = energy_gradient_angle * (-(1.0f / (fmaxf(sin_theta, 1e-6f))));
 
     auto stretch_plus_bend_first_ = [&]() {
         return add_float3_(scale_float3_(unit_ij, energy_gradient_distance_ij),

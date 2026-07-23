@@ -97,7 +97,7 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
             velocity_dot_velocity += __shfl_xor_sync(full_mask_k, velocity_dot_velocity, offset);
         }
 
-        float const rms_gradient = sqrtf(gradient_dot_gradient * __frcp_rn(static_cast<float>(num_elements)));
+        float const rms_gradient = sqrtf(gradient_dot_gradient / static_cast<float>(num_elements));
         last_rms_gradient = rms_gradient;
         if (rms_gradient < gradient_threshold) {
             return {energy, rms_gradient, iteration, 0};
