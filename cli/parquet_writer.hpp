@@ -53,6 +53,8 @@ struct writer_inputs_t {
     // Per-conformer slot arrays (length == num_molecules * max_conformers). Writer only reads the
     // first `n_conformers_per_molecule[m]` slots per molecule — slots [M..K) are unused.
     std::span<std::uint8_t const> status;
+    /// Slot-addressed via `smallfield::api::conformer_slot_layout_t{max_atoms, max_conformers}`;
+    /// structure-of-arrays within each slot, filled by either the GPU or the RDKit fallback.
     std::span<__half const> coordinates;
     std::span<float const> energies;
 };

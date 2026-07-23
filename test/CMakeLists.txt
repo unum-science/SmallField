@@ -48,6 +48,7 @@ add_mixed_test(kernels mmff_gradient)
 
 # --- preprocess/ ---
 add_mixed_test(preprocess chirality)
+add_cpp_test(api conformer_slot_layout)
 add_cpp_test(preprocess descriptor)
 add_cpp_test(preprocess native_murcko)
 add_cpp_test(preprocess csd_torsion_predicates)

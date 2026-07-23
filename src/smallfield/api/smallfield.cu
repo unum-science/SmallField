@@ -691,10 +691,15 @@ void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
             __half *dest_slot = handle.host_coords_out.data() + static_cast<std::size_t>(destination_slot) * host_coord_stride;
             __half const *source_slot_ptr =
                 handle.host_coords_sorted.data() + static_cast<std::size_t>(source_slot) * gpu_coord_stride;
-            for (std::uint32_t dim = 0; dim < 3; ++dim) {
-                std::memcpy(dest_slot + dim * handle.host_max_atoms, source_slot_ptr + dim * handle.gpu_max_atoms,
+            // Both sides are structure-of-arrays but with different strides, so copy
+            // component-by-component.  See `conformer_slot_layout_t` for the contract
+            // shared with the RDKit fallback producer and the Parquet writer.
+            conformer_slot_layout_t const destination_layout {handle.host_max_atoms, 1u};
+            conformer_slot_layout_t const source_layout {handle.gpu_max_atoms, 1u};
+            for (std::uint32_t axis = 0; axis < 3u; ++axis)
+                std::memcpy(dest_slot + destination_layout.component_offset(axis, 0u),
+                            source_slot_ptr + source_layout.component_offset(axis, 0u),
                             handle.gpu_max_atoms * sizeof(__half));
-            }
         }
     }
 }

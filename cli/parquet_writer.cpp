@@ -16,6 +16,8 @@
 #include <arrow/util/float16.h>
 #include <parquet/arrow/writer.h>
 
+#include "smallfield/api/conformer_layout.hpp"
+
 namespace smallfield::cli {
 
 namespace fs = std::filesystem;
@@ -48,6 +50,7 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
     std::span<std::uint32_t const> conformer_slot_per_row, std::uint32_t max_conformers, std::uint32_t stride_halves) {
 
     std::int64_t const num_rows = static_cast<std::int64_t>(row_outcomes.size());
+    smallfield::api::conformer_slot_layout_t const slot_layout {stride_halves / 3u, max_conformers};
 
     // Prefix-scan total halves needed (only success rows contribute > 0).
     // Caller (write_shard) is responsible for the size invariants on
@@ -64,7 +67,11 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
         if (row_outcomes[r] != 1) continue;
         std::uint64_t const m = molecule_index_per_row[r];
         if (m >= num_atoms_per_molecule.size()) return nullptr; // caller-contract violation
-        total_halves += static_cast<std::int64_t>(num_atoms_per_molecule[m]) * 3;
+        // Clamp exactly as the emit loop below does, so the allocation and the
+        // offsets stay in agreement when a caller reports more atoms than fit.
+        std::uint32_t atom_count = static_cast<std::uint32_t>(num_atoms_per_molecule[m]);
+        if (atom_count > slot_layout.max_atoms) atom_count = slot_layout.max_atoms;
+        total_halves += static_cast<std::int64_t>(atom_count) * 3;
     }
 
     auto offsets_buffer_result = arrow::AllocateBuffer((num_rows + 1) * sizeof(std::int32_t));
@@ -92,17 +99,23 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
         if (row_outcomes[r] == 1) {
             std::uint64_t const m = molecule_index_per_row[r];
             std::uint32_t const c = conformer_slot_per_row[r];
-            std::uint32_t row_halves = static_cast<std::uint32_t>(num_atoms_per_molecule[m]) * 3u;
+            std::uint32_t const max_atoms = slot_layout.max_atoms;
             // Defence against a contract-violating caller: per-mol num_atoms must
             // fit in the stride.  Clamp rather than OOB; the slot's coords beyond
             // stride_halves don't exist in `coordinates` regardless.
-            if (row_halves > stride_halves) row_halves = stride_halves;
-            if (row_halves > 0) {
-                std::size_t const src_offset = (static_cast<std::size_t>(m) * max_conformers + c) * stride_halves;
-                if (src_offset + row_halves > coordinates.size()) return nullptr;
+            std::uint32_t atom_count = static_cast<std::uint32_t>(num_atoms_per_molecule[m]);
+            if (atom_count > max_atoms) atom_count = max_atoms;
+            if (atom_count > 0) {
+                std::size_t const src_offset = slot_layout.slot_offset(m, c);
+                if (src_offset + stride_halves > coordinates.size()) return nullptr;
                 std::uint16_t const *src = reinterpret_cast<std::uint16_t const *>(coordinates.data()) + src_offset;
-                std::memcpy(values + running, src, row_halves * sizeof(std::uint16_t));
-                running += static_cast<std::int32_t>(row_halves);
+                // Transpose the structure-of-arrays slot into the tight interleaved
+                // `(atom_count, 3)` block a Parquet row exposes.  See
+                // `conformer_slot_layout_t` for why a contiguous copy is not valid here.
+                for (std::uint32_t atom = 0; atom < atom_count; ++atom)
+                    for (std::uint32_t axis = 0; axis < 3u; ++axis)
+                        values[running + atom * 3u + axis] = src[slot_layout.component_offset(axis, atom)];
+                running += static_cast<std::int32_t>(atom_count * 3u);
             }
             validity[r >> 3] |= static_cast<std::uint8_t>(1u << (r & 7));
         }

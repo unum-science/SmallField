@@ -49,7 +49,8 @@ static void warm_up_rdkit_globals_for_fallback_() {
 std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallback_outputs_t &outputs) {
     std::uint32_t const num_conformers = inputs.num_conformers;
     std::uint32_t const max_atoms = inputs.max_atoms;
-    std::uint32_t const coordinate_stride = max_atoms * 3;
+    sfapi::conformer_slot_layout_t const slot_layout {max_atoms, num_conformers};
+    std::uint32_t const coordinate_stride = static_cast<std::uint32_t>(slot_layout.slot_stride());
     std::uint64_t const num_retries = inputs.retry_indices.size();
 
     if (num_retries == 0) return 0;
@@ -165,11 +166,15 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
             std::memset(reinterpret_cast<void *>(outputs.coordinates.data() + coord_base), 0,
                         sizeof(__half) * coordinate_stride);
 
+            // Slot layout is shared with the GPU producer -- see `conformer_slot_layout_t`.
             for (unsigned int atom_index = 0; atom_index < mol->getNumAtoms(); ++atom_index) {
                 auto const &position = conformer.getAtomPos(atom_index);
-                outputs.coordinates[coord_base + atom_index * 3 + 0] = __float2half(static_cast<float>(position.x));
-                outputs.coordinates[coord_base + atom_index * 3 + 1] = __float2half(static_cast<float>(position.y));
-                outputs.coordinates[coord_base + atom_index * 3 + 2] = __float2half(static_cast<float>(position.z));
+                outputs.coordinates[coord_base + slot_layout.component_offset(0u, atom_index)] =
+                    __float2half(static_cast<float>(position.x));
+                outputs.coordinates[coord_base + slot_layout.component_offset(1u, atom_index)] =
+                    __float2half(static_cast<float>(position.y));
+                outputs.coordinates[coord_base + slot_layout.component_offset(2u, atom_index)] =
+                    __float2half(static_cast<float>(position.z));
             }
 
             outputs.energies[molecule_index * num_conformers + conformer_slot] = energy_kcal_per_mol;

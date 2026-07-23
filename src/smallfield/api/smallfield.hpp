@@ -42,6 +42,7 @@ using cudaStream_t = void *;
 #include <vector>
 
 #include "smallfield/api/batch_pool.hpp"
+#include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/api/conformer_status.hpp"
 #include "smallfield/log.hpp"
 
@@ -77,13 +78,13 @@ inline constexpr std::array<std::uint32_t, atom_limited_bin_count_k> atom_limite
     16, 32, 48, 64, 80, 96, 112, 128,
 };
 
-/** @brief Maximum atom count the kernels support per molecule.  Matches
- *  `molecule_descriptor_t::max_atoms_k`; larger molecules are rejected by
- *  preprocess with `conformer_status_t::too_many_atoms`. */
-inline constexpr std::uint32_t max_atoms_per_molecule_k = 128;
+// `max_atoms_per_molecule_k` lives in `conformer_layout.hpp` (included above); it
+// matches `molecule_descriptor_t::max_atoms_k`, and larger molecules are rejected by
+// preprocess with `conformer_status_t::too_many_atoms`.
 
 /** @brief Worst-case conformer count used for pre-allocation at construction. */
 inline constexpr std::uint32_t max_conformer_count_k = 16;
+
 
 /**
  *  @brief Per-device launch-configuration cache populated once at `context_t`
@@ -205,6 +206,8 @@ struct context_t {
      *  @param[in] max_atoms_per_molecule Maximum atom count (with H) across the batch.
      *      Molecules exceeding this are skipped.
      *  @param[out] coordinates_out Output half-precision coordinates. Size: molecules * conformers * max_atoms * 3.
+     *      Structure-of-arrays per slot -- address it through @ref conformer_slot_layout_t,
+     *      never by a contiguous `3 * num_atoms` read from the slot base.
      *  @param[out] energies_out Output MMFF94 energies (kcal/mol). Size: molecules * conformers.
      *  @param[out] status_out Output per-conformer status. Size: molecules * conformers.
      *  @param[out] num_atoms_out Optional. If non-empty, filled with each `molecule`'s
