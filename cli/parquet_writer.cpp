@@ -393,7 +393,11 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     provenance->Append("num_conformers", std::to_string(max_conformers));
     provenance->Append("max_atoms", std::to_string(inputs.max_atoms));
     if (!inputs.dataset.empty()) provenance->Append("dataset", inputs.dataset);
-    provenance->Append("coordinate_frame", "principal-axis");
+    // Coordinates are centroid-centered but orientation is not canonicalized: the metric
+    // embedding aligns to principal axes, but the subsequent FIRE/MMFF relaxation drifts the
+    // pose off that frame. Report the frame we actually ship. A true canonical principal-axis
+    // pose (a final reframe with a fixed sign convention) is a possible future enhancement.
+    provenance->Append("coordinate_frame", "centered");
     provenance->Append("schema_version", "2");
     provenance->Append("dedup", "none");
 
