@@ -15,14 +15,18 @@
  *  only the per-slot failures are re-embedded; partial GPU successes are kept.
  */
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -36,9 +40,11 @@
 
 #include <cuda_fp16.h>
 
+#include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/log.hpp"
 #include "smallfield/nvtx.hpp"
+#include "smallfield/postprocess.hpp"
 
 #include "parquet_reader.hpp"
 #include "parquet_writer.hpp"
@@ -48,14 +54,25 @@
 namespace fs = std::filesystem;
 namespace sfapi = smallfield::api;
 namespace sfcli = smallfield::cli;
+namespace sfpost = smallfield::postprocess;
 using smallfield::logger_t;
 using smallfield::thousands;
+
+/** Set by SIGINT/SIGTERM.  The reader-role stops feeding new shards at the next shard boundary so
+ *  in-flight batches drain and their shards are written before the pipeline exits cleanly (exit 0).
+ *  This is the graceful pre-emption path: no partial-shard loss, and resume skips the completed
+ *  shards.  Async-signal-safe: a lock-free atomic flag, nothing else touched in the handler. */
+namespace {
+std::atomic<bool> g_stop_requested {false};
+extern "C" void handle_stop_signal(int) { g_stop_requested.store(true, std::memory_order_relaxed); }
+} // namespace
 
 /** All CLI flags.  Immutable after parse. */
 struct cli_config_t {
     fs::path input_dir;
     fs::path output_dir;
     std::string smiles_column = "smiles";
+    std::string dataset; ///< provenance dataset name (e.g. "pubchem", "gdb13"); "" = omit from metadata
     std::uint32_t num_conformers = 3;
     std::uint32_t max_atoms = 128;
     /** @brief Target `coprocessed-batch` size in molecules; 0 = auto (100 K per visible GPU). */
@@ -75,6 +92,7 @@ void print_usage() {
   --output DIR                folder for output parquet-shards (*.3D.parquet)
                               (default: same as --input — sister files alongside)
   --smiles-column NAME        input column name (default: smiles)
+  --dataset NAME              provenance dataset name embedded in output metadata (e.g. gdb13)
   --num-conformers K          conformers per molecule (default: 3)
   --max-atoms N               per-molecule atom cap (default: 128)
   --batch-size N              molecules per coprocessed-batch (default: auto = 100K per GPU)
@@ -126,6 +144,11 @@ bool parse_cli(int argc, char **argv, cli_config_t &config) {
             auto value = require_value("smiles-column");
             if (!value) return false;
             config.smiles_column = value;
+        }
+        else if (flag == "--dataset") {
+            auto value = require_value("dataset");
+            if (!value) return false;
+            config.dataset = value;
         }
         else if (flag == "--num-conformers") {
             auto value = require_value("num-conformers");
@@ -204,7 +227,9 @@ struct output_buffers_t {
     std::vector<std::uint16_t> num_heavy_atoms_per_molecule;
     std::vector<std::uint16_t> num_bonds_per_molecule;
     std::vector<float> molecular_weight_per_molecule;
-    std::vector<std::uint8_t> n_conformers_per_molecule; ///< M, post-Kabsch dedup (0 if mol failed)
+    std::vector<std::uint8_t> n_conformers_per_molecule; ///< K conformers per molecule (0 if mol failed)
+    std::vector<double> usr;                             ///< 12 per conformer slot
+    std::vector<double> usrcat;                          ///< 60 per conformer slot
     std::vector<std::uint32_t> retry_indices;
 
     void resize_for(std::uint64_t num_molecules, std::uint32_t num_conformers, std::uint32_t max_atoms) {
@@ -212,6 +237,8 @@ struct output_buffers_t {
         std::size_t const coordinate_total = total_conformers * max_atoms * 3u;
         if (coordinates.size() < coordinate_total) coordinates.resize(coordinate_total);
         if (energies.size() < total_conformers) energies.resize(total_conformers);
+        if (usr.size() < total_conformers * 12u) usr.resize(total_conformers * 12u);
+        if (usrcat.size() < total_conformers * 60u) usrcat.resize(total_conformers * 60u);
         if (status.size() < total_conformers) status.resize(total_conformers);
         if (status_codes.size() < total_conformers) status_codes.resize(total_conformers);
         if (solver_codes.size() < total_conformers) solver_codes.resize(total_conformers);
@@ -398,6 +425,12 @@ void reader_loop(std::vector<sfcli::shard_pair_t const *> const &pending, cli_co
     coprocessed_batch_accumulator_t accumulator;
 
     for (auto const *pair : pending) {
+        // Graceful pre-emption: stop enqueuing new shards at this boundary; already-accumulated and
+        // in-flight batches still drain and get written below, then the pipeline exits cleanly.
+        if (g_stop_requested.load(std::memory_order_relaxed)) {
+            logger.info("stop requested — draining in-flight work and exiting");
+            break;
+        }
         sfcli::shard_data_t data;
         if (!sfcli::read_shard(pair->input_path, config.smiles_column, data)) {
             logger.error("read failed, skipping: {}", pair->input_path.string());
@@ -515,6 +548,63 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
     out.send(std::move(sentinel));
 }
 
+/** Compute USR/USRCAT shape descriptors and separate disconnected fragments on the finished
+ *  coordinates of a batch, after the RDKit fallback so every slot is final.  Pharmacophores are
+ *  typed once per molecule (`build_shape_context`); then, per successful conformer, the
+ *  structure-of-arrays slot is read into an interleaved `(atom, 3)` block, multi-fragment geometry
+ *  is separated in place and written back so the writer emits the fixed coordinates, and the 12-dim
+ *  USR + 60-dim USRCAT vectors are computed.  Descriptors for non-success or preprocess-failed slots
+ *  stay zero (the writer nulls those rows).  Reuses the fallback-role thread budget. */
+void compute_shape_descriptors(cli_config_t const &config, thread_budget_t const &budget,
+                               coprocessed_batch_accumulator_t const &acc, output_buffers_t *buf) {
+    std::uint64_t const num_molecules = acc.total_molecules;
+    std::uint32_t const num_conformers = config.num_conformers;
+    std::uint32_t const max_atoms = config.max_atoms;
+    sfapi::conformer_slot_layout_t const slot_layout {max_atoms, num_conformers};
+    std::uint64_t const total_conformers = num_molecules * num_conformers;
+    std::fill_n(buf->usr.data(), total_conformers * 12u, 0.0);
+    std::fill_n(buf->usrcat.data(), total_conformers * 60u, 0.0);
+    int const threads = budget.fallback > 0 ? budget.fallback : omp_get_max_threads();
+
+#pragma omp parallel for schedule(dynamic, 256) num_threads(threads) if (threads > 1)
+    for (std::uint64_t m = 0; m < num_molecules; ++m) {
+        std::uint8_t const num_atoms_u8 = buf->num_atoms_per_molecule[m];
+        if (num_atoms_u8 == 0) continue; // preprocess failed: no coordinates to describe
+        sfpost::molecule_shape_context_t const context = sfpost::build_shape_context(acc.combined_smiles[m]);
+        // Guard: the descriptor parse must reproduce the exact atom order the coordinates were
+        // written in.  Same parse params make this deterministic; a mismatch means skip, not corrupt.
+        if (!context.ok || context.num_atoms != num_atoms_u8) continue;
+        std::uint32_t const num_atoms = num_atoms_u8;
+
+        std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
+        for (std::uint32_t conformer = 0; conformer < num_conformers; ++conformer) {
+            std::uint64_t const flat = m * num_conformers + conformer;
+            if (buf->status_codes[flat] != static_cast<std::uint8_t>(sfapi::conformer_status_t::success)) continue;
+            std::size_t const slot_base = slot_layout.slot_offset(m, conformer);
+            for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
+                for (std::uint32_t axis = 0; axis < 3u; ++axis)
+                    interleaved[atom * 3u + axis] =
+                        __half2float(buf->coordinates[slot_base + slot_layout.component_offset(axis, atom)]);
+
+            std::span<float> coords_view {interleaved.data(), static_cast<std::size_t>(num_atoms) * 3u};
+            if (context.num_components > 1) {
+                sfpost::separate_fragments(coords_view, context);
+                for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
+                    for (std::uint32_t axis = 0; axis < 3u; ++axis)
+                        buf->coordinates[slot_base + slot_layout.component_offset(axis, atom)] =
+                            __float2half(interleaved[atom * 3u + axis]);
+            }
+
+            std::array<double, 12> usr {};
+            std::array<double, 60> usrcat {};
+            sfpost::usr_descriptor(coords_view, num_atoms, usr);
+            sfpost::usrcat_descriptor(coords_view, context, usrcat);
+            std::copy(usr.begin(), usr.end(), buf->usr.data() + flat * 12u);
+            std::copy(usrcat.begin(), usrcat.end(), buf->usrcat.data() + flat * 60u);
+        }
+    }
+}
+
 void fallback_loop(cli_config_t const &config, thread_budget_t const &budget, handoff_t<coprocessed_batch_result_t> &in,
                    handoff_t<coprocessed_batch_result_t> &out) {
     omp_set_num_threads(budget.fallback);
@@ -553,6 +643,11 @@ void fallback_loop(cli_config_t const &config, thread_budget_t const &budget, ha
             result.fallback_recovered = num_recovered;
         }
 
+        {
+            SMALLFIELD_NVTX_RANGE_COLORED("postprocess: descriptors+fragments", 0x8E44AD);
+            compute_shape_descriptors(config, budget, acc, buf);
+        }
+
         out.send(std::move(result));
     }
 }
@@ -570,9 +665,10 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
         std::uint64_t const num_molecules = acc.total_molecules;
         SMALLFIELD_NVTX_RANGE_COLORED("writer: parquet", 0x27AE60);
 
-        // Populate n_conformers_per_molecule. Without Kabsch dedup (task #23 will plug it in
-        // here), surviving molecules emit all K candidate slots; failed mols emit zero.
-        // The writer translates 0 into a single all-null row for provenance.
+        // Populate n_conformers_per_molecule. Deduplication is intentionally not applied (the K
+        // seeds are already diverse — see the corpus regeneration note): every surviving molecule
+        // emits all K candidate slots; failed molecules emit zero, which the writer translates into
+        // a single all-null row so every input row keeps at least one output row.
         for (std::uint64_t m = 0; m < num_molecules; ++m) {
             buf->n_conformers_per_molecule[m] = buf->num_atoms_per_molecule[m] != 0
                                                     ? static_cast<std::uint8_t>(config.num_conformers)
@@ -590,6 +686,7 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
 
             sfcli::writer_inputs_t writer_inputs {
                 acc.input_file_pairs[file_idx]->input_path.stem().string(),
+                config.dataset,
                 acc.input_file_data[file_idx].base_row_index,
                 file_molecules,
                 config.num_conformers,
@@ -604,6 +701,8 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
                 std::span<__half const>(buf->coordinates.data() + conf_begin * coord_stride,
                                         file_conformers * coord_stride),
                 std::span<float const>(buf->energies.data() + conf_begin, file_conformers),
+                std::span<double const>(buf->usr.data() + conf_begin * 12u, file_conformers * 12u),
+                std::span<double const>(buf->usrcat.data() + conf_begin * 60u, file_conformers * 60u),
             };
 
             auto const &output_path = acc.input_file_pairs[file_idx]->output_path;
@@ -661,6 +760,12 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
 int main(int argc, char **argv) {
     cli_config_t config;
     if (!parse_cli(argc, argv, config)) return 2;
+
+    // Graceful pre-emption: SIGINT/SIGTERM ask the reader to stop at the next shard boundary so
+    // in-flight shards finish and write.  A runner wrapper pairs this with a pause sentinel to hold
+    // off relaunch, freeing the GPU on demand.
+    std::signal(SIGINT, handle_stop_signal);
+    std::signal(SIGTERM, handle_stop_signal);
 
     logger_t logger;
     logger.verbose_level = config.verbose_level;

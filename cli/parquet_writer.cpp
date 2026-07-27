@@ -2,10 +2,16 @@
 
 #include <cstdio>
 #include <cstring>
+
+#include <algorithm>
+#include <array>
 #include <memory>
+#include <string>
+#include <utility>
 
 #include <arrow/array/array_nested.h>
 #include <arrow/array/builder_binary.h>
+#include <arrow/array/builder_nested.h>
 #include <arrow/array/builder_primitive.h>
 #include <arrow/array/data.h>
 #include <arrow/array/util.h>
@@ -14,6 +20,7 @@
 #include <arrow/table.h>
 #include <arrow/type.h>
 #include <arrow/util/float16.h>
+#include <arrow/util/key_value_metadata.h>
 #include <parquet/arrow/writer.h>
 
 #include "smallfield/api/conformer_layout.hpp"
@@ -133,6 +140,44 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
     return arrow::MakeArray(std::move(list_data));
 }
 
+/**
+ *  @brief Pack a per-slot descriptor array (USR = 12, USRCAT = 60 doubles per slot) into a nullable
+ *  `List<float64>`, one element per output row.  A row emits its `stride` doubles only when it is a
+ *  success row and `values` is non-empty; otherwise it is null.  Slot addressing matches the coord
+ *  packer: `flat = mol * max_conformers + slot`, values live at `[flat*stride, flat*stride+stride)`.
+ */
+static std::shared_ptr<arrow::Array> pack_descriptor_as_list(
+    std::span<double const> values, std::uint32_t stride, std::span<std::int8_t const> row_outcomes,
+    std::span<std::uint64_t const> molecule_index_per_row, std::span<std::uint32_t const> conformer_slot_per_row,
+    std::uint32_t max_conformers) {
+
+    auto value_builder = std::make_shared<arrow::DoubleBuilder>();
+    arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+    std::int64_t const num_rows = static_cast<std::int64_t>(row_outcomes.size());
+    bool const have_values = !values.empty();
+
+    for (std::int64_t r = 0; r < num_rows; ++r) {
+        if (have_values && row_outcomes[r] == 1) {
+            std::uint64_t const m = molecule_index_per_row[r];
+            std::uint32_t const c = conformer_slot_per_row[r];
+            std::size_t const base = (static_cast<std::size_t>(m) * max_conformers + c) * stride;
+            if (base + stride > values.size()) {
+                if (!list_builder.AppendNull().ok()) return nullptr;
+                continue;
+            }
+            if (!list_builder.Append().ok()) return nullptr;
+            if (!value_builder->AppendValues(values.data() + base, stride).ok()) return nullptr;
+        }
+        else {
+            if (!list_builder.AppendNull().ok()) return nullptr;
+        }
+    }
+
+    std::shared_ptr<arrow::Array> out;
+    if (!list_builder.Finish(&out).ok()) return nullptr;
+    return out;
+}
+
 bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     std::uint64_t const num_molecules = inputs.num_molecules;
     std::uint32_t const max_conformers = inputs.max_conformers;
@@ -193,6 +238,14 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     mol_per_row.reserve(total_rows);
     std::vector<std::uint32_t> slot_per_row;
     slot_per_row.reserve(total_rows);
+    // conformer_index emitted per row is the energy rank within the molecule (0 = lowest energy),
+    // not the original K-slot; rows within a molecule are energy-sorted below.
+    std::vector<std::uint8_t> conf_index_per_row;
+    conf_index_per_row.reserve(total_rows);
+
+    // K is tiny (3 in production); a fixed stack buffer avoids a per-molecule heap allocation on
+    // the hot path.  Molecules with more slots than this fall back to unsorted emission.
+    constexpr std::uint32_t max_sortable_conformers_k = 64;
 
     for (std::uint64_t m = 0; m < num_molecules; ++m) {
         std::uint8_t const M = inputs.n_conformers_per_molecule[m];
@@ -200,15 +253,32 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
             row_outcomes.push_back(-1);
             mol_per_row.push_back(m);
             slot_per_row.push_back(0);
+            conf_index_per_row.push_back(0);
+            continue;
         }
-        else {
-            for (std::uint32_t c = 0; c < M; ++c) {
-                std::size_t const flat = static_cast<std::size_t>(m) * max_conformers + c;
-                std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 0;
-                row_outcomes.push_back(status_code == 0 ? 1 : 0);
-                mol_per_row.push_back(m);
-                slot_per_row.push_back(c);
-            }
+
+        // Energy-sort this molecule's slots: successful conformers first (ascending energy), failed
+        // slots (null energy) trail in slot order.  conformer_index then reads as an energy rank.
+        auto slot_key = [&](std::uint32_t c) -> std::pair<int, float> {
+            std::size_t const flat = static_cast<std::size_t>(m) * max_conformers + c;
+            std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 1;
+            float const energy = (flat < inputs.energies.size()) ? inputs.energies[flat] : 0.0f;
+            return {status_code == 0 ? 0 : 1, energy};
+        };
+        std::array<std::uint32_t, max_sortable_conformers_k> order {};
+        std::uint32_t const sortable = std::min<std::uint32_t>(M, max_sortable_conformers_k);
+        for (std::uint32_t c = 0; c < sortable; ++c) order[c] = c;
+        std::stable_sort(order.begin(), order.begin() + sortable,
+                         [&](std::uint32_t a, std::uint32_t b) { return slot_key(a) < slot_key(b); });
+
+        for (std::uint32_t rank = 0; rank < M; ++rank) {
+            std::uint32_t const c = rank < sortable ? order[rank] : rank; // overflow: unsorted tail
+            std::size_t const flat = static_cast<std::size_t>(m) * max_conformers + c;
+            std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 0;
+            row_outcomes.push_back(status_code == 0 ? 1 : 0);
+            mol_per_row.push_back(m);
+            slot_per_row.push_back(c);
+            conf_index_per_row.push_back(static_cast<std::uint8_t>(rank));
         }
     }
 
@@ -254,7 +324,7 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
         (void)input_shard_builder.Append(inputs.input_shard_stem);
         (void)input_row_builder.Append(input_row);
         (void)smiles_builder.Append(smi.data(), static_cast<std::int32_t>(smi.size()));
-        (void)conformer_index_builder.Append(static_cast<std::uint8_t>(c));
+        (void)conformer_index_builder.Append(conf_index_per_row[r]);
         (void)status_builder.Append(status_code);
 
         if (mol_ok(m)) {
@@ -302,20 +372,49 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
         return false;
     }
 
-    auto schema = arrow::schema({
-        arrow::field("input_shard", arrow::utf8(), false),
-        arrow::field("input_row", arrow::uint64(), false),
-        arrow::field("smiles", arrow::utf8(), false),
-        arrow::field("conformer_index", arrow::uint8(), false),
-        arrow::field("status", arrow::uint8(), false),
-        arrow::field("n_heavy_atoms", arrow::uint16(), true),
-        arrow::field("n_atoms", arrow::uint16(), true),
-        arrow::field("n_bonds", arrow::uint16(), true),
-        arrow::field("molecular_weight", arrow::float32(), true),
-        arrow::field("n_conformers", arrow::uint8(), true),
-        arrow::field("conformer_coords", arrow::list(arrow::float16()), true),
-        arrow::field("conformer_energy", arrow::float32(), true),
-    });
+    std::shared_ptr<arrow::Array> usr_array = pack_descriptor_as_list(
+        inputs.usr, 12u, std::span<std::int8_t const>(row_outcomes), std::span<std::uint64_t const>(mol_per_row),
+        std::span<std::uint32_t const>(slot_per_row), max_conformers);
+    std::shared_ptr<arrow::Array> usrcat_array = pack_descriptor_as_list(
+        inputs.usrcat, 60u, std::span<std::int8_t const>(row_outcomes), std::span<std::uint64_t const>(mol_per_row),
+        std::span<std::uint32_t const>(slot_per_row), max_conformers);
+    if (!usr_array || !usrcat_array) {
+        std::fprintf(stderr, "[smallfield_batch] descriptor buffer build failed\n");
+        return false;
+    }
+
+    // Provenance: schema-level key-value metadata so the bytes are self-describing (a
+    // content-addressed store keeps no path context).  SMALLFIELD_GIT_SHA is injected by CMake.
+    auto provenance = std::make_shared<arrow::KeyValueMetadata>();
+    provenance->Append("producer", "smallfield_batch");
+#ifdef SMALLFIELD_GIT_SHA
+    provenance->Append("producer_git_sha", SMALLFIELD_GIT_SHA);
+#endif
+    provenance->Append("num_conformers", std::to_string(max_conformers));
+    provenance->Append("max_atoms", std::to_string(inputs.max_atoms));
+    if (!inputs.dataset.empty()) provenance->Append("dataset", inputs.dataset);
+    provenance->Append("coordinate_frame", "principal-axis");
+    provenance->Append("schema_version", "2");
+    provenance->Append("dedup", "none");
+
+    auto schema = arrow::schema(
+        {
+            arrow::field("input_shard", arrow::utf8(), false),
+            arrow::field("input_row", arrow::uint64(), false),
+            arrow::field("smiles", arrow::utf8(), false),
+            arrow::field("conformer_index", arrow::uint8(), false),
+            arrow::field("status", arrow::uint8(), false),
+            arrow::field("n_heavy_atoms", arrow::uint16(), true),
+            arrow::field("n_atoms", arrow::uint16(), true),
+            arrow::field("n_bonds", arrow::uint16(), true),
+            arrow::field("molecular_weight", arrow::float32(), true),
+            arrow::field("n_conformers", arrow::uint8(), true),
+            arrow::field("conformer_coords", arrow::list(arrow::float16()), true),
+            arrow::field("conformer_energy", arrow::float32(), true),
+            arrow::field("usr", arrow::list(arrow::float64()), true),
+            arrow::field("usrcat", arrow::list(arrow::float64()), true),
+        },
+        provenance);
 
     auto table = arrow::Table::Make(schema, {
                                                 input_shard_array,
@@ -330,6 +429,8 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
                                                 n_conformers_array,
                                                 coord_array,
                                                 conformer_energy_array,
+                                                usr_array,
+                                                usrcat_array,
                                             });
 
     auto outfile_result = arrow::io::FileOutputStream::Open(path.string());

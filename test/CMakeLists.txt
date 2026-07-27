@@ -54,6 +54,9 @@ add_cpp_test(preprocess native_murcko)
 add_cpp_test(preprocess csd_torsion_predicates)
 add_cpp_test(preprocess element_gate)
 
+# --- postprocess/ ---
+add_cpp_test(postprocess shape_descriptors)
+
 # --- parameters/ ---
 add_mixed_test(parameters mmff94_tables)
 

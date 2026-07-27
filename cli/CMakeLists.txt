@@ -47,7 +47,19 @@ target_include_directories(smallfield_batch PRIVATE
 set_target_properties(smallfield_batch PROPERTIES
     LINKER_LANGUAGE CUDA)
 
-message(STATUS "SmallField batch binary: ENABLED")
+# Embed the producer git SHA so output shards are self-describing in a content-addressed
+# store (see the provenance key-value metadata in parquet_writer.cpp).
+execute_process(
+    COMMAND git -C ${CMAKE_SOURCE_DIR} rev-parse --short=12 HEAD
+    OUTPUT_VARIABLE SMALLFIELD_GIT_SHA_VALUE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT SMALLFIELD_GIT_SHA_VALUE)
+    set(SMALLFIELD_GIT_SHA_VALUE "unknown")
+endif()
+target_compile_definitions(smallfield_batch PRIVATE SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}")
+
+message(STATUS "SmallField batch binary: ENABLED (git ${SMALLFIELD_GIT_SHA_VALUE})")
 
 if(SMALLFIELD_ENABLE_NVTX)
     target_compile_definitions(smallfield_batch PRIVATE SMALLFIELD_ENABLE_NVTX)

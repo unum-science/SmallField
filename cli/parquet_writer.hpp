@@ -2,22 +2,28 @@
  *  @file parquet_writer.hpp
  *  @brief Write a single per-conformer-row 3D Parquet shard ("*.3D.parquet").
  *
- *  Output schema (canonical, 12 fields):
+ *  Output schema (canonical, 14 fields):
  *
  *  | Field                | Type             | Nullable | Per   | Notes                                      |
  *  |----------------------|------------------|----------|-------|--------------------------------------------|
  *  | input_shard          | utf8             | no       | row   | source parquet stem                        |
  *  | input_row            | uint64           | no       | row   | 0-based row in source                      |
  *  | smiles               | utf8             | no       | row   |                                            |
- *  | conformer_index      | uint8            | no       | row   | 0..M-1 within the molecule                 |
+ *  | conformer_index      | uint8            | no       | row   | 0..M-1, energy rank (0 = lowest energy)    |
  *  | status               | uint8            | no       | row   | conformer_status_t enum                    |
  *  | n_heavy_atoms        | uint16           | yes      | mol   | null if mol failed preprocess              |
  *  | n_atoms              | uint16           | yes      | mol   | atoms incl. H; null on preprocess failure  |
  *  | n_bonds              | uint16           | yes      | mol   | bonds incl. H; null on preprocess failure  |
  *  | molecular_weight     | float32          | yes      | mol   | exact MW in Daltons; null on failure       |
- *  | n_conformers         | uint8            | yes      | mol   | M (post-Kabsch); null on preprocess failure|
+ *  | n_conformers         | uint8            | yes      | mol   | K (no dedup); null on preprocess failure   |
  *  | conformer_coords     | List<float16>    | yes      | row   | 3*n_atoms halves; null if status != success|
  *  | conformer_energy     | float32          | yes      | row   | this row's MMFF94 energy; null on failure  |
+ *  | usr                  | List<float64>    | yes      | row   | 12-dim USR shape vector; null if !success  |
+ *  | usrcat               | List<float64>    | yes      | row   | 60-dim USRCAT shape vector; null if !success|
+ *
+ *  Rows within a molecule are emitted energy-sorted (lowest first); conformer_index
+ *  is the energy rank. Schema-level key-value metadata records provenance (producer
+ *  git sha, num_conformers, max_atoms, dataset, coordinate frame, schema version).
  */
 
 #pragma once
@@ -35,6 +41,7 @@ namespace smallfield::cli {
 
 struct writer_inputs_t {
     std::string input_shard_stem;
+    std::string dataset; ///< dataset name for provenance (e.g. "pubchem", "gdb13"); "" = omit
     std::uint64_t base_row_index = 0;
     std::uint64_t num_molecules = 0;
     std::uint32_t max_conformers = 0; ///< K, the slot stride per molecule in the input arrays
@@ -57,6 +64,12 @@ struct writer_inputs_t {
     /// structure-of-arrays within each slot, filled by either the GPU or the RDKit fallback.
     std::span<__half const> coordinates;
     std::span<float const> energies;
+
+    // Per-conformer shape descriptors, slot-addressed like `energies` but with a wider stride:
+    // slot s = m*max_conformers + c occupies usr[s*12 .. s*12+12) and usrcat[s*60 .. s*60+60).
+    // Empty spans opt the column out (emitted all-null). Non-success slots are written null.
+    std::span<double const> usr;    ///< 12 doubles per slot
+    std::span<double const> usrcat; ///< 60 doubles per slot
 };
 
 [[nodiscard]] bool write_shard(std::filesystem::path const &path, writer_inputs_t const &inputs);
