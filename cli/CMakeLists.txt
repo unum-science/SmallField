@@ -64,3 +64,33 @@ message(STATUS "SmallField batch binary: ENABLED (git ${SMALLFIELD_GIT_SHA_VALUE
 if(SMALLFIELD_ENABLE_NVTX)
     target_compile_definitions(smallfield_batch PRIVATE SMALLFIELD_ENABLE_NVTX)
 endif()
+
+# Descriptor-augmentation binary: rewrites existing *.3D.parquet shards into the
+# canonical 14-column schema by computing USR/USRCAT from the stored fp16 coordinates
+# and re-emitting through the shared writer (parquet_writer.cpp) — byte-identical to the
+# batch producer's output.  CPU-only; reuses the producer's writer + descriptor code.
+add_executable(smallfield_descriptors
+    smallfield_descriptors.cpp
+    parquet_writer.cpp)
+
+set_source_files_properties(
+    smallfield_descriptors.cpp parquet_writer.cpp
+    PROPERTIES LANGUAGE CXX)
+
+target_link_libraries(smallfield_descriptors PRIVATE
+    smallfield_lib
+    OpenMP::OpenMP_CXX
+    Arrow::arrow_shared
+    Parquet::parquet_shared
+    $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
+
+target_include_directories(smallfield_descriptors PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+
+set_target_properties(smallfield_descriptors PROPERTIES
+    LINKER_LANGUAGE CUDA)
+
+# Same provenance SHA as the batch producer so augmented shards report an identical
+# producer_git_sha in their key-value metadata.
+target_compile_definitions(smallfield_descriptors PRIVATE SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}")
