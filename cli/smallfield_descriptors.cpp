@@ -255,8 +255,7 @@ struct reembed_conformer_t {
     float energy = 0.0f;
     bool has_coords = false;
     std::vector<std::uint16_t> coord_bits;   ///< tight interleaved (n_atoms, 3) fp16 bit patterns
-    std::array<double, 12> usr {};
-    std::array<double, 60> usrcat {};
+    std::array<double, 60> usrcat {};        ///< USR is the first 12 of USRCAT; not stored separately
 };
 
 /** @brief One molecule copied verbatim from a `--reembed` shard (its already-corrected geometry). */
@@ -286,13 +285,11 @@ inline std::string reembed_key(std::string_view input_shard, std::uint64_t input
 void load_reembed_shard(input_shard_t const &shard, reembed_index_t &index) {
     arrow::HalfFloatArray const &coords_values = *shard.coords_values;
     arrow::ListArray const &coords_list = *shard.conformer_coords;
-    // USR / USRCAT are optional on a reembed shard; bind once so the verbatim path stays
-    // truly verbatim when they are present, and leaves zeros when the shard predates them.
-    auto const *usr_column = bind_column<arrow::ListArray>(*shard.table, "usr");
+    // USRCAT is optional on a reembed shard; bind once so the verbatim path stays truly verbatim
+    // when present, and leaves zeros when the shard predates it. Stored as fp16 (list<float16>).
     auto const *usrcat_column = bind_column<arrow::ListArray>(*shard.table, "usrcat");
-    auto const *usr_values = usr_column ? dynamic_cast<arrow::DoubleArray const *>(usr_column->values().get()) : nullptr;
     auto const *usrcat_values =
-        usrcat_column ? dynamic_cast<arrow::DoubleArray const *>(usrcat_column->values().get()) : nullptr;
+        usrcat_column ? dynamic_cast<arrow::HalfFloatArray const *>(usrcat_column->values().get()) : nullptr;
     for (std::int64_t row = 0; row < shard.num_rows; ++row) {
         std::string_view const stem = shard.input_shard->GetView(row);
         std::uint64_t const input_row = shard.input_row->Value(row);
@@ -323,17 +320,11 @@ void load_reembed_shard(input_shard_t const &shard, reembed_index_t &index) {
         }
         if (shard.conformer_energy->IsValid(row)) conformer.energy = shard.conformer_energy->Value(row);
 
-        if (usr_values && usr_column->IsValid(row)) {
-            std::int64_t const begin = usr_column->value_offset(row);
-            if (usr_column->value_offset(row + 1) - begin >= 12)
-                for (std::size_t d = 0; d < 12; ++d)
-                    conformer.usr[d] = usr_values->Value(begin + static_cast<std::int64_t>(d));
-        }
         if (usrcat_values && usrcat_column->IsValid(row)) {
             std::int64_t const begin = usrcat_column->value_offset(row);
             if (usrcat_column->value_offset(row + 1) - begin >= 60)
                 for (std::size_t d = 0; d < 60; ++d)
-                    conformer.usrcat[d] = usrcat_values->Value(begin + static_cast<std::int64_t>(d));
+                    conformer.usrcat[d] = half_bits_to_float(usrcat_values->Value(begin + static_cast<std::int64_t>(d)));
         }
 
         molecule.conformers.push_back(std::move(conformer));
@@ -426,8 +417,7 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
     std::vector<__half> coordinates(total_slots * slot_layout.slot_stride(), __float2half(0.0f));
     std::vector<float> energies(total_slots, 0.0f);
     std::vector<std::uint8_t> status_codes(total_slots, 1); // default non-success for unused slots
-    std::vector<double> usr(total_slots * 12u, 0.0);
-    std::vector<double> usrcat(total_slots * 60u, 0.0);
+    std::vector<double> usrcat(total_slots * 60u, 0.0);     // float64 input; writer downcasts to fp16
 
     std::vector<std::string_view> smiles(num_molecules);
     std::vector<std::uint8_t> num_atoms_per_molecule(num_molecules, 0);
@@ -471,7 +461,6 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
                         for (std::uint32_t axis = 0; axis < 3u; ++axis)
                             coordinates[slot_base + slot_layout.component_offset(axis, atom)] =
                                 half_from_bits(conformer.coord_bits[atom * 3u + axis]);
-                    std::copy(conformer.usr.begin(), conformer.usr.end(), usr.data() + flat * 12u);
                     std::copy(conformer.usrcat.begin(), conformer.usrcat.end(), usrcat.data() + flat * 60u);
                 }
             }
@@ -536,11 +525,8 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
                         float_to_half(interleaved[atom * 3u + axis]);
 
             if (context_usable) {
-                std::array<double, 12> usr_row {};
                 std::array<double, 60> usrcat_row {};
-                sfpost::usr_descriptor(coords_view, num_atoms, usr_row);
                 sfpost::usrcat_descriptor(coords_view, context, usrcat_row);
-                std::copy(usr_row.begin(), usr_row.end(), usr.data() + flat * 12u);
                 std::copy(usrcat_row.begin(), usrcat_row.end(), usrcat.data() + flat * 60u);
             }
             // else: descriptors stay zero-filled (not null), coordinates preserved.
@@ -564,7 +550,6 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
         std::span<std::uint8_t const>(status_codes.data(), total_slots),
         std::span<__half const>(coordinates.data(), coordinates.size()),
         std::span<float const>(energies.data(), total_slots),
-        std::span<double const>(usr.data(), usr.size()),
         std::span<double const>(usrcat.data(), usrcat.size()),
     };
     return sfcli::write_shard(output_path, writer_inputs);

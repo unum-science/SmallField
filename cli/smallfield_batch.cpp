@@ -228,8 +228,7 @@ struct output_buffers_t {
     std::vector<std::uint16_t> num_bonds_per_molecule;
     std::vector<float> molecular_weight_per_molecule;
     std::vector<std::uint8_t> n_conformers_per_molecule; ///< K conformers per molecule (0 if mol failed)
-    std::vector<double> usr;                             ///< 12 per conformer slot
-    std::vector<double> usrcat;                          ///< 60 per conformer slot
+    std::vector<double> usrcat;                          ///< 60 per conformer slot (USR = first 12)
     std::vector<std::uint32_t> retry_indices;
 
     void resize_for(std::uint64_t num_molecules, std::uint32_t num_conformers, std::uint32_t max_atoms) {
@@ -237,7 +236,6 @@ struct output_buffers_t {
         std::size_t const coordinate_total = total_conformers * max_atoms * 3u;
         if (coordinates.size() < coordinate_total) coordinates.resize(coordinate_total);
         if (energies.size() < total_conformers) energies.resize(total_conformers);
-        if (usr.size() < total_conformers * 12u) usr.resize(total_conformers * 12u);
         if (usrcat.size() < total_conformers * 60u) usrcat.resize(total_conformers * 60u);
         if (status.size() < total_conformers) status.resize(total_conformers);
         if (status_codes.size() < total_conformers) status_codes.resize(total_conformers);
@@ -562,7 +560,6 @@ void compute_shape_descriptors(cli_config_t const &config, thread_budget_t const
     std::uint32_t const max_atoms = config.max_atoms;
     sfapi::conformer_slot_layout_t const slot_layout {max_atoms, num_conformers};
     std::uint64_t const total_conformers = num_molecules * num_conformers;
-    std::fill_n(buf->usr.data(), total_conformers * 12u, 0.0);
     std::fill_n(buf->usrcat.data(), total_conformers * 60u, 0.0);
     int const threads = budget.fallback > 0 ? budget.fallback : omp_get_max_threads();
 
@@ -595,11 +592,8 @@ void compute_shape_descriptors(cli_config_t const &config, thread_budget_t const
                             __float2half(interleaved[atom * 3u + axis]);
             }
 
-            std::array<double, 12> usr {};
             std::array<double, 60> usrcat {};
-            sfpost::usr_descriptor(coords_view, num_atoms, usr);
             sfpost::usrcat_descriptor(coords_view, context, usrcat);
-            std::copy(usr.begin(), usr.end(), buf->usr.data() + flat * 12u);
             std::copy(usrcat.begin(), usrcat.end(), buf->usrcat.data() + flat * 60u);
         }
     }
@@ -701,7 +695,6 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
                 std::span<__half const>(buf->coordinates.data() + conf_begin * coord_stride,
                                         file_conformers * coord_stride),
                 std::span<float const>(buf->energies.data() + conf_begin, file_conformers),
-                std::span<double const>(buf->usr.data() + conf_begin * 12u, file_conformers * 12u),
                 std::span<double const>(buf->usrcat.data() + conf_begin * 60u, file_conformers * 60u),
             };
 

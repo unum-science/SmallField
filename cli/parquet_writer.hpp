@@ -18,8 +18,11 @@
  *  | n_conformers         | uint8            | yes      | mol   | K (no dedup); null on preprocess failure   |
  *  | conformer_coords     | List<float16>    | yes      | row   | 3*n_atoms halves; null if status != success|
  *  | conformer_energy     | float32          | yes      | row   | this row's MMFF94 energy; null on failure  |
- *  | usr                  | List<float64>    | yes      | row   | 12-dim USR shape vector; null if !success  |
- *  | usrcat               | List<float64>    | yes      | row   | 60-dim USRCAT shape vector; null if !success|
+ *  | usrcat               | List<float16>    | yes      | row   | 60-dim USRCAT shape vector; null if !success|
+ *
+ *  USRCAT's first 12 values ARE the USR descriptor, so USR is not stored separately. USRCAT is
+ *  fp16 (its value range is small and it is derived from fp16 coordinates, so higher precision
+ *  would be illusory).
  *
  *  Rows within a molecule are emitted energy-sorted (lowest first); conformer_index
  *  is the energy rank. Schema-level key-value metadata records provenance (producer
@@ -65,11 +68,12 @@ struct writer_inputs_t {
     std::span<__half const> coordinates;
     std::span<float const> energies;
 
-    // Per-conformer shape descriptors, slot-addressed like `energies` but with a wider stride:
-    // slot s = m*max_conformers + c occupies usr[s*12 .. s*12+12) and usrcat[s*60 .. s*60+60).
-    // Empty spans opt the column out (emitted all-null). Non-success slots are written null.
-    std::span<double const> usr;    ///< 12 doubles per slot
-    std::span<double const> usrcat; ///< 60 doubles per slot
+    // Per-conformer USRCAT shape descriptor, slot-addressed like `energies` but with a stride of 60:
+    // slot s = m*max_conformers + c occupies usrcat[s*60 .. s*60+60). Supplied as float64 (computed
+    // precision) and downcast to float16 on write. Empty span opts the column out (all-null); non-
+    // success slots are written null. The 12-dim USR descriptor is not stored separately — it is
+    // exactly the first 12 values of USRCAT.
+    std::span<double const> usrcat; ///< 60 doubles per slot; stored as list<float16>
 };
 
 [[nodiscard]] bool write_shard(std::filesystem::path const &path, writer_inputs_t const &inputs);

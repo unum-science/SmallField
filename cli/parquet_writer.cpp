@@ -141,17 +141,19 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
 }
 
 /**
- *  @brief Pack a per-slot descriptor array (USR = 12, USRCAT = 60 doubles per slot) into a nullable
- *  `List<float64>`, one element per output row.  A row emits its `stride` doubles only when it is a
- *  success row and `values` is non-empty; otherwise it is null.  Slot addressing matches the coord
- *  packer: `flat = mol * max_conformers + slot`, values live at `[flat*stride, flat*stride+stride)`.
+ *  @brief Pack a per-slot USRCAT descriptor (60 doubles per slot) into a nullable `List<float16>`,
+ *  one element per output row, downcasting each value to half precision on write.  A row emits its
+ *  `stride` values only when it is a success row and `values` is non-empty; otherwise it is null.
+ *  Slot addressing matches the coord packer: `flat = mol * max_conformers + slot`, values live at
+ *  `[flat*stride, flat*stride+stride)`.  fp16 is honest precision here: USRCAT's value range is small
+ *  and it is derived from fp16 coordinates, so storing float64 would be illusory precision.
  */
-static std::shared_ptr<arrow::Array> pack_descriptor_as_list(
+static std::shared_ptr<arrow::Array> pack_usrcat_as_fp16_list(
     std::span<double const> values, std::uint32_t stride, std::span<std::int8_t const> row_outcomes,
     std::span<std::uint64_t const> molecule_index_per_row, std::span<std::uint32_t const> conformer_slot_per_row,
     std::uint32_t max_conformers) {
 
-    auto value_builder = std::make_shared<arrow::DoubleBuilder>();
+    auto value_builder = std::make_shared<arrow::HalfFloatBuilder>();
     arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
     std::int64_t const num_rows = static_cast<std::int64_t>(row_outcomes.size());
     bool const have_values = !values.empty();
@@ -166,7 +168,12 @@ static std::shared_ptr<arrow::Array> pack_descriptor_as_list(
                 continue;
             }
             if (!list_builder.Append().ok()) return nullptr;
-            if (!value_builder->AppendValues(values.data() + base, stride).ok()) return nullptr;
+            for (std::uint32_t k = 0; k < stride; ++k) {
+                __half const half_value = __float2half(static_cast<float>(values[base + k]));
+                std::uint16_t bits;
+                std::memcpy(&bits, &half_value, sizeof(bits));
+                if (!value_builder->Append(bits).ok()) return nullptr;
+            }
         }
         else {
             if (!list_builder.AppendNull().ok()) return nullptr;
@@ -372,13 +379,10 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
         return false;
     }
 
-    std::shared_ptr<arrow::Array> usr_array = pack_descriptor_as_list(
-        inputs.usr, 12u, std::span<std::int8_t const>(row_outcomes), std::span<std::uint64_t const>(mol_per_row),
-        std::span<std::uint32_t const>(slot_per_row), max_conformers);
-    std::shared_ptr<arrow::Array> usrcat_array = pack_descriptor_as_list(
+    std::shared_ptr<arrow::Array> usrcat_array = pack_usrcat_as_fp16_list(
         inputs.usrcat, 60u, std::span<std::int8_t const>(row_outcomes), std::span<std::uint64_t const>(mol_per_row),
         std::span<std::uint32_t const>(slot_per_row), max_conformers);
-    if (!usr_array || !usrcat_array) {
+    if (!usrcat_array) {
         std::fprintf(stderr, "[smallfield_batch] descriptor buffer build failed\n");
         return false;
     }
@@ -415,8 +419,7 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
             arrow::field("n_conformers", arrow::uint8(), true),
             arrow::field("conformer_coords", arrow::list(arrow::float16()), true),
             arrow::field("conformer_energy", arrow::float32(), true),
-            arrow::field("usr", arrow::list(arrow::float64()), true),
-            arrow::field("usrcat", arrow::list(arrow::float64()), true),
+            arrow::field("usrcat", arrow::list(arrow::float16()), true),
         },
         provenance);
 
@@ -433,7 +436,6 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
                                                 n_conformers_array,
                                                 coord_array,
                                                 conformer_energy_array,
-                                                usr_array,
                                                 usrcat_array,
                                             });
 
