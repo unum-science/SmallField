@@ -924,6 +924,16 @@ conformer_status_t context_t::generate_conformers(
             }
         if (!any_molecules) return;
 
+        // Small-molecule datasets (e.g. GDB13) pack most of a wave into a single atom-count bin,
+        // which can exceed the metric-embedding scratch sized at construction from a wave-size
+        // estimate.  The prepass bails (returns false) on an oversized bin, so grow the scratch to
+        // this wave's per-device molecule count first.  It is grow-only (a no-op after the first
+        // oversized wave) and the buffer is a uint32 per molecule (~KB-MB scale), so this is cheap;
+        // done serially here to keep the one-time cudaMalloc out of the per-device launch fan-out.
+        for (std::uint32_t d = 0; d < num_devices; ++d)
+            if (per_device_batches[d].num_molecules > 0)
+                ensure_metric_scratch(*this, d, per_device_batches[d].num_molecules, max_atoms_per_molecule_k);
+
         handles_out.resize(num_devices);
         timings_out.assign(num_devices, gpu_phase_ms_t {});
 #pragma omp parallel for num_threads(num_devices) schedule(static, 1)
