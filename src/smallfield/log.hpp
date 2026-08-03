@@ -15,7 +15,7 @@
  *  smallfield::logger_t log;
  *  log.info("loaded {} smiles ({} mols/s)", count, rate);
  *  log.verbose_level = 1;
- *  log.trace("chunk {}/{}", i, n);          // emits only when verbose_level >= 1
+ *  log.trace("wave {}/{}", i, n);           // emits only when verbose_level >= 1
  *  @endcode
  */
 
@@ -131,7 +131,7 @@ struct logger_t {
                fmt_string, std::forward<args_types_>(args)...);
     }
 
-    /** @brief Emit only when @ref verbose_level >= 1 (chunk-level summary tier). */
+    /** @brief Emit only when @ref verbose_level >= 1 (wave-level summary tier). */
     template <typename... args_types_>
     void trace(fmt::format_string<args_types_...> fmt_string, args_types_ &&...args) const {
         if (verbose_level < 1) return;

@@ -37,7 +37,7 @@ using smallfield::types::etk_distance_constraint_k;
 using smallfield::types::etk_torsion_descriptor_t;
 using smallfield::types::etk_torsion_k;
 using smallfield::types::etkdg_molecule_metadata_t;
-using smallfield::types::max_atoms_k;
+using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::mmff94_typing_patch_t;
 
 #if defined(__CUDACC__)
@@ -95,7 +95,7 @@ static __global__ __launch_bounds__(32, 8) void etk_build_csr_kernel(
     std::uint32_t num_molecules, etk_atom_interaction_t *__restrict__ interactions,
     etk_atom_offsets_t *__restrict__ atom_offsets, etkdg_molecule_metadata_t *__restrict__ metadata) {
 
-    __shared__ std::uint32_t cursors[max_atoms_k];
+    __shared__ std::uint32_t cursors[max_atoms_per_molecule_k];
 
     std::uint32_t const mol = blockIdx.x;
     if (mol >= num_molecules) return;
@@ -113,7 +113,7 @@ static __global__ __launch_bounds__(32, 8) void etk_build_csr_kernel(
 
     etk_torsion_descriptor_t const *mol_torsions = torsions + (std::size_t)mol * torsion_stride;
     distance_constraint_t const *mol_constraints = constraints + meta.constraint_offset;
-    etk_atom_offsets_t *mol_atom_offsets = atom_offsets + meta.etk_atom_offsets_start;
+    etk_atom_offsets_t *mol_atom_offsets = atom_offsets + meta.etk_atom_csr_offset;
     etk_atom_interaction_t *mol_interactions = interactions + meta.etk_interaction_offset;
 
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) mol_atom_offsets[atom] = {0u, 0u};
@@ -127,7 +127,7 @@ static __global__ __launch_bounds__(32, 8) void etk_build_csr_kernel(
 
     std::uint32_t running = 0;
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-        mol_atom_offsets[atom].interaction_start = meta.etk_interaction_offset + running;
+        mol_atom_offsets[atom].interaction_offset = meta.etk_interaction_offset + running;
         cursors[atom] = running;
         running += mol_atom_offsets[atom].interaction_count;
     }

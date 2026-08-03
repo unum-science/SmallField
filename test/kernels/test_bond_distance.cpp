@@ -101,7 +101,7 @@ void test_device_matches_host(std::vector<std::string> const &smiles_list) {
     auto batch = sfp::prepare_molecule_batch(views, smallfield::keep_all_fragments_k);
     SF_TEST_ASSERT(batch.num_molecules > 0, "no molecule survived preprocessing");
 
-    std::vector<std::uint8_t> device_matrix(batch.layout.count_bond_distance, std::uint8_t {0});
+    std::vector<std::uint8_t> device_matrix(batch.layout.num_bond_distance, std::uint8_t {0});
     run_bond_distance_bfs_on_gpu(batch.host.data(), batch.layout, batch.num_molecules, device_matrix.data());
 
     auto const metadata = batch.molecule_metadata();

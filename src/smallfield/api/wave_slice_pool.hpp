@@ -1,14 +1,14 @@
 /**
- *  @file batch_pool.hpp
- *  @brief Unified per-chunk batch pool: one pinned host allocation + a
- *  shared `batch_layout_t` describing every per-molecule array.
+ *  @file wave_slice_pool.hpp
+ *  @brief Unified per-wave-slice pool: one pinned host allocation + a
+ *  shared `wave_slice_layout_t` describing every per-molecule array.
  *
  *  Replaces the pre-existing design where `etkdg_molecule_batch_t` held 14
  *  separate `std::vector<T>` fields and the launch path did 14 pageable
  *  `cudaMemcpyAsync` calls (which silently degrade to synchronous).
  *
  *  Flow:
- *    1. `prepare_molecule_batch` computes `batch_layout_t` from the per-molecule prefix-scanned
+ *    1. `prepare_molecule_batch` computes `wave_slice_layout_t` from the per-molecule prefix-scanned
  *       sizes, resizes one pinned host buffer, and memcpys per-molecule arrays at their byte
  *       offsets.
  *    2. `launch_gpu_pipeline` issues ONE `cudaMemcpyAsync` of the host
@@ -156,9 +156,11 @@ using device_byte_buffer_t = byte_buffer_t<device_alloc_t, device_dealloc_t>;
 
 /**
  *  @brief Byte-level layout of the 16 per-molecule sub-regions inside a
- *  `batch_pool_t`.
+ *  `wave_slice_pool_t`.
  *
- *  Every region is `(byte_offset, element_count)`; the byte size is derived
+ *  Every region is `(byte_offset, element_count)` — offsets here count @b bytes, while the
+ *  per-molecule offsets in @ref smallfield::types::etkdg_molecule_metadata_t count @b elements;
+ *  the byte size is derived
  *  from `count * sizeof(T)` at the call site.  All offsets are aligned to
  *  `region_alignment` (256 bytes by default — matches the CUDA alignment
  *  convention the old `launch_gpu_pipeline` used when carving its pool).
@@ -179,7 +181,7 @@ using device_byte_buffer_t = byte_buffer_t<device_alloc_t, device_dealloc_t>;
  *  Reading a device-only region off a host view is out of bounds; only the device view addresses
  *  those regions, and the host buffer stops at `bytes_uploaded`.
  */
-struct batch_layout_t {
+struct wave_slice_layout_t {
     static constexpr std::size_t region_alignment = 256;
 
     std::size_t bytes_uploaded = 0;
@@ -189,60 +191,60 @@ struct batch_layout_t {
     std::uint32_t torsion_stride = 0;
 
     // One entry per sub-region; `count` is in T-sized elements, NOT bytes.
-    std::size_t offset_bounds = 0;
-    std::size_t count_bounds = 0; // float
-    std::size_t offset_chirals = 0;
-    std::size_t count_chirals = 0; // chiral_center_descriptor_t
-    std::size_t offset_torsions = 0;
-    std::size_t count_torsions = 0; // etk_torsion_descriptor_t
-    std::size_t offset_distance_cons = 0;
-    std::size_t count_distance_cons = 0; // distance_constraint_t
-    std::size_t offset_mmff_atom_vdw = 0;
-    std::size_t count_mmff_atom_vdw = 0; // mmff94_atom_vdw_params_t (one per atom)
-    std::size_t offset_mmff_atom_charge = 0;
-    std::size_t count_mmff_atom_charge = 0; // float (one per atom)
-    std::size_t offset_bond_distance = 0;
-    std::size_t count_bond_distance = 0; // std::uint8_t (N² per molecule)
-    std::size_t offset_mmff_bonds = 0;
-    std::size_t count_mmff_bonds = 0; // mmff94_bond_t
-    std::size_t offset_mmff_angles = 0;
-    std::size_t count_mmff_angles = 0; // mmff94_angle_t
-    std::size_t offset_mmff_torsions = 0;
-    std::size_t count_mmff_torsions = 0; // mmff94_torsion_t
-    std::size_t offset_mmff_oops = 0;
-    std::size_t count_mmff_oops = 0; // mmff94_oop_t
-    std::size_t offset_mmff_stretchbends = 0;
-    std::size_t count_mmff_stretchbends = 0; // mmff94_stretchbend_t
-    std::size_t offset_mmff_interactions = 0;
-    std::size_t count_mmff_interactions = 0; // mmff94_atom_interaction_t
-    std::size_t offset_mmff_atom_offsets = 0;
-    std::size_t count_mmff_atom_offsets = 0; // mmff94_atom_offsets_t
-    std::size_t offset_etk_interactions = 0;
-    std::size_t count_etk_interactions = 0; // etk_atom_interaction_t
-    std::size_t offset_etk_atom_offsets = 0;
-    std::size_t count_etk_atom_offsets = 0; // etk_atom_offsets_t
-    std::size_t offset_metadata = 0;
-    std::size_t count_metadata = 0; // etkdg_molecule_metadata_t
-    std::size_t offset_input_indices = 0;
-    std::size_t count_input_indices = 0; // std::uint32_t
-    std::size_t offset_descriptors = 0;
-    std::size_t count_descriptors = 0; // molecule_descriptor_t (one per molecule)
-    std::size_t offset_atom_bases = 0;
-    std::size_t count_atom_bases = 0; // std::uint32_t (first atom of each molecule)
-    std::size_t offset_mmff_bases = 0;
-    std::size_t count_mmff_bases = 0; // mmff94_packed_offsets_t (one per molecule)
-    std::size_t offset_typing_patches = 0;
-    std::size_t count_typing_patches = 0; // mmff94_typing_patch_t
-    std::size_t offset_patch_atom_types = 0;
-    std::size_t count_patch_atom_types = 0; // std::uint8_t (one per patched atom)
-    std::size_t offset_patch_atom_charges = 0;
-    std::size_t count_patch_atom_charges = 0; // float (one per patched atom)
-    std::size_t offset_atom_types = 0;
-    std::size_t count_atom_types = 0; // std::uint8_t (one per atom)
-    std::size_t offset_typing_status = 0;
-    std::size_t count_typing_status = 0; // std::uint8_t (one per molecule)
-    std::size_t offset_torsion_counts = 0;
-    std::size_t count_torsion_counts = 0; // std::uint32_t (one per molecule)
+    std::size_t bounds_byte_offset = 0;
+    std::size_t num_bounds = 0; // float
+    std::size_t chirals_byte_offset = 0;
+    std::size_t num_chirals = 0; // chiral_center_descriptor_t
+    std::size_t torsions_byte_offset = 0;
+    std::size_t num_torsions = 0; // etk_torsion_descriptor_t
+    std::size_t distance_constraints_byte_offset = 0;
+    std::size_t num_distance_constraints = 0; // distance_constraint_t
+    std::size_t mmff_atom_vdw_byte_offset = 0;
+    std::size_t num_mmff_atom_vdw = 0; // mmff94_atom_vdw_params_t (one per atom)
+    std::size_t mmff_atom_charge_byte_offset = 0;
+    std::size_t num_mmff_atom_charge = 0; // float (one per atom)
+    std::size_t bond_distance_byte_offset = 0;
+    std::size_t num_bond_distance = 0; // std::uint8_t (N² per molecule)
+    std::size_t mmff_bonds_byte_offset = 0;
+    std::size_t num_mmff_bonds = 0; // mmff94_bond_t
+    std::size_t mmff_angles_byte_offset = 0;
+    std::size_t num_mmff_angles = 0; // mmff94_angle_t
+    std::size_t mmff_torsions_byte_offset = 0;
+    std::size_t num_mmff_torsions = 0; // mmff94_torsion_t
+    std::size_t mmff_oops_byte_offset = 0;
+    std::size_t num_mmff_oops = 0; // mmff94_oop_t
+    std::size_t mmff_stretchbends_byte_offset = 0;
+    std::size_t num_mmff_stretchbends = 0; // mmff94_stretchbend_t
+    std::size_t mmff_interactions_byte_offset = 0;
+    std::size_t num_mmff_interactions = 0; // mmff94_atom_interaction_t
+    std::size_t mmff_atom_offsets_byte_offset = 0;
+    std::size_t num_mmff_atom_offsets = 0; // mmff94_atom_offsets_t
+    std::size_t etk_interactions_byte_offset = 0;
+    std::size_t num_etk_interactions = 0; // etk_atom_interaction_t
+    std::size_t etk_atom_offsets_byte_offset = 0;
+    std::size_t num_etk_atom_offsets = 0; // etk_atom_offsets_t
+    std::size_t metadata_byte_offset = 0;
+    std::size_t num_metadata = 0; // etkdg_molecule_metadata_t
+    std::size_t input_indices_byte_offset = 0;
+    std::size_t num_input_indices = 0; // std::uint32_t
+    std::size_t descriptors_byte_offset = 0;
+    std::size_t num_descriptors = 0; // molecule_descriptor_t (one per molecule)
+    std::size_t atom_bases_byte_offset = 0;
+    std::size_t num_atom_bases = 0; // std::uint32_t (first atom of each molecule)
+    std::size_t mmff_bases_byte_offset = 0;
+    std::size_t num_mmff_bases = 0; // mmff94_packed_offsets_t (one per molecule)
+    std::size_t typing_patches_byte_offset = 0;
+    std::size_t num_typing_patches = 0; // mmff94_typing_patch_t
+    std::size_t patch_atom_types_byte_offset = 0;
+    std::size_t num_patch_atom_types = 0; // std::uint8_t (one per patched atom)
+    std::size_t patch_atom_charges_byte_offset = 0;
+    std::size_t num_patch_atom_charges = 0; // float (one per patched atom)
+    std::size_t atom_types_byte_offset = 0;
+    std::size_t num_atom_types = 0; // std::uint8_t (one per atom)
+    std::size_t typing_status_byte_offset = 0;
+    std::size_t num_typing_status = 0; // std::uint8_t (one per molecule)
+    std::size_t torsion_counts_byte_offset = 0;
+    std::size_t num_torsion_counts = 0; // std::uint32_t (one per molecule)
 };
 
 constexpr std::size_t align_up_bytes_(std::size_t value, std::size_t alignment) noexcept {
@@ -256,7 +258,7 @@ constexpr std::size_t align_up_bytes_(std::size_t value, std::size_t alignment) 
  */
 template <typename element_>
 constexpr std::size_t place_region_(std::size_t &running_offset, std::size_t count) noexcept {
-    running_offset = align_up_bytes_(running_offset, batch_layout_t::region_alignment);
+    running_offset = align_up_bytes_(running_offset, wave_slice_layout_t::region_alignment);
     std::size_t const here = running_offset;
     running_offset += count * sizeof(element_);
     return here;
@@ -283,7 +285,7 @@ std::span<element_ const> span_at_(buffer_ const &buffer, std::size_t byte_offse
  */
 struct batch_pool_view_t {
     std::byte *base = nullptr;
-    batch_layout_t const *layout = nullptr;
+    wave_slice_layout_t const *layout = nullptr;
 
     template <typename element_>
     std::span<element_> region(std::size_t byte_offset, std::size_t count) const noexcept {
@@ -292,101 +294,105 @@ struct batch_pool_view_t {
     }
 
     std::span<float> bounds_matrices() const noexcept {
-        return region<float>(layout->offset_bounds, layout->count_bounds);
+        return region<float>(layout->bounds_byte_offset, layout->num_bounds);
     }
     std::span<chiral_center_descriptor_t> chiral_centers() const noexcept {
-        return region<chiral_center_descriptor_t>(layout->offset_chirals, layout->count_chirals);
+        return region<chiral_center_descriptor_t>(layout->chirals_byte_offset, layout->num_chirals);
     }
     std::span<etk_torsion_descriptor_t> etk_torsions() const noexcept {
-        return region<etk_torsion_descriptor_t>(layout->offset_torsions, layout->count_torsions);
+        return region<etk_torsion_descriptor_t>(layout->torsions_byte_offset, layout->num_torsions);
     }
     std::span<distance_constraint_t> distance_constraints() const noexcept {
-        return region<distance_constraint_t>(layout->offset_distance_cons, layout->count_distance_cons);
+        return region<distance_constraint_t>(layout->distance_constraints_byte_offset,
+                                             layout->num_distance_constraints);
     }
     std::span<mmff94_atom_vdw_params_t> mmff_atom_vdw() const noexcept {
-        return region<mmff94_atom_vdw_params_t>(layout->offset_mmff_atom_vdw, layout->count_mmff_atom_vdw);
+        return region<mmff94_atom_vdw_params_t>(layout->mmff_atom_vdw_byte_offset, layout->num_mmff_atom_vdw);
     }
     std::span<float> mmff_atom_charge() const noexcept {
-        return region<float>(layout->offset_mmff_atom_charge, layout->count_mmff_atom_charge);
+        return region<float>(layout->mmff_atom_charge_byte_offset, layout->num_mmff_atom_charge);
     }
     std::span<std::uint8_t> bond_distance() const noexcept {
-        return region<std::uint8_t>(layout->offset_bond_distance, layout->count_bond_distance);
+        return region<std::uint8_t>(layout->bond_distance_byte_offset, layout->num_bond_distance);
     }
     std::span<mmff94_bond_t> mmff_bonds() const noexcept {
-        return region<mmff94_bond_t>(layout->offset_mmff_bonds, layout->count_mmff_bonds);
+        return region<mmff94_bond_t>(layout->mmff_bonds_byte_offset, layout->num_mmff_bonds);
     }
     std::span<mmff94_angle_t> mmff_angles() const noexcept {
-        return region<mmff94_angle_t>(layout->offset_mmff_angles, layout->count_mmff_angles);
+        return region<mmff94_angle_t>(layout->mmff_angles_byte_offset, layout->num_mmff_angles);
     }
     std::span<mmff94_torsion_t> mmff_torsions() const noexcept {
-        return region<mmff94_torsion_t>(layout->offset_mmff_torsions, layout->count_mmff_torsions);
+        return region<mmff94_torsion_t>(layout->mmff_torsions_byte_offset, layout->num_mmff_torsions);
     }
     std::span<mmff94_oop_t> mmff_oops() const noexcept {
-        return region<mmff94_oop_t>(layout->offset_mmff_oops, layout->count_mmff_oops);
+        return region<mmff94_oop_t>(layout->mmff_oops_byte_offset, layout->num_mmff_oops);
     }
     std::span<mmff94_stretchbend_t> mmff_stretchbends() const noexcept {
-        return region<mmff94_stretchbend_t>(layout->offset_mmff_stretchbends, layout->count_mmff_stretchbends);
+        return region<mmff94_stretchbend_t>(layout->mmff_stretchbends_byte_offset, layout->num_mmff_stretchbends);
     }
     std::span<mmff94_atom_interaction_t> mmff_interactions() const noexcept {
-        return region<mmff94_atom_interaction_t>(layout->offset_mmff_interactions, layout->count_mmff_interactions);
+        return region<mmff94_atom_interaction_t>(layout->mmff_interactions_byte_offset, layout->num_mmff_interactions);
     }
     std::span<mmff94_atom_offsets_t> mmff_atom_offsets() const noexcept {
-        return region<mmff94_atom_offsets_t>(layout->offset_mmff_atom_offsets, layout->count_mmff_atom_offsets);
+        return region<mmff94_atom_offsets_t>(layout->mmff_atom_offsets_byte_offset, layout->num_mmff_atom_offsets);
     }
     std::span<etk_atom_interaction_t> etk_interactions() const noexcept {
-        return region<etk_atom_interaction_t>(layout->offset_etk_interactions, layout->count_etk_interactions);
+        return region<etk_atom_interaction_t>(layout->etk_interactions_byte_offset, layout->num_etk_interactions);
     }
     std::span<etk_atom_offsets_t> etk_atom_offsets() const noexcept {
-        return region<etk_atom_offsets_t>(layout->offset_etk_atom_offsets, layout->count_etk_atom_offsets);
+        return region<etk_atom_offsets_t>(layout->etk_atom_offsets_byte_offset, layout->num_etk_atom_offsets);
     }
     std::span<etkdg_molecule_metadata_t> molecule_metadata() const noexcept {
-        return region<etkdg_molecule_metadata_t>(layout->offset_metadata, layout->count_metadata);
+        return region<etkdg_molecule_metadata_t>(layout->metadata_byte_offset, layout->num_metadata);
     }
     std::span<std::uint32_t> input_indices() const noexcept {
-        return region<std::uint32_t>(layout->offset_input_indices, layout->count_input_indices);
+        return region<std::uint32_t>(layout->input_indices_byte_offset, layout->num_input_indices);
     }
     std::span<molecule_descriptor_t> descriptors() const noexcept {
-        return region<molecule_descriptor_t>(layout->offset_descriptors, layout->count_descriptors);
+        return region<molecule_descriptor_t>(layout->descriptors_byte_offset, layout->num_descriptors);
     }
     std::span<std::uint32_t> atom_bases() const noexcept {
-        return region<std::uint32_t>(layout->offset_atom_bases, layout->count_atom_bases);
+        return region<std::uint32_t>(layout->atom_bases_byte_offset, layout->num_atom_bases);
     }
     std::span<mmff94_packed_offsets_t> mmff_bases() const noexcept {
-        return region<mmff94_packed_offsets_t>(layout->offset_mmff_bases, layout->count_mmff_bases);
+        return region<mmff94_packed_offsets_t>(layout->mmff_bases_byte_offset, layout->num_mmff_bases);
     }
     std::span<mmff94_typing_patch_t> typing_patches() const noexcept {
-        return region<mmff94_typing_patch_t>(layout->offset_typing_patches, layout->count_typing_patches);
+        return region<mmff94_typing_patch_t>(layout->typing_patches_byte_offset, layout->num_typing_patches);
     }
     std::span<std::uint8_t> patch_atom_types() const noexcept {
-        return region<std::uint8_t>(layout->offset_patch_atom_types, layout->count_patch_atom_types);
+        return region<std::uint8_t>(layout->patch_atom_types_byte_offset, layout->num_patch_atom_types);
     }
     std::span<float> patch_atom_charges() const noexcept {
-        return region<float>(layout->offset_patch_atom_charges, layout->count_patch_atom_charges);
+        return region<float>(layout->patch_atom_charges_byte_offset, layout->num_patch_atom_charges);
     }
     std::span<std::uint8_t> atom_types() const noexcept {
-        return region<std::uint8_t>(layout->offset_atom_types, layout->count_atom_types);
+        return region<std::uint8_t>(layout->atom_types_byte_offset, layout->num_atom_types);
     }
     std::span<std::uint8_t> typing_status() const noexcept {
-        return region<std::uint8_t>(layout->offset_typing_status, layout->count_typing_status);
+        return region<std::uint8_t>(layout->typing_status_byte_offset, layout->num_typing_status);
     }
     std::span<std::uint32_t> torsion_counts() const noexcept {
-        return region<std::uint32_t>(layout->offset_torsion_counts, layout->count_torsion_counts);
+        return region<std::uint32_t>(layout->torsion_counts_byte_offset, layout->num_torsion_counts);
     }
 };
 
 /**
- *  @brief Per-chunk batch pool: one pinned host allocation + layout.
+ *  @brief Per-wave-slice pool: one pinned host allocation + layout.
  *
  *  `prepare_molecule_batch` fills the pool on the CPU.  The launch path
  *  uses a device-side mirror (inside `launch_scratch_t`) carved by the
- *  same `batch_layout_t`, and issues one `cudaMemcpyAsync` of the whole
+ *  same `wave_slice_layout_t`, and issues one `cudaMemcpyAsync` of the whole
  *  host buffer to the device mirror.
  */
-struct batch_pool_t {
+struct wave_slice_pool_t {
     pinned_byte_buffer_t host;
-    batch_layout_t layout;
+    wave_slice_layout_t layout;
     std::uint32_t num_molecules = 0;
-    std::uint32_t max_atoms_per_molecule = 0;
+    /** @brief The largest atom count actually present in this slice — an observation, not the cap.
+     *  @ref smallfield::types::max_atoms_per_molecule_k is the cap; conflating the two is what
+     *  sized a kernel stride from one wave and a caller's buffer from the other. */
+    std::uint32_t observed_max_atoms = 0;
     /** @brief Slice-local indices for every molecule rejected by the
      *  `preprocess-step`, tagged with the rejection reason.  Populated by
      *  `prepare_molecule_batch_into`; consumed by the caller to stamp
@@ -425,12 +431,12 @@ struct batch_pool_t {
     std::span<float> patch_atom_charges() noexcept { return host_view().patch_atom_charges(); }
 
     std::span<etkdg_molecule_metadata_t const> molecule_metadata() const noexcept {
-        return {reinterpret_cast<etkdg_molecule_metadata_t const *>(host.data() + layout.offset_metadata),
-                layout.count_metadata};
+        return {reinterpret_cast<etkdg_molecule_metadata_t const *>(host.data() + layout.metadata_byte_offset),
+                layout.num_metadata};
     }
     std::span<std::uint32_t const> input_indices() const noexcept {
-        return {reinterpret_cast<std::uint32_t const *>(host.data() + layout.offset_input_indices),
-                layout.count_input_indices};
+        return {reinterpret_cast<std::uint32_t const *>(host.data() + layout.input_indices_byte_offset),
+                layout.num_input_indices};
     }
 };
 

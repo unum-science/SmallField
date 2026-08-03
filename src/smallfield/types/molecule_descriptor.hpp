@@ -32,7 +32,7 @@
 namespace smallfield::types {
 
 /** Maximum atom count supported by the single-warp GPU pipeline. */
-inline constexpr std::uint32_t max_atoms_k = 128;
+inline constexpr std::uint32_t max_atoms_per_molecule_k = 128;
 
 /** Maximum bond count. Drug-like molecules with N≤128 rarely exceed 160 bonds. */
 inline constexpr std::uint32_t max_bonds_k = 256;
@@ -86,20 +86,20 @@ struct alignas(8) molecule_descriptor_t {
     std::uint16_t num_bonds;
     std::uint8_t num_rings;
 
-    std::uint8_t element[max_atoms_k];       ///< atomic number (0 for padding)
-    std::uint8_t hybridization[max_atoms_k]; ///< hybridization_t
-    std::uint8_t degree[max_atoms_k];        ///< total explicit degree
-    std::uint8_t num_hydrogens[max_atoms_k]; ///< total H count (implicit + explicit)
-    std::int8_t formal_charge[max_atoms_k];
-    std::uint8_t atom_flags[max_atoms_k];    ///< bitwise OR of atom_flag_t
-    std::uint8_t smallest_ring[max_atoms_k]; ///< smallest SSSR ring size containing atom (0 if none)
+    std::uint8_t element[max_atoms_per_molecule_k];       ///< atomic number (0 for padding)
+    std::uint8_t hybridization[max_atoms_per_molecule_k]; ///< hybridization_t
+    std::uint8_t degree[max_atoms_per_molecule_k];        ///< total explicit degree
+    std::uint8_t num_hydrogens[max_atoms_per_molecule_k]; ///< total H count (implicit + explicit)
+    std::int8_t formal_charge[max_atoms_per_molecule_k];
+    std::uint8_t atom_flags[max_atoms_per_molecule_k];    ///< bitwise OR of atom_flag_t
+    std::uint8_t smallest_ring[max_atoms_per_molecule_k]; ///< smallest SSSR ring size containing atom (0 if none)
     /** @brief Ring-bond connectivity, the SMARTS `x<n>` primitive: how many of the atom's bonds
      *  carry @ref bond_flag_in_ring_k.  Zero for an acyclic atom and for a ring atom whose every
      *  bond leaves the ring, which cannot happen, so zero reads as "not in a ring". */
-    std::uint8_t ring_bond_degree[max_atoms_k];
-    std::uint8_t cip_rank[max_atoms_k];      ///< CIP priority rank (0 = lowest)
-    std::uint8_t chiral_tag[max_atoms_k];    ///< 0=none, 1=CW, 2=CCW
-    std::uint8_t isotope[max_atoms_k];       ///< isotope mass number (0 = natural / unspecified)
+    std::uint8_t ring_bond_degree[max_atoms_per_molecule_k];
+    std::uint8_t cip_rank[max_atoms_per_molecule_k];   ///< CIP priority rank (0 = lowest)
+    std::uint8_t chiral_tag[max_atoms_per_molecule_k]; ///< 0=none, 1=CW, 2=CCW
+    std::uint8_t isotope[max_atoms_per_molecule_k];    ///< isotope mass number (0 = natural / unspecified)
 
     std::uint8_t bond_atom_i[max_bonds_k];
     std::uint8_t bond_atom_j[max_bonds_k];
@@ -112,13 +112,13 @@ struct alignas(8) molecule_descriptor_t {
     std::uint8_t bond_stereo_atom_i[max_bonds_k];
     std::uint8_t bond_stereo_atom_j[max_bonds_k];
 
-    std::uint16_t neighbor_offset[max_atoms_k + 1]; ///< prefix sum; neighbor_offset[N] = total
+    std::uint16_t neighbor_offset[max_atoms_per_molecule_k + 1]; ///< prefix sum; neighbor_offset[N] = total
     std::uint8_t neighbor_atom[max_neighbor_entries_k];
     std::uint16_t neighbor_bond[max_neighbor_entries_k];
 
     std::uint16_t ring_offset[max_rings_k + 1];  ///< atoms per ring, prefix sum
-    std::uint8_t ring_atoms[max_atoms_k * 2];    ///< concatenated ring atoms (SSSR is sparse)
-    std::uint32_t atom_ring_bitmap[max_atoms_k]; ///< bit r of atom a = atom a is in ring r
+    std::uint8_t ring_atoms[max_atoms_per_molecule_k * 2];    ///< concatenated ring atoms (SSSR is sparse)
+    std::uint32_t atom_ring_bitmap[max_atoms_per_molecule_k]; ///< bit r of atom a = atom a is in ring r
 };
 
 /**
@@ -130,37 +130,37 @@ struct alignas(8) molecule_descriptor_t {
  *  Preconditions:
  *   - Hydrogens added (MolOps::addHs)
  *   - Sanitized (SmilesToMol with sanitize=true, default)
- *   - num_atoms ≤ max_atoms_k
+ *   - num_atoms ≤ max_atoms_per_molecule_k
  *
  *  @param[in] molecule RDKit molecule.
- *  @param[out] desc Descriptor to fill. Any prior contents overwritten.
+ *  @param[out] descriptor Descriptor to fill. Any prior contents overwritten.
  *  @return true on success, false if the molecule exceeds capacity.
  */
-inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t &desc) {
+inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t &descriptor) {
     std::uint32_t const num_atoms = molecule.getNumAtoms();
     std::uint32_t const num_bonds = molecule.getNumBonds();
-    if (num_atoms > max_atoms_k || num_bonds > max_bonds_k) return false;
+    if (num_atoms > max_atoms_per_molecule_k || num_bonds > max_bonds_k) return false;
 
     // Zero counts and prefix arrays. Per-atom/per-bond arrays don't need zeroing
     // since we fully populate entries [0, num_atoms/num_bonds).
-    std::memset(desc.atom_flags, 0, sizeof(desc.atom_flags));
-    std::memset(desc.atom_ring_bitmap, 0, sizeof(desc.atom_ring_bitmap));
-    std::memset(desc.bond_flags, 0, sizeof(desc.bond_flags));
+    std::memset(descriptor.atom_flags, 0, sizeof(descriptor.atom_flags));
+    std::memset(descriptor.atom_ring_bitmap, 0, sizeof(descriptor.atom_ring_bitmap));
+    std::memset(descriptor.bond_flags, 0, sizeof(descriptor.bond_flags));
 
-    desc.num_atoms = static_cast<std::uint8_t>(num_atoms);
-    desc.num_bonds = static_cast<std::uint16_t>(num_bonds);
+    descriptor.num_atoms = static_cast<std::uint8_t>(num_atoms);
+    descriptor.num_bonds = static_cast<std::uint16_t>(num_bonds);
 
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
         auto const *atom = molecule.getAtomWithIdx(a);
-        desc.element[a] = static_cast<std::uint8_t>(atom->getAtomicNum());
-        desc.hybridization[a] = static_cast<std::uint8_t>(atom->getHybridization());
-        desc.degree[a] = static_cast<std::uint8_t>(atom->getDegree());
-        desc.num_hydrogens[a] = static_cast<std::uint8_t>(atom->getTotalNumHs(true));
-        desc.formal_charge[a] = static_cast<std::int8_t>(atom->getFormalCharge());
-        desc.isotope[a] = static_cast<std::uint8_t>(std::min<unsigned>(atom->getIsotope(), 255));
-        desc.smallest_ring[a] = 0;
-        desc.cip_rank[a] = 0;
-        desc.chiral_tag[a] = 0;
+        descriptor.element[a] = static_cast<std::uint8_t>(atom->getAtomicNum());
+        descriptor.hybridization[a] = static_cast<std::uint8_t>(atom->getHybridization());
+        descriptor.degree[a] = static_cast<std::uint8_t>(atom->getDegree());
+        descriptor.num_hydrogens[a] = static_cast<std::uint8_t>(atom->getTotalNumHs(true));
+        descriptor.formal_charge[a] = static_cast<std::int8_t>(atom->getFormalCharge());
+        descriptor.isotope[a] = static_cast<std::uint8_t>(std::min<unsigned>(atom->getIsotope(), 255));
+        descriptor.smallest_ring[a] = 0;
+        descriptor.cip_rank[a] = 0;
+        descriptor.chiral_tag[a] = 0;
 
         std::uint8_t flags = 0;
         if (atom->getIsAromatic()) flags |= atom_flag_aromatic_k;
@@ -169,24 +169,24 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
         // lone pair availability via charge/hybridization, but this covers drug-like cases).
         int const element = atom->getAtomicNum();
         if (element == 7 || element == 8) flags |= atom_flag_hbond_acceptor_k;
-        desc.atom_flags[a] = flags;
+        descriptor.atom_flags[a] = flags;
 
         // Chiral tag
         auto chiral = atom->getChiralTag();
         if (chiral == RDKit::Atom::CHI_TETRAHEDRAL_CW) {
-            desc.chiral_tag[a] = 1;
-            desc.atom_flags[a] |= atom_flag_has_chirality_k;
+            descriptor.chiral_tag[a] = 1;
+            descriptor.atom_flags[a] |= atom_flag_has_chirality_k;
         }
         else if (chiral == RDKit::Atom::CHI_TETRAHEDRAL_CCW) {
-            desc.chiral_tag[a] = 2;
-            desc.atom_flags[a] |= atom_flag_has_chirality_k;
+            descriptor.chiral_tag[a] = 2;
+            descriptor.atom_flags[a] |= atom_flag_has_chirality_k;
         }
     }
 
     for (std::uint32_t b = 0; b < num_bonds; ++b) {
         auto const *bond = molecule.getBondWithIdx(b);
-        desc.bond_atom_i[b] = static_cast<std::uint8_t>(bond->getBeginAtomIdx());
-        desc.bond_atom_j[b] = static_cast<std::uint8_t>(bond->getEndAtomIdx());
+        descriptor.bond_atom_i[b] = static_cast<std::uint8_t>(bond->getBeginAtomIdx());
+        descriptor.bond_atom_j[b] = static_cast<std::uint8_t>(bond->getEndAtomIdx());
         // Aromatic bonds report order 1.5 — we encode the integer representation here
         // and set the aromatic flag separately.
         auto order = bond->getBondType();
@@ -195,7 +195,7 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
         else if (order == RDKit::Bond::DOUBLE) bond_order_u8 = 2;
         else if (order == RDKit::Bond::TRIPLE) bond_order_u8 = 3;
         else if (order == RDKit::Bond::AROMATIC) bond_order_u8 = 1; // aromatic → treat as single for topology
-        desc.bond_order[b] = bond_order_u8;
+        descriptor.bond_order[b] = bond_order_u8;
 
         std::uint8_t flags = 0;
         if (bond->getIsAromatic()) flags |= bond_flag_aromatic_k;
@@ -203,96 +203,97 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
         auto stereo = bond->getStereo();
         if (stereo == RDKit::Bond::STEREOE || stereo == RDKit::Bond::STEREOTRANS) flags |= bond_flag_stereo_e_k;
         if (stereo == RDKit::Bond::STEREOZ || stereo == RDKit::Bond::STEREOCIS) flags |= bond_flag_stereo_z_k;
-        desc.bond_flags[b] = flags;
+        descriptor.bond_flags[b] = flags;
 
         // The E/Z assignment is stated relative to a specific pair of substituents, one
         // per double-bond end.  Record them so the bounds builder can tell which side any
         // given 1-4 partner lands on.
-        desc.bond_stereo_atom_i[b] = no_stereo_atom_k;
-        desc.bond_stereo_atom_j[b] = no_stereo_atom_k;
+        descriptor.bond_stereo_atom_i[b] = no_stereo_atom_k;
+        descriptor.bond_stereo_atom_j[b] = no_stereo_atom_k;
         if (flags & (bond_flag_stereo_e_k | bond_flag_stereo_z_k)) {
             auto const &stereo_atoms = bond->getStereoAtoms();
             if (stereo_atoms.size() == 2) {
                 std::uint32_t const first = static_cast<std::uint32_t>(stereo_atoms[0]);
                 std::uint32_t const second = static_cast<std::uint32_t>(stereo_atoms[1]);
                 if (first < num_atoms && second < num_atoms) {
-                    desc.bond_stereo_atom_i[b] = static_cast<std::uint8_t>(first);
-                    desc.bond_stereo_atom_j[b] = static_cast<std::uint8_t>(second);
+                    descriptor.bond_stereo_atom_i[b] = static_cast<std::uint8_t>(first);
+                    descriptor.bond_stereo_atom_j[b] = static_cast<std::uint8_t>(second);
                 }
             }
         }
     }
 
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
-        if (desc.element[a] != 1) continue;
+        if (descriptor.element[a] != 1) continue;
         auto const *atom = molecule.getAtomWithIdx(a);
         for (auto const *neighbor : molecule.atomNeighbors(atom)) {
             int const n_element = neighbor->getAtomicNum();
             if (n_element == 7 || n_element == 8) {
-                desc.atom_flags[a] |= atom_flag_hbond_donor_h_k;
+                descriptor.atom_flags[a] |= atom_flag_hbond_donor_h_k;
                 break;
             }
         }
     }
 
     // First pass: count neighbors per atom.
-    std::uint16_t cursor[max_atoms_k + 1] = {};
+    std::uint16_t cursor[max_atoms_per_molecule_k + 1] = {};
     for (std::uint32_t b = 0; b < num_bonds; ++b) {
-        cursor[desc.bond_atom_i[b] + 1]++;
-        cursor[desc.bond_atom_j[b] + 1]++;
+        cursor[descriptor.bond_atom_i[b] + 1]++;
+        cursor[descriptor.bond_atom_j[b] + 1]++;
     }
     // Prefix sum into neighbor_offset.
-    desc.neighbor_offset[0] = 0;
-    for (std::uint32_t a = 0; a < num_atoms; ++a) desc.neighbor_offset[a + 1] = desc.neighbor_offset[a] + cursor[a + 1];
+    descriptor.neighbor_offset[0] = 0;
+    for (std::uint32_t a = 0; a < num_atoms; ++a)
+        descriptor.neighbor_offset[a + 1] = descriptor.neighbor_offset[a] + cursor[a + 1];
     // Reset cursor for second pass (used as write position).
-    std::memcpy(cursor, desc.neighbor_offset, sizeof(std::uint16_t) * (num_atoms + 1));
+    std::memcpy(cursor, descriptor.neighbor_offset, sizeof(std::uint16_t) * (num_atoms + 1));
     // Second pass: fill neighbor_atom + neighbor_bond.
     for (std::uint32_t b = 0; b < num_bonds; ++b) {
-        std::uint8_t const ai = desc.bond_atom_i[b];
-        std::uint8_t const aj = desc.bond_atom_j[b];
-        desc.neighbor_atom[cursor[ai]] = aj;
-        desc.neighbor_bond[cursor[ai]] = static_cast<std::uint16_t>(b);
+        std::uint8_t const ai = descriptor.bond_atom_i[b];
+        std::uint8_t const aj = descriptor.bond_atom_j[b];
+        descriptor.neighbor_atom[cursor[ai]] = aj;
+        descriptor.neighbor_bond[cursor[ai]] = static_cast<std::uint16_t>(b);
         cursor[ai]++;
-        desc.neighbor_atom[cursor[aj]] = ai;
-        desc.neighbor_bond[cursor[aj]] = static_cast<std::uint16_t>(b);
+        descriptor.neighbor_atom[cursor[aj]] = ai;
+        descriptor.neighbor_bond[cursor[aj]] = static_cast<std::uint16_t>(b);
         cursor[aj]++;
     }
 
     // A bond is in a ring iff there's a path from atom_i to atom_j not using that bond.
     // Cheap test: check RDKit's bond->getIsRingBond() via the RingInfo.
-    std::memset(desc.ring_bond_degree, 0, sizeof(desc.ring_bond_degree));
+    std::memset(descriptor.ring_bond_degree, 0, sizeof(descriptor.ring_bond_degree));
     auto const *ring_info = molecule.getRingInfo();
     if (ring_info != nullptr && ring_info->isInitialized()) {
         for (std::uint32_t b = 0; b < num_bonds; ++b) {
             if (ring_info->numBondRings(b) == 0) continue;
-            desc.bond_flags[b] |= bond_flag_in_ring_k;
-            desc.ring_bond_degree[desc.bond_atom_i[b]]++;
-            desc.ring_bond_degree[desc.bond_atom_j[b]]++;
+            descriptor.bond_flags[b] |= bond_flag_in_ring_k;
+            descriptor.ring_bond_degree[descriptor.bond_atom_i[b]]++;
+            descriptor.ring_bond_degree[descriptor.bond_atom_j[b]]++;
         }
 
         auto const &atom_rings = ring_info->atomRings();
         std::uint32_t const n_rings = std::min(static_cast<std::uint32_t>(atom_rings.size()), max_rings_k);
-        desc.num_rings = static_cast<std::uint8_t>(n_rings);
-        desc.ring_offset[0] = 0;
+        descriptor.num_rings = static_cast<std::uint8_t>(n_rings);
+        descriptor.ring_offset[0] = 0;
         std::uint16_t ring_cursor = 0;
         for (std::uint32_t r = 0; r < n_rings; ++r) {
             auto const &ring = atom_rings[r];
-            for (int atom_idx : ring) {
-                if (ring_cursor >= max_atoms_k * 2) break;
-                desc.ring_atoms[ring_cursor++] = static_cast<std::uint8_t>(atom_idx);
-                desc.atom_ring_bitmap[atom_idx] |= (1u << r);
-                desc.atom_flags[atom_idx] |= atom_flag_in_ring_k;
+            for (int atom_index : ring) {
+                if (ring_cursor >= max_atoms_per_molecule_k * 2) break;
+                descriptor.ring_atoms[ring_cursor++] = static_cast<std::uint8_t>(atom_index);
+                descriptor.atom_ring_bitmap[atom_index] |= (1u << r);
+                descriptor.atom_flags[atom_index] |= atom_flag_in_ring_k;
                 // Track smallest ring size per atom.
                 std::uint8_t const rs = static_cast<std::uint8_t>(ring.size());
-                if (desc.smallest_ring[atom_idx] == 0 || rs < desc.smallest_ring[atom_idx])
-                    desc.smallest_ring[atom_idx] = rs;
+                if (descriptor.smallest_ring[atom_index] == 0 || rs < descriptor.smallest_ring[atom_index])
+                    descriptor.smallest_ring[atom_index] = rs;
             }
-            desc.ring_offset[r + 1] = ring_cursor;
+            descriptor.ring_offset[r + 1] = ring_cursor;
         }
     }
     else {
-        desc.num_rings = 0;
-        desc.ring_offset[0] = 0;
+        descriptor.num_rings = 0;
+        descriptor.ring_offset[0] = 0;
     }
 
     return true;
@@ -301,16 +302,16 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
 /**
  *  Convenience accessors for the descriptor. All inline, no allocations.
  */
-inline bool atom_has_flag(molecule_descriptor_t const &desc, std::uint32_t atom_idx, atom_flag_t flag) {
-    return (desc.atom_flags[atom_idx] & flag) != 0;
+inline bool atom_has_flag(molecule_descriptor_t const &descriptor, std::uint32_t atom_index, atom_flag_t flag) {
+    return (descriptor.atom_flags[atom_index] & flag) != 0;
 }
 
-inline bool bond_has_flag(molecule_descriptor_t const &desc, std::uint32_t bond_idx, bond_flag_t flag) {
-    return (desc.bond_flags[bond_idx] & flag) != 0;
+inline bool bond_has_flag(molecule_descriptor_t const &descriptor, std::uint32_t bond_index, bond_flag_t flag) {
+    return (descriptor.bond_flags[bond_index] & flag) != 0;
 }
 
 /**
- *  @brief Fill @p matrix with the all-pairs bond-hop counts of @p desc.
+ *  @brief Fill @p matrix with the all-pairs bond-hop counts of @p descriptor.
  *
  *  One breadth-first search per source atom over the CSR adjacency, writing row @c source
  *  at @c source*row_stride.  Atoms with no bonded path between them — the two halves of a
@@ -318,14 +319,15 @@ inline bool bond_has_flag(molecule_descriptor_t const &desc, std::uint32_t bond_
  *  "unreachable", and 255 is also the saturation value, unreachable for N <= 128 where the
  *  longest simple path is 127 hops.
  *
- *  @param[in] desc Descriptor supplying the atom count and the CSR adjacency.
- *  @param[out] matrix Caller-owned buffer of at least @p row_stride times @c desc.num_atoms bytes.
- *  @param[in] row_stride Element distance between consecutive rows; at least @c desc.num_atoms.
+ *  @param[in] descriptor Descriptor supplying the atom count and the CSR adjacency.
+ *  @param[out] matrix Caller-owned buffer of at least @p row_stride times @c descriptor.num_atoms bytes.
+ *  @param[in] row_stride Element distance between consecutive rows; at least @c descriptor.num_atoms.
  */
-inline void fill_bond_distances(molecule_descriptor_t const &desc, std::uint8_t *matrix, std::uint32_t row_stride) {
-    std::uint32_t const num_atoms = desc.num_atoms;
+inline void fill_bond_distances(molecule_descriptor_t const &descriptor, std::uint8_t *matrix,
+                                std::uint32_t row_stride) {
+    std::uint32_t const num_atoms = descriptor.num_atoms;
     std::memset(matrix, 255, static_cast<std::size_t>(row_stride) * num_atoms);
-    std::uint8_t queue[max_atoms_k];
+    std::uint8_t queue[max_atoms_per_molecule_k];
     for (std::uint32_t source = 0; source < num_atoms; ++source) {
         std::uint8_t *const row = matrix + static_cast<std::size_t>(source) * row_stride;
         row[source] = 0;
@@ -335,10 +337,10 @@ inline void fill_bond_distances(molecule_descriptor_t const &desc, std::uint8_t 
         while (head < tail) {
             std::uint8_t const current = queue[head++];
             std::uint8_t const next_distance = static_cast<std::uint8_t>(row[current] + 1);
-            std::uint16_t const start = desc.neighbor_offset[current];
-            std::uint16_t const end = desc.neighbor_offset[current + 1];
+            std::uint16_t const start = descriptor.neighbor_offset[current];
+            std::uint16_t const end = descriptor.neighbor_offset[current + 1];
             for (std::uint16_t n = start; n < end; ++n) {
-                std::uint8_t const neighbor = desc.neighbor_atom[n];
+                std::uint8_t const neighbor = descriptor.neighbor_atom[n];
                 if (row[neighbor] > next_distance) {
                     row[neighbor] = next_distance;
                     queue[tail++] = neighbor;
@@ -349,8 +351,8 @@ inline void fill_bond_distances(molecule_descriptor_t const &desc, std::uint8_t 
 }
 
 /** True iff atom i and atom j are in the same SSSR ring. */
-inline bool share_ring(molecule_descriptor_t const &desc, std::uint32_t i, std::uint32_t j) {
-    return (desc.atom_ring_bitmap[i] & desc.atom_ring_bitmap[j]) != 0;
+inline bool share_ring(molecule_descriptor_t const &descriptor, std::uint32_t i, std::uint32_t j) {
+    return (descriptor.atom_ring_bitmap[i] & descriptor.atom_ring_bitmap[j]) != 0;
 }
 
 } // namespace smallfield::types

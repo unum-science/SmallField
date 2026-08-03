@@ -53,7 +53,7 @@ using smallfield::types::atom_has_flag;
 using smallfield::types::bond_flag_aromatic_k;
 using smallfield::types::etk_torsion_descriptor_t;
 using smallfield::types::hybridization_sp2_k;
-using smallfield::types::max_atoms_k;
+using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::max_bonds_k;
 using smallfield::types::molecule_descriptor_t;
 
@@ -63,7 +63,7 @@ struct csd_compiled_pattern_t {
     std::unique_ptr<RDKit::ROMol const> pattern;
     std::vector<double> V;
     std::vector<std::int8_t> signs;
-    std::uint32_t idx[4];            ///< atom indices in the pattern for labels :1 through :4
+    std::uint32_t index[4];          ///< atom indices in the pattern for labels :1 through :4
     std::uint64_t required_elements; ///< bitset: bit N = pattern requires element N
     std::uint8_t
         required_hybridizations; ///< bitset: bit H = pattern requires hybridization H (see @ref hybridization_t)
@@ -132,7 +132,7 @@ inline bool parse_pattern_line(std::string const &line, csd_compiled_pattern_t &
 
 /**
  *  Parse the embedded .in block (one SMARTS per non-comment line) and compile each
- *  SMARTS to an ROMol. Fills required_elements bitset and the atom-label idx[4].
+ *  SMARTS to an ROMol. Fills required_elements bitset and the atom-label index[4].
  */
 inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &block) {
     std::vector<csd_compiled_pattern_t> out;
@@ -149,7 +149,7 @@ inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &b
         if (!pat.pattern) continue;
 
         // Find the atoms labeled :1 through :4 via their molAtomMapNumber property.
-        pat.idx[0] = pat.idx[1] = pat.idx[2] = pat.idx[3] = 0xFFFFFFFFu;
+        pat.index[0] = pat.index[1] = pat.index[2] = pat.index[3] = 0xFFFFFFFFu;
         pat.required_elements = 0;
         pat.required_hybridizations = 0;
         pat.requires_aromatic = false;
@@ -157,15 +157,15 @@ inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &b
             auto const *patom = pat.pattern->getAtomWithIdx(i);
             int map_num;
             if (patom->getPropIfPresent("molAtomMapNumber", map_num))
-                if (map_num >= 1 && map_num <= 4) pat.idx[map_num - 1] = i;
+                if (map_num >= 1 && map_num <= 4) pat.index[map_num - 1] = i;
             int const anum = patom->getAtomicNum();
             if (anum > 0 && anum < 64) pat.required_elements |= (1ULL << anum);
             if (patom->getIsAromatic()) pat.requires_aromatic = true;
         }
 
         // Valid pattern must have all 4 atom labels mapped.
-        if (pat.idx[0] == 0xFFFFFFFFu || pat.idx[1] == 0xFFFFFFFFu || pat.idx[2] == 0xFFFFFFFFu ||
-            pat.idx[3] == 0xFFFFFFFFu)
+        if (pat.index[0] == 0xFFFFFFFFu || pat.index[1] == 0xFFFFFFFFu || pat.index[2] == 0xFFFFFFFFu ||
+            pat.index[3] == 0xFFFFFFFFu)
             continue;
 
         // Try to parse into a simple linear native form. Falls through silently on
@@ -222,14 +222,14 @@ inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
  *  that getExperimentalTorsions produces.  Everything reads the flat descriptor, so the same
  *  answer comes out of the device kernel in `smallfield/cuda/csd_torsion_device.cuh`.
  *
- *  @param[in] desc Molecule descriptor with topology, property and ring arrays.
+ *  @param[in] descriptor Molecule descriptor with topology, property and ring arrays.
  *  @param[out] torsions Extracted torsions; any prior contents are dropped.
  */
-inline void extract_etk_torsions_native(molecule_descriptor_t const &desc,
+inline void extract_etk_torsions_native(molecule_descriptor_t const &descriptor,
                                         std::vector<etk_torsion_descriptor_t> &torsions) {
     torsions.clear();
 
-    csd_molecule_gate_t const gate = build_molecule_gate(desc);
+    csd_molecule_gate_t const gate = build_molecule_gate(descriptor);
 
     // One bond claims at most one torsion, first pattern in file order wins.
     std::uint8_t done_bonds[max_bonds_k] = {};
@@ -245,10 +245,10 @@ inline void extract_etk_torsions_native(molecule_descriptor_t const &desc,
 
         // Stack-only native matcher. Zero heap allocations in this branch.
         match_linear_pattern(
-            desc, csd_pattern_view_t(pattern.native_form), done_bonds,
+            descriptor, csd_pattern_view_t(pattern.native_form), done_bonds,
             [&](std::uint8_t a1, std::uint8_t a2, std::uint8_t a3, std::uint8_t a4, std::uint32_t bond_index) -> bool {
                 done_bonds[bond_index] = 1;
-                if (bond_excluded_by_ring_fusion(desc, bond_index) || bond_ring_count(desc, bond_index) > 3)
+                if (bond_excluded_by_ring_fusion(descriptor, bond_index) || bond_ring_count(descriptor, bond_index) > 3)
                     return true;
 
                 etk_torsion_descriptor_t torsion {};
@@ -265,21 +265,21 @@ inline void extract_etk_torsions_native(molecule_descriptor_t const &desc,
     }
 
     // Matches RDKit getExperimentalTorsions' useBasicKnowledge=true behavior.
-    for (std::uint32_t ring_index = 0; ring_index < desc.num_rings; ++ring_index) {
-        std::uint32_t const size = ring_atom_count(desc, ring_index);
+    for (std::uint32_t ring_index = 0; ring_index < descriptor.num_rings; ++ring_index) {
+        std::uint32_t const size = ring_atom_count(descriptor, ring_index);
         if (size < 4 || size > 6) continue;
-        std::uint16_t const start = desc.ring_offset[ring_index];
+        std::uint16_t const start = descriptor.ring_offset[ring_index];
         for (std::uint32_t position = 0; position < size; ++position) {
-            std::uint8_t const a1 = desc.ring_atoms[start + position];
-            std::uint8_t const a2 = desc.ring_atoms[start + (position + 1) % size];
-            std::uint8_t const a3 = desc.ring_atoms[start + (position + 2) % size];
-            std::uint8_t const a4 = desc.ring_atoms[start + (position + 3) % size];
-            std::uint32_t const bond_index = find_bond_between(desc, a2, a3);
+            std::uint8_t const a1 = descriptor.ring_atoms[start + position];
+            std::uint8_t const a2 = descriptor.ring_atoms[start + (position + 1) % size];
+            std::uint8_t const a3 = descriptor.ring_atoms[start + (position + 2) % size];
+            std::uint8_t const a4 = descriptor.ring_atoms[start + (position + 3) % size];
+            std::uint32_t const bond_index = find_bond_between(descriptor, a2, a3);
             if (bond_index == no_bond_index_k) continue;
             if (done_bonds[bond_index]) continue;
             constexpr std::uint8_t planar_k = hybridization_sp2_k;
-            if (desc.hybridization[a1] != planar_k || desc.hybridization[a2] != planar_k ||
-                desc.hybridization[a3] != planar_k || desc.hybridization[a4] != planar_k)
+            if (descriptor.hybridization[a1] != planar_k || descriptor.hybridization[a2] != planar_k ||
+                descriptor.hybridization[a3] != planar_k || descriptor.hybridization[a4] != planar_k)
                 continue;
 
             done_bonds[bond_index] = 1;

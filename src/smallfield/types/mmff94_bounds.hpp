@@ -1,8 +1,8 @@
 /**
  *  @file mmff94_bounds.hpp
  *  @brief Per-molecule MMFF94 term-count upper bounds shared between the
- *         CPU extractor (`src/mmff94/mmff94_cpu.hpp`) and the GPU extractor
- *         (`src/mmff94/mmff94_extract_device.cuh`).
+ *         CPU extractor (`source/mmff94/mmff94_cpu.hpp`) and the GPU extractor
+ *         (`source/mmff94/mmff94_extract_device.cuh`).
  *
  *  Drug-like molecules with 128 heavy+H atoms never approach these limits;
  *  they exist so every stack-sized scratch array has a compile-time

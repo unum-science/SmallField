@@ -13,10 +13,15 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "smallfield/types/molecule_descriptor.hpp"
+
 namespace smallfield::api {
 
-/** @brief Maximum atom count the kernels support per molecule. */
-inline constexpr std::uint32_t max_atoms_per_molecule_k = 128;
+/** @brief Maximum atom count the kernels support per molecule.
+ *  One definition, re-exported here because the coordinate layout is stated in these terms; the
+ *  descriptor's array bounds and this stride have to be the same number or the two disagree about
+ *  what a molecule can hold. */
+using types::max_atoms_per_molecule_k;
 
 /**
  *  @brief Addressing for one conformer slot inside a coordinates buffer.

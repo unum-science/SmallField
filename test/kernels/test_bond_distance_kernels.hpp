@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "smallfield/api/batch_pool.hpp"
+#include "smallfield/api/wave_slice_pool.hpp"
 
 /**
  *  @brief Mirror a prepared batch onto the device and run the warp BFS over it.
@@ -16,7 +16,7 @@
  *  @param[in] host_pool Base of the batch's pinned host buffer.
  *  @param[in] layout Byte layout of the batch's regions.
  *  @param[in] molecule_count Number of molecules in the batch.
- *  @param[out] bond_distance_out Receives @c layout.count_bond_distance bytes.
+ *  @param[out] bond_distance_out Receives @c layout.num_bond_distance bytes.
  */
-void run_bond_distance_bfs_on_gpu(std::byte const *host_pool, smallfield::api::batch_layout_t const &layout,
+void run_bond_distance_bfs_on_gpu(std::byte const *host_pool, smallfield::api::wave_slice_layout_t const &layout,
                                   std::uint32_t molecule_count, std::uint8_t *bond_distance_out);

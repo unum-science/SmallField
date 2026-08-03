@@ -40,9 +40,9 @@ static void test_chirality_correct_conformer() {
 
         // Extract graph-only chiral targets from the molecular graph.
         std::vector<sft::chiral_center_descriptor_t> chirals;
-        sft::molecule_descriptor_t desc;
-        sft::build_descriptor(*mol, desc);
-        sfp::extract_chiral_centers(*mol, desc, chirals);
+        sft::molecule_descriptor_t descriptor;
+        sft::build_descriptor(*mol, descriptor);
+        sfp::extract_chiral_centers(*mol, descriptor, chirals);
         std::printf("    found %zu chiral centers\n", chirals.size());
 
         if (chirals.empty()) {
@@ -77,9 +77,9 @@ static void test_chirality_inverted() {
     std::uint32_t const num_atoms = mol->getNumAtoms();
 
     std::vector<sft::chiral_center_descriptor_t> chirals;
-    sft::molecule_descriptor_t desc;
-    sft::build_descriptor(*mol, desc);
-    sfp::extract_chiral_centers(*mol, desc, chirals);
+    sft::molecule_descriptor_t descriptor;
+    sft::build_descriptor(*mol, descriptor);
+    sfp::extract_chiral_centers(*mol, descriptor, chirals);
 
     if (chirals.empty()) {
         std::printf("  skipping (no chirals extracted)\n");

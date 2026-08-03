@@ -122,7 +122,8 @@ bool build_descriptor_from_smiles(std::string const &smiles, sft::molecule_descr
     catch (...) {
         return false;
     }
-    if (molecule->getNumAtoms() > sft::max_atoms_k || molecule->getNumBonds() > sft::max_bonds_k) return false;
+    if (molecule->getNumAtoms() > sft::max_atoms_per_molecule_k || molecule->getNumBonds() > sft::max_bonds_k)
+        return false;
     return sft::build_descriptor(*molecule, descriptor);
 }
 

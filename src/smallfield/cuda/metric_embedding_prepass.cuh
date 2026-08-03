@@ -346,8 +346,8 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
  *
  *  The previous entry point allocated scratch per atom-count group via cudaMalloc and
  *  queried cusolver workspace size per group, both of which are synchronous device
- *  operations that force the CPU to wait.  At 30-ish atom-count groups per chunk ×
- *  8 GPUs × N chunks, that overhead adds up to ~800 ms per chunk per GPU and was the
+ *  operations that force the CPU to wait.  At 30-ish atom-count groups per wave ×
+ *  8 GPUs × N waves, that overhead adds up to ~800 ms per wave per GPU and was the
  *  reason the pipelined dispatcher needed `std::thread` to parallelize across GPUs.
  *  With pre-allocation this function is truly non-blocking.
  */
@@ -438,7 +438,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
 
     // No final stream sync: the prepass is stream-ordered with whatever work the
     // caller launches next on the same stream. Caller's `finalize_gpu_pipeline`
-    // syncs the stream once per chunk, which is enough.
+    // syncs the stream once per wave, which is enough.
     return success;
 }
 

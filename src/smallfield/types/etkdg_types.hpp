@@ -50,6 +50,12 @@ enum etk_interaction_type_t : std::uint8_t {
 /**
  *  Per-molecule metadata for the ETKDG pipeline.
  *  One per molecule in the batch; offsets point into concatenated arrays.
+ *
+ *  Every offset here counts @b elements, never bytes.  The batch layout in
+ *  @ref smallfield::api::wave_slice_layout_t carves the same regions out of the pool and its offsets
+ *  count bytes, so the two are named apart — `bounds_offset` here against `bounds_byte_offset`
+ *  there.  They used to differ only by word order, which reads the same and compiles the same
+ *  while addressing memory four times too far.
  */
 struct etkdg_molecule_metadata_t {
     std::uint32_t num_atoms;
@@ -73,9 +79,9 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t mmff_torsion_offset;
     std::uint32_t mmff_oop_offset;
     std::uint32_t mmff_stretchbend_offset;
-    std::uint32_t mmff_atom_offsets_start;
+    std::uint32_t mmff_atom_csr_offset;
     std::uint32_t etk_interaction_offset; ///< offset into batched ETK interaction list
-    std::uint32_t etk_atom_offsets_start; ///< offset into batched ETK atom offsets
+    std::uint32_t etk_atom_csr_offset;    ///< offset into batched ETK atom offsets
     /**
      *  @brief Reserved for a future host-side bounds quantisation step.
      *
@@ -263,11 +269,11 @@ struct mmff94_atom_interaction_t {
  *  on the fly from the `bond_distance` matrix.
  */
 struct mmff94_atom_offsets_t {
-    std::uint32_t bond_start;
-    std::uint32_t angle_start;
-    std::uint32_t torsion_start;
-    std::uint32_t oop_start;
-    std::uint32_t stretchbend_start;
+    std::uint32_t bond_offset;
+    std::uint32_t angle_offset;
+    std::uint32_t torsion_offset;
+    std::uint32_t oop_offset;
+    std::uint32_t stretchbend_offset;
     // These are `uint32_t` because a central atom in a large drug-like molecule can participate in
     // more than 255 torsions.  A narrower counter wraps, the torsion writes overflow into the next
     // atom's OOP region, and the kernel then reads torsion term indices out of `oop_params` — an
@@ -295,7 +301,7 @@ struct etk_atom_interaction_t {
  *  @brief Per-atom offset into the ETK interaction list.
  */
 struct etk_atom_offsets_t {
-    std::uint32_t interaction_start;
+    std::uint32_t interaction_offset;
     std::uint32_t interaction_count;
 };
 

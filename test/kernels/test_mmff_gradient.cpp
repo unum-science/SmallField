@@ -83,7 +83,7 @@ auto build_single_oop_prepared(sfp::etkdg_prepared_molecule_t const &prepared) {
         std::uint8_t const atom = atoms[role];
         std::uint32_t const position = static_cast<std::uint16_t>(single.mmff_interactions.size());
         single.mmff_atom_offsets[atom] = {};
-        single.mmff_atom_offsets[atom].oop_start = position;
+        single.mmff_atom_offsets[atom].oop_offset = position;
         single.mmff_atom_offsets[atom].oop_count = 1;
         single.mmff_interactions.push_back({0, sft::mmff94_out_of_plane_k, static_cast<sft::atom_role_t>(role)});
     }

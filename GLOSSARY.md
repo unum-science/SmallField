@@ -13,7 +13,8 @@ A `parquet-shard` carries roughly a million molecules; a `coprocessed-batch` agg
 | __`parquet-shard`__     | One on-disk Parquet file. Inputs and outputs both use this unit.                                                                                                                                                             | ~1 M molecules                    |
 | __`coprocessed-batch`__ | One call to `context_t::generate_conformers`. Aggregates molecules from one or more `parquet-shards` into a batch large enough to saturate all visible GPUs.                                                                 | `num_gpus × 100 K` molecules      |
 | __`embedding-wave`__    | Subdivision of a `coprocessed-batch`. The unit of CPU/GPU pipelined work: wave N+1's CPU step overlaps wave N's GPU step.                                                                                                    | ~50 K molecules (VRAM-aware auto) |
-| __`atom-limited-bin`__  | Inside one `embedding-wave`, molecules are grouped into bins whose member atom counts fall under a fixed cap (16, 32, 48, 64, 80, 96, 112, 128). Each bin dispatches one kernel launch with shared memory sized for the cap. | 6–8 K molecules/bin               |
+| __`wave-slice`__        | One `embedding-wave`'s share for a single GPU. The unit a `batch_pool_t` actually holds; the per-device stripe below produces one per device per wave.                                                       | wave ÷ `num_gpus`                 |
+| __`atom-limited-bin`__  | Inside one `wave-slice`, molecules are grouped into bins whose member atom counts fall under a fixed cap (16, 32, 48, 64, 80, 96, 112, 128). Each bin dispatches one kernel launch with shared memory sized for the cap. | 6–8 K molecules/bin               |
 | __`molecule`__          | One input SMILES → K output conformers.                                                                                                                                                                                      | —                                 |
 
 Within one `embedding-wave` the per-device stripe sorts molecules by `molecule_complexity_score_` (a pure function of `etkdg_molecule_metadata_t`; see `src/smallfield/preprocess/molecule_complexity.hpp`) descending and assigns sorted rank `k` to device `k % device_count`.
@@ -134,9 +135,10 @@ Glossary terms are vocabulary; the table below points at where each one is groun
 | Glossary term       | Canonical location in source                                                                                                                  |
 | :------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------- |
 | `parquet-shard`     | `cli/smallfield_batch.cpp` — path-based iteration, no dedicated struct                                                                        |
-| `coprocessed-batch` | `batch_pool_t` in `src/smallfield/api/batch_pool.hpp` (alias `etkdg_molecule_batch_t` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`) |
+| `coprocessed-batch` | `coprocessed_batch_accumulator_t` in `cli/smallfield_batch.cpp` — one `generate_conformers` call        |
+| `wave-slice`        | `batch_pool_t` in `src/smallfield/api/batch_pool.hpp` (alias `etkdg_molecule_batch_t` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`) |
 | `embedding-wave`    | `wave_record_t` in `src/smallfield/api/smallfield.cu`                                                                                         |
-| `atom-limited-bin`  | `atom_limited_bin_caps[]` in `src/smallfield/api/smallfield.cu`                                                                               |
+| `atom-limited-bin`  | `atom_limited_bin_caps_k[]` in `src/smallfield/api/smallfield.hpp`                                                                            |
 | pipeline roles      | `cli/smallfield_batch.cpp` — architectural comment blocks, no per-role struct                                                                 |
 | `preprocess-step`   | `prepare_molecule_batch_into` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`                                                          |
 | `embedding-step`    | `launch_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                                                                   |

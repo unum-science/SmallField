@@ -41,7 +41,7 @@ using cudaStream_t = void *;
 #include <string_view>
 #include <vector>
 
-#include "smallfield/api/batch_pool.hpp"
+#include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/api/conformer_status.hpp"
 #include "smallfield/log.hpp"
@@ -73,7 +73,7 @@ inline constexpr std::array<std::uint32_t, atom_limited_bin_count_k> atom_limite
 };
 
 // `max_atoms_per_molecule_k` lives in `conformer_layout.hpp` (included above); it
-// matches `molecule_descriptor_t::max_atoms_k`, and larger molecules are rejected by
+// matches `molecule_descriptor_t::max_atoms_per_molecule_k`, and larger molecules are rejected by
 // preprocess with `conformer_status_t::too_many_atoms`.
 
 /** @brief Worst-case conformer count used for pre-allocation at construction. */
@@ -137,7 +137,7 @@ struct context_t {
      *  own pool.  Eliminates the concurrent-pinned-source-DMA pattern that
      *  arose when all devices read the same shared pinned buffer.
      */
-    std::array<std::array<batch_pool_t, max_devices_k>, 2> batch_slots_per_device {};
+    std::array<std::array<wave_slice_pool_t, max_devices_k>, 2> batch_slots_per_device {};
     /** @brief Per-device molecule count every pool above was pre-sized for.  The wave
      *  sizer clamps to this so a runtime wave can never exceed the construction-time
      *  reservation and trigger a grow from inside the per-device launch fan-out. */

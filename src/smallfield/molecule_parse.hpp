@@ -4,7 +4,7 @@
  *
  *  Four call sites used to parse independently — the device preprocess path, the legacy host path,
  *  the shape-descriptor postprocess and the CPU fallback — and they had already drifted: one gated
- *  the atom count against a hardcoded `128` where another used @c max_atoms_k, and their `AddHs`
+ *  the atom count against a hardcoded `128` where another used @c max_atoms_per_molecule_k, and their `AddHs`
  *  failure semantics differed four ways.
  *
  *  Drift here is not cosmetic.  `compute_shape_descriptors` accepts a molecule's descriptors only
@@ -59,7 +59,7 @@ struct parse_options_t {
      *  The preprocess path passes the compile-time warp-pipeline cap, the CPU fallback passes the
      *  operator's runtime `--max-atoms`, and the postprocess path passes zero because it only ever
      *  sees molecules the pipeline already accepted. */
-    std::uint32_t max_atoms = types::max_atoms_k;
+    std::uint32_t max_atoms = types::max_atoms_per_molecule_k;
     salt_policy_t salt_policy = keep_largest_fragment_k;
     metadata_policy_t metadata_policy = skip_metadata_k;
 };

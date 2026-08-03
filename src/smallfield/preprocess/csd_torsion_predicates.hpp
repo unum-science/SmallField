@@ -44,7 +44,7 @@
 namespace smallfield::preprocess {
 using smallfield::types::atom_flag_aromatic_k;
 using smallfield::types::atom_flag_in_ring_k;
-using smallfield::types::max_atoms_k;
+using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::molecule_descriptor_t;
 
 /**
@@ -167,16 +167,16 @@ struct recursive_visit_t {
 };
 
 /** @brief Test whether a bond satisfies one @ref bond_disjunct_t. */
-[[gnu::hot]] SMALLFIELD_HD_ inline bool bond_disjunct_match(molecule_descriptor_t const &desc, std::uint32_t bond_index,
-                                                            bond_disjunct_t const &disjunct) {
-    if (disjunct.bond_order != 0 && desc.bond_order[bond_index] != disjunct.bond_order) return false;
-    std::uint8_t const flags = desc.bond_flags[bond_index];
+[[gnu::hot]] SMALLFIELD_HD_ inline bool bond_disjunct_match(molecule_descriptor_t const &descriptor,
+                                                            std::uint32_t bond_index, bond_disjunct_t const &disjunct) {
+    if (disjunct.bond_order != 0 && descriptor.bond_order[bond_index] != disjunct.bond_order) return false;
+    std::uint8_t const flags = descriptor.bond_flags[bond_index];
     if ((flags & disjunct.require_flags) != disjunct.require_flags) return false;
     if ((flags & disjunct.forbid_flags) != 0) return false;
     return true;
 }
 
-SMALLFIELD_HD_ inline bool recursive_match_node(molecule_descriptor_t const &desc, recursive_pool_view_t pool,
+SMALLFIELD_HD_ inline bool recursive_match_node(molecule_descriptor_t const &descriptor, recursive_pool_view_t pool,
                                                 std::uint8_t node_index, std::uint32_t atom_index,
                                                 recursive_visit_t &visited);
 
@@ -184,16 +184,16 @@ SMALLFIELD_HD_ inline bool recursive_match_node(molecule_descriptor_t const &des
  *  @brief Test whether a single atom satisfies one @ref atom_disjunct_t — one OR branch
  *  of a SMARTS atom expression, including its recursive guard when it carries one.
  *
- *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] descriptor Molecule descriptor with topology and property arrays.
  *  @param[in] atom_index Atom to test.
  *  @param[in] disjunct One conjunction of SMARTS primitives.
  *  @param[in] pool Sub-query nodes the disjunct's recursive guard indexes into.
  *  @return True when every primitive holds.
  */
-[[gnu::hot]] SMALLFIELD_HD_ inline bool atom_disjunct_match(molecule_descriptor_t const &desc, std::uint32_t atom_index,
-                                                            atom_disjunct_t const &disjunct,
+[[gnu::hot]] SMALLFIELD_HD_ inline bool atom_disjunct_match(molecule_descriptor_t const &descriptor,
+                                                            std::uint32_t atom_index, atom_disjunct_t const &disjunct,
                                                             recursive_pool_view_t pool) {
-    std::uint8_t const element = desc.element[atom_index];
+    std::uint8_t const element = descriptor.element[atom_index];
     if (disjunct.element_mask != 0) {
         if (disjunct.element_mask_exclusive) {
             // Exclude-set: bit N set ⇒ element N is forbidden. Elements > 63
@@ -207,19 +207,20 @@ SMALLFIELD_HD_ inline bool recursive_match_node(molecule_descriptor_t const &des
             if ((disjunct.element_mask & (1ULL << element)) == 0) return false;
         }
     }
-    if (disjunct.min_degree != 0 && desc.degree[atom_index] != disjunct.min_degree) return false;
+    if (disjunct.min_degree != 0 && descriptor.degree[atom_index] != disjunct.min_degree) return false;
     if (disjunct.heavy_degree != 0) {
-        std::uint8_t const degree = desc.degree[atom_index];
-        std::uint8_t const num_hydrogens = desc.num_hydrogens[atom_index];
+        std::uint8_t const degree = descriptor.degree[atom_index];
+        std::uint8_t const num_hydrogens = descriptor.num_hydrogens[atom_index];
         std::uint8_t const heavy = (degree >= num_hydrogens) ? static_cast<std::uint8_t>(degree - num_hydrogens) : 0;
         if (heavy != disjunct.heavy_degree) return false;
     }
-    if (disjunct.exact_h_count != 0xFF && desc.num_hydrogens[atom_index] != disjunct.exact_h_count) return false;
-    if (disjunct.forbid_h_count != 0xFF && desc.num_hydrogens[atom_index] == disjunct.forbid_h_count) return false;
-    if (disjunct.ring_bond_degree != 0xFF && desc.ring_bond_degree[atom_index] != disjunct.ring_bond_degree)
+    if (disjunct.exact_h_count != 0xFF && descriptor.num_hydrogens[atom_index] != disjunct.exact_h_count) return false;
+    if (disjunct.forbid_h_count != 0xFF && descriptor.num_hydrogens[atom_index] == disjunct.forbid_h_count)
+        return false;
+    if (disjunct.ring_bond_degree != 0xFF && descriptor.ring_bond_degree[atom_index] != disjunct.ring_bond_degree)
         return false;
     if (disjunct.ring_size != 0) {
-        std::uint8_t const smallest = desc.smallest_ring[atom_index];
+        std::uint8_t const smallest = descriptor.smallest_ring[atom_index];
         if (smallest < disjunct.ring_size || smallest > disjunct.ring_size_max) return false;
     }
     if (disjunct.ring_count != 0) {
@@ -228,19 +229,21 @@ SMALLFIELD_HD_ inline bool recursive_match_node(molecule_descriptor_t const &des
         // rings than that are conservatively under-counted, but RDKit's own
         // R<n> matcher has the same SSSR dependency so divergence only
         // appears on molecules the descriptor already treats specially.
-        std::uint8_t const count = static_cast<std::uint8_t>(__builtin_popcount(desc.atom_ring_bitmap[atom_index]));
+        std::uint8_t const count = static_cast<std::uint8_t>(
+            __builtin_popcount(descriptor.atom_ring_bitmap[atom_index]));
         if (count != disjunct.ring_count) return false;
     }
-    if (disjunct.hybridization != 0 && desc.hybridization[atom_index] != disjunct.hybridization) return false;
+    if (disjunct.hybridization != 0 && descriptor.hybridization[atom_index] != disjunct.hybridization) return false;
     std::int8_t constexpr no_charge_k = std::numeric_limits<std::int8_t>::min();
-    if (disjunct.formal_charge != no_charge_k && desc.formal_charge[atom_index] != disjunct.formal_charge) return false;
-    std::uint8_t const flags = desc.atom_flags[atom_index];
+    if (disjunct.formal_charge != no_charge_k && descriptor.formal_charge[atom_index] != disjunct.formal_charge)
+        return false;
+    std::uint8_t const flags = descriptor.atom_flags[atom_index];
     if ((flags & disjunct.require_flags) != disjunct.require_flags) return false;
     if ((flags & disjunct.forbid_flags) != 0) return false;
     if (disjunct.recursive_root != no_recursive_node_k) {
         recursive_visit_t visited;
         visited.count = 0;
-        bool const satisfied = recursive_match_node(desc, pool, disjunct.recursive_root, atom_index, visited);
+        bool const satisfied = recursive_match_node(descriptor, pool, disjunct.recursive_root, atom_index, visited);
         if (satisfied == (disjunct.recursive_negate != 0)) return false;
     }
     return true;
@@ -253,37 +256,37 @@ SMALLFIELD_HD_ inline bool recursive_match_node(molecule_descriptor_t const &des
  *  `$([c]([cH,nX2H0])[cH,nX2H0])` demand two different neighbours rather than one
  *  neighbour counted twice.
  *
- *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] descriptor Molecule descriptor with topology and property arrays.
  *  @param[in] pool Sub-query nodes.
  *  @param[in] child_index First sibling still to bind; @ref no_recursive_node_k when the list is exhausted.
  *  @param[in] parent_atom Molecule atom the siblings hang off.
  *  @param[inout] visited Atoms already claimed by this walk; restored on every failed branch.
  *  @return True when the whole sibling list binds.
  */
-SMALLFIELD_HD_ inline bool recursive_match_children(molecule_descriptor_t const &desc, recursive_pool_view_t pool,
+SMALLFIELD_HD_ inline bool recursive_match_children(molecule_descriptor_t const &descriptor, recursive_pool_view_t pool,
                                                     std::uint8_t child_index, std::uint32_t parent_atom,
                                                     recursive_visit_t &visited) {
     if (child_index == no_recursive_node_k) return true;
     recursive_node_t const &child = pool.nodes[child_index];
-    std::uint16_t const start = desc.neighbor_offset[parent_atom];
-    std::uint16_t const end = desc.neighbor_offset[parent_atom + 1];
+    std::uint16_t const start = descriptor.neighbor_offset[parent_atom];
+    std::uint16_t const end = descriptor.neighbor_offset[parent_atom + 1];
     for (std::uint16_t entry = start; entry < end; ++entry) {
-        std::uint8_t const candidate = desc.neighbor_atom[entry];
+        std::uint8_t const candidate = descriptor.neighbor_atom[entry];
         bool claimed = false;
         for (std::uint8_t slot = 0; slot < visited.count; ++slot) claimed = claimed || visited.atoms[slot] == candidate;
         if (claimed) continue;
 
         bool bond_ok = false;
         for (std::uint8_t slot = 0; slot < child.num_bond_disjuncts && !bond_ok; ++slot)
-            bond_ok = bond_disjunct_match(desc, desc.neighbor_bond[entry], child.bond_disjuncts[slot]);
+            bond_ok = bond_disjunct_match(descriptor, descriptor.neighbor_bond[entry], child.bond_disjuncts[slot]);
         if (!bond_ok) continue;
 
         std::uint8_t const mark = visited.count;
-        if (!recursive_match_node(desc, pool, child_index, candidate, visited)) {
+        if (!recursive_match_node(descriptor, pool, child_index, candidate, visited)) {
             visited.count = mark;
             continue;
         }
-        if (recursive_match_children(desc, pool, child.next_sibling, parent_atom, visited)) return true;
+        if (recursive_match_children(descriptor, pool, child.next_sibling, parent_atom, visited)) return true;
         visited.count = mark;
     }
     return false;
@@ -292,41 +295,41 @@ SMALLFIELD_HD_ inline bool recursive_match_children(molecule_descriptor_t const 
 /**
  *  @brief Bind one sub-query node to @p atom_index and its whole subtree below that.
  *
- *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] descriptor Molecule descriptor with topology and property arrays.
  *  @param[in] pool Sub-query nodes.
  *  @param[in] node_index Node to bind.
  *  @param[in] atom_index Molecule atom to bind it to.
  *  @param[inout] visited Atoms already claimed by this walk; @p atom_index joins them on success.
  *  @return True when the node and its subtree bind.
  */
-SMALLFIELD_HD_ inline bool recursive_match_node(molecule_descriptor_t const &desc, recursive_pool_view_t pool,
+SMALLFIELD_HD_ inline bool recursive_match_node(molecule_descriptor_t const &descriptor, recursive_pool_view_t pool,
                                                 std::uint8_t node_index, std::uint32_t atom_index,
                                                 recursive_visit_t &visited) {
     recursive_node_t const &node = pool.nodes[node_index];
     bool any_disjunct = false;
     for (std::uint8_t slot = 0; slot < node.num_atom_disjuncts && !any_disjunct; ++slot)
-        any_disjunct = atom_disjunct_match(desc, atom_index, node.atom_disjuncts[slot], pool);
+        any_disjunct = atom_disjunct_match(descriptor, atom_index, node.atom_disjuncts[slot], pool);
     if (!any_disjunct) return false;
     if (visited.count >= max_recursive_visited_k) return false;
     visited.atoms[visited.count++] = static_cast<std::uint8_t>(atom_index);
-    return recursive_match_children(desc, pool, node.first_child, atom_index, visited);
+    return recursive_match_children(descriptor, pool, node.first_child, atom_index, visited);
 }
 
 /**
  *  @brief Evaluate a compiled recursive sub-query against one atom.
  *
- *  @param[in] desc Molecule descriptor filled by @ref build_descriptor.
- *  @param[in] atom_index Atom to test; must be below `desc.num_atoms`.
+ *  @param[in] descriptor Molecule descriptor filled by @ref build_descriptor.
+ *  @param[in] atom_index Atom to test; must be below `descriptor.num_atoms`.
  *  @param[in] pool Sub-query nodes the root indexes into.
  *  @param[in] root Node the sub-query is rooted at, or @ref no_recursive_node_k for "no constraint".
  *  @return True when @p atom_index satisfies the sub-query.
  */
-SMALLFIELD_HD_ inline bool recursive_query_match(molecule_descriptor_t const &desc, std::uint32_t atom_index,
+SMALLFIELD_HD_ inline bool recursive_query_match(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
                                                  recursive_pool_view_t pool, std::uint8_t root) {
     if (root == no_recursive_node_k) return true;
     recursive_visit_t visited;
     visited.count = 0;
-    return recursive_match_node(desc, pool, root, atom_index, visited);
+    return recursive_match_node(descriptor, pool, root, atom_index, visited);
 }
 
 } // namespace smallfield::preprocess

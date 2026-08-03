@@ -49,22 +49,22 @@ struct device_capacities_t {
 /**
  *  @brief Upper-bound the elements every device preprocessing kernel can emit for one molecule.
  *
- *  @param[in] desc Flat descriptor the kernels will read.
+ *  @param[in] descriptor Flat descriptor the kernels will read.
  *  @param[in] num_distance_constraints 1-2 and 1-3 constraints the host already emitted, which
  *             enter the ETK per-atom list alongside the torsions.
  *  @return Per-region capacities, each clamped to the matching @c max_mmff_*_per_mol_k ceiling
  *          the extractor itself saturates at.
  */
-inline device_capacities_t compute_device_capacities(molecule_descriptor_t const &desc,
+inline device_capacities_t compute_device_capacities(molecule_descriptor_t const &descriptor,
                                                      std::uint32_t num_distance_constraints) noexcept {
-    std::uint32_t const num_atoms = desc.num_atoms;
-    std::uint32_t const num_bonds = desc.num_bonds;
+    std::uint32_t const num_atoms = descriptor.num_atoms;
+    std::uint32_t const num_bonds = descriptor.num_bonds;
 
     // Angles and stretch-bends both walk the neighbour pairs of every centre.
     std::uint32_t angle_pairs = 0;
     std::uint32_t out_of_plane_slots = 0;
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint32_t const degree = desc.degree[center];
+        std::uint32_t const degree = descriptor.degree[center];
         angle_pairs += degree * (degree > 0 ? degree - 1 : 0) / 2;
         // The extractor caches at most eight neighbours and emits one term per cached neighbour.
         if (degree >= 3) out_of_plane_slots += std::min<std::uint32_t>(degree, 8);
@@ -73,8 +73,8 @@ inline device_capacities_t compute_device_capacities(molecule_descriptor_t const
     // Torsions walk every bond as the central pair and pair off the two end atoms' other neighbours.
     std::uint32_t torsion_quadruples = 0;
     for (std::uint32_t bond = 0; bond < num_bonds; ++bond) {
-        std::uint32_t const degree_j = desc.degree[desc.bond_atom_i[bond]];
-        std::uint32_t const degree_k = desc.degree[desc.bond_atom_j[bond]];
+        std::uint32_t const degree_j = descriptor.degree[descriptor.bond_atom_i[bond]];
+        std::uint32_t const degree_k = descriptor.degree[descriptor.bond_atom_j[bond]];
         torsion_quadruples += (degree_j > 0 ? degree_j - 1 : 0) * (degree_k > 0 ? degree_k - 1 : 0);
     }
 

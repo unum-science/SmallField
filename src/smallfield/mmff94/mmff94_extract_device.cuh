@@ -16,7 +16,7 @@
  *     staging per molecule, and report their actual per-term-type counts
  *     to the `per_mol_counts` array.
  *   - `mmff94_scan_counts_kernel` + `mmff94_compact_terms_kernel` turn that
- *     staging into the packed variable-length layout `batch_pool_t` and
+ *     staging into the packed variable-length layout `wave_slice_pool_t` and
  *     `mmff_polish_warp_kernel` consume: one contiguous array per term type,
  *     per-molecule bases stamped into `etkdg_molecule_metadata_t`, and the
  *     per-atom CSR starts rebased from molecule-relative to batch-global.
@@ -60,7 +60,7 @@ using smallfield::types::atom_role_second_k;
 using smallfield::types::atom_role_third_k;
 using smallfield::types::bond_flag_aromatic_k;
 using smallfield::types::etkdg_molecule_metadata_t;
-using smallfield::types::max_atoms_k;
+using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::max_bonds_k;
 using smallfield::types::max_mmff_angles_per_mol_k;
 using smallfield::types::max_mmff_bonds_per_mol_k;
@@ -163,12 +163,12 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     }
 
     std::uint32_t const lane = threadIdx.x;
-    molecule_descriptor_t const &desc = descriptors[mol];
+    molecule_descriptor_t const &descriptor = descriptors[mol];
     std::uint32_t const atom_off = atom_offsets[mol];
     std::uint8_t const *atom_types = atom_types_all + atom_off;
     float const *charges = atom_charges_all + atom_off;
-    std::uint32_t const num_atoms = desc.num_atoms;
-    std::uint32_t const num_bonds = desc.num_bonds;
+    std::uint32_t const num_atoms = descriptor.num_atoms;
+    std::uint32_t const num_bonds = descriptor.num_bonds;
 
     // Per-molecule output bases.
     mmff94_atom_vdw_params_t *vdw_out = out_atom_vdw + atom_off;
@@ -201,11 +201,11 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     __shared__ std::uint8_t s_bond_type[max_bonds_k];
     __shared__ float s_bond_r0[max_bonds_k];
     for (std::uint32_t b = lane; b < num_bonds; b += 32) {
-        std::uint8_t const i = desc.bond_atom_i[b];
-        std::uint8_t const j = desc.bond_atom_j[b];
+        std::uint8_t const i = descriptor.bond_atom_i[b];
+        std::uint8_t const j = descriptor.bond_atom_j[b];
         std::uint8_t bt = 0;
-        bool const arom_bond = (desc.bond_flags[b] & bond_flag_aromatic_k) != 0;
-        if (desc.bond_order[b] == 1 && !arom_bond) {
+        bool const arom_bond = (descriptor.bond_flags[b] & bond_flag_aromatic_k) != 0;
+        if (descriptor.bond_order[b] == 1 && !arom_bond) {
             auto const *pi = lookup_prop(tables, atom_types[i]);
             auto const *pj = lookup_prop(tables, atom_types[j]);
             if (pi && pj && ((pi->sbmb && pj->sbmb) || (pi->arom && pj->arom))) bt = 1;
@@ -218,7 +218,7 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
             r0 = bp->r0;
         }
         else {
-            auto const emp = native_bond_empirical(tables, desc.element[i], desc.element[j]);
+            auto const emp = native_bond_empirical(tables, descriptor.element[i], descriptor.element[j]);
             kb = emp.first;
             r0 = emp.second;
         }
@@ -253,16 +253,16 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     std::span<std::uint8_t const> bond_types {bond_type_arr, num_bonds};
     std::span<std::uint8_t const> at_span {atom_types, num_atoms};
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint16_t const nstart = desc.neighbor_offset[center];
-        std::uint16_t const nend = desc.neighbor_offset[center + 1];
+        std::uint16_t const nstart = descriptor.neighbor_offset[center];
+        std::uint16_t const nend = descriptor.neighbor_offset[center + 1];
         for (std::uint16_t a = nstart; a < nend; ++a) {
             for (std::uint16_t b = a + 1; b < nend; ++b) {
-                std::uint32_t const ai = desc.neighbor_atom[a];
-                std::uint32_t const aj = desc.neighbor_atom[b];
-                std::int32_t const bond_index_ic = find_bond_idx(desc, ai, center);
-                std::int32_t const bond_index_cj = find_bond_idx(desc, center, aj);
+                std::uint32_t const ai = descriptor.neighbor_atom[a];
+                std::uint32_t const aj = descriptor.neighbor_atom[b];
+                std::int32_t const bond_index_ic = find_bond_index(descriptor, ai, center);
+                std::int32_t const bond_index_cj = find_bond_index(descriptor, center, aj);
                 if (bond_index_ic < 0 || bond_index_cj < 0) continue;
-                std::uint8_t const at_code = native_get_mmff_angle_type(desc, bond_types, ai, center, aj);
+                std::uint8_t const at_code = native_get_mmff_angle_type(descriptor, bond_types, ai, center, aj);
                 auto const *ap = lookup_angle(tables, at_code, atom_types[ai], atom_types[center], atom_types[aj]);
                 float ka = 0.0f, theta0_deg = 0.0f;
                 bool use_empirical = !ap || native_is_zero(ap->ka);
@@ -274,7 +274,7 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
                     float const r0_ic = bond_r0[bond_index_ic];
                     float const r0_cj = bond_r0[bond_index_cj];
                     float const override_deg = ap ? ap->theta0_deg : -1.0f;
-                    auto const emp = native_angle_empirical(desc, tables, at_span, ai, center, aj, r0_ic, r0_cj,
+                    auto const emp = native_angle_empirical(descriptor, tables, at_span, ai, center, aj, r0_ic, r0_cj,
                                                             override_deg);
                     ka = emp.first;
                     theta0_deg = emp.second;
@@ -304,19 +304,19 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
 
     // Torsion terms.
     for (std::uint32_t b = 0; b < num_bonds; ++b) {
-        std::uint32_t const j = desc.bond_atom_i[b];
-        std::uint32_t const k = desc.bond_atom_j[b];
-        std::uint16_t const jstart = desc.neighbor_offset[j];
-        std::uint16_t const jend = desc.neighbor_offset[j + 1];
-        std::uint16_t const kstart = desc.neighbor_offset[k];
-        std::uint16_t const kend = desc.neighbor_offset[k + 1];
+        std::uint32_t const j = descriptor.bond_atom_i[b];
+        std::uint32_t const k = descriptor.bond_atom_j[b];
+        std::uint16_t const jstart = descriptor.neighbor_offset[j];
+        std::uint16_t const jend = descriptor.neighbor_offset[j + 1];
+        std::uint16_t const kstart = descriptor.neighbor_offset[k];
+        std::uint16_t const kend = descriptor.neighbor_offset[k + 1];
         for (std::uint16_t nj = jstart; nj < jend; ++nj) {
-            std::uint32_t const i = desc.neighbor_atom[nj];
+            std::uint32_t const i = descriptor.neighbor_atom[nj];
             if (i == k) continue;
             for (std::uint16_t nk = kstart; nk < kend; ++nk) {
-                std::uint32_t const l = desc.neighbor_atom[nk];
+                std::uint32_t const l = descriptor.neighbor_atom[nk];
                 if (l == j) continue;
-                auto const tt = native_get_mmff_torsion_type(desc, at_span, bond_types, i, j, k, l);
+                auto const tt = native_get_mmff_torsion_type(descriptor, at_span, bond_types, i, j, k, l);
                 auto const hit = lookup_torsion(tables, tt.first, tt.second, atom_types[i], atom_types[j],
                                                 atom_types[k], atom_types[l]);
                 float v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
@@ -326,7 +326,7 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
                     v3 = hit.second->v3;
                 }
                 else {
-                    auto const emp = native_torsion_empirical(desc, tables, at_span, j, k, (std::int32_t)b);
+                    auto const emp = native_torsion_empirical(descriptor, tables, at_span, j, k, (std::int32_t)b);
                     v1 = emp[0];
                     v2 = emp[1];
                     v3 = emp[2];
@@ -343,13 +343,13 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
 
     // OOP terms.
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint32_t const deg = desc.degree[center];
+        std::uint32_t const deg = descriptor.degree[center];
         if (deg < 3) continue;
-        std::uint16_t const nstart = desc.neighbor_offset[center];
+        std::uint16_t const nstart = descriptor.neighbor_offset[center];
         std::uint8_t neighbor_cache[8];
         std::uint32_t neighbor_count = 0;
-        for (std::uint16_t nn = nstart; nn < desc.neighbor_offset[center + 1] && neighbor_count < 8; ++nn)
-            neighbor_cache[neighbor_count++] = desc.neighbor_atom[nn];
+        for (std::uint16_t nn = nstart; nn < descriptor.neighbor_offset[center + 1] && neighbor_count < 8; ++nn)
+            neighbor_cache[neighbor_count++] = descriptor.neighbor_atom[nn];
         for (std::uint32_t a = 0; a < neighbor_count; ++a) {
             std::uint8_t plane[2];
             std::uint32_t plane_count = 0;
@@ -385,8 +385,9 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
             swap_flag = stbn.first;
         }
         else {
-            auto dfsb = lookup_dfsb(tables, periodic_table_row(desc.element[a.i]),
-                                    periodic_table_row(desc.element[a.j]), periodic_table_row(desc.element[a.k]));
+            auto dfsb = lookup_dfsb(tables, periodic_table_row(descriptor.element[a.i]),
+                                    periodic_table_row(descriptor.element[a.j]),
+                                    periodic_table_row(descriptor.element[a.k]));
             if (!dfsb.second) continue;
             kba_ijk = dfsb.second->kba_ijk;
             kba_kji = dfsb.second->kba_kji;
@@ -432,19 +433,19 @@ static __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
 
     // Per-atom per-type write cursors.  Block-scoped so the five arrays cost
     // 2.5 KB per warp instead of per thread; only lane 0 ever touches them.
-    __shared__ std::uint32_t cursors_bond[max_atoms_k];
-    __shared__ std::uint32_t cursors_angle[max_atoms_k];
-    __shared__ std::uint32_t cursors_torsion[max_atoms_k];
-    __shared__ std::uint32_t cursors_oop[max_atoms_k];
-    __shared__ std::uint32_t cursors_stretchbend[max_atoms_k];
+    __shared__ std::uint32_t cursors_bond[max_atoms_per_molecule_k];
+    __shared__ std::uint32_t cursors_angle[max_atoms_per_molecule_k];
+    __shared__ std::uint32_t cursors_torsion[max_atoms_per_molecule_k];
+    __shared__ std::uint32_t cursors_oop[max_atoms_per_molecule_k];
+    __shared__ std::uint32_t cursors_stretchbend[max_atoms_per_molecule_k];
 
     std::uint32_t const mol = blockIdx.x;
     if (mol >= num_molecules) return;
     if (threadIdx.x != 0) return;
     if (typing_status[mol] != 0) return;
 
-    auto const &desc = descriptors[mol];
-    std::uint32_t const num_atoms = desc.num_atoms;
+    auto const &descriptor = descriptors[mol];
+    std::uint32_t const num_atoms = descriptor.num_atoms;
     std::uint32_t const ao = atom_offsets[mol];
     auto const &c = per_mol_counts[mol];
 
@@ -491,15 +492,15 @@ static __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
     std::uint32_t running = 0;
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
         auto &off = offsets[a];
-        off.bond_start = running;
+        off.bond_offset = running;
         running += off.bond_count;
-        off.angle_start = running;
+        off.angle_offset = running;
         running += off.angle_count;
-        off.torsion_start = running;
+        off.torsion_offset = running;
         running += off.torsion_count;
-        off.oop_start = running;
+        off.oop_offset = running;
         running += off.oop_count;
-        off.stretchbend_start = running;
+        off.stretchbend_offset = running;
         running += off.stretchbend_count;
     }
     // Running is the total interactions for this molecule. Store in
@@ -508,11 +509,11 @@ static __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
 
     // Seed the write cursors from the `_start` fields just computed.
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
-        cursors_bond[a] = offsets[a].bond_start;
-        cursors_angle[a] = offsets[a].angle_start;
-        cursors_torsion[a] = offsets[a].torsion_start;
-        cursors_oop[a] = offsets[a].oop_start;
-        cursors_stretchbend[a] = offsets[a].stretchbend_start;
+        cursors_bond[a] = offsets[a].bond_offset;
+        cursors_angle[a] = offsets[a].angle_offset;
+        cursors_torsion[a] = offsets[a].torsion_offset;
+        cursors_oop[a] = offsets[a].oop_offset;
+        cursors_stretchbend[a] = offsets[a].stretchbend_offset;
     }
 
     // Pass 2 — write interactions.
@@ -614,7 +615,7 @@ __device__ inline void copy_packed_terms_(element_ const *__restrict__ source, e
 }
 
 /**
- *  @brief Compact the fixed-stride staging arrays into the packed layout `batch_pool_t` uses.
+ *  @brief Compact the fixed-stride staging arrays into the packed layout `wave_slice_pool_t` uses.
  *
  *  One warp per molecule.  Every term type is copied from its 116 KB per-molecule staging slot
  *  to the batch-global base the scan assigned, the per-atom CSR starts are rebased from
@@ -685,11 +686,11 @@ static __launch_bounds__(32, 8) __global__ void mmff94_compact_terms_kernel(
     std::uint32_t const num_atoms = descriptors[mol].num_atoms;
     for (std::uint32_t atom = lane; atom < num_atoms; atom += 32) {
         auto entry = typed ? atom_interaction_offsets[atom_base + atom] : mmff94_atom_offsets_t {};
-        entry.bond_start += bases.interactions;
-        entry.angle_start += bases.interactions;
-        entry.torsion_start += bases.interactions;
-        entry.oop_start += bases.interactions;
-        entry.stretchbend_start += bases.interactions;
+        entry.bond_offset += bases.interactions;
+        entry.angle_offset += bases.interactions;
+        entry.torsion_offset += bases.interactions;
+        entry.oop_offset += bases.interactions;
+        entry.stretchbend_offset += bases.interactions;
         atom_interaction_offsets[atom_base + atom] = entry;
     }
 
@@ -705,7 +706,7 @@ static __launch_bounds__(32, 8) __global__ void mmff94_compact_terms_kernel(
     entry.mmff_torsion_offset = bases.torsions;
     entry.mmff_oop_offset = bases.oops;
     entry.mmff_stretchbend_offset = bases.stretchbends;
-    entry.mmff_atom_offsets_start = atom_base;
+    entry.mmff_atom_csr_offset = atom_base;
     entry.mmff_atom_vdw_offset = atom_base;
     entry.mmff_atom_charge_offset = atom_base;
 }

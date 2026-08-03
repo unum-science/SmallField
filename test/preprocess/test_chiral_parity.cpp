@@ -225,7 +225,7 @@ void check_against_geometry(RDKit::ROMol const &molecule, sft::molecule_descript
  *  @param[inout] tally Counters advanced by this molecule.
  */
 void check_molecule(RDKit::RWMol &molecule, std::string const &label, bool with_geometry, oracle_tally_t &tally) {
-    if (molecule.getNumAtoms() > sft::max_atoms_k || molecule.getNumBonds() > sft::max_bonds_k) return;
+    if (molecule.getNumAtoms() > sft::max_atoms_per_molecule_k || molecule.getNumBonds() > sft::max_bonds_k) return;
 
     sft::molecule_descriptor_t descriptor;
     if (!sft::build_descriptor(molecule, descriptor)) return;

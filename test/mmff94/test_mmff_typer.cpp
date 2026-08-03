@@ -79,24 +79,24 @@ void test_one(std::string const &smiles, bool verbose) {
     RDKit::MMFF::MMFFMolProperties props(*mol);
     if (!props.isValid()) return;
 
-    sft::molecule_descriptor_t desc;
-    if (!sft::build_descriptor(*mol, desc)) return;
-    std::vector<std::uint8_t> nat(desc.num_atoms);
-    sfmmff::native_compute_mmff_atom_types(desc, nat);
-    std::vector<float> nat_fc(desc.num_atoms), nat_pc(desc.num_atoms);
-    sfmmff::native_compute_mmff_formal_charges(desc, nat, nat_fc);
-    sfmmff::native_compute_mmff_partial_charges(desc, tables, nat, nat_fc, nat_pc);
+    sft::molecule_descriptor_t descriptor;
+    if (!sft::build_descriptor(*mol, descriptor)) return;
+    std::vector<std::uint8_t> nat(descriptor.num_atoms);
+    sfmmff::native_compute_mmff_atom_types(descriptor, nat);
+    std::vector<float> nat_fc(descriptor.num_atoms), nat_pc(descriptor.num_atoms);
+    sfmmff::native_compute_mmff_formal_charges(descriptor, nat, nat_fc);
+    sfmmff::native_compute_mmff_partial_charges(descriptor, tables, nat, nat_fc, nat_pc);
 
     ++n_mols_tested;
     bool this_mol_ok = true;
-    for (std::uint32_t a = 0; a < desc.num_atoms; ++a) {
+    for (std::uint32_t a = 0; a < descriptor.num_atoms; ++a) {
         ++n_atoms_checked;
         std::uint8_t const rdk_t = props.getMMFFAtomType(a);
         if (rdk_t != nat[a]) {
             ++n_atoms_mismatch;
             this_mol_ok = false;
             if (verbose && mismatches.size() < 20)
-                mismatches.push_back(summary_t {(int)desc.element[a], rdk_t, nat[a], smiles});
+                mismatches.push_back(summary_t {(int)descriptor.element[a], rdk_t, nat[a], smiles});
         }
         if (rdk_t == nat[a]) {
             ++n_charges_checked;
@@ -107,7 +107,7 @@ void test_one(std::string const &smiles, bool verbose) {
                 this_mol_ok = false;
                 if (verbose && mismatches.size() < 20) {
                     summary_t m;
-                    m.element = (int)desc.element[a];
+                    m.element = (int)descriptor.element[a];
                     m.smiles = std::string("chg ") + smiles + " (rdk=" + std::to_string(rdk_pc) +
                                " nat=" + std::to_string(nat_pc[a]) + ")";
                     mismatches.push_back(m);

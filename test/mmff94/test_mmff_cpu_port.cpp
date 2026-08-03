@@ -244,14 +244,14 @@ bool compare_mol(std::string_view smiles, sfp::etkdg_prepared_molecule_t const &
  *  torsion/angle/stbn keys miss ring context.  The native CPU port is
  *  validated against this, not against `extract_mmff94_params`, so that
  *  any latent cache bugs don't contaminate the comparison. */
-void rdkit_direct_extract(RDKit::ROMol &mol, sft::molecule_descriptor_t const &desc,
+void rdkit_direct_extract(RDKit::ROMol &mol, sft::molecule_descriptor_t const &descriptor,
                           sfp::etkdg_prepared_molecule_t &out) {
     if (!mol.hasProp(RDKit::common_properties::_MMFFSanitized)) {
         mol.setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
     }
     RDKit::MMFF::MMFFMolProperties props(mol);
     if (!props.isValid()) return;
-    std::uint32_t const num_atoms = desc.num_atoms;
+    std::uint32_t const num_atoms = descriptor.num_atoms;
     out.mmff_atom_vdw.resize(num_atoms);
     out.mmff_atom_charge.resize(num_atoms);
     auto const *vc = RDKit::MMFF::DefaultParameters::getMMFFVdW();
@@ -270,22 +270,22 @@ void rdkit_direct_extract(RDKit::ROMol &mol, sft::molecule_descriptor_t const &d
         out.mmff_atom_charge[a] = (float)props.getMMFFPartialCharge(a);
     }
     auto find_bond = [&](std::uint32_t a, std::uint32_t b) -> std::int32_t {
-        for (std::uint16_t n = desc.neighbor_offset[a]; n < desc.neighbor_offset[a + 1]; ++n)
-            if (desc.neighbor_atom[n] == b) return desc.neighbor_bond[n];
+        for (std::uint16_t n = descriptor.neighbor_offset[a]; n < descriptor.neighbor_offset[a + 1]; ++n)
+            if (descriptor.neighbor_atom[n] == b) return descriptor.neighbor_bond[n];
         return -1;
     };
-    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
-        std::uint32_t i = desc.bond_atom_i[b], j = desc.bond_atom_j[b];
+    for (std::uint32_t b = 0; b < descriptor.num_bonds; ++b) {
+        std::uint32_t i = descriptor.bond_atom_i[b], j = descriptor.bond_atom_j[b];
         unsigned bt;
         ForceFields::MMFF::MMFFBond bp;
         if (!props.getMMFFBondStretchParams(mol, i, j, bt, bp)) continue;
         out.mmff_bonds.push_back({(std::uint8_t)i, (std::uint8_t)j, {0, 0}, (float)bp.kb, (float)bp.r0, 0.0f});
     }
     for (std::uint32_t c = 0; c < num_atoms; ++c) {
-        std::uint16_t ns = desc.neighbor_offset[c], ne = desc.neighbor_offset[c + 1];
+        std::uint16_t ns = descriptor.neighbor_offset[c], ne = descriptor.neighbor_offset[c + 1];
         for (std::uint16_t a = ns; a < ne; ++a)
             for (std::uint16_t b = a + 1; b < ne; ++b) {
-                std::uint32_t ai = desc.neighbor_atom[a], aj = desc.neighbor_atom[b];
+                std::uint32_t ai = descriptor.neighbor_atom[a], aj = descriptor.neighbor_atom[b];
                 if (find_bond(ai, c) < 0 || find_bond(c, aj) < 0) continue;
                 unsigned at;
                 ForceFields::MMFF::MMFFAngle ap;
@@ -296,15 +296,15 @@ void rdkit_direct_extract(RDKit::ROMol &mol, sft::molecule_descriptor_t const &d
                                            (float)(ap.theta0 * M_PI / 180.0), 0.0f});
             }
     }
-    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
-        std::uint32_t j = desc.bond_atom_i[b], k = desc.bond_atom_j[b];
-        std::uint16_t js = desc.neighbor_offset[j], je = desc.neighbor_offset[j + 1];
-        std::uint16_t ks = desc.neighbor_offset[k], ke = desc.neighbor_offset[k + 1];
+    for (std::uint32_t b = 0; b < descriptor.num_bonds; ++b) {
+        std::uint32_t j = descriptor.bond_atom_i[b], k = descriptor.bond_atom_j[b];
+        std::uint16_t js = descriptor.neighbor_offset[j], je = descriptor.neighbor_offset[j + 1];
+        std::uint16_t ks = descriptor.neighbor_offset[k], ke = descriptor.neighbor_offset[k + 1];
         for (std::uint16_t nj = js; nj < je; ++nj) {
-            std::uint32_t i = desc.neighbor_atom[nj];
+            std::uint32_t i = descriptor.neighbor_atom[nj];
             if (i == k) continue;
             for (std::uint16_t nk = ks; nk < ke; ++nk) {
-                std::uint32_t l = desc.neighbor_atom[nk];
+                std::uint32_t l = descriptor.neighbor_atom[nk];
                 if (l == j) continue;
                 unsigned tt;
                 ForceFields::MMFF::MMFFTor tp;
@@ -315,11 +315,12 @@ void rdkit_direct_extract(RDKit::ROMol &mol, sft::molecule_descriptor_t const &d
         }
     }
     for (std::uint32_t c = 0; c < num_atoms; ++c) {
-        if (desc.degree[c] < 3) continue;
-        std::uint16_t ns = desc.neighbor_offset[c];
+        if (descriptor.degree[c] < 3) continue;
+        std::uint16_t ns = descriptor.neighbor_offset[c];
         std::uint8_t nb[8];
         std::uint32_t nc = 0;
-        for (std::uint16_t n = ns; n < desc.neighbor_offset[c + 1] && nc < 8; ++n) nb[nc++] = desc.neighbor_atom[n];
+        for (std::uint16_t n = ns; n < descriptor.neighbor_offset[c + 1] && nc < 8; ++n)
+            nb[nc++] = descriptor.neighbor_atom[n];
         for (std::uint32_t a = 0; a < nc; ++a) {
             std::uint8_t pl[2];
             std::uint32_t pc = 0;
@@ -332,10 +333,10 @@ void rdkit_direct_extract(RDKit::ROMol &mol, sft::molecule_descriptor_t const &d
         }
     }
     for (std::uint32_t c = 0; c < num_atoms; ++c) {
-        std::uint16_t ns = desc.neighbor_offset[c], ne = desc.neighbor_offset[c + 1];
+        std::uint16_t ns = descriptor.neighbor_offset[c], ne = descriptor.neighbor_offset[c + 1];
         for (std::uint16_t a = ns; a < ne; ++a)
             for (std::uint16_t b = a + 1; b < ne; ++b) {
-                std::uint32_t ai = desc.neighbor_atom[a], aj = desc.neighbor_atom[b];
+                std::uint32_t ai = descriptor.neighbor_atom[a], aj = descriptor.neighbor_atom[b];
                 if (find_bond(ai, c) < 0 || find_bond(c, aj) < 0) continue;
                 unsigned sbt;
                 ForceFields::MMFF::MMFFStbn sb;
@@ -373,13 +374,13 @@ void run_one(std::string_view smiles, sfparam::mmff94_tables_view_t const &table
     std::uint32_t const num_atoms = mol->getNumAtoms();
     if (num_atoms > 128) return;
 
-    sft::molecule_descriptor_t desc;
-    if (!sft::build_descriptor(*mol, desc)) return;
+    sft::molecule_descriptor_t descriptor;
+    if (!sft::build_descriptor(*mol, descriptor)) return;
 
     // RDKit direct (cache-free) baseline.
     sfp::etkdg_prepared_molecule_t rdk_result;
     rdk_result.num_atoms = num_atoms;
-    rdkit_direct_extract(*mol, desc, rdk_result);
+    rdkit_direct_extract(*mol, descriptor, rdk_result);
 
     // Native path — pull atom types + charges from MMFFMolProperties (same
     // source as the RDKit path).
@@ -398,13 +399,13 @@ void run_one(std::string_view smiles, sfparam::mmff94_tables_view_t const &table
 
     sfp::etkdg_prepared_molecule_t nat_result;
     nat_result.num_atoms = num_atoms;
-    sfmmff::extract_mmff94_params_native(desc, atom_types, charges, tables, nat_result);
+    sfmmff::extract_mmff94_params_native(descriptor, atom_types, charges, tables, nat_result);
 
     // Fully-native: zero runtime RDKit. Term counts should match the
     // hybrid path on molecules where our typer agrees with RDKit.
     sfp::etkdg_prepared_molecule_t fn;
     fn.num_atoms = num_atoms;
-    (void)sfmmff::extract_mmff94_params_fully_native(desc, tables, fn);
+    [[maybe_unused]] bool const extracted = sfmmff::extract_mmff94_params_fully_native(descriptor, tables, fn);
 
     int const fails_before = n_fails;
     bool const ok = compare_mol(smiles, rdk_result, nat_result, verbose);

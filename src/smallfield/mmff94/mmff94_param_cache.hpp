@@ -18,7 +18,7 @@
  *  parameter tables plus the type-determination work.
  *
  *  The cache is keyed on the RDKit-assigned MMFF atom types (obtained
- *  cheaply via `mmff_props.getMMFFAtomType(atom_idx)` — array access) plus
+ *  cheaply via `mmff_props.getMMFFAtomType(atom_index)` — array access) plus
  *  bond order / aromaticity / ring flags of the relevant bonds.  This is
  *  the same information RDKit's internal classification uses, so a cache
  *  hit is byte-identical to calling the RDKit function.

@@ -336,7 +336,7 @@ int main(int argc, char **argv) {
         bool packed_matches = meta.num_mmff_bonds == gpu_counts.bonds && meta.num_mmff_angles == gpu_counts.angles &&
                               meta.num_mmff_torsions == gpu_counts.torsions && meta.num_mmff_oops == gpu_counts.oops &&
                               meta.num_mmff_stretchbends == gpu_counts.stretchbends &&
-                              meta.mmff_atom_offsets_start == atom_offset_base;
+                              meta.mmff_atom_csr_offset == atom_offset_base;
         auto const slices_equal = [&](void const *staged, void const *packed_slice, std::size_t bytes) {
             return std::memcmp(staged, packed_slice, bytes) == 0;
         };
@@ -354,7 +354,7 @@ int main(int argc, char **argv) {
                                           gpu_counts.stretchbends * sizeof(sft::mmff94_stretchbend_t));
         }
         if (packed_matches && descriptor.num_atoms > 0) {
-            std::uint32_t const interaction_base = packed.atom_offsets[atom_offset_base].bond_start;
+            std::uint32_t const interaction_base = packed.atom_offsets[atom_offset_base].bond_offset;
             packed_matches = slices_equal(
                 interactions.data() + static_cast<std::size_t>(molecule_index) * sft::max_mmff_interactions_per_mol_k,
                 packed.interactions.data() + interaction_base,
@@ -362,11 +362,12 @@ int main(int argc, char **argv) {
             for (std::uint32_t atom_index = 0; atom_index < descriptor.num_atoms && packed_matches; ++atom_index) {
                 auto const &staged_offset = atom_offsets_out[atom_offset_base + atom_index];
                 auto const &packed_offset = packed.atom_offsets[atom_offset_base + atom_index];
-                packed_matches = packed_offset.bond_start == staged_offset.bond_start + interaction_base &&
-                                 packed_offset.angle_start == staged_offset.angle_start + interaction_base &&
-                                 packed_offset.torsion_start == staged_offset.torsion_start + interaction_base &&
-                                 packed_offset.oop_start == staged_offset.oop_start + interaction_base &&
-                                 packed_offset.stretchbend_start == staged_offset.stretchbend_start + interaction_base;
+                packed_matches = packed_offset.bond_offset == staged_offset.bond_offset + interaction_base &&
+                                 packed_offset.angle_offset == staged_offset.angle_offset + interaction_base &&
+                                 packed_offset.torsion_offset == staged_offset.torsion_offset + interaction_base &&
+                                 packed_offset.oop_offset == staged_offset.oop_offset + interaction_base &&
+                                 packed_offset.stretchbend_offset ==
+                                     staged_offset.stretchbend_offset + interaction_base;
             }
         }
         if (packed_matches) { ++matching_packed_count; }

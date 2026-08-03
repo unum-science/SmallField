@@ -669,18 +669,18 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
         }
 
         acc.input_file_boundaries.push_back(num_molecules);
-        for (std::size_t file_idx = 0; file_idx < acc.input_file_pairs.size(); ++file_idx) {
-            std::uint64_t const mol_begin = acc.input_file_boundaries[file_idx];
-            std::uint64_t const mol_end = acc.input_file_boundaries[file_idx + 1];
+        for (std::size_t file_index = 0; file_index < acc.input_file_pairs.size(); ++file_index) {
+            std::uint64_t const mol_begin = acc.input_file_boundaries[file_index];
+            std::uint64_t const mol_end = acc.input_file_boundaries[file_index + 1];
             std::uint64_t const file_molecules = mol_end - mol_begin;
             std::uint64_t const conf_begin = mol_begin * config.num_conformers;
             std::uint64_t const file_conformers = file_molecules * config.num_conformers;
             std::size_t const coord_stride = static_cast<std::size_t>(config.max_atoms) * 3u;
 
             sfcli::writer_inputs_t writer_inputs {
-                acc.input_file_pairs[file_idx]->input_path.stem().string(),
+                acc.input_file_pairs[file_index]->input_path.stem().string(),
                 config.dataset,
-                acc.input_file_data[file_idx].base_row_index,
+                acc.input_file_data[file_index].base_row_index,
                 file_molecules,
                 config.num_conformers,
                 config.max_atoms,
@@ -697,7 +697,7 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
                 std::span<double const>(buf->usrcat.data() + conf_begin * 60u, file_conformers * 60u),
             };
 
-            auto const &output_path = acc.input_file_pairs[file_idx]->output_path;
+            auto const &output_path = acc.input_file_pairs[file_index]->output_path;
             if (!sfcli::write_shard(output_path, writer_inputs)) {
                 logger.error("write failed: {}", output_path.string());
             }

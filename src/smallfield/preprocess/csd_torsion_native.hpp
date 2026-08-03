@@ -306,7 +306,7 @@ inline bool compile_recursive_body(std::string_view body, std::uint8_t nesting, 
  *  - `x<n>` — ring-bond connectivity
  *  - `^<n>` — hybridisation
  *  - `+` / `-` / `+<n>` / `-<n>` — formal charge
- *  - `:<n>` — atom map label (ignored; labels are tracked externally via idx[])
+ *  - `:<n>` — atom map label (ignored; labels are tracked externally via index[])
  *  - `$(...)` / `!$(...)` — recursive sub-query, compiled into @p pool
  *
  *  @param[in] token The disjunct body (no leading/trailing separators).
@@ -985,17 +985,17 @@ inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
     for (std::size_t c = 0; c < num_conjuncts; ++c) total *= num_alts[c];
     if (total > max_disjuncts_k) return false;
 
-    std::size_t idx[max_conjuncts_k] = {};
+    std::size_t index[max_conjuncts_k] = {};
     for (std::size_t combo = 0; combo < total; ++combo) {
         bond_disjunct_t &disjunct = bc.disjuncts[bc.num_disjuncts];
         disjunct = {};
         for (std::size_t c = 0; c < num_conjuncts; ++c) {
-            // Compose "alt[c][idx[c]]" as the current conjunct's primitive
+            // Compose "alt[c][index[c]]" as the current conjunct's primitive
             // and fold into the disjunct.  parse_bond_conjunct starts from a
             // fresh disjunct; here we want accumulation, so hand it an empty
             // then merge the three uint8 fields.
             bond_disjunct_t next {};
-            if (!parse_bond_conjunct(alts[c][idx[c]], next)) return false;
+            if (!parse_bond_conjunct(alts[c][index[c]], next)) return false;
             if (next.bond_order != 0) {
                 if (disjunct.bond_order != 0 && disjunct.bond_order != next.bond_order) return false;
                 disjunct.bond_order = next.bond_order;
@@ -1005,8 +1005,8 @@ inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
         }
         ++bc.num_disjuncts;
         for (std::size_t c = 0; c < num_conjuncts; ++c) {
-            if (++idx[c] < num_alts[c]) break;
-            idx[c] = 0;
+            if (++index[c] < num_alts[c]) break;
+            index[c] = 0;
         }
     }
     return bc.num_disjuncts > 0;
@@ -1546,16 +1546,16 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
 /**
  *  @brief Test whether a single atom satisfies a parsed atom constraint.
  *
- *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] descriptor Molecule descriptor with topology and property arrays.
  *  @param[in] atom_index Atom to test.
  *  @param[in] constraint Disjunct list parsed from one bracketed atom expression.
  *  @param[in] pool Sub-query nodes the constraint's recursive guards index into.
  *  @return True when any disjunct matches.
  */
-SMALLFIELD_HD_ inline bool atom_match(molecule_descriptor_t const &desc, std::uint32_t atom_index,
+SMALLFIELD_HD_ inline bool atom_match(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
                                       simple_atom_constraint_t const &constraint, recursive_pool_view_t pool) {
     for (std::uint8_t slot = 0; slot < constraint.num_disjuncts; ++slot)
-        if (atom_disjunct_match(desc, atom_index, constraint.disjuncts[slot], pool)) return true;
+        if (atom_disjunct_match(descriptor, atom_index, constraint.disjuncts[slot], pool)) return true;
     return false;
 }
 
@@ -1567,7 +1567,7 @@ SMALLFIELD_HD_ inline bool atom_match(molecule_descriptor_t const &desc, std::ui
  *  neighbour, seeded with the atoms the torsion match already claimed so the body
  *  cannot walk back onto them — which is exactly the distinctness RDKit enforces.
  *
- *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] descriptor Molecule descriptor with topology and property arrays.
  *  @param[in] atom_index Index of the neighbour atom to test.
  *  @param[in] bond_index Index of the bond connecting the torsion atom to @p atom_index.
  *  @param[in] constraint Neighbour constraint parsed from a branch sub-pattern.
@@ -1575,15 +1575,15 @@ SMALLFIELD_HD_ inline bool atom_match(molecule_descriptor_t const &desc, std::ui
  *  @param[in] seed Atoms the surrounding match has already claimed.
  *  @return True when the neighbour and everything the branch hangs off it bind.
  */
-SMALLFIELD_HD_ inline bool neighbor_match(molecule_descriptor_t const &desc, std::uint32_t atom_index,
+SMALLFIELD_HD_ inline bool neighbor_match(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
                                           std::uint32_t bond_index, simple_neighbor_constraint_t const &constraint,
                                           recursive_pool_view_t pool, recursive_visit_t const &seed) {
     bool any_bond_disjunct = false;
     for (std::uint8_t slot = 0; slot < constraint.num_bond_disjuncts && !any_bond_disjunct; ++slot)
-        any_bond_disjunct = bond_disjunct_match(desc, bond_index, constraint.bond_disjuncts[slot]);
+        any_bond_disjunct = bond_disjunct_match(descriptor, bond_index, constraint.bond_disjuncts[slot]);
     if (!any_bond_disjunct) return false;
     recursive_visit_t visited = seed;
-    return recursive_match_node(desc, pool, constraint.node, atom_index, visited);
+    return recursive_match_node(descriptor, pool, constraint.node, atom_index, visited);
 }
 
 /**
@@ -1593,7 +1593,7 @@ SMALLFIELD_HD_ inline bool neighbor_match(molecule_descriptor_t const &desc, std
  *  branches are present we try both orderings so a pattern like `(~[N,n])(~[N,n])` can
  *  map either way.
  *
- *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] descriptor Molecule descriptor with topology and property arrays.
  *  @param[in] atom_index Torsion atom whose branches are being checked.
  *  @param[in] constraint Parsed constraint carrying the branch list.
  *  @param[in] pool Sub-query nodes the branch bodies compiled into.
@@ -1601,26 +1601,27 @@ SMALLFIELD_HD_ inline bool neighbor_match(molecule_descriptor_t const &desc, std
  *  @param[in] chain_b Second chain-adjacent atom to keep out of the branch assignment.
  *  @return True when every branch binds to a distinct neighbour.
  */
-SMALLFIELD_HD_ inline bool check_branch_neighbors(molecule_descriptor_t const &desc, std::uint32_t atom_index,
+SMALLFIELD_HD_ inline bool check_branch_neighbors(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
                                                   simple_atom_constraint_t const &constraint,
                                                   recursive_pool_view_t pool, std::uint32_t chain_a,
                                                   std::uint32_t chain_b) {
     std::uint8_t const num_branches = constraint.num_neighbor_branches;
     if (num_branches == 0) return true;
-    std::uint16_t const start = desc.neighbor_offset[atom_index];
-    std::uint16_t const end = desc.neighbor_offset[atom_index + 1];
+    std::uint16_t const start = descriptor.neighbor_offset[atom_index];
+    std::uint16_t const end = descriptor.neighbor_offset[atom_index + 1];
 
     recursive_visit_t seed;
     seed.count = 0;
     seed.atoms[seed.count++] = static_cast<std::uint8_t>(atom_index);
-    if (chain_a < max_atoms_k) seed.atoms[seed.count++] = static_cast<std::uint8_t>(chain_a);
-    if (chain_b < max_atoms_k) seed.atoms[seed.count++] = static_cast<std::uint8_t>(chain_b);
+    if (chain_a < max_atoms_per_molecule_k) seed.atoms[seed.count++] = static_cast<std::uint8_t>(chain_a);
+    if (chain_b < max_atoms_per_molecule_k) seed.atoms[seed.count++] = static_cast<std::uint8_t>(chain_b);
 
     if (num_branches == 1) {
         for (std::uint16_t entry = start; entry < end; ++entry) {
-            std::uint8_t const candidate = desc.neighbor_atom[entry];
+            std::uint8_t const candidate = descriptor.neighbor_atom[entry];
             if (candidate == chain_a || candidate == chain_b) continue;
-            if (neighbor_match(desc, candidate, desc.neighbor_bond[entry], constraint.neighbor_branch[0], pool, seed))
+            if (neighbor_match(descriptor, candidate, descriptor.neighbor_bond[entry], constraint.neighbor_branch[0],
+                               pool, seed))
                 return true;
         }
         return false;
@@ -1628,18 +1629,19 @@ SMALLFIELD_HD_ inline bool check_branch_neighbors(molecule_descriptor_t const &d
 
     // Two branches: two distinct neighbours, one per branch slot.
     for (std::uint16_t first = start; first < end; ++first) {
-        std::uint8_t const first_atom = desc.neighbor_atom[first];
+        std::uint8_t const first_atom = descriptor.neighbor_atom[first];
         if (first_atom == chain_a || first_atom == chain_b) continue;
-        if (!neighbor_match(desc, first_atom, desc.neighbor_bond[first], constraint.neighbor_branch[0], pool, seed))
+        if (!neighbor_match(descriptor, first_atom, descriptor.neighbor_bond[first], constraint.neighbor_branch[0],
+                            pool, seed))
             continue;
         recursive_visit_t second_seed = seed;
         second_seed.atoms[second_seed.count++] = first_atom;
         for (std::uint16_t second = start; second < end; ++second) {
             if (second == first) continue;
-            std::uint8_t const second_atom = desc.neighbor_atom[second];
+            std::uint8_t const second_atom = descriptor.neighbor_atom[second];
             if (second_atom == chain_a || second_atom == chain_b) continue;
-            if (neighbor_match(desc, second_atom, desc.neighbor_bond[second], constraint.neighbor_branch[1], pool,
-                               second_seed))
+            if (neighbor_match(descriptor, second_atom, descriptor.neighbor_bond[second], constraint.neighbor_branch[1],
+                               pool, second_seed))
                 return true;
         }
     }
@@ -1647,11 +1649,11 @@ SMALLFIELD_HD_ inline bool check_branch_neighbors(molecule_descriptor_t const &d
 }
 
 /** @brief Test whether a bond satisfies a parsed bond constraint. */
-SMALLFIELD_HD_ inline bool bond_match(molecule_descriptor_t const &desc, std::uint32_t bond_index,
+SMALLFIELD_HD_ inline bool bond_match(molecule_descriptor_t const &descriptor, std::uint32_t bond_index,
                                       simple_bond_constraint_t const &constraint) {
     if (constraint.num_disjuncts == 0) return true; // empty constraint = "any bond" (defensive)
     for (std::uint8_t slot = 0; slot < constraint.num_disjuncts; ++slot)
-        if (bond_disjunct_match(desc, bond_index, constraint.disjuncts[slot])) return true;
+        if (bond_disjunct_match(descriptor, bond_index, constraint.disjuncts[slot])) return true;
     return false;
 }
 
@@ -1664,7 +1666,7 @@ SMALLFIELD_HD_ inline bool bond_match(molecule_descriptor_t const &desc, std::ui
  *  stack of at most @ref max_ring_closure_atoms_k levels rather than recursing, so a GPU thread
  *  runs it inside a frame the compiler sizes once.
  *
- *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] descriptor Molecule descriptor with topology and property arrays.
  *  @param[in] closure Parsed arc, walked from `:4` toward `:1`.
  *  @param[in] pool Sub-query nodes the arc atoms' recursive guards index into.
  *  @param[in] origin Molecule atom bound to `:4`, where the arc starts.
@@ -1673,25 +1675,26 @@ SMALLFIELD_HD_ inline bool bond_match(molecule_descriptor_t const &desc, std::ui
  *  @param[in] seed_count Entries the caller placed in @p visited.
  *  @return True when some assignment of the arc atoms closes onto @p target.
  */
-SMALLFIELD_HD_ inline bool ring_closure_walk(molecule_descriptor_t const &desc, simple_ring_closure_t const &closure,
-                                             recursive_pool_view_t pool, std::uint32_t origin, std::uint32_t target,
-                                             std::uint8_t *visited, std::uint8_t seed_count) {
+SMALLFIELD_HD_ inline bool ring_closure_walk(molecule_descriptor_t const &descriptor,
+                                             simple_ring_closure_t const &closure, recursive_pool_view_t pool,
+                                             std::uint32_t origin, std::uint32_t target, std::uint8_t *visited,
+                                             std::uint8_t seed_count) {
     std::uint8_t const total = closure.num_atoms;
     std::uint16_t cursor[max_ring_closure_atoms_k + 1];
     std::uint8_t standing[max_ring_closure_atoms_k + 1];
     standing[0] = static_cast<std::uint8_t>(origin);
-    cursor[0] = desc.neighbor_offset[origin];
+    cursor[0] = descriptor.neighbor_offset[origin];
     std::uint8_t depth = 0;
     std::uint8_t visited_count = seed_count;
 
     while (true) {
         std::uint8_t const current = standing[depth];
         if (depth == total) {
-            std::uint16_t const start = desc.neighbor_offset[current];
-            std::uint16_t const end = desc.neighbor_offset[current + 1];
+            std::uint16_t const start = descriptor.neighbor_offset[current];
+            std::uint16_t const end = descriptor.neighbor_offset[current + 1];
             for (std::uint16_t entry = start; entry < end; ++entry)
-                if (desc.neighbor_atom[entry] == target &&
-                    bond_match(desc, desc.neighbor_bond[entry], closure.closing_bond))
+                if (descriptor.neighbor_atom[entry] == target &&
+                    bond_match(descriptor, descriptor.neighbor_bond[entry], closure.closing_bond))
                     return true;
             if (depth == 0) return false;
             --depth;
@@ -1700,29 +1703,29 @@ SMALLFIELD_HD_ inline bool ring_closure_walk(molecule_descriptor_t const &desc, 
         }
 
         simple_ring_atom_t const &wanted = closure.atom[depth];
-        std::uint16_t const end = desc.neighbor_offset[current + 1];
+        std::uint16_t const end = descriptor.neighbor_offset[current + 1];
         bool descended = false;
         while (cursor[depth] < end) {
             std::uint16_t const entry = cursor[depth]++;
-            std::uint8_t const candidate = desc.neighbor_atom[entry];
+            std::uint8_t const candidate = descriptor.neighbor_atom[entry];
             bool claimed = false;
             for (std::uint8_t slot = 0; slot < visited_count; ++slot) claimed = claimed || visited[slot] == candidate;
             if (claimed) continue;
 
             bool bond_ok = false;
             for (std::uint8_t slot = 0; slot < wanted.num_bond_disjuncts && !bond_ok; ++slot)
-                bond_ok = bond_disjunct_match(desc, desc.neighbor_bond[entry], wanted.bond_disjuncts[slot]);
+                bond_ok = bond_disjunct_match(descriptor, descriptor.neighbor_bond[entry], wanted.bond_disjuncts[slot]);
             if (!bond_ok) continue;
 
             bool atom_ok = false;
             for (std::uint8_t slot = 0; slot < wanted.num_atom_disjuncts && !atom_ok; ++slot)
-                atom_ok = atom_disjunct_match(desc, candidate, wanted.atom_disjuncts[slot], pool);
+                atom_ok = atom_disjunct_match(descriptor, candidate, wanted.atom_disjuncts[slot], pool);
             if (!atom_ok) continue;
 
             visited[visited_count++] = candidate;
             ++depth;
             standing[depth] = candidate;
-            cursor[depth] = desc.neighbor_offset[candidate];
+            cursor[depth] = descriptor.neighbor_offset[candidate];
             descended = true;
             break;
         }
@@ -1734,16 +1737,16 @@ SMALLFIELD_HD_ inline bool ring_closure_walk(molecule_descriptor_t const &desc, 
 }
 
 /** @brief Verify the ring a closing pattern draws around an already-bound torsion. */
-SMALLFIELD_HD_ inline bool ring_closure_match(molecule_descriptor_t const &desc, simple_ring_closure_t const &closure,
-                                              recursive_pool_view_t pool, std::uint32_t a1, std::uint32_t a2,
-                                              std::uint32_t a3, std::uint32_t a4) {
+SMALLFIELD_HD_ inline bool ring_closure_match(molecule_descriptor_t const &descriptor,
+                                              simple_ring_closure_t const &closure, recursive_pool_view_t pool,
+                                              std::uint32_t a1, std::uint32_t a2, std::uint32_t a3, std::uint32_t a4) {
     if (!closure.active) return true;
     std::uint8_t visited[4 + max_ring_closure_atoms_k];
     visited[0] = static_cast<std::uint8_t>(a1);
     visited[1] = static_cast<std::uint8_t>(a2);
     visited[2] = static_cast<std::uint8_t>(a3);
     visited[3] = static_cast<std::uint8_t>(a4);
-    return ring_closure_walk(desc, closure, pool, a4, a1, visited, 4);
+    return ring_closure_walk(descriptor, closure, pool, a4, a1, visited, 4);
 }
 
 /** Shortest ring RDKit's torsion extraction still treats as a macrocycle rather than a fused ring. */
@@ -1755,17 +1758,17 @@ inline constexpr std::uint32_t no_bond_index_k = 0xFFFFFFFFu;
 /**
  *  @brief Bond index joining two atoms, or @ref no_bond_index_k when they are not bonded.
  *
- *  @param[in] desc Molecule descriptor supplying the CSR adjacency.
+ *  @param[in] descriptor Molecule descriptor supplying the CSR adjacency.
  *  @param[in] first_atom One end of the sought bond.
  *  @param[in] second_atom Other end of the sought bond.
  *  @return Bond index, or the sentinel.
  */
-SMALLFIELD_HD_ inline std::uint32_t find_bond_between(molecule_descriptor_t const &desc, std::uint32_t first_atom,
+SMALLFIELD_HD_ inline std::uint32_t find_bond_between(molecule_descriptor_t const &descriptor, std::uint32_t first_atom,
                                                       std::uint32_t second_atom) {
-    std::uint16_t const start = desc.neighbor_offset[first_atom];
-    std::uint16_t const end = desc.neighbor_offset[first_atom + 1];
+    std::uint16_t const start = descriptor.neighbor_offset[first_atom];
+    std::uint16_t const end = descriptor.neighbor_offset[first_atom + 1];
     for (std::uint16_t entry = start; entry < end; ++entry)
-        if (desc.neighbor_atom[entry] == second_atom) return desc.neighbor_bond[entry];
+        if (descriptor.neighbor_atom[entry] == second_atom) return descriptor.neighbor_bond[entry];
     return no_bond_index_k;
 }
 
@@ -1784,25 +1787,25 @@ struct csd_molecule_gate_t {
 /**
  *  @brief Fold a molecule's atoms into the prefilter keys the pattern gates are tested against.
  *
- *  @param[in] desc Molecule descriptor with the per-atom property arrays.
+ *  @param[in] descriptor Molecule descriptor with the per-atom property arrays.
  *  @return The molecule's element, hybridization and aromaticity keys.
  */
-SMALLFIELD_HD_ inline csd_molecule_gate_t build_molecule_gate(molecule_descriptor_t const &desc) {
+SMALLFIELD_HD_ inline csd_molecule_gate_t build_molecule_gate(molecule_descriptor_t const &descriptor) {
     csd_molecule_gate_t gate {};
-    std::uint32_t const num_atoms = desc.num_atoms;
+    std::uint32_t const num_atoms = descriptor.num_atoms;
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
-        std::uint8_t const element = desc.element[atom_index];
+        std::uint8_t const element = descriptor.element[atom_index];
         if (element > 0 && element < 64) gate.elements |= (1ULL << element);
-        if ((desc.atom_flags[atom_index] & atom_flag_aromatic_k) != 0) gate.has_aromatic = 1;
-        std::uint8_t const hybridization = desc.hybridization[atom_index];
+        if ((descriptor.atom_flags[atom_index] & atom_flag_aromatic_k) != 0) gate.has_aromatic = 1;
+        std::uint8_t const hybridization = descriptor.hybridization[atom_index];
         if (hybridization < 8) gate.hybridizations |= static_cast<std::uint8_t>(1u << hybridization);
     }
     return gate;
 }
 
 /** @brief Atom count of ring @p ring_index. */
-SMALLFIELD_HD_ inline std::uint32_t ring_atom_count(molecule_descriptor_t const &desc, std::uint32_t ring_index) {
-    return static_cast<std::uint32_t>(desc.ring_offset[ring_index + 1] - desc.ring_offset[ring_index]);
+SMALLFIELD_HD_ inline std::uint32_t ring_atom_count(molecule_descriptor_t const &descriptor, std::uint32_t ring_index) {
+    return static_cast<std::uint32_t>(descriptor.ring_offset[ring_index + 1] - descriptor.ring_offset[ring_index]);
 }
 
 /**
@@ -1812,19 +1815,19 @@ SMALLFIELD_HD_ inline std::uint32_t ring_atom_count(molecule_descriptor_t const 
  *  set of consecutive pairs, wrapping from the last atom back to the first.  Two ring atoms that
  *  are bonded without being consecutive belong to a bridge, and that bond is not part of the ring.
  *
- *  @param[in] desc Molecule descriptor carrying the ring table.
+ *  @param[in] descriptor Molecule descriptor carrying the ring table.
  *  @param[in] ring_index Ring to inspect.
  *  @param[in] first_atom One end of the bond.
  *  @param[in] second_atom Other end of the bond.
  *  @return True when the bond lies on the ring.
  */
-SMALLFIELD_HD_ inline bool ring_holds_bond(molecule_descriptor_t const &desc, std::uint32_t ring_index,
+SMALLFIELD_HD_ inline bool ring_holds_bond(molecule_descriptor_t const &descriptor, std::uint32_t ring_index,
                                            std::uint8_t first_atom, std::uint8_t second_atom) {
-    std::uint16_t const start = desc.ring_offset[ring_index];
-    std::uint32_t const size = ring_atom_count(desc, ring_index);
+    std::uint16_t const start = descriptor.ring_offset[ring_index];
+    std::uint32_t const size = ring_atom_count(descriptor, ring_index);
     for (std::uint32_t position = 0; position < size; ++position) {
-        std::uint8_t const current = desc.ring_atoms[start + position];
-        std::uint8_t const following = desc.ring_atoms[start + (position + 1) % size];
+        std::uint8_t const current = descriptor.ring_atoms[start + position];
+        std::uint8_t const following = descriptor.ring_atoms[start + (position + 1) % size];
         if (current == first_atom && following == second_atom) return true;
         if (current == second_atom && following == first_atom) return true;
     }
@@ -1834,32 +1837,32 @@ SMALLFIELD_HD_ inline bool ring_holds_bond(molecule_descriptor_t const &desc, st
 /**
  *  @brief How many SSSR rings a bond lies on, the value RDKit reports as `numBondRings`.
  *
- *  @param[in] desc Molecule descriptor carrying the ring table.
+ *  @param[in] descriptor Molecule descriptor carrying the ring table.
  *  @param[in] bond_index Bond to count.
  *  @return Ring count, capped by the descriptor's ring capacity.
  */
-SMALLFIELD_HD_ inline std::uint32_t bond_ring_count(molecule_descriptor_t const &desc, std::uint32_t bond_index) {
-    std::uint8_t const first_atom = desc.bond_atom_i[bond_index];
-    std::uint8_t const second_atom = desc.bond_atom_j[bond_index];
-    std::uint32_t const shared = desc.atom_ring_bitmap[first_atom] & desc.atom_ring_bitmap[second_atom];
+SMALLFIELD_HD_ inline std::uint32_t bond_ring_count(molecule_descriptor_t const &descriptor, std::uint32_t bond_index) {
+    std::uint8_t const first_atom = descriptor.bond_atom_i[bond_index];
+    std::uint8_t const second_atom = descriptor.bond_atom_j[bond_index];
+    std::uint32_t const shared = descriptor.atom_ring_bitmap[first_atom] & descriptor.atom_ring_bitmap[second_atom];
     std::uint32_t count = 0;
-    for (std::uint32_t ring_index = 0; ring_index < desc.num_rings; ++ring_index) {
+    for (std::uint32_t ring_index = 0; ring_index < descriptor.num_rings; ++ring_index) {
         if ((shared & (1u << ring_index)) == 0) continue;
-        if (ring_holds_bond(desc, ring_index, first_atom, second_atom)) ++count;
+        if (ring_holds_bond(descriptor, ring_index, first_atom, second_atom)) ++count;
     }
     return count;
 }
 
 /** @brief Whether two rings share more than one bond, which is what marks them fused. */
-SMALLFIELD_HD_ inline bool rings_share_two_bonds(molecule_descriptor_t const &desc, std::uint32_t first_ring,
+SMALLFIELD_HD_ inline bool rings_share_two_bonds(molecule_descriptor_t const &descriptor, std::uint32_t first_ring,
                                                  std::uint32_t second_ring) {
-    std::uint16_t const start = desc.ring_offset[first_ring];
-    std::uint32_t const size = ring_atom_count(desc, first_ring);
+    std::uint16_t const start = descriptor.ring_offset[first_ring];
+    std::uint32_t const size = ring_atom_count(descriptor, first_ring);
     std::uint32_t shared = 0;
     for (std::uint32_t position = 0; position < size; ++position) {
-        std::uint8_t const current = desc.ring_atoms[start + position];
-        std::uint8_t const following = desc.ring_atoms[start + (position + 1) % size];
-        if (!ring_holds_bond(desc, second_ring, current, following)) continue;
+        std::uint8_t const current = descriptor.ring_atoms[start + position];
+        std::uint8_t const following = descriptor.ring_atoms[start + (position + 1) % size];
+        if (!ring_holds_bond(descriptor, second_ring, current, following)) continue;
         if (++shared > 1) return true;
     }
     return false;
@@ -1873,22 +1876,23 @@ SMALLFIELD_HD_ inline bool rings_share_two_bonds(molecule_descriptor_t const &de
  *  a ring smaller than @ref min_macrocycle_size_k, so the macrocycle exemption is already implied
  *  by the size test on the ring that carries the bond.
  *
- *  @param[in] desc Molecule descriptor carrying the ring table.
+ *  @param[in] descriptor Molecule descriptor carrying the ring table.
  *  @param[in] bond_index Bond to test.
  *  @return True when the bond may not carry a torsion.
  */
-SMALLFIELD_HD_ inline bool bond_excluded_by_ring_fusion(molecule_descriptor_t const &desc, std::uint32_t bond_index) {
-    std::uint8_t const first_atom = desc.bond_atom_i[bond_index];
-    std::uint8_t const second_atom = desc.bond_atom_j[bond_index];
-    std::uint32_t const shared = desc.atom_ring_bitmap[first_atom] & desc.atom_ring_bitmap[second_atom];
-    std::uint32_t const num_rings = desc.num_rings;
+SMALLFIELD_HD_ inline bool bond_excluded_by_ring_fusion(molecule_descriptor_t const &descriptor,
+                                                        std::uint32_t bond_index) {
+    std::uint8_t const first_atom = descriptor.bond_atom_i[bond_index];
+    std::uint8_t const second_atom = descriptor.bond_atom_j[bond_index];
+    std::uint32_t const shared = descriptor.atom_ring_bitmap[first_atom] & descriptor.atom_ring_bitmap[second_atom];
+    std::uint32_t const num_rings = descriptor.num_rings;
     for (std::uint32_t carrier = 0; carrier < num_rings; ++carrier) {
         if ((shared & (1u << carrier)) == 0) continue;
-        if (ring_atom_count(desc, carrier) >= min_macrocycle_size_k) continue;
-        if (!ring_holds_bond(desc, carrier, first_atom, second_atom)) continue;
+        if (ring_atom_count(descriptor, carrier) >= min_macrocycle_size_k) continue;
+        if (!ring_holds_bond(descriptor, carrier, first_atom, second_atom)) continue;
         for (std::uint32_t other = 0; other < num_rings; ++other) {
             if (other == carrier) continue;
-            if (rings_share_two_bonds(desc, carrier, other)) return true;
+            if (rings_share_two_bonds(descriptor, carrier, other)) return true;
         }
     }
     return false;
@@ -1902,58 +1906,60 @@ SMALLFIELD_HD_ inline bool bond_excluded_by_ring_fusion(molecule_descriptor_t co
  *  index order.  Every binding is handed to @p emit; returning true from @p emit stops the scan,
  *  which is how the dispatcher takes the first match and leaves the rest unexplored.
  *
- *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] descriptor Molecule descriptor with topology and property arrays.
  *  @param[in] pattern Handle on the pattern's constraints and sub-query nodes.
  *  @param[in] bond_index Bond to bind as the central one.
  *  @param[in] emit Callable taking `(a1, a2, a3, a4, bond_index)` and returning true to stop.
  *  @return True when @p emit stopped the scan.
  */
 template <typename emit_fn_>
-SMALLFIELD_HD_ inline bool match_pattern_at_bond(molecule_descriptor_t const &desc, csd_pattern_view_t const &pattern,
-                                                 std::uint32_t bond_index, emit_fn_ &&emit) {
-    std::uint8_t const begin_atom = desc.bond_atom_i[bond_index];
-    std::uint8_t const end_atom = desc.bond_atom_j[bond_index];
+SMALLFIELD_HD_ inline bool match_pattern_at_bond(molecule_descriptor_t const &descriptor,
+                                                 csd_pattern_view_t const &pattern, std::uint32_t bond_index,
+                                                 emit_fn_ &&emit) {
+    std::uint8_t const begin_atom = descriptor.bond_atom_i[bond_index];
+    std::uint8_t const end_atom = descriptor.bond_atom_j[bond_index];
 
     for (std::uint32_t flip = 0; flip < 2; ++flip) {
         std::uint8_t const a2 = flip ? end_atom : begin_atom;
         std::uint8_t const a3 = flip ? begin_atom : end_atom;
 
-        if (!atom_match(desc, a2, pattern.atom[1], pattern.pool)) continue;
-        if (!atom_match(desc, a3, pattern.atom[2], pattern.pool)) continue;
-        if (!bond_match(desc, bond_index, pattern.bond[1])) continue;
+        if (!atom_match(descriptor, a2, pattern.atom[1], pattern.pool)) continue;
+        if (!atom_match(descriptor, a3, pattern.atom[2], pattern.pool)) continue;
+        if (!bond_match(descriptor, bond_index, pattern.bond[1])) continue;
 
         // Iterate neighbors of a2 (excluding a3) for atom[0] (aka :1).
-        std::uint16_t const second_start = desc.neighbor_offset[a2];
-        std::uint16_t const second_end = desc.neighbor_offset[a2 + 1];
+        std::uint16_t const second_start = descriptor.neighbor_offset[a2];
+        std::uint16_t const second_end = descriptor.neighbor_offset[a2 + 1];
         constexpr std::uint32_t no_chain_atom_k = 0xFFu;
         for (std::uint16_t first_entry = second_start; first_entry < second_end; ++first_entry) {
-            std::uint8_t const a1 = desc.neighbor_atom[first_entry];
+            std::uint8_t const a1 = descriptor.neighbor_atom[first_entry];
             if (a1 == a3) continue;
-            std::uint16_t const bond_01 = desc.neighbor_bond[first_entry];
-            if (!atom_match(desc, a1, pattern.atom[0], pattern.pool)) continue;
-            if (!bond_match(desc, bond_01, pattern.bond[0])) continue;
+            std::uint16_t const bond_01 = descriptor.neighbor_bond[first_entry];
+            if (!atom_match(descriptor, a1, pattern.atom[0], pattern.pool)) continue;
+            if (!bond_match(descriptor, bond_01, pattern.bond[0])) continue;
 
             // Branches on atom[0] depend only on (a1, a2); branches on
             // atom[1] depend on (a2, a1, a3). Both are independent of a4,
             // so check them before iterating a4's candidates.
-            if (!check_branch_neighbors(desc, a1, pattern.atom[0], pattern.pool, a2, no_chain_atom_k)) continue;
-            if (!check_branch_neighbors(desc, a2, pattern.atom[1], pattern.pool, a1, a3)) continue;
+            if (!check_branch_neighbors(descriptor, a1, pattern.atom[0], pattern.pool, a2, no_chain_atom_k)) continue;
+            if (!check_branch_neighbors(descriptor, a2, pattern.atom[1], pattern.pool, a1, a3)) continue;
 
             // Iterate neighbors of a3 (excluding a2) for atom[3] (aka :4).
-            std::uint16_t const third_start = desc.neighbor_offset[a3];
-            std::uint16_t const third_end = desc.neighbor_offset[a3 + 1];
+            std::uint16_t const third_start = descriptor.neighbor_offset[a3];
+            std::uint16_t const third_end = descriptor.neighbor_offset[a3 + 1];
             for (std::uint16_t fourth_entry = third_start; fourth_entry < third_end; ++fourth_entry) {
-                std::uint8_t const a4 = desc.neighbor_atom[fourth_entry];
+                std::uint8_t const a4 = descriptor.neighbor_atom[fourth_entry];
                 if (a4 == a2 || a4 == a1) continue; // all 4 torsion atoms must be distinct
-                std::uint16_t const bond_23 = desc.neighbor_bond[fourth_entry];
-                if (!atom_match(desc, a4, pattern.atom[3], pattern.pool)) continue;
-                if (!bond_match(desc, bond_23, pattern.bond[2])) continue;
+                std::uint16_t const bond_23 = descriptor.neighbor_bond[fourth_entry];
+                if (!atom_match(descriptor, a4, pattern.atom[3], pattern.pool)) continue;
+                if (!bond_match(descriptor, bond_23, pattern.bond[2])) continue;
 
                 // Branches on atom[2] depend on a4; atom[3] depends on a3, a4.
-                if (!check_branch_neighbors(desc, a3, pattern.atom[2], pattern.pool, a2, a4)) continue;
-                if (!check_branch_neighbors(desc, a4, pattern.atom[3], pattern.pool, a3, no_chain_atom_k)) continue;
+                if (!check_branch_neighbors(descriptor, a3, pattern.atom[2], pattern.pool, a2, a4)) continue;
+                if (!check_branch_neighbors(descriptor, a4, pattern.atom[3], pattern.pool, a3, no_chain_atom_k))
+                    continue;
                 if (pattern.closure != nullptr &&
-                    !ring_closure_match(desc, *pattern.closure, pattern.pool, a1, a2, a3, a4))
+                    !ring_closure_match(descriptor, *pattern.closure, pattern.pool, a1, a2, a3, a4))
                     continue;
 
                 if (emit(a1, a2, a3, a4, bond_index)) return true;
@@ -1964,20 +1970,20 @@ SMALLFIELD_HD_ inline bool match_pattern_at_bond(molecule_descriptor_t const &de
 }
 
 /**
- *  @brief Try @p pattern against every bond of @p desc that @p done_bonds has not claimed.
+ *  @brief Try @p pattern against every bond of @p descriptor that @p done_bonds has not claimed.
  *
- *  @param[in] desc Molecule descriptor with topology and property arrays.
+ *  @param[in] descriptor Molecule descriptor with topology and property arrays.
  *  @param[in] pattern Handle on the pattern's constraints and sub-query nodes.
  *  @param[in] done_bonds One byte per bond, non-zero for a bond an earlier pattern already claimed.
  *  @param[in] emit Callable taking `(a1, a2, a3, a4, bond_index)`; true moves on to the next bond.
  */
 template <typename emit_fn_>
-inline void match_linear_pattern(molecule_descriptor_t const &desc, csd_pattern_view_t const &pattern,
+inline void match_linear_pattern(molecule_descriptor_t const &descriptor, csd_pattern_view_t const &pattern,
                                  std::uint8_t const *done_bonds, emit_fn_ &&emit) {
-    std::uint32_t const num_bonds = desc.num_bonds;
+    std::uint32_t const num_bonds = descriptor.num_bonds;
     for (std::uint32_t bond_index = 0; bond_index < num_bonds; ++bond_index) {
         if (done_bonds[bond_index]) continue;
-        match_pattern_at_bond(desc, pattern, bond_index, emit);
+        match_pattern_at_bond(descriptor, pattern, bond_index, emit);
     }
 }
 

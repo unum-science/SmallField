@@ -110,7 +110,7 @@ __host__ __device__ __forceinline__ std::uint32_t compute_bounds_row_stride(std:
  *
  *  @tparam write_gradient When true, computes and writes gradient; when false, energy only.
  *  @param[in] bounds_matrix Int8-quantized bounds matrix in shared memory. Upper bound at
- *      [min_idx × bounds_row_stride + max_idx], lower at [max_idx × bounds_row_stride + min_idx].
+ *      [min_index × bounds_row_stride + max_index], lower at [max_index × bounds_row_stride + min_index].
  *      Dequantize with `q · inv_scale + mol_min`.
  *  @param[in] mol_min Per-molecule floor — the dequantization baseline.
  *  @param[in] inv_scale Per-molecule range / 255 — the per-step size.

@@ -36,7 +36,7 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/api/batch_pool.hpp"
+#include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 
 namespace smallfield::parameters {
@@ -120,19 +120,19 @@ inline std::size_t align_up_(std::size_t v, std::size_t a) { return (v + a - 1) 
  *  span that targets the device arena at that location.  Updates `offset`
  *  to the next 256-byte-aligned position. */
 template <typename element_>
-mmff94_span_t<element_> place_table_(std::byte *arena_base, std::size_t &offset, std::vector<element_> const &src) {
-    if (src.empty()) return mmff94_span_t<element_> {};
-    std::size_t const bytes = src.size() * sizeof(element_);
+mmff94_span_t<element_> place_table_(std::byte *arena_base, std::size_t &offset, std::vector<element_> const &source) {
+    if (source.empty()) return mmff94_span_t<element_> {};
+    std::size_t const bytes = source.size() * sizeof(element_);
     offset = align_up_(offset, 256);
-    element_ *dst = reinterpret_cast<element_ *>(arena_base + offset);
-    cudaMemcpy(dst, src.data(), bytes, cudaMemcpyHostToDevice);
+    element_ *destination = reinterpret_cast<element_ *>(arena_base + offset);
+    cudaMemcpy(destination, source.data(), bytes, cudaMemcpyHostToDevice);
     offset += bytes;
-    return mmff94_span_t<element_> {dst, src.size()};
+    return mmff94_span_t<element_> {destination, source.size()};
 }
 
 template <typename element_>
 mmff94_span_t<element_> place_const_or_global_(std::byte *arena_base, std::size_t &offset,
-                                               std::vector<element_> const &src, void const *const_symbol_dev_ptr,
+                                               std::vector<element_> const &source, void const *const_symbol_dev_ptr,
                                                std::size_t const_cap) {
     // Always use global memory for now. Constant-memory placement via
     // cudaGetSymbolAddress + reading through a plain device pointer is
@@ -140,7 +140,7 @@ mmff94_span_t<element_> place_const_or_global_(std::byte *arena_base, std::size_
     // revisit as a perf tweak once the current upload path is stable.
     (void)const_symbol_dev_ptr;
     (void)const_cap;
-    return place_table_(arena_base, offset, src);
+    return place_table_(arena_base, offset, source);
 }
 
 } // namespace detail_mmff94

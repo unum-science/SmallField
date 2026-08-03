@@ -247,7 +247,7 @@ struct mmff94_span_t {
  *  functions and by host/device alike — on host `ptr_` points into the
  *  `std::vector`s inside `mmff94_tables_host_t`; on device it points
  *  into a `cudaMalloc`ed arena built by `upload_mmff94_tables_to_device`
- *  (see `src/mmff94_tables_device.cuh`). */
+ *  (see `source/mmff94_tables_device.cuh`). */
 struct mmff94_tables_view_t {
     mmff94_span_t<mmff94_vdw_entry_t> vdw;
     mmff94_span_t<mmff94_bond_entry_t> bond;
@@ -357,9 +357,9 @@ SMALLFIELD_HD_ inline std::size_t lower_bound_u8_(element_ const *base, std::siz
 /** Binary-search cascade matching `MMFFVdWCollection::operator()`. */
 SMALLFIELD_HD_ inline mmff94_vdw_entry_t const *lookup_vdw(mmff94_tables_view_t const &t,
                                                            std::uint8_t atom_type) noexcept {
-    std::size_t const idx = lower_bound_u8_(t.vdw.data(), t.vdw.size(), atom_type,
-                                            [](mmff94_vdw_entry_t const &e) { return e.atom_type; });
-    if (idx < t.vdw.size() && t.vdw[idx].atom_type == atom_type) return &t.vdw[idx];
+    std::size_t const index = lower_bound_u8_(t.vdw.data(), t.vdw.size(), atom_type,
+                                              [](mmff94_vdw_entry_t const &e) { return e.atom_type; });
+    if (index < t.vdw.size() && t.vdw[index].atom_type == atom_type) return &t.vdw[index];
     return nullptr;
 }
 
@@ -438,9 +438,9 @@ SMALLFIELD_HD_ inline mmff94_prop_entry_t const *lookup_prop(mmff94_tables_view_
 /** PBCI (partial-bond-charge-increment) lookup by atom type. */
 SMALLFIELD_HD_ inline mmff94_pbci_entry_t const *lookup_pbci(mmff94_tables_view_t const &t,
                                                              std::uint8_t atom_type) noexcept {
-    std::size_t const idx = lower_bound_u8_(t.pbci.data(), t.pbci.size(), atom_type,
-                                            [](mmff94_pbci_entry_t const &e) { return e.atom_type; });
-    if (idx < t.pbci.size() && t.pbci[idx].atom_type == atom_type) return &t.pbci[idx];
+    std::size_t const index = lower_bound_u8_(t.pbci.data(), t.pbci.size(), atom_type,
+                                              [](mmff94_pbci_entry_t const &e) { return e.atom_type; });
+    if (index < t.pbci.size() && t.pbci[index].atom_type == atom_type) return &t.pbci[index];
     return nullptr;
 }
 
@@ -498,9 +498,9 @@ SMALLFIELD_HD_ inline mmff94_bndk_entry_t const *lookup_bndk(mmff94_tables_view_
 /** Covalent radius + Pauling electronegativity lookup by atomic number. */
 SMALLFIELD_HD_ inline mmff94_covrad_entry_t const *lookup_covrad(mmff94_tables_view_t const &t,
                                                                  std::uint8_t atomic_num) noexcept {
-    std::size_t const idx = lower_bound_u8_(t.covrad.data(), t.covrad.size(), atomic_num,
-                                            [](mmff94_covrad_entry_t const &e) { return e.atomic_num; });
-    if (idx < t.covrad.size() && t.covrad[idx].atomic_num == atomic_num) return &t.covrad[idx];
+    std::size_t const index = lower_bound_u8_(t.covrad.data(), t.covrad.size(), atomic_num,
+                                              [](mmff94_covrad_entry_t const &e) { return e.atomic_num; });
+    if (index < t.covrad.size() && t.covrad[index].atomic_num == atomic_num) return &t.covrad[index];
     return nullptr;
 }
 

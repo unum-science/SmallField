@@ -132,10 +132,10 @@ std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>> rdk
     RDKit::SubstructMatch(mol, *pat.pattern, matches, /*uniquify=*/false, /*recursionPossible=*/true);
     std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>> out;
     for (auto const &m : matches) {
-        std::uint32_t a1 = static_cast<std::uint32_t>(m[pat.idx[0]].second);
-        std::uint32_t a2 = static_cast<std::uint32_t>(m[pat.idx[1]].second);
-        std::uint32_t a3 = static_cast<std::uint32_t>(m[pat.idx[2]].second);
-        std::uint32_t a4 = static_cast<std::uint32_t>(m[pat.idx[3]].second);
+        std::uint32_t a1 = static_cast<std::uint32_t>(m[pat.index[0]].second);
+        std::uint32_t a2 = static_cast<std::uint32_t>(m[pat.index[1]].second);
+        std::uint32_t a3 = static_cast<std::uint32_t>(m[pat.index[2]].second);
+        std::uint32_t a4 = static_cast<std::uint32_t>(m[pat.index[3]].second);
         if (a1 > a4 || (a1 == a4 && a2 > a3)) {
             std::swap(a1, a4);
             std::swap(a2, a3);
@@ -315,7 +315,7 @@ int main() {
             ++skipped;
             continue;
         }
-        if (mol->getNumAtoms() > sft::max_atoms_k || mol->getNumBonds() > sft::max_bonds_k) {
+        if (mol->getNumAtoms() > sft::max_atoms_per_molecule_k || mol->getNumBonds() > sft::max_bonds_k) {
             ++skipped;
             continue;
         }

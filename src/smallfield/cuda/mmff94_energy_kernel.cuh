@@ -508,25 +508,25 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
                                          &total_energy, &gradient_acc);
         }
 
-        for (std::uint32_t index = offsets.bond_start; index < offsets.bond_start + offsets.bond_count; ++index)
+        for (std::uint32_t index = offsets.bond_offset; index < offsets.bond_offset + offsets.bond_count; ++index)
             mmff_bond_contribution_(positions, num_atoms, atom, bond_params[interactions[index].term_index],
                                     interactions[index].role, &total_energy, &gradient_acc);
 
-        for (std::uint32_t index = offsets.angle_start; index < offsets.angle_start + offsets.angle_count; ++index)
+        for (std::uint32_t index = offsets.angle_offset; index < offsets.angle_offset + offsets.angle_count; ++index)
             mmff_angle_contribution_(positions, num_atoms, atom, angle_params[interactions[index].term_index],
                                      interactions[index].role, &total_energy, &gradient_acc);
 
-        for (std::uint32_t index = offsets.torsion_start; index < offsets.torsion_start + offsets.torsion_count;
+        for (std::uint32_t index = offsets.torsion_offset; index < offsets.torsion_offset + offsets.torsion_count;
              ++index)
             mmff_torsion_contribution_(positions, num_atoms, atom, torsion_params[interactions[index].term_index],
                                        interactions[index].role, &total_energy, &gradient_acc);
 
-        for (std::uint32_t index = offsets.oop_start; index < offsets.oop_start + offsets.oop_count; ++index)
+        for (std::uint32_t index = offsets.oop_offset; index < offsets.oop_offset + offsets.oop_count; ++index)
             mmff_oop_contribution_(positions, num_atoms, atom, oop_params[interactions[index].term_index],
                                    interactions[index].role, &total_energy, &gradient_acc);
 
-        for (std::uint32_t index = offsets.stretchbend_start;
-             index < offsets.stretchbend_start + offsets.stretchbend_count; ++index)
+        for (std::uint32_t index = offsets.stretchbend_offset;
+             index < offsets.stretchbend_offset + offsets.stretchbend_count; ++index)
             mmff_stretchbend_contribution_(positions, num_atoms, atom,
                                            stretchbend_params[interactions[index].term_index], interactions[index].role,
                                            &total_energy, &gradient_acc);

@@ -35,7 +35,7 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/api/batch_pool.hpp"
+#include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/types/etkdg_types.hpp"
@@ -247,7 +247,7 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
     if (molecule_index >= num_molecules) return;
     std::uint32_t const lane = threadIdx.x;
 
-    molecule_descriptor_t const &desc = descriptors[molecule_index];
+    molecule_descriptor_t const &descriptor = descriptors[molecule_index];
     etk_torsion_descriptor_t *const output = torsions + static_cast<std::size_t>(molecule_index) * torsion_stride;
 
     // Bonds an earlier pattern already claimed, one bit per bond, shared so the ring pass on lane 0
@@ -256,8 +256,8 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
     if (lane < max_bonds_k / warp_size_k) claimed_words[lane] = 0;
     __syncwarp();
 
-    csd_molecule_gate_t const gate = build_molecule_gate(desc);
-    std::uint32_t const num_bonds = desc.num_bonds;
+    csd_molecule_gate_t const gate = build_molecule_gate(descriptor);
+    std::uint32_t const num_bonds = descriptor.num_bonds;
     std::uint32_t written = 0;
 
     for (std::uint32_t bond_base = 0; bond_base < num_bonds; bond_base += warp_size_k) {
@@ -277,7 +277,7 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
 
             csd_pattern_view_t const view = device_pattern_view(table, pattern);
             bool const bound = match_pattern_at_bond(
-                desc, view, bond_index,
+                descriptor, view, bond_index,
                 [&](std::uint8_t a1, std::uint8_t a2, std::uint8_t a3, std::uint8_t a4, std::uint32_t) -> bool {
                     matched_atoms[0] = a1;
                     matched_atoms[1] = a2;
@@ -294,7 +294,8 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
         // A claimed bond on a fused small ring, or on more than three rings, carries no torsion —
         // it stays claimed so the ring pass below leaves it alone too.
         bool emits = claimed;
-        if (claimed && (bond_excluded_by_ring_fusion(desc, bond_index) || bond_ring_count(desc, bond_index) > 3))
+        if (claimed &&
+            (bond_excluded_by_ring_fusion(descriptor, bond_index) || bond_ring_count(descriptor, bond_index) > 3))
             emits = false;
 
         std::uint32_t const claim_mask = __ballot_sync(0xFFFFFFFFu, claimed);
@@ -318,23 +319,23 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
     // Ring torsions mirror RDKit's `useBasicKnowledge=true`: a flat four-atom run around a small
     // ring claims its central bond, and which run wins depends on ring order, so this stays serial.
     if (lane == 0) {
-        for (std::uint32_t ring_index = 0; ring_index < desc.num_rings; ++ring_index) {
-            std::uint32_t const size = ring_atom_count(desc, ring_index);
+        for (std::uint32_t ring_index = 0; ring_index < descriptor.num_rings; ++ring_index) {
+            std::uint32_t const size = ring_atom_count(descriptor, ring_index);
             if (size < 4 || size > 6) continue;
-            std::uint16_t const start = desc.ring_offset[ring_index];
+            std::uint16_t const start = descriptor.ring_offset[ring_index];
             for (std::uint32_t position = 0; position < size; ++position) {
-                std::uint8_t const a1 = desc.ring_atoms[start + position];
-                std::uint8_t const a2 = desc.ring_atoms[start + (position + 1) % size];
-                std::uint8_t const a3 = desc.ring_atoms[start + (position + 2) % size];
-                std::uint8_t const a4 = desc.ring_atoms[start + (position + 3) % size];
-                std::uint32_t const bond_index = find_bond_between(desc, a2, a3);
+                std::uint8_t const a1 = descriptor.ring_atoms[start + position];
+                std::uint8_t const a2 = descriptor.ring_atoms[start + (position + 1) % size];
+                std::uint8_t const a3 = descriptor.ring_atoms[start + (position + 2) % size];
+                std::uint8_t const a4 = descriptor.ring_atoms[start + (position + 3) % size];
+                std::uint32_t const bond_index = find_bond_between(descriptor, a2, a3);
                 if (bond_index == no_bond_index_k) continue;
                 std::uint32_t const word = bond_index / warp_size_k;
                 std::uint32_t const bit = 1u << (bond_index % warp_size_k);
                 if ((claimed_words[word] & bit) != 0) continue;
                 constexpr std::uint8_t planar_k = hybridization_sp2_k;
-                if (desc.hybridization[a1] != planar_k || desc.hybridization[a2] != planar_k ||
-                    desc.hybridization[a3] != planar_k || desc.hybridization[a4] != planar_k)
+                if (descriptor.hybridization[a1] != planar_k || descriptor.hybridization[a2] != planar_k ||
+                    descriptor.hybridization[a3] != planar_k || descriptor.hybridization[a4] != planar_k)
                     continue;
 
                 claimed_words[word] |= bit;

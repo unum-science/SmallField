@@ -115,13 +115,13 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
             if (atom_count > 0) {
                 std::size_t const src_offset = slot_layout.slot_offset(m, c);
                 if (src_offset + stride_halves > coordinates.size()) return nullptr;
-                std::uint16_t const *src = reinterpret_cast<std::uint16_t const *>(coordinates.data()) + src_offset;
+                std::uint16_t const *source = reinterpret_cast<std::uint16_t const *>(coordinates.data()) + src_offset;
                 // Transpose the structure-of-arrays slot into the tight interleaved
                 // `(atom_count, 3)` block a Parquet row exposes.  See
                 // `conformer_slot_layout_t` for why a contiguous copy is not valid here.
                 for (std::uint32_t atom = 0; atom < atom_count; ++atom)
                     for (std::uint32_t axis = 0; axis < 3u; ++axis)
-                        values[running + atom * 3u + axis] = src[slot_layout.component_offset(axis, atom)];
+                        values[running + atom * 3u + axis] = source[slot_layout.component_offset(axis, atom)];
                 running += static_cast<std::int32_t>(atom_count * 3u);
             }
             validity[r >> 3] |= static_cast<std::uint8_t>(1u << (r & 7));

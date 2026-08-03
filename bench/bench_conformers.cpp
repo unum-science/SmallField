@@ -53,10 +53,10 @@ static std::vector<std::string> load_smiles(std::string const &path, std::uint32
 
 static double percentile(std::vector<double> &sorted_values, double p) {
     if (sorted_values.empty()) return 0.0;
-    double idx = p / 100.0 * static_cast<double>(sorted_values.size() - 1);
-    std::size_t lo = static_cast<std::size_t>(idx);
+    double index = p / 100.0 * static_cast<double>(sorted_values.size() - 1);
+    std::size_t lo = static_cast<std::size_t>(index);
     std::size_t hi = std::min(lo + 1, sorted_values.size() - 1);
-    double frac = idx - static_cast<double>(lo);
+    double frac = index - static_cast<double>(lo);
     return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac;
 }
 

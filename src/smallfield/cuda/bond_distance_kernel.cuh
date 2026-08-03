@@ -38,11 +38,11 @@
 namespace smallfield::cuda {
 
 using smallfield::types::etkdg_molecule_metadata_t;
-using smallfield::types::max_atoms_k;
+using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::molecule_descriptor_t;
 
-/** @brief 32-bit words needed to hold one bit per atom at the @ref max_atoms_k cap. */
-inline constexpr std::uint32_t bond_distance_mask_words_k = max_atoms_k / 32u;
+/** @brief 32-bit words needed to hold one bit per atom at the @ref max_atoms_per_molecule_k cap. */
+inline constexpr std::uint32_t bond_distance_mask_words_k = max_atoms_per_molecule_k / 32u;
 
 /** @brief Hop count written for a pair with no bonded path between its atoms. */
 inline constexpr std::uint8_t bond_distance_unreachable_k = 255u;

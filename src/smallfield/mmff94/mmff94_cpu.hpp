@@ -81,72 +81,74 @@ SMALLFIELD_HD_ inline std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num
 // Neighbor CSR convenience helpers.
 
 /** Find the bond index between atoms i and j via the descriptor's neighbor CSR.
- *  Returns -1 on miss. Matches `find_bond_idx` in
+ *  Returns -1 on miss. Matches `find_bond_index` in
  *  `etkdg_preprocess.hpp`. */
-SMALLFIELD_HD_ inline std::int32_t find_bond_idx(molecule_descriptor_t const &desc, std::uint32_t i,
-                                                 std::uint32_t j) noexcept {
-    std::uint16_t const start = desc.neighbor_offset[i];
-    std::uint16_t const end = desc.neighbor_offset[i + 1];
+SMALLFIELD_HD_ inline std::int32_t find_bond_index(molecule_descriptor_t const &descriptor, std::uint32_t i,
+                                                   std::uint32_t j) noexcept {
+    std::uint16_t const start = descriptor.neighbor_offset[i];
+    std::uint16_t const end = descriptor.neighbor_offset[i + 1];
     for (std::uint16_t n = start; n < end; ++n)
-        if (desc.neighbor_atom[n] == j) return desc.neighbor_bond[n];
+        if (descriptor.neighbor_atom[n] == j) return descriptor.neighbor_bond[n];
     return -1;
 }
 
 /** Are `atom_i` and `atom_k` both adjacent to `atom_j` AND to each other?
  *  I.e., does the i-j-k angle close back into a 3-ring.  Purely uses the
  *  descriptor's CSR — no ring info required. */
-SMALLFIELD_HD_ inline bool angle_in_ring_of_size_3(molecule_descriptor_t const &desc, std::uint32_t i,
+SMALLFIELD_HD_ inline bool angle_in_ring_of_size_3(molecule_descriptor_t const &descriptor, std::uint32_t i,
                                                    std::uint32_t k) noexcept {
-    return find_bond_idx(desc, i, k) >= 0;
+    return find_bond_index(descriptor, i, k) >= 0;
 }
 
 /** Do atoms i and k share a common neighbor that isn't j?  Matches
  *  `RDKit::MMFF::isAngleInRingOfSize3or4`'s size-4 branch exactly. */
-SMALLFIELD_HD_ inline bool angle_has_common_neighbor(molecule_descriptor_t const &desc, std::uint32_t i,
+SMALLFIELD_HD_ inline bool angle_has_common_neighbor(molecule_descriptor_t const &descriptor, std::uint32_t i,
                                                      std::uint32_t j, std::uint32_t k) noexcept {
-    std::uint16_t const atom_i_neighbor_start = desc.neighbor_offset[i];
-    std::uint16_t const atom_i_neighbor_end = desc.neighbor_offset[i + 1];
+    std::uint16_t const atom_i_neighbor_start = descriptor.neighbor_offset[i];
+    std::uint16_t const atom_i_neighbor_end = descriptor.neighbor_offset[i + 1];
     for (std::uint16_t neighbor_offset_i = atom_i_neighbor_start; neighbor_offset_i < atom_i_neighbor_end;
          ++neighbor_offset_i) {
-        std::uint32_t const candidate_atom = desc.neighbor_atom[neighbor_offset_i];
+        std::uint32_t const candidate_atom = descriptor.neighbor_atom[neighbor_offset_i];
         if (candidate_atom == j) continue;
-        if (find_bond_idx(desc, candidate_atom, k) >= 0 && candidate_atom != j) return true;
+        if (find_bond_index(descriptor, candidate_atom, k) >= 0 && candidate_atom != j) return true;
     }
     return false;
 }
 
 /** Ring size containing the i-j-k angle, or 0 if not 3/4.  Matches
  *  `isAngleInRingOfSize3or4` exactly. */
-SMALLFIELD_HD_ inline unsigned native_is_angle_in_ring_3_or_4(molecule_descriptor_t const &desc, std::uint32_t i,
+SMALLFIELD_HD_ inline unsigned native_is_angle_in_ring_3_or_4(molecule_descriptor_t const &descriptor, std::uint32_t i,
                                                               std::uint32_t j, std::uint32_t k) noexcept {
     // Caller should hold that i-j and j-k are real bonds; we only
     // trigger on the ring closure checks here.
-    if (find_bond_idx(desc, i, j) < 0 || find_bond_idx(desc, j, k) < 0) return 0;
-    if (angle_in_ring_of_size_3(desc, i, k)) return 3;
-    if (angle_has_common_neighbor(desc, i, j, k)) return 4;
+    if (find_bond_index(descriptor, i, j) < 0 || find_bond_index(descriptor, j, k) < 0) return 0;
+    if (angle_in_ring_of_size_3(descriptor, i, k)) return 3;
+    if (angle_has_common_neighbor(descriptor, i, j, k)) return 4;
     return 0;
 }
 
 /** Ring size containing the i-j-k-l torsion, or 0 if not 4/5.  Matches
  *  `isTorsionInRingOfSize4or5` exactly. */
-SMALLFIELD_HD_ inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const &desc, std::uint32_t i,
-                                                                std::uint32_t j, std::uint32_t k,
+SMALLFIELD_HD_ inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const &descriptor,
+                                                                std::uint32_t i, std::uint32_t j, std::uint32_t k,
                                                                 std::uint32_t l) noexcept {
-    if (find_bond_idx(desc, i, j) < 0 || find_bond_idx(desc, j, k) < 0 || find_bond_idx(desc, k, l) < 0) return 0;
-    if (find_bond_idx(desc, l, i) >= 0) return 4;
+    if (find_bond_index(descriptor, i, j) < 0 || find_bond_index(descriptor, j, k) < 0 ||
+        find_bond_index(descriptor, k, l) < 0)
+        return 0;
+    if (find_bond_index(descriptor, l, i) >= 0) return 4;
     // Size-5: do atoms i and l share a common neighbor that isn't j/k?
-    std::uint16_t const atom_i_neighbor_start = desc.neighbor_offset[i];
-    std::uint16_t const atom_i_neighbor_end = desc.neighbor_offset[i + 1];
+    std::uint16_t const atom_i_neighbor_start = descriptor.neighbor_offset[i];
+    std::uint16_t const atom_i_neighbor_end = descriptor.neighbor_offset[i + 1];
     for (std::uint16_t neighbor_offset_i = atom_i_neighbor_start; neighbor_offset_i < atom_i_neighbor_end;
          ++neighbor_offset_i) {
-        std::uint32_t const candidate_from_i = desc.neighbor_atom[neighbor_offset_i];
+        std::uint32_t const candidate_from_i = descriptor.neighbor_atom[neighbor_offset_i];
         if (candidate_from_i == j) continue;
         // Is `candidate_from_i` also a neighbor of l, and not k?
-        std::uint16_t const atom_l_neighbor_start = desc.neighbor_offset[l];
-        std::uint16_t const atom_l_neighbor_end = desc.neighbor_offset[l + 1];
+        std::uint16_t const atom_l_neighbor_start = descriptor.neighbor_offset[l];
+        std::uint16_t const atom_l_neighbor_end = descriptor.neighbor_offset[l + 1];
         for (std::uint16_t neighbor_offset_l = atom_l_neighbor_start; neighbor_offset_l < atom_l_neighbor_end;
              ++neighbor_offset_l) {
-            std::uint32_t const candidate_from_l = desc.neighbor_atom[neighbor_offset_l];
+            std::uint32_t const candidate_from_l = descriptor.neighbor_atom[neighbor_offset_l];
             if (candidate_from_l == k) continue;
             if (candidate_from_i == candidate_from_l) return 5;
         }
@@ -159,18 +161,18 @@ SMALLFIELD_HD_ inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descrip
 /** Native port of `MMFFMolProperties::getMMFFBondType`. Returns 1 iff the bond is SINGLE and both
  *  endpoints are sbmb atoms or both are aromatic
  *  atoms (per MMFFProp).  Otherwise returns 0. */
-SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &desc,
+SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &descriptor,
                                                              mmff94_tables_view_t const &t,
                                                              std::span<std::uint8_t const> atom_types,
-                                                             std::uint32_t bond_idx) noexcept {
-    std::uint8_t const bo = desc.bond_order[bond_idx];
-    bool const aromatic_bond = (desc.bond_flags[bond_idx] & bond_flag_aromatic_k) != 0;
+                                                             std::uint32_t bond_index) noexcept {
+    std::uint8_t const bo = descriptor.bond_order[bond_index];
+    bool const aromatic_bond = (descriptor.bond_flags[bond_index] & bond_flag_aromatic_k) != 0;
     // RDKit's rule triggers only when the bond is SINGLE. Aromatic bonds in
     // the descriptor report order=1 with the aromatic flag set, so we key on
     // `bo == 1 && !aromatic_bond` to exclude aromatic.
     if (!(bo == 1 && !aromatic_bond)) return 0;
-    std::uint8_t const i = desc.bond_atom_i[bond_idx];
-    std::uint8_t const j = desc.bond_atom_j[bond_idx];
+    std::uint8_t const i = descriptor.bond_atom_i[bond_index];
+    std::uint8_t const j = descriptor.bond_atom_j[bond_index];
     auto const *pi = lookup_prop(t, atom_types[i]);
     auto const *pj = lookup_prop(t, atom_types[j]);
     if (!pi || !pj) return 0;
@@ -179,15 +181,15 @@ SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor
 }
 
 /** Native port of `MMFFMolProperties::getMMFFAngleType`. */
-SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &desc,
+SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &descriptor,
                                                               std::span<std::uint8_t const> bond_types, std::uint32_t i,
                                                               std::uint32_t j, std::uint32_t k) noexcept {
-    std::int32_t const bond_index_ij = find_bond_idx(desc, i, j);
-    std::int32_t const bond_index_jk = find_bond_idx(desc, j, k);
+    std::int32_t const bond_index_ij = find_bond_index(descriptor, i, j);
+    std::int32_t const bond_index_jk = find_bond_index(descriptor, j, k);
     if (bond_index_ij < 0 || bond_index_jk < 0) return 0;
     unsigned const bond_type_sum = bond_types[bond_index_ij] + bond_types[bond_index_jk];
     unsigned angle_type = bond_type_sum;
-    unsigned const size = native_is_angle_in_ring_3_or_4(desc, i, j, k);
+    unsigned const size = native_is_angle_in_ring_3_or_4(descriptor, i, j, k);
     if (size) {
         angle_type = size;
         if (bond_type_sum) angle_type += (bond_type_sum + size - 2);
@@ -198,29 +200,29 @@ SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_angle_type(molecule_descripto
 /** Native port of `MMFFMolProperties::getMMFFTorsionType`, returning
  *  (primary, secondary) matching RDKit's pair. */
 SMALLFIELD_HD_ inline std::pair<std::uint8_t, std::uint8_t> native_get_mmff_torsion_type(
-    molecule_descriptor_t const &desc, std::span<std::uint8_t const> atom_types,
+    molecule_descriptor_t const &descriptor, std::span<std::uint8_t const> atom_types,
     std::span<std::uint8_t const> bond_types, std::uint32_t i, std::uint32_t j, std::uint32_t k,
     std::uint32_t l) noexcept {
-    std::int32_t const bond_index_jk = find_bond_idx(desc, j, k);
-    std::int32_t const bond_index_ij = find_bond_idx(desc, i, j);
-    std::int32_t const bond_index_kl = find_bond_idx(desc, k, l);
+    std::int32_t const bond_index_jk = find_bond_index(descriptor, j, k);
+    std::int32_t const bond_index_ij = find_bond_index(descriptor, i, j);
+    std::int32_t const bond_index_kl = find_bond_index(descriptor, k, l);
     if (bond_index_jk < 0 || bond_index_ij < 0 || bond_index_kl < 0) return {0, 0};
 
     std::uint8_t const bond_type_ij = bond_types[bond_index_ij];
     std::uint8_t const bond_type_jk = bond_types[bond_index_jk];
     std::uint8_t const bond_type_kl = bond_types[bond_index_kl];
-    bool const jk_single = (desc.bond_order[bond_index_jk] == 1) &&
-                           !(desc.bond_flags[bond_index_jk] & bond_flag_aromatic_k);
+    bool const jk_single = (descriptor.bond_order[bond_index_jk] == 1) &&
+                           !(descriptor.bond_flags[bond_index_jk] & bond_flag_aromatic_k);
 
     unsigned torsion_type = bond_type_jk;
     unsigned secondary = 0;
     if (bond_type_jk == 0 && jk_single && (bond_type_ij == 1 || bond_type_kl == 1)) torsion_type = 2;
 
-    unsigned const size = native_is_torsion_in_ring_4_or_5(desc, i, j, k, l);
+    unsigned const size = native_is_torsion_in_ring_4_or_5(descriptor, i, j, k, l);
     if (size == 4) {
         // Skip the 4-ring reassignment for torsions where the "4-ring" is
         // actually a pair of fused 3-rings (i-k or j-l already bonded).
-        bool const fused_3_3 = (find_bond_idx(desc, i, k) >= 0) || (find_bond_idx(desc, j, l) >= 0);
+        bool const fused_3_3 = (find_bond_index(descriptor, i, k) >= 0) || (find_bond_index(descriptor, j, l) >= 0);
         if (!fused_3_3) {
             secondary = torsion_type;
             torsion_type = 4;
@@ -291,13 +293,13 @@ SMALLFIELD_HD_ inline std::pair<float, float> native_bond_empirical(mmff94_table
  *  is finite (≥ 0), it replaces the crd/mltb/val-derived default θ₀; use
  *  this to match RDKit's behaviour when a table entry exists with ka=0
  *  (then RDKit keeps the table's θ₀ and recomputes ka empirically). */
-SMALLFIELD_HD_ inline std::pair<float, float> native_angle_empirical(molecule_descriptor_t const &desc,
+SMALLFIELD_HD_ inline std::pair<float, float> native_angle_empirical(molecule_descriptor_t const &descriptor,
                                                                      mmff94_tables_view_t const &t,
                                                                      std::span<std::uint8_t const> atom_types,
                                                                      std::uint32_t i, std::uint32_t j, std::uint32_t k,
                                                                      float r0_ij, float r0_jk,
                                                                      float theta0_override_deg = -1.0f) noexcept {
-    std::uint8_t const a_i = desc.element[i], a_j = desc.element[j], a_k = desc.element[k];
+    std::uint8_t const a_i = descriptor.element[i], a_j = descriptor.element[j], a_k = descriptor.element[k];
 
     // θ₀ — depends on central-atom crd / mltb / val / linh.
     auto const *prop_j = lookup_prop(t, atom_types[j]);
@@ -314,7 +316,7 @@ SMALLFIELD_HD_ inline std::pair<float, float> native_angle_empirical(molecule_de
             break;
         }
     }
-    unsigned const ring_size = native_is_angle_in_ring_3_or_4(desc, i, j, k);
+    unsigned const ring_size = native_is_angle_in_ring_3_or_4(descriptor, i, j, k);
     if (ring_size == 3) theta0_deg = 60.0f;
     else if (ring_size == 4) theta0_deg = 90.0f;
     if (theta0_override_deg >= 0.0f) theta0_deg = theta0_override_deg;
@@ -378,11 +380,11 @@ SMALLFIELD_HD_ inline std::pair<float, float> native_angle_empirical(molecule_de
 /** Empirical torsion rule (MMFF.V rules a-h).  Matches
  *  `getMMFFTorsionEmpiricalRuleParams`.  Returns (V1, V2, V3).  Bond type
  *  of the central bond is passed in so we avoid re-looking-it-up. */
-SMALLFIELD_HD_ inline std::array<float, 3> native_torsion_empirical(molecule_descriptor_t const &desc,
+SMALLFIELD_HD_ inline std::array<float, 3> native_torsion_empirical(molecule_descriptor_t const &descriptor,
                                                                     mmff94_tables_view_t const &t,
                                                                     std::span<std::uint8_t const> atom_types,
                                                                     std::uint32_t j, std::uint32_t k,
-                                                                    std::int32_t bond_jk_idx) noexcept {
+                                                                    std::int32_t bond_jk_index) noexcept {
     auto const *jp = lookup_prop(t, atom_types[j]);
     auto const *kp = lookup_prop(t, atom_types[k]);
     std::array<float, 3> out {0.0f, 0.0f, 0.0f};
@@ -419,12 +421,12 @@ SMALLFIELD_HD_ inline std::array<float, 3> native_torsion_empirical(molecule_des
         }
     };
     float U0, V0, W0, U1, V1_, W1;
-    U_V_W(desc.element[j], U0, V0, W0);
-    U_V_W(desc.element[k], U1, V1_, W1);
+    U_V_W(descriptor.element[j], U0, V0, W0);
+    U_V_W(descriptor.element[k], U1, V1_, W1);
     float const N_jk = static_cast<float>((jp->crd - 1) * (kp->crd - 1));
-    bool const jk_double = desc.bond_order[bond_jk_idx] == 2;
-    bool const jk_aromatic = (desc.bond_flags[bond_jk_idx] & bond_flag_aromatic_k) != 0;
-    bool const jk_single = desc.bond_order[bond_jk_idx] == 1 && !jk_aromatic;
+    bool const jk_double = descriptor.bond_order[bond_jk_index] == 2;
+    bool const jk_aromatic = (descriptor.bond_flags[bond_jk_index] & bond_flag_aromatic_k) != 0;
+    bool const jk_single = descriptor.bond_order[bond_jk_index] == 1 && !jk_aromatic;
 
     // rule (a): linear heavy atom on either side — all zero.
     if (jp->linh || kp->linh) return out;
@@ -491,7 +493,7 @@ SMALLFIELD_HD_ inline std::array<float, 3> native_torsion_empirical(molecule_des
     bool const g_trigger = (jk_single && jp->mltb && kp->mltb) || (jp->mltb && kp->pilp) || (jp->pilp && kp->mltb);
     if (g_trigger) {
         if (jp->pilp && kp->pilp) return out;
-        std::uint8_t const ai = desc.element[j], ak = desc.element[k];
+        std::uint8_t const ai = descriptor.element[j], ak = descriptor.element[k];
         std::uint8_t const row_j = periodic_table_row(ai);
         std::uint8_t const row_k = periodic_table_row(ak);
         float pi_jk = 0.0f;
@@ -513,7 +515,7 @@ SMALLFIELD_HD_ inline std::array<float, 3> native_torsion_empirical(molecule_des
     }
 
     // rule (h).
-    std::uint8_t const ai = desc.element[j], ak = desc.element[k];
+    std::uint8_t const ai = descriptor.element[j], ak = descriptor.element[k];
     if ((ai == 8 || ai == 16) && (ak == 8 || ak == 16)) { out[1] = -std::sqrt(W0 * W1); }
     else { out[2] = std::sqrt(V0 * V1_) / N_jk; }
     return out;

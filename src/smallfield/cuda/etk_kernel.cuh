@@ -172,10 +172,10 @@ __device__ __forceinline__ float evaluate_etk_torsion_energy(
     for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
         float3 gradient_acc {0.0f, 0.0f, 0.0f};
 
-        std::uint32_t const interaction_start = atom_offsets[atom].interaction_start;
+        std::uint32_t const interaction_offset = atom_offsets[atom].interaction_offset;
         std::uint32_t const interaction_count = atom_offsets[atom].interaction_count;
 
-        for (std::uint32_t index = interaction_start; index < interaction_start + interaction_count; ++index) {
+        for (std::uint32_t index = interaction_offset; index < interaction_offset + interaction_count; ++index) {
             auto const &entry = interactions[index];
 
             if (entry.interaction_type == etk_torsion_k) {

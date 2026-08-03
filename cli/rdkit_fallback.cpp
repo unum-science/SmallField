@@ -131,12 +131,12 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         if (conformer_ids.empty()) continue;
 
         bool recovered_any = false;
-        std::uint32_t fresh_idx = 0;
+        std::uint32_t fresh_index = 0;
         for (std::uint32_t conformer_slot = 0; conformer_slot < num_conformers; ++conformer_slot) {
             std::uint8_t const slot_status = outputs.status[molecule_index * num_conformers + conformer_slot];
             if (slot_status == static_cast<std::uint8_t>(sfapi::conformer_status_t::success)) continue;
-            if (fresh_idx >= conformer_ids.size()) break;
-            int const rdkit_conformer_id = conformer_ids[fresh_idx++];
+            if (fresh_index >= conformer_ids.size()) break;
+            int const rdkit_conformer_id = conformer_ids[fresh_index++];
 
             // MMFF optimise this conformer in place.
             float energy_kcal_per_mol = 0.0f;

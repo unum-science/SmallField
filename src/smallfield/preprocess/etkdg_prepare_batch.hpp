@@ -53,7 +53,7 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 #include <GraphMol/Descriptors/MolDescriptors.h>
 
-#include "smallfield/api/batch_pool.hpp"
+#include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/molecule_parse.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/parameters/forcefield_tables.hpp"
@@ -68,9 +68,9 @@
 using smallfield::types::max_mmff_interactions_per_mol_k;
 
 namespace smallfield::preprocess {
-using smallfield::api::batch_layout_t;
-using smallfield::api::batch_pool_t;
 using smallfield::api::place_region_;
+using smallfield::api::wave_slice_layout_t;
+using smallfield::api::wave_slice_pool_t;
 using smallfield::mmff94::make_angle_key_;
 using smallfield::mmff94::make_bond_stretch_key_;
 using smallfield::mmff94::make_oop_key_;
@@ -111,7 +111,7 @@ using smallfield::types::etk_torsion_k;
 using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::fill_bond_distances;
 using smallfield::types::hybridization_sp2_k;
-using smallfield::types::max_atoms_k;
+using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::max_bonds_k;
 using smallfield::types::mmff94_angle_center_k;
 using smallfield::types::mmff94_angle_end_k;
@@ -202,22 +202,30 @@ struct etkdg_prepared_molecule_t {
  *  Unlike a freely rotatable 1-4 pair, a stereo-defined double bond fixes this distance,
  *  which is how ETKDG enforces E/Z through the bounds matrix.
  */
-inline float stereo_one_four_distance(molecule_descriptor_t const &desc, std::uint32_t first, std::uint32_t second,
-                                      std::uint32_t third, std::uint32_t fourth, std::uint32_t bond_first_second,
-                                      std::uint32_t bond_second_third, std::uint32_t bond_third_fourth, bool is_cis) {
+/** @brief Which side of the double bond the two reference substituents sit on. */
+enum double_bond_geometry_t : std::uint8_t {
+    double_bond_trans_k = 0,
+    double_bond_cis_k = 1,
+};
+
+inline float stereo_one_four_distance(molecule_descriptor_t const &descriptor, std::uint32_t first,
+                                      std::uint32_t second, std::uint32_t third, std::uint32_t fourth,
+                                      std::uint32_t bond_first_second, std::uint32_t bond_second_third,
+                                      std::uint32_t bond_third_fourth, double_bond_geometry_t geometry) {
     auto bond_length = [&](std::uint32_t bond_index, std::uint32_t a, std::uint32_t b) {
-        bool const aromatic = (desc.bond_flags[bond_index] & bond_flag_aromatic_k) != 0;
-        return ideal_bond_length_angstrom(desc.element[a], desc.element[b], desc.bond_order[bond_index], aromatic);
+        bool const aromatic = (descriptor.bond_flags[bond_index] & bond_flag_aromatic_k) != 0;
+        return ideal_bond_length_angstrom(descriptor.element[a], descriptor.element[b],
+                                          descriptor.bond_order[bond_index], aromatic);
     };
     float const length_12 = bond_length(bond_first_second, first, second);
     float const length_23 = bond_length(bond_second_third, second, third);
     float const length_34 = bond_length(bond_third_fourth, third, fourth);
 
-    float const angle_123 = ideal_angle_radians(desc.hybridization[second]);
-    float const angle_234 = ideal_angle_radians(desc.hybridization[third]);
+    float const angle_123 = ideal_angle_radians(descriptor.hybridization[second]);
+    float const angle_234 = ideal_angle_radians(descriptor.hybridization[third]);
     float const cos_123 = std::cos(angle_123), sin_123 = std::sin(angle_123);
     float const cos_234 = std::cos(angle_234), sin_234 = std::sin(angle_234);
-    float const cos_torsion = is_cis ? 1.0f : -1.0f;
+    float const cos_torsion = geometry == double_bond_cis_k ? 1.0f : -1.0f;
 
     float const squared = length_12 * length_12 + length_23 * length_23 + length_34 * length_34 -
                           2.0f * length_12 * length_23 * cos_123 - 2.0f * length_23 * length_34 * cos_234 +
@@ -225,14 +233,14 @@ inline float stereo_one_four_distance(molecule_descriptor_t const &desc, std::ui
     return std::sqrt(std::max(0.01f, squared));
 }
 
-inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<float> &bounds) {
-    std::uint32_t const num_atoms = desc.num_atoms;
+inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::vector<float> &bounds) {
+    std::uint32_t const num_atoms = descriptor.num_atoms;
     bounds.assign(static_cast<std::size_t>(num_atoms) * num_atoms, 0.0f);
 
     // The 1-4 and long-range sweeps below are the only host consumers of the hop matrix, so it
     // lives on this frame at the molecule's own row stride rather than inside the descriptor.
-    std::uint8_t bond_hops[max_atoms_k * max_atoms_k];
-    fill_bond_distances(desc, bond_hops, num_atoms);
+    std::uint8_t bond_hops[max_atoms_per_molecule_k * max_atoms_per_molecule_k];
+    fill_bond_distances(descriptor, bond_hops, num_atoms);
 
     auto set_pair = [&](std::uint32_t a, std::uint32_t b, float lower, float upper) {
         std::uint32_t const row = std::min(a, b);
@@ -248,33 +256,34 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
 
     // set12 — exact ideal bond lengths ± 2% tolerance per bond from the descriptor.
     constexpr float bond_tolerance_k = 0.02f;
-    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
-        std::uint32_t const i = desc.bond_atom_i[b];
-        std::uint32_t const j = desc.bond_atom_j[b];
-        bool const aromatic = (desc.bond_flags[b] & bond_flag_aromatic_k) != 0;
-        float const ideal = ideal_bond_length_angstrom(desc.element[i], desc.element[j], desc.bond_order[b], aromatic);
+    for (std::uint32_t b = 0; b < descriptor.num_bonds; ++b) {
+        std::uint32_t const i = descriptor.bond_atom_i[b];
+        std::uint32_t const j = descriptor.bond_atom_j[b];
+        bool const aromatic = (descriptor.bond_flags[b] & bond_flag_aromatic_k) != 0;
+        float const ideal = ideal_bond_length_angstrom(descriptor.element[i], descriptor.element[j],
+                                                       descriptor.bond_order[b], aromatic);
         set_pair(i, j, ideal * (1.0f - bond_tolerance_k), ideal * (1.0f + bond_tolerance_k));
     }
 
     // set13 — one 1-3 bound per pair of neighbors around every center atom.
     // Loop is O(N × d²) where d is the typical degree (small).
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint32_t const nbegin = desc.neighbor_offset[center];
-        std::uint32_t const nend = desc.neighbor_offset[center + 1];
-        float const theta = ideal_angle_radians(desc.hybridization[center]);
+        std::uint32_t const nbegin = descriptor.neighbor_offset[center];
+        std::uint32_t const nend = descriptor.neighbor_offset[center + 1];
+        float const theta = ideal_angle_radians(descriptor.hybridization[center]);
         float const cos_theta = std::cos(theta);
         for (std::uint32_t p = nbegin; p < nend; ++p) {
-            std::uint32_t const i = desc.neighbor_atom[p];
-            std::uint32_t const bond_ci = desc.neighbor_bond[p];
-            bool const ar_ci = (desc.bond_flags[bond_ci] & bond_flag_aromatic_k) != 0;
-            float const d_ci = ideal_bond_length_angstrom(desc.element[center], desc.element[i],
-                                                          desc.bond_order[bond_ci], ar_ci);
+            std::uint32_t const i = descriptor.neighbor_atom[p];
+            std::uint32_t const bond_ci = descriptor.neighbor_bond[p];
+            bool const ar_ci = (descriptor.bond_flags[bond_ci] & bond_flag_aromatic_k) != 0;
+            float const d_ci = ideal_bond_length_angstrom(descriptor.element[center], descriptor.element[i],
+                                                          descriptor.bond_order[bond_ci], ar_ci);
             for (std::uint32_t q = p + 1; q < nend; ++q) {
-                std::uint32_t const j = desc.neighbor_atom[q];
-                std::uint32_t const bond_cj = desc.neighbor_bond[q];
-                bool const ar_cj = (desc.bond_flags[bond_cj] & bond_flag_aromatic_k) != 0;
-                float const d_cj = ideal_bond_length_angstrom(desc.element[center], desc.element[j],
-                                                              desc.bond_order[bond_cj], ar_cj);
+                std::uint32_t const j = descriptor.neighbor_atom[q];
+                std::uint32_t const bond_cj = descriptor.neighbor_bond[q];
+                bool const ar_cj = (descriptor.bond_flags[bond_cj] & bond_flag_aromatic_k) != 0;
+                float const d_cj = ideal_bond_length_angstrom(descriptor.element[center], descriptor.element[j],
+                                                              descriptor.bond_order[bond_cj], ar_cj);
                 float const d_ij = std::sqrt(
                     std::max(0.0f, d_ci * d_ci + d_cj * d_cj - 2.0f * d_ci * d_cj * cos_theta));
                 // ± 3% tolerance — 1-3 distances tend to have slightly more slack.
@@ -288,16 +297,16 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
     // the check entirely in the common zero case.
     std::uint32_t stereo_bonds[max_bonds_k];
     std::uint32_t num_stereo_bonds = 0;
-    for (std::uint32_t b = 0; b < desc.num_bonds; ++b)
-        if ((desc.bond_flags[b] & (bond_flag_stereo_e_k | bond_flag_stereo_z_k)) != 0 &&
-            desc.bond_stereo_atom_i[b] != no_stereo_atom_k)
+    for (std::uint32_t b = 0; b < descriptor.num_bonds; ++b)
+        if ((descriptor.bond_flags[b] & (bond_flag_stereo_e_k | bond_flag_stereo_z_k)) != 0 &&
+            descriptor.bond_stereo_atom_i[b] != no_stereo_atom_k)
             stereo_bonds[num_stereo_bonds++] = b;
 
     auto find_bond_between = [&](std::uint32_t a, std::uint32_t b) -> std::int32_t {
-        std::uint32_t const nbegin = desc.neighbor_offset[a];
-        std::uint32_t const nend = desc.neighbor_offset[a + 1];
+        std::uint32_t const nbegin = descriptor.neighbor_offset[a];
+        std::uint32_t const nend = descriptor.neighbor_offset[a + 1];
         for (std::uint32_t p = nbegin; p < nend; ++p)
-            if (desc.neighbor_atom[p] == b) return static_cast<std::int32_t>(desc.neighbor_bond[p]);
+            if (descriptor.neighbor_atom[p] == b) return static_cast<std::int32_t>(descriptor.neighbor_bond[p]);
         return -1;
     };
 
@@ -314,8 +323,8 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
             bool stereo_constrained = false;
             for (std::uint32_t s = 0; s < num_stereo_bonds && !stereo_constrained; ++s) {
                 std::uint32_t const bond = stereo_bonds[s];
-                std::uint32_t end_near_i = desc.bond_atom_i[bond];
-                std::uint32_t end_near_j = desc.bond_atom_j[bond];
+                std::uint32_t end_near_i = descriptor.bond_atom_i[bond];
+                std::uint32_t end_near_j = descriptor.bond_atom_j[bond];
                 std::int32_t bond_i = find_bond_between(i, end_near_i);
                 std::int32_t bond_j = find_bond_between(j, end_near_j);
                 if (bond_i < 0 || bond_j < 0) {
@@ -327,25 +336,26 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
                 // The flag fixes the relationship of the two recorded reference atoms.
                 // Any other substituent on an end sits opposite that end's reference, so
                 // each mismatch flips the sense.
-                std::uint32_t const reference_i = desc.bond_stereo_atom_i[bond];
-                std::uint32_t const reference_j = desc.bond_stereo_atom_j[bond];
+                std::uint32_t const reference_i = descriptor.bond_stereo_atom_i[bond];
+                std::uint32_t const reference_j = descriptor.bond_stereo_atom_j[bond];
                 bool reference_on_i_side = find_bond_between(reference_i, end_near_i) >= 0;
                 std::uint32_t const own_reference = reference_on_i_side ? reference_i : reference_j;
                 std::uint32_t const other_reference = reference_on_i_side ? reference_j : reference_i;
-                bool is_cis = (desc.bond_flags[bond] & bond_flag_stereo_z_k) != 0;
-                if (i != own_reference) is_cis = !is_cis;
-                if (j != other_reference) is_cis = !is_cis;
+                bool cis = (descriptor.bond_flags[bond] & bond_flag_stereo_z_k) != 0;
+                if (i != own_reference) cis = !cis;
+                if (j != other_reference) cis = !cis;
+                double_bond_geometry_t const geometry = cis ? double_bond_cis_k : double_bond_trans_k;
 
-                float const target = stereo_one_four_distance(desc, i, end_near_i, end_near_j, j,
+                float const target = stereo_one_four_distance(descriptor, i, end_near_i, end_near_j, j,
                                                               static_cast<std::uint32_t>(bond_i), bond,
-                                                              static_cast<std::uint32_t>(bond_j), is_cis);
+                                                              static_cast<std::uint32_t>(bond_j), geometry);
                 set_pair(i, j, target * 0.95f, target * 1.05f);
                 stereo_constrained = true;
             }
             if (stereo_constrained) continue;
 
             // Approximate: upper ≈ 3 × average C-C bond ≈ 4.5 Å; lower ≈ VdW contact.
-            float const lower = vdw_lower_bound_angstrom(desc.element[i], desc.element[j]);
+            float const lower = vdw_lower_bound_angstrom(descriptor.element[i], descriptor.element[j]);
             float const upper = 4.5f;
             // Only widen — never replace a tighter (i,j) bound from set13.
             std::uint32_t const row = std::min(i, j);
@@ -362,7 +372,7 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
         for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
             std::uint8_t const hops = bond_hops[i * num_atoms + j];
             if (hops <= 3) continue;
-            float const lower = vdw_lower_bound_angstrom(desc.element[i], desc.element[j]);
+            float const lower = vdw_lower_bound_angstrom(descriptor.element[i], descriptor.element[j]);
             bounds[j * num_atoms + i] = lower; // lower triangle
         }
     }
@@ -385,19 +395,19 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
  *  the stored order alike, so it contributes no parity of its own and drops out.
  *
  *  @param[in] molecule RDKit molecule; stereochemistry is assigned in place.
- *  @param[in] desc Flat descriptor supplying the chiral tags and the CSR adjacency.
+ *  @param[in] descriptor Flat descriptor supplying the chiral tags and the CSR adjacency.
  *  @param[out] chiral_centers Filled with one descriptor per tetrahedral center.
  */
-inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
+inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descriptor_t const &descriptor,
                                    std::vector<chiral_center_descriptor_t> &chiral_centers) {
     chiral_centers.clear();
     auto &stereo_molecule = const_cast<RDKit::ROMol &>(molecule);
     RDKit::MolOps::assignStereochemistry(stereo_molecule, true, true, true);
 
-    std::uint32_t const num_atoms = desc.num_atoms;
+    std::uint32_t const num_atoms = descriptor.num_atoms;
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
-        if (desc.chiral_tag[a] == 0) continue;
-        if (desc.degree[a] < 3) continue;
+        if (descriptor.chiral_tag[a] == 0) continue;
+        if (descriptor.degree[a] < 3) continue;
 
         // `assignStereochemistry` strips the tag off every atom that parsed with one but is
         // not a stereocenter, so a surviving tag is the membership test for this center.
@@ -406,16 +416,16 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
                                      assigned_tag == RDKit::Atom::CHI_TETRAHEDRAL_CCW;
         if (!is_stereocenter) continue;
 
-        chiral_center_descriptor_t descriptor {};
-        descriptor.center_atom = static_cast<std::uint8_t>(a);
+        chiral_center_descriptor_t chiral_center {};
+        chiral_center.center_atom = static_cast<std::uint8_t>(a);
 
         // Collect the neighbors in CSR order, which is the bond order the tag is defined against.
         std::uint8_t ordered[4] = {0, 0, 0, 0};
         std::uint32_t count = 0;
-        std::uint16_t const neighbor_first = desc.neighbor_offset[a];
-        std::uint16_t const neighbor_last = desc.neighbor_offset[a + 1];
+        std::uint16_t const neighbor_first = descriptor.neighbor_offset[a];
+        std::uint16_t const neighbor_last = descriptor.neighbor_offset[a + 1];
         for (std::uint16_t n = neighbor_first; n < neighbor_last && count < 4; ++n)
-            ordered[count++] = desc.neighbor_atom[n];
+            ordered[count++] = descriptor.neighbor_atom[n];
 
         // Insertion sort by ascending atom index over at most four entries, counting the swaps.
         std::uint32_t swaps = 0;
@@ -430,13 +440,13 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
             ordered[slot] = moving;
         }
 
-        for (std::uint32_t slot = 0; slot < 4; ++slot) descriptor.neighbor_atoms[slot] = ordered[slot];
+        for (std::uint32_t slot = 0; slot < 4; ++slot) chiral_center.neighbor_atoms[slot] = ordered[slot];
 
-        int const tag_sign = (desc.chiral_tag[a] == 1) ? 1 : -1;
+        int const tag_sign = (descriptor.chiral_tag[a] == 1) ? 1 : -1;
         int const order_parity = (swaps % 2 == 0) ? 1 : -1;
-        descriptor.target_sign = static_cast<std::int8_t>(-tag_sign * order_parity);
+        chiral_center.target_sign = static_cast<std::int8_t>(-tag_sign * order_parity);
 
-        chiral_centers.push_back(descriptor);
+        chiral_centers.push_back(chiral_center);
     }
 }
 
@@ -451,23 +461,24 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
  *  @param[in] bounds_matrix Flat N x N distance bounds (row-major, from build_bounds_matrix()).
  *  @param[out] constraints Filled with 1-2 bond and 1-3 angle distance constraints.
  */
-inline void extract_distance_constraints(molecule_descriptor_t const &desc, std::vector<float> const &bounds_matrix,
+inline void extract_distance_constraints(molecule_descriptor_t const &descriptor,
+                                         std::vector<float> const &bounds_matrix,
                                          std::vector<distance_constraint_t> &constraints) {
     constraints.clear();
-    std::uint32_t const num_atoms = desc.num_atoms;
+    std::uint32_t const num_atoms = descriptor.num_atoms;
 
     // Reserve exact capacity: 1-2 count = num_bonds, 1-3 count = sum choose(degree, 2).
     std::uint32_t num_13 = 0;
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
-        std::uint32_t d = desc.degree[a];
+        std::uint32_t d = descriptor.degree[a];
         num_13 += d * (d - 1) / 2;
     }
-    constraints.reserve(desc.num_bonds + num_13);
+    constraints.reserve(descriptor.num_bonds + num_13);
 
     // 1-2 bond constraints: one emit per bond, exact bounds from the matrix.
-    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
-        std::uint32_t const atom_i = desc.bond_atom_i[b];
-        std::uint32_t const atom_j = desc.bond_atom_j[b];
+    for (std::uint32_t b = 0; b < descriptor.num_bonds; ++b) {
+        std::uint32_t const atom_i = descriptor.bond_atom_i[b];
+        std::uint32_t const atom_j = descriptor.bond_atom_j[b];
         std::uint32_t const row_min = std::min(atom_i, atom_j);
         std::uint32_t const row_max = std::max(atom_i, atom_j);
 
@@ -483,12 +494,12 @@ inline void extract_distance_constraints(molecule_descriptor_t const &desc, std:
 
     // 1-3 constraints: iterate each atom as center, enumerate neighbor pairs via CSR.
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint16_t const start = desc.neighbor_offset[center];
-        std::uint16_t const end = desc.neighbor_offset[center + 1];
+        std::uint16_t const start = descriptor.neighbor_offset[center];
+        std::uint16_t const end = descriptor.neighbor_offset[center + 1];
         for (std::uint16_t a = start; a < end; ++a) {
             for (std::uint16_t b = a + 1; b < end; ++b) {
-                std::uint32_t const ni = desc.neighbor_atom[a];
-                std::uint32_t const nj = desc.neighbor_atom[b];
+                std::uint32_t const ni = descriptor.neighbor_atom[a];
+                std::uint32_t const nj = descriptor.neighbor_atom[b];
                 std::uint32_t const row_min = std::min(ni, nj);
                 std::uint32_t const row_max = std::max(ni, nj);
 
@@ -601,10 +612,10 @@ inline void build_etk_interaction_lists(etkdg_prepared_molecule_t &result) {
     auto const &torsions = result.etk_torsions;
     auto const &constraints = result.distance_constraints;
 
-    // pass 1: count interactions per atom. num_atoms <= max_atoms_k so the
+    // pass 1: count interactions per atom. num_atoms <= max_atoms_per_molecule_k so the
     // fixed-size std::array lives on the stack and avoids a per-molecule heap
     // allocation on the hot prep path.
-    std::array<std::uint32_t, max_atoms_k> counts {};
+    std::array<std::uint32_t, max_atoms_per_molecule_k> counts {};
     for (auto const &torsion : torsions) {
         counts[torsion.atom_indices[0]]++;
         counts[torsion.atom_indices[1]]++;
@@ -626,9 +637,9 @@ inline void build_etk_interaction_lists(etkdg_prepared_molecule_t &result) {
 
     // pass 2: fill entries
     result.etk_interactions.resize(running);
-    std::array<std::uint32_t, max_atoms_k> cursors {};
+    std::array<std::uint32_t, max_atoms_per_molecule_k> cursors {};
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-        cursors[atom] = result.etk_atom_offsets[atom].interaction_start;
+        cursors[atom] = result.etk_atom_offsets[atom].interaction_offset;
 
     for (std::uint32_t term = 0; term < torsions.size(); ++term) {
         result.etk_interactions[cursors[torsions[term].atom_indices[0]]++] = {term, etk_torsion_k, atom_role_first_k};
@@ -661,7 +672,7 @@ inline void build_etk_interaction_lists(etkdg_prepared_molecule_t &result) {
  *          molecule as not parametrizable.
  */
 inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol const &molecule,
-                                                                 molecule_descriptor_t const &desc,
+                                                                 molecule_descriptor_t const &descriptor,
                                                                  etkdg_prepared_molecule_t &result) {
     result.mmff_atom_vdw.clear();
     result.mmff_atom_charge.clear();
@@ -676,11 +687,11 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     }
     RDKit::MMFF::MMFFMolProperties mmff_props(mol);
 
-    std::uint32_t const num_atoms = desc.num_atoms;
+    std::uint32_t const num_atoms = descriptor.num_atoms;
 
     // Precompute per-atom MMFF types and per-bond signatures for the global parameter cache in
-    // src/mmff94/mmff94_param_cache.hpp. Atom types are cheap array reads from mmff_props and
-    // bond signatures come straight from `desc`. These feed the cache-key packers so we can short-circuit
+    // source/mmff94/mmff94_param_cache.hpp. Atom types are cheap array reads from mmff_props and
+    // bond signatures come straight from `descriptor`. These feed the cache-key packers so we can short-circuit
     // RDKit's per-term std::map lookups.
     //
     // `getMMFFAtomType` returns 0 for atoms outside the MMFF94 parameter set
@@ -689,7 +700,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     // gate, `etkdg_pipeline_warp_kernel` does an OOB write through
     // element-keyed parameter LUTs in `forcefield_tables.hpp` and poisons
     // every subsequent CUDA call on every device.
-    std::uint8_t atom_type[max_atoms_k];
+    std::uint8_t atom_type[max_atoms_per_molecule_k];
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
         atom_type[a] = static_cast<std::uint8_t>(mmff_props.getMMFFAtomType(a));
         if (atom_type[a] == 0) return smallfield::api::conformer_status_t::unsupported_element;
@@ -701,14 +712,14 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     // on-device and must fall back to CPU ETKDGv3.
     if (!mmff_props.isValid()) return smallfield::api::conformer_status_t::unsupported_element;
     std::uint8_t bond_signature[max_bonds_k];
-    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
-        bool const arom = (desc.bond_flags[b] & bond_flag_aromatic_k) != 0;
-        bool const in_ring = (desc.bond_flags[b] & bond_flag_in_ring_k) != 0;
-        bond_signature[b] = pack_bond_signature_(desc.bond_order[b], arom, in_ring);
+    for (std::uint32_t b = 0; b < descriptor.num_bonds; ++b) {
+        bool const arom = (descriptor.bond_flags[b] & bond_flag_aromatic_k) != 0;
+        bool const in_ring = (descriptor.bond_flags[b] & bond_flag_in_ring_k) != 0;
+        bond_signature[b] = pack_bond_signature_(descriptor.bond_order[b], arom, in_ring);
     }
-    auto find_bond_idx = [&](std::uint32_t i, std::uint32_t j) -> std::int32_t {
-        for (std::uint16_t n = desc.neighbor_offset[i]; n < desc.neighbor_offset[i + 1]; ++n)
-            if (desc.neighbor_atom[n] == j) return desc.neighbor_bond[n];
+    auto find_bond_index = [&](std::uint32_t i, std::uint32_t j) -> std::int32_t {
+        for (std::uint16_t n = descriptor.neighbor_offset[i]; n < descriptor.neighbor_offset[i + 1]; ++n)
+            if (descriptor.neighbor_atom[n] == j) return descriptor.neighbor_bond[n];
         return -1;
     };
 
@@ -738,9 +749,9 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     // Build bond terms — iterate descriptor's bond list (no RDKit traversal).
     // Cache-first: key by (atom_type_pair, bond_signature). Cache hit skips
     // RDKit's getMMFFBondStretchParams + its internal std::map lookup.
-    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
-        std::uint32_t const i = desc.bond_atom_i[b];
-        std::uint32_t const j = desc.bond_atom_j[b];
+    for (std::uint32_t b = 0; b < descriptor.num_bonds; ++b) {
+        std::uint32_t const i = descriptor.bond_atom_i[b];
+        std::uint32_t const j = descriptor.bond_atom_j[b];
         std::uint64_t const key = make_bond_stretch_key_(atom_type[i], atom_type[j], bond_signature[b]);
         mmff_bond_cached_t cached_vals {};
         if (auto const *hit = mmff_bond_cache().find(key)) { cached_vals = *hit; }
@@ -763,14 +774,14 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
 
     // Build angle terms — iterate atoms as angle centers, enumerate neighbor pairs via CSR.
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint16_t const nstart = desc.neighbor_offset[center];
-        std::uint16_t const nend = desc.neighbor_offset[center + 1];
+        std::uint16_t const nstart = descriptor.neighbor_offset[center];
+        std::uint16_t const nend = descriptor.neighbor_offset[center + 1];
         for (std::uint16_t a = nstart; a < nend; ++a) {
             for (std::uint16_t b = a + 1; b < nend; ++b) {
-                std::uint32_t const ai = desc.neighbor_atom[a];
-                std::uint32_t const aj = desc.neighbor_atom[b];
-                std::int32_t const bond_index_ic = find_bond_idx(ai, center);
-                std::int32_t const bond_index_cj = find_bond_idx(center, aj);
+                std::uint32_t const ai = descriptor.neighbor_atom[a];
+                std::uint32_t const aj = descriptor.neighbor_atom[b];
+                std::int32_t const bond_index_ic = find_bond_index(ai, center);
+                std::int32_t const bond_index_cj = find_bond_index(center, aj);
                 if (bond_index_ic < 0 || bond_index_cj < 0) continue;
                 std::uint64_t const key = make_angle_key_(atom_type[ai], atom_type[center], atom_type[aj],
                                                           bond_signature[bond_index_ic], bond_signature[bond_index_cj]);
@@ -796,23 +807,23 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     }
 
     // Build torsion terms — iterate descriptor's bonds as central, enumerate end-atom neighbors.
-    for (std::uint32_t b = 0; b < desc.num_bonds; ++b) {
-        std::uint32_t const j = desc.bond_atom_i[b];
-        std::uint32_t const k = desc.bond_atom_j[b];
-        std::uint16_t const jstart = desc.neighbor_offset[j];
-        std::uint16_t const jend = desc.neighbor_offset[j + 1];
-        std::uint16_t const kstart = desc.neighbor_offset[k];
-        std::uint16_t const kend = desc.neighbor_offset[k + 1];
+    for (std::uint32_t b = 0; b < descriptor.num_bonds; ++b) {
+        std::uint32_t const j = descriptor.bond_atom_i[b];
+        std::uint32_t const k = descriptor.bond_atom_j[b];
+        std::uint16_t const jstart = descriptor.neighbor_offset[j];
+        std::uint16_t const jend = descriptor.neighbor_offset[j + 1];
+        std::uint16_t const kstart = descriptor.neighbor_offset[k];
+        std::uint16_t const kend = descriptor.neighbor_offset[k + 1];
         std::uint8_t const bsig_jk = bond_signature[b];
         for (std::uint16_t nj = jstart; nj < jend; ++nj) {
-            std::uint32_t const i = desc.neighbor_atom[nj];
+            std::uint32_t const i = descriptor.neighbor_atom[nj];
             if (i == k) continue;
-            std::uint16_t const bond_index_ij = desc.neighbor_bond[nj];
+            std::uint16_t const bond_index_ij = descriptor.neighbor_bond[nj];
             std::uint8_t const bsig_ij = bond_signature[bond_index_ij];
             for (std::uint16_t nk = kstart; nk < kend; ++nk) {
-                std::uint32_t const l = desc.neighbor_atom[nk];
+                std::uint32_t const l = descriptor.neighbor_atom[nk];
                 if (l == j) continue;
-                std::uint16_t const bond_index_kl = desc.neighbor_bond[nk];
+                std::uint16_t const bond_index_kl = descriptor.neighbor_bond[nk];
                 std::uint8_t const bsig_kl = bond_signature[bond_index_kl];
                 std::uint64_t const key = make_torsion_key_(atom_type[i], atom_type[j], atom_type[k], atom_type[l],
                                                             bsig_ij, bsig_jk, bsig_kl);
@@ -836,13 +847,13 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
 
     // Build out-of-plane bending terms for sp2 centers with ≥3 neighbors.
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint32_t const degree = desc.degree[center];
+        std::uint32_t const degree = descriptor.degree[center];
         if (degree < 3) continue;
-        std::uint16_t const nstart = desc.neighbor_offset[center];
+        std::uint16_t const nstart = descriptor.neighbor_offset[center];
         std::uint8_t neighbor_cache[8];
         std::uint32_t neighbor_count = 0;
-        for (std::uint16_t n = nstart; n < desc.neighbor_offset[center + 1] && neighbor_count < 8; ++n)
-            neighbor_cache[neighbor_count++] = desc.neighbor_atom[n];
+        for (std::uint16_t n = nstart; n < descriptor.neighbor_offset[center + 1] && neighbor_count < 8; ++n)
+            neighbor_cache[neighbor_count++] = descriptor.neighbor_atom[n];
 
         for (std::uint32_t a = 0; a < neighbor_count; ++a) {
             std::uint8_t plane[2];
@@ -872,14 +883,14 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
 
     // Build stretch-bend terms — same topology as angles.
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint16_t const nstart = desc.neighbor_offset[center];
-        std::uint16_t const nend = desc.neighbor_offset[center + 1];
+        std::uint16_t const nstart = descriptor.neighbor_offset[center];
+        std::uint16_t const nend = descriptor.neighbor_offset[center + 1];
         for (std::uint16_t a = nstart; a < nend; ++a) {
             for (std::uint16_t b = a + 1; b < nend; ++b) {
-                std::uint32_t const ai = desc.neighbor_atom[a];
-                std::uint32_t const aj = desc.neighbor_atom[b];
-                std::int32_t const bond_index_ic = find_bond_idx(ai, center);
-                std::int32_t const bond_index_cj = find_bond_idx(center, aj);
+                std::uint32_t const ai = descriptor.neighbor_atom[a];
+                std::uint32_t const aj = descriptor.neighbor_atom[b];
+                std::int32_t const bond_index_ic = find_bond_index(ai, center);
+                std::int32_t const bond_index_cj = find_bond_index(center, aj);
                 if (bond_index_ic < 0 || bond_index_cj < 0) continue;
                 std::uint64_t const key = make_stretchbend_key_(atom_type[ai], atom_type[center], atom_type[aj],
                                                                 bond_signature[bond_index_ic],
@@ -918,13 +929,13 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     auto const &stretchbends = result.mmff_stretchbends;
 
     // pass 1: count per-type interactions per atom. Fixed-size stack array
-    // sized to the hard atom-count cap (max_atoms_k=128) — no per-molecule
+    // sized to the hard atom-count cap (max_atoms_per_molecule_k=128) — no per-molecule
     // heap allocation on the prep path.
     struct per_atom_counts_t {
         // `uint32_t` not `uint8_t`: see `mmff94_atom_offsets_t` comment.
         std::uint32_t bond, angle, torsion, oop, stretchbend;
     };
-    std::array<per_atom_counts_t, max_atoms_k> type_counts {};
+    std::array<per_atom_counts_t, max_atoms_per_molecule_k> type_counts {};
     for (auto const &b : bonds) {
         type_counts[b.atom_i].bond++;
         type_counts[b.atom_j].bond++;
@@ -968,19 +979,19 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
         assert(counts.torsion <= max_mmff_interactions_per_mol_k && "per-atom torsion_count exceeds mol cap");
         assert(counts.oop <= max_mmff_interactions_per_mol_k && "per-atom oop_count exceeds mol cap");
         assert(counts.stretchbend <= max_mmff_interactions_per_mol_k && "per-atom stretchbend_count exceeds mol cap");
-        offsets.bond_start = running;
+        offsets.bond_offset = running;
         offsets.bond_count = counts.bond;
         running += counts.bond;
-        offsets.angle_start = running;
+        offsets.angle_offset = running;
         offsets.angle_count = counts.angle;
         running += counts.angle;
-        offsets.torsion_start = running;
+        offsets.torsion_offset = running;
         offsets.torsion_count = counts.torsion;
         running += counts.torsion;
-        offsets.oop_start = running;
+        offsets.oop_offset = running;
         offsets.oop_count = counts.oop;
         running += counts.oop;
-        offsets.stretchbend_start = running;
+        offsets.stretchbend_offset = running;
         offsets.stretchbend_count = counts.stretchbend;
         running += counts.stretchbend;
     }
@@ -993,10 +1004,10 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     struct per_atom_cursors_t {
         std::uint32_t bond, angle, torsion, oop, stretchbend;
     };
-    std::array<per_atom_cursors_t, max_atoms_k> cursors {};
+    std::array<per_atom_cursors_t, max_atoms_per_molecule_k> cursors {};
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
         auto const &off = result.mmff_atom_offsets[atom];
-        cursors[atom] = {off.bond_start, off.angle_start, off.torsion_start, off.oop_start, off.stretchbend_start};
+        cursors[atom] = {off.bond_offset, off.angle_offset, off.torsion_offset, off.oop_offset, off.stretchbend_offset};
     }
 
     for (std::uint32_t term = 0; term < bonds.size(); ++term) {
@@ -1070,7 +1081,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
     using smallfield::api::conformer_status_t;
 
     smallfield::parse_options_t parse_options;
-    parse_options.max_atoms = max_atoms_k; // single-warp pipeline cap
+    parse_options.max_atoms = max_atoms_per_molecule_k; // single-warp pipeline cap
     parse_options.metadata_policy = smallfield::compute_metadata_k;
     smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
     if (parsed.status != conformer_status_t::success) return parsed.status;
@@ -1086,17 +1097,17 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
 
     conformer_status_t mmff_status = conformer_status_t::success;
     try {
-        molecule_descriptor_t desc;
-        if (!build_descriptor(*mol, desc)) {
+        molecule_descriptor_t descriptor;
+        if (!build_descriptor(*mol, descriptor)) {
             result.num_atoms = 0;
             return conformer_status_t::invalid_smiles;
         }
-        build_bounds_matrix(desc, result.bounds_matrix);
-        extract_chiral_centers(*mol, desc, result.chiral_centers);
-        extract_etk_torsions_native(desc, result.etk_torsions);
-        extract_distance_constraints(desc, result.bounds_matrix, result.distance_constraints);
+        build_bounds_matrix(descriptor, result.bounds_matrix);
+        extract_chiral_centers(*mol, descriptor, result.chiral_centers);
+        extract_etk_torsions_native(descriptor, result.etk_torsions);
+        extract_distance_constraints(descriptor, result.bounds_matrix, result.distance_constraints);
         build_etk_interaction_lists(result);
-        mmff_status = extract_mmff94_params(*mol, desc, result);
+        mmff_status = extract_mmff94_params(*mol, descriptor, result);
     }
     catch (...) {
         result.num_atoms = 0;
@@ -1132,9 +1143,9 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
     result.metadata.mmff_torsion_offset = 0;
     result.metadata.mmff_oop_offset = 0;
     result.metadata.mmff_stretchbend_offset = 0;
-    result.metadata.mmff_atom_offsets_start = 0;
+    result.metadata.mmff_atom_csr_offset = 0;
     result.metadata.etk_interaction_offset = 0;
-    result.metadata.etk_atom_offsets_start = 0;
+    result.metadata.etk_atom_csr_offset = 0;
     result.metadata.bounds_min = 0.0f;
     result.metadata.bounds_inv_scale = 1.0f;
     return conformer_status_t::success;
@@ -1219,7 +1230,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std:
     result.capacities = device_capacities_t {};
 
     smallfield::parse_options_t parse_options;
-    parse_options.max_atoms = max_atoms_k; // single-warp pipeline cap
+    parse_options.max_atoms = max_atoms_per_molecule_k; // single-warp pipeline cap
     parse_options.metadata_policy = smallfield::compute_metadata_k;
     parse_options.salt_policy = salt_policy;
     smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
@@ -1241,7 +1252,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std:
 
         // The device typer runs the same code on the same descriptor, so deciding here which
         // molecules it will reject needs no readback: the answer is already computable.
-        std::array<std::uint8_t, max_atoms_k> atom_types_scratch {};
+        std::array<std::uint8_t, max_atoms_per_molecule_k> atom_types_scratch {};
         std::span<std::uint8_t> atom_types_span {atom_types_scratch.data(), num_atoms};
         if (!native_compute_mmff_atom_types(result.descriptor, atom_types_span))
             typing_status = read_rdkit_mmff_typing(*molecule, num_atoms, result.patch_atom_types,
@@ -1275,12 +1286,12 @@ inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std:
 /**
  *  @brief Batch of molecules packed into a single pinned host buffer.
  *
- *  Type alias onto `batch_pool_t`, which owns one contiguous pinned host allocation plus a
- *  byte-level `batch_layout_t` describing every sub-region.  The launch path issues ONE
+ *  Type alias onto `wave_slice_pool_t`, which owns one contiguous pinned host allocation plus a
+ *  byte-level `wave_slice_layout_t` describing every sub-region.  The launch path issues ONE
  *  `cudaMemcpyAsync` of the uploaded prefix into a per-GPU device mirror; the regions past that
  *  prefix exist only on the device and the preprocessing kernels fill them there.
  */
-using etkdg_molecule_batch_t = batch_pool_t;
+using etkdg_molecule_batch_t = wave_slice_pool_t;
 
 /**
  *  @brief Per-molecule element counts of every region a batch carries.
@@ -1330,8 +1341,8 @@ inline void accumulate_sizes(per_mol_sizes_t &totals, etkdg_molecule_metadata_t 
 }
 
 /**
- *  Derive the `batch_layout_t` from total per-region counts.  Every region's byte offset is
- *  aligned to `batch_layout_t::region_alignment` so the GPU pool slicing in `launch_gpu_pipeline`
+ *  Derive the `wave_slice_layout_t` from total per-region counts.  Every region's byte offset is
+ *  aligned to `wave_slice_layout_t::region_alignment` so the GPU pool slicing in `launch_gpu_pipeline`
  *  inherits correct alignment for free.
  *
  *  The uploaded prefix carries only what the host produces.  Everything the preprocessing kernels
@@ -1342,70 +1353,71 @@ inline void accumulate_sizes(per_mol_sizes_t &totals, etkdg_molecule_metadata_t 
  *  @param[in] n_valid Molecules that survived preprocessing.
  *  @param[in] torsion_stride Slots the CSD matcher reserves per molecule.
  */
-inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::uint32_t n_valid,
-                                           std::uint32_t torsion_stride) {
-    batch_layout_t layout {};
+inline wave_slice_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::uint32_t n_valid,
+                                                std::uint32_t torsion_stride) {
+    wave_slice_layout_t layout {};
     std::size_t running = 0;
     layout.torsion_stride = torsion_stride;
 
-    layout.offset_bounds = place_region_<float>(running, totals.bounds);
-    layout.count_bounds = totals.bounds;
-    layout.offset_chirals = place_region_<chiral_center_descriptor_t>(running, totals.chirals);
-    layout.count_chirals = totals.chirals;
-    layout.offset_distance_cons = place_region_<distance_constraint_t>(running, totals.distance_constraints);
-    layout.count_distance_cons = totals.distance_constraints;
-    layout.offset_descriptors = place_region_<molecule_descriptor_t>(running, n_valid);
-    layout.count_descriptors = n_valid;
-    layout.offset_atom_bases = place_region_<std::uint32_t>(running, n_valid);
-    layout.count_atom_bases = n_valid;
-    layout.offset_mmff_bases = place_region_<mmff94_packed_offsets_t>(running, n_valid);
-    layout.count_mmff_bases = n_valid;
-    layout.offset_typing_patches = place_region_<mmff94_typing_patch_t>(running, totals.patch_records);
-    layout.count_typing_patches = totals.patch_records;
-    layout.offset_patch_atom_types = place_region_<std::uint8_t>(running, totals.patch_atoms);
-    layout.count_patch_atom_types = totals.patch_atoms;
-    layout.offset_patch_atom_charges = place_region_<float>(running, totals.patch_atoms);
-    layout.count_patch_atom_charges = totals.patch_atoms;
-    layout.offset_metadata = place_region_<etkdg_molecule_metadata_t>(running, n_valid);
-    layout.count_metadata = n_valid;
-    layout.offset_input_indices = place_region_<std::uint32_t>(running, n_valid);
-    layout.count_input_indices = n_valid;
+    layout.bounds_byte_offset = place_region_<float>(running, totals.bounds);
+    layout.num_bounds = totals.bounds;
+    layout.chirals_byte_offset = place_region_<chiral_center_descriptor_t>(running, totals.chirals);
+    layout.num_chirals = totals.chirals;
+    layout.distance_constraints_byte_offset = place_region_<distance_constraint_t>(running,
+                                                                                   totals.distance_constraints);
+    layout.num_distance_constraints = totals.distance_constraints;
+    layout.descriptors_byte_offset = place_region_<molecule_descriptor_t>(running, n_valid);
+    layout.num_descriptors = n_valid;
+    layout.atom_bases_byte_offset = place_region_<std::uint32_t>(running, n_valid);
+    layout.num_atom_bases = n_valid;
+    layout.mmff_bases_byte_offset = place_region_<mmff94_packed_offsets_t>(running, n_valid);
+    layout.num_mmff_bases = n_valid;
+    layout.typing_patches_byte_offset = place_region_<mmff94_typing_patch_t>(running, totals.patch_records);
+    layout.num_typing_patches = totals.patch_records;
+    layout.patch_atom_types_byte_offset = place_region_<std::uint8_t>(running, totals.patch_atoms);
+    layout.num_patch_atom_types = totals.patch_atoms;
+    layout.patch_atom_charges_byte_offset = place_region_<float>(running, totals.patch_atoms);
+    layout.num_patch_atom_charges = totals.patch_atoms;
+    layout.metadata_byte_offset = place_region_<etkdg_molecule_metadata_t>(running, n_valid);
+    layout.num_metadata = n_valid;
+    layout.input_indices_byte_offset = place_region_<std::uint32_t>(running, n_valid);
+    layout.num_input_indices = n_valid;
 
     layout.bytes_uploaded = running;
 
     std::size_t const torsion_slots = static_cast<std::size_t>(n_valid) * torsion_stride;
-    layout.offset_torsions = place_region_<etk_torsion_descriptor_t>(running, torsion_slots);
-    layout.count_torsions = torsion_slots;
-    layout.offset_torsion_counts = place_region_<std::uint32_t>(running, n_valid);
-    layout.count_torsion_counts = n_valid;
-    layout.offset_etk_interactions = place_region_<etk_atom_interaction_t>(running, totals.etk_interactions);
-    layout.count_etk_interactions = totals.etk_interactions;
-    layout.offset_etk_atom_offsets = place_region_<etk_atom_offsets_t>(running, totals.atoms);
-    layout.count_etk_atom_offsets = totals.atoms;
-    layout.offset_atom_types = place_region_<std::uint8_t>(running, totals.atoms);
-    layout.count_atom_types = totals.atoms;
-    layout.offset_typing_status = place_region_<std::uint8_t>(running, n_valid);
-    layout.count_typing_status = n_valid;
-    layout.offset_mmff_atom_vdw = place_region_<mmff94_atom_vdw_params_t>(running, totals.atoms);
-    layout.count_mmff_atom_vdw = totals.atoms;
-    layout.offset_mmff_atom_charge = place_region_<float>(running, totals.atoms);
-    layout.count_mmff_atom_charge = totals.atoms;
-    layout.offset_mmff_bonds = place_region_<mmff94_bond_t>(running, totals.mmff_bonds);
-    layout.count_mmff_bonds = totals.mmff_bonds;
-    layout.offset_mmff_angles = place_region_<mmff94_angle_t>(running, totals.mmff_angles);
-    layout.count_mmff_angles = totals.mmff_angles;
-    layout.offset_mmff_torsions = place_region_<mmff94_torsion_t>(running, totals.mmff_torsions);
-    layout.count_mmff_torsions = totals.mmff_torsions;
-    layout.offset_mmff_oops = place_region_<mmff94_oop_t>(running, totals.mmff_oops);
-    layout.count_mmff_oops = totals.mmff_oops;
-    layout.offset_mmff_stretchbends = place_region_<mmff94_stretchbend_t>(running, totals.mmff_stretchbends);
-    layout.count_mmff_stretchbends = totals.mmff_stretchbends;
-    layout.offset_mmff_interactions = place_region_<mmff94_atom_interaction_t>(running, totals.mmff_interactions);
-    layout.count_mmff_interactions = totals.mmff_interactions;
-    layout.offset_mmff_atom_offsets = place_region_<mmff94_atom_offsets_t>(running, totals.atoms);
-    layout.count_mmff_atom_offsets = totals.atoms;
-    layout.offset_bond_distance = place_region_<std::uint8_t>(running, totals.bond_distance);
-    layout.count_bond_distance = totals.bond_distance;
+    layout.torsions_byte_offset = place_region_<etk_torsion_descriptor_t>(running, torsion_slots);
+    layout.num_torsions = torsion_slots;
+    layout.torsion_counts_byte_offset = place_region_<std::uint32_t>(running, n_valid);
+    layout.num_torsion_counts = n_valid;
+    layout.etk_interactions_byte_offset = place_region_<etk_atom_interaction_t>(running, totals.etk_interactions);
+    layout.num_etk_interactions = totals.etk_interactions;
+    layout.etk_atom_offsets_byte_offset = place_region_<etk_atom_offsets_t>(running, totals.atoms);
+    layout.num_etk_atom_offsets = totals.atoms;
+    layout.atom_types_byte_offset = place_region_<std::uint8_t>(running, totals.atoms);
+    layout.num_atom_types = totals.atoms;
+    layout.typing_status_byte_offset = place_region_<std::uint8_t>(running, n_valid);
+    layout.num_typing_status = n_valid;
+    layout.mmff_atom_vdw_byte_offset = place_region_<mmff94_atom_vdw_params_t>(running, totals.atoms);
+    layout.num_mmff_atom_vdw = totals.atoms;
+    layout.mmff_atom_charge_byte_offset = place_region_<float>(running, totals.atoms);
+    layout.num_mmff_atom_charge = totals.atoms;
+    layout.mmff_bonds_byte_offset = place_region_<mmff94_bond_t>(running, totals.mmff_bonds);
+    layout.num_mmff_bonds = totals.mmff_bonds;
+    layout.mmff_angles_byte_offset = place_region_<mmff94_angle_t>(running, totals.mmff_angles);
+    layout.num_mmff_angles = totals.mmff_angles;
+    layout.mmff_torsions_byte_offset = place_region_<mmff94_torsion_t>(running, totals.mmff_torsions);
+    layout.num_mmff_torsions = totals.mmff_torsions;
+    layout.mmff_oops_byte_offset = place_region_<mmff94_oop_t>(running, totals.mmff_oops);
+    layout.num_mmff_oops = totals.mmff_oops;
+    layout.mmff_stretchbends_byte_offset = place_region_<mmff94_stretchbend_t>(running, totals.mmff_stretchbends);
+    layout.num_mmff_stretchbends = totals.mmff_stretchbends;
+    layout.mmff_interactions_byte_offset = place_region_<mmff94_atom_interaction_t>(running, totals.mmff_interactions);
+    layout.num_mmff_interactions = totals.mmff_interactions;
+    layout.mmff_atom_offsets_byte_offset = place_region_<mmff94_atom_offsets_t>(running, totals.atoms);
+    layout.num_mmff_atom_offsets = totals.atoms;
+    layout.bond_distance_byte_offset = place_region_<std::uint8_t>(running, totals.bond_distance);
+    layout.num_bond_distance = totals.bond_distance;
     layout.bytes_total = running;
     return layout;
 }
@@ -1416,7 +1428,7 @@ inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::u
  *  adding the thread's pool-wide base.
  */
 struct batch_prep_per_mol_record_t {
-    std::uint32_t original_idx;
+    std::uint32_t original_index;
     /** @brief Thread-local base of this molecule inside the MMFF interaction array.  The metadata
      *  has no field for it because only the per-atom CSR entries reference it, and those are
      *  device-built; the launch path passes it through `mmff_bases` instead. */
@@ -1456,7 +1468,7 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::size_t mmff_interaction_count = 0;
     std::vector<batch_prep_per_mol_record_t> mols;
     /** @brief Slice-local input indices for every molecule this thread's slice rejected, each
-     *  tagged with the reason.  Aggregated upstream into `batch_pool_t::rejected_input_indices`. */
+     *  tagged with the reason.  Aggregated upstream into `wave_slice_pool_t::rejected_input_indices`. */
     std::vector<smallfield::api::rejected_mol_t> rejected_input_indices;
     std::uint32_t max_atoms_seen = 0;
     std::uint32_t max_bonds_seen = 0;
@@ -1571,7 +1583,7 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
             if (num_bonds > contribution.max_bonds_seen) contribution.max_bonds_seen = num_bonds;
 
             batch_prep_per_mol_record_t record;
-            record.original_idx = static_cast<std::uint32_t>(m);
+            record.original_index = static_cast<std::uint32_t>(m);
             record.metadata = prepared.metadata;
             record.metadata.bounds_offset = static_cast<std::uint32_t>(
                 append_bytes_(contribution.bounds_bytes, prepared.bounds_matrix.data(),
@@ -1591,8 +1603,8 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
             std::uint32_t const atom_base = static_cast<std::uint32_t>(contribution.atom_count);
             record.metadata.mmff_atom_vdw_offset = atom_base;
             record.metadata.mmff_atom_charge_offset = atom_base;
-            record.metadata.mmff_atom_offsets_start = atom_base;
-            record.metadata.etk_atom_offsets_start = atom_base;
+            record.metadata.mmff_atom_csr_offset = atom_base;
+            record.metadata.etk_atom_csr_offset = atom_base;
             contribution.atom_count += num_atoms;
 
             record.metadata.bond_distance_offset = static_cast<std::uint32_t>(contribution.bond_distance_count);
@@ -1689,7 +1701,7 @@ static inline void scan_per_region_offsets_(std::vector<batch_prep_thread_contri
  *  into the batch's pinned pool, plus metadata rebase from thread-local to pool-wide offsets.
  *
  *  @pre `batch.host.ensure_capacity(batch.layout.bytes_uploaded)` has succeeded;
- *       `batch.num_molecules`, `batch.max_atoms_per_molecule`, and `batch.layout` are populated.
+ *       `batch.num_molecules`, `batch.observed_max_atoms`, and `batch.layout` are populated.
  */
 static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribution_t> const &contribs,
                                          std::vector<batch_prep_thread_bases_t> const &bases,
@@ -1749,8 +1761,8 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
             meta.constraint_offset += static_cast<std::uint32_t>(base.distance_constraints);
             meta.mmff_atom_vdw_offset += static_cast<std::uint32_t>(base.atoms);
             meta.mmff_atom_charge_offset += static_cast<std::uint32_t>(base.atoms);
-            meta.mmff_atom_offsets_start += static_cast<std::uint32_t>(base.atoms);
-            meta.etk_atom_offsets_start += static_cast<std::uint32_t>(base.atoms);
+            meta.mmff_atom_csr_offset += static_cast<std::uint32_t>(base.atoms);
+            meta.etk_atom_csr_offset += static_cast<std::uint32_t>(base.atoms);
             meta.bond_distance_offset += static_cast<std::uint32_t>(base.bond_distance);
             meta.etk_interaction_offset += static_cast<std::uint32_t>(base.etk_interactions);
             meta.mmff_bond_offset += static_cast<std::uint32_t>(base.mmff_bonds);
@@ -1761,7 +1773,7 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
             // The matcher writes at a fixed stride, so a molecule's torsions start at its slot.
             meta.torsion_offset = static_cast<std::uint32_t>(slot) * torsion_stride;
             metadata_span[slot] = meta;
-            input_indices_span[slot] = record.original_idx;
+            input_indices_span[slot] = record.original_index;
             atom_bases_span[slot] = meta.mmff_atom_vdw_offset;
             mmff_bases_span[slot] = {meta.mmff_bond_offset,
                                      meta.mmff_angle_offset,
@@ -1790,8 +1802,8 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
 inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list, etkdg_molecule_batch_t &batch,
                                         smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
     batch.num_molecules = 0;
-    batch.max_atoms_per_molecule = 0;
-    batch.layout = batch_layout_t {};
+    batch.observed_max_atoms = 0;
+    batch.layout = wave_slice_layout_t {};
 
     // Persistent per-call scratch.  Safe as long as this function is not called concurrently from
     // multiple outer threads.  The CLI's 4-role pipeline guarantees this (preprocess-step runs
@@ -1807,11 +1819,11 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
     scan_per_region_offsets_(contribs, bases, totals, n_valid, max_atoms_reduction, max_bonds_reduction);
 
     batch.num_molecules = n_valid;
-    batch.max_atoms_per_molecule = max_atoms_reduction;
+    batch.observed_max_atoms = max_atoms_reduction;
     batch.layout = compute_batch_layout(totals, n_valid, std::max<std::uint32_t>(max_bonds_reduction, 1u));
     if (batch.layout.bytes_uploaded > 0 && !batch.host.ensure_capacity(batch.layout.bytes_uploaded)) {
         batch.num_molecules = 0;
-        batch.layout = batch_layout_t {};
+        batch.layout = wave_slice_layout_t {};
         return;
     }
 
@@ -1893,8 +1905,8 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
 
     for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
         per_device_out[device_index].num_molecules = 0;
-        per_device_out[device_index].max_atoms_per_molecule = 0;
-        per_device_out[device_index].layout = batch_layout_t {};
+        per_device_out[device_index].observed_max_atoms = 0;
+        per_device_out[device_index].layout = wave_slice_layout_t {};
     }
     if (total_mol_count == 0) return;
 
@@ -1935,7 +1947,7 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
     // Invert the shared batch's patch list so a molecule can find its own patch in constant time.
     auto const shared_patches = shared_view.typing_patches();
     scratch.patch_of_molecule.assign(total_mol_count, distribute_scratch_t::no_typing_patch_k);
-    for (std::uint32_t patch_index = 0; patch_index < shared.layout.count_typing_patches; ++patch_index)
+    for (std::uint32_t patch_index = 0; patch_index < shared.layout.num_typing_patches; ++patch_index)
         scratch.patch_of_molecule[shared_patches[patch_index].molecule_index] = patch_index;
 
 #pragma omp parallel for num_threads(static_cast<int>(device_count)) schedule(static, 1)
@@ -1968,14 +1980,14 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
             }
         }
 
-        batch_layout_t device_layout = compute_batch_layout(totals, device_mol_count,
-                                                            std::max<std::uint32_t>(max_bonds_seen, 1u));
+        wave_slice_layout_t device_layout = compute_batch_layout(totals, device_mol_count,
+                                                                 std::max<std::uint32_t>(max_bonds_seen, 1u));
         out.num_molecules = device_mol_count;
-        out.max_atoms_per_molecule = max_atoms_seen;
+        out.observed_max_atoms = max_atoms_seen;
         out.layout = device_layout;
         if (device_layout.bytes_uploaded > 0 && !out.host.ensure_capacity(device_layout.bytes_uploaded)) {
             out.num_molecules = 0;
-            out.layout = batch_layout_t {};
+            out.layout = wave_slice_layout_t {};
             continue;
         }
         if (device_mol_count == 0) continue;
@@ -2038,8 +2050,8 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
             destination_meta.torsion_offset = position * device_layout.torsion_stride;
             destination_meta.mmff_atom_vdw_offset = running.atoms;
             destination_meta.mmff_atom_charge_offset = running.atoms;
-            destination_meta.mmff_atom_offsets_start = running.atoms;
-            destination_meta.etk_atom_offsets_start = running.atoms;
+            destination_meta.mmff_atom_csr_offset = running.atoms;
+            destination_meta.etk_atom_csr_offset = running.atoms;
             destination_meta.bond_distance_offset = running.bond_distance;
             destination_meta.etk_interaction_offset = running.etk_interactions;
             destination_meta.mmff_bond_offset = running.mmff_bonds;

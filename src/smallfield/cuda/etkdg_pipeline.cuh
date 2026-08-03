@@ -427,7 +427,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
             // Torsion refinement: Run ETK torsion refinement in 3D with 100 FIRE iterations.
             if (meta.num_etk_torsions > 0) {
                 etk_torsion_energy_functor_t etk_functor {mol_torsions, mol_constraints, etk_interactions,
-                                                          etk_atom_offsets + meta.etk_atom_offsets_start, num_atoms};
+                                                          etk_atom_offsets + meta.etk_atom_csr_offset, num_atoms};
 
                 fire_result_t const etk_result = run_fire_stage_(
                     positions, velocities, gradient, dimensions_3d, refinement_policy.etk_initial_iterations,
@@ -555,7 +555,7 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
                                               mmff_oop_terms + meta.mmff_oop_offset,
                                               mmff_stretchbend_terms + meta.mmff_stretchbend_offset,
                                               mmff_interactions,
-                                              mmff_atom_offsets + meta.mmff_atom_offsets_start,
+                                              mmff_atom_offsets + meta.mmff_atom_csr_offset,
                                               num_atoms};
 
         float *positions = shared_float;
@@ -605,12 +605,13 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
  *  @code{.cpp}
  *  std::uint32_t const block = 256;
  *  std::uint32_t const grid = (num_elements + block - 1) / block;
- *  convert_coords_fp32_to_fp16_kernel<<<grid, block, 0, stream>>>(src, dst, num_elements);
+ *  convert_coords_fp32_to_fp16_kernel<<<grid, block, 0, stream>>>(source, destination, num_elements);
  *  @endcode
  */
-__global__ void convert_coords_fp32_to_fp16_kernel(float const *src, __half *dst, std::uint32_t num_elements) {
-    std::uint32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < num_elements) dst[idx] = __float2half_rn(src[idx]);
+__global__ void convert_coords_fp32_to_fp16_kernel(float const *source, __half *destination,
+                                                   std::uint32_t num_elements) {
+    std::uint32_t const index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < num_elements) destination[index] = __float2half_rn(source[index]);
 }
 
 } // namespace smallfield::cuda

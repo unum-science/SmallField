@@ -13,7 +13,7 @@
  *    3. A heavy-rescue branch in `mmff_polish_warp_kernel` that runs a
  *       second FIRE stage (doubling iterations) when the molecule crosses
  *       the `is_heavy_refinement_case_` threshold — see
- *       `src/smallfield/cuda/etkdg_pipeline.cuh:86-97`.
+ *       `source/smallfield/cuda/etkdg_pipeline.cuh:86-97`.
  *
  *  The weights here mirror the kernel-side heuristics so the balance
  *  estimate agrees with the bin-dispatch and rescue decisions the kernels

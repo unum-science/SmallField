@@ -76,10 +76,7 @@ void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &ta
     print_gpu_memory_usage("before alloc");
     std::fprintf( //
         stderr,
-        "alloc plan: desc=%.2f GB bonds=%.2f GB angles=%.2f GB tors=%.2f GB " "oops=%.2f GB stbn=%.2f GB " "inter=%" "."
-                                                                                                                     "2"
-                                                                                                                     "f"
-                                                                                                                     " " "GB\n",
+        "alloc plan: descriptor=%.2f GB bonds=%.2f GB angles=%.2f GB tors=%.2f GB " "oops=%.2f GB stbn=%.2f GB " "inter" "=%" "." "2" "f" " " "GB\n",
         num_molecules * sizeof(sft::molecule_descriptor_t) / 1.0e9, per_bond_bytes / 1.0e9, per_angle_bytes / 1.0e9,
         per_torsion_bytes / 1.0e9, per_out_of_plane_bytes / 1.0e9, per_stretch_bend_bytes / 1.0e9,
         per_interaction_bytes / 1.0e9);

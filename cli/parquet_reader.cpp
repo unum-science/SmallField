@@ -47,20 +47,20 @@ bool read_shard(fs::path const &path, std::string const &smiles_column, shard_da
     auto reader = std::move(reader_result).ValueOrDie();
 
     int const num_parquet_columns = reader->parquet_reader()->metadata()->schema()->num_columns();
-    int smiles_col_idx = -1;
+    int smiles_col_index = -1;
     for (int i = 0; i < num_parquet_columns; ++i) {
         if (reader->parquet_reader()->metadata()->schema()->Column(i)->name() == smiles_column) {
-            smiles_col_idx = i;
+            smiles_col_index = i;
             break;
         }
     }
-    if (smiles_col_idx < 0) {
+    if (smiles_col_index < 0) {
         std::fprintf(stderr, "  column %s not found in %s\n", smiles_column.c_str(), path.string().c_str());
         return false;
     }
 
     std::shared_ptr<arrow::Table> table;
-    auto read_status = reader->ReadTable({smiles_col_idx}, &table);
+    auto read_status = reader->ReadTable({smiles_col_index}, &table);
     if (!read_status.ok() || !table) {
         std::fprintf(stderr, "  read failed: %s: %s\n", path.string().c_str(), read_status.message().c_str());
         return false;
