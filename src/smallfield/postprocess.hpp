@@ -43,6 +43,8 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 #include <GraphMol/Substruct/SubstructMatch.h>
 
+#include "smallfield/molecule_parse.hpp"
+
 namespace smallfield::postprocess {
 
 #pragma region Shape Context
@@ -267,18 +269,21 @@ inline std::array<RDKit::ROMol const *, 4> const &credo_matchers() {
  *  @return A populated context with @c ok == true on success; @c ok == false
  *          (and empty fields) if parsing or typing threw.
  */
-inline molecule_shape_context_t build_shape_context(std::string_view smiles) {
+inline molecule_shape_context_t build_shape_context(
+    std::string_view smiles, smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
     molecule_shape_context_t context;
     try {
-        RDKit::SmilesParserParams params;
-        params.sanitize = true;
-        params.removeHs = false;
-        params.strictCXSMILES = false;
-        std::unique_ptr<RDKit::RWMol> mol(RDKit::SmilesToMol(std::string(smiles), params));
-        if (!mol) return context;
-        RDKit::MolOps::addHs(*mol);
+        // Same contract as the preprocess path, counterion removal included: this atom count is
+        // compared against the one the pipeline recorded, so the two parses have to agree.  The cap
+        // is left off because every molecule reaching here already passed the pipeline's own gate.
+        smallfield::parse_options_t parse_options;
+        parse_options.max_atoms = 0;
+        parse_options.salt_policy = salt_policy;
+        smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
+        if (!parsed.molecule) return context;
+        std::unique_ptr<RDKit::RWMol> mol = std::move(parsed.molecule);
 
-        context.num_atoms = mol->getNumAtoms();
+        context.num_atoms = parsed.num_atoms;
 
         // Type the four CREDO subsets exactly as RDKit's getAtomIdsForFeatures does:
         // collect every matched atom index, preserving RDKit's collection order.

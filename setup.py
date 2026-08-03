@@ -77,6 +77,8 @@ rdkit_libraries = [
     "RDKitEigenSolvers",
     "RDKitMolTransforms",
     "RDKitChemTransforms",
+    "RDKitDescriptors",
+    "RDKitMolStandardize",
 ]
 
 boost_libraries = ["boost_serialization", "boost_iostreams"]

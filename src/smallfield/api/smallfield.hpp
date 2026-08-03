@@ -176,7 +176,11 @@ struct context_t {
     /**
      *  @brief Generate 3D conformers for a batch of molecules.
      *
-     *  @param[in] smiles Input SMILES strings (one per molecule).
+     *  Only a molecule's largest fragment is embedded — a counterion has no meaningful conformer,
+     *  and MMFF94 cannot type an isolated one — so every readback below describes that parent
+     *  fragment rather than the input string.
+     *
+     *  @param[in] smiles Input SMILES strings (one per molecule); salt forms are accepted.
      *  @param[in] config Pipeline configuration.
      *  @param[in] max_atoms_per_molecule Maximum atom count (with H) across the batch.
      *      Molecules exceeding this are skipped.

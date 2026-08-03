@@ -54,6 +54,7 @@
 #include <GraphMol/Descriptors/MolDescriptors.h>
 
 #include "smallfield/api/batch_pool.hpp"
+#include "smallfield/molecule_parse.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/parameters/forcefield_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
@@ -1068,45 +1069,20 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
 
     using smallfield::api::conformer_status_t;
 
-    std::unique_ptr<RDKit::RWMol> mol;
-    try {
-        // RDKit::SmilesToMol takes std::string const& — one unavoidable std::string
-        // construction per molecule. Kept scoped to this single call.
-        // removeHs=false: we immediately call addHs() below, so letting the parser
-        // strip explicit Hs first would waste ~5 % of CPU prep time.
-        std::string const smiles_str {smiles};
-        RDKit::SmilesParserParams params;
-        params.sanitize = true;
-        params.removeHs = false;
-        params.strictCXSMILES = false;
-        mol.reset(RDKit::SmilesToMol(smiles_str, params));
-    }
-    catch (...) {
-        return conformer_status_t::invalid_smiles;
-    }
-    if (!mol) return conformer_status_t::invalid_smiles;
-
-    try {
-        RDKit::MolOps::addHs(*mol);
-    }
-    catch (...) {
-        return conformer_status_t::invalid_smiles;
-    }
-    std::uint32_t const num_atoms = mol->getNumAtoms();
-    if (num_atoms > 128) return conformer_status_t::too_many_atoms; // single-warp pipeline cap
+    smallfield::parse_options_t parse_options;
+    parse_options.max_atoms = max_atoms_k; // single-warp pipeline cap
+    parse_options.metadata_policy = smallfield::compute_metadata_k;
+    smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
+    if (parsed.status != conformer_status_t::success) return parsed.status;
+    std::unique_ptr<RDKit::RWMol> mol = std::move(parsed.molecule);
+    std::uint32_t const num_atoms = parsed.num_atoms;
     result.num_atoms = num_atoms;
 
-    // Optional host-side readback fields — read once from the post-AddHs RDKit
-    // mol so callers can populate `n_heavy_atoms`, `n_bonds`, `molecular_weight`
-    // columns without a duplicate parse on the Python side.
-    result.metadata.num_heavy_atoms = static_cast<std::uint32_t>(mol->getNumHeavyAtoms());
-    result.metadata.num_bonds = static_cast<std::uint32_t>(mol->getNumBonds());
-    try {
-        result.metadata.molecular_weight = static_cast<float>(RDKit::Descriptors::calcExactMW(*mol));
-    }
-    catch (...) {
-        result.metadata.molecular_weight = 0.0f;
-    }
+    // Optional host-side readback fields, measured on the same molecule the geometry describes so
+    // callers can populate `n_heavy_atoms`, `n_bonds` and `molecular_weight` without a second parse.
+    result.metadata.num_heavy_atoms = parsed.num_heavy_atoms;
+    result.metadata.num_bonds = parsed.num_bonds;
+    result.metadata.molecular_weight = parsed.molecular_weight;
 
     conformer_status_t mmff_status = conformer_status_t::success;
     try {
@@ -1229,6 +1205,7 @@ inline smallfield::api::conformer_status_t read_rdkit_mmff_typing(RDKit::ROMol c
  *  `conformer_status_t::success`.
  */
 inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std::string_view smiles,
+                                                                            smallfield::salt_policy_t salt_policy,
                                                                             etkdg_prepared_molecule_t &result) {
     using smallfield::api::conformer_status_t;
     using smallfield::mmff94::native_compute_mmff_atom_types;
@@ -1241,40 +1218,19 @@ inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std:
     result.patch_atom_charges.clear();
     result.capacities = device_capacities_t {};
 
-    std::unique_ptr<RDKit::RWMol> molecule;
-    try {
-        // RDKit::SmilesToMol takes std::string const& — one unavoidable std::string construction
-        // per molecule, kept scoped to this single call.  removeHs=false because addHs follows.
-        std::string const smiles_string {smiles};
-        RDKit::SmilesParserParams parameters;
-        parameters.sanitize = true;
-        parameters.removeHs = false;
-        parameters.strictCXSMILES = false;
-        molecule.reset(RDKit::SmilesToMol(smiles_string, parameters));
-    }
-    catch (...) {
-        return conformer_status_t::invalid_smiles;
-    }
-    if (!molecule) return conformer_status_t::invalid_smiles;
-
-    try {
-        RDKit::MolOps::addHs(*molecule);
-    }
-    catch (...) {
-        return conformer_status_t::invalid_smiles;
-    }
-    std::uint32_t const num_atoms = molecule->getNumAtoms();
-    if (num_atoms > max_atoms_k) return conformer_status_t::too_many_atoms; // single-warp pipeline cap
+    smallfield::parse_options_t parse_options;
+    parse_options.max_atoms = max_atoms_k; // single-warp pipeline cap
+    parse_options.metadata_policy = smallfield::compute_metadata_k;
+    parse_options.salt_policy = salt_policy;
+    smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
+    if (parsed.status != conformer_status_t::success) return parsed.status;
+    std::unique_ptr<RDKit::RWMol> molecule = std::move(parsed.molecule);
+    std::uint32_t const num_atoms = parsed.num_atoms;
 
     result.metadata = etkdg_molecule_metadata_t {};
-    result.metadata.num_heavy_atoms = static_cast<std::uint32_t>(molecule->getNumHeavyAtoms());
-    result.metadata.num_bonds = static_cast<std::uint32_t>(molecule->getNumBonds());
-    try {
-        result.metadata.molecular_weight = static_cast<float>(RDKit::Descriptors::calcExactMW(*molecule));
-    }
-    catch (...) {
-        result.metadata.molecular_weight = 0.0f;
-    }
+    result.metadata.num_heavy_atoms = parsed.num_heavy_atoms;
+    result.metadata.num_bonds = parsed.num_bonds;
+    result.metadata.molecular_weight = parsed.molecular_weight;
 
     conformer_status_t typing_status = conformer_status_t::success;
     try {
@@ -1564,6 +1520,7 @@ inline void warm_up_rdkit_globals_once_() {
  *  the input molecules with thread-local metadata offsets.
  */
 static inline void prepare_per_thread_contribs_(std::span<std::string_view const> smiles_list,
+                                                smallfield::salt_policy_t salt_policy,
                                                 std::vector<batch_prep_thread_contribution_t> &contribs) {
     warm_up_rdkit_globals_once_();
     int const n_threads_max = omp_get_max_threads();
@@ -1602,7 +1559,7 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
         auto &contribution = contribs[thread_rank];
 #pragma omp for schedule(dynamic, 64)
         for (std::size_t m = 0; m < n; ++m) {
-            auto const status = prepare_molecule_for_device_into(smiles_list[m], contribution.scratch);
+            auto const status = prepare_molecule_for_device_into(smiles_list[m], salt_policy, contribution.scratch);
             auto const &prepared = contribution.scratch;
             if (prepared.num_atoms == 0) {
                 contribution.rejected_input_indices.push_back({static_cast<std::uint32_t>(m), status});
@@ -1830,7 +1787,8 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
  *  lock.  The `static` contribs vector persists capacities across calls so the allocator's fast
  *  path handles every call after the first.
  */
-inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list, etkdg_molecule_batch_t &batch) {
+inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list, etkdg_molecule_batch_t &batch,
+                                        smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
     batch.num_molecules = 0;
     batch.max_atoms_per_molecule = 0;
     batch.layout = batch_layout_t {};
@@ -1839,7 +1797,7 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
     // multiple outer threads.  The CLI's 4-role pipeline guarantees this (preprocess-step runs
     // only on the gpu-runner-role thread).
     static std::vector<batch_prep_thread_contribution_t> contribs;
-    prepare_per_thread_contribs_(smiles_list, contribs);
+    prepare_per_thread_contribs_(smiles_list, salt_policy, contribs);
 
     std::vector<batch_prep_thread_bases_t> bases;
     per_mol_sizes_t totals {};
@@ -1873,9 +1831,11 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
  *  Kept for call sites that don't participate in the pipelined dispatcher — tests, one-shot
  *  invocations.  The hot path should prefer @ref prepare_molecule_batch_into.
  */
-inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view const> smiles_list) {
+inline etkdg_molecule_batch_t prepare_molecule_batch(
+    std::span<std::string_view const> smiles_list,
+    smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
     etkdg_molecule_batch_t batch {};
-    prepare_molecule_batch_into(smiles_list, batch);
+    prepare_molecule_batch_into(smiles_list, batch, salt_policy);
     return batch;
 }
 

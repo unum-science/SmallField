@@ -11,6 +11,7 @@
 
 #include <GraphMol/Chirality.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
+#include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -18,6 +19,7 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
 #include "smallfield/api/smallfield.hpp"
+#include "smallfield/molecule_parse.hpp"
 
 namespace smallfield::cli {
 
@@ -87,38 +89,28 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
             continue;
         }
 
-        std::unique_ptr<RDKit::RWMol> mol;
-        try {
-            RDKit::SmilesParserParams params;
-            params.sanitize = true;
-            params.removeHs = false;
-            params.strictCXSMILES = false;
-            mol.reset(RDKit::SmilesToMol(std::string(smiles), params));
-        }
-        catch (...) { /* ignore */
-        }
-
-        if (!mol) {
+        // Same parse contract as the GPU path, counterion removal included, so a molecule recovered
+        // here carries the atom count and geometry the rest of the pipeline expects.
+        smallfield::parse_options_t parse_options;
+        parse_options.max_atoms = max_atoms;
+        smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
+        if (parsed.status != sfapi::conformer_status_t::success) {
             for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
                 outputs.status[molecule_index * num_conformers + conformer_index] = static_cast<std::uint8_t>(
-                    sfapi::conformer_status_t::invalid_smiles);
+                    parsed.status);
             continue;
         }
+        std::unique_ptr<RDKit::RWMol> mol = std::move(parsed.molecule);
 
-        try {
-            RDKit::MolOps::addHs(*mol);
-        }
-        catch (...) {
-            mol.reset();
-        }
-        if (!mol) continue;
-        if (mol->getNumAtoms() > max_atoms) {
+        // Embedding is the dominant CPU cost here, and it is wasted on a molecule the force field
+        // cannot type: `constructForceField` throws below and every conformer fails anyway.  Ask
+        // first, so an untypeable molecule costs a typing check instead of K embeddings.
+        if (!RDKit::MMFF::MMFFMolProperties(*mol).isValid()) {
             for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
                 outputs.status[molecule_index * num_conformers + conformer_index] = static_cast<std::uint8_t>(
-                    sfapi::conformer_status_t::too_many_atoms);
+                    sfapi::conformer_status_t::unsupported_element);
             continue;
         }
-        outputs.num_atoms_per_molecule[molecule_index] = static_cast<std::uint8_t>(mol->getNumAtoms());
 
         RDKit::DGeomHelpers::EmbedParameters embed_params = RDKit::DGeomHelpers::ETKDGv3;
         embed_params.randomSeed = static_cast<int>(inputs.random_seed);
@@ -184,7 +176,14 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
             outputs.solver[molecule_index * num_conformers + conformer_slot] = 1;
             recovered_any = true;
         }
-        if (recovered_any) num_recovered.fetch_add(1, std::memory_order_relaxed);
+        // Only a molecule that actually produced a conformer gets an atom count.  Writing it before
+        // the embed left unrecovered molecules carrying a non-zero count over all-zero coordinates,
+        // which defeats the `num_atoms == 0` guard downstream and buys them a full shape-context
+        // parse plus four substructure searches for a row that has no geometry.
+        if (recovered_any) {
+            outputs.num_atoms_per_molecule[molecule_index] = static_cast<std::uint8_t>(mol->getNumAtoms());
+            num_recovered.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     return num_recovered.load();

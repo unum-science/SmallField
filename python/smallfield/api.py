@@ -70,8 +70,9 @@ def generate_conformers(
     are pre-sorted by energy ascending (failed conformers last); `num_atoms[i]` is the
     post-preprocess atom count (with H) for molecule `i`, or `0` if preprocess rejected it.
     The remaining three readback arrays (`num_heavy_atoms`, `num_bonds`, `molecular_weight`)
-    come from the same post-AddHs RDKit mol used by SmallField's preprocess, so callers can
-    populate the canonical parquet schema columns without a duplicate parse.
+    come from the same molecule SmallField embedded, so callers can populate the canonical
+    parquet schema columns without a duplicate parse. Preprocessing keeps only the largest
+    fragment, so for a salt these describe the parent, not the input string.
     """
 
     gpu_context = Context(list(device_ids or []))

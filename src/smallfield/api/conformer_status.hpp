@@ -32,8 +32,9 @@ enum class conformer_status_t : std::uint8_t {
     preprocess_timeout = 5,
     /** @brief Molecule contains an atom whose `MMFF94` atom type cannot be assigned
      *  by `RDKit::MMFF::MMFFMolProperties::getMMFFAtomType` (returns 0).  Covers
-     *  transition metals, lanthanides, and other elements outside the MMFF94
-     *  parameter set.  Routed to the `fallback-role` for ETKDGv3 (no MMFF). */
+     *  transition metals, lanthanides, boron, and other elements outside the MMFF94
+     *  parameter set.  The `fallback-role` sees these too, and rejects them on the same typing
+     *  check before spending an embedding on a molecule it could never minimise. */
     unsupported_element = 6,
 };
 

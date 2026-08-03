@@ -2,13 +2,13 @@
  *  @file parquet_writer.hpp
  *  @brief Write a single per-conformer-row 3D Parquet shard ("*.3D.parquet").
  *
- *  Output schema (canonical, 14 fields):
+ *  Output schema (canonical, 13 fields):
  *
  *  | Field                | Type             | Nullable | Per   | Notes                                      |
  *  |----------------------|------------------|----------|-------|--------------------------------------------|
  *  | input_shard          | utf8             | no       | row   | source parquet stem                        |
  *  | input_row            | uint64           | no       | row   | 0-based row in source                      |
- *  | smiles               | utf8             | no       | row   |                                            |
+ *  | smiles               | utf8             | no       | row   | the input SMILES, salt form included       |
  *  | conformer_index      | uint8            | no       | row   | 0..M-1, energy rank (0 = lowest energy)    |
  *  | status               | uint8            | no       | row   | conformer_status_t enum                    |
  *  | n_heavy_atoms        | uint16           | yes      | mol   | null if mol failed preprocess              |
@@ -23,6 +23,12 @@
  *  USRCAT's first 12 values ARE the USR descriptor, so USR is not stored separately. USRCAT is
  *  fp16 (its value range is small and it is derived from fp16 coordinates, so higher precision
  *  would be illusory).
+ *
+ *  Preprocessing keeps only a molecule's largest fragment, so every column derived from the
+ *  geometry — n_atoms, n_heavy_atoms, n_bonds, molecular_weight, conformer_coords, usrcat —
+ *  describes that parent fragment, while `smiles` is the input as given and may name a salt.
+ *  Re-parsing `smiles` through `smallfield::parse_smiles` reproduces the parent, which is what
+ *  keeps the two consistent; computing a property from `smiles` without that step will not agree.
  *
  *  Rows within a molecule are emitted energy-sorted (lowest first); conformer_index
  *  is the energy rank. Schema-level key-value metadata records provenance (producer

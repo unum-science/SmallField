@@ -96,7 +96,9 @@ void test_device_matches_host(std::vector<std::string> const &smiles_list) {
     views.reserve(smiles_list.size());
     for (auto const &smiles : smiles_list) views.emplace_back(smiles);
 
-    auto batch = sfp::prepare_molecule_batch(views);
+    // Counterions are kept deliberately: a disconnected fragment is the only way to reach the
+    // unreachable-hop sentinel, and the production path strips them.
+    auto batch = sfp::prepare_molecule_batch(views, smallfield::keep_all_fragments_k);
     SF_TEST_ASSERT(batch.num_molecules > 0, "no molecule survived preprocessing");
 
     std::vector<std::uint8_t> device_matrix(batch.layout.count_bond_distance, std::uint8_t {0});

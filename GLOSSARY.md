@@ -124,7 +124,8 @@ The Parquet writer persists the raw byte.
 |     2 | `mmff_unconverged`   | MMFF94 polish did not converge inside the iteration budget.                                                 |
 |     3 | `invalid_smiles`     | SMILES failed to parse or produced an empty `molecule`.                                                     |
 |     4 | `too_many_atoms`     | Atom count exceeds the compile-time kernel bound.                                                           |
-|     5 | `preprocess_timeout` | `preprocess-step` exceeded the per-`molecule` 2 s deadline (RDKit VF2 worst-case); `fallback-role` retries. |
+|     5 | `preprocess_timeout` | Reserved. Nothing produces it; the value is kept so shipped shard bytes keep their meaning.                  |
+|     6 | `unsupported_element` | An atom has no MMFF94 type — boron, transition metals, lanthanides. Neither GPU nor `fallback-role` recovers it. |
 
 ## Code Map
 

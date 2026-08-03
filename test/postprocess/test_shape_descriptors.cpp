@@ -154,7 +154,9 @@ void validate_fragment_separation() {
     std::unique_ptr<RDKit::RWMol> mol = prepare_mol(salt);
     SF_TEST_ASSERT(mol != nullptr, "prepare_mol failed for salt");
 
-    sfp::molecule_shape_context_t const context = sfp::build_shape_context(salt);
+    // `separate_fragments` is a geometric utility over a multi-component context; the production
+    // path strips counterions before it can ever see one, so the test builds the context itself.
+    sfp::molecule_shape_context_t const context = sfp::build_shape_context(salt, smallfield::keep_all_fragments_k);
     SF_TEST_ASSERT(context.ok, "build_shape_context failed for salt");
     SF_TEST_ASSERT(context.num_components == 2, "salt should have exactly two components");
 
