@@ -1,5 +1,6 @@
 // Minimal CPU-prep profile driver: just runs SmallField generate_conformers once on 241K.
 // No RDKit CPU baseline, no cross-val, no warmup. Lets perf record focus on prep CPU only.
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -45,11 +46,26 @@ int main(int argc, char **argv) {
     ctx.generate_conformers(smiles_views, config, max_atoms, coords, energies, status);
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    // Attempted throughput counts molecules that never reached the GPU, so a corpus that rejects
+    // more looks faster than it is.  Report produced conformers alongside it, and break the
+    // failures down by reason so a rejection class cannot grow unnoticed.
     std::uint64_t ok = 0;
-    for (auto status_code : status)
+    std::array<std::uint64_t, 8> by_status {};
+    for (auto status_code : status) {
         if (status_code == sfapi::conformer_status_t::success) ++ok;
-    std::printf("Wall %.1f ms, mol/s %.1f, succeeded %lu / %zu\n", ms, storage.size() * 1000.0 / ms, (unsigned long)ok,
-                status.size());
+        auto const code = static_cast<std::size_t>(status_code);
+        if (code < by_status.size()) ++by_status[code];
+    }
+    std::printf("Wall %.1f ms, mol/s %.1f, conf/s %.1f, succeeded %lu / %zu\n", ms, storage.size() * 1000.0 / ms,
+                ok * 1000.0 / ms, (unsigned long)ok, status.size());
+
+    constexpr std::array<char const *, 8> status_names {
+        "success",        "stereo_failure",     "mmff_unconverged",    "invalid_smiles",
+        "too_many_atoms", "preprocess_timeout", "unsupported_element", "other"};
+    for (std::size_t code = 1; code < by_status.size(); ++code)
+        if (by_status[code] > 0)
+            std::printf("  %-20s %10lu  %5.2f %%\n", status_names[code], (unsigned long)by_status[code],
+                        100.0 * static_cast<double>(by_status[code]) / static_cast<double>(status.size()));
 
     return 0;
 }

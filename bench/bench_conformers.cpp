@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -159,10 +160,16 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
 
     double const elapsed_ms_value = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
-    // Count successes.
+    // Conf/s already divides by produced conformers, so it is comparable across corpora with
+    // different rejection rates.  The breakdown is what makes a rejection class visible: the
+    // 128-atom cap alone drops about 4 % of PubChem before any molecule reaches the GPU.
     std::uint32_t num_successful_conformers = 0;
-    for (auto status_code : status_out)
+    std::array<std::uint64_t, 8> conformers_by_status {};
+    for (auto status_code : status_out) {
         if (status_code == sfapi::conformer_status_t::success) num_successful_conformers++;
+        auto const code = static_cast<std::size_t>(status_code);
+        if (code < conformers_by_status.size()) ++conformers_by_status[code];
+    }
 
     double const mol_per_sec = num_smiles / (elapsed_ms_value / 1000.0);
     double const conf_per_sec = num_successful_conformers / (elapsed_ms_value / 1000.0);
@@ -170,6 +177,14 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     std::printf("  Mol/s:     %.1f\n", mol_per_sec);
     std::printf("  Conf/s:    %.1f\n", conf_per_sec);
     std::printf("  Succeeded: %u / %zu conformers\n", num_successful_conformers, total_conformers);
+    constexpr std::array<char const *, 8> status_names {
+        "success",        "stereo_failure",     "mmff_unconverged",    "invalid_smiles",
+        "too_many_atoms", "preprocess_timeout", "unsupported_element", "other"};
+    for (std::size_t code = 1; code < conformers_by_status.size(); ++code)
+        if (conformers_by_status[code] > 0)
+            std::printf(
+                "    %-20s %10lu  %5.2f %%\n", status_names[code], (unsigned long)conformers_by_status[code],
+                100.0 * static_cast<double>(conformers_by_status[code]) / static_cast<double>(total_conformers));
     std::uint64_t const cuda_errors = gpu_context.cuda_error_count.load();
     if (cuda_errors > 0) std::fprintf(stderr, "  cuda errors during single-GPU bench: %lu\n", cuda_errors);
 }

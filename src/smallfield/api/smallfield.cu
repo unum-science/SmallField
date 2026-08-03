@@ -53,21 +53,44 @@ static inline std::size_t align_up(std::size_t value, std::size_t alignment) {
 }
 
 /**
+ *  @brief Rough upper bound on the per-molecule bytes a wave stages in pinned host memory.
+ *
+ *  Covers the uploaded prefix only — the bounds matrix, the descriptor, the chiral centres, the
+ *  1-2 / 1-3 constraints and the per-molecule bases and metadata — because the host buffer stops at
+ *  `batch_layout_t::bytes_uploaded` and never addresses the device-only regions.  At the 128-atom
+ *  cap the bounds matrix dominates; the slack term covers the constraint list, whose length scales
+ *  with the bond and neighbour-pair counts rather than with the atom count alone.
+ *
+ *  @param[in] max_atoms Atom-count cap the wave is sized against.
+ *  @return Bytes to reserve per molecule in a pinned host slot.
+ */
+static inline std::size_t estimate_per_molecule_uploaded_bytes(std::uint32_t max_atoms) noexcept {
+    std::size_t const n = max_atoms;
+    std::size_t const bounds_bytes = n * n * sizeof(float);
+    std::size_t const descriptor_bytes = sizeof(molecule_descriptor_t);
+    std::size_t const per_atom_slack = n * 128u;
+    std::size_t const per_mol_fixed = 1024u;
+    return bounds_bytes + descriptor_bytes + per_atom_slack + per_mol_fixed;
+}
+
+/**
  *  @brief Rough upper bound on the per-molecule batch-pool footprint in a wave.
  *
- *  Used by @ref generate_conformers to pre-size the per-call 2-slot batch-prep ring so the pinned
- *  host buffer never reallocates while a wave's H2D is in flight, and by the wave sizer to divide
- *  a VRAM budget into molecules.  It has to cover both sides of the pool: the uploaded prefix
- *  (bounds matrix, descriptor, chiral centres, constraints) and the device-only regions the
- *  preprocessing kernels fill (hop-count matrix, ETK torsions and their CSR, every MMFF term array
- *  and its CSR).  At the 128-atom cap the bounds and hop-count matrices dominate, and the term
- *  reservations are the capacity bounds `compute_device_capacities` hands out.
+ *  Used by the wave sizer to divide a VRAM budget into molecules.  It has to cover both sides of
+ *  the pool: the uploaded prefix @ref estimate_per_molecule_uploaded_bytes accounts for, and the
+ *  device-only regions the preprocessing kernels fill — hop-count matrix, ETK torsions and their
+ *  CSR, every MMFF term array and its CSR.  The term reservations are the capacity bounds
+ *  `compute_device_capacities` hands out.
+ *
+ *  Sizing a pinned host slot with this figure over-reserves by roughly 2.5× at the 128-atom cap,
+ *  since the device-only regions never reach the host; use the uploaded bound for that.
+ *
+ *  @param[in] max_atoms Atom-count cap the wave is sized against.
+ *  @return Bytes to reserve per molecule across the device pool and the uploaded prefix together.
  */
 static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_atoms) noexcept {
     std::size_t const n = max_atoms;
-    std::size_t const bounds_bytes = n * n * sizeof(float);
     std::size_t const bond_distance_bytes = n * n * sizeof(std::uint8_t);
-    std::size_t const descriptor_bytes = sizeof(molecule_descriptor_t);
     // A 128-atom molecule with explicit hydrogens carries on the order of 140 bonds; the term
     // reservations scale with that bond count and with the neighbour-pair count around each atom.
     std::size_t const bonds = n + 16u;
@@ -76,10 +99,8 @@ static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_at
                                         (sizeof(mmff94_bond_t) + sizeof(mmff94_angle_t) + sizeof(mmff94_torsion_t) +
                                          sizeof(mmff94_oop_t) + sizeof(mmff94_stretchbend_t));
     std::size_t const csr_bytes = 32u * bonds * sizeof(mmff94_atom_interaction_t);
-    std::size_t const per_atom_slack = n * 128u;
-    std::size_t const per_mol_fixed = 1024u;
-    return bounds_bytes + bond_distance_bytes + descriptor_bytes + torsion_bytes + mmff_term_bytes + csr_bytes +
-           per_atom_slack + per_mol_fixed;
+    return estimate_per_molecule_uploaded_bytes(max_atoms) + bond_distance_bytes + torsion_bytes + mmff_term_bytes +
+           csr_bytes;
 }
 
 /**
@@ -404,9 +425,13 @@ context_t::context_t(std::span<int const> devices) {
         auto &scratch = *launch_scratch[device_index];
         scratch.device_pool.ensure_capacity(worst_case_layout.device_pool_bytes);
         scratch.host_staging.ensure_capacity(worst_case_layout.host_pool_bytes);
-        for (auto &slot_row : batch_slots_per_device)
-            slot_row[device_index].host.ensure_capacity(per_device_batch_bytes);
     }
+    // The pinned batch slots are deliberately left unreserved.  `prepare_molecule_batch_into`
+    // sizes each one from the wave's own `bytes_uploaded`, and preprocess partitions atom-count
+    // descending, so the first wave carries the largest molecules and every slot reaches its peak
+    // capacity on that wave; later waves find the buffer already large enough.  Reserving here
+    // instead would have to assume the 128-atom cap, which costs 86 KB per molecule against the
+    // 12 KB a corpus like GDB13 actually stages.
 }
 
 context_t::~context_t() {
@@ -1110,11 +1135,12 @@ conformer_status_t context_t::generate_conformers(
     // sized for max_atoms_per_molecule but the kernel wrote with a smaller stride.
     std::uint32_t const effective_max_atoms = max_atoms_per_molecule;
 
-    // `context_t::context_t` pre-grew every per-device pool (launch_scratch,
-    // metric_scratch, batch_slots_per_device) to the worst-case wave footprint
-    // using `cudaMemGetInfo` + the [10K, 400K] wave clamps, so no mid-run
-    // `ensure_capacity(grow)` can fire on the hot path.  The per-launch
-    // `ensure_capacity` calls in `launch_gpu_pipeline` are no-ops at steady state.
+    // `context_t::context_t` pre-grew the device pool, the pinned staging and the metric scratch
+    // to the worst-case wave footprint using `cudaMemGetInfo` + the [10K, 400K] wave clamps, so no
+    // mid-run `ensure_capacity(grow)` can fire on the hot path.  The per-launch `ensure_capacity`
+    // calls in `launch_gpu_pipeline` are no-ops at steady state.  The pinned batch slots are the
+    // exception: they size themselves from the first wave's `bytes_uploaded`, which is the largest
+    // any wave will need because preprocess partitions atom-count descending.
 
     std::vector<wave_record_t> wave_records;
     auto const t_call_start = std::chrono::high_resolution_clock::now();
