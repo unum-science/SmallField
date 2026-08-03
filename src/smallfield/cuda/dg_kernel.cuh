@@ -9,8 +9,9 @@
  *   E_4th_dim  = w₄·Σᵢ xᵢ₄²
  *
  *  Architecture: atom-centric. Each thread owns ceil(N/32) atoms and accumulates
- *  their gradients in registers. Coordinates are broadcast via __shfl_sync in
- *  32-atom tiles. No atomicAdd. No pair index scan.
+ *  their gradients in registers. The partner atom of the inner loop is warp-uniform,
+ *  so its coordinates come from a broadcast read of the shared-memory position array.
+ *  No atomicAdd. No pair index scan.
  *
  *  Bounds matrix is int8-quantized with a per-molecule (min, inv_scale) pair
  *  (floats broadcast in registers).  Storage per pair is 1 byte — half the
@@ -103,8 +104,9 @@ __host__ __device__ __forceinline__ std::uint32_t compute_bounds_row_stride(std:
  *  @brief Atom-centric distance geometry energy and gradient evaluation.
  *
  *  Each thread owns atoms {lane, lane+32, lane+64, ...} and accumulates their
- *  gradients in registers. All-pairs distance violations are computed by iterating
- *  other atoms in 32-atom tiles via __shfl_sync.
+ *  gradients in registers. All-pairs distance violations are computed by walking
+ *  every other atom in a warp-uniform inner loop, whose coordinates are read
+ *  straight out of @p positions as a broadcast.
  *
  *  @tparam write_gradient When true, computes and writes gradient; when false, energy only.
  *  @param[in] bounds_matrix Int8-quantized bounds matrix in shared memory. Upper bound at
@@ -139,7 +141,6 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
     std::uint32_t lane) {
 
     std::uint32_t const dim = spatial_dimension;
-    std::uint32_t const num_tiles = (num_atoms + warp_size_k - 1) / warp_size_k;
 
     if constexpr (write_gradient) {
         for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) gradient[i] = 0.0f;
@@ -148,159 +149,133 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
 
     float total_energy = 0.0f;
 
-    // process atoms in 32-atom tiles
-    // for each tile of "owned" atoms, iterate all other atoms via shuffle tiles
-    for (std::uint32_t tile_a = 0; tile_a < num_tiles; ++tile_a) {
-        std::uint32_t const atom = tile_a * warp_size_k + lane;
-        bool const atom_valid = atom < num_atoms;
+    // Each lane owns the atoms {lane, lane+32, ...} and walks every other atom for each of them.
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
 
-        // load this tile's coordinates into registers
+        // Coordinates and gradient accumulator of the owned atom, held in registers.
         float coord_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if (atom_valid) {
-            for (std::uint32_t d = 0; d < dim; ++d) coord_a[d] = positions[d * num_atoms + atom];
-        }
-
-        // gradient accumulators for this atom (registers, no shared memory)
+        for (std::uint32_t d = 0; d < dim; ++d) coord_a[d] = positions[d * num_atoms + atom];
         float grad_a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        // iterate all other atoms in tiles
-        for (std::uint32_t tile_b = 0; tile_b < num_tiles; ++tile_b) {
-            std::uint32_t const other_base = tile_b * warp_size_k;
+        // The lane-varying row index of the bounds matrix is fixed for this atom, so its row
+        // base is hoisted; the transposed read keeps `other` in the row term and `atom` in the
+        // column, which is likewise conflict-free because the column varies by one per lane.
+        std::uint8_t const *__restrict__ own_bounds_row = bounds_matrix + atom * bounds_row_stride;
 
-            // load tile_b's coordinates into registers for shuffling
-            float coord_b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            std::uint32_t const other_load = other_base + lane;
-            if (other_load < num_atoms) {
-                for (std::uint32_t d = 0; d < dim; ++d) coord_b[d] = positions[d * num_atoms + other_load];
+        // `other` is warp-uniform, so every `positions[d * num_atoms + other]` is a broadcast
+        // read of one shared-memory word — no per-lane partner registers, no shuffles.
+        for (std::uint32_t other = 0; other < num_atoms; ++other) {
+            if (other == atom) continue;
+
+            float const delta_x = positions[other] - coord_a[0];
+            float const delta_y = positions[num_atoms + other] - coord_a[1];
+            float const delta_z = positions[2 * num_atoms + other] - coord_a[2];
+            float distance_squared = fmaf(delta_x, delta_x, fmaf(delta_y, delta_y, delta_z * delta_z));
+            float delta_w = 0.0f;
+            if (dim == 4) {
+                delta_w = positions[3 * num_atoms + other] - coord_a[3];
+                distance_squared = fmaf(delta_w, delta_w, distance_squared);
             }
 
-            // each lane broadcasts one atom from tile_b
-            // all lanes MUST participate in __shfl_sync (full_mask_k),
-            // so shuffles are outside the validity check
-            for (std::uint32_t slot = 0; slot < warp_size_k; ++slot) {
-                std::uint32_t const other = other_base + slot;
+            float const inverse_distance = rsqrtf(fmaxf(distance_squared, 1e-12f));
+            float const distance = distance_squared * inverse_distance;
 
-                // all lanes participate in shuffles
-                float const bx = __shfl_sync(full_mask_k, coord_b[0], slot);
-                float const by = __shfl_sync(full_mask_k, coord_b[1], slot);
-                float const bz = __shfl_sync(full_mask_k, coord_b[2], slot);
-                float const bw = (dim == 4) ? __shfl_sync(full_mask_k, coord_b[3], slot) : 0.0f;
+            // Read bounds (int8 → dequantized float via a single FMA per value).  The upper
+            // bound lives above the diagonal and the lower bound below, so which of the two
+            // reads is which follows the atom ordering.
+            bool const atom_first = atom < other;
+            std::uint8_t const own_row_q = own_bounds_row[other];
+            std::uint8_t const other_row_q = bounds_matrix[other * bounds_row_stride + atom];
+            float const upper_bound = __fmaf_rn(__uint2float_rn(atom_first ? own_row_q : other_row_q), inv_scale,
+                                                mol_min);
+            float const lower_bound = __fmaf_rn(__uint2float_rn(atom_first ? other_row_q : own_row_q), inv_scale,
+                                                mol_min);
 
-                // skip invalid pairs after shuffles
-                if (!atom_valid || other >= num_atoms || other == atom) continue;
+            // upper bound violation
+            if (distance > upper_bound) {
+                float const violation = distance - upper_bound;
+                if (atom_first) total_energy += upper_violation_weight * violation * violation;
 
-                float const delta_x = bx - coord_a[0];
-                float const delta_y = by - coord_a[1];
-                float const delta_z = bz - coord_a[2];
-                float distance_squared = fmaf(delta_x, delta_x, fmaf(delta_y, delta_y, delta_z * delta_z));
-                float delta_w = 0.0f;
-                if (dim == 4) {
-                    delta_w = bw - coord_a[3];
-                    distance_squared = fmaf(delta_w, delta_w, distance_squared);
+                if constexpr (write_gradient) {
+                    float const scale = 2.0f * upper_violation_weight * violation * inverse_distance;
+                    grad_a[0] -= scale * delta_x;
+                    grad_a[1] -= scale * delta_y;
+                    grad_a[2] -= scale * delta_z;
+                    if (dim == 4) grad_a[3] -= scale * delta_w;
                 }
+            }
 
-                float const inverse_distance = rsqrtf(fmaxf(distance_squared, 1e-12f));
-                float const distance = distance_squared * inverse_distance;
+            // lower bound violation
+            if (distance < lower_bound) {
+                float const violation = lower_bound - distance;
+                if (atom_first) total_energy += lower_violation_weight * violation * violation;
 
-                // read bounds (int8 → dequantized float via a single FMA per value)
-                std::uint32_t const min_idx = (atom < other) ? atom : other;
-                std::uint32_t const max_idx = (atom < other) ? other : atom;
-                std::uint8_t const upper_q = bounds_matrix[min_idx * bounds_row_stride + max_idx];
-                std::uint8_t const lower_q = bounds_matrix[max_idx * bounds_row_stride + min_idx];
-                float const upper_bound = __fmaf_rn(__uint2float_rn(upper_q), inv_scale, mol_min);
-                float const lower_bound = __fmaf_rn(__uint2float_rn(lower_q), inv_scale, mol_min);
-
-                // upper bound violation
-                if (distance > upper_bound) {
-                    float const violation = distance - upper_bound;
-                    if (atom < other) total_energy += upper_violation_weight * violation * violation;
-
-                    if constexpr (write_gradient) {
-                        float const scale = 2.0f * upper_violation_weight * violation * inverse_distance;
-                        grad_a[0] -= scale * delta_x;
-                        grad_a[1] -= scale * delta_y;
-                        grad_a[2] -= scale * delta_z;
-                        if (dim == 4) grad_a[3] -= scale * delta_w;
-                    }
-                }
-
-                // lower bound violation
-                if (distance < lower_bound) {
-                    float const violation = lower_bound - distance;
-                    if (atom < other) total_energy += lower_violation_weight * violation * violation;
-
-                    if constexpr (write_gradient) {
-                        float const scale = -2.0f * lower_violation_weight * violation * inverse_distance;
-                        grad_a[0] -= scale * delta_x;
-                        grad_a[1] -= scale * delta_y;
-                        grad_a[2] -= scale * delta_z;
-                        if (dim == 4) grad_a[3] -= scale * delta_w;
-                    }
+                if constexpr (write_gradient) {
+                    float const scale = -2.0f * lower_violation_weight * violation * inverse_distance;
+                    grad_a[0] -= scale * delta_x;
+                    grad_a[1] -= scale * delta_y;
+                    grad_a[2] -= scale * delta_z;
+                    if (dim == 4) grad_a[3] -= scale * delta_w;
                 }
             }
         }
 
         // chiral volume contributions for this atom; volume and gradient share
         // the same edge_b/c/d and the cross(edge_c, edge_d) intermediate.
-        if (atom_valid) {
-            for (std::uint32_t c = 0; c < num_chiral_centers; ++c) {
-                auto const &center = chiral_centers[c];
-                std::uint8_t const chiral_center_atom = center.center_atom;
-                std::uint8_t const chiral_neighbor_a = center.neighbor_atoms[0];
-                std::uint8_t const chiral_neighbor_b = center.neighbor_atoms[1];
-                std::uint8_t const chiral_neighbor_c = center.neighbor_atoms[2];
+        for (std::uint32_t c = 0; c < num_chiral_centers; ++c) {
+            auto const &center = chiral_centers[c];
+            std::uint8_t const chiral_center_atom = center.center_atom;
+            std::uint8_t const chiral_neighbor_a = center.neighbor_atoms[0];
+            std::uint8_t const chiral_neighbor_b = center.neighbor_atoms[1];
+            std::uint8_t const chiral_neighbor_c = center.neighbor_atoms[2];
 
-                float3 const center_position = load_position_(positions, num_atoms, chiral_center_atom);
-                float3 const edge_b = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_a),
-                                                  center_position);
-                float3 const edge_c = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_b),
-                                                  center_position);
-                float3 const edge_d = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_c),
-                                                  center_position);
-                float3 const cross_cd = cross_float3_(edge_c, edge_d);
-                float const volume = dot_float3_(edge_b, cross_cd);
+            float3 const center_position = load_position_(positions, num_atoms, chiral_center_atom);
+            float3 const edge_b = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_a), center_position);
+            float3 const edge_c = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_b), center_position);
+            float3 const edge_d = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_c), center_position);
+            float3 const cross_cd = cross_float3_(edge_c, edge_d);
+            float const volume = dot_float3_(edge_b, cross_cd);
 
-                float const target_sign = static_cast<float>(center.target_sign);
-                if (volume * target_sign >= 0.0f) continue;
+            float const target_sign = static_cast<float>(center.target_sign);
+            if (volume * target_sign >= 0.0f) continue;
 
-                // only one thread per chiral center counts the energy
-                if (atom == chiral_center_atom) total_energy += chiral_volume_weight * volume * volume;
+            // only one thread per chiral center counts the energy
+            if (atom == chiral_center_atom) total_energy += chiral_volume_weight * volume * volume;
 
-                if constexpr (write_gradient) {
-                    // V = edge_b · (edge_c × edge_d).  Chain rule:
-                    //   dV/dr_b = edge_c × edge_d  (= cross_cd, already computed)
-                    //   dV/dr_c = edge_d × edge_b
-                    //   dV/dr_d = edge_b × edge_c
-                    //   dV/dr_center = -(dV/dr_b + dV/dr_c + dV/dr_d)
-                    float const scale = 2.0f * chiral_volume_weight * volume;
-                    auto add_scaled_to_grad_a_ = [&](float3 const &delta) {
-                        grad_a[0] += scale * delta.x;
-                        grad_a[1] += scale * delta.y;
-                        grad_a[2] += scale * delta.z;
-                    };
+            if constexpr (write_gradient) {
+                // V = edge_b · (edge_c × edge_d).  Chain rule:
+                //   dV/dr_b = edge_c × edge_d  (= cross_cd, already computed)
+                //   dV/dr_c = edge_d × edge_b
+                //   dV/dr_d = edge_b × edge_c
+                //   dV/dr_center = -(dV/dr_b + dV/dr_c + dV/dr_d)
+                float const scale = 2.0f * chiral_volume_weight * volume;
+                auto add_scaled_to_grad_a_ = [&](float3 const &delta) {
+                    grad_a[0] += scale * delta.x;
+                    grad_a[1] += scale * delta.y;
+                    grad_a[2] += scale * delta.z;
+                };
 
-                    if (atom == chiral_neighbor_a) { add_scaled_to_grad_a_(cross_cd); }
-                    else if (atom == chiral_neighbor_b) { add_scaled_to_grad_a_(cross_float3_(edge_d, edge_b)); }
-                    else if (atom == chiral_neighbor_c) { add_scaled_to_grad_a_(cross_float3_(edge_b, edge_c)); }
-                    else if (atom == chiral_center_atom) {
-                        float3 const dvdc = cross_float3_(edge_d, edge_b);
-                        float3 const dvdd = cross_float3_(edge_b, edge_c);
-                        add_scaled_to_grad_a_(scale_float3_(add_float3_(add_float3_(cross_cd, dvdc), dvdd), -1.0f));
-                    }
+                if (atom == chiral_neighbor_a) { add_scaled_to_grad_a_(cross_cd); }
+                else if (atom == chiral_neighbor_b) { add_scaled_to_grad_a_(cross_float3_(edge_d, edge_b)); }
+                else if (atom == chiral_neighbor_c) { add_scaled_to_grad_a_(cross_float3_(edge_b, edge_c)); }
+                else if (atom == chiral_center_atom) {
+                    float3 const dvdc = cross_float3_(edge_d, edge_b);
+                    float3 const dvdd = cross_float3_(edge_b, edge_c);
+                    add_scaled_to_grad_a_(scale_float3_(add_float3_(add_float3_(cross_cd, dvdc), dvdd), -1.0f));
                 }
             }
+        }
 
-            // fourth-dimension crush penalty: w4*xi4²
-            if (fourth_dimension_penalty_weight > 0.0f && dim == 4) {
-                float const w_coord = coord_a[3];
-                total_energy += fourth_dimension_penalty_weight * w_coord * w_coord;
-                if constexpr (write_gradient) grad_a[3] += 2.0f * fourth_dimension_penalty_weight * w_coord;
-            }
+        // fourth-dimension crush penalty: w4*xi4²
+        if (fourth_dimension_penalty_weight > 0.0f && dim == 4) {
+            float const w_coord = coord_a[3];
+            total_energy += fourth_dimension_penalty_weight * w_coord * w_coord;
+            if constexpr (write_gradient) grad_a[3] += 2.0f * fourth_dimension_penalty_weight * w_coord;
+        }
 
-            // write gradient for this atom (direct write, no atomicAdd)
-            if constexpr (write_gradient) {
-                for (std::uint32_t d = 0; d < dim; ++d) gradient[d * num_atoms + atom] = grad_a[d];
-            }
+        // write gradient for this atom (direct write, no atomicAdd)
+        if constexpr (write_gradient) {
+            for (std::uint32_t d = 0; d < dim; ++d) gradient[d * num_atoms + atom] = grad_a[d];
         }
     }
 

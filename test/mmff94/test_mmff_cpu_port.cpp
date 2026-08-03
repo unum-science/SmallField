@@ -269,11 +269,6 @@ void rdkit_direct_extract(RDKit::ROMol &mol, sft::molecule_descriptor_t const &d
         out.mmff_atom_vdw[a] = p;
         out.mmff_atom_charge[a] = (float)props.getMMFFPartialCharge(a);
     }
-    out.bond_distance.resize(static_cast<std::size_t>(num_atoms) * num_atoms);
-    for (std::uint32_t i = 0; i < num_atoms; ++i)
-        for (std::uint32_t j = 0; j < num_atoms; ++j)
-            out.bond_distance[i * num_atoms + j] = desc.bond_distance[i * sft::max_atoms_k + j];
-
     auto find_bond = [&](std::uint32_t a, std::uint32_t b) -> std::int32_t {
         for (std::uint16_t n = desc.neighbor_offset[a]; n < desc.neighbor_offset[a + 1]; ++n)
             if (desc.neighbor_atom[n] == b) return desc.neighbor_bond[n];

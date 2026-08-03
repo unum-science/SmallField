@@ -81,15 +81,13 @@ std::vector<float> interleaved_to_soa(std::vector<float> const &interleaved) {
  *  The per-atom interaction CSR is left exactly as production builds it — rebuilding it
  *  by hand would test the reconstruction rather than the kernel.  Excluded bonded terms
  *  are zeroed at their force constants, which contributes neither energy nor gradient,
- *  and the nonbonded sweep — enumerated on the fly from `bond_distance` rather than from
- *  a list — is switched off by marking every pair with the BFS-unreachable sentinel the
- *  kernel already skips.
+ *  The nonbonded sweep is enumerated on the fly from the hop matrix rather than from a list,
+ *  so it is isolated at the call site instead: the caller hands the kernel a matrix of the
+ *  unreachable sentinel for every other term, which the sweep skips pair by pair.
  */
 sfp::etkdg_prepared_molecule_t isolate_term(sfp::etkdg_prepared_molecule_t const &full, term_kind_t kind) {
     sfp::etkdg_prepared_molecule_t single = full;
 
-    if (kind != term_kind_t::nonbonded)
-        single.bond_distance.assign(single.bond_distance.size(), std::uint8_t {255});
     if (kind != term_kind_t::bond)
         for (auto &term : single.mmff_bonds) term.force_constant = 0.0f;
     if (kind != term_kind_t::angle)
@@ -160,6 +158,13 @@ void compare_terms(std::string const &smiles, char const *label, float perturbat
         sftest::set_coords_interleaved(*mol, interleaved.data());
     }
     std::vector<float> gradient;
+    // Production rebuilds the hop matrix on the device, so this single-molecule harness derives
+    // it from the bond list, and hands the sweep an all-unreachable matrix whenever the
+    // comparison isolates some other term.
+    std::vector<std::uint8_t> bond_hops;
+    sftest::fill_bond_hops(prepared_full.mmff_bonds.data(), static_cast<std::uint32_t>(prepared_full.mmff_bonds.size()),
+                           prepared_full.num_atoms, bond_hops);
+    std::vector<std::uint8_t> const unreachable_hops(bond_hops.size(), std::uint8_t {255});
 
     term_kind_t const kinds[] = {term_kind_t::bond,    term_kind_t::angle,   term_kind_t::stretchbend,
                                  term_kind_t::oop,     term_kind_t::torsion, term_kind_t::nonbonded};
@@ -173,7 +178,7 @@ void compare_terms(std::string const &smiles, char const *label, float perturbat
         gpu_mmff_energy(positions.data(), single.num_atoms,
                         single.mmff_atom_vdw.empty() ? nullptr : single.mmff_atom_vdw.data(),
                         single.mmff_atom_charge.empty() ? nullptr : single.mmff_atom_charge.data(),
-                        single.bond_distance.empty() ? nullptr : single.bond_distance.data(),
+                        kind == term_kind_t::nonbonded ? bond_hops.data() : unreachable_hops.data(),
                         single.mmff_bonds.empty() ? nullptr : single.mmff_bonds.data(),
                         static_cast<std::uint32_t>(single.mmff_bonds.size()),
                         single.mmff_angles.empty() ? nullptr : single.mmff_angles.data(),

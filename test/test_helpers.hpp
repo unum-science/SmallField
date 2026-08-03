@@ -177,5 +177,45 @@ inline std::vector<std::string> standard_test_smiles() {
     };
 }
 
+/**
+ *  @brief Rebuild the packed N x N bond-hop matrix a single-molecule energy call expects.
+ *
+ *  The production pool carries no such matrix on the host — a warp BFS fills the device-only
+ *  region from the bond list — so the harnesses that drive one molecule through the energy
+ *  kernel derive it here from the same bond list, breadth-first from every source atom.
+ *  Pairs with no bonded path keep 255, which the nonbonded sweep reads as unreachable.
+ *
+ *  @param[in] bonds Bond terms, each exposing @c atom_i and @c atom_j.
+ *  @param[in] bond_count Number of bonds.
+ *  @param[in] num_atoms Atom count; the matrix is @p num_atoms squared entries.
+ *  @param[out] matrix Resized to @p num_atoms squared and filled row-major.
+ */
+template <typename bond_>
+inline void fill_bond_hops(bond_ const *bonds, std::uint32_t bond_count, std::uint32_t num_atoms,
+                           std::vector<std::uint8_t> &matrix) {
+    matrix.assign(static_cast<std::size_t>(num_atoms) * num_atoms, std::uint8_t {255});
+    std::vector<std::uint8_t> queue(num_atoms, std::uint8_t {0});
+    for (std::uint32_t source = 0; source < num_atoms; ++source) {
+        std::uint8_t *const row = matrix.data() + static_cast<std::size_t>(source) * num_atoms;
+        row[source] = 0;
+        std::uint32_t head = 0, tail = 0;
+        queue[tail++] = static_cast<std::uint8_t>(source);
+        while (head < tail) {
+            std::uint8_t const current = queue[head++];
+            std::uint8_t const next_distance = static_cast<std::uint8_t>(row[current] + 1);
+            for (std::uint32_t bond = 0; bond < bond_count; ++bond) {
+                std::uint8_t neighbor = 255;
+                if (bonds[bond].atom_i == current) neighbor = bonds[bond].atom_j;
+                else if (bonds[bond].atom_j == current) neighbor = bonds[bond].atom_i;
+                else continue;
+                if (row[neighbor] > next_distance) {
+                    row[neighbor] = next_distance;
+                    queue[tail++] = neighbor;
+                }
+            }
+        }
+    }
+}
+
 } // namespace tests
 } // namespace smallfield

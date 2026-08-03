@@ -45,6 +45,7 @@ endmacro()
 add_mixed_test(kernels triangle_smooth)
 add_mixed_test(kernels dg_energy)
 add_mixed_test(kernels mmff_gradient)
+add_mixed_test(kernels bond_distance)
 
 # The reproducibility check compiles metric_embedding_prepass.cuh itself so it can drive the
 # embed kernel over thousands of identical blocks. It therefore must not also link
@@ -109,6 +110,8 @@ target_include_directories(
   ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 set_target_properties(test_pipeline PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME test_pipeline COMMAND test_pipeline)
+
+add_cpp_test(api seed_determinism)
 
 add_executable(test_ez_stereo api/test_ez_stereo.cpp)
 set_source_files_properties(api/test_ez_stereo.cpp PROPERTIES LANGUAGE CXX)

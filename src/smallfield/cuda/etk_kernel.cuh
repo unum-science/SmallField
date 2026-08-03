@@ -49,14 +49,12 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     std::uint8_t const atom_k = torsion.atom_indices[2];
     std::uint8_t const atom_l = torsion.atom_indices[3];
 
-    // Bond vectors used by both the dihedral and the Wilson B-matrix chain rule.
-    // bond_vec_2 = -bond_vec_1 by construction; kept as a separate name so the
-    // switch arms below read the way the Wilson derivation is written.
+    // Bond vectors of the i-j-k-l chain.  The second half-plane is spanned by (j-k) and (l-k),
+    // and (j-k) is the negation of @c bond_vec_1, so these three cover both planes.
     float3 const bond_vec_0 = sub_float3_(load_position_(positions, num_atoms, atom_i),
                                           load_position_(positions, num_atoms, atom_j));
     float3 const bond_vec_1 = sub_float3_(load_position_(positions, num_atoms, atom_k),
                                           load_position_(positions, num_atoms, atom_j));
-    float3 const bond_vec_2 = scale_float3_(bond_vec_1, -1.0f);
     float3 const bond_vec_3 = sub_float3_(load_position_(positions, num_atoms, atom_l),
                                           load_position_(positions, num_atoms, atom_k));
 
@@ -64,13 +62,42 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     float const inverse_normal_length_0 = rsqrtf(fmaxf(dot_float3_(normal_0, normal_0), 1e-10f));
     normal_0 = scale_float3_(normal_0, inverse_normal_length_0);
 
-    float3 normal_1 = cross_float3_(bond_vec_2, bond_vec_3);
+    // cross(-bond_vec_1, bond_vec_3) written with the negation absorbed by swapping operands.
+    float3 normal_1 = cross_float3_(bond_vec_3, bond_vec_1);
     float const inverse_normal_length_1 = rsqrtf(fmaxf(dot_float3_(normal_1, normal_1), 1e-10f));
     normal_1 = scale_float3_(normal_1, inverse_normal_length_1);
 
     float const cos_phi = fmaxf(-1.0f, fminf(1.0f, dot_float3_(normal_0, normal_1)));
     float const sin_phi_sq = 1.0f - cos_phi * cos_phi;
     float const sin_phi = (sin_phi_sq > 0.0f) ? sqrtf(sin_phi_sq) : 0.0f;
+
+    // Direction of this atom's torsion force, which the Fourier coefficients only rescale.
+    // The Wilson B-matrix gradient is cross(cos_grad_0, lever_0) + cross(cos_grad_1, lever_1)
+    // with a per-role pair of lever arms, and the cosine gradients are
+    //   cos_grad_0 = (normal_1 - cos φ · normal_0) / |n_0|,  cos_grad_1 = (normal_0 - cos φ · normal_1) / |n_1|.
+    // Folding each inverse length into its lever and expanding the two crosses by bilinearity
+    // collapses the whole expression to the two crosses below, so the bond vectors, the plane
+    // normals, and the levers all die here instead of surviving the Fourier recurrence — only
+    // this one vector does.  The four roles' forces still sum to zero by Newton's 3rd law.
+    float3 force_direction {0.0f, 0.0f, 0.0f};
+    if constexpr (write_gradient) {
+        float3 lever_0 {0.0f, 0.0f, 0.0f};
+        float3 lever_1 {0.0f, 0.0f, 0.0f};
+        switch (atom_role) {
+        case atom_role_first_k: lever_0 = scale_float3_(bond_vec_1, -inverse_normal_length_0); break;
+        case atom_role_second_k:
+            lever_0 = scale_float3_(sub_float3_(bond_vec_1, bond_vec_0), inverse_normal_length_0);
+            lever_1 = scale_float3_(bond_vec_3, -inverse_normal_length_1);
+            break;
+        case atom_role_third_k:
+            lever_0 = scale_float3_(bond_vec_0, inverse_normal_length_0);
+            lever_1 = scale_float3_(add_float3_(bond_vec_3, bond_vec_1), inverse_normal_length_1);
+            break;
+        case atom_role_fourth_k: lever_1 = scale_float3_(bond_vec_1, -inverse_normal_length_1); break;
+        }
+        force_direction = add_float3_(cross_float3_(normal_0, sub_float3_(lever_1, scale_float3_(lever_0, cos_phi))),
+                                      cross_float3_(normal_1, sub_float3_(lever_0, scale_float3_(lever_1, cos_phi))));
+    }
 
     // Chebyshev recurrence for 6-term Fourier series
     float energy = 0.0f;
@@ -105,34 +132,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
                                ? (-energy_gradient_dihedral / sin_phi)
                                : (-energy_second_gradient_dihedral / fmaxf(fabsf(cos_phi), 1e-10f));
 
-    float3 const cos_grad_0 = scale_float3_(sub_float3_(normal_1, scale_float3_(normal_0, cos_phi)),
-                                            inverse_normal_length_0);
-    float3 const cos_grad_1 = scale_float3_(sub_float3_(normal_0, scale_float3_(normal_1, cos_phi)),
-                                            inverse_normal_length_1);
-
-    // Wilson B-matrix chain rule for the atom at @p atom_role.  Each role's
-    // gradient is a sum of one or two cross products of the cosine gradients
-    // and bond vectors (or differences of bond vectors at the central atoms
-    // j and k).  The four force expressions sum to zero by Newton's 3rd law.
-    float3 force {0.0f, 0.0f, 0.0f};
-    switch (atom_role) {
-    case atom_role_first_k:
-        force = cross_float3_(bond_vec_1, cos_grad_0);
-        break;
-    case atom_role_second_k:
-        force = sub_float3_(cross_float3_(cos_grad_0, sub_float3_(bond_vec_1, bond_vec_0)),
-                            cross_float3_(cos_grad_1, bond_vec_3));
-        break;
-    case atom_role_third_k:
-        force = add_float3_(cross_float3_(cos_grad_0, bond_vec_0),
-                            cross_float3_(cos_grad_1, sub_float3_(bond_vec_3, bond_vec_2)));
-        break;
-    case atom_role_fourth_k:
-        force = cross_float3_(cos_grad_1, bond_vec_2);
-        break;
-    }
-    force = scale_float3_(force, sin_term);
-    accumulate_gradient_(gradient, force);
+    accumulate_gradient_(gradient, scale_float3_(force_direction, sin_term));
     return energy;
 }
 

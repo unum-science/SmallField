@@ -28,6 +28,7 @@ namespace py = pybind11;
 #include "smallfield/cuda/etkdg_pipeline.cuh"
 #include "smallfield/cuda_error.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+#include "smallfield/cuda/bond_distance_kernel.cuh"
 #include "smallfield/cuda/metric_embedding_prepass.cuh"
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/nvtx.hpp"
@@ -46,13 +47,14 @@ static inline std::size_t align_up(std::size_t value, std::size_t alignment) {
 }
 
 /**
- *  @brief Rough upper bound on the per-molecule pinned-host footprint in a wave.
+ *  @brief Rough upper bound on the per-molecule batch-pool footprint in a wave.
  *
  *  Used by @ref generate_conformers to pre-size the per-call 2-slot batch-prep
  *  ring so the pinned host buffer never reallocates while a wave's H2D is in
  *  flight.  Overestimates: at @c max_atoms=128 ~91 KB/molecule covers the
- *  bounds matrix, bond-distance byte matrix, MMFF per-atom vdw/charge, and the
- *  variable-length interaction lists plus slack.
+ *  bounds matrix, the device-only hop-count matrix, MMFF per-atom vdw/charge,
+ *  and the variable-length interaction lists plus slack.  The hop-count term is
+ *  device-resident only, so the pinned side is over-reserved by that much.
  */
 static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_atoms) noexcept {
     std::size_t const n = max_atoms;
@@ -529,9 +531,9 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
     // Upload: single H2D of the per-device batch pool (reads from this
     // device's private pinned buffer — no cross-device sharing).
     cudaEventRecord(handle.event_upload_start, stream);
-    if (per_device_batch.layout.bytes_total > 0)
+    if (per_device_batch.layout.bytes_uploaded > 0)
         sink.check(cudaMemcpyAsync(device_base + layout.device_off_batch, per_device_batch.host.data(),
-                                   per_device_batch.layout.bytes_total, cudaMemcpyHostToDevice, stream),
+                                   per_device_batch.layout.bytes_uploaded, cudaMemcpyHostToDevice, stream),
                    "H2D per-device batch pool");
 
     // Zero the fp32 coordinate buffer before kernel launches.  write_conformer_output_
@@ -545,6 +547,14 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
     if (total_coords > 0)
         sink.check(cudaMemsetAsync(handle.device_coords_fp32.data(), 0, total_coords * sizeof(float), stream),
                    "memset device_coords_fp32 zero");
+
+    // The hop-count matrix is the pool's one device-only region: N x N bytes per molecule
+    // against the 16-byte-per-bond list it is derived from, so a warp BFS rebuilds it here
+    // instead of the upload carrying it.  It has to land before `mmff_polish_warp_kernel`
+    // reads it, and this stream is in order, so the launch sits with the other prologue work.
+    launch_bond_distance_bfs(device_view.mmff_bonds().data(), device_view.molecule_metadata().data(),
+                             device_view.bond_distance().data(), per_device_molecule_count, stream);
+    sink.check(cudaPeekAtLastError(), "bond_distance_bfs_kernel launch");
 
     cudaEventRecord(handle.event_metric_start, stream);
 
@@ -574,10 +584,17 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
         std::uint32_t const shared_bytes_mmff = compute_mmff_polish_shared_memory_bytes(bin_max_atoms);
         int const blocks_per_multiprocessor_etkdg = launch_config.blocks_per_multiprocessor_etkdg[bin_index];
         int const blocks_per_multiprocessor_mmff = launch_config.blocks_per_multiprocessor_mmff[bin_index];
+        // Both kernels assign one warp per (molecule, conformer) pair, so the index space the
+        // grid has to cover is the pair count, not the molecule count.  Several atom-count bins
+        // hold fewer molecules than the device has resident-warp slots; scaling by the conformer
+        // count is what lets those launches fill the device.
+        std::uint32_t const bin_pair_count = bin_size * conformer_count;
         std::uint32_t const grid_size_etkdg = std::min(
-            bin_size, static_cast<std::uint32_t>(blocks_per_multiprocessor_etkdg * streaming_multiprocessor_count));
+            bin_pair_count,
+            static_cast<std::uint32_t>(blocks_per_multiprocessor_etkdg * streaming_multiprocessor_count));
         std::uint32_t const grid_size_mmff = std::min(
-            bin_size, static_cast<std::uint32_t>(blocks_per_multiprocessor_mmff * streaming_multiprocessor_count));
+            bin_pair_count,
+            static_cast<std::uint32_t>(blocks_per_multiprocessor_mmff * streaming_multiprocessor_count));
 
         etkdg_pipeline_warp_kernel<<<grid_size_etkdg, 32, shared_bytes_etkdg, stream>>>(
             device_view.bounds_matrices().data(),
@@ -585,10 +602,11 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
             device_view.chiral_centers().data(), device_view.etk_torsions().data(),
             device_view.distance_constraints().data(), device_view.etk_interactions().data(),
             device_view.etk_atom_offsets().data(), device_metadata_sorted + bin_start,
+            device_view.input_indices().data() + bin_start,
             handle.device_coords_fp32.data() + bin_start * conformer_count * gpu_max_atoms_per_molecule * 3,
             handle.device_energies_out.data() + bin_start * conformer_count,
             handle.device_status_out.data() + bin_start * conformer_count, bin_size, conformer_count,
-            stereo_retry_limit, bin_max_atoms, gpu_max_atoms_per_molecule, gpu_max_atoms_per_molecule, seed);
+            stereo_retry_limit, bin_max_atoms, gpu_max_atoms_per_molecule, gpu_max_atoms_per_molecule, wave_base, seed);
         sink.check(cudaPeekAtLastError(), "etkdg_pipeline_warp_kernel launch");
 
         mmff_polish_warp_kernel<<<grid_size_mmff, 32, shared_bytes_mmff, stream>>>(

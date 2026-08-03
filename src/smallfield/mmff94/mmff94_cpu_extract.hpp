@@ -36,7 +36,6 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc, std:
                                          etkdg_prepared_molecule_t &result) {
     result.mmff_atom_vdw.clear();
     result.mmff_atom_charge.clear();
-    result.bond_distance.clear();
     result.mmff_bonds.clear();
     result.mmff_angles.clear();
     result.mmff_torsions.clear();
@@ -64,11 +63,6 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc, std:
         result.mmff_atom_vdw[a] = params;
         result.mmff_atom_charge[a] = charges[a];
     }
-
-    result.bond_distance.resize(static_cast<std::size_t>(num_atoms) * num_atoms);
-    for (std::uint32_t i = 0; i < num_atoms; ++i)
-        for (std::uint32_t j = 0; j < num_atoms; ++j)
-            result.bond_distance[i * num_atoms + j] = desc.bond_distance[i * max_atoms_k + j];
 
     std::array<std::uint8_t, max_bonds_k> bond_type_arr {};
     for (std::uint32_t b = 0; b < num_bonds; ++b) {

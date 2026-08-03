@@ -166,7 +166,10 @@ using device_byte_buffer_t = byte_buffer_t<device_alloc_t, device_dealloc_t>;
  *    written by GPU kernels; the host buffer does not allocate space for
  *    them.
  *
- *  Currently every region is uploaded, so `bytes_uploaded == bytes_total`.
+ *  The hop-count region is the one device-only region: a warp BFS over the bond
+ *  list fills it after the upload, so it is placed last and the host buffer stops
+ *  at `bytes_uploaded`.  Reading `bond_distance()` off a host view is therefore
+ *  out of bounds; only the device view addresses that region.
  */
 struct batch_layout_t {
     static constexpr std::size_t region_alignment = 256;

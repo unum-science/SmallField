@@ -97,7 +97,6 @@ using smallfield::types::bond_flag_aromatic_k;
 using smallfield::types::bond_flag_in_ring_k;
 using smallfield::types::bond_flag_stereo_e_k;
 using smallfield::types::bond_flag_stereo_z_k;
-using smallfield::types::no_stereo_atom_k;
 using smallfield::types::build_descriptor;
 using smallfield::types::chiral_center_descriptor_t;
 using smallfield::types::distance_constraint_t;
@@ -107,6 +106,7 @@ using smallfield::types::etk_distance_constraint_k;
 using smallfield::types::etk_torsion_descriptor_t;
 using smallfield::types::etk_torsion_k;
 using smallfield::types::etkdg_molecule_metadata_t;
+using smallfield::types::fill_bond_distances;
 using smallfield::types::hybridization_sp2_k;
 using smallfield::types::max_atoms_k;
 using smallfield::types::max_bonds_k;
@@ -125,6 +125,7 @@ using smallfield::types::mmff94_stretchbend_t;
 using smallfield::types::mmff94_torsion_k;
 using smallfield::types::mmff94_torsion_t;
 using smallfield::types::molecule_descriptor_t;
+using smallfield::types::no_stereo_atom_k;
 
 /**
  *  @brief Complete preprocessed molecule ready for GPU pipeline upload.
@@ -138,7 +139,6 @@ struct etkdg_prepared_molecule_t {
     // MMFF94 per-atom data (kernel enumerates nonbonded pairs on-the-fly from bond_distance).
     std::vector<mmff94_atom_vdw_params_t> mmff_atom_vdw; ///< one per atom
     std::vector<float> mmff_atom_charge;                 ///< one per atom
-    std::vector<std::uint8_t> bond_distance;             ///< N x N BFS matrix (copy of descriptor's)
     std::vector<mmff94_bond_t> mmff_bonds;
     std::vector<mmff94_angle_t> mmff_angles;
     std::vector<mmff94_torsion_t> mmff_torsions;
@@ -216,6 +216,11 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
     std::uint32_t const num_atoms = desc.num_atoms;
     bounds.assign(static_cast<std::size_t>(num_atoms) * num_atoms, 0.0f);
 
+    // The 1-4 and long-range sweeps below are the only host consumers of the hop matrix, so it
+    // lives on this frame at the molecule's own row stride rather than inside the descriptor.
+    std::uint8_t bond_hops[max_atoms_k * max_atoms_k];
+    fill_bond_distances(desc, bond_hops, num_atoms);
+
     auto set_pair = [&](std::uint32_t a, std::uint32_t b, float lower, float upper) {
         std::uint32_t const row = std::min(a, b);
         std::uint32_t const col = std::max(a, b);
@@ -285,11 +290,10 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
 
     // set14 — conservative envelope for 1-4 pairs. Takes the sum of two bond lengths
     // plus a torsion-dependent spread as the upper bound; VdW minimum sum as the lower.
-    // Uses descriptor BFS distances.
     for (std::uint32_t i = 0; i < num_atoms; ++i) {
         for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
-            std::uint8_t const bd = desc.bond_distance[i * max_atoms_k + j];
-            if (bd != 3) continue;
+            std::uint8_t const hops = bond_hops[i * num_atoms + j];
+            if (hops != 3) continue;
 
             // A 1-4 pair spanning a stereo-defined double bond has a determined
             // end-to-end distance rather than a free envelope.  Leaving the generic
@@ -340,11 +344,11 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
         }
     }
 
-    // Long-range pairs (bond_distance > 3): VdW lower bound, keep upper unconstrained.
+    // Long-range pairs (more than three hops apart): VdW lower bound, keep upper unconstrained.
     for (std::uint32_t i = 0; i < num_atoms; ++i) {
         for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
-            std::uint8_t const bd = desc.bond_distance[i * max_atoms_k + j];
-            if (bd <= 3) continue;
+            std::uint8_t const hops = bond_hops[i * num_atoms + j];
+            if (hops <= 3) continue;
             float const lower = vdw_lower_bound_angstrom(desc.element[i], desc.element[j]);
             bounds[j * num_atoms + i] = lower; // lower triangle
         }
@@ -648,7 +652,6 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
                                                                  etkdg_prepared_molecule_t &result) {
     result.mmff_atom_vdw.clear();
     result.mmff_atom_charge.clear();
-    result.bond_distance.clear();
     result.mmff_bonds.clear();
     result.mmff_angles.clear();
     result.mmff_torsions.clear();
@@ -719,14 +722,6 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
         result.mmff_atom_charge[a] = static_cast<float>(mmff_props.getMMFFPartialCharge(a));
     }
 
-    // Copy the N x N bond_distance slice from the descriptor into a per-molecule packed
-    // block (no 128-row stride). The kernel reads bond_distance[i * N + j] with N =
-    // meta.num_atoms.
-    result.bond_distance.resize(static_cast<std::size_t>(num_atoms) * num_atoms);
-    for (std::uint32_t i = 0; i < num_atoms; ++i)
-        for (std::uint32_t j = 0; j < num_atoms; ++j)
-            result.bond_distance[i * num_atoms + j] = desc.bond_distance[i * max_atoms_k + j];
-
     // Build bond terms — iterate descriptor's bond list (no RDKit traversal).
     // Cache-first: key by (atom_type_pair, bond_signature). Cache hit skips
     // RDKit's getMMFFBondStretchParams + its internal std::map lookup.
@@ -739,7 +734,12 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
         else {
             unsigned int bond_type;
             ForceFields::MMFF::MMFFBond bp;
-            if (!mmff_props.getMMFFBondStretchParams(mol, i, j, bond_type, bp)) continue;
+            // Dropping the term would understate the molecule's energy by a whole bond stretch, and
+            // the device hop-count BFS derives adjacency from this list, so a missing entry also
+            // shifts the 1-2 / 1-3 / 1-4 nonbonded exclusions.  Reject the molecule instead and let
+            // the fallback role handle it.
+            if (!mmff_props.getMMFFBondStretchParams(mol, i, j, bond_type, bp))
+                return smallfield::api::conformer_status_t::unsupported_element;
             cached_vals.kb = static_cast<float>(bp.kb);
             cached_vals.r0 = static_cast<float>(bp.r0);
             mmff_bond_cache().insert(key, cached_vals);
@@ -1044,7 +1044,6 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
     result.distance_constraints.clear();
     result.mmff_atom_vdw.clear();
     result.mmff_atom_charge.clear();
-    result.bond_distance.clear();
     result.mmff_bonds.clear();
     result.mmff_angles.clear();
     result.mmff_torsions.clear();
@@ -1243,7 +1242,7 @@ inline per_mol_sizes_t extract_sizes(etkdg_prepared_molecule_t const &p) {
     s.dcons = static_cast<std::uint32_t>(p.distance_constraints.size());
     s.mmff_atom_vdw = static_cast<std::uint32_t>(p.mmff_atom_vdw.size());
     s.mmff_atom_charge = static_cast<std::uint32_t>(p.mmff_atom_charge.size());
-    s.bond_distance = static_cast<std::uint32_t>(p.bond_distance.size());
+    s.bond_distance = p.num_atoms * p.num_atoms;
     s.mmff_bonds = static_cast<std::uint32_t>(p.mmff_bonds.size());
     s.mmff_angles = static_cast<std::uint32_t>(p.mmff_angles.size());
     s.mmff_torsions = static_cast<std::uint32_t>(p.mmff_torsions.size());
@@ -1294,7 +1293,9 @@ inline etkdg_molecule_metadata_t make_meta(etkdg_molecule_metadata_t base, per_m
  *  pool slicing in `launch_gpu_pipeline` inherits correct alignment for free.
  *
  *  Regions are placed in a fixed order; the order itself is an implementation
- *  detail — consumers only read `offset_*` / `count_*` pairs.
+ *  detail — consumers only read `offset_*` / `count_*` pairs — with one exception.  The
+ *  hop-count region is placed last, past `bytes_uploaded`, because a warp BFS fills it on
+ *  the device from the bond list; it exists in the device pool only and never crosses PCIe.
  */
 inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::uint32_t n_valid) {
     batch_layout_t layout {};
@@ -1312,8 +1313,6 @@ inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::u
     layout.count_mmff_atom_vdw = totals.mmff_atom_vdw;
     layout.offset_mmff_atom_charge = place_region_<float>(running, totals.mmff_atom_charge);
     layout.count_mmff_atom_charge = totals.mmff_atom_charge;
-    layout.offset_bond_distance = place_region_<std::uint8_t>(running, totals.bond_distance);
-    layout.count_bond_distance = totals.bond_distance;
     layout.offset_mmff_bonds = place_region_<mmff94_bond_t>(running, totals.mmff_bonds);
     layout.count_mmff_bonds = totals.mmff_bonds;
     layout.offset_mmff_angles = place_region_<mmff94_angle_t>(running, totals.mmff_angles);
@@ -1338,6 +1337,8 @@ inline batch_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::u
     layout.count_input_indices = n_valid;
 
     layout.bytes_uploaded = running;
+    layout.offset_bond_distance = place_region_<std::uint8_t>(running, totals.bond_distance);
+    layout.count_bond_distance = totals.bond_distance;
     layout.bytes_total = running;
     return layout;
 }
@@ -1388,7 +1389,6 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::vector<std::byte> dcons_bytes;
     std::vector<std::byte> atom_vdw_bytes;
     std::vector<std::byte> atom_charge_bytes;
-    std::vector<std::byte> bond_distance_bytes;
     std::vector<std::byte> mmff_bonds_bytes;
     std::vector<std::byte> mmff_angles_bytes;
     std::vector<std::byte> mmff_torsions_bytes;
@@ -1398,6 +1398,10 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::vector<std::byte> mmff_atom_offsets_bytes;
     std::vector<std::byte> etk_interactions_bytes;
     std::vector<std::byte> etk_atom_offsets_bytes;
+    /** @brief Running element count of this thread's share of the hop-count region.  The bytes
+     *  themselves are never staged: the region is device-only and a warp BFS fills it after the
+     *  upload, so the thread accumulates only the size its molecules claim. */
+    std::size_t bond_distance_count = 0;
     std::vector<batch_prep_per_mol_record_t> mols;
     /** @brief Slice-local input indices for every molecule rejected by this
      *  thread's slice of `prepare_per_thread_contribs_`, each tagged with
@@ -1482,7 +1486,6 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
         type_counts.dcons_bytes.clear();
         type_counts.atom_vdw_bytes.clear();
         type_counts.atom_charge_bytes.clear();
-        type_counts.bond_distance_bytes.clear();
         type_counts.mmff_bonds_bytes.clear();
         type_counts.mmff_angles_bytes.clear();
         type_counts.mmff_torsions_bytes.clear();
@@ -1495,6 +1498,7 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
         type_counts.mols.clear();
         type_counts.rejected_input_indices.clear();
         type_counts.max_atoms_seen = 0;
+        type_counts.bond_distance_count = 0;
     }
 
     std::size_t const n = smiles_list.size();
@@ -1547,10 +1551,8 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
                 append_bytes_(type_counts.atom_charge_bytes, p.mmff_atom_charge.data(),
                               p.mmff_atom_charge.size() * sizeof(float)) /
                 sizeof(float));
-            rec.metadata.bond_distance_offset = static_cast<std::uint32_t>(
-                append_bytes_(type_counts.bond_distance_bytes, p.bond_distance.data(),
-                              p.bond_distance.size() * sizeof(std::uint8_t)) /
-                sizeof(std::uint8_t));
+            rec.metadata.bond_distance_offset = static_cast<std::uint32_t>(type_counts.bond_distance_count);
+            type_counts.bond_distance_count += static_cast<std::size_t>(p.num_atoms) * p.num_atoms;
             rec.metadata.mmff_bond_offset = static_cast<std::uint32_t>(
                 append_bytes_(type_counts.mmff_bonds_bytes, p.mmff_bonds.data(),
                               p.mmff_bonds.size() * sizeof(mmff94_bond_t)) /
@@ -1645,7 +1647,7 @@ static inline void scan_per_region_offsets_(std::vector<batch_prep_thread_contri
         bases[t].atom_charge = totals.mmff_atom_charge;
         totals.mmff_atom_charge += type_counts.atom_charge_bytes.size() / sizeof(float);
         bases[t].bond_distance = totals.bond_distance;
-        totals.bond_distance += type_counts.bond_distance_bytes.size() / sizeof(std::uint8_t);
+        totals.bond_distance += type_counts.bond_distance_count;
         bases[t].mmff_bonds = totals.mmff_bonds;
         totals.mmff_bonds += type_counts.mmff_bonds_bytes.size() / sizeof(mmff94_bond_t);
         bases[t].mmff_angles = totals.mmff_angles;
@@ -1676,7 +1678,7 @@ static inline void scan_per_region_offsets_(std::vector<batch_prep_thread_contri
  *  byte-accumulator region into the batch's pinned pool, plus metadata rebase
  *  from thread-local offsets to pool-wide offsets.
  *
- *  @pre `batch.host.ensure_capacity(batch.layout.bytes_total)` has succeeded;
+ *  @pre `batch.host.ensure_capacity(batch.layout.bytes_uploaded)` has succeeded;
  *       `batch.num_molecules`, `batch.max_atoms_per_molecule`, and
  *       `batch.layout` are already populated by the caller.
  */
@@ -1690,7 +1692,6 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
     auto dcons_span = batch.distance_constraints();
     auto mmff_vdw_span = batch.mmff_atom_vdw();
     auto mmff_charge_span = batch.mmff_atom_charge();
-    auto bond_distance_span = batch.bond_distance();
     auto mmff_bonds_span = batch.mmff_bonds();
     auto mmff_angles_span = batch.mmff_angles();
     auto mmff_tors_span = batch.mmff_torsions();
@@ -1725,9 +1726,6 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
         if (!type_counts.atom_charge_bytes.empty())
             std::memcpy(mmff_charge_span.data() + b.atom_charge, type_counts.atom_charge_bytes.data(),
                         type_counts.atom_charge_bytes.size());
-        if (!type_counts.bond_distance_bytes.empty())
-            std::memcpy(bond_distance_span.data() + b.bond_distance, type_counts.bond_distance_bytes.data(),
-                        type_counts.bond_distance_bytes.size());
         if (!type_counts.mmff_bonds_bytes.empty())
             std::memcpy(mmff_bonds_span.data() + b.mmff_bonds, type_counts.mmff_bonds_bytes.data(),
                         type_counts.mmff_bonds_bytes.size());
@@ -1835,7 +1833,7 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
     batch.num_molecules = n_valid;
     batch.max_atoms_per_molecule = max_atoms_reduction;
     batch.layout = compute_batch_layout(totals, n_valid);
-    if (batch.layout.bytes_total > 0 && !batch.host.ensure_capacity(batch.layout.bytes_total)) {
+    if (batch.layout.bytes_uploaded > 0 && !batch.host.ensure_capacity(batch.layout.bytes_uploaded)) {
         batch.num_molecules = 0;
         batch.layout = batch_layout_t {};
         return;
@@ -2028,7 +2026,7 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
         out.num_molecules = device_mol_count;
         out.max_atoms_per_molecule = max_atoms_seen;
         out.layout = device_layout;
-        if (device_layout.bytes_total > 0 && !out.host.ensure_capacity(device_layout.bytes_total)) {
+        if (device_layout.bytes_uploaded > 0 && !out.host.ensure_capacity(device_layout.bytes_uploaded)) {
             out.num_molecules = 0;
             out.layout = batch_layout_t {};
             continue;
@@ -2041,7 +2039,6 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
         auto dcons_dst = out.distance_constraints();
         auto vdw_dst = out.mmff_atom_vdw();
         auto charge_dst = out.mmff_atom_charge();
-        auto bond_distance_dst = out.bond_distance();
         auto bonds_dst = out.mmff_bonds();
         auto angles_dst = out.mmff_angles();
         auto torsions_mmff_dst = out.mmff_torsions();
@@ -2061,7 +2058,6 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
         auto const dcons_src = shared_view.distance_constraints();
         auto const vdw_src = shared_view.mmff_atom_vdw();
         auto const charge_src = shared_view.mmff_atom_charge();
-        auto const bond_distance_src = shared_view.bond_distance();
         auto const bonds_src = shared_view.mmff_bonds();
         auto const angles_src = shared_view.mmff_angles();
         auto const torsions_mmff_src = shared_view.mmff_torsions();
@@ -2090,9 +2086,6 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
                         atom_count * sizeof(mmff94_atom_vdw_params_t));
             std::memcpy(charge_dst.data() + running.mmff_atom_charge,
                         charge_src.data() + src_meta.mmff_atom_charge_offset, atom_count * sizeof(float));
-            std::memcpy(bond_distance_dst.data() + running.bond_distance,
-                        bond_distance_src.data() + src_meta.bond_distance_offset,
-                        static_cast<std::size_t>(atom_count) * atom_count * sizeof(std::uint8_t));
             std::memcpy(bonds_dst.data() + running.mmff_bonds, bonds_src.data() + src_meta.mmff_bond_offset,
                         src_meta.num_mmff_bonds * sizeof(mmff94_bond_t));
             std::memcpy(angles_dst.data() + running.mmff_angles, angles_src.data() + src_meta.mmff_angle_offset,

@@ -81,14 +81,16 @@ static void validate_molecule(std::string const &smiles) {
             SF_TEST_ASSERT(rdkit_neighbors[i] == desc_neighbors[i], "neighbor index mismatch");
     }
 
-    // Compare to RDKit's Floyd-Warshall on a few random pairs.
-    double *rdkit_dist = RDKit::MolOps::getDistanceMat(*mol);
+    // Compare the derived hop matrix to RDKit's Floyd-Warshall.
+    std::vector<std::uint8_t> bond_hops(static_cast<std::size_t>(N) * N, std::uint8_t {255});
+    sft::fill_bond_distances(descriptor, bond_hops.data(), N);
+    double *rdkit_distances = RDKit::MolOps::getDistanceMat(*mol);
     for (std::uint32_t i = 0; i < N; ++i) {
         for (std::uint32_t j = 0; j < N; ++j) {
-            double rd = rdkit_dist[i * N + j];
-            if (rd >= 1e7) continue; // unreachable in RDKit's LOCAL_INF encoding
-            std::uint32_t d = sft::bonds_between(descriptor, i, j);
-            SF_TEST_ASSERT(static_cast<double>(d) == rd, "bond_distance mismatch with Floyd-Warshall");
+            double const reference = rdkit_distances[i * N + j];
+            if (reference >= 1e7) continue; // unreachable in RDKit's LOCAL_INF encoding
+            SF_TEST_ASSERT(static_cast<double>(bond_hops[i * N + j]) == reference,
+                           "bond hop count mismatch with Floyd-Warshall");
         }
     }
 

@@ -493,9 +493,9 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
         mmff94_atom_vdw_params_t const p_atom = atom_vdw_params[atom];
         float const q_atom = atom_charge[atom];
 
-        // Nonbonded pairs, enumerated from bond_distance.  bond_distance is built
-        // by BFS over the undirected bond graph (molecule_descriptor.hpp::build),
-        // so it is symmetric — bond_distance[atom*N+j] == bond_distance[j*N+atom].
+        // Nonbonded pairs, enumerated from bond_distance, which a warp BFS over the
+        // undirected bond graph fills (cuda/bond_distance_kernel.cuh) — so it is
+        // symmetric: bond_distance[atom*N+j] == bond_distance[j*N+atom].
         // We sweep j in a single contiguous row read; whichever endpoint has the
         // lower index owns the pair's energy, the other endpoint contributes its
         // gradient with first_endpoint=false.

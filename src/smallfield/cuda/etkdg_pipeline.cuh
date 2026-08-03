@@ -6,7 +6,7 @@
  *  pattern, split to keep register pressure per kernel under the launch-bounds
  *  cap.  The monolithic predecessor hit 145 regs/thread because DG/ETK/MMFF
  *  state was held simultaneously across branch boundaries; each sub-kernel
- *  here lands in the 70-90 reg range.
+ *  here lands at 72 regs/thread on sm_90.
  *
  *  @c etkdg_pipeline_warp_kernel — bounds quantization through final validation
  *  (bounds quantize → DG FIRE → stereo retry → fourth-dim crush → ETK torsion
@@ -31,7 +31,7 @@
  *   MMFF94 polish: in the @c mmff_polish_warp_kernel sibling
  *
  *  Architecture:
- *   - warp-loop: gridDim warps, each loops over molecules with stride
+ *   - warp-loop: gridDim warps, each loops over (molecule, conformer) pairs with stride
  *   - atom-centric: no atomicAdd, no pair index scan
  *   - int8 bounds: per-molecule linear quantization, 16 KB at N=128
  *   - Philox RNG: stateless counter-based, ~100 cycles init
@@ -243,22 +243,31 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
 /**
  *  Persistent warp-loop ETKDG kernel covering bounds quantization through final validation.
  *
- *  Launch: <<<min(total_molecules, max_concurrent_warps), 32, shared_bytes>>>
- *  Each warp loops over molecules with stride = gridDim.x.
+ *  Launch: <<<min(total_molecules × num_conformers, max_concurrent_warps), 32, shared_bytes>>>
+ *  Each warp loops over (molecule, conformer) pairs with stride = gridDim.x.
+ *
+ *  The unit of work is a pair rather than a molecule because the atom-count bins hold wildly
+ *  different molecule counts: at a 50 K wave over the PubChem distribution, four of the eight
+ *  bins hold fewer molecules than the resident-warp cap, so their launches cannot fill the
+ *  device.  Multiplying the index space by the conformer count fills them.  The price is that
+ *  the bounds quantization is paid per conformer instead of per molecule.
  *
  *  `__launch_bounds__(32, 4)` is a floor, not a cap: it asks nvcc to keep the kernel fitting at
  *  least four blocks per SM, and at 32 threads that permits far more registers than the hardware
  *  allows, so it constrains nothing here.  What actually bounds occupancy is the register count
  *  against the SM register file, and below the largest bins, the 32-blocks-per-SM slot limit.
  *
- *  @b Register-pressure-audit — nvcc 13.0, `cuobjdump --dump-resource-usage`:
- *    sm_80=79, sm_90=80, sm_100=128, sm_120=127 regs/thread, no spills (STACK=0, LOCAL=0).
- *    On sm_90 that is 65536 / (80 × 32) = 25 blocks/SM = 25 warps, against a hard ceiling of
+ *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`:
+ *    sm_80=72, sm_90=72, sm_100=118, sm_120=123 regs/thread.  The two Hopper-and-earlier
+ *    targets spill nothing (STACK=0, LOCAL=0); both Blackwell targets carry a 120-byte frame.
+ *    On sm_90 that is 65536 / (72 × 32) = 28 blocks/SM = 28 warps, against a hard ceiling of
  *    32 warps — a 32-thread block can never fill more than 32 of the SM's 64 warp slots, so
- *    50 % is the most this shape can reach at any register count.  Cutting to 64 regs/thread
- *    reaches that ceiling and is worth about 1.28×; nothing below 32 regs/thread buys more.
- *    Refactor targets: shrink stereo-retry-loop captured state, audit the DG and ETK functor
- *    captures, look for per-thread temporaries promotable to shared memory.
+ *    50 % is the most this shape can reach at any register count.  Reaching 64 regs/thread
+ *    would buy the last 1.14× of that; nothing below 32 regs/thread buys more.
+ *    The remaining eight registers are not in the energy evaluators any more: stubbing the DG
+ *    chiral loop out of the sm_90 build drops it to 71 and stubbing the ETK torsion term drops
+ *    it not at all, while stubbing the whole ETK stage drops it to 64.  What is left is the
+ *    state the stereo-retry loop and the FIRE driver carry across every stage.
  *
  *  Writes ETK-refined 3D positions into @c conformer_coordinates_out;
  *  @c mmff_polish_warp_kernel runs next on the same buffer.
@@ -272,11 +281,12 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     distance_constraint_t const *__restrict__ distance_constraints,
     etk_atom_interaction_t const *__restrict__ etk_interactions,
     etk_atom_offsets_t const *__restrict__ etk_atom_offsets,
-    etkdg_molecule_metadata_t const *__restrict__ molecule_metadata, float *__restrict__ conformer_coordinates_out,
+    etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
+    std::uint32_t const *__restrict__ molecule_input_indices, float *__restrict__ conformer_coordinates_out,
     float *__restrict__ conformer_energies_out, std::uint8_t *__restrict__ conformer_status_out,
     std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t max_stereo_attempts,
     std::uint32_t max_atoms_per_molecule, std::uint32_t initial_coordinate_stride, std::uint32_t output_atoms_stride,
-    std::uint64_t random_seed) {
+    std::uint32_t wave_input_base, std::uint64_t random_seed) {
 
     std::uint32_t const warp_id = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
@@ -290,8 +300,13 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
     float *shared_float = reinterpret_cast<float *>(shared_raw + aligned_bounds_bytes);
 
-    // Process molecules in a warp loop with gridDim.x stride.
-    for (std::uint32_t mol = warp_id; mol < total_molecules; mol += grid_stride) {
+    // Process (molecule, conformer) pairs in a warp loop with gridDim.x stride.  The flat pair
+    // index decomposes into the bin-relative molecule and the conformer slot within it.
+    std::uint32_t const total_pairs = total_molecules * num_conformers_per_molecule;
+    for (std::uint32_t pair_index = warp_id; pair_index < total_pairs; pair_index += grid_stride) {
+        std::uint32_t const mol = pair_index / num_conformers_per_molecule;
+        std::uint32_t const conf = pair_index - mol * num_conformers_per_molecule;
+
         auto const meta = molecule_metadata[mol];
         auto const refinement_policy = select_refinement_policy_(meta);
         std::uint32_t const num_atoms = meta.num_atoms;
@@ -350,83 +365,97 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         etk_torsion_descriptor_t const *mol_torsions = torsion_terms + meta.torsion_offset;
         distance_constraint_t const *mol_constraints = distance_constraints + meta.constraint_offset;
 
-        // Initialize the Philox RNG once per molecule.
-        curandStatePhilox4_32_10_t rng_state;
-        curand_init(random_seed, mol * 32 + lane, 0, &rng_state);
+        // Seed Philox from the molecule's position in the caller's input, not from its offset
+        // inside the device batch.  Preprocess distributes molecules across host threads with a
+        // dynamic schedule and then atom-count-sorts them, so the batch offset of a given
+        // molecule varies between runs while its input position does not; keying off the input
+        // position is what makes a fixed `random_seed` reproduce the same conformers.  The
+        // conformer index enters the stream too, so the conformers of one molecule stay
+        // independent of each other.
+        std::uint64_t const global_input_index = wave_input_base + molecule_input_indices[mol];
+        std::uint64_t const sequence = (global_input_index * num_conformers_per_molecule + conf) * warp_size_k + lane;
 
-        // Generate conformers for this molecule.
-        for (std::uint32_t conf = 0; conf < num_conformers_per_molecule; ++conf) {
-            bool succeeded = false;
-            float final_energy = 0.0f;
+        // A Philox state is a dozen registers wide, and it is touched only while the attempt
+        // seeds its coordinates.  Rebuilding it at the head of every attempt from an explicit
+        // absolute offset keeps it out of the DG, crush, and ETK stages entirely; two Philox
+        // rounds per attempt are far cheaper than carrying the state across all of them.
+        // The offset is the exact position the carried state would have reached: each attempt
+        // first skips 100 elements per attempt index, then draws four uniforms for every atom
+        // this lane owns.
+        std::uint32_t const lane_owned_atoms = (lane < num_atoms)
+                                                   ? ((num_atoms - lane + warp_size_k - 1u) / warp_size_k)
+                                                   : 0u;
 
-            for (std::uint32_t attempt = 0; attempt < max_stereo_attempts; ++attempt) {
-                skipahead(static_cast<unsigned long long>(conf * 1000 + attempt * 100), &rng_state);
-                initialize_from_metric_coordinates_(mol_initial_coordinates, positions, initial_coordinate_stride,
-                                                    num_atoms, conf, attempt, lane, &rng_state);
+        bool succeeded = false;
+        float final_energy = 0.0f;
 
-                // Distance geometry minimization: Run DG minimization in 4D with up to 100 FIRE iterations.
-                distance_geometry_energy_functor_t dg_functor {shared_bounds,
-                                                               mol_chirals,
-                                                               mol_min,
-                                                               inv_scale,
-                                                               bounds_row_stride,
-                                                               num_atoms,
-                                                               meta.num_chiral_centers,
-                                                               4,
-                                                               1.0f,
-                                                               1.0f,
-                                                               100.0f,
-                                                               0.0f};
+        for (std::uint32_t attempt = 0; attempt < max_stereo_attempts; ++attempt) {
+            unsigned long long const attempt_offset = 50ull * attempt * (attempt + 1ull) +
+                                                      4ull * attempt * lane_owned_atoms;
+            curandStatePhilox4_32_10_t rng_state;
+            curand_init(random_seed, sequence, attempt_offset, &rng_state);
+            initialize_from_metric_coordinates_(mol_initial_coordinates, positions, initial_coordinate_stride,
+                                                num_atoms, conf, attempt, lane, &rng_state);
 
-                fire_result_t const dg_result = fire_minimize_(positions, velocities, gradient, dimensions_4d, 100, 1e-4f, lane,
-                                                               dg_functor);
-                (void)dg_result;
+            // Distance geometry minimization: Run DG minimization in 4D with up to 100 FIRE iterations.
+            distance_geometry_energy_functor_t dg_functor {shared_bounds,
+                                                           mol_chirals,
+                                                           mol_min,
+                                                           inv_scale,
+                                                           bounds_row_stride,
+                                                           num_atoms,
+                                                           meta.num_chiral_centers,
+                                                           4,
+                                                           1.0f,
+                                                           1.0f,
+                                                           100.0f,
+                                                           0.0f};
 
-                // Stereochemistry validation: Check stereochemistry.
-                if (meta.num_chiral_centers > 0) {
-                    if (!validate_chirality_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane))
-                        continue;
-                }
+            [[maybe_unused]] fire_result_t const dg_result = fire_minimize_(
+                positions, velocities, gradient, dimensions_4d, 100, 1e-4f, lane, dg_functor);
 
-                // Fourth-dimension crush: Crush the fourth dimension with 50 FIRE iterations.
-                dg_functor.fourth_dimension_penalty_weight = 10.0f;
-                fire_result_t const crush_result = fire_minimize_(positions, velocities, gradient, dimensions_4d, 50, 1e-4f,
-                                                                  lane, dg_functor);
-
-                // Torsion refinement: Run ETK torsion refinement in 3D with 100 FIRE iterations.
-                if (meta.num_etk_torsions > 0) {
-                    etk_torsion_energy_functor_t etk_functor {mol_torsions, mol_constraints, etk_interactions,
-                                                              etk_atom_offsets + meta.etk_atom_offsets_start,
-                                                              num_atoms};
-
-                    fire_result_t const etk_result = run_fire_stage_(
-                        positions, velocities, gradient, dimensions_3d, refinement_policy.etk_initial_iterations,
-                        refinement_policy.etk_continuation_iterations, refinement_policy.etk_gradient_threshold, lane,
-                        etk_functor);
-                    final_energy = etk_result.energy;
-                }
-                else { final_energy = crush_result.energy; }
-
-                // Final validation: Run final validation.
-                bool valid = true;
-                if (meta.num_chiral_centers > 0) {
-                    valid = validate_chirality_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane);
-                }
-
-                if (valid) {
-                    // ETK-refined 3D positions are the final output of this kernel.
-                    // The sibling mmff_polish_warp_kernel picks them up from
-                    // conformer_coordinates_out and runs MMFF94 polish in-place.
-                    succeeded = true;
-                    break;
-                }
+            // Stereochemistry validation: Check stereochemistry.
+            if (meta.num_chiral_centers > 0) {
+                if (!validate_chirality_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane)) continue;
             }
 
-            // Write the conformer output.
-            write_conformer_output_(conformer_coordinates_out, conformer_energies_out, conformer_status_out, positions,
-                                    mol, conf, num_atoms, output_atoms_stride, num_conformers_per_molecule,
-                                    final_energy, succeeded, lane);
+            // Fourth-dimension crush: Crush the fourth dimension with 50 FIRE iterations.
+            dg_functor.fourth_dimension_penalty_weight = 10.0f;
+            fire_result_t const crush_result = fire_minimize_(positions, velocities, gradient, dimensions_4d, 50, 1e-4f,
+                                                              lane, dg_functor);
+
+            // Torsion refinement: Run ETK torsion refinement in 3D with 100 FIRE iterations.
+            if (meta.num_etk_torsions > 0) {
+                etk_torsion_energy_functor_t etk_functor {mol_torsions, mol_constraints, etk_interactions,
+                                                          etk_atom_offsets + meta.etk_atom_offsets_start, num_atoms};
+
+                fire_result_t const etk_result = run_fire_stage_(
+                    positions, velocities, gradient, dimensions_3d, refinement_policy.etk_initial_iterations,
+                    refinement_policy.etk_continuation_iterations, refinement_policy.etk_gradient_threshold, lane,
+                    etk_functor);
+                final_energy = etk_result.energy;
+            }
+            else { final_energy = crush_result.energy; }
+
+            // Final validation: Run final validation.
+            bool valid = true;
+            if (meta.num_chiral_centers > 0) {
+                valid = validate_chirality_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane);
+            }
+
+            if (valid) {
+                // ETK-refined 3D positions are the final output of this kernel.
+                // The sibling mmff_polish_warp_kernel picks them up from
+                // conformer_coordinates_out and runs MMFF94 polish in-place.
+                succeeded = true;
+                break;
+            }
         }
+
+        // Write the conformer output.
+        write_conformer_output_(conformer_coordinates_out, conformer_energies_out, conformer_status_out, positions, mol,
+                                conf, num_atoms, output_atoms_stride, num_conformers_per_molecule, final_energy,
+                                succeeded, lane);
     }
 }
 
@@ -442,10 +471,10 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
  *  Shared memory at bin 128 is ~4.5 KB, FIRE scratch only, since no bounds matrix is needed here.
  *  Registers bind before shared memory at every bin.
  *
- *  @b Register-pressure-audit — nvcc 13.0, `cuobjdump --dump-resource-usage`:
- *    sm_80=69, sm_90=72, sm_100=103, sm_120=106 regs/thread.  On sm_90 that is 28 blocks/SM,
- *    against the same 32-warp ceiling a 32-thread block imposes, so this kernel sits closer to
- *    its limit than its sibling does.
+ *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`:
+ *    sm_80=64, sm_90=72, sm_100=94, sm_120=103 regs/thread, no spills (STACK=0, LOCAL=0).
+ *    On sm_90 that is 28 blocks/SM, against the same 32-warp ceiling a 32-thread block imposes,
+ *    which is exactly where its sibling sits.
  *
  *    @c bond_distance is read from global memory on every FIRE iteration, N² per iteration.  It
  *    is only ever tested as `< 3`, `== 3`, and `>= 4`, which is two bits per pair, so an N²/4
@@ -474,15 +503,24 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
     //   [positions, velocities, gradient: 3 × 3·bin_max_atoms × float]
     //   [atom_vdw cache: bin_max_atoms × mmff94_atom_vdw_params_t]
     //   [atom_charge cache: bin_max_atoms × float]
-    // The caches are loaded ONCE per molecule and reused across every FIRE
-    // step of every conformer, eliminating ~2N² duplicate global reads of
+    // The caches are loaded once per warp-loop iteration and reused across every
+    // FIRE step, eliminating ~2N² duplicate global reads of
     // atom_vdw_params[j] / atom_charge[j] inside the nonbonded inner loop.
     extern __shared__ float shared_float[];
     auto *shared_atom_vdw =
         reinterpret_cast<mmff94_atom_vdw_params_t *>(shared_float + 9u * bin_max_atoms);
     float *shared_atom_charge = reinterpret_cast<float *>(shared_atom_vdw + bin_max_atoms);
 
-    for (std::uint32_t mol = warp_id; mol < total_molecules; mol += grid_stride) {
+    // One warp per (molecule, conformer) pair, matching the sibling kernel's index space so
+    // both launches size their grid off the same pair count.
+    std::uint32_t const total_pairs = total_molecules * num_conformers_per_molecule;
+    for (std::uint32_t pair_index = warp_id; pair_index < total_pairs; pair_index += grid_stride) {
+        std::uint32_t const mol = pair_index / num_conformers_per_molecule;
+        std::uint32_t const conf = pair_index - mol * num_conformers_per_molecule;
+
+        std::uint32_t const slot = mol * num_conformers_per_molecule + conf;
+        if (conformer_status_in[slot] != 0) continue;
+
         auto const meta = molecule_metadata[mol];
         std::uint32_t const num_atoms = meta.num_atoms;
         std::uint32_t const dimensions_3d = 3 * num_atoms;
@@ -492,7 +530,7 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
 
         auto const refinement_policy = select_refinement_policy_(meta);
 
-        // Stage per-atom params into shmem for this molecule.  6 float-words
+        // Stage per-atom params into shmem for this pair.  6 float-words
         // per atom_vdw entry (24 bytes, aligned 8) + 1 word per atom_charge.
         // Iterate as a flat float-words sweep so all lanes participate.
         {
@@ -524,42 +562,35 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
         float *velocities = shared_float + dimensions_3d;
         float *gradient = shared_float + 2 * dimensions_3d;
 
-        for (std::uint32_t conf = 0; conf < num_conformers_per_molecule; ++conf) {
-            std::uint32_t const slot = mol * num_conformers_per_molecule + conf;
-            if (conformer_status_in[slot] != 0) continue;
+        std::uint32_t const coord_offset = slot * output_atoms_stride * 3;
 
-            std::uint32_t const coord_offset = slot * output_atoms_stride * 3;
+        // Stage in ETK-refined positions from global memory (SoA layout).
+        for (std::uint32_t d = 0; d < 3; ++d)
+            for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
+                positions[d * num_atoms + i] = conformer_coordinates_out[coord_offset + d * output_atoms_stride + i];
+        __syncwarp(full_mask_k);
 
-            // Stage in ETK-refined positions from global memory (SoA layout).
-            for (std::uint32_t d = 0; d < 3; ++d)
-                for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
-                    positions[d * num_atoms + i] =
-                        conformer_coordinates_out[coord_offset + d * output_atoms_stride + i];
-            __syncwarp(full_mask_k);
+        fire_result_t mmff_result = run_fire_stage_(positions, velocities, gradient, dimensions_3d,
+                                                    refinement_policy.mmff_initial_iterations,
+                                                    refinement_policy.mmff_continuation_iterations,
+                                                    refinement_policy.mmff_gradient_threshold, lane, mmff_functor);
 
-            fire_result_t mmff_result = run_fire_stage_(positions, velocities, gradient, dimensions_3d,
-                                                        refinement_policy.mmff_initial_iterations,
-                                                        refinement_policy.mmff_continuation_iterations,
-                                                        refinement_policy.mmff_gradient_threshold, lane, mmff_functor);
-
-            bool const run_heavy_rescue = is_heavy_refinement_case_(meta) &&
-                                          (mmff_result.status != 0 ||
-                                           mmff_result.energy > heavy_mmff_rescue_threshold_(meta));
-            if (run_heavy_rescue) {
-                mmff_result = run_fire_stage_(positions, velocities, gradient, dimensions_3d, 160, 160, 2.5e-5f, lane,
-                                              mmff_functor);
-            }
-            float const mmff_energy = mmff_result.energy;
-
-            // Write polished positions + updated energy back.  Status is left
-            // untouched: MMFF non-convergence does not mark the conformer failed.
-            for (std::uint32_t d = 0; d < 3; ++d)
-                for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
-                    conformer_coordinates_out[coord_offset + d * output_atoms_stride + i] =
-                        positions[d * num_atoms + i];
-            if (lane == 0) conformer_energies_out[slot] = mmff_energy;
-            __syncwarp(full_mask_k);
+        bool const run_heavy_rescue = is_heavy_refinement_case_(meta) &&
+                                      (mmff_result.status != 0 ||
+                                       mmff_result.energy > heavy_mmff_rescue_threshold_(meta));
+        if (run_heavy_rescue) {
+            mmff_result = run_fire_stage_(positions, velocities, gradient, dimensions_3d, 160, 160, 2.5e-5f, lane,
+                                          mmff_functor);
         }
+        float const mmff_energy = mmff_result.energy;
+
+        // Write polished positions + updated energy back.  Status is left
+        // untouched: MMFF non-convergence does not mark the conformer failed.
+        for (std::uint32_t d = 0; d < 3; ++d)
+            for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
+                conformer_coordinates_out[coord_offset + d * output_atoms_stride + i] = positions[d * num_atoms + i];
+        if (lane == 0) conformer_energies_out[slot] = mmff_energy;
+        __syncwarp(full_mask_k);
     }
 }
 

@@ -44,10 +44,15 @@ void evaluate_mmff_energy_and_gradient(sfp::etkdg_prepared_molecule_t const &pre
                                        std::vector<float> const &positions_soa, float *out_energy,
                                        std::vector<float> &gradient_out) {
     gradient_out.assign(positions_soa.size(), 0.0f);
+    // The pool ships no hop matrix: the device rebuilds it per wave from the bond list, and this
+    // single-molecule harness does the same so the nonbonded sweep sees production's exclusions.
+    std::vector<std::uint8_t> bond_hops;
+    sftest::fill_bond_hops(prepared.mmff_bonds.data(), static_cast<std::uint32_t>(prepared.mmff_bonds.size()),
+                           prepared.num_atoms, bond_hops);
     gpu_mmff_energy(positions_soa.data(), prepared.num_atoms,
                     prepared.mmff_atom_vdw.empty() ? nullptr : prepared.mmff_atom_vdw.data(),
                     prepared.mmff_atom_charge.empty() ? nullptr : prepared.mmff_atom_charge.data(),
-                    prepared.bond_distance.empty() ? nullptr : prepared.bond_distance.data(),
+                    bond_hops.empty() ? nullptr : bond_hops.data(),
                     prepared.mmff_bonds.empty() ? nullptr : prepared.mmff_bonds.data(),
                     static_cast<std::uint32_t>(prepared.mmff_bonds.size()),
                     prepared.mmff_angles.empty() ? nullptr : prepared.mmff_angles.data(),

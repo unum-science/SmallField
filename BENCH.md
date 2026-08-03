@@ -1,7 +1,7 @@
 # SmallField Benchmarks
 
 Throughput, scaling, and quality measurements on the current build.
-Last refreshed 2026-04-16.
+Last refreshed 2026-07-31.
 
 Covers ETKDG + MMFF94 conformer generation.
 
@@ -26,6 +26,37 @@ See [`GLOSSARY.md`](GLOSSARY.md) for the canonical vocabulary used below (`parqu
 ## End-to-End Throughput
 
 All numbers are conformers per second — succeeded conformers divided by wall time.
+
+### Single H100, PubChem 5K, K=3
+
+Measured on this box, three interleaved runs per arm, `--multi-gpu-only`, spread under 1 %.
+
+| Build | conf/s | Note |
+| :---- | -----: | :--- |
+Both corpora, three runs per arm on an idle box, comparing `1a0bcda` against `31a1e85` — conformer parallelism, the device bond-hop BFS, and the register cut together, of which parallelism dominates.
+
+| Corpus | before | after | |
+| :----- | -----: | ----: | :-- |
+| PubChem, stratified across 116 shards | 1 924 | 4 359 | __2.27×__ |
+| Enamine REAL, stratified across 8 shards | 4 612 | 7 262 | __1.58×__ |
+
+The gap between the two is the point.
+The old shape capped its grid at the molecule count, so an atom-limited bin holding fewer molecules than the grid cap could not fill the device.
+PubChem spreads across all eight bins and starves in four of them; REAL tops out at 72 atoms, so bins 96, 112 and 128 are empty and 98 % of its molecules land in bins 48 and 64 — which were already large enough to fill the grid.
+REAL was less starved to begin with, and gains correspondingly less.
+
+REAL is also faster in absolute terms on both builds, and succeeds at 99.2 % against PubChem's ~91 %: narrower molecules, fewer stereo retries.
+
+| Same PubChem measurement, at 72 regs/thread instead of 80 | 4 359 | +0.2 %, inside the noise |
+
+That second row is a negative result worth keeping.
+Dropping `etkdg_pipeline_warp_kernel` from 80 to 72 registers lifts it from 25 to 28 blocks per SM, a 12 % occupancy gain, and moves throughput by nothing measurable — so the kernel is not occupancy-limited at production bin sizes, and the remaining eight registers to 64 would not pay either.
+
+On Enamine REAL, the acceptance corpus, the same build runs at __7 262 conf/s__ (7275 / 7237 / 7275, 0.5 % spread) with a 99.2 % success rate.
+REAL tops out at 72 atoms, so bins 96, 112 and 128 are empty and 98 % of molecules land in bins 48 and 64.
+
+The old shape also swings with machine load — an interleaved set taken while other work shared the box read 1 371–1 937 against 4 097–4 270 — which is the signature of a latency-bound launch.
+The new shape holds under 1 % either way.
 
 ### SmallField — 8 GPUs, USearch 10M
 
@@ -115,8 +146,16 @@ Captures under `bench/profiling/ncu/2026-04-16-phase3/`.
 | `mmff_polish_warp_kernel`    |  64 |   96 |   2.30 KB |                  30 / 20 |         41.67 % |
 | `mmff_polish_warp_kernel`    | 128 |   96 |   4.61 KB |                  18 / 20 |         37.50 % |
 
-The MMFF polish kernel runs with 4.5× higher theoretical occupancy than the DG+ETK kernel at bin 128 because it carries no bounds matrix in shared memory — only the 3D FIRE scratch arrays.
-The DG+ETK kernel is shared-memory-bound at large molecules; its int8-quantized bounds matrix — 16 KB at N=128 — is the binding constraint.
+Those figures are sm_120.
+On this H100, `cuobjdump --dump-resource-usage` reports `etkdg_pipeline_warp_kernel` at __80 regs__ and `mmff_polish_warp_kernel` at 72, no spills.
+
+__Registers bind, not shared memory.__
+The shared-memory reading above holds only at N=128, which is 0.1 % of PubChem.
+At the median molecule of 45 atoms the DG kernel uses 4.5 KB of the SM's 228 KB, while 80 regs/thread allows 25 blocks/SM.
+
+There is also a ceiling independent of both: a 32-thread block can occupy at most 32 of the SM's 64 warp slots, so __50 % is the most this kernel shape can reach at any register count__.
+`maxBlocksPerMultiProcessor` is 32, measured.
+Cutting to 64 regs/thread reaches that ceiling and is worth about 1.28×; nothing below 32 regs/thread buys more.
 
 ## Quality Snapshot
 

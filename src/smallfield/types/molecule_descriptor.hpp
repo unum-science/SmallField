@@ -10,7 +10,10 @@
  *  Layout is SoA for cache locality and so the same struct can be memcpy'd straight
  *  to device memory when the GPU upload format converges with the CPU working format.
  *
- *  Size: ~22 KB for N=128. Stack-allocates cleanly.
+ *  Size: ~5.5 KB for N=128. Stack-allocates cleanly.  The all-pairs bond-hop matrix is
+ *  not a member: it costs 16 KB and is a pure function of the 1.8 KB CSR adjacency, so
+ *  every consumer derives it — @ref fill_bond_distances on the host, the warp BFS in
+ *  `smallfield/cuda/bond_distance_kernel.cuh` on the device.
  */
 
 #pragma once
@@ -112,8 +115,6 @@ struct alignas(8) molecule_descriptor_t {
     std::uint16_t neighbor_offset[max_atoms_k + 1]; ///< prefix sum; neighbor_offset[N] = total
     std::uint8_t neighbor_atom[max_neighbor_entries_k];
     std::uint16_t neighbor_bond[max_neighbor_entries_k];
-
-    std::uint8_t bond_distance[max_atoms_k * max_atoms_k]; ///< BFS shortest path (clamped to 255)
 
     std::uint16_t ring_offset[max_rings_k + 1];  ///< atoms per ring, prefix sum
     std::uint8_t ring_atoms[max_atoms_k * 2];    ///< concatenated ring atoms (SSSR is sparse)
@@ -257,29 +258,6 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
         cursor[aj]++;
     }
 
-    // distance clamped to 255 (plenty for N≤128). Unreachable pairs stay 255.
-    std::memset(desc.bond_distance, 255, sizeof(desc.bond_distance));
-    std::uint8_t bfs_queue[max_atoms_k];
-    for (std::uint32_t source = 0; source < num_atoms; ++source) {
-        desc.bond_distance[source * max_atoms_k + source] = 0;
-        std::uint32_t head = 0;
-        std::uint32_t tail = 0;
-        bfs_queue[tail++] = static_cast<std::uint8_t>(source);
-        while (head < tail) {
-            std::uint8_t current = bfs_queue[head++];
-            std::uint8_t next_dist = desc.bond_distance[source * max_atoms_k + current] + 1;
-            std::uint16_t const start = desc.neighbor_offset[current];
-            std::uint16_t const end = desc.neighbor_offset[current + 1];
-            for (std::uint16_t n = start; n < end; ++n) {
-                std::uint8_t neighbor = desc.neighbor_atom[n];
-                if (desc.bond_distance[source * max_atoms_k + neighbor] > next_dist) {
-                    desc.bond_distance[source * max_atoms_k + neighbor] = next_dist;
-                    bfs_queue[tail++] = neighbor;
-                }
-            }
-        }
-    }
-
     // A bond is in a ring iff there's a path from atom_i to atom_j not using that bond.
     // Cheap test: check RDKit's bond->getIsRingBond() via the RingInfo.
     std::memset(desc.ring_bond_degree, 0, sizeof(desc.ring_bond_degree));
@@ -331,9 +309,43 @@ inline bool bond_has_flag(molecule_descriptor_t const &desc, std::uint32_t bond_
     return (desc.bond_flags[bond_idx] & flag) != 0;
 }
 
-/** Bond distance between atoms i and j (in bonds). 255 if unreachable. */
-inline std::uint8_t bonds_between(molecule_descriptor_t const &desc, std::uint32_t i, std::uint32_t j) {
-    return desc.bond_distance[i * max_atoms_k + j];
+/**
+ *  @brief Fill @p matrix with the all-pairs bond-hop counts of @p desc.
+ *
+ *  One breadth-first search per source atom over the CSR adjacency, writing row @c source
+ *  at @c source*row_stride.  Atoms with no bonded path between them — the two halves of a
+ *  salt, a solvate's water — keep the 255 sentinel that the MMFF nonbonded sweep reads as
+ *  "unreachable", and 255 is also the saturation value, unreachable for N <= 128 where the
+ *  longest simple path is 127 hops.
+ *
+ *  @param[in] desc Descriptor supplying the atom count and the CSR adjacency.
+ *  @param[out] matrix Caller-owned buffer of at least @p row_stride times @c desc.num_atoms bytes.
+ *  @param[in] row_stride Element distance between consecutive rows; at least @c desc.num_atoms.
+ */
+inline void fill_bond_distances(molecule_descriptor_t const &desc, std::uint8_t *matrix, std::uint32_t row_stride) {
+    std::uint32_t const num_atoms = desc.num_atoms;
+    std::memset(matrix, 255, static_cast<std::size_t>(row_stride) * num_atoms);
+    std::uint8_t queue[max_atoms_k];
+    for (std::uint32_t source = 0; source < num_atoms; ++source) {
+        std::uint8_t *const row = matrix + static_cast<std::size_t>(source) * row_stride;
+        row[source] = 0;
+        std::uint32_t head = 0;
+        std::uint32_t tail = 0;
+        queue[tail++] = static_cast<std::uint8_t>(source);
+        while (head < tail) {
+            std::uint8_t const current = queue[head++];
+            std::uint8_t const next_distance = static_cast<std::uint8_t>(row[current] + 1);
+            std::uint16_t const start = desc.neighbor_offset[current];
+            std::uint16_t const end = desc.neighbor_offset[current + 1];
+            for (std::uint16_t n = start; n < end; ++n) {
+                std::uint8_t const neighbor = desc.neighbor_atom[n];
+                if (row[neighbor] > next_distance) {
+                    row[neighbor] = next_distance;
+                    queue[tail++] = neighbor;
+                }
+            }
+        }
+    }
 }
 
 /** True iff atom i and atom j are in the same SSSR ring. */
