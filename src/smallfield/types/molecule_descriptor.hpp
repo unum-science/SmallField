@@ -69,6 +69,9 @@ enum bond_flag_t : std::uint8_t {
     bond_flag_stereo_z_k = 1u << 4, ///< Z / cis
 };
 
+/** @brief Sentinel in `bond_stereo_atom_i` / `_j` for a bond with no E/Z assignment. */
+inline constexpr std::uint8_t no_stereo_atom_k = 0xFFu;
+
 /**
  *  Flat molecule descriptor. All fields SoA, stack-allocated.
  *
@@ -95,6 +98,12 @@ struct alignas(8) molecule_descriptor_t {
     std::uint8_t bond_atom_j[max_bonds_k];
     std::uint8_t bond_order[max_bonds_k]; ///< 1, 2, 3 (aromatic reported as 4; check flags)
     std::uint8_t bond_flags[max_bonds_k]; ///< bitwise OR of bond_flag_t
+    /** @brief The two substituents the E/Z flag is stated relative to — one neighbour of
+     *  each double-bond end, `no_stereo_atom_k` when the bond carries no E/Z.  The flag
+     *  alone is not enough to place an arbitrary 1-4 pair: it fixes the relationship of
+     *  *these* two atoms, and any other substituent sits on the opposite side of its end. */
+    std::uint8_t bond_stereo_atom_i[max_bonds_k];
+    std::uint8_t bond_stereo_atom_j[max_bonds_k];
 
     std::uint16_t neighbor_offset[max_atoms_k + 1]; ///< prefix sum; neighbor_offset[N] = total
     std::uint8_t neighbor_atom[max_neighbor_entries_k];
@@ -190,6 +199,23 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
         if (stereo == RDKit::Bond::STEREOE || stereo == RDKit::Bond::STEREOTRANS) flags |= bond_flag_stereo_e_k;
         if (stereo == RDKit::Bond::STEREOZ || stereo == RDKit::Bond::STEREOCIS) flags |= bond_flag_stereo_z_k;
         desc.bond_flags[b] = flags;
+
+        // The E/Z assignment is stated relative to a specific pair of substituents, one
+        // per double-bond end.  Record them so the bounds builder can tell which side any
+        // given 1-4 partner lands on.
+        desc.bond_stereo_atom_i[b] = no_stereo_atom_k;
+        desc.bond_stereo_atom_j[b] = no_stereo_atom_k;
+        if (flags & (bond_flag_stereo_e_k | bond_flag_stereo_z_k)) {
+            auto const &stereo_atoms = bond->getStereoAtoms();
+            if (stereo_atoms.size() == 2) {
+                std::uint32_t const first = static_cast<std::uint32_t>(stereo_atoms[0]);
+                std::uint32_t const second = static_cast<std::uint32_t>(stereo_atoms[1]);
+                if (first < num_atoms && second < num_atoms) {
+                    desc.bond_stereo_atom_i[b] = static_cast<std::uint8_t>(first);
+                    desc.bond_stereo_atom_j[b] = static_cast<std::uint8_t>(second);
+                }
+            }
+        }
     }
 
     for (std::uint32_t a = 0; a < num_atoms; ++a) {

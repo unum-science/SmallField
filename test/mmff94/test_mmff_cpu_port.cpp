@@ -295,7 +295,9 @@ void rdkit_direct_extract(RDKit::ROMol &mol, sft::molecule_descriptor_t const &d
                 unsigned at;
                 ForceFields::MMFF::MMFFAngle ap;
                 if (!props.getMMFFAngleBendParams(mol, ai, c, aj, at, ap)) continue;
-                out.mmff_angles.push_back({(std::uint8_t)ai, (std::uint8_t)c, (std::uint8_t)aj, 0, (float)ap.ka,
+                auto const *prop_center = (*RDKit::MMFF::DefaultParameters::getMMFFProp())(props.getMMFFAtomType(c));
+                std::uint8_t const is_linear = (prop_center && prop_center->linh) ? 1u : 0u;
+                out.mmff_angles.push_back({(std::uint8_t)ai, (std::uint8_t)c, (std::uint8_t)aj, is_linear, (float)ap.ka,
                                            (float)(ap.theta0 * M_PI / 180.0), 0.0f});
             }
     }

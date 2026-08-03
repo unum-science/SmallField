@@ -133,7 +133,7 @@ __device__ __forceinline__ fire_result_t run_fire_stage_(float *positions, float
  */
 __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory_bytes(std::uint32_t max_atoms) {
     std::uint32_t const dimensions_4d = 4 * max_atoms;
-    std::uint32_t const bounds_bytes = max_atoms * max_atoms * sizeof(std::uint8_t);
+    std::uint32_t const bounds_bytes = max_atoms * compute_bounds_row_stride(max_atoms) * sizeof(std::uint8_t);
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
     std::uint32_t const fire_arrays = 3 * dimensions_4d * sizeof(float);
     return aligned_bounds_bytes + fire_arrays;
@@ -290,7 +290,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     extern __shared__ char shared_raw[];
     std::uint32_t const max_n = max_atoms_per_molecule;
     std::uint8_t *shared_bounds = reinterpret_cast<std::uint8_t *>(shared_raw);
-    std::uint32_t const bounds_bytes = max_n * max_n * sizeof(std::uint8_t);
+    std::uint32_t const bounds_bytes = max_n * compute_bounds_row_stride(max_n) * sizeof(std::uint8_t);
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
     float *shared_float = reinterpret_cast<float *>(shared_raw + aligned_bounds_bytes);
 
@@ -335,11 +335,16 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         float const scale_quantize = 255.0f / range;
         float const inv_scale = range * (1.0f / 255.0f);
 
-        for (std::uint32_t i = lane; i < bounds_size; i += warp_size_k) {
-            float const v = global_bounds[i];
-            int q = __float2int_rn((v - mol_min) * scale_quantize);
-            q = max(0, min(255, q));
-            shared_bounds[i] = static_cast<std::uint8_t>(q);
+        // Global keeps the packed n² stride the metric prepass wrote back; shared uses the
+        // bank-conflict-free padded stride, so the flat index has to be decomposed.
+        std::uint32_t const bounds_row_stride = compute_bounds_row_stride(num_atoms);
+        for (std::uint32_t entry_index = lane; entry_index < bounds_size; entry_index += warp_size_k) {
+            float const value = global_bounds[entry_index];
+            int quantized = __float2int_rn((value - mol_min) * scale_quantize);
+            quantized = max(0, min(255, quantized));
+            std::uint32_t const row = entry_index / num_atoms;
+            std::uint32_t const column = entry_index - row * num_atoms;
+            shared_bounds[row * bounds_row_stride + column] = static_cast<std::uint8_t>(quantized);
         }
         __syncwarp(full_mask_k);
 
@@ -364,9 +369,18 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                                                     num_atoms, conf, attempt, lane, &rng_state);
 
                 // Distance geometry minimization: Run DG minimization in 4D with up to 100 FIRE iterations.
-                distance_geometry_energy_functor_t dg_functor {
-                    shared_bounds, mol_chirals, mol_min, inv_scale, num_atoms, meta.num_chiral_centers, 4,
-                    1.0f,          1.0f,        100.0f,  0.0f};
+                distance_geometry_energy_functor_t dg_functor {shared_bounds,
+                                                               mol_chirals,
+                                                               mol_min,
+                                                               inv_scale,
+                                                               bounds_row_stride,
+                                                               num_atoms,
+                                                               meta.num_chiral_centers,
+                                                               4,
+                                                               1.0f,
+                                                               1.0f,
+                                                               100.0f,
+                                                               0.0f};
 
                 fire_result_t const dg_result = fire_minimize_(positions, velocities, gradient, dimensions_4d, 100, 1e-4f, lane,
                                                                dg_functor);

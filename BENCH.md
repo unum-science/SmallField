@@ -120,25 +120,40 @@ The DG+ETK kernel is shared-memory-bound at large molecules; its int8-quantized 
 
 ## Quality Snapshot
 
-Quality check from ChEMBL 8,948 molecules / 3 conformers each, sampled on 256 successful conformers:
+RDKit's MMFF94 is evaluated on SmallField's __own output geometry__, so the two columns describe identical coordinates and the per-conformer difference is the quantity that measures agreement.
+Percentiles of the two energy distributions taken separately do not: a uniform offset, a heavy one-sided tail, and partial cancellation all produce the same apparent shift.
 
-| Metric                          |             Value |
-| ------------------------------- | ----------------: |
-| Finite RDKit MMFF94 evaluations | 250 / 256 = 97.7% |
-| RDKit MMFF94 P50                |     68.8 kcal/mol |
-| SmallField P50                  |     62.7 kcal/mol |
-| Heavy-bin gate, 100–128 atoms   |              PASS |
+Quality check from PubChem 5,000 molecules / 3 conformers each, sampled on 512 successful conformers:
 
-Per-bin medians from the same quality sample:
+| Metric                             |                Value |
+| ---------------------------------- | -------------------: |
+| Finite RDKit MMFF94 evaluations    |    509 / 512 = 99.4% |
+| SmallField − RDKit, paired P50     |      −0.0 kcal/mol   |
+| SmallField − RDKit, paired P5 / P95 | −55.8 / +0.8 kcal/mol |
+| SmallField − RDKit, paired minimum  |    −137.2 kcal/mol   |
+| Heavy-bin gate, 100–128 atoms      |                 FAIL |
 
-| Atom bin | Count | RDKit P50 | SmallField P50 |
-| -------: | ----: | --------: | -------------: |
-|     0–20 |     4 |      13.8 |           13.8 |
-|    20–40 |    76 |      39.3 |           29.4 |
-|    40–60 |   104 |      68.0 |           62.8 |
-|    60–80 |    34 |     103.1 |           94.0 |
-|   80–100 |    19 |     106.2 |          103.1 |
-|  100–128 |    13 |     157.9 |          158.0 |
+Paired per-bin deltas from the same quality sample:
+
+| Atom bin | Count | delta P50 | delta P95 | delta min |
+| -------: | ----: | --------: | --------: | --------: |
+|     0–20 |    10 |      −0.0 |      −0.0 |     −56.8 |
+|    20–40 |   180 |      −0.0 |      +1.5 |    −108.9 |
+|    40–60 |   227 |      −0.0 |      +0.4 |    −129.6 |
+|    60–80 |    67 |      −0.0 |      +0.2 |     −69.0 |
+|   80–100 |    16 |      −1.3 |      +0.1 |    −137.2 |
+|  100–128 |     9 |      −1.7 |     +46.2 |     −75.3 |
+
+Two things the paired view shows that separately-sorted percentiles hid:
+
+- __The median conformer agrees with RDKit to within rounding.__
+  Every bin below 80 atoms has a paired median of −0.0 kcal/mol.
+  Earlier revisions of this table reported a several-kcal/mol gap in SmallField's favour across those same bins; that gap was an artifact of sorting the two arrays independently, not a real energy difference.
+- __A minority of conformers sit far below RDKit.__
+  The paired P5 is −55.8 and the minimum −137.2 kcal/mol, so roughly 5 % of conformers land in a region the MMFF94 functional form does not bound from below — the cubic bend factor `(1 + cb · Δθ)` turns negative past Δθ > 143°, and the FIRE minimizer has no energy-decrease check to reject the step.
+  Tracking this tail is the purpose of the `delta min` column.
+
+The 100–128 bin carries only 9 samples here, so its `FAIL` reflects one outlier rather than a bin-wide regression; re-run at a larger `--quality-samples` before reading anything into it.
 
 ## Reproduction Commands
 

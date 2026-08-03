@@ -96,6 +96,9 @@ using smallfield::types::atom_role_second_k;
 using smallfield::types::atom_role_third_k;
 using smallfield::types::bond_flag_aromatic_k;
 using smallfield::types::bond_flag_in_ring_k;
+using smallfield::types::bond_flag_stereo_e_k;
+using smallfield::types::bond_flag_stereo_z_k;
+using smallfield::types::no_stereo_atom_k;
 using smallfield::types::build_descriptor;
 using smallfield::types::chiral_center_descriptor_t;
 using smallfield::types::distance_constraint_t;
@@ -186,6 +189,36 @@ struct etkdg_prepared_molecule_t {
  *  small residual; we validate P50 energy within 1 kcal/mol of the RDKit
  *  baseline via the quality gate in `bench_chembl`.
  */
+/**
+ *  @brief End-to-end distance of a 1-4 chain `first — second = third — fourth` whose
+ *  central bond is planar, at a torsion of 0 for cis or pi for trans.
+ *
+ *  Unlike a freely rotatable 1-4 pair, a stereo-defined double bond fixes this distance,
+ *  which is how ETKDG enforces E/Z through the bounds matrix.
+ */
+inline float stereo_one_four_distance(molecule_descriptor_t const &desc, std::uint32_t first, std::uint32_t second,
+                                      std::uint32_t third, std::uint32_t fourth, std::uint32_t bond_first_second,
+                                      std::uint32_t bond_second_third, std::uint32_t bond_third_fourth, bool is_cis) {
+    auto bond_length = [&](std::uint32_t bond_index, std::uint32_t a, std::uint32_t b) {
+        bool const aromatic = (desc.bond_flags[bond_index] & bond_flag_aromatic_k) != 0;
+        return ideal_bond_length_angstrom(desc.element[a], desc.element[b], desc.bond_order[bond_index], aromatic);
+    };
+    float const length_12 = bond_length(bond_first_second, first, second);
+    float const length_23 = bond_length(bond_second_third, second, third);
+    float const length_34 = bond_length(bond_third_fourth, third, fourth);
+
+    float const angle_123 = ideal_angle_radians(desc.hybridization[second]);
+    float const angle_234 = ideal_angle_radians(desc.hybridization[third]);
+    float const cos_123 = std::cos(angle_123), sin_123 = std::sin(angle_123);
+    float const cos_234 = std::cos(angle_234), sin_234 = std::sin(angle_234);
+    float const cos_torsion = is_cis ? 1.0f : -1.0f;
+
+    float const squared = length_12 * length_12 + length_23 * length_23 + length_34 * length_34 -
+                          2.0f * length_12 * length_23 * cos_123 - 2.0f * length_23 * length_34 * cos_234 +
+                          2.0f * length_12 * length_34 * (cos_123 * cos_234 - sin_123 * sin_234 * cos_torsion);
+    return std::sqrt(std::max(0.01f, squared));
+}
+
 inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<float> &bounds) {
     std::uint32_t const num_atoms = desc.num_atoms;
     bounds.assign(static_cast<std::size_t>(num_atoms) * num_atoms, 0.0f);
@@ -239,6 +272,24 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
         }
     }
 
+    // Collect the E/Z-defined double bonds up front.  Drug-like molecules have none or a
+    // handful, so the 1-4 sweep below scans a tiny list rather than all bonds, and skips
+    // the check entirely in the common zero case.
+    std::uint32_t stereo_bonds[max_bonds_k];
+    std::uint32_t num_stereo_bonds = 0;
+    for (std::uint32_t b = 0; b < desc.num_bonds; ++b)
+        if ((desc.bond_flags[b] & (bond_flag_stereo_e_k | bond_flag_stereo_z_k)) != 0 &&
+            desc.bond_stereo_atom_i[b] != no_stereo_atom_k)
+            stereo_bonds[num_stereo_bonds++] = b;
+
+    auto find_bond_between = [&](std::uint32_t a, std::uint32_t b) -> std::int32_t {
+        std::uint32_t const nbegin = desc.neighbor_offset[a];
+        std::uint32_t const nend = desc.neighbor_offset[a + 1];
+        for (std::uint32_t p = nbegin; p < nend; ++p)
+            if (desc.neighbor_atom[p] == b) return static_cast<std::int32_t>(desc.neighbor_bond[p]);
+        return -1;
+    };
+
     // set14 — conservative envelope for 1-4 pairs. Takes the sum of two bond lengths
     // plus a torsion-dependent spread as the upper bound; VdW minimum sum as the lower.
     // Uses descriptor BFS distances.
@@ -246,6 +297,43 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
         for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
             std::uint8_t const bd = desc.bond_distance[i * max_atoms_k + j];
             if (bd != 3) continue;
+
+            // A 1-4 pair spanning a stereo-defined double bond has a determined
+            // end-to-end distance rather than a free envelope.  Leaving the generic
+            // 4.5 Å upper in place lets smoothing and FIRE settle on either isomer.
+            bool stereo_constrained = false;
+            for (std::uint32_t s = 0; s < num_stereo_bonds && !stereo_constrained; ++s) {
+                std::uint32_t const bond = stereo_bonds[s];
+                std::uint32_t end_near_i = desc.bond_atom_i[bond];
+                std::uint32_t end_near_j = desc.bond_atom_j[bond];
+                std::int32_t bond_i = find_bond_between(i, end_near_i);
+                std::int32_t bond_j = find_bond_between(j, end_near_j);
+                if (bond_i < 0 || bond_j < 0) {
+                    std::swap(end_near_i, end_near_j);
+                    bond_i = find_bond_between(i, end_near_i);
+                    bond_j = find_bond_between(j, end_near_j);
+                    if (bond_i < 0 || bond_j < 0) continue;
+                }
+                // The flag fixes the relationship of the two recorded reference atoms.
+                // Any other substituent on an end sits opposite that end's reference, so
+                // each mismatch flips the sense.
+                std::uint32_t const reference_i = desc.bond_stereo_atom_i[bond];
+                std::uint32_t const reference_j = desc.bond_stereo_atom_j[bond];
+                bool reference_on_i_side = find_bond_between(reference_i, end_near_i) >= 0;
+                std::uint32_t const own_reference = reference_on_i_side ? reference_i : reference_j;
+                std::uint32_t const other_reference = reference_on_i_side ? reference_j : reference_i;
+                bool is_cis = (desc.bond_flags[bond] & bond_flag_stereo_z_k) != 0;
+                if (i != own_reference) is_cis = !is_cis;
+                if (j != other_reference) is_cis = !is_cis;
+
+                float const target = stereo_one_four_distance(desc, i, end_near_i, end_near_j, j,
+                                                              static_cast<std::uint32_t>(bond_i), bond,
+                                                              static_cast<std::uint32_t>(bond_j), is_cis);
+                set_pair(i, j, target * 0.95f, target * 1.05f);
+                stereo_constrained = true;
+            }
+            if (stereo_constrained) continue;
+
             // Approximate: upper ≈ 3 × average C-C bond ≈ 4.5 Å; lower ≈ VdW contact.
             float const lower = vdw_lower_bound_angstrom(desc.element[i], desc.element[j]);
             float const upper = 4.5f;
@@ -688,9 +776,13 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
                     cached_vals.theta0_rad = static_cast<float>(ap.theta0 * M_PI / 180.0);
                     mmff_angle_cache().insert(key, cached_vals);
                 }
+                // `linh` depends only on the central atom's MMFF type, so it is read
+                // outside the angle-parameter cache rather than widening that key.
+                auto const *prop_center = (*RDKit::MMFF::DefaultParameters::getMMFFProp())(atom_type[center]);
+                std::uint8_t const is_linear = (prop_center && prop_center->linh) ? 1u : 0u;
                 result.mmff_angles.push_back({static_cast<std::uint8_t>(ai), static_cast<std::uint8_t>(center),
-                                              static_cast<std::uint8_t>(aj), 0, cached_vals.ka, cached_vals.theta0_rad,
-                                              0.0f});
+                                              static_cast<std::uint8_t>(aj), is_linear, cached_vals.ka,
+                                              cached_vals.theta0_rad, 0.0f});
             }
         }
     }

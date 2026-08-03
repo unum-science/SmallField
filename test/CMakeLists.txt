@@ -66,6 +66,21 @@ add_mixed_test(mmff94 mmff_gpu_extract)
 add_cpp_test(mmff94 mmff_cpu_port)
 add_cpp_test(mmff94 mmff_typer)
 
+# Per-term parity reuses the single-molecule energy entry point that the gradient
+# test's kernel wrapper already exposes.
+add_executable(test_mmff_term_parity mmff94/test_mmff_term_parity.cpp
+  kernels/test_mmff_gradient_kernels.cu)
+set_source_files_properties(mmff94/test_mmff_term_parity.cpp PROPERTIES LANGUAGE
+  CXX)
+target_link_libraries(test_mmff_term_parity PRIVATE test_helpers smallfield_lib
+  OpenMP::OpenMP_CXX)
+target_include_directories(
+  test_mmff_term_parity PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+set_target_properties(test_mmff_term_parity PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON LINKER_LANGUAGE CUDA)
+add_test(NAME test_mmff_term_parity COMMAND test_mmff_term_parity)
+
 # --- api/ ---
 add_executable(test_pipeline api/test_pipeline.cpp)
 set_source_files_properties(api/test_pipeline.cpp PROPERTIES LANGUAGE CXX)
@@ -76,3 +91,13 @@ target_include_directories(
   ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 set_target_properties(test_pipeline PROPERTIES LINKER_LANGUAGE CUDA)
 add_test(NAME test_pipeline COMMAND test_pipeline)
+
+add_executable(test_ez_stereo api/test_ez_stereo.cpp)
+set_source_files_properties(api/test_ez_stereo.cpp PROPERTIES LANGUAGE CXX)
+target_link_libraries(test_ez_stereo PRIVATE test_helpers smallfield_lib
+  OpenMP::OpenMP_CXX)
+target_include_directories(
+  test_ez_stereo PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+set_target_properties(test_ez_stereo PROPERTIES LINKER_LANGUAGE CUDA)
+add_test(NAME test_ez_stereo COMMAND test_ez_stereo)

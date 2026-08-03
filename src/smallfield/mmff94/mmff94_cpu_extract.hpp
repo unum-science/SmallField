@@ -137,8 +137,10 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &desc, std:
                     theta0_deg = emp.second;
                 }
                 float const theta0_rad = theta0_deg * static_cast<float>(M_PI) / 180.0f;
+                auto const *prop_center = lookup_prop(tables, atom_types[center]);
+                std::uint8_t const is_linear = (prop_center && prop_center->linh) ? 1u : 0u;
                 result.mmff_angles.push_back({static_cast<std::uint8_t>(ai), static_cast<std::uint8_t>(center),
-                                              static_cast<std::uint8_t>(aj), 0, ka, theta0_rad, 0.0f});
+                                              static_cast<std::uint8_t>(aj), is_linear, ka, theta0_rad, 0.0f});
                 angles_scratch[num_angles_scratch++] = {static_cast<std::uint8_t>(ai),
                                                         static_cast<std::uint8_t>(center),
                                                         static_cast<std::uint8_t>(aj),

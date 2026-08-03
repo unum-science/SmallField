@@ -59,6 +59,18 @@ static double percentile(std::vector<double> &sorted_values, double p) {
     return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac;
 }
 
+/** @brief Fill @p delta with sorted per-conformer `smallfield − rdkit` differences.
+ *  Inputs must be in matching sample order; the subtraction happens before any sort so
+ *  the pairing survives.  @p delta is caller-owned and reused across bins — it keeps its
+ *  capacity, so the per-bin loop allocates once rather than once per bin. */
+static void paired_energy_delta_into(std::vector<double> const &rdkit_energies,
+                                     std::vector<double> const &smallfield_energies, std::vector<double> &delta) {
+    delta.clear();
+    for (std::size_t sample_index = 0; sample_index < rdkit_energies.size(); ++sample_index)
+        delta.push_back(smallfield_energies[sample_index] - rdkit_energies[sample_index]);
+    std::sort(delta.begin(), delta.end());
+}
+
 static void bench_rdkit_cpu(std::vector<std::string> const &smiles, std::uint32_t num_conformers,
                             std::uint32_t max_stereo_attempts) {
     int num_threads = omp_get_max_threads();
@@ -298,6 +310,22 @@ static void cross_validate(std::vector<std::string> const &smiles, std::vector<_
                 100.0 * num_finite_energies / successful_conformers.size());
 
     if (!finite_rdkit_energies.empty()) {
+        // Both columns describe the same geometry — RDKit is evaluated on SmallField's
+        // own output coordinates — so the per-conformer difference is the quantity that
+        // measures agreement.  Independently sorted marginals do not: a uniform offset,
+        // a heavy negative tail, and partial cancellation all produce the same shift.
+        // Scratch reused by every delta computation below, including the per-bin loop.
+        std::vector<double> paired_delta;
+        paired_delta.reserve(finite_rdkit_energies.size());
+        paired_energy_delta_into(finite_rdkit_energies, finite_smallfield_energies, paired_delta);
+
+        std::printf("  SmallField − RDKit, paired per conformer (kcal/mol):\n");
+        std::printf("    P5=%+.1f  P25=%+.1f  P50=%+.1f  P75=%+.1f  P95=%+.1f  min=%+.1f  max=%+.1f\n",
+                    percentile(paired_delta, 5), percentile(paired_delta, 25), percentile(paired_delta, 50),
+                    percentile(paired_delta, 75), percentile(paired_delta, 95), paired_delta.front(),
+                    paired_delta.back());
+
+        // Marginals are retained for context only; they do not measure agreement.
         std::sort(finite_rdkit_energies.begin(), finite_rdkit_energies.end());
         std::sort(finite_smallfield_energies.begin(), finite_smallfield_energies.end());
 
@@ -310,15 +338,21 @@ static void cross_validate(std::vector<std::string> const &smiles, std::vector<_
                     percentile(finite_smallfield_energies, 25), percentile(finite_smallfield_energies, 50),
                     percentile(finite_smallfield_energies, 75), percentile(finite_smallfield_energies, 95));
 
-        // Print the per-atom-count breakdown.
+        // Print the per-atom-count breakdown.  `delta_min` surfaces the negative tail
+        // that a shifted median hides — the MMFF cubic bend term is unbounded below
+        // past Δθ > 143°, and only the minimum exposes a conformer that fell into it.
         std::printf("  Per-atom-count breakdown:\n");
-        std::printf("    %6s  %6s  %8s  %8s\n", "atoms", "count", "rdkit_P50", "sf_P50");
-        std::vector<std::uint32_t> atom_count_bins = {20, 40, 60, 80, 100, 128};
-        std::vector<double> heavy_atom_rdkit_energies;
-        for (std::size_t bin_index = 0; bin_index < atom_count_bins.size(); ++bin_index) {
+        std::printf("    %6s  %6s  %9s  %9s  %9s\n", "atoms", "count", "delta_P50", "delta_P95", "delta_min");
+        constexpr std::uint32_t atom_count_bins[] = {20, 40, 60, 80, 100, 128};
+        // Four scratch buffers hoisted out of the bin loop; each is cleared per bin and
+        // keeps its capacity, so the whole breakdown costs one growth phase.
+        std::vector<double> bin_rdkit_energies, bin_smallfield_energies, bin_delta;
+        std::vector<double> heavy_atom_rdkit_energies, heavy_atom_delta;
+        for (std::size_t bin_index = 0; bin_index < std::size(atom_count_bins); ++bin_index) {
             std::uint32_t lower_bound = (bin_index == 0) ? 0 : atom_count_bins[bin_index - 1];
             std::uint32_t upper_bound = atom_count_bins[bin_index];
-            std::vector<double> bin_rdkit_energies, bin_smallfield_energies;
+            bin_rdkit_energies.clear();
+            bin_smallfield_energies.clear();
             for (std::size_t sample_index = 0; sample_index < successful_conformers.size(); ++sample_index) {
                 if (std::isfinite(rdkit_reference_energies[sample_index]) && atom_counts[sample_index] > lower_bound &&
                     atom_counts[sample_index] <= upper_bound) {
@@ -326,21 +360,26 @@ static void cross_validate(std::vector<std::string> const &smiles, std::vector<_
                     bin_smallfield_energies.push_back(smallfield_energies[sample_index]);
                 }
             }
-            if (!bin_rdkit_energies.empty()) {
+            if (bin_rdkit_energies.empty()) continue;
+            paired_energy_delta_into(bin_rdkit_energies, bin_smallfield_energies, bin_delta);
+            std::printf("    %3u-%-3u  %5zu  %+9.1f  %+9.1f  %+9.1f\n", lower_bound, upper_bound, bin_delta.size(),
+                        percentile(bin_delta, 50), percentile(bin_delta, 95), bin_delta.front());
+            if (lower_bound == 100 && upper_bound == 128) {
                 std::sort(bin_rdkit_energies.begin(), bin_rdkit_energies.end());
-                std::sort(bin_smallfield_energies.begin(), bin_smallfield_energies.end());
-                std::printf("    %3u-%-3u  %5zu  %8.1f  %8.1f\n", lower_bound, upper_bound, bin_rdkit_energies.size(),
-                            percentile(bin_rdkit_energies, 50), percentile(bin_smallfield_energies, 50));
-                if (lower_bound == 100 && upper_bound == 128) heavy_atom_rdkit_energies = bin_rdkit_energies;
+                heavy_atom_rdkit_energies = bin_rdkit_energies;
+                heavy_atom_delta = bin_delta;
             }
         }
 
         if (!heavy_atom_rdkit_energies.empty()) {
             double const heavy_p50 = percentile(heavy_atom_rdkit_energies, 50);
             double const heavy_p95 = percentile(heavy_atom_rdkit_energies, 95);
-            bool const passes_gate = heavy_p50 < 180.0 && heavy_p95 < 300.0;
-            std::printf("  Heavy-bin gate (100-128 atoms): P50=%.1f  P95=%.1f  [%s]\n", heavy_p50, heavy_p95,
-                        passes_gate ? "PASS" : "FAIL");
+            double const heavy_delta_p50 = percentile(heavy_atom_delta, 50);
+            // The absolute bounds catch a blown-up geometry; the paired median catches a
+            // force-field divergence that leaves the absolute energies looking plausible.
+            bool const passes_gate = heavy_p50 < 180.0 && heavy_p95 < 300.0 && std::fabs(heavy_delta_p50) < 10.0;
+            std::printf("  Heavy-bin gate (100-128 atoms): P50=%.1f  P95=%.1f  delta_P50=%+.1f  [%s]\n", heavy_p50,
+                        heavy_p95, heavy_delta_p50, passes_gate ? "PASS" : "FAIL");
         }
     }
 }

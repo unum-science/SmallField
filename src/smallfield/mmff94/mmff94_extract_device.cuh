@@ -250,9 +250,11 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
                     theta0_deg = emp.second;
                 }
                 float const theta0_rad = theta0_deg * (float)M_PI / 180.0f;
+                auto const *prop_center = lookup_prop(tables, at_span[center]);
+                std::uint8_t const is_linear = (prop_center && prop_center->linh) ? 1u : 0u;
                 if (angle_count < max_mmff_angles_per_mol_k) {
                     angles_out[angle_count++] = {
-                        (std::uint8_t)ai, (std::uint8_t)center, (std::uint8_t)aj, 0, ka, theta0_rad, 0.0f};
+                        (std::uint8_t)ai, (std::uint8_t)center, (std::uint8_t)aj, is_linear, ka, theta0_rad, 0.0f};
                 }
                 else { overflow = 1; }
                 if (as_count < max_mmff_angles_per_mol_k) {

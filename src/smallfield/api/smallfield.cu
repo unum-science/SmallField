@@ -308,6 +308,11 @@ context_t::context_t(std::span<int const> devices) {
                                                per_device_worst_case_count;
     pipeline_pool_layout_t const worst_case_layout = compute_pipeline_pool_layout_(
         per_device_batch_bytes, per_device_worst_case_count, max_conformer_count_k, max_atoms_per_molecule_k);
+    // Published so `compute_wave_size_` cannot hand back a wave larger than what was
+    // just reserved.  The two sizers disagree otherwise: this one assumes the worst-case
+    // `max_conformer_count_k`, while the runtime one uses the caller's actual K, which at
+    // K=3 halves the per-molecule estimate and doubles the wave it is willing to return.
+    per_device_reserved_molecules = per_device_worst_case_count;
 
     for (std::size_t device_index = 0; device_index < device_count; ++device_index) {
         cudaSetDevice(device_ids[device_index]);
@@ -505,10 +510,17 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
     handle.event_download_start = launch_buffers.event_download_start;
     handle.event_end = launch_buffers.event_end;
 
-    // Pools were pre-sized to worst case at ctor; calls here are no-ops
-    // barring a pathologically large input that exceeded the worst-case probe.
-    launch_buffers.device_pool.ensure_capacity(layout.device_pool_bytes);
-    launch_buffers.host_staging.ensure_capacity(layout.host_pool_bytes);
+    // Pools were pre-sized to worst case at ctor; calls here are no-ops barring a
+    // pathologically large input that exceeded the worst-case probe.  A failure leaves
+    // the buffer pointer null, so bail with `device_id` at its -1 default and let
+    // `finalize_wave` skip this handle rather than memcpy through nothing.
+    if (!launch_buffers.device_pool.ensure_capacity(layout.device_pool_bytes) ||
+        !launch_buffers.host_staging.ensure_capacity(layout.host_pool_bytes)) {
+        if (sink.log != nullptr)
+            sink.log->error("launch_gpu_pipeline: pool allocation failed on device {} ({} device, {} host bytes)",
+                            device_id, layout.device_pool_bytes, layout.host_pool_bytes);
+        return gpu_pipeline_handle_t {};
+    }
 
     std::byte *const device_base = launch_buffers.device_pool.data();
     std::byte *const host_base = launch_buffers.host_staging.data();
@@ -672,6 +684,15 @@ void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
     std::uint32_t const host_coord_stride = handle.host_max_atoms * 3;
     std::uint32_t const conformer_count = handle.conformer_count;
     bool const has_perm = !handle.sort_perm.empty();
+    // This loop runs between the stream drain above and the next wave's launch, so
+    // every GPU is idle for its duration — at 400K molecules and K=3 it is millions of
+    // scattered 256-byte copies.  `input_indices` is a permutation and `destination_slot`
+    // is a pure function of `sorted_index` and `conf`, so no two iterations touch the
+    // same output bytes and the loop parallelises as written.  Devices are still
+    // finalized one at a time: they were launched together and carry equal work, so the
+    // later stream drains return immediately, and keeping the fan-out on this loop lets
+    // each device's permutation use every core rather than one core per device.
+#pragma omp parallel for schedule(static)
     for (std::uint32_t sorted_index = 0; sorted_index < handle.per_device_molecule_count; ++sorted_index) {
         std::uint32_t const input_index = input_indices[sorted_index];
         std::uint32_t const caller_index = has_perm ? handle.sort_perm[handle.wave_base + input_index] : input_index;
@@ -784,6 +805,14 @@ static std::uint32_t compute_wave_size_(context_t const &ctx, config_t const &co
     if (bytes_per_molecule > 0 && budget_bytes > 0) auto_wave = budget_bytes / bytes_per_molecule;
     if (auto_wave < 10'000u) auto_wave = 10'000u;
     if (auto_wave > 400'000u) auto_wave = 400'000u;
+
+    // Never exceed what the constructor reserved.  Pools are pre-grown per device, so the
+    // ceiling is `reserved × devices`; going past it would fire `ensure_capacity` from
+    // inside the per-device OMP fan-out, which is the driver-lock contention the
+    // pre-allocation exists to avoid.
+    std::uint64_t const reserved_ceiling = static_cast<std::uint64_t>(ctx.per_device_reserved_molecules) *
+                                           std::max<std::size_t>(1u, ctx.device_ids.size());
+    if (reserved_ceiling > 0 && auto_wave > reserved_ceiling) auto_wave = reserved_ceiling;
     return static_cast<std::uint32_t>(auto_wave);
 }
 

@@ -28,7 +28,9 @@
 
 #include "smallfield/module_fwd.hpp"
 
-#include <chrono>
+#include <cstdint> // `std::uint32_t`
+
+#include <chrono> // `std::chrono::steady_clock`
 
 namespace smallfield::preprocess {
 
@@ -39,17 +41,28 @@ namespace smallfield::preprocess {
  *  deadline" and every `exceeded` call returns false.
  */
 struct preprocess_deadline_t {
+    /** @brief Probes between real clock reads.  VF2 consults the deadline once per
+     *  candidate atom pairing, where `steady_clock::now()` costs roughly nineteen times
+     *  a trivial comparator; reading it every 256th probe bounds the overshoot at 255
+     *  atom comparisons, which is nanoseconds against a millisecond budget.  Power of
+     *  two so the test is a single mask. */
+    static constexpr std::uint32_t clock_sample_period_k = 256;
+
     std::chrono::steady_clock::time_point deadline {};
+    std::uint32_t probe_counter = 0;
     bool tripped = false;
 
     /** @brief Stamp the deadline `budget` in the future and clear the tripped flag. */
     void reset(std::chrono::milliseconds budget) noexcept {
         deadline = std::chrono::steady_clock::now() + budget;
+        probe_counter = 0;
         tripped = false;
     }
 
     /** @brief True once the current steady-clock time is past the deadline; latches tripped. */
     bool exceeded() noexcept {
+        if (tripped) return true;
+        if ((probe_counter++ & (clock_sample_period_k - 1u)) != 0u) return false;
         if (std::chrono::steady_clock::now() > deadline) {
             tripped = true;
             return true;

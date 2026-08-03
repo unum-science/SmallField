@@ -335,6 +335,20 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
         torsions.push_back(torsion);
     };
 
+    // One parameter block serves every pattern in this molecule: the callback captures
+    // only `deadline`, which does not vary across patterns.  Constructing it inside the
+    // loop heap-allocates the `std::function` once per pattern, roughly 900 times per
+    // molecule.  `extraAtomCheck` consults the caller-owned deadline on every VF2 atom
+    // comparison; once past it the callback returns `false` and VF2 unwinds in
+    // O(candidates) rather than hanging in its pathological worst case.  A null
+    // `deadline` makes `exceeded_or_null` constant-false and the callback a no-op.
+    RDKit::SubstructMatchParameters match_params;
+    match_params.uniquify = false;
+    match_params.recursionPossible = true;
+    match_params.extraAtomCheck = [deadline](RDKit::Atom const &, RDKit::Atom const &) noexcept {
+        return !exceeded_or_null(deadline);
+    };
+
     for (std::size_t pattern_index = 0; pattern_index < patterns.size(); ++pattern_index) {
         // Once the per-molecule deadline has fired, every further `SubstructMatch`
         // on this molecule would also short-circuit via `extraAtomCheck`, but
@@ -397,19 +411,8 @@ inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_d
             continue; // skip full-molecule SubstructMatch
         }
 
-        // Fallback: run RDKit SubstructMatch on the full molecule.
-        // `extraAtomCheck` consults the caller-owned `deadline` on every VF2
-        // atom comparison; once the deadline is past, the callback returns
-        // `false` and VF2 unwinds in O(candidates) rather than hanging in
-        // its pathological worst case.  The lambda captures the pointer by
-        // value — when `deadline` is null, `exceeded_or_null` always
-        // returns false and the callback is a no-op.
-        RDKit::SubstructMatchParameters match_params;
-        match_params.uniquify = false;
-        match_params.recursionPossible = true;
-        match_params.extraAtomCheck = [deadline](RDKit::Atom const &, RDKit::Atom const &) noexcept {
-            return !exceeded_or_null(deadline);
-        };
+        // Fallback: run RDKit SubstructMatch on the full molecule, under the
+        // deadline-guarded `match_params` built once above the loop.
         auto const matches = RDKit::SubstructMatch(molecule, *pat.pattern, match_params);
 
         bool any_r_group = false;

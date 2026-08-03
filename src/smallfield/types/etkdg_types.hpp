@@ -185,13 +185,14 @@ struct alignas(16) mmff94_bond_t {
  */
 struct alignas(16) mmff94_angle_t {
     std::uint8_t atom_i;
-    std::uint8_t atom_j; ///< central atom
+    std::uint8_t atom_j;    ///< central atom
     std::uint8_t atom_k;
-    std::uint8_t padding;
+    std::uint8_t is_linear; ///< 1 when the central atom is MMFF94 `linh` — use the linear-bend form
     float force_constant;    ///< ka (mdyn·angstrom/rad²)
     float equilibrium_angle; ///< θ₀ (radians)
     float padding_float;
 };
+static_assert(sizeof(mmff94_angle_t) == 16);
 
 /**
  *  @brief MMFF94 torsion term.

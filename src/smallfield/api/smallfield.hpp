@@ -150,6 +150,10 @@ struct context_t {
      *  arose when all devices read the same shared pinned buffer.
      */
     std::array<std::array<batch_pool_t, max_devices_k>, 2> batch_slots_per_device {};
+    /** @brief Per-device molecule count every pool above was pre-sized for.  The wave
+     *  sizer clamps to this so a runtime wave can never exceed the construction-time
+     *  reservation and trigger a grow from inside the per-device launch fan-out. */
+    std::uint32_t per_device_reserved_molecules = 0;
     /**
      *  @brief Optional scaffold cache, disabled by default.  When enabled,
      *  SubstructMatch calls for the CSD torsion patterns that remain RDKit

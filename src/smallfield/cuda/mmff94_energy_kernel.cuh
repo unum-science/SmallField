@@ -29,7 +29,8 @@ constexpr float mmff_vdw_gamma_k = 0.12f; // gamma
 constexpr float mmff_bond_prefactor_k = 143.9325f;
 constexpr float mmff_bond_cubic_stretch_k = -2.0f;
 constexpr float mmff_angle_prefactor_k = 0.043844f;
-constexpr float mmff_angle_cubic_bend_k = -0.007f;
+constexpr float mmff_angle_cubic_bend_k = -0.006981317f;
+constexpr float mmff_linear_bend_prefactor_k = 143.9325f;
 constexpr float mmff_torsion_prefactor_k = 0.5f;
 constexpr float mmff_stretch_bend_prefactor_k = 2.51210f;
 constexpr float mmff_degrees_to_radians_k = 3.14159265f / 180.0f;
@@ -190,18 +191,32 @@ __device__ __forceinline__ void mmff_angle_contribution_(float const *positions,
     float const sin_theta_sq = 1.0f - cos_theta * cos_theta;
     float const sin_theta = (sin_theta_sq > 1e-12f) ? sqrtf(sin_theta_sq) : 1e-6f;
     float const theta = acosf(cos_theta);
-    float const dtheta_deg = (theta - angle.equilibrium_angle) * mmff_radians_to_degrees_k;
 
-    // energy (counted once, by role 0 = atom_i)
-    if (role == atom_role_first_k)
-        *energy += 0.5f * mmff_angle_prefactor_k * angle.force_constant * dtheta_deg * dtheta_deg *
-                   (1.0f + mmff_angle_cubic_bend_k * dtheta_deg);
+    float factor;
+    if (angle.is_linear) {
+        // Linear centers — alkyne carbon, nitrile nitrogen, allene, CO₂ — use
+        // E = 143.9325 · ka · (1 + cos θ).  The quadratic form over-stiffens badly
+        // here: at θ₀ = 180° and a 60° deviation it returns roughly 1.5× the correct
+        // energy.  ∂E/∂θ = −143.9325 · ka · sin θ, and the −1/sinθ chain rule below
+        // cancels the sine exactly, so the factor is constant in θ.
+        if (role == atom_role_first_k)
+            *energy += mmff_linear_bend_prefactor_k * angle.force_constant * (1.0f + cos_theta);
+        factor = mmff_linear_bend_prefactor_k * angle.force_constant;
+    }
+    else {
+        float const dtheta_deg = (theta - angle.equilibrium_angle) * mmff_radians_to_degrees_k;
 
-    // ∂E/∂rᵢ = ∂E/∂θ · ∂cosθ/∂rᵢ · (−1/sinθ); rad2deg converts the derivative
-    // to work with the -1/sinθ chain rule.
-    float const energy_gradient_angle = mmff_radians_to_degrees_k * mmff_angle_prefactor_k * angle.force_constant *
-                                        dtheta_deg * (1.0f + 1.5f * mmff_angle_cubic_bend_k * dtheta_deg);
-    float const factor = energy_gradient_angle * (-(1.0f / (sin_theta)));
+        // energy (counted once, by role 0 = atom_i)
+        if (role == atom_role_first_k)
+            *energy += 0.5f * mmff_angle_prefactor_k * angle.force_constant * dtheta_deg * dtheta_deg *
+                       (1.0f + mmff_angle_cubic_bend_k * dtheta_deg);
+
+        // ∂E/∂rᵢ = ∂E/∂θ · ∂cosθ/∂rᵢ · (−1/sinθ); rad2deg converts the derivative
+        // to work with the -1/sinθ chain rule.
+        float const energy_gradient_angle = mmff_radians_to_degrees_k * mmff_angle_prefactor_k * angle.force_constant *
+                                            dtheta_deg * (1.0f + 1.5f * mmff_angle_cubic_bend_k * dtheta_deg);
+        factor = energy_gradient_angle * (-(1.0f / (sin_theta)));
+    }
 
     float3 grad {0.0f, 0.0f, 0.0f};
     if (role == atom_role_first_k) {
