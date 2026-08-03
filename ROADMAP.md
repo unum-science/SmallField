@@ -200,6 +200,9 @@ Risk low.
   Closed.
 - __`__noinline__` on `fire_minimize_`__ — increased register pressure to 207, dropping theoretical occupancy to 16.67 %.
   nvcc re-inlined when the hint was removed; compiler default was already optimal.
+- __`cudaEventSynchronize` in place of the finalize stream drain__ — swapping the `cudaStreamSynchronize` in `finalize_gpu_pipeline` for a sync on the recorded end event surfaced `cudaErrorNotSupportedOnDeviceAddressSpace` on several hundred waves per shard under PubChem drug-like load.
+  The stream drain is correct whether or not the end event was recorded and costs about 5 ms per wave per device.
+  Reverted.
 
 ## Parked (not on roadmap)
 

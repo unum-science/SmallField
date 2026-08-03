@@ -263,14 +263,11 @@ struct mmff94_atom_offsets_t {
     std::uint32_t torsion_start;
     std::uint32_t oop_start;
     std::uint32_t stretchbend_start;
-    // `uint32_t` not `uint8_t` (the original): a central atom in a large
-    // drug-like molecule can participate in >255 torsions, which silently
-    // wrapped the previous uint8 counter and left the torsion writes
-    // overflowing into the next atom's OOP region; the kernel then read
-    // torsion term indices out of `oop_params`, producing an
-    // "illegal memory access".  `uint16_t` would raise the ceiling to 65535,
-    // but `uint32_t` removes the ceiling entirely at negligible memory cost
-    // (40 bytes per atom-offset entry vs 28 bytes previously).
+    // These are `uint32_t` because a central atom in a large drug-like molecule can participate in
+    // more than 255 torsions.  A narrower counter wraps, the torsion writes overflow into the next
+    // atom's OOP region, and the kernel then reads torsion term indices out of `oop_params` — an
+    // illegal memory access.  `uint16_t` would raise the ceiling to 65535; `uint32_t` removes it
+    // entirely for 40 bytes per atom-offset entry.
     std::uint32_t bond_count;
     std::uint32_t angle_count;
     std::uint32_t torsion_count;

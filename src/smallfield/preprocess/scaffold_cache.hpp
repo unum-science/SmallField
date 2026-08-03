@@ -17,7 +17,7 @@
  *     a 64-bit hash of the scaffold's canonical SMILES.  64 shards reduce
  *     contention across the 192-thread OpenMP prep pool to practical zero.
  *   - Each entry stores, per non-native CSD pattern, the list of 4-atom
- *     match tuples in **scaffold atom space**.  Callers translate via a
+ *     match tuples in @b scaffold-atom-space.  Callers translate via a
  *     scaffold-to-molecule atom index map produced at cache-miss time.
  *   - Grow-only; LRU-style eviction lives behind a size cap.
  *     Even at ~100 K unique scaffolds the cache stays under ~2.5 GB.

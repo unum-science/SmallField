@@ -50,6 +50,20 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 message(STATUS "CMAKE_CUDA_ARCHITECTURES = ${CMAKE_CUDA_ARCHITECTURES}")
 
+# Point `core.hooksPath` at `.githooks` here — configuring the build arms the `pre-commit` /
+# `commit-msg` checks, each of which carries its own rationale in that file.  Skipped when built
+# as a subproject, since mutating a consumer's Git config is not this project's business, and
+# without `.git`, as in a tarball build.
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND git config core.hooksPath .githooks
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        RESULT_VARIABLE _smallfield_hooks_status OUTPUT_QUIET ERROR_QUIET)
+    if(_smallfield_hooks_status EQUAL 0)
+        message(STATUS "smallfield: Git hooks enabled (core.hooksPath -> .githooks)")
+    endif()
+endif()
+
 # Enable -Wall -Wextra globally on non-MSVC toolchains.
 # CUDA device code gets the host warnings forwarded through -Xcompiler.
 # We intentionally avoid -Werror: warnings should surface but not block builds.

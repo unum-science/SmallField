@@ -371,12 +371,10 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_idx, std::size_t m
 
     cudaSetDevice(ctx.device_ids[device_idx]);
 
-    // The fused embed_4d_power_iter_kernel runs entirely on shared memory
-    // (gram + means + eigenvectors + scratch all live in shmem for the
-    // kernel's lifetime), so the only persistent device scratch is the
-    // group_indices uint32 list — which-mol-goes-into-which-bin.  ~640 MB of
-    // gram_matrices / eigenvalues / cusolver workspace per device, sized for
-    // the pre-fused-kernel chain, is no longer needed.
+    // `embed_4d_power_iter_kernel` runs entirely out of shared memory — Gram matrix, means,
+    // eigenvectors and reduction scratch all live there for the kernel's lifetime — so the only
+    // persistent device scratch is the `group_indices` uint32 list of which molecule goes into
+    // which bin, which is KB-scale.
     std::size_t const group_bytes = align_up(new_group * sizeof(std::uint32_t), 256);
     if (!s.pool.ensure_capacity(group_bytes)) {
         ctx.logger.error("ensure_metric_scratch: device allocation ({} bytes) failed", group_bytes);
@@ -654,11 +652,9 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
  */
 void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
     handle.sink.check(cudaSetDevice(handle.device_id), "cudaSetDevice(finalize_gpu_pipeline)");
-    // A prior attempt to swap this for `cudaEventSynchronize(handle.event_end)`
-    // surfaced `cudaErrorNotSupportedOnDeviceAddressSpace` on a fraction of
-    // waves (several hundred per shard) — see the 12:37 run on PubChem shard 30.
-    // Stream-sync is cheap enough at ~5 ms per wave per device and is
-    // unambiguously correct regardless of whether the end-event was recorded.
+    // Draining the stream, rather than syncing on `handle.event_end`, is correct whether or not
+    // the end event was ever recorded, and costs about 5 ms per wave per device.  See ROADMAP.md
+    // under "Optimizations tried and rejected" for why the event form is not used.
     handle.sink.check(cudaStreamSynchronize(handle.stream), "cudaStreamSynchronize(finalize)");
 
     if (handle.timings_out != nullptr && handle.event_end != nullptr) {

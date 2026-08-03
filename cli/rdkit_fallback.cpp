@@ -36,8 +36,9 @@ static void warm_up_rdkit_globals_for_fallback_() {
                 RDKit::MolOps::addHs(*warm);
                 RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
                                                      /*flagPossibleStereoCenters=*/true);
+                // Constructing the properties is the warm-up: it forces RDKit's lazy MMFF
+                // parameter singletons to load before the parallel region opens on them.
                 RDKit::MMFF::MMFFMolProperties props(*warm);
-                (void)props.isValid();
             }
         }
         catch (...) {

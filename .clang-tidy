@@ -1,0 +1,34 @@
+# Conservative clang-tidy configuration for a CUDA + RDKit pipeline. Device code and
+# intrinsics-heavy kernels trigger many false positives in the broader checkers, so the
+# enabled set stays narrow and focused on real bugs.
+#
+# Advisory, not a gate: `WarningsAsErrors` is empty and no Git hook runs this. Style is
+# enforced by `.githooks/pre-commit`. Run this by hand against a compilation database when
+# you want a second opinion on a file:
+#
+#   cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .
+#   clang-tidy -p build src/smallfield/preprocess/etkdg_prepare_batch.hpp
+
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-assignment-in-if-condition,
+  -bugprone-casting-through-void,
+  -bugprone-macro-parentheses,
+  misc-redundant-expression,
+  misc-unused-using-decls,
+  performance-*,
+  -performance-avoid-endl,
+  readability-duplicate-include,
+  readability-misleading-indentation,
+  readability-redundant-preprocessor,
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/smallfield/.*'
+FormatStyle: file
+CheckOptions:
+  - key: bugprone-assert-side-effect.AssertMacros
+    value: 'assert,SF_TEST_ASSERT'

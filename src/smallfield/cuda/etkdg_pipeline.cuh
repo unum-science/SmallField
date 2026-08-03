@@ -246,23 +246,19 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
  *  Launch: <<<min(total_molecules, max_concurrent_warps), 32, shared_bytes>>>
  *  Each warp loops over molecules with stride = gridDim.x.
  *
- *  `__launch_bounds__(32, 4)` guarantees nvcc keeps this kernel fitting at
- *  least four blocks per SM.  With MMFF stripped out into the sibling
- *  kernel, the remaining inlined state (DG + ETK functors + stereo retry
- *  loop) lands in ~90 regs/thread vs the 145 the monolithic predecessor
- *  paid, which lifts the register-cap occupancy headroom materially.
+ *  `__launch_bounds__(32, 4)` is a floor, not a cap: it asks nvcc to keep the kernel fitting at
+ *  least four blocks per SM, and at 32 threads that permits far more registers than the hardware
+ *  allows, so it constrains nothing here.  What actually bounds occupancy is the register count
+ *  against the SM register file, and below the largest bins, the 32-blocks-per-SM slot limit.
  *
- *  **Register pressure audit (2026-05-05, nvcc 13.0, post-bin-stratified-coord-stride):**
- *    sm_80=79, sm_90=80, **sm_100=128**, sm_120=127 regs/thread.  No spills
- *    reported (STACK=0, LOCAL=0) but sm_100 is exactly at nvcc's no-spill
- *    ceiling — fragile.  At 32 threads × 4 blocks/SM × 128 regs that's only
- *    4 warps/SM = 6.25 % warp occupancy on B200's 64-warp SMs.  Reducing
- *    sm_100 register count would let `__launch_bounds__` bump from (32, 4)
- *    to (32, 8) or (32, 12), doubling/tripling warp occupancy.  Refactor
- *    targets: shrink stereo-retry-loop captured state, audit DG + ETK
- *    functor lambda captures, look for per-thread temporaries promotable
- *    to shmem.  Tracked as a follow-up; verified above 2026-05-05 via
- *    `cuobjdump --dump-resource-usage libsmallfield_python_lib.so`.
+ *  @b Register-pressure-audit — nvcc 13.0, `cuobjdump --dump-resource-usage`:
+ *    sm_80=79, sm_90=80, sm_100=128, sm_120=127 regs/thread, no spills (STACK=0, LOCAL=0).
+ *    On sm_90 that is 65536 / (80 × 32) = 25 blocks/SM = 25 warps, against a hard ceiling of
+ *    32 warps — a 32-thread block can never fill more than 32 of the SM's 64 warp slots, so
+ *    50 % is the most this shape can reach at any register count.  Cutting to 64 regs/thread
+ *    reaches that ceiling and is worth about 1.28×; nothing below 32 regs/thread buys more.
+ *    Refactor targets: shrink stereo-retry-loop captured state, audit the DG and ETK functor
+ *    captures, look for per-thread temporaries promotable to shared memory.
  *
  *  Writes ETK-refined 3D positions into @c conformer_coordinates_out;
  *  @c mmff_polish_warp_kernel runs next on the same buffer.
@@ -443,20 +439,18 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
  *  and energy in place.  Skips slots that failed stereo (status != 0) and
  *  molecules with zero MMFF terms.
  *
- *  Shared memory at bin 128 drops to ~4.5 KB (FIRE scratch only; no bounds
- *  matrix is needed here).  Reg cap is the binding occupancy constraint —
- *  the kernel lands around 90 regs vs the 145 the old monolithic form paid,
- *  ~22 blocks/SM from registers.
+ *  Shared memory at bin 128 is ~4.5 KB, FIRE scratch only, since no bounds matrix is needed here.
+ *  Registers bind before shared memory at every bin.
  *
- *  **Register pressure audit (2026-05-05, nvcc 13.0):**
- *    sm_80=69, sm_90=72, sm_100=103, sm_120=106 regs/thread.  sm_100/sm_120
- *    are well above the original ~90 estimate; same fragility pattern as
- *    `etkdg_pipeline_warp_kernel`.  Reducing reg pressure on Blackwell
- *    would lift `__launch_bounds__(32, 4)` to (32, 6+), improving warp
- *    occupancy proportionally.  bond_distance is read from global memory
- *    (line 482) — a triangle-pack of the symmetric BFS hop count would
- *    halve global-bandwidth pressure for the nonbonded inner loop, but
- *    it's not in shmem so SRAM is unaffected.  Tracked as follow-up.
+ *  @b Register-pressure-audit — nvcc 13.0, `cuobjdump --dump-resource-usage`:
+ *    sm_80=69, sm_90=72, sm_100=103, sm_120=106 regs/thread.  On sm_90 that is 28 blocks/SM,
+ *    against the same 32-warp ceiling a 32-thread block imposes, so this kernel sits closer to
+ *    its limit than its sibling does.
+ *
+ *    @c bond_distance is read from global memory on every FIRE iteration, N² per iteration.  It
+ *    is only ever tested as `< 3`, `== 3`, and `>= 4`, which is two bits per pair, so an N²/4
+ *    packed copy staged into shared memory alongside the FIRE arrays would remove that traffic
+ *    without displacing anything.
  *
  *  @see etkdg_pipeline_warp_kernel
  */

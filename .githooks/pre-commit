@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+#
+# SmallField pre-commit: enforce the house style on staged changes before they land.
+#
+# Each check inspects only the ADDED lines of a staged file, so legacy code migrates on its own
+# schedule while no new violation sneaks in, and each prints the specific reason when it fires.
+# The dispatch loop at the bottom diffs every staged file exactly once and hands the added lines
+# to each check through the `file` / `added` globals - the checks themselves are grep one-liners.
+# Configuring the CMake build arms these hooks; see the `core.hooksPath` block in CMakeLists.txt.
+#
+# Each check below carries its own rationale, so this file is the rulebook. When a rule needs to
+# bend for a legitimate one-off, edit the rule and document the bend rather than reaching for the
+# bypass; there is deliberately no in-band escape comment.
+#
+# Three rules matter here but cannot be matched by a regex, so they live as prose and in review:
+#
+#   Fill a caller-owned output rather than returning a container. Write `fill_x_into(input, out)`
+#   with `out.clear()`, not `std::vector<T> compute_x(input)`, and hoist the scratch above the
+#   loop that consumes it so a growth phase happens once.
+#
+#   A comment that asserts a measurable fact is a test. If a comment states a property, either the
+#   code enforces it or the comment goes. Every stale assertion found in this tree redirected real
+#   work - a comment claiming shared memory above a kernel-local array, a docstring describing a
+#   three-stream pipeline above code that creates one stream, a header claiming 84 % pattern
+#   coverage against a measured 86.8 %.
+#
+#   A performance number states its corpus, its sample size, and its weighting. A microbenchmark
+#   of an isolated access pattern is not an expected result: the 6.9x bounds-read figure measured
+#   here was real at 128 atoms, which is 0.1 % of PubChem, against 2.47x weighted by the real
+#   distribution and under 3 % end to end. Compare A against B inside one run, since absolute
+#   throughput drifts 10-15 % on a loaded machine while the ratio does not. Report the tail, not
+#   only the median. Say what you could not measure.
+#
+# Bypass knowingly (you almost never should) with: git commit --no-verify
+
+set -u
+LC_ALL=C # ? Byte-wise regexes, immune to the committer's locale
+
+failed=0
+
+# Prints the reason and the first offending lines, and marks the commit rejected.
+fail() { # fail <matches> <message-line>...
+    local matches=$1
+    shift
+    local line
+    for line in "$@"; do echo "pre-commit: $line"; done
+    printf '%s\n' "$matches" | head -5
+    failed=1
+}
+
+#pragma region C, C++, and CUDA
+
+# Discarding a return value through a C-era `(void)expr` cast reads as hiding something and does
+# not compose with `[[nodiscard]]`. Bind the value and mark it, or consume it in an if-init.
+check_void_discards() {
+    local discards
+    discards=$(printf '%s\n' "$added" | grep -E '\(void\)[[:space:]]*[a-z_]' || true)
+    [ -z "$discards" ] || fail "$discards" \
+        "$file discards a value through a (void) cast - bind it with [[maybe_unused]] or" \
+        "            consume it in an if-init statement:"
+}
+
+# Backward-looking prose in comments rots the moment the next rewrite ships and reads as changelog
+# noise. Comments describe what the code is and does now; history belongs in commit messages,
+# and decision records belong in ROADMAP.md.
+#
+# `previously` is matched bare, which over-matches algorithm prose - "projections onto
+# previously-found eigenvectors" describes deflation state, not code history. Rephrase such a line
+# ("already-found") rather than widening the exception list: the alternative is a noun allowlist
+# that silently stops catching the real cases as vocabulary drifts.
+check_backward_references() {
+    local history
+    history=$(printf '%s\n' "$added" |
+        grep -inE '(//|/\*|^\+[[:space:]]*\*).*\b(previously|used to (be|do|work)|no longer|formerly|was replaced|the (old|previous) (design|implementation|version|approach|chain|form)|prior attempt|Phase [0-9])\b' || true)
+    [ -z "$history" ] || fail "$history" \
+        "$file carries backward-looking prose in a comment - describe the present behavior;" \
+        "            history lives in commit messages and ROADMAP.md:"
+}
+
+# A run of three or more dashes, equals, hashes, or slashes used as a visual divider carries no
+# information the sentence beneath it does not already carry. Sections are named by #pragma region.
+check_rulers() {
+    local rulers
+    rulers=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*(([#]+|//|\*)[[:space:]]*[-=]{3,}|/{4,}|#{3,})[[:space:]]*$' || true)
+    [ -z "$rulers" ] || fail "$rulers" \
+        "$file draws a decorative ruler - name the section with #pragma region or write the sentence:"
+}
+
+# Every @param declares its direction so a reader knows whether the callee reads, writes, or
+# mutates. A bare @param and the comma form @param[in,out] are both rejected; the one spelling
+# for a mutated argument is @param[inout].
+check_param_directions() {
+    local params
+    params=$(printf '%s\n' "$added" |
+        grep -E '@param([[:space:]]+[a-zA-Z_]|\[[[:space:]]*(in[[:space:]]*,|out[[:space:]]*,))' || true)
+    [ -z "$params" ] || fail "$params" \
+        "$file has an @param without a direction, or uses the comma form - write @param[in]," \
+        "            @param[out], or @param[inout]:"
+}
+
+# Doxygen renders @b and @c, not Markdown: **bold** and __bold__ inside a comment print literally.
+# The underscore arm requires whitespace between the delimiters, which is what separates Markdown
+# emphasis from the CUDA and GCC keyword forms - __global__, __restrict__, __LINE__ carry none.
+# A single-word __token__ is therefore deliberately not caught: it is indistinguishable from a
+# keyword, and widening the pattern to reach it would flag every kernel qualifier in the tree.
+check_markdown_doxygen() {
+    local emphasis
+    emphasis=$(printf '%s\n' "$added" |
+        grep -E '(//|/\*|^\+[[:space:]]*\*)[^*_]*(\*\*[^*]+\*\*|__[a-zA-Z][^_]*[[:space:]][^_]*__)' || true)
+    [ -z "$emphasis" ] || fail "$emphasis" \
+        "$file uses Markdown emphasis inside a Doxygen comment - use @b for one or two tokens:"
+}
+
+# Documentation is /** ... */ only. The ///, //!, and /*! forms fragment the doc style, and //
+# is reserved for implementation notes inside function bodies.
+check_doc_comment_forms() {
+    local forms
+    forms=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*(///|//!|/\*!)' || true)
+    [ -z "$forms" ] || fail "$forms" \
+        "$file uses a ///, //!, or /*! doc comment - documentation is /** ... */:"
+}
+
+# clang-format mis-tokenises a dash inside a region name and reflows around it, so the region
+# markers drift out of place on the next format run. Region names are plain words.
+check_region_dashes() {
+    local regions
+    regions=$(printf '%s\n' "$added" | grep -E '#pragma[[:space:]]+(region|endregion)[[:space:]]+.*[][()-]' || true)
+    [ -z "$regions" ] || fail "$regions" \
+        "$file names a #pragma region with a dash or bracket - use plain words:"
+}
+
+# The checked-in .clang-format and .cmake-format.py profiles are the law, so a file formats clean
+# as a whole rather than fencing off regions the formatter is told to skip.
+check_formatter_off() {
+    local directives
+    directives=$(printf '%s\n' "$added" |
+        grep -E '(//[[:space:]]*clang-format[[:space:]]+(on|off)|#[[:space:]]*cmake-format:[[:space:]]*(on|off))' || true)
+    [ -z "$directives" ] || fail "$directives" \
+        "$file disables a formatter in-band - the checked-in profiles are the law:"
+}
+
+# A container of pointers is a pointer chase plus an allocation per element for something whose
+# count is usually known and small. Store values, or store indices into a flat arena.
+check_pointer_containers() {
+    local containers
+    containers=$(printf '%s\n' "$added" |
+        grep -E '(std::)?(vector|array)[[:space:]]*<[[:space:]]*(std::)?(unique_ptr|shared_ptr)|(std::)?(vector|array)[[:space:]]*<[[:space:]]*[A-Za-z_][A-Za-z_0-9:]*[[:space:]]*\*' || true)
+    [ -z "$containers" ] || fail "$containers" \
+        "$file holds pointers inside a container - store values, or indices into a flat arena:"
+}
+
+# Per-worker state is an explicit rank into caller-owned scratch, not implicit per-thread storage.
+# Hidden global state is why prepare_molecule_batch_into cannot be called concurrently today.
+check_thread_local() {
+    local locals
+    locals=$(printf '%s\n' "$added" | grep -E '\bthread_local\b' || true)
+    [ -z "$locals" ] || fail "$locals" \
+        "$file declares thread_local state - pass a caller-owned scratch and a thread rank:"
+}
+
+# Positional aggregate initialization silently survives a field insertion or rename: the literal
+# keeps compiling and means something else. Past three fields, name them.
+check_positional_aggregates() {
+    local aggregates
+    aggregates=$(printf '%s\n' "$added" |
+        grep -E '(push_back|emplace_back|emplace)[[:space:]]*\([[:space:]]*\{[^}.]*,[^}.]*,[^}.]*,[^}.]*\}' || true)
+    [ -z "$aggregates" ] || fail "$aggregates" \
+        "$file initializes an aggregate positionally past three fields - use designated" \
+        "            initializers so a field insertion cannot silently shift the meaning:"
+}
+
+# Spell the concept out. A coined short form saves keystrokes once and costs a reader every time.
+# Whole-word only, so `rng_state`, `coords_ptr`, and `num_atoms` are untouched - the rule is about
+# a bare abbreviation standing alone as a name, not about a segment inside a spelled-out one.
+check_abbreviations() {
+    local abbreviations
+    abbreviations=$(printf '%s\n' "$added" |
+        grep -E '\b(idx|cfg|tbl|cnt|rng|tmp|buf|ptr|src|dst|nbr)\b' || true)
+    [ -z "$abbreviations" ] || fail "$abbreviations" \
+        "$file uses an abbreviated identifier - spell it out (index, config, table, count," \
+        "            generator, scratch, buffer, pointer, source, destination, neighbor):"
+}
+
+#pragma endregion C, C++, and CUDA
+
+#pragma region CUDA only
+
+# Fleets of devices are orchestrated with per-device non-blocking streams and events from one host
+# thread: kernel launches are already asynchronous, cross-device ordering is cudaStreamWaitEvent,
+# and completion is an event-sync loop, so a host thread adds nothing but scheduling noise.
+check_host_threads() {
+    local threads
+    threads=$(printf '%s\n' "$added" |
+        grep -E '\bstd::(thread|jthread|async)\b|#include[[:space:]]*<thread>|\bpthread_' || true)
+    [ -z "$threads" ] || fail "$threads" \
+        "$file spawns host threads in a CUDA source - orchestrate devices with per-device" \
+        "            non-blocking cudaStream_t and cudaEvent_t from one host thread:"
+}
+
+#pragma endregion CUDA only
+
+#pragma region Library headers
+
+# A bare bool parameter names nothing at the call site: generate(n, true, false) is unreadable.
+# A recurring two-state axis earns a two-value enum.
+check_boolean_parameters() {
+    local booleans
+    booleans=$(printf '%s\n' "$added" | grep -E '[(,][[:space:]]*bool[[:space:]]+[a-z_]+[[:space:]]*[,)]' || true)
+    [ -z "$booleans" ] || fail "$booleans" \
+        "$file takes a bare bool parameter - name the choice with a two-value enum:"
+}
+
+# The library prints through fmt:: and its own logger. Iostreams are locale-dependent,
+# allocation-happy, and verbose; the CLI and tests may still use C stdio.
+check_iostreams() {
+    local streams
+    streams=$(printf '%s\n' "$added" |
+        grep -E '\bstd::(cout|cerr|clog|i?fstream|o?fstream|[io]?stringstream)\b|#include[[:space:]]*<(iostream|sstream|fstream)>' || true)
+    [ -z "$streams" ] || fail "$streams" \
+        "$file uses an iostream in a library header - print through fmt:: or the project logger:"
+}
+
+#pragma endregion Library headers
+
+#pragma region Markdown
+
+# Emphasis is __bold__ and _italic_, never the asterisk forms, so the rendered and raw text agree
+# across every renderer these documents pass through.
+check_markdown_asterisks() {
+    local emphasis
+    emphasis=$(printf '%s\n' "$added" | grep -E '\*\*[^*]+\*\*|[^*]\*[A-Za-z][^*]*\*[^*]' || true)
+    [ -z "$emphasis" ] || fail "$emphasis" \
+        "$file uses asterisk emphasis - bold is __like this__ and italic is _like this_:"
+}
+
+#pragma endregion Markdown
+
+# One pass: enumerate the staged files once, diff each once, and dispatch by extension. The list is
+# NUL-delimited so a filename with spaces can never split.
+while IFS= read -r -d '' file; do
+    added=$(git diff --cached --unified=0 -- "$file" | grep '^+' | grep -v '^+++' || true)
+    [ -n "$added" ] || continue
+    case "$file" in
+    *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
+        check_void_discards
+        check_backward_references
+        check_rulers
+        check_param_directions
+        check_markdown_doxygen
+        check_doc_comment_forms
+        check_region_dashes
+        check_formatter_off
+        check_pointer_containers
+        check_thread_local
+        check_positional_aggregates
+        check_abbreviations
+        ;;&
+    *.cu | *.cuh)
+        check_host_threads
+        ;;&
+    src/*.hpp | src/*.cuh)
+        check_boolean_parameters
+        check_iostreams
+        ;;
+    *.md) check_markdown_asterisks ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACM -z)
+
+# Formatter gates. `git clang-format` scores only the changed lines, so legacy formatting is left
+# alone and a fresh clone without the tool still commits. cmake-format has no changed-lines mode,
+# so it runs whole-file against the checked-in profile.
+if command -v git-clang-format > /dev/null 2>&1 && [ -f .clang-format ]; then
+    if ! git clang-format --staged --diff --quiet > /dev/null 2>&1; then
+        echo "pre-commit: staged C/C++/CUDA lines are not clang-format clean - run \`git clang-format --staged\`"
+        failed=1
+    fi
+fi
+
+# cmake-format and ruff have no changed-lines mode, so a naive whole-file gate would demand a
+# reformat of the entire file to add three lines - the flag day the added-lines discipline exists
+# to avoid. Gate on the delta instead: a file that was already unclean at HEAD stays committable,
+# but a file that WAS clean may not stop being clean.
+# The baseline keeps its original basename inside a scratch directory: both cmake-format and ruff
+# pick their parser from the file name, so a `mktemp` name would be checked as the wrong language
+# and report clean no matter what it contains.
+was_clean_at_head() { # was_clean_at_head <file> <checker-command...>
+    local path=$1
+    shift
+    local scratch baseline clean
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/smallfield-baseline-XXXXXX") || return 0
+    baseline="$scratch/$(basename "$path")"
+    if ! git show "HEAD:$path" > "$baseline" 2> /dev/null; then
+        rm -rf "$scratch" # ? New file: nothing to compare against, so require it clean
+        return 0
+    fi
+    clean=1
+    "$@" "$baseline" > /dev/null 2>&1 && clean=0
+    rm -rf "$scratch"
+    return $clean
+}
+
+if command -v cmake-format > /dev/null 2>&1 && [ -f .cmake-format.py ]; then
+    while IFS= read -r -d '' file; do
+        case "$file" in
+        CMakeLists.txt | *.cmake) ;;
+        *) continue ;;
+        esac
+        was_clean_at_head "$file" cmake-format --check || continue
+        if ! cmake-format --check "$file" > /dev/null 2>&1; then
+            echo "pre-commit: $file was cmake-format clean and no longer is - run \`cmake-format -i\`"
+            failed=1
+        fi
+    done < <(git diff --cached --name-only --diff-filter=ACM -z)
+fi
+
+if command -v ruff > /dev/null 2>&1; then
+    while IFS= read -r -d '' file; do
+        case "$file" in
+        *.py) ;;
+        *) continue ;;
+        esac
+        was_clean_at_head "$file" ruff format --check || continue
+        if ! ruff format --check "$file" > /dev/null 2>&1; then
+            echo "pre-commit: $file was ruff-format clean and no longer is - run \`ruff format\`"
+            failed=1
+        fi
+    done < <(git diff --cached --name-only --diff-filter=ACM -z)
+fi
+
+if [ "$failed" -ne 0 ]; then
+    echo ""
+    echo "Fix the staged changes and commit again. Bypass knowingly with: git commit --no-verify"
+    exit 1
+fi
+exit 0

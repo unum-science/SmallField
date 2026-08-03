@@ -318,6 +318,15 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     // Helper: bool indicating whether mol m's preprocess succeeded (n_atoms > 0).
     auto mol_ok = [&](std::uint64_t m) -> bool { return inputs.num_atoms_per_molecule[m] != 0; };
 
+    // Every builder above is reserved for `total_rows`, so the fixed-width appends below cannot
+    // fail on capacity.  `smiles_builder` is the exception: `Reserve` sizes the offset array, not
+    // the character data, so its append can still hit an allocation failure and truncate the shard
+    // silently.  Keep the first failure and check once after the loop rather than branching per row.
+    arrow::Status append_status;
+    auto record_append = [&append_status](arrow::Status status) {
+        if (append_status.ok() && !status.ok()) append_status = std::move(status);
+    };
+
     for (std::uint64_t r = 0; r < total_rows; ++r) {
         std::uint64_t const m = mol_per_row[r];
         std::uint32_t const c = slot_per_row[r];
@@ -328,32 +337,37 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
         std::size_t const flat = static_cast<std::size_t>(m) * max_conformers + c;
         std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 0;
 
-        (void)input_shard_builder.Append(inputs.input_shard_stem);
-        (void)input_row_builder.Append(input_row);
-        (void)smiles_builder.Append(smi.data(), static_cast<std::int32_t>(smi.size()));
-        (void)conformer_index_builder.Append(conf_index_per_row[r]);
-        (void)status_builder.Append(status_code);
+        record_append(input_shard_builder.Append(inputs.input_shard_stem));
+        record_append(input_row_builder.Append(input_row));
+        record_append(smiles_builder.Append(smi.data(), static_cast<std::int32_t>(smi.size())));
+        record_append(conformer_index_builder.Append(conf_index_per_row[r]));
+        record_append(status_builder.Append(status_code));
 
         if (mol_ok(m)) {
-            (void)n_heavy_atoms_builder.Append(
-                inputs.num_heavy_atoms_per_molecule.empty() ? 0u : inputs.num_heavy_atoms_per_molecule[m]);
-            (void)n_atoms_builder.Append(static_cast<std::uint16_t>(inputs.num_atoms_per_molecule[m]));
-            (void)n_bonds_builder.Append(inputs.num_bonds_per_molecule.empty() ? 0u : inputs.num_bonds_per_molecule[m]);
-            (void)molecular_weight_builder.Append(
-                inputs.molecular_weight_per_molecule.empty() ? 0.0f : inputs.molecular_weight_per_molecule[m]);
-            (void)n_conformers_builder.Append(inputs.n_conformers_per_molecule[m]);
+            record_append(n_heavy_atoms_builder.Append(
+                inputs.num_heavy_atoms_per_molecule.empty() ? 0u : inputs.num_heavy_atoms_per_molecule[m]));
+            record_append(n_atoms_builder.Append(static_cast<std::uint16_t>(inputs.num_atoms_per_molecule[m])));
+            record_append(
+                n_bonds_builder.Append(inputs.num_bonds_per_molecule.empty() ? 0u : inputs.num_bonds_per_molecule[m]));
+            record_append(molecular_weight_builder.Append(
+                inputs.molecular_weight_per_molecule.empty() ? 0.0f : inputs.molecular_weight_per_molecule[m]));
+            record_append(n_conformers_builder.Append(inputs.n_conformers_per_molecule[m]));
         }
         else {
-            (void)n_heavy_atoms_builder.AppendNull();
-            (void)n_atoms_builder.AppendNull();
-            (void)n_bonds_builder.AppendNull();
-            (void)molecular_weight_builder.AppendNull();
-            (void)n_conformers_builder.AppendNull();
+            record_append(n_heavy_atoms_builder.AppendNull());
+            record_append(n_atoms_builder.AppendNull());
+            record_append(n_bonds_builder.AppendNull());
+            record_append(molecular_weight_builder.AppendNull());
+            record_append(n_conformers_builder.AppendNull());
         }
 
-        if (outcome == 1) { (void)conformer_energy_builder.Append(inputs.energies[flat]); }
-        else { (void)conformer_energy_builder.AppendNull(); }
+        if (outcome == 1) { record_append(conformer_energy_builder.Append(inputs.energies[flat])); }
+        else { record_append(conformer_energy_builder.AppendNull()); }
     }
+
+    // A failed append leaves the column arrays inconsistent in length, which Parquet would happily
+    // write as a truncated shard.  Refuse instead.
+    if (!append_status.ok()) return false;
 
     std::shared_ptr<arrow::Array> input_shard_array, input_row_array, smiles_array, conformer_index_array;
     std::shared_ptr<arrow::Array> status_array, n_heavy_atoms_array, n_atoms_array, n_bonds_array;

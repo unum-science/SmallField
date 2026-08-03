@@ -117,12 +117,9 @@ struct metric_scratch_t {
     std::span<std::uint32_t> group_indices {}; ///< [max_group_size]
     std::size_t max_group_size = 0;
     std::uint32_t max_atoms = 0;
-    // The previous chain (smooth_and_build_gram_kernel → cusolverDnXsyevBatched →
-    // project_metric_coordinates_kernel) needed gram / eigenvalue / cusolver
-    // workspace allocations sized for the worst-case wave (~640 MB/device at
-    // 10K mols × 128² floats).  embed_4d_power_iter_kernel folds all of that
-    // into one fused launch, so the only surviving scratch is group_indices —
-    // a per-bin uint32 list of which-molecule-goes-into-which-bin.
+    // `embed_4d_power_iter_kernel` holds the Gram matrix, means, eigenvectors and reduction
+    // scratch in shared memory for its whole lifetime, so the only persistent device scratch is
+    // `group_indices` — a per-bin uint32 list of which molecule goes into which bin.
 };
 
 // Forward-declare persistent per-device launch scratch. Defined in smallfield.cu

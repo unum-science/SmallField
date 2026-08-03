@@ -451,9 +451,8 @@ void reader_loop(std::vector<sfcli::shard_pair_t const *> const &pending, cli_co
 
 void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, thread_budget_t const &budget,
                      handoff_t<coprocessed_batch_accumulator_t> &in, handoff_t<coprocessed_batch_result_t> &out,
-                     buffer_pool_t &pool, progress_counters_t &counters) {
+                     buffer_pool_t &pool, [[maybe_unused]] progress_counters_t &counters) {
     omp_set_num_threads(budget.gpu_runner);
-    (void)counters;
 
     sfapi::config_t generation_config;
     generation_config.num_conformers = config.num_conformers;
@@ -478,7 +477,7 @@ void gpu_runner_loop(sfapi::context_t &gpu_context, cli_config_t const &config, 
         // a batch-level `mmff_unconverged` return may still have the majority
         // of conformers succeed, so we discard the aggregate and let the
         // per-conformer codes drive subsequent stages.
-        (void)gpu_context.generate_conformers(
+        [[maybe_unused]] sfapi::conformer_status_t const batch_status = gpu_context.generate_conformers(
             std::span<std::string_view const>(accumulator.combined_smiles), generation_config, config.max_atoms,
             std::span<__half>(buf->coordinates.data(), total_conformers * config.max_atoms * 3u),
             std::span<float>(buf->energies.data(), total_conformers),
@@ -710,8 +709,15 @@ void writer_loop(cli_config_t const &config, thread_budget_t const &budget, logg
                 sentinel += ".encoded";
                 FILE *fp = std::fopen(sentinel.string().c_str(), "wb");
                 if (fp) {
-                    (void)std::fwrite("v1\n", 1, 3, fp);
+                    // `--resume` skips any shard whose sentinel exists, so a short write would
+                    // leave a file that makes the next run skip an unencoded shard.
+                    std::size_t const written = std::fwrite("v1\n", 1, 3, fp);
                     std::fclose(fp);
+                    if (written != 3) {
+                        std::error_code remove_error;
+                        std::filesystem::remove(sentinel, remove_error);
+                        logger.error("sentinel write truncated, removed: {}", sentinel.string());
+                    }
                 }
                 else { logger.error("sentinel write failed: {}", sentinel.string()); }
             }

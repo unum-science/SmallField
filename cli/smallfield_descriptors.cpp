@@ -616,8 +616,15 @@ int main(int argc, char **argv) {
 
         FILE *fp = std::fopen(sentinel.string().c_str(), "wb");
         if (fp) {
-            (void)std::fwrite("v1\n", 1, 3, fp);
+            // `--resume` skips any shard whose sentinel exists, so a short write would leave a
+            // file that makes the next run skip an unprocessed shard.
+            std::size_t const written = std::fwrite("v1\n", 1, 3, fp);
             std::fclose(fp);
+            if (written != 3) {
+                std::error_code remove_error;
+                std::filesystem::remove(sentinel, remove_error);
+                logger.error("sentinel write truncated, removed: {}", sentinel.string());
+            }
         }
         else { logger.error("sentinel write failed: {}", sentinel.string()); }
 
