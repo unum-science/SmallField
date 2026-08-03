@@ -48,7 +48,7 @@ using smallfield::types::molecule_descriptor_t;
  *  makes one pass per atom, so the caching doesn't amortise).  Writes
  *  atom types to `atom_types_out + atom_offsets[mol_idx]` and charges
  *  to `atom_charges_out + atom_offsets[mol_idx]`. */
-__launch_bounds__(32, 8) __global__
+static __launch_bounds__(32, 8) __global__
     void mmff94_type_and_charge_kernel(molecule_descriptor_t const *__restrict__ descriptors,
                                        std::uint32_t const *__restrict__ atom_offsets, std::uint32_t num_molecules,
                                        mmff94_tables_view_t tables_view, std::uint8_t *__restrict__ atom_types_out,

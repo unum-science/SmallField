@@ -36,6 +36,7 @@
 #include <cuda_runtime.h>
 
 #include "smallfield/api/batch_pool.hpp"
+#include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
@@ -74,9 +75,6 @@ inline constexpr std::size_t csd_torsion_stack_bytes_k = 1024;
 
 /** Value of @ref csd_device_pattern_t::closure_offset for a pattern that closes no ring. */
 inline constexpr std::uint32_t no_closure_offset_k = 0xFFFFFFFFu;
-
-/** Bonds one warp claims per pass; one lane owns one bond. */
-inline constexpr std::uint32_t warp_size_k = 32;
 
 /**
  *  POD mirror of one compiled torsion pattern.  Everything the matcher reads is either inline here
@@ -240,12 +238,10 @@ __device__ inline csd_pattern_view_t device_pattern_view(csd_torsion_table_view_
  *  @param[in] torsion_stride Slots reserved per molecule; a molecule emitting more is truncated.
  *  @param[out] torsion_counts Torsions written per molecule, before truncation.
  */
-__global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(molecule_descriptor_t const *__restrict__ descriptors,
-                                                                  std::uint32_t num_molecules,
-                                                                  csd_torsion_table_view_t table,
-                                                                  etk_torsion_descriptor_t *__restrict__ torsions,
-                                                                  std::uint32_t torsion_stride,
-                                                                  std::uint32_t *__restrict__ torsion_counts) {
+static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
+    molecule_descriptor_t const *__restrict__ descriptors, std::uint32_t num_molecules, csd_torsion_table_view_t table,
+    etk_torsion_descriptor_t *__restrict__ torsions, std::uint32_t torsion_stride,
+    std::uint32_t *__restrict__ torsion_counts) {
 
     std::uint32_t const molecule_index = blockIdx.x;
     if (molecule_index >= num_molecules) return;

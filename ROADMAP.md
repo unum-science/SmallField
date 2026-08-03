@@ -8,9 +8,10 @@ For shipped work see [`CHANGELOG.md`](CHANGELOG.md); for measured throughput see
 Every number below carries a scale tag — for example `10M USearch, K=1, 8-GPU` or `100K ChEMBL, K=1, 1-GPU`.
 This matters because:
 
-- Scaffold-cache hit rate is dataset-diversity-bound.
-  On 50 K ChEMBL it is 85 %; on 10 M USearch it is 33 %; on Enamine REAL it is expected lower.
-  Any CPU optimisation whose wall-time share depends on cache-hit rate changes by several × across scales.
+- Corpus shape decides which bins exist at all.
+  PubChem spreads across all eight atom-limited bins with 1 % above 112 atoms; Enamine REAL tops out at 72 atoms, so three bins are empty and 98 % of molecules land in bins 48 and 64; GDB13 is 96 % in bin 32.
+  A number measured on one of those does not transfer to another — the warp-per-pair change is 2.27 × on PubChem and 1.58 × on REAL for exactly this reason.
+  Sample with `bench/sample_corpora.py`, which draws across shards; the head of one shard is not a sample of the corpus.
 - Kernel occupancy is dominated by launch parallelism, not per-kernel resource pressure.
   At bins with ≤ 100 molecules, achieved occupancy is 2 %; at bins with 2 000+ molecules it rises to 23–32 %.
   Extrapolating "the kernel is idle" from small-dataset measurements is misleading.
@@ -21,6 +22,11 @@ Rule of thumb: do not trust any number in this document that is not paired with 
 When re-profiling to drive a decision, aim for ≥ 1 M molecules and at least 10 `embedding-waves` of steady state — and separately note whether the workload is drug-like (ChEMBL, PubChem) or diverse combinatorial (USearch, Enamine, ZINC).
 
 ## Baseline (2026-04-19)
+
+__This table is superseded and kept for provenance only.__
+Every VF2 symbol in it — `VF2SubState::match`, `MatchSubqueries`, `SubstructMatch`, `QueryAtom::Match`, `AndQuery`, `EqualityQuery`, `atomCompat`, together about 23 % of host CPU — no longer exists on any code path.
+The scaffold cache it references is deleted, so its hit rate no longer means anything.
+Re-profile before using any share below to justify work.
 
 CPU hotspots — 10 M USearch, K=1, 8-GPU, scaffold-cache hit 33.4 %, captured before the round-1 / round-2 CSD-torsion work landed.
 `perf record -F 199 --call-graph dwarf,8192 bench_profile /tmp/usearch_10M.smi 1`.
@@ -91,6 +97,9 @@ Expected gain 4–6 % host prep.
 Effort small — one pragma change plus an optional sort.
 Risk low.
 
+The 5.17 % is measured against a `prepare_per_thread_contribs_` that still typed and extracted MMFF terms on the host.
+Those stages are on the device now, so the loop this item targets is a fraction of what was profiled and the imbalance has to be re-measured before the fix is sized.
+
 ### 2b. Multi-`parquet-shard` Invocation for Full 4-Role Overlap
 
 The `smallfield_batch` CLI runs a persistent 4-role pipeline — `reader-role → gpu-runner-role → fallback-role → writer-role`, with depth-3 ring handoffs between them — but the historical wrapper (`/tmp/pubchem_per_shard_loop.sh`) invoked `smallfield_batch` once per `parquet-shard`.
@@ -116,19 +125,16 @@ Expected gain 4–7 % host prep, upper end if combined with item 2 above.
 Effort medium — requires decoupling SMILES parse from the rest of `prepare_molecule_batch_into`.
 Risk low to medium — RDKit's SMILES parser is thread-safe for independent molecules.
 
-### 4. 3-way kernel split (DG + ETK-torsion + MMFF)
+### 4. Kernel Occupancy — Closed, Not Worth Pursuing
 
-`etkdg_pipeline_warp_kernel` achieved 10–15 % occupancy vs 25–37 % theoretical at medium bins (see baseline table).
-Register pressure (95 / thread) is the secondary constraint after shared-memory.
-`mmff_polish_warp_kernel` is near-ceiling already (32 % achieved vs 41.7 % theoretical at bin 128); no meaningful headroom there.
+Retired by measurement rather than delivered.
+`etkdg_pipeline_warp_kernel` went from 80 to 72 registers per thread, lifting it from 25 to 28 blocks per SM, and PubChem 5K at K=3 moved from 4351 to 4359 conf/s on an idle box — 0.2 %, inside a 0.6 % spread.
 
-Split `etkdg_pipeline_warp_kernel` into `etkdg_metric_kernel` (DG + stereo retry + fourth-dim crush) and `etkdg_torsion_kernel` (ETK torsion refinement).
-Each sub-kernel should fit under ≤ 80 regs/thread and raise its per-block occupancy ceiling.
-Existing `mmff_polish_warp_kernel` unchanged.
-Expected gain 3–6 % single-GPU K=3 (revised down from earlier estimates: at measured occupancy numbers the binding constraint is launch-parallelism, not register spill; the split only helps if we also end up with more concurrent blocks per SM).
-Gated on measuring the global-memory round-trip cost of `positions[]` between kernels — at chunk = 100 K, K = 3, that is roughly 150 MB of extra DMA per bin boundary.
-Effort medium.
-Risk medium — kernel structure change; numeric parity must stay within the existing P95 energy-delta tolerance on `validate_parquet.py`.
+A 12 % occupancy gain buying nothing measurable says the kernel is not occupancy-limited at production bin sizes, so neither a 3-way split nor the remaining eight registers to 64 would pay.
+
+Two further constraints found while establishing that.
+A 32-thread block can occupy at most 32 of an SM's 64 warp slots, measured via `maxBlocksPerMultiProcessor`, so 50 % is this shape's ceiling at any register count — the occupancy table in the baseline above quotes figures at and beyond 100 % that are unreachable on any GPU this project targets.
+And shared memory binds only at N=128, which is 1 % of PubChem and __0 % of Enamine REAL__, whose molecules top out at 72 atoms.
 
 ### 5. Allocator Pressure Reduction
 
@@ -138,7 +144,27 @@ Scattered across small-vector warmups in the hot loop (`build_descriptor`, `extr
 Audit `prepare_molecule_batch_into` for temp-alloc sites; promote short-lived `std::vector` to per-thread scratch with grow-only capacity; pre-size the known-bounded containers.
 Expected gain 3–5 % host prep.
 Effort medium.
-Risk low (RAII scratch is a well-understood pattern; the project already uses it for batch pools).
+Risk low — RAII scratch is a well-understood pattern and the project already uses it for batch pools.
+
+`extract_mmff94_params` and the per-thread contribs are gone from the host path, which is where most of this allocation sat, so the 6.9 % is stale and needs a fresh profile before the audit is worth running.
+
+### 6. Attribute the Fixed Context-Construction Cost
+
+`context_t` construction costs about 35 seconds before a single molecule is embedded, measured as the gap between total process time and the timed `generate_conformers` window on a 20-molecule input.
+It is a fixed cost, independent of corpus size and conformer count.
+
+Excluded so far, each measured directly: the MMFF94 table extraction from RDKit and the compiled CSD torsion table, since `test_mmff94_tables`, `test_mmff_gpu_typer` and `test_csd_torsion_device` each build their tables and finish in under half a second; CUDA module loading, since `CUDA_MODULE_LOADING=LAZY` changes nothing; and PTX JIT, since `cuobjdump` reports an sm_90 cubin in the binary.
+Neither the per-device scratch struct nor the MMFF staging layout is large enough to explain it — the struct holds only buffer handles and the staging window is a few hundred megabytes.
+
+The CLI amortizes this over a whole shard, so it does not touch dataset throughput, but it dominates short runs and the Python binding, and it silently distorts any whole-process utilization measurement.
+Attribute it before optimizing anything else in the startup path.
+
+### 7. Widen the ETK CSR Build Past One Lane
+
+`etk_build_csr_kernel` in `device_preprocess.cuh` launches a warp per molecule and then returns every lane but the first, so the counting pass, the prefix sum over the per-atom cursors and the scatter all run serially on lane 0.
+The work is a single pass over the molecule's torsions and constraints, so it is small next to the ETKDG kernel and was not worth blocking the device-preprocessing merge on.
+A lane-strided count with a warp-scan over the cursors is the natural fix.
+Measure the kernel in isolation first — if it is under a percent of the wave it stays a note.
 
 ## Dataset Roadmap
 
@@ -204,56 +230,47 @@ Risk low.
   The stream drain is correct whether or not the end event was recorded and costs about 5 ms per wave per device.
   Reverted.
 
-### 6. Reproducible output at a fixed seed
+### 6. Reproducible Output at a Fixed Seed — Delivered
 
-The 4D metric embedding is now bitwise reproducible, but the pipeline as a whole is not.
-`prepare_per_thread_contribs_` distributes molecules with `schedule(dynamic, 64)`, so which host thread prepares which molecule varies run to run.
-Molecules therefore land at different offsets inside their device batch, and the per-molecule RNG seed is `mol * 32 + lane` — a function of that offset.
-Two runs at the same `random_seed` consequently produce different conformers.
+Philox was keyed off the molecule's offset inside its device batch, which varies with host-thread timing under `schedule(dynamic, 64)`, so a fixed `random_seed` did not reproduce.
+It now seeds from the input row index.
+`test_seed_determinism` runs `generate_conformers` twice in one process at default OpenMP width and compares coordinates, energies and status bitwise.
 
-Measured: a `generate_conformers`-twice comparison passes at 600 molecules under `OMP_NUM_THREADS=1` and fails with default OpenMP, which isolates the cause to the scheduling rather than to any kernel.
+This was worth more than the throughput work it shipped alongside: before it, a quality comparison was not comparing the same sample twice, and a FIRE change had to be reverted because a genuine regression could not be told from run-to-run sample drift.
 
-Seeding from a stable per-molecule identity — the input row index rather than the batch offset — removes the dependency without giving up dynamic scheduling, which the load imbalance genuinely needs.
-Worth doing before any claim that a shipped shard is regenerable.
+### 7. Retiring the VF2 Fallback — Delivered
 
-## Parked (not on roadmap)
+All 470 CSD patterns compile natively, verified at 9 020 710 pattern checks over 19 193 PubChem molecules with zero disagreements.
+The fallback is gone, and with it `scaffold_cache.hpp`, `native_murcko.hpp` and `preprocess_deadline.hpp` — three subsystems that served nothing else.
+A pattern the compiler cannot read is now a load-time abort: the pattern library is checked-in data, so an unreadable entry is a build problem.
 
-- __MMFF parameter static-LUT replacement__ — at 10 M scale MMFF-related CPU is ~8 % total; a 66 % reduction on per-term lookup cost gives ≤ 3 % wall.
-  The existing `thread_local std::unordered_map` cache is already lock-free; the proposed static-array replacement would add a dependency (`tsl::robin_map` or similar) and complexity for modest gain.
-  The old 23 % MMFF-lookup figure in earlier drafts reflected pre-cache measurement; the cache already captured the bulk of the win.
-- __Further `__syncwarp` removals__ — four clearly-redundant sites landed on 2026-04-18.
-  The remaining 13 sites are load-bearing (they guard cross-lane reads in shared memory).
-- __Bounds matrix int4 nibble-packing__ — marginal gain per author's prior analysis; precision risk on bonded-pair windows.
+`conformer_status_t::preprocess_timeout` is kept and marked reserved, because status codes are written as integers into every shipped shard and removing the enumerator would renumber the ones after it.
 
-## Billion-scale workloads
+### 8. Preprocessing on the Device — Delivered
 
-The CLI already streams shard-by-shard: `reader-role` reads one `parquet-shard` at a time, accumulates into a `coprocessed-batch`, `gpu-runner-role` runs its internal `embedding-wave` pipeline, `fallback-role` handles unresolved conformers, `writer-role` flushes an output `parquet-shard`.
-ROMols are released per `embedding-wave`, output per `parquet-shard` — nothing scales with total input size.
+Every expensive stage downstream of `build_descriptor` runs on the device: the bond-hop BFS, MMFF typing, MMFF term extraction with compaction, CSD torsion matching, and the ETK per-atom CSR build.
+The host uploads a descriptor, a bounds matrix, chiral centres, the 1-2 and 1-3 constraints, and per-molecule bases; nothing downstream of that returns to the CPU.
 
-Remaining gaps at 1–10 B molecule scale are captured in the Dataset roadmap above (scaffold-aware sharding, adaptive cache eviction, direct cloud input).
+Measured per molecule, host single-threaded against device including launch and synchronize:
 
-Projected wall time at the current 10K mol/s host-prep ceiling, no further optimisations applied:
+| Stage | PubChem | Enamine REAL |
+| :---- | ------: | -----------: |
+| CSD torsion matching | 203.2 → 8.0 µs, __25.4×__ | 227.9 → 5.2 µs, __43.9×__ |
 
-| Library           | Molecules | Wall estimate |
-| :---------------- | --------: | ------------: |
-| Enamine REAL      |     1.2 B |        ~33 hr |
-| GDB-13            |     1.0 B |        ~27 hr |
-| REAL Space tier 2 |     7.0 B |       ~195 hr |
-| ZINC22            |    37.0 B |         weeks |
+For scale, the RDKit front-end that stays on the host — parse, sanitize, `AddHs`, stereo — is 228 µs per molecule, so torsion matching alone cost about as much as all of it.
 
-Scaffold cache internals: a 64-shard `tsl::robin_map<uint64_t, scaffold_cache_entry_t>` at ~5 KB per entry, keyed by Bemis-Murcko hash.
-On curated ChEMBL (4 698 unique scaffolds across 237 600 cyclic molecules, 98 % reuse) it adds +44 % throughput.
-Long-tail libraries show lower hit rates — that is what the adaptive-eviction + scaffold-aware-sharding gaps in the Dataset roadmap address.
+End to end, three runs per arm with both arms built and run back to back on one idle H100 at K=3, medians: stratified PubChem 4269 → 4666 conf/s, __+9.3 %__; Enamine REAL 7055 → 7770 conf/s, __+10.1 %__.
+Both 5000-molecule corpora fit a single wave, so this measures the serial regime and not the overlapped one.
 
-### 7. Retiring the VF2 fallback — deletion order
+The pipeline is GPU-bound for the first time.
+Sampling `utilization.gpu` at 100 ms across a 20 000-molecule stratified PubChem run gives 7.71 seconds of GPU-busy time against a 8.05 second `generate_conformers` window — about 96 %.
+A whole-process reading instead shows 17 %, because roughly 35 seconds of fixed context construction sits outside the measured window and dilutes it; quote the generate window, not the process.
+This is the condition the kernel-side roadmap items were waiting on.
 
-Once the native matcher reaches 470/470, `csd_torsion_dispatcher.hpp`'s `SubstructMatch` fallback goes, and with it three subsystems that exist only to serve it: `scaffold_cache.hpp`, `native_murcko.hpp` — the cache's key function — and `preprocess_deadline.hpp`, whose sole purpose is escaping VF2's pathological worst case.
+Sizing the device-filled regions uses host-computed upper bounds over the descriptor's own topology rather than a readback of the exact scan totals, which keeps the whole preprocessing chain asynchronous.
+The slack is roughly twice the packed footprint — 34.5 KB reserved against 17.2 KB held on PubChem, 35.1 KB against 19.4 KB on Enamine REAL — and it raises the per-molecule batch estimate from about 89 KB to about 198 KB, which pulls an auto-sized wave off the 400 K clamp to roughly 263 K on an 80 GB card.
 
-Two constraints on that deletion.
+Paired energies are unchanged on PubChem and improve on Enamine REAL, from P50 -0.7 / P95 +1.4 to P50 -0.0 / P95 +0.7.
+The improvement is a bug fix rather than a numerical gain: the host extractor skipped any term whose RDKit parameter lookup failed, silently shipping a molecule with a missing angle or torsion, where the device extractor falls back to the empirical rules MMFF94 defines for exactly that case.
 
-`conformer_status_t::preprocess_timeout` must __stay__ even once unreachable.
-Status codes are written as integers into every shipped `*.3D.parquet`, so removing the enumerator renumbers the ones after it and silently changes what already-written shards mean.
-Mark it reserved rather than deleting it.
-
-`context_t::enable_scaffold_cache` and `get_scaffold_cache_stats` are public API called from `bench_profile.cpp` and `bench_conformers.cpp`.
-Both go, and both benches need updating in the same commit.
+What remains host-side and portable in principle: `build_bounds_matrix`, `extract_distance_constraints` and `extract_chiral_centers` are all already pure over `molecule_descriptor_t`.

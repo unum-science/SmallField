@@ -300,6 +300,26 @@ struct etk_atom_offsets_t {
 };
 
 /**
+ *  @brief One molecule the device MMFF typer cannot type, with the host's answer for it.
+ *
+ *  The native typer leaves an atom at type 0 for a minority of molecules — 4.63 % of a 5000-SMILES
+ *  stratified PubChem sample, 0.02 % of a 5000-SMILES Enamine REAL sample.  The host runs the same
+ *  typer over the same descriptor before the wave launches, so it knows which molecules those are
+ *  without a readback; where RDKit can parametrise one, its atom types and partial charges are
+ *  staged here, a device pass writes them over the typer's output and clears the molecule's typing
+ *  status, and the extractor treats the molecule as typed.  Where RDKit cannot parametrise it
+ *  either, the molecule is rejected with `unsupported_element` as it always was.  On both samples
+ *  above that second case covers every untyped molecule and this array stays empty, so the patch is
+ *  a guard against a corpus where the two typers disagree rather than a hot path.
+ */
+struct mmff94_typing_patch_t {
+    std::uint32_t molecule_index; ///< position of the molecule inside the batch
+    std::uint32_t atom_base;      ///< first atom of the molecule in the batch-global per-atom arrays
+    std::uint32_t patch_base;     ///< first atom of the molecule inside the staged patch arrays
+    std::uint32_t atom_count;
+};
+
+/**
  *  Bounds matrix layout convention:
  *
  *  Full N x N float matrix, row-major.

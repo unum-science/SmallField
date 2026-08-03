@@ -101,19 +101,13 @@ struct mmff94_per_mol_counts_t {
 /**
  *  @brief Batch-global base offset of one molecule inside each packed term array.
  *
- *  One entry per molecule, produced by @ref mmff94_scan_counts_kernel as the exclusive
- *  prefix sum of @ref mmff94_per_mol_counts_t.  The same struct carries the batch totals
- *  in its one-element companion output, which is what the host reads back to size the
- *  packed arrays before launching the compaction.
+ *  @ref mmff94_scan_counts_kernel produces one entry per molecule as the exclusive prefix sum
+ *  of @ref mmff94_per_mol_counts_t, and its one-element companion output carries the batch
+ *  totals a caller reads back to size the packed arrays.  The conformer pipeline instead fills
+ *  the array on the host from per-molecule capacity bounds and skips the scan entirely, so the
+ *  sizing never crosses the bus.
  */
-struct mmff94_packed_offsets_t {
-    std::uint32_t bonds;
-    std::uint32_t angles;
-    std::uint32_t torsions;
-    std::uint32_t oops;
-    std::uint32_t stretchbends;
-    std::uint32_t interactions;
-};
+using smallfield::types::mmff94_packed_offsets_t;
 
 /** Number of independently scanned components in @ref mmff94_packed_offsets_t. */
 inline constexpr std::uint32_t mmff94_packed_components_k = 6;
@@ -146,7 +140,7 @@ static_assert(sizeof(angle_scratch_t) == 16, "angle scratch must stay at 8 KB pe
  *  are written into the per-molecule fixed-stride slots of the output
  *  arrays.  Blockers on this kernel are avoided by keeping per-molecule
  *  state in shared memory (angle_scratch + per-bond scratch). */
-__launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
+static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     // Inputs
     molecule_descriptor_t const *__restrict__ descriptors, std::uint8_t const *__restrict__ atom_types_all,
     float const *__restrict__ atom_charges_all, std::uint32_t const *__restrict__ atom_offsets,
@@ -428,7 +422,7 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
  *  block per molecule, lane-0-only (the CSR-build cost is tiny
  *  relative to the term extractor and cross-molecule parallelism
  *  dominates). */
-__launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
+static __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
     molecule_descriptor_t const *__restrict__ descriptors, std::uint32_t const *__restrict__ atom_offsets,
     std::uint32_t num_molecules, mmff94_per_mol_counts_t *__restrict__ per_mol_counts,
     mmff94_bond_t const *__restrict__ bonds_all, mmff94_angle_t const *__restrict__ angles_all,
@@ -563,7 +557,7 @@ __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
  *  @param[out] per_mol_offsets one entry per molecule, the base of that molecule in each packed array
  *  @param[out] totals single entry holding the batch-wide element count of each packed array
  */
-__launch_bounds__(mmff94_scan_block_k, 1) __global__
+static __launch_bounds__(mmff94_scan_block_k, 1) __global__
     void mmff94_scan_counts_kernel(mmff94_per_mol_counts_t const *__restrict__ per_mol_counts,
                                    std::uint32_t num_molecules, mmff94_packed_offsets_t *__restrict__ per_mol_offsets,
                                    mmff94_packed_offsets_t *__restrict__ totals) {
@@ -650,7 +644,7 @@ __device__ inline void copy_packed_terms_(element_ const *__restrict__ source, e
  *  @param[out] metadata per-molecule metadata whose MMFF offset and count fields are stamped here
  *  @param[in] typing_status per-molecule typer status; non-zero routes the molecule to the CPU fallback
  */
-__launch_bounds__(32, 8) __global__ void mmff94_compact_terms_kernel(
+static __launch_bounds__(32, 8) __global__ void mmff94_compact_terms_kernel(
     molecule_descriptor_t const *__restrict__ descriptors, std::uint32_t const *__restrict__ atom_offsets,
     std::uint32_t num_molecules, mmff94_per_mol_counts_t const *__restrict__ per_mol_counts,
     mmff94_packed_offsets_t const *__restrict__ per_mol_offsets, mmff94_bond_t const *__restrict__ staged_bonds,

@@ -53,11 +53,14 @@ inline constexpr std::size_t mmff94_hl_const_cap_k = 64;
 inline constexpr std::size_t mmff94_bndk_const_cap_k = 64;
 
 #if defined(__CUDACC__)
-__constant__ mmff94_prop_entry_t c_mmff94_prop[mmff94_prop_const_cap_k];
-__constant__ mmff94_def_entry_t c_mmff94_def[mmff94_def_const_cap_k];
-__constant__ mmff94_covrad_entry_t c_mmff94_covrad[mmff94_covrad_const_cap_k];
-__constant__ mmff94_hl_entry_t c_mmff94_hl[mmff94_hl_const_cap_k];
-__constant__ mmff94_bndk_entry_t c_mmff94_bndk[mmff94_bndk_const_cap_k];
+// Internal linkage: every translation unit that includes this header gets its own constant-memory
+// copy, so a test that compiles the header and also links the library does not hand nvlink two
+// definitions of one device symbol.  Each copy is uploaded by that unit's own table upload.
+static __constant__ mmff94_prop_entry_t c_mmff94_prop[mmff94_prop_const_cap_k];
+static __constant__ mmff94_def_entry_t c_mmff94_def[mmff94_def_const_cap_k];
+static __constant__ mmff94_covrad_entry_t c_mmff94_covrad[mmff94_covrad_const_cap_k];
+static __constant__ mmff94_hl_entry_t c_mmff94_hl[mmff94_hl_const_cap_k];
+static __constant__ mmff94_bndk_entry_t c_mmff94_bndk[mmff94_bndk_const_cap_k];
 #endif
 
 /** Per-GPU device-resident view.  Owns a grow-only device byte arena for the

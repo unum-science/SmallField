@@ -6,8 +6,11 @@
  *  every atom pair: 1-2 and 1-3 are excluded, 1-4 is scaled, everything further apart is
  *  a full interaction, and an unreachable pair — the two halves of a salt — is a full
  *  interaction too.  That matrix is N x N bytes per molecule, sixteen kilobytes at the
- *  128-atom cap, against the 16-byte-per-bond list it is derived from, so it is cheaper
+ *  128-atom cap, against the two bytes per bond it is derived from, so it is cheaper
  *  to rebuild it on the device than to ship it across PCIe.
+ *
+ *  The bond list comes from the molecule descriptor rather than from the MMFF bond terms, so this
+ *  pass depends on nothing but the upload and can run while the MMFF extractor is still working.
  *
  *  One warp owns one molecule and one lane owns one source atom, striding by the warp
  *  width when the molecule has more than 32 atoms.  A lane keeps its visited and frontier
@@ -36,7 +39,7 @@ namespace smallfield::cuda {
 
 using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::max_atoms_k;
-using smallfield::types::mmff94_bond_t;
+using smallfield::types::molecule_descriptor_t;
 
 /** @brief 32-bit words needed to hold one bit per atom at the @ref max_atoms_k cap. */
 inline constexpr std::uint32_t bond_distance_mask_words_k = max_atoms_k / 32u;
@@ -47,11 +50,11 @@ inline constexpr std::uint8_t bond_distance_unreachable_k = 255u;
 /**
  *  @brief Fill the batch pool's per-molecule N x N hop-count blocks.
  *
- *  Reads the molecule's bond terms at @c mmff_bond_offset and writes @c num_atoms squared
+ *  Reads the molecule's own bond list out of its descriptor and writes @c num_atoms squared
  *  bytes at @c bond_distance_offset, packed with no padding stride: row @c i of molecule
  *  @c m starts at @c bond_distance_offset + i * num_atoms.
  *
- *  @param[in] bonds Batch-wide MMFF bond terms; only the atom pair of each term is read.
+ *  @param[in] descriptors Batch-wide molecule descriptors; only the bond atom pairs are read.
  *  @param[in] metadata One entry per molecule, carrying both region offsets and the atom count.
  *  @param[out] bond_distance Batch-wide hop-count region, one N x N block per molecule.
  *  @param[in] molecule_count Number of molecules in @p metadata.
@@ -60,7 +63,7 @@ inline constexpr std::uint8_t bond_distance_unreachable_k = 255u;
  *  test that compiles the header and also links the library does not hand nvlink two definitions
  *  of one device symbol.
  */
-static __global__ void bond_distance_bfs_kernel(mmff94_bond_t const *__restrict__ bonds,
+static __global__ void bond_distance_bfs_kernel(molecule_descriptor_t const *__restrict__ descriptors,
                                                 etkdg_molecule_metadata_t const *__restrict__ metadata,
                                                 std::uint8_t *__restrict__ bond_distance,
                                                 std::uint32_t molecule_count) {
@@ -74,8 +77,8 @@ static __global__ void bond_distance_bfs_kernel(mmff94_bond_t const *__restrict_
         std::uint32_t const num_atoms = meta.num_atoms;
         if (num_atoms == 0) continue;
         std::uint8_t *const block = bond_distance + meta.bond_distance_offset;
-        mmff94_bond_t const *const molecule_bonds = bonds + meta.mmff_bond_offset;
-        std::uint32_t const bond_count = meta.num_mmff_bonds;
+        molecule_descriptor_t const &descriptor = descriptors[molecule];
+        std::uint32_t const bond_count = descriptor.num_bonds;
 
         // Every pair starts unreachable; the sweeps below overwrite the ones a path reaches.
         for (std::uint32_t entry = lane; entry < num_atoms * num_atoms; entry += warp_size_k)
@@ -95,8 +98,8 @@ static __global__ void bond_distance_bfs_kernel(mmff94_bond_t const *__restrict_
             for (std::uint32_t depth = 1; depth < num_atoms; ++depth) {
                 std::uint32_t next[bond_distance_mask_words_k] = {0u, 0u, 0u, 0u};
                 for (std::uint32_t bond = 0; bond < bond_count; ++bond) {
-                    std::uint32_t const atom_i = molecule_bonds[bond].atom_i;
-                    std::uint32_t const atom_j = molecule_bonds[bond].atom_j;
+                    std::uint32_t const atom_i = descriptor.bond_atom_i[bond];
+                    std::uint32_t const atom_j = descriptor.bond_atom_j[bond];
                     bool const reached_i = (frontier[atom_i / 32u] >> (atom_i % 32u)) & 1u;
                     bool const reached_j = (frontier[atom_j / 32u] >> (atom_j % 32u)) & 1u;
                     if (reached_i) next[atom_j / 32u] |= 1u << (atom_j % 32u);
@@ -131,15 +134,15 @@ static __global__ void bond_distance_bfs_kernel(mmff94_bond_t const *__restrict_
 /**
  *  @brief Enqueue @ref bond_distance_bfs_kernel over a whole batch.
  *
- *  @param[in] bonds Device pointer to the batch's MMFF bond region.
+ *  @param[in] descriptors Device pointer to the batch's molecule-descriptor region.
  *  @param[in] metadata Device pointer to the batch's per-molecule metadata region.
  *  @param[out] bond_distance Device pointer to the batch's hop-count region.
  *  @param[in] molecule_count Number of molecules in the batch.
  *  @param[in] stream Stream to enqueue on.
  */
-inline void launch_bond_distance_bfs(mmff94_bond_t const *bonds, etkdg_molecule_metadata_t const *metadata,
-                                     std::uint8_t *bond_distance, std::uint32_t molecule_count,
-                                     cudaStream_t stream = nullptr) {
+inline void launch_bond_distance_bfs(molecule_descriptor_t const *descriptors,
+                                     etkdg_molecule_metadata_t const *metadata, std::uint8_t *bond_distance,
+                                     std::uint32_t molecule_count, cudaStream_t stream = nullptr) {
     if (molecule_count == 0) return;
     constexpr std::uint32_t block_threads_k = 128;
     constexpr std::uint32_t warps_per_block_k = block_threads_k / warp_size_k;
@@ -147,7 +150,8 @@ inline void launch_bond_distance_bfs(mmff94_bond_t const *bonds, etkdg_molecule_
     // for the tail; the grid-stride loop in the kernel covers whatever the cap leaves over.
     std::uint32_t const warp_blocks = (molecule_count + warps_per_block_k - 1u) / warps_per_block_k;
     std::uint32_t const blocks = warp_blocks < 4096u ? warp_blocks : 4096u;
-    bond_distance_bfs_kernel<<<blocks, block_threads_k, 0, stream>>>(bonds, metadata, bond_distance, molecule_count);
+    bond_distance_bfs_kernel<<<blocks, block_threads_k, 0, stream>>>(descriptors, metadata, bond_distance,
+                                                                     molecule_count);
 }
 
 } // namespace smallfield::cuda

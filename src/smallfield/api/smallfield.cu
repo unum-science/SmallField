@@ -29,7 +29,13 @@ namespace py = pybind11;
 #include "smallfield/cuda_error.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/cuda/bond_distance_kernel.cuh"
+#include "smallfield/cuda/csd_torsion_device.cuh"
+#include "smallfield/cuda/device_preprocess.cuh"
 #include "smallfield/cuda/metric_embedding_prepass.cuh"
+#include "smallfield/mmff94/mmff94_extract_device.cuh"
+#include "smallfield/mmff94/mmff94_typer_device.cuh"
+#include "smallfield/parameters/mmff94_tables_device.cuh"
+#include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/nvtx.hpp"
 
@@ -49,20 +55,75 @@ static inline std::size_t align_up(std::size_t value, std::size_t alignment) {
 /**
  *  @brief Rough upper bound on the per-molecule batch-pool footprint in a wave.
  *
- *  Used by @ref generate_conformers to pre-size the per-call 2-slot batch-prep
- *  ring so the pinned host buffer never reallocates while a wave's H2D is in
- *  flight.  Overestimates: at @c max_atoms=128 ~91 KB/molecule covers the
- *  bounds matrix, the device-only hop-count matrix, MMFF per-atom vdw/charge,
- *  and the variable-length interaction lists plus slack.  The hop-count term is
- *  device-resident only, so the pinned side is over-reserved by that much.
+ *  Used by @ref generate_conformers to pre-size the per-call 2-slot batch-prep ring so the pinned
+ *  host buffer never reallocates while a wave's H2D is in flight, and by the wave sizer to divide
+ *  a VRAM budget into molecules.  It has to cover both sides of the pool: the uploaded prefix
+ *  (bounds matrix, descriptor, chiral centres, constraints) and the device-only regions the
+ *  preprocessing kernels fill (hop-count matrix, ETK torsions and their CSR, every MMFF term array
+ *  and its CSR).  At the 128-atom cap the bounds and hop-count matrices dominate, and the term
+ *  reservations are the capacity bounds `compute_device_capacities` hands out.
  */
 static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_atoms) noexcept {
     std::size_t const n = max_atoms;
     std::size_t const bounds_bytes = n * n * sizeof(float);
     std::size_t const bond_distance_bytes = n * n * sizeof(std::uint8_t);
-    std::size_t const per_atom_slack = n * 64u;
+    std::size_t const descriptor_bytes = sizeof(molecule_descriptor_t);
+    // A 128-atom molecule with explicit hydrogens carries on the order of 140 bonds; the term
+    // reservations scale with that bond count and with the neighbour-pair count around each atom.
+    std::size_t const bonds = n + 16u;
+    std::size_t const torsion_bytes = bonds * sizeof(etk_torsion_descriptor_t);
+    std::size_t const mmff_term_bytes = 4u * bonds *
+                                        (sizeof(mmff94_bond_t) + sizeof(mmff94_angle_t) + sizeof(mmff94_torsion_t) +
+                                         sizeof(mmff94_oop_t) + sizeof(mmff94_stretchbend_t));
+    std::size_t const csr_bytes = 32u * bonds * sizeof(mmff94_atom_interaction_t);
+    std::size_t const per_atom_slack = n * 128u;
     std::size_t const per_mol_fixed = 1024u;
-    return bounds_bytes + bond_distance_bytes + per_atom_slack + per_mol_fixed;
+    return bounds_bytes + bond_distance_bytes + descriptor_bytes + torsion_bytes + mmff_term_bytes + csr_bytes +
+           per_atom_slack + per_mol_fixed;
+}
+
+/**
+ *  @brief Molecules the MMFF extractor processes per pass through its fixed-stride staging.
+ *
+ *  The extractor and the CSR builder write into per-molecule slots of fixed stride, which costs
+ *  118 KB per molecule; a whole wave's worth of that would be gigabytes of VRAM standing idle
+ *  between kernels.  Running the extract-build-compact triple over a fixed window instead caps the
+ *  staging at this many molecules — 243 MB, allocated once per device — and costs three kernel
+ *  launches per window against the milliseconds each window spends in the extractor.
+ */
+inline constexpr std::uint32_t mmff_extract_window_k = 2048;
+
+/** @brief Byte offsets of the MMFF extractor's fixed-stride staging arrays within one buffer. */
+struct mmff_staging_layout_t {
+    std::size_t offset_bonds;
+    std::size_t offset_angles;
+    std::size_t offset_torsions;
+    std::size_t offset_oops;
+    std::size_t offset_stretchbends;
+    std::size_t offset_interactions;
+    std::size_t offset_counts;
+    std::size_t bytes_total;
+};
+
+/** @brief Place the staging arrays for @ref mmff_extract_window_k molecules back to back. */
+static mmff_staging_layout_t compute_mmff_staging_layout_() noexcept {
+    std::size_t const window = mmff_extract_window_k;
+    mmff_staging_layout_t layout {};
+    std::size_t running = 0;
+    auto place = [&](std::size_t bytes) {
+        std::size_t const here = align_up(running, 256);
+        running = here + bytes;
+        return here;
+    };
+    layout.offset_bonds = place(window * max_mmff_bonds_per_mol_k * sizeof(mmff94_bond_t));
+    layout.offset_angles = place(window * max_mmff_angles_per_mol_k * sizeof(mmff94_angle_t));
+    layout.offset_torsions = place(window * max_mmff_torsions_per_mol_k * sizeof(mmff94_torsion_t));
+    layout.offset_oops = place(window * max_mmff_oops_per_mol_k * sizeof(mmff94_oop_t));
+    layout.offset_stretchbends = place(window * max_mmff_stretchbends_per_mol_k * sizeof(mmff94_stretchbend_t));
+    layout.offset_interactions = place(window * max_mmff_interactions_per_mol_k * sizeof(mmff94_atom_interaction_t));
+    layout.offset_counts = place(window * sizeof(mmff94_per_mol_counts_t));
+    layout.bytes_total = running;
+    return layout;
 }
 
 /**
@@ -77,6 +138,13 @@ static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_at
 struct launch_scratch_t {
     device_byte_buffer_t device_pool;
     pinned_byte_buffer_t host_staging;
+    /** @brief Fixed-stride staging the MMFF extractor and CSR builder write into, one window's
+     *  worth; the compaction pass copies out of it into the batch pool's packed arrays. */
+    device_byte_buffer_t mmff_staging;
+    /** @brief This device's copy of the MMFF94 parameter tables, uploaded once at construction. */
+    mmff94_tables_device_t mmff_tables;
+    /** @brief This device's copy of the compiled CSD torsion patterns, uploaded once. */
+    csd_torsion_table_device_t csd_torsion_table;
     // Persistent CUDA events for per-phase timing. Created once per device on
     // first launch and reused across every wave. Allocating events inside the
     // hot loop and destroying them after each finalize triggered an intermittent
@@ -265,11 +333,25 @@ context_t::context_t(std::span<int const> devices) {
     metric_scratch.resize(device_count);
     launch_scratch.resize(device_count);
 
+    // The MMFF94 parameter tables and the compiled CSD torsion patterns are process-wide constants
+    // extracted once from RDKit; each device gets its own arena so no kernel reaches across a
+    // device boundary for a parameter lookup.
+    mmff94_tables_host_t mmff_tables_host;
+    extract_mmff94_tables_from_rdkit(mmff_tables_host);
+    csd_torsion_table_host_t csd_torsion_host;
+    build_csd_torsion_table(csd_torsion_host);
+    mmff_staging_layout_t const staging_layout = compute_mmff_staging_layout_();
+
     for (std::size_t device_index = 0; device_index < device_count; ++device_index) {
         cudaSetDevice(device_ids[device_index]);
         cudaStreamCreate(&streams[device_index]);
         launch_scratch[device_index] = std::make_unique<launch_scratch_t>();
         auto &scratch = *launch_scratch[device_index];
+        upload_mmff94_tables_to_device(mmff_tables_host, scratch.mmff_tables);
+        upload_csd_torsion_table_to_device(csd_torsion_host, scratch.csd_torsion_table);
+        if (!scratch.mmff_staging.ensure_capacity(staging_layout.bytes_total))
+            this->logger.error("context_t: MMFF staging allocation ({} bytes) failed on device {}",
+                               staging_layout.bytes_total, device_ids[device_index]);
         // Persistent timing events; `cudaEventBlockingSync` keeps host-side
         // synchronize off the CPU busy-wait path when many streams share cores.
         cudaEventCreateWithFlags(&scratch.event_upload_start, cudaEventBlockingSync);
@@ -446,6 +528,108 @@ struct gpu_pipeline_handle_t {
 };
 
 /**
+ *  @brief Enqueue everything that turns an uploaded batch of descriptors into the force field the
+ *  conformer kernels read.
+ *
+ *  Six passes, all asynchronous on @p stream:
+ *    1. the hop-count BFS over each descriptor's bond list;
+ *    2. the MMFF atom typer and its partial-charge pass;
+ *    3. the typing patch, which hands the molecules the native typer rejects RDKit's answer;
+ *    4. the MMFF term extractor, CSR builder and compaction, one window of molecules at a time;
+ *    5. the CSD torsion matcher;
+ *    6. the ETK per-atom CSR builder.
+ *
+ *  No pass reads anything back.  The per-molecule bases each writer needs came up with the batch
+ *  in `mmff_bases`, prefix-summed on the host from capacity bounds, so the packed-array sizing
+ *  never has to wait on `mmff94_scan_counts_kernel`'s totals.
+ *
+ *  @param[in] device_view Device mirror of the batch pool.
+ *  @param[in] batch_layout Layout the mirror was carved with; supplies the torsion stride.
+ *  @param[inout] launch_buffers This device's persistent scratch, holding the parameter tables and
+ *                the extractor's fixed-stride staging.
+ *  @param[in] molecule_count Molecules in the batch.
+ *  @param[in] stream Stream to enqueue on.
+ *  @param[in] sink Error sink routing failures through the caller's logger.
+ */
+static void enqueue_device_preprocess_(batch_pool_dev_view_t const &device_view, batch_layout_t const &batch_layout,
+                                       launch_scratch_t &launch_buffers, std::uint32_t molecule_count,
+                                       cudaStream_t stream, cuda_error_sink_t const &sink) {
+    if (molecule_count == 0) return;
+
+    auto *const descriptors = device_view.descriptors().data();
+    auto *const metadata = device_view.molecule_metadata().data();
+    auto *const atom_bases = device_view.atom_bases().data();
+    auto *const mmff_bases = device_view.mmff_bases().data();
+    auto *const atom_types = device_view.atom_types().data();
+    auto *const atom_charges = device_view.mmff_atom_charge().data();
+    auto *const typing_status = device_view.typing_status().data();
+    auto *const atom_offsets = device_view.mmff_atom_offsets().data();
+
+    launch_bond_distance_bfs(descriptors, metadata, device_view.bond_distance().data(), molecule_count, stream);
+    sink.check(cudaPeekAtLastError(), "bond_distance_bfs_kernel launch");
+
+    launch_mmff94_type_and_charge(descriptors, atom_bases, molecule_count, launch_buffers.mmff_tables.view, atom_types,
+                                  atom_charges, typing_status, stream);
+    sink.check(cudaPeekAtLastError(), "mmff94_type_and_charge_kernel launch");
+
+    std::uint32_t const patch_count = static_cast<std::uint32_t>(batch_layout.count_typing_patches);
+    if (sink.log != nullptr)
+        sink.log->trace2("device preprocess: {} of {} molecules take the host typing path", patch_count,
+                         molecule_count);
+    launch_mmff94_apply_typing_patch(device_view.typing_patches().data(), patch_count,
+                                     device_view.patch_atom_types().data(), device_view.patch_atom_charges().data(),
+                                     atom_types, atom_charges, typing_status, stream);
+    sink.check(cudaPeekAtLastError(), "mmff94_apply_typing_patch_kernel launch");
+
+    mmff_staging_layout_t const staging = compute_mmff_staging_layout_();
+    std::byte *const staging_base = launch_buffers.mmff_staging.data();
+    auto *const staged_bonds = reinterpret_cast<mmff94_bond_t *>(staging_base + staging.offset_bonds);
+    auto *const staged_angles = reinterpret_cast<mmff94_angle_t *>(staging_base + staging.offset_angles);
+    auto *const staged_torsions = reinterpret_cast<mmff94_torsion_t *>(staging_base + staging.offset_torsions);
+    auto *const staged_oops = reinterpret_cast<mmff94_oop_t *>(staging_base + staging.offset_oops);
+    auto *const staged_stretchbends = reinterpret_cast<mmff94_stretchbend_t *>(staging_base +
+                                                                               staging.offset_stretchbends);
+    auto *const staged_interactions = reinterpret_cast<mmff94_atom_interaction_t *>(staging_base +
+                                                                                    staging.offset_interactions);
+    auto *const window_counts = reinterpret_cast<mmff94_per_mol_counts_t *>(staging_base + staging.offset_counts);
+
+    for (std::uint32_t window_start = 0; window_start < molecule_count; window_start += mmff_extract_window_k) {
+        std::uint32_t const window_size = std::min(mmff_extract_window_k, molecule_count - window_start);
+        launch_mmff94_extract_terms(descriptors + window_start, atom_types, atom_charges, atom_bases + window_start,
+                                    window_size, launch_buffers.mmff_tables.view, device_view.mmff_atom_vdw().data(),
+                                    atom_charges, staged_bonds, staged_angles, staged_torsions, staged_oops,
+                                    staged_stretchbends, window_counts, typing_status + window_start, stream);
+        sink.check(cudaPeekAtLastError(), "mmff94_extract_terms_kernel launch");
+
+        launch_mmff94_build_csr(descriptors + window_start, atom_bases + window_start, window_size, window_counts,
+                                staged_bonds, staged_angles, staged_torsions, staged_oops, staged_stretchbends,
+                                staged_interactions, atom_offsets, typing_status + window_start, stream);
+        sink.check(cudaPeekAtLastError(), "mmff94_build_csr_kernel launch");
+
+        launch_mmff94_compact_terms(descriptors + window_start, atom_bases + window_start, window_size, window_counts,
+                                    mmff_bases + window_start, staged_bonds, staged_angles, staged_torsions,
+                                    staged_oops, staged_stretchbends, staged_interactions,
+                                    device_view.mmff_bonds().data(), device_view.mmff_angles().data(),
+                                    device_view.mmff_torsions().data(), device_view.mmff_oops().data(),
+                                    device_view.mmff_stretchbends().data(), device_view.mmff_interactions().data(),
+                                    atom_offsets, metadata + window_start, typing_status + window_start, stream);
+        sink.check(cudaPeekAtLastError(), "mmff94_compact_terms_kernel launch");
+    }
+
+    std::uint32_t const torsion_stride = batch_layout.torsion_stride;
+    launch_csd_torsion_match(descriptors, molecule_count, launch_buffers.csd_torsion_table.view,
+                             device_view.etk_torsions().data(), torsion_stride, device_view.torsion_counts().data(),
+                             stream);
+    sink.check(cudaPeekAtLastError(), "csd_torsion_match_kernel launch");
+
+    launch_etk_build_csr(device_view.etk_torsions().data(), torsion_stride, device_view.torsion_counts().data(),
+                         device_view.distance_constraints().data(), molecule_count,
+                         device_view.etk_interactions().data(), device_view.etk_atom_offsets().data(), metadata,
+                         stream);
+    sink.check(cudaPeekAtLastError(), "etk_build_csr_kernel launch");
+}
+
+/**
  *  @brief Enqueue upload, metric prepass, kernels, and download on this
  *  device's three-stream pipeline.  Returns immediately; caller eventually
  *  calls `finalize_gpu_pipeline` with the returned handle.
@@ -548,13 +732,12 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
         sink.check(cudaMemsetAsync(handle.device_coords_fp32.data(), 0, total_coords * sizeof(float), stream),
                    "memset device_coords_fp32 zero");
 
-    // The hop-count matrix is the pool's one device-only region: N x N bytes per molecule
-    // against the 16-byte-per-bond list it is derived from, so a warp BFS rebuilds it here
-    // instead of the upload carrying it.  It has to land before `mmff_polish_warp_kernel`
-    // reads it, and this stream is in order, so the launch sits with the other prologue work.
-    launch_bond_distance_bfs(device_view.mmff_bonds().data(), device_view.molecule_metadata().data(),
-                             device_view.bond_distance().data(), per_device_molecule_count, stream);
-    sink.check(cudaPeekAtLastError(), "bond_distance_bfs_kernel launch");
+    // The device preprocessing chain.  Everything from here to the metric prepass reads the
+    // uploaded descriptors and writes the regions past `bytes_uploaded`, so the host ships the
+    // molecular graph and the GPU derives the force field from it.  One stream, in order, so each
+    // pass sees the previous one's output without an event or a synchronize anywhere.
+    enqueue_device_preprocess_(device_view, per_device_batch.layout, launch_buffers, per_device_molecule_count, stream,
+                               sink);
 
     cudaEventRecord(handle.event_metric_start, stream);
 

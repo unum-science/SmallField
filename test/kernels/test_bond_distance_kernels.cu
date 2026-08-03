@@ -29,7 +29,7 @@ void run_bond_distance_bfs_on_gpu(std::byte const *host_pool, sfa::batch_layout_
     cudaMemset(device_pool + layout.offset_bond_distance, 0xAB, layout.count_bond_distance);
 
     sfa::batch_pool_view_t device_view {device_pool, &layout};
-    sfc::launch_bond_distance_bfs(device_view.mmff_bonds().data(), device_view.molecule_metadata().data(),
+    sfc::launch_bond_distance_bfs(device_view.descriptors().data(), device_view.molecule_metadata().data(),
                                   device_view.bond_distance().data(), molecule_count);
     cudaDeviceSynchronize();
     cudaMemcpy(bond_distance_out, device_pool + layout.offset_bond_distance, layout.count_bond_distance,

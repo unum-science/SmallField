@@ -27,4 +27,21 @@ inline constexpr std::uint32_t max_mmff_interactions_per_mol_k =
     max_mmff_bonds_per_mol_k * 2 + max_mmff_angles_per_mol_k * 3 + max_mmff_torsions_per_mol_k * 4 +
     max_mmff_oops_per_mol_k * 4 + max_mmff_stretchbends_per_mol_k * 3;
 
+/**
+ *  @brief Batch-global base element of one molecule inside each packed MMFF term array.
+ *
+ *  The device compaction pass reads one entry per molecule and writes that molecule's terms
+ *  starting at the named element.  The pipeline fills the array on the host by prefix-summing
+ *  the per-molecule capacities, which is what keeps the packed-array sizing off the device and
+ *  out of a readback.
+ */
+struct mmff94_packed_offsets_t {
+    std::uint32_t bonds;
+    std::uint32_t angles;
+    std::uint32_t torsions;
+    std::uint32_t oops;
+    std::uint32_t stretchbends;
+    std::uint32_t interactions;
+};
+
 } // namespace smallfield::types
