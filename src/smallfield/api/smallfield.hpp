@@ -42,6 +42,7 @@ using cudaStream_t = void *;
 #include <vector>
 
 #include "smallfield/api/wave_slice_pool.hpp"
+#include "smallfield/types/atom_limited_bins.hpp"
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/api/conformer_status.hpp"
 #include "smallfield/log.hpp"
@@ -66,11 +67,10 @@ struct config_t {
 /** @brief Upper bound on devices a single `context_t` can manage. */
 inline constexpr std::size_t max_devices_k = 16;
 
-/** @brief Atom-count bins for `atom-limited-bin` kernel dispatch. */
-inline constexpr std::size_t atom_limited_bin_count_k = 8;
-inline constexpr std::array<std::uint32_t, atom_limited_bin_count_k> atom_limited_bin_caps_k = {
-    16, 32, 48, 64, 80, 96, 112, 128,
-};
+/** @brief Atom-count bins for `atom-limited-bin` kernel dispatch; one definition, shared with the
+ *  metric prepass so the two cannot partition the same wave differently. */
+using types::atom_limited_bin_caps_k;
+using types::atom_limited_bin_count_k;
 
 // `max_atoms_per_molecule_k` lives in `conformer_layout.hpp` (included above); it
 // matches `molecule_descriptor_t::max_atoms_per_molecule_k`, and larger molecules are rejected by

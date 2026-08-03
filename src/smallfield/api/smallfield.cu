@@ -389,7 +389,7 @@ context_t::context_t(std::span<int const> devices) {
     // `cudaFuncAttributeMaxDynamicSharedMemorySize` on the embed kernel stays
     // in effect for the lifetime of each device's primary context.  At bin 128
     // the kernel needs ~67 KB shared, above the 48 KB default.
-    constexpr std::uint32_t max_bin_n = 128;
+    constexpr std::uint32_t max_bin_n = max_atoms_per_molecule_k;
     constexpr std::size_t max_embed_shared_bytes = static_cast<std::size_t>(max_bin_n * max_bin_n + max_bin_n + 1 +
                                                                             4 * max_bin_n + max_bin_n + 4 + 1) *
                                                    sizeof(float);

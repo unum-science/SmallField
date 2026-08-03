@@ -208,6 +208,11 @@ Risk low.
 
 ## Optimizations Tried and Rejected
 
+- __Size-aware distance-geometry budget__ — the DG stage runs a flat 100 FIRE iterations for every molecule while `select_refinement_policy_` already scales the ETK and MMFF stages, so it looked like the one stage whose cost grows with the bounds matrix had simply been missed.
+  Giving it the same three tiers — 60 iterations for light molecules, 160 for heavy — cost 3 102 conformers on stratified 500 K PubChem at K=3 and pushed `stereo_failure` from 0.87 % to 1.07 %, for no wall-time change at all: 198.7 s against 199.8 s.
+  Cutting the budget yields a worse starting geometry, and chirality validation is what notices.
+  The stage is not oversized for small molecules; it is what makes their stereocentres survive.
+  Reverted.
 - __Gradient register tile__ — moved FIRE gradient array from shared to per-lane registers to attack `long_scoreboard` stalls.
   ncu showed stalls came from positions/velocities reads, not gradient.
   Registers rose 116 → 146 with no occupancy win.

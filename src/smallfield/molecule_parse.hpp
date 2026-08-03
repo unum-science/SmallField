@@ -136,6 +136,11 @@ inline parse_result_t parse_smiles(std::string_view smiles, parse_options_t cons
             // fragment the force field can actually type.
             static RDKit::MolStandardize::LargestFragmentChooser const chooser {/*preferOrganic=*/true};
             chooser.chooseInPlace(*result.molecule);
+            // Removing atoms leaves the ring information describing the molecule that was parsed,
+            // not the one that survived, and anything that consults it afterwards — aromatic SMARTS
+            // matching, MMFF typing — throws `RingInfo not initialized` rather than reading stale
+            // rings.  Re-sanitising is the honest repair and only the multi-fragment minority pays.
+            RDKit::MolOps::sanitizeMol(*result.molecule);
         }
         catch (...) {
             result.molecule.reset();

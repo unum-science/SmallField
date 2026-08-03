@@ -33,6 +33,7 @@
 
 #include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/cuda_error.hpp"
+#include "smallfield/types/atom_limited_bins.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::cuda {
@@ -371,13 +372,12 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
     // Everything in a bin padds up to the bin's N for the eigendecomposition, so
     // cusolver is called ONCE per bin instead of once per exact atom count (~30 calls
     // today). Per-call CPU overhead inside cusolver dominated the per-launch wall.
-    constexpr std::uint32_t bin_atom_counts_k[] = {16, 32, 48, 64, 80, 96, 112, 128};
-    constexpr std::uint32_t num_bins_k = sizeof(bin_atom_counts_k) / sizeof(bin_atom_counts_k[0]);
+    auto const &bin_atom_counts_k = smallfield::types::atom_limited_bin_caps_k;
+    constexpr std::uint32_t num_bins_k = static_cast<std::uint32_t>(smallfield::types::atom_limited_bin_count_k);
 
     auto bin_for = [&](std::uint32_t num_atoms) -> int {
-        for (std::uint32_t b = 0; b < num_bins_k; ++b)
-            if (num_atoms <= bin_atom_counts_k[b]) return static_cast<int>(b);
-        return -1;
+        std::size_t const bin_index = smallfield::types::atom_limited_bin_for(num_atoms);
+        return bin_index < smallfield::types::atom_limited_bin_count_k ? static_cast<int>(bin_index) : -1;
     };
 
     // Bins are reused across calls via a thread_local store; no per-call allocation.

@@ -132,7 +132,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
                                  std::uint32_t max_stereo_attempts, std::vector<__half> &coords_out,
                                  std::vector<float> &energies_out, std::vector<sfapi::conformer_status_t> &status_out) {
     std::uint32_t const num_smiles = static_cast<std::uint32_t>(smiles.size());
-    std::uint32_t const max_atoms = 128;
+    std::uint32_t const max_atoms = smallfield::types::max_atoms_per_molecule_k;
     std::printf("\n=== System B: SmallField GPU ===\n");
 
     // Build string_view span for the library.
@@ -192,7 +192,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
 static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, std::uint32_t num_conformers,
                                        std::uint32_t max_stereo_attempts) {
     std::uint32_t const num_smiles = static_cast<std::uint32_t>(smiles.size());
-    std::uint32_t const max_atoms = 128;
+    std::uint32_t const max_atoms = smallfield::types::max_atoms_per_molecule_k;
     std::printf("\n=== System B: SmallField multi-GPU (all GPUs) ===\n");
 
     // Build string_view span for the library.

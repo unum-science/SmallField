@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
     smiles_views.reserve(storage.size());
     for (auto const &s : storage) smiles_views.emplace_back(s);
 
-    std::uint32_t const max_atoms = 128;
+    std::uint32_t const max_atoms = smallfield::types::max_atoms_per_molecule_k;
     std::uint32_t const n_conf = n_conf_arg;
     std::printf("Conformers/molecule: %u\n", n_conf);
     std::vector<__half> coords(storage.size() * n_conf * max_atoms * 3);

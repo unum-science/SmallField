@@ -32,10 +32,10 @@
 namespace smallfield::types {
 
 /** Maximum atom count supported by the single-warp GPU pipeline. */
-inline constexpr std::uint32_t max_atoms_per_molecule_k = 128;
+inline constexpr std::uint32_t max_atoms_per_molecule_k = 192;
 
 /** Maximum bond count. Drug-like molecules with N≤128 rarely exceed 160 bonds. */
-inline constexpr std::uint32_t max_bonds_k = 256;
+inline constexpr std::uint32_t max_bonds_k = 384;
 
 /** Maximum number of neighbors stored across all atoms (adjacency CSR size). */
 inline constexpr std::uint32_t max_neighbor_entries_k = max_bonds_k * 2;
