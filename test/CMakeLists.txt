@@ -46,13 +46,31 @@ add_mixed_test(kernels triangle_smooth)
 add_mixed_test(kernels dg_energy)
 add_mixed_test(kernels mmff_gradient)
 
+# The reproducibility check compiles metric_embedding_prepass.cuh itself so it can drive the
+# embed kernel over thousands of identical blocks. It therefore must not also link
+# smallfield_lib, which carries its own device copy of that kernel: nvlink would see the symbol
+# defined twice. RDKit comes in only for the test_helpers.hpp assertion macros.
+add_executable(test_embedding_determinism kernels/test_embedding_determinism.cpp
+  kernels/test_embedding_determinism_kernels.cu)
+set_source_files_properties(kernels/test_embedding_determinism.cpp PROPERTIES
+  LANGUAGE CXX)
+target_link_libraries(test_embedding_determinism PRIVATE test_helpers
+  ${RDKIT_LIBS} fmt::fmt)
+target_include_directories(
+  test_embedding_determinism PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+set_target_properties(test_embedding_determinism PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON LINKER_LANGUAGE CUDA)
+add_test(NAME test_embedding_determinism COMMAND test_embedding_determinism)
+
+
 # --- preprocess/ ---
 add_mixed_test(preprocess chirality)
 add_cpp_test(api conformer_slot_layout)
 add_cpp_test(preprocess descriptor)
-add_cpp_test(preprocess native_murcko)
 add_cpp_test(preprocess csd_torsion_predicates)
 add_cpp_test(preprocess element_gate)
+add_cpp_test(preprocess chiral_parity)
 
 # --- postprocess/ ---
 add_cpp_test(postprocess shape_descriptors)

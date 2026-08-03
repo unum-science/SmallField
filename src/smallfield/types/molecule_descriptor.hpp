@@ -90,6 +90,10 @@ struct alignas(8) molecule_descriptor_t {
     std::int8_t formal_charge[max_atoms_k];
     std::uint8_t atom_flags[max_atoms_k];    ///< bitwise OR of atom_flag_t
     std::uint8_t smallest_ring[max_atoms_k]; ///< smallest SSSR ring size containing atom (0 if none)
+    /** @brief Ring-bond connectivity, the SMARTS `x<n>` primitive: how many of the atom's bonds
+     *  carry @ref bond_flag_in_ring_k.  Zero for an acyclic atom and for a ring atom whose every
+     *  bond leaves the ring, which cannot happen, so zero reads as "not in a ring". */
+    std::uint8_t ring_bond_degree[max_atoms_k];
     std::uint8_t cip_rank[max_atoms_k];      ///< CIP priority rank (0 = lowest)
     std::uint8_t chiral_tag[max_atoms_k];    ///< 0=none, 1=CW, 2=CCW
     std::uint8_t isotope[max_atoms_k];       ///< isotope mass number (0 = natural / unspecified)
@@ -278,10 +282,14 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
 
     // A bond is in a ring iff there's a path from atom_i to atom_j not using that bond.
     // Cheap test: check RDKit's bond->getIsRingBond() via the RingInfo.
+    std::memset(desc.ring_bond_degree, 0, sizeof(desc.ring_bond_degree));
     auto const *ring_info = molecule.getRingInfo();
     if (ring_info != nullptr && ring_info->isInitialized()) {
         for (std::uint32_t b = 0; b < num_bonds; ++b) {
-            if (ring_info->numBondRings(b) > 0) desc.bond_flags[b] |= bond_flag_in_ring_k;
+            if (ring_info->numBondRings(b) == 0) continue;
+            desc.bond_flags[b] |= bond_flag_in_ring_k;
+            desc.ring_bond_degree[desc.bond_atom_i[b]]++;
+            desc.ring_bond_degree[desc.bond_atom_j[b]]++;
         }
 
         auto const &atom_rings = ring_info->atomRings();

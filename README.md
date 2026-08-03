@@ -175,11 +175,20 @@ make -j$(nproc)
 ctest --output-on-failure
 ```
 
+Two more flags are needed on hosts whose default toolchain has moved ahead of the CUDA toolkit.
+`nvcc` 12.8 rejects GCC 15, so the host compiler must be pinned.
+`find_package(fmt)` otherwise resolves to a system `libfmt` that does not match the headers in the RDKit prefix — surfacing as an undefined `fmt::v*::vprint` at link time rather than at configure time.
+
+```bash
+cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_CUDA_HOST_COMPILER=g++-14 \
+    -Dfmt_DIR=/path/to/conda/env/lib/cmake/fmt
+```
+
 ## C++ Benchmarks
 
 ```bash
 cd build
-cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc) bench_conformers
 
 # ETKDG + MMFF94 throughput (RDKit CPU vs SmallField GPU)

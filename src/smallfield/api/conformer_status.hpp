@@ -22,8 +22,13 @@ enum class conformer_status_t : std::uint8_t {
     mmff_unconverged = 2,
     invalid_smiles = 3,
     too_many_atoms = 4,
-    /** @brief `preprocess-step` exceeded the per-`molecule` deadline (RDKit VF2 worst-case).
-     *  Downstream `fallback-role` may still successfully produce ETKDGv3 conformers. */
+    /** @brief Reserved.  Nothing produces this: it marked a `preprocess-step` that exceeded its
+     *  per-`molecule` deadline, and the deadline guarded RDKit VF2's pathological worst case.  The
+     *  native matcher covers the whole pattern corpus, so no substructure search runs.
+     *
+     *  The value stays because status codes are written as integers into every shipped
+     *  `*.3D.parquet`: removing it renumbers everything after it and silently changes what
+     *  already-written shards mean. */
     preprocess_timeout = 5,
     /** @brief Molecule contains an atom whose `MMFF94` atom type cannot be assigned
      *  by `RDKit::MMFF::MMFFMolProperties::getMMFFAtomType` (returns 0).  Covers

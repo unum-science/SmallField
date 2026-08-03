@@ -204,6 +204,18 @@ Risk low.
   The stream drain is correct whether or not the end event was recorded and costs about 5 ms per wave per device.
   Reverted.
 
+### 6. Reproducible output at a fixed seed
+
+The 4D metric embedding is now bitwise reproducible, but the pipeline as a whole is not.
+`prepare_per_thread_contribs_` distributes molecules with `schedule(dynamic, 64)`, so which host thread prepares which molecule varies run to run.
+Molecules therefore land at different offsets inside their device batch, and the per-molecule RNG seed is `mol * 32 + lane` — a function of that offset.
+Two runs at the same `random_seed` consequently produce different conformers.
+
+Measured: a `generate_conformers`-twice comparison passes at 600 molecules under `OMP_NUM_THREADS=1` and fails with default OpenMP, which isolates the cause to the scheduling rather than to any kernel.
+
+Seeding from a stable per-molecule identity — the input row index rather than the batch offset — removes the dependency without giving up dynamic scheduling, which the load imbalance genuinely needs.
+Worth doing before any claim that a shipped shard is regenerable.
+
 ## Parked (not on roadmap)
 
 - __MMFF parameter static-LUT replacement__ — at 10 M scale MMFF-related CPU is ~8 % total; a 66 % reduction on per-term lookup cost gives ≤ 3 % wall.
@@ -232,3 +244,16 @@ Projected wall time at the current 10K mol/s host-prep ceiling, no further optim
 Scaffold cache internals: a 64-shard `tsl::robin_map<uint64_t, scaffold_cache_entry_t>` at ~5 KB per entry, keyed by Bemis-Murcko hash.
 On curated ChEMBL (4 698 unique scaffolds across 237 600 cyclic molecules, 98 % reuse) it adds +44 % throughput.
 Long-tail libraries show lower hit rates — that is what the adaptive-eviction + scaffold-aware-sharding gaps in the Dataset roadmap address.
+
+### 7. Retiring the VF2 fallback — deletion order
+
+Once the native matcher reaches 470/470, `csd_torsion_dispatcher.hpp`'s `SubstructMatch` fallback goes, and with it three subsystems that exist only to serve it: `scaffold_cache.hpp`, `native_murcko.hpp` — the cache's key function — and `preprocess_deadline.hpp`, whose sole purpose is escaping VF2's pathological worst case.
+
+Two constraints on that deletion.
+
+`conformer_status_t::preprocess_timeout` must __stay__ even once unreachable.
+Status codes are written as integers into every shipped `*.3D.parquet`, so removing the enumerator renumbers the ones after it and silently changes what already-written shards mean.
+Mark it reserved rather than deleting it.
+
+`context_t::enable_scaffold_cache` and `get_scaffold_cache_stats` are public API called from `bench_profile.cpp` and `bench_conformers.cpp`.
+Both go, and both benches need updating in the same commit.

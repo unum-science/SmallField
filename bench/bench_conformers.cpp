@@ -199,7 +199,6 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     // Opt in to scaffold-based SubstructMatch caching.
     // Amortises RDKit fallback cost across molecules sharing the same Murcko
     // scaffold; safe no-op if disabled or for acyclic molecules.
-    gpu_context.enable_scaffold_cache();
 
     // Allow 1-GPU runs via --multi-gpu-only (used by scaling sweeps that
     // control GPU count via CUDA_VISIBLE_DEVICES). The "multi" in the

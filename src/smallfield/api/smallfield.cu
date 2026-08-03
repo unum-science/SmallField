@@ -17,8 +17,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "smallfield/preprocess/scaffold_cache.hpp"
-
 #if defined(SMALLFIELD_BUILD_PYTHON)
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -341,16 +339,6 @@ context_t::~context_t() {
         launch_scratch[device_index].reset();
         cudaStreamDestroy(streams[device_index]);
     }
-    scaffold_cache.reset(); // no-op if null
-}
-
-void context_t::enable_scaffold_cache() {
-    if (!scaffold_cache) scaffold_cache = std::make_unique<scaffold_cache_t>();
-}
-
-scaffold_cache_stats_t context_t::get_scaffold_cache_stats() const {
-    if (!scaffold_cache) return {};
-    return scaffold_cache->stats();
 }
 
 /**
@@ -1013,8 +1001,7 @@ conformer_status_t context_t::generate_conformers(
     auto prep_slice_into_slot = [&](std::size_t slot, std::uint32_t begin, std::uint32_t end) {
         SMALLFIELD_NVTX_RANGE_COLORED("prep: rdkit preprocess", 0x8E44AD);
         std::span<batch_pool_t, max_devices_k> slot_span {batch_slots_per_device[slot].data(), max_devices_k};
-        prepare_per_device_batches_into(smiles_view.subspan(begin, end - begin), num_devices, slot_span,
-                                        scaffold_cache.get(), &rejected_buf);
+        prepare_per_device_batches_into(smiles_view.subspan(begin, end - begin), num_devices, slot_span, &rejected_buf);
         for (rejected_mol_t const &entry : rejected_buf) {
             std::uint32_t const sorted_idx = begin + entry.slice_local_index;
             std::uint32_t const caller_idx = sort_perm_view[sorted_idx];

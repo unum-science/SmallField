@@ -31,11 +31,18 @@
 
 #include <cuda_runtime.h>
 
+#include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/cuda_error.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::cuda {
 using smallfield::types::etkdg_molecule_metadata_t;
+
+/** Thread count of every @ref embed_4d_power_iter_kernel block; one block handles one molecule. */
+constexpr std::uint32_t embed_block_size_k = 128;
+
+/** One staging slot per warp for the block-wide sum in @ref embed_4d_power_iter_kernel. */
+constexpr std::uint32_t embed_reduction_slots_k = embed_block_size_k / warp_size_k;
 
 /**
  * @brief Reads the upper distance bound for atom pair (i, j) from the float bounds matrix.
@@ -96,27 +103,63 @@ __device__ __forceinline__ float midpoint_distance_squared_(float const *bounds,
 }
 
 /**
+ *  @brief Deterministic block-wide float sum.
+ *
+ *  Reduces inside each warp with butterfly shuffles, stages one partial per warp in
+ *  @p warp_partials, then has every thread re-add the partials in warp order.  The
+ *  summation tree depends only on lane and warp index, so the result is bitwise
+ *  identical on every run and in every thread — the property a shared-memory float
+ *  @c atomicAdd cannot offer, since it commits contributions in whatever order the
+ *  scheduler grants and float addition does not associate.
+ *
+ *  Both barriers live inside, so a caller may invoke this straight out of a loop that
+ *  produced @p value and consume the return value immediately.  Every thread of the
+ *  block must reach the call.
+ *
+ *  @param[in] value This thread's contribution to the sum.
+ *  @param[inout] warp_partials Shared scratch of at least @ref embed_reduction_slots_k floats.
+ *  @return The sum across the whole block, identical in every thread.
+ */
+__device__ __forceinline__ float embed_block_reduce_sum_(float value, float *warp_partials) {
+    sf_assert_(blockDim.x == embed_block_size_k);
+    std::uint32_t const lane_in_warp = threadIdx.x % warp_size_k;
+    std::uint32_t const warp_index = threadIdx.x / warp_size_k;
+    float const warp_sum = warp_reduce_sum_f32_(value);
+    __syncthreads(); // ? Readers of the previous reduction must finish before the restage
+    if (lane_in_warp == 0) warp_partials[warp_index] = warp_sum;
+    __syncthreads();
+    float total = 0.0f;
+    for (std::uint32_t warp = 0; warp < embed_reduction_slots_k; ++warp) total += warp_partials[warp];
+    return total;
+}
+
+/**
  *  @brief Fused bounds-smooth → Gram → top-4 eigen → 4D embedding kernel.
  *
- *  One block per molecule.  Reuses the existing triangle-smooth + Gram build
- *  code, then runs deflated power iteration to extract the four largest
- *  eigenvalues + eigenvectors, and writes the 4D embedding directly into
- *  @c initial_coordinates.  Replaces the three-kernel chain
- *  (smooth_and_build_gram_kernel → cusolverDnXsyevBatched →
- *  project_metric_coordinates_kernel) with a single launch — no cusolver,
- *  no host workspace, no inter-kernel Gram-matrix global memory traffic.
+ *  One block of @ref embed_block_size_k threads per molecule.  Smooths the bounds with
+ *  triangle inequalities, builds the double-centered Gram matrix, runs deflated power
+ *  iteration to extract the four largest eigenvalues + eigenvectors, and writes the 4D
+ *  embedding directly into @c initial_coordinates — one launch, no cusolver, no host
+ *  workspace, no inter-kernel Gram-matrix global memory traffic.
+ *
+ *  Every block-wide sum goes through @ref embed_block_reduce_sum_, so the embedding is a
+ *  pure function of the bounds matrix: bitwise equal across launches and across blocks,
+ *  which is what lets a shipped shard be regenerated. test_embedding_determinism pins it.
  *
  *  Shared memory layout (all floats):
  *    gram[N × N]                (overwrites bounds buffer after smoothing)
- *    row_means[N]               (transient during Gram build)
+ *    row_means[max(N, 4)]       (Gram build; reduction staging afterwards)
  *    grand_mean[1]              (transient)
  *    v[4][N]                    (eigenvector estimates)
  *    w[N]                       (mat-vec scratch)
  *    lambda[4]                  (eigenvalue estimates)
- *    dot[1]                     (reduction scratch)
- *  At N=128: 16384 + 128 + 1 + 512 + 128 + 4 + 1 = 17158 floats ≈ 67 KB.
+ *  At N=128: 16384 + 128 + 1 + 512 + 128 + 4 = 17157 floats ≈ 67 KB.
  *
- *  @see smooth_and_build_gram_kernel
+ *  @param[inout] bounds_matrices Flat per-molecule bounds matrices, smoothed in place.
+ *  @param[in] molecule_metadata Per-molecule atom counts and bounds offsets.
+ *  @param[in] molecule_indices Molecule index handled by each block.
+ *  @param[out] initial_coordinates Destination for the 4D metric embedding.
+ *  @param[in] max_atoms_per_molecule Stride between coordinate dimensions.
  */
 __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
                                            etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
@@ -132,16 +175,20 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     if (num_atoms == 0) return;
 
     extern __shared__ float embed_shared_raw[];
+    // The row-mean region is at least one slot per warp so it can stage the block reductions
+    // once the Gram build that produced the row means is done with it.
+    std::uint32_t const row_means_extent = max(num_atoms, embed_reduction_slots_k);
     float *shared_gram = embed_shared_raw; // N × N, reused for bounds smoothing
     float *row_means = shared_gram + num_atoms * num_atoms;
-    float *grand_mean_ptr = row_means + num_atoms; // 1
-    float *v0 = grand_mean_ptr + 1;                // v[0]  ... v[3]
-    float *v1 = v0 + num_atoms;
-    float *v2 = v1 + num_atoms;
-    float *v3 = v2 + num_atoms;
-    float *w = v3 + num_atoms;
-    float *lambda_ptr = w + num_atoms;       // 4
-    float *dot_accumulator = lambda_ptr + 4; // 1 (reduction scratch)
+    float *warp_partials = row_means;                     // Live only after the Gram build
+    float *grand_mean_ptr = row_means + row_means_extent; // 1
+    // The four eigenvector estimates are one contiguous 4 × N block, so estimate k is reached by
+    // pointer arithmetic on the loop counter. An array of four pointers indexed by that counter
+    // would be a runtime-indexed local array, which nvcc places on the stack rather than in
+    // registers, costing a per-thread spill for no gain over the multiply.
+    float *eigenvectors = grand_mean_ptr + 1; // 4 × N
+    float *w = eigenvectors + 4 * num_atoms;
+    float *lambda_ptr = w + num_atoms; // 4
 
     float *global_bounds = bounds_matrices + meta.bounds_offset;
     float *molecule_coordinates = initial_coordinates + molecule_index * max_atoms_per_molecule * 4;
@@ -195,48 +242,42 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     __syncthreads();
     float const grand_mean = grand_mean_ptr[0];
 
-    // Build the Gram matrix in place, overwriting the smoothed bounds. Every thread computes
-    // its Gram entries into registers first, then writes them back after a full-block barrier;
-    // midpoint_distance_squared_ reads both upper and lower bound entries, so all reads must complete
-    // before any writes. Each thread holds at most ⌈N²/block_size⌉ entries — at N=128 with 128 threads
-    // that's 128 floats or 512 B per thread, comfortable in local memory.
-    constexpr std::uint32_t max_entries_per_thread_k = 128; // supports up to N=128 at 128 threads
-    float register_buffer[max_entries_per_thread_k];
-    std::uint32_t entries_per_thread = 0;
+    // Build the Gram matrix in place, overwriting the smoothed bounds. midpoint_distance_squared_
+    // reads both the upper and the lower bound of a pair, so a cell must not be overwritten while
+    // another thread still needs it. Walking the upper triangle makes each unordered pair {i, j}
+    // the property of exactly one thread: that thread reads both of the pair's cells and, since
+    // the double-centered Gram matrix is symmetric, writes the one value it computed into both.
+    // No cell is ever touched by two threads, so no staging across a barrier is needed and the
+    // kernel keeps every intermediate in registers.
     for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += block_size) {
         std::uint32_t const i = linear_index / num_atoms;
         std::uint32_t const j = linear_index % num_atoms;
-        float const sq = midpoint_distance_squared_(shared_gram, num_atoms, i, j);
-        register_buffer[entries_per_thread++] = -0.5f * (sq - row_means[i] - row_means[j] + grand_mean);
+        if (i > j) continue;
+        float const squared_distance = midpoint_distance_squared_(shared_gram, num_atoms, i, j);
+        float const centered = -0.5f * (squared_distance - row_means[i] - row_means[j] + grand_mean);
+        shared_gram[i * num_atoms + j] = centered;
+        shared_gram[j * num_atoms + i] = centered;
     }
-    __syncthreads();
-    entries_per_thread = 0;
-    for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += block_size)
-        shared_gram[linear_index] = register_buffer[entries_per_thread++];
     __syncthreads();
 
     // Deflated power iteration for the top-4 eigenvectors.
     // For each k in 0..3, iterate v_k ← (G - Σ_{j<k} λ_j v_j v_j^T) v_k / ‖·‖.
     // With positive-semidefinite Gram matrices the top eigenvalues are all
     // non-negative and power iteration converges.
-    float *eigenvector_ptrs[4] = {v0, v1, v2, v3};
     constexpr std::uint32_t max_power_iterations_k = 60;
     constexpr float convergence_tolerance_k = 1e-4f;
     for (std::uint32_t k = 0; k < 4; ++k) {
-        float *eigenvector_k = eigenvector_ptrs[k];
+        float *eigenvector_k = eigenvectors + k * num_atoms;
         // Initialize with a non-trivial vector orthogonal to e_0..e_{k-1} for better
         // deflation start (simple: e_k plus a small spread).
         for (std::uint32_t i = lane; i < num_atoms; i += block_size)
             eigenvector_k[i] = (i == k) ? 1.0f : 0.5f / static_cast<float>(num_atoms);
         __syncthreads();
         // Normalize initial eigenvector_k to unit length.
-        if (lane == 0) dot_accumulator[0] = 0.0f;
-        __syncthreads();
-        float local_sq = 0.0f;
-        for (std::uint32_t i = lane; i < num_atoms; i += block_size) local_sq += eigenvector_k[i] * eigenvector_k[i];
-        atomicAdd(dot_accumulator, local_sq);
-        __syncthreads();
-        float eigenvector_k_norm = sqrtf(fmaxf(dot_accumulator[0], 1e-20f));
+        float local_square_sum = 0.0f;
+        for (std::uint32_t i = lane; i < num_atoms; i += block_size)
+            local_square_sum += eigenvector_k[i] * eigenvector_k[i];
+        float const eigenvector_k_norm = sqrtf(fmaxf(embed_block_reduce_sum_(local_square_sum, warp_partials), 1e-20f));
         for (std::uint32_t i = lane; i < num_atoms; i += block_size) eigenvector_k[i] /= eigenvector_k_norm;
         __syncthreads();
 
@@ -251,28 +292,22 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
             __syncthreads();
 
             // Deflation: w -= Σ_{j<k} λ_j (v_j · w) v_j  (since G is symmetric PSD, removing
-            // projections onto previously-found eigenvectors lets power iteration converge
+            // projections onto the already-found eigenvectors lets power iteration converge
             // onto the next-largest eigenvalue).
             for (std::uint32_t j = 0; j < k; ++j) {
-                if (lane == 0) dot_accumulator[0] = 0.0f;
-                __syncthreads();
-                float local = 0.0f;
-                for (std::uint32_t i = lane; i < num_atoms; i += block_size) local += eigenvector_ptrs[j][i] * w[i];
-                atomicAdd(dot_accumulator, local);
-                __syncthreads();
-                float const proj = dot_accumulator[0];
-                for (std::uint32_t i = lane; i < num_atoms; i += block_size) w[i] -= proj * eigenvector_ptrs[j][i];
+                float const *eigenvector_j = eigenvectors + j * num_atoms;
+                float local_projection = 0.0f;
+                for (std::uint32_t i = lane; i < num_atoms; i += block_size)
+                    local_projection += eigenvector_j[i] * w[i];
+                float const projection = embed_block_reduce_sum_(local_projection, warp_partials);
+                for (std::uint32_t i = lane; i < num_atoms; i += block_size) w[i] -= projection * eigenvector_j[i];
                 __syncthreads();
             }
 
             // λ = ‖w‖
-            if (lane == 0) dot_accumulator[0] = 0.0f;
-            __syncthreads();
-            float local_w = 0.0f;
-            for (std::uint32_t i = lane; i < num_atoms; i += block_size) local_w += w[i] * w[i];
-            atomicAdd(dot_accumulator, local_w);
-            __syncthreads();
-            float const lambda = sqrtf(fmaxf(dot_accumulator[0], 1e-20f));
+            float local_w_square_sum = 0.0f;
+            for (std::uint32_t i = lane; i < num_atoms; i += block_size) local_w_square_sum += w[i] * w[i];
+            float const lambda = sqrtf(fmaxf(embed_block_reduce_sum_(local_w_square_sum, warp_partials), 1e-20f));
 
             // Normalize and check convergence.
             for (std::uint32_t i = lane; i < num_atoms; i += block_size) eigenvector_k[i] = w[i] / lambda;
@@ -293,7 +328,7 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     for (std::uint32_t atom = lane; atom < num_atoms; atom += block_size) {
         for (std::uint32_t dim = 0; dim < 4; ++dim) {
             float const lam = fmaxf(lambda_ptr[dim], 0.0f);
-            float const value = (lam > 1e-8f) ? sqrtf(lam) * eigenvector_ptrs[dim][atom] : 0.0f;
+            float const value = (lam > 1e-8f) ? sqrtf(lam) * eigenvectors[dim * num_atoms + atom] : 0.0f;
             molecule_coordinates[dim * max_atoms_per_molecule + atom] = value;
         }
     }
@@ -356,7 +391,6 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         bin_groups[bin].push_back(mol);
     }
 
-    constexpr std::uint32_t block_size_k = 128;
     bool success = true;
 
     // The `cudaFuncAttributeMaxDynamicSharedMemorySize` attribute for
@@ -384,9 +418,11 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         std::uint32_t *const device_group_indices = scratch.group_indices.data();
 
         // Shared memory for embed_4d_power_iter_kernel:
-        //   gram[N²] + row_means[N] + grand_mean[1] + v[4][N] + w[N] + lambda[4] + dot[1]
-        std::size_t const shared_bytes =
-            static_cast<std::size_t>(bin_n * bin_n + bin_n + 1 + 4 * bin_n + bin_n + 4 + 1) * sizeof(float);
+        //   gram[N²] + row_means[N] + grand_mean[1] + v[4][N] + w[N] + lambda[4]
+        // The reduction staging slots live inside the row-mean region, and every bin's N is far
+        // above embed_reduction_slots_k, so they cost nothing on top of this.
+        std::size_t const shared_bytes = static_cast<std::size_t>(bin_n * bin_n + bin_n + 1 + 4 * bin_n + bin_n + 4) *
+                                         sizeof(float);
 
         success &= sink.check(cudaMemcpyAsync(device_group_indices, group.data(), group_size * sizeof(std::uint32_t),
                                               cudaMemcpyHostToDevice, stream),
@@ -395,7 +431,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
 
         // One kernel launch replaces the smooth-and-build-gram + cusolverDnXsyevBatched +
         // project chain. No cusolver state updates, no global Gram/eigenvalue buffers.
-        embed_4d_power_iter_kernel<<<static_cast<unsigned int>(group_size), block_size_k, shared_bytes, stream>>>(
+        embed_4d_power_iter_kernel<<<static_cast<unsigned int>(group_size), embed_block_size_k, shared_bytes, stream>>>(
             device_bounds, device_metadata, device_group_indices, device_initial_coordinates, max_atoms_per_molecule);
         success &= sink.check(cudaGetLastError(), "embed_4d_power_iter_kernel launch");
     }

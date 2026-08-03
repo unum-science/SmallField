@@ -101,16 +101,21 @@ struct etkdg_molecule_metadata_t {
 
 /**
  *  Chiral center descriptor.
- *  Stores the central atom, its four CIP-priority-ordered neighbors,
- *  and the expected sign of the signed tetrahedral volume.
+ *  Stores the central atom, its neighbors in ascending atom-index order, and the expected sign of
+ *  the signed tetrahedral volume over that order.
+ *
+ *  The ordering is index-based, not CIP-based: `target_sign` is derived from the tetrahedral tag
+ *  and the parity of this permutation relative to the bond order the tag is defined against, so
+ *  any deterministic order works as long as the same one is used at derivation and validation.
+ *  A three-coordinate center stores its three bonded neighbors and leaves the fourth slot unused.
  *
  *  Validation: V = (r_b - r_a) . ((r_c - r_a) x (r_d - r_a))
  *  where a = center, b,c,d = neighbor_atoms[0..2]; sign(V) must equal target_sign.
  */
 struct alignas(8) chiral_center_descriptor_t {
     std::uint8_t center_atom;       ///< central atom index within molecule
-    std::uint8_t neighbor_atoms[4]; ///< four CIP-ordered neighbor atom indices
-    std::int8_t target_sign;        ///< +1 (R) or -1 (S) configuration
+    std::uint8_t neighbor_atoms[4]; ///< neighbor atom indices, ascending
+    std::int8_t target_sign;        ///< expected sign of the signed tetrahedral volume
     std::uint8_t padding[2];
 };
 

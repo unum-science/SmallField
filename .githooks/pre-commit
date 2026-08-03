@@ -173,10 +173,14 @@ check_positional_aggregates() {
 # Spell the concept out. A coined short form saves keystrokes once and costs a reader every time.
 # Whole-word only, so `rng_state`, `coords_ptr`, and `num_atoms` are untouched - the rule is about
 # a bare abbreviation standing alone as a name, not about a segment inside a spelled-out one.
+#
+# A `/` on either side excludes it: `/tmp/corpus.smi` and `src/smallfield/...` are filesystem
+# paths, not identifiers, and this project names both constantly. Matching them taught nothing and
+# would have pushed every path string through a bypass.
 check_abbreviations() {
     local abbreviations
     abbreviations=$(printf '%s\n' "$added" |
-        grep -E '\b(idx|cfg|tbl|cnt|rng|tmp|buf|ptr|src|dst|nbr)\b' || true)
+        grep -E '(^|[^/[:alnum:]_])(idx|cfg|tbl|cnt|rng|tmp|buf|ptr|src|dst|nbr)([^/[:alnum:]_]|$)' || true)
     [ -z "$abbreviations" ] || fail "$abbreviations" \
         "$file uses an abbreviated identifier - spell it out (index, config, table, count," \
         "            generator, scratch, buffer, pointer, source, destination, neighbor):"

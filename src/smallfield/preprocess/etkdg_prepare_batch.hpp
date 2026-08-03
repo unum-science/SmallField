@@ -4,7 +4,7 @@
  *
  *  Converts molecular graphs into GPU-ready data structures:
  *   - Distance bounds matrix (N x N, smoothed via triangle inequality)
- *   - Chiral center descriptors (CIP-ordered neighbors, target sign)
+ *   - Chiral center descriptors (index-ordered neighbors, target volume sign)
  *   - ETK torsion descriptors (CSD Fourier coefficients)
  *   - 1-2 / 1-3 distance constraints
  *
@@ -61,7 +61,6 @@
 #include "smallfield/preprocess/molecule_complexity.hpp"
 #include "smallfield/mmff94/mmff94_param_cache.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
-#include "smallfield/preprocess/cip_ranks.hpp"
 
 using smallfield::types::max_mmff_interactions_per_mol_k;
 
@@ -126,12 +125,6 @@ using smallfield::types::mmff94_stretchbend_t;
 using smallfield::types::mmff94_torsion_k;
 using smallfield::types::mmff94_torsion_t;
 using smallfield::types::molecule_descriptor_t;
-
-// Forward declaration — actual definition in scaffold_cache.hpp. Threaded
-// through the prep call chain as an opaque pointer to avoid pulling the
-// scaffold-cache header (and its concurrency primitives) into every TU
-// that includes etkdg_preprocess.hpp.
-class scaffold_cache_t;
 
 /**
  *  @brief Complete preprocessed molecule ready for GPU pipeline upload.
@@ -361,11 +354,21 @@ inline void build_bounds_matrix(molecule_descriptor_t const &desc, std::vector<f
 /**
  *  @brief Extract graph-only chiral center descriptors.
  *
- *  Neighbors are sorted by decreasing CIP priority. With that ordering, the GPU
- *  triple product over the top-three ligands has a stable sign convention:
- *  R → negative volume, S → positive volume.
+ *  The downstream constraint is the sign of the triple product over the center and
+ *  the first three stored neighbors, and that sign is fixed by exactly two things:
+ *  the atom's tetrahedral tag, which RDKit defines against the order the bonds appear
+ *  on the atom, and the parity of the stored neighbor order against that same bond
+ *  order. The descriptor's CSR adjacency is filled in bond order, so sorting the
+ *  neighbors by ascending atom index and counting the swaps yields that parity, and
+ *  an odd count flips the handedness the tag encodes.
  *
- *  @param[in] molecule RDKit molecule with stereochemistry assigned.
+ *  The rule is uniform across coordination numbers. A three-coordinate center such as
+ *  a sulfoxide sulfur or a phosphine phosphorus carries a lone pair as its fourth
+ *  substituent, which sits behind the three bonded neighbors in the bond order and in
+ *  the stored order alike, so it contributes no parity of its own and drops out.
+ *
+ *  @param[in] molecule RDKit molecule; stereochemistry is assigned in place.
+ *  @param[in] desc Flat descriptor supplying the chiral tags and the CSR adjacency.
  *  @param[out] chiral_centers Filled with one descriptor per tetrahedral center.
  */
 inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
@@ -374,55 +377,47 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
     auto &stereo_molecule = const_cast<RDKit::ROMol &>(molecule);
     RDKit::MolOps::assignStereochemistry(stereo_molecule, true, true, true);
 
-    // Keep RDKit's CIP ranker. Two native attempts so far:
-    //   Attempt 1: initial sorted-tuple partition refinement gave 98.94 % agreement,
-    //        P50 energy delta widened -5.4 → -5.8, throughput -2 %. Reverted.
-    //   Attempt 2: added an aromatic-bond multiplier=2 fix to reach 99.71 % agreement, P50 delta
-    //        widened to -6.3, throughput -2.8 %. Even at 99.71 % the 5 / 1698
-    //        residual chiral mis-orderings flip the GPU's chirality penalty
-    //        sign on those centres, producing measurably worse conformers.
-    // Investigation in ROADMAP.md ("Tried and rejected") — needs a CIP rule-1c phantom-atom
-    // implementation (asymmetric duplicate atoms for π-bond endpoints) to
-    // close the last 0.29 %. Until then RDKit's call is faster AND correct.
-    RDKit::UINT_VECT cip_ranks(molecule.getNumAtoms(), 0);
-    RDKit::Chirality::assignAtomCIPRanks(molecule, cip_ranks);
-
     std::uint32_t const num_atoms = desc.num_atoms;
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
         if (desc.chiral_tag[a] == 0) continue;
         if (desc.degree[a] < 3) continue;
 
-        auto const *atom = molecule.getAtomWithIdx(a);
-        if (!atom->hasProp("_CIPCode")) continue;
+        // `assignStereochemistry` strips the tag off every atom that parsed with one but is
+        // not a stereocenter, so a surviving tag is the membership test for this center.
+        auto const assigned_tag = molecule.getAtomWithIdx(a)->getChiralTag();
+        bool const is_stereocenter = assigned_tag == RDKit::Atom::CHI_TETRAHEDRAL_CW ||
+                                     assigned_tag == RDKit::Atom::CHI_TETRAHEDRAL_CCW;
+        if (!is_stereocenter) continue;
 
         chiral_center_descriptor_t descriptor {};
         descriptor.center_atom = static_cast<std::uint8_t>(a);
 
-        // Collect neighbors via descriptor's CSR adjacency, sort by CIP rank.
+        // Collect the neighbors in CSR order, which is the bond order the tag is defined against.
         std::uint8_t ordered[4] = {0, 0, 0, 0};
         std::uint32_t count = 0;
-        std::uint16_t const nstart = desc.neighbor_offset[a];
-        std::uint16_t const nend = desc.neighbor_offset[a + 1];
-        for (std::uint16_t n = nstart; n < nend && count < 4; ++n) ordered[count++] = desc.neighbor_atom[n];
-        // Insertion sort by (cip_rank desc, idx asc) — at most 4 elements.
-        for (std::uint32_t i = 1; i < count; ++i) {
-            std::uint8_t const v = ordered[i];
-            std::uint32_t j = i;
-            while (j > 0) {
-                std::uint8_t const u = ordered[j - 1];
-                bool const before = (cip_ranks[u] != cip_ranks[v]) ? (cip_ranks[u] < cip_ranks[v]) : (u > v);
-                if (!before) break;
-                ordered[j] = u;
-                --j;
+        std::uint16_t const neighbor_first = desc.neighbor_offset[a];
+        std::uint16_t const neighbor_last = desc.neighbor_offset[a + 1];
+        for (std::uint16_t n = neighbor_first; n < neighbor_last && count < 4; ++n)
+            ordered[count++] = desc.neighbor_atom[n];
+
+        // Insertion sort by ascending atom index over at most four entries, counting the swaps.
+        std::uint32_t swaps = 0;
+        for (std::uint32_t upper = 1; upper < count; ++upper) {
+            std::uint8_t const moving = ordered[upper];
+            std::uint32_t slot = upper;
+            while (slot > 0 && ordered[slot - 1] > moving) {
+                ordered[slot] = ordered[slot - 1];
+                --slot;
+                ++swaps;
             }
-            ordered[j] = v;
+            ordered[slot] = moving;
         }
 
-        for (std::uint32_t i = 0; i < 4; ++i) descriptor.neighbor_atoms[i] = ordered[i];
+        for (std::uint32_t slot = 0; slot < 4; ++slot) descriptor.neighbor_atoms[slot] = ordered[slot];
 
-        std::string cip_code;
-        atom->getProp("_CIPCode", cip_code);
-        descriptor.target_sign = (cip_code == "S") ? 1 : -1;
+        int const tag_sign = (desc.chiral_tag[a] == 1) ? 1 : -1;
+        int const order_parity = (swaps % 2 == 0) ? 1 : -1;
+        descriptor.target_sign = static_cast<std::int8_t>(-tag_sign * order_parity);
 
         chiral_centers.push_back(descriptor);
     }
@@ -1041,9 +1036,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
  *  the in-band drop signal.
  */
 inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_view smiles,
-                                                                 etkdg_prepared_molecule_t &result,
-                                                                 scaffold_cache_t *cache = nullptr,
-                                                                 preprocess_deadline_t *deadline = nullptr) {
+                                                                 etkdg_prepared_molecule_t &result) {
     result.num_atoms = 0;
     result.bounds_matrix.clear();
     result.chiral_centers.clear();
@@ -1113,7 +1106,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
         }
         build_bounds_matrix(desc, result.bounds_matrix);
         extract_chiral_centers(*mol, desc, result.chiral_centers);
-        extract_etk_torsions_native(*mol, desc, result.etk_torsions, cache, deadline);
+        extract_etk_torsions_native(*mol, desc, result.etk_torsions);
         extract_distance_constraints(desc, result.bounds_matrix, result.distance_constraints);
         build_etk_interaction_lists(result);
         mmff_status = extract_mmff94_params(*mol, desc, result);
@@ -1477,7 +1470,7 @@ inline void warm_up_rdkit_globals_once_() {
     });
 }
 
-static inline void prepare_per_thread_contribs_(std::span<std::string_view const> smiles_list, scaffold_cache_t *cache,
+static inline void prepare_per_thread_contribs_(std::span<std::string_view const> smiles_list,
                                                 std::vector<batch_prep_thread_contribution_t> &contribs) {
     warm_up_rdkit_globals_once_();
     int const n_threads_max = omp_get_max_threads();
@@ -1513,28 +1506,9 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
     {
         int const tid = omp_get_thread_num();
         auto &type_counts = contribs[tid];
-        // Stack-owned per-`molecule` deadline; no thread_local state.  The
-        // pointer threads through `prepare_molecule_into` →
-        // `extract_etk_torsions_native` → the `extraAtomCheck` lambda
-        // captured in `SubstructMatchParameters`.  2 s is a safe upper
-        // bound — the p99 drug-like molecule preprocess finishes in <10 ms.
-        preprocess_deadline_t deadline;
 #pragma omp for schedule(dynamic, 64)
         for (std::size_t m = 0; m < n; ++m) {
-            deadline.reset(std::chrono::milliseconds {2000});
-            auto const status = prepare_molecule_into(smiles_list[m], type_counts.scratch, cache, &deadline);
-            if (deadline.tripped) {
-                // Partial scratch may be incoherent; drop it and record the
-                // input index so `generate_conformers` can stamp
-                // `conformer_status_t::preprocess_timeout` and route the
-                // molecule to the `fallback-role` for ETKDGv3 retry.  The
-                // deadline path bypasses `status` because the partial
-                // result may have any reason code stale from earlier work.
-                type_counts.scratch.num_atoms = 0;
-                type_counts.rejected_input_indices.push_back(
-                    {static_cast<std::uint32_t>(m), smallfield::api::conformer_status_t::preprocess_timeout});
-                continue;
-            }
+            auto const status = prepare_molecule_into(smiles_list[m], type_counts.scratch);
             auto const &p = type_counts.scratch;
             if (p.num_atoms == 0) {
                 // `prepare_molecule_into` reports a precise rejection reason
@@ -1839,8 +1813,7 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
  *  `static` contribs vector persists capacities across calls so the
  *  allocator's fast path handles every call after the first.
  */
-inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list, etkdg_molecule_batch_t &batch,
-                                        scaffold_cache_t *cache = nullptr) {
+inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list, etkdg_molecule_batch_t &batch) {
     batch.num_molecules = 0;
     batch.max_atoms_per_molecule = 0;
     batch.layout = batch_layout_t {};
@@ -1851,7 +1824,7 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
     // gpu-runner-role thread).  A future streaming submit API that drives
     // prep concurrently would need a caller-owned scratch.
     static std::vector<batch_prep_thread_contribution_t> contribs;
-    prepare_per_thread_contribs_(smiles_list, cache, contribs);
+    prepare_per_thread_contribs_(smiles_list, contribs);
 
     std::vector<batch_prep_thread_bases_t> bases;
     per_mol_sizes_t totals {};
@@ -1888,10 +1861,9 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
  *  pipelined dispatcher — tests, one-shot invocations.  The hot path should
  *  prefer @ref prepare_molecule_batch_into.
  */
-inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view const> smiles_list,
-                                                     scaffold_cache_t *cache = nullptr) {
+inline etkdg_molecule_batch_t prepare_molecule_batch(std::span<std::string_view const> smiles_list) {
     etkdg_molecule_batch_t batch {};
-    prepare_molecule_batch_into(smiles_list, batch, cache);
+    prepare_molecule_batch_into(smiles_list, batch);
     return batch;
 }
 
@@ -2227,11 +2199,11 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
  */
 inline void prepare_per_device_batches_into(
     std::span<std::string_view const> smiles_list, std::uint32_t device_count,
-    std::span<etkdg_molecule_batch_t> per_device_out, scaffold_cache_t *cache = nullptr,
+    std::span<etkdg_molecule_batch_t> per_device_out,
     std::vector<smallfield::api::rejected_mol_t> *rejected_input_indices_out = nullptr) {
     static etkdg_molecule_batch_t shared_scratch;
     static distribute_scratch_t distribute_scratch;
-    prepare_molecule_batch_into(smiles_list, shared_scratch, cache);
+    prepare_molecule_batch_into(smiles_list, shared_scratch);
     distribute_batch_to_per_device_pools_(shared_scratch, device_count, per_device_out, distribute_scratch);
     if (rejected_input_indices_out != nullptr) {
         rejected_input_indices_out->assign(shared_scratch.rejected_input_indices.begin(),

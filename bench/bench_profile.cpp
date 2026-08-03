@@ -10,7 +10,6 @@
 #include <cuda_fp16.h>
 
 #include "smallfield/api/smallfield.hpp"
-#include "smallfield/preprocess/scaffold_cache.hpp"
 
 namespace sfapi = smallfield::api;
 
@@ -39,7 +38,6 @@ int main(int argc, char **argv) {
     std::vector<sfapi::conformer_status_t> status(storage.size() * n_conf);
 
     sfapi::context_t ctx;
-    ctx.enable_scaffold_cache();
     sfapi::config_t config;
     config.num_conformers = n_conf;
 
@@ -53,9 +51,5 @@ int main(int argc, char **argv) {
     std::printf("Wall %.1f ms, mol/s %.1f, succeeded %lu / %zu\n", ms, storage.size() * 1000.0 / ms, (unsigned long)ok,
                 status.size());
 
-    auto stats = ctx.get_scaffold_cache_stats();
-    std::uint64_t total = stats.hits + stats.misses;
-    std::printf("Scaffold cache: %lu entries, %lu hits, %lu misses (hit rate %.1f%%)\n", (unsigned long)stats.entries,
-                (unsigned long)stats.hits, (unsigned long)stats.misses, total ? 100.0 * stats.hits / total : 0.0);
     return 0;
 }
