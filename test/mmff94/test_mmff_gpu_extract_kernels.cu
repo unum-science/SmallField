@@ -28,7 +28,8 @@ void launch_mmff94_gpu_extract_pipeline(
     std::uint32_t bond_stride, sft::mmff94_angle_t *out_angles, std::uint32_t angle_stride,
     sft::mmff94_torsion_t *out_torsions, std::uint32_t torsion_stride, sft::mmff94_oop_t *out_oops,
     std::uint32_t oop_stride, sft::mmff94_stretchbend_t *out_stbns, std::uint32_t stbn_stride,
-    sft::mmff94_atom_interaction_t *out_interactions, sft::mmff94_atom_offsets_t *out_atom_offsets) {
+    sft::mmff94_atom_interaction_t *out_interactions, sft::mmff94_atom_offsets_t *out_atom_offsets,
+    mmff94_packed_host_result_t &packed_out) {
     sfparam::mmff94_tables_device_t device_tables;
     sfparam::upload_mmff94_tables_to_device(tables_host, device_tables);
     if (device_tables.arena.data() == nullptr) {
@@ -103,6 +104,79 @@ void launch_mmff94_gpu_extract_pipeline(
                cudaMemcpyDeviceToHost);
     cudaMemcpy(out_atom_offsets, atom_offsets_device,
                static_cast<std::size_t>(total_atoms) * sizeof(sft::mmff94_atom_offsets_t), cudaMemcpyDeviceToHost);
+
+    // Compaction: scan the per-molecule counts, read the totals back to size the
+    // packed arrays, then compact the fixed-stride staging into them.
+    sfmmff::mmff94_packed_offsets_t *packed_offsets_device = nullptr;
+    sfmmff::mmff94_packed_offsets_t *packed_totals_device = nullptr;
+    cudaMalloc(&packed_offsets_device, num_mols * sizeof(sfmmff::mmff94_packed_offsets_t));
+    cudaMalloc(&packed_totals_device, sizeof(sfmmff::mmff94_packed_offsets_t));
+    sfmmff::launch_mmff94_scan_counts(per_molecule_counts_device, num_mols, packed_offsets_device,
+                                      packed_totals_device);
+    cudaDeviceSynchronize();
+    sfmmff::mmff94_packed_offsets_t packed_totals {};
+    cudaMemcpy(&packed_totals, packed_totals_device, sizeof(packed_totals), cudaMemcpyDeviceToHost);
+
+    packed_out.bonds.resize(packed_totals.bonds);
+    packed_out.angles.resize(packed_totals.angles);
+    packed_out.torsions.resize(packed_totals.torsions);
+    packed_out.oops.resize(packed_totals.oops);
+    packed_out.stretchbends.resize(packed_totals.stretchbends);
+    packed_out.interactions.resize(packed_totals.interactions);
+    packed_out.atom_offsets.resize(total_atoms);
+    packed_out.metadata.resize(num_mols);
+
+    sft::mmff94_bond_t *packed_bond_device = nullptr;
+    sft::mmff94_angle_t *packed_angle_device = nullptr;
+    sft::mmff94_torsion_t *packed_torsion_device = nullptr;
+    sft::mmff94_oop_t *packed_oop_device = nullptr;
+    sft::mmff94_stretchbend_t *packed_stretch_bend_device = nullptr;
+    sft::mmff94_atom_interaction_t *packed_interaction_device = nullptr;
+    sft::etkdg_molecule_metadata_t *metadata_device = nullptr;
+    cudaMalloc(&packed_bond_device, (packed_totals.bonds + 1) * sizeof(sft::mmff94_bond_t));
+    cudaMalloc(&packed_angle_device, (packed_totals.angles + 1) * sizeof(sft::mmff94_angle_t));
+    cudaMalloc(&packed_torsion_device, (packed_totals.torsions + 1) * sizeof(sft::mmff94_torsion_t));
+    cudaMalloc(&packed_oop_device, (packed_totals.oops + 1) * sizeof(sft::mmff94_oop_t));
+    cudaMalloc(&packed_stretch_bend_device, (packed_totals.stretchbends + 1) * sizeof(sft::mmff94_stretchbend_t));
+    cudaMalloc(&packed_interaction_device, (packed_totals.interactions + 1) * sizeof(sft::mmff94_atom_interaction_t));
+    cudaMalloc(&metadata_device, num_mols * sizeof(sft::etkdg_molecule_metadata_t));
+    cudaMemset(metadata_device, 0, num_mols * sizeof(sft::etkdg_molecule_metadata_t));
+
+    sfmmff::launch_mmff94_compact_terms(
+        descriptor_device, atom_offset_device, num_mols, per_molecule_counts_device, packed_offsets_device, bond_device,
+        angle_device, torsion_device, oop_device, stretch_bend_device, interaction_device, packed_bond_device,
+        packed_angle_device, packed_torsion_device, packed_oop_device, packed_stretch_bend_device,
+        packed_interaction_device, atom_offsets_device, metadata_device, typing_status_device);
+    cudaDeviceSynchronize();
+    error = cudaGetLastError();
+    if (error != cudaSuccess) { std::fprintf(stderr, "compaction kernel error: %s\n", cudaGetErrorString(error)); }
+
+    cudaMemcpy(packed_out.bonds.data(), packed_bond_device, packed_totals.bonds * sizeof(sft::mmff94_bond_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(packed_out.angles.data(), packed_angle_device, packed_totals.angles * sizeof(sft::mmff94_angle_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(packed_out.torsions.data(), packed_torsion_device,
+               packed_totals.torsions * sizeof(sft::mmff94_torsion_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(packed_out.oops.data(), packed_oop_device, packed_totals.oops * sizeof(sft::mmff94_oop_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(packed_out.stretchbends.data(), packed_stretch_bend_device,
+               packed_totals.stretchbends * sizeof(sft::mmff94_stretchbend_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(packed_out.interactions.data(), packed_interaction_device,
+               packed_totals.interactions * sizeof(sft::mmff94_atom_interaction_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(packed_out.atom_offsets.data(), atom_offsets_device,
+               static_cast<std::size_t>(total_atoms) * sizeof(sft::mmff94_atom_offsets_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(packed_out.metadata.data(), metadata_device, num_mols * sizeof(sft::etkdg_molecule_metadata_t),
+               cudaMemcpyDeviceToHost);
+
+    cudaFree(packed_offsets_device);
+    cudaFree(packed_totals_device);
+    cudaFree(packed_bond_device);
+    cudaFree(packed_angle_device);
+    cudaFree(packed_torsion_device);
+    cudaFree(packed_oop_device);
+    cudaFree(packed_stretch_bend_device);
+    cudaFree(packed_interaction_device);
+    cudaFree(metadata_device);
     cudaFree(interaction_device);
     cudaFree(atom_offsets_device);
 

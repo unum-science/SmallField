@@ -11,13 +11,20 @@
  *     speedup (drug-like mols average < 30 atoms / 30 bonds).  The win
  *     is in the cross-molecule dimension: 50 K molecules × 132 SMs ×
  *     8 blocks/SM = ~1000 molecules in flight at steady state.
- *   - Per-molecule output slots have fixed stride (`max_mmff_*_per_mol`
- *     constants).  Each molecule writes into its own reserved slice of
- *     the output arrays, and reports its actual per-term-type counts
- *     to the `per_mol_counts` array.  Downstream passes compact if
- *     desired — today's CPU pipeline already stores variable-length
- *     arrays via `etkdg_prepared_molecule_t` and consumes counts from
- *     metadata, so the layout is compatible.
+ *   - The extractor and the CSR builder write into per-molecule slots of
+ *     fixed stride (`max_mmff_*_per_mol` constants), which costs 116 KB of
+ *     staging per molecule, and report their actual per-term-type counts
+ *     to the `per_mol_counts` array.
+ *   - `mmff94_scan_counts_kernel` + `mmff94_compact_terms_kernel` turn that
+ *     staging into the packed variable-length layout `batch_pool_t` and
+ *     `mmff_polish_warp_kernel` consume: one contiguous array per term type,
+ *     per-molecule bases stamped into `etkdg_molecule_metadata_t`, and the
+ *     per-atom CSR starts rebased from molecule-relative to batch-global.
+ *     `test_mmff_gpu_extract` prints both footprints per molecule and gates
+ *     the packed arrays byte for byte against the staging; it measures 17.2 KB
+ *     per molecule over 19 167 PubChem molecules and 19.4 KB over 20 009
+ *     Enamine REAL molecules, so compaction buys 6.1x to 6.9x on those corpora
+ *     and the packed arrays are the ones a 50 K-molecule wave allocates.
  */
 
 #pragma once
@@ -52,6 +59,7 @@ using smallfield::types::atom_role_fourth_k;
 using smallfield::types::atom_role_second_k;
 using smallfield::types::atom_role_third_k;
 using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::max_atoms_k;
 using smallfield::types::max_bonds_k;
 using smallfield::types::max_mmff_angles_per_mol_k;
@@ -90,20 +98,45 @@ struct mmff94_per_mol_counts_t {
     std::uint8_t padding;
 };
 
+/**
+ *  @brief Batch-global base offset of one molecule inside each packed term array.
+ *
+ *  One entry per molecule, produced by @ref mmff94_scan_counts_kernel as the exclusive
+ *  prefix sum of @ref mmff94_per_mol_counts_t.  The same struct carries the batch totals
+ *  in its one-element companion output, which is what the host reads back to size the
+ *  packed arrays before launching the compaction.
+ */
+struct mmff94_packed_offsets_t {
+    std::uint32_t bonds;
+    std::uint32_t angles;
+    std::uint32_t torsions;
+    std::uint32_t oops;
+    std::uint32_t stretchbends;
+    std::uint32_t interactions;
+};
+
+/** Number of independently scanned components in @ref mmff94_packed_offsets_t. */
+inline constexpr std::uint32_t mmff94_packed_components_k = 6;
+
+/** Thread count of the single-block scan that turns per-molecule counts into packed offsets. */
+inline constexpr std::uint32_t mmff94_scan_block_k = 512;
+
 namespace detail_extract {
 
 /** Angle scratch — populated during the angle pass and consumed by the
  *  stretch-bend pass.  Sized at `max_mmff_angles_per_mol_k` slots per
- *  molecule and stored in shared memory (≤ 16 B × 512 = 8 KB per block
- *  — fits comfortably within the SM shared-memory cap. */
+ *  molecule and held in shared memory, one array per block rather than
+ *  one per thread: 16 B × 512 = 8 KB per block, which the static
+ *  `__shared__` assertion below pins to the struct layout. */
 struct angle_scratch_t {
     std::uint8_t i, j, k;
     std::uint8_t angle_type;
     std::uint8_t bond_type_ij, bond_type_jk;
     std::int16_t bond_index_ij, bond_index_jk;
     float theta0_deg;
-    float ka;
 };
+
+static_assert(sizeof(angle_scratch_t) == 16, "angle scratch must stay at 8 KB per block");
 
 } // namespace detail_extract
 
@@ -203,6 +236,10 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     }
     __syncwarp();
 
+    // Angle scratch — populated by the angle pass, consumed by the stretch-bend
+    // pass.  Block-scoped, so the cost is 8 KB per warp rather than per thread.
+    __shared__ detail_extract::angle_scratch_t shared_angle_scratch[max_mmff_angles_per_mol_k];
+
     // From here on the passes with atomic cursors must run on lane-0
     // only to preserve deterministic ordering for byte-equality with CPU.
     if (lane != 0) return;
@@ -217,8 +254,7 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     std::uint8_t overflow = (num_bonds > max_mmff_bonds_per_mol_k) ? 1 : 0;
 
     // Angle terms (and angle-scratch for stretch-bend reuse).
-    detail_extract::angle_scratch_t as[max_mmff_angles_per_mol_k];
-    std::uint32_t as_count = 0;
+    std::uint32_t angle_scratch_count = 0;
 
     std::span<std::uint8_t const> bond_types {bond_type_arr, num_bonds};
     std::span<std::uint8_t const> at_span {atom_types, num_atoms};
@@ -257,17 +293,16 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
                         (std::uint8_t)ai, (std::uint8_t)center, (std::uint8_t)aj, is_linear, ka, theta0_rad, 0.0f};
                 }
                 else { overflow = 1; }
-                if (as_count < max_mmff_angles_per_mol_k) {
-                    as[as_count++] = {(std::uint8_t)ai,
-                                      (std::uint8_t)center,
-                                      (std::uint8_t)aj,
-                                      at_code,
-                                      bond_type_arr[bond_index_ic],
-                                      bond_type_arr[bond_index_cj],
-                                      (std::int16_t)bond_index_ic,
-                                      (std::int16_t)bond_index_cj,
-                                      theta0_deg,
-                                      ka};
+                if (angle_scratch_count < max_mmff_angles_per_mol_k) {
+                    shared_angle_scratch[angle_scratch_count++] = {(std::uint8_t)ai,
+                                                                   (std::uint8_t)center,
+                                                                   (std::uint8_t)aj,
+                                                                   at_code,
+                                                                   bond_type_arr[bond_index_ic],
+                                                                   bond_type_arr[bond_index_cj],
+                                                                   (std::int16_t)bond_index_ic,
+                                                                   (std::int16_t)bond_index_cj,
+                                                                   theta0_deg};
                 }
             }
         }
@@ -339,8 +374,8 @@ __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     }
 
     // Stretch-bend terms (reuse angle scratch).
-    for (std::uint32_t i = 0; i < as_count; ++i) {
-        auto const &a = as[i];
+    for (std::uint32_t i = 0; i < angle_scratch_count; ++i) {
+        auto const &a = shared_angle_scratch[i];
         auto const *prop_j = lookup_prop(tables, atom_types[a.j]);
         if (prop_j && prop_j->linh) continue;
         std::uint8_t const sbt = native_get_mmff_stretch_bend_type(
@@ -400,6 +435,14 @@ __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
     mmff94_torsion_t const *__restrict__ torsions_all, mmff94_oop_t const *__restrict__ oops_all,
     mmff94_stretchbend_t const *__restrict__ stbns_all, mmff94_atom_interaction_t *__restrict__ interactions_all,
     mmff94_atom_offsets_t *__restrict__ atom_offsets_all, std::uint8_t const *__restrict__ typing_status) {
+
+    // Per-atom per-type write cursors.  Block-scoped so the five arrays cost
+    // 2.5 KB per warp instead of per thread; only lane 0 ever touches them.
+    __shared__ std::uint32_t cursors_bond[max_atoms_k];
+    __shared__ std::uint32_t cursors_angle[max_atoms_k];
+    __shared__ std::uint32_t cursors_torsion[max_atoms_k];
+    __shared__ std::uint32_t cursors_oop[max_atoms_k];
+    __shared__ std::uint32_t cursors_stretchbend[max_atoms_k];
 
     std::uint32_t const mol = blockIdx.x;
     if (mol >= num_molecules) return;
@@ -469,18 +512,13 @@ __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
     // per_mol_counts for downstream CSR consumers.
     per_mol_counts[mol].interactions = (std::uint16_t)running;
 
-    // Per-atom per-type cursors (reuse `_start` as running cursor).
-    std::uint32_t cursors_bond[max_atoms_k];
-    std::uint32_t cursors_angle[max_atoms_k];
-    std::uint32_t cursors_torsion[max_atoms_k];
-    std::uint32_t cursors_oop[max_atoms_k];
-    std::uint32_t cursors_sb[max_atoms_k];
+    // Seed the write cursors from the `_start` fields just computed.
     for (std::uint32_t a = 0; a < num_atoms; ++a) {
         cursors_bond[a] = offsets[a].bond_start;
         cursors_angle[a] = offsets[a].angle_start;
         cursors_torsion[a] = offsets[a].torsion_start;
         cursors_oop[a] = offsets[a].oop_start;
-        cursors_sb[a] = offsets[a].stretchbend_start;
+        cursors_stretchbend[a] = offsets[a].stretchbend_start;
     }
 
     // Pass 2 — write interactions.
@@ -506,10 +544,176 @@ __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
         interactions[cursors_oop[oops[t].atom_l]++] = {t, mmff94_out_of_plane_k, atom_role_fourth_k};
     }
     for (std::uint32_t t = 0; t < c.stretchbends; ++t) {
-        interactions[cursors_sb[stbns[t].atom_i]++] = {t, mmff94_stretch_bend_k, atom_role_first_k};
-        interactions[cursors_sb[stbns[t].atom_j]++] = {t, mmff94_stretch_bend_k, atom_role_second_k};
-        interactions[cursors_sb[stbns[t].atom_k]++] = {t, mmff94_stretch_bend_k, atom_role_third_k};
+        interactions[cursors_stretchbend[stbns[t].atom_i]++] = {t, mmff94_stretch_bend_k, atom_role_first_k};
+        interactions[cursors_stretchbend[stbns[t].atom_j]++] = {t, mmff94_stretch_bend_k, atom_role_second_k};
+        interactions[cursors_stretchbend[stbns[t].atom_k]++] = {t, mmff94_stretch_bend_k, atom_role_third_k};
     }
+}
+
+/**
+ *  @brief Exclusive prefix sum of the per-molecule term counts, plus the batch totals.
+ *
+ *  Launched as a single block of @ref mmff94_scan_block_k threads that sweeps the molecule
+ *  axis one tile at a time, carrying the running sums in registers.  A 50 K-molecule wave is
+ *  98 tiles of a six-component Hillis-Steele scan, which costs a few microseconds against the
+ *  millisecond-scale extractor it feeds, and it needs no temporary block-sum array.
+ *
+ *  @param[in] per_mol_counts one entry per molecule, as written by the extractor and the CSR builder
+ *  @param[in] num_molecules number of entries in @p per_mol_counts
+ *  @param[out] per_mol_offsets one entry per molecule, the base of that molecule in each packed array
+ *  @param[out] totals single entry holding the batch-wide element count of each packed array
+ */
+__launch_bounds__(mmff94_scan_block_k, 1) __global__
+    void mmff94_scan_counts_kernel(mmff94_per_mol_counts_t const *__restrict__ per_mol_counts,
+                                   std::uint32_t num_molecules, mmff94_packed_offsets_t *__restrict__ per_mol_offsets,
+                                   mmff94_packed_offsets_t *__restrict__ totals) {
+
+    __shared__ std::uint32_t partial_sums[mmff94_packed_components_k][mmff94_scan_block_k];
+    std::uint32_t const slot = threadIdx.x;
+    std::uint32_t carry[mmff94_packed_components_k] = {0, 0, 0, 0, 0, 0};
+
+    for (std::uint32_t tile_base = 0; tile_base < num_molecules; tile_base += mmff94_scan_block_k) {
+        std::uint32_t const molecule = tile_base + slot;
+        std::uint32_t own[mmff94_packed_components_k] = {0, 0, 0, 0, 0, 0};
+        if (molecule < num_molecules) {
+            auto const counts = per_mol_counts[molecule];
+            own[0] = counts.bonds;
+            own[1] = counts.angles;
+            own[2] = counts.torsions;
+            own[3] = counts.oops;
+            own[4] = counts.stretchbends;
+            own[5] = counts.interactions;
+        }
+        for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
+            partial_sums[component][slot] = own[component];
+        __syncthreads();
+
+        for (std::uint32_t stride = 1; stride < mmff94_scan_block_k; stride <<= 1) {
+            std::uint32_t addend[mmff94_packed_components_k];
+            for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
+                addend[component] = slot >= stride ? partial_sums[component][slot - stride] : 0u;
+            __syncthreads();
+            for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
+                partial_sums[component][slot] += addend[component];
+            __syncthreads();
+        }
+
+        if (molecule < num_molecules)
+            per_mol_offsets[molecule] = {
+                carry[0] + partial_sums[0][slot] - own[0], carry[1] + partial_sums[1][slot] - own[1],
+                carry[2] + partial_sums[2][slot] - own[2], carry[3] + partial_sums[3][slot] - own[3],
+                carry[4] + partial_sums[4][slot] - own[4], carry[5] + partial_sums[5][slot] - own[5]};
+        for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
+            carry[component] += partial_sums[component][mmff94_scan_block_k - 1];
+        __syncthreads();
+    }
+
+    if (slot == 0) *totals = {carry[0], carry[1], carry[2], carry[3], carry[4], carry[5]};
+}
+
+/** Lane-strided copy of @p count elements from the staging slot into the packed array. */
+template <typename element_>
+__device__ inline void copy_packed_terms_(element_ const *__restrict__ source, element_ *__restrict__ destination,
+                                          std::uint32_t count, std::uint32_t lane) {
+    for (std::uint32_t element_index = lane; element_index < count; element_index += 32)
+        destination[element_index] = source[element_index];
+}
+
+/**
+ *  @brief Compact the fixed-stride staging arrays into the packed layout `batch_pool_t` uses.
+ *
+ *  One warp per molecule.  Every term type is copied from its 116 KB per-molecule staging slot
+ *  to the batch-global base the scan assigned, the per-atom CSR starts are rebased from
+ *  molecule-relative to batch-global, and the molecule's metadata entry gains the offsets and
+ *  counts that `mmff_polish_warp_kernel` and `bond_distance_kernel` read.  A molecule the typer
+ *  routed to the CPU fallback carries zero counts, so it contributes an empty slice and its
+ *  metadata offsets stay well-formed.
+ *
+ *  @param[in] descriptors device-resident molecule descriptors, read for the atom count
+ *  @param[in] atom_offsets batch-global first-atom index of each molecule
+ *  @param[in] num_molecules number of molecules in the batch
+ *  @param[in] per_mol_counts per-molecule term counts from the extractor and the CSR builder
+ *  @param[in] per_mol_offsets per-molecule packed bases from @ref mmff94_scan_counts_kernel
+ *  @param[in] staged_bonds fixed-stride bond staging, `max_mmff_bonds_per_mol_k` per molecule
+ *  @param[in] staged_angles fixed-stride angle staging
+ *  @param[in] staged_torsions fixed-stride torsion staging
+ *  @param[in] staged_oops fixed-stride out-of-plane staging
+ *  @param[in] staged_stbns fixed-stride stretch-bend staging
+ *  @param[in] staged_interactions fixed-stride CSR staging, `max_mmff_interactions_per_mol_k` per molecule
+ *  @param[out] packed_bonds packed bond array, sized from the scan totals
+ *  @param[out] packed_angles packed angle array
+ *  @param[out] packed_torsions packed torsion array
+ *  @param[out] packed_oops packed out-of-plane array
+ *  @param[out] packed_stbns packed stretch-bend array
+ *  @param[out] packed_interactions packed CSR interaction array
+ *  @param[inout] atom_interaction_offsets per-atom CSR starts, rebased in place
+ *  @param[out] metadata per-molecule metadata whose MMFF offset and count fields are stamped here
+ *  @param[in] typing_status per-molecule typer status; non-zero routes the molecule to the CPU fallback
+ */
+__launch_bounds__(32, 8) __global__ void mmff94_compact_terms_kernel(
+    molecule_descriptor_t const *__restrict__ descriptors, std::uint32_t const *__restrict__ atom_offsets,
+    std::uint32_t num_molecules, mmff94_per_mol_counts_t const *__restrict__ per_mol_counts,
+    mmff94_packed_offsets_t const *__restrict__ per_mol_offsets, mmff94_bond_t const *__restrict__ staged_bonds,
+    mmff94_angle_t const *__restrict__ staged_angles, mmff94_torsion_t const *__restrict__ staged_torsions,
+    mmff94_oop_t const *__restrict__ staged_oops, mmff94_stretchbend_t const *__restrict__ staged_stbns,
+    mmff94_atom_interaction_t const *__restrict__ staged_interactions, mmff94_bond_t *__restrict__ packed_bonds,
+    mmff94_angle_t *__restrict__ packed_angles, mmff94_torsion_t *__restrict__ packed_torsions,
+    mmff94_oop_t *__restrict__ packed_oops, mmff94_stretchbend_t *__restrict__ packed_stbns,
+    mmff94_atom_interaction_t *__restrict__ packed_interactions,
+    mmff94_atom_offsets_t *__restrict__ atom_interaction_offsets, etkdg_molecule_metadata_t *__restrict__ metadata,
+    std::uint8_t const *__restrict__ typing_status) {
+
+    std::uint32_t const mol = blockIdx.x;
+    if (mol >= num_molecules) return;
+    std::uint32_t const lane = threadIdx.x;
+
+    auto const counts = per_mol_counts[mol];
+    auto const bases = per_mol_offsets[mol];
+    std::uint32_t const atom_base = atom_offsets[mol];
+
+    copy_packed_terms_(staged_bonds + (std::size_t)mol * max_mmff_bonds_per_mol_k, packed_bonds + bases.bonds,
+                       counts.bonds, lane);
+    copy_packed_terms_(staged_angles + (std::size_t)mol * max_mmff_angles_per_mol_k, packed_angles + bases.angles,
+                       counts.angles, lane);
+    copy_packed_terms_(staged_torsions + (std::size_t)mol * max_mmff_torsions_per_mol_k,
+                       packed_torsions + bases.torsions, counts.torsions, lane);
+    copy_packed_terms_(staged_oops + (std::size_t)mol * max_mmff_oops_per_mol_k, packed_oops + bases.oops, counts.oops,
+                       lane);
+    copy_packed_terms_(staged_stbns + (std::size_t)mol * max_mmff_stretchbends_per_mol_k,
+                       packed_stbns + bases.stretchbends, counts.stretchbends, lane);
+    copy_packed_terms_(staged_interactions + (std::size_t)mol * max_mmff_interactions_per_mol_k,
+                       packed_interactions + bases.interactions, counts.interactions, lane);
+
+    // The CSR builder wrote molecule-relative starts; the consumers index one
+    // batch-global interaction array, so shift every start by this molecule's base.
+    // A fallback molecule never entered the CSR builder, so its slots start empty.
+    bool const typed = typing_status[mol] == 0;
+    std::uint32_t const num_atoms = descriptors[mol].num_atoms;
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += 32) {
+        auto entry = typed ? atom_interaction_offsets[atom_base + atom] : mmff94_atom_offsets_t {};
+        entry.bond_start += bases.interactions;
+        entry.angle_start += bases.interactions;
+        entry.torsion_start += bases.interactions;
+        entry.oop_start += bases.interactions;
+        entry.stretchbend_start += bases.interactions;
+        atom_interaction_offsets[atom_base + atom] = entry;
+    }
+
+    if (lane != 0) return;
+    auto &entry = metadata[mol];
+    entry.num_mmff_bonds = counts.bonds;
+    entry.num_mmff_angles = counts.angles;
+    entry.num_mmff_torsions = counts.torsions;
+    entry.num_mmff_oops = counts.oops;
+    entry.num_mmff_stretchbends = counts.stretchbends;
+    entry.mmff_bond_offset = bases.bonds;
+    entry.mmff_angle_offset = bases.angles;
+    entry.mmff_torsion_offset = bases.torsions;
+    entry.mmff_oop_offset = bases.oops;
+    entry.mmff_stretchbend_offset = bases.stretchbends;
+    entry.mmff_atom_offsets_start = atom_base;
+    entry.mmff_atom_vdw_offset = atom_base;
+    entry.mmff_atom_charge_offset = atom_base;
 }
 #endif // __CUDACC__
 
@@ -525,6 +729,32 @@ inline void launch_mmff94_build_csr(molecule_descriptor_t const *descriptors, st
     mmff94_build_csr_kernel<<<num_molecules, 32, 0, stream>>>(descriptors, atom_offsets, num_molecules, per_mol_counts,
                                                               bonds, angles, torsions, oops, stbns, interactions,
                                                               atom_offsets_out, typing_status);
+}
+
+/** Host launcher for the count scan.  The caller reads @p totals back to size the packed arrays. */
+inline void launch_mmff94_scan_counts(mmff94_per_mol_counts_t const *per_mol_counts, std::uint32_t num_molecules,
+                                      mmff94_packed_offsets_t *per_mol_offsets, mmff94_packed_offsets_t *totals,
+                                      cudaStream_t stream = nullptr) {
+    if (num_molecules == 0) return;
+    mmff94_scan_counts_kernel<<<1, mmff94_scan_block_k, 0, stream>>>(per_mol_counts, num_molecules, per_mol_offsets,
+                                                                     totals);
+}
+
+/** Host launcher for the compaction pass. */
+inline void launch_mmff94_compact_terms(
+    molecule_descriptor_t const *descriptors, std::uint32_t const *atom_offsets, std::uint32_t num_molecules,
+    mmff94_per_mol_counts_t const *per_mol_counts, mmff94_packed_offsets_t const *per_mol_offsets,
+    mmff94_bond_t const *staged_bonds, mmff94_angle_t const *staged_angles, mmff94_torsion_t const *staged_torsions,
+    mmff94_oop_t const *staged_oops, mmff94_stretchbend_t const *staged_stbns,
+    mmff94_atom_interaction_t const *staged_interactions, mmff94_bond_t *packed_bonds, mmff94_angle_t *packed_angles,
+    mmff94_torsion_t *packed_torsions, mmff94_oop_t *packed_oops, mmff94_stretchbend_t *packed_stbns,
+    mmff94_atom_interaction_t *packed_interactions, mmff94_atom_offsets_t *atom_interaction_offsets,
+    etkdg_molecule_metadata_t *metadata, std::uint8_t const *typing_status, cudaStream_t stream = nullptr) {
+    if (num_molecules == 0) return;
+    mmff94_compact_terms_kernel<<<num_molecules, 32, 0, stream>>>(
+        descriptors, atom_offsets, num_molecules, per_mol_counts, per_mol_offsets, staged_bonds, staged_angles,
+        staged_torsions, staged_oops, staged_stbns, staged_interactions, packed_bonds, packed_angles, packed_torsions,
+        packed_oops, packed_stbns, packed_interactions, atom_interaction_offsets, metadata, typing_status);
 }
 #endif
 

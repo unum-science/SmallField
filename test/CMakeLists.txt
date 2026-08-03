@@ -46,6 +46,7 @@ add_mixed_test(kernels triangle_smooth)
 add_mixed_test(kernels dg_energy)
 add_mixed_test(kernels mmff_gradient)
 add_mixed_test(kernels bond_distance)
+add_mixed_test(kernels csd_torsion_device)
 
 # The reproducibility check compiles metric_embedding_prepass.cuh itself so it can drive the
 # embed kernel over thousands of identical blocks. It therefore must not also link

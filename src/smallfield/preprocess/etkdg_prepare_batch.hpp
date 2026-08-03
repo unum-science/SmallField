@@ -1105,7 +1105,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
         }
         build_bounds_matrix(desc, result.bounds_matrix);
         extract_chiral_centers(*mol, desc, result.chiral_centers);
-        extract_etk_torsions_native(*mol, desc, result.etk_torsions);
+        extract_etk_torsions_native(desc, result.etk_torsions);
         extract_distance_constraints(desc, result.bounds_matrix, result.distance_constraints);
         build_etk_interaction_lists(result);
         mmff_status = extract_mmff94_params(*mol, desc, result);

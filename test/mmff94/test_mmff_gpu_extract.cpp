@@ -140,12 +140,13 @@ int main(int argc, char **argv) {
                                                              sft::max_mmff_interactions_per_mol_k);
     std::vector<sft::mmff94_atom_offsets_t> atom_offsets_out(total_atoms);
 
+    mmff94_packed_host_result_t packed;
     launch_mmff94_gpu_extract_pipeline(tables_host, descriptors.data(), num_molecules, atom_offsets.data(), total_atoms,
                                        counts.data(), typing_status.data(), bonds.data(), sft::max_mmff_bonds_per_mol_k,
                                        angles.data(), sft::max_mmff_angles_per_mol_k, torsions.data(),
                                        sft::max_mmff_torsions_per_mol_k, oops.data(), sft::max_mmff_oops_per_mol_k,
                                        stretch_bend_terms.data(), sft::max_mmff_stretchbends_per_mol_k,
-                                       interactions.data(), atom_offsets_out.data());
+                                       interactions.data(), atom_offsets_out.data(), packed);
 
     // CPU reference via extract_mmff94_params_fully_native.
     int matching_molecule_count = 0;
@@ -163,10 +164,15 @@ int main(int argc, char **argv) {
     int mismatched_stretch_bend_count = 0;
     int matching_csr_count = 0;
     int mismatched_csr_count = 0;
+    int matching_packed_count = 0;
+    int mismatched_packed_count = 0;
+    int typer_fallback_count = 0;
+    int extractor_fallback_count = 0;
 
     for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
         if (typing_status[molecule_index] != 0) {
             ++skipped_molecule_count;
+            ++typer_fallback_count;
             continue;
         }
 
@@ -175,6 +181,7 @@ int main(int argc, char **argv) {
         cpu_reference.num_atoms = descriptor.num_atoms;
         if (!sfmmff::extract_mmff94_params_fully_native(descriptor, host_view, cpu_reference)) {
             ++skipped_molecule_count;
+            ++extractor_fallback_count;
             continue;
         }
 
@@ -320,6 +327,55 @@ int main(int argc, char **argv) {
             else { ++matching_csr_count; }
         }
 
+        // Packed-layout check.  The staged slices above are already known good
+        // against the CPU, so the compaction pass is correct exactly when the
+        // packed arrays reproduce them byte for byte at the metadata-declared
+        // offsets, with every CSR start shifted into the batch-global
+        // interaction array.
+        auto const &meta = packed.metadata[molecule_index];
+        bool packed_matches = meta.num_mmff_bonds == gpu_counts.bonds && meta.num_mmff_angles == gpu_counts.angles &&
+                              meta.num_mmff_torsions == gpu_counts.torsions && meta.num_mmff_oops == gpu_counts.oops &&
+                              meta.num_mmff_stretchbends == gpu_counts.stretchbends &&
+                              meta.mmff_atom_offsets_start == atom_offset_base;
+        auto const slices_equal = [&](void const *staged, void const *packed_slice, std::size_t bytes) {
+            return std::memcmp(staged, packed_slice, bytes) == 0;
+        };
+        if (packed_matches) {
+            packed_matches = slices_equal(bond_terms, packed.bonds.data() + meta.mmff_bond_offset,
+                                          gpu_counts.bonds * sizeof(sft::mmff94_bond_t)) &&
+                             slices_equal(angle_terms, packed.angles.data() + meta.mmff_angle_offset,
+                                          gpu_counts.angles * sizeof(sft::mmff94_angle_t)) &&
+                             slices_equal(torsion_terms, packed.torsions.data() + meta.mmff_torsion_offset,
+                                          gpu_counts.torsions * sizeof(sft::mmff94_torsion_t)) &&
+                             slices_equal(oop_terms, packed.oops.data() + meta.mmff_oop_offset,
+                                          gpu_counts.oops * sizeof(sft::mmff94_oop_t)) &&
+                             slices_equal(stretch_bend_terms_slot,
+                                          packed.stretchbends.data() + meta.mmff_stretchbend_offset,
+                                          gpu_counts.stretchbends * sizeof(sft::mmff94_stretchbend_t));
+        }
+        if (packed_matches && descriptor.num_atoms > 0) {
+            std::uint32_t const interaction_base = packed.atom_offsets[atom_offset_base].bond_start;
+            packed_matches = slices_equal(
+                interactions.data() + static_cast<std::size_t>(molecule_index) * sft::max_mmff_interactions_per_mol_k,
+                packed.interactions.data() + interaction_base,
+                gpu_counts.interactions * sizeof(sft::mmff94_atom_interaction_t));
+            for (std::uint32_t atom_index = 0; atom_index < descriptor.num_atoms && packed_matches; ++atom_index) {
+                auto const &staged_offset = atom_offsets_out[atom_offset_base + atom_index];
+                auto const &packed_offset = packed.atom_offsets[atom_offset_base + atom_index];
+                packed_matches = packed_offset.bond_start == staged_offset.bond_start + interaction_base &&
+                                 packed_offset.angle_start == staged_offset.angle_start + interaction_base &&
+                                 packed_offset.torsion_start == staged_offset.torsion_start + interaction_base &&
+                                 packed_offset.oop_start == staged_offset.oop_start + interaction_base &&
+                                 packed_offset.stretchbend_start == staged_offset.stretchbend_start + interaction_base;
+            }
+        }
+        if (packed_matches) { ++matching_packed_count; }
+        else {
+            ++mismatched_packed_count;
+            molecule_matches = false;
+            if (mismatched_packed_count < 5) std::printf("  mol=%u packed layout diff\n", molecule_index);
+        }
+
         if (molecule_matches) ++matching_molecule_count;
         else ++mismatched_molecule_count;
     }
@@ -332,6 +388,31 @@ int main(int argc, char **argv) {
     std::printf("oops:     %d / %d\n", matching_oop_count, mismatched_oop_count);
     std::printf("stbns:    %d / %d\n", matching_stretch_bend_count, mismatched_stretch_bend_count);
     std::printf("csr atoms: %d / %d\n", matching_csr_count, mismatched_csr_count);
+    std::printf("packed:   %d / %d\n", matching_packed_count, mismatched_packed_count);
+
+    // Footprint accounting: the staging arrays are fixed-stride, so their cost is
+    // the same for every molecule; the packed arrays cost what the batch actually
+    // holds.  Both numbers are per molecule so the ratio is the compaction win.
+    std::size_t const staged_bytes_per_molecule =
+        sft::max_mmff_bonds_per_mol_k * sizeof(sft::mmff94_bond_t) +
+        sft::max_mmff_angles_per_mol_k * sizeof(sft::mmff94_angle_t) +
+        sft::max_mmff_torsions_per_mol_k * sizeof(sft::mmff94_torsion_t) +
+        sft::max_mmff_oops_per_mol_k * sizeof(sft::mmff94_oop_t) +
+        sft::max_mmff_stretchbends_per_mol_k * sizeof(sft::mmff94_stretchbend_t) +
+        sft::max_mmff_interactions_per_mol_k * sizeof(sft::mmff94_atom_interaction_t);
+    std::size_t const packed_bytes = packed.bonds.size() * sizeof(sft::mmff94_bond_t) +
+                                     packed.angles.size() * sizeof(sft::mmff94_angle_t) +
+                                     packed.torsions.size() * sizeof(sft::mmff94_torsion_t) +
+                                     packed.oops.size() * sizeof(sft::mmff94_oop_t) +
+                                     packed.stretchbends.size() * sizeof(sft::mmff94_stretchbend_t) +
+                                     packed.interactions.size() * sizeof(sft::mmff94_atom_interaction_t);
+    std::printf("bytes/mol: staged %zu, packed %.1f (%.1fx)\n", staged_bytes_per_molecule,
+                static_cast<double>(packed_bytes) / num_molecules,
+                static_cast<double>(staged_bytes_per_molecule) * num_molecules / static_cast<double>(packed_bytes));
+    std::printf("fallback: typer %.2f %% (%d), extractor %.2f %% (%d), combined %.2f %% of %u\n",
+                100.0 * typer_fallback_count / num_molecules, typer_fallback_count,
+                100.0 * extractor_fallback_count / num_molecules, extractor_fallback_count,
+                100.0 * skipped_molecule_count / num_molecules, num_molecules);
     if (mismatched_molecule_count > 0) {
         std::printf("FAIL\n");
         return 1;

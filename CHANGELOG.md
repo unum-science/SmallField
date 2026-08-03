@@ -685,7 +685,9 @@ Each item references a CHANGELOG-worthy ship event prior to the round-1 / round-
 - __MMFF parameter table extraction__ — full MMFF94 typing, charge, term extraction ported to native flat-array code.
   Byte-identical on 20 K ChEMBL: atom-type 99.91 %, partial-charge 99.97 %, term failure 22 ppm.
 - __GPU MMFF atom typer + charge kernel__ — 1 045 580 atoms byte-identical vs CPU; 439 / 20 K molecules fall back.
+  Re-measured on stratified corpora: 4.31 % of PubChem falls back, and 0.005 % of Enamine REAL — one molecule in 20 009.
 - __GPU term extraction + CSR build__ — 941 / 1 009 test molecules match; remainder dispatched to CPU.
+  Re-measured, the extractor adds no fallbacks of its own beyond the typer's on either corpus, so the combined rate is the typer's.
 - __SMILES parse with `removeHs=false`__ — skipped the `removeHs` + re-`addHs` round-trip.
   Saved ~6 % of CPU prep wall time.
 - __Scaffold cache__ — caches torsion-pattern match results by Bemis-Murcko scaffold. +44 % throughput on curated ChEMBL (4 698 unique scaffolds across 237 600 cyclic molecules, 98 % reuse).

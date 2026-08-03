@@ -214,157 +214,84 @@ inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
  *  ForceFields::CrystalFF::getExperimentalTorsions().
  *
  *  For each pattern, check the element, aromaticity and hybridization bitsets against the molecule
- *  and skip the ones that cannot match, then run the native matcher on the rest.
+ *  and skip the ones that cannot match, then run the native matcher on the rest.  A bond carries at
+ *  most one torsion and the first pattern in file order claims it; a bond on a fused small ring, or
+ *  on more than three rings, is claimed and left empty.
  *
  *  Also handles the "basic knowledge" torsions (flat aromatic rings, sp2 centers with 3 neighbors)
- *  that getExperimentalTorsions produces.
+ *  that getExperimentalTorsions produces.  Everything reads the flat descriptor, so the same
+ *  answer comes out of the device kernel in `smallfield/cuda/csd_torsion_device.cuh`.
+ *
+ *  @param[in] desc Molecule descriptor with topology, property and ring arrays.
+ *  @param[out] torsions Extracted torsions; any prior contents are dropped.
  */
-
-inline void extract_etk_torsions_native(RDKit::ROMol const &molecule, molecule_descriptor_t const &desc,
+inline void extract_etk_torsions_native(molecule_descriptor_t const &desc,
                                         std::vector<etk_torsion_descriptor_t> &torsions) {
     torsions.clear();
 
-    std::uint32_t const num_atoms = desc.num_atoms;
-    std::uint32_t const num_bonds = desc.num_bonds;
-
-    std::uint64_t molecule_elements = 0;
-    std::uint8_t molecule_hybridizations = 0;
-    bool has_aromatic = false;
-    for (std::uint32_t a = 0; a < num_atoms; ++a) {
-        std::uint8_t e = desc.element[a];
-        if (e > 0 && e < 64) molecule_elements |= (1ULL << e);
-        if (atom_has_flag(desc, a, atom_flag_aromatic_k)) has_aromatic = true;
-        std::uint8_t h = desc.hybridization[a];
-        if (h < 8) molecule_hybridizations |= static_cast<std::uint8_t>(1u << h);
-    }
-
-    // Bond-index sets are stack arrays bounded by `max_bonds_k`, not heap bitsets: this runs once
-    // per molecule inside the OpenMP preprocess fan-out, and the ring set was reallocated on every
-    // iteration of the outer ring loop.
-    std::uint8_t excluded_bonds[max_bonds_k] = {};
-    {
-        auto const *ring_info = molecule.getRingInfo();
-        if (ring_info != nullptr && ring_info->isInitialized()) {
-            constexpr std::uint32_t min_macrocycle_size = 9;
-            auto const &bond_rings = ring_info->bondRings();
-            std::uint8_t ring_bonds[max_bonds_k];
-            for (auto rii = bond_rings.begin(); rii != bond_rings.end(); ++rii) {
-                std::memset(ring_bonds, 0, num_bonds);
-                for (auto bi : *rii) ring_bonds[bi] = 1;
-                for (auto rjj = rii + 1; rjj != bond_rings.end(); ++rjj) {
-                    if (rii->size() >= min_macrocycle_size && rjj->size() >= min_macrocycle_size) continue;
-                    std::uint32_t n_common = 0;
-                    for (auto bj : *rjj) {
-                        if (ring_bonds[bj]) {
-                            if (++n_common > 1) break;
-                        }
-                    }
-                    if (n_common > 1) {
-                        if (rii->size() < min_macrocycle_size)
-                            for (auto bi : *rii) excluded_bonds[bi] = 1;
-                        if (rjj->size() < min_macrocycle_size)
-                            for (auto bj : *rjj) excluded_bonds[bj] = 1;
-                    }
-                }
-            }
-        }
-    }
-
-    auto const *ring_info = molecule.getRingInfo();
+    csd_molecule_gate_t const gate = build_molecule_gate(desc);
 
     // One bond claims at most one torsion, first pattern in file order wins.
-    std::uint8_t done_bonds_u8[max_bonds_k] = {};
+    std::uint8_t done_bonds[max_bonds_k] = {};
 
     auto const &patterns = csd_patterns();
 
-    auto emit_torsion_for = [&](std::uint8_t a1, std::uint8_t a2, std::uint8_t a3, std::uint8_t a4,
-                                csd_compiled_pattern_t const &pat) {
-        auto const *bnd = molecule.getBondBetweenAtoms(a2, a3);
-        if (!bnd) return;
-        unsigned int const bid = bnd->getIdx();
-        if (excluded_bonds[bid] != 0 || ring_info->numBondRings(bid) > 3) {
-            done_bonds_u8[bid] = 1;
-            return;
-        }
-        if (done_bonds_u8[bid]) return;
-        done_bonds_u8[bid] = 1;
-        etk_torsion_descriptor_t torsion {};
-        torsion.atom_indices[0] = a1;
-        torsion.atom_indices[1] = a2;
-        torsion.atom_indices[2] = a3;
-        torsion.atom_indices[3] = a4;
-        for (std::uint32_t i = 0; i < 6; ++i) {
-            double const sign = (i < pat.signs.size()) ? static_cast<double>(pat.signs[i]) : 1.0;
-            double const V = (i < pat.V.size()) ? pat.V[i] : 0.0;
-            torsion.fourier_coefficients[i] = static_cast<float>(sign * V);
-        }
-        torsions.push_back(torsion);
-    };
-
     for (std::size_t pattern_index = 0; pattern_index < patterns.size(); ++pattern_index) {
-        auto const &pat = patterns[pattern_index];
+        auto const &pattern = patterns[pattern_index];
         // Element prefilter: skip patterns whose required elements are absent.
-        if ((pat.required_elements & ~molecule_elements) != 0) continue;
-        if (pat.requires_aromatic && !has_aromatic) continue;
-        if ((pat.required_hybridizations & ~molecule_hybridizations) != 0) continue;
+        if ((pattern.required_elements & ~gate.elements) != 0) continue;
+        if (pattern.requires_aromatic && !gate.has_aromatic) continue;
+        if ((pattern.required_hybridizations & ~gate.hybridizations) != 0) continue;
 
-        if (pat.native) {
-            // Stack-only native matcher. Zero heap allocations in this branch.
-            match_linear_pattern(
-                desc, pat.native_form, done_bonds_u8,
-                [&](std::uint8_t a1, std::uint8_t a2, std::uint8_t a3, std::uint8_t a4, std::uint32_t bid) -> bool {
-                    if (excluded_bonds[bid] != 0 || ring_info->numBondRings(bid) > 3) {
-                        done_bonds_u8[bid] = 1;
-                        return true;
-                    }
-                    done_bonds_u8[bid] = 1;
-
-                    etk_torsion_descriptor_t torsion {};
-                    torsion.atom_indices[0] = a1;
-                    torsion.atom_indices[1] = a2;
-                    torsion.atom_indices[2] = a3;
-                    torsion.atom_indices[3] = a4;
-                    for (std::uint32_t i = 0; i < 6; ++i)
-                        torsion.fourier_coefficients[i] = static_cast<float>(pat.native_form.signs[i]) *
-                                                          pat.native_form.V[i];
-                    torsions.push_back(torsion);
+        // Stack-only native matcher. Zero heap allocations in this branch.
+        match_linear_pattern(
+            desc, csd_pattern_view_t(pattern.native_form), done_bonds,
+            [&](std::uint8_t a1, std::uint8_t a2, std::uint8_t a3, std::uint8_t a4, std::uint32_t bond_index) -> bool {
+                done_bonds[bond_index] = 1;
+                if (bond_excluded_by_ring_fusion(desc, bond_index) || bond_ring_count(desc, bond_index) > 3)
                     return true;
-                });
-            continue;
-        }
+
+                etk_torsion_descriptor_t torsion {};
+                torsion.atom_indices[0] = a1;
+                torsion.atom_indices[1] = a2;
+                torsion.atom_indices[2] = a3;
+                torsion.atom_indices[3] = a4;
+                for (std::uint32_t term = 0; term < 6; ++term)
+                    torsion.fourier_coefficients[term] = static_cast<float>(pattern.native_form.signs[term]) *
+                                                         pattern.native_form.V[term];
+                torsions.push_back(torsion);
+                return true;
+            });
     }
 
     // Matches RDKit getExperimentalTorsions' useBasicKnowledge=true behavior.
-    if (ring_info != nullptr && ring_info->isInitialized()) {
-        for (auto const &atom_ring : ring_info->atomRings()) {
-            std::uint32_t const rsize = static_cast<std::uint32_t>(atom_ring.size());
-            if (rsize < 4 || rsize > 6) continue;
-            for (std::uint32_t i = 0; i < rsize; ++i) {
-                std::uint32_t const a1 = atom_ring[i];
-                std::uint32_t const a2 = atom_ring[(i + 1) % rsize];
-                std::uint32_t const a3 = atom_ring[(i + 2) % rsize];
-                std::uint32_t const a4 = atom_ring[(i + 3) % rsize];
-                auto const *bnd = molecule.getBondBetweenAtoms(a2, a3);
-                if (!bnd) continue;
-                std::uint32_t const bid = bnd->getIdx();
-                if (done_bonds_u8[bid]) continue;
-                constexpr std::uint8_t sp2 = hybridization_sp2_k;
-                if (desc.hybridization[a1] != sp2 || desc.hybridization[a2] != sp2 || desc.hybridization[a3] != sp2 ||
-                    desc.hybridization[a4] != sp2)
-                    continue;
+    for (std::uint32_t ring_index = 0; ring_index < desc.num_rings; ++ring_index) {
+        std::uint32_t const size = ring_atom_count(desc, ring_index);
+        if (size < 4 || size > 6) continue;
+        std::uint16_t const start = desc.ring_offset[ring_index];
+        for (std::uint32_t position = 0; position < size; ++position) {
+            std::uint8_t const a1 = desc.ring_atoms[start + position];
+            std::uint8_t const a2 = desc.ring_atoms[start + (position + 1) % size];
+            std::uint8_t const a3 = desc.ring_atoms[start + (position + 2) % size];
+            std::uint8_t const a4 = desc.ring_atoms[start + (position + 3) % size];
+            std::uint32_t const bond_index = find_bond_between(desc, a2, a3);
+            if (bond_index == no_bond_index_k) continue;
+            if (done_bonds[bond_index]) continue;
+            constexpr std::uint8_t planar_k = hybridization_sp2_k;
+            if (desc.hybridization[a1] != planar_k || desc.hybridization[a2] != planar_k ||
+                desc.hybridization[a3] != planar_k || desc.hybridization[a4] != planar_k)
+                continue;
 
-                done_bonds_u8[bid] = 1;
-                done_bonds_u8[bid] = 1;
-                etk_torsion_descriptor_t torsion {};
-                torsion.atom_indices[0] = static_cast<std::uint8_t>(a1);
-                torsion.atom_indices[1] = static_cast<std::uint8_t>(a2);
-                torsion.atom_indices[2] = static_cast<std::uint8_t>(a3);
-                torsion.atom_indices[3] = static_cast<std::uint8_t>(a4);
-                // Flat-ring signature: signs[1]=-1, V[1]=100.0 (from RDKit's hardcoded values).
-                for (std::uint32_t k = 0; k < 6; ++k) torsion.fourier_coefficients[k] = 0.0f;
-                torsion.fourier_coefficients[1] = -100.0f;
-                torsions.push_back(torsion);
-            }
+            done_bonds[bond_index] = 1;
+            etk_torsion_descriptor_t torsion {};
+            torsion.atom_indices[0] = a1;
+            torsion.atom_indices[1] = a2;
+            torsion.atom_indices[2] = a3;
+            torsion.atom_indices[3] = a4;
+            // Flat-ring signature: signs[1]=-1, V[1]=100.0 (from RDKit's hardcoded values).
+            for (std::uint32_t term = 0; term < 6; ++term) torsion.fourier_coefficients[term] = 0.0f;
+            torsion.fourier_coefficients[1] = -100.0f;
+            torsions.push_back(torsion);
         }
     }
 }

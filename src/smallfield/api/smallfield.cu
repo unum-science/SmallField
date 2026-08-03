@@ -1183,8 +1183,15 @@ PYBIND11_MODULE(_smallfield, m) {
                 std::vector<smallfield::api::conformer_status_t> status_buf(total_conf);
                 std::span<smallfield::api::conformer_status_t> status_span(status_buf);
 
-                ctx.generate_conformers(smiles_span, config, max_atoms_per_molecule, coords_span, energies_span,
-                                        status_span);
+                {
+                    // Release the GIL for the duration.  This call runs minutes on a production
+                    // batch and touches no Python object — every buffer above is already owned by
+                    // C++ — so holding the interpreter lock would freeze every other thread in the
+                    // process for the whole run.
+                    py::gil_scoped_release const unlocked;
+                    ctx.generate_conformers(smiles_span, config, max_atoms_per_molecule, coords_span, energies_span,
+                                            status_span);
+                }
 
                 // Convert __half coordinates back to float for Python.
                 float *coords_ptr = coords_np.mutable_data();
