@@ -1,27 +1,61 @@
 [build-system]
-requires = ["setuptools>=42", "wheel", "pybind11", "numpy"]
+requires = ["setuptools>=82", "pybind11>=3.1", "numpy>=2.5"]
 build-backend = "setuptools.build_meta"
 
+# Floors match `pixi.toml`, which pins the only environment this is built and tested
+# in: Python 3.12, setuptools 82, pybind11 3.1, numpy 2.5. Claiming a wider range would
+# be claiming untested support.
 [project]
 name = "smallfield"
-version = "0.1.0"
-description = "Fast MMFF94 force field implementation with CPU (AVX-512) and GPU (CUDA) support"
+dynamic = ["version"]
+description = "GPU conformer generation from SMILES: ETKDG distance geometry and MMFF94 optimization, entirely in shared memory"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [
   { name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com" },
 ]
 urls = { Homepage = "https://github.com/unum-science/SmallField" }
-dependencies = ["numpy", "rich>=13"]
+dependencies = ["numpy>=2.5", "rich>=15"]
+keywords = [
+  "cheminformatics",
+  "conformer-generation",
+  "distance-geometry",
+  "etkdg",
+  "mmff94",
+  "molecular-mechanics",
+  "smiles",
+  "shape-descriptors",
+  "virtual-screening",
+  "cuda",
+  "gpu",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Environment :: GPU :: NVIDIA CUDA :: 12",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Chemistry",
+]
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-benchmark", "rdkit"]
 dev = ["pytest", "pytest-benchmark", "rdkit", "pybind11", "black", "ruff"]
+# `setup.py` reads the GPU's compute capability to pick one architecture for the
+# binding. It falls back to `nvidia-smi`, so this is a convenience, not a requirement.
+gpu-autodetect = ["pycuda"]
+
+# The VERSION file is the single source of truth: `setup.py` reads it, and
+# `python/smallfield/__init__.py` carries a literal that a test asserts against it.
+[tool.setuptools.dynamic]
+version = { file = "VERSION" }
 
 [tool.black]
 line-length = 120
-target-version = ['py37', 'py38', 'py39', 'py310']
+target-version = ['py312']
 
 [tool.ruff]
 line-length = 120

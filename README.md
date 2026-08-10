@@ -149,11 +149,16 @@ smallfield_batch --input chembl_smi/ --output chembl_3d_mmff/ \
 
 ## Installation
 
-Python package:
+There are no wheels: SmallField compiles CUDA and links RDKit, so every install builds from source and needs `nvcc`, CMake, and the RDKit development headers already present.
 
 ```bash
-pip install -e .
+pip install --no-build-isolation "git+https://github.com/unum-science/SmallField.git"
 ```
+
+`--no-build-isolation` matters — under build isolation `pip` cannot see the RDKit and CUDA installation the build shells out to.
+From a clone, `pip install --no-build-isolation -e .` does the same thing.
+
+`pixi.toml` pins the environment this is developed and tested in — Python 3.14, RDKit 2025.09, Arrow 24 — and `pixi install` reproduces it.
 
 C++ tests and benchmarks need RDKit from conda-forge:
 

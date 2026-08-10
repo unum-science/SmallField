@@ -1,0 +1,25 @@
+# Shared editor settings for the files `.clang-format` does not reach.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.{c,h,cc,cpp,hpp,cu,cuh}]
+indent_size = 4 # matches .clang-format IndentWidth
+
+[*.py]
+indent_size = 4
+max_line_length = 120 # matches [tool.black] and [tool.ruff] line-length
+
+[*.{cmake,txt}]
+indent_size = 4
+
+[*.{yml,yaml,toml,json}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false # two trailing spaces are a hard line break

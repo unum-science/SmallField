@@ -310,7 +310,10 @@ check_split_literals() {
 
 check_markdown_asterisks() {
     local emphasis
-    emphasis=$(printf '%s\n' "$added" | grep -E '\*\*[^*]+\*\*|[^*]\*[A-Za-z][^*]*\*[^*]' || true)
+    # Inline code spans are stripped first: a document that explains this very rule has to
+    # name `**bold**` to say it is banned, and inside backticks that is code, not emphasis.
+    emphasis=$(printf '%s\n' "$added" | sed 's/`[^`]*`//g' |
+        grep -E '\*\*[^*]+\*\*|[^*]\*[A-Za-z][^*]*\*[^*]' || true)
     [ -z "$emphasis" ] || fail "$emphasis" \
         "$file uses asterisk emphasis - bold is __like this__ and italic is _like this_:"
 }
