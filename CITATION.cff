@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+title: "SmallField: GPU conformer generation with ETKDG and MMFF94"
+message: "If you use this software, please cite it as below."
+type: software
+version: 0.3.0
+authors:
+  - given-names: Ash
+    family-names: Vardanian
+    email: 1983160+ashvardanian@users.noreply.github.com
+repository-code: "https://github.com/unum-science/SmallField"
+license: Apache-2.0
+abstract: >-
+  SmallField generates 3D molecular conformers from SMILES strings on the GPU,
+  combining ETKDG distance geometry with Cambridge Structural Database torsion
+  preferences and MMFF94 optimization. Geometries, energies, and torsion
+  matching are cross-validated term by term against RDKit, so the speedup is an
+  implementation result rather than a change of method.
+
+  One molecule is assigned to a single CUDA warp and its entire optimization is
+  kept in on-chip memory. Reduced-precision representations of the intermediate
+  state, most notably a quantized distance-bounds matrix, are what make that
+  residency possible: throughput comes from occupancy rather than from
+  approximating the physics. Output is reproducible bitwise under a fixed seed,
+  and the library deliberately answers one question — given a SMILES string,
+  produce K geometries consistent with it.
+keywords:
+  - cheminformatics
+  - conformer generation
+  - distance geometry
+  - ETKDG
+  - MMFF94
+  - molecular mechanics
+  - SMILES
+  - shape descriptors
+  - virtual screening
+  - CUDA
+  - GPU

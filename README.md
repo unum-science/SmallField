@@ -49,8 +49,8 @@ The seven things SmallField does that a baseline RDKit pipeline does not.
 __One CUDA warp per molecule, all pipeline stages in shared memory, no global-memory atomics.__
 Each thread of a warp owns `ceil(N/32)` atoms and accumulates gradients in registers via `__shfl_sync`; there is no `atomicAdd` and no pair-index scanning anywhere on the device.
 
-__Half-precision bounds matrix.__
-The N×N distance bounds live in `__half` shared memory, halving the per-block footprint and letting small molecules fit up to 16 blocks per SM.
+__Int8 distance-bounds matrix.__
+The N×N bounds live in shared memory as `uint8_t` with a per-molecule linear dequantization, halving the footprint against `__half` — 32 KB to 16 KB at 128 atoms — so more molecules stay resident per multiprocessor.
 
 __Native classical-MDS metric embedding warm start.__
 The metric-embedding stage starts from a SmallField-owned bounds-matrix embedding instead of RDKit's coordinate generator, which removes the largest preprocess step from the host critical path.
