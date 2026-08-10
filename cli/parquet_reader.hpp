@@ -8,18 +8,18 @@
 
 #pragma once
 
-#include <cstdint>
-#include <filesystem>
-#include <span>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <cstdint> // `std::uint64_t`
+
+#include <filesystem>  // `std::filesystem::path`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <arrow/table.h>
 
 namespace smallfield::cli {
 
-/** @brief Zero-copy SMILES views backed by an Arrow table; the table must outlive the views. */
+/** Zero-copy SMILES views backed by an Arrow table; the table must outlive the views. */
 struct shard_data_t {
     std::shared_ptr<arrow::Table> table;
     std::vector<std::string_view> smiles;

@@ -108,10 +108,6 @@ Everything in between is full overlap.
 - `distribute_scratch_t` (`src/smallfield/preprocess/etkdg_prepare_batch.hpp`) — grow-only CSR scratch (sort permutation + per-device flat buffer + per-device offsets) reused across every `embedding-wave` so the stripe partition never allocates on the hot path.
 - `metric_scratch_t` (`src/smallfield/api/smallfield.hpp`) — per-GPU device scratch for the metric-embedding prepass within an `embedding-step`.
 - `launch_scratch_t` (`src/smallfield/api/smallfield.cu`) — per-GPU persistent device pool + pinned host staging; one per GPU, reused across `embedding-waves`.
-- `preprocess_deadline_t` (`src/smallfield/preprocess/preprocess_deadline.hpp`) — stack-owned steady-clock deadline + latched tripped-flag, stamped 2 s ahead before each `molecule` in the `preprocess-step`.
-  The OMP-for body threads a pointer through `prepare_molecule_into` → `extract_etk_torsions_native` → an `extraAtomCheck` lambda wired into `RDKit::SubstructMatchParameters` (RDKit ≥ 2025.09.6).
-  Returning `false` from the callback unwinds VF2 in O(candidates) instead of its pathological worst case.
-  Each OMP worker owns its own stack-local instance — no `thread_local` or process-wide state.
 
 ## Conformer Status Codes
 

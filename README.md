@@ -59,11 +59,9 @@ __FIRE optimizer instead of L-BFGS.__
 Three shared arrays (positions, velocities, gradient) carry the entire optimiser state vs the fifteen L-BFGS would need; the saved shared memory pays for the warp residency above.
 
 __Native CSD torsion matcher.__
-408 of the 470 SMARTS patterns shipped with RDKit's experimental-torsion library now parse natively and run via a stack-only matcher, byte-equivalent to `RDKit::SubstructMatch` over a 1 M USearch sample.
-This eliminated the bulk of the VF2 + query-chain CPU hot-spot at 10 M scale.
-
-__Native Bemis-Murcko scaffold canonicalisation and a sharded scaffold cache.__
-Replaces RDKit's O(N³) Murcko decomposition with an O(N+M) ring-peel and uses a 64-shard concurrent cache to amortise expensive `SubstructMatch` calls across molecules sharing a scaffold.
+All 470 SMARTS patterns shipped with RDKit's experimental-torsion library parse natively and run via a stack-only matcher, byte-equivalent to `RDKit::SubstructMatch` over a 1 M USearch sample.
+There is no VF2 fallback: a pattern the compiler cannot read is a load-time error rather than a silent runtime detour.
+This removed the VF2 + query-chain CPU hot-spot at 10 M scale entirely.
 
 __Per-atom interaction lists.__
 Built in two passes (count, then fill) on the CPU; the GPU iterates only the relevant terms per atom rather than scanning the full pair list.
@@ -101,17 +99,8 @@ Wave N+1's preprocess overlaps wave N's embedding via a depth-2 batch-pool ring.
 
 ## Performance
 
-Measured on the current 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host with jemalloc preloaded.
-See [`BENCH.md`](BENCH.md) for the full methodology and per-bin kernel profile.
-
-__ETKDG + MMFF94__ (conformer generation):
-
-| Dataset        | Workload                | RDKit CPU (192 thr) | SmallField 1 GPU | SmallField 8 GPU | Notes                                                     |
-| :------------- | :---------------------- | ------------------: | ---------------: | ---------------: | :-------------------------------------------------------- |
-| ChEMBL 8,948   | 3 conformers / molecule |         588.3 mol/s |    1,032.9 mol/s |    1,342.6 mol/s | 2.28x faster than RDKit at 8 GPU; 96.7% conformer success |
-| ChEMBL 241,596 | 1 conformer / molecule  |       1,734.8 mol/s |    4,900.7 mol/s |   16,826.6 mol/s | 9.70x faster than RDKit at 8 GPU; 96.6% conformer success |
-
-See [`BENCH.md`](BENCH.md) for the full methodology and per-bin kernel profile.
+On an 8× RTX PRO 6000 Blackwell / 2× Xeon 6776P host, SmallField generates ETKDG + MMFF94 conformers up to __9.7× faster than RDKit__ across 192 CPU threads, at 16,826 mol/s on ChEMBL 241,596 with one conformer per molecule.
+Every number, with its corpus, its hardware and its methodology, lives in [`BENCH.md`](BENCH.md) — including single-H100 figures and the nvMolKit comparison.
 
 NVIDIA's [nvMolKit](https://docs.nvidia.com/bionemo/) also targets GPU conformer generation, but it requires the BioNeMo proprietary stack.
 SmallField is open-source and runs on any CUDA 12+ GPU.
@@ -170,29 +159,18 @@ C++ tests and benchmarks need RDKit from conda-forge:
 
 ```bash
 micromamba install -c conda-forge rdkit-dev
-cd build && cmake .. -DRDKIT_PREFIX=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-ctest --output-on-failure
-```
-
-Two more flags are needed on hosts whose default toolchain has moved ahead of the CUDA toolkit.
-`nvcc` 12.8 rejects GCC 15, so the host compiler must be pinned.
-`find_package(fmt)` otherwise resolves to a system `libfmt` that does not match the headers in the RDKit prefix — surfacing as an undefined `fmt::v*::vprint` at link time rather than at configure time.
-
-```bash
-cmake .. -DRDKIT_PREFIX=/path/to/conda/env -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_CUDA_HOST_COMPILER=g++-14 \
-    -Dfmt_DIR=/path/to/conda/env/lib/cmake/fmt
+cmake -S . -B build -DRDKIT_PREFIX=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
 ```
 
 ## C++ Benchmarks
 
 ```bash
-cd build
-make -j$(nproc) bench_conformers
+cmake --build build -j$(nproc) --target bench_conformers
 
 # ETKDG + MMFF94 throughput (RDKit CPU vs SmallField GPU)
-./bench/bench_conformers --smi /path/to/chembl.smi
+./build/bench/bench_conformers --smi /path/to/chembl.smi
 ```
 
 `--multi-gpu-only` on `bench_conformers` reports isolated 1/2/4/8-GPU scaling.
@@ -203,7 +181,7 @@ make -j$(nproc) bench_conformers
 src/smallfield/api/         public C++ API (smallfield.hpp)
 src/smallfield/types/       plain data structures shared host + device
 src/smallfield/parameters/  MMFF94 parameter tables
-src/smallfield/preprocess/  CPU preprocessing: SMILES parse, bounds, CIP, CSD torsions, scaffold cache
+src/smallfield/preprocess/  CPU preprocessing: SMILES parse, bounds, CIP, CSD torsions
 src/smallfield/mmff94/      native MMFF94 typer, charge, term extractor (CPU + GPU)
 src/smallfield/cuda/        CUDA kernels: metric embedding, DG, ETK, MMFF, FIRE
 cli/                        smallfield_batch (gen) — Parquet → Parquet

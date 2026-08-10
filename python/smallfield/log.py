@@ -6,7 +6,7 @@ process-wide global — mirrors the "owned on context" pattern from the C++
 side.
 
 Output lines are prefixed with ``[YYYY-MM-DD HH:MM:SS | +HH:MM:SS]`` — wall
-clock plus elapsed from the logger's ``start_time``.  Colors are handled by
+clock plus elapsed from the logger's ``start_time``. Colors are handled by
 `rich`; ``NO_COLOR`` and non-TTY sinks are honored automatically.
 """
 
@@ -86,7 +86,7 @@ class Logger:
             self._emit(self.console, "trace2", message, *args)
 
 
-#: Module-level logger for one-shot scripts.  Library code should
+#: Module-level logger for one-shot scripts. Library code should
 #: construct a local ``Logger`` rather than reach for this.
 log = Logger()
 

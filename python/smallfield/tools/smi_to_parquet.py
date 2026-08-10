@@ -2,13 +2,13 @@
 Convert a SMILES file (one SMILES per line, optionally with whitespace-separated name)
 into a folder of Parquet shards that ``smallfield_batch`` can consume.
 
-Output shards have two columns: ``id`` (string) and ``smiles`` (string).  Shard
+Output shards have two columns: ``id`` (string) and ``smiles`` (string). Shard
 filenames are deterministic given the input path and ``--rows-per-shard``::
 
     shard_0000000000_0000999999.parquet   # rows [0, 1_000_000)
     shard_0001000000_0001999999.parquet   # rows [1_000_000, 2_000_000)
 
-Re-running with the same arguments overwrites.  Pass ``--workers N`` to parallelise
+Re-running with the same arguments overwrites. Pass ``--workers N`` to parallelise
 shard writes across N processes (I/O bound above ~4 workers).
 
 Example::
@@ -43,8 +43,8 @@ SHARD_NAME_FMT = "shard_{start:010d}_{end:010d}.parquet"
 def _iter_smiles_file(path: Path) -> Iterator[Tuple[str, str]]:
     """Yield (id, smiles) pairs from a SMILES file.
 
-    Each line is split on whitespace.  Column 1 is SMILES; column 2 (if present)
-    is treated as the id.  Lines starting with ``#`` or empty lines are skipped.
+    Each line is split on whitespace. Column 1 is SMILES; column 2 (if present)
+    is treated as the id. Lines starting with ``#`` or empty lines are skipped.
     If no id is supplied, the 1-based line number is used.
     """
     with open(path, "rt", encoding="utf-8", errors="replace") as fh:

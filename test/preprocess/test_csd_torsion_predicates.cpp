@@ -4,7 +4,7 @@
  *
  *  Two layers of correctness gate:
  *   - @b Sub-query @b validation: every distinct `$(...)` body appearing in the CSD
- *     pattern corpus is compiled by @ref compile_recursive_body and cross-checked
+ *     pattern corpus is compiled by `compile_recursive_body` and cross-checked
  *     against `RDKit::SmartsToMol` + `SubstructMatch` at every atom of every test
  *     molecule.
  *   - @b Full-pattern @b validation: for every CSD torsion pattern the dispatcher
@@ -22,16 +22,17 @@
  *  always debug the native side, never weaken the assertion.
  */
 
-#include <algorithm>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <memory>
-#include <set>
-#include <string>
-#include <unordered_set>
-#include <vector>
+#include <cstdio>  // `fprintf`, `stderr`
+#include <cstdlib> // `std::exit`, `std::getenv`
+#include <cstring> // `std::memset`
+
+#include <algorithm>     // `std::unique`, `std::min`
+#include <fstream>       // `std::ifstream`
+#include <memory>        // `std::unique_ptr`
+#include <set>           // `std::set`
+#include <string>        // `std::string`, `std::getline`
+#include <unordered_set> // `std::unordered_set`
+#include <vector>        // `std::vector`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -42,6 +43,7 @@
 #include "smallfield/preprocess/csd_torsion_native.hpp"
 #include "smallfield/preprocess/csd_torsion_predicates.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
@@ -99,7 +101,7 @@ std::unordered_set<std::uint32_t> rdkit_root_match_set(RDKit::ROMol const &mol, 
 void validate_recursive_for_molecule(recursive_case_t const &compiled, RDKit::ROMol const &mol,
                                      sft::molecule_descriptor_t const &descriptor, std::string const &smiles) {
     std::unique_ptr<RDKit::ROMol const> query(RDKit::SmartsToMol(compiled.body));
-    SF_TEST_ASSERT(query != nullptr, compiled.body);
+    sf_verify_(query != nullptr, compiled.body);
 
     auto const rdkit_roots = rdkit_root_match_set(mol, *query);
 
@@ -114,14 +116,14 @@ void validate_recursive_for_molecule(recursive_case_t const &compiled, RDKit::RO
                          sft::atom_has_flag(descriptor, atom, sft::atom_flag_aromatic_k) ? 1 : 0,
                          descriptor.degree[atom], descriptor.num_hydrogens[atom], descriptor.hybridization[atom]);
             std::fprintf(stderr, "  SMILES: %s\n", smiles.c_str());
-            SF_TEST_ASSERT(false, "sub-query mismatch vs RDKit");
+            sf_verify_(false, "sub-query mismatch vs RDKit");
         }
     }
 }
 
 /**
- *  Reduce a set of RDKit `MatchVectType` hits to the set of torsion-atom
- *  4-tuples identified by the pattern's `:1 :2 :3 :4` labels.  Each tuple is
+ *  @brief Reduce a set of RDKit `MatchVectType` hits to the set of torsion-atom
+ *  4-tuples identified by the pattern's `:1 :2 :3 :4` labels. Each tuple is
  *  normalised so swapping endpoints (a1↔a4, a2↔a3) yields the same canonical
  *  form — the native matcher and RDKit may emit the two orientations in
  *  different order, but the torsion semantics is symmetric.
@@ -147,8 +149,8 @@ std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>> rdk
 }
 
 /**
- *  Run every native-parsed pattern against @p mol and compare the emitted
- *  4-tuple set to RDKit's SubstructMatch.  Returns the number of patterns
+ *  @brief Run every native-parsed pattern against @p mol and compare the emitted
+ *  4-tuple set to RDKit's SubstructMatch. Returns the number of patterns
  *  fully agreed; aborts on any disagreement.
  */
 std::size_t validate_patterns_for_molecule(RDKit::ROMol const &mol, sft::molecule_descriptor_t const &descriptor,
@@ -160,7 +162,7 @@ std::size_t validate_patterns_for_molecule(RDKit::ROMol const &mol, sft::molecul
         if (!pat.native) continue;
 
         // Collect native matches. We cannot use the dispatcher's `done_bonds`
-        // shortcut here because we want EVERY emission, not just the first
+        // shortcut here because we want @b every emission, not just the first
         // per bond; use a fresh stub that never marks the bond done.
         std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>> native_tuples;
         std::memset(done_bonds_u8, 0, sizeof(done_bonds_u8));
@@ -186,7 +188,7 @@ std::size_t validate_patterns_for_molecule(RDKit::ROMol const &mol, sft::molecul
             for (auto const &t : rdkit_tuples)
                 std::fprintf(stderr, " (%u,%u,%u,%u)", std::get<0>(t), std::get<1>(t), std::get<2>(t), std::get<3>(t));
             std::fprintf(stderr, "\n");
-            SF_TEST_ASSERT(false, "pattern mismatch vs RDKit");
+            sf_verify_(false, "pattern mismatch vs RDKit");
         }
         ++ok;
     }
@@ -263,7 +265,7 @@ int main() {
     };
     for (auto &compiled : cases) {
         compiled.pool.num_nodes = 0;
-        SF_TEST_ASSERT(sfp::compile_recursive_body(compiled.body, 0, compiled.pool, compiled.root), compiled.body);
+        sf_verify_(sfp::compile_recursive_body(compiled.body, 0, compiled.pool, compiled.root), compiled.body);
     }
 
     // Corpus selection: env-var override → tier-1/tier-2; default → built-in
@@ -321,9 +323,9 @@ int main() {
         }
 
         // Skip molecules whose SSSR exceeds the descriptor's ring capacity
-        // (`max_rings_k = 32`).  Ring-based pattern constraints silently
+        // (`max_rings_k = 32`). Ring-based pattern constraints silently
         // under-match for such inputs because `atom_ring_bitmap` / `smallest_ring`
-        // are only populated for rings [0, max_rings_k).  Pathological
+        // are only populated for rings [0, max_rings_k). Pathological
         // polycyclic cages (e.g. fused-cyclopropane P+-scaffold in USearch)
         // are the only inputs that trigger this — the production pipeline
         // rarely encounters them, and the preprocess rejects them upstream
@@ -357,7 +359,7 @@ int main() {
     std::printf("Pattern checks: %zu (= %zu molecules × %zu native patterns)\n", total_pattern_checks, total_validated,
                 native_patterns);
     std::size_t const expected_min = std::min<std::size_t>(max_mols, 8);
-    SF_TEST_ASSERT(total_validated >= expected_min, "fewer molecules validated than the corpus floor — bad test data?");
+    sf_verify_(total_validated >= expected_min, "fewer molecules validated than the corpus floor — bad test data?");
     std::printf("\nAll native sub-query + pattern cross-validation tests passed.\n");
     return 0;
 }

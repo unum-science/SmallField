@@ -10,24 +10,23 @@
  *  Layout is SoA for cache locality and so the same struct can be memcpy'd straight
  *  to device memory when the GPU upload format converges with the CPU working format.
  *
- *  Size: ~5.5 KB for N=128. Stack-allocates cleanly.  The all-pairs bond-hop matrix is
- *  not a member: it costs 16 KB and is a pure function of the 1.8 KB CSR adjacency, so
- *  every consumer derives it — @ref fill_bond_distances on the host, the warp BFS in
- *  `smallfield/cuda/bond_distance_kernel.cuh` on the device.
+ *  Stack-allocates cleanly. The all-pairs bond-hop matrix is not a member: it is a pure
+ *  function of the CSR adjacency, so every consumer derives it — `fill_bond_distances`
+ *  on the host, the warp BFS in `smallfield/cuda/bond_distance_kernel.cuh` on the device.
  */
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
-
-#include <cstdint>
-#include <cstring>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstring> // `std::memset`, `std::memcpy`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/Atom.h>
 #include <GraphMol/Bond.h>
 #include <GraphMol/RingInfo.h>
 #include <GraphMol/MolOps.h>
+
+#include "smallfield/module_fwd.hpp"
 
 namespace smallfield::types {
 
@@ -58,8 +57,10 @@ enum hybridization_t : std::uint8_t {
 enum atom_flag_t : std::uint8_t {
     atom_flag_aromatic_k = 1u << 0,
     atom_flag_in_ring_k = 1u << 1,
-    atom_flag_hbond_donor_h_k = 1u << 2,  ///< H covalently bound to N or O
-    atom_flag_hbond_acceptor_k = 1u << 3, ///< N or O with a lone pair
+    /** H covalently bound to N or O. */
+    atom_flag_hbond_donor_h_k = 1u << 2,
+    /** N or O with a lone pair. */
+    atom_flag_hbond_acceptor_k = 1u << 3,
     atom_flag_has_chirality_k = 1u << 4,
 };
 
@@ -68,15 +69,17 @@ enum bond_flag_t : std::uint8_t {
     bond_flag_aromatic_k = 1u << 0,
     bond_flag_in_ring_k = 1u << 1,
     bond_flag_conjugated_k = 1u << 2,
-    bond_flag_stereo_e_k = 1u << 3, ///< E / trans
-    bond_flag_stereo_z_k = 1u << 4, ///< Z / cis
+    /** E / trans. */
+    bond_flag_stereo_e_k = 1u << 3,
+    /** Z / cis. */
+    bond_flag_stereo_z_k = 1u << 4,
 };
 
-/** @brief Sentinel in `bond_stereo_atom_i` / `_j` for a bond with no E/Z assignment. */
+/** Sentinel in `bond_stereo_atom_i` / `_j` for a bond with no E/Z assignment. */
 inline constexpr std::uint8_t no_stereo_atom_k = 0xFFu;
 
 /**
- *  Flat molecule descriptor. All fields SoA, stack-allocated.
+ *  @brief Flat molecule descriptor. All fields SoA, stack-allocated.
  *
  *  Filled by build_descriptor() in one pass through RDKit's API. Used by every
  *  downstream preprocessing stage. No RDKit calls once this is built.
@@ -86,43 +89,58 @@ struct alignas(8) molecule_descriptor_t {
     std::uint16_t num_bonds;
     std::uint8_t num_rings;
 
-    std::uint8_t element[max_atoms_per_molecule_k];       ///< atomic number (0 for padding)
-    std::uint8_t hybridization[max_atoms_per_molecule_k]; ///< hybridization_t
-    std::uint8_t degree[max_atoms_per_molecule_k];        ///< total explicit degree
-    std::uint8_t num_hydrogens[max_atoms_per_molecule_k]; ///< total H count (implicit + explicit)
+    /** Atomic number (0 for padding). */
+    std::uint8_t element[max_atoms_per_molecule_k];
+    /** `hybridization_t` value. */
+    std::uint8_t hybridization[max_atoms_per_molecule_k];
+    /** Total explicit degree. */
+    std::uint8_t degree[max_atoms_per_molecule_k];
+    /** Total H count (implicit + explicit). */
+    std::uint8_t num_hydrogens[max_atoms_per_molecule_k];
     std::int8_t formal_charge[max_atoms_per_molecule_k];
-    std::uint8_t atom_flags[max_atoms_per_molecule_k];    ///< bitwise OR of atom_flag_t
-    std::uint8_t smallest_ring[max_atoms_per_molecule_k]; ///< smallest SSSR ring size containing atom (0 if none)
-    /** @brief Ring-bond connectivity, the SMARTS `x<n>` primitive: how many of the atom's bonds
-     *  carry @ref bond_flag_in_ring_k.  Zero for an acyclic atom and for a ring atom whose every
+    /** Bitwise OR of atom_flag_t. */
+    std::uint8_t atom_flags[max_atoms_per_molecule_k];
+    /** Smallest SSSR ring size containing atom (0 if none). */
+    std::uint8_t smallest_ring[max_atoms_per_molecule_k];
+    /** Ring-bond connectivity, the SMARTS `x<n>` primitive: how many of the atom's bonds
+     *  carry `bond_flag_in_ring_k`. Zero for an acyclic atom and for a ring atom whose every
      *  bond leaves the ring, which cannot happen, so zero reads as "not in a ring". */
     std::uint8_t ring_bond_degree[max_atoms_per_molecule_k];
-    std::uint8_t cip_rank[max_atoms_per_molecule_k];   ///< CIP priority rank (0 = lowest)
-    std::uint8_t chiral_tag[max_atoms_per_molecule_k]; ///< 0=none, 1=CW, 2=CCW
-    std::uint8_t isotope[max_atoms_per_molecule_k];    ///< isotope mass number (0 = natural / unspecified)
+    /** CIP priority rank (0 = lowest). */
+    std::uint8_t cip_rank[max_atoms_per_molecule_k];
+    /** 0=none, 1=CW, 2=CCW. */
+    std::uint8_t chiral_tag[max_atoms_per_molecule_k];
+    /** Isotope mass number (0 = natural / unspecified). */
+    std::uint8_t isotope[max_atoms_per_molecule_k];
 
     std::uint8_t bond_atom_i[max_bonds_k];
     std::uint8_t bond_atom_j[max_bonds_k];
-    std::uint8_t bond_order[max_bonds_k]; ///< 1, 2, 3 (aromatic reported as 4; check flags)
-    std::uint8_t bond_flags[max_bonds_k]; ///< bitwise OR of bond_flag_t
-    /** @brief The two substituents the E/Z flag is stated relative to — one neighbour of
-     *  each double-bond end, `no_stereo_atom_k` when the bond carries no E/Z.  The flag
+    /** 1, 2, 3 (aromatic reported as 4; check flags). */
+    std::uint8_t bond_order[max_bonds_k];
+    /** Bitwise OR of bond_flag_t. */
+    std::uint8_t bond_flags[max_bonds_k];
+    /** The two substituents the E/Z flag is stated relative to — one neighbour of
+     *  each double-bond end, `no_stereo_atom_k` when the bond carries no E/Z. The flag
      *  alone is not enough to place an arbitrary 1-4 pair: it fixes the relationship of
      *  *these* two atoms, and any other substituent sits on the opposite side of its end. */
     std::uint8_t bond_stereo_atom_i[max_bonds_k];
     std::uint8_t bond_stereo_atom_j[max_bonds_k];
 
-    std::uint16_t neighbor_offset[max_atoms_per_molecule_k + 1]; ///< prefix sum; neighbor_offset[N] = total
+    /** Prefix sum; neighbor_offset[N] = total. */
+    std::uint16_t neighbor_offset[max_atoms_per_molecule_k + 1];
     std::uint8_t neighbor_atom[max_neighbor_entries_k];
     std::uint16_t neighbor_bond[max_neighbor_entries_k];
 
-    std::uint16_t ring_offset[max_rings_k + 1];  ///< atoms per ring, prefix sum
-    std::uint8_t ring_atoms[max_atoms_per_molecule_k * 2];    ///< concatenated ring atoms (SSSR is sparse)
-    std::uint32_t atom_ring_bitmap[max_atoms_per_molecule_k]; ///< bit r of atom a = atom a is in ring r
+    /** Atoms per ring, prefix sum. */
+    std::uint16_t ring_offset[max_rings_k + 1];
+    /** Concatenated ring atoms (SSSR is sparse). */
+    std::uint8_t ring_atoms[max_atoms_per_molecule_k * 2];
+    /** Bit r of atom a = atom a is in ring r. */
+    std::uint32_t atom_ring_bitmap[max_atoms_per_molecule_k];
 };
 
 /**
- *  Build a flat descriptor from an RDKit molecule in a single pass.
+ *  @brief Build a flat descriptor from an RDKit molecule in a single pass.
  *
  *  Reads every field we need for downstream preprocessing. After this call the
  *  ROMol can be discarded for preprocessing purposes.
@@ -206,7 +224,7 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
         descriptor.bond_flags[b] = flags;
 
         // The E/Z assignment is stated relative to a specific pair of substituents, one
-        // per double-bond end.  Record them so the bounds builder can tell which side any
+        // per double-bond end. Record them so the bounds builder can tell which side any
         // given 1-4 partner lands on.
         descriptor.bond_stereo_atom_i[b] = no_stereo_atom_k;
         descriptor.bond_stereo_atom_j[b] = no_stereo_atom_k;
@@ -300,7 +318,7 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
 }
 
 /**
- *  Convenience accessors for the descriptor. All inline, no allocations.
+ *  @brief Convenience accessors for the descriptor. All inline, no allocations.
  */
 inline bool atom_has_flag(molecule_descriptor_t const &descriptor, std::uint32_t atom_index, atom_flag_t flag) {
     return (descriptor.atom_flags[atom_index] & flag) != 0;
@@ -313,15 +331,15 @@ inline bool bond_has_flag(molecule_descriptor_t const &descriptor, std::uint32_t
 /**
  *  @brief Fill @p matrix with the all-pairs bond-hop counts of @p descriptor.
  *
- *  One breadth-first search per source atom over the CSR adjacency, writing row @c source
- *  at @c source*row_stride.  Atoms with no bonded path between them — the two halves of a
+ *  One breadth-first search per source atom over the CSR adjacency, writing row `source`
+ *  at `source*row_stride`. Atoms with no bonded path between them — the two halves of a
  *  salt, a solvate's water — keep the 255 sentinel that the MMFF nonbonded sweep reads as
  *  "unreachable", and 255 is also the saturation value, unreachable for N <= 128 where the
  *  longest simple path is 127 hops.
  *
  *  @param[in] descriptor Descriptor supplying the atom count and the CSR adjacency.
- *  @param[out] matrix Caller-owned buffer of at least @p row_stride times @c descriptor.num_atoms bytes.
- *  @param[in] row_stride Element distance between consecutive rows; at least @c descriptor.num_atoms.
+ *  @param[out] matrix Caller-owned buffer of at least @p row_stride times `descriptor.num_atoms` bytes.
+ *  @param[in] row_stride Element distance between consecutive rows; at least `descriptor.num_atoms`.
  */
 inline void fill_bond_distances(molecule_descriptor_t const &descriptor, std::uint8_t *matrix,
                                 std::uint32_t row_stride) {

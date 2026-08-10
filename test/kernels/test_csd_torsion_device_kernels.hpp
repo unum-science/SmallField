@@ -1,21 +1,26 @@
+/**
+ *  @file test_csd_torsion_device_kernels.hpp
+ *  @brief Device harness for the CSD torsion matcher, for use by its unit tests.
+ */
+
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint32_t`
 
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-/** @brief Compile the CSD pattern corpus, upload it, and return an opaque owner handle.
+/** Compile the CSD pattern corpus, upload it, and return an opaque owner handle.
  *  @param[out] table_bytes Bytes the uploaded table occupies on the device.
  *  @return Handle to pass to the launcher, or null when the upload failed. */
 void *create_csd_torsion_device_table(std::size_t &table_bytes);
 
-/** @brief Release a handle from @ref create_csd_torsion_device_table.
+/** Release a handle from `create_csd_torsion_device_table`.
  *  @param[in] handle Handle to release; null is ignored. */
 void destroy_csd_torsion_device_table(void *handle);
 
-/** @brief Run the device matcher over a batch of descriptors and copy the results back.
+/** Run the device matcher over a batch of descriptors and copy the results back.
  *  @param[in] handle Table handle.
  *  @param[in] descriptors Host-side descriptors, one per molecule.
  *  @param[in] num_molecules Molecules in the batch.

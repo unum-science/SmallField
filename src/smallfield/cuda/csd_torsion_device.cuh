@@ -3,38 +3,37 @@
  *  @brief Device-resident CSD torsion table and the warp-per-molecule matcher that reads it.
  *
  *  The CSD torsion preferences compile to 470 stack-only patterns whose matcher, in
- *  `preprocess/csd_torsion_native.hpp`, is a pure function of @ref molecule_descriptor_t.  This
+ *  `preprocess/csd_torsion_native.hpp`, is a pure function of `molecule_descriptor_t`. This
  *  header carries that matcher to the GPU: it flattens the compiled patterns into POD mirrors,
  *  uploads them into one device arena the way `parameters/mmff94_tables_device.cuh` uploads the
  *  MMFF tables, and runs one warp per molecule over the result.
  *
- *  Two members of the host pattern cannot cross.  A @ref recursive_pool_t is a fixed 40-node pool
- *  even though the widest body in the corpus spends seven nodes, and a @ref simple_ring_closure_t
- *  is half a kilobyte that only the ring-closing patterns use.  Both move into shared arenas the
+ *  Two members of the host pattern cannot cross. A `recursive_pool_t` is a fixed 40-node pool
+ *  even though the widest body in the corpus spends seven nodes, and a `simple_ring_closure_t`
+ *  is half a kilobyte that only the ring-closing patterns use. Both move into shared arenas the
  *  pattern indexes by offset, which is what turns a 2.6 MB table into a 660 KB one, and the
- *  matcher reads a pattern through @ref csd_pattern_view_t so the same body serves both layouts.
+ *  matcher reads a pattern through `csd_pattern_view_t` so the same body serves both layouts.
  *
  *  Work assignment: a lane owns one bond and walks the pattern list in file order until a pattern
  *  binds, which is exactly the "first pattern claims the bond" rule the host loop implements from
- *  the other side.  The pattern is warp-uniform, so every lane reads the same address and the
- *  table streams through L2 once per warp rather than once per lane.  The ring torsions that
+ *  the other side. The pattern is warp-uniform, so every lane reads the same address and the
+ *  table streams through L2 once per warp rather than once per lane. The ring torsions that
  *  RDKit's `useBasicKnowledge` adds are order-dependent between rings and run on lane 0.
  *
- *  Correctness: identical torsion set per molecule to @ref extract_etk_torsions_native, checked
+ *  Correctness: identical torsion set per molecule to `extract_etk_torsions_native`, checked
  *  molecule by molecule in `test/kernels/test_csd_torsion_device.cpp`.
  */
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
+#include <cstdint> // `std::uint32_t`, `std::uint64_t`
+#include <cstdio>  // `std::fprintf`
 
-#include <cstdint>
-#include <cstdio> // `std::fprintf`
-
-#include <vector>
+#include <vector> // `std::vector`
 
 #include <cuda_runtime.h>
 
+#include "smallfield/module_fwd.hpp"
 #include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
@@ -64,33 +63,41 @@ using smallfield::types::max_bonds_k;
 using smallfield::types::molecule_descriptor_t;
 
 /**
- *  Per-thread device stack the matcher needs.  Sub-query evaluation still recurses, bounded by the
- *  compiled corpus rather than by the molecule: a body nests at most @ref max_recursive_depth_k
- *  levels of `$(...)` and walks at most @ref max_recursive_hops_k hops from its root.  Driving the
+ *  @brief Per-thread device stack the matcher needs. Sub-query evaluation still recurses, bounded by the
+ *  compiled corpus rather than by the molecule: a body nests at most `max_recursive_depth_k`
+ *  levels of `$(...)` and walks at most `max_recursive_hops_k` hops from its root. Driving the
  *  limit down until the kernel faults puts the peak between 512 and 768 bytes across 39168 PubChem
  *  and Enamine REAL molecules, so the CUDA default of 1024 already suffices and @ref
  *  ensure_csd_torsion_device_stack only has work to do when a caller lowered it.
  */
 inline constexpr std::size_t csd_torsion_stack_bytes_k = 1024;
 
-/** Value of @ref csd_device_pattern_t::closure_offset for a pattern that closes no ring. */
+/** Value of `csd_device_pattern_t::closure_offset` for a pattern that closes no ring. */
 inline constexpr std::uint32_t no_closure_offset_k = 0xFFFFFFFFu;
 
 /**
- *  POD mirror of one compiled torsion pattern.  Everything the matcher reads is either inline here
+ *  @brief POD mirror of one compiled torsion pattern. Everything the matcher reads is either inline here
  *  or reachable through an offset into the table's node and closure arenas, so the whole struct is
- *  memcpy-able to the device.  The six Fourier coefficients are the host's `signs[i] * V[i]`
+ *  memcpy-able to the device. The six Fourier coefficients are the host's `signs[i] * V[i]`
  *  products, folded at upload time because the kernel never needs the two factors apart.
  */
 struct alignas(8) csd_device_pattern_t {
-    simple_atom_constraint_t atom[4];     ///< the labelled atoms `:1` through `:4`
-    simple_bond_constraint_t bond[3];     ///< chain bonds; the central `:2`-`:3` bond is index 1
-    std::uint64_t required_elements;      ///< bit N set when a match needs element N present
-    std::uint32_t pool_offset;            ///< first sub-query node of this pattern in the node arena
-    std::uint32_t closure_offset;         ///< ring closure in the closure arena; @ref no_closure_offset_k when absent
-    float fourier_coefficients[6];        ///< V₁ through V₆ with the pattern's signs already applied
-    std::uint8_t required_hybridizations; ///< bit H set when a match needs hybridization H present
-    std::uint8_t requires_aromatic;       ///< 1 when a match needs an aromatic atom
+    /** The labelled atoms `:1` through `:4`. */
+    simple_atom_constraint_t atom[4];
+    /** Chain bonds; the central `:2`-`:3` bond is index 1. */
+    simple_bond_constraint_t bond[3];
+    /** Bit N set when a match needs element N present. */
+    std::uint64_t required_elements;
+    /** First sub-query node of this pattern in the node arena. */
+    std::uint32_t pool_offset;
+    /** Ring closure in the closure arena; `no_closure_offset_k` when absent. */
+    std::uint32_t closure_offset;
+    /** V₁ through V₆ with the pattern's signs already applied. */
+    float fourier_coefficients[6];
+    /** Bit H set when a match needs hybridization H present. */
+    std::uint8_t required_hybridizations;
+    /** 1 when a match needs an aromatic atom. */
+    std::uint8_t requires_aromatic;
     std::uint8_t padding[6];
 };
 
@@ -108,7 +115,7 @@ struct csd_torsion_table_host_t {
     std::vector<recursive_node_t> nodes;
     std::vector<simple_ring_closure_t> closures;
 
-    /** @brief Total bytes the three arrays occupy on the device, before alignment padding. */
+    /** Total bytes the three arrays occupy on the device, before alignment padding. */
     std::size_t byte_size() const {
         return patterns.size() * sizeof(csd_device_pattern_t) + nodes.size() * sizeof(recursive_node_t) +
                closures.size() * sizeof(simple_ring_closure_t);
@@ -120,7 +127,7 @@ struct csd_torsion_table_host_t {
  *
  *  Node indices stay pattern-local — a disjunct's `recursive_root` keeps indexing its own pattern's
  *  nodes — because the kernel hands the matcher a node pointer already biased by the pattern's
- *  @ref csd_device_pattern_t::pool_offset.
+ *  `csd_device_pattern_t::pool_offset`.
  *
  *  @param[out] out Staging buffers; any prior contents are dropped.
  */
@@ -158,11 +165,14 @@ inline void build_csd_torsion_table(csd_torsion_table_host_t &out) {
     }
 }
 
-/** Per-GPU device-resident table.  Owns one grow-only arena holding all three arrays. */
+/** Per-GPU device-resident table. Owns one grow-only arena holding all three arrays. */
 struct csd_torsion_table_device_t {
-    device_byte_buffer_t arena;    ///< single device allocation, RAII-managed
-    csd_torsion_table_view_t view; ///< pointers into @ref arena
-    std::size_t arena_bytes = 0;   ///< bytes actually placed, padding included
+    /** Single device allocation, RAII-managed. */
+    device_byte_buffer_t arena;
+    /** Pointers into `arena`. */
+    csd_torsion_table_view_t view;
+    /** Bytes actually placed, padding included. */
+    std::size_t arena_bytes = 0;
 
     csd_torsion_table_device_t() = default;
     csd_torsion_table_device_t(csd_torsion_table_device_t const &) = delete;
@@ -175,7 +185,7 @@ inline std::size_t align_up(std::size_t value, std::size_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-/** @brief Copy one host array into the arena at the next 256-byte boundary and return its address. */
+/** Copy one host array into the arena at the next 256-byte boundary and return its address. */
 template <typename element_>
 element_ *place_array(std::byte *arena_base, std::size_t &offset, std::vector<element_> const &source) {
     if (source.empty()) return nullptr;
@@ -188,7 +198,7 @@ element_ *place_array(std::byte *arena_base, std::size_t &offset, std::vector<el
 
 } // namespace detail_csd_torsion
 
-/** @brief Raise the per-thread device stack to @ref csd_torsion_stack_bytes_k when it sits lower. */
+/** Raise the per-thread device stack to `csd_torsion_stack_bytes_k` when it sits lower. */
 inline void ensure_csd_torsion_device_stack() {
     std::size_t current = 0;
     if (cudaDeviceGetLimit(&current, cudaLimitStackSize) != cudaSuccess) return;
@@ -198,7 +208,7 @@ inline void ensure_csd_torsion_device_stack() {
 /**
  *  @brief Upload the staged table into one device arena and fill in the view that indexes it.
  *
- *  @param[in] host Staging buffers filled by @ref build_csd_torsion_table.
+ *  @param[in] host Staging buffers filled by `build_csd_torsion_table`.
  *  @param[out] table Device arena and view; the caller keeps it alive for every kernel that reads it.
  */
 inline void upload_csd_torsion_table_to_device(csd_torsion_table_host_t const &host,
@@ -219,7 +229,7 @@ inline void upload_csd_torsion_table_to_device(csd_torsion_table_host_t const &h
     cudaDeviceSynchronize();
 }
 
-/** @brief Assemble the matcher's read handle on one device pattern. */
+/** Assemble the matcher's read handle on one device pattern. */
 __device__ inline csd_pattern_view_t device_pattern_view(csd_torsion_table_view_t const &table,
                                                          csd_device_pattern_t const &pattern) {
     simple_ring_closure_t const *closure = pattern.closure_offset == no_closure_offset_k
@@ -358,7 +368,7 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
 }
 
 /**
- *  @brief Launch @ref csd_torsion_match_kernel, one warp per molecule.
+ *  @brief Launch `csd_torsion_match_kernel`, one warp per molecule.
  *
  *  @param[in] descriptors Device-resident descriptors.
  *  @param[in] num_molecules Molecules to process.

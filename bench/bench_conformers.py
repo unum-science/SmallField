@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         "--gpus",
         type=str,
         default="",
-        help="Comma-separated GPU IDs (e.g. '0,1,2,3').  Empty = all visible.",
+        help="Comma-separated GPU IDs (e.g. '0,1,2,3'). Empty = all visible.",
     )
     parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--skip-rdkit", action="store_true", help="Skip the pure-RDKit system.")

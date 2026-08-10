@@ -1,6 +1,11 @@
+/**
+ *  @file test_mmff_gpu_typer_kernels.hpp
+ *  @brief Device harness for the MMFF94 GPU atom typer, for use by its unit tests.
+ */
+
 #pragma once
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"

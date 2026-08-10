@@ -4,12 +4,12 @@
  *
  *  `logger_t` is a plain struct owned by the object that needs it — `context_t`
  *  carries one, `smallfield_batch` owns its own for shard progress, each bench
- *  constructs a local one.  No process-wide singletons, no thread_locals.
+ *  constructs a local one. No process-wide singletons, no thread_locals.
  *
  *  Formatting is layered on `{fmt}`: `fmt::format`, `fmt::print`, and
- *  `fmt::text_style` for color.  The built-in `fmt::print(stream, style, …)`
+ *  `fmt::text_style` for color. The built-in `fmt::print(stream, style, ...)`
  *  auto-disables ANSI escapes when the stream is not a terminal, and the logger
- *  further gates on `NO_COLOR` via @ref detect_color_enabled.
+ *  further gates on `NO_COLOR` via `detect_color_enabled`.
  *
  *  @code{.cpp}
  *  smallfield::logger_t log;
@@ -21,17 +21,18 @@
 
 #pragma once
 
-#include <chrono>
-#include <concepts>
-#include <cstdio>
-#include <cstdlib>
+#include <cstdio>  // `stdout`, `stderr`
+#include <cstdlib> // `std::getenv`
 #include <ctime>
-#include <locale>
-#include <stdexcept>
-#include <string>
-#include <unistd.h>
-#include <utility>
 
+#include <chrono> // `std::chrono::system_clock`, `std::chrono::steady_clock`
+#include <concepts>
+#include <locale>
+#include <stdexcept> // `std::runtime_error`
+#include <string>    // `std::string`
+#include <utility>   // `std::forward`
+
+#include <unistd.h>
 #include <fmt/chrono.h>
 #include <fmt/color.h>
 #include <fmt/format.h>
@@ -56,7 +57,7 @@ inline std::locale const &grouping_locale() {
     return loc;
 }
 
-/** @brief `1234567 → "1,234,567"`. Uses @ref grouping_locale. */
+/** Formats `1234567` as `"1,234,567"`. Uses `grouping_locale`. */
 template <typename integer_>
     requires std::integral<integer_>
 inline std::string thousands(integer_ v) {
@@ -65,7 +66,7 @@ inline std::string thousands(integer_ v) {
     else return fmt::format(grouping_locale(), "{:L}", static_cast<std::uint64_t>(v));
 }
 
-/** @brief Wall-clock `time_point` formatted as "YYYY-MM-DD HH:MM:SS" in local time. */
+/** Wall-clock `time_point` formatted as "YYYY-MM-DD HH:MM:SS" in local time. */
 inline std::string format_wall_time(std::chrono::system_clock::time_point const &tp) {
     std::time_t const seconds_since_epoch = std::chrono::system_clock::to_time_t(tp);
     std::tm tm_local {};
@@ -74,7 +75,7 @@ inline std::string format_wall_time(std::chrono::system_clock::time_point const 
                        tm_local.tm_mday, tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
 }
 
-/** @brief Elapsed `duration` formatted as "HH:MM:SS" for pairing with wall clock. */
+/** Elapsed `duration` formatted as "HH:MM:SS" for pairing with wall clock. */
 inline std::string format_hms(std::chrono::steady_clock::duration const &d) {
     auto const total_seconds = std::chrono::duration_cast<std::chrono::seconds>(d).count();
     return fmt::format("{:02}:{:02}:{:02}", total_seconds / 3600, (total_seconds / 60) % 60, total_seconds % 60);
@@ -84,7 +85,7 @@ inline std::string format_hms(std::chrono::steady_clock::duration const &d) {
  *  @brief True when ANSI styling should be emitted to stdout.
  *
  *  Requires stdout to be a terminal and `NO_COLOR` to be unset (cf.
- *  https://no-color.org/).  Cached after the first call.
+ *  https://no-color.org/). Cached after the first call.
  */
 inline bool detect_color_enabled() {
     static bool const enabled = []() {
@@ -102,13 +103,14 @@ inline bool detect_color_enabled() {
  *  e.g. `ctx.logger.verbose_level = 2` before `generate_conformers`.
  */
 struct logger_t {
-    int verbose_level = 0; ///< 0 silent, 1 summary, 2 per-device detail
+    /** 0 silent, 1 summary, 2 per-device detail. */
+    int verbose_level = 0;
     std::FILE *info_stream = stdout;
     std::FILE *warn_stream = stderr;
     std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
     bool color_enabled = detect_color_enabled();
 
-    /** @brief `"[2026-04-18 10:17:15 | +00:13:27]"` — wall clock plus elapsed. */
+    /** `"[2026-04-18 10:17:15 | +00:13:27]"` — wall clock plus elapsed. */
     std::string timestamp_prefix() const {
         return fmt::format("[{} | +{}]", format_wall_time(std::chrono::system_clock::now()),
                            format_hms(std::chrono::steady_clock::now() - start_time));
@@ -131,7 +133,7 @@ struct logger_t {
                fmt_string, std::forward<args_types_>(args)...);
     }
 
-    /** @brief Emit only when @ref verbose_level >= 1 (wave-level summary tier). */
+    /** Emit only when `verbose_level` >= 1 (wave-level summary tier). */
     template <typename... args_types_>
     void trace(fmt::format_string<args_types_...> fmt_string, args_types_ &&...args) const {
         if (verbose_level < 1) return;
@@ -139,7 +141,7 @@ struct logger_t {
                std::forward<args_types_>(args)...);
     }
 
-    /** @brief Emit only when @ref verbose_level >= 2 (per-device detail tier). */
+    /** Emit only when `verbose_level` >= 2 (per-device detail tier). */
     template <typename... args_types_>
     void trace2(fmt::format_string<args_types_...> fmt_string, args_types_ &&...args) const {
         if (verbose_level < 2) return;
@@ -151,13 +153,13 @@ struct logger_t {
     template <typename... args_types_>
     void write_(std::FILE *stream, fmt::text_style style, fmt::format_string<args_types_...> fmt_string,
                 args_types_ &&...args) const {
-        // `fmt::print(stream, style, fmt, args…)` with an empty style emits no
+        // `fmt::print(stream, style, fmt, args...)` with an empty style emits no
         // ANSI escapes; no need to branch.
         fmt::print(stream, "{} ", timestamp_prefix());
         fmt::print(stream, style, fmt_string, std::forward<args_types_>(args)...);
         std::fputc('\n', stream);
         // `fflush` here so redirected-to-file log tails are live and long-running
-        // jobs expose progress mid-shard.  Cost is one syscall per line; with
+        // jobs expose progress mid-shard. Cost is one syscall per line; with
         // hundreds of lines over a multi-hour run this is negligible.
         std::fflush(stream);
     }

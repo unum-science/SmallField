@@ -1,10 +1,9 @@
 /**
  *  @file molecule_complexity.hpp
- *  @brief Per-molecule work estimate used by the complexity-descending
- *  stripe partition in `distribute_batch_to_per_device_pools_`.
+ *  @brief Per-molecule work estimate used by the complexity-descending stripe partition in
+ *  `distribute_batch_to_per_device_pools_`.
  *
- *  Atom count alone is a weak proxy for kernel wall time.  Within one
- *  `embedding-wave` the dominant GPU costs are:
+ *  Atom count alone is a weak proxy for kernel wall time. Within one `embedding-wave` the dominant GPU costs are:
  *
  *    1. Bounds-matrix smoothing + nonbonded pair scan: O(num_atoms²).
  *    2. FIRE minimisation over MMFF + ETK torsions: linear in torsion count
@@ -15,25 +14,23 @@
  *       the `is_heavy_refinement_case_` threshold — see
  *       `source/smallfield/cuda/etkdg_pipeline.cuh:86-97`.
  *
- *  The weights here mirror the kernel-side heuristics so the balance
- *  estimate agrees with the bin-dispatch and rescue decisions the kernels
- *  themselves make at runtime.  Pure function, no allocation, no state.
+ *  The weights here mirror the kernel-side heuristics so the balance estimate agrees with the bin-dispatch and
+ *  rescue decisions the kernels themselves make at runtime. Pure function, no allocation, no state.
  */
 
 #pragma once
 
+#include <cstdint> // `std::uint64_t`
+
 #include "smallfield/module_fwd.hpp"
-
-#include <cstdint>
-
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::preprocess {
 
 /** Returns a unit-less work estimate for one molecule's `embedding-step` on
- *  the GPU.  Monotonic with `num_atoms` in expectation, so an ascending
+ *  the GPU. Monotonic with `num_atoms` in expectation, so an ascending
  *  sort by this score still keeps the per-device `atom-limited-bin`
- *  dispatch order sane.  Larger values mean more work, so the stripe
+ *  dispatch order sane. Larger values mean more work, so the stripe
  *  partition sorts by this descending and assigns sorted rank `k` to
  *  device `k % device_count`. */
 inline constexpr std::uint64_t molecule_complexity_score_(

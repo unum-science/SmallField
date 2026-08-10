@@ -2,15 +2,15 @@
  *  @file smallfield_descriptors.cpp
  *  @brief Augment existing 3D conformer parquet-shards in place with shape descriptors.
  *
- *  The batch producer `smallfield_batch` emits the canonical 14-column `*.3D.parquet`
- *  schema: per-conformer USR / USRCAT shape vectors, energy-sorted conformers, and
- *  provenance metadata.  Shards produced before that upgrade carry the older 12-column
- *  schema (no `usr` / `usrcat`, conformers not energy-sorted).  Re-running the GPU to
+ *  The batch producer `smallfield_batch` emits the canonical `*.3D.parquet`
+ *  schema: per-conformer USRCAT shape vectors, energy-sorted conformers, and
+ *  provenance metadata. Older shards lack this schema entirely, with no
+ *  `usrcat` column and conformers not energy-sorted. Re-running the GPU to
  *  regenerate them would be wasteful and would perturb coordinates; instead this tool
  *  reads each old shard, computes the missing descriptors from the ALREADY-STORED
  *  (fp16-rounded) coordinates using the exact same native descriptor code the producer
- *  uses (@ref smallfield::postprocess), and re-emits the full canonical schema through
- *  the producer's own writer (@ref smallfield::cli::write_shard).  Output is therefore
+ *  uses (`smallfield::postprocess`), and re-emits the full canonical schema through
+ *  the producer's own writer (`smallfield::cli::write_shard`). Output is therefore
  *  identical to what the batch producer would have written for the same geometry.
  *
  *  Because the input coordinates in a 3D shard are already a tight interleaved
@@ -45,9 +45,7 @@
 #include <vector>        // `std::vector`
 
 #include <omp.h>
-
 #include <cuda_fp16.h>
-
 #include <arrow/array.h>
 #include <arrow/io/file.h>
 #include <arrow/table.h>
@@ -70,22 +68,27 @@ namespace {
 
 #pragma region Configuration
 
-/** All CLI flags.  Immutable after parse. */
+/** All CLI flags. Immutable after parse. */
 struct cli_config_t {
     fs::path input_dir;
     fs::path output_dir;
-    fs::path reembed_dir;      ///< optional folder of corrected 14-column shards; "" = disabled
-    std::string dataset;       ///< provenance dataset name (e.g. "pubchem"); "" = omit from metadata
-    int threads = 0;           ///< OpenMP threads across molecules within a shard; 0 = all cores
-    bool resume = true;        ///< skip shards whose `<output>.encoded` sentinel exists
-    std::uint32_t max_atoms = sfapi::max_atoms_per_molecule_k; ///< coord stride / provenance `max_atoms`
+    /** Optional folder of corrected shards; "" = disabled. */
+    fs::path reembed_dir;
+    /** Provenance dataset name (e.g. "pubchem"); "" = omit from metadata. */
+    std::string dataset;
+    /** OpenMP threads across molecules within a shard; 0 = all cores. */
+    int threads = 0;
+    /** Skip shards whose `<output>.encoded` sentinel exists. */
+    bool resume = true;
+    /** Coord stride / provenance `max_atoms`. */
+    std::uint32_t max_atoms = sfapi::max_atoms_per_molecule_k;
 };
 
 void print_usage() {
     fmt::print(stderr, R"(Usage: smallfield_descriptors --input DIR --output DIR [options]
   --input DIR       folder of 3D parquet-shards to augment (*.3D.parquet)
   --output DIR      folder for augmented output shards (*.3D.parquet)
-  --reembed DIR     folder of corrected 14-column shards; molecules present there are
+  --reembed DIR     folder of corrected 13-column shards; molecules present there are
                     copied verbatim instead of augmented (e.g. re-embedded multi-fragment)
   --dataset NAME    provenance dataset name embedded in output metadata (e.g. pubchem)
   --threads N       OpenMP threads across molecules within a shard (default: all cores)
@@ -155,17 +158,17 @@ bool parse_cli(int argc, char **argv, cli_config_t &config) {
 
 #pragma region fp16 Conversion
 
-/** @brief Decode one fp16 bit pattern (as stored by Arrow `HalfFloat`) to a host float. */
+/** Decode one fp16 bit pattern (as stored by Arrow `HalfFloat`) to a host float. */
 inline float half_bits_to_float(std::uint16_t bits) {
     __half value;
     std::memcpy(&value, &bits, sizeof(value));
     return __half2float(value);
 }
 
-/** @brief Encode a host float to an fp16 bit pattern, packed into an `__half` slot. */
+/** Encode a host float to an fp16 bit pattern, packed into an `__half` slot. */
 inline __half float_to_half(float value) { return __float2half(value); }
 
-/** @brief Reinterpret an fp16 bit pattern as an `__half` (no numeric conversion). */
+/** Reinterpret an fp16 bit pattern as an `__half` (no numeric conversion). */
 inline __half half_from_bits(std::uint16_t bits) {
     __half value;
     std::memcpy(&value, &bits, sizeof(value));
@@ -180,7 +183,7 @@ inline __half half_from_bits(std::uint16_t bits) {
  *  @brief A single input 3D shard read into typed columns, keeping the Arrow table alive.
  *
  *  The shard is single-chunked via `CombineChunks` so every column is one contiguous
- *  array and per-row access is a plain index.  SMILES and the input-shard stem are held
+ *  array and per-row access is a plain index. SMILES and the input-shard stem are held
  *  as `string_view`s into the table's buffers, so the table must outlive this struct.
  */
 struct input_shard_t {
@@ -237,8 +240,8 @@ bool read_input_shard(fs::path const &path, input_shard_t &out) {
     out.conformer_energy = bind_column<arrow::FloatArray>(*out.table, "conformer_energy");
     out.num_rows = out.table->num_rows();
 
-    if (!out.input_shard || !out.input_row || !out.smiles || !out.conformer_index || !out.status ||
-        !out.n_atoms || !out.n_conformers || !out.conformer_coords || !out.conformer_energy)
+    if (!out.input_shard || !out.input_row || !out.smiles || !out.conformer_index || !out.status || !out.n_atoms ||
+        !out.n_conformers || !out.conformer_coords || !out.conformer_energy)
         return false;
     out.coords_values = dynamic_cast<arrow::HalfFloatArray const *>(out.conformer_coords->values().get());
     if (!out.coords_values) return false;
@@ -249,16 +252,18 @@ bool read_input_shard(fs::path const &path, input_shard_t &out) {
 
 #pragma region Reembed Store
 
-/** @brief One conformer row copied verbatim from a `--reembed` shard. */
+/** One conformer row copied verbatim from a `--reembed` shard. */
 struct reembed_conformer_t {
     std::uint8_t status = 0;
     float energy = 0.0f;
     bool has_coords = false;
-    std::vector<std::uint16_t> coord_bits;   ///< tight interleaved (n_atoms, 3) fp16 bit patterns
-    std::array<double, 60> usrcat {};        ///< USR is the first 12 of USRCAT; not stored separately
+    /** Tight interleaved (n_atoms, 3) fp16 bit patterns. */
+    std::vector<std::uint16_t> coord_bits;
+    /** USR is the first 12 of USRCAT, not stored separately. */
+    std::array<double, 60> usrcat {};
 };
 
-/** @brief One molecule copied verbatim from a `--reembed` shard (its already-corrected geometry). */
+/** One molecule copied verbatim from a `--reembed` shard (its already-corrected geometry). */
 struct reembed_molecule_t {
     std::uint8_t num_atoms = 0;
     std::uint16_t n_heavy_atoms = 0;
@@ -271,7 +276,7 @@ struct reembed_molecule_t {
 
 using reembed_index_t = std::unordered_map<std::string, reembed_molecule_t>;
 
-/** @brief Compose the `(input_shard, input_row)` identity key used to match reembed molecules. */
+/** Compose the `(input_shard, input_row)` identity key used to match reembed molecules. */
 inline std::string reembed_key(std::string_view input_shard, std::uint64_t input_row) {
     std::string key;
     key.reserve(input_shard.size() + 21);
@@ -281,15 +286,16 @@ inline std::string reembed_key(std::string_view input_shard, std::uint64_t input
     return key;
 }
 
-/** @brief Copy one reembed shard's molecules into @p index, keyed by `(input_shard, input_row)`. */
+/** Copy one reembed shard's molecules into @p index, keyed by `(input_shard, input_row)`. */
 void load_reembed_shard(input_shard_t const &shard, reembed_index_t &index) {
     arrow::HalfFloatArray const &coords_values = *shard.coords_values;
     arrow::ListArray const &coords_list = *shard.conformer_coords;
     // USRCAT is optional on a reembed shard; bind once so the verbatim path stays truly verbatim
     // when present, and leaves zeros when the shard predates it. Stored as fp16 (list<float16>).
     auto const *usrcat_column = bind_column<arrow::ListArray>(*shard.table, "usrcat");
-    auto const *usrcat_values =
-        usrcat_column ? dynamic_cast<arrow::HalfFloatArray const *>(usrcat_column->values().get()) : nullptr;
+    auto const *usrcat_values = usrcat_column
+                                    ? dynamic_cast<arrow::HalfFloatArray const *>(usrcat_column->values().get())
+                                    : nullptr;
     for (std::int64_t row = 0; row < shard.num_rows; ++row) {
         std::string_view const stem = shard.input_shard->GetView(row);
         std::uint64_t const input_row = shard.input_row->Value(row);
@@ -303,8 +309,9 @@ void load_reembed_shard(input_shard_t const &shard, reembed_index_t &index) {
                                          ? shard.n_heavy_atoms->Value(row)
                                          : 0;
             molecule.n_bonds = shard.n_bonds && shard.n_bonds->IsValid(row) ? shard.n_bonds->Value(row) : 0;
-            molecule.molecular_weight =
-                shard.molecular_weight && shard.molecular_weight->IsValid(row) ? shard.molecular_weight->Value(row) : 0.0f;
+            molecule.molecular_weight = shard.molecular_weight && shard.molecular_weight->IsValid(row)
+                                            ? shard.molecular_weight->Value(row)
+                                            : 0.0f;
             molecule.n_conformers = shard.n_conformers->IsValid(row) ? shard.n_conformers->Value(row) : 0;
         }
 
@@ -315,8 +322,7 @@ void load_reembed_shard(input_shard_t const &shard, reembed_index_t &index) {
             std::int64_t const begin = coords_list.value_offset(row);
             std::int64_t const end = coords_list.value_offset(row + 1);
             conformer.coord_bits.reserve(static_cast<std::size_t>(end - begin));
-            for (std::int64_t k = begin; k < end; ++k)
-                conformer.coord_bits.push_back(coords_values.Value(k));
+            for (std::int64_t k = begin; k < end; ++k) conformer.coord_bits.push_back(coords_values.Value(k));
         }
         if (shard.conformer_energy->IsValid(row)) conformer.energy = shard.conformer_energy->Value(row);
 
@@ -324,7 +330,8 @@ void load_reembed_shard(input_shard_t const &shard, reembed_index_t &index) {
             std::int64_t const begin = usrcat_column->value_offset(row);
             if (usrcat_column->value_offset(row + 1) - begin >= 60)
                 for (std::size_t d = 0; d < 60; ++d)
-                    conformer.usrcat[d] = half_bits_to_float(usrcat_values->Value(begin + static_cast<std::int64_t>(d)));
+                    conformer.usrcat[d] = half_bits_to_float(
+                        usrcat_values->Value(begin + static_cast<std::int64_t>(d)));
         }
 
         molecule.conformers.push_back(std::move(conformer));
@@ -355,24 +362,25 @@ reembed_index_t build_reembed_index(fs::path const &reembed_dir, logger_t const 
 
 #pragma region Shard Augmentation
 
-/** @brief Per-shard counters folded into the progress log. */
+/** Per-shard counters folded into the progress log. */
 struct shard_stats_t {
-    std::atomic<std::uint64_t> ctx_mismatch {0};   ///< molecules whose SMILES parse did not match stored n_atoms
+    /** Molecules whose SMILES parse did not match stored n_atoms. */
+    std::atomic<std::uint64_t> ctx_mismatch {0};
     std::atomic<std::uint64_t> fragments_separated {0};
     std::uint64_t from_reembed = 0;
 };
 
 /**
- *  @brief Augment one input shard and write the canonical 14-column output shard.
+ *  @brief Augment one input shard and write the canonical output shard.
  *
  *  Rows are grouped by `input_row`; molecules are contiguous, so molecule index
- *  `m` maps to `input_row = base_row_index + m`.  Every molecule's conformer rows
+ *  `m` maps to `input_row = base_row_index + m`. Every molecule's conformer rows
  *  are laid into structure-of-arrays conformer slots exactly as the GPU producer
- *  would, so the producer's own @ref sfcli::write_shard can energy-sort, rank
+ *  would, so the producer's own `sfcli::write_shard` can energy-sort, rank
  *  `conformer_index`, couple nulls, and pack descriptors — guaranteeing identical
- *  output bytes.  Descriptors are computed from the stored fp16 coordinates via the
- *  native @ref sfpost path; multi-fragment molecules are `separate_fragments`'d and
- *  their corrected coordinates written back.  Molecules found in @p reembed are
+ *  output bytes. Descriptors are computed from the stored fp16 coordinates via the
+ *  native `sfpost` path; multi-fragment molecules are `separate_fragments`'d and
+ *  their corrected coordinates written back. Molecules found in @p reembed are
  *  copied verbatim from there instead.
  */
 bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reembed_index_t const &reembed,
@@ -382,7 +390,7 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
         return false;
     }
 
-    // Contiguous molecule span: m -> input_row = base + m.  The 3D schema guarantees
+    // Contiguous molecule span: m -> input_row = base + m. The 3D schema guarantees
     // rows are grouped and input_row is contiguous, so every m owns at least one row.
     std::uint64_t base_row = shard.input_row->Value(0);
     std::uint64_t max_row = base_row;
@@ -400,13 +408,14 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
         std::uint64_t const m = shard.input_row->Value(row) - base_row;
         rows_for_molecule[m].push_back(row);
         observed_conformers = std::max<std::uint32_t>(observed_conformers,
-                                                       static_cast<std::uint32_t>(rows_for_molecule[m].size()));
+                                                      static_cast<std::uint32_t>(rows_for_molecule[m].size()));
     }
     // The slot stride K must cover the widest molecule (original or reembed) and match the
-    // producer's `num_conformers` provenance value.  Reembed molecules can only add rows.
+    // producer's `num_conformers` provenance value. Reembed molecules can only add rows.
     std::uint32_t max_conformers = observed_conformers;
     for (auto const &[key, molecule] : reembed)
-        max_conformers = std::max<std::uint32_t>(max_conformers, static_cast<std::uint32_t>(molecule.conformers.size()));
+        max_conformers = std::max<std::uint32_t>(max_conformers,
+                                                 static_cast<std::uint32_t>(molecule.conformers.size()));
 
     std::uint32_t const max_atoms = config.max_atoms;
     sfapi::conformer_slot_layout_t const slot_layout {max_atoms, max_conformers};
@@ -459,8 +468,8 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
                     std::size_t const slot_base = slot_layout.slot_offset(m, static_cast<std::uint32_t>(c));
                     for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
                         for (std::uint32_t axis = 0; axis < 3u; ++axis)
-                            coordinates[slot_base + slot_layout.component_offset(axis, atom)] =
-                                half_from_bits(conformer.coord_bits[atom * 3u + axis]);
+                            coordinates[slot_base + slot_layout.component_offset(axis, atom)] = half_from_bits(
+                                conformer.coord_bits[atom * 3u + axis]);
                     std::copy(conformer.usrcat.begin(), conformer.usrcat.end(), usrcat.data() + flat * 60u);
                 }
             }
@@ -473,19 +482,20 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
                                               ? static_cast<std::uint8_t>(shard.n_atoms->Value(first_row))
                                               : 0;
         num_atoms_per_molecule[m] = num_atoms_u8;
-        num_heavy_atoms_per_molecule[m] =
-            shard.n_heavy_atoms && shard.n_heavy_atoms->IsValid(first_row) ? shard.n_heavy_atoms->Value(first_row) : 0;
-        num_bonds_per_molecule[m] =
-            shard.n_bonds && shard.n_bonds->IsValid(first_row) ? shard.n_bonds->Value(first_row) : 0;
+        num_heavy_atoms_per_molecule[m] = shard.n_heavy_atoms && shard.n_heavy_atoms->IsValid(first_row)
+                                              ? shard.n_heavy_atoms->Value(first_row)
+                                              : 0;
+        num_bonds_per_molecule[m] = shard.n_bonds && shard.n_bonds->IsValid(first_row) ? shard.n_bonds->Value(first_row)
+                                                                                       : 0;
         molecular_weight_per_molecule[m] = shard.molecular_weight && shard.molecular_weight->IsValid(first_row)
                                                ? shard.molecular_weight->Value(first_row)
                                                : 0.0f;
-        n_conformers_per_molecule[m] =
-            shard.n_conformers->IsValid(first_row) ? shard.n_conformers->Value(first_row) : 0;
+        n_conformers_per_molecule[m] = shard.n_conformers->IsValid(first_row) ? shard.n_conformers->Value(first_row)
+                                                                              : 0;
 
         if (num_atoms_u8 == 0) continue; // preprocess-failed molecule: single null row, no coords
 
-        // Type the molecule once (same parse contract the producer uses).  A mismatch between
+        // Type the molecule once (same parse contract the producer uses). A mismatch between
         // the reparsed atom count and the stored n_atoms means the coordinate order can't be
         // trusted for descriptors — keep the coordinates, emit zero-filled descriptors, and count.
         sfpost::molecule_shape_context_t const context = sfpost::build_shape_context(smiles[m]);
@@ -513,7 +523,7 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
             std::span<float> coords_view {interleaved.data(), wanted};
 
             // Multi-fragment safety net: separate disconnected components and write the corrected
-            // geometry back, mirroring the producer.  Only when the context is usable (needs labels).
+            // geometry back, mirroring the producer. Only when the context is usable (needs labels).
             if (context_usable && context.num_components > 1) {
                 sfpost::separate_fragments(coords_view, context);
                 stats.fragments_separated.fetch_add(1, std::memory_order_relaxed);
@@ -521,8 +531,8 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
 
             for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
                 for (std::uint32_t axis = 0; axis < 3u; ++axis)
-                    coordinates[slot_base + slot_layout.component_offset(axis, atom)] =
-                        float_to_half(interleaved[atom * 3u + axis]);
+                    coordinates[slot_base + slot_layout.component_offset(axis, atom)] = float_to_half(
+                        interleaved[atom * 3u + axis]);
 
             if (context_usable) {
                 std::array<double, 60> usrcat_row {};
@@ -568,7 +578,7 @@ int main(int argc, char **argv) {
     fs::create_directories(config.output_dir, ec);
 
     // Inventory: every *.3D.parquet in --input is an input here (unlike smallfield_batch,
-    // where *.3D.parquet names are outputs).  Skip the .encoded sentinels themselves.
+    // where *.3D.parquet names are outputs). Skip the .encoded sentinels themselves.
     std::vector<fs::path> inputs;
     for (auto const &entry : fs::directory_iterator(config.input_dir)) {
         std::string const name = entry.path().filename().string();

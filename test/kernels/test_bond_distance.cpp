@@ -2,24 +2,25 @@
  *  @file test_bond_distance.cpp
  *  @brief Byte-for-byte parity between the device hop-count BFS and the host all-pairs BFS.
  *
- *  A warp BFS rebuilds the N x N hop matrix the MMFF nonbonded sweep reads, on the device,
+ *  A warp BFS rebuilds the N × N hop matrix the MMFF nonbonded sweep reads, on the device,
  *  from the batch's bond list; the host builds the same matrix from the descriptor's CSR
- *  adjacency.  Two different traversals over two different encodings of the
+ *  adjacency. Two different traversals over two different encodings of the
  *  same graph, so the check is exact equality over every byte of every molecule — a single
  *  differing entry silently changes which pairs the sweep treats as 1-4 or as excluded.
  *
  *  Corpus: `SMALLFIELD_TEST_CORPUS=/path/to.smi` streams real molecules, capped by
- *  `SMALLFIELD_TEST_MAX_MOLS` (default 300).  Absent it the built-in list runs, which carries
+ *  `SMALLFIELD_TEST_MAX_MOLS` (default 300). Absent it the built-in list runs, which carries
  *  its own multi-fragment salts so the 255 unreachable sentinel is covered either way.
  */
 
-#include <cstdio>
-#include <cstdlib>
-#include <fstream>
-#include <memory>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <cstdio>  // `fprintf`, `stderr`
+#include <cstdlib> // `std::getenv`
+
+#include <fstream>     // `std::ifstream`
+#include <memory>      // `std::unique_ptr`
+#include <string>      // `std::string`, `std::getline`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -37,7 +38,7 @@ namespace sftest = smallfield::tests;
 
 namespace {
 
-/** @brief Load up to @p max_count SMILES strings from @p path, one per line, first field only. */
+/** Load up to @p max_count SMILES strings from @p path, one per line, first field only. */
 std::vector<std::string> load_smiles(char const *path, std::size_t max_count) {
     std::vector<std::string> smiles_list;
     std::ifstream file(path);
@@ -99,7 +100,7 @@ void test_device_matches_host(std::vector<std::string> const &smiles_list) {
     // Counterions are kept deliberately: a disconnected fragment is the only way to reach the
     // unreachable-hop sentinel, and the production path strips them.
     auto batch = sfp::prepare_molecule_batch(views, smallfield::keep_all_fragments_k);
-    SF_TEST_ASSERT(batch.num_molecules > 0, "no molecule survived preprocessing");
+    sf_verify_(batch.num_molecules > 0, "no molecule survived preprocessing");
 
     std::vector<std::uint8_t> device_matrix(batch.layout.num_bond_distance, std::uint8_t {0});
     run_bond_distance_bfs_on_gpu(batch.host.data(), batch.layout, batch.num_molecules, device_matrix.data());
@@ -115,7 +116,7 @@ void test_device_matches_host(std::vector<std::string> const &smiles_list) {
         auto const &meta = metadata[molecule];
         std::string const &smiles = smiles_list[input_indices[molecule]];
         std::uint32_t const num_atoms = host_bond_hops(smiles, reference);
-        SF_TEST_ASSERT(num_atoms == meta.num_atoms, smiles.c_str());
+        sf_verify_(num_atoms == meta.num_atoms, smiles.c_str());
 
         std::uint8_t const *device_block = device_matrix.data() + meta.bond_distance_offset;
         std::size_t local_unreachable = 0;
@@ -125,7 +126,7 @@ void test_device_matches_host(std::vector<std::string> const &smiles_list) {
                 if (device_block[entry] != reference[entry]) {
                     std::fprintf(stderr, "FAIL: %s pair (%u,%u): device %u, host %u\n", smiles.c_str(), i, j,
                                  device_block[entry], reference[entry]);
-                    SF_TEST_ASSERT(false, "device hop count differs from the host BFS");
+                    sf_verify_(false, "device hop count differs from the host BFS");
                 }
                 if (reference[entry] == 255) ++local_unreachable;
             }
@@ -135,7 +136,7 @@ void test_device_matches_host(std::vector<std::string> const &smiles_list) {
         if (local_unreachable > 0) ++molecules_with_fragments;
     }
 
-    SF_TEST_ASSERT(molecules_with_fragments > 0, "corpus covered no disconnected fragment");
+    sf_verify_(molecules_with_fragments > 0, "corpus covered no disconnected fragment");
     std::printf("  %u molecules, %zu matrix bytes, %zu unreachable pairs across %zu multi-fragment molecules\n",
                 batch.num_molecules, compared_bytes, unreachable_pairs, molecules_with_fragments);
 }
@@ -153,7 +154,7 @@ int main() {
     for (auto &smiles : sftest::standard_test_smiles()) smiles_list.push_back(std::move(smiles));
     if (corpus_path) {
         auto streamed = load_smiles(corpus_path, max_molecules);
-        SF_TEST_ASSERT(!streamed.empty(), corpus_path);
+        sf_verify_(!streamed.empty(), corpus_path);
         std::printf("Corpus: %s (up to %zu molecules) plus built-ins\n", corpus_path, max_molecules);
         for (auto &smiles : streamed) smiles_list.push_back(std::move(smiles));
     }

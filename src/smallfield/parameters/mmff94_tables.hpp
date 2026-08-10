@@ -5,7 +5,7 @@
  *  RDKit's `DefaultParameters::getMMFF*()` collections are
  *  ultimately backed by parallel `std::vector<std::uint8_t>` lookup columns
  *  and a `std::vector<MMFF*>` parameter column — the `operator()` helpers
- *  do a cascade of `std::equal_range` calls against those vectors.  For a
+ *  do a cascade of `std::equal_range` calls against those vectors. For a
  *  GPU port we want the same data in flat POD arrays we can upload with
  *  one `cudaMemcpy` each and binary-search on the device.
  *
@@ -30,34 +30,33 @@
 
 #pragma once
 
+#include <cstdint> // `std::uint8_t`
+
+#include <algorithm> // `std::lower_bound`
+#include <utility>   // `std::pair`
+#include <vector>    // `std::vector`
+
 #include "smallfield/module_fwd.hpp"
 
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <span>
-#include <utility>
-#include <vector>
-
-// `SMALLFIELD_HD_` resolves to `__host__ __device__` when compiled by nvcc,
-// empty otherwise, so every `lookup_*` below is callable from both host
-// C++ and device kernels with the same source.
+/*  `SF_HOST_DEVICE_` resolves to `__host__ __device__` when compiled by nvcc, empty otherwise, so
+ *  every `lookup_*` below is callable from both host C++ and device kernels with the same source. */
 #if defined(__CUDACC__)
-#define SMALLFIELD_HD_ __host__ __device__
+#define SF_HOST_DEVICE_ __host__ __device__
 #else
-#define SMALLFIELD_HD_
+#define SF_HOST_DEVICE_
 #endif
 
 namespace smallfield::parameters {
 
-// Flat POD entry structs for every MMFF94 parameter table.
+#pragma region Table Entry Structs
 
 /** Van-der-Waals parameters, one entry per MMFF atom type. Matches `mmff94_atom_vdw_params_t` in
  *  `types/etkdg_types.hpp` in most respects; the difference is that this struct keys by `atom_type`
  *  for lookup. */
 struct alignas(8) mmff94_vdw_entry_t {
     std::uint8_t atom_type;
-    std::uint8_t donor_acceptor; ///< 0 = '-', 1 = 'A' (acceptor), 2 = 'D' (donor)
+    /** 0 = '-', 1 = 'A' (acceptor), 2 = 'D' (donor). */
+    std::uint8_t donor_acceptor;
     std::uint8_t padding[2];
     float alpha_i;
     float n_i;
@@ -71,7 +70,8 @@ static_assert(sizeof(mmff94_vdw_entry_t) == 32);
 /** Bond-stretch parameter (kb, r0), keyed by (canonical atom type pair,
  *  MMFF bond type 0/1). */
 struct alignas(16) mmff94_bond_entry_t {
-    std::uint8_t i_type; ///< canonical: i_type <= j_type
+    /** Canonical: i_type <= j_type. */
+    std::uint8_t i_type;
     std::uint8_t j_type;
     std::uint8_t bond_type;
     std::uint8_t padding;
@@ -84,8 +84,10 @@ static_assert(sizeof(mmff94_bond_entry_t) == 16);
 /** Angle-bend parameter (ka, theta0 in deg), keyed by (j_type, i_type,
  *  k_type, angle_type) with i_type ≤ k_type canonical. */
 struct alignas(16) mmff94_angle_entry_t {
-    std::uint8_t j_type; ///< center atom type
-    std::uint8_t i_type; ///< canonical: i_type <= k_type
+    /** Center atom type. */
+    std::uint8_t j_type;
+    /** Canonical: i_type <= k_type. */
+    std::uint8_t i_type;
     std::uint8_t k_type;
     std::uint8_t angle_type;
     float ka;
@@ -95,8 +97,8 @@ struct alignas(16) mmff94_angle_entry_t {
 static_assert(sizeof(mmff94_angle_entry_t) == 16);
 
 /** Torsion parameter (V1, V2, V3), keyed by (j, k, i, l, torsion_type)
- *  with canonicalization defined in RDKit's `MMFFTorCollection::
- *  getMMFFTorParams`: when canJ > canK, swap (i,j)↔(l,k). */
+ *  with canonicalization defined in RDKit's
+ *  `MMFFTorCollection::getMMFFTorParams`: when canJ > canK, swap (i,j)↔(l,k). */
 struct alignas(16) mmff94_torsion_entry_t {
     std::uint8_t j_type;
     std::uint8_t k_type;
@@ -113,8 +115,10 @@ static_assert(sizeof(mmff94_torsion_entry_t) == 32);
 /** Out-of-plane bend parameter (koop), keyed by (j, canI, canK, canL)
  *  where (canI, canK, canL) is sorted ascending. */
 struct alignas(8) mmff94_oop_entry_t {
-    std::uint8_t j_type; ///< center
-    std::uint8_t i_type; ///< sorted
+    /** Center. */
+    std::uint8_t j_type;
+    /** Sorted. */
+    std::uint8_t i_type;
     std::uint8_t k_type;
     std::uint8_t l_type;
     float koop;
@@ -126,7 +130,8 @@ static_assert(sizeof(mmff94_oop_entry_t) == 8 || sizeof(mmff94_oop_entry_t) == 1
  *  flag returned alongside (whether i/k were swapped canonically). */
 struct alignas(16) mmff94_stbn_entry_t {
     std::uint8_t j_type;
-    std::uint8_t i_type; ///< canonical: i_type <= k_type
+    /** Canonical: i_type <= k_type. */
+    std::uint8_t i_type;
     std::uint8_t k_type;
     std::uint8_t stretch_bend_type;
     float kba_ijk;
@@ -135,10 +140,11 @@ struct alignas(16) mmff94_stbn_entry_t {
 };
 static_assert(sizeof(mmff94_stbn_entry_t) == 16);
 
-/** Default-stretch-bend (DFSB) fallback parameter.  Used by RDKit when
+/** Default-stretch-bend (DFSB) fallback parameter. Used by RDKit when
  *  primary Stbn lookup fails: keyed by (periodic-table row of i, j, k). */
 struct alignas(8) mmff94_dfsb_entry_t {
-    std::uint8_t row_i; ///< canonical: row_i <= row_k
+    /** Canonical: row_i <= row_k. */
+    std::uint8_t row_i;
     std::uint8_t row_j;
     std::uint8_t row_k;
     std::uint8_t padding;
@@ -147,9 +153,9 @@ struct alignas(8) mmff94_dfsb_entry_t {
 };
 static_assert(sizeof(mmff94_dfsb_entry_t) == 16);
 
-/** MMFFProp — per-atom-type chemical properties.  Used by
+/** MMFFProp — per-atom-type chemical properties. Used by
  *  `getMMFFBondType` (sbmb / arom fields) and by the empirical
- *  angle-bending rule (crd / val / mltb / linh fields).  Dense array
+ *  angle-bending rule (crd / val / mltb / linh fields). Dense array
  *  indexed directly by atom_type (one slot per possible type, zeros
  *  for unused slots), mirroring `mmff94_def_entry_t`. */
 struct alignas(8) mmff94_prop_entry_t {
@@ -164,7 +170,7 @@ struct alignas(8) mmff94_prop_entry_t {
 };
 static_assert(sizeof(mmff94_prop_entry_t) == 8);
 
-/** MMFFDef equivalence levels — 4 bytes per atom type.  Indexed directly
+/** MMFFDef equivalence levels — 4 bytes per atom type. Indexed directly
  *  by `atom_type` (stored as dense array, one entry per possible type in
  *  [1, max_atom_type], with zeros for unused slots). */
 struct mmff94_def_entry_t {
@@ -181,9 +187,9 @@ struct alignas(8) mmff94_pbci_entry_t {
 };
 static_assert(sizeof(mmff94_pbci_entry_t) == 16);
 
-/** Bond-charge-increment parameter.  The *directional* increment
+/** Bond-charge-increment parameter. The *directional* increment
  *  applied from atom i to atom j; atom i's partial charge gains `bci`,
- *  atom j loses it.  Sorted by (i, j, bond_type); RDKit's Chg lookup
+ *  atom j loses it. Sorted by (i, j, bond_type); RDKit's Chg lookup
  *  checks (i,j,bt) and (j,i,bt), flipping sign accordingly. */
 struct alignas(8) mmff94_chg_entry_t {
     std::uint8_t i_type;
@@ -195,10 +201,11 @@ struct alignas(8) mmff94_chg_entry_t {
 static_assert(sizeof(mmff94_chg_entry_t) == 8);
 
 /** Bndk default-bond parameter, keyed by (atomic_number_i, atomic_number_j)
- *  canonical ordering.  Used by RDKit's empirical bond-stretch rule when
+ *  canonical ordering. Used by RDKit's empirical bond-stretch rule when
  *  the primary Bond lookup fails. */
 struct alignas(8) mmff94_bndk_entry_t {
-    std::uint8_t atomic_num_i; ///< canonical: i <= j
+    /** Canonical: i <= j. */
+    std::uint8_t atomic_num_i;
     std::uint8_t atomic_num_j;
     std::uint8_t padding[2];
     float kb;
@@ -209,7 +216,8 @@ static_assert(sizeof(mmff94_bndk_entry_t) == 16);
 /** Herschbach-Laurie's rule parameter, for Badger's rule bond stretch
  *  estimation when neither Bond nor Bndk have the pair. */
 struct alignas(8) mmff94_hl_entry_t {
-    std::uint8_t row_i; ///< canonical: row_i <= row_j
+    /** Canonical: row_i <= row_j. */
+    std::uint8_t row_i;
     std::uint8_t row_j;
     std::uint8_t padding[2];
     float a_ij;
@@ -228,22 +236,24 @@ struct mmff94_covrad_entry_t {
 };
 static_assert(sizeof(mmff94_covrad_entry_t) == 12);
 
-// Read-only view over the tables, shared between host and device.
+#pragma endregion Table Entry Structs
 
-/** @brief POD read-only span for MMFF94 table rows, ABI-safe across host and device. */
+#pragma region Table View
+
+/** POD read-only span for MMFF94 table rows, ABI-safe across host and device. */
 template <typename element_>
 struct mmff94_span_t {
     element_ const *ptr_ = nullptr;
     std::size_t size_ = 0;
-    SMALLFIELD_HD_ element_ const *data() const noexcept { return ptr_; }
-    SMALLFIELD_HD_ std::size_t size() const noexcept { return size_; }
-    SMALLFIELD_HD_ bool empty() const noexcept { return size_ == 0; }
-    SMALLFIELD_HD_ element_ const *begin() const noexcept { return ptr_; }
-    SMALLFIELD_HD_ element_ const *end() const noexcept { return ptr_ + size_; }
-    SMALLFIELD_HD_ element_ const &operator[](std::size_t i) const noexcept { return ptr_[i]; }
+    SF_HOST_DEVICE_ element_ const *data() const noexcept { return ptr_; }
+    SF_HOST_DEVICE_ std::size_t size() const noexcept { return size_; }
+    SF_HOST_DEVICE_ bool empty() const noexcept { return size_ == 0; }
+    SF_HOST_DEVICE_ element_ const *begin() const noexcept { return ptr_; }
+    SF_HOST_DEVICE_ element_ const *end() const noexcept { return ptr_ + size_; }
+    SF_HOST_DEVICE_ element_ const &operator[](std::size_t i) const noexcept { return ptr_[i]; }
 };
 
-/** POD view over every extracted MMFF table.  Consumed by all `lookup_*`
+/** POD view over every extracted MMFF table. Consumed by all `lookup_*`
  *  functions and by host/device alike — on host `ptr_` points into the
  *  `std::vector`s inside `mmff94_tables_host_t`; on device it points
  *  into a `cudaMalloc`ed arena built by `upload_mmff94_tables_to_device`
@@ -273,39 +283,56 @@ struct mmff94_tables_view_t {
     std::uint8_t max_atom_type = 0;
 };
 
-// Aggregate host-side table container.
+#pragma endregion Table View
+
+#pragma region Table Container
 
 /** All MMFF94 parameter tables in a single container, extracted once at
- *  context init.  Each vector is sorted in the exact lookup order RDKit
+ *  context init. Each vector is sorted in the exact lookup order RDKit
  *  uses internally — see the per-collection `d_*` column orderings in
  *  `rdkit/ForceField/MMFF/Params.h`. */
 struct mmff94_tables_host_t {
-    std::vector<mmff94_vdw_entry_t> vdw;         ///< sorted by atom_type
-    std::vector<mmff94_bond_entry_t> bond;       ///< sorted by (i, j, bond_type)
-    std::vector<mmff94_angle_entry_t> angle;     ///< sorted by (j, i, k, angle_type)
-    std::vector<mmff94_torsion_entry_t> torsion; ///< sorted by (j, k, i, l, tor_type)
-    std::vector<mmff94_oop_entry_t> oop;         ///< sorted by (j, i, k, l)
-    std::vector<mmff94_stbn_entry_t> stbn;       ///< sorted by (j, i, k, sb_type)
-    std::vector<mmff94_dfsb_entry_t> dfsb;       ///< sorted by (row_i, row_j, row_k)
-    std::vector<mmff94_def_entry_t> def;         ///< dense: indexed directly by atom_type
-    std::vector<mmff94_prop_entry_t> prop;       ///< dense: indexed directly by atom_type
-    std::vector<mmff94_pbci_entry_t> pbci;       ///< sorted by atom_type
-    std::vector<mmff94_chg_entry_t> chg;         ///< sorted by (i, j, bond_type)
-    std::vector<mmff94_bndk_entry_t> bndk;       ///< sorted by (atomic_num_i, atomic_num_j)
-    std::vector<mmff94_hl_entry_t> hl;           ///< sorted by (row_i, row_j)
-    std::vector<mmff94_covrad_entry_t> covrad;   ///< sorted by atomic_num
+    /** Sorted by atom_type. */
+    std::vector<mmff94_vdw_entry_t> vdw;
+    /** Sorted by (i, j, bond_type). */
+    std::vector<mmff94_bond_entry_t> bond;
+    /** Sorted by (j, i, k, angle_type). */
+    std::vector<mmff94_angle_entry_t> angle;
+    /** Sorted by (j, k, i, l, tor_type). */
+    std::vector<mmff94_torsion_entry_t> torsion;
+    /** Sorted by (j, i, k, l). */
+    std::vector<mmff94_oop_entry_t> oop;
+    /** Sorted by (j, i, k, sb_type). */
+    std::vector<mmff94_stbn_entry_t> stbn;
+    /** Sorted by (row_i, row_j, row_k). */
+    std::vector<mmff94_dfsb_entry_t> dfsb;
+    /** Dense: indexed directly by atom_type. */
+    std::vector<mmff94_def_entry_t> def;
+    /** Dense: indexed directly by atom_type. */
+    std::vector<mmff94_prop_entry_t> prop;
+    /** Sorted by atom_type. */
+    std::vector<mmff94_pbci_entry_t> pbci;
+    /** Sorted by (i, j, bond_type). */
+    std::vector<mmff94_chg_entry_t> chg;
+    /** Sorted by (atomic_num_i, atomic_num_j). */
+    std::vector<mmff94_bndk_entry_t> bndk;
+    /** Sorted by (row_i, row_j). */
+    std::vector<mmff94_hl_entry_t> hl;
+    /** Sorted by atomic_num. */
+    std::vector<mmff94_covrad_entry_t> covrad;
 
-    // VdW collection scalar constants (from MMFFVdWCollection members)
+    /** VdW collection scalar constants, from `MMFFVdWCollection` members. */
     float vdw_power = 0.25f;
     float vdw_b = 0.2f;
     float vdw_beta = 12.0f;
     float vdw_darad = 0.8f;
     float vdw_daeps = 0.5f;
 
-    std::uint8_t max_atom_type = 0; ///< highest atom type seen (for MMFFDef indexing)
+    /** Highest atom type seen (for MMFFDef indexing). */
+    std::uint8_t max_atom_type = 0;
 
     /** Build a read-only view that references this container's vector
-     *  storage.  Cheap — just copies pointers + sizes + scalar constants. */
+     *  storage. Cheap — just copies pointers + sizes + scalar constants. */
     mmff94_tables_view_t view() const noexcept {
         mmff94_tables_view_t v;
         v.vdw = {vdw.data(), vdw.size()};
@@ -332,15 +359,19 @@ struct mmff94_tables_host_t {
     }
 };
 
-// Hand-rolled lower_bound. `std::lower_bound` from libstdc++ compiles on device with
-// `--expt-relaxed-constexpr` but has been seen to stop the binary search
-// early on device — in practice returning the first few elements only
-// and declaring the key "not found" for anything past ~8 entries in a
-// 95-element sorted array. Rolling our own fixes the issue and keeps
-// the code path identical between host and device.
+#pragma endregion Table Container
+
+/**
+ *  @brief Hand-rolled `lower_bound` for a `std::uint8_t` key, used by every lookup cascade below.
+ *
+ *  `std::lower_bound` from libstdc++ compiles on device with `--expt-relaxed-constexpr` but has been
+ *  seen to stop the binary search early on device, in practice returning the first few elements only
+ *  and declaring the key not found for anything past about 8 entries in a 95-element sorted array.
+ *  Rolling our own fixes the issue and keeps the code path identical between host and device.
+ */
 template <typename element_, typename key_accessor_>
-SMALLFIELD_HD_ inline std::size_t lower_bound_u8_(element_ const *base, std::size_t n, std::uint8_t key,
-                                                  key_accessor_ &&kf) noexcept {
+SF_HOST_DEVICE_ inline std::size_t lower_bound_u8_(element_ const *base, std::size_t n, std::uint8_t key,
+                                                   key_accessor_ &&kf) noexcept {
     std::size_t lo = 0, hi = n;
     while (lo < hi) {
         std::size_t const mid = lo + (hi - lo) / 2;
@@ -350,13 +381,15 @@ SMALLFIELD_HD_ inline std::size_t lower_bound_u8_(element_ const *base, std::siz
     return lo;
 }
 
-// Host-side lookups that match RDKit's operator() behaviour. These serve two callers: the
-// cross-validation test sanity-checks that we extracted sorted data correctly, and the native CPU port
-// of `extract_mmff94_params`. Must produce results byte-identical to RDKit.
-
-/** Binary-search cascade matching `MMFFVdWCollection::operator()`. */
-SMALLFIELD_HD_ inline mmff94_vdw_entry_t const *lookup_vdw(mmff94_tables_view_t const &t,
-                                                           std::uint8_t atom_type) noexcept {
+/**
+ *  @brief Binary-search cascade matching `MMFFVdWCollection::operator()`.
+ *
+ *  This and the lookups below match RDKit's `operator()` behaviour, byte-identical to RDKit, and
+ *  serve two callers: the cross-validation test, which sanity-checks that we extracted sorted data
+ *  correctly, and the native CPU port of `extract_mmff94_params`.
+ */
+SF_HOST_DEVICE_ inline mmff94_vdw_entry_t const *lookup_vdw(mmff94_tables_view_t const &t,
+                                                            std::uint8_t atom_type) noexcept {
     std::size_t const index = lower_bound_u8_(t.vdw.data(), t.vdw.size(), atom_type,
                                               [](mmff94_vdw_entry_t const &e) { return e.atom_type; });
     if (index < t.vdw.size() && t.vdw[index].atom_type == atom_type) return &t.vdw[index];
@@ -365,8 +398,8 @@ SMALLFIELD_HD_ inline mmff94_vdw_entry_t const *lookup_vdw(mmff94_tables_view_t 
 
 /** Binary-search cascade matching `MMFFBondCollection::operator()`.
  *  Canonicalises (atom_i, atom_j) to (lo, hi). */
-SMALLFIELD_HD_ inline mmff94_bond_entry_t const *lookup_bond(mmff94_tables_view_t const &t, std::uint8_t bond_type,
-                                                             std::uint8_t atom_i, std::uint8_t atom_j) noexcept {
+SF_HOST_DEVICE_ inline mmff94_bond_entry_t const *lookup_bond(mmff94_tables_view_t const &t, std::uint8_t bond_type,
+                                                              std::uint8_t atom_i, std::uint8_t atom_j) noexcept {
     std::uint8_t lo = atom_i, hi = atom_j;
     if (lo > hi) {
         std::uint8_t tmp = lo;
@@ -395,9 +428,9 @@ SMALLFIELD_HD_ inline mmff94_bond_entry_t const *lookup_bond(mmff94_tables_view_
 
 /** Binary-search cascade matching `MMFFAngleCollection::operator()` —
  *  including the 4-level equivalence fallback via MMFFDef. */
-SMALLFIELD_HD_ inline mmff94_angle_entry_t const *lookup_angle(mmff94_tables_view_t const &t, std::uint8_t angle_type,
-                                                               std::uint8_t atom_i, std::uint8_t atom_j_center,
-                                                               std::uint8_t atom_k) noexcept {
+SF_HOST_DEVICE_ inline mmff94_angle_entry_t const *lookup_angle(mmff94_tables_view_t const &t, std::uint8_t angle_type,
+                                                                std::uint8_t atom_i, std::uint8_t atom_j_center,
+                                                                std::uint8_t atom_k) noexcept {
     mmff94_angle_entry_t const *a0 = t.angle.data();
     std::size_t const n = t.angle.size();
     auto j_key = [](mmff94_angle_entry_t const &e) { return e.j_type; };
@@ -429,28 +462,29 @@ SMALLFIELD_HD_ inline mmff94_angle_entry_t const *lookup_angle(mmff94_tables_vie
 }
 
 /** MMFFProp dense lookup — `nullptr` for unknown atom types. */
-SMALLFIELD_HD_ inline mmff94_prop_entry_t const *lookup_prop(mmff94_tables_view_t const &t,
-                                                             std::uint8_t atom_type) noexcept {
+SF_HOST_DEVICE_ inline mmff94_prop_entry_t const *lookup_prop(mmff94_tables_view_t const &t,
+                                                              std::uint8_t atom_type) noexcept {
     if (atom_type == 0 || atom_type >= t.prop.size()) return nullptr;
     return &t.prop[atom_type];
 }
 
 /** PBCI (partial-bond-charge-increment) lookup by atom type. */
-SMALLFIELD_HD_ inline mmff94_pbci_entry_t const *lookup_pbci(mmff94_tables_view_t const &t,
-                                                             std::uint8_t atom_type) noexcept {
+SF_HOST_DEVICE_ inline mmff94_pbci_entry_t const *lookup_pbci(mmff94_tables_view_t const &t,
+                                                              std::uint8_t atom_type) noexcept {
     std::size_t const index = lower_bound_u8_(t.pbci.data(), t.pbci.size(), atom_type,
                                               [](mmff94_pbci_entry_t const &e) { return e.atom_type; });
     if (index < t.pbci.size() && t.pbci[index].atom_type == atom_type) return &t.pbci[index];
     return nullptr;
 }
 
-/** Signed bond-charge-increment lookup.  Mirrors
+/** Signed bond-charge-increment lookup. Mirrors
  *  `MMFFChgCollection::getMMFFChgParams`: returns (sign, bci) where sign
  *  is -1 if (i_type <= j_type) held in the tabulation order, +1 if the
- *  arguments had to be swapped.  Returns {0, nullptr} on miss. */
-SMALLFIELD_HD_ inline std::pair<int, mmff94_chg_entry_t const *> lookup_chg(mmff94_tables_view_t const &t,
-                                                                            std::uint8_t bond_type, std::uint8_t atom_i,
-                                                                            std::uint8_t atom_j) noexcept {
+ *  arguments had to be swapped. Returns {0, nullptr} on miss. */
+SF_HOST_DEVICE_ inline std::pair<int, mmff94_chg_entry_t const *> lookup_chg(mmff94_tables_view_t const &t,
+                                                                             std::uint8_t bond_type,
+                                                                             std::uint8_t atom_i,
+                                                                             std::uint8_t atom_j) noexcept {
     int sign = -1;
     std::uint8_t lo = atom_i, hi = atom_j;
     if (atom_i > atom_j) {
@@ -475,8 +509,8 @@ SMALLFIELD_HD_ inline std::pair<int, mmff94_chg_entry_t const *> lookup_chg(mmff
 }
 
 /** Bndk (default bond by atomic-number pair) lookup. */
-SMALLFIELD_HD_ inline mmff94_bndk_entry_t const *lookup_bndk(mmff94_tables_view_t const &t, std::uint8_t atomic_i,
-                                                             std::uint8_t atomic_j) noexcept {
+SF_HOST_DEVICE_ inline mmff94_bndk_entry_t const *lookup_bndk(mmff94_tables_view_t const &t, std::uint8_t atomic_i,
+                                                              std::uint8_t atomic_j) noexcept {
     std::uint8_t lo = atomic_i, hi = atomic_j;
     if (lo > hi) {
         std::uint8_t tmp = lo;
@@ -496,8 +530,8 @@ SMALLFIELD_HD_ inline mmff94_bndk_entry_t const *lookup_bndk(mmff94_tables_view_
 }
 
 /** Covalent radius + Pauling electronegativity lookup by atomic number. */
-SMALLFIELD_HD_ inline mmff94_covrad_entry_t const *lookup_covrad(mmff94_tables_view_t const &t,
-                                                                 std::uint8_t atomic_num) noexcept {
+SF_HOST_DEVICE_ inline mmff94_covrad_entry_t const *lookup_covrad(mmff94_tables_view_t const &t,
+                                                                  std::uint8_t atomic_num) noexcept {
     std::size_t const index = lower_bound_u8_(t.covrad.data(), t.covrad.size(), atomic_num,
                                               [](mmff94_covrad_entry_t const &e) { return e.atomic_num; });
     if (index < t.covrad.size() && t.covrad[index].atomic_num == atomic_num) return &t.covrad[index];
@@ -505,8 +539,8 @@ SMALLFIELD_HD_ inline mmff94_covrad_entry_t const *lookup_covrad(mmff94_tables_v
 }
 
 /** Herschbach-Laurie lookup by periodic-table-row pair. */
-SMALLFIELD_HD_ inline mmff94_hl_entry_t const *lookup_hl(mmff94_tables_view_t const &t, std::uint8_t row_i,
-                                                         std::uint8_t row_j) noexcept {
+SF_HOST_DEVICE_ inline mmff94_hl_entry_t const *lookup_hl(mmff94_tables_view_t const &t, std::uint8_t row_i,
+                                                          std::uint8_t row_j) noexcept {
     std::uint8_t lo = row_i, hi = row_j;
     if (lo > hi) {
         std::uint8_t tmp = lo;
@@ -525,11 +559,11 @@ SMALLFIELD_HD_ inline mmff94_hl_entry_t const *lookup_hl(mmff94_tables_view_t co
     return nullptr;
 }
 
-/** OOP bend lookup with 4-stage equivalence cascade.  Matches
+/** OOP bend lookup with 4-stage equivalence cascade. Matches
  *  `MMFFOopCollection::operator()` exactly. */
-SMALLFIELD_HD_ inline mmff94_oop_entry_t const *lookup_oop(mmff94_tables_view_t const &t, std::uint8_t atom_i,
-                                                           std::uint8_t atom_j, std::uint8_t atom_k,
-                                                           std::uint8_t atom_l) noexcept {
+SF_HOST_DEVICE_ inline mmff94_oop_entry_t const *lookup_oop(mmff94_tables_view_t const &t, std::uint8_t atom_i,
+                                                            std::uint8_t atom_j, std::uint8_t atom_k,
+                                                            std::uint8_t atom_l) noexcept {
     mmff94_oop_entry_t const *o0 = t.oop.data();
     std::size_t const n = t.oop.size();
     auto j_key = [](mmff94_oop_entry_t const &e) { return e.j_type; };
@@ -572,11 +606,11 @@ SMALLFIELD_HD_ inline mmff94_oop_entry_t const *lookup_oop(mmff94_tables_view_t 
     return nullptr;
 }
 
-/** Stretch-bend lookup with swap tracking.  No equivalence cascade (the
- *  STBN table is a single level).  Swap indicates whether kba_ijk and
+/** Stretch-bend lookup with swap tracking. No equivalence cascade (the
+ *  STBN table is a single level). Swap indicates whether kba_ijk and
  *  kba_kji should be exchanged — matches
  *  `MMFFStbnCollection::getMMFFStbnParams`. */
-SMALLFIELD_HD_ inline std::pair<bool, mmff94_stbn_entry_t const *> lookup_stbn(
+SF_HOST_DEVICE_ inline std::pair<bool, mmff94_stbn_entry_t const *> lookup_stbn(
     mmff94_tables_view_t const &t, std::uint8_t stretch_bend_type, std::uint8_t bond_type_1, std::uint8_t bond_type_2,
     std::uint8_t atom_i, std::uint8_t atom_j_center, std::uint8_t atom_k) noexcept {
     bool swap = false;
@@ -610,9 +644,9 @@ SMALLFIELD_HD_ inline std::pair<bool, mmff94_stbn_entry_t const *> lookup_stbn(
 }
 
 /** DFSB fallback lookup by periodic-table-row triple, with swap. */
-SMALLFIELD_HD_ inline std::pair<bool, mmff94_dfsb_entry_t const *> lookup_dfsb(mmff94_tables_view_t const &t,
-                                                                               std::uint8_t row_i, std::uint8_t row_j,
-                                                                               std::uint8_t row_k) noexcept {
+SF_HOST_DEVICE_ inline std::pair<bool, mmff94_dfsb_entry_t const *> lookup_dfsb(mmff94_tables_view_t const &t,
+                                                                                std::uint8_t row_i, std::uint8_t row_j,
+                                                                                std::uint8_t row_k) noexcept {
     bool swap = false;
     std::uint8_t lo = row_i, hi = row_k;
     if (lo > hi) {
@@ -638,11 +672,11 @@ SMALLFIELD_HD_ inline std::pair<bool, mmff94_dfsb_entry_t const *> lookup_dfsb(m
 }
 
 /** Torsion lookup with 5-stage equivalence cascade + fallback to the
- *  secondary torsion type.  Mirrors
- *  `MMFFTorCollection::getMMFFTorParams` exactly.  Returns the resolved
+ *  secondary torsion type. Mirrors
+ *  `MMFFTorCollection::getMMFFTorParams` exactly. Returns the resolved
  *  (canonical torsion type, params pointer) — caller uses the canonical
  *  tor type for downstream debug/metrics, and nullptr params on miss. */
-SMALLFIELD_HD_ inline std::pair<unsigned, mmff94_torsion_entry_t const *> lookup_torsion(
+SF_HOST_DEVICE_ inline std::pair<unsigned, mmff94_torsion_entry_t const *> lookup_torsion(
     mmff94_tables_view_t const &t, std::uint8_t tor_type_primary, std::uint8_t tor_type_secondary, std::uint8_t atom_i,
     std::uint8_t atom_j, std::uint8_t atom_k, std::uint8_t atom_l) noexcept {
     mmff94_torsion_entry_t const *hit = nullptr;

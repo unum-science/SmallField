@@ -3,24 +3,23 @@
  *  @brief The two device passes that close the gap between the preprocessing kernels and the
  *  pipeline that consumes their output.
  *
- *  @c mmff94_type_and_charge_kernel leaves a per-molecule status behind, and the molecules it
+ *  `mmff94_type_and_charge_kernel` leaves a per-molecule status behind, and the molecules it
  *  flags need atom types and charges from somewhere else before the extractor runs;
- *  @ref mmff94_apply_typing_patch_kernel writes the host's answer for exactly those molecules.
+ *  `mmff94_apply_typing_patch_kernel` writes the host's answer for exactly those molecules.
  *
- *  @c csd_torsion_match_kernel emits a torsion list per molecule, and
- *  @c etkdg_pipeline_warp_kernel reads those torsions through a per-atom CSR;
- *  @ref etk_build_csr_kernel builds that CSR on the device from the torsions the matcher wrote
- *  and the 1-2 / 1-3 constraints the host emitted, mirroring @c build_etk_interaction_lists.
+ *  `csd_torsion_match_kernel` emits a torsion list per molecule, and
+ *  `etkdg_pipeline_warp_kernel` reads those torsions through a per-atom CSR;
+ *  `etk_build_csr_kernel` builds that CSR on the device from the torsions the matcher wrote
+ *  and the 1-2 / 1-3 constraints the host emitted, mirroring `build_etk_interaction_lists`.
  */
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
-
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
 #include <cuda_runtime.h>
 
+#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
@@ -45,7 +44,7 @@ using smallfield::types::mmff94_typing_patch_t;
 /**
  *  @brief Overwrite the typer's output for the molecules the host already knows it cannot type.
  *
- *  One warp per patch record, lane-strided over the molecule's atoms.  Clearing the typing status
+ *  One warp per patch record, lane-strided over the molecule's atoms. Clearing the typing status
  *  is what routes the molecule back into the normal extractor path.
  *
  *  @param[in] patches One record per flagged molecule.
@@ -76,8 +75,8 @@ static __global__ __launch_bounds__(32, 8) void mmff94_apply_typing_patch_kernel
  *
  *  One block per molecule, lane 0 only: the two counting passes carry per-atom cursors that a
  *  lane-parallel form would have to serialise anyway, and a drug-like molecule spends tens of
- *  microseconds of a millisecond-scale wave here.  Term indices stay molecule-relative because
- *  @c etk_torsion_energy_functor_t indexes the molecule's own torsion and constraint slices, while
+ *  microseconds of a millisecond-scale wave here. Term indices stay molecule-relative because
+ *  `etk_torsion_energy_functor_t` indexes the molecule's own torsion and constraint slices, while
  *  the interaction starts are batch-global because it indexes one interaction array.
  *
  *  @param[in] torsions Batch-global torsion array the matcher filled at a fixed per-molecule stride.
@@ -104,7 +103,7 @@ static __global__ __launch_bounds__(32, 8) void etk_build_csr_kernel(
     auto &meta = metadata[mol];
     std::uint32_t const num_atoms = meta.num_atoms;
     std::uint32_t const num_constraints = meta.num_distance_constraints;
-    // The matcher reports what it matched; the reservation is what fits.  They agree for every
+    // The matcher reports what it matched; the reservation is what fits. They agree for every
     // molecule whose torsion set stays inside its bond list, which is every molecule the matcher
     // can produce, and the clamp keeps a future widening of the rule from writing out of bounds.
     std::uint32_t torsion_count = torsion_counts[mol];
@@ -146,7 +145,7 @@ static __global__ __launch_bounds__(32, 8) void etk_build_csr_kernel(
     }
 }
 
-/** @brief Launch @ref mmff94_apply_typing_patch_kernel, one warp per flagged molecule. */
+/** Launch `mmff94_apply_typing_patch_kernel`, one warp per flagged molecule. */
 inline void launch_mmff94_apply_typing_patch(mmff94_typing_patch_t const *patches, std::uint32_t num_patches,
                                              std::uint8_t const *staged_atom_types, float const *staged_atom_charges,
                                              std::uint8_t *atom_types, float *atom_charges, std::uint8_t *typing_status,
@@ -156,7 +155,7 @@ inline void launch_mmff94_apply_typing_patch(mmff94_typing_patch_t const *patche
         patches, num_patches, staged_atom_types, staged_atom_charges, atom_types, atom_charges, typing_status);
 }
 
-/** @brief Launch @ref etk_build_csr_kernel, one block per molecule. */
+/** Launch `etk_build_csr_kernel`, one block per molecule. */
 inline void launch_etk_build_csr(etk_torsion_descriptor_t const *torsions, std::uint32_t torsion_stride,
                                  std::uint32_t const *torsion_counts, distance_constraint_t const *constraints,
                                  std::uint32_t num_molecules, etk_atom_interaction_t *interactions,

@@ -119,6 +119,17 @@ The pipelined chunk scheduler overlaps CPU prep with GPU execution across device
   SmallField marks individual failures and continues (98.6 % vs 96.8 %).
 - nvMolKit would need ~55 hours to process 10M at its observed 1-GPU rate.
 
+### SmallField vs RDKit — ChEMBL, 8× RTX PRO 6000 Blackwell
+
+Molecules per second rather than conformers per second, against RDKit on the same host's 192 CPU threads.
+
+| Dataset        | Workload                | RDKit CPU (192 thr) | SmallField 1 GPU | SmallField 8 GPU | Notes                                                     |
+| :------------- | :---------------------- | ------------------: | ---------------: | ---------------: | :-------------------------------------------------------- |
+| ChEMBL 8,948   | 3 conformers / molecule |         588.3 mol/s |    1,032.9 mol/s |    1,342.6 mol/s | 2.28x faster than RDKit at 8 GPU; 96.7% conformer success |
+| ChEMBL 241,596 | 1 conformer / molecule  |       1,734.8 mol/s |    4,900.7 mol/s |   16,826.6 mol/s | 9.70x faster than RDKit at 8 GPU; 96.6% conformer success |
+
+ChEMBL 8,948 is small enough that the pipeline never reaches steady state, which is why its 8-GPU multiplier is the weaker of the two.
+
 ## Bottleneck Summary
 
 At 8 GPUs × K=1 on USearch 10M the pipeline is __host-bound__.

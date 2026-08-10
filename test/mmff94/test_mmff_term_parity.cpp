@@ -12,24 +12,23 @@
  *  rather than from a list — is suppressed by marking every pair BFS-unreachable.
  */
 
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
+#include <cmath>   // `std::isfinite`, `std::fabs`
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdio>  // `printf`
 
-#include <iostream> // RDKit's `AtomTyper.h` uses `std::cout` without including it
+#include <iostream> // RDKit's `AtomTyper.h` needs it but does not include it
 #include <memory>   // `std::unique_ptr`
-#include <sstream>  // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
-#include <string>
-#include <vector>
+#include <sstream>  // RDKit's `AtomTyper.h` needs it but does not include it
+#include <string>   // `std::string`
+#include <vector>   // `std::vector`
 
 #include <boost/shared_ptr.hpp>
-
 #include <GraphMol/GraphMol.h>
-
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
@@ -50,7 +49,7 @@ extern "C" void gpu_mmff_energy(float const *host_positions, std::uint32_t num_a
 
 namespace {
 
-/** @brief Which single MMFF94 term a comparison isolates. */
+/** Which single MMFF94 term a comparison isolates. */
 enum class term_kind_t { bond, angle, stretchbend, oop, torsion, nonbonded };
 
 char const *term_name(term_kind_t kind) {
@@ -79,8 +78,8 @@ std::vector<float> interleaved_to_soa(std::vector<float> const &interleaved) {
  *  @brief Copy @p full with every term but @p kind neutralized.
  *
  *  The per-atom interaction CSR is left exactly as production builds it — rebuilding it
- *  by hand would test the reconstruction rather than the kernel.  Excluded bonded terms
- *  are zeroed at their force constants, which contributes neither energy nor gradient,
+ *  by hand would test the reconstruction rather than the kernel. Excluded bonded terms
+ *  are zeroed at their force constants, which contributes neither energy nor gradient.
  *  The nonbonded sweep is enumerated on the fly from the hop matrix rather than from a list,
  *  so it is isolated at the call site instead: the caller hands the kernel a matrix of the
  *  unreachable sentinel for every other term, which the sweep skips pair by pair.
@@ -101,7 +100,7 @@ sfp::etkdg_prepared_molecule_t isolate_term(sfp::etkdg_prepared_molecule_t const
     return single;
 }
 
-/** @brief RDKit MMFF94 energy with exactly @p kind enabled, at the molecule's coordinates. */
+/** RDKit MMFF94 energy with exactly @p kind enabled, at the molecule's coordinates. */
 double rdkit_single_term_energy(RDKit::RWMol &mol, term_kind_t kind) {
     RDKit::MMFF::MMFFMolProperties props(mol);
     if (!props.isValid()) return std::nan("");
@@ -125,7 +124,7 @@ std::uint32_t failures = 0;
  *
  *  An RDKit-embedded geometry sits at or near equilibrium, where several MMFF forms
  *  coincide — a linear center at theta = 180 gives the same energy under the quadratic
- *  and the linear bend, so a comparison there cannot tell them apart.  Distorting the
+ *  and the linear bend, so a comparison there cannot tell them apart. Distorting the
  *  geometry moves the terms onto the parts of their curves that actually differ.
  */
 void perturb(std::vector<float> &positions_soa, std::uint32_t num_atoms, float amplitude) {
@@ -144,8 +143,8 @@ void compare_terms(std::string const &smiles, char const *label, float perturbat
         return;
     }
     auto mol = sftest::mol_from_smiles(smiles);
-    SF_TEST_ASSERT(mol != nullptr, "failed to build RDKit molecule");
-    SF_TEST_ASSERT(sftest::embed_molecule(*mol), "failed to embed RDKit molecule");
+    sf_verify_(mol != nullptr, "failed to build RDKit molecule");
+    sf_verify_(sftest::embed_molecule(*mol), "failed to embed RDKit molecule");
 
     std::vector<float> positions = interleaved_to_soa(sftest::extract_coords_interleaved(*mol));
     if (perturbation > 0.0f) {
@@ -166,11 +165,10 @@ void compare_terms(std::string const &smiles, char const *label, float perturbat
                            prepared_full.num_atoms, bond_hops);
     std::vector<std::uint8_t> const unreachable_hops(bond_hops.size(), std::uint8_t {255});
 
-    term_kind_t const kinds[] = {term_kind_t::bond,    term_kind_t::angle,   term_kind_t::stretchbend,
-                                 term_kind_t::oop,     term_kind_t::torsion, term_kind_t::nonbonded};
+    term_kind_t const kinds[] = {term_kind_t::bond, term_kind_t::angle,   term_kind_t::stretchbend,
+                                 term_kind_t::oop,  term_kind_t::torsion, term_kind_t::nonbonded};
     if (perturbation > 0.0f) std::printf("  %s (%s, distorted %.2f A)\n", label, smiles.c_str(), perturbation);
-    else
-        std::printf("  %s (%s)\n", label, smiles.c_str());
+    else std::printf("  %s (%s)\n", label, smiles.c_str());
     for (term_kind_t kind : kinds) {
         auto const single = isolate_term(prepared_full, kind);
         gradient.assign(positions.size(), 0.0f);
@@ -227,7 +225,7 @@ int main() {
     compare_terms("CC#CC", "2-butyne", 0.30f);
     compare_terms("CC(=O)Oc1ccccc1C(=O)O", "aspirin", 0.20f);
 
-    SF_TEST_ASSERT(failures == 0, "every MMFF94 term must match RDKit in isolation");
+    sf_verify_(failures == 0, "every MMFF94 term must match RDKit in isolation");
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

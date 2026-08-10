@@ -25,17 +25,14 @@
 
 #pragma once
 
+#include <cmath>   // `std::fabs`, `std::pow`
+#include <cstdint> // `std::uint8_t`, `std::int32_t`
+
+#include <array>   // `std::array`
+#include <span>    // `std::span`
+#include <utility> // `std::pair`
+
 #include "smallfield/module_fwd.hpp"
-
-#include <algorithm>
-#include <array>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <span>
-#include <utility>
-#include <vector>
-
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
@@ -51,11 +48,11 @@ using smallfield::parameters::mmff94_tables_view_t;
 using smallfield::types::bond_flag_aromatic_k;
 using smallfield::types::molecule_descriptor_t;
 
-// Periodic-table row utilities that match RDKit's helpers.
+#pragma region Periodic Table Rows
 
 /** Matches `RDKit::MMFF::getPeriodicTableRow`: row 0 holds H and He; row 1 Li through Ne;
  *  row 2 Na through Ar; row 3 K through Kr; row 4 Rb through Xe. */
-SMALLFIELD_HD_ inline std::uint8_t periodic_table_row(std::uint8_t atomic_num) noexcept {
+SF_HOST_DEVICE_ inline std::uint8_t periodic_table_row(std::uint8_t atomic_num) noexcept {
     if (atomic_num >= 3 && atomic_num <= 10) return 1;
     if (atomic_num >= 11 && atomic_num <= 18) return 2;
     if (atomic_num >= 19 && atomic_num <= 36) return 3;
@@ -64,8 +61,8 @@ SMALLFIELD_HD_ inline std::uint8_t periodic_table_row(std::uint8_t atomic_num) n
 }
 
 /** Matches `RDKit::MMFF::getPeriodicTableRowHL` — 1-based, transition
- *  metals ×10.  Used only by the Herschbach-Laurie fallback. */
-SMALLFIELD_HD_ inline std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num) noexcept {
+ *  metals ×10. Used only by the Herschbach-Laurie fallback. */
+SF_HOST_DEVICE_ inline std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num) noexcept {
     std::uint8_t row = 0;
     if (atomic_num == 2) row = 1;
     else if (atomic_num >= 3 && atomic_num <= 10) row = 2;
@@ -78,13 +75,15 @@ SMALLFIELD_HD_ inline std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num
     return row;
 }
 
-// Neighbor CSR convenience helpers.
+#pragma endregion Periodic Table Rows
+
+#pragma region Neighbor CSR Helpers
 
 /** Find the bond index between atoms i and j via the descriptor's neighbor CSR.
  *  Returns -1 on miss. Matches `find_bond_index` in
  *  `etkdg_preprocess.hpp`. */
-SMALLFIELD_HD_ inline std::int32_t find_bond_index(molecule_descriptor_t const &descriptor, std::uint32_t i,
-                                                   std::uint32_t j) noexcept {
+SF_HOST_DEVICE_ inline std::int32_t find_bond_index(molecule_descriptor_t const &descriptor, std::uint32_t i,
+                                                    std::uint32_t j) noexcept {
     std::uint16_t const start = descriptor.neighbor_offset[i];
     std::uint16_t const end = descriptor.neighbor_offset[i + 1];
     for (std::uint16_t n = start; n < end; ++n)
@@ -93,17 +92,17 @@ SMALLFIELD_HD_ inline std::int32_t find_bond_index(molecule_descriptor_t const &
 }
 
 /** Are `atom_i` and `atom_k` both adjacent to `atom_j` AND to each other?
- *  I.e., does the i-j-k angle close back into a 3-ring.  Purely uses the
+ *  I.e., does the i-j-k angle close back into a 3-ring. Purely uses the
  *  descriptor's CSR — no ring info required. */
-SMALLFIELD_HD_ inline bool angle_in_ring_of_size_3(molecule_descriptor_t const &descriptor, std::uint32_t i,
-                                                   std::uint32_t k) noexcept {
+SF_HOST_DEVICE_ inline bool angle_in_ring_of_size_3(molecule_descriptor_t const &descriptor, std::uint32_t i,
+                                                    std::uint32_t k) noexcept {
     return find_bond_index(descriptor, i, k) >= 0;
 }
 
-/** Do atoms i and k share a common neighbor that isn't j?  Matches
+/** Do atoms i and k share a common neighbor that isn't j? Matches
  *  `RDKit::MMFF::isAngleInRingOfSize3or4`'s size-4 branch exactly. */
-SMALLFIELD_HD_ inline bool angle_has_common_neighbor(molecule_descriptor_t const &descriptor, std::uint32_t i,
-                                                     std::uint32_t j, std::uint32_t k) noexcept {
+SF_HOST_DEVICE_ inline bool angle_has_common_neighbor(molecule_descriptor_t const &descriptor, std::uint32_t i,
+                                                      std::uint32_t j, std::uint32_t k) noexcept {
     std::uint16_t const atom_i_neighbor_start = descriptor.neighbor_offset[i];
     std::uint16_t const atom_i_neighbor_end = descriptor.neighbor_offset[i + 1];
     for (std::uint16_t neighbor_offset_i = atom_i_neighbor_start; neighbor_offset_i < atom_i_neighbor_end;
@@ -115,10 +114,10 @@ SMALLFIELD_HD_ inline bool angle_has_common_neighbor(molecule_descriptor_t const
     return false;
 }
 
-/** Ring size containing the i-j-k angle, or 0 if not 3/4.  Matches
+/** Ring size containing the i-j-k angle, or 0 if not 3/4. Matches
  *  `isAngleInRingOfSize3or4` exactly. */
-SMALLFIELD_HD_ inline unsigned native_is_angle_in_ring_3_or_4(molecule_descriptor_t const &descriptor, std::uint32_t i,
-                                                              std::uint32_t j, std::uint32_t k) noexcept {
+SF_HOST_DEVICE_ inline unsigned native_is_angle_in_ring_3_or_4(molecule_descriptor_t const &descriptor, std::uint32_t i,
+                                                               std::uint32_t j, std::uint32_t k) noexcept {
     // Caller should hold that i-j and j-k are real bonds; we only
     // trigger on the ring closure checks here.
     if (find_bond_index(descriptor, i, j) < 0 || find_bond_index(descriptor, j, k) < 0) return 0;
@@ -127,11 +126,11 @@ SMALLFIELD_HD_ inline unsigned native_is_angle_in_ring_3_or_4(molecule_descripto
     return 0;
 }
 
-/** Ring size containing the i-j-k-l torsion, or 0 if not 4/5.  Matches
+/** Ring size containing the i-j-k-l torsion, or 0 if not 4/5. Matches
  *  `isTorsionInRingOfSize4or5` exactly. */
-SMALLFIELD_HD_ inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const &descriptor,
-                                                                std::uint32_t i, std::uint32_t j, std::uint32_t k,
-                                                                std::uint32_t l) noexcept {
+SF_HOST_DEVICE_ inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const &descriptor,
+                                                                 std::uint32_t i, std::uint32_t j, std::uint32_t k,
+                                                                 std::uint32_t l) noexcept {
     if (find_bond_index(descriptor, i, j) < 0 || find_bond_index(descriptor, j, k) < 0 ||
         find_bond_index(descriptor, k, l) < 0)
         return 0;
@@ -156,15 +155,17 @@ SMALLFIELD_HD_ inline unsigned native_is_torsion_in_ring_4_or_5(molecule_descrip
     return 0;
 }
 
-// Native MMFF type classification.
+#pragma endregion Neighbor CSR Helpers
+
+#pragma region Native Type Classification
 
 /** Native port of `MMFFMolProperties::getMMFFBondType`. Returns 1 iff the bond is SINGLE and both
  *  endpoints are sbmb atoms or both are aromatic
- *  atoms (per MMFFProp).  Otherwise returns 0. */
-SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &descriptor,
-                                                             mmff94_tables_view_t const &t,
-                                                             std::span<std::uint8_t const> atom_types,
-                                                             std::uint32_t bond_index) noexcept {
+ *  atoms (per MMFFProp). Otherwise returns 0. */
+SF_HOST_DEVICE_ inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &descriptor,
+                                                              mmff94_tables_view_t const &t,
+                                                              std::span<std::uint8_t const> atom_types,
+                                                              std::uint32_t bond_index) noexcept {
     std::uint8_t const bo = descriptor.bond_order[bond_index];
     bool const aromatic_bond = (descriptor.bond_flags[bond_index] & bond_flag_aromatic_k) != 0;
     // RDKit's rule triggers only when the bond is SINGLE. Aromatic bonds in
@@ -181,9 +182,10 @@ SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_bond_type(molecule_descriptor
 }
 
 /** Native port of `MMFFMolProperties::getMMFFAngleType`. */
-SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &descriptor,
-                                                              std::span<std::uint8_t const> bond_types, std::uint32_t i,
-                                                              std::uint32_t j, std::uint32_t k) noexcept {
+SF_HOST_DEVICE_ inline std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &descriptor,
+                                                               std::span<std::uint8_t const> bond_types,
+                                                               std::uint32_t i, std::uint32_t j,
+                                                               std::uint32_t k) noexcept {
     std::int32_t const bond_index_ij = find_bond_index(descriptor, i, j);
     std::int32_t const bond_index_jk = find_bond_index(descriptor, j, k);
     if (bond_index_ij < 0 || bond_index_jk < 0) return 0;
@@ -199,7 +201,7 @@ SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_angle_type(molecule_descripto
 
 /** Native port of `MMFFMolProperties::getMMFFTorsionType`, returning
  *  (primary, secondary) matching RDKit's pair. */
-SMALLFIELD_HD_ inline std::pair<std::uint8_t, std::uint8_t> native_get_mmff_torsion_type(
+SF_HOST_DEVICE_ inline std::pair<std::uint8_t, std::uint8_t> native_get_mmff_torsion_type(
     molecule_descriptor_t const &descriptor, std::span<std::uint8_t const> atom_types,
     std::span<std::uint8_t const> bond_types, std::uint32_t i, std::uint32_t j, std::uint32_t k,
     std::uint32_t l) noexcept {
@@ -239,8 +241,8 @@ SMALLFIELD_HD_ inline std::pair<std::uint8_t, std::uint8_t> native_get_mmff_tors
 }
 
 /** Native port of the free function `getMMFFStretchBendType`. */
-SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_stretch_bend_type(unsigned angle_type, unsigned bond_type_1,
-                                                                     unsigned bond_type_2) noexcept {
+SF_HOST_DEVICE_ inline std::uint8_t native_get_mmff_stretch_bend_type(unsigned angle_type, unsigned bond_type_1,
+                                                                      unsigned bond_type_2) noexcept {
     switch (angle_type) {
     case 1: return (bond_type_1 || (bond_type_1 == bond_type_2)) ? 1 : 2;
     case 2: return 3;
@@ -254,15 +256,17 @@ SMALLFIELD_HD_ inline std::uint8_t native_get_mmff_stretch_bend_type(unsigned an
     }
 }
 
-// Empirical fallback rules used when a parameter lookup misses.
+#pragma endregion Native Type Classification
+
+#pragma region Empirical Fallback Rules
 
 /** Empirical bond-stretch rule from MMFF.V equations 18-19. Matches
  *  `getMMFFBondStretchEmpiricalRuleParams` and returns (kb, r0) by value.
  *  Internally uses `double` to match RDKit's precision; inputs/outputs are
  *  float for parity with the extracted-table pipeline. */
-SMALLFIELD_HD_ inline std::pair<float, float> native_bond_empirical(mmff94_tables_view_t const &t,
-                                                                    std::uint8_t atomic_i,
-                                                                    std::uint8_t atomic_j) noexcept {
+SF_HOST_DEVICE_ inline std::pair<float, float> native_bond_empirical(mmff94_tables_view_t const &t,
+                                                                     std::uint8_t atomic_i,
+                                                                     std::uint8_t atomic_j) noexcept {
     auto const *cov_i = lookup_covrad(t, atomic_i);
     auto const *cov_j = lookup_covrad(t, atomic_j);
     if (!cov_i || !cov_j) return {0.0f, 0.0f};
@@ -287,18 +291,18 @@ SMALLFIELD_HD_ inline std::pair<float, float> native_bond_empirical(mmff94_table
     return {static_cast<float>(kb), static_cast<float>(r0)};
 }
 
-/** Empirical angle-bend rule (MMFF.V, Table VI + eqs).  Takes already-
+/** Empirical angle-bend rule (MMFF.V, Table VI + eqs). Takes already-
  *  computed bond params for the two flanking bonds and returns (ka, θ₀deg).
- *  Matches `getMMFFAngleBendEmpiricalRuleParams`.  If `theta0_override_deg`
+ *  Matches `getMMFFAngleBendEmpiricalRuleParams`. If `theta0_override_deg`
  *  is finite (≥ 0), it replaces the crd/mltb/val-derived default θ₀; use
  *  this to match RDKit's behaviour when a table entry exists with ka=0
  *  (then RDKit keeps the table's θ₀ and recomputes ka empirically). */
-SMALLFIELD_HD_ inline std::pair<float, float> native_angle_empirical(molecule_descriptor_t const &descriptor,
-                                                                     mmff94_tables_view_t const &t,
-                                                                     std::span<std::uint8_t const> atom_types,
-                                                                     std::uint32_t i, std::uint32_t j, std::uint32_t k,
-                                                                     float r0_ij, float r0_jk,
-                                                                     float theta0_override_deg = -1.0f) noexcept {
+SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_descriptor_t const &descriptor,
+                                                                      mmff94_tables_view_t const &t,
+                                                                      std::span<std::uint8_t const> atom_types,
+                                                                      std::uint32_t i, std::uint32_t j, std::uint32_t k,
+                                                                      float r0_ij, float r0_jk,
+                                                                      float theta0_override_deg = -1.0f) noexcept {
     std::uint8_t const a_i = descriptor.element[i], a_j = descriptor.element[j], a_k = descriptor.element[k];
 
     // θ₀ — depends on central-atom crd / mltb / val / linh.
@@ -377,14 +381,14 @@ SMALLFIELD_HD_ inline std::pair<float, float> native_angle_empirical(molecule_de
     return {static_cast<float>(ka), theta0_deg};
 }
 
-/** Empirical torsion rule (MMFF.V rules a-h).  Matches
- *  `getMMFFTorsionEmpiricalRuleParams`.  Returns (V1, V2, V3).  Bond type
+/** Empirical torsion rule (MMFF.V rules a-h). Matches
+ *  `getMMFFTorsionEmpiricalRuleParams`. Returns (V1, V2, V3). Bond type
  *  of the central bond is passed in so we avoid re-looking-it-up. */
-SMALLFIELD_HD_ inline std::array<float, 3> native_torsion_empirical(molecule_descriptor_t const &descriptor,
-                                                                    mmff94_tables_view_t const &t,
-                                                                    std::span<std::uint8_t const> atom_types,
-                                                                    std::uint32_t j, std::uint32_t k,
-                                                                    std::int32_t bond_jk_index) noexcept {
+SF_HOST_DEVICE_ inline std::array<float, 3> native_torsion_empirical(molecule_descriptor_t const &descriptor,
+                                                                     mmff94_tables_view_t const &t,
+                                                                     std::span<std::uint8_t const> atom_types,
+                                                                     std::uint32_t j, std::uint32_t k,
+                                                                     std::int32_t bond_jk_index) noexcept {
     auto const *jp = lookup_prop(t, atom_types[j]);
     auto const *kp = lookup_prop(t, atom_types[k]);
     std::array<float, 3> out {0.0f, 0.0f, 0.0f};
@@ -521,10 +525,14 @@ SMALLFIELD_HD_ inline std::array<float, 3> native_torsion_empirical(molecule_des
     return out;
 }
 
-// Top-level native extractor.
+#pragma endregion Empirical Fallback Rules
+
+#pragma region Native Extractor
 
 /** isDoubleZero predicate matching RDKit's 1e-10 threshold. Used by the
  *  angle-bend + torsion fallback logic. */
-SMALLFIELD_HD_ inline bool native_is_zero(float v) noexcept { return std::fabs(v) < 1.0e-10f; }
+SF_HOST_DEVICE_ inline bool native_is_zero(float v) noexcept { return std::fabs(v) < 1.0e-10f; }
+
+#pragma endregion Native Extractor
 
 } // namespace smallfield::mmff94

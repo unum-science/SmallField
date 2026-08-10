@@ -3,23 +3,22 @@
  *  @brief Minimal force-field lookup tables for the native bounds-matrix builder.
  *
  *  Covers the drug-like subset of the periodic table (H, C, N, O, F, P, S,
- *  Cl, Br, I and a few others).  For elements outside the table we fall back
- *  to generic carbon-like values — never fails, at worst looses a few percent
- *  of quality on unusual elements that are already outside MMFF94's native
- *  coverage.
+ *  Cl, Br, I and a few others). Elements outside the table fall back to
+ *  generic carbon-like values; in practice `preprocess/etkdg_prepare_batch.hpp`
+ *  rejects any molecule with an element outside MMFF94's coverage before it
+ *  reaches these tables, so the fallback values are not exercised in production.
  *
- *  All values in Å and radians.  Rendered as static constexpr arrays indexed
+ *  All values in Å and radians. Rendered as static constexpr arrays indexed
  *  by atomic number; lookup is O(1) with a bounds check.
  */
 
 #pragma once
 
+#include <cstdint> // `std::uint8_t`
+
+#include <array> // `std::array`
+
 #include "smallfield/module_fwd.hpp"
-
-#include <array>
-#include <cmath>
-#include <cstdint>
-
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield::parameters {

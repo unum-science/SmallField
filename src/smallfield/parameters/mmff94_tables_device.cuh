@@ -2,11 +2,11 @@
  *  @file mmff94_tables_device.cuh
  *  @brief Upload MMFF94 tables from host to device.
  *
- *  Mirrors `mmff94_tables_host_t` on the device.  The host side extracts
+ *  Mirrors `mmff94_tables_host_t` on the device. The host side extracts
  *  RDKit's tables into flat POD vectors (see `mmff94_tables.hpp`); this
  *  header owns a one-time-per-GPU RAII device byte arena holding exactly the
  *  same POD entries, and returns an `mmff94_tables_view_t` whose
- *  `std::span<T const>` fields point at the device arena.  Every
+ *  `std::span<T const>` fields point at the device arena. Every
  *  `lookup_*` in `mmff94_tables.hpp` then works identically host-side and
  *  device-side with no logic duplication.
  *
@@ -17,7 +17,7 @@
  *  the warp-per-molecule access pattern.
  *
  *  The constant-memory tables are sized generously (see below) so an
- *  RDKit upgrade that adds a few atom types doesn't overflow.  If
+ *  RDKit upgrade that adds a few atom types doesn't overflow. If
  *  upload_mmff94_tables_to_device finds a table larger than its constant
  *  slot, it falls back to global memory for that table — a non-fatal
  *  degradation.
@@ -25,17 +25,15 @@
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
+#include <cstdio> // `fprintf`, `stderr`
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <span>
-#include <utility>
-#include <vector>
+#include <span>    // `std::span`
+#include <utility> // `std::move`
+#include <vector>  // `std::vector`
 
 #include <cuda_runtime.h>
 
+#include "smallfield/module_fwd.hpp"
 #include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 
@@ -43,9 +41,11 @@ namespace smallfield::parameters {
 
 using smallfield::api::device_byte_buffer_t;
 
-// Constant-memory tables. Budgets sized for MMFF94 with headroom; as of 2026-04-14 RDKit's live counts
-// are 99 prop entries, 100 def, 54 covrad, 25 hl, and 35 bndk.
-// The chosen slot sizes leave 10-30 % headroom for future RDKit updates.
+/**
+ *  @brief Constant-memory table capacities, sized for MMFF94 with headroom over RDKit's live counts.
+ *
+ *  The budgets leave slack for a future RDKit update that adds a few more entries.
+ */
 inline constexpr std::size_t mmff94_prop_const_cap_k = 128;
 inline constexpr std::size_t mmff94_def_const_cap_k = 128;
 inline constexpr std::size_t mmff94_covrad_const_cap_k = 64;
@@ -53,9 +53,14 @@ inline constexpr std::size_t mmff94_hl_const_cap_k = 64;
 inline constexpr std::size_t mmff94_bndk_const_cap_k = 64;
 
 #if defined(__CUDACC__)
-// Internal linkage: every translation unit that includes this header gets its own constant-memory
-// copy, so a test that compiles the header and also links the library does not hand nvlink two
-// definitions of one device symbol.  Each copy is uploaded by that unit's own table upload.
+/**
+ *  @brief Constant-memory MMFF94 tables, one copy per translation unit.
+ *
+ *  Internal linkage means every translation unit that includes this header gets its own
+ *  constant-memory copy, so a test that compiles the header and also links the library does not
+ *  hand nvlink two definitions of one device symbol. Each copy is uploaded by that unit's own
+ *  table upload.
+ */
 static __constant__ mmff94_prop_entry_t c_mmff94_prop[mmff94_prop_const_cap_k];
 static __constant__ mmff94_def_entry_t c_mmff94_def[mmff94_def_const_cap_k];
 static __constant__ mmff94_covrad_entry_t c_mmff94_covrad[mmff94_covrad_const_cap_k];
@@ -63,14 +68,16 @@ static __constant__ mmff94_hl_entry_t c_mmff94_hl[mmff94_hl_const_cap_k];
 static __constant__ mmff94_bndk_entry_t c_mmff94_bndk[mmff94_bndk_const_cap_k];
 #endif
 
-/** Per-GPU device-resident view.  Owns a grow-only device byte arena for the
+/** Per-GPU device-resident view. Owns a grow-only device byte arena for the
  *  large tables; the `view` field plugs into every `lookup_*`.
  *  Pointers inside `view.prop/def/covrad/hl/bndk` target the
  *  `__constant__` symbols when the small-table capacities were sufficient;
  *  otherwise they fall back to device-global slots inside this arena. */
 struct mmff94_tables_device_t {
-    device_byte_buffer_t arena; ///< single grow-only device allocation, RAII-managed
-    mmff94_tables_view_t view;  ///< spans point into arena / __constant__
+    /** Single grow-only device allocation, RAII-managed. */
+    device_byte_buffer_t arena;
+    /** Spans point into arena / __constant__. */
+    mmff94_tables_view_t view;
     int device_id = -1;
 
     mmff94_tables_device_t() = default;
@@ -117,7 +124,7 @@ namespace detail_mmff94 {
 inline std::size_t align_up_(std::size_t v, std::size_t a) { return (v + a - 1) & ~(a - 1); }
 
 /** Helper: copy a host vector to device at the given offset, returning a
- *  span that targets the device arena at that location.  Updates `offset`
+ *  span that targets the device arena at that location. Updates `offset`
  *  to the next 256-byte-aligned position. */
 template <typename element_>
 mmff94_span_t<element_> place_table_(std::byte *arena_base, std::size_t &offset, std::vector<element_> const &source) {
@@ -145,7 +152,7 @@ mmff94_span_t<element_> place_const_or_global_(std::byte *arena_base, std::size_
 
 } // namespace detail_mmff94
 
-/** Upload every MMFF94 table in `host` to device memory.  `out` is filled
+/** Upload every MMFF94 table in `host` to device memory. `out` is filled
  *  with device pointers; caller owns it and must keep it alive for the
  *  lifetime of any kernel launch that reads via `out.view`. */
 inline void upload_mmff94_tables_to_device(mmff94_tables_host_t const &host, mmff94_tables_device_t &out) {

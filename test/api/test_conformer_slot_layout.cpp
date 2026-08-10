@@ -5,16 +5,17 @@
  *  A shipped writer once copied `3 * num_atoms` contiguous halves from a slot base,
  *  which reads x for the real atoms and then inter-component padding -- so y and z
  *  were dropped for every molecule with `3 * num_atoms <= max_atoms`, and the stored
- *  geometry collapsed onto the x axis.  Bond lengths and energies both still looked
+ *  geometry collapsed onto the x axis. Bond lengths and energies both still looked
  *  plausible; only a degeneracy check exposes it, so that is what this test asserts.
  */
 
-#include <cassert>
-#include <array>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <vector>
+#include <cassert> // `assert`
+#include <cmath>   // `std::abs`
+#include <cstdint> // `std::uint32_t`
+#include <cstdio>  // `fprintf`, `stderr`
+
+#include <array>  // `std::array`
+#include <vector> // `std::vector`
 
 #include "smallfield/api/conformer_layout.hpp"
 
@@ -22,7 +23,7 @@ using smallfield::api::conformer_slot_layout_t;
 
 namespace {
 
-/** @brief Emulates the writer's slot-to-row transpose without the Arrow machinery. */
+/** Emulates the writer's slot-to-row transpose without the Arrow machinery. */
 std::vector<float> pack_row(std::vector<float> const &slot, conformer_slot_layout_t const &layout,
                             std::uint32_t atom_count) {
     std::vector<float> row(static_cast<std::size_t>(atom_count) * 3u);
@@ -32,7 +33,7 @@ std::vector<float> pack_row(std::vector<float> const &slot, conformer_slot_layou
     return row;
 }
 
-/** @brief Rank of the centered coordinate cloud; a real conformer spans 3 dimensions. */
+/** Rank of the centered coordinate cloud; a real conformer spans 3 dimensions. */
 std::uint32_t coordinate_rank(std::vector<float> const &row, std::uint32_t atom_count) {
     float center[3] = {0.0f, 0.0f, 0.0f};
     for (std::uint32_t atom = 0; atom < atom_count; ++atom)
@@ -65,8 +66,10 @@ std::uint32_t coordinate_rank(std::vector<float> const &row, std::uint32_t atom_
 int main() {
     // A tetrahedron: genuinely three-dimensional, so any layout error collapses its rank.
     constexpr std::uint32_t atom_count = 4;
-    float const reference[atom_count][3] = {
-        {0.000f, 0.000f, 0.000f}, {1.520f, 0.000f, 0.000f}, {0.760f, 1.316f, 0.000f}, {0.760f, 0.438f, 1.240f}};
+    float const reference[atom_count][3] = {{0.000f, 0.000f, 0.000f},
+                                            {1.520f, 0.000f, 0.000f},
+                                            {0.760f, 1.316f, 0.000f},
+                                            {0.760f, 0.438f, 1.240f}};
 
     // `max_atoms` far exceeds `atom_count`, which is exactly the regime the bug hit:
     // 3 * 4 = 12 halves never reach the y component at offset 128.
@@ -83,8 +86,8 @@ int main() {
         for (std::uint32_t axis = 0; axis < 3u; ++axis)
             assert(row[atom * 3u + axis] == reference[atom][axis] && "slot transpose lost a component");
 
-    // The assertion the original bug would have failed: a contiguous read yields
-    // rank 1 (all points on the x axis); a correct transpose yields rank 3.
+    // A contiguous read collapses every point onto the x axis and so yields rank 1, while a correct
+    // transpose yields rank 3. This is the assertion that separates the two.
     std::uint32_t const rank = coordinate_rank(row, atom_count);
     if (rank != 3u) {
         std::fprintf(stderr, "FAIL: coordinate rank %u, expected 3 (geometry is degenerate)\n", rank);

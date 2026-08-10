@@ -1,12 +1,18 @@
-// Minimal CPU-prep profile driver: just runs SmallField generate_conformers once on 241K.
-// No RDKit CPU baseline, no cross-val, no warmup. Lets perf record focus on prep CPU only.
-#include <array>
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <fstream>
-#include <string>
-#include <vector>
+/**
+ *  @file bench_profile.cpp
+ *  @brief Minimal CPU-prep profile driver: runs SmallField generate_conformers once.
+ *
+ *  No RDKit CPU baseline, no cross-validation, no warmup — lets perf record
+ *  focus on prep CPU only.
+ */
+
+#include <cstdio> // `printf`
+
+#include <array>   // `std::array`
+#include <chrono>  // `std::chrono::steady_clock`, `std::chrono::duration`
+#include <fstream> // `std::ifstream`
+#include <string>  // `std::string`, `std::getline`
+#include <vector>  // `std::vector`
 
 #include <cuda_fp16.h>
 
@@ -43,11 +49,12 @@ int main(int argc, char **argv) {
     config.num_conformers = n_conf;
 
     auto t0 = std::chrono::steady_clock::now();
-    ctx.generate_conformers(smiles_views, config, max_atoms, coords, energies, status);
+    [[maybe_unused]] auto const batch_status = ctx.generate_conformers(smiles_views, config, max_atoms, coords,
+                                                                       energies, status);
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     // Attempted throughput counts molecules that never reached the GPU, so a corpus that rejects
-    // more looks faster than it is.  Report produced conformers alongside it, and break the
+    // more looks faster than it is. Report produced conformers alongside it, and break the
     // failures down by reason so a rejection class cannot grow unnoticed.
     std::uint64_t ok = 0;
     std::array<std::uint64_t, 8> by_status {};

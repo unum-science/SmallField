@@ -5,24 +5,25 @@
  *  The device kernel and `extract_etk_torsions_native` read the same flat descriptor and the same
  *  compiled pattern corpus, one through a device arena and one through the host pattern objects,
  *  so their torsion sets must agree exactly — same four atom indices in the same order, same six
- *  Fourier coefficients bit for bit.  Anything less means the POD mirror of a pattern lost
+ *  Fourier coefficients bit for bit. Anything less means the POD mirror of a pattern lost
  *  something on the way to the device.
  *
  *  Corpus: the built-in standards by default, so a fresh clone stays green; point
  *  `SMALLFIELD_TEST_CORPUS` at a `.smi` file, colon-separated for several, for a wide sweep.
  */
 
-#include <cstdint>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <memory>
-#include <set>
-#include <string>
-#include <tuple>
-#include <vector>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdio>  // `fprintf`, `stderr`
+#include <cstdlib> // `std::exit`, `std::getenv`
+#include <cstring> // `std::memcpy`
+
+#include <chrono>  // `std::chrono::steady_clock`, `std::chrono::duration`
+#include <fstream> // `std::ifstream`
+#include <memory>  // `std::unique_ptr`
+#include <set>     // `std::set`
+#include <string>  // `std::string`, `std::getline`
+#include <tuple>   // `std::tuple`
+#include <vector>  // `std::vector`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -31,6 +32,7 @@
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+
 #include "test_csd_torsion_device_kernels.hpp"
 #include "test_helpers.hpp"
 
@@ -43,7 +45,7 @@ namespace {
 /** Molecules uploaded in one launch; keeps the device staging buffers comfortably small. */
 constexpr std::uint32_t batch_capacity_k = 1024;
 
-/** Output slots per molecule.  A bond carries at most one torsion, so the bond capacity suffices. */
+/** Output slots per molecule. A bond carries at most one torsion, so the bond capacity suffices. */
 constexpr std::uint32_t torsion_stride_k = sft::max_bonds_k;
 
 /** One torsion reduced to a comparable key: the four atoms in order plus the six coefficients. */
@@ -65,7 +67,7 @@ torsion_key_t torsion_key(sft::etk_torsion_descriptor_t const &torsion) {
                           bits[5]};
 }
 
-/** @brief Load SMILES from one file, one per line, keeping at most @p max_count of them.
+/** Load SMILES from one file, one per line, keeping at most @p max_count of them.
  *  @param[in] path File to read.
  *  @param[in] max_count Upper bound on lines kept.
  *  @return The loaded SMILES; empty when the file cannot be opened. */
@@ -86,7 +88,7 @@ std::vector<std::string> load_smiles(std::string const &path, std::size_t max_co
     return loaded;
 }
 
-/** @brief Split a colon-separated corpus list into its paths.
+/** Split a colon-separated corpus list into its paths.
  *  @param[in] value Colon-separated list.
  *  @return The individual paths. */
 std::vector<std::string> split_paths(char const *value) {
@@ -103,7 +105,7 @@ std::vector<std::string> split_paths(char const *value) {
     return paths;
 }
 
-/** @brief Parse and hydrogenate one SMILES into a descriptor.
+/** Parse and hydrogenate one SMILES into a descriptor.
  *  @param[in] smiles Molecule to build.
  *  @param[out] descriptor Filled on success.
  *  @return True when the molecule parsed and fits the descriptor's capacity. */
@@ -147,7 +149,7 @@ int main() {
 
     std::size_t table_bytes = 0;
     void *table_handle = create_csd_torsion_device_table(table_bytes);
-    SF_TEST_ASSERT(table_handle != nullptr, "device torsion table upload failed");
+    sf_verify_(table_handle != nullptr, "device torsion table upload failed");
     std::printf("Device pattern table: %zu bytes\n", table_bytes);
 
     std::vector<sft::molecule_descriptor_t> descriptors;
@@ -163,7 +165,7 @@ int main() {
     std::size_t mismatches = 0;
     std::size_t total_torsions = 0;
     // Correctness is the gate, but the port only earns its place if the device is faster than the
-    // host it replaces, so both sides are timed over the same molecules.  The device figure covers
+    // host it replaces, so both sides are timed over the same molecules. The device figure covers
     // the launch and the synchronize; the host figure is one thread, which is what the preprocess
     // fan-out gives each molecule.
     double host_microseconds = 0.0;
@@ -177,7 +179,7 @@ int main() {
                                                            device_torsions.data(), device_counts.data());
         device_microseconds +=
             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - device_start).count();
-        SF_TEST_ASSERT(launched, "device torsion kernel failed");
+        sf_verify_(launched, "device torsion kernel failed");
 
         for (std::uint32_t molecule = 0; molecule < count; ++molecule) {
             auto const host_start = std::chrono::steady_clock::now();
@@ -188,7 +190,7 @@ int main() {
             for (auto const &torsion : host_torsions) expected.insert(torsion_key(torsion));
 
             std::uint32_t const produced_count = device_counts[molecule];
-            SF_TEST_ASSERT(produced_count <= torsion_stride_k, "device torsion count overflowed the output slots");
+            sf_verify_(produced_count <= torsion_stride_k, "device torsion count overflowed the output slots");
             std::set<torsion_key_t> produced;
             sft::etk_torsion_descriptor_t const *slots = device_torsions.data() +
                                                          static_cast<std::size_t>(molecule) * torsion_stride_k;
@@ -224,8 +226,8 @@ int main() {
         std::printf("Matching cost per molecule: host %.2f us (1 thread), device %.2f us (launch + sync), %.2fx\n",
                     host_per, device_per, device_per > 0.0 ? host_per / device_per : 0.0);
     }
-    SF_TEST_ASSERT(compared > 0, "no molecules were compared");
-    SF_TEST_ASSERT(mismatches == 0, "device torsion sets diverge from the host extractor");
+    sf_verify_(compared > 0, "no molecules were compared");
+    sf_verify_(mismatches == 0, "device torsion sets diverge from the host extractor");
     std::printf("PASS: device and host torsion sets agree on every molecule\n");
     return 0;
 }

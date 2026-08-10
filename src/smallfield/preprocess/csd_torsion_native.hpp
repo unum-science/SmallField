@@ -2,35 +2,30 @@
  *  @file csd_torsion_native.hpp
  *  @brief Stack-only native matcher for simple CSD torsion SMARTS patterns.
  *
- *  Handles 4-atom torsion paths like "[C]-[C]-[N]-[*]" entirely on the stack, with
- *  zero heap allocations in the hot path. The four atoms are bound by their `:1`-`:4`
- *  map labels, so a labelled atom inside a branch — `[a:1][c:2]!@;-[C:3](=[N:4])(-N)`
- *  — binds like any other. Atom-level OR (`[cH,nX2H0]`), bond-level OR (`@;=,:`),
- *  ring-size ranges (`r{5-8}`), ring-bond connectivity (`x3`), a ring closure that
- *  walks the four labelled atoms back around a cycle, and recursive `$(...)` bodies
- *  compiled into the bounded sub-query pool of @ref csd_torsion_predicates.hpp are
- *  all handled natively — the whole 470-pattern CSD library compiles.
+ *  Handles 4-atom torsion paths like "[C]-[C]-[N]-[*]" entirely on the stack, with zero heap allocations in the
+ *  hot path. The four atoms are bound by their `:1`-`:4` map labels, so a labelled atom inside a branch —
+ *  `[a:1][c:2]!@;-[C:3](=[N:4])(-N)` — binds like any other. Atom-level OR (`[cH,nX2H0]`), bond-level OR
+ *  (`@;=,:`), ring-size ranges (`r{5-8}`), ring-bond connectivity (`x3`), a ring closure that walks the four
+ *  labelled atoms back around a cycle, and recursive `$(...)` bodies compiled into the bounded sub-query pool
+ *  of `csd_torsion_predicates`.hpp are all handled natively — the whole 470-pattern CSD library compiles.
  *
- *  Why this matters: 192-thread OpenMP preprocessing saturates at 32 threads today
- *  because every SubstructMatch call allocates and destroys several std::vector
- *  objects plus VF2 state arrays. Removing those allocations restores linear thread
- *  scaling.
+ *  Why this matters: 192-thread OpenMP preprocessing saturates at 32 threads today because every SubstructMatch
+ *  call allocates and destroys several std::vector objects plus VF2 state arrays. Removing those allocations
+ *  restores linear thread scaling.
  *
- *  Correctness: identical matches to RDKit for every pattern. Validated by a
- *  per-pattern per-atom byte-equivalence test against RDKit's `SubstructMatch`
- *  (see `test_csd_torsion_predicates.cpp`).
+ *  Correctness: identical matches to RDKit for every pattern. Validated by a per-pattern per-atom
+ *  byte-equivalence test against RDKit's `SubstructMatch` (see `test_csd_torsion_predicates.cpp`).
  */
 
 #pragma once
 
+#include <cctype>  // `std::isdigit`, `std::isalpha`
+#include <cstdint> // `std::uint8_t`, `std::int8_t`
+
+#include <limits>      // `std::numeric_limits`
+#include <string_view> // `std::string_view`
+
 #include "smallfield/module_fwd.hpp"
-
-#include <cctype>
-#include <cstdint>
-#include <cstring>
-#include <limits>
-#include <string_view>
-
 #include "smallfield/preprocess/csd_torsion_predicates.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
@@ -47,7 +42,7 @@ using smallfield::types::hybridization_sp_k;
 using smallfield::types::molecule_descriptor_t;
 
 /**
- *  Outcome of folding one SMARTS primitive run into an @ref atom_disjunct_t.  A
+ *  @brief Outcome of folding one SMARTS primitive run into an `atom_disjunct_t`. A
  *  contradiction between two primitives of the same conjunction — `r3` next to
  *  `r{5-6}`, two different `X<n>` — is not a parse failure: the disjunct simply
  *  matches nothing and is dropped, while the rest of the disjunction stands.
@@ -55,84 +50,97 @@ using smallfield::types::molecule_descriptor_t;
  *  the whole pattern to RDKit.
  */
 enum term_parse_t : std::uint8_t {
-    term_parsed_k = 0,        ///< primitives folded in; the disjunct is satisfiable
-    term_unsatisfiable_k = 1, ///< two primitives contradict; drop this disjunct
-    term_unsupported_k = 2,   ///< syntax outside the compiler's vocabulary
+    /** Primitives folded in, the disjunct is satisfiable. */
+    term_parsed_k = 0,
+    /** Two primitives contradict, drop this disjunct. */
+    term_unsatisfiable_k = 1,
+    /** Syntax outside the compiler's vocabulary. */
+    term_unsupported_k = 2,
 };
 
 /**
- *  Per-atom branch-neighbor constraint.  Represents an inline neighbour specified
+ *  @brief Per-atom branch-neighbor constraint. Represents an inline neighbour specified
  *  in SMARTS via `]([…])` — e.g. `[c:2]([cH1])` = carbon with an aromatic-CH
- *  neighbour.  The branch body compiles into the same sub-query pool the `$(...)`
+ *  neighbour. The branch body compiles into the same sub-query pool the `$(...)`
  *  bodies use, so `(cO)` and `([cH0]Cl)` walk two hops with no extra machinery,
  *  and the bond operator that opens the branch stays here because it applies to
  *  the edge from the torsion atom rather than to anything inside the body.
  */
 struct simple_neighbor_constraint_t {
     bond_disjunct_t bond_disjuncts[max_disjuncts_k];
-    std::uint8_t num_bond_disjuncts; ///< 1 for an explicit op; 2 for the implicit single-or-aromatic default
-    std::uint8_t node;               ///< sub-query node the neighbour atom must satisfy
-    std::uint8_t active;             ///< 1 if this slot carries a real constraint
+    /** 1 for an explicit op, 2 for the implicit single-or-aromatic default. */
+    std::uint8_t num_bond_disjuncts;
+    /** Sub-query node the neighbour atom must satisfy. */
+    std::uint8_t node;
+    /** 1 if this slot carries a real constraint. */
+    std::uint8_t active;
     std::uint8_t padding[5];
 };
 
 /**
- *  Per-atom constraint extracted from SMARTS.  All fields stack-allocated.
+ *  @brief Per-atom constraint extracted from SMARTS. All fields stack-allocated.
  *  OR-of-element/of-primitives (`[N,O,S]`, `[cH1,n]`) is expressed via a short
- *  @ref atom_disjunct_t list, each disjunct carrying its own recursive guard so
+ *  `atom_disjunct_t` list, each disjunct carrying its own recursive guard so
  *  a spec like `[$([NX3H1]),$([NX3H2])]` distributes correctly.
  */
 struct simple_atom_constraint_t {
     atom_disjunct_t disjuncts[max_disjuncts_k];
-    std::uint8_t num_disjuncts;         ///< 1 for plain spec; up to 4 for `[a,b,c,d]`
-    std::uint8_t num_neighbor_branches; ///< 0, 1, or 2 inline `(...)` neighbour branches
+    /** 1 for plain spec, up to 4 for `[a,b,c,d]`. */
+    std::uint8_t num_disjuncts;
+    /** 0, 1, or 2 inline `(...)` neighbour branches. */
+    std::uint8_t num_neighbor_branches;
     std::uint8_t padding[6];
-    simple_neighbor_constraint_t neighbor_branch[2]; ///< active slots defined by num_neighbor_branches
+    /** Active slots defined by num_neighbor_branches. */
+    simple_neighbor_constraint_t neighbor_branch[2];
 };
 
 /** Per-bond constraint extracted from SMARTS. */
 struct simple_bond_constraint_t {
     bond_disjunct_t disjuncts[max_disjuncts_k];
-    std::uint8_t num_disjuncts; ///< 1 for plain op; up to 4 for `a,b,c,d`
+    /** 1 for plain op, up to 4 for `a,b,c,d`. */
+    std::uint8_t num_disjuncts;
     std::uint8_t padding[3];
 };
 
 /**
- *  Longest run of unlabelled atoms a ring-closing pattern may place between `:4`
- *  and `:1`.  The widest ring in the CSD small-ring library is the eight-membered
+ *  @brief Longest run of unlabelled atoms a ring-closing pattern may place between `:4`
+ *  and `:1`. The widest ring in the CSD small-ring library is the eight-membered
  *  `[CX4;r{5-8}:1]1@[CX4;r{5-8}:2]@;-[CX4;x3;r{5-8}:3]@[!#1;r{5-8}:4]@[!#1]@[!#1]@[!#1]@[!#1]1`.
  */
 inline constexpr std::uint8_t max_ring_closure_atoms_k = 4;
 
 /**
- *  One unlabelled atom on the arc that closes a ring pattern back onto `:1`,
- *  together with the edge reaching it from the preceding arc atom.  Arc atoms
+ *  @brief One unlabelled atom on the arc that closes a ring pattern back onto `:1`,
+ *  together with the edge reaching it from the preceding arc atom. Arc atoms
  *  carry no inline branches in the CSD library, so a bare disjunct list is the
  *  whole constraint.
  */
 struct simple_ring_atom_t {
     atom_disjunct_t atom_disjuncts[max_disjuncts_k];
-    bond_disjunct_t bond_disjuncts[max_disjuncts_k]; ///< edge from the previous arc atom, or from `:4`
+    /** Edge from the previous arc atom, or from `:4`. */
+    bond_disjunct_t bond_disjuncts[max_disjuncts_k];
     std::uint8_t num_atom_disjuncts;
     std::uint8_t num_bond_disjuncts;
     std::uint8_t padding[6];
 };
 
 /**
- *  The arc a ring-closing pattern draws from `:4` back to `:1`, walked in that
- *  direction.  With @ref num_atoms zero the two labelled atoms are bonded
+ *  @brief The arc a ring-closing pattern draws from `:4` back to `:1`, walked in that
+ *  direction. With `num_atoms` zero the two labelled atoms are bonded
  *  directly, which is how the four-membered `[…:1]1@[…:2]@;-[…:3]@[…:4]1` reads.
  */
 struct simple_ring_closure_t {
     simple_ring_atom_t atom[max_ring_closure_atoms_k];
-    simple_bond_constraint_t closing_bond; ///< edge from the last arc atom onto `:1`
+    /** Edge from the last arc atom onto `:1`. */
+    simple_bond_constraint_t closing_bond;
     std::uint8_t num_atoms;
-    std::uint8_t active; ///< 1 when the pattern closes a ring at all
+    /** 1 when the pattern closes a ring at all. */
+    std::uint8_t active;
     std::uint8_t padding[6];
 };
 
 /**
- *  Fully parsed linear 4-atom torsion pattern: [atom0]-bond01-[atom1]-bond12-[atom2]-bond23-[atom3].
+ *  @brief Fully parsed linear 4-atom torsion pattern: [atom0]-bond01-[atom1]-bond12-[atom2]-bond23-[atom3].
  *  Labels :1,:2,:3,:4 in SMARTS correspond to atom[0],atom[1],atom[2],atom[3] here.
  *  Central bond is bond[1] (between atom[1] and atom[2]).
  */
@@ -140,31 +148,36 @@ struct simple_torsion_pattern_t {
     simple_atom_constraint_t atom[4];
     simple_bond_constraint_t bond[3];
     simple_ring_closure_t closure;
-    recursive_pool_t pool; ///< every `$(...)` body and inline branch body the pattern compiled to
+    /** Every `$(...)` body and inline branch body the pattern compiled to. */
+    recursive_pool_t pool;
     std::int8_t signs[6];
     float V[6];
 };
 
 /**
- *  Borrowed handle on the four atom constraints, three bond constraints, ring closure and
- *  sub-query nodes of one pattern.  The matcher reads a pattern only through this handle, so a
- *  host @ref simple_torsion_pattern_t that owns everything inline and a device pattern whose
- *  closure and nodes live in shared arenas both drive the same match.  A null @ref closure means
+ *  @brief Borrowed handle on the four atom constraints, three bond constraints, ring closure and
+ *  sub-query nodes of one pattern. The matcher reads a pattern only through this handle, so a
+ *  host `simple_torsion_pattern_t` that owns everything inline and a device pattern whose
+ *  closure and nodes live in shared arenas both drive the same match. A null `closure` means
  *  the pattern closes no ring, which is how a device table drops the 500 bytes an inactive
  *  closure would otherwise cost in every one of the 470 entries.
  */
 struct csd_pattern_view_t {
-    simple_atom_constraint_t const *atom = nullptr; ///< four labelled atoms, `:1` through `:4`
-    simple_bond_constraint_t const *bond = nullptr; ///< three chain bonds, central bond at index 1
-    simple_ring_closure_t const *closure = nullptr; ///< arc back from `:4` onto `:1`; null when absent
-    recursive_pool_view_t pool;                     ///< sub-query nodes the constraints index into
+    /** Four labelled atoms, `:1` through `:4`. */
+    simple_atom_constraint_t const *atom = nullptr;
+    /** Three chain bonds, central bond at index 1. */
+    simple_bond_constraint_t const *bond = nullptr;
+    /** Arc back from `:4` onto `:1`; null when absent. */
+    simple_ring_closure_t const *closure = nullptr;
+    /** Sub-query nodes the constraints index into. */
+    recursive_pool_view_t pool;
 
     csd_pattern_view_t() = default;
-    SMALLFIELD_HD_ csd_pattern_view_t(simple_atom_constraint_t const *atom_constraints,
-                                      simple_bond_constraint_t const *bond_constraints,
-                                      simple_ring_closure_t const *ring_closure, recursive_pool_view_t node_pool)
+    SF_HOST_DEVICE_ csd_pattern_view_t(simple_atom_constraint_t const *atom_constraints,
+                                       simple_bond_constraint_t const *bond_constraints,
+                                       simple_ring_closure_t const *ring_closure, recursive_pool_view_t node_pool)
         : atom(atom_constraints), bond(bond_constraints), closure(ring_closure), pool(node_pool) {}
-    SMALLFIELD_HD_ csd_pattern_view_t(simple_torsion_pattern_t const &pattern)
+    SF_HOST_DEVICE_ csd_pattern_view_t(simple_torsion_pattern_t const &pattern)
         : atom(pattern.atom), bond(pattern.bond), closure(&pattern.closure), pool(pattern.pool) {}
 };
 
@@ -188,7 +201,7 @@ inline std::uint8_t symbol_to_element(std::string_view sym) {
 }
 
 /**
- *  Maximum number of atoms — chain atoms plus map-labelled inline branches —
+ *  @brief Maximum number of atoms — chain atoms plus map-labelled inline branches —
  *  that the SMARTS scanner records before declaring a pattern too wide for the
  *  4-atom matcher.
  */
@@ -198,26 +211,33 @@ inline constexpr std::size_t max_pattern_atoms_k = 8;
 inline constexpr std::size_t max_atom_branches_k = 3;
 
 /**
- *  Sentinel atom index: the parent of a pattern root, and an unbound torsion
+ *  @brief Sentinel atom index: the parent of a pattern root, and an unbound torsion
  *  slot while the four labels are still being resolved.
  */
 inline constexpr std::uint8_t no_atom_k = 0xFF;
 
 /**
- *  One atom of a scanned SMARTS pattern together with the edge to the atom it
- *  hangs off.  @ref parse_linear_torsion scans a pattern into this shape first
+ *  @brief One atom of a scanned SMARTS pattern together with the edge to the atom it
+ *  hangs off. `parse_linear_torsion` scans a pattern into this shape first
  *  and binds the torsion atoms afterwards by their `:n` map label, so a labelled
  *  atom may sit anywhere in the text as long as the labels form a path.
  */
 struct scanned_atom_t {
-    std::string_view text;                             ///< atom text with its brackets; reused as branch text
-    std::string_view spec;                             ///< bracket interior; empty for a shorthand element
-    std::string_view bond_op;                          ///< bond operator on the edge to @ref parent
-    std::string_view branch_text[max_atom_branches_k]; ///< unlabelled inline branches, bond operator included
+    /** Atom text with its brackets, reused as branch text. */
+    std::string_view text;
+    /** Bracket interior, empty for a shorthand element. */
+    std::string_view spec;
+    /** Bond operator on the edge to `parent`. */
+    std::string_view bond_op;
+    /** Unlabelled inline branches, bond operator included. */
+    std::string_view branch_text[max_atom_branches_k];
     std::uint8_t num_branches;
-    std::uint8_t map_number; ///< SMARTS `:n` label; 0 when the atom carries none
-    std::uint8_t parent;     ///< atom this one hangs off; @ref no_atom_k at the root
-    std::uint8_t bracketed;  ///< 1 for `[…]`, 0 for a shorthand element symbol
+    /** SMARTS `:n` label; 0 when the atom carries none. */
+    std::uint8_t map_number;
+    /** Atom this one hangs off, `no_atom_k` at the root. */
+    std::uint8_t parent;
+    /** 1 for `[…]`, 0 for a shorthand element symbol. */
+    std::uint8_t bracketed;
 };
 
 /**
@@ -288,10 +308,10 @@ inline bool compile_recursive_body(std::string_view body, std::uint8_t nesting, 
 
 /**
  *  @brief Parse one disjunct (the text between `,` separators inside a SMARTS
- *  bracket expression) into an @ref atom_disjunct_t.
+ *  bracket expression) into an `atom_disjunct_t`.
  *
  *  A "term" is a conjunction of primitives separated by `&`/`;` or implicit
- *  concatenation.  Each atomic-OR branch of the parent expression lives in one
+ *  concatenation. Each atomic-OR branch of the parent expression lives in one
  *  disjunct and shares one element identity, one aromaticity, one H-count, etc.
  *
  *  Tokens supported:
@@ -313,16 +333,16 @@ inline bool compile_recursive_body(std::string_view body, std::uint8_t nesting, 
  *  @param[in] nesting How many `$(...)` levels enclose this term, zero at a pattern's own atoms.
  *  @param[out] disjunct Accumulator populated with parsed primitives.
  *  @param[inout] pool Sub-query nodes a `$(...)` primitive appends to.
- *  @return @ref term_parsed_k, @ref term_unsatisfiable_k, or @ref term_unsupported_k.
+ *  @return `term_parsed_k`, `term_unsatisfiable_k`, or `term_unsupported_k`.
  */
 inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting, atom_disjunct_t &disjunct,
                                     recursive_pool_t &pool) {
     bool negate_next = false;
     std::size_t p = 0;
-    bool aromatic_positive = false;  ///< non-negated lowercase symbol (e.g. `c`, `n`)
-    bool aliphatic_positive = false; ///< non-negated uppercase symbol (e.g. `C`, `N`)
+    bool aromatic_positive = false;  // non-negated lowercase symbol, e.g. `c` or `n`
+    bool aliphatic_positive = false; // non-negated uppercase symbol, e.g. `C` or `N`
     bool term_has_element = false;
-    bool saw_bare_H = false; ///< `H` without trailing digit — may be element or H-count
+    bool saw_bare_H = false; // `H` without trailing digit — may be element or H-count
     bool saw_wildcard = false;
 
     while (p < token.size()) {
@@ -393,7 +413,7 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
             if (num == 0 || num >= 64) return term_unsupported_k;
             std::uint64_t const bit = (1ULL << num);
             if (negate_next) {
-                // `!#n` → element ≠ n.  Encode as exclusive mask so elements
+                // `!#n` → element ≠ n. Encode as exclusive mask so elements
                 // beyond bit-63 (heavy metals in the corpus) still match.
                 if (!term_has_element) {
                     disjunct.element_mask = bit;
@@ -416,7 +436,7 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
                 else if (!disjunct.element_mask_exclusive) { disjunct.element_mask |= bit; }
                 else {
                     // Exclusive mask already; a positive primitive narrows to
-                    // just that element minus the existing exclusions.  If the
+                    // just that element minus the existing exclusions. If the
                     // element was in the exclusion set, the spec is unsatisfiable.
                     if (disjunct.element_mask & bit) return term_unsatisfiable_k;
                     disjunct.element_mask = bit;
@@ -440,10 +460,10 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
             continue;
         }
         if (c == 'D') {
-            // SMARTS `D<n>` — explicit degree (includes explicit H).  Running
+            // SMARTS `D<n>` — explicit degree (includes explicit H). Running
             // on an `addHs`-ed molecule, this is the same as the atom's
             // `getDegree()` and matches the SMARTS `X<n>` semantics on the
-            // same input.  Both primitives therefore write to `min_degree`.
+            // same input. Both primitives therefore write to `min_degree`.
             if (negate_next) return term_unsupported_k;
             ++p;
             std::uint32_t num = 0;
@@ -458,7 +478,7 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
         }
         if (c == 'x') {
             // SMARTS `x<n>` — ring-bond connectivity, the number of the atom's
-            // bonds that lie in a ring.  `x0` is a real constraint, so the
+            // bonds that lie in a ring. `x0` is a real constraint, so the
             // "unconstrained" sentinel is 0xFF rather than zero.
             if (negate_next) return term_unsupported_k;
             ++p;
@@ -510,7 +530,7 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
         if (c == 'R') {
             ++p;
             if (negate_next) {
-                // `!R` — atom is in no ring.  A negated ring COUNT (`!R2`) is a
+                // `!R` — atom is in no ring. A negated ring COUNT (`!R2`) is a
                 // different query and stays outside the vocabulary.
                 if (p < token.size() && std::isdigit(static_cast<unsigned char>(token[p]))) return term_unsupported_k;
                 disjunct.forbid_flags |= atom_flag_in_ring_k;
@@ -528,9 +548,9 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
                     disjunct.forbid_flags |= atom_flag_in_ring_k;
                 }
                 else {
-                    // R<n> — atom is a member of exactly n SSSR rings.  Matched
+                    // R<n> — atom is a member of exactly n SSSR rings. Matched
                     // via `__builtin_popcount(atom_ring_bitmap)` by
-                    // @ref atom_disjunct_match.  Multiple `R<n>` primitives
+                    // `atom_disjunct_match`. Multiple `R<n>` primitives
                     // with different counts in the same conjunction is
                     // unsatisfiable; drop the disjunct.
                     if (disjunct.ring_count != 0 && disjunct.ring_count != num) return term_unsatisfiable_k;
@@ -548,7 +568,7 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
         if (c == 'r') {
             ++p;
             if (negate_next) {
-                // `!r` — atom is in no ring.  A negated ring SIZE (`!r5`) is a
+                // `!r` — atom is in no ring. A negated ring SIZE (`!r5`) is a
                 // different query and stays outside the vocabulary.
                 if (p < token.size() && (std::isdigit(static_cast<unsigned char>(token[p])) || token[p] == '{'))
                     return term_unsupported_k;
@@ -709,7 +729,7 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
         return term_unsatisfiable_k;
 
     // Aromaticity from element-symbol case: only driven by NON-negated element
-    // primitives.  `[!O]` (negated uppercase O) leaves aromaticity unconstrained
+    // primitives. `[!O]` (negated uppercase O) leaves aromaticity unconstrained
     // so that an aromatic C or aromatic O can still match "not aliphatic-O".
     if (aromatic_positive && !aliphatic_positive) disjunct.require_flags |= atom_flag_aromatic_k;
     else if (aliphatic_positive && !aromatic_positive) disjunct.forbid_flags |= atom_flag_aromatic_k;
@@ -728,17 +748,17 @@ inline void reset_atom_disjunct(atom_disjunct_t &disjunct) {
     disjunct.formal_charge = std::numeric_limits<std::int8_t>::min();
 }
 /**
- *  Parse the content of a SMARTS atom bracket (`[...]`) into a fully populated
- *  @ref simple_atom_constraint_t.
+ *  @brief Parse the content of a SMARTS atom bracket (`[...]`) into a fully populated
+ *  `simple_atom_constraint_t`.
  *
  *  SMARTS logical-operator precedence: `!` (highest) → `&` (implicit/explicit
- *  high-precedence AND) → `,` (OR) → `;` (low-precedence AND).  Concretely:
+ *  high-precedence AND) → `,` (OR) → `;` (low-precedence AND). Concretely:
  *
  *  - `A,a;r{5-8}`   = `(A,a);(r{5-8})`           = `(A OR a) AND r{5-8}`.
  *  - `!#1;R2,R3;r5` = `(!#1);(R2,R3);(r5)`       = `!#1 AND (R2 OR R3) AND r5`.
  *  - `cH1,n`        = single conjunct of 2 alts  = `cH1 OR n`.
  *
- *  Representation: each @ref atom_disjunct_t stores one pure conjunction of
+ *  Representation: each `atom_disjunct_t` stores one pure conjunction of
  *  primitives, and an atom matches the parent spec if any disjunct matches.
  *  Mixed AND/OR specs are converted to disjunctive normal form via the
  *  cross-product of the `,`-alternatives across every `;`-separated conjunct.
@@ -761,7 +781,7 @@ inline bool parse_atom_spec(std::string_view spec, std::uint8_t nesting, simple_
     std::string_view working_spec = spec;
 
     // Step 1: split working_spec on top-level `;` into conjuncts (respecting
-    // `(` depth in case a recursive predicate leaves behind parens).  Each
+    // `(` depth in case a recursive predicate leaves behind parens). Each
     // conjunct is later split on top-level `,` into OR-alternatives.
     constexpr std::size_t max_conjuncts_k = 6;
     std::string_view conjuncts[max_conjuncts_k];
@@ -809,8 +829,8 @@ inline bool parse_atom_spec(std::string_view spec, std::uint8_t nesting, simple_
         if (num_alts[c] == 0) return false;
     }
 
-    // Step 3: cross-product to DNF.  Abort if the result exceeds the storage
-    // capacity of @ref simple_atom_constraint_t.
+    // Step 3: cross-product to DNF. Abort if the result exceeds the storage
+    // capacity of `simple_atom_constraint_t`.
     std::size_t total = 1;
     for (std::size_t c = 0; c < num_conjuncts; ++c) total *= num_alts[c];
     if (total > max_disjuncts_k) return false;
@@ -841,8 +861,8 @@ inline bool parse_atom_spec(std::string_view spec, std::uint8_t nesting, simple_
 }
 
 /**
- *  Parse the text of a bond operator chunk (AND-conjunction of primitives) into a
- *  single @ref bond_disjunct_t.  Shared helper used by @ref parse_bond_op and by
+ *  @brief Parse the text of a bond operator chunk (AND-conjunction of primitives) into a
+ *  single `bond_disjunct_t`. Shared helper used by `parse_bond_op` and by
  *  bond-OR splitting.
  */
 inline bool parse_bond_conjunct(std::string_view op, bond_disjunct_t &bc) {
@@ -923,8 +943,8 @@ inline bool parse_bond_conjunct(std::string_view op, bond_disjunct_t &bc) {
 }
 
 /**
- *  Parse a bond operator into @ref simple_bond_constraint_t, flattening to
- *  disjunctive normal form.  Follows the same SMARTS precedence as @ref
+ *  @brief Parse a bond operator into `simple_bond_constraint_t`, flattening to
+ *  disjunctive normal form. Follows the same SMARTS precedence as @ref
  *  parse_atom_spec: `;` is lowest (AND), `,` is OR, `&`/implicit is higher AND.
  *
  *  Empty @p op is the SMARTS default "single or aromatic" (two disjuncts).
@@ -934,7 +954,7 @@ inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
     bc = {};
     if (op.empty()) {
         // Implicit bond = "single or aromatic" = order-1-and-non-aromatic
-        // OR order-1-and-aromatic.  Both disjuncts pin bond_order to 1 so a
+        // OR order-1-and-aromatic. Both disjuncts pin bond_order to 1 so a
         // triple bond with an incidental aromatic flag cannot slip through.
         bc.num_disjuncts = 2;
         bc.disjuncts[0] = {};
@@ -991,7 +1011,7 @@ inline bool parse_bond_op(std::string_view op, simple_bond_constraint_t &bc) {
         disjunct = {};
         for (std::size_t c = 0; c < num_conjuncts; ++c) {
             // Compose "alt[c][index[c]]" as the current conjunct's primitive
-            // and fold into the disjunct.  parse_bond_conjunct starts from a
+            // and fold into the disjunct. parse_bond_conjunct starts from a
             // fresh disjunct; here we want accumulation, so hand it an empty
             // then merge the three uint8 fields.
             bond_disjunct_t next {};
@@ -1020,11 +1040,11 @@ inline constexpr std::size_t max_recursive_body_atoms_k = 8;
  *
  *  Unlike the pattern-level scan this one descends into `(...)` branches instead of
  *  keeping them as text, because a sub-query body is a tree of arbitrary shape rather
- *  than a path with leaves.  Ring closures and anything else that would make the body
+ *  than a path with leaves. Ring closures and anything else that would make the body
  *  cyclic are outside the vocabulary and bail out.
  *
  *  @param[in] text Chain to scan, e.g. `[C](=O)([NX3H1])[NX3H1]`.
- *  @param[in] parent Scanned index the first atom of the chain hangs off, @ref no_atom_k at the root.
+ *  @param[in] parent Scanned index the first atom of the chain hangs off, `no_atom_k` at the root.
  *  @param[inout] atoms Flat tree filled in scan order.
  *  @param[inout] atom_count Entries already written to @p atoms.
  *  @return True when the whole chain scanned.
@@ -1098,7 +1118,7 @@ inline bool scan_recursive_chain(std::string_view text, std::uint8_t parent, sca
 /**
  *  @brief Turn one scanned atom and everything hanging off it into pool nodes.
  *
- *  @param[in] atoms Flat tree produced by @ref scan_recursive_chain.
+ *  @param[in] atoms Flat tree produced by `scan_recursive_chain`.
  *  @param[in] atom_count Entries in @p atoms.
  *  @param[in] scanned_index Atom to compile.
  *  @param[in] nesting How many `$(...)` levels enclose the body being compiled.
@@ -1160,7 +1180,7 @@ inline bool compile_recursive_body(std::string_view body, std::uint8_t nesting, 
  *  @brief Parse the content of an inline `(...)` branch into a neighbour constraint.
  *
  *  The branch content is what sits between the parentheses — `cH1` from `([cH1])`,
- *  `=O` from `(=O)`, `[cH0]Cl` from `([cH0]Cl)`.  A leading bond operator applies to
+ *  `=O` from `(=O)`, `[cH0]Cl` from `([cH0]Cl)`. A leading bond operator applies to
  *  the edge leaving the torsion atom and stays on the constraint; everything after it
  *  compiles into the sub-query pool, so a branch may be a chain, may fan out, and may
  *  carry `$(...)` guards of its own.
@@ -1195,24 +1215,14 @@ inline bool parse_branch_spec(std::string_view branch, recursive_pool_t &pool,
     return true;
 }
 
-/**
- *  Attempt to compile a 4-atom torsion SMARTS into @ref simple_torsion_pattern_t.
- *  Returns false on any feature the matcher cannot represent: a ring closure, an
- *  unknown recursive body, a spare atom that is itself branched, or more than two
- *  inline neighbour constraints on one torsion atom.
- *
- *  The four torsion atoms are bound by their `:1`-`:4` map labels and have to form
- *  a connected path 1-2-3-4; where they sit in the text does not matter, so
- *  `[a:1][c:2]!@;-[C:3](=[N:4])(-N)` binds even though `:4` lives inside a branch.
- *  Every other atom of the pattern must be a leaf hanging off one of the four, and
- *  becomes an inline neighbour constraint on it.
- */
 /** One undirected edge of a scanned SMARTS pattern, chain edge or ring closure alike. */
 struct scanned_edge_t {
-    std::string_view bond_op; ///< empty for a ring closure, which carries the SMARTS default bond
+    /** Empty for a ring closure, which carries the SMARTS default bond. */
+    std::string_view bond_op;
     std::uint8_t first;
     std::uint8_t second;
-    std::uint8_t forbidden; ///< 1 for the three edges the labelled path already owns
+    /** 1 for the three edges the labelled path already owns. */
+    std::uint8_t forbidden;
     std::uint8_t padding;
 };
 
@@ -1252,6 +1262,18 @@ inline bool walk_closure_arc(scanned_edge_t const *edges, std::size_t edge_count
     return false;
 }
 
+/**
+ *  @brief Attempt to compile a 4-atom torsion SMARTS into `simple_torsion_pattern_t`.
+ *  Returns false on any feature the matcher cannot represent: a ring closure, an
+ *  unknown recursive body, a spare atom that is itself branched, or more than two
+ *  inline neighbour constraints on one torsion atom.
+ *
+ *  The four torsion atoms are bound by their `:1`-`:4` map labels and have to form
+ *  a connected path 1-2-3-4; where they sit in the text does not matter, so
+ *  `[a:1][c:2]!@;-[C:3](=[N:4])(-N)` binds even though `:4` lives inside a branch.
+ *  Every other atom of the pattern must be a leaf hanging off one of the four, and
+ *  becomes an inline neighbour constraint on it.
+ */
 inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern_t &pat) {
     pat = {};
     pat.pool.num_nodes = 0;
@@ -1262,14 +1284,14 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
     std::uint8_t previous_chain_atom = no_atom_k;
 
     // Ring-closure bookkeeping: one open slot per digit, and the single closure edge
-    // the matcher can represent.  A second closure would draw a fused system.
+    // the matcher can represent. A second closure would draw a fused system.
     std::uint8_t closure_open[10];
     for (auto &slot : closure_open) slot = no_atom_k;
     std::uint8_t closure_first = no_atom_k;
     std::uint8_t closure_second = no_atom_k;
 
     while (position < smarts.size()) {
-        // Bond operator run preceding the next atom.  A digit here would put a bond
+        // Bond operator run preceding the next atom. A digit here would put a bond
         // operator on a ring closure and a parenthesis is a branch hanging off
         // nothing: neither reads back into the four-atom path.
         std::size_t const operator_start = position;
@@ -1313,9 +1335,9 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
         previous_chain_atom = static_cast<std::uint8_t>(current);
 
         // Ring-closure digits and inline `(...)` branches, in whichever order the text
-        // writes them.  A branch holding a map label becomes a scanned atom of its own
+        // writes them. A branch holding a map label becomes a scanned atom of its own
         // so that label can join the torsion path; every other branch stays verbatim
-        // text for @ref parse_branch_spec.
+        // text for `parse_branch_spec`.
         while (position < smarts.size()) {
             if (std::isdigit(static_cast<unsigned char>(smarts[position]))) {
                 std::uint8_t const digit = static_cast<std::uint8_t>(smarts[position] - '0');
@@ -1515,7 +1537,7 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
         if (!attached) return false;
 
         // A branch reads as its bond operator followed by its atom, and the two
-        // are contiguous in the source when the spare atom is the child.  When it
+        // are contiguous in the source when the spare atom is the child. When it
         // is instead the parent of a torsion atom, the operator sits on the far
         // side of the atom text, so only an implicit edge reads back.
         std::string_view branch_form;
@@ -1552,8 +1574,8 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
  *  @param[in] pool Sub-query nodes the constraint's recursive guards index into.
  *  @return True when any disjunct matches.
  */
-SMALLFIELD_HD_ inline bool atom_match(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
-                                      simple_atom_constraint_t const &constraint, recursive_pool_view_t pool) {
+SF_HOST_DEVICE_ inline bool atom_match(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
+                                       simple_atom_constraint_t const &constraint, recursive_pool_view_t pool) {
     for (std::uint8_t slot = 0; slot < constraint.num_disjuncts; ++slot)
         if (atom_disjunct_match(descriptor, atom_index, constraint.disjuncts[slot], pool)) return true;
     return false;
@@ -1563,7 +1585,7 @@ SMALLFIELD_HD_ inline bool atom_match(molecule_descriptor_t const &descriptor, s
  *  @brief Test whether the neighbour of a torsion atom satisfies one inline branch.
  *
  *  The bond rule is checked first: it is the cheapest and the most selective for a
- *  branch like `(=O)`.  The branch body then evaluates as a sub-query rooted at the
+ *  branch like `(=O)`. The branch body then evaluates as a sub-query rooted at the
  *  neighbour, seeded with the atoms the torsion match already claimed so the body
  *  cannot walk back onto them — which is exactly the distinctness RDKit enforces.
  *
@@ -1575,9 +1597,9 @@ SMALLFIELD_HD_ inline bool atom_match(molecule_descriptor_t const &descriptor, s
  *  @param[in] seed Atoms the surrounding match has already claimed.
  *  @return True when the neighbour and everything the branch hangs off it bind.
  */
-SMALLFIELD_HD_ inline bool neighbor_match(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
-                                          std::uint32_t bond_index, simple_neighbor_constraint_t const &constraint,
-                                          recursive_pool_view_t pool, recursive_visit_t const &seed) {
+SF_HOST_DEVICE_ inline bool neighbor_match(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
+                                           std::uint32_t bond_index, simple_neighbor_constraint_t const &constraint,
+                                           recursive_pool_view_t pool, recursive_visit_t const &seed) {
     bool any_bond_disjunct = false;
     for (std::uint8_t slot = 0; slot < constraint.num_bond_disjuncts && !any_bond_disjunct; ++slot)
         any_bond_disjunct = bond_disjunct_match(descriptor, bond_index, constraint.bond_disjuncts[slot]);
@@ -1587,9 +1609,9 @@ SMALLFIELD_HD_ inline bool neighbor_match(molecule_descriptor_t const &descripto
 }
 
 /**
- *  Verify that @p atom_index has enough neighbours satisfying @p constraint's branch
- *  list.  Branch neighbours are drawn from @p atom_index's adjacency, excluding the two
- *  chain-adjacent atoms @p chain_a and @p chain_b (pass 0xFF if unused).  When two
+ *  @brief Verify that @p atom_index has enough neighbours satisfying @p constraint's branch
+ *  list. Branch neighbours are drawn from @p atom_index's adjacency, excluding the two
+ *  chain-adjacent atoms @p chain_a and @p chain_b (pass 0xFF if unused). When two
  *  branches are present we try both orderings so a pattern like `(~[N,n])(~[N,n])` can
  *  map either way.
  *
@@ -1601,10 +1623,10 @@ SMALLFIELD_HD_ inline bool neighbor_match(molecule_descriptor_t const &descripto
  *  @param[in] chain_b Second chain-adjacent atom to keep out of the branch assignment.
  *  @return True when every branch binds to a distinct neighbour.
  */
-SMALLFIELD_HD_ inline bool check_branch_neighbors(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
-                                                  simple_atom_constraint_t const &constraint,
-                                                  recursive_pool_view_t pool, std::uint32_t chain_a,
-                                                  std::uint32_t chain_b) {
+SF_HOST_DEVICE_ inline bool check_branch_neighbors(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
+                                                   simple_atom_constraint_t const &constraint,
+                                                   recursive_pool_view_t pool, std::uint32_t chain_a,
+                                                   std::uint32_t chain_b) {
     std::uint8_t const num_branches = constraint.num_neighbor_branches;
     if (num_branches == 0) return true;
     std::uint16_t const start = descriptor.neighbor_offset[atom_index];
@@ -1648,9 +1670,9 @@ SMALLFIELD_HD_ inline bool check_branch_neighbors(molecule_descriptor_t const &d
     return false;
 }
 
-/** @brief Test whether a bond satisfies a parsed bond constraint. */
-SMALLFIELD_HD_ inline bool bond_match(molecule_descriptor_t const &descriptor, std::uint32_t bond_index,
-                                      simple_bond_constraint_t const &constraint) {
+/** Test whether a bond satisfies a parsed bond constraint. */
+SF_HOST_DEVICE_ inline bool bond_match(molecule_descriptor_t const &descriptor, std::uint32_t bond_index,
+                                       simple_bond_constraint_t const &constraint) {
     if (constraint.num_disjuncts == 0) return true; // empty constraint = "any bond" (defensive)
     for (std::uint8_t slot = 0; slot < constraint.num_disjuncts; ++slot)
         if (bond_disjunct_match(descriptor, bond_index, constraint.disjuncts[slot])) return true;
@@ -1662,8 +1684,8 @@ SMALLFIELD_HD_ inline bool bond_match(molecule_descriptor_t const &descriptor, s
  *
  *  Every arc atom is bound in order and the walk stops on the first arc that satisfies the
  *  pattern, because the emitted torsion is named by the four labelled atoms alone: which ring
- *  atoms carried it does not change the answer.  The depth-first search carries its own explicit
- *  stack of at most @ref max_ring_closure_atoms_k levels rather than recursing, so a GPU thread
+ *  atoms carried it does not change the answer. The depth-first search carries its own explicit
+ *  stack of at most `max_ring_closure_atoms_k` levels rather than recursing, so a GPU thread
  *  runs it inside a frame the compiler sizes once.
  *
  *  @param[in] descriptor Molecule descriptor with topology and property arrays.
@@ -1675,10 +1697,10 @@ SMALLFIELD_HD_ inline bool bond_match(molecule_descriptor_t const &descriptor, s
  *  @param[in] seed_count Entries the caller placed in @p visited.
  *  @return True when some assignment of the arc atoms closes onto @p target.
  */
-SMALLFIELD_HD_ inline bool ring_closure_walk(molecule_descriptor_t const &descriptor,
-                                             simple_ring_closure_t const &closure, recursive_pool_view_t pool,
-                                             std::uint32_t origin, std::uint32_t target, std::uint8_t *visited,
-                                             std::uint8_t seed_count) {
+SF_HOST_DEVICE_ inline bool ring_closure_walk(molecule_descriptor_t const &descriptor,
+                                              simple_ring_closure_t const &closure, recursive_pool_view_t pool,
+                                              std::uint32_t origin, std::uint32_t target, std::uint8_t *visited,
+                                              std::uint8_t seed_count) {
     std::uint8_t const total = closure.num_atoms;
     std::uint16_t cursor[max_ring_closure_atoms_k + 1];
     std::uint8_t standing[max_ring_closure_atoms_k + 1];
@@ -1736,10 +1758,10 @@ SMALLFIELD_HD_ inline bool ring_closure_walk(molecule_descriptor_t const &descri
     }
 }
 
-/** @brief Verify the ring a closing pattern draws around an already-bound torsion. */
-SMALLFIELD_HD_ inline bool ring_closure_match(molecule_descriptor_t const &descriptor,
-                                              simple_ring_closure_t const &closure, recursive_pool_view_t pool,
-                                              std::uint32_t a1, std::uint32_t a2, std::uint32_t a3, std::uint32_t a4) {
+/** Verify the ring a closing pattern draws around an already-bound torsion. */
+SF_HOST_DEVICE_ inline bool ring_closure_match(molecule_descriptor_t const &descriptor,
+                                               simple_ring_closure_t const &closure, recursive_pool_view_t pool,
+                                               std::uint32_t a1, std::uint32_t a2, std::uint32_t a3, std::uint32_t a4) {
     if (!closure.active) return true;
     std::uint8_t visited[4 + max_ring_closure_atoms_k];
     visited[0] = static_cast<std::uint8_t>(a1);
@@ -1752,19 +1774,19 @@ SMALLFIELD_HD_ inline bool ring_closure_match(molecule_descriptor_t const &descr
 /** Shortest ring RDKit's torsion extraction still treats as a macrocycle rather than a fused ring. */
 inline constexpr std::uint32_t min_macrocycle_size_k = 9;
 
-/** Sentinel returned by @ref find_bond_between when the two atoms are not bonded. */
+/** Sentinel returned by `find_bond_between` when the two atoms are not bonded. */
 inline constexpr std::uint32_t no_bond_index_k = 0xFFFFFFFFu;
 
 /**
- *  @brief Bond index joining two atoms, or @ref no_bond_index_k when they are not bonded.
+ *  @brief Bond index joining two atoms, or `no_bond_index_k` when they are not bonded.
  *
  *  @param[in] descriptor Molecule descriptor supplying the CSR adjacency.
  *  @param[in] first_atom One end of the sought bond.
  *  @param[in] second_atom Other end of the sought bond.
  *  @return Bond index, or the sentinel.
  */
-SMALLFIELD_HD_ inline std::uint32_t find_bond_between(molecule_descriptor_t const &descriptor, std::uint32_t first_atom,
-                                                      std::uint32_t second_atom) {
+SF_HOST_DEVICE_ inline std::uint32_t find_bond_between(molecule_descriptor_t const &descriptor,
+                                                       std::uint32_t first_atom, std::uint32_t second_atom) {
     std::uint16_t const start = descriptor.neighbor_offset[first_atom];
     std::uint16_t const end = descriptor.neighbor_offset[first_atom + 1];
     for (std::uint16_t entry = start; entry < end; ++entry)
@@ -1773,14 +1795,17 @@ SMALLFIELD_HD_ inline std::uint32_t find_bond_between(molecule_descriptor_t cons
 }
 
 /**
- *  Molecule-wide prefilter keys: which elements and hybridizations a molecule offers and whether
+ *  @brief Molecule-wide prefilter keys: which elements and hybridizations a molecule offers and whether
  *  anything in it is aromatic, so a pattern demanding something absent is skipped before a single
  *  bond is touched.
  */
 struct csd_molecule_gate_t {
-    std::uint64_t elements;      ///< bit N set when element N is present
-    std::uint8_t hybridizations; ///< bit H set when hybridization H is present
-    std::uint8_t has_aromatic;   ///< 1 when any atom is aromatic
+    /** Bit N set when element N is present. */
+    std::uint64_t elements;
+    /** Bit H set when hybridization H is present. */
+    std::uint8_t hybridizations;
+    /** 1 when any atom is aromatic. */
+    std::uint8_t has_aromatic;
     std::uint8_t padding[6];
 };
 
@@ -1790,7 +1815,7 @@ struct csd_molecule_gate_t {
  *  @param[in] descriptor Molecule descriptor with the per-atom property arrays.
  *  @return The molecule's element, hybridization and aromaticity keys.
  */
-SMALLFIELD_HD_ inline csd_molecule_gate_t build_molecule_gate(molecule_descriptor_t const &descriptor) {
+SF_HOST_DEVICE_ inline csd_molecule_gate_t build_molecule_gate(molecule_descriptor_t const &descriptor) {
     csd_molecule_gate_t gate {};
     std::uint32_t const num_atoms = descriptor.num_atoms;
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
@@ -1803,8 +1828,9 @@ SMALLFIELD_HD_ inline csd_molecule_gate_t build_molecule_gate(molecule_descripto
     return gate;
 }
 
-/** @brief Atom count of ring @p ring_index. */
-SMALLFIELD_HD_ inline std::uint32_t ring_atom_count(molecule_descriptor_t const &descriptor, std::uint32_t ring_index) {
+/** Atom count of ring @p ring_index. */
+SF_HOST_DEVICE_ inline std::uint32_t ring_atom_count(molecule_descriptor_t const &descriptor,
+                                                     std::uint32_t ring_index) {
     return static_cast<std::uint32_t>(descriptor.ring_offset[ring_index + 1] - descriptor.ring_offset[ring_index]);
 }
 
@@ -1812,7 +1838,7 @@ SMALLFIELD_HD_ inline std::uint32_t ring_atom_count(molecule_descriptor_t const 
  *  @brief Whether @p first_atom and @p second_atom are consecutive on ring @p ring_index.
  *
  *  The descriptor stores each SSSR ring as its atoms in cycle order, so the ring's bond set is the
- *  set of consecutive pairs, wrapping from the last atom back to the first.  Two ring atoms that
+ *  set of consecutive pairs, wrapping from the last atom back to the first. Two ring atoms that
  *  are bonded without being consecutive belong to a bridge, and that bond is not part of the ring.
  *
  *  @param[in] descriptor Molecule descriptor carrying the ring table.
@@ -1821,8 +1847,8 @@ SMALLFIELD_HD_ inline std::uint32_t ring_atom_count(molecule_descriptor_t const 
  *  @param[in] second_atom Other end of the bond.
  *  @return True when the bond lies on the ring.
  */
-SMALLFIELD_HD_ inline bool ring_holds_bond(molecule_descriptor_t const &descriptor, std::uint32_t ring_index,
-                                           std::uint8_t first_atom, std::uint8_t second_atom) {
+SF_HOST_DEVICE_ inline bool ring_holds_bond(molecule_descriptor_t const &descriptor, std::uint32_t ring_index,
+                                            std::uint8_t first_atom, std::uint8_t second_atom) {
     std::uint16_t const start = descriptor.ring_offset[ring_index];
     std::uint32_t const size = ring_atom_count(descriptor, ring_index);
     for (std::uint32_t position = 0; position < size; ++position) {
@@ -1841,7 +1867,8 @@ SMALLFIELD_HD_ inline bool ring_holds_bond(molecule_descriptor_t const &descript
  *  @param[in] bond_index Bond to count.
  *  @return Ring count, capped by the descriptor's ring capacity.
  */
-SMALLFIELD_HD_ inline std::uint32_t bond_ring_count(molecule_descriptor_t const &descriptor, std::uint32_t bond_index) {
+SF_HOST_DEVICE_ inline std::uint32_t bond_ring_count(molecule_descriptor_t const &descriptor,
+                                                     std::uint32_t bond_index) {
     std::uint8_t const first_atom = descriptor.bond_atom_i[bond_index];
     std::uint8_t const second_atom = descriptor.bond_atom_j[bond_index];
     std::uint32_t const shared = descriptor.atom_ring_bitmap[first_atom] & descriptor.atom_ring_bitmap[second_atom];
@@ -1853,9 +1880,9 @@ SMALLFIELD_HD_ inline std::uint32_t bond_ring_count(molecule_descriptor_t const 
     return count;
 }
 
-/** @brief Whether two rings share more than one bond, which is what marks them fused. */
-SMALLFIELD_HD_ inline bool rings_share_two_bonds(molecule_descriptor_t const &descriptor, std::uint32_t first_ring,
-                                                 std::uint32_t second_ring) {
+/** Whether two rings share more than one bond, which is what marks them fused. */
+SF_HOST_DEVICE_ inline bool rings_share_two_bonds(molecule_descriptor_t const &descriptor, std::uint32_t first_ring,
+                                                  std::uint32_t second_ring) {
     std::uint16_t const start = descriptor.ring_offset[first_ring];
     std::uint32_t const size = ring_atom_count(descriptor, first_ring);
     std::uint32_t shared = 0;
@@ -1872,16 +1899,16 @@ SMALLFIELD_HD_ inline bool rings_share_two_bonds(molecule_descriptor_t const &de
  *  @brief Whether a bond sits on a small ring fused to another ring, which bars it from a torsion.
  *
  *  RDKit's experimental-torsion extraction drops every bond of a ring that shares more than one
- *  bond with a second ring, unless both rings are macrocycles.  A bond only ever falls out through
- *  a ring smaller than @ref min_macrocycle_size_k, so the macrocycle exemption is already implied
+ *  bond with a second ring, unless both rings are macrocycles. A bond only ever falls out through
+ *  a ring smaller than `min_macrocycle_size_k`, so the macrocycle exemption is already implied
  *  by the size test on the ring that carries the bond.
  *
  *  @param[in] descriptor Molecule descriptor carrying the ring table.
  *  @param[in] bond_index Bond to test.
  *  @return True when the bond may not carry a torsion.
  */
-SMALLFIELD_HD_ inline bool bond_excluded_by_ring_fusion(molecule_descriptor_t const &descriptor,
-                                                        std::uint32_t bond_index) {
+SF_HOST_DEVICE_ inline bool bond_excluded_by_ring_fusion(molecule_descriptor_t const &descriptor,
+                                                         std::uint32_t bond_index) {
     std::uint8_t const first_atom = descriptor.bond_atom_i[bond_index];
     std::uint8_t const second_atom = descriptor.bond_atom_j[bond_index];
     std::uint32_t const shared = descriptor.atom_ring_bitmap[first_atom] & descriptor.atom_ring_bitmap[second_atom];
@@ -1903,7 +1930,7 @@ SMALLFIELD_HD_ inline bool bond_excluded_by_ring_fusion(molecule_descriptor_t co
  *
  *  Both orientations of the central bond are tried, because SMARTS is directional while torsion
  *  semantics is symmetric, and the two labelled end atoms are drawn from the CSR adjacency in
- *  index order.  Every binding is handed to @p emit; returning true from @p emit stops the scan,
+ *  index order. Every binding is handed to @p emit; returning true from @p emit stops the scan,
  *  which is how the dispatcher takes the first match and leaves the rest unexplored.
  *
  *  @param[in] descriptor Molecule descriptor with topology and property arrays.
@@ -1913,9 +1940,9 @@ SMALLFIELD_HD_ inline bool bond_excluded_by_ring_fusion(molecule_descriptor_t co
  *  @return True when @p emit stopped the scan.
  */
 template <typename emit_fn_>
-SMALLFIELD_HD_ inline bool match_pattern_at_bond(molecule_descriptor_t const &descriptor,
-                                                 csd_pattern_view_t const &pattern, std::uint32_t bond_index,
-                                                 emit_fn_ &&emit) {
+SF_HOST_DEVICE_ inline bool match_pattern_at_bond(molecule_descriptor_t const &descriptor,
+                                                  csd_pattern_view_t const &pattern, std::uint32_t bond_index,
+                                                  emit_fn_ &&emit) {
     std::uint8_t const begin_atom = descriptor.bond_atom_i[bond_index];
     std::uint8_t const end_atom = descriptor.bond_atom_j[bond_index];
 

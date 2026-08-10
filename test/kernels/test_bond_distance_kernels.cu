@@ -3,7 +3,7 @@
  *  @brief Device-side driver for the hop-count BFS parity test.
  */
 
-#include <cstdio>
+#include <cstdio> // `fprintf`, `stderr`
 
 #include <cuda_runtime.h>
 

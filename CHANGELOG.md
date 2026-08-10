@@ -6,6 +6,52 @@ The road still ahead lives in [`ROADMAP.md`](ROADMAP.md); experiments that did n
 Throughput numbers throughout this file are measured on the same 8x RTX PRO 6000 Blackwell / 2x Xeon 6776P host as [`BENCH.md`](BENCH.md), 10M USearch K=1 unless otherwise noted.
 The CPU cumulative gain on that workload from the original 2026-04-19 baseline (20 283 mol/s) to the current head (23 735 mol/s) is __+16.9 %__.
 
+## Reproducible Output at a Fixed Seed
+
+Philox was keyed off the molecule's offset inside its device batch, which varies with host-thread timing under `schedule(dynamic, 64)`, so a fixed `random_seed` did not reproduce.
+It now seeds from the input row index.
+`test_seed_determinism` runs `generate_conformers` twice in one process at default OpenMP width and compares coordinates, energies and status bitwise.
+
+This was worth more than the throughput work it shipped alongside: before it, a quality comparison was not comparing the same sample twice, and a FIRE change had to be reverted because a genuine regression could not be told from run-to-run sample drift.
+
+## Retiring the VF2 Fallback
+
+All 470 CSD patterns compile natively, verified at 9 020 710 pattern checks over 19 193 PubChem molecules with zero disagreements.
+The fallback is gone, and with it `scaffold_cache.hpp`, `native_murcko.hpp` and `preprocess_deadline.hpp` — three subsystems that served nothing else.
+A pattern the compiler cannot read is now a load-time abort: the pattern library is checked-in data, so an unreadable entry is a build problem.
+
+`conformer_status_t::preprocess_timeout` is kept and marked reserved, because status codes are written as integers into every shipped shard and removing the enumerator would renumber the ones after it.
+
+## Preprocessing on the Device
+
+Every expensive stage downstream of `build_descriptor` runs on the device: the bond-hop BFS, MMFF typing, MMFF term extraction with compaction, CSD torsion matching, and the ETK per-atom CSR build.
+The host uploads a descriptor, a bounds matrix, chiral centres, the 1-2 and 1-3 constraints, and per-molecule bases; nothing downstream of that returns to the CPU.
+
+Measured per molecule, host single-threaded against device including launch and synchronize:
+
+| Stage | PubChem | Enamine REAL |
+| :---- | ------: | -----------: |
+| CSD torsion matching | 203.2 → 8.0 µs, __25.4×__ | 227.9 → 5.2 µs, __43.9×__ |
+
+For scale, the RDKit front-end that stays on the host — parse, sanitize, `AddHs`, stereo — is 228 µs per molecule, so torsion matching alone cost about as much as all of it.
+
+End to end, three runs per arm with both arms built and run back to back on one idle H100 at K=3, medians: stratified PubChem 4269 → 4666 conf/s, __+9.3 %__; Enamine REAL 7055 → 7770 conf/s, __+10.1 %__.
+Both 5000-molecule corpora fit a single wave, so this measures the serial regime and not the overlapped one.
+
+The pipeline is GPU-bound for the first time.
+Sampling `utilization.gpu` at 100 ms across a 20 000-molecule stratified PubChem run gives 7.71 seconds of GPU-busy time against a 8.05 second `generate_conformers` window — about 96 %.
+A whole-process reading instead shows 17 %, because roughly 35 seconds of fixed context construction sits outside the measured window and dilutes it; quote the generate window, not the process.
+This is the condition the kernel-side roadmap items were waiting on.
+
+Sizing the device-filled regions uses host-computed upper bounds over the descriptor's own topology rather than a readback of the exact scan totals, which keeps the whole preprocessing chain asynchronous.
+The slack is roughly twice the packed footprint — 34.5 KB reserved against 17.2 KB held on PubChem, 35.1 KB against 19.4 KB on Enamine REAL — and it raises the per-molecule batch estimate from about 89 KB to about 198 KB, which pulls an auto-sized wave off the 400 K clamp to roughly 263 K on an 80 GB card.
+
+Paired energies are unchanged on PubChem and improve on Enamine REAL, from P50 -0.7 / P95 +1.4 to P50 -0.0 / P95 +0.7.
+The improvement is a bug fix rather than a numerical gain: the host extractor skipped any term whose RDKit parameter lookup failed, silently shipping a molecule with a missing angle or torsion, where the device extractor falls back to the empirical rules MMFF94 defines for exactly that case.
+
+What remains host-side and portable in principle: `build_bounds_matrix`, `extract_distance_constraints` and `extract_chiral_centers` are all already pure over `molecule_descriptor_t`.
+
+
 ## MACE-OFF Megakernel B α–β-3 — 2026-04-26 — Full Chain Landed
 
 Megakernel B is the per-atom downstream-chain fusion sketched in the file header of `mace_tk_atom_chain_fused_kernel.cuh`.
@@ -414,7 +460,7 @@ End-to-end MACE-OFF refinement now has a stable C++ / Python / CLI surface along
   Single-GPU today; multi-GPU is a thread-per- device fan-out plus the existing `shard_inventory` queue.
 - __Doc cleanup__: retired `MACE.md`, `MACE_INFERENCE.md`, `MACE_INTEGRATION_PLAN.md`, `MACE_OPTIMIZATION_ROADMAP.md`, `MACE_BENCH_REPORT.md` — planning + measurement docs whose load-bearing content has been absorbed into `README.md`, `BENCH.md`, `GLOSSARY.md`, `ROADMAP.md`, and the entries below.
 
-## MACE-OFF Kernel Optimisation Pass — 2026-04-25
+## MACE-OFF Kernel Optimization Pass — 2026-04-25
 
 Kernel-only ms/config at the saturating shape (batch=2048, n_atoms=30, energy+forces, captured-graph replay, MACE-OFF23-small, H100 SXM5): __0.272 → 0.0600__ = __4.5× speedup__, closing the with-forces gap to cueq small from 9.83× → 1.95×.
 At this rate one H100 relaxes ~835 confs/sec end-to-end LBFGS @ 20 steps.

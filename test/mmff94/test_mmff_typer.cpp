@@ -1,22 +1,21 @@
 /**
  *  @file test_mmff_typer.cpp
- *  @brief Cross-validate the native MMFF atom typer against RDKit's
- *  `MMFFMolProperties::getMMFFAtomType` on drug-like SMILES. Target: ≥ 99 % per-atom match on
- *  ChEMBL 20K. Some discrepancy is expected because we don't yet invoke MMFF-specific aromaticity.
+ *  @brief Cross-validate the native MMFF atom typer against RDKit's `MMFFMolProperties::getMMFFAtomType`.
+ *
+ *  On drug-like SMILES. Target: ≥ 99 % per-atom match on ChEMBL 20K. Some discrepancy is expected because we don't
+ *  yet invoke MMFF-specific aromaticity.
  */
 
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <cstring>
-#include <fstream>
-#include <memory>
-#include <span>
-#include <string>
-#include <vector>
+#include <cmath>  // `std::fabs`
+#include <cstdio> // `printf`
+
+#include <fstream> // `std::ifstream`
+#include <memory>  // `std::unique_ptr`
+#include <sstream> // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
+#include <string>  // `std::string`, `std::to_string`
+#include <vector>  // `std::vector`
 
 #include <boost/shared_ptr.hpp>
-
 #include <RDGeneral/types.h>
 #include <ForceField/MMFF/Params.h>
 #include <GraphMol/GraphMol.h>
@@ -168,7 +167,7 @@ int main(int argc, char **argv) {
     for (auto const &m : mismatches) {
         std::printf("  element=%d rdk=%u nat=%u  [%s]\n", m.element, m.expected, m.got, m.smiles.c_str());
     }
-    // Gate: 99 % atom-level match for curated + 95 % for full ChEMBL.
+    // Gate: 99.9 % atom-level match for curated + 95 % for full ChEMBL.
     double const min_match = (argc > 1) ? 95.0 : 99.9;
     if (atom_match < min_match) {
         std::printf("FAIL (atom match %.3f%% < %.1f%%)\n", atom_match, min_match);

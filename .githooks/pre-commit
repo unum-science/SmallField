@@ -121,6 +121,66 @@ check_doc_comment_forms() {
         "$file uses a ///, //!, or /*! doc comment - documentation is /** ... */:"
 }
 
+# A member is documented above it, never beside it. A trailing ///< ties the declaration column to
+# the longest comment in the struct, so editing one comment re-pads every neighbour, and the prose
+# gets whatever width the declaration leaves over instead of the full line.
+check_trailing_member_docs() {
+    local trailing
+    trailing=$(printf '%s\n' "$added" | grep -E '//[!/]<' || true)
+    [ -z "$trailing" ] || fail "$trailing" \
+        "$file documents a member beside it - move the text above the member as /** ... */:"
+}
+
+# Nothing in this tree runs Doxygen, so @c, @ref, and @a are markup no reader ever sees. Backticks
+# render everywhere and, unlike @c, can span a whole expression rather than a single token - which
+# is what @c foo == bar always got wrong.
+check_doxygen_symbol_markup() {
+    local markup
+    markup=$(printf '%s\n' "$added" | grep -E '@(c|ref|a)[[:space:]]+[A-Za-z_`]' || true)
+    [ -z "$markup" ] || fail "$markup" \
+        "$file uses @c, @ref, or @a - inline code and symbol names take backticks:"
+}
+
+# One space separates sentences. Two is a typewriter habit that survives into diffs as invisible
+# churn. Exactly two spaces are matched, so a run of three or more used for column alignment inside
+# a comment is left alone.
+check_sentence_spacing() {
+    local spacing
+    spacing=$(printf '%s\n' "$added" | grep -E '(//|/\*|^\+[[:space:]]*\*).*[a-z0-9)]\.  [A-Z@`]' || true)
+    [ -z "$spacing" ] || fail "$spacing" \
+        "$file separates sentences with two spaces in a comment - one is enough:"
+}
+
+# A one-line doc block is just the sentence. @brief earns its place only in a block long enough to
+# have a detail paragraph under it, where it marks which line is the summary.
+check_redundant_brief() {
+    local briefs
+    briefs=$(printf '%s\n' "$added" | grep -E '/\*\*[[:space:]]+@brief[^*]*\*/' || true)
+    [ -z "$briefs" ] || fail "$briefs" \
+        "$file puts @brief on a one-line doc block - drop it, the sentence is the brief:"
+}
+
+# A // comment at column zero sits outside every function body, where it is either documentation or
+# a section banner. Documentation is /** ... */, prose that documents no symbol is /* ... */, and a
+# section is named by #pragma region. Body comments are indented and so are never matched here.
+check_scope_comments() {
+    local banners
+    banners=$(printf '%s\n' "$added" | grep -E '^\+//[[:space:]]' || true)
+    [ -z "$banners" ] || fail "$banners" \
+        "$file puts a // comment at namespace scope - use /** */ for a symbol, /* */ for prose," \
+        "            or #pragma region for a section:"
+}
+
+# Backticks promise something a compiler would accept, so a span carrying a multiplication dot, a
+# typographic minus, or a superscript is math wearing a code fence. SMARTS patterns are deliberately
+# excluded: they are a real language and none of these characters appear in one.
+check_backtick_math() {
+    local math
+    math=$(printf '%s\n' "$added" | grep -E '`[^`]*[·×−‖²³][^`]*`' || true)
+    [ -z "$math" ] || fail "$math" \
+        "$file puts math inside backticks - backticks are for code, state the maths as prose:"
+}
+
 # clang-format mis-tokenises a dash inside a region name and reflows around it, so the region
 # markers drift out of place on the next format run. Region names are plain words.
 check_region_dashes() {
@@ -217,10 +277,16 @@ check_boolean_parameters() {
 
 # The library prints through fmt:: and its own logger. Iostreams are locale-dependent,
 # allocation-happy, and verbose; the CLI and tests may still use C stdio.
+#
+# The rule catches iostream *use*, not the include. RDKit's `AtomTyper.h` names
+# `std::stringstream` and `std::cout` without including either, so a header that
+# includes it must supply `<sstream>` itself or fail to compile. Banning the include
+# would forbid a translation unit from being self-contained, which is the opposite
+# of what this check is for.
 check_iostreams() {
     local streams
     streams=$(printf '%s\n' "$added" |
-        grep -E '\bstd::(cout|cerr|clog|i?fstream|o?fstream|[io]?stringstream)\b|#include[[:space:]]*<(iostream|sstream|fstream)>' || true)
+        grep -E '\bstd::(cout|cerr|clog|i?fstream|o?fstream|[io]?stringstream)\b' || true)
     [ -z "$streams" ] || fail "$streams" \
         "$file uses an iostream in a library header - print through fmt:: or the project logger:"
 }
@@ -231,6 +297,17 @@ check_iostreams() {
 
 # Emphasis is __bold__ and _italic_, never the asterisk forms, so the rendered and raw text agree
 # across every renderer these documents pass through.
+# clang-format splits a string literal that overruns the column limit, and splits the
+# pieces again on the next run, until a word reads "a" "r" "r" "a" "y" "s". Split long
+# literals yourself at a sensible boundary and pin each fragment with a trailing `//`.
+check_split_literals() {
+    local shredded
+    shredded=$(printf '%s\n' "$added" |
+        grep -E '"[A-Za-z0-9_]"[[:space:]]+"|[A-Za-z0-9_]"[[:space:]]+"[A-Za-z0-9_]' || true)
+    [ -z "$shredded" ] || fail "$shredded" \
+        "$file splits a string literal mid-word - break it yourself and pin each line with a trailing //:"
+}
+
 check_markdown_asterisks() {
     local emphasis
     emphasis=$(printf '%s\n' "$added" | grep -E '\*\*[^*]+\*\*|[^*]\*[A-Za-z][^*]*\*[^*]' || true)
@@ -253,12 +330,19 @@ while IFS= read -r -d '' file; do
         check_param_directions
         check_markdown_doxygen
         check_doc_comment_forms
+        check_trailing_member_docs
+        check_doxygen_symbol_markup
+        check_sentence_spacing
+        check_redundant_brief
+        check_scope_comments
+        check_backtick_math
         check_region_dashes
         check_formatter_off
         check_pointer_containers
         check_thread_local
         check_positional_aggregates
         check_abbreviations
+        check_split_literals
         ;;&
     *.cu | *.cuh)
         check_host_threads
@@ -275,7 +359,10 @@ done < <(git diff --cached --name-only --diff-filter=ACM -z)
 # alone and a fresh clone without the tool still commits. cmake-format has no changed-lines mode,
 # so it runs whole-file against the checked-in profile.
 if command -v git-clang-format > /dev/null 2>&1 && [ -f .clang-format ]; then
-    if ! git clang-format --staged --diff --quiet > /dev/null 2>&1; then
+    # Scope it to the languages this profile describes. `git clang-format` also claims
+    # `.json` by default, and a `.clang-format` without a Json section makes it exit
+    # non-zero on any staged JSON file, which reads here as a formatting failure.
+    if ! git clang-format --staged --diff --quiet --extensions c,h,cc,cpp,hpp,cu,cuh > /dev/null 2>&1; then
         echo "pre-commit: staged C/C++/CUDA lines are not clang-format clean - run \`git clang-format --staged\`"
         failed=1
     fi

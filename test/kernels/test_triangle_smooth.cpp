@@ -6,9 +6,10 @@
  *  CUDA kernel calls are in test_triangle_smooth_kernels.cu.
  */
 
-#include <cmath>
-#include <cstdio>
-#include <vector>
+#include <cmath>  // `std::fabs`
+#include <cstdio> // `printf`
+
+#include <vector> // `std::vector`
 
 #include <DistGeom/BoundsMatrix.h>
 #include <DistGeom/TriangleSmooth.h>
@@ -18,17 +19,17 @@
 
 namespace sftest = smallfield::tests;
 
-// defined in test_triangle_smooth_kernels.cu (compiled by nvcc)
+/** Defined in `test_triangle_smooth_kernels.cu`, compiled by nvcc. */
 extern "C" void gpu_triangle_smooth(float *host_bounds, std::uint32_t num_atoms);
 
 static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
     std::printf("  testing: %s\n", smiles.c_str());
 
     auto mol = sftest::mol_from_smiles(smiles);
-    SF_TEST_ASSERT(mol != nullptr, "failed to parse SMILES");
+    sf_verify_(mol != nullptr, "failed to parse SMILES");
 
     std::uint32_t const num_atoms = mol->getNumAtoms();
-    SF_TEST_ASSERT(num_atoms <= 128, "molecule too large for warp-level smoothing");
+    sf_verify_(num_atoms <= 128, "molecule too large for warp-level smoothing");
 
     // get RDKit reference bounds matrix (already smoothed)
     auto rdkit_bounds = sftest::rdkit_bounds_matrix(*mol);
@@ -40,7 +41,7 @@ static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
         DistGeom::BoundsMatPtr bounds_mat(bounds_raw);
         RDKit::DGeomHelpers::initBoundsMat(bounds_raw);
         RDKit::DGeomHelpers::setTopolBounds(*mol, bounds_mat);
-        // do NOT smooth on CPU — the GPU kernel does that
+        // do @b not smooth on CPU — the GPU kernel does that
 
         for (std::uint32_t i = 0; i < num_atoms; ++i) {
             for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
@@ -90,7 +91,7 @@ static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
                 float const u_ik = (i < k) ? gpu_bounds[i * num_atoms + k] : gpu_bounds[k * num_atoms + i];
                 float const u_kj = (k < j) ? gpu_bounds[k * num_atoms + j] : gpu_bounds[j * num_atoms + k];
 
-                SF_TEST_ASSERT(upper_ij <= u_ik + u_kj + 0.01f, "triangle inequality violation for upper bounds");
+                sf_verify_(upper_ij <= u_ik + u_kj + 0.01f, "triangle inequality violation for upper bounds");
             }
         }
     }

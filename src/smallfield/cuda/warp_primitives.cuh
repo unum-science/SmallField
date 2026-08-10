@@ -10,7 +10,7 @@
 
 #if defined(__CUDACC__)
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`
 #include <cuda_runtime.h>
 
 namespace smallfield::cuda {
@@ -18,36 +18,35 @@ namespace smallfield::cuda {
 constexpr std::uint32_t warp_size_k = 32;
 constexpr unsigned int full_mask_k = 0xFFFFFFFF;
 
-// Debug-only assertion that compiles to nothing in Release.  Use this to
-// guard pointer-math accesses (e.g. matrix_view_2d::operator()) so OOB
-// derefs trap immediately under compute-sanitizer / a debugger instead of
-// silently corrupting memory and crashing later somewhere unrelated.
-//
-//  - Device path: __trap() so compute-sanitizer captures the kernel
-//    offender with full thread/block coordinates.
-//  - Host path: __builtin_trap() so gdb / a core dump points at the bad
-//    caller.
-//  - Release (NDEBUG): no-op; same SASS as raw pointer math.
+/**
+ *  @brief Debug-only assertion that compiles to nothing in Release.
+ *
+ *  Guards pointer-math accesses, such as `matrix_view_2d::operator()`, so out-of-bounds derefs trap
+ *  immediately under compute-sanitizer or a debugger instead of silently corrupting memory and
+ *  crashing later somewhere unrelated. The device path calls `__trap()` so compute-sanitizer reports
+ *  the offending thread and block coordinates; the host path calls `__builtin_trap()` so gdb or a
+ *  core dump points at the bad caller; Release, under `NDEBUG`, compiles to nothing.
+ */
 #if defined(NDEBUG)
 #define sf_assert_(cond) ((void)0)
 #elif defined(__CUDA_ARCH__)
-#define sf_assert_(cond)                                                                                               \
-    do {                                                                                                               \
-        if (!(cond)) { __trap(); }                                                                                     \
+#define sf_assert_(cond)           \
+    do {                           \
+        if (!(cond)) { __trap(); } \
     } while (0)
 #else
-#define sf_assert_(cond)                                                                                               \
-    do {                                                                                                               \
-        if (!(cond)) { __builtin_trap(); }                                                                             \
+#define sf_assert_(cond)                   \
+    do {                                   \
+        if (!(cond)) { __builtin_trap(); } \
     } while (0)
 #endif
 
 /**
  *  @brief Type-safe view of a row-major N×N matrix.
  *
- *  12 bytes (pointer + uint32 stride).  Trivially copyable so it passes
- *  through `__global__` kernel arguments without a dance.  In Release
- *  the @ref operator() compiles to the same SASS as raw `data[i*n+j]`.
+ *  12 bytes (pointer + uint32 stride). Trivially copyable so it passes
+ *  through `__global__` kernel arguments without a dance. In Release
+ *  the `operator`() compiles to the same SASS as raw `data[i*n+j]`.
  *  In Debug (`!NDEBUG`) it asserts `i < n && j < n` and traps on OOB —
  *  this is the guardrail that catches stride / offset bugs before they
  *  silently corrupt neighbouring memory.
@@ -58,8 +57,7 @@ struct matrix_view_2d {
     std::uint32_t n = 0;
 
     constexpr matrix_view_2d() noexcept = default;
-    __host__ __device__ constexpr matrix_view_2d(value_type_ *data_, std::uint32_t n_) noexcept
-        : data(data_), n(n_) {}
+    __host__ __device__ constexpr matrix_view_2d(value_type_ *data_, std::uint32_t n_) noexcept : data(data_), n(n_) {}
 
     __host__ __device__ __forceinline__ value_type_ &operator()(std::uint32_t i, std::uint32_t j) const noexcept {
         sf_assert_(i < n && j < n);
@@ -69,8 +67,8 @@ struct matrix_view_2d {
 
 /**
  *  @brief Type-safe view of a SoA `[x0..xN, y0..yN, z0..zN]` 3-component
- *  buffer.  Mirrors @ref load_position_ / @ref store_gradient_ semantics
- *  with the same Debug-mode bounds check as @ref matrix_view_2d.
+ *  buffer. Mirrors `load_position_` / `store_gradient_` semantics
+ *  with the same Debug-mode bounds check as `matrix_view_2d`.
  */
 template <typename value_type_>
 struct soa_view_3d {
@@ -108,8 +106,7 @@ __device__ __forceinline__ float3 scale_float3_(float3 const &value, float scale
 }
 
 /** Load atom @p atom from a SoA position array [x0..xN, y0..yN, z0..zN] of length 3*num_atoms. */
-__device__ __forceinline__ float3 load_position_(float const *positions, std::uint32_t num_atoms,
-                                                 std::uint32_t atom) {
+__device__ __forceinline__ float3 load_position_(float const *positions, std::uint32_t num_atoms, std::uint32_t atom) {
     return {positions[atom], positions[num_atoms + atom], positions[2u * num_atoms + atom]};
 }
 
@@ -131,12 +128,12 @@ __device__ __forceinline__ void accumulate_gradient_(float3 *gradient, float3 co
  *
  *  For an angle θ formed at a center j by neighbors @p this_atom and @p other_atom, where
  *  `this_unit` and `other_unit` are the corresponding bond unit vectors *from* j and
- *  `inverse_distance_this` is `1 / |r_{this,j}|`:
+ *  `inverse_distance_this` is 1 / |r_this - r_j|:
  *
- *      ∂cosθ/∂r_this = (other_unit − cosθ · this_unit) / |r_{this,j}|
+ *      ∂cosθ/∂r_this = (other_unit − cosθ · this_unit) / |r_this - r_j|
  *
  *  Used by mmff_angle_contribution_ and mmff_stretchbend_contribution_; the
- *  center-atom gradient is just `−(grad_first + grad_third)` from this formula.
+ *  center-atom gradient is just `-(grad_first + grad_third)` from this formula.
  */
 __device__ __forceinline__ float3 angle_cosine_gradient_(float3 const &this_unit, float3 const &other_unit,
                                                          float cos_theta, float inverse_distance_this) {

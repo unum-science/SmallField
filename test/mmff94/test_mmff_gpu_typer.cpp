@@ -1,24 +1,24 @@
 /**
  *  @file test_mmff_gpu_typer.cpp
  *  @brief Run the GPU MMFF typer kernel against the native CPU typer on a set of drug-like SMILES.
+ *
  *  Gate: byte-identical atom types and per-atom partial charges.
  */
 
-#include <algorithm>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <iostream>
-#include <memory>
-#include <span>
-#include <string>
-#include <vector>
+#include <cmath>  // `std::fabs`
+#include <cstdio> // `printf`
+
+#include <algorithm> // `std::max`, `std::unique`
+#include <fstream>   // `std::ifstream`
+#include <iostream>  // RDKit's `AtomTyper.h` needs it but does not include it
+#include <memory>    // `std::unique_ptr`
+#include <span>      // `std::span`
+#include <sstream>   // RDKit's `AtomTyper.h` needs it but does not include it
+#include <string>    // `std::string`, `std::getline`
+#include <vector>    // `std::vector`
 
 #include <boost/shared_ptr.hpp>
 #include <cuda_runtime.h>
-
 #include <RDGeneral/types.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 #include <GraphMol/GraphMol.h>
@@ -28,8 +28,9 @@
 #include "smallfield/mmff94/mmff94_typer.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
-#include "test_mmff_gpu_typer_kernels.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+
+#include "test_mmff_gpu_typer_kernels.hpp"
 
 namespace sf = smallfield;
 namespace sfmmff = smallfield::mmff94;

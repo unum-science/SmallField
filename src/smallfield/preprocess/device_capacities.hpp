@@ -4,15 +4,15 @@
  *
  *  The MMFF extractor, the CSD torsion matcher and the ETK CSR builder all write into batch-global
  *  arrays at a base the host assigns, so the host has to know how much room each molecule claims
- *  before any kernel runs.  Every count below is an enumeration count over the descriptor's own
+ *  before any kernel runs. Every count below is an enumeration count over the descriptor's own
  *  topology, and every kernel emits a subset of that enumeration — a torsion whose three barrier
  *  heights all vanish is dropped, an out-of-plane centre with no table entry is dropped — so the
  *  numbers here are upper bounds that hold molecule by molecule.
  *
- *  Sizing this way is what lets the pipeline skip @c mmff94_scan_counts_kernel: the scan's totals
+ *  Sizing this way is what lets the pipeline skip `mmff94_scan_counts_kernel`: the scan's totals
  *  are exact but live in device memory, and reading them back to size the packed arrays would put
- *  a synchronize in the middle of an otherwise asynchronous chain.  The price is the slack between
- *  bound and actual, which leaves gaps in the packed arrays that no consumer reads.  Measured over
+ *  a synchronize in the middle of an otherwise asynchronous chain. The price is the slack between
+ *  bound and actual, which leaves gaps in the packed arrays that no consumer reads. Measured over
  *  a 5000-SMILES stratified PubChem sample the device-only regions reserve 34.5 KB per molecule
  *  against the 17.2 KB the packed arrays actually hold, and over a 5000-SMILES Enamine REAL sample
  *  35.1 KB against 19.4 KB — so the slack costs roughly twice the packed footprint, and buys an
@@ -21,12 +21,11 @@
 
 #pragma once
 
+#include <cstdint> // `std::uint32_t`
+
+#include <algorithm> // `std::min`
+
 #include "smallfield/module_fwd.hpp"
-
-#include <cstdint>
-
-#include <algorithm>
-
 #include "smallfield/types/mmff94_bounds.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
@@ -34,7 +33,7 @@ namespace smallfield::preprocess {
 
 using smallfield::types::molecule_descriptor_t;
 
-/** @brief Elements one molecule claims in each device-filled region. */
+/** Elements one molecule claims in each device-filled region. */
 struct device_capacities_t {
     std::uint32_t etk_torsions;
     std::uint32_t etk_interactions;
@@ -52,7 +51,7 @@ struct device_capacities_t {
  *  @param[in] descriptor Flat descriptor the kernels will read.
  *  @param[in] num_distance_constraints 1-2 and 1-3 constraints the host already emitted, which
  *             enter the ETK per-atom list alongside the torsions.
- *  @return Per-region capacities, each clamped to the matching @c max_mmff_*_per_mol_k ceiling
+ *  @return Per-region capacities, each clamped to the matching `max_mmff_*_per_mol_k` ceiling
  *          the extractor itself saturates at.
  */
 inline device_capacities_t compute_device_capacities(molecule_descriptor_t const &descriptor,

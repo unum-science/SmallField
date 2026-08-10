@@ -1,16 +1,18 @@
 /**
  *  @file test_csd_torsion_device_kernels.cu
- *  @brief Device-side half of the CSD torsion parity test: upload the pattern table, run the
- *  warp-per-molecule matcher over a batch of descriptors, and hand the torsions back to the host
- *  .cpp that compares them against `extract_etk_torsions_native`.
+ *  @brief Device-side half of the CSD torsion parity test.
+ *
+ *  Uploads the pattern table, runs the warp-per-molecule matcher over a batch of descriptors, and hands the
+ *  torsions back to the host .cpp that compares them against `extract_etk_torsions_native`.
  */
 
-#include <cstdint>
-#include <cstdio>
+#include <cstdint> // `std::uint32_t`
+#include <cstdio>  // `fprintf`, `stderr`
 
 #include <cuda_runtime.h>
 
 #include "smallfield/cuda/csd_torsion_device.cuh"
+
 #include "test_csd_torsion_device_kernels.hpp"
 
 namespace sfcuda = smallfield::cuda;

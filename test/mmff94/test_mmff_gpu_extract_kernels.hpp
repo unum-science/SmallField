@@ -1,7 +1,13 @@
+/**
+ *  @file test_mmff_gpu_extract_kernels.hpp
+ *  @brief Device harness for the MMFF94 GPU term-extraction pipeline, for use by its unit tests.
+ */
+
 #pragma once
 
-#include <cstdint>
-#include <vector>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+
+#include <vector> // `std::vector`
 
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"

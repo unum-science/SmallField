@@ -4,11 +4,11 @@
  *
  *  Layout decisions (initial pass, optimisable later):
  *   - One block per molecule; lane-0 does all the work within a
- *     molecule.  Atom typing + lookup enumeration is an inherently
+ *     molecule. Atom typing + lookup enumeration is an inherently
  *     graph-walking algorithm with short-lived per-molecule state
  *     (angle_scratch etc.) — SIMT parallelism across atoms / bonds is
  *     possible but adds substantial complexity for modest per-molecule
- *     speedup (drug-like mols average < 30 atoms / 30 bonds).  The win
+ *     speedup (drug-like mols average < 30 atoms / 30 bonds). The win
  *     is in the cross-molecule dimension: 50 K molecules × 132 SMs ×
  *     8 blocks/SM = ~1000 molecules in flight at steady state.
  *   - The extractor and the CSR builder write into per-molecule slots of
@@ -29,11 +29,11 @@
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
+#include <cstdint> // `std::uint16_t`, `std::uint8_t`
 
-#include <cstdint>
 #include <cuda_runtime.h>
 
+#include "smallfield/module_fwd.hpp"
 #include "smallfield/mmff94/mmff94_cpu.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"
@@ -84,7 +84,7 @@ using smallfield::types::mmff94_torsion_k;
 using smallfield::types::mmff94_torsion_t;
 using smallfield::types::molecule_descriptor_t;
 
-/** Per-molecule term counts.  Written by the emit kernel; consumed by
+/** Per-molecule term counts. Written by the emit kernel; consumed by
  *  the CSR build kernel and by downstream pipeline stages that need
  *  per-molecule offsets into the term arrays. */
 struct mmff94_per_mol_counts_t {
@@ -94,22 +94,23 @@ struct mmff94_per_mol_counts_t {
     std::uint16_t oops;
     std::uint16_t stretchbends;
     std::uint16_t interactions;
-    std::uint8_t overflow; ///< non-zero if any fixed stride was saturated
+    /** Non-zero if any fixed stride was saturated. */
+    std::uint8_t overflow;
     std::uint8_t padding;
 };
 
 /**
  *  @brief Batch-global base offset of one molecule inside each packed term array.
  *
- *  @ref mmff94_scan_counts_kernel produces one entry per molecule as the exclusive prefix sum
- *  of @ref mmff94_per_mol_counts_t, and its one-element companion output carries the batch
- *  totals a caller reads back to size the packed arrays.  The conformer pipeline instead fills
+ *  `mmff94_scan_counts_kernel` produces one entry per molecule as the exclusive prefix sum
+ *  of `mmff94_per_mol_counts_t`, and its one-element companion output carries the batch
+ *  totals a caller reads back to size the packed arrays. The conformer pipeline instead fills
  *  the array on the host from per-molecule capacity bounds and skips the scan entirely, so the
  *  sizing never crosses the bus.
  */
 using smallfield::types::mmff94_packed_offsets_t;
 
-/** Number of independently scanned components in @ref mmff94_packed_offsets_t. */
+/** Number of independently scanned components in `mmff94_packed_offsets_t`. */
 inline constexpr std::uint32_t mmff94_packed_components_k = 6;
 
 /** Thread count of the single-block scan that turns per-molecule counts into packed offsets. */
@@ -118,7 +119,7 @@ inline constexpr std::uint32_t mmff94_scan_block_k = 512;
 namespace detail_extract {
 
 /** Angle scratch — populated during the angle pass and consumed by the
- *  stretch-bend pass.  Sized at `max_mmff_angles_per_mol_k` slots per
+ *  stretch-bend pass. Sized at `max_mmff_angles_per_mol_k` slots per
  *  molecule and held in shared memory, one array per block rather than
  *  one per thread: 16 B × 512 = 8 KB per block, which the static
  *  `__shared__` assertion below pins to the struct layout. */
@@ -135,10 +136,10 @@ static_assert(sizeof(angle_scratch_t) == 16, "angle scratch must stay at 8 KB pe
 } // namespace detail_extract
 
 #if defined(__CUDACC__)
-/** Single-kernel MMFF94 term extractor.  One block per molecule; lane 0
- *  of the block does all enumeration + classification + lookup.  Outputs
+/** Single-kernel MMFF94 term extractor. One block per molecule; lane 0
+ *  of the block does all enumeration + classification + lookup. Outputs
  *  are written into the per-molecule fixed-stride slots of the output
- *  arrays.  Blockers on this kernel are avoided by keeping per-molecule
+ *  arrays. Blockers on this kernel are avoided by keeping per-molecule
  *  state in shared memory (angle_scratch + per-bond scratch). */
 static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     // Inputs
@@ -231,7 +232,7 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     __syncwarp();
 
     // Angle scratch — populated by the angle pass, consumed by the stretch-bend
-    // pass.  Block-scoped, so the cost is 8 KB per warp rather than per thread.
+    // pass. Block-scoped, so the cost is 8 KB per warp rather than per thread.
     __shared__ detail_extract::angle_scratch_t shared_angle_scratch[max_mmff_angles_per_mol_k];
 
     // From here on the passes with atomic cursors must run on lane-0
@@ -419,7 +420,7 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
 }
 
 /** Build the MMFF per-atom CSR interaction list from emitted terms.
- *  Mirrors `mmff94_cpu.hpp:731-802` — two-pass count + write.  One
+ *  Mirrors `mmff94_cpu.hpp:731-802` — two-pass count + write. One
  *  block per molecule, lane-0-only (the CSR-build cost is tiny
  *  relative to the term extractor and cross-molecule parallelism
  *  dominates). */
@@ -431,7 +432,7 @@ static __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
     mmff94_stretchbend_t const *__restrict__ stbns_all, mmff94_atom_interaction_t *__restrict__ interactions_all,
     mmff94_atom_offsets_t *__restrict__ atom_offsets_all, std::uint8_t const *__restrict__ typing_status) {
 
-    // Per-atom per-type write cursors.  Block-scoped so the five arrays cost
+    // Per-atom per-type write cursors. Block-scoped so the five arrays cost
     // 2.5 KB per warp instead of per thread; only lane 0 ever touches them.
     __shared__ std::uint32_t cursors_bond[max_atoms_per_molecule_k];
     __shared__ std::uint32_t cursors_angle[max_atoms_per_molecule_k];
@@ -548,8 +549,8 @@ static __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
 /**
  *  @brief Exclusive prefix sum of the per-molecule term counts, plus the batch totals.
  *
- *  Launched as a single block of @ref mmff94_scan_block_k threads that sweeps the molecule
- *  axis one tile at a time, carrying the running sums in registers.  A 50 K-molecule wave is
+ *  Launched as a single block of `mmff94_scan_block_k` threads that sweeps the molecule
+ *  axis one tile at a time, carrying the running sums in registers. A 50 K-molecule wave is
  *  98 tiles of a six-component Hillis-Steele scan, which costs a few microseconds against the
  *  millisecond-scale extractor it feeds, and it needs no temporary block-sum array.
  *
@@ -617,10 +618,10 @@ __device__ inline void copy_packed_terms_(element_ const *__restrict__ source, e
 /**
  *  @brief Compact the fixed-stride staging arrays into the packed layout `wave_slice_pool_t` uses.
  *
- *  One warp per molecule.  Every term type is copied from its 116 KB per-molecule staging slot
+ *  One warp per molecule. Every term type is copied from its 116 KB per-molecule staging slot
  *  to the batch-global base the scan assigned, the per-atom CSR starts are rebased from
  *  molecule-relative to batch-global, and the molecule's metadata entry gains the offsets and
- *  counts that `mmff_polish_warp_kernel` and `bond_distance_kernel` read.  A molecule the typer
+ *  counts that `mmff_polish_warp_kernel` and `bond_distance_kernel` read. A molecule the typer
  *  routed to the CPU fallback carries zero counts, so it contributes an empty slice and its
  *  metadata offsets stay well-formed.
  *
@@ -628,7 +629,7 @@ __device__ inline void copy_packed_terms_(element_ const *__restrict__ source, e
  *  @param[in] atom_offsets batch-global first-atom index of each molecule
  *  @param[in] num_molecules number of molecules in the batch
  *  @param[in] per_mol_counts per-molecule term counts from the extractor and the CSR builder
- *  @param[in] per_mol_offsets per-molecule packed bases from @ref mmff94_scan_counts_kernel
+ *  @param[in] per_mol_offsets per-molecule packed bases from `mmff94_scan_counts_kernel`
  *  @param[in] staged_bonds fixed-stride bond staging, `max_mmff_bonds_per_mol_k` per molecule
  *  @param[in] staged_angles fixed-stride angle staging
  *  @param[in] staged_torsions fixed-stride torsion staging
@@ -726,7 +727,7 @@ inline void launch_mmff94_build_csr(molecule_descriptor_t const *descriptors, st
                                                               atom_offsets_out, typing_status);
 }
 
-/** Host launcher for the count scan.  The caller reads @p totals back to size the packed arrays. */
+/** Host launcher for the count scan. The caller reads @p totals back to size the packed arrays. */
 inline void launch_mmff94_scan_counts(mmff94_per_mol_counts_t const *per_mol_counts, std::uint32_t num_molecules,
                                       mmff94_packed_offsets_t *per_mol_offsets, mmff94_packed_offsets_t *totals,
                                       cudaStream_t stream = nullptr) {

@@ -4,11 +4,11 @@
  *
  *  Launches one device lookup per probe key (vdw / bond / angle / torsion
  *  / oop / stbn) and writes the resolved parameters into a device output
- *  buffer.  The host then bit-equals the device result against the
+ *  buffer. The host then bit-equals the device result against the
  *  host-side lookup over the same inputs.
  */
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
 #include <cuda_runtime.h>
 
@@ -123,7 +123,7 @@ __global__ void stbn_lookup_kernel(sf::parameters::mmff94_tables_view_t view, st
     results[probe_index] = result;
 }
 
-// Host-callable launchers.
+#pragma region Host Callable Launchers
 
 void launch_device_vdw_lookup(sf::parameters::mmff94_tables_view_t view, vdw_query_t const *queries,
                               vdw_result_t *results, std::uint32_t query_count) {
@@ -154,6 +154,8 @@ void launch_device_stbn_lookup(sf::parameters::mmff94_tables_view_t view, stbn_q
                                stbn_result_t *results, std::uint32_t query_count) {
     stbn_lookup_kernel<<<(query_count + 127) / 128, 128>>>(view, queries, results, query_count);
 }
+
+#pragma endregion Host Callable Launchers
 
 void *device_tables_create(sf::parameters::mmff94_tables_host_t const &host_tables,
                            sf::parameters::mmff94_tables_view_t &out_view) {

@@ -1,16 +1,18 @@
 /**
  *  @file test_dg_energy.cpp
  *  @brief Tests for DG energy evaluation, gradient correctness, and L-BFGS convergence.
- *  Compiled with g++ (C++20). CUDA kernels in test_dg_energy_kernels.cu.
+ *
+ *  Compiled with g++, C++20. CUDA kernels in test_dg_energy_kernels.cu.
  */
 
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <random>
-#include <vector>
+#include <cmath>  // `std::sqrt`, `std::fabs`
+#include <cstdio> // `printf`
+
+#include <random> // `std::mt19937`, `std::uniform_real_distribution`
+#include <vector> // `std::vector`
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
@@ -26,8 +28,11 @@ extern "C" void gpu_dg_minimize(float *host_coords, float const *host_bounds, st
                                 float fourth_dim_weight, std::int32_t max_iterations, float gradient_threshold,
                                 float *out_energy, std::int32_t *out_iterations, std::int32_t *out_status);
 
-// CPU reference: compute DG distance violation energy in double precision.
-// Uses float32 bounds (the GPU uses half-precision, so energies will differ).
+/**
+ *  @brief CPU reference: compute DG distance violation energy in double precision.
+ *
+ *  Uses float32 bounds, the GPU uses half-precision, so energies will differ.
+ */
 static double cpu_dg_energy_reference(double const *coords, float const *bounds, std::uint32_t num_atoms,
                                       std::uint32_t dim, float upper_weight, float lower_weight) {
     double energy = 0.0;
@@ -60,10 +65,10 @@ static void test_dg_energy_known_violation() {
     std::printf("test_dg_energy_known_violation\n");
 
     auto mol = sftest::mol_from_smiles("CCO");
-    SF_TEST_ASSERT(mol != nullptr, "failed to parse CCO");
+    sf_verify_(mol != nullptr, "failed to parse CCO");
 
     bool ok = sftest::embed_molecule(*mol);
-    SF_TEST_ASSERT(ok, "failed to embed CCO");
+    sf_verify_(ok, "failed to embed CCO");
 
     std::uint32_t const num_atoms = mol->getNumAtoms();
     std::uint32_t const dim = 4;
@@ -101,20 +106,20 @@ static void test_dg_energy_known_violation() {
     std::printf("  GPU energy: %.6f  CPU reference: %.6f  relative_error: %.6e\n", gpu_energy, cpu_energy,
                 relative_error);
 
-    SF_TEST_ASSERT(gpu_energy > 0.0f, "energy must be positive with violations");
+    sf_verify_(gpu_energy > 0.0f, "energy must be positive with violations");
     // half-precision bounds introduce ~1% error per bound value, which compounds
     // across N*(N-1)/2 pairs. allow generous tolerance.
-    SF_TEST_ASSERT(relative_error < 1.0, "GPU energy must be same order of magnitude as CPU reference");
+    sf_verify_(relative_error < 1.0, "GPU energy must be same order of magnitude as CPU reference");
 }
 
 static void test_dg_gradient_finite_difference() {
     std::printf("test_dg_gradient_finite_difference\n");
 
     auto mol = sftest::mol_from_smiles("CCO");
-    SF_TEST_ASSERT(mol != nullptr, "failed to parse CCO");
+    sf_verify_(mol != nullptr, "failed to parse CCO");
 
     bool ok = sftest::embed_molecule(*mol);
-    SF_TEST_ASSERT(ok, "failed to embed CCO");
+    sf_verify_(ok, "failed to embed CCO");
 
     std::uint32_t const num_atoms = mol->getNumAtoms();
     std::uint32_t const dim = 4;
@@ -184,7 +189,7 @@ static void test_dg_gradient_finite_difference() {
     std::printf("  checked %u components, %u mismatches, max_rel_error=%.6f\n", num_checked, num_mismatches,
                 max_relative_error);
 
-    SF_TEST_ASSERT(num_mismatches <= num_checked / 4, "too many gradient mismatches (>25%)");
+    sf_verify_(num_mismatches <= num_checked / 4, "too many gradient mismatches (>25%)");
 }
 
 static void test_dg_minimize_convergence() {
@@ -196,7 +201,7 @@ static void test_dg_minimize_convergence() {
         std::printf("  testing: %s\n", smiles.c_str());
 
         auto prepared = sfp::prepare_molecule(smiles);
-        SF_TEST_ASSERT(prepared.num_atoms > 0, "failed to prepare molecule");
+        sf_verify_(prepared.num_atoms > 0, "failed to prepare molecule");
 
         std::uint32_t const num_atoms = prepared.num_atoms;
         std::uint32_t const dim = 4;
@@ -238,7 +243,7 @@ static void test_dg_minimize_convergence() {
         // project to 3D and check MMFF94 energy via RDKit
         auto mol = sftest::mol_from_smiles(smiles);
         bool embedded = sftest::embed_molecule(*mol);
-        SF_TEST_ASSERT(embedded, "failed to embed for cross-reference");
+        sf_verify_(embedded, "failed to embed for cross-reference");
 
         // extract 3D from SoA (first 3 dimensions)
         std::vector<float> coords_3d(num_atoms * 3);
@@ -252,7 +257,7 @@ static void test_dg_minimize_convergence() {
         double mmff_energy = sftest::rdkit_mmff94_energy(*mol);
         std::printf("    MMFF94 energy at DG coords: %.2f kcal/mol\n", mmff_energy);
 
-        SF_TEST_ASSERT(std::isfinite(mmff_energy), "MMFF94 energy must be finite after DG minimization");
+        sf_verify_(std::isfinite(mmff_energy), "MMFF94 energy must be finite after DG minimization");
     }
 }
 

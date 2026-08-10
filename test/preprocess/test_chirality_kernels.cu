@@ -3,7 +3,7 @@
  *  @brief CUDA kernel wrappers for chirality validation test. Compiled by nvcc.
  */
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`
 
 #include <cuda_runtime.h>
 

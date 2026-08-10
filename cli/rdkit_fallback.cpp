@@ -1,14 +1,18 @@
-#include "rdkit_fallback.hpp"
+/**
+ *  @file rdkit_fallback.cpp
+ *  @brief RDKit-based conformer generation for molecules the GPU pipeline failed on.
+ */
 
-#include <atomic>
-#include <cstdio>
-#include <cstring>
-#include <memory>
-#include <mutex>
-#include <vector>
+#include <cstring> // `std::memset`
+
+#include <atomic>  // `std::atomic`
+#include <memory>  // `std::unique_ptr`
+#include <mutex>   // `std::once_flag`, `std::call_once`
+#include <sstream> // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
+#include <vector>  // `std::vector`
 
 #include <omp.h>
-
+#include <cuda_fp16.h>
 #include <GraphMol/Chirality.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
@@ -21,13 +25,15 @@
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/molecule_parse.hpp"
 
+#include "rdkit_fallback.hpp"
+
 namespace smallfield::cli {
 
 namespace sfapi = smallfield::api;
 
 /** Single-threaded warm-up that forces every RDKit lazy-init singleton we
  *  touch in the fallback OMP loop to populate its caches before the pool of
- *  ~188 fallback threads starts racing on first access.  See matching
+ *  ~188 fallback threads starts racing on first access. See matching
  *  `warm_up_rdkit_globals_once_` in `etkdg_prepare_batch.hpp`. */
 static void warm_up_rdkit_globals_for_fallback_() {
     static std::once_flag flag;
@@ -70,9 +76,9 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         std::string_view const smiles = inputs.smiles[molecule_index];
 
         // Conformer-granular fallback: count per-slot failures and only re-embed
-        // for the slots that actually need attention.  Successful GPU conformers
+        // for the slots that actually need attention. Successful GPU conformers
         // (solver==0, status==success) are preserved untouched — they keep their
-        // GPU coordinates, energy, and status.  Anything not flipped to success
+        // GPU coordinates, energy, and status. Anything not flipped to success
         // by this loop keeps its existing failed status; the solver code below
         // is only updated when we successfully recover a slot.
         std::uint32_t needed_slots = 0;
@@ -103,7 +109,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         std::unique_ptr<RDKit::RWMol> mol = std::move(parsed.molecule);
 
         // Embedding is the dominant CPU cost here, and it is wasted on a molecule the force field
-        // cannot type: `constructForceField` throws below and every conformer fails anyway.  Ask
+        // cannot type: `constructForceField` throws below and every conformer fails anyway. Ask
         // first, so an untypeable molecule costs a typing check instead of K embeddings.
         if (!RDKit::MMFF::MMFFMolProperties(*mol).isValid()) {
             for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
@@ -159,15 +165,15 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
             std::memset(reinterpret_cast<void *>(outputs.coordinates.data() + coord_base), 0,
                         sizeof(__half) * coordinate_stride);
 
-            // Slot layout is shared with the GPU producer -- see `conformer_slot_layout_t`.
+            // Slot layout is shared with the GPU producer — see `conformer_slot_layout_t`.
             for (unsigned int atom_index = 0; atom_index < mol->getNumAtoms(); ++atom_index) {
                 auto const &position = conformer.getAtomPos(atom_index);
-                outputs.coordinates[coord_base + slot_layout.component_offset(0u, atom_index)] =
-                    __float2half(static_cast<float>(position.x));
-                outputs.coordinates[coord_base + slot_layout.component_offset(1u, atom_index)] =
-                    __float2half(static_cast<float>(position.y));
-                outputs.coordinates[coord_base + slot_layout.component_offset(2u, atom_index)] =
-                    __float2half(static_cast<float>(position.z));
+                outputs.coordinates[coord_base + slot_layout.component_offset(0u, atom_index)] = __float2half(
+                    static_cast<float>(position.x));
+                outputs.coordinates[coord_base + slot_layout.component_offset(1u, atom_index)] = __float2half(
+                    static_cast<float>(position.y));
+                outputs.coordinates[coord_base + slot_layout.component_offset(2u, atom_index)] = __float2half(
+                    static_cast<float>(position.z));
             }
 
             outputs.energies[molecule_index * num_conformers + conformer_slot] = energy_kcal_per_mol;
@@ -176,7 +182,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
             outputs.solver[molecule_index * num_conformers + conformer_slot] = 1;
             recovered_any = true;
         }
-        // Only a molecule that actually produced a conformer gets an atom count.  Writing it before
+        // Only a molecule that actually produced a conformer gets an atom count. Writing it before
         // the embed left unrecovered molecules carrying a non-zero count over all-zero coordinates,
         // which defeats the `num_atoms == 0` guard downstream and buys them a full shape-context
         // parse plus four substructure searches for a row that has no geometry.

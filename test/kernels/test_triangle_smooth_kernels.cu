@@ -6,7 +6,7 @@
  *  test_triangle_smooth.cpp, compiled by g++.
  */
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`
 
 #include <cuda_runtime.h>
 
@@ -16,7 +16,7 @@ namespace sfc = smallfield::cuda;
 
 extern "C" {
 
-// kernel that copies bounds to shared memory, smooths, copies back
+/** Kernel that copies bounds to shared memory, smooths, copies back. */
 __global__ void triangle_smooth_shared_kernel(float *global_bounds, std::uint32_t num_atoms) {
     extern __shared__ float shared_bounds[];
     std::uint32_t const lane = threadIdx.x;

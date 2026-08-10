@@ -1,23 +1,22 @@
 /**
  *  @file test_mmff94_tables.cpp
- *  @brief Cross-validate extracted MMFF94 tables against RDKit's live `operator()` lookups on the
- *  host, and validate device-side lookups byte-equal the host lookups via CUDA kernels.
+ *  @brief Cross-validate extracted MMFF94 tables against RDKit's live `operator()` lookups on the host.
+ *
+ *  Validates device-side lookups byte-equal the host lookups via CUDA kernels.
  */
 
-#include <cassert>
-#include <cmath>
-#include <cstdio>
-#include <cstring>
-#include <iostream>
-#include <random>
-#include <sstream>
-#include <vector>
+#include <cmath>   // `std::abs`
+#include <cstdio>  // `printf`, `stdout`
+#include <cstring> // `std::memcpy`
+
+#include <iostream> // RDKit's `AtomTyper.h` needs it but does not include it
+#include <random>   // `std::mt19937`, `std::uniform_int_distribution`
+#include <sstream>  // RDKit's `AtomTyper.h` needs it but does not include it
+#include <vector>   // `std::vector`
 
 #include <boost/shared_ptr.hpp>
 #include <cuda_runtime.h>
-
 #include <RDGeneral/types.h>
-
 #include <ForceField/MMFF/Params.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 
@@ -144,7 +143,10 @@ void validate_angle_lookup(sf::parameters::mmff94_tables_host_t const &host_tabl
     }
 }
 
-// Device cross-validation - upload tables, build random queries, launch kernels, compare bit-wise to host lookup.
+/**
+ *  @brief Device cross-validation — upload tables, build random queries, launch kernels, compare
+ *  bit-wise to host lookup.
+ */
 void run_device_lookup_cross_checks(sf::parameters::mmff94_tables_host_t const &host_tables) {
     sf::parameters::mmff94_tables_view_t device_lookup_view {};
     void *device_handle = device_tables_create(host_tables, device_lookup_view);
@@ -339,7 +341,8 @@ int main() {
     std::fflush(stdout);
     sf::parameters::extract_mmff94_tables_from_rdkit(host_tables);
     std::printf(
-        "extract done: vdw=%zu bond=%zu angle=%zu tor=%zu oop=%zu stbn=%zu dfsb=%zu def=%zu pbci=%zu chg=%zu " "hl=" "%" "z" "u" " " "max_at=" "%u\n",
+        "extract done: vdw=%zu bond=%zu angle=%zu tor=%zu oop=%zu stbn=%zu dfsb=%zu def=%zu pbci=%zu chg=%zu " //
+        "hl=%zu max_at=%u\n",
         host_tables.vdw.size(), host_tables.bond.size(), host_tables.angle.size(), host_tables.torsion.size(),
         host_tables.oop.size(), host_tables.stbn.size(), host_tables.dfsb.size(), host_tables.def.size(),
         host_tables.pbci.size(), host_tables.chg.size(), host_tables.hl.size(), host_tables.max_atom_type);

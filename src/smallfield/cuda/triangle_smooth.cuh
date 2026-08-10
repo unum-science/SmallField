@@ -3,12 +3,15 @@
  *  @brief Floyd-Warshall triangle inequality smoothing on a float bounds matrix.
  *
  *  Tightens the N x N bounds matrix by enforcing:
- *   upper: uᵢⱼ ← min(uᵢⱼ, uᵢₖ + uₖⱼ)   for all k
- *   lower: lᵢⱼ ← max(lᵢⱼ, lᵢₖ − uₖⱼ, lₖⱼ − uᵢₖ)  for all k
  *
- *  Runs entirely within one warp (32 threads).  Production smoothing now
- *  happens inside metric_embedding_prepass_kernel; this header is kept for
- *  the standalone smoothing-only test (test_triangle_smooth).
+ *  @verbatim
+ *  upper: u_ij <- min(u_ij, u_ik + u_kj)   for all k
+ *  lower: l_ij <- max(l_ij, l_ik - u_kj, l_kj - u_ik)  for all k
+ *  @endverbatim
+ *
+ *  Runs entirely within one warp of 32 threads. Production smoothing runs inside
+ *  `metric_embedding_prepass_kernel`, and this header serves the standalone smoothing-only test,
+ *  `test_triangle_smooth`.
  *
  *  Convention: bounds[i*N+j] with i < j = upper, i > j = lower, diagonal = 0.
  */

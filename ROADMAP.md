@@ -21,7 +21,7 @@ This matters because:
 Rule of thumb: do not trust any number in this document that is not paired with a scale tag.
 When re-profiling to drive a decision, aim for ≥ 1 M molecules and at least 10 `embedding-waves` of steady state — and separately note whether the workload is drug-like (ChEMBL, PubChem) or diverse combinatorial (USearch, Enamine, ZINC).
 
-## Baseline (2026-04-19)
+## Baseline as of 2026-04-19
 
 __This table is superseded and kept for provenance only.__
 Every VF2 symbol in it — `VF2SubState::match`, `MatchSubqueries`, `SubstructMatch`, `QueryAtom::Match`, `AndQuery`, `EqualityQuery`, `atomCompat`, together about 23 % of host CPU — no longer exists on any code path.
@@ -193,11 +193,14 @@ Per the README's `Project Goals & FAQ`, SmallField respects the input SMILES and
 ### 2. Scaffold-Aware Input Sharding
 
 Today `smi_to_parquet.py` writes offset-based shards.
-At 10 M USearch the scaffold-cache hit rate is 33 %; at Enamine REAL (1.2 B, much longer-tail scaffold distribution) it will drop further.
-Grouping input molecules by Bemis-Murcko scaffold before sharding raises the intra-shard cache hit rate and amortises torsion-pattern matching.
-Effort small (modify `smi_to_parquet.py` to compute scaffold hash and cluster).
+Grouping input molecules by Bemis-Murcko scaffold before sharding would place structurally similar molecules in the same `coprocessed-batch`.
+Effort small — compute a scaffold hash in `smi_to_parquet.py` and cluster on it.
 Risk low.
-Expected gain is scaffold-hit-rate-dependent: on ChEMBL-like corpora maybe negligible; on Enamine REAL potentially +20–40 % throughput by keeping the cache warm.
+
+__The original justification for this item is void.__
+It rested on a 33 % scaffold-cache hit rate measured at 10 M USearch, and that cache was deleted along with the VF2 fallback, so there is no longer a cache to keep warm.
+Any remaining gain would have to come from somewhere else — warp divergence in the native torsion matcher, or `atom-limited-bin` fill — and none of that has been measured.
+Re-derive the mechanism and measure it before costing this work.
 
 ### 3. Direct Cloud / S3 Input
 
@@ -235,47 +238,5 @@ Risk low.
   The stream drain is correct whether or not the end event was recorded and costs about 5 ms per wave per device.
   Reverted.
 
-### 6. Reproducible Output at a Fixed Seed — Delivered
-
-Philox was keyed off the molecule's offset inside its device batch, which varies with host-thread timing under `schedule(dynamic, 64)`, so a fixed `random_seed` did not reproduce.
-It now seeds from the input row index.
-`test_seed_determinism` runs `generate_conformers` twice in one process at default OpenMP width and compares coordinates, energies and status bitwise.
-
-This was worth more than the throughput work it shipped alongside: before it, a quality comparison was not comparing the same sample twice, and a FIRE change had to be reverted because a genuine regression could not be told from run-to-run sample drift.
-
-### 7. Retiring the VF2 Fallback — Delivered
-
-All 470 CSD patterns compile natively, verified at 9 020 710 pattern checks over 19 193 PubChem molecules with zero disagreements.
-The fallback is gone, and with it `scaffold_cache.hpp`, `native_murcko.hpp` and `preprocess_deadline.hpp` — three subsystems that served nothing else.
-A pattern the compiler cannot read is now a load-time abort: the pattern library is checked-in data, so an unreadable entry is a build problem.
-
-`conformer_status_t::preprocess_timeout` is kept and marked reserved, because status codes are written as integers into every shipped shard and removing the enumerator would renumber the ones after it.
-
-### 8. Preprocessing on the Device — Delivered
-
-Every expensive stage downstream of `build_descriptor` runs on the device: the bond-hop BFS, MMFF typing, MMFF term extraction with compaction, CSD torsion matching, and the ETK per-atom CSR build.
-The host uploads a descriptor, a bounds matrix, chiral centres, the 1-2 and 1-3 constraints, and per-molecule bases; nothing downstream of that returns to the CPU.
-
-Measured per molecule, host single-threaded against device including launch and synchronize:
-
-| Stage | PubChem | Enamine REAL |
-| :---- | ------: | -----------: |
-| CSD torsion matching | 203.2 → 8.0 µs, __25.4×__ | 227.9 → 5.2 µs, __43.9×__ |
-
-For scale, the RDKit front-end that stays on the host — parse, sanitize, `AddHs`, stereo — is 228 µs per molecule, so torsion matching alone cost about as much as all of it.
-
-End to end, three runs per arm with both arms built and run back to back on one idle H100 at K=3, medians: stratified PubChem 4269 → 4666 conf/s, __+9.3 %__; Enamine REAL 7055 → 7770 conf/s, __+10.1 %__.
-Both 5000-molecule corpora fit a single wave, so this measures the serial regime and not the overlapped one.
-
-The pipeline is GPU-bound for the first time.
-Sampling `utilization.gpu` at 100 ms across a 20 000-molecule stratified PubChem run gives 7.71 seconds of GPU-busy time against a 8.05 second `generate_conformers` window — about 96 %.
-A whole-process reading instead shows 17 %, because roughly 35 seconds of fixed context construction sits outside the measured window and dilutes it; quote the generate window, not the process.
-This is the condition the kernel-side roadmap items were waiting on.
-
-Sizing the device-filled regions uses host-computed upper bounds over the descriptor's own topology rather than a readback of the exact scan totals, which keeps the whole preprocessing chain asynchronous.
-The slack is roughly twice the packed footprint — 34.5 KB reserved against 17.2 KB held on PubChem, 35.1 KB against 19.4 KB on Enamine REAL — and it raises the per-molecule batch estimate from about 89 KB to about 198 KB, which pulls an auto-sized wave off the 400 K clamp to roughly 263 K on an 80 GB card.
-
-Paired energies are unchanged on PubChem and improve on Enamine REAL, from P50 -0.7 / P95 +1.4 to P50 -0.0 / P95 +0.7.
-The improvement is a bug fix rather than a numerical gain: the host extractor skipped any term whose RDKit parameter lookup failed, silently shipping a molecule with a missing angle or torsion, where the device extractor falls back to the empirical rules MMFF94 defines for exactly that case.
-
-What remains host-side and portable in principle: `build_bounds_matrix`, `extract_distance_constraints` and `extract_chiral_centers` are all already pure over `molecule_descriptor_t`.
+Delivered work is recorded in [`CHANGELOG.md`](CHANGELOG.md), including the fixed-seed reproducibility fix,
+the retirement of the VF2 fallback, and the move of preprocessing onto the device.

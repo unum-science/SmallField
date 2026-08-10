@@ -7,17 +7,17 @@
  *  Also validates BFS distance matrix against RDKit's getDistanceMat() (Floyd-Warshall).
  */
 
-#include <cstdio>
-#include <cstdlib>
-#include <memory>
-#include <string>
-#include <vector>
+#include <cstdio> // `printf`
+
+#include <string> // `std::string`
+#include <vector> // `std::vector`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
 #include "smallfield/types/molecule_descriptor.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sft = smallfield::types;
@@ -25,41 +25,41 @@ namespace sftest = smallfield::tests;
 
 static void validate_molecule(std::string const &smiles) {
     auto mol = sftest::mol_from_smiles(smiles);
-    SF_TEST_ASSERT(mol != nullptr, smiles.c_str());
+    sf_verify_(mol != nullptr, smiles.c_str());
 
     sft::molecule_descriptor_t descriptor;
     bool ok = sft::build_descriptor(*mol, descriptor);
-    SF_TEST_ASSERT(ok, ("build_descriptor failed for: " + smiles).c_str());
+    sf_verify_(ok, ("build_descriptor failed for: " + smiles).c_str());
 
     std::uint32_t const N = mol->getNumAtoms();
-    SF_TEST_ASSERT(descriptor.num_atoms == N, "num_atoms mismatch");
-    SF_TEST_ASSERT(descriptor.num_bonds == mol->getNumBonds(), "num_bonds mismatch");
+    sf_verify_(descriptor.num_atoms == N, "num_atoms mismatch");
+    sf_verify_(descriptor.num_bonds == mol->getNumBonds(), "num_bonds mismatch");
 
     for (std::uint32_t a = 0; a < N; ++a) {
         auto const *atom = mol->getAtomWithIdx(a);
-        SF_TEST_ASSERT(descriptor.element[a] == atom->getAtomicNum(), "element mismatch");
-        SF_TEST_ASSERT(descriptor.hybridization[a] == static_cast<std::uint8_t>(atom->getHybridization()),
-                       "hybridization mismatch");
-        SF_TEST_ASSERT(descriptor.degree[a] == atom->getDegree(), "degree mismatch");
-        SF_TEST_ASSERT(descriptor.num_hydrogens[a] == atom->getTotalNumHs(true), "num_hydrogens mismatch");
-        SF_TEST_ASSERT(descriptor.formal_charge[a] == static_cast<std::int8_t>(atom->getFormalCharge()),
-                       "formal_charge mismatch");
+        sf_verify_(descriptor.element[a] == atom->getAtomicNum(), "element mismatch");
+        sf_verify_(descriptor.hybridization[a] == static_cast<std::uint8_t>(atom->getHybridization()),
+                   "hybridization mismatch");
+        sf_verify_(descriptor.degree[a] == atom->getDegree(), "degree mismatch");
+        sf_verify_(descriptor.num_hydrogens[a] == atom->getTotalNumHs(true), "num_hydrogens mismatch");
+        sf_verify_(descriptor.formal_charge[a] == static_cast<std::int8_t>(atom->getFormalCharge()),
+                   "formal_charge mismatch");
 
         bool const expect_aromatic = atom->getIsAromatic();
         bool const actual_aromatic = sft::atom_has_flag(descriptor, a, sft::atom_flag_aromatic_k);
-        SF_TEST_ASSERT(expect_aromatic == actual_aromatic, "aromatic flag mismatch");
+        sf_verify_(expect_aromatic == actual_aromatic, "aromatic flag mismatch");
     }
 
     for (std::uint32_t b = 0; b < mol->getNumBonds(); ++b) {
         auto const *bond = mol->getBondWithIdx(b);
         std::uint32_t const bi = bond->getBeginAtomIdx();
         std::uint32_t const bj = bond->getEndAtomIdx();
-        SF_TEST_ASSERT(descriptor.bond_atom_i[b] == bi, "bond atom_i mismatch");
-        SF_TEST_ASSERT(descriptor.bond_atom_j[b] == bj, "bond atom_j mismatch");
+        sf_verify_(descriptor.bond_atom_i[b] == bi, "bond atom_i mismatch");
+        sf_verify_(descriptor.bond_atom_j[b] == bj, "bond atom_j mismatch");
 
         bool const expect_aromatic = bond->getIsAromatic();
         bool const actual_aromatic = sft::bond_has_flag(descriptor, b, sft::bond_flag_aromatic_k);
-        SF_TEST_ASSERT(expect_aromatic == actual_aromatic, "bond aromatic flag mismatch");
+        sf_verify_(expect_aromatic == actual_aromatic, "bond aromatic flag mismatch");
     }
 
     for (std::uint32_t a = 0; a < N; ++a) {
@@ -76,9 +76,9 @@ static void validate_molecule(std::string const &smiles) {
         for (std::uint16_t n = start; n < end; ++n) desc_neighbors.push_back(descriptor.neighbor_atom[n]);
         std::sort(desc_neighbors.begin(), desc_neighbors.end());
 
-        SF_TEST_ASSERT(rdkit_neighbors.size() == desc_neighbors.size(), "neighbor count mismatch");
+        sf_verify_(rdkit_neighbors.size() == desc_neighbors.size(), "neighbor count mismatch");
         for (std::size_t i = 0; i < rdkit_neighbors.size(); ++i)
-            SF_TEST_ASSERT(rdkit_neighbors[i] == desc_neighbors[i], "neighbor index mismatch");
+            sf_verify_(rdkit_neighbors[i] == desc_neighbors[i], "neighbor index mismatch");
     }
 
     // Compare the derived hop matrix to RDKit's Floyd-Warshall.
@@ -89,8 +89,8 @@ static void validate_molecule(std::string const &smiles) {
         for (std::uint32_t j = 0; j < N; ++j) {
             double const reference = rdkit_distances[i * N + j];
             if (reference >= 1e7) continue; // unreachable in RDKit's LOCAL_INF encoding
-            SF_TEST_ASSERT(static_cast<double>(bond_hops[i * N + j]) == reference,
-                           "bond hop count mismatch with Floyd-Warshall");
+            sf_verify_(static_cast<double>(bond_hops[i * N + j]) == reference,
+                       "bond hop count mismatch with Floyd-Warshall");
         }
     }
 
@@ -98,12 +98,12 @@ static void validate_molecule(std::string const &smiles) {
     for (std::uint32_t a = 0; a < N; ++a) {
         bool const expect_in_ring = ring_info->numAtomRings(a) > 0;
         bool const actual_in_ring = sft::atom_has_flag(descriptor, a, sft::atom_flag_in_ring_k);
-        SF_TEST_ASSERT(expect_in_ring == actual_in_ring, "atom in-ring flag mismatch");
+        sf_verify_(expect_in_ring == actual_in_ring, "atom in-ring flag mismatch");
     }
     for (std::uint32_t b = 0; b < mol->getNumBonds(); ++b) {
         bool const expect_ring = ring_info->numBondRings(b) > 0;
         bool const actual_ring = sft::bond_has_flag(descriptor, b, sft::bond_flag_in_ring_k);
-        SF_TEST_ASSERT(expect_ring == actual_ring, "bond in-ring flag mismatch");
+        sf_verify_(expect_ring == actual_ring, "bond in-ring flag mismatch");
     }
 
     std::printf("  ok: %s (N=%u, bonds=%u, rings=%u)\n", smiles.c_str(), N, descriptor.num_bonds, descriptor.num_rings);

@@ -7,7 +7,7 @@ The set is grouped by axis; each axis targets a specific code path that has
 historically been the source of crashes or correctness bugs:
 
   1. atom-count bin edges  — the 8 atom-limited-bin caps {16,32,48,64,80,96,112,128}
-     plus their immediate neighbors.  Exercises kernel grid sizing and per-bin
+     plus their immediate neighbors. Exercises kernel grid sizing and per-bin
      shared-memory paths.
   2. per-atom interaction density — cage and fused-ring templates pushing any
      single atom into a large number of bonds/angles/torsions/oops/stretchbends,
@@ -30,7 +30,7 @@ Usage:
         --meta   test/preprocess/adversarial.meta.json
 
 Output format: `adversarial.smi` is one SMILES per line, no IDs — fed into
-smi_to_parquet.py for consumption by smallfield_batch.  The meta JSON
+smi_to_parquet.py for consumption by smallfield_batch. The meta JSON
 records which template each row came from, so diagnostic messages can point
 at the boundary a failing molecule exercises.
 """
@@ -53,7 +53,7 @@ class template_t:
     name: str
     smiles_generator: Callable[[], Iterable[str]]
     target_code_path: str
-    # Expansion multiplier.  Used by the scaffold-cache-stress axis to emit
+    # Expansion multiplier. Used by the scaffold-cache-stress axis to emit
     # many similar decorations of a single scaffold.
     multiplicity: int = 1
 
@@ -66,7 +66,7 @@ def _repeat_c(n: int) -> str:
 
 def _star_alkane(branch_count: int, branch_length: int) -> str:
     """Star alkane: central carbon with `branch_count` branches, each
-    `branch_length` carbons long.  Valid only for branch_count ≤ 4 (carbon
+    `branch_length` carbons long. Valid only for branch_count ≤ 4 (carbon
     valence); for larger branch counts we build a dendrimer-style tree."""
 
     if branch_count <= 4:
@@ -93,7 +93,7 @@ def _substituted_aniline(n: int) -> Iterable[str]:
         "OC(C)=O", "N", "NC(=O)C",
     ]
     # Generate n distinct combinations of decorations at the 2, 3, 4 positions
-    # of the aniline ring.  Use integer encoding so results are deterministic
+    # of the aniline ring. Use integer encoding so results are deterministic
     # and reproducible across platforms.
     count = 0
     for i in range(len(decorations)):
@@ -240,7 +240,7 @@ def build_templates() -> list[template_t]:
 
     # Axis 9: VF2 hang candidates — highly-substituted polycyclic aromatics and
     # heavily fused cages whose symmetry blows up VF2's recursion depth in
-    # `RDKit::SubstructMatch`.  Without the `preprocess_deadline` +
+    # `RDKit::SubstructMatch`. Without the `preprocess_deadline` +
     # `extraAtomCheck` hook (RDKit 2025.09.6 feature), one of these can stall
     # the OMP-for preprocess-step indefinitely and freeze the 4-role pipeline.
     # The new per-molecule deadline caps each at ~2 s and stamps

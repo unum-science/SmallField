@@ -5,7 +5,7 @@
  *  The MMFF nonbonded sweep enumerates pairs on the fly and needs the hop count between
  *  every atom pair: 1-2 and 1-3 are excluded, 1-4 is scaled, everything further apart is
  *  a full interaction, and an unreachable pair — the two halves of a salt — is a full
- *  interaction too.  That matrix is N x N bytes per molecule, sixteen kilobytes at the
+ *  interaction too. That matrix is N x N bytes per molecule, sixteen kilobytes at the
  *  128-atom cap, against the two bytes per bond it is derived from, so it is cheaper
  *  to rebuild it on the device than to ship it across PCIe.
  *
@@ -13,10 +13,10 @@
  *  pass depends on nothing but the upload and can run while the MMFF extractor is still working.
  *
  *  One warp owns one molecule and one lane owns one source atom, striding by the warp
- *  width when the molecule has more than 32 atoms.  A lane keeps its visited and frontier
+ *  width when the molecule has more than 32 atoms. A lane keeps its visited and frontier
  *  sets as four 32-bit words covering the 128-atom cap and expands a level by sweeping the
  *  molecule's bond list once: every lane of the warp reads the same bond, so the sweep is a
- *  broadcast out of L1 rather than 32 independent streams.  Bond counts are small — a
+ *  broadcast out of L1 rather than 32 independent streams. Bond counts are small — a
  *  drug-like molecule with explicit hydrogens carries well under 160 — and the level count
  *  is the graph's eccentricity, so the sweep costs far less than the N x N stores it feeds.
  */
@@ -27,7 +27,7 @@
 
 #if defined(__CUDACC__)
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
 #include <cuda_runtime.h>
 
@@ -41,18 +41,18 @@ using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::molecule_descriptor_t;
 
-/** @brief 32-bit words needed to hold one bit per atom at the @ref max_atoms_per_molecule_k cap. */
+/** 32-bit words needed to hold one bit per atom at the `max_atoms_per_molecule_k` cap. */
 inline constexpr std::uint32_t bond_distance_mask_words_k = max_atoms_per_molecule_k / 32u;
 
-/** @brief Hop count written for a pair with no bonded path between its atoms. */
+/** Hop count written for a pair with no bonded path between its atoms. */
 inline constexpr std::uint8_t bond_distance_unreachable_k = 255u;
 
 /**
  *  @brief Fill the batch pool's per-molecule N x N hop-count blocks.
  *
- *  Reads the molecule's own bond list out of its descriptor and writes @c num_atoms squared
- *  bytes at @c bond_distance_offset, packed with no padding stride: row @c i of molecule
- *  @c m starts at @c bond_distance_offset + i * num_atoms.
+ *  Reads the molecule's own bond list out of its descriptor and writes `num_atoms` squared
+ *  bytes at `bond_distance_offset`, packed with no padding stride: row `i` of molecule
+ *  `m` starts at `bond_distance_offset + i * num_atoms`.
  *
  *  @param[in] descriptors Batch-wide molecule descriptors; only the bond atom pairs are read.
  *  @param[in] metadata One entry per molecule, carrying both region offsets and the atom count.
@@ -132,7 +132,7 @@ static __global__ void bond_distance_bfs_kernel(molecule_descriptor_t const *__r
 }
 
 /**
- *  @brief Enqueue @ref bond_distance_bfs_kernel over a whole batch.
+ *  @brief Enqueue `bond_distance_bfs_kernel` over a whole batch.
  *
  *  @param[in] descriptors Device pointer to the batch's molecule-descriptor region.
  *  @param[in] metadata Device pointer to the batch's per-molecule metadata region.

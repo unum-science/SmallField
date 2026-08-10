@@ -4,32 +4,34 @@
  *
  *  Generates conformers for a set of E/Z isomer pairs, hands the coordinates back to
  *  RDKit, re-perceives stereochemistry from 3D, and asserts the perceived bond stereo
- *  matches what the input SMILES declared.  Without a stereo-aware 1-4 bounds envelope
+ *  matches what the input SMILES declared. Without a stereo-aware 1-4 bounds envelope
  *  both isomers of a pair collapse to whichever geometry the minimizer happens to reach.
  */
 
-#include <cstdio>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <cstdio> // `printf`
+
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <cuda_fp16.h>
-
 #include <GraphMol/MolOps.h>
 
 #include "smallfield/api/smallfield.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;
 
-/** @brief One isomer under test and the bond stereo its SMILES declares. */
+/** One isomer under test and the bond stereo its SMILES declares. */
 struct ez_case_t {
     char const *smiles;
-    bool expect_cis; ///< true for Z / cis, false for E / trans
+    /** True for Z / cis, false for E / trans. */
+    bool expect_cis;
 };
 
-/** @brief Perceive bond stereo from 3D and report whether any double bond is cis. */
+/** Perceive bond stereo from 3D and report whether any double bond is cis. */
 static bool perceived_any_cis(RDKit::RWMol &mol, bool &found_stereo) {
     RDKit::MolOps::assignStereochemistryFrom3D(mol);
     found_stereo = false;
@@ -51,14 +53,14 @@ int main() {
     // Each pair differs only in double-bond configuration, so a stereo-blind bounds
     // envelope produces indistinguishable geometry for both members.
     std::vector<ez_case_t> const cases = {
-        {"C/C=C/C", false},              // trans-2-butene
-        {"C/C=C\\C", true},              // cis-2-butene
-        {"C/C=C/CC", false},             // trans-2-pentene
-        {"C/C=C\\CC", true},             // cis-2-pentene
-        {"Cl/C=C/Cl", false},            // trans-1,2-dichloroethene
-        {"Cl/C=C\\Cl", true},            // cis-1,2-dichloroethene
-        {"C/C=C/c1ccccc1", false},       // trans-beta-methylstyrene
-        {"C/C=C\\c1ccccc1", true},       // cis-beta-methylstyrene
+        {"C/C=C/C", false},        // trans-2-butene
+        {"C/C=C\\C", true},        // cis-2-butene
+        {"C/C=C/CC", false},       // trans-2-pentene
+        {"C/C=C\\CC", true},       // cis-2-pentene
+        {"Cl/C=C/Cl", false},      // trans-1,2-dichloroethene
+        {"Cl/C=C\\Cl", true},      // cis-1,2-dichloroethene
+        {"C/C=C/c1ccccc1", false}, // trans-beta-methylstyrene
+        {"C/C=C\\c1ccccc1", true}, // cis-beta-methylstyrene
     };
 
     std::vector<std::string> smiles_storage;
@@ -77,7 +79,9 @@ int main() {
     sfapi::context_t context {std::span<int const> {}};
     sfapi::config_t config;
     config.num_conformers = num_conformers;
-    context.generate_conformers(smiles, config, max_atoms, coords, energies, status);
+    auto const batch_status = context.generate_conformers(smiles, config, max_atoms, coords, energies, status);
+    sf_verify_(batch_status == sfapi::conformer_status_t::success,
+               "the batch must generate; otherwise every per-slot check below passes vacuously");
 
     std::uint32_t checked = 0, matched = 0, unperceived = 0;
     std::vector<float> interleaved;
@@ -91,8 +95,7 @@ int main() {
             std::uint32_t const num_atoms = molecule->getNumAtoms();
             // `set_coords_interleaved` writes into an existing conformer, and a molecule
             // parsed from SMILES carries none.
-            if (molecule->getNumConformers() == 0)
-                molecule->addConformer(new RDKit::Conformer(num_atoms), true);
+            if (molecule->getNumConformers() == 0) molecule->addConformer(new RDKit::Conformer(num_atoms), true);
 
             // Slot layout is SoA at the caller's 128-atom stride.
             std::size_t const base = slot * max_atoms * 3;
@@ -119,12 +122,12 @@ int main() {
     std::printf("E/Z round-trip: %u conformers checked, %u matched, %u without perceivable stereo\n", checked, matched,
                 unperceived);
 
-    SF_TEST_ASSERT(checked > 0, "at least one conformer must be generated");
+    sf_verify_(checked > 0, "at least one conformer must be generated");
     // Allow a small share of conformers whose geometry RDKit cannot assign, but every
     // conformer that does carry perceivable stereo must carry the declared one.
     std::uint32_t const perceivable = checked - unperceived;
-    SF_TEST_ASSERT(perceivable > 0, "at least one conformer must have perceivable double-bond stereo");
-    SF_TEST_ASSERT(matched == perceivable, "every perceivable conformer must match its declared E/Z");
+    sf_verify_(perceivable > 0, "at least one conformer must have perceivable double-bond stereo");
+    sf_verify_(matched == perceivable, "every perceivable conformer must match its declared E/Z");
 
     std::printf("ALL TESTS PASSED\n");
     return 0;

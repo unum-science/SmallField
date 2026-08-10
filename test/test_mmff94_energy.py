@@ -1,3 +1,9 @@
+"""Pytest suite for the `smallfield.api` Python surface: package layout, single- and
+batch-SMILES conformer generation, and error handling on invalid input.
+
+Run with ``pytest test/test_mmff94_energy.py``.
+"""
+
 from __future__ import annotations
 
 import numpy as np

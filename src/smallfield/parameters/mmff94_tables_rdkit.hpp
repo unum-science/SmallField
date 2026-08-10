@@ -11,10 +11,11 @@
 
 #pragma once
 
-#include "smallfield/parameters/mmff94_tables.hpp"
-
 #include <ForceField/MMFF/Params.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
+
+#include "smallfield/parameters/mmff94_tables.hpp"
+#include <sstream> // RDKit's `AtomTyper.h` needs it but does not include it
 
 namespace RDKit {
 namespace MMFF {
@@ -30,8 +31,8 @@ ForceFields::MMFF::MMFFCovRadPauEleCollection const *getMMFFCovRadPauEle();
 namespace smallfield::parameters {
 
 /**
- *  Extract every MMFF94 parameter table from RDKit's defaults collection
- *  into flat sorted std::vectors.  Only called once per process.
+ *  @brief Extract every MMFF94 parameter table from RDKit's defaults collection
+ *  into flat sorted std::vectors. Only called once per process.
  */
 inline void extract_mmff94_tables_from_rdkit(mmff94_tables_host_t &out) {
     namespace MMFF = ForceFields::MMFF;

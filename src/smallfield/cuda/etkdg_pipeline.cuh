@@ -4,19 +4,17 @@
  *
  *  The pipeline lives in two sibling kernels that share the `warp_per_molecule`
  *  pattern, split to keep register pressure per kernel under the launch-bounds
- *  cap.  The monolithic predecessor hit 145 regs/thread because DG/ETK/MMFF
- *  state was held simultaneously across branch boundaries; each sub-kernel
- *  here lands at 72 regs/thread on sm_90.
+ *  cap; each sub-kernel here lands at 72 regs/thread on sm_90.
  *
- *  @c etkdg_pipeline_warp_kernel — bounds quantization through final validation
+ *  `etkdg_pipeline_warp_kernel` — bounds quantization through final validation
  *  (bounds quantize → DG FIRE → stereo retry → fourth-dim crush → ETK torsion
  *  → final validation).
- *  Writes ETK-refined 3D positions to @c conformer_coordinates_out.
+ *  Writes ETK-refined 3D positions to `conformer_coordinates_out`.
  *
- *  @c mmff_polish_warp_kernel — MMFF94 polish (MMFF94 relaxation + optional heavy
- *  rescue).  Reads positions from @c conformer_coordinates_out (written by
+ *  `mmff_polish_warp_kernel` — MMFF94 polish (MMFF94 relaxation + optional heavy
+ *  rescue). Reads positions from `conformer_coordinates_out` (written by
  *  the first kernel), overwrites them with the MMFF-polished coordinates,
- *  replaces the ETK energy with the MMFF energy in @c conformer_energies_out.
+ *  replaces the ETK energy with the MMFF energy in `conformer_energies_out`.
  *  Skips slots whose status is non-zero (failed stereo) or whose molecule
  *  has no MMFF terms.
  *
@@ -28,7 +26,7 @@
  *   fourth-dimension crush: FIRE with w₄ penalty
  *   torsion refinement: ETK 3D FIRE, atom-centric
  *   final validation: post-refinement stereochemistry check
- *   MMFF94 polish: in the @c mmff_polish_warp_kernel sibling
+ *   MMFF94 polish: in the `mmff_polish_warp_kernel` sibling
  *
  *  Architecture:
  *   - warp-loop: gridDim warps, each loops over (molecule, conformer) pairs with stride
@@ -56,7 +54,7 @@
 namespace smallfield::cuda {
 using namespace smallfield::types;
 
-/** @brief Per-molecule FIRE iteration budgets for ETK torsion refinement and MMFF94 polish. */
+/** Per-molecule FIRE iteration budgets for ETK torsion refinement and MMFF94 polish. */
 struct refinement_policy_t {
     std::int32_t etk_initial_iterations;
     std::int32_t etk_continuation_iterations;
@@ -103,10 +101,9 @@ select_refinement_policy_(etkdg_molecule_metadata_t const &meta) {
 
 template <typename energy_gradient_functor_>
 __device__ __forceinline__ fire_result_t run_fire_stage_(float *positions, float *velocities, float *gradient,
-                                                         std::uint32_t num_elements,
-                                                         std::int32_t initial_iterations,
-                                                         std::int32_t continuation_iterations,
-                                                         float gradient_threshold, std::uint32_t lane,
+                                                         std::uint32_t num_elements, std::int32_t initial_iterations,
+                                                         std::int32_t continuation_iterations, float gradient_threshold,
+                                                         std::uint32_t lane,
                                                          energy_gradient_functor_ &&compute_energy_gradient) {
     fire_result_t result = fire_minimize_(positions, velocities, gradient, num_elements, initial_iterations,
                                           gradient_threshold, lane, compute_energy_gradient);
@@ -126,8 +123,7 @@ __device__ __forceinline__ fire_result_t run_fire_stage_(float *positions, float
  *
  *  Layout: [bounds matrix: N² × uint8_t][positions, velocities, gradient: 3 × 4N × float].
  *  Bounds are int8-quantized with a per-molecule min/inv_scale pair kept in
- *  registers — halves the bounds footprint vs the previous `__half` layout,
- *  32 KB → 16 KB at N=128.
+ *  registers: 16 KB at N=128, half of what a `__half` layout would cost.
  *
  *  @see compute_mmff_polish_shared_memory_bytes
  */
@@ -148,7 +144,7 @@ __host__ __device__ __forceinline__ std::uint32_t compute_pipeline_shared_memory
  *  than a pair-distance matrix.
  *  At N=128: 4.5 KB FIRE + 3.5 KB caches = ~8 KB; still leaves comfortable
  *  occupancy headroom on Hopper / Blackwell (typically reg-cap-bound rather
- *  than shmem-bound).  The caches eliminate ~2N² duplicate global reads of
+ *  than shmem-bound). The caches eliminate ~2N² duplicate global reads of
  *  atom_vdw_params[j] / atom_charge[j] per FIRE step.
  *
  *  @see compute_pipeline_shared_memory_bytes
@@ -157,7 +153,7 @@ __host__ __device__ __forceinline__ std::uint32_t compute_mmff_polish_shared_mem
     std::uint32_t const dimensions_3d = 3 * max_atoms;
     std::uint32_t const fire_bytes = 3 * dimensions_3d * sizeof(float);
     std::uint32_t const atom_vdw_bytes = max_atoms * static_cast<std::uint32_t>(
-                                                          sizeof(smallfield::types::mmff94_atom_vdw_params_t));
+                                                         sizeof(smallfield::types::mmff94_atom_vdw_params_t));
     std::uint32_t const atom_charge_bytes = max_atoms * static_cast<std::uint32_t>(sizeof(float));
     return fire_bytes + atom_vdw_bytes + atom_charge_bytes;
 }
@@ -241,7 +237,7 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
 }
 
 /**
- *  Persistent warp-loop ETKDG kernel covering bounds quantization through final validation.
+ *  @brief Persistent warp-loop ETKDG kernel covering bounds quantization through final validation.
  *
  *  Launch: <<<min(total_molecules × num_conformers, max_concurrent_warps), 32, shared_bytes>>>
  *  Each warp loops over (molecule, conformer) pairs with stride = gridDim.x.
@@ -249,28 +245,30 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
  *  The unit of work is a pair rather than a molecule because the atom-count bins hold wildly
  *  different molecule counts: at a 50 K wave over the PubChem distribution, four of the eight
  *  bins hold fewer molecules than the resident-warp cap, so their launches cannot fill the
- *  device.  Multiplying the index space by the conformer count fills them.  The price is that
+ *  device. Multiplying the index space by the conformer count fills them. The price is that
  *  the bounds quantization is paid per conformer instead of per molecule.
  *
  *  `__launch_bounds__(32, 4)` is a floor, not a cap: it asks nvcc to keep the kernel fitting at
  *  least four blocks per SM, and at 32 threads that permits far more registers than the hardware
- *  allows, so it constrains nothing here.  What actually bounds occupancy is the register count
+ *  allows, so it constrains nothing here. What actually bounds occupancy is the register count
  *  against the SM register file, and below the largest bins, the 32-blocks-per-SM slot limit.
  *
  *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`:
- *    sm_80=72, sm_90=72, sm_100=118, sm_120=123 regs/thread.  The two Hopper-and-earlier
+ *    sm_80=72, sm_89=80, sm_90=72, sm_100=118, sm_120=123 regs/thread. The Hopper-and-earlier
  *    targets spill nothing (STACK=0, LOCAL=0); both Blackwell targets carry a 120-byte frame.
+ *    sm_89 costs eight registers more than its neighbours, which fits 25 blocks/SM rather than
+ *    28 — still short of the 32-warp ceiling below, so the shape is unchanged, only tighter.
  *    On sm_90 that is 65536 / (72 × 32) = 28 blocks/SM = 28 warps, against a hard ceiling of
  *    32 warps — a 32-thread block can never fill more than 32 of the SM's 64 warp slots, so
- *    50 % is the most this shape can reach at any register count.  Reaching 64 regs/thread
+ *    50 % is the most this shape can reach at any register count. Reaching 64 regs/thread
  *    would buy the last 1.14× of that; nothing below 32 regs/thread buys more.
  *    The remaining eight registers are not in the energy evaluators any more: stubbing the DG
  *    chiral loop out of the sm_90 build drops it to 71 and stubbing the ETK torsion term drops
- *    it not at all, while stubbing the whole ETK stage drops it to 64.  What is left is the
+ *    it not at all, while stubbing the whole ETK stage drops it to 64. What is left is the
  *    state the stereo-retry loop and the FIRE driver carry across every stage.
  *
- *  Writes ETK-refined 3D positions into @c conformer_coordinates_out;
- *  @c mmff_polish_warp_kernel runs next on the same buffer.
+ *  Writes ETK-refined 3D positions into `conformer_coordinates_out`;
+ *  `mmff_polish_warp_kernel` runs next on the same buffer.
  *
  *  @see mmff_polish_warp_kernel
  */
@@ -292,7 +290,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const grid_stride = gridDim.x;
 
-    // Layout shared memory as [bounds matrix: N² uint8_t] [positions, velocities, gradient: 3 * 4N floats].
+    // Layout shared memory as [bounds matrix: N² uint8_t] [positions, velocities, gradient: 3 × 4N floats].
     extern __shared__ char shared_raw[];
     std::uint32_t const max_n = max_atoms_per_molecule;
     std::uint8_t *shared_bounds = reinterpret_cast<std::uint8_t *>(shared_raw);
@@ -300,7 +298,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     std::uint32_t const aligned_bounds_bytes = align_up_(bounds_bytes, alignof(float));
     float *shared_float = reinterpret_cast<float *>(shared_raw + aligned_bounds_bytes);
 
-    // Process (molecule, conformer) pairs in a warp loop with gridDim.x stride.  The flat pair
+    // Process (molecule, conformer) pairs in a warp loop with gridDim.x stride. The flat pair
     // index decomposes into the bin-relative molecule and the conformer slot within it.
     std::uint32_t const total_pairs = total_molecules * num_conformers_per_molecule;
     for (std::uint32_t pair_index = warp_id; pair_index < total_pairs; pair_index += grid_stride) {
@@ -324,9 +322,11 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         // Bounds quantization: Load post-smoothed bounds (the metric prepass
         // wrote smoothed bounds back into global memory at meta.bounds_offset),
         // find per-molecule [min, max] across the warp, and int8-quantize into
-        // shared memory.  Linear quantization:
-        //   q = round((x − mol_min) · scale_quantize),
-        //   x ≈ q · inv_scale + mol_min at read.
+        // shared memory. Linear quantization:
+        //
+        //   q = round((x - mol_min) * scale_quantize),
+        //   x ~= q * inv_scale + mol_min at read.
+        //
         // The min/max scan must run on the *post-smoothed* values — host-side
         // precompute in prepare_molecule_into would be over the un-smoothed
         // matrix and produces a different range, breaking the dequantisation.
@@ -366,17 +366,17 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         distance_constraint_t const *mol_constraints = distance_constraints + meta.constraint_offset;
 
         // Seed Philox from the molecule's position in the caller's input, not from its offset
-        // inside the device batch.  Preprocess distributes molecules across host threads with a
+        // inside the device batch. Preprocess distributes molecules across host threads with a
         // dynamic schedule and then atom-count-sorts them, so the batch offset of a given
         // molecule varies between runs while its input position does not; keying off the input
-        // position is what makes a fixed `random_seed` reproduce the same conformers.  The
+        // position is what makes a fixed `random_seed` reproduce the same conformers. The
         // conformer index enters the stream too, so the conformers of one molecule stay
         // independent of each other.
         std::uint64_t const global_input_index = wave_input_base + molecule_input_indices[mol];
         std::uint64_t const sequence = (global_input_index * num_conformers_per_molecule + conf) * warp_size_k + lane;
 
         // A Philox state is a dozen registers wide, and it is touched only while the attempt
-        // seeds its coordinates.  Rebuilding it at the head of every attempt from an explicit
+        // seeds its coordinates. Rebuilding it at the head of every attempt from an explicit
         // absolute offset keeps it out of the DG, crush, and ETK stages entirely; two Philox
         // rounds per attempt are far cheaper than carrying the state across all of them.
         // The offset is the exact position the carried state would have reached: each attempt
@@ -460,23 +460,23 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
 }
 
 /**
- *  Persistent warp-loop MMFF94 polish kernel.
+ *  @brief Persistent warp-loop MMFF94 polish kernel.
  *
- *  Reads ETK-refined 3D positions from @c conformer_coordinates_out (produced
- *  by @c etkdg_pipeline_warp_kernel on the same stream + wave), runs MMFF94
+ *  Reads ETK-refined 3D positions from `conformer_coordinates_out` (produced
+ *  by `etkdg_pipeline_warp_kernel` on the same stream + wave), runs MMFF94
  *  FIRE with the per-molecule refinement policy, and overwrites the positions
- *  and energy in place.  Skips slots that failed stereo (status != 0) and
+ *  and energy in place. Skips slots that failed stereo (status != 0) and
  *  molecules with zero MMFF terms.
  *
  *  Shared memory at bin 128 is ~4.5 KB, FIRE scratch only, since no bounds matrix is needed here.
  *  Registers bind before shared memory at every bin.
  *
  *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`:
- *    sm_80=64, sm_90=72, sm_100=94, sm_120=103 regs/thread, no spills (STACK=0, LOCAL=0).
+ *    sm_80=64, sm_89=64, sm_90=72, sm_100=94, sm_120=103 regs/thread, no spills (STACK=0, LOCAL=0).
  *    On sm_90 that is 28 blocks/SM, against the same 32-warp ceiling a 32-thread block imposes,
  *    which is exactly where its sibling sits.
  *
- *    @c bond_distance is read from global memory on every FIRE iteration, N² per iteration.  It
+ *    `bond_distance` is read from global memory on every FIRE iteration, N² per iteration. It
  *    is only ever tested as `< 3`, `== 3`, and `>= 4`, which is two bits per pair, so an N²/4
  *    packed copy staged into shared memory alongside the FIRE arrays would remove that traffic
  *    without displacing anything.
@@ -500,15 +500,16 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
     std::uint32_t const grid_stride = gridDim.x;
 
     // Shared layout (sized at launch by compute_mmff_polish_shared_memory_bytes(bin_max_atoms)):
-    //   [positions, velocities, gradient: 3 × 3·bin_max_atoms × float]
-    //   [atom_vdw cache: bin_max_atoms × mmff94_atom_vdw_params_t]
-    //   [atom_charge cache: bin_max_atoms × float]
+    //
+    //   [positions, velocities, gradient: 3 * 3 * bin_max_atoms * float]
+    //   [atom_vdw cache: bin_max_atoms * mmff94_atom_vdw_params_t]
+    //   [atom_charge cache: bin_max_atoms * float]
+    //
     // The caches are loaded once per warp-loop iteration and reused across every
     // FIRE step, eliminating ~2N² duplicate global reads of
     // atom_vdw_params[j] / atom_charge[j] inside the nonbonded inner loop.
     extern __shared__ float shared_float[];
-    auto *shared_atom_vdw =
-        reinterpret_cast<mmff94_atom_vdw_params_t *>(shared_float + 9u * bin_max_atoms);
+    auto *shared_atom_vdw = reinterpret_cast<mmff94_atom_vdw_params_t *>(shared_float + 9u * bin_max_atoms);
     float *shared_atom_charge = reinterpret_cast<float *>(shared_atom_vdw + bin_max_atoms);
 
     // One warp per (molecule, conformer) pair, matching the sibling kernel's index space so
@@ -538,11 +539,9 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
             float const *global_vdw_words = reinterpret_cast<float const *>(global_vdw);
             float *shared_vdw_words = reinterpret_cast<float *>(shared_atom_vdw);
             std::uint32_t const vdw_words = num_atoms * (sizeof(mmff94_atom_vdw_params_t) / sizeof(float));
-            for (std::uint32_t i = lane; i < vdw_words; i += warp_size_k)
-                shared_vdw_words[i] = global_vdw_words[i];
+            for (std::uint32_t i = lane; i < vdw_words; i += warp_size_k) shared_vdw_words[i] = global_vdw_words[i];
             float const *global_charge = mmff_atom_charge + meta.mmff_atom_charge_offset;
-            for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
-                shared_atom_charge[i] = global_charge[i];
+            for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k) shared_atom_charge[i] = global_charge[i];
         }
         __syncwarp(full_mask_k);
 
@@ -584,7 +583,7 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
         }
         float const mmff_energy = mmff_result.energy;
 
-        // Write polished positions + updated energy back.  Status is left
+        // Write polished positions + updated energy back. Status is left
         // untouched: MMFF non-convergence does not mark the conformer failed.
         for (std::uint32_t d = 0; d < 3; ++d)
             for (std::uint32_t i = lane; i < num_atoms; i += warp_size_k)
@@ -597,9 +596,8 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
 /**
  *  @brief Element-wise fp32 → fp16 conversion of the coordinate buffer.
  *
- *  Launched after @c mmff_polish_warp_kernel as the final stream step before D2H.
- *  Halves the device→host bandwidth and removes the host-side @c __float2half loop
- *  that previously ran on the calling thread inside @c generate_conformers.
+ *  Launched after `mmff_polish_warp_kernel` as the final stream step before D2H.
+ *  Halves the device→host bandwidth versus shipping fp32 coordinates.
  *
  *  One thread per element, vector-friendly grid:
  *  @code{.cpp}

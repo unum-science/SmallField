@@ -1,33 +1,29 @@
 /**
- *  @file bench_mmff_gpu.cpp
- *  @brief GPU MMFF kernel-trio scaling benchmark: measure end-to-end wall time
- *  of the GPU MMFF kernel trio (type+charge, term extraction, CSR
- *  build) vs the CPU native path across large batches.  Reports
- *  mol/s throughput + per-stage timing breakdown.
+ *  @file bench_mmff_kernels.cpp
+ *  @brief GPU MMFF kernel-trio scaling benchmark.
+ *
+ *  Measures end-to-end wall time of the GPU MMFF kernel trio — type+charge, term extraction, CSR build — vs the CPU
+ *  native path across large batches. Reports mol/s throughput + per-stage timing breakdown.
  *
  *  Usage:
- *    bench_mmff_gpu /path/to/chembl.smi [max_mols] [--warmup N]
+ *    bench_mmff_kernels /path/to/chembl.smi [max_mols] [--warmup N]
  *
- *  Default max_mols = 10K.  ChEMBL-scale inputs (240K) use ~12 GB
- *  of GPU memory for the per-molecule fixed-stride output arrays;
- *  chunk internally if you need more.
+ *  Default max_mols = 10K. ChEMBL-scale inputs, 240K, use ~12 GB of GPU memory for the per-molecule fixed-stride
+ *  output arrays; chunk internally if you need more.
  */
 
-#include <algorithm>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <memory>
-#include <span>
-#include <string>
-#include <vector>
+#include <cstdio> // `fprintf`, `stderr`
+
+#include <algorithm> // `std::min`, `std::unique`
+#include <chrono>    // `std::chrono::high_resolution_clock`, `std::chrono::duration`
+#include <fstream>   // `std::ifstream`
+#include <memory>    // `std::unique_ptr`
+#include <string>    // `std::string`, `std::getline`
+#include <vector>    // `std::vector`
 
 #include <omp.h>
 #include <boost/shared_ptr.hpp>
 #include <cuda_runtime.h>
-
 #include <RDGeneral/types.h>
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -77,7 +73,7 @@ struct parsed_molecule_t {
     bool is_valid = false;
 };
 
-/** Parse SMILES + build descriptor.  OpenMP-parallel. */
+/** Parse SMILES + build descriptor. OpenMP-parallel. */
 std::vector<parsed_molecule_t> parse_smiles_batch(std::vector<std::string> const &smiles_batch) {
     std::vector<parsed_molecule_t> parsed_molecules(smiles_batch.size());
 #pragma omp parallel for schedule(dynamic, 64)

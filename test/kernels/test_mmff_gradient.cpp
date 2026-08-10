@@ -3,12 +3,14 @@
  *  @brief MMFF94 energy and gradient validation for OOP and full-stage terms.
  */
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <vector>
+#include <cmath>   // `std::fabs`, `std::isfinite`
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+
+#include <algorithm> // `std::max`
+#include <vector>    // `std::vector`
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
@@ -70,7 +72,7 @@ void evaluate_mmff_energy_and_gradient(sfp::etkdg_prepared_molecule_t const &pre
 }
 
 auto build_single_oop_prepared(sfp::etkdg_prepared_molecule_t const &prepared) {
-    SF_TEST_ASSERT(!prepared.mmff_oops.empty(), "prepared molecule must contain at least one OOP term");
+    sf_verify_(!prepared.mmff_oops.empty(), "prepared molecule must contain at least one OOP term");
 
     sfp::etkdg_prepared_molecule_t single {};
     single.num_atoms = prepared.num_atoms;
@@ -95,13 +97,13 @@ void test_single_oop_gradient_finite_difference() {
 
     std::string const smiles = "CC(=O)Oc1ccccc1C(=O)O";
     auto prepared_full = sfp::prepare_molecule(smiles);
-    SF_TEST_ASSERT(prepared_full.num_atoms > 0, "failed to prepare molecule");
-    SF_TEST_ASSERT(!prepared_full.mmff_oops.empty(), "test molecule must contain OOP terms");
+    sf_verify_(prepared_full.num_atoms > 0, "failed to prepare molecule");
+    sf_verify_(!prepared_full.mmff_oops.empty(), "test molecule must contain OOP terms");
 
     auto prepared = build_single_oop_prepared(prepared_full);
     auto mol = sftest::mol_from_smiles(smiles);
-    SF_TEST_ASSERT(mol != nullptr, "failed to build RDKit molecule");
-    SF_TEST_ASSERT(sftest::embed_molecule(*mol), "failed to embed RDKit molecule");
+    sf_verify_(mol != nullptr, "failed to build RDKit molecule");
+    sf_verify_(sftest::embed_molecule(*mol), "failed to embed RDKit molecule");
 
     std::vector<float> positions = interleaved_to_soa(sftest::extract_coords_interleaved(*mol));
     std::vector<float> analytical_gradient;
@@ -131,8 +133,8 @@ void test_single_oop_gradient_finite_difference() {
             float const abs_error = std::fabs(analytical - finite_difference);
             float const rel_error = abs_error / std::max(1.0f, std::fabs(finite_difference));
 
-            SF_TEST_ASSERT(abs_error < 2.0e-2f || rel_error < 5.0e-2f,
-                           "analytical OOP gradient must match finite differences");
+            sf_verify_(abs_error < 2.0e-2f || rel_error < 5.0e-2f,
+                       "analytical OOP gradient must match finite differences");
         }
     }
 }
@@ -142,13 +144,13 @@ void test_full_mmff_gradient_and_energy() {
 
     std::string const smiles = "CC(=O)Oc1ccccc1C(=O)O";
     auto prepared = sfp::prepare_molecule(smiles);
-    SF_TEST_ASSERT(prepared.num_atoms > 0, "failed to prepare molecule");
-    SF_TEST_ASSERT(!prepared.mmff_oops.empty(), "test molecule must contain OOP terms");
-    SF_TEST_ASSERT(!prepared.mmff_stretchbends.empty(), "test molecule must contain stretch-bend terms");
+    sf_verify_(prepared.num_atoms > 0, "failed to prepare molecule");
+    sf_verify_(!prepared.mmff_oops.empty(), "test molecule must contain OOP terms");
+    sf_verify_(!prepared.mmff_stretchbends.empty(), "test molecule must contain stretch-bend terms");
 
     auto mol = sftest::mol_from_smiles(smiles);
-    SF_TEST_ASSERT(mol != nullptr, "failed to build RDKit molecule");
-    SF_TEST_ASSERT(sftest::embed_molecule(*mol), "failed to embed RDKit molecule");
+    sf_verify_(mol != nullptr, "failed to build RDKit molecule");
+    sf_verify_(sftest::embed_molecule(*mol), "failed to embed RDKit molecule");
 
     auto interleaved = sftest::extract_coords_interleaved(*mol);
     auto positions = interleaved_to_soa(interleaved);
@@ -158,9 +160,9 @@ void test_full_mmff_gradient_and_energy() {
     evaluate_mmff_energy_and_gradient(prepared, positions, &gpu_energy, gradient);
 
     double const rdkit_energy = sftest::rdkit_mmff94_energy(*mol);
-    SF_TEST_ASSERT(std::isfinite(rdkit_energy), "RDKit MMFF energy must be finite");
-    SF_TEST_ASSERT(std::fabs(static_cast<double>(gpu_energy) - rdkit_energy) < 1.0,
-                   "MMFF stage energy must match RDKit at the same coordinates");
+    sf_verify_(std::isfinite(rdkit_energy), "RDKit MMFF energy must be finite");
+    sf_verify_(std::fabs(static_cast<double>(gpu_energy) - rdkit_energy) < 1.0,
+               "MMFF stage energy must match RDKit at the same coordinates");
 
     float sum_x = 0.0f;
     float sum_y = 0.0f;
@@ -170,8 +172,8 @@ void test_full_mmff_gradient_and_energy() {
         sum_y += gradient[prepared.num_atoms + atom];
         sum_z += gradient[2 * prepared.num_atoms + atom];
     }
-    SF_TEST_ASSERT(std::fabs(sum_x) < 1.0e-2f && std::fabs(sum_y) < 1.0e-2f && std::fabs(sum_z) < 1.0e-2f,
-                   "MMFF analytical gradients must remain translationally invariant");
+    sf_verify_(std::fabs(sum_x) < 1.0e-2f && std::fabs(sum_y) < 1.0e-2f && std::fabs(sum_z) < 1.0e-2f,
+               "MMFF analytical gradients must remain translationally invariant");
 
     constexpr float epsilon = 1.0e-4f;
     std::vector<std::uint32_t> sample_components;
@@ -195,8 +197,8 @@ void test_full_mmff_gradient_and_energy() {
         float const analytical = gradient[component];
         float const abs_error = std::fabs(analytical - finite_difference);
         float const rel_error = abs_error / std::max(1.0f, std::fabs(finite_difference));
-        SF_TEST_ASSERT(abs_error < 2.5e-2f || rel_error < 7.5e-2f,
-                       "full MMFF analytical gradients must match finite differences");
+        sf_verify_(abs_error < 2.5e-2f || rel_error < 7.5e-2f,
+                   "full MMFF analytical gradients must match finite differences");
     }
 }
 

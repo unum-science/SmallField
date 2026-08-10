@@ -2,9 +2,8 @@
  *  @file smallfield.hpp
  *  @brief Public C++ API for SmallField conformer generation.
  *
- *  Single header for C++ users. Provides batch GPU conformer generation
- *  with automatic multi-GPU dispatch, wave-based scheduling, and
- *  half-precision coordinate output.
+ *  Single header for C++ users. Provides batch GPU conformer generation with automatic multi-GPU dispatch,
+ *  wave-based scheduling, and half-precision coordinate output.
  *
  *  @code{.cpp}
  *  smallfield::context_t ctx;  // all GPUs
@@ -28,18 +27,18 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #else
-// forward-declare for non-CUDA translation units
+/** Forward-declares for non-CUDA translation units. */
 struct __half;
 using cudaStream_t = void *;
 #endif
 
-#include <array>
-#include <atomic>
-#include <cstdint>
-#include <memory>
-#include <span>
-#include <string_view>
-#include <vector>
+#include <array>       // `std::array`
+#include <atomic>      // `std::atomic`
+#include <cstdint>     // `std::uint32_t`, `std::uint64_t`
+#include <memory>      // `std::unique_ptr`
+#include <span>        // `std::span`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/types/atom_limited_bins.hpp"
@@ -49,9 +48,8 @@ using cudaStream_t = void *;
 
 namespace smallfield::api {
 
-// `conformer_status_t` is defined in `smallfield/api/conformer_status.hpp`
-// (transitively included above) so `batch_pool.hpp` can name it without a
-// cyclic dependency on this header.
+/*  `conformer_status_t` is defined in `smallfield/api/conformer_status.hpp`, transitively included
+ *  above, so `batch_pool.hpp` can name it without a cyclic dependency on this header. */
 
 /**
  *  @brief Pipeline configuration.
@@ -59,32 +57,31 @@ namespace smallfield::api {
 struct config_t {
     std::uint32_t num_conformers = 3;
     std::uint32_t max_stereo_attempts = 10;
-    /** @brief Target `embedding-wave` size for pipelined dispatch; 0 = VRAM-aware auto. */
+    /** Target `embedding-wave` size for pipelined dispatch; 0 = VRAM-aware auto. */
     std::uint32_t wave_size = 0;
     std::uint64_t random_seed = 42;
 };
 
-/** @brief Upper bound on devices a single `context_t` can manage. */
+/** Upper bound on devices a single `context_t` can manage. */
 inline constexpr std::size_t max_devices_k = 16;
 
-/** @brief Atom-count bins for `atom-limited-bin` kernel dispatch; one definition, shared with the
+/** Atom-count bins for `atom-limited-bin` kernel dispatch; one definition, shared with the
  *  metric prepass so the two cannot partition the same wave differently. */
 using types::atom_limited_bin_caps_k;
 using types::atom_limited_bin_count_k;
 
-// `max_atoms_per_molecule_k` lives in `conformer_layout.hpp` (included above); it
-// matches `molecule_descriptor_t::max_atoms_per_molecule_k`, and larger molecules are rejected by
-// preprocess with `conformer_status_t::too_many_atoms`.
+/*  `max_atoms_per_molecule_k` lives in `conformer_layout.hpp`, included above. It matches
+ *  `molecule_descriptor_t::max_atoms_per_molecule_k`, and larger molecules are rejected by
+ *  preprocess with `conformer_status_t::too_many_atoms`. */
 
-/** @brief Worst-case conformer count used for pre-allocation at construction. */
+/** Worst-case conformer count used for pre-allocation at construction. */
 inline constexpr std::uint32_t max_conformer_count_k = 16;
-
 
 /**
  *  @brief Per-device launch-configuration cache populated once at `context_t`
- *  construction.  Replaces the per-bin-per-wave `cudaOccupancyMaxActiveBlocksPerMultiprocessor`
- *  probes that used to fire on the hot path from the OMP-parallel launch
- *  region on every device for every bin for every wave.
+ *  construction, so the per-wave hot path never calls
+ *  `cudaOccupancyMaxActiveBlocksPerMultiprocessor` from inside the OMP-parallel
+ *  launch region.
  */
 struct device_launch_config_t {
     int streaming_multiprocessor_count = 0;
@@ -93,59 +90,67 @@ struct device_launch_config_t {
 };
 
 /**
- *  @brief GPU context managing CUDA streams and cuSOLVER handles.
- *
- *  Reuse across multiple generate_conformers() calls to avoid re-initialization.
- */
-/**
  *  @brief Per-GPU persistent scratch buffers for the metric-embedding prepass.
  *
- *  Allocated once per @c context_t so the prepass can run fully stream-async
- *  without per-wave @c cudaMalloc / @c cudaFree pairs that otherwise serialize
- *  the launch phase.  Sized for the worst case: all molecules in a wave having
+ *  Allocated once per `context_t` so the prepass can run fully stream-async
+ *  without per-wave `cudaMalloc` / `cudaFree` pairs that otherwise serialize
+ *  the launch phase. Sized for the worst case: all molecules in a wave having
  *  the maximum supported atom count.
  */
 struct metric_scratch_t {
-    device_byte_buffer_t pool; ///< owning grow-only device buffer
-    // Non-owning span into @c pool — rebound in @c ensure_metric_scratch on growth.
-    std::span<std::uint32_t> group_indices {}; ///< [max_group_size]
+    /** Owning grow-only device buffer. */
+    device_byte_buffer_t pool;
+    /** Non-owning span into `pool`, sized `[max_group_size]` — rebound in
+     *  `ensure_metric_scratch` on growth. */
+    std::span<std::uint32_t> group_indices {};
     std::size_t max_group_size = 0;
     std::uint32_t max_atoms = 0;
-    // `embed_4d_power_iter_kernel` holds the Gram matrix, means, eigenvectors and reduction
-    // scratch in shared memory for its whole lifetime, so the only persistent device scratch is
-    // `group_indices` — a per-bin uint32 list of which molecule goes into which bin.
+    /*  `embed_4d_power_iter_kernel` holds the Gram matrix, means, eigenvectors and reduction scratch
+     *  in shared memory for its whole lifetime, so the only persistent device scratch is
+     *  `group_indices` — a per-bin uint32 list of which molecule goes into which bin. */
 };
 
-// Forward-declare persistent per-device launch scratch. Defined in smallfield.cu
-// so the public header does not need CUDA RAII wrappers.
+/**
+ *  @brief Forward-declares persistent per-device launch scratch.
+ *
+ *  Defined in `smallfield.cu` so the public header does not need CUDA RAII wrappers.
+ */
 struct launch_scratch_t;
 
+/**
+ *  @brief GPU context managing CUDA streams and cuSOLVER handles.
+ *
+ *  Reuse across multiple `generate_conformers` calls to avoid re-initialization.
+ */
 struct context_t {
     std::vector<int> device_ids;
-    /** @brief One CUDA stream per device.  All per-wave work on a given
+    /** One CUDA stream per device. All per-wave work on a given
      *  device (H2D, kernels, D2H) runs stream-ordered on its own stream. */
     std::vector<cudaStream_t> streams;
-    std::vector<metric_scratch_t> metric_scratch;                  ///< one per device
-    std::vector<std::unique_ptr<launch_scratch_t>> launch_scratch; ///< one per device
-    std::vector<device_launch_config_t> launch_configs;            ///< one per device
+    /** One per device. */
+    std::vector<metric_scratch_t> metric_scratch;
+    /** One per device. */
+    std::vector<std::unique_ptr<launch_scratch_t>> launch_scratch;
+    /** One per device. */
+    std::vector<device_launch_config_t> launch_configs;
     /**
      *  @brief Persistent per-device 2-slot pinned batch pool ring.
      *
      *  Each GPU owns its own pinned source buffer per slot; preprocess writes
      *  every molecule's bytes into the pool assigned to that molecule's target
      *  device, and the per-device `cudaMemcpyAsync H2D` reads only from its
-     *  own pool.  Eliminates the concurrent-pinned-source-DMA pattern that
+     *  own pool. Eliminates the concurrent-pinned-source-DMA pattern that
      *  arose when all devices read the same shared pinned buffer.
      */
     std::array<std::array<wave_slice_pool_t, max_devices_k>, 2> batch_slots_per_device {};
-    /** @brief Per-device molecule count every pool above was pre-sized for.  The wave
+    /** Per-device molecule count every pool above was pre-sized for. The wave
      *  sizer clamps to this so a runtime wave can never exceed the construction-time
      *  reservation and trigger a grow from inside the per-device launch fan-out. */
     std::uint32_t per_device_reserved_molecules = 0;
 
     /**
-     *  @brief Owned per-context logger.  Tune verbosity via
-     *  `ctx.logger.verbose_level = 1;` before calling @ref generate_conformers.
+     *  @brief Owned per-context logger. Tune verbosity via
+     *  `ctx.logger.verbose_level = 1;` before calling `generate_conformers`.
      *  Library diagnostics (wave timing table, per-device breakdown) route
      *  through `logger.trace` / `logger.trace2`; CUDA errors through
      *  `logger.error`.
@@ -155,10 +160,10 @@ struct context_t {
     /**
      *  @brief Per-context CUDA error accumulator, incremented by
      *  `check_cuda_status_` every time a CUDA / cuSOLVER API call returns a
-     *  non-success status.  Production callers read this after each
-     *  @ref generate_conformers call and exit non-zero if it is positive,
+     *  non-success status. Production callers read this after each
+     *  `generate_conformers` call and exit non-zero if it is positive,
      *  catching silent failures that would otherwise hide behind per-wave
-     *  zero-filled outputs.  Reset via `ctx.cuda_error_count.store(0)`.
+     *  zero-filled outputs. Reset via `ctx.cuda_error_count.store(0)`.
      */
     std::atomic<std::uint64_t> cuda_error_count {0};
 
@@ -185,12 +190,12 @@ struct context_t {
      *  @param[in] max_atoms_per_molecule Maximum atom count (with H) across the batch.
      *      Molecules exceeding this are skipped.
      *  @param[out] coordinates_out Output half-precision coordinates. Size: molecules * conformers * max_atoms * 3.
-     *      Structure-of-arrays per slot -- address it through @ref conformer_slot_layout_t,
+     *      Structure-of-arrays per slot -- address it through `conformer_slot_layout_t`,
      *      never by a contiguous `3 * num_atoms` read from the slot base.
      *  @param[out] energies_out Output MMFF94 energies (kcal/mol). Size: molecules * conformers.
      *  @param[out] status_out Output per-conformer status. Size: molecules * conformers.
      *  @param[out] num_atoms_out Optional. If non-empty, filled with each `molecule`'s
-     *      atom count (heavy + explicit H) post-preprocess.  Size: molecules (one per
+     *      atom count (heavy + explicit H) post-preprocess. Size: molecules (one per
      *      input SMILES). 0 for molecules that failed preprocess (invalid_smiles /
      *      too_many_atoms / preprocess_timeout). Lets downstream writers emit tight
      *      per-row coordinate lists instead of padded fixed-size-list blocks.

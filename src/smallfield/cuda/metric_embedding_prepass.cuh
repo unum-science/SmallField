@@ -7,13 +7,13 @@
  *     upper/lower distance bounds matrix.
  *  2. Gram matrix construction from midpoint squared distances with
  *     double-centering.
- *  3. Batched eigendecomposition via cuSOLVER (syevjBatched) to extract
- *     the top-4 eigenvectors.
+ *  3. Deflated power iteration to extract the top-4 eigenvectors of the
+ *     Gram matrix.
  *  4. Projection into 4D metric coordinates as the initial embedding
  *     for subsequent ETKDG refinement stages.
  *
- *  Molecules are grouped by atom count so that cuSOLVER batched calls
- *  operate on identically-sized matrices for maximum throughput.
+ *  Molecules are grouped by atom count into fixed bins so each kernel launch
+ *  operates on identically-sized matrices.
  */
 
 #pragma once
@@ -22,12 +22,10 @@
 
 #if defined(__CUDACC__)
 
-#include <algorithm>
-#include <array>
-#include <cstdint>
-#include <cstdio>
-#include <span>
-#include <vector>
+#include <array>   // `std::array`
+#include <cstdint> // `std::uint32_t`
+#include <span>    // `std::span`
+#include <vector>  // `std::vector`
 
 #include <cuda_runtime.h>
 
@@ -39,22 +37,22 @@
 namespace smallfield::cuda {
 using smallfield::types::etkdg_molecule_metadata_t;
 
-/** Thread count of every @ref embed_4d_power_iter_kernel block; one block handles one molecule. */
+/** Thread count of every `embed_4d_power_iter_kernel` block; one block handles one molecule. */
 constexpr std::uint32_t embed_block_size_k = 128;
 
-/** One staging slot per warp for the block-wide sum in @ref embed_4d_power_iter_kernel. */
+/** One staging slot per warp for the block-wide sum in `embed_4d_power_iter_kernel`. */
 constexpr std::uint32_t embed_reduction_slots_k = embed_block_size_k / warp_size_k;
 
 /**
- * @brief Reads the upper distance bound for atom pair (i, j) from the float bounds matrix.
+ *  @brief Reads the upper distance bound for atom pair (i, j) from the float bounds matrix.
  *
- * The upper bound is stored at bounds[min(i, j) * N + max(i, j)].
+ *  The upper bound is stored at bounds[min(i, j) * N + max(i, j)].
  *
- * @param[in] bounds Flat N x N bounds matrix in row-major order.
- * @param[in] num_atoms Number of atoms N in the molecule.
- * @param[in] atom_a First atom index.
- * @param[in] atom_b Second atom index.
- * @return Upper distance bound between atom_a and atom_b.
+ *  @param[in] bounds Flat N × N bounds matrix in row-major order.
+ *  @param[in] num_atoms Number of atoms N in the molecule.
+ *  @param[in] atom_a First atom index.
+ *  @param[in] atom_b Second atom index.
+ *  @return Upper distance bound between atom_a and atom_b.
  */
 __device__ __forceinline__ float read_upper_bound_float_(float const *bounds, std::uint32_t num_atoms,
                                                          std::uint32_t atom_a, std::uint32_t atom_b) {
@@ -64,15 +62,15 @@ __device__ __forceinline__ float read_upper_bound_float_(float const *bounds, st
 }
 
 /**
- * @brief Reads the lower distance bound for atom pair (i, j) from the float bounds matrix.
+ *  @brief Reads the lower distance bound for atom pair (i, j) from the float bounds matrix.
  *
- * The lower bound is stored at bounds[max(i, j) * N + min(i, j)].
+ *  The lower bound is stored at bounds[max(i, j) * N + min(i, j)].
  *
- * @param[in] bounds Flat N x N bounds matrix in row-major order.
- * @param[in] num_atoms Number of atoms N in the molecule.
- * @param[in] atom_a First atom index.
- * @param[in] atom_b Second atom index.
- * @return Lower distance bound between atom_a and atom_b.
+ *  @param[in] bounds Flat N × N bounds matrix in row-major order.
+ *  @param[in] num_atoms Number of atoms N in the molecule.
+ *  @param[in] atom_a First atom index.
+ *  @param[in] atom_b Second atom index.
+ *  @return Lower distance bound between atom_a and atom_b.
  */
 __device__ __forceinline__ float read_lower_bound_float_(float const *bounds, std::uint32_t num_atoms,
                                                          std::uint32_t atom_a, std::uint32_t atom_b) {
@@ -82,17 +80,17 @@ __device__ __forceinline__ float read_lower_bound_float_(float const *bounds, st
 }
 
 /**
- * @brief Returns ((upper + lower) / 2)^2 for Gram-matrix double-centering.
+ *  @brief Returns ((upper + lower) / 2)² for Gram-matrix double-centering.
  *
- * Computes the squared midpoint distance between two atoms from their upper and lower bounds.
- * Returns zero when atom_i equals atom_j.
+ *  Computes the squared midpoint distance between two atoms from their upper and lower bounds.
+ *  Returns zero when atom_i equals atom_j.
  *
- * @param[in] bounds Flat N x N bounds matrix in row-major order.
- * @param[in] num_atoms Number of atoms N in the molecule.
- * @param[in] atom_i First atom index.
- * @param[in] atom_j Second atom index.
- * @return Squared midpoint distance between atom_i and atom_j.
- * @see embed_4d_power_iter_kernel
+ *  @param[in] bounds Flat N × N bounds matrix in row-major order.
+ *  @param[in] num_atoms Number of atoms N in the molecule.
+ *  @param[in] atom_i First atom index.
+ *  @param[in] atom_j Second atom index.
+ *  @return Squared midpoint distance between atom_i and atom_j.
+ *  @see embed_4d_power_iter_kernel
  */
 __device__ __forceinline__ float midpoint_distance_squared_(float const *bounds, std::uint32_t num_atoms,
                                                             std::uint32_t atom_i, std::uint32_t atom_j) {
@@ -107,18 +105,18 @@ __device__ __forceinline__ float midpoint_distance_squared_(float const *bounds,
  *  @brief Deterministic block-wide float sum.
  *
  *  Reduces inside each warp with butterfly shuffles, stages one partial per warp in
- *  @p warp_partials, then has every thread re-add the partials in warp order.  The
+ *  @p warp_partials, then has every thread re-add the partials in warp order. The
  *  summation tree depends only on lane and warp index, so the result is bitwise
  *  identical on every run and in every thread — the property a shared-memory float
- *  @c atomicAdd cannot offer, since it commits contributions in whatever order the
+ *  `atomicAdd` cannot offer, since it commits contributions in whatever order the
  *  scheduler grants and float addition does not associate.
  *
  *  Both barriers live inside, so a caller may invoke this straight out of a loop that
- *  produced @p value and consume the return value immediately.  Every thread of the
+ *  produced @p value and consume the return value immediately. Every thread of the
  *  block must reach the call.
  *
  *  @param[in] value This thread's contribution to the sum.
- *  @param[inout] warp_partials Shared scratch of at least @ref embed_reduction_slots_k floats.
+ *  @param[inout] warp_partials Shared scratch of at least `embed_reduction_slots_k` floats.
  *  @return The sum across the whole block, identical in every thread.
  */
 __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *warp_partials) {
@@ -126,7 +124,7 @@ __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *war
     std::uint32_t const lane_in_warp = threadIdx.x % warp_size_k;
     std::uint32_t const warp_index = threadIdx.x / warp_size_k;
     float const warp_sum = warp_reduce_sum_f32_(value);
-    __syncthreads(); // ? Readers of the previous reduction must finish before the restage
+    __syncthreads(); // Readers of the previous reduction must finish before the restage
     if (lane_in_warp == 0) warp_partials[warp_index] = warp_sum;
     __syncthreads();
     float total = 0.0f;
@@ -137,23 +135,27 @@ __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *war
 /**
  *  @brief Fused bounds-smooth → Gram → top-4 eigen → 4D embedding kernel.
  *
- *  One block of @ref embed_block_size_k threads per molecule.  Smooths the bounds with
+ *  One block of `embed_block_size_k` threads per molecule. Smooths the bounds with
  *  triangle inequalities, builds the double-centered Gram matrix, runs deflated power
  *  iteration to extract the four largest eigenvalues + eigenvectors, and writes the 4D
- *  embedding directly into @c initial_coordinates — one launch, no cusolver, no host
+ *  embedding directly into `initial_coordinates` — one launch, no cusolver, no host
  *  workspace, no inter-kernel Gram-matrix global memory traffic.
  *
- *  Every block-wide sum goes through @ref embed_block_reduce_sum_, so the embedding is a
+ *  Every block-wide sum goes through `embed_block_reduce_sum_`, so the embedding is a
  *  pure function of the bounds matrix: bitwise equal across launches and across blocks,
  *  which is what lets a shipped shard be regenerated. test_embedding_determinism pins it.
  *
  *  Shared memory layout (all floats):
- *    gram[N × N]                (overwrites bounds buffer after smoothing)
+ *
+ *  @verbatim
+ *    gram[N x N]                (overwrites bounds buffer after smoothing)
  *    row_means[max(N, 4)]       (Gram build; reduction staging afterwards)
  *    grand_mean[1]              (transient)
  *    v[4][N]                    (eigenvector estimates)
  *    w[N]                       (mat-vec scratch)
  *    lambda[4]                  (eigenvalue estimates)
+ *  @endverbatim
+ *
  *  At N=128: 16384 + 128 + 1 + 512 + 128 + 4 = 17157 floats ≈ 67 KB.
  *
  *  @param[inout] bounds_matrices Flat per-molecule bounds matrices, smoothed in place.
@@ -340,17 +342,10 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
  *  scratch pool.
  *
  *  @p scratch must be pre-sized for @p num_molecules × @p max_atoms_per_molecule by
- *  the caller (see `ensure_metric_scratch` in smallfield.cu).  This function performs
- *  no device allocations and no CPU-side synchronization; all CUDA/cusolver calls go
- *  on @p stream, so the caller can issue kernel launches against @p stream
+ *  the caller (see `ensure_metric_scratch` in smallfield.cu). This function performs
+ *  no device allocations and no CPU-side synchronization; all CUDA calls go on
+ *  @p stream, so the caller can issue kernel launches against @p stream
  *  immediately afterward and the driver orders them correctly.
- *
- *  The previous entry point allocated scratch per atom-count group via cudaMalloc and
- *  queried cusolver workspace size per group, both of which are synchronous device
- *  operations that force the CPU to wait.  At 30-ish atom-count groups per wave ×
- *  8 GPUs × N waves, that overhead adds up to ~800 ms per wave per GPU and was the
- *  reason the pipelined dispatcher needed `std::thread` to parallelize across GPUs.
- *  With pre-allocation this function is truly non-blocking.
  */
 template <typename scratch_>
 inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
@@ -369,9 +364,8 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         return false;
 
     // Bin molecules into 8 fixed wave-dispatch buckets {16,32,48,64,80,96,112,128}.
-    // Everything in a bin padds up to the bin's N for the eigendecomposition, so
-    // cusolver is called ONCE per bin instead of once per exact atom count (~30 calls
-    // today). Per-call CPU overhead inside cusolver dominated the per-launch wall.
+    // Everything in a bin pads up to the bin's N for the eigendecomposition, so the
+    // kernel launches ONCE per bin instead of once per exact atom count.
     auto const &bin_atom_counts_k = smallfield::types::atom_limited_bin_caps_k;
     constexpr std::uint32_t num_bins_k = static_cast<std::uint32_t>(smallfield::types::atom_limited_bin_count_k);
 
@@ -395,11 +389,9 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
 
     // The `cudaFuncAttributeMaxDynamicSharedMemorySize` attribute for
     // `embed_4d_power_iter_kernel` is set once per device in
-    // `context_t::context_t` at construction. Re-asserting it here used to race
-    // when this function was reached concurrently from OMP per-device worker
-    // threads — each call mutates driver-global per-kernel attribute state on
-    // the same symbol, producing torn state that surfaced as an
-    // `illegal memory access` on a later kernel launch.
+    // `context_t::context_t` at construction and must not be re-asserted here:
+    // this function runs concurrently from OMP per-device worker threads, and
+    // the attribute mutates driver-global per-kernel state on the same symbol.
 
     for (std::uint32_t b = 0; b < num_bins_k && success; ++b) {
         auto const &group = bin_groups[b];
@@ -410,7 +402,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         if (group_size > scratch.max_group_size || bin_n > scratch.max_atoms) {
             if (sink.log != nullptr)
                 sink.log->error(
-                    "metric_embedding_prepass: scratch too small (need group={} bin_n={}, have group={} " "atoms={})",
+                    "metric_embedding_prepass: scratch too small (need group={} bin_n={}, have group={} atoms={})",
                     group_size, bin_n, scratch.max_group_size, scratch.max_atoms);
             return false;
         }
@@ -429,8 +421,8 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
                               "cudaMemcpyAsync(bin group indices)");
         if (!success) continue;
 
-        // One kernel launch replaces the smooth-and-build-gram + cusolverDnXsyevBatched +
-        // project chain. No cusolver state updates, no global Gram/eigenvalue buffers.
+        // One kernel launch performs the smooth-and-build-gram + eigendecomposition + project
+        // chain entirely on-device: no host-side workspace, no global Gram/eigenvalue buffers.
         embed_4d_power_iter_kernel<<<static_cast<unsigned int>(group_size), embed_block_size_k, shared_bytes, stream>>>(
             device_bounds, device_metadata, device_group_indices, device_initial_coordinates, max_atoms_per_molecule);
         success &= sink.check(cudaGetLastError(), "embed_4d_power_iter_kernel launch");

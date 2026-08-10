@@ -1,25 +1,23 @@
 /**
  *  @file test_mmff_cpu_port.cpp
- *  @brief Cross-validate the native MMFF CPU port
- *  (`extract_mmff94_params_native`) against the existing RDKit-backed
- *  path (`extract_mmff94_params`).  Must produce byte-identical MMFF
- *  term arrays on a curated SMILES set; small numerical deltas (≤ 1e-3)
- *  are allowed on empirical-rule fallback terms due to float/double
- *  rounding in MMFF.V eqs 18-19 and the torsion rules.
+ *  @brief Cross-validate the native MMFF CPU port against the existing RDKit-backed path.
+ *
+ *  `extract_mmff94_params_native` is compared against `extract_mmff94_params`. Must produce byte-identical MMFF
+ *  term arrays on a curated SMILES set; small numerical deltas ≤ 1e-3 are allowed on empirical-rule fallback terms
+ *  due to float/double rounding in MMFF.V eqs 18-19 and the torsion rules.
  */
 
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <span>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <cmath>   // `std::fabs`
+#include <cstdio>  // `printf`
+#include <cstring> // `std::memcpy`
+
+#include <fstream>     // `std::ifstream`
+#include <sstream>     // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
+#include <string>      // `std::string`, `std::getline`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <boost/shared_ptr.hpp>
-
 #include <RDGeneral/types.h>
 #include <ForceField/MMFF/Params.h>
 #include <GraphMol/GraphMol.h>
@@ -221,12 +219,11 @@ bool compare_mol(std::string_view smiles, sfp::etkdg_prepared_molecule_t const &
             !near(r.equilibrium_distance_ij, n.equilibrium_distance_ij) ||
             !near(r.equilibrium_distance_kj, n.equilibrium_distance_kj)) {
             if (verbose)
-                std::printf(
-                    "    sb[%zu] ijk=%u-%u-%u rdk k=(%.4f, %.4f) θ₀=%.4f r0=(%.4f, %.4f) " "nat k=(%.4f, %.4f) " "θ₀=%."
-                                                                                                                 "4f " "r0=(%.4f," " %.4f)\n",
-                    t, r.atom_i, r.atom_j, r.atom_k, r.kba_ijk, r.kba_kji, r.equilibrium_angle,
-                    r.equilibrium_distance_ij, r.equilibrium_distance_kj, n.kba_ijk, n.kba_kji, n.equilibrium_angle,
-                    n.equilibrium_distance_ij, n.equilibrium_distance_kj);
+                std::printf("    sb[%zu] ijk=%u-%u-%u rdk k=(%.4f, %.4f) θ₀=%.4f r0=(%.4f, %.4f) nat k=(%.4f, %.4f) " //
+                            "θ₀=%.4f r0=(%.4f, %.4f)\n",
+                            t, r.atom_i, r.atom_j, r.atom_k, r.kba_ijk, r.kba_kji, r.equilibrium_angle,
+                            r.equilibrium_distance_ij, r.equilibrium_distance_kj, n.kba_ijk, n.kba_kji,
+                            n.equilibrium_angle, n.equilibrium_distance_ij, n.equilibrium_distance_kj);
             ++n_fails;
         }
     }
@@ -241,7 +238,7 @@ bool compare_mol(std::string_view smiles, sfp::etkdg_prepared_molecule_t const &
 
 /** Build a "ground truth" prepared molecule by calling RDKit's per-term
  *  `getMMFF*Params` directly — bypasses the `mmff_param_cache`, whose
- *  torsion/angle/stbn keys miss ring context.  The native CPU port is
+ *  torsion/angle/stbn keys miss ring context. The native CPU port is
  *  validated against this, not against `extract_mmff94_params`, so that
  *  any latent cache bugs don't contaminate the comparison. */
 void rdkit_direct_extract(RDKit::ROMol &mol, sft::molecule_descriptor_t const &descriptor,

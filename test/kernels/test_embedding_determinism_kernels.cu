@@ -2,13 +2,13 @@
  *  @file test_embedding_determinism_kernels.cu
  *  @brief CUDA driver for the metric-embedding reproducibility test.
  *
- *  Compiled by nvcc.  The host test logic is in test_embedding_determinism.cpp,
+ *  Compiled by nvcc. The host test logic is in test_embedding_determinism.cpp,
  *  compiled by g++.
  */
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`
 
-#include <vector>
+#include <vector> // `std::vector`
 
 #include <cuda_runtime.h>
 
@@ -20,7 +20,7 @@ using smallfield::types::etkdg_molecule_metadata_t;
 extern "C" {
 
 /**
- *  @brief Runs @c embed_4d_power_iter_kernel over @p num_molecules copies of one bounds matrix.
+ *  @brief Runs `embed_4d_power_iter_kernel` over @p num_molecules copies of one bounds matrix.
  *
  *  Every block sees byte-identical input, so every block owes byte-identical output, whatever
  *  streaming multiprocessor it lands on and whichever of its warps arrives at a reduction first.

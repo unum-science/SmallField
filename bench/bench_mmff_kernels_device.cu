@@ -1,20 +1,21 @@
 /**
- *  @file bench_mmff_gpu_kernels.cu
- *  @brief Device-side launcher for the MMFF GPU kernel trio.  Times
- *  each kernel with `cudaEvent`s and reports the totals back to the
- *  host benchmark driver.  Drops the output buffers back to the host
- *  only for the first molecule (smoke-check) to avoid ≥10 GB D2H on
- *  large batches.
+ *  @file bench_mmff_kernels_device.cu
+ *  @brief Device-side launcher for the MMFF GPU kernel trio.
+ *
+ *  Times each kernel with `cudaEvent`s and reports the totals back to the host benchmark driver. Drops the output
+ *  buffers back to the host only for the first molecule — a smoke check — to avoid ≥10 GB D2H on large batches.
  */
 
-#include <cstdint>
-#include <cstdio>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdio>  // `fprintf`, `stderr`
+
 #include <cuda_runtime.h>
 
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_device.cuh"
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
+
 #include "bench_mmff_kernels_device.hpp"
 
 namespace sfmmff = smallfield::mmff94;
@@ -76,7 +77,8 @@ void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &ta
     print_gpu_memory_usage("before alloc");
     std::fprintf( //
         stderr,
-        "alloc plan: descriptor=%.2f GB bonds=%.2f GB angles=%.2f GB tors=%.2f GB " "oops=%.2f GB stbn=%.2f GB " "inter" "=%" "." "2" "f" " " "GB\n",
+        "alloc plan: descriptor=%.2f GB bonds=%.2f GB angles=%.2f GB tors=%.2f GB oops=%.2f GB stbn=%.2f GB " //
+        "inter=%.2f GB\n",
         num_molecules * sizeof(sft::molecule_descriptor_t) / 1.0e9, per_bond_bytes / 1.0e9, per_angle_bytes / 1.0e9,
         per_torsion_bytes / 1.0e9, per_out_of_plane_bytes / 1.0e9, per_stretch_bend_bytes / 1.0e9,
         per_interaction_bytes / 1.0e9);

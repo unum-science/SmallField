@@ -1,6 +1,11 @@
+/**
+ *  @file bench_mmff_kernels_device.hpp
+ *  @brief Device-side launcher for the GPU MMFF kernel-trio scaling benchmark.
+ */
+
 #pragma once
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`
 
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"

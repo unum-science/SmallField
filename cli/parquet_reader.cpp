@@ -1,13 +1,19 @@
-#include "parquet_reader.hpp"
+/**
+ *  @file parquet_reader.cpp
+ *  @brief Read a single Parquet shard into zero-copy SMILES views.
+ */
 
-#include <cstdio>
-#include <memory>
+#include <cstdio> // `fprintf`, `stderr`
+
+#include <memory> // `std::shared_ptr`
 
 #include <arrow/array.h>
 #include <arrow/io/file.h>
 #include <arrow/table.h>
 #include <parquet/arrow/reader.h>
 #include <parquet/file_reader.h>
+
+#include "parquet_reader.hpp"
 
 namespace smallfield::cli {
 

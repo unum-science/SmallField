@@ -32,7 +32,8 @@ struct fire_result_t {
     float energy;
     float rms_gradient;
     std::int32_t iterations;
-    std::int32_t status; ///< 0 = converged below @p gradient_threshold, 1 = hit max_iterations.
+    /** 0 = converged below @p gradient_threshold, 1 = hit max_iterations. */
+    std::int32_t status;
 };
 
 /**
@@ -48,7 +49,7 @@ struct fire_result_t {
  *  @param[in] gradient_threshold Convergence when rms(gradient) < threshold.
  *  @param[in] lane Warp lane index (threadIdx.x % 32).
  *  @param[in] compute_energy_gradient The energy/gradient functor.
- *  @return Warp-uniform @ref fire_result_t with energy, RMS gradient, iteration count, and status.
+ *  @return Warp-uniform `fire_result_t` with energy, RMS gradient, iteration count, and status.
  *  @see distance_geometry_energy_functor_t, etk_torsion_energy_functor_t, mmff94_energy_functor_t
  */
 template <typename energy_gradient_functor_>
@@ -109,7 +110,7 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
             float const velocity_norm = sqrtf(fmaxf(velocity_dot_velocity, 1e-20f));
             float const velocity_over_force_ratio = velocity_norm * inverse_force_norm;
 
-            // v = (1-α)·v + α·|v|·F̂  where F = -gradient
+            // v = (1-α)·v + α·|v|·(F / |F|)  where F = -gradient
             for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) {
                 velocities[i] = (1.0f - alpha) * velocities[i] - alpha * velocity_over_force_ratio * gradient[i];
             }

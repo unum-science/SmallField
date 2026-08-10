@@ -1,13 +1,18 @@
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
-#include <limits>
-#include <memory>
-#include <span>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <vector>
+/**
+ *  @file _binding.cpp
+ *  @brief pybind11 bindings exposing the SmallField C++ API as the `_smallfield` Python module.
+ */
+
+#include <cstdint> // `std::uint32_t`, `std::uint64_t`
+#include <cstring> // `std::memcpy`
+
+#include <algorithm>   // `std::stable_sort`
+#include <limits>      // `std::numeric_limits`
+#include <memory>      // `std::make_unique`
+#include <span>        // `std::span`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <cuda_fp16.h>
 #include <pybind11/numpy.h>
@@ -149,5 +154,4 @@ PYBIND11_MODULE(_smallfield, m) {
             },
             py::arg("smiles"), py::arg("num_conformers") = 3, py::arg("max_atoms_per_molecule") = 128,
             py::arg("max_stereo_attempts") = 10, py::arg("random_seed") = 42);
-
 }

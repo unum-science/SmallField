@@ -1,29 +1,29 @@
 /**
- *  @file nvtx_range.hpp
+ *  @file nvtx.hpp
  *  @brief Scoped NVTX ranges for attributing host-side pipeline time in Nsight Systems.
  *
- *  The batch driver overlaps four roles -- reader, gpu-runner, fallback, writer -- on
+ *  The batch driver overlaps four roles — reader, gpu-runner, fallback, writer — on
  *  one thread each, so a flat `nsys` timeline shows CUDA activity but cannot say which
- *  role a host thread was in, nor which roles were genuinely concurrent.  Wrapping each
+ *  role a host thread was in, nor which roles were genuinely concurrent. Wrapping each
  *  role's per-batch body in a named range makes the overlap (or lack of it) directly
  *  readable, which is what distinguishes "the GPU is idle because the pipeline stalled"
  *  from "the GPU is idle because the host is still doing RDKit work".
  *
  *  Header-only and dependency-free: NVTX3 ships inside the CUDA toolkit and needs no
- *  link-time library.  Compiles to nothing when `SMALLFIELD_ENABLE_NVTX` is undefined,
+ *  link-time library. Compiles to nothing when `SMALLFIELD_ENABLE_NVTX` is undefined,
  *  so annotated builds and shipping builds stay byte-identical by default.
  */
 #pragma once
 
 #if defined(SMALLFIELD_ENABLE_NVTX)
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`
 
 #include <nvtx3/nvToolsExt.h>
 
 namespace smallfield {
 
-/** @brief RAII NVTX range: pushes on construction, pops at end of scope. */
+/** RAII NVTX range: pushes on construction, pops at end of scope. */
 struct nvtx_range_t {
     explicit nvtx_range_t(char const *name, std::uint32_t color = 0x4080C0u) {
         nvtxEventAttributes_t attributes = {};
@@ -42,18 +42,22 @@ struct nvtx_range_t {
 
 } // namespace smallfield
 
-// `##` suppresses expansion of its operands, so `nvtx_scope_##__LINE__` would paste
-// the literal identifier `nvtx_scope___LINE__` and collide whenever two ranges share
-// a scope.  Two-level indirection expands `__LINE__` first.
-#define SMALLFIELD_NVTX_PASTE_(prefix, suffix) prefix##suffix
-#define SMALLFIELD_NVTX_NAME_(line) SMALLFIELD_NVTX_PASTE_(nvtx_scope_, line)
-#define SMALLFIELD_NVTX_RANGE(name) ::smallfield::nvtx_range_t SMALLFIELD_NVTX_NAME_(__LINE__) { name }
-#define SMALLFIELD_NVTX_RANGE_COLORED(name, color)                                                                     \
-    ::smallfield::nvtx_range_t SMALLFIELD_NVTX_NAME_(__LINE__) { name, color }
+/**
+ *  @brief `##` suppresses expansion of its operands, so `nvtx_scope_##__LINE__` would paste the
+ *  literal identifier `nvtx_scope___LINE__` and collide whenever two ranges share a scope.
+ *
+ *  Two-level indirection expands `__LINE__` first.
+ */
+#define SF_NVTX_PASTE_(prefix, suffix) prefix##suffix
+#define SF_NVTX_NAME_(line) SF_NVTX_PASTE_(nvtx_scope_, line)
+#define SF_NVTX_RANGE(name) \
+    ::smallfield::nvtx_range_t SF_NVTX_NAME_(__LINE__) { name }
+#define SF_NVTX_RANGE_COLORED(name, color) \
+    ::smallfield::nvtx_range_t SF_NVTX_NAME_(__LINE__) { name, color }
 
 #else
 
-#define SMALLFIELD_NVTX_RANGE(name) ((void)0)
-#define SMALLFIELD_NVTX_RANGE_COLORED(name, color) ((void)0)
+#define SF_NVTX_RANGE(name) ((void)0)
+#define SF_NVTX_RANGE_COLORED(name, color) ((void)0)
 
 #endif

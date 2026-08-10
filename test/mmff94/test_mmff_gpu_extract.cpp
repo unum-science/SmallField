@@ -1,25 +1,23 @@
 /**
  *  @file test_mmff_gpu_extract.cpp
- *  @brief Compare the GPU MMFF term extractor output against
- *  the CPU native extractor on a batch of drug-like SMILES.  Byte-
- *  identity required for every bonded term of every molecule where the
- *  GPU typer flagged success (typing_status == 0).
+ *  @brief Compare the GPU MMFF term extractor against the CPU native extractor.
+ *
+ *  Runs a batch of drug-like SMILES through both paths. Byte identity is required for every bonded
+ *  term of every molecule where the GPU typer flagged success, meaning `typing_status == 0`.
  */
 
-#include <algorithm>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <memory>
-#include <span>
-#include <string>
-#include <vector>
+#include <cmath>   // `std::fabs`
+#include <cstdio>  // `printf`
+#include <cstring> // `std::memcmp`
+
+#include <algorithm> // `std::max`, `std::unique`
+#include <fstream>   // `std::ifstream`
+#include <memory>    // `std::unique_ptr`
+#include <string>    // `std::string`, `std::getline`
+#include <vector>    // `std::vector`
 
 #include <boost/shared_ptr.hpp>
 #include <cuda_runtime.h>
-
 #include <RDGeneral/types.h>
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -31,9 +29,10 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
-#include "test_mmff_gpu_extract_kernels.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+
+#include "test_mmff_gpu_extract_kernels.hpp"
 
 namespace sf = smallfield;
 namespace sfmmff = smallfield::mmff94;
@@ -317,7 +316,7 @@ int main(int argc, char **argv) {
                 molecule_matches = false;
                 if (mismatched_csr_count < 5) {
                     std::printf(
-                        "  mol=%u atom=%u CSR count diff: " "cpu=(b%u a%u t%u o%u s%u) gpu=(b%u a%u t%u o%u s%u)\n",
+                        "  mol=%u atom=%u CSR count diff: cpu=(b%u a%u t%u o%u s%u) gpu=(b%u a%u t%u o%u s%u)\n",
                         molecule_index, atom_index, cpu_offset.bond_count, cpu_offset.angle_count,
                         cpu_offset.torsion_count, cpu_offset.oop_count, cpu_offset.stretchbend_count,
                         gpu_offset.bond_count, gpu_offset.angle_count, gpu_offset.torsion_count, gpu_offset.oop_count,
@@ -327,7 +326,7 @@ int main(int argc, char **argv) {
             else { ++matching_csr_count; }
         }
 
-        // Packed-layout check.  The staged slices above are already known good
+        // Packed-layout check. The staged slices above are already known good
         // against the CPU, so the compaction pass is correct exactly when the
         // packed arrays reproduce them byte for byte at the metadata-declared
         // offsets, with every CSR start shifted into the batch-global
@@ -393,7 +392,7 @@ int main(int argc, char **argv) {
 
     // Footprint accounting: the staging arrays are fixed-stride, so their cost is
     // the same for every molecule; the packed arrays cost what the batch actually
-    // holds.  Both numbers are per molecule so the ratio is the compaction win.
+    // holds. Both numbers are per molecule so the ratio is the compaction win.
     std::size_t const staged_bytes_per_molecule =
         sft::max_mmff_bonds_per_mol_k * sizeof(sft::mmff94_bond_t) +
         sft::max_mmff_angles_per_mol_k * sizeof(sft::mmff94_angle_t) +

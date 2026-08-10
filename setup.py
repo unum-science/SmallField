@@ -201,8 +201,9 @@ class BuildExt(build_ext):
         include_dirs = " ".join(f"-I{dir}" for dir in include_dirs)
         output_file = os.path.join(output_dir, "smallfield.o")
 
-        # Let's try inferring the compute capability from the GPU
-        arch_code = "90"
+        # Detected per build, unlike CMakeLists.txt which ships a multi-arch fatbin.
+        default_arch_code = "90"
+        arch_code = None
         try:
             import pycuda.driver as cuda
             import pycuda.autoinit
@@ -223,6 +224,17 @@ class BuildExt(build_ext):
                     arch_code = cap.replace(".", "")
             except Exception:
                 pass
+
+        if arch_code is None:
+            # No GPU reachable, so the guess is probably wrong. Say so rather than
+            # silently emitting a binding for the wrong device.
+            arch_code = default_arch_code
+            print(
+                f"warning: no GPU detected, building the Python binding for sm_{arch_code}. "
+                f"Set CUDA_ARCH_CODE to override.",
+                file=sys.stderr,
+            )
+        arch_code = os.environ.get("CUDA_ARCH_CODE", arch_code)
 
         # Pass AVX-512 flags to host compiler via -Xcompiler
         host_flags = (

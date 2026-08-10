@@ -1,11 +1,16 @@
+/**
+ *  @file test_mmff94_tables_kernels.hpp
+ *  @brief Device launchers for the MMFF94 parameter table lookups, for use by their unit tests.
+ */
+
 #pragma once
 
-#include <cstdint>
-
-#include "mmff94_lookup_probes.hpp"
+#include <cstdint> // `std::uint32_t`
 
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_device.cuh"
+
+#include "mmff94_lookup_probes.hpp"
 
 void launch_device_vdw_lookup(smallfield::parameters::mmff94_tables_view_t view, vdw_query_t const *queries,
                               vdw_result_t *results, std::uint32_t query_count);

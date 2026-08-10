@@ -2,22 +2,20 @@
  *  @file molecule_parse.hpp
  *  @brief The one place a SMILES string becomes an `RWMol`.
  *
- *  Four call sites used to parse independently — the device preprocess path, the legacy host path,
- *  the shape-descriptor postprocess and the CPU fallback — and they had already drifted: one gated
- *  the atom count against a hardcoded `128` where another used @c max_atoms_per_molecule_k, and their `AddHs`
- *  failure semantics differed four ways.
+ *  Four call sites need a SMILES parsed — the device preprocess path, the host preprocess path, the
+ *  shape-descriptor postprocess, and the CPU fallback — and independent parsing lets them drift:
+ *  one site gating the atom count against a hardcoded 128 where another uses
+ *  `max_atoms_per_molecule_k`, or `AddHs` failure semantics differing between sites.
  *
- *  Drift here is not cosmetic.  `compute_shape_descriptors` accepts a molecule's descriptors only
+ *  Drift here is not cosmetic. `compute_shape_descriptors` accepts a molecule's descriptors only
  *  when a fresh parse reproduces the atom count the GPU path recorded, so two sites that disagree
  *  about how a SMILES becomes a molecule silently cost that molecule its shape descriptors.
  *
- *  Deliberately free of CUDA and of the batch pool, so `cli/` and @ref postprocess.hpp can include
+ *  Deliberately free of CUDA and of the batch pool, so `cli/` and `postprocess`.hpp can include
  *  it without pulling in `cuda_runtime.h`.
  */
 
 #pragma once
-
-#include "smallfield/module_fwd.hpp"
 
 #include <cstdint> // `std::uint32_t`
 
@@ -31,31 +29,32 @@
 #include <GraphMol/MolStandardize/Fragment.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
+#include "smallfield/module_fwd.hpp"
 #include "smallfield/api/conformer_status.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield {
 
-/** @brief What to do with a SMILES that names more than one disconnected fragment. */
+/** What to do with a SMILES that names more than one disconnected fragment. */
 enum salt_policy_t : std::uint8_t {
-    /** @brief Keep every fragment, counterions included.  The bond-hop tests need this to reach the
+    /** Keep every fragment, counterions included. The bond-hop tests need this to reach the
      *  unreachable-hop sentinel, which a single connected component never produces. */
     keep_all_fragments_k = 0,
-    /** @brief Keep the largest fragment and drop the rest.  A counterion has no meaningful
+    /** Keep the largest fragment and drop the rest. A counterion has no meaningful
      *  conformer, and MMFF94 cannot type an isolated `HCl`, so keeping one rejects the whole
      *  molecule — parent included. */
     keep_largest_fragment_k = 1,
 };
 
-/** @brief Whether to spend the extra RDKit calls that fill the shard's descriptive columns. */
+/** Whether to spend the extra RDKit calls that fill the shard's descriptive columns. */
 enum metadata_policy_t : std::uint8_t {
     skip_metadata_k = 0,
     compute_metadata_k = 1,
 };
 
-/** @brief Knobs the four call sites genuinely disagree on. */
+/** Knobs the four call sites genuinely disagree on. */
 struct parse_options_t {
-    /** @brief Reject past this many atoms, counting hydrogens; zero disables the check.
+    /** Reject past this many atoms, counting hydrogens; zero disables the check.
      *  The preprocess path passes the compile-time warp-pipeline cap, the CPU fallback passes the
      *  operator's runtime `--max-atoms`, and the postprocess path passes zero because it only ever
      *  sees molecules the pipeline already accepted. */
@@ -64,13 +63,13 @@ struct parse_options_t {
     metadata_policy_t metadata_policy = skip_metadata_k;
 };
 
-/** @brief A parsed molecule, or the reason there isn't one. */
+/** A parsed molecule, or the reason there isn't one. */
 struct parse_result_t {
-    /** @brief Null unless @ref status is `success`. */
+    /** Null unless `status` is `success`. */
     std::unique_ptr<RDKit::RWMol> molecule;
     api::conformer_status_t status = api::conformer_status_t::invalid_smiles;
     std::uint32_t num_atoms = 0;
-    /** @brief Zero unless @ref parse_options_t::metadata_policy asked for them. */
+    /** Zero unless `parse_options_t::metadata_policy` asked for them. */
     std::uint32_t num_heavy_atoms = 0;
     std::uint32_t num_bonds = 0;
     float molecular_weight = 0.0f;
@@ -82,7 +81,7 @@ namespace detail {
  *  @brief Whether a SMILES names more than one fragment.
  *
  *  A `.` inside brackets is part of an atom specification rather than a fragment separator, so the
- *  scan tracks bracket depth.  Worth the pass: the chooser walks the whole graph, and on every
+ *  scan tracks bracket depth. Worth the pass: the chooser walks the whole graph, and on every
  *  corpus measured here the overwhelming majority of molecules are a single fragment.
  */
 inline bool names_multiple_fragments(std::string_view smiles) noexcept {
@@ -103,7 +102,7 @@ inline bool names_multiple_fragments(std::string_view smiles) noexcept {
  *  @brief Parse a SMILES into a hydrogen-explicit molecule, applying one shared contract.
  *
  *  Order is the contract: parse, drop counterions, add hydrogens, gate on atom count, then
- *  optionally measure.  Dropping fragments has to precede @c AddHs so the hydrogen count belongs to
+ *  optionally measure. Dropping fragments has to precede `AddHs` so the hydrogen count belongs to
  *  the parent, and precede the atom-count gate so a bulky counterion stops pushing an otherwise
  *  ordinary molecule past the cap.
  *
@@ -116,7 +115,7 @@ inline parse_result_t parse_smiles(std::string_view smiles, parse_options_t cons
 
     try {
         // RDKit::SmilesToMol takes std::string const& — one unavoidable construction per molecule,
-        // kept scoped to this call.  removeHs=false because addHs follows.
+        // kept scoped to this call. removeHs=false because addHs follows.
         std::string const smiles_string {smiles};
         RDKit::SmilesParserParams parameters;
         parameters.sanitize = true;
@@ -131,7 +130,7 @@ inline parse_result_t parse_smiles(std::string_view smiles, parse_options_t cons
 
     if (options.salt_policy == keep_largest_fragment_k && detail::names_multiple_fragments(smiles)) {
         try {
-            // Stateless and const, so one instance serves every worker thread.  `preferOrganic`
+            // Stateless and const, so one instance serves every worker thread. `preferOrganic`
             // keeps the organic parent even when a metal cluster carries more atoms, which is the
             // fragment the force field can actually type.
             static RDKit::MolStandardize::LargestFragmentChooser const chooser {/*preferOrganic=*/true};
@@ -139,7 +138,7 @@ inline parse_result_t parse_smiles(std::string_view smiles, parse_options_t cons
             // Removing atoms leaves the ring information describing the molecule that was parsed,
             // not the one that survived, and anything that consults it afterwards — aromatic SMARTS
             // matching, MMFF typing — throws `RingInfo not initialized` rather than reading stale
-            // rings.  Re-sanitising is the honest repair and only the multi-fragment minority pays.
+            // rings. Re-sanitising is the honest repair and only the multi-fragment minority pays.
             RDKit::MolOps::sanitizeMol(*result.molecule);
         }
         catch (...) {

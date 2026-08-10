@@ -3,7 +3,7 @@
  *  @brief CUDA kernel wrappers for DG energy test. Compiled by nvcc.
  */
 
-#include <cstdint>
+#include <cstdint> // `std::uint8_t`, `std::uint32_t`
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -14,8 +14,8 @@
 namespace sfc = smallfield::cuda;
 
 /**
- *  Quantize the incoming float bounds into the int8 shared-memory layout that
- *  the production `distance_geometry_energy_functor_t` consumes.  The source is
+ *  @brief Quantize the incoming float bounds into the int8 shared-memory layout that
+ *  the production `distance_geometry_energy_functor_t` consumes. The source is
  *  packed at `num_atoms`; the destination uses the bank-conflict-free padded
  *  stride, so the flat index is decomposed on the way in — mirroring the
  *  production quantization loop in `etkdg_pipeline_warp_kernel`.
@@ -95,29 +95,19 @@ __global__ void dg_minimize_kernel(float *positions, float const *bounds_float, 
     float mol_min = 0.0f, inv_scale = 0.0f;
     quantize_bounds_into_shared_(bounds_float, shared_bounds, num_atoms, lane, &mol_min, &inv_scale);
 
-    std::uint32_t const bounds_bytes_aligned = (num_atoms * bounds_row_stride * sizeof(std::uint8_t) + sizeof(float) -
-                                                1) &
-                                               ~(sizeof(float) - 1);
+    std::uint32_t const bounds_bytes_aligned =
+        (num_atoms * bounds_row_stride * sizeof(std::uint8_t) + sizeof(float) - 1) & ~(sizeof(float) - 1);
     float *shared_float = reinterpret_cast<float *>(shared_raw + bounds_bytes_aligned);
 
     float *velocities = shared_float;
     float *gradient = velocities + num_elements;
 
-    sfc::distance_geometry_energy_functor_t functor {shared_bounds,
-                                                     nullptr,
-                                                     mol_min,
-                                                     inv_scale,
-                                                     bounds_row_stride,
-                                                     num_atoms,
-                                                     0,
-                                                     spatial_dimension,
-                                                     upper_weight,
-                                                     lower_weight,
-                                                     0.0f,
-                                                     fourth_dim_weight};
+    sfc::distance_geometry_energy_functor_t functor {shared_bounds,     nullptr,      mol_min, inv_scale,
+                                                     bounds_row_stride, num_atoms,    0,       spatial_dimension,
+                                                     upper_weight,      lower_weight, 0.0f,    fourth_dim_weight};
 
-    sfc::fire_result_t const result = sfc::fire_minimize_(positions, velocities, gradient, num_elements,
-                                                          max_iterations, gradient_threshold, lane, functor);
+    sfc::fire_result_t const result = sfc::fire_minimize_(positions, velocities, gradient, num_elements, max_iterations,
+                                                          gradient_threshold, lane, functor);
     if (lane == 0) {
         *out_energy = result.energy;
         *out_iterations = result.iterations;
@@ -178,10 +168,9 @@ void gpu_dg_minimize(float *host_coords, float const *host_bounds, std::uint32_t
     cudaMemcpy(device_bounds, host_bounds, bounds_size * sizeof(float), cudaMemcpyHostToDevice);
 
     // Shared memory: bounds_uint8 + velocities + gradient (FIRE: 2 arrays beyond positions).
-    std::uint32_t const bounds_bytes_aligned = (num_atoms * sfc::compute_bounds_row_stride(num_atoms) *
-                                                    sizeof(std::uint8_t) +
-                                                sizeof(float) - 1) &
-                                               ~(sizeof(float) - 1);
+    std::uint32_t const bounds_bytes_aligned =
+        (num_atoms * sfc::compute_bounds_row_stride(num_atoms) * sizeof(std::uint8_t) + sizeof(float) - 1) &
+        ~(sizeof(float) - 1);
     std::uint32_t const shared_bytes = bounds_bytes_aligned + 2 * num_elements * sizeof(float);
 
     dg_minimize_kernel<<<1, 32, shared_bytes>>>(device_coords, device_bounds, num_atoms, spatial_dimension,

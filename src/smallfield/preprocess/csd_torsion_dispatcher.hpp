@@ -2,36 +2,32 @@
  *  @file csd_torsion_dispatcher.hpp
  *  @brief CSD torsion extraction with an element prefilter and a native matcher.
  *
- *  Replaces `ForceFields::CrystalFF::getExperimentalTorsions()` with an owned matching loop.  The
- *  CSD SMARTS patterns are loaded once at static-init and compiled by @ref parse_linear_torsion
- *  (see `csd_torsion_native.hpp`).  For every molecule the loop applies an element, aromaticity and
- *  hybridization prefilter, then runs the stack-only @ref match_linear_pattern.  No heap allocation
+ *  Replaces `ForceFields::CrystalFF::getExperimentalTorsions()` with an owned matching loop. The
+ *  CSD SMARTS patterns are loaded once at static-init and compiled by `parse_linear_torsion`
+ *  (see `csd_torsion_native.hpp`). For every molecule the loop applies an element, aromaticity and
+ *  hybridization prefilter, then runs the stack-only `match_linear_pattern`. No heap allocation
  *  and no RDKit substructure search on the hot path.
  *
  *  The whole loaded corpus — v2 plus smallrings, 470 patterns — compiles natively, so there is no
- *  fallback.  A pattern the compiler cannot read is a load-time error rather than a silent runtime
+ *  fallback. A pattern the compiler cannot read is a load-time error rather than a silent runtime
  *  detour: the pattern library is checked-in data, so an unreadable entry is a build problem, and a
  *  fallback would hide it behind a path that never otherwise executes.
  *
- *  Correctness: identical torsion set to RDKit's `getExperimentalTorsions()`.  The native matcher is
+ *  Correctness: identical torsion set to RDKit's `getExperimentalTorsions()`. The native matcher is
  *  byte-equivalence validated against RDKit across 19193 PubChem molecules in
  *  `test_csd_torsion_predicates.cpp` — 9020710 pattern checks, zero disagreements.
  */
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
-
-#include <cstdint>
+#include <cstdint> // `std::int8_t`, `std::uint32_t`
 #include <cstdio>  // `std::fprintf`
 #include <cstdlib> // `std::abort`
-#include <cstring> // `std::memset`
-#include <memory>
-#include <mutex>
+
+#include <memory> // `std::unique_ptr`
 #include <sstream>
-#include <string>
-#include <tuple>
-#include <vector>
+#include <string> // `std::string`, `std::getline`
+#include <vector> // `std::vector`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/Atom.h>
@@ -43,6 +39,7 @@
 #include <GraphMol/ChemTransforms/ChemTransforms.h>
 #include <GraphMol/SmilesParse/SmilesWrite.h>
 
+#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/preprocess/csd_torsion_native.hpp"
@@ -63,20 +60,25 @@ struct csd_compiled_pattern_t {
     std::unique_ptr<RDKit::ROMol const> pattern;
     std::vector<double> V;
     std::vector<std::int8_t> signs;
-    std::uint32_t index[4];          ///< atom indices in the pattern for labels :1 through :4
-    std::uint64_t required_elements; ///< bitset: bit N = pattern requires element N
-    std::uint8_t
-        required_hybridizations; ///< bitset: bit H = pattern requires hybridization H (see @ref hybridization_t)
-    bool requires_aromatic;      ///< true if any pattern atom is aromatic
-    bool native;                 ///< true if the pattern parsed cleanly into native form
-    simple_torsion_pattern_t native_form; ///< valid only when native == true
+    /** Atom indices in the pattern for labels :1 through :4. */
+    std::uint32_t index[4];
+    /** Bitset: bit N = pattern requires element N. */
+    std::uint64_t required_elements;
+    /** Bitset: bit H = pattern requires hybridization H (see `hybridization_t`). */
+    std::uint8_t required_hybridizations;
+    /** True if any pattern atom is aromatic. */
+    bool requires_aromatic;
+    /** True if the pattern parsed cleanly into native form. */
+    bool native;
+    /** Valid only when native == true. */
+    simple_torsion_pattern_t native_form;
 };
 
 /**
- *  Hybridizations that every match of the pattern must contain.  Per-atom,
- *  a hybridization H is required iff EVERY disjunct of that atom pins
+ *  @brief Hybridizations that every match of the pattern must contain. Per-atom,
+ *  a hybridization H is required iff @b every disjunct of that atom pins
  *  hybridization to H; if any disjunct is unconstrained or pins a different
- *  value, the atom can still match molecules without H.  The pattern's
+ *  value, the atom can still match molecules without H. The pattern's
  *  overall required mask is the union of these per-atom required sets
  *  across the 4 labelled atoms (branches excluded — they're soft).
  */
@@ -131,7 +133,7 @@ inline bool parse_pattern_line(std::string const &line, csd_compiled_pattern_t &
 }
 
 /**
- *  Parse the embedded .in block (one SMARTS per non-comment line) and compile each
+ *  @brief Parse the embedded .in block (one SMARTS per non-comment line) and compile each
  *  SMARTS to an ROMol. Fills required_elements bitset and the atom-label index[4].
  */
 inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &block) {
@@ -187,7 +189,7 @@ inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &b
 /** Lazy-load and compile all CSD patterns once per process.
  *
  *  A pattern the native compiler cannot read aborts here rather than falling back to an RDKit
- *  substructure search.  The pattern library is checked-in data, so an unreadable entry is a build
+ *  substructure search. The pattern library is checked-in data, so an unreadable entry is a build
  *  problem that should be loud; a fallback would hide it behind a path nothing else exercises, and
  *  carry the scaffold cache, Murcko decomposition and VF2 deadline machinery along with it. */
 inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
@@ -200,7 +202,7 @@ inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
             if (!pattern.native) {
                 std::fprintf(
                     stderr,
-                    "smallfield: CSD torsion pattern does not compile natively and there is no " "fallback:\n  %s\n",
+                    "smallfield: CSD torsion pattern does not compile natively and there is no fallback:\n  %s\n",
                     pattern.smarts.c_str());
                 std::abort();
             }
@@ -214,12 +216,12 @@ inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
  *  ForceFields::CrystalFF::getExperimentalTorsions().
  *
  *  For each pattern, check the element, aromaticity and hybridization bitsets against the molecule
- *  and skip the ones that cannot match, then run the native matcher on the rest.  A bond carries at
+ *  and skip the ones that cannot match, then run the native matcher on the rest. A bond carries at
  *  most one torsion and the first pattern in file order claims it; a bond on a fused small ring, or
  *  on more than three rings, is claimed and left empty.
  *
  *  Also handles the "basic knowledge" torsions (flat aromatic rings, sp2 centers with 3 neighbors)
- *  that getExperimentalTorsions produces.  Everything reads the flat descriptor, so the same
+ *  that getExperimentalTorsions produces. Everything reads the flat descriptor, so the same
  *  answer comes out of the device kernel in `smallfield/cuda/csd_torsion_device.cuh`.
  *
  *  @param[in] descriptor Molecule descriptor with topology, property and ring arrays.

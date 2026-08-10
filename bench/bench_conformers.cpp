@@ -1,5 +1,5 @@
 /**
- *  @file bench_chembl.cpp
+ *  @file bench_conformers.cpp
  *  @brief Unified benchmark: RDKit CPU vs SmallField GPU on ChEMBL dataset.
  *
  *  Measures:
@@ -9,25 +9,24 @@
  *   4. Scaling analysis across batch sizes
  */
 
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cmath>
-#include <cstdio>
-#include <cstring>
-#include <fstream>
-#include <numeric>
-#include <random>
-#include <string>
-#include <vector>
+#include <cmath>  // `std::isfinite`, `std::fabs`
+#include <cstdio> // `printf`, `fprintf`
+
+#include <algorithm> // `std::min`, `std::sort`
+#include <array>     // `std::array`
+#include <chrono>    // `std::chrono::high_resolution_clock`, `std::chrono::duration`
+#include <fstream>   // `std::ifstream`
+#include <random>    // `std::mt19937`
+#include <string>    // `std::string`, `std::getline`
+#include <vector>    // `std::vector`
 
 #include <cuda_fp16.h>
-
 #include <GraphMol/DistGeomHelpers/Embedder.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
 #include <omp.h>
 
 #include "smallfield/api/smallfield.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sf = smallfield;
@@ -35,7 +34,7 @@ namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;
 using clock_type = std::chrono::high_resolution_clock;
 
-// Load SMILES from a file, one per line.
+/** Load SMILES from a file, one per line. */
 static std::vector<std::string> load_smiles(std::string const &path, std::uint32_t max_count = 0) {
     std::vector<std::string> result;
     std::ifstream file(path);
@@ -60,9 +59,9 @@ static double percentile(std::vector<double> &sorted_values, double p) {
     return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac;
 }
 
-/** @brief Fill @p delta with sorted per-conformer `smallfield − rdkit` differences.
+/** Fill @p delta with sorted per-conformer differences, smallfield minus rdkit.
  *  Inputs must be in matching sample order; the subtraction happens before any sort so
- *  the pairing survives.  @p delta is caller-owned and reused across bins — it keeps its
+ *  the pairing survives. @p delta is caller-owned and reused across bins — it keeps its
  *  capacity, so the per-bin loop allocates once rather than once per bin. */
 static void paired_energy_delta_into(std::vector<double> const &rdkit_energies,
                                      std::vector<double> const &smallfield_energies, std::vector<double> &delta) {
@@ -142,7 +141,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     generation_config.num_conformers = num_conformers;
     generation_config.max_stereo_attempts = max_stereo_attempts;
 
-    // Allocate output buffers.  Use size_t arithmetic — the coordinate
+    // Allocate output buffers. Use size_t arithmetic — the coordinate
     // buffer for 10M × K=3 × 128 atoms × 3 dims exceeds UINT32_MAX elements.
     std::size_t const total_conformers = static_cast<std::size_t>(num_smiles) * num_conformers;
     coords_out.resize(total_conformers * max_atoms * 3);
@@ -154,14 +153,14 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     sfapi::context_t gpu_context(std::span<int const>(&device_id, 1));
 
     auto const start_time = clock_type::now();
-    (void)gpu_context.generate_conformers(smiles_views, generation_config, max_atoms, coords_out, energies_out,
-                                          status_out);
+    [[maybe_unused]] auto const batch_status = gpu_context.generate_conformers(
+        smiles_views, generation_config, max_atoms, coords_out, energies_out, status_out);
     auto const end_time = clock_type::now();
 
     double const elapsed_ms_value = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
     // Conf/s already divides by produced conformers, so it is comparable across corpora with
-    // different rejection rates.  The breakdown is what makes a rejection class visible: the
+    // different rejection rates. The breakdown is what makes a rejection class visible: the
     // 128-atom cap alone drops about 4 % of PubChem before any molecule reaches the GPU.
     std::uint32_t num_successful_conformers = 0;
     std::array<std::uint64_t, 8> conformers_by_status {};
@@ -202,7 +201,7 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     generation_config.num_conformers = num_conformers;
     generation_config.max_stereo_attempts = max_stereo_attempts;
 
-    // Allocate output buffers.  Use size_t arithmetic — the coordinate
+    // Allocate output buffers. Use size_t arithmetic — the coordinate
     // buffer for 10M × K=3 × 128 atoms × 3 dims exceeds UINT32_MAX elements.
     std::size_t const total_conformers = static_cast<std::size_t>(num_smiles) * num_conformers;
     std::vector<__half> coords(total_conformers * max_atoms * 3);
@@ -215,9 +214,9 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     // Amortises RDKit fallback cost across molecules sharing the same Murcko
     // scaffold; safe no-op if disabled or for acyclic molecules.
 
-    // Allow 1-GPU runs via --multi-gpu-only (used by scaling sweeps that
-    // control GPU count via CUDA_VISIBLE_DEVICES). The "multi" in the
-    // flag name is historical; the path still runs correctly on 1 GPU.
+    // Allow single-GPU runs via `--multi-gpu-only`, which scaling sweeps use when they control the
+    // GPU count through `CUDA_VISIBLE_DEVICES`. The flag says "multi" but the path runs correctly
+    // on one GPU.
     if (gpu_context.device_ids.empty()) {
         std::printf("  Skipped (no GPU available)\n");
         return;
@@ -225,7 +224,8 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     std::printf("  Using %zu GPUs\n", gpu_context.device_ids.size());
 
     auto const start_time = clock_type::now();
-    (void)gpu_context.generate_conformers(smiles_views, generation_config, max_atoms, coords, energies, status);
+    [[maybe_unused]] auto const batch_status = gpu_context.generate_conformers(smiles_views, generation_config,
+                                                                               max_atoms, coords, energies, status);
     auto const end_time = clock_type::now();
 
     double const elapsed_ms_value = std::chrono::duration<double, std::milli>(end_time - start_time).count();
@@ -326,7 +326,7 @@ static void cross_validate(std::vector<std::string> const &smiles, std::vector<_
     if (!finite_rdkit_energies.empty()) {
         // Both columns describe the same geometry — RDKit is evaluated on SmallField's
         // own output coordinates — so the per-conformer difference is the quantity that
-        // measures agreement.  Independently sorted marginals do not: a uniform offset,
+        // measures agreement. Independently sorted marginals do not: a uniform offset,
         // a heavy negative tail, and partial cancellation all produce the same shift.
         // Scratch reused by every delta computation below, including the per-bin loop.
         std::vector<double> paired_delta;
@@ -352,7 +352,7 @@ static void cross_validate(std::vector<std::string> const &smiles, std::vector<_
                     percentile(finite_smallfield_energies, 25), percentile(finite_smallfield_energies, 50),
                     percentile(finite_smallfield_energies, 75), percentile(finite_smallfield_energies, 95));
 
-        // Print the per-atom-count breakdown.  `delta_min` surfaces the negative tail
+        // Print the per-atom-count breakdown. `delta_min` surfaces the negative tail
         // that a shifted median hides — the MMFF cubic bend term is unbounded below
         // past Δθ > 143°, and only the minimum exposes a conformer that fell into it.
         std::printf("  Per-atom-count breakdown:\n");

@@ -3,25 +3,25 @@
  *  @brief Asserts that the 4D metric embedding is bitwise reproducible.
  *
  *  The metric prepass seeds every later ETKDG stage, so an order-dependent block
- *  reduction inside it — a shared-memory float @c atomicAdd, say, whose commit order
+ *  reduction inside it — a shared-memory float `atomicAdd`, say, whose commit order
  *  the scheduler picks and whose addition does not associate — makes the coordinates
- *  of a shipped shard unregenerable.  A dataset that cannot be reproduced byte for
+ *  of a shipped shard unregenerable. A dataset that cannot be reproduced byte for
  *  byte cannot be audited, so this test pins the property twice over: the same bounds
  *  matrix embedded in two separate launches must agree, and thousands of identical
  *  copies embedded inside one launch must agree with each other, since they differ
  *  only in which streaming multiprocessor and which neighbours they draw.
  */
 
-#include <cmath>
-#include <cstdio>
-#include <cstring>
+#include <cmath>   // `std::sqrt`
+#include <cstdio>  // `printf`
+#include <cstring> // `std::memcmp`
 
-#include <random>
-#include <vector>
+#include <random> // `std::mt19937`, `std::uniform_real_distribution`
+#include <vector> // `std::vector`
 
 #include "test_helpers.hpp"
 
-// Defined in test_embedding_determinism_kernels.cu, compiled by nvcc.
+/** Defined in `test_embedding_determinism_kernels.cu`, compiled by nvcc. */
 extern "C" int gpu_embed_replicated(float const *host_bounds, std::uint32_t num_atoms, std::uint32_t num_molecules,
                                     float *host_coordinates);
 
@@ -58,15 +58,15 @@ int main() {
     std::vector<float> second_run(first_run.size());
 
     int const first_status = gpu_embed_replicated(bounds.data(), num_atoms_k, num_molecules_k, first_run.data());
-    SF_TEST_ASSERT(first_status == 0, "first embedding launch must succeed");
+    sf_verify_(first_status == 0, "first embedding launch must succeed");
     int const second_status = gpu_embed_replicated(bounds.data(), num_atoms_k, num_molecules_k, second_run.data());
-    SF_TEST_ASSERT(second_status == 0, "second embedding launch must succeed");
+    sf_verify_(second_status == 0, "second embedding launch must succeed");
 
     std::size_t const molecule_bytes = coordinates_per_molecule * sizeof(float);
     bool any_nonzero = false;
     for (std::size_t component = 0; component < coordinates_per_molecule; ++component)
         if (first_run[component] != 0.0f) any_nonzero = true;
-    SF_TEST_ASSERT(any_nonzero, "the embedding must not be all zeros, or the comparison proves nothing");
+    sf_verify_(any_nonzero, "the embedding must not be all zeros, or the comparison proves nothing");
 
     // Reports up to four differing components so a failure names the magnitude, not just a count.
     auto report_divergence = [&](char const *what, std::uint32_t molecule, float const *left, float const *right) {
@@ -106,8 +106,8 @@ int main() {
         report_divergence("within-launch", first_within_launch, first_run.data(),
                           first_run.data() + first_within_launch * coordinates_per_molecule);
 
-    SF_TEST_ASSERT(across_launches == 0, "two launches over the same bounds must produce identical coordinates");
-    SF_TEST_ASSERT(within_launch == 0, "identical molecules in one launch must produce identical coordinates");
+    sf_verify_(across_launches == 0, "two launches over the same bounds must produce identical coordinates");
+    sf_verify_(within_launch == 0, "identical molecules in one launch must produce identical coordinates");
 
     std::printf("\ntest_embedding_determinism: PASSED\n");
     return 0;

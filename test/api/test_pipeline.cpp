@@ -1,18 +1,21 @@
 /**
  *  @file test_pipeline.cpp
  *  @brief End-to-end ETKDG pipeline test using the SmallField library API.
+ *
  *  Tests: SMILES → context_t::generate_conformers → RDKit cross-validation.
  */
 
-#include <cmath>
-#include <cstdio>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <cmath>  // `std::isfinite`
+#include <cstdio> // `printf`
+
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <cuda_fp16.h>
 
 #include "smallfield/api/smallfield.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfapi = smallfield::api;
@@ -113,8 +116,8 @@ int main() {
                 total_successful > 0 ? 100.0 * total_finite_energy / total_successful : 0.0);
     std::printf("    reasonable energy:     %u (< 500 kcal/mol)\n", total_reasonable_energy);
 
-    SF_TEST_ASSERT(total_successful > 0, "at least one conformer must succeed");
-    SF_TEST_ASSERT(success_rate >= 50.0, "success rate must be at least 50%%");
+    sf_verify_(total_successful > 0, "at least one conformer must succeed");
+    sf_verify_(success_rate >= 50.0, "success rate must be at least 50%%");
 
     std::printf("\ntest_pipeline: PASSED\n");
     return 0;

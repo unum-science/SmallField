@@ -1,23 +1,23 @@
 /**
  *  @file test_element_gate.cpp
- *  @brief Validate the host-side element-validation gate added to
- *  `prepare_molecule_into`.
+ *  @brief Validate the host-side element-validation gate in `prepare_molecule_into`.
  *
- *  Before this gate, molecules whose atoms fall outside the MMFF94
- *  parameter set (Y, lanthanides, transition metals, etc.) silently
- *  survived preprocess and OOB'd inside `etkdg_pipeline_warp_kernel`,
- *  poisoning every subsequent CUDA call on every device.  These tests
- *  assert each known rejection path returns the right
- *  `conformer_status_t` so the caller can route to CPU fallback or
- *  surface a precise error to the user.
+ *  Molecules whose atoms fall outside the MMFF94 parameter set (Y, lanthanides,
+ *  transition metals, etc.) must be rejected here: left unchecked they reach
+ *  `etkdg_pipeline_warp_kernel` and go out of bounds, poisoning every subsequent
+ *  CUDA call on every device. These tests assert each known rejection path
+ *  returns the right `conformer_status_t` so the caller can route to CPU
+ *  fallback or surface a precise error to the user.
  */
 
-#include <cstdio>
-#include <cstdlib>
-#include <string>
+#include <cstdio>  // `fprintf`, `stderr`
+#include <cstdlib> // `std::exit`
+
+#include <string> // `std::string`
 
 #include "smallfield/api/conformer_status.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfapi = smallfield::api;

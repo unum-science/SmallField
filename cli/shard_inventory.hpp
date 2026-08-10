@@ -1,31 +1,26 @@
 /**
  *  @file shard_inventory.hpp
- *  @brief Glob input Parquet shards and decide which outputs already exist
- *         so a `--resume` run skips finished shards.
+ *  @brief Glob input Parquet shards and decide which outputs already exist so a `--resume` run skips finished shards.
  *
- *  Restart policy: each input shard `<name>.parquet` deterministically maps
- *  to output `<name>.3D.parquet` (note the dot — matches the canonical
- *  `*.3D.parquet` naming shared with the Python reference reimplementation).
- *  An output is considered complete iff a sentinel file `<output>.encoded`
- *  exists. The sentinel is written by the writer ONLY after the parquet has
- *  been atomically closed, so a kill mid-write never falsely flags
- *  completion.
+ *  Restart policy: each input shard `<name>.parquet` deterministically maps to output `<name>.3D.parquet`, note the
+ *  dot, matching the canonical `*.3D.parquet` naming shared with the Python reference reimplementation. An output
+ *  is considered complete iff a sentinel file `<output>.encoded` exists. The sentinel is written by the writer @b
+ *  only after the parquet has been atomically closed, so a kill mid-write never falsely flags completion.
  *
- *  Files whose name already ends with `.3D.parquet` are treated as outputs
- *  and excluded from the input set — important when `--output` defaults to
- *  the same directory as `--input`.
+ *  Files whose name already ends with `.3D.parquet` are treated as outputs and excluded from the input set —
+ *  important when `--output` defaults to the same directory as `--input`.
  */
 
 #pragma once
 
-#include <cstdint>
-#include <filesystem>
-#include <string>
-#include <vector>
+#include <cstdint> // `std::uint64_t`
+
+#include <filesystem> // `std::filesystem::path`
+#include <vector>     // `std::vector`
 
 namespace smallfield::cli {
 
-/** @brief One input/output Parquet shard with its row count and completion flag. */
+/** One input/output Parquet shard with its row count and completion flag. */
 struct shard_pair_t {
     std::filesystem::path input_path;
     std::filesystem::path output_path;
@@ -39,7 +34,7 @@ struct shard_pair_t {
  *  and mark shards whose `<output>.encoded` sentinel exists as
  *  `already_complete`.
  *
- *  @param resume when true, already-complete shards are flagged; when false,
+ *  @param[in] resume when true, already-complete shards are flagged; when false,
  *         all outputs are considered pending (caller will overwrite).
  */
 std::vector<shard_pair_t> inventory_shards(std::filesystem::path const &input_dir,

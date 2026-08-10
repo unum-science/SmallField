@@ -1,38 +1,34 @@
 /**
  *  @file etkdg_prepare_batch.hpp
- *  @brief CPU-side ETKDG preprocessing using RDKit C++ API (stages 0-1).
+ *  @brief CPU-side ETKDG preprocessing using RDKit C++ API.
  *
  *  Converts molecular graphs into GPU-ready data structures:
- *   - Distance bounds matrix (N x N, smoothed via triangle inequality)
+ *   - Distance bounds matrix (N × N, smoothed via triangle inequality)
  *   - Chiral center descriptors (index-ordered neighbors, target volume sign)
  *   - ETK torsion descriptors (CSD Fourier coefficients)
  *   - 1-2 / 1-3 distance constraints
  *
- *  All functions operate on RDKit ROMol objects and produce flat arrays
- *  suitable for upload to GPU global memory.
+ *  All functions operate on RDKit ROMol objects and produce flat arrays suitable for upload to GPU global memory.
  */
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
+#include <cassert> // `assert`
+#include <cmath>   // `std::cos`, `std::sin`
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstring> // `std::memcpy`
 
-#include <algorithm>
-#include <array>
-#include <cassert>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <limits>
-#include <memory>
-#include <mutex>
-#include <span>
-#include <string>
-#include <string_view>
-#include <type_traits>
-#include <utility>
-#include <vector>
+#include <algorithm>   // `std::max`, `std::min`
+#include <array>       // `std::array`
+#include <memory>      // `std::unique_ptr`
+#include <mutex>       // `std::call_once`, `std::once_flag`
+#include <span>        // `std::span`
+#include <sstream>     // RDKit's `AtomTyper.h` needs it but does not include it
+#include <string_view> // `std::string_view`
+#include <utility>     // `std::move`
+#include <vector>      // `std::vector`
+
+#include "smallfield/module_fwd.hpp"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -46,7 +42,6 @@
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/Chirality.h>
 #include <GraphMol/DistGeomHelpers/BoundsMatrixBuilder.h>
-#include <GraphMol/ForceFieldHelpers/CrystalFF/TorsionPreferences.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
 #include <GraphMol/MolOps.h>
@@ -137,13 +132,17 @@ using smallfield::types::no_stereo_atom_k;
  */
 struct etkdg_prepared_molecule_t {
     std::uint32_t num_atoms;
-    std::vector<float> bounds_matrix; ///< N x N flat, unsmoothed
+    /** N × N flat, unsmoothed. */
+    std::vector<float> bounds_matrix;
     std::vector<chiral_center_descriptor_t> chiral_centers;
     std::vector<etk_torsion_descriptor_t> etk_torsions;
-    std::vector<distance_constraint_t> distance_constraints; ///< 1-2 bond, 1-3 angle
+    /** 1-2 bond, 1-3 angle. */
+    std::vector<distance_constraint_t> distance_constraints;
     // MMFF94 per-atom data (kernel enumerates nonbonded pairs on-the-fly from bond_distance).
-    std::vector<mmff94_atom_vdw_params_t> mmff_atom_vdw; ///< one per atom
-    std::vector<float> mmff_atom_charge;                 ///< one per atom
+    /** One per atom. */
+    std::vector<mmff94_atom_vdw_params_t> mmff_atom_vdw;
+    /** One per atom. */
+    std::vector<float> mmff_atom_charge;
     std::vector<mmff94_bond_t> mmff_bonds;
     std::vector<mmff94_angle_t> mmff_angles;
     std::vector<mmff94_torsion_t> mmff_torsions;
@@ -156,45 +155,22 @@ struct etkdg_prepared_molecule_t {
     std::vector<etk_atom_interaction_t> etk_interactions;
     std::vector<etk_atom_offsets_t> etk_atom_offsets;
     etkdg_molecule_metadata_t metadata;
-    /** @brief Flat topology the device preprocessing kernels read; filled by every prep path. */
+    /** Flat topology the device preprocessing kernels read; filled by every prep path. */
     molecule_descriptor_t descriptor;
-    /** @brief Elements this molecule claims in each device-filled region. */
+    /** Elements this molecule claims in each device-filled region. */
     device_capacities_t capacities;
-    /** @brief Atom types RDKit assigned, present only when the native typer rejected the molecule. */
+    /** Atom types RDKit assigned, present only when the native typer rejected the molecule. */
     std::vector<std::uint8_t> patch_atom_types;
-    /** @brief Partial charges RDKit assigned, present only alongside @ref patch_atom_types. */
+    /** Partial charges RDKit assigned, present only alongside `patch_atom_types`. */
     std::vector<float> patch_atom_charges;
 };
 
-/**
- *  @brief Build the distance bounds matrix from a molecular graph.
- *
- *  Uses RDKit's BoundsMatrixBuilder to compute initial bounds from
- *  bond lengths, VdW radii, and angle-derived 1-3 distances.
- *
- *  Output layout (N x N row-major):
- *  @code{.cpp}
- *  bounds[i*N + j]  // i < j → upper bound (angstroms)
- *  bounds[i*N + j]  // i > j → lower bound (angstroms)
- *  @endcode
- *
- *  @param[in] molecule RDKit molecule with explicit hydrogens.
- *  @param[out] bounds Flat N x N float array filled in row-major order.
- */
-/**
- *  @brief Native zero-heap bounds-matrix builder.
- *
- *  Replaces RDKit's `setTopolBounds`, which allocates a fresh
- *  `DistGeom::BoundsMatrix` plus two `boost::shared_array<>` per molecule and
- *  walks RDKit's atom typer — roughly 140 KB of throwaway heap per call.
- *  This version reads only from the flat `molecule_descriptor_t` and the
- *  small `forcefield_tables.hpp` and writes directly into `bounds`.
- *
- *  The values are close but not bit-identical to `setTopolBounds`'s output.
- *  Downstream triangle smoothing (GPU) + FIRE refinement (GPU) absorb the
- *  small residual; we validate P50 energy within 1 kcal/mol of the RDKit
- *  baseline via the quality gate in `bench_chembl`.
- */
+/** Which side of the double bond the two reference substituents sit on. */
+enum double_bond_geometry_t : std::uint8_t {
+    double_bond_trans_k = 0,
+    double_bond_cis_k = 1,
+};
+
 /**
  *  @brief End-to-end distance of a 1-4 chain `first — second = third — fourth` whose
  *  central bond is planar, at a torsion of 0 for cis or pi for trans.
@@ -202,12 +178,6 @@ struct etkdg_prepared_molecule_t {
  *  Unlike a freely rotatable 1-4 pair, a stereo-defined double bond fixes this distance,
  *  which is how ETKDG enforces E/Z through the bounds matrix.
  */
-/** @brief Which side of the double bond the two reference substituents sit on. */
-enum double_bond_geometry_t : std::uint8_t {
-    double_bond_trans_k = 0,
-    double_bond_cis_k = 1,
-};
-
 inline float stereo_one_four_distance(molecule_descriptor_t const &descriptor, std::uint32_t first,
                                       std::uint32_t second, std::uint32_t third, std::uint32_t fourth,
                                       std::uint32_t bond_first_second, std::uint32_t bond_second_third,
@@ -233,6 +203,27 @@ inline float stereo_one_four_distance(molecule_descriptor_t const &descriptor, s
     return std::sqrt(std::max(0.01f, squared));
 }
 
+/**
+ *  @brief Native zero-heap builder for the distance bounds matrix.
+ *
+ *  Replaces RDKit's `setTopolBounds`, which allocates a fresh `DistGeom::BoundsMatrix` plus two
+ *  `boost::shared_array<>` per molecule and walks RDKit's atom typer, roughly 140 KB of throwaway
+ *  heap per call. This version reads only from the flat `molecule_descriptor_t` and the small
+ *  `forcefield_tables.hpp`, and writes directly into `bounds`.
+ *
+ *  The values are close but not bit-identical to `setTopolBounds`'s output. Downstream triangle
+ *  smoothing and FIRE refinement, both on the GPU, absorb the small residual; `bench_conformers`
+ *  reports the paired energy distribution against the RDKit baseline.
+ *
+ *  Output layout, N × N row-major:
+ *  @verbatim
+ *  bounds[i * N + j], i < j   upper bound distance in angstroms
+ *  bounds[i * N + j], i > j   lower bound distance in angstroms
+ *  @endverbatim
+ *
+ *  @param[in] descriptor Molecule graph with explicit hydrogens already added.
+ *  @param[out] bounds Flat N × N float array filled in row-major order.
+ */
 inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::vector<float> &bounds) {
     std::uint32_t const num_atoms = descriptor.num_atoms;
     bounds.assign(static_cast<std::size_t>(num_atoms) * num_atoms, 0.0f);
@@ -292,7 +283,7 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::ve
         }
     }
 
-    // Collect the E/Z-defined double bonds up front.  Drug-like molecules have none or a
+    // Collect the E/Z-defined double bonds up front. Drug-like molecules have none or a
     // handful, so the 1-4 sweep below scans a tiny list rather than all bonds, and skips
     // the check entirely in the common zero case.
     std::uint32_t stereo_bonds[max_bonds_k];
@@ -318,7 +309,7 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::ve
             if (hops != 3) continue;
 
             // A 1-4 pair spanning a stereo-defined double bond has a determined
-            // end-to-end distance rather than a free envelope.  Leaving the generic
+            // end-to-end distance rather than a free envelope. Leaving the generic
             // 4.5 Å upper in place lets smoothing and FIRE settle on either isomer.
             bool stereo_constrained = false;
             for (std::uint32_t s = 0; s < num_stereo_bonds && !stereo_constrained; ++s) {
@@ -458,7 +449,7 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
  *  values from RDKit's setTopolBounds().
  *
  *  @param[in] molecule RDKit molecule whose topology defines the constraints.
- *  @param[in] bounds_matrix Flat N x N distance bounds (row-major, from build_bounds_matrix()).
+ *  @param[in] bounds_matrix Flat N × N distance bounds (row-major, from build_bounds_matrix()).
  *  @param[out] constraints Filled with 1-2 bond and 1-3 angle distance constraints.
  */
 inline void extract_distance_constraints(molecule_descriptor_t const &descriptor,
@@ -512,89 +503,6 @@ inline void extract_distance_constraints(molecule_descriptor_t const &descriptor
                 constraint.penalty_weight = 5.0f;
                 constraints.push_back(constraint);
             }
-        }
-    }
-}
-
-/**
- *  @brief Extract ETK torsion terms with CSD Fourier coefficients.
- *
- *  Uses RDKit's experimental torsion angle preferences (Riniker & Landrum,
- *  JCIM 2015) via ForceFields::CrystalFF::getExperimentalTorsions() to obtain
- *  atom-type-specific Fourier coefficients from the Cambridge Structural
- *  Database torsion library. Falls back to generic 3-fold barriers when no
- *  CSD torsions are found.
- *
- *  @param[in] molecule RDKit molecule with explicit hydrogens.
- *  @param[out] torsions Filled with one descriptor per torsion term.
- */
-inline void extract_etk_torsions(RDKit::ROMol const &molecule, std::vector<etk_torsion_descriptor_t> &torsions) {
-    torsions.clear();
-
-    // Get CSD experimental torsion preferences from RDKit.
-    ForceFields::CrystalFF::CrystalFFDetails crystal_details;
-    ForceFields::CrystalFF::getExperimentalTorsions(molecule, crystal_details,
-                                                    /*useExpTorsions=*/true,
-                                                    /*useSmallRingTorsions=*/true,
-                                                    /*useMacrocycleTorsions=*/false,
-                                                    /*useBasicKnowledge=*/true,
-                                                    /*version=*/2);
-
-    // Convert RDKit's torsion data to the SmallField descriptor format.
-    for (std::size_t t = 0; t < crystal_details.expTorsionAtoms.size(); ++t) {
-        auto const &atom_indices = crystal_details.expTorsionAtoms[t];
-        if (atom_indices.size() < 4) continue;
-
-        auto const &angle_data = crystal_details.expTorsionAngles[t];
-        auto const &signs = angle_data.first;
-        auto const &force_constants = angle_data.second;
-
-        etk_torsion_descriptor_t torsion {};
-        torsion.atom_indices[0] = static_cast<std::uint8_t>(atom_indices[0]);
-        torsion.atom_indices[1] = static_cast<std::uint8_t>(atom_indices[1]);
-        torsion.atom_indices[2] = static_cast<std::uint8_t>(atom_indices[2]);
-        torsion.atom_indices[3] = static_cast<std::uint8_t>(atom_indices[3]);
-
-        // Combine signs and force constants: Vn = signs[n] * forceConstants[n].
-        for (std::size_t n = 0; n < 6 && n < force_constants.size(); ++n) {
-            float sign = (n < signs.size()) ? static_cast<float>(signs[n]) : 1.0f;
-            torsion.fourier_coefficients[n] = sign * static_cast<float>(force_constants[n]);
-        }
-
-        torsions.push_back(torsion);
-    }
-
-    // If no CSD torsions are found, fall back to generic 3-fold barriers for rotatable bonds.
-    if (torsions.empty()) {
-        for (auto const &bond : molecule.bonds()) {
-            if (bond->getIsAromatic() || bond->getBondTypeAsDouble() > 1.5) continue;
-
-            unsigned int atom_j = bond->getBeginAtomIdx();
-            unsigned int atom_k = bond->getEndAtomIdx();
-            unsigned int atom_i = static_cast<unsigned int>(-1);
-            unsigned int atom_l = static_cast<unsigned int>(-1);
-
-            for (auto const &neighbor : molecule.atomNeighbors(molecule.getAtomWithIdx(atom_j))) {
-                if (neighbor->getIdx() != atom_k) {
-                    atom_i = neighbor->getIdx();
-                    break;
-                }
-            }
-            for (auto const &neighbor : molecule.atomNeighbors(molecule.getAtomWithIdx(atom_k))) {
-                if (neighbor->getIdx() != atom_j) {
-                    atom_l = neighbor->getIdx();
-                    break;
-                }
-            }
-            if (atom_i == static_cast<unsigned int>(-1) || atom_l == static_cast<unsigned int>(-1)) continue;
-
-            etk_torsion_descriptor_t torsion {};
-            torsion.atom_indices[0] = static_cast<std::uint8_t>(atom_i);
-            torsion.atom_indices[1] = static_cast<std::uint8_t>(atom_j);
-            torsion.atom_indices[2] = static_cast<std::uint8_t>(atom_k);
-            torsion.atom_indices[3] = static_cast<std::uint8_t>(atom_l);
-            torsion.fourier_coefficients[2] = 1.0f; // Generic V₃ = 1.0.
-            torsions.push_back(torsion);
         }
     }
 }
@@ -695,7 +603,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     // RDKit's per-term std::map lookups.
     //
     // `getMMFFAtomType` returns 0 for atoms outside the MMFF94 parameter set
-    // (Y, lanthanides, transition metals, etc.).  Detect that here on the
+    // (Y, lanthanides, transition metals, etc.). Detect that here on the
     // host so the molecule never reaches the GPU pipeline — without this
     // gate, `etkdg_pipeline_warp_kernel` does an OOB write through
     // element-keyed parameter LUTs in `forcefield_tables.hpp` and poisons
@@ -707,7 +615,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     }
 
     // Defence in depth: catch the rare case of all-typed atoms but
-    // unparametrized interactions (e.g. missing torsion params).  Same
+    // unparametrized interactions (e.g. missing torsion params). Same
     // routing as the per-atom case — the molecule can't be MMFF-optimised
     // on-device and must fall back to CPU ETKDGv3.
     if (!mmff_props.isValid()) return smallfield::api::conformer_status_t::unsupported_element;
@@ -760,7 +668,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
             ForceFields::MMFF::MMFFBond bp;
             // Dropping the term would understate the molecule's energy by a whole bond stretch, and
             // the device hop-count BFS derives adjacency from this list, so a missing entry also
-            // shifts the 1-2 / 1-3 / 1-4 nonbonded exclusions.  Reject the molecule instead and let
+            // shifts the 1-2 / 1-3 / 1-4 nonbonded exclusions. Reject the molecule instead and let
             // the fallback role handle it.
             if (!mmff_props.getMMFFBondStretchParams(mol, i, j, bond_type, bp))
                 return smallfield::api::conformer_status_t::unsupported_element;
@@ -965,7 +873,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
 
     // compute per-type offsets: bonds first, then angles, etc. No nonbonded range.
     // Sanity-assert that no per-atom interaction count exceeds the documented
-    // bound `max_mmff_interactions_per_mol_k`.  The original `uint8_t` storage
+    // bound `max_mmff_interactions_per_mol_k`. The original `uint8_t` storage
     // silently wrapped here for dense drug-like atoms with >255 torsions; the
     // new `uint32_t` storage removes the ceiling, but the assert catches any
     // upstream bug that would still stage corrupt data to the GPU.
@@ -1048,15 +956,15 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
 }
 
 /**
- *  @brief Fill a caller-owned @p result with stages 0-1 output for one SMILES.
+ *  @brief Fill a caller-owned @p result with the full preprocessing output for one SMILES.
  *
- *  Called from @c prepare_molecule_batch with a thread-local @c result that is
+ *  Called from `prepare_molecule_batch` with a thread-local `result` that is
  *  reused across every molecule the thread processes — each molecule's vectors
  *  keep their capacity from the previous call, so push_back stays on the hot
- *  path without heap allocation after the first few molecules.  Sets
- *  @c result.num_atoms = 0 on failure and returns the rejection reason; on
- *  success returns @c conformer_status_t::success.  Callers that don't need
- *  the per-molecule reason code can still test @c result.num_atoms == 0 as
+ *  path without heap allocation after the first few molecules. Sets
+ *  `result.num_atoms = 0` on failure and returns the rejection reason; on
+ *  success returns `conformer_status_t::success`. Callers that don't need
+ *  the per-molecule reason code can still test `result.num_atoms == 0` as
  *  the in-band drop signal.
  */
 inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_view smiles,
@@ -1115,7 +1023,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
     }
     if (mmff_status != conformer_status_t::success) {
         // MMFF could not parametrise this molecule (e.g. atomic number outside
-        // the MMFF94 set).  The mmff_* result vectors are empty after the
+        // the MMFF94 set). The mmff_* result vectors are empty after the
         // early return inside `extract_mmff94_params`, but ETK fields above
         // are populated; clear num_atoms so downstream packing skips this mol.
         result.num_atoms = 0;
@@ -1155,7 +1063,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
  *  @brief Convert a SMILES string to a fresh `etkdg_prepared_molecule_t`.
  *
  *  Thin wrapper around `prepare_molecule_into` used by tests and by the
- *  non-pipelined path.  Allocates a fresh struct per call — NOT the hot path;
+ *  non-pipelined path. Allocates a fresh struct per call — @b not the hot path;
  *  the batched path inside `prepare_molecule_batch` uses thread_local scratch
  *  to keep vector capacities.
  */
@@ -1168,11 +1076,11 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string_view smiles) {
 /**
  *  @brief Read RDKit's MMFF94 atom types and partial charges for one molecule.
  *
- *  Reached only when @c native_compute_mmff_atom_types leaves an atom untyped, which happens for
+ *  Reached only when `native_compute_mmff_atom_types` leaves an atom untyped, which happens for
  *  4.63 % of a 5000-SMILES stratified PubChem sample and 0.02 % of a 5000-SMILES Enamine REAL
- *  sample.  The device extractor is a pure function of the types and charges it is handed, so
+ *  sample. The device extractor is a pure function of the types and charges it is handed, so
  *  where RDKit can type such a molecule, supplying RDKit's answer keeps it on the same path as
- *  every other one; where RDKit cannot, the caller rejects it.  On both samples above RDKit
+ *  every other one; where RDKit cannot, the caller rejects it. On both samples above RDKit
  *  rejects every one of them, so this returns `unsupported_element` throughout.
  *
  *  @param[in] molecule RDKit molecule with explicit hydrogens, already sanitized.
@@ -1208,11 +1116,11 @@ inline smallfield::api::conformer_status_t read_rdkit_mmff_typing(RDKit::ROMol c
  *
  *  The host keeps what depends on RDKit's molecular graph — the parse, `AddHs`, the flat
  *  descriptor, the bounds matrix, the chiral centres, the 1-2 / 1-3 constraints — plus the
- *  per-region capacities the launch path turns into per-molecule bases.  The CSD torsion match,
+ *  per-region capacities the launch path turns into per-molecule bases. The CSD torsion match,
  *  the MMFF atom typing and charges, the MMFF term extraction and both per-atom CSRs run on the
  *  device from the descriptor this function fills.
  *
- *  Sets @c result.num_atoms to zero on rejection and returns the reason; on success returns
+ *  Sets `result.num_atoms` to zero on rejection and returns the reason; on success returns
  *  `conformer_status_t::success`.
  */
 inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std::string_view smiles,
@@ -1270,7 +1178,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std:
     result.metadata.num_atoms = num_atoms;
     result.metadata.num_chiral_centers = static_cast<std::uint32_t>(result.chiral_centers.size());
     result.metadata.num_distance_constraints = static_cast<std::uint32_t>(result.distance_constraints.size());
-    // The device stamps the real term counts once it has extracted them.  Seeding the fields with
+    // The device stamps the real term counts once it has extracted them. Seeding the fields with
     // the capacities keeps `molecule_complexity_score_` a usable balance estimate in the meantime,
     // since every capacity is monotonic in the term count it bounds.
     result.metadata.num_etk_torsions = result.capacities.etk_torsions;
@@ -1287,7 +1195,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std:
  *  @brief Batch of molecules packed into a single pinned host buffer.
  *
  *  Type alias onto `wave_slice_pool_t`, which owns one contiguous pinned host allocation plus a
- *  byte-level `wave_slice_layout_t` describing every sub-region.  The launch path issues ONE
+ *  byte-level `wave_slice_layout_t` describing every sub-region. The launch path issues ONE
  *  `cudaMemcpyAsync` of the uploaded prefix into a per-GPU device mirror; the regions past that
  *  prefix exist only on the device and the preprocessing kernels fill them there.
  */
@@ -1297,15 +1205,16 @@ using etkdg_molecule_batch_t = wave_slice_pool_t;
  *  @brief Per-molecule element counts of every region a batch carries.
  *
  *  Packed into one cache-line-aligned struct so the prefix scan over per-molecule sizes is one
- *  pass over a single struct rather than a dozen parallel accumulator chains.  The device-filled
+ *  pass over a single struct rather than a dozen parallel accumulator chains. The device-filled
  *  regions contribute their capacity rather than their eventual content, since that is what the
- *  host reserves for them.  The @c valid field doubles as the dense-output compaction counter.
+ *  host reserves for them. The `valid` field doubles as the dense-output compaction counter.
  */
 struct alignas(64) per_mol_sizes_t {
     std::uint32_t bounds;
     std::uint32_t chirals;
     std::uint32_t distance_constraints;
-    std::uint32_t atoms; ///< per-atom regions: types, charges, VdW params, and both CSR offset arrays
+    /** Per-atom regions: types, charges, VdW params, and both CSR offset arrays. */
+    std::uint32_t atoms;
     std::uint32_t bond_distance;
     std::uint32_t etk_interactions;
     std::uint32_t mmff_bonds;
@@ -1316,12 +1225,13 @@ struct alignas(64) per_mol_sizes_t {
     std::uint32_t mmff_interactions;
     std::uint32_t patch_atoms;
     std::uint32_t patch_records;
-    std::uint32_t valid; ///< 0 if the molecule failed preprocessing, 1 otherwise
+    /** 0 if the molecule failed preprocessing, 1 otherwise. */
+    std::uint32_t valid;
     std::uint32_t padding;
 };
 static_assert(sizeof(per_mol_sizes_t) == 64, "per_mol_sizes_t must be one cache line");
 
-/** @brief Accumulate one molecule's capacities into a running total. */
+/** Accumulate one molecule's capacities into a running total. */
 inline void accumulate_sizes(per_mol_sizes_t &totals, etkdg_molecule_metadata_t const &metadata,
                              device_capacities_t const &capacities) {
     std::uint32_t const num_atoms = metadata.num_atoms;
@@ -1341,11 +1251,11 @@ inline void accumulate_sizes(per_mol_sizes_t &totals, etkdg_molecule_metadata_t 
 }
 
 /**
- *  Derive the `wave_slice_layout_t` from total per-region counts.  Every region's byte offset is
+ *  @brief Derive the `wave_slice_layout_t` from total per-region counts. Every region's byte offset is
  *  aligned to `wave_slice_layout_t::region_alignment` so the GPU pool slicing in `launch_gpu_pipeline`
  *  inherits correct alignment for free.
  *
- *  The uploaded prefix carries only what the host produces.  Everything the preprocessing kernels
+ *  The uploaded prefix carries only what the host produces. Everything the preprocessing kernels
  *  write — both CSRs, the ETK torsions, every MMFF term array, the per-atom types and charges, the
  *  typer status and the hop-count matrix — is placed past `bytes_uploaded` and never crosses PCIe.
  *
@@ -1429,7 +1339,7 @@ inline wave_slice_layout_t compute_batch_layout(per_mol_sizes_t const &totals, s
  */
 struct batch_prep_per_mol_record_t {
     std::uint32_t original_index;
-    /** @brief Thread-local base of this molecule inside the MMFF interaction array.  The metadata
+    /** Thread-local base of this molecule inside the MMFF interaction array. The metadata
      *  has no field for it because only the per-atom CSR entries reference it, and those are
      *  device-built; the launch path passes it through `mmff_bases` instead. */
     std::uint32_t mmff_interaction_base;
@@ -1440,7 +1350,7 @@ struct batch_prep_per_mol_record_t {
  *  @brief Per-OpenMP-thread contribution buffer for the three-stage `preprocess-step` of
  *  `prepare_molecule_batch_into`.
  *
- *  One instance per thread.  The per-region `*_bytes` accumulators hold the concatenation of the
+ *  One instance per thread. The per-region `*_bytes` accumulators hold the concatenation of the
  *  host-produced regions for every molecule that thread processed, in append order; the `*_count`
  *  accumulators hold the reservations for the device-filled regions, which carry no host bytes.
  *  Persisted across calls via a file-scope `static` vector so the `std::vector` capacities survive.
@@ -1454,7 +1364,7 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::vector<std::byte> patch_atom_types_bytes;
     std::vector<std::byte> patch_atom_charges_bytes;
     std::vector<mmff94_typing_patch_t> typing_patches;
-    /** @brief Running element counts of this thread's share of every device-filled region.  The
+    /** Running element counts of this thread's share of every device-filled region. The
      *  bytes are never staged: the kernels write them in place after the upload, so the thread
      *  accumulates only the room its molecules claim. */
     std::size_t atom_count = 0;
@@ -1467,14 +1377,14 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::size_t mmff_stretchbend_count = 0;
     std::size_t mmff_interaction_count = 0;
     std::vector<batch_prep_per_mol_record_t> mols;
-    /** @brief Slice-local input indices for every molecule this thread's slice rejected, each
-     *  tagged with the reason.  Aggregated upstream into `wave_slice_pool_t::rejected_input_indices`. */
+    /** Slice-local input indices for every molecule this thread's slice rejected, each
+     *  tagged with the reason. Aggregated upstream into `wave_slice_pool_t::rejected_input_indices`. */
     std::vector<smallfield::api::rejected_mol_t> rejected_input_indices;
     std::uint32_t max_atoms_seen = 0;
     std::uint32_t max_bonds_seen = 0;
 };
 
-/** @brief Per-thread pool-wide base offsets computed by `scan_per_region_offsets_`. */
+/** Per-thread pool-wide base offsets computed by `scan_per_region_offsets_`. */
 struct batch_prep_thread_bases_t {
     std::size_t bounds, chirals, distance_constraints;
     std::size_t atoms, bond_distance, etk_interactions;
@@ -1483,7 +1393,7 @@ struct batch_prep_thread_bases_t {
     std::size_t dense_slot;
 };
 
-/** @brief Append `bytes` bytes from `source` to the back of `destination`; return the pre-append offset. */
+/** Append `bytes` bytes from `source` to the back of `destination`; return the pre-append offset. */
 static inline std::size_t append_bytes_(std::vector<std::byte> &destination, void const *source, std::size_t bytes) {
     std::size_t const offset = destination.size();
     if (bytes > 0) {
@@ -1498,9 +1408,9 @@ static inline std::size_t append_bytes_(std::vector<std::byte> &destination, voi
  *  parallel-for races on first access.
  *
  *  Touches the SMILES parser, addHs, `assignStereochemistry` (which pulls in the CIP-rank global
- *  state), the MMFF94 parameter tables, and an ETKDG-style substructure match path.  These all
+ *  state), the MMFF94 parameter tables, and an ETKDG-style substructure match path. These all
  *  have process-wide lazy-loaded caches that in some RDKit versions are not safe for concurrent
- *  first-time access.  `std::call_once` guarantees the warm-up runs exactly once per process
+ *  first-time access. `std::call_once` guarantees the warm-up runs exactly once per process
  *  regardless of how many call sites reach here.
  */
 inline void warm_up_rdkit_globals_once_() {
@@ -1517,7 +1427,7 @@ inline void warm_up_rdkit_globals_once_() {
             }
         }
         catch (...) {
-            // Warm-up is best-effort.  If it throws, the subsequent parallel-for call hits the
+            // Warm-up is best-effort. If it throws, the subsequent parallel-for call hits the
             // same cache-miss path; it costs the race protection, not correctness.
         }
     });
@@ -1528,7 +1438,7 @@ inline void warm_up_rdkit_globals_once_() {
  *  each OpenMP thread's contribution buffer.
  *
  *  Resizes `contribs` to `omp_get_max_threads()` and clears prior contents while preserving the
- *  inner `std::vector` capacities.  After return, each thread's contribution carries its share of
+ *  inner `std::vector` capacities. After return, each thread's contribution carries its share of
  *  the input molecules with thread-local metadata offsets.
  */
 static inline void prepare_per_thread_contribs_(std::span<std::string_view const> smiles_list,
@@ -1561,9 +1471,9 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
     }
 
     std::size_t const n = smiles_list.size();
-    // CRITICAL: this file is included by `smallfield.cu` which is compiled with nvcc.  For OpenMP
+    // CRITICAL: this file is included by `smallfield.cu` which is compiled with nvcc. For OpenMP
     // to actually parallelize here, the CMake target must pass `-Xcompiler=-fopenmp` through nvcc
-    // to the host compiler.  Otherwise nvcc silently ignores the pragma and this loop runs
+    // to the host compiler. Otherwise nvcc silently ignores the pragma and this loop runs
     // single-threaded — 20x slowdown.
 #pragma omp parallel
     {
@@ -1796,7 +1706,7 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
  *
  *  Recycling the pinned buffer across `embedding-waves` is the lever that kills pinned-memory
  *  allocator contention at 8-GPU scale — `cudaHostAlloc`/`cudaFreeHost` serialize on a driver
- *  lock.  The `static` contribs vector persists capacities across calls so the allocator's fast
+ *  lock. The `static` contribs vector persists capacities across calls so the allocator's fast
  *  path handles every call after the first.
  */
 inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list, etkdg_molecule_batch_t &batch,
@@ -1805,8 +1715,8 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
     batch.observed_max_atoms = 0;
     batch.layout = wave_slice_layout_t {};
 
-    // Persistent per-call scratch.  Safe as long as this function is not called concurrently from
-    // multiple outer threads.  The CLI's 4-role pipeline guarantees this (preprocess-step runs
+    // Persistent per-call scratch. Safe as long as this function is not called concurrently from
+    // multiple outer threads. The CLI's 4-role pipeline guarantees this (preprocess-step runs
     // only on the gpu-runner-role thread).
     static std::vector<batch_prep_thread_contribution_t> contribs;
     prepare_per_thread_contribs_(smiles_list, salt_policy, contribs);
@@ -1827,7 +1737,7 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
         return;
     }
 
-    // Merge every thread's rejected-input indices into the batch's flat list.  Each entry carries
+    // Merge every thread's rejected-input indices into the batch's flat list. Each entry carries
     // the slice-local index plus the `conformer_status_t` reason code.
     batch.rejected_input_indices.clear();
     for (auto const &contribution : contribs)
@@ -1839,9 +1749,10 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
 }
 
 /**
- *  Convenience wrapper that returns a fresh batch (allocates a new pinned buffer every call).
- *  Kept for call sites that don't participate in the pipelined dispatcher — tests, one-shot
- *  invocations.  The hot path should prefer @ref prepare_molecule_batch_into.
+ *  @brief Convenience wrapper returning a fresh batch, allocating a new pinned buffer every call.
+ *
+ *  Serves call sites outside the pipelined dispatcher, such as tests and one-shot invocations. The
+ *  hot path should prefer `prepare_molecule_batch_into`.
  */
 inline etkdg_molecule_batch_t prepare_molecule_batch(
     std::span<std::string_view const> smiles_list,
@@ -1856,20 +1767,23 @@ inline etkdg_molecule_batch_t prepare_molecule_batch(
  *
  *  Holds the sort permutation, the CSR-packed per-device assignment list, the per-device CSR
  *  offset array, the shared-batch molecule-to-patch lookup, and the per-device per-molecule
- *  capacity staging the pack loop consumes.  One instance per caller; reused across every
+ *  capacity staging the pack loop consumes. One instance per caller; reused across every
  *  `embedding-wave` so the distribute hot path never allocates.
  */
 struct distribute_scratch_t {
-    std::vector<std::uint32_t> sort_permutation; ///< length: total_mol_count
-    std::vector<std::uint32_t> per_device_flat;  ///< length: total_mol_count, CSR values
-    /** @brief Index into the shared batch's typing-patch array for each molecule, or
-     *  @ref no_typing_patch_k when the molecule was typed natively. */
+    /** Length: total_mol_count. */
+    std::vector<std::uint32_t> sort_permutation;
+    /** Length: total_mol_count, CSR values. */
+    std::vector<std::uint32_t> per_device_flat;
+    /** Index into the shared batch's typing-patch array for each molecule, or
+     *  `no_typing_patch_k` when the molecule was typed natively. */
     std::vector<std::uint32_t> patch_of_molecule;
     static constexpr std::uint32_t no_typing_patch_k = 0xFFFFFFFFu;
     // Room for twice the `smallfield::api::max_devices_k = 16` the API admits; smallfield.cu
     // compile-time-asserts the two against each other.
     static constexpr std::uint32_t max_devices_k = 32u;
-    std::array<std::uint32_t, max_devices_k + 1u> per_device_offsets {}; ///< length: device_count + 1
+    /** Length: device_count + 1. */
+    std::array<std::uint32_t, max_devices_k + 1u> per_device_offsets {};
     std::array<std::vector<device_capacities_t>, max_devices_k> capacities_per_mol {};
 };
 
@@ -1889,10 +1803,10 @@ struct distribute_scratch_t {
  *
  *  Caller ensures `per_device_out[d].host` is pre-sized to hold this device's slice.
  *
- *  @param[in] shared Packed shared batch produced by @ref prepare_molecule_batch_into.
+ *  @param[in] shared Packed shared batch produced by `prepare_molecule_batch_into`.
  *  @param[in] device_count Devices to partition across.
  *  @param[out] per_device_out One pinned pool per device, filled in place.
- *  @param[inout] scratch Grow-only caller-owned scratch; see @ref distribute_scratch_t.
+ *  @param[inout] scratch Grow-only caller-owned scratch; see `distribute_scratch_t`.
  */
 inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &shared, std::uint32_t device_count,
                                                   std::span<etkdg_molecule_batch_t> per_device_out,
@@ -2073,11 +1987,11 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
 
 /**
  *  @brief Preprocess + distribute entry: produce `device_count` per-device pinned batch pools with
- *  a complexity-descending stripe partition.  Each device's pool holds only its assigned mols in
+ *  a complexity-descending stripe partition. Each device's pool holds only its assigned mols in
  *  complexity-ascending (→ atom-count-ascending on average) order for kernel bin dispatch.
  *
  *  Internally reuses the three-stage preprocess against a reusable shared batch, then distributes
- *  to the per-device pools.  Two file-scope `static` scratch instances hold the pinned shared
+ *  to the per-device pools. Two file-scope `static` scratch instances hold the pinned shared
  *  batch and the distribution CSR buffers so neither allocation fires on the hot path.
  *
  *  @param[in] smiles_list Slice of input SMILES to prepare.

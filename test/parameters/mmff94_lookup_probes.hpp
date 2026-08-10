@@ -1,6 +1,11 @@
+/**
+ *  @file mmff94_lookup_probes.hpp
+ *  @brief Query/result structs for probing each MMFF94 parameter table lookup in isolation.
+ */
+
 #pragma once
 
-#include <cstdint>
+#include <cstdint> // `std::uint8_t`
 
 struct vdw_query_t {
     std::uint8_t atom_type;

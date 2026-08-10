@@ -8,14 +8,23 @@
  *  - ETK torsion descriptors (CSD Fourier coefficients)
  *  - Distance constraints (1-2 bond, 1-3 angle-derived bounds)
  *
- *  All structs use `alignas` (C++17) for portable alignment.
+ *  All structs use `alignas` for portable alignment.
+ *
+ *  The bounds matrix is a full N × N float matrix in row-major order, matching RDKit's
+ *  `DistGeom::BoundsMatrix` convention. Distances are in angstroms.
+ *
+ *  @verbatim
+ *  bounds[i * N + j], i < j   upper bound distance
+ *  bounds[i * N + j], i > j   lower bound distance
+ *  bounds[i * N + i]          0.0
+ *  @endverbatim
  */
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
+#include <cstdint> // `std::uint8_t`, `std::uint32_t`
 
-#include <cstdint>
+#include "smallfield/module_fwd.hpp"
 
 namespace smallfield::types {
 
@@ -51,10 +60,10 @@ enum etk_interaction_type_t : std::uint8_t {
  *  Per-molecule metadata for the ETKDG pipeline.
  *  One per molecule in the batch; offsets point into concatenated arrays.
  *
- *  Every offset here counts @b elements, never bytes.  The batch layout in
- *  @ref smallfield::api::wave_slice_layout_t carves the same regions out of the pool and its offsets
+ *  Every offset here counts @b elements, never bytes. The batch layout in
+ *  `smallfield::api::wave_slice_layout_t` carves the same regions out of the pool and its offsets
  *  count bytes, so the two are named apart — `bounds_offset` here against `bounds_byte_offset`
- *  there.  They used to differ only by word order, which reads the same and compiles the same
+ *  there — rather than differing only by word order, which would read and compile the same
  *  while addressing memory four times too far.
  */
 struct etkdg_molecule_metadata_t {
@@ -71,42 +80,51 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t num_mmff_torsions;
     std::uint32_t num_mmff_oops;
     std::uint32_t num_mmff_stretchbends;
-    std::uint32_t mmff_atom_vdw_offset;    ///< offset into batched per-atom VdW params (= atom offset)
-    std::uint32_t mmff_atom_charge_offset; ///< offset into batched per-atom charge (= atom offset)
-    std::uint32_t bond_distance_offset;    ///< offset into batched per-molecule N×N bond_distance
+    /** Offset into batched per-atom VdW params (= atom offset). */
+    std::uint32_t mmff_atom_vdw_offset;
+    /** Offset into batched per-atom charge (= atom offset). */
+    std::uint32_t mmff_atom_charge_offset;
+    /** Offset into batched per-molecule N×N bond_distance. */
+    std::uint32_t bond_distance_offset;
     std::uint32_t mmff_bond_offset;
     std::uint32_t mmff_angle_offset;
     std::uint32_t mmff_torsion_offset;
     std::uint32_t mmff_oop_offset;
     std::uint32_t mmff_stretchbend_offset;
     std::uint32_t mmff_atom_csr_offset;
-    std::uint32_t etk_interaction_offset; ///< offset into batched ETK interaction list
-    std::uint32_t etk_atom_csr_offset;    ///< offset into batched ETK atom offsets
+    /** Offset into batched ETK interaction list. */
+    std::uint32_t etk_interaction_offset;
+    /** Offset into batched ETK atom offsets. */
+    std::uint32_t etk_atom_csr_offset;
     /**
      *  @brief Reserved for a future host-side bounds quantisation step.
      *
      *  The current pipeline computes per-molecule (mol_min, inv_scale) inside
      *  etkdg_pipeline_warp_kernel because the metric prepass smooths bounds in
      *  global memory and the quantise step must scan the *post-smoothed*
-     *  values.  If smoothing ever moves host-side these slots can carry the
+     *  values. If smoothing ever moves host-side these slots can carry the
      *  pre-quantised range — until then they are unused (set to {0, 1} by
      *  prepare_molecule_into) and the kernel ignores them.
      */
     float bounds_min;
     float bounds_inv_scale;
     /**
-     *  @brief Optional readback fields, populated by preprocess and bubbled to the
-     *  caller via the corresponding output spans on @ref context_t::generate_conformers.
-     *  GPU kernels do NOT read these — they are pure host-side passthroughs computed
-     *  once per molecule from the post-`AddHs` RDKit `RWMol`.
+     *  @brief Heavy, non-hydrogen, atom count.
+     *
+     *  This and the two fields below are optional readbacks, populated by preprocess and bubbled
+     *  to the caller via the corresponding output spans on `context_t::generate_conformers`. GPU
+     *  kernels do @b not read these — they are pure host-side passthroughs computed once per
+     *  molecule from the post-`AddHs` RDKit `RWMol`.
      */
-    std::uint32_t num_heavy_atoms;        ///< heavy (non-H) atom count
-    std::uint32_t num_bonds;              ///< total bond count, including H bonds
-    float molecular_weight;               ///< exact molecular weight in Daltons
+    std::uint32_t num_heavy_atoms;
+    /** Total bond count, including H bonds. */
+    std::uint32_t num_bonds;
+    /** Exact molecular weight in Daltons. */
+    float molecular_weight;
 };
 
 /**
- *  Chiral center descriptor.
+ *  @brief Chiral center descriptor.
  *  Stores the central atom, its neighbors in ascending atom-index order, and the expected sign of
  *  the signed tetrahedral volume over that order.
  *
@@ -115,62 +133,85 @@ struct etkdg_molecule_metadata_t {
  *  any deterministic order works as long as the same one is used at derivation and validation.
  *  A three-coordinate center stores its three bonded neighbors and leaves the fourth slot unused.
  *
- *  Validation: V = (r_b - r_a) . ((r_c - r_a) x (r_d - r_a))
- *  where a = center, b,c,d = neighbor_atoms[0..2]; sign(V) must equal target_sign.
+ *  @verbatim
+ *  Validation: V = dot(r_b - r_a, cross(r_c - r_a, r_d - r_a))
+ *  where a = center and b, c, d = neighbor_atoms[0..2]; sign(V) must equal target_sign.
+ *  @endverbatim
  */
 struct alignas(8) chiral_center_descriptor_t {
-    std::uint8_t center_atom;       ///< central atom index within molecule
-    std::uint8_t neighbor_atoms[4]; ///< neighbor atom indices, ascending
-    std::int8_t target_sign;        ///< expected sign of the signed tetrahedral volume
+    /** Central atom index within molecule. */
+    std::uint8_t center_atom;
+    /** Neighbor atom indices, ascending. */
+    std::uint8_t neighbor_atoms[4];
+    /** Expected sign of the signed tetrahedral volume. */
+    std::int8_t target_sign;
     std::uint8_t padding[2];
 };
 
 /**
  *  ETK torsion term from CSD (Cambridge Structural Database) preferences.
  *
- *  E_torsion = Σₙ₌₁⁶ Vₙ·cos(n·φ)
+ *  @verbatim
+ *  E_torsion = Σ_{n=1..6} V_n * cos(n * φ)
  *  where φ is the dihedral angle defined by atom_indices[0]-[1]-[2]-[3].
+ *  @endverbatim
  */
 struct alignas(32) etk_torsion_descriptor_t {
-    std::uint8_t atom_indices[4]; ///< dihedral atoms i-j-k-l within molecule
+    /** Dihedral atoms i-j-k-l within molecule. */
+    std::uint8_t atom_indices[4];
     std::uint8_t padding[4];
-    float fourier_coefficients[6]; ///< V₁ through V₆ (kcal/mol)
+    /** V₁ through V₆ (kcal/mol). */
+    float fourier_coefficients[6];
 };
 
 /**
  *  Distance constraint for distance geometry and ETK refinement stages.
  *
- *  E = penalty_weight · max(0, dᵢⱼ - upper)² + penalty_weight · max(0, lower - dᵢⱼ)²
- *  where dᵢⱼ = ‖rᵢ - rⱼ‖
+ *  @verbatim
+ *  E = penalty_weight * max(0, d_ij - upper)^2 + penalty_weight * max(0, lower - d_ij)^2
+ *  where d_ij = |r_i - r_j|
+ *  @endverbatim
  */
 struct alignas(16) distance_constraint_t {
-    std::uint8_t atom_index_i;    ///< first atom index within molecule
-    std::uint8_t atom_index_j;    ///< second atom index within molecule
-    std::uint8_t constraint_type; ///< 0 = 1-2 bond, 1 = 1-3 angle-derived, 2 = custom
+    /** First atom index within molecule. */
+    std::uint8_t atom_index_i;
+    /** Second atom index within molecule. */
+    std::uint8_t atom_index_j;
+    /** 0 = 1-2 bond, 1 = 1-3 angle-derived, 2 = custom. */
+    std::uint8_t constraint_type;
     std::uint8_t padding;
-    float lower_bound_angstrom; ///< minimum allowed interatomic distance
-    float upper_bound_angstrom; ///< maximum allowed interatomic distance
-    float penalty_weight;       ///< force constant for bound violation penalty
+    /** Minimum allowed interatomic distance. */
+    float lower_bound_angstrom;
+    /** Maximum allowed interatomic distance. */
+    float upper_bound_angstrom;
+    /** Force constant for bound violation penalty. */
+    float penalty_weight;
 };
 
 /**
  *  @brief Per-atom MMFF94 VdW parameters.
  *
  *  Stored once per atom; combined pairwise inside the kernel via Halgren's
- *  combining rule (R*_ij) and Slater-Kirkwood (epsilon_ij).  Replaces the
- *  materialized nonbonded pair array — the kernel enumerates pairs on the
- *  fly from the descriptor's `bond_distance` matrix.
+ *  combining rule (R*_ij) and Slater-Kirkwood (epsilon_ij). The kernel
+ *  enumerates nonbonded pairs on the fly from the descriptor's
+ *  `bond_distance` matrix rather than reading a materialized pair array.
  *
  *  Matches the atom-level data surfaced by RDKit's MMFFVdW entry plus
  *  the donor-acceptor flag used by `scaleVdWParams`.
  */
 struct alignas(8) mmff94_atom_vdw_params_t {
-    float alpha;                 ///< polarizability (α)
-    float n_effective;           ///< effective number of valence electrons (N)
-    float a_scale;               ///< A_i — preserved for parity with other MMFF variants
-    float g_factor;              ///< G_i (Slater-Kirkwood factor)
-    float r_star;                ///< this atom's VdW radius (R*)
-    std::uint8_t donor_acceptor; ///< 0 = '-', 1 = 'A' acceptor, 2 = 'D' donor
+    /** Polarizability (α). */
+    float alpha;
+    /** Effective number of valence electrons (N). */
+    float n_effective;
+    /** A_i — preserved for parity with other MMFF variants. */
+    float a_scale;
+    /** G_i (Slater-Kirkwood factor). */
+    float g_factor;
+    /** This atom's VdW radius (R*). */
+    float r_star;
+    /** 0 = '-', 1 = 'A' acceptor, 2 = 'D' donor. */
+    std::uint8_t donor_acceptor;
     std::uint8_t padding[3];
 };
 static_assert(sizeof(mmff94_atom_vdw_params_t) == 24);
@@ -178,29 +219,39 @@ static_assert(sizeof(mmff94_atom_vdw_params_t) == 24);
 /**
  *  @brief MMFF94 bond stretching term.
  *
- *  E = 0.5 * 143.9325 * kb * dr² * (1 + cs * dr + 7/12 * cs² * dr²)
+ *  @verbatim
+ *  E = 0.5 * 143.9325 * kb * dr^2 * (1 + cs * dr + 7/12 * cs^2 * dr^2)
+ *  @endverbatim
  */
 struct alignas(16) mmff94_bond_t {
     std::uint8_t atom_i;
     std::uint8_t atom_j;
     std::uint8_t padding[2];
-    float force_constant;       ///< kb (mdyn/angstrom)
-    float equilibrium_distance; ///< r0 (angstroms)
+    /** `kb` in mdyn per angstrom. */
+    float force_constant;
+    /** `r0` in angstroms. */
+    float equilibrium_distance;
     float padding_float;
 };
 
 /**
  *  @brief MMFF94 angle bending term.
  *
- *  E = 0.5 * 0.043844 * ka * Δθ² * (1 + cb * Δθ)
+ *  @verbatim
+ *  E = 0.5 * 0.043844 * ka * Δθ^2 * (1 + cb * Δθ)
+ *  @endverbatim
  */
 struct alignas(16) mmff94_angle_t {
     std::uint8_t atom_i;
-    std::uint8_t atom_j;    ///< central atom
+    /** Central atom. */
+    std::uint8_t atom_j;
     std::uint8_t atom_k;
-    std::uint8_t is_linear; ///< 1 when the central atom is MMFF94 `linh` — use the linear-bend form
-    float force_constant;    ///< ka (mdyn·angstrom/rad²)
-    float equilibrium_angle; ///< θ₀ (radians)
+    /** 1 when the central atom is MMFF94 `linh` — use the linear-bend form. */
+    std::uint8_t is_linear;
+    /** `ka` in mdyn·angstrom per rad². */
+    float force_constant;
+    /** θ₀ (radians). */
+    float equilibrium_angle;
     float padding_float;
 };
 static_assert(sizeof(mmff94_angle_t) == 16);
@@ -208,57 +259,83 @@ static_assert(sizeof(mmff94_angle_t) == 16);
 /**
  *  @brief MMFF94 torsion term.
  *
- *  E = 0.5 * (V1*(1+cos(phi)) + V2*(1-cos(2*phi)) + V3*(1+cos(3*phi)))
+ *  @verbatim
+ *  E = 0.5 * (V1*(1+cos(φ)) + V2*(1-cos(2*φ)) + V3*(1+cos(3*φ)))
+ *  @endverbatim
  */
 struct alignas(16) mmff94_torsion_t {
     std::uint8_t atom_i;
     std::uint8_t atom_j;
     std::uint8_t atom_k;
     std::uint8_t atom_l;
-    float v1; ///< first barrier height (kcal/mol)
-    float v2; ///< second barrier height (kcal/mol)
-    float v3; ///< third barrier height (kcal/mol)
+    /** First barrier height (kcal/mol). */
+    float v1;
+    /** Second barrier height (kcal/mol). */
+    float v2;
+    /** Third barrier height (kcal/mol). */
+    float v3;
 };
 
 /**
- *  MMFF94 out-of-plane bending. E = 0.5·0.043844·koop·chi² (chi in degrees).
- *  Wilson angle: chi = angle between bond j→i and the plane j-k-l.
+ *  MMFF94 out-of-plane bending.
+ *
+ *  @verbatim
+ *  E = 0.5*0.043844*koop*chi^2 (chi in degrees)
+ *  Wilson angle: chi = angle between bond j->i and the plane j-k-l.
+ *  @endverbatim
  */
 struct alignas(16) mmff94_oop_t {
-    std::uint8_t atom_i;  ///< out-of-plane atom
-    std::uint8_t atom_j;  ///< central sp2 atom
-    std::uint8_t atom_k;  ///< in-plane neighbor 1
-    std::uint8_t atom_l;  ///< in-plane neighbor 2
-    float force_constant; ///< koop (mdyn·angstrom/rad²)
+    /** Out-of-plane atom. */
+    std::uint8_t atom_i;
+    /** Central sp2 atom. */
+    std::uint8_t atom_j;
+    /** In-plane neighbor 1. */
+    std::uint8_t atom_k;
+    /** In-plane neighbor 2. */
+    std::uint8_t atom_l;
+    /** `koop` in mdyn·angstrom per rad². */
+    float force_constant;
     float padding[2];
 };
 
 /**
  *  @brief MMFF94 stretch-bend coupling term.
  *
- *  E = 2.5121 * (kba_ijk * Δrᵢⱼ + kba_kji * Δrₖⱼ) * Δθ
+ *  @verbatim
+ *  E = 2.5121 * (kba_ijk * Δr_ij + kba_kji * Δr_kj) * Δθ
+ *  @endverbatim
  */
 struct alignas(32) mmff94_stretchbend_t {
-    std::uint8_t atom_i; ///< end atom 1
-    std::uint8_t atom_j; ///< central atom
-    std::uint8_t atom_k; ///< end atom 2
+    /** End atom 1. */
+    std::uint8_t atom_i;
+    /** Central atom. */
+    std::uint8_t atom_j;
+    /** End atom 2. */
+    std::uint8_t atom_k;
     std::uint8_t padding;
-    float kba_ijk;                 ///< stretch-bend force constant (bond i-j)
-    float kba_kji;                 ///< stretch-bend force constant (bond k-j)
-    float equilibrium_angle;       ///< θ₀ (radians)
-    float equilibrium_distance_ij; ///< r₀_ij (angstroms)
-    float equilibrium_distance_kj; ///< r₀_kj (angstroms)
+    /** Stretch-bend force constant (bond i-j). */
+    float kba_ijk;
+    /** Stretch-bend force constant (bond k-j). */
+    float kba_kji;
+    /** θ₀ (radians). */
+    float equilibrium_angle;
+    /** r₀_ij (angstroms). */
+    float equilibrium_distance_ij;
+    /** r₀_kj (angstroms). */
+    float equilibrium_distance_kj;
     float padding_float;
 };
 
 /**
- *  Per-atom MMFF94 interaction descriptor for the per-atom adjacency list.
+ *  @brief Per-atom MMFF94 interaction descriptor for the per-atom adjacency list.
  *  Each entry says: "atom X participates in term Y with role Z".
  *  interaction_type: mmff94_nonbonded_k through mmff94_stretch_bend_k
  */
 struct mmff94_atom_interaction_t {
-    std::uint32_t term_index;                   ///< index into the type-specific parameter array
-    mmff94_interaction_type_t interaction_type; ///< nonbonded, bond, angle(end/center), torsion, oop, stretch-bend
+    /** Index into the type-specific parameter array. */
+    std::uint32_t term_index;
+    /** Nonbonded, bond, angle(end/center), torsion, oop, stretch-bend. */
+    mmff94_interaction_type_t interaction_type;
     atom_role_t role;
 };
 
@@ -267,6 +344,12 @@ struct mmff94_atom_interaction_t {
  *
  *  No `nonbonded_*` fields — the nonbonded kernel loop enumerates pairs
  *  on the fly from the `bond_distance` matrix.
+ *
+ *  The counts are `uint32_t` because a central atom in a large drug-like molecule can participate
+ *  in more than 255 torsions. A narrower counter wraps, the torsion writes overflow into the next
+ *  atom's OOP region, and the kernel then reads torsion term indices out of `oop_params` — an
+ *  illegal memory access. `uint16_t` would raise the ceiling to 65535, and `uint32_t` removes it
+ *  entirely for 40 bytes per atom-offset entry.
  */
 struct mmff94_atom_offsets_t {
     std::uint32_t bond_offset;
@@ -274,11 +357,6 @@ struct mmff94_atom_offsets_t {
     std::uint32_t torsion_offset;
     std::uint32_t oop_offset;
     std::uint32_t stretchbend_offset;
-    // These are `uint32_t` because a central atom in a large drug-like molecule can participate in
-    // more than 255 torsions.  A narrower counter wraps, the torsion writes overflow into the next
-    // atom's OOP region, and the kernel then reads torsion term indices out of `oop_params` — an
-    // illegal memory access.  `uint16_t` would raise the ceiling to 65535; `uint32_t` removes it
-    // entirely for 40 bytes per atom-offset entry.
     std::uint32_t bond_count;
     std::uint32_t angle_count;
     std::uint32_t torsion_count;
@@ -293,7 +371,8 @@ struct mmff94_atom_offsets_t {
  */
 struct etk_atom_interaction_t {
     std::uint32_t term_index;
-    etk_interaction_type_t interaction_type; ///< etk_torsion_k or etk_distance_constraint_k
+    /** etk_torsion_k or etk_distance_constraint_k. */
+    etk_interaction_type_t interaction_type;
     atom_role_t role;
 };
 
@@ -309,31 +388,23 @@ struct etk_atom_offsets_t {
  *  @brief One molecule the device MMFF typer cannot type, with the host's answer for it.
  *
  *  The native typer leaves an atom at type 0 for a minority of molecules — 4.63 % of a 5000-SMILES
- *  stratified PubChem sample, 0.02 % of a 5000-SMILES Enamine REAL sample.  The host runs the same
+ *  stratified PubChem sample, 0.02 % of a 5000-SMILES Enamine REAL sample. The host runs the same
  *  typer over the same descriptor before the wave launches, so it knows which molecules those are
  *  without a readback; where RDKit can parametrise one, its atom types and partial charges are
  *  staged here, a device pass writes them over the typer's output and clears the molecule's typing
- *  status, and the extractor treats the molecule as typed.  Where RDKit cannot parametrise it
- *  either, the molecule is rejected with `unsupported_element` as it always was.  On both samples
+ *  status, and the extractor treats the molecule as typed. Where RDKit cannot parametrise it
+ *  either, the molecule is rejected with `unsupported_element` as it always was. On both samples
  *  above that second case covers every untyped molecule and this array stays empty, so the patch is
  *  a guard against a corpus where the two typers disagree rather than a hot path.
  */
 struct mmff94_typing_patch_t {
-    std::uint32_t molecule_index; ///< position of the molecule inside the batch
-    std::uint32_t atom_base;      ///< first atom of the molecule in the batch-global per-atom arrays
-    std::uint32_t patch_base;     ///< first atom of the molecule inside the staged patch arrays
+    /** Position of the molecule inside the batch. */
+    std::uint32_t molecule_index;
+    /** First atom of the molecule in the batch-global per-atom arrays. */
+    std::uint32_t atom_base;
+    /** First atom of the molecule inside the staged patch arrays. */
+    std::uint32_t patch_base;
     std::uint32_t atom_count;
 };
-
-/**
- *  Bounds matrix layout convention:
- *
- *  Full N x N float matrix, row-major.
- *  bounds[i*N + j] with i < j  stores the upper bound distance (angstroms)
- *  bounds[i*N + j] with i > j  stores the lower bound distance (angstroms)
- *  bounds[i*N + i] = 0.0
- *
- *  This matches RDKit's DistGeom::BoundsMatrix convention.
- */
 
 } // namespace smallfield::types

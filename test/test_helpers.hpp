@@ -9,13 +9,14 @@
 
 #pragma once
 
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <memory>
-#include <string>
-#include <vector>
+#include <cmath>   // `std::fabs`
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdio>  // `fprintf`, `stderr`
+#include <cstdlib> // `std::exit`
+
+#include <memory> // `std::unique_ptr`
+#include <string> // `std::string`
+#include <vector> // `std::vector`
 
 #include <DistGeom/BoundsMatrix.h>
 #include <DistGeom/TriangleSmooth.h>
@@ -31,9 +32,13 @@
 namespace smallfield {
 namespace tests {
 
-// simple assertion macros (no test framework dependency)
-// prefixed with SF_ to avoid collision with RDKit's TEST_ASSERT
-#define SF_TEST_ASSERT(condition, message)                                                 \
+/**
+ *  @brief Fail the test with a message and the source location when @p condition is false.
+ *
+ *  Carries the `sf_` prefix so it cannot collide with RDKit's own `TEST_ASSERT`, which keeps the
+ *  tests free of any framework dependency.
+ */
+#define sf_verify_(condition, message)                                                     \
     do {                                                                                   \
         if (!(condition)) {                                                                \
             std::fprintf(stderr, "FAIL: %s\n  at %s:%d\n", (message), __FILE__, __LINE__); \
@@ -41,8 +46,8 @@ namespace tests {
         }                                                                                  \
     } while (0)
 
-#define SF_TEST_NEAR(actual, expected, tolerance, message)                                                       \
-    SF_TEST_ASSERT(                                                                                              \
+#define sf_verify_near_(actual, expected, tolerance, message)                                                    \
+    sf_verify_(                                                                                                  \
         std::fabs(static_cast<double>(actual) - static_cast<double>(expected)) < static_cast<double>(tolerance), \
         (message))
 
@@ -133,10 +138,10 @@ inline double rdkit_mmff94_energy(RDKit::RWMol &mol, int conformer_id = -1) {
 }
 
 /**
- *  @brief Get the smoothed bounds matrix from RDKit as a flat N x N double array.
+ *  @brief Get the smoothed bounds matrix from RDKit as a flat N × N double array.
  *
  *  @param[inout] mol Molecule to compute bounds for.
- *  @return Row-major N x N flat double vector (upper triangle = upper bounds, lower = lower bounds).
+ *  @return Row-major N × N flat double vector (upper triangle = upper bounds, lower = lower bounds).
  */
 inline std::vector<double> rdkit_bounds_matrix(RDKit::RWMol &mol) {
     std::uint32_t const num_atoms = mol.getNumAtoms();
@@ -146,7 +151,7 @@ inline std::vector<double> rdkit_bounds_matrix(RDKit::RWMol &mol) {
     RDKit::DGeomHelpers::setTopolBounds(mol, bounds_matrix);
     DistGeom::triangleSmoothBounds(bounds_raw);
 
-    // flatten to row-major N x N
+    // flatten to row-major N × N
     std::vector<double> flat(num_atoms * num_atoms, 0.0);
     for (std::uint32_t i = 0; i < num_atoms; ++i) {
         for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
@@ -178,14 +183,14 @@ inline std::vector<std::string> standard_test_smiles() {
 }
 
 /**
- *  @brief Rebuild the packed N x N bond-hop matrix a single-molecule energy call expects.
+ *  @brief Rebuild the packed N × N bond-hop matrix a single-molecule energy call expects.
  *
  *  The production pool carries no such matrix on the host — a warp BFS fills the device-only
  *  region from the bond list — so the harnesses that drive one molecule through the energy
  *  kernel derive it here from the same bond list, breadth-first from every source atom.
  *  Pairs with no bonded path keep 255, which the nonbonded sweep reads as unreachable.
  *
- *  @param[in] bonds Bond terms, each exposing @c atom_i and @c atom_j.
+ *  @param[in] bonds Bond terms, each exposing `atom_i` and `atom_j`.
  *  @param[in] bond_count Number of bonds.
  *  @param[in] num_atoms Atom count; the matrix is @p num_atoms squared entries.
  *  @param[out] matrix Resized to @p num_atoms squared and filled row-major.

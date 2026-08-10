@@ -3,8 +3,9 @@
  *  @brief CUDA kernel wrapper for MMFF94 energy and gradient tests.
  */
 
-#include <algorithm>
-#include <cstdint>
+#include <cstdint> // `std::uint8_t`, `std::uint32_t`
+
+#include <algorithm> // `std::max`
 
 #include <cuda_runtime.h>
 
@@ -80,7 +81,7 @@ void gpu_mmff_energy(float const *host_positions, std::uint32_t num_atoms,
     // Guards check both num_atoms and the host pointer: build_single_oop_prepared
     // and similar synthetic test fixtures construct a molecule with num_atoms > 0
     // but empty mmff_atom_vdw / atom_charge / bond_distance vectors (the harness
-    // wrapper substitutes nullptr for empty().data()).  Without the pointer
+    // wrapper substitutes nullptr for empty().data()). Without the pointer
     // check the cudaMemcpy hits cudaErrorInvalidValue per slot per FD probe and
     // emits ~75 sanitizer-flagged API errors per test_single_oop run.
     if (num_atoms > 0 && host_atom_vdw != nullptr)

@@ -1,13 +1,16 @@
 /**
  *  @file test_chirality.cpp
  *  @brief Tests for GPU chirality validation vs RDKit reference.
- *  Compiled with g++ (C++20). CUDA kernels in test_chirality_kernels.cu.
+ *
+ *  Compiled with g++, C++20. CUDA kernels in test_chirality_kernels.cu.
  */
 
-#include <cstdio>
-#include <vector>
+#include <cstdio> // `printf`
+
+#include <vector> // `std::vector`
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
@@ -32,10 +35,10 @@ static void test_chirality_correct_conformer() {
         std::printf("  testing: %s\n", smiles.c_str());
 
         auto mol = sftest::mol_from_smiles(smiles);
-        SF_TEST_ASSERT(mol != nullptr, "failed to parse SMILES");
+        sf_verify_(mol != nullptr, "failed to parse SMILES");
 
         bool embedded = sftest::embed_molecule(*mol);
-        SF_TEST_ASSERT(embedded, "failed to embed molecule");
+        sf_verify_(embedded, "failed to embed molecule");
         std::uint32_t const num_atoms = mol->getNumAtoms();
 
         // Extract graph-only chiral targets from the molecular graph.
@@ -62,7 +65,7 @@ static void test_chirality_correct_conformer() {
         bool result = gpu_validate_chirality(coords_soa.data(), chirals.data(), num_atoms,
                                              static_cast<std::uint32_t>(chirals.size()));
         std::printf("    graph-based check: %s\n", result ? "PASS" : "FAIL");
-        SF_TEST_ASSERT(result, "embedded RDKit conformer must satisfy extracted chirality targets");
+        sf_verify_(result, "embedded RDKit conformer must satisfy extracted chirality targets");
     }
 }
 
@@ -70,10 +73,10 @@ static void test_chirality_inverted() {
     std::printf("test_chirality_inverted\n");
 
     auto mol = sftest::mol_from_smiles("C[C@@H](O)CC");
-    SF_TEST_ASSERT(mol != nullptr, "failed to parse");
+    sf_verify_(mol != nullptr, "failed to parse");
 
     bool embedded = sftest::embed_molecule(*mol);
-    SF_TEST_ASSERT(embedded, "failed to embed");
+    sf_verify_(embedded, "failed to embed");
     std::uint32_t const num_atoms = mol->getNumAtoms();
 
     std::vector<sft::chiral_center_descriptor_t> chirals;
@@ -104,7 +107,7 @@ static void test_chirality_inverted() {
                                                  static_cast<std::uint32_t>(flipped_chirals.size()));
     std::printf("  original: %s, flipped: %s\n", result_original ? "PASS" : "FAIL", result_flipped ? "PASS" : "FAIL");
     // The key test is that the original and flipped targets produce opposite results.
-    SF_TEST_ASSERT(result_original != result_flipped, "flipping chiral sign must change validation outcome");
+    sf_verify_(result_original != result_flipped, "flipping chiral sign must change validation outcome");
 }
 
 int main() {

@@ -1,28 +1,29 @@
 /**
  *  @file test_seed_determinism.cpp
- *  @brief Asserts that a fixed @c random_seed reproduces conformers bit for bit.
+ *  @brief Asserts that a fixed `random_seed` reproduces conformers bit for bit.
  *
- *  Two @c generate_conformers calls in one process, same input, same seed, default OpenMP
- *  thread count.  The threading matters: preprocess hands molecules to host threads with a
+ *  Two `generate_conformers` calls in one process, same input, same seed, default OpenMP
+ *  thread count. The threading matters: preprocess hands molecules to host threads with a
  *  dynamic schedule and then atom-count-sorts them per device, so a molecule's offset inside
- *  the device batch is a function of thread timing.  Seeding the pipeline off that offset made
+ *  the device batch is a function of thread timing. Seeding the pipeline off that offset made
  *  the pipeline irreproducible in a way that pinning to one thread would hide, which is why
  *  this test deliberately leaves OpenMP at its default width and uses enough molecules for the
  *  dynamic chunks to interleave differently between the two calls.
  */
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
+#include <cstdint> // `std::uint32_t`
+#include <cstdio>  // `printf`
+#include <cstring> // `std::memcmp`
 
-#include <span>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <span>        // `std::span`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <cuda_fp16.h>
 
 #include "smallfield/api/smallfield.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfapi = smallfield::api;

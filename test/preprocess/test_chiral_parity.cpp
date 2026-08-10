@@ -25,14 +25,15 @@
  *  SMILES corpus named by argv[1].
  */
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <fstream>
-#include <memory>
-#include <string>
-#include <vector>
+#include <cmath>   // `std::fabs`
+#include <cstdint> // `std::uint64_t`, `std::uint8_t`
+#include <cstdio>  // `printf`
+
+#include <algorithm> // `std::sort`, `std::min`
+#include <fstream>   // `std::ifstream`
+#include <memory>    // `std::unique_ptr`
+#include <string>    // `std::string`, `std::getline`
+#include <vector>    // `std::vector`
 
 #include <GraphMol/Chirality.h>
 #include <GraphMol/GraphMol.h>
@@ -40,6 +41,7 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
@@ -155,7 +157,7 @@ void check_against_cip(RDKit::ROMol const &molecule, sft::molecule_descriptor_t 
         int const reference_sign = (cip_code == "S") ? 1 : -1;
 
         int const parity = permutation_parity(reference_order, center.neighbor_atoms, count);
-        SF_TEST_ASSERT(parity != 0, "emitted neighbors must be a permutation of the CIP-ordered neighbors");
+        sf_verify_(parity != 0, "emitted neighbors must be a permutation of the CIP-ordered neighbors");
         int const expected_sign = reference_sign * parity;
 
         ++tally.cip_compared;
@@ -287,7 +289,7 @@ std::vector<std::string> stereo_test_smiles() {
  */
 void check_stereoisomers(std::string const &smiles, oracle_tally_t &tally) {
     auto base = sftest::mol_from_smiles(smiles);
-    SF_TEST_ASSERT(base != nullptr, "curated SMILES must parse");
+    sf_verify_(base != nullptr, "curated SMILES must parse");
 
     std::vector<std::uint32_t> tagged_atoms;
     for (auto const *atom : base->atoms()) {
@@ -296,7 +298,7 @@ void check_stereoisomers(std::string const &smiles, oracle_tally_t &tally) {
             tagged_atoms.push_back(atom->getIdx());
     }
     if (tagged_atoms.empty()) std::printf("  NO TAG SURVIVED: %s\n", smiles.c_str());
-    SF_TEST_ASSERT(!tagged_atoms.empty(), "curated SMILES must carry at least one tetrahedral tag");
+    sf_verify_(!tagged_atoms.empty(), "curated SMILES must carry at least one tetrahedral tag");
 
     std::uint32_t const enumerated_atoms = std::min<std::uint32_t>(tagged_atoms.size(), 4);
     std::uint32_t const variants = 1u << enumerated_atoms;
@@ -361,13 +363,13 @@ int main(int argc, char **argv) {
     std::printf("test_chiral_parity: curated stereo set with exhaustive tag enumeration\n");
     for (auto const &smiles : stereo_test_smiles()) check_stereoisomers(smiles, curated);
     report("curated", curated);
-    SF_TEST_ASSERT(curated.cip_compared >= 400, "curated set must reach several hundred CIP comparisons");
-    SF_TEST_ASSERT(curated.three_coordinate > 0, "curated set must exercise three-coordinate centers");
-    SF_TEST_ASSERT(curated.rank_ties > 0, "curated set must exercise a pseudo-asymmetric center");
-    SF_TEST_ASSERT(curated.geometry_compared >= 50, "curated set must reach the geometric oracle");
-    SF_TEST_ASSERT(curated.geometry_three_coordinate > 0, "geometric oracle must reach a three-coordinate center");
-    SF_TEST_ASSERT(curated.cip_mismatches == 0, "every curated stereocenter must match the CIP oracle");
-    SF_TEST_ASSERT(curated.geometry_mismatches == 0, "every curated stereocenter must match its embedded geometry");
+    sf_verify_(curated.cip_compared >= 400, "curated set must reach several hundred CIP comparisons");
+    sf_verify_(curated.three_coordinate > 0, "curated set must exercise three-coordinate centers");
+    sf_verify_(curated.rank_ties > 0, "curated set must exercise a pseudo-asymmetric center");
+    sf_verify_(curated.geometry_compared >= 50, "curated set must reach the geometric oracle");
+    sf_verify_(curated.geometry_three_coordinate > 0, "geometric oracle must reach a three-coordinate center");
+    sf_verify_(curated.cip_mismatches == 0, "every curated stereocenter must match the CIP oracle");
+    sf_verify_(curated.geometry_mismatches == 0, "every curated stereocenter must match its embedded geometry");
 
     char const *corpus_path = argc > 1 ? argv[1] : nullptr;
     if (corpus_path != nullptr) {
@@ -387,7 +389,7 @@ int main(int argc, char **argv) {
             }
         }
         report("corpus", corpus_tally);
-        SF_TEST_ASSERT(corpus_tally.cip_mismatches == 0, "every corpus stereocenter must match the CIP oracle");
+        sf_verify_(corpus_tally.cip_mismatches == 0, "every corpus stereocenter must match the CIP oracle");
     }
 
     std::printf("ALL TESTS PASSED\n");

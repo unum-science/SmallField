@@ -1,28 +1,25 @@
 /**
  *  @file test_shape_descriptors.cpp
- *  @brief Golden test: native USR / USRCAT match RDKit within tolerance, and
- *         fragment separation is a non-overlapping rigid layout.
+ *  @brief Golden test: native USR / USRCAT match RDKit within tolerance.
  *
- *  For a spread of molecules we parse with the library's parse contract, embed
- *  one ETKDGv3 conformer (fixed seed), MMFF-optimize, then feed that conformer's
- *  float coordinates to both the native descriptors and RDKit's reference
- *  `Descriptors::USR` / `USRCAT`.  To compare like with like, the RDKit conformer
- *  is overwritten with the same float-rounded coordinates the native path sees,
- *  so any residual difference is accumulation order only.  Gate: max abs
- *  difference < 1e-4 on all 12 (USR) and 60 (USRCAT) elements.
+ *  Fragment separation is a non-overlapping rigid layout. For a spread of molecules we parse with the library's
+ *  parse contract, embed one ETKDGv3 conformer with a fixed seed, MMFF-optimize, then feed that conformer's float
+ *  coordinates to both the native descriptors and RDKit's reference `Descriptors::USR` / `USRCAT`. To compare like
+ *  with like, the RDKit conformer is overwritten with the same float-rounded coordinates the native path sees, so
+ *  any residual difference is accumulation order only. Gate: max abs difference < 1e-4 on all 12 USR elements and
+ *  all 60 USRCAT elements.
  *
- *  Also checks that the acetate/sodium salt is two components and that
- *  `separate_fragments` pushes the two fragment centroids apart while leaving
- *  intra-fragment distances unchanged (rigid translation).
+ *  Also checks that the acetate/sodium salt is two components and that `separate_fragments` pushes the two fragment
+ *  centroids apart while leaving intra-fragment distances unchanged — a rigid translation.
  */
 
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <memory>
-#include <string>
-#include <vector>
+#include <cmath>   // `std::fabs`, `std::sqrt`
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdio>  // `printf`
+
+#include <memory> // `std::unique_ptr`
+#include <string> // `std::string`
+#include <vector> // `std::vector`
 
 #include <GraphMol/Descriptors/USRDescriptor.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
@@ -32,14 +29,17 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
 #include "smallfield/postprocess.hpp"
+
 #include "test_helpers.hpp"
 
 namespace sfp = smallfield::postprocess;
 
 namespace {
 
-// Parse with the same contract build_shape_context uses, add Hs, embed one
-// ETKDGv3 conformer with a fixed seed, and MMFF-optimize it.
+/**
+ *  @brief Parse with the same contract `build_shape_context` uses, add Hs, embed one
+ *  ETKDGv3 conformer with a fixed seed, and MMFF-optimize it.
+ */
 std::unique_ptr<RDKit::RWMol> prepare_mol(std::string const &smiles, int seed = 0xC0FFEE) {
     RDKit::SmilesParserParams params;
     params.sanitize = true;
@@ -67,7 +67,7 @@ double max_abs_diff(std::vector<double> const &reference, double const *native, 
 
 void validate_descriptors(std::string const &smiles) {
     std::unique_ptr<RDKit::RWMol> mol = prepare_mol(smiles);
-    SF_TEST_ASSERT(mol != nullptr, ("prepare_mol failed for: " + smiles).c_str());
+    sf_verify_(mol != nullptr, ("prepare_mol failed for: " + smiles).c_str());
 
     std::uint32_t const num_atoms = mol->getNumAtoms();
     std::vector<float> coords = smallfield::tests::extract_coords_interleaved(*mol);
@@ -77,8 +77,8 @@ void validate_descriptors(std::string const &smiles) {
     smallfield::tests::set_coords_interleaved(*mol, coords.data());
 
     sfp::molecule_shape_context_t const context = sfp::build_shape_context(smiles);
-    SF_TEST_ASSERT(context.ok, ("build_shape_context failed for: " + smiles).c_str());
-    SF_TEST_ASSERT(context.num_atoms == num_atoms, "num_atoms mismatch between context and RDKit mol");
+    sf_verify_(context.ok, ("build_shape_context failed for: " + smiles).c_str());
+    sf_verify_(context.num_atoms == num_atoms, "num_atoms mismatch between context and RDKit mol");
 
     // USR.
     std::array<double, 12> native_usr {};
@@ -99,11 +99,11 @@ void validate_descriptors(std::string const &smiles) {
     bool const pass = usr_deviation < tolerance && usrcat_deviation < tolerance;
     std::printf("  [%s] %-34s USR maxdev=%.3e  USRCAT maxdev=%.3e\n", pass ? "PASS" : "FAIL", smiles.c_str(),
                 usr_deviation, usrcat_deviation);
-    SF_TEST_ASSERT(usr_deviation < tolerance, ("USR deviation exceeds tolerance for: " + smiles).c_str());
-    SF_TEST_ASSERT(usrcat_deviation < tolerance, ("USRCAT deviation exceeds tolerance for: " + smiles).c_str());
+    sf_verify_(usr_deviation < tolerance, ("USR deviation exceeds tolerance for: " + smiles).c_str());
+    sf_verify_(usrcat_deviation < tolerance, ("USRCAT deviation exceeds tolerance for: " + smiles).c_str());
 }
 
-// Sum of pairwise distances within one component -- rigid translation invariant.
+/** Sum of pairwise distances within one component — rigid translation invariant. */
 double intra_component_distance_sum(std::vector<float> const &coords, std::vector<std::uint8_t> const &label,
                                     std::uint8_t component) {
     std::vector<std::uint32_t> atoms;
@@ -152,36 +152,34 @@ double centroid_distance(std::array<double, 3> const &a, std::array<double, 3> c
 void validate_fragment_separation() {
     std::string const salt = "CC(=O)[O-].[Na+]";
     std::unique_ptr<RDKit::RWMol> mol = prepare_mol(salt);
-    SF_TEST_ASSERT(mol != nullptr, "prepare_mol failed for salt");
+    sf_verify_(mol != nullptr, "prepare_mol failed for salt");
 
     // `separate_fragments` is a geometric utility over a multi-component context; the production
     // path strips counterions before it can ever see one, so the test builds the context itself.
     sfp::molecule_shape_context_t const context = sfp::build_shape_context(salt, smallfield::keep_all_fragments_k);
-    SF_TEST_ASSERT(context.ok, "build_shape_context failed for salt");
-    SF_TEST_ASSERT(context.num_components == 2, "salt should have exactly two components");
+    sf_verify_(context.ok, "build_shape_context failed for salt");
+    sf_verify_(context.num_components == 2, "salt should have exactly two components");
 
     std::vector<float> coords = smallfield::tests::extract_coords_interleaved(*mol);
 
     double const intra0_before = intra_component_distance_sum(coords, context.component_label, 0);
     double const intra1_before = intra_component_distance_sum(coords, context.component_label, 1);
-    double const centroid_gap_before =
-        centroid_distance(component_centroid(coords, context.component_label, 0),
-                          component_centroid(coords, context.component_label, 1));
+    double const centroid_gap_before = centroid_distance(component_centroid(coords, context.component_label, 0),
+                                                         component_centroid(coords, context.component_label, 1));
 
     sfp::separate_fragments(std::span<float>(coords.data(), coords.size()), context);
 
     double const intra0_after = intra_component_distance_sum(coords, context.component_label, 0);
     double const intra1_after = intra_component_distance_sum(coords, context.component_label, 1);
-    double const centroid_gap_after =
-        centroid_distance(component_centroid(coords, context.component_label, 0),
-                          component_centroid(coords, context.component_label, 1));
+    double const centroid_gap_after = centroid_distance(component_centroid(coords, context.component_label, 0),
+                                                        component_centroid(coords, context.component_label, 1));
 
     std::printf("  [salt] centroid gap %.3f -> %.3f  intra sums (%.4f,%.4f)->(%.4f,%.4f)\n", centroid_gap_before,
                 centroid_gap_after, intra0_before, intra1_before, intra0_after, intra1_after);
 
-    SF_TEST_ASSERT(centroid_gap_after > centroid_gap_before, "separation did not push fragment centroids apart");
-    SF_TEST_NEAR(intra0_after, intra0_before, 1e-3, "component 0 intra-fragment distances changed");
-    SF_TEST_NEAR(intra1_after, intra1_before, 1e-3, "component 1 intra-fragment distances changed");
+    sf_verify_(centroid_gap_after > centroid_gap_before, "separation did not push fragment centroids apart");
+    sf_verify_near_(intra0_after, intra0_before, 1e-3, "component 0 intra-fragment distances changed");
+    sf_verify_near_(intra1_after, intra1_before, 1e-3, "component 1 intra-fragment distances changed");
 }
 
 } // namespace
@@ -191,10 +189,10 @@ int main() {
 
     validate_descriptors("CCO");
     validate_descriptors("c1ccccc1");
-    validate_descriptors("CC(=O)Oc1ccccc1C(=O)O");        // aspirin
-    validate_descriptors("Nc1ccc(cc1)S(=O)(=O)N");        // sulfanilamide: donors + acceptors
-    validate_descriptors("OC(=O)CCc1cc(O)c(O)cc1");       // multiple donors/acceptors/aromatic
-    validate_descriptors("CC(=O)Nc1ccc(O)cc1");           // paracetamol
+    validate_descriptors("CC(=O)Oc1ccccc1C(=O)O");  // aspirin
+    validate_descriptors("Nc1ccc(cc1)S(=O)(=O)N");  // sulfanilamide: donors + acceptors
+    validate_descriptors("OC(=O)CCc1cc(O)c(O)cc1"); // multiple donors/acceptors/aromatic
+    validate_descriptors("CC(=O)Nc1ccc(O)cc1");     // paracetamol
 
     std::printf("Validating fragment separation...\n");
     validate_fragment_separation();

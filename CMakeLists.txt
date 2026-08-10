@@ -1,11 +1,15 @@
 cmake_minimum_required(VERSION 3.18)
 
-# Default CUDA architectures.  The fatbin shipped to deployment covers
-# Ampere (sm_80), Hopper (sm_90), and Blackwell consumer / RTX PRO
-# (sm_120) so feature-gated paths in the kernels (e.g. cooperative_groups
-# TMA copies on sm_90+, DPX on sm_90+) actually emit per-arch SASS.
-# `120` (vs `120-real`) emits both SASS and PTX so the binary can JIT on
-# future hardware that hasn't shipped yet.
+# Default CUDA architectures.  Each entry is a device the project is
+# expected to run on, so the fatbin carries real SASS for it: Ampere
+# (sm_80), Ada / L40S (sm_89), Hopper (sm_90), Blackwell datacenter
+# (sm_100), and Blackwell consumer / RTX PRO (sm_120).
+#
+# `120` (vs `120-real`) is the only entry emitting PTX as well as SASS.
+# PTX JIT is forward-only — it never lowers onto an older architecture —
+# so PTX from the newest entry covers hardware that hasn't shipped yet
+# and covers nothing already on this list.  A device missing from the
+# list therefore finds no cubin and no JIT path, and simply fails to run.
 #
 # For fast dev-iteration on a single known GPU, pass
 # -DSMALLFIELD_NATIVE_CUDA_ARCH=ON or an explicit
@@ -14,7 +18,7 @@ cmake_minimum_required(VERSION 3.18)
 #
 # These two settings must run BEFORE project() so the CUDA toolkit
 # auto-detect at project-time doesn't override us with sm_75 default.
-set(SMALLFIELD_DEFAULT_CUDA_ARCH "80-real;90-real;100-real;120"
+set(SMALLFIELD_DEFAULT_CUDA_ARCH "80-real;89-real;90-real;100-real;120"
     CACHE STRING "Default fatbin CUDA architectures")
 option(SMALLFIELD_NATIVE_CUDA_ARCH
     "Detect a single native CUDA arch via nvidia-smi instead of the multi-arch fatbin"
@@ -49,6 +53,23 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 message(STATUS "CMAKE_CUDA_ARCHITECTURES = ${CMAKE_CUDA_ARCHITECTURES}")
+
+# Compiler cache, when one is installed.  Unchanged translation units then cost
+# nothing on rebuilds, branch switches and CI restores, which dominates the
+# inner loop far more than any one-off compile-speed flag.
+find_program(SMALLFIELD_COMPILER_CACHE NAMES ccache sccache)
+if(SMALLFIELD_COMPILER_CACHE)
+    message(STATUS "Using compiler cache: ${SMALLFIELD_COMPILER_CACHE}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${SMALLFIELD_COMPILER_CACHE}")
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${SMALLFIELD_COMPILER_CACHE}")
+endif()
+
+# Deliberately not passing nvcc `--threads`: it makes one invocation compile its
+# architectures concurrently, which is 55 % faster in isolation but no faster here,
+# because `-j` already saturates the machine across targets and the two layers of
+# parallelism then contend.  Measured 366 s without against 380 s with, 5 arches,
+# 16 cores.  Likewise no precompiled header — nvcc flattens `#include` directives
+# away before the host compiler runs, so a `.gch` can never be consulted.
 
 # Point `core.hooksPath` at `.githooks` here — configuring the build arms the `pre-commit` /
 # `commit-msg` checks, each of which carries its own rationale in that file.  Skipped when built
@@ -179,9 +200,13 @@ if(NOT RDKit_FOUND)
         "Pass -DRDKIT_PREFIX=/path/to/conda/env")
 endif()
 
-# `{fmt}` — used everywhere for formatted and colored logging.  Conda-forge
-# ships it at `$CONDA_PREFIX/lib/cmake/fmt/`; pass `-Dfmt_DIR=<prefix>/lib/cmake/fmt`
-# if the package is installed outside CMAKE_PREFIX_PATH.
+# `{fmt}` — used everywhere for formatted and colored logging.  The same
+# conda-forge environment that supplies RDKit ships it, so search there first.
+# A system `libfmt` whose headers disagree with the RDKit prefix otherwise wins
+# and the mismatch only surfaces as an undefined `fmt::v*::vprint` at link time.
+if(DEFINED RDKIT_PREFIX)
+    list(PREPEND CMAKE_PREFIX_PATH "${RDKIT_PREFIX}")
+endif()
 find_package(fmt REQUIRED CONFIG)
 
 # OpenMP for CPU parallelism

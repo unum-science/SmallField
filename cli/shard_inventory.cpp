@@ -1,13 +1,19 @@
-#include "shard_inventory.hpp"
+/**
+ *  @file shard_inventory.cpp
+ *  @brief Glob input Parquet shards and decide which outputs already exist.
+ */
 
-#include <algorithm>
-#include <cstdio>
-#include <string_view>
+#include <cstdio> // `fprintf`, `stderr`
+
+#include <algorithm>   // `std::sort`
+#include <string_view> // `std::string_view`
 #include <system_error>
 
 #include <arrow/io/file.h>
 #include <parquet/arrow/reader.h>
 #include <parquet/file_reader.h>
+
+#include "shard_inventory.hpp"
 
 namespace smallfield::cli {
 
@@ -25,7 +31,7 @@ static std::uint64_t parquet_row_count(fs::path const &path) {
     }
 }
 
-/// @brief A *.parquet whose name ends with ".3D.parquet" is one of our own outputs.
+/** A *.parquet whose name ends with ".3D.parquet" is one of our own outputs. */
 static bool is_output_shard(fs::path const &path) {
     std::string const filename = path.filename().string();
     constexpr std::string_view suffix = ".3D.parquet";

@@ -5,28 +5,26 @@
  *  Molecules are sorted by atom count and grouped into bins whose members all fit under one cap.
  *  The ladder is even to 128 and then jumps to 192, because past 128 atoms the molecules are rare —
  *  about 4 % of PubChem and none of GDB13 or Enamine REAL — and each bin costs shared memory that
- *  scales with the square of its cap.  One wide bin serves them; a finer ladder up there would buy
+ *  scales with the square of its cap. One wide bin serves them; a finer ladder up there would buy
  *  nothing and cost occupancy on the bins that carry the work.
  *  Two independent consumers key off that partition — the pipeline dispatch sizes shared memory and
- *  occupancy per bin, and the metric prepass batches its eigendecomposition per bin — and they used
- *  to declare the ladder separately with nothing tying them together.  Changing one alone would have
- *  had the prepass embed molecules under one partition while the pipeline dispatched under another.
+ *  occupancy per bin, and the metric prepass batches its eigendecomposition per bin — sharing one
+ *  definition keeps the prepass and the pipeline from partitioning the same wave differently.
  */
 
 #pragma once
-
-#include "smallfield/module_fwd.hpp"
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
 
 #include <array> // `std::array`
 
+#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield::types {
 
-/** @brief Atom-count caps for `atom-limited-bin` dispatch, ascending. */
+/** Atom-count caps for `atom-limited-bin` dispatch, ascending. */
 inline constexpr std::size_t atom_limited_bin_count_k = 9;
 inline constexpr std::array<std::uint32_t, atom_limited_bin_count_k> atom_limited_bin_caps_k = {
     16, 32, 48, 64, 80, 96, 112, 128, 192,
@@ -39,7 +37,7 @@ static_assert(atom_limited_bin_caps_k.back() == max_atoms_per_molecule_k,
  *  @brief Index of the bin a molecule of @p num_atoms belongs to.
  *
  *  @param[in] num_atoms Atom count including hydrogens.
- *  @return Bin index, or @ref atom_limited_bin_count_k when the molecule exceeds every cap.
+ *  @return Bin index, or `atom_limited_bin_count_k` when the molecule exceeds every cap.
  */
 inline constexpr std::size_t atom_limited_bin_for(std::uint32_t num_atoms) noexcept {
     for (std::size_t bin_index = 0; bin_index < atom_limited_bin_count_k; ++bin_index)

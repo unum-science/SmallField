@@ -1,21 +1,22 @@
 /**
  *  @file test_mmff_gpu_typer_kernels.cu
- *  @brief Validate the GPU MMFF typer kernel: run it on a batch of
- *  descriptors and hand results back to the host .cpp for byte-level
- *  comparison vs the CPU native typer.
+ *  @brief Validate the GPU MMFF typer kernel.
+ *
+ *  Runs it on a batch of descriptors and hands results back to the host .cpp for byte-level comparison vs the
+ *  CPU native typer.
  */
 
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdio>  // `fprintf`, `stderr`
 
 #include <cuda_runtime.h>
 
+#include "smallfield/mmff94/mmff94_typer_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_device.cuh"
-#include "smallfield/mmff94/mmff94_typer_device.cuh"
-#include "test_mmff_gpu_typer_kernels.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+
+#include "test_mmff_gpu_typer_kernels.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;

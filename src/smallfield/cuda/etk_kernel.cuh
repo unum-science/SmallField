@@ -2,9 +2,12 @@
  *  @file etk_kernel.cuh
  *  @brief Atom-centric ETK torsion energy and gradient for warp-level L-BFGS.
  *
- *  Implements CSD-derived torsion Fourier potentials for ETKDG stage 7:
- *   E_torsion    = Σₖ Σₙ₌₁⁶ Vₙ·cos(n·φₖ)
- *   E_constraint = Σ_c w_c·max(0, d_c − u_c)² + w_c·max(0, l_c − d_c)²
+ *  Implements CSD-derived torsion Fourier potentials for ETKDG stage 7.
+ *
+ *  @verbatim
+ *  E_torsion    = Σ_k Σ_n V_n * cos(n * φ_k), for n = 1..6
+ *  E_constraint = Σ_c w_c * max(0, d_c - u_c)^2 + w_c * max(0, l_c - d_c)^2
+ *  @endverbatim
  *
  *  Architecture: atom-centric with __sincosf + Chebyshev recurrence.
  *  Each thread owns ceil(N/32) atoms, iterates all torsions/constraints,
@@ -49,8 +52,8 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     std::uint8_t const atom_k = torsion.atom_indices[2];
     std::uint8_t const atom_l = torsion.atom_indices[3];
 
-    // Bond vectors of the i-j-k-l chain.  The second half-plane is spanned by (j-k) and (l-k),
-    // and (j-k) is the negation of @c bond_vec_1, so these three cover both planes.
+    // Bond vectors of the i-j-k-l chain. The second half-plane is spanned by (j-k) and (l-k),
+    // and (j-k) is the negation of `bond_vec_1`, so these three cover both planes.
     float3 const bond_vec_0 = sub_float3_(load_position_(positions, num_atoms, atom_i),
                                           load_position_(positions, num_atoms, atom_j));
     float3 const bond_vec_1 = sub_float3_(load_position_(positions, num_atoms, atom_k),
@@ -78,7 +81,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     // Folding each inverse length into its lever and expanding the two crosses by bilinearity
     // collapses the whole expression to the two crosses below, so the bond vectors, the plane
     // normals, and the levers all die here instead of surviving the Fourier recurrence — only
-    // this one vector does.  The four roles' forces still sum to zero by Newton's 3rd law.
+    // this one vector does. The four roles' forces still sum to zero by Newton's 3rd law.
     float3 force_direction {0.0f, 0.0f, 0.0f};
     if constexpr (write_gradient) {
         float3 lever_0 {0.0f, 0.0f, 0.0f};
@@ -114,7 +117,7 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
             energy_gradient_dihedral -= n_as_float * coeff * sin_curr;
             energy_second_gradient_dihedral -= n_as_float * n_as_float * coeff * cos_curr;
         }
-        // Chebyshev: sin((n+1)phi) = 2cos(φ)sin(nφ) - sin((n-1)phi)
+        // Chebyshev: sin((n+1)φ) = 2cos(φ)sin(nφ) - sin((n-1)φ)
         float const sin_next = 2.0f * cos_phi * sin_curr - sin_prev;
         float const cos_next = 2.0f * cos_phi * cos_curr - cos_prev;
         sin_prev = sin_curr;
@@ -126,8 +129,8 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     if constexpr (!write_gradient) return energy;
 
     // sin_term = -energy_gradient_dihedral / sin(φ), needed for the chain rule ∂E/∂r = sin_term * ∂cos(φ)/∂r
-    // at phi = 0 or pi, sin(φ) → 0 but energy_gradient_dihedral → 0 too (sin(nφ) = 0 for integer n).
-    // L'Hopital: lim[sin->0] energy_gradient_dihedral/sin(φ) = ∂²E/∂φ² / cos(φ)
+    // at φ = 0 or pi, sin(φ) -> 0 but energy_gradient_dihedral -> 0 too (sin(nφ) = 0 for integer n).
+    // L'Hopital: lim[sin->0] energy_gradient_dihedral/sin(φ) = ∂^2E/∂φ^2 / cos(φ)
     float const sin_term = (fabsf(sin_phi) > 1e-6f)
                                ? (-energy_gradient_dihedral / sin_phi)
                                : (-energy_second_gradient_dihedral / fmaxf(fabsf(cos_phi), 1e-10f));

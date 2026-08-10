@@ -2,11 +2,14 @@
  *  @file dg_kernel.cuh
  *  @brief Atom-centric distance geometry energy and gradient for warp-level L-BFGS.
  *
- *  Implements the DG violation energy used in ETKDG stages 4 and 6:
- *   E_total = E_distance + E_chiral + E_4th_dim
- *   E_distance = Σᵢ<ⱼ [ w_upper·max(0, dᵢⱼ − uᵢⱼ)² + w_lower·max(0, lᵢⱼ − dᵢⱼ)² ]
- *   E_chiral   = Σ_c  w_chiral·V_c²   (when sign(V_c) ≠ target)
- *   E_4th_dim  = w₄·Σᵢ xᵢ₄²
+ *  Implements the DG violation energy used in ETKDG stages 4 and 6.
+ *
+ *  @verbatim
+ *  E_total    = E_distance + E_chiral + E_4th_dim
+ *  E_distance = Σ_{i<j} [ w_upper * max(0, d_ij - u_ij)^2 + w_lower * max(0, l_ij - d_ij)^2 ]
+ *  E_chiral   = Σ_c  w_chiral * V_c^2   (when sign(V_c) != target)
+ *  E_4th_dim  = w_4 * Σ_i x_i4^2
+ *  @endverbatim
  *
  *  Architecture: atom-centric. Each thread owns ceil(N/32) atoms and accumulates
  *  their gradients in registers. The partner atom of the inner loop is warp-uniform,
@@ -14,9 +17,9 @@
  *  No atomicAdd. No pair index scan.
  *
  *  Bounds matrix is int8-quantized with a per-molecule (min, inv_scale) pair
- *  (floats broadcast in registers).  Storage per pair is 1 byte — half the
+ *  (floats broadcast in registers). Storage per pair is 1 byte — half the
  *  __half layout — and at N=128 the shared footprint drops from 32 KB to 16 KB.
- *  Dequantize at read site with a single FMA: `bound = q · inv_scale + mol_min`.
+ *  Dequantize at read site with a single FMA: `bound = q * inv_scale + mol_min`.
  */
 
 #pragma once
@@ -25,7 +28,7 @@
 
 #if defined(__CUDACC__)
 
-#include <cstdint>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/cuda/warp_primitives.cuh"
@@ -36,7 +39,7 @@ using smallfield::types::chiral_center_descriptor_t;
 /**
  *  @brief Compute the signed tetrahedral volume for one chiral center.
  *
- *  V = (r_b - r_a) . ((r_c - r_a) x (r_d - r_a)).
+ *  V = (r_b - r_a) · ((r_c - r_a) × (r_d - r_a)).
  *  Uses only xyz (ignores the 4th dimension).
  *  Positions in SoA layout: @p positions[d * num_atoms + i] for dimension d.
  *
@@ -86,12 +89,12 @@ __device__ __forceinline__ bool validate_chirality_(float const *positions, std:
     return __ballot_sync(full_mask_k, lane_ok) == full_mask_k;
 }
 
-/** @brief Row stride in bytes for the shared int8 bounds matrix.
+/** Row stride in bytes for the shared int8 bounds matrix.
  *
  *  The DG inner loop reads `bounds[atom * stride + other]` with `atom` lane-varying and
- *  `other` warp-uniform, so lanes are separated by `stride` bytes.  Shared memory banks
+ *  `other` warp-uniform, so lanes are separated by `stride` bytes. Shared memory banks
  *  are 4-byte words, making the conflict degree `32 / gcd(stride / 4, 32)` — 32-way at an
- *  unpadded N=128.  Rounding to a multiple of 4 with an odd quotient forces that gcd to
+ *  unpadded N=128. Rounding to a multiple of 4 with an odd quotient forces that gcd to
  *  1 for every N, so all 32 lanes land on distinct banks.
  */
 __host__ __device__ __forceinline__ std::uint32_t compute_bounds_row_stride(std::uint32_t num_atoms) {
@@ -111,7 +114,7 @@ __host__ __device__ __forceinline__ std::uint32_t compute_bounds_row_stride(std:
  *  @tparam write_gradient When true, computes and writes gradient; when false, energy only.
  *  @param[in] bounds_matrix Int8-quantized bounds matrix in shared memory. Upper bound at
  *      [min_index × bounds_row_stride + max_index], lower at [max_index × bounds_row_stride + min_index].
- *      Dequantize with `q · inv_scale + mol_min`.
+ *      Dequantize with `q * inv_scale + mol_min`.
  *  @param[in] mol_min Per-molecule floor — the dequantization baseline.
  *  @param[in] inv_scale Per-molecule range / 255 — the per-step size.
  *  @param[in] bounds_row_stride Row stride of @p bounds_matrix in bytes; padded away from
@@ -133,12 +136,11 @@ __host__ __device__ __forceinline__ std::uint32_t compute_bounds_row_stride(std:
  */
 template <bool write_gradient>
 __device__ __forceinline__ float evaluate_distance_geometry_energy(
-    std::uint8_t const *__restrict__ bounds_matrix, float mol_min, float inv_scale,
-    std::uint32_t bounds_row_stride, chiral_center_descriptor_t const *__restrict__ chiral_centers,
-    std::uint32_t num_atoms, std::uint32_t num_chiral_centers, std::uint32_t spatial_dimension,
-    float upper_violation_weight, float lower_violation_weight, float chiral_volume_weight,
-    float fourth_dimension_penalty_weight, float const *positions, float *gradient, std::uint32_t num_elements,
-    std::uint32_t lane) {
+    std::uint8_t const *__restrict__ bounds_matrix, float mol_min, float inv_scale, std::uint32_t bounds_row_stride,
+    chiral_center_descriptor_t const *__restrict__ chiral_centers, std::uint32_t num_atoms,
+    std::uint32_t num_chiral_centers, std::uint32_t spatial_dimension, float upper_violation_weight,
+    float lower_violation_weight, float chiral_volume_weight, float fourth_dimension_penalty_weight,
+    float const *positions, float *gradient, std::uint32_t num_elements, std::uint32_t lane) {
 
     std::uint32_t const dim = spatial_dimension;
 
@@ -180,7 +182,7 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
             float const inverse_distance = rsqrtf(fmaxf(distance_squared, 1e-12f));
             float const distance = distance_squared * inverse_distance;
 
-            // Read bounds (int8 → dequantized float via a single FMA per value).  The upper
+            // Read bounds (int8 → dequantized float via a single FMA per value). The upper
             // bound lives above the diagonal and the lower bound below, so which of the two
             // reads is which follows the atom ordering.
             bool const atom_first = atom < other;
@@ -243,10 +245,11 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
             if (atom == chiral_center_atom) total_energy += chiral_volume_weight * volume * volume;
 
             if constexpr (write_gradient) {
-                // V = edge_b · (edge_c × edge_d).  Chain rule:
-                //   dV/dr_b = edge_c × edge_d  (= cross_cd, already computed)
-                //   dV/dr_c = edge_d × edge_b
-                //   dV/dr_d = edge_b × edge_c
+                // V = edge_b · (edge_c × edge_d). Chain rule:
+                //
+                //   dV/dr_b      = cross(edge_c, edge_d)  (= cross_cd, already computed)
+                //   dV/dr_c      = cross(edge_d, edge_b)
+                //   dV/dr_d      = cross(edge_b, edge_c)
                 //   dV/dr_center = -(dV/dr_b + dV/dr_c + dV/dr_d)
                 float const scale = 2.0f * chiral_volume_weight * volume;
                 auto add_scaled_to_grad_a_ = [&](float3 const &delta) {
@@ -266,7 +269,7 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
             }
         }
 
-        // fourth-dimension crush penalty: w4*xi4²
+        // fourth-dimension crush penalty: w_4 * x_i4^2
         if (fourth_dimension_penalty_weight > 0.0f && dim == 4) {
             float const w_coord = coord_a[3];
             total_energy += fourth_dimension_penalty_weight * w_coord * w_coord;
@@ -297,7 +300,8 @@ struct distance_geometry_energy_functor_t {
     chiral_center_descriptor_t const *__restrict__ chiral_centers;
     float mol_min;
     float inv_scale;
-    std::uint32_t bounds_row_stride; ///< row stride of `bounds_matrix`, padded off `num_atoms`
+    /** Row stride of `bounds_matrix`, padded off `num_atoms`. */
+    std::uint32_t bounds_row_stride;
     std::uint32_t num_atoms;
     std::uint32_t num_chiral_centers;
     std::uint32_t spatial_dimension; // 3 or 4
@@ -322,8 +326,7 @@ struct distance_geometry_energy_functor_t {
         return evaluate_distance_geometry_energy<true>(
             bounds_matrix, mol_min, inv_scale, bounds_row_stride, chiral_centers, num_atoms, num_chiral_centers,
             spatial_dimension, upper_violation_weight, lower_violation_weight, chiral_volume_weight,
-            fourth_dimension_penalty_weight,
-            positions, gradient, num_elements, lane);
+            fourth_dimension_penalty_weight, positions, gradient, num_elements, lane);
     }
 
     /**
@@ -341,8 +344,7 @@ struct distance_geometry_energy_functor_t {
         return evaluate_distance_geometry_energy<false>(
             bounds_matrix, mol_min, inv_scale, bounds_row_stride, chiral_centers, num_atoms, num_chiral_centers,
             spatial_dimension, upper_violation_weight, lower_violation_weight, chiral_volume_weight,
-            fourth_dimension_penalty_weight,
-            positions, nullptr, num_elements, lane);
+            fourth_dimension_penalty_weight, positions, nullptr, num_elements, lane);
     }
 };
 

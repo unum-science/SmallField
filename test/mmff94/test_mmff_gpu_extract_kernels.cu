@@ -1,13 +1,12 @@
 /**
  *  @file test_mmff_gpu_extract_kernels.cu
- *  @brief Validate the GPU MMFF term-extractor kernel: run it and hand
- *  results back to the host for byte-level diff vs the CPU native
- *  extractor.
+ *  @brief Validate the GPU MMFF term-extractor kernel.
+ *
+ *  Runs it and hands results back to the host for byte-level diff vs the CPU native extractor.
  */
 
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdio>  // `fprintf`, `stderr`
 
 #include <cuda_runtime.h>
 
@@ -15,6 +14,7 @@
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_device.cuh"
+
 #include "test_mmff_gpu_extract_kernels.hpp"
 
 namespace sfmmff = smallfield::mmff94;

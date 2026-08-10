@@ -9,8 +9,7 @@ Compare each energy term against RDKit's MMFF94 implementation:
 - Van der Waals
 - Electrostatic
 
-This script validates that SmallField produces comparable results to RDKit
-before we proceed with SIMD/GPU optimization.
+This script validates that SmallField produces comparable results to RDKit.
 """
 
 import sys
@@ -30,7 +29,7 @@ except ImportError:
     log.error("RDKit required. Install with: pixi add rdkit")
     sys.exit(1)
 
-# MMFF94 Constants (must match Mojo implementation exactly)
+# MMFF94 Constants (must match the native implementation exactly)
 MMFF_BOND_PREFACTOR = 143.9325  # mdyn*A -> kcal/mol
 MMFF_CUBIC_STRETCH = -2.0  # A^-1
 
@@ -143,7 +142,7 @@ def vdw_energy(r: float, epsilon: float, r_star: float) -> float:
 def elec_energy(r: float, qi: float, qj: float, dielectric: float = 1.0) -> float:
     """MMFF94 buffered Coulomb electrostatic energy.
 
-    ``E = 332.0716 · qi · qj / [dielectric · (r + 0.05)]``.  The 0.05 Å buffer
+    ``E = 332.0716 · qi · qj / [dielectric · (r + 0.05)]``. The 0.05 Å buffer
     prevents singularity at short range; 332.0716 converts e²/(4π·ε₀) to
     kcal·Å/mol.
 
@@ -329,9 +328,7 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
     pos = get_atom_positions(mol)
     n_atoms = mol.GetNumAtoms()
 
-    # =========================================================================
-    # BOND STRETCHING
-    # =========================================================================
+    # region Bond Stretching
     smallfield_bond = 0.0
     rdkit_bond = 0.0
     n_bonds = 0
@@ -352,10 +349,9 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
 
     # RDKit doesn't expose per-term energies directly, but we can estimate
     # by comparing our implementation
+    # endregion Bond Stretching
 
-    # =========================================================================
-    # ANGLE BENDING
-    # =========================================================================
+    # region Angle Bending
     smallfield_angle = 0.0
     n_angles = 0
 
@@ -380,9 +376,9 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
                         smallfield_angle += e
                         n_angles += 1
 
-    # =========================================================================
-    # TORSION
-    # =========================================================================
+    # endregion Angle Bending
+
+    # region Torsion
     smallfield_torsion = 0.0
     n_torsions = 0
 
@@ -407,9 +403,9 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
                         smallfield_torsion += e
                         n_torsions += 1
 
-    # =========================================================================
-    # VAN DER WAALS
-    # =========================================================================
+    # endregion Torsion
+
+    # region Van Der Waals
     smallfield_vdw = 0.0
     n_vdw = 0
 
@@ -457,9 +453,9 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
                 smallfield_vdw += e
                 n_vdw += 1
 
-    # =========================================================================
-    # ELECTROSTATIC
-    # =========================================================================
+    # endregion Van Der Waals
+
+    # region Electrostatic
     smallfield_elec = 0.0
     n_elec = 0
 
@@ -486,9 +482,9 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
             smallfield_elec += e
             n_elec += 1
 
-    # =========================================================================
-    # STRETCH-BEND COUPLING
-    # =========================================================================
+    # endregion Electrostatic
+
+    # region Stretch-Bend Coupling
     smallfield_stbn = 0.0
     n_stbn = 0
 
@@ -526,9 +522,9 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
                         smallfield_stbn += e
                         n_stbn += 1
 
-    # =========================================================================
-    # OUT-OF-PLANE BENDING (for sp2 centers)
-    # =========================================================================
+    # endregion Stretch-Bend Coupling
+
+    # region Out-Of-Plane Bending (For sp2 Centers)
     smallfield_oop = 0.0
     n_oop = 0
 
@@ -559,9 +555,9 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
                     smallfield_oop += e
                     n_oop += 1
 
-    # =========================================================================
-    # SUMMARY
-    # =========================================================================
+    # endregion Out-Of-Plane Bending (For sp2 Centers)
+
+    # region Summary
     smallfield_total = (
         smallfield_bond
         + smallfield_angle
@@ -617,6 +613,7 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
         breakdown.add_row("difference", f"{result['difference']:12.4f}")
         breakdown.add_row("relative error", f"{result['relative_error']*100:12.2f} %")
         log.console.print(breakdown)
+    # endregion Summary
 
     return result
 

@@ -6,15 +6,15 @@
  *
  *  Drug-like molecules with 128 heavy+H atoms never approach these limits;
  *  they exist so every stack-sized scratch array has a compile-time
- *  constant bound.  A molecule that exceeds any of them is flagged in
+ *  constant bound. A molecule that exceeds any of them is flagged in
  *  per-molecule status and routed to the CPU RDKit fallback path.
  */
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
+#include <cstdint> // `std::uint32_t`
 
-#include <cstdint>
+#include "smallfield/module_fwd.hpp"
 
 namespace smallfield::types {
 
@@ -31,7 +31,7 @@ inline constexpr std::uint32_t max_mmff_interactions_per_mol_k =
  *  @brief Batch-global base element of one molecule inside each packed MMFF term array.
  *
  *  The device compaction pass reads one entry per molecule and writes that molecule's terms
- *  starting at the named element.  The pipeline fills the array on the host by prefix-summing
+ *  starting at the named element. The pipeline fills the array on the host by prefix-summing
  *  the per-molecule capacities, which is what keeps the packed-array sizing off the device and
  *  out of a readback.
  */

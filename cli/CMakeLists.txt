@@ -66,7 +66,7 @@ if(SMALLFIELD_ENABLE_NVTX)
 endif()
 
 # Descriptor-augmentation binary: rewrites existing *.3D.parquet shards into the
-# canonical 14-column schema by computing USR/USRCAT from the stored fp16 coordinates
+# canonical 13-column schema by computing USR/USRCAT from the stored fp16 coordinates
 # and re-emitting through the shared writer (parquet_writer.cpp) — byte-identical to the
 # batch producer's output.  CPU-only; reuses the producer's writer + descriptor code.
 add_executable(smallfield_descriptors
