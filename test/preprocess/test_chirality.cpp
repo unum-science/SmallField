@@ -20,7 +20,6 @@
 #include <cstdint> // `std::int8_t`, `std::uint32_t`, `std::uint64_t`
 
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -48,61 +47,35 @@ static constexpr std::size_t max_printed_lines_k = 10;
 /** A verdict is a flag: it agrees with what was expected of it or it does not. */
 static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
 
-#pragma region Coordinate Views
-
-/** Coordinates as `(axis, atom)`, the layout `validate_chirality_` reads. */
-using coordinates_soa_t_ =
-    sft::mdspan_ns::mdspan<float, sft::mdspan_ns::extents<std::uint32_t, 3, sft::mdspan_ns::dynamic_extent>>;
-
-/** Coordinates as `(atom, axis)`, the layout RDKit's conformer API speaks. */
-using coordinates_interleaved_t_ =
-    sft::mdspan_ns::mdspan<float, sft::mdspan_ns::extents<std::uint32_t, sft::mdspan_ns::dynamic_extent, 3>>;
-
-/** Grow @p storage to hold one molecule's SoA coordinates, zero it, and view it. */
-static coordinates_soa_t_ reset_coordinates_soa_(std::vector<float> &storage, std::uint32_t num_atoms) {
-    storage.assign(static_cast<std::size_t>(num_atoms) * 3u, 0.0f);
-    return coordinates_soa_t_ {storage.data(), 3u, num_atoms};
-}
-
-/** Grow @p storage to hold one molecule's interleaved coordinates, zero it, and view it. */
-static coordinates_interleaved_t_ reset_coordinates_interleaved_(std::vector<float> &storage, std::uint32_t num_atoms) {
-    storage.assign(static_cast<std::size_t>(num_atoms) * 3u, 0.0f);
-    return coordinates_interleaved_t_ {storage.data(), num_atoms, 3u};
-}
+#pragma region Conformer Access
 
 /**
- *  @brief Copy an interleaved `(atom, 3)` block into an SoA `(3, atom)` one.
+ *  @brief Read a molecule's default conformer straight into caller-owned atom-major storage.
  *
- *  The two layouts are the same bytes in a different order, and written out as index arithmetic they are two
- *  expressions a reader has to decode with nothing stopping one being passed where the other is expected.
- *  The extent travels inside each view, so the atom count cannot disagree with the storage behind it.
+ *  @param[in] molecule Molecule carrying the conformer to read.
+ *  @param[out] atom_major View spanning exactly the molecule's atoms.
  */
-static void scatter_interleaved_into_soa_(coordinates_interleaved_t_ source, coordinates_soa_t_ destination) {
-    sf_verify_(destination.extent(1) == source.extent(0), "coordinate views disagree on the atom count");
-    for (std::uint32_t atom = 0; atom < source.extent(0); ++atom)
-        for (std::uint32_t axis = 0; axis < 3u; ++axis) destination(axis, atom) = source(atom, axis);
-}
-
-/** Read a molecule's default conformer straight into caller-owned interleaved storage. */
-static void read_conformer_into_(RDKit::ROMol const &molecule, coordinates_interleaved_t_ interleaved) {
-    sf_verify_(interleaved.extent(0) == molecule.getNumAtoms(), "the interleaved view does not fit the molecule");
+static void read_conformer_into_(RDKit::ROMol const &molecule, sft::conformer_aos_t atom_major) {
+    sf_verify_(atom_major.extent(0) == molecule.getNumAtoms(), "the atom-major view does not fit the molecule");
     auto const &conformer = molecule.getConformer();
-    for (std::uint32_t atom = 0; atom < interleaved.extent(0); ++atom) {
+    for (std::uint32_t atom = 0; atom < atom_major.extent(0); ++atom) {
         auto const &position = conformer.getAtomPos(atom);
-        interleaved(atom, 0) = static_cast<float>(position.x);
-        interleaved(atom, 1) = static_cast<float>(position.y);
-        interleaved(atom, 2) = static_cast<float>(position.z);
+        atom_major(atom, 0) = static_cast<float>(position.x);
+        atom_major(atom, 1) = static_cast<float>(position.y);
+        atom_major(atom, 2) = static_cast<float>(position.z);
     }
 }
 
-#pragma endregion Coordinate Views
+#pragma endregion Conformer Access
 
 #pragma region Molecule Walk
 
 /** Buffers one molecule's check reuses, declared above the walk so a growth phase happens once. */
 struct chirality_scratch_t {
-    std::vector<float> interleaved;
-    std::vector<float> positions;
+    /** RDKit's conformer, one xyz triple per atom. */
+    std::vector<float> atom_major;
+    /** The same coordinates as three contiguous axis planes, which is what the device check reads. */
+    std::vector<float> axis_major;
     std::vector<sft::chiral_center_descriptor_t> targets;
     std::vector<sft::chiral_center_descriptor_t> inverted_targets;
     sft::molecule_descriptor_t descriptor;
@@ -181,18 +154,20 @@ static molecule_outcome_t check_molecule_(std::string const &smiles, chirality_s
     if (scratch.targets.empty()) return molecule_outcome_t::achiral_k;
 
     std::uint32_t const num_atoms = molecule->getNumAtoms();
-    auto const interleaved = reset_coordinates_interleaved_(scratch.interleaved, num_atoms);
-    auto const positions = reset_coordinates_soa_(scratch.positions, num_atoms);
-    read_conformer_into_(*molecule, interleaved);
-    scatter_interleaved_into_soa_(interleaved, positions);
+    auto const atom_major = sft::reset_coordinates_aos<sft::coordinate_role_t::position_k>(scratch.atom_major,
+                                                                                           num_atoms);
+    auto const axis_major = sft::reset_coordinates_soa<sft::coordinate_role_t::position_k, sft::conformer_dimensions_k>(
+        scratch.axis_major, num_atoms);
+    read_conformer_into_(*molecule, atom_major);
+    sft::transpose_into(atom_major, axis_major);
 
     scratch.inverted_targets.assign(scratch.targets.begin(), scratch.targets.end());
     for (auto &center : scratch.inverted_targets) center.target_sign = static_cast<std::int8_t>(-center.target_sign);
 
     num_centers = static_cast<std::uint32_t>(scratch.targets.size());
-    bool const upright = sftest::gpu_validate_chirality(positions.data_handle(), scratch.targets.data(), num_atoms,
+    bool const upright = sftest::gpu_validate_chirality(axis_major.data_handle(), scratch.targets.data(), num_atoms,
                                                         num_centers);
-    bool const inverted = sftest::gpu_validate_chirality(positions.data_handle(), scratch.inverted_targets.data(),
+    bool const inverted = sftest::gpu_validate_chirality(axis_major.data_handle(), scratch.inverted_targets.data(),
                                                          num_atoms, num_centers);
 
     reporter.mismatch("chirality", "smiles={} centers={}", smiles, num_centers)
@@ -203,7 +178,7 @@ static molecule_outcome_t check_molecule_(std::string const &smiles, chirality_s
 }
 
 /** Check every molecule of one section, bucketing each by how far it got. */
-static void walk_(std::span<std::string const> corpus, chirality_scratch_t &scratch,
+static void walk_(custd::span<std::string const> corpus, chirality_scratch_t &scratch,
                   sftest::diagnostic_reporter_t &reporter, chirality_tally_t &tally) {
     for (auto const &smiles : corpus) {
         std::uint32_t num_centers = 0;

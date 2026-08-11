@@ -17,6 +17,16 @@
       }
     },
     {
+      "name": "debug",
+      "displayName": "Debug",
+      "description": "One architecture, no NDEBUG. The only preset where `sf_assert_` is live.",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
       "name": "release",
       "displayName": "Release",
       "description": "The full 80/89/90/100/120 fatbin, which is what ships.",
@@ -42,6 +52,10 @@
       "configurePreset": "dev"
     },
     {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
       "name": "release",
       "configurePreset": "release"
     },
@@ -54,6 +68,13 @@
     {
       "name": "dev",
       "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug",
       "output": {
         "outputOnFailure": true
       }

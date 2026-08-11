@@ -18,6 +18,7 @@
 #include <GraphMol/MolOps.h>
 
 #include "smallfield/api/smallfield.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "test/test_rdkit_reference_helpers.hpp"
 
@@ -91,13 +92,14 @@ int main() {
     constexpr std::uint32_t num_conformers = 4;
     constexpr std::uint32_t max_atoms = 128;
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(smiles.size());
+    sfapi::conformer_slot_layout_t const slot_layout {max_atoms, num_conformers};
     std::size_t const total_slots = static_cast<std::size_t>(num_molecules) * num_conformers;
 
     std::vector<__half> coords(total_slots * max_atoms * 3);
     std::vector<float> energies(total_slots);
     std::vector<sfapi::conformer_status_t> status(total_slots);
 
-    sfapi::context_t context {std::span<int const> {}};
+    sfapi::context_t context {custd::span<int const> {}};
     sfapi::config_t config;
     config.num_conformers = num_conformers;
     auto const batch_status = context.generate_conformers(smiles, config, max_atoms, coords, energies, status);
@@ -118,12 +120,9 @@ int main() {
             // parsed from SMILES carries none.
             if (molecule->getNumConformers() == 0) molecule->addConformer(new RDKit::Conformer(num_atoms), true);
 
-            // Slot layout is SoA at the caller's 128-atom stride.
-            std::size_t const base = slot * max_atoms * 3;
+            std::size_t const base = slot_layout.slot_offset(mol_index, conformer);
             interleaved.assign(static_cast<std::size_t>(num_atoms) * 3, 0.0f);
-            for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-                for (std::uint32_t axis = 0; axis < 3; ++axis)
-                    interleaved[atom * 3 + axis] = __half2float(coords[base + axis * max_atoms + atom]);
+            sfapi::gather_slot_into_interleaved(coords.data() + base, slot_layout, num_atoms, interleaved.data());
             sftest::set_coords_interleaved(*molecule, interleaved.data());
 
             bond_stereo_t const perceived = perceived_bond_stereo(*molecule);

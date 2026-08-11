@@ -9,7 +9,7 @@ An experiment that was tried and rejected without landing is dated by the commit
 Every number names the hardware it was measured on, because this project targets Hopper and Blackwell alike and at every tier from one GPU to a multi-node cluster.
 A number without that label is unlabelled, not implicitly the machine `BENCH.md` happens to use — entries here span single-H100 kernel work and 8-GPU Blackwell throughput runs, and the two do not transfer.
 
-## 2026-08-11 — Batch Region Offsets Past the 32-Bit Ceiling
+## 2026-08-11 — Batch Region Offsets Past the 32-Bit Ceiling — `2b385db`
 
 `per_mol_sizes_t::bounds` and `::bond_distance` summed `num_atoms * num_atoms` across a batch in `std::uint32_t`, and that sum sized the pinned allocation.
 At a uniform 104 atoms it wrapped at 397 094 molecules, under the 400 000-molecule wave clamp; at the clamp itself the 17.3 GB of bounds data reserved 125 MB.

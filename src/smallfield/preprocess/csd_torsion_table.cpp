@@ -771,8 +771,8 @@ static constexpr csd_torsion_row_t torsion_rows_small_rings_k[] = {
 
 #pragma endregion Torsion rows
 
-std::span<csd_torsion_row_t const> csd_torsion_rows_v2() { return torsion_rows_v2_k; }
+custd::span<csd_torsion_row_t const> csd_torsion_rows_v2() { return torsion_rows_v2_k; }
 
-std::span<csd_torsion_row_t const> csd_torsion_rows_small_rings() { return torsion_rows_small_rings_k; }
+custd::span<csd_torsion_row_t const> csd_torsion_rows_small_rings() { return torsion_rows_small_rings_k; }
 
 } // namespace smallfield::preprocess

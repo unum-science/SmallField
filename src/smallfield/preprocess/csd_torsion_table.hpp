@@ -22,7 +22,7 @@
 
 #include <cstdint> // `std::int8_t`
 
-#include <span> // `std::span`
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::preprocess {
 
@@ -37,9 +37,9 @@ struct csd_torsion_row_t {
 };
 
 /** The general corpus, from RDKit's `torsionPreferences_v2.in`. */
-std::span<csd_torsion_row_t const> csd_torsion_rows_v2();
+custd::span<csd_torsion_row_t const> csd_torsion_rows_v2();
 
 /** The small-ring corpus, from RDKit's `torsionPreferences_smallrings.in`, consulted after v2. */
-std::span<csd_torsion_row_t const> csd_torsion_rows_small_rings();
+custd::span<csd_torsion_row_t const> csd_torsion_rows_small_rings();
 
 } // namespace smallfield::preprocess

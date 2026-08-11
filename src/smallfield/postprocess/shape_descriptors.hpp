@@ -35,7 +35,6 @@
 
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
 
@@ -45,6 +44,7 @@
 #include <GraphMol/Substruct/SubstructMatch.h>
 
 #include "smallfield/molecule_parse.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::postprocess {
 
@@ -80,7 +80,7 @@ struct point3_t {
 };
 
 /** Reads atom @p atom_index from a tight interleaved (num_atoms, 3) float buffer. */
-inline point3_t read_point_(std::span<float const> coords_interleaved, std::uint32_t atom_index) {
+inline point3_t read_point_(custd::span<float const> coords_interleaved, std::uint32_t atom_index) {
     std::size_t const base = static_cast<std::size_t>(atom_index) * 3u;
     return point3_t {static_cast<double>(coords_interleaved[base + 0u]),
                      static_cast<double>(coords_interleaved[base + 1u]),
@@ -106,7 +106,7 @@ inline double point_distance_(point3_t const &first, point3_t const &second) {
  *  2 = atom farthest from the centroid (fct); 3 = atom farthest from fct (ftf).
  *  Tie-breaking matches RDKit's `smallestValId` / `largestValId`: strict comparison, first winning index kept.
  */
-inline std::array<point3_t, 4> reference_points_(std::span<float const> coords_interleaved, std::uint32_t num_atoms) {
+inline std::array<point3_t, 4> reference_points_(custd::span<float const> coords_interleaved, std::uint32_t num_atoms) {
     std::array<point3_t, 4> points {};
 
     // ctd: centroid of all atoms.
@@ -206,8 +206,8 @@ inline std::array<double, 3> calculate_moments_(std::vector<double> const &dista
  *  CREDO subset for USRCAT extension blocks. Output is written reference-point major starting at @p out_offset.
  *  An empty subset writes twelve zeros, exactly as RDKit's empty `reducedCoords` path does.
  */
-inline void moments_for_subset_(std::span<float const> coords_interleaved, std::array<point3_t, 4> const &points,
-                                std::span<std::uint32_t const> atom_indices, double *out, std::size_t out_offset) {
+inline void moments_for_subset_(custd::span<float const> coords_interleaved, std::array<point3_t, 4> const &points,
+                                custd::span<std::uint32_t const> atom_indices, double *out, std::size_t out_offset) {
     std::vector<double> distances;
     distances.reserve(atom_indices.size());
     for (std::size_t reference = 0; reference < 4; ++reference) {
@@ -310,7 +310,7 @@ inline molecule_shape_context_t build_shape_context(
  *  @param[in] num_atoms          atom count (must equal `coords_interleaved.size() / 3`).
  *  @param[out] out               12 doubles, reference-point major (ctd, cst, fct, ftf).
  */
-inline void usr_descriptor(std::span<float const> coords_interleaved, std::uint32_t num_atoms,
+inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uint32_t num_atoms,
                            std::array<double, 12> &out) {
     std::array<point3_t, 4> const points = reference_points_(coords_interleaved, num_atoms);
     std::vector<std::uint32_t> all_atoms(num_atoms);
@@ -330,7 +330,7 @@ inline void usr_descriptor(std::span<float const> coords_interleaved, std::uint3
  *  @param[in] context            context from `build_shape_context` for this molecule.
  *  @param[out] out               60 doubles.
  */
-inline void usrcat_descriptor(std::span<float const> coords_interleaved, molecule_shape_context_t const &context,
+inline void usrcat_descriptor(custd::span<float const> coords_interleaved, molecule_shape_context_t const &context,
                               std::array<double, 60> &out) {
     std::array<point3_t, 4> const points = reference_points_(coords_interleaved, context.num_atoms);
 

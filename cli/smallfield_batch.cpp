@@ -30,7 +30,6 @@
 #include <filesystem>         // `std::filesystem::path`, `std::filesystem::create_directories`
 #include <limits>             // `std::numeric_limits`
 #include <mutex>              // `std::mutex`, `std::unique_lock`
-#include <span>               // `std::span`
 #include <stdexcept>          // `std::runtime_error`
 #include <string>             // `std::string`
 #include <string_view>        // `std::string_view`
@@ -47,6 +46,7 @@
 #include "smallfield/nvtx.hpp"
 #include "smallfield/postprocess/fragment_separation.hpp"
 #include "smallfield/postprocess/shape_descriptors.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "cli/parquet_reader.hpp"
 #include "cli/parquet_writer.hpp"
@@ -93,7 +93,7 @@ struct cli_config_t {
     /** Provenance dataset name (e.g. "pubchem", "gdb13"); "" = omit from metadata. */
     std::string dataset;
     std::uint32_t num_conformers = 3;
-    std::uint32_t max_atoms = 128;
+    std::uint32_t max_atoms = sfapi::max_atoms_per_molecule_k;
     /** Target `coprocessed-batch` size in molecules; 0 = auto (100 K per visible GPU). */
     std::uint32_t batch_size = 0;
     std::vector<int> gpu_ids;
@@ -114,7 +114,7 @@ static void print_usage_() {
   --smiles-column NAME        input column name (default: smiles)
   --dataset NAME              provenance dataset name embedded in output metadata (e.g. gdb13)
   --num-conformers K          conformers per molecule, 1 to 16 (default: 3)
-  --max-atoms N               per-molecule atom cap, 1 to 192 (default: 128)
+  --max-atoms N               per-molecule atom cap, 1 to 192 (default: 192)
   --batch-size N              molecules per coprocessed-batch (default: auto = 100K per GPU)
   --coprocessed-batch-size N         alias for --batch-size
   --chunk-size N              alias for --batch-size
@@ -572,14 +572,14 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
         // have the majority of conformers succeed, so the aggregate is discarded and the per-conformer
         // codes drive subsequent stages.
         [[maybe_unused]] sfapi::conformer_status_t const batch_status = gpu_context.generate_conformers(
-            std::span<std::string_view const>(accumulator.combined_smiles), generation_config, config.max_atoms,
-            std::span<__half>(buffer->coordinates.data(), total_conformers * config.max_atoms * 3u),
-            std::span<float>(buffer->energies.data(), total_conformers),
-            std::span<sfapi::conformer_status_t>(buffer->status.data(), total_conformers),
-            std::span<std::uint8_t>(buffer->num_atoms_per_molecule.data(), num_molecules),
-            std::span<std::uint16_t>(buffer->num_heavy_atoms_per_molecule.data(), num_molecules),
-            std::span<std::uint16_t>(buffer->num_bonds_per_molecule.data(), num_molecules),
-            std::span<float>(buffer->molecular_weight_per_molecule.data(), num_molecules));
+            accumulator.combined_smiles, generation_config, config.max_atoms,
+            custd::span<__half>(buffer->coordinates.data(), total_conformers * config.max_atoms * 3u),
+            custd::span<float>(buffer->energies.data(), total_conformers),
+            custd::span<sfapi::conformer_status_t>(buffer->status.data(), total_conformers),
+            custd::span<std::uint8_t>(buffer->num_atoms_per_molecule.data(), num_molecules),
+            custd::span<std::uint16_t>(buffer->num_heavy_atoms_per_molecule.data(), num_molecules),
+            custd::span<std::uint16_t>(buffer->num_bonds_per_molecule.data(), num_molecules),
+            custd::span<float>(buffer->molecular_weight_per_molecule.data(), num_molecules));
 
         // Kernel-OOB guardrail: any CUDA error during this batch poisons the driver context on every device,
         // and every subsequent shard would also silently produce garbage. Park the shards that contributed
@@ -679,13 +679,13 @@ static void compute_shape_descriptors_(cli_config_t const &config, thread_budget
             std::uint64_t const flat = molecule_index * num_conformers + conformer;
             if (buffer->status_codes[flat] != static_cast<std::uint8_t>(sfapi::conformer_status_t::success_k)) continue;
             std::size_t const slot_base = slot_layout.slot_offset(molecule_index, conformer);
-            sfcli::gather_slot_into_interleaved(buffer->coordinates.data() + slot_base, slot_layout, num_atoms,
+            sfapi::gather_slot_into_interleaved(buffer->coordinates.data() + slot_base, slot_layout, num_atoms,
                                                 interleaved.data());
 
-            std::span<float> coords_view {interleaved.data(), static_cast<std::size_t>(num_atoms) * 3u};
+            custd::span<float> coords_view {interleaved.data(), static_cast<std::size_t>(num_atoms) * 3u};
             if (context.num_components > 1) {
                 sfpost::separate_fragments(coords_view, context);
-                sfcli::scatter_interleaved_into_slot(interleaved.data(), slot_layout, num_atoms,
+                sfapi::scatter_interleaved_into_slot(interleaved.data(), slot_layout, num_atoms,
                                                      buffer->coordinates.data() + slot_base);
             }
 
@@ -716,19 +716,19 @@ static void fallback_loop_(cli_config_t const &config, thread_budget_t const &bu
 
         if (!buffer->retry_indices.empty()) {
             sfcli::rdkit_fallback_inputs_t fallback_inputs {
-                std::span<std::string_view const>(accumulator.combined_smiles),
-                std::span<std::uint32_t const>(buffer->retry_indices),
+                accumulator.combined_smiles,
+                buffer->retry_indices,
                 config.num_conformers,
                 config.max_atoms,
                 budget.fallback,
                 config.random_seed,
             };
             sfcli::rdkit_fallback_outputs_t fallback_outputs {
-                std::span<std::uint8_t>(buffer->status_codes.data(), total_conformers),
-                std::span<std::uint8_t>(buffer->solver_codes.data(), total_conformers),
-                std::span<std::uint8_t>(buffer->num_atoms_per_molecule.data(), num_molecules),
-                std::span<__half>(buffer->coordinates.data(), total_conformers * config.max_atoms * 3u),
-                std::span<float>(buffer->energies.data(), total_conformers),
+                custd::span<std::uint8_t>(buffer->status_codes.data(), total_conformers),
+                custd::span<std::uint8_t>(buffer->solver_codes.data(), total_conformers),
+                custd::span<std::uint8_t>(buffer->num_atoms_per_molecule.data(), num_molecules),
+                custd::span<__half>(buffer->coordinates.data(), total_conformers * config.max_atoms * 3u),
+                custd::span<float>(buffer->energies.data(), total_conformers),
             };
             auto const num_recovered = sfcli::rdkit_fallback(fallback_inputs, fallback_outputs);
             result.fallback_attempted = buffer->retry_indices.size();
@@ -784,17 +784,18 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
                 file_molecules,
                 config.num_conformers,
                 config.max_atoms,
-                std::span<std::string_view const>(accumulator.combined_smiles.data() + mol_begin, file_molecules),
-                std::span<std::uint8_t const>(buffer->num_atoms_per_molecule.data() + mol_begin, file_molecules),
-                std::span<std::uint16_t const>(buffer->num_heavy_atoms_per_molecule.data() + mol_begin, file_molecules),
-                std::span<std::uint16_t const>(buffer->num_bonds_per_molecule.data() + mol_begin, file_molecules),
-                std::span<float const>(buffer->molecular_weight_per_molecule.data() + mol_begin, file_molecules),
-                std::span<std::uint8_t const>(buffer->n_conformers_per_molecule.data() + mol_begin, file_molecules),
-                std::span<std::uint8_t const>(buffer->status_codes.data() + conf_begin, file_conformers),
-                std::span<__half const>(buffer->coordinates.data() + conf_begin * coord_stride,
-                                        file_conformers * coord_stride),
-                std::span<float const>(buffer->energies.data() + conf_begin, file_conformers),
-                std::span<double const>(buffer->usrcat.data() + conf_begin * 60u, file_conformers * 60u),
+                custd::span<std::string_view const>(accumulator.combined_smiles.data() + mol_begin, file_molecules),
+                custd::span<std::uint8_t const>(buffer->num_atoms_per_molecule.data() + mol_begin, file_molecules),
+                custd::span<std::uint16_t const>(buffer->num_heavy_atoms_per_molecule.data() + mol_begin,
+                                                 file_molecules),
+                custd::span<std::uint16_t const>(buffer->num_bonds_per_molecule.data() + mol_begin, file_molecules),
+                custd::span<float const>(buffer->molecular_weight_per_molecule.data() + mol_begin, file_molecules),
+                custd::span<std::uint8_t const>(buffer->n_conformers_per_molecule.data() + mol_begin, file_molecules),
+                custd::span<std::uint8_t const>(buffer->status_codes.data() + conf_begin, file_conformers),
+                custd::span<__half const>(buffer->coordinates.data() + conf_begin * coord_stride,
+                                          file_conformers * coord_stride),
+                custd::span<float const>(buffer->energies.data() + conf_begin, file_conformers),
+                custd::span<double const>(buffer->usrcat.data() + conf_begin * 60u, file_conformers * 60u),
             };
 
             auto const &output_path = accumulator.input_file_pairs[file_index]->output_path;
@@ -897,7 +898,7 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    sfapi::context_t gpu_context(std::span<int const>(config.gpu_ids));
+    sfapi::context_t gpu_context(config.gpu_ids);
     // Share the CLI's verbose level with the library so `--verbose=1|2` enables
     // the per-wave table and per-device breakdown emitted from smallfield.cu.
     gpu_context.logger.verbose_level = config.verbose_level;

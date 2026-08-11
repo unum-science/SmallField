@@ -18,7 +18,6 @@
 
 #include <array>   // `std::array`
 #include <cstdint> // `std::uint32_t`
-#include <span>    // `std::span`
 #include <vector>  // `std::vector`
 
 #include <cuda_runtime.h>
@@ -27,9 +26,13 @@
 #include "smallfield/cuda_error.hpp"
 #include "smallfield/types/atom_limited_bins.hpp"
 #include "smallfield/types/etkdg_types.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::cuda {
 using smallfield::types::etkdg_molecule_metadata_t;
+using smallfield::types::lower_distance_bound_at;
+using smallfield::types::packed_matrix;
+using smallfield::types::upper_distance_bound_at;
 
 /** Thread count of every `embed_4d_power_iter_kernel` block; one block handles one molecule. */
 constexpr std::uint32_t embed_block_size_k = 128;
@@ -38,39 +41,25 @@ constexpr std::uint32_t embed_block_size_k = 128;
 constexpr std::uint32_t embed_reduction_slots_k = embed_block_size_k / warp_size_k;
 
 /**
- *  @brief Reads the upper distance bound for atom pair (i, j) from the float bounds matrix.
+ *  @brief Dynamic shared floats `embed_4d_power_iter_kernel` needs for a molecule of @p num_atoms atoms.
  *
- *  The upper bound is stored at bounds[min(i, j) * N + max(i, j)].
+ *  States the layout the kernel carves, term for term: the Gram matrix, the row means widened to hold the
+ *  block reduction's staging slots, the grand mean, four eigenvector estimates, the mat-vec scratch, and
+ *  four eigenvalues. Every block derives its own layout from its own atom count, so a launch covering
+ *  several molecules sizes its request from the largest.
  *
- *  @param[in] bounds Flat N × N bounds matrix in row-major order.
- *  @param[in] num_atoms Number of atoms N in the molecule.
- *  @param[in] atom_a First atom index.
- *  @param[in] atom_b Second atom index.
- *  @return Upper distance bound between atom_a and atom_b.
+ *  @param[in] num_atoms Atoms the launch is sized against.
+ *  @return Floats of dynamic shared memory to request.
  */
-__device__ __forceinline__ float read_upper_bound_float_(float const *bounds, std::uint32_t num_atoms,
-                                                         std::uint32_t atom_a, std::uint32_t atom_b) {
-    std::uint32_t const row = min(atom_a, atom_b);
-    std::uint32_t const column = max(atom_a, atom_b);
-    return bounds[row * num_atoms + column];
+__host__ __device__ __forceinline__ std::size_t embed_shared_floats(std::uint32_t num_atoms) noexcept {
+    std::size_t const atoms = num_atoms;
+    std::size_t const row_means_extent = atoms > embed_reduction_slots_k ? atoms : embed_reduction_slots_k;
+    return atoms * atoms + row_means_extent + 1u + 4u * atoms + atoms + 4u;
 }
 
-/**
- *  @brief Reads the lower distance bound for atom pair (i, j) from the float bounds matrix.
- *
- *  The lower bound is stored at bounds[max(i, j) * N + min(i, j)].
- *
- *  @param[in] bounds Flat N × N bounds matrix in row-major order.
- *  @param[in] num_atoms Number of atoms N in the molecule.
- *  @param[in] atom_a First atom index.
- *  @param[in] atom_b Second atom index.
- *  @return Lower distance bound between atom_a and atom_b.
- */
-__device__ __forceinline__ float read_lower_bound_float_(float const *bounds, std::uint32_t num_atoms,
-                                                         std::uint32_t atom_a, std::uint32_t atom_b) {
-    std::uint32_t const row = max(atom_a, atom_b);
-    std::uint32_t const column = min(atom_a, atom_b);
-    return bounds[row * num_atoms + column];
+/** Bytes of the same request. */
+__host__ __device__ __forceinline__ std::size_t embed_shared_bytes(std::uint32_t num_atoms) noexcept {
+    return embed_shared_floats(num_atoms) * sizeof(float);
 }
 
 /**
@@ -79,18 +68,17 @@ __device__ __forceinline__ float read_lower_bound_float_(float const *bounds, st
  *  Computes the squared midpoint distance between two atoms from their upper and lower bounds.
  *  Returns zero when atom_i equals atom_j.
  *
- *  @param[in] bounds Flat N × N bounds matrix in row-major order.
- *  @param[in] num_atoms Number of atoms N in the molecule.
+ *  @param[in] bounds Square bounds matrix over the molecule's atoms.
  *  @param[in] atom_i First atom index.
  *  @param[in] atom_j Second atom index.
  *  @return Squared midpoint distance between atom_i and atom_j.
  *  @see embed_4d_power_iter_kernel
  */
-__device__ __forceinline__ float midpoint_distance_squared_(float const *bounds, std::uint32_t num_atoms,
-                                                            std::uint32_t atom_i, std::uint32_t atom_j) {
+__device__ __forceinline__ float midpoint_distance_squared_(packed_matrix<float const> bounds, std::uint32_t atom_i,
+                                                            std::uint32_t atom_j) {
     if (atom_i == atom_j) return 0.0f;
-    float const upper = read_upper_bound_float_(bounds, num_atoms, atom_i, atom_j);
-    float const lower = read_lower_bound_float_(bounds, num_atoms, atom_i, atom_j);
+    float const upper = upper_distance_bound_at(bounds, atom_i, atom_j);
+    float const lower = lower_distance_bound_at(bounds, atom_i, atom_j);
     float const distance = 0.5f * (fmaxf(lower, 0.0f) + fmaxf(upper, lower));
     return distance * distance;
 }
@@ -150,7 +138,8 @@ __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *war
  *    lambda[4]                  (eigenvalue estimates)
  *  @endverbatim
  *
- *  At N=128: 16384 + 128 + 1 + 512 + 128 + 4 = 17157 floats ≈ 67 KB.
+ *  `embed_shared_floats` states this same layout as an expression, and every launch site sizes its request
+ *  from it rather than restating the sum.
  *
  *  @param[inout] bounds_matrices Flat per-molecule bounds matrices, smoothed in place.
  *  @param[in] molecule_metadata Per-molecule atom counts and bounds offsets.
@@ -196,22 +185,30 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
         shared_gram[linear_index] = global_bounds[linear_index];
     __syncthreads();
 
+    // A read view over the shared block while it still holds bounds. The element type is `const` because
+    // every access through it is a read; it carries no aliasing promise, so the in-place updates below and
+    // the Gram build further down stay visible through it.
+    packed_matrix<float const> const shared_bounds {shared_gram, num_atoms, num_atoms};
+
     // Floyd-Warshall triangle smoothing on the N × N block.
     for (std::uint32_t pivot = 0; pivot < num_atoms; ++pivot) {
         for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += block_size) {
             std::uint32_t const row = linear_index / num_atoms;
             std::uint32_t const column = linear_index % num_atoms;
             if (row == column || row == pivot || column == pivot) continue;
-            float const upper_row_pivot = read_upper_bound_float_(shared_gram, num_atoms, row, pivot);
-            float const upper_pivot_column = read_upper_bound_float_(shared_gram, num_atoms, pivot, column);
+            float const upper_row_pivot = upper_distance_bound_at(shared_bounds, row, pivot);
+            float const upper_pivot_column = upper_distance_bound_at(shared_bounds, pivot, column);
+            // Above the diagonal the cell is the pair's upper bound, below it the lower one, so the branch
+            // picks which of the two inequalities applies rather than which cell to touch. The lower bounds
+            // stay inside the branch that consults them, where they cost no register on the other path.
             if (row < column) {
                 float const candidate = upper_row_pivot + upper_pivot_column;
                 float &current = shared_gram[row * num_atoms + column];
                 if (candidate < current) current = candidate;
             }
             else {
-                float const lower_row_pivot = read_lower_bound_float_(shared_gram, num_atoms, row, pivot);
-                float const lower_pivot_column = read_lower_bound_float_(shared_gram, num_atoms, pivot, column);
+                float const lower_row_pivot = lower_distance_bound_at(shared_bounds, row, pivot);
+                float const lower_pivot_column = lower_distance_bound_at(shared_bounds, pivot, column);
                 float &current = shared_gram[row * num_atoms + column];
                 current = fmaxf(current,
                                 fmaxf(lower_row_pivot - upper_pivot_column, lower_pivot_column - upper_row_pivot));
@@ -228,7 +225,7 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     for (std::uint32_t atom = lane; atom < num_atoms; atom += block_size) {
         float row_sum = 0.0f;
         for (std::uint32_t other = 0; other < num_atoms; ++other)
-            row_sum += midpoint_distance_squared_(shared_gram, num_atoms, atom, other);
+            row_sum += midpoint_distance_squared_(shared_bounds, atom, other);
         row_means[atom] = row_sum / static_cast<float>(num_atoms);
     }
     __syncthreads();
@@ -250,7 +247,7 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
         std::uint32_t const row = linear_index / num_atoms;
         std::uint32_t const column = linear_index % num_atoms;
         if (row > column) continue;
-        float const squared_distance = midpoint_distance_squared_(shared_gram, num_atoms, row, column);
+        float const squared_distance = midpoint_distance_squared_(shared_bounds, row, column);
         float const centered = -0.5f * (squared_distance - row_means[row] - row_means[column] + grand_mean);
         shared_gram[row * num_atoms + column] = centered;
         shared_gram[column * num_atoms + row] = centered;
@@ -351,7 +348,7 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
 template <typename scratch_>
 inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
                                                     etkdg_molecule_metadata_t const *device_metadata,
-                                                    std::span<etkdg_molecule_metadata_t const> host_metadata,
+                                                    custd::span<etkdg_molecule_metadata_t const> host_metadata,
                                                     std::uint32_t max_atoms_per_molecule,
                                                     float *device_initial_coordinates, scratch_ &scratch,
                                                     cuda_error_sink_t sink, cudaStream_t stream = nullptr) {
@@ -411,10 +408,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         std::uint32_t *const device_group_indices = scratch.group_indices.data();
 
         // Shared memory for embed_4d_power_iter_kernel:
-        // The reduction staging slots live inside the row-mean region, and every bin's N is far
-        // above embed_reduction_slots_k, so they cost nothing on top of this.
-        std::size_t const shared_bytes = static_cast<std::size_t>(bin_n * bin_n + bin_n + 1 + 4 * bin_n + bin_n + 4) *
-                                         sizeof(float);
+        std::size_t const shared_bytes = embed_shared_bytes(bin_n);
 
         success &= sink.check(cudaMemcpyAsync(device_group_indices, group.data(), group_size * sizeof(std::uint32_t),
                                               cudaMemcpyHostToDevice, stream),

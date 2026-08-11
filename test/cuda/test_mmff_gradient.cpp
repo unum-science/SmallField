@@ -27,7 +27,6 @@
 
 #include <algorithm>   // `std::max`
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -35,6 +34,7 @@
 #include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "test/cuda/test_mmff_gradient_kernels.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
@@ -51,35 +51,9 @@ namespace smallfield::tests {
 
 #pragma region Coordinate Layout
 
-/**
- *  @brief Offset of one coordinate component inside the axis-major block the energy kernel reads.
- *
- *  RDKit hands out `(atoms, 3)` and the kernel takes `(3, atoms)`. Both are flat `float` arrays of the
- *  same length, so the compiler cannot tell them apart and this name is what does.
- *
- *  @param[in] axis Spatial dimension, `0` for x through `2` for z.
- *  @param[in] atom Atom index inside the molecule.
- *  @param[in] num_atoms Atoms the block holds, which is its axis stride.
- *  @return Index into the axis-major block.
- */
-static constexpr std::size_t soa_component_offset_(std::uint32_t axis, std::uint32_t atom,
-                                                   std::uint32_t num_atoms) noexcept {
-    return static_cast<std::size_t>(axis) * num_atoms + atom;
-}
-
-/**
- *  @brief Write an interleaved `(atoms, 3)` coordinate block into the `(3, atoms)` block the kernel takes.
- *
- *  @param[in] interleaved Atom-major coordinates, `3 * num_atoms` components.
- *  @param[out] soa_positions Grown to match @p interleaved, then filled axis-major.
- */
-static void scatter_interleaved_into_soa_(std::span<float const> interleaved, std::vector<float> &soa_positions) {
-    std::uint32_t const num_atoms = static_cast<std::uint32_t>(interleaved.size() / 3);
-    soa_positions.assign(interleaved.size(), 0.0f);
-    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-        for (std::uint32_t axis = 0; axis < 3; ++axis) // the three spatial dimensions
-            soa_positions[soa_component_offset_(axis, atom, num_atoms)] = interleaved[atom * 3 + axis];
-}
+/** A gradient carries one component per coordinate, so it is read through the coordinate layout itself. */
+using gradient_soa_t =
+    sft::coordinates_soa<sft::coordinate_role_t::gradient_k, float const, sft::conformer_dimensions_k>;
 
 /** The field name one gradient component prints under, so a mismatch line names it rather than numbering it. */
 static constexpr std::string_view gradient_field_name_(std::uint32_t axis) noexcept {
@@ -124,9 +98,9 @@ struct gradient_scratch_t {
     /** The same molecule stripped down to its first out-of-plane bend. */
     sfp::etkdg_prepared_molecule_t single_oop {};
     /** RDKit's conformer, atom-major. */
-    std::vector<float> interleaved;
+    std::vector<float> atom_major;
     /** The same coordinates axis-major; a probe perturbs one component and restores it. */
-    std::vector<float> positions;
+    std::vector<float> axis_major;
     /** Analytical gradient of the full stage at the unperturbed coordinates. */
     std::vector<float> stage_gradient;
     /** Analytical gradient of the isolated out-of-plane term at the same coordinates. */
@@ -149,8 +123,9 @@ struct gradient_scratch_t {
  *  @param[out] gradient Grown to match @p positions, then filled axis-major.
  *  @return Total energy in kcal per mol.
  */
-static float mmff_energy_and_gradient_(sfp::etkdg_prepared_molecule_t const &prepared, std::span<float const> positions,
-                                       gradient_scratch_t &scratch, std::vector<float> &gradient) {
+static float mmff_energy_and_gradient_(sfp::etkdg_prepared_molecule_t const &prepared,
+                                       custd::span<float const> positions, gradient_scratch_t &scratch,
+                                       std::vector<float> &gradient) {
     gradient.assign(positions.size(), 0.0f);
     fill_bond_hops_into(prepared.mmff_bonds,
                         sft::reset_square_matrix(scratch.bond_hops, prepared.num_atoms, sft::unreachable_hops_k));
@@ -177,24 +152,26 @@ static float mmff_energy_and_gradient_(sfp::etkdg_prepared_molecule_t const &pre
 }
 
 /**
- *  @brief Central difference of the device energy with respect to one coordinate of `scratch.positions`.
+ *  @brief Central difference of the device energy with respect to one coordinate of `scratch.axis_major`.
  *
  *  The perturbed component is restored to the exact value it held, so a caller may walk every component
  *  of one molecule through the same buffer.
  *
  *  @param[in] prepared Molecule whose energy is differentiated.
- *  @param[in] component Index into the axis-major coordinates, as `soa_component_offset_` spells it.
+ *  @param[in] axis Spatial dimension of the perturbed component, `0` for x through `2` for z.
+ *  @param[in] atom Atom whose coordinate is perturbed.
  *  @param[inout] scratch Holds the coordinates, and the buffers the two energy calls fill.
  *  @return The derivative in kcal per mol per angstrom.
  */
-static float finite_difference_component_(sfp::etkdg_prepared_molecule_t const &prepared, std::size_t component,
-                                          gradient_scratch_t &scratch) {
-    float const original = scratch.positions[component];
-    scratch.positions[component] = original + finite_difference_step_k;
-    float const energy_plus = mmff_energy_and_gradient_(prepared, scratch.positions, scratch, scratch.probe_gradient);
-    scratch.positions[component] = original - finite_difference_step_k;
-    float const energy_minus = mmff_energy_and_gradient_(prepared, scratch.positions, scratch, scratch.probe_gradient);
-    scratch.positions[component] = original;
+static float finite_difference_component_(sfp::etkdg_prepared_molecule_t const &prepared, std::uint32_t axis,
+                                          std::uint32_t atom, gradient_scratch_t &scratch) {
+    sft::conformer_soa_t const coordinates {scratch.axis_major.data(), prepared.num_atoms};
+    float const original = coordinates(atom, axis);
+    coordinates(atom, axis) = original + finite_difference_step_k;
+    float const energy_plus = mmff_energy_and_gradient_(prepared, scratch.axis_major, scratch, scratch.probe_gradient);
+    coordinates(atom, axis) = original - finite_difference_step_k;
+    float const energy_minus = mmff_energy_and_gradient_(prepared, scratch.axis_major, scratch, scratch.probe_gradient);
+    coordinates(atom, axis) = original;
     return (energy_plus - energy_minus) / (2.0f * finite_difference_step_k);
 }
 
@@ -417,8 +394,9 @@ static void fill_single_oop_term_into_(sfp::etkdg_prepared_molecule_t const &pre
 static void compare_oop_gradient_(std::string const &smiles, gradient_scratch_t &scratch,
                                   diagnostic_reporter_t &reporter, gradient_tally_t &tally) {
     fill_single_oop_term_into_(scratch.prepared, scratch.single_oop);
-    [[maybe_unused]] float const term_energy = mmff_energy_and_gradient_(scratch.single_oop, scratch.positions, scratch,
-                                                                         scratch.term_gradient);
+    [[maybe_unused]] float const term_energy = mmff_energy_and_gradient_(scratch.single_oop, scratch.axis_major,
+                                                                         scratch, scratch.term_gradient);
+    gradient_soa_t const term_gradient {scratch.term_gradient.data(), scratch.single_oop.num_atoms};
 
     sft::mmff94_oop_t const &oop = scratch.single_oop.mmff_oops.front();
     std::uint32_t const oop_atoms[] = {oop.atom_i, oop.atom_j, oop.atom_k, oop.atom_l};
@@ -428,11 +406,11 @@ static void compare_oop_gradient_(std::string const &smiles, gradient_scratch_t 
 
     for (std::uint32_t role = 0; role < 4; ++role) {     // the term's i, j, k and l positions
         for (std::uint32_t axis = 0; axis < 3; ++axis) { // the three spatial dimensions
-            std::size_t const component = soa_component_offset_(axis, oop_atoms[role], scratch.single_oop.num_atoms);
-            float const finite_difference = finite_difference_component_(scratch.single_oop, component, scratch);
-            float const analytical = scratch.term_gradient[component];
+            std::uint32_t const atom = oop_atoms[role];
+            float const finite_difference = finite_difference_component_(scratch.single_oop, axis, atom, scratch);
+            float const analytical = term_gradient(atom, axis);
             tally.worst_oop_error = std::max(tally.worst_oop_error, std::fabs(analytical - finite_difference));
-            reporter.mismatch("oop_gradient", "smiles={} atom={} role={}", smiles, oop_atoms[role], role)
+            reporter.mismatch("oop_gradient", "smiles={} atom={} role={}", smiles, atom, role)
                 .field(gradient_field_name_(axis), finite_difference, analytical, agree);
         }
     }
@@ -444,16 +422,16 @@ static void compare_oop_gradient_(std::string const &smiles, gradient_scratch_t 
  *
  *  @param[in] smiles Molecule under test, carried into the diagnostic keys.
  *  @param[in] gradient Full-stage analytical gradient, axis-major.
- *  @param[in] num_atoms Atoms behind @p gradient, which is its axis stride.
  *  @param[inout] reporter Section that receives one comparison per axis.
  */
-static void compare_translation_invariance_(std::string const &smiles, std::span<float const> gradient,
-                                            std::uint32_t num_atoms, diagnostic_reporter_t &reporter) {
+static void compare_translation_invariance_(std::string const &smiles, gradient_soa_t gradient,
+                                            diagnostic_reporter_t &reporter) {
+    std::uint32_t const num_atoms = gradient.extent(0);
     float axis_sums[3] = {0.0f, 0.0f, 0.0f};
     float magnitude_sum = 0.0f;
     for (std::uint32_t axis = 0; axis < 3; ++axis) // the three spatial dimensions
         for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-            float const component = gradient[soa_component_offset_(axis, atom, num_atoms)];
+            float const component = gradient(atom, axis);
             axis_sums[axis] += component;
             magnitude_sum += std::fabs(component);
         }
@@ -482,17 +460,20 @@ static void compare_translation_invariance_(std::string const &smiles, std::span
 static void compare_stage_gradient_(std::string const &smiles, gradient_scratch_t &scratch,
                                     diagnostic_reporter_t &reporter, gradient_tally_t &tally) {
     std::uint32_t const num_atoms = scratch.prepared.num_atoms;
-    std::size_t const total_components = scratch.stage_gradient.size();
+    gradient_soa_t const stage_gradient {scratch.stage_gradient.data(), num_atoms};
+    std::size_t const total_components = stage_gradient.size();
     std::size_t const stride = std::max<std::size_t>(1, total_components / sampled_components_per_molecule_k);
     auto const agree = [](float finite_difference, float analytical) noexcept {
         return full_stage_tolerance_k.agree(finite_difference, analytical);
     };
 
+    // The counter walks storage, which an axis-major view packs one whole axis at a time, so the axis is the
+    // quotient and the atom the remainder however the view is subscripted.
     for (std::size_t component = 0; component < total_components; component += stride) {
-        float const finite_difference = finite_difference_component_(scratch.prepared, component, scratch);
-        float const analytical = scratch.stage_gradient[component];
         std::uint32_t const axis = static_cast<std::uint32_t>(component / num_atoms);
         std::uint32_t const atom = static_cast<std::uint32_t>(component % num_atoms);
+        float const finite_difference = finite_difference_component_(scratch.prepared, axis, atom, scratch);
+        float const analytical = stage_gradient(atom, axis);
         tally.worst_stage_error = std::max(tally.worst_stage_error, std::fabs(analytical - finite_difference));
         reporter.mismatch("stage_gradient", "smiles={} atom={}", smiles, atom)
             .field(gradient_field_name_(axis), finite_difference, analytical, agree);
@@ -530,15 +511,19 @@ static molecule_outcome_t compare_molecule_(std::string const &smiles, gradient_
         return molecule_outcome_t::unaligned_k;
     }
 
-    // `extract_coords_interleaved` returns its buffer, so one allocation per molecule escapes the
-    // surrounding scratch; `extract_coords_into` is the shape the shared helper wants.
-    scratch.interleaved = extract_coords_interleaved(*molecule);
-    scatter_interleaved_into_soa_(scratch.interleaved, scratch.positions);
+    // `extract_coords_interleaved` returns its buffer, so this one copy allocates per molecule while every
+    // other buffer the sweep touches lives in the scratch.
+    scratch.atom_major = extract_coords_interleaved(*molecule);
+    sft::conformer_aos_t const atom_major {scratch.atom_major.data(), rdkit_atoms};
+    sft::conformer_soa_t const axis_major =
+        sft::reset_coordinates_soa<sft::coordinate_role_t::position_k, sft::conformer_dimensions_k>(scratch.axis_major,
+                                                                                                    rdkit_atoms);
+    sft::transpose_into(atom_major, axis_major);
 
     double const rdkit_energy = rdkit_mmff94_energy(*molecule);
     if (!std::isfinite(rdkit_energy)) return molecule_outcome_t::unreferenced_k;
 
-    float const device_energy = mmff_energy_and_gradient_(scratch.prepared, scratch.positions, scratch,
+    float const device_energy = mmff_energy_and_gradient_(scratch.prepared, scratch.axis_major, scratch,
                                                           scratch.stage_gradient);
     std::string_view const divergence_reason = known_energy_divergence_(smiles);
     if (divergence_reason.empty())
@@ -553,7 +538,7 @@ static molecule_outcome_t compare_molecule_(std::string const &smiles, gradient_
         if (energies_agree_(rdkit_energy, static_cast<double>(device_energy))) ++tally.stale_divergence;
     }
 
-    compare_translation_invariance_(smiles, scratch.stage_gradient, scratch.prepared.num_atoms,
+    compare_translation_invariance_(smiles, gradient_soa_t {scratch.stage_gradient.data(), rdkit_atoms},
                                     reporters.translation_invariance);
     compare_stage_gradient_(smiles, scratch, reporters.stage_gradient, tally);
 

@@ -24,7 +24,6 @@
 #include <cstdlib> // `std::abort`
 
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -42,6 +41,7 @@
 #include "smallfield/log.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/views.hpp"
 #include "smallfield/preprocess/csd_torsion_native.hpp"
 #include "smallfield/preprocess/csd_torsion_table.hpp"
 
@@ -104,7 +104,7 @@ inline std::uint8_t compute_required_hybridizations(simple_torsion_pattern_t con
  *  @brief Parse the embedded .in block (one SMARTS per non-comment line) and compile each
  *  SMARTS to an ROMol. Fills required_elements bitset and the atom-label index[4].
  */
-inline void compile_patterns_into(std::span<csd_torsion_row_t const> rows, std::vector<csd_compiled_pattern_t> &out) {
+inline void compile_patterns_into(custd::span<csd_torsion_row_t const> rows, std::vector<csd_compiled_pattern_t> &out) {
     out.reserve(out.size() + rows.size());
     for (csd_torsion_row_t const &row : rows) {
         csd_compiled_pattern_t compiled_pattern;

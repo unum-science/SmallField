@@ -10,6 +10,7 @@
 
 #include "smallfield/mmff94/mmff94_term_equations.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+#include "smallfield/types/views.hpp"
 #include "smallfield/utilities.hpp"
 
 namespace smallfield::mmff94 {
@@ -32,7 +33,7 @@ using smallfield::types::mmff94_torsion_k;
 using smallfield::types::molecule_descriptor_t;
 
 inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor,
-                                         std::span<std::uint8_t const> atom_types, std::span<float const> charges,
+                                         custd::span<std::uint8_t const> atom_types, custd::span<float const> charges,
                                          mmff94_tables_view_t const &tables, etkdg_prepared_molecule_t &result) {
     result.mmff_atom_vdw.clear();
     result.mmff_atom_charge.clear();
@@ -68,7 +69,7 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor
     for (std::uint32_t bond = 0; bond < num_bonds; ++bond) {
         bond_type_arr[bond] = native_get_mmff_bond_type(descriptor, tables, atom_types, bond);
     }
-    std::span<std::uint8_t const> bond_types {bond_type_arr.data(), num_bonds};
+    custd::span<std::uint8_t const> bond_types {bond_type_arr.data(), num_bonds};
 
     std::array<float, max_bonds_k> bond_r0 {};
     for (std::uint32_t bond = 0; bond < num_bonds; ++bond) {
@@ -429,9 +430,9 @@ inline bool extract_mmff94_params_fully_native(molecule_descriptor_t const &desc
     std::array<std::uint8_t, max_atoms_per_molecule_k> atom_types_buf {};
     std::array<float, max_atoms_per_molecule_k> formal_charges_buf {};
     std::array<float, max_atoms_per_molecule_k> partial_charges_buf {};
-    std::span<std::uint8_t> atom_types {atom_types_buf.data(), num_atoms};
-    std::span<float> formal_charges {formal_charges_buf.data(), num_atoms};
-    std::span<float> partial_charges {partial_charges_buf.data(), num_atoms};
+    custd::span<std::uint8_t> atom_types {atom_types_buf.data(), num_atoms};
+    custd::span<float> formal_charges {formal_charges_buf.data(), num_atoms};
+    custd::span<float> partial_charges {partial_charges_buf.data(), num_atoms};
 
     if (!native_compute_mmff_atom_types(descriptor, atom_types)) return false;
     native_compute_mmff_formal_charges(descriptor, atom_types, formal_charges);

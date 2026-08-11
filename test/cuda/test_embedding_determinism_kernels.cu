@@ -64,8 +64,7 @@ int gpu_embed_replicated(float const *host_bounds, std::uint32_t num_atoms, std:
                cudaMemcpyHostToDevice);
     cudaMemcpy(device_indices, indices.data(), indices.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice);
 
-    std::size_t const shared_bytes =
-        static_cast<std::size_t>(num_atoms * num_atoms + num_atoms + 1 + 4 * num_atoms + num_atoms + 4) * sizeof(float);
+    std::size_t const shared_bytes = sfc::embed_shared_bytes(num_atoms);
     cudaFuncSetAttribute(sfc::embed_4d_power_iter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(shared_bytes));
 

@@ -207,7 +207,7 @@ if (NOT MSVC)
 endif ()
 # `--expt-relaxed-constexpr` lets device code call `constexpr` functions not themselves annotated `__host__ __device__`.
 # It does not rescue libstdc++'s <algorithm>: `std::lower_bound` silently miscompiles on device, which is why the MMFF
-# device lookups use the hand-rolled `lower_bound_u8_` in `mmff94_tables.hpp` instead. `--extended-lambda` permits the
+# device lookups use the hand-rolled `lower_bound_` in `mmff94_tables.hpp` instead. `--extended-lambda` permits the
 # comparator lambdas those lookups pass. Both are unconditional -- a Debug build needs them exactly as much as a Release
 # one, and scoping them to Release is what previously broke every `.cu` under `test/` and `bench/` in Debug.
 #

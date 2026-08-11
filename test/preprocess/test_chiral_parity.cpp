@@ -29,7 +29,6 @@
 
 #include <algorithm>   // `std::find`, `std::min`, `std::sort`
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -42,6 +41,7 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
@@ -105,7 +105,7 @@ static bool signs_agree_(int reference, int observed) noexcept { return referenc
  *  @param[in] to Target ordering, a permutation of @p from.
  *  @return +1 for an even permutation, -1 for an odd one, 0 when the two disagree.
  */
-static int permutation_parity_(std::span<std::uint8_t const> from, std::span<std::uint8_t const> to) {
+static int permutation_parity_(custd::span<std::uint8_t const> from, custd::span<std::uint8_t const> to) {
     std::uint32_t positions[4] = {0, 0, 0, 0};
     for (std::size_t target = 0; target < to.size(); ++target) {
         auto const source = std::find(from.begin(), from.end(), to[target]);
@@ -126,7 +126,7 @@ static int permutation_parity_(std::span<std::uint8_t const> from, std::span<std
  *  @param[in] order Neighbor atom indices to inspect.
  *  @return True as soon as one repeated rank is found.
  */
-static bool any_rank_tie_(RDKit::UINT_VECT const &cip_ranks, std::span<std::uint8_t const> order) {
+static bool any_rank_tie_(RDKit::UINT_VECT const &cip_ranks, custd::span<std::uint8_t const> order) {
     for (std::size_t left = 0; left < order.size(); ++left)
         for (std::size_t right = left + 1; right < order.size(); ++right)
             if (cip_ranks[order[left]] == cip_ranks[order[right]]) return true;
@@ -177,7 +177,7 @@ static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descr
 
         // A repeated rank leaves the CIP ordering, and with it the sign that ordering
         // implies, undetermined. The geometric oracle covers these centers instead.
-        std::span<std::uint8_t> const cip_ordered {reference_order, count};
+        custd::span<std::uint8_t> const cip_ordered {reference_order, count};
         if (any_rank_tie_(cip_ranks, cip_ordered)) {
             ++tally.rank_ties;
             continue;

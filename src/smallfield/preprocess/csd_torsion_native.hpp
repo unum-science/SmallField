@@ -23,11 +23,11 @@
 #include <cstdint> // `std::uint8_t`, `std::int8_t`
 
 #include <limits>      // `std::numeric_limits`
-#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
 #include "smallfield/preprocess/csd_torsion_predicates.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::preprocess {
 using smallfield::types::atom_flag_aromatic_k;
@@ -1097,7 +1097,7 @@ inline bool scan_recursive_chain(std::string_view text, std::uint8_t parent, sca
  *  @param[out] node Index of the node @p scanned_index compiled to.
  *  @return True when the whole subtree fits the compiler's vocabulary.
  */
-inline bool build_recursive_nodes(std::span<scanned_atom_t const> atoms, std::uint8_t scanned_index,
+inline bool build_recursive_nodes(custd::span<scanned_atom_t const> atoms, std::uint8_t scanned_index,
                                   std::uint8_t nesting, std::uint8_t hops, recursive_pool_t &pool, std::uint8_t &node) {
     if (hops > max_recursive_hops_k) return false;
     if (pool.num_nodes >= max_recursive_nodes_k) return false;
@@ -1210,8 +1210,8 @@ struct scanned_edge_t {
  *  @param[inout] route_length Entries currently in @p route.
  *  @return True when @p route ends on @p target.
  */
-inline bool walk_closure_arc(std::span<scanned_edge_t const> edges, std::uint8_t target, std::span<std::uint8_t> route,
-                             std::uint8_t &route_length) {
+inline bool walk_closure_arc(custd::span<scanned_edge_t const> edges, std::uint8_t target,
+                             custd::span<std::uint8_t> route, std::uint8_t &route_length) {
     std::uint8_t const current = route[route_length - 1];
     if (current == target) return true;
     if (route_length >= route.size()) return false;

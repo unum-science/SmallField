@@ -34,8 +34,8 @@ void launch_mmff94_gpu_extract_pipeline(
     sft::mmff94_atom_interaction_t *out_interactions, sft::mmff94_atom_offsets_t *out_atom_offsets,
     mmff94_packed_host_result_t &packed_out) {
     sfparam::mmff94_tables_device_t device_tables;
-    sfparam::upload_mmff94_tables_to_device(tables_host, device_tables);
-    if (device_tables.arena.data() == nullptr) {
+    sfparam::upload_mmff94_tables_to_device(tables_host, device_tables, nullptr);
+    if (device_tables.view.vdw.empty()) {
         fmt::println(stderr, "NOTE mmff_extract_kernels field=table_upload succeeded=0");
         return;
     }

@@ -26,7 +26,6 @@
 #include <algorithm>   // `std::max`
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -221,13 +220,12 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smil
     std::uint32_t const num_atoms = molecule.getNumAtoms();
     scratch.coordinates = extract_coords_interleaved(molecule);
     set_coords_interleaved(molecule, scratch.coordinates.data());
-    std::span<float const> const coordinates {scratch.coordinates.data(), scratch.coordinates.size()};
 
-    sfp::usr_descriptor(coordinates, num_atoms, scratch.native_usr);
+    sfp::usr_descriptor(scratch.coordinates, num_atoms, scratch.native_usr);
     scratch.rdkit_usr.assign(scratch.native_usr.size(), 0.0);
     RDKit::Descriptors::USR(molecule, scratch.rdkit_usr);
 
-    sfp::usrcat_descriptor(coordinates, context, scratch.native_usrcat);
+    sfp::usrcat_descriptor(scratch.coordinates, context, scratch.native_usrcat);
     scratch.rdkit_usrcat.assign(scratch.native_usrcat.size(), 0.0);
     // `USRCAT` reads the atom-id argument as an input whenever it arrives non-empty, so a reused buffer would
     // type this molecule with the previous one's CREDO subsets and compare two unrelated descriptors.
@@ -355,7 +353,7 @@ static void check_separation_(sfp::molecule_shape_context_t const &context, std:
         scratch.offaxis_before[component] = centroid_offaxis_(scratch.centroid_before[component]);
     }
 
-    sfp::separate_fragments(std::span<float>(scratch.coordinates.data(), scratch.coordinates.size()), context);
+    sfp::separate_fragments(scratch.coordinates, context);
 
     auto const unchanged = [](double reference, double observed) {
         return std::fabs(reference - observed) <= rigid_relative_tolerance_k * std::max(1.0, std::fabs(reference));

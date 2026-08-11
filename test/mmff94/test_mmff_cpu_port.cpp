@@ -20,7 +20,6 @@
 #include <algorithm>   // `std::binary_search`, `std::max`, `std::sort`
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <sstream>     // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
@@ -42,6 +41,7 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "test/test_rdkit_reference_helpers.hpp"
 
@@ -733,7 +733,7 @@ static molecule_verdict_t run_one_(std::string_view smiles, sfparam::mmff94_tabl
  *  @param[in] policy Whether every molecule is narrated, or only the first molecules that differ.
  *  @param[inout] tally Molecule verdicts and term counts, accumulated across sweeps.
  */
-static void sweep_(std::span<std::string const> corpus, sfparam::mmff94_tables_view_t const &tables,
+static void sweep_(custd::span<std::string const> corpus, sfparam::mmff94_tables_view_t const &tables,
                    narration_policy_t policy, port_tally_t &tally) {
     molecule_under_test_t subject;
     int narrated_failures = 0;

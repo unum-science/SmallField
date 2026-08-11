@@ -162,6 +162,59 @@ using conformer_aos_t = coordinates_aos<coordinate_role_t::position_k, float>;
 
 #pragma endregion Aliases
 
+#pragma region Distance Bounds
+
+/*
+ *  A bounds matrix folds both ends of every atom pair into one square: the upper triangle holds the pair's
+ *  upper bound and the lower triangle its lower bound, so reaching a bound means ordering the two atom
+ *  indices and choosing which of them lands in the row. Written out at a call site that is a two-line dance
+ *  whose correct and inverted forms differ in nothing but that choice, and both read plausible. Naming it
+ *  takes the pair unordered instead, so a caller never states an order at all. Equal indices land on the
+ *  diagonal, which the convention holds at zero in both roles.
+ *
+ *  They are `constexpr` rather than `__host__ __device__` because this header is compiled as plain C++ by
+ *  `test/parameters/test_mmff94_tables.cpp`, where a CUDA attribute is not a keyword the host compiler
+ *  knows. Device code reaches them through `--expt-relaxed-constexpr`, the same route `utilities.hpp` takes.
+ *
+ *  They read one bound each rather than returning both, and that is measured rather than assumed. Both
+ *  smoothing loops branch on which inequality applies before it is known whether the lower bound is wanted,
+ *  so a pair-returning form holds a value one branch never reads live across that branch, and `cuobjdump`
+ *  charges `triangle_smooth_kernel` the extra registers for it. The packed view itself is free:
+ *  `triangle_smooth_kernel` compiles to the same SASS through these as through raw index arithmetic.
+ */
+
+/**
+ *  @brief Upper distance bound of an atom pair, from the packed square's upper triangle.
+ *
+ *  @param[in] matrix Square bounds matrix over one molecule's atoms.
+ *  @param[in] first_atom One end of the pair; the two ends are interchangeable.
+ *  @param[in] second_atom The other end.
+ *  @return Furthest apart the pair may go, in angstrom.
+ */
+constexpr float upper_distance_bound_at(packed_matrix<float const> matrix, std::uint32_t first_atom,
+                                        std::uint32_t second_atom) noexcept {
+    std::uint32_t const row = first_atom < second_atom ? first_atom : second_atom;
+    std::uint32_t const column = first_atom < second_atom ? second_atom : first_atom;
+    return matrix(row, column);
+}
+
+/**
+ *  @brief Lower distance bound of an atom pair, from the packed square's lower triangle.
+ *
+ *  @param[in] matrix Square bounds matrix over one molecule's atoms.
+ *  @param[in] first_atom One end of the pair; the two ends are interchangeable.
+ *  @param[in] second_atom The other end.
+ *  @return Closest the pair may come, in angstrom.
+ */
+constexpr float lower_distance_bound_at(packed_matrix<float const> matrix, std::uint32_t first_atom,
+                                        std::uint32_t second_atom) noexcept {
+    std::uint32_t const row = first_atom < second_atom ? second_atom : first_atom;
+    std::uint32_t const column = first_atom < second_atom ? first_atom : second_atom;
+    return matrix(row, column);
+}
+
+#pragma endregion Distance Bounds
+
 #pragma region Builders
 
 /**

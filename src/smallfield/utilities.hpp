@@ -20,6 +20,37 @@
 
 #pragma once
 
+/**
+ *  @brief Debug-only assertion that compiles to nothing in Release.
+ *
+ *  Guards pointer-math accesses so an out-of-bounds deref traps immediately under compute-sanitizer or a
+ *  debugger instead of silently corrupting memory and crashing later somewhere unrelated. Note that
+ *  `cuda::std::mdspan` performs no such check of its own, even with `CCCL_ENABLE_ASSERTIONS` set, so raw
+ *  index arithmetic and every view whose extents must agree still want this. The device path calls
+ *  `__trap()` so compute-sanitizer reports the offending thread and block coordinates; the host path calls
+ *  `__builtin_trap()` so gdb or a core dump points at the bad caller.
+ *
+ *  @b Only the `debug` preset carries these. `dev`, `release` and `profile` all define `NDEBUG`, where this
+ *  compiles to nothing — so a check written here is a check `cmake --preset debug` runs and the inner loop
+ *  does not. Anything that must hold in a shipped build belongs in the code rather than in this macro.
+ *
+ *  It lives here rather than beside the warp primitives because `types/views.hpp` needs it and host code
+ *  includes that header, while everything in `cuda/` sits behind a `__CUDACC__` guard.
+ */
+#if defined(NDEBUG)
+#define sf_assert_(cond) ((void)0)
+#elif defined(__CUDA_ARCH__)
+#define sf_assert_(cond)           \
+    do {                           \
+        if (!(cond)) { __trap(); } \
+    } while (0)
+#else
+#define sf_assert_(cond)                   \
+    do {                                   \
+        if (!(cond)) { __builtin_trap(); } \
+    } while (0)
+#endif
+
 namespace smallfield {
 
 /**

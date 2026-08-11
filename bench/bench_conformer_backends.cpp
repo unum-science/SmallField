@@ -33,6 +33,7 @@
 #include <omp.h>
 
 #include "smallfield/api/smallfield.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "bench/bench_arguments.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
@@ -118,30 +119,6 @@ static std::size_t atom_count_bin_of_(std::uint32_t num_atoms) {
 }
 
 #pragma endregion Statistics
-
-#pragma region Coordinates
-
-/**
- *  @brief Gather one conformer out of the half-precision coordinate pool into interleaved `xyz` floats.
- *
- *  The pool is atom-major per axis — axis `axis` of atom `atom` sits at `offset + axis * stride + atom` — while
- *  RDKit takes `x y z` per atom. This is the whole of that transposition, in the gather direction.
- *
- *  @param[in] coords Coordinate pool for the whole batch.
- *  @param[in] coordinate_offset First element of this conformer's slot, in halves.
- *  @param[in] num_atoms Atoms to gather, at most the pool's per-conformer stride.
- *  @param[out] interleaved Caller-owned destination, resized to three floats per atom.
- */
-static void gather_conformer_into_interleaved_(std::vector<__half> const &coords, std::size_t coordinate_offset,
-                                               std::uint32_t num_atoms, std::vector<float> &interleaved) {
-    interleaved.resize(static_cast<std::size_t>(num_atoms) * 3);
-    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-        for (std::uint32_t axis = 0; axis < 3; ++axis)
-            interleaved[atom * 3 + axis] = __half2float(
-                coords[coordinate_offset + axis * coordinate_stride_atoms_k + atom]);
-}
-
-#pragma endregion Coordinates
 
 #pragma region Benchmarked Systems
 
@@ -236,7 +213,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
 
     // Single GPU.
     int const device_id = 0;
-    sfapi::context_t gpu_context(std::span<int const>(&device_id, 1));
+    sfapi::context_t gpu_context(custd::span<int const>(&device_id, 1));
 
     auto const start_time = clock_type_t::now();
     [[maybe_unused]] auto const batch_status = gpu_context.generate_conformers(
@@ -343,6 +320,7 @@ static gate_verdict_t cross_validate(std::vector<std::string> const &smiles, std
                                      std::vector<sfapi::conformer_status_t> const &status, std::uint32_t num_conformers,
                                      std::uint32_t max_samples) {
     std::uint32_t const num_smiles = static_cast<std::uint32_t>(smiles.size());
+    sfapi::conformer_slot_layout_t const slot_layout {coordinate_stride_atoms_k, num_conformers};
     fmt::println("\nQuality cross-validation");
 
     // Build the list of succeeded conformers.
@@ -384,10 +362,11 @@ static gate_verdict_t cross_validate(std::vector<std::string> const &smiles, std
             std::uint32_t const flat_index = molecule_index * num_conformers + conformer_index;
             // The pool is indexed in `std::size_t`: a 10 M molecule run at K=3 passes UINT32_MAX
             // elements around conformer 11.2 M, and the wrapped offset reads another molecule.
-            std::size_t const coordinate_offset = static_cast<std::size_t>(flat_index) * coordinate_stride_atoms_k * 3;
+            std::size_t const coordinate_offset = slot_layout.slot_offset(molecule_index, conformer_index);
 
-            std::vector<float> interleaved_coordinates;
-            gather_conformer_into_interleaved_(coords, coordinate_offset, num_atoms, interleaved_coordinates);
+            std::vector<float> interleaved_coordinates(static_cast<std::size_t>(num_atoms) * 3u);
+            sfapi::gather_slot_into_interleaved(coords.data() + coordinate_offset, slot_layout, num_atoms,
+                                                interleaved_coordinates.data());
             sftest::set_coords_interleaved(*rdkit_molecule, interleaved_coordinates.data());
             rdkit_reference_energies[sample_index] = sftest::rdkit_mmff94_energy(*rdkit_molecule);
             smallfield_energies[sample_index] = static_cast<double>(energies[flat_index]);

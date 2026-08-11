@@ -33,7 +33,6 @@
 #include <cstring> // `std::memcmp`, `std::memset`
 
 #include <algorithm>   // `std::min`
-#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -44,6 +43,7 @@
 
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/api/smallfield.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
@@ -162,7 +162,7 @@ struct generation_outputs_t {
  *  @param[in] poison Byte the outputs are stamped with before the call.
  *  @param[out] outputs_out Sized, stamped, then filled by the pipeline.
  */
-static void generate_into(sfapi::context_t &context, std::span<std::string_view const> corpus,
+static void generate_into(sfapi::context_t &context, custd::span<std::string_view const> corpus,
                           conformer_slot_layout_t layout, int poison, generation_outputs_t &outputs_out) {
     sfapi::config_t config;
     config.num_conformers = layout.num_conformers;
@@ -218,7 +218,7 @@ struct slot_difference_t {
  *  @param[in] second Slot of the second run.
  *  @return Where the slots first part company, how far apart they are, and how much of that is a zero.
  */
-static slot_difference_t compare_slot_(std::span<__half const> first, std::span<__half const> second) {
+static slot_difference_t compare_slot_(custd::span<__half const> first, custd::span<__half const> second) {
     slot_difference_t difference;
     difference.first_element = first.size();
     for (std::size_t element = 0; element < first.size(); ++element) {
@@ -254,8 +254,8 @@ static void compare_runs_into(diagnostic_reporter_t &reporter, std::string_view 
         for (std::uint32_t conformer = 0; conformer < layout.num_conformers; ++conformer) {
             std::size_t const slot = molecule * layout.num_conformers + conformer;
             std::size_t const base = layout.slot_offset(molecule, conformer);
-            std::span<__half const> const first_slot {first.coordinates.data() + base, layout.slot_stride()};
-            std::span<__half const> const second_slot {second.coordinates.data() + base, layout.slot_stride()};
+            custd::span<__half const> const first_slot {first.coordinates.data() + base, layout.slot_stride()};
+            custd::span<__half const> const second_slot {second.coordinates.data() + base, layout.slot_stride()};
 
             slot_difference_t const difference = compare_slot_(first_slot, second_slot);
             bool const coordinates_agree = difference.first_element == first_slot.size();
@@ -317,12 +317,12 @@ static void print_section_summary(std::string_view subject, divergence_tally_t c
  *  @param[in] reporter Section counters and diagnostics.
  *  @param[out] first_out The first run, kept so the caller can gate on what it produced.
  */
-static void check_repeatability(std::span<std::string_view const> corpus, conformer_slot_layout_t layout,
+static void check_repeatability(custd::span<std::string_view const> corpus, conformer_slot_layout_t layout,
                                 diagnostic_reporter_t &reporter, generation_outputs_t &first_out) {
     generation_outputs_t second, third;
     int const device_id = 0;
     {
-        sfapi::context_t context(std::span<int const>(&device_id, 1));
+        sfapi::context_t context(custd::span<int const>(&device_id, 1));
         generate_into(context, corpus, layout, first_run_poison_k, first_out);
         generate_into(context, corpus, layout, second_run_poison_k, second);
     }
@@ -334,7 +334,7 @@ static void check_repeatability(std::span<std::string_view const> corpus, confor
     /*  A second context after the first is destroyed is what a second process sees: fresh per-device
      *  scratch, and a wave size resolved against whatever VRAM is free at that moment. */
     {
-        sfapi::context_t context(std::span<int const>(&device_id, 1));
+        sfapi::context_t context(custd::span<int const>(&device_id, 1));
         generate_into(context, corpus, layout, second_run_poison_k, third);
     }
 
@@ -354,7 +354,7 @@ static void check_repeatability(std::span<std::string_view const> corpus, confor
  *  @param[in] reporter Section counters and diagnostics.
  *  @param[out] tally_out Filled with what the section counted.
  */
-static void check_batch_composition(std::span<std::string_view const> corpus, conformer_slot_layout_t layout,
+static void check_batch_composition(custd::span<std::string_view const> corpus, conformer_slot_layout_t layout,
                                     diagnostic_reporter_t &reporter, divergence_tally_t &tally_out) {
     std::size_t const prefix_size = std::min<std::size_t>(composition_prefix_k, corpus.size());
     std::size_t const extended_size = std::min<std::size_t>(prefix_size + composition_extension_k, corpus.size());
@@ -364,11 +364,11 @@ static void check_batch_composition(std::span<std::string_view const> corpus, co
     generation_outputs_t alone, extended;
     int const device_id = 0;
     {
-        sfapi::context_t context(std::span<int const>(&device_id, 1));
+        sfapi::context_t context(custd::span<int const>(&device_id, 1));
         generate_into(context, corpus.first(prefix_size), layout, first_run_poison_k, alone);
     }
     {
-        sfapi::context_t context(std::span<int const>(&device_id, 1));
+        sfapi::context_t context(custd::span<int const>(&device_id, 1));
         generate_into(context, corpus.first(extended_size), layout, second_run_poison_k, extended);
     }
 

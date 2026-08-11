@@ -30,6 +30,7 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/views.hpp"
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::mmff94 {
@@ -70,7 +71,7 @@ static __launch_bounds__(32, 8) __global__
     __syncwarp();
 
     // Hydrogens, keyed on heavy-atom types, so must run after the heavy-atom pass.
-    std::span<std::uint8_t const> types_span(types, num_atoms);
+    custd::span<std::uint8_t const> types_span(types, num_atoms);
     for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
         if (descriptor.element[atom] != 1) continue;
         types[atom] = native_set_mmff_hydrogen_type(descriptor, atom, types_span);
@@ -79,7 +80,7 @@ static __launch_bounds__(32, 8) __global__
 
     // Lane-0-only charge computation; the flood fill is serial.
     // Reserve per-molecule scratch for formal charges in a shared buffer
-    // owned by this block — fits within max_atoms_per_molecule_k = 128 ≤ 512 B.
+    // owned by this block — fits within max_atoms_per_molecule_k = 192 ≤ 768 B.
     __shared__ float formal_charges_shared[max_atoms_per_molecule_k];
     if (lane == 0) {
         // Status: if any atom type is 0, this molecule failed typing.
@@ -91,11 +92,11 @@ static __launch_bounds__(32, 8) __global__
             }
         typing_status[molecule] = status;
         if (status == 0) {
-            std::span<std::uint8_t const> at_const(types, num_atoms);
-            std::span<float> fc_span(formal_charges_shared, num_atoms);
+            custd::span<std::uint8_t const> at_const(types, num_atoms);
+            custd::span<float> fc_span(formal_charges_shared, num_atoms);
             native_compute_mmff_formal_charges(descriptor, at_const, fc_span);
-            std::span<float const> fc_const(formal_charges_shared, num_atoms);
-            std::span<float> pc_span(charges, num_atoms);
+            custd::span<float const> fc_const(formal_charges_shared, num_atoms);
+            custd::span<float> pc_span(charges, num_atoms);
             native_compute_mmff_partial_charges(descriptor, tables_view, at_const, fc_const, pc_span);
         }
         else {

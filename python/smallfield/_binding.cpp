@@ -9,7 +9,6 @@
 #include <algorithm>   // `std::stable_sort`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::make_unique`
-#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -20,6 +19,7 @@
 #include <pybind11/stl.h>
 
 #include "smallfield/api/smallfield.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace py = pybind11;
 
@@ -39,7 +39,7 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
 
     py::class_<smallfield::api::context_t>(smallfield_module, "Context", "GPU context managing CUDA resources.")
         .def(py::init([](std::vector<int> device_ids) {
-                 std::span<int const> device_span(device_ids.data(), device_ids.size());
+                 custd::span<int const> const device_span(device_ids);
                  return std::make_unique<smallfield::api::context_t>(device_span);
              }),
              py::arg("device_ids") = std::vector<int> {})
@@ -67,21 +67,28 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
                 auto molecular_weight_array = py::array_t<float>(static_cast<py::ssize_t>(num_molecules));
 
                 std::vector<std::string_view> smiles_views(smiles_list.begin(), smiles_list.end());
-                std::span<std::string_view const> smiles_span(smiles_views);
-
                 std::vector<__half> half_coordinates(total_coordinates);
-                std::span<__half> coordinates_span(half_coordinates);
-                std::span<float> energies_span(energies_array.mutable_data(), total_conformers);
                 std::vector<smallfield::api::conformer_status_t> status_buffer(total_conformers);
-                std::span<smallfield::api::conformer_status_t> status_span(status_buffer);
-                std::span<std::uint8_t> num_atoms_span(num_atoms_array.mutable_data(), num_molecules);
-                std::span<std::uint16_t> num_heavy_atoms_span(num_heavy_atoms_array.mutable_data(), num_molecules);
-                std::span<std::uint16_t> num_bonds_span(num_bonds_array.mutable_data(), num_molecules);
-                std::span<float> molecular_weight_span(molecular_weight_array.mutable_data(), num_molecules);
 
-                gpu_context.generate_conformers(smiles_span, config, max_atoms_per_molecule, coordinates_span,
-                                                energies_span, status_span, num_atoms_span, num_heavy_atoms_span,
-                                                num_bonds_span, molecular_weight_span);
+                // The NumPy-backed outputs are the only ones needing an explicit extent: `mutable_data`
+                // hands back a bare pointer, so the count comes from the shape we allocated above.
+                custd::span<float> const energies_span(energies_array.mutable_data(), total_conformers);
+                custd::span<std::uint8_t> const num_atoms_span(num_atoms_array.mutable_data(), num_molecules);
+                custd::span<std::uint16_t> const num_heavy_atoms_span(num_heavy_atoms_array.mutable_data(),
+                                                                      num_molecules);
+                custd::span<std::uint16_t> const num_bonds_span(num_bonds_array.mutable_data(), num_molecules);
+                custd::span<float> const molecular_weight_span(molecular_weight_array.mutable_data(), num_molecules);
+
+                // The whole wave runs without the GIL, so other interpreter threads keep running for
+                // however many minutes it takes. Nothing inside touches a Python object: the NumPy
+                // buffers are sized above and reached through raw spans.
+                {
+                    py::gil_scoped_release const unlocked;
+                    [[maybe_unused]] smallfield::api::conformer_status_t const batch_status =
+                        gpu_context.generate_conformers(smiles_views, config, max_atoms_per_molecule, half_coordinates,
+                                                        energies_span, status_buffer, num_atoms_span,
+                                                        num_heavy_atoms_span, num_bonds_span, molecular_weight_span);
+                }
 
                 // Per-molecule sort by energy ascending. Failed conformers (status != success) sort last so
                 // that successful conformers fill the lowest indices. Tie-break on original index for

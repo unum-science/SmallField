@@ -1922,8 +1922,8 @@ struct distribute_scratch_t {
      *  `no_typing_patch_k` when the molecule was typed natively. */
     std::vector<std::uint32_t> patch_of_molecule;
     static constexpr std::uint32_t no_typing_patch_k = 0xFFFFFFFFu;
-    // Room for twice the `smallfield::api::max_devices_k = 16` the API admits; `smallfield.cu`
-    // compile-time-asserts the two against each other.
+    // Room for twice the `smallfield::api::max_devices_k` the API admits; `smallfield.cu` asserts the
+    // two against each other where it clamps the device list.
     static constexpr std::uint32_t max_devices_k = 32u;
     /** Length: device_count + 1. */
     std::array<std::uint32_t, max_devices_k + 1u> per_device_offsets {};

@@ -37,10 +37,10 @@
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
 #include <array> // `std::array`
-#include <span>  // `std::span`
 
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::mmff94 {
 using smallfield::parameters::lookup_prop;
@@ -1030,7 +1030,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
  *  switches can key on them.
  */
 constexpr std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
-                                                     std::span<std::uint8_t const> atom_types) noexcept {
+                                                     custd::span<std::uint8_t const> atom_types) noexcept {
     std::uint8_t atom_type = 0;
     std::uint16_t const neighbor_start = descriptor.neighbor_offset[atom_index];
     std::uint16_t const neighbor_end = descriptor.neighbor_offset[atom_index + 1];
@@ -1130,8 +1130,8 @@ constexpr std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const
  *  formal charge from SMILES parsing).
  */
 constexpr void native_compute_mmff_formal_charges(molecule_descriptor_t const &descriptor,
-                                                  std::span<std::uint8_t const> atom_types,
-                                                  std::span<float> formal_charges) noexcept {
+                                                  custd::span<std::uint8_t const> atom_types,
+                                                  custd::span<float> formal_charges) noexcept {
     std::uint32_t const num_atoms = descriptor.num_atoms;
     // Initialise with zero — only atom types listed below get overridden.
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) formal_charges[atom_index] = 0.0f;
@@ -1318,9 +1318,9 @@ constexpr void native_compute_mmff_formal_charges(molecule_descriptor_t const &d
  *  MMFF.V. */
 SF_HOST_DEVICE_ inline void native_compute_mmff_partial_charges(molecule_descriptor_t const &descriptor,
                                                                 mmff94_tables_view_t const &tables,
-                                                                std::span<std::uint8_t const> atom_types,
-                                                                std::span<float const> formal_charges,
-                                                                std::span<float> partial_charges) noexcept {
+                                                                custd::span<std::uint8_t const> atom_types,
+                                                                custd::span<float const> formal_charges,
+                                                                custd::span<float> partial_charges) noexcept {
     std::uint32_t const num_atoms = descriptor.num_atoms;
     for (std::uint32_t index = 0; index < num_atoms; ++index) {
         std::uint8_t const atom_type = atom_types[index];
@@ -1402,7 +1402,7 @@ SF_HOST_DEVICE_ inline void native_compute_mmff_partial_charges(molecule_descrip
  *  Returns true iff every atom was typed successfully.
  */
 constexpr bool native_compute_mmff_atom_types(molecule_descriptor_t const &descriptor,
-                                              std::span<std::uint8_t> atom_types) noexcept {
+                                              custd::span<std::uint8_t> atom_types) noexcept {
     std::uint32_t const num_atoms = descriptor.num_atoms;
     bool ok = true;
     // Heavy atoms first.

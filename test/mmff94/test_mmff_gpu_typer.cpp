@@ -11,7 +11,6 @@
 
 #include <iostream>    // RDKit's `AtomTyper.h` needs it but does not include it
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <sstream>     // RDKit's `AtomTyper.h` needs it but does not include it
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
@@ -184,15 +183,10 @@ static std::size_t compare_molecule_(typer_reporters_t &reporters, cpu_typing_sc
                                      charge_comparison_t charges) {
     std::uint32_t const num_atoms = descriptor.num_atoms;
     scratch.resize(num_atoms);
-    std::span<std::uint8_t> atom_types_view(scratch.atom_types);
-    sfmmff::native_compute_mmff_atom_types(descriptor, atom_types_view);
-    std::span<std::uint8_t const> const_atom_types_view(scratch.atom_types);
-    std::span<float> formal_charge_view(scratch.formal_charges);
-    sfmmff::native_compute_mmff_formal_charges(descriptor, const_atom_types_view, formal_charge_view);
-    std::span<float const> const_formal_charge_view(scratch.formal_charges);
-    std::span<float> partial_charge_view(scratch.partial_charges);
-    sfmmff::native_compute_mmff_partial_charges(descriptor, host_view, const_atom_types_view, const_formal_charge_view,
-                                                partial_charge_view);
+    sfmmff::native_compute_mmff_atom_types(descriptor, scratch.atom_types);
+    sfmmff::native_compute_mmff_formal_charges(descriptor, scratch.atom_types, scratch.formal_charges);
+    sfmmff::native_compute_mmff_partial_charges(descriptor, host_view, scratch.atom_types, scratch.formal_charges,
+                                                scratch.partial_charges);
 
     std::size_t mismatching_atoms = 0;
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {

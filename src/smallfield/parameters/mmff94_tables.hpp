@@ -31,6 +31,7 @@
 #include <utility> // `std::pair`
 #include <vector>  // `std::vector`
 
+#include "smallfield/types/views.hpp"
 #include "smallfield/utilities.hpp"
 
 /*  `SF_HOST_DEVICE_` resolves to `__host__ __device__` when compiled by nvcc, empty otherwise, so a
@@ -249,38 +250,31 @@ static_assert(sizeof(mmff94_covrad_entry_t) == 12);
 
 #pragma region Table View
 
-/** POD read-only span for MMFF94 table rows, ABI-safe across host and device. */
-template <typename element_>
-struct mmff94_span {
-    element_ const *ptr_ = nullptr;
-    std::size_t size_ = 0;
-    constexpr element_ const *data() const noexcept { return ptr_; }
-    constexpr std::size_t size() const noexcept { return size_; }
-    constexpr bool empty() const noexcept { return size_ == 0; }
-    constexpr element_ const *begin() const noexcept { return ptr_; }
-    constexpr element_ const *end() const noexcept { return ptr_ + size_; }
-    constexpr element_ const &operator[](std::size_t index) const noexcept { return ptr_[index]; }
-};
-
-/** POD view over every extracted MMFF table. Consumed by all `lookup_*` functions and by host/device
- *  alike — on host `ptr_` points into the `std::vector`s inside `mmff94_tables_host_t`; on device it
- *  points into a `cudaMalloc`ed arena built by `upload_mmff94_tables_to_device`, see
- *  `parameters/mmff94_tables_device.cuh`. */
+/**
+ *  @brief POD view over every extracted MMFF table, passed by value into kernels.
+ *
+ *  Consumed by all `lookup_*` functions and by host and device alike — on host each span points into
+ *  the `std::vector`s inside `mmff94_tables_host_t`; on device into the per-table device buffers that
+ *  `upload_mmff94_tables_to_device` fills, see `parameters/mmff94_tables_device.cuh`.
+ *
+ *  The spans are `custd::span` rather than `std::span` because `std::span`'s members are not
+ *  `__host__ __device__`, so the shared `lookup_*` cascades could not index one from a kernel.
+ */
 struct mmff94_tables_view_t {
-    mmff94_span<mmff94_vdw_entry_t> vdw;
-    mmff94_span<mmff94_bond_entry_t> bond;
-    mmff94_span<mmff94_angle_entry_t> angle;
-    mmff94_span<mmff94_torsion_entry_t> torsion;
-    mmff94_span<mmff94_oop_entry_t> oop;
-    mmff94_span<mmff94_stbn_entry_t> stbn;
-    mmff94_span<mmff94_dfsb_entry_t> dfsb;
-    mmff94_span<mmff94_def_entry_t> def;
-    mmff94_span<mmff94_prop_entry_t> prop;
-    mmff94_span<mmff94_pbci_entry_t> pbci;
-    mmff94_span<mmff94_chg_entry_t> chg;
-    mmff94_span<mmff94_bndk_entry_t> bndk;
-    mmff94_span<mmff94_hl_entry_t> hl;
-    mmff94_span<mmff94_covrad_entry_t> covrad;
+    custd::span<mmff94_vdw_entry_t const> vdw;
+    custd::span<mmff94_bond_entry_t const> bond;
+    custd::span<mmff94_angle_entry_t const> angle;
+    custd::span<mmff94_torsion_entry_t const> torsion;
+    custd::span<mmff94_oop_entry_t const> oop;
+    custd::span<mmff94_stbn_entry_t const> stbn;
+    custd::span<mmff94_dfsb_entry_t const> dfsb;
+    custd::span<mmff94_def_entry_t const> def;
+    custd::span<mmff94_prop_entry_t const> prop;
+    custd::span<mmff94_pbci_entry_t const> pbci;
+    custd::span<mmff94_chg_entry_t const> chg;
+    custd::span<mmff94_bndk_entry_t const> bndk;
+    custd::span<mmff94_hl_entry_t const> hl;
+    custd::span<mmff94_covrad_entry_t const> covrad;
 
     float vdw_power = 0.25f;
     float vdw_b = 0.2f;
@@ -290,6 +284,11 @@ struct mmff94_tables_view_t {
 
     std::uint8_t max_atom_type = 0;
 };
+
+/*  Fourteen 16-byte spans, five floats and a byte, padded to the pointer alignment. The upload in
+ *  `mmff94_tables_device.cuh` writes these fields and every MMFF kernel takes the struct by value, so a
+ *  change in the layout silently redirects every parameter lookup on the device. */
+static_assert(sizeof(mmff94_tables_view_t) == 248);
 
 #pragma endregion Table View
 

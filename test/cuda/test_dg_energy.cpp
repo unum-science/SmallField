@@ -2,10 +2,10 @@
  *  @file test/cuda/test_dg_energy.cpp
  *  @brief Gate the device distance-geometry energy, its analytic gradient, and FIRE minimization.
  *
- *  Distance geometry embeds in @b four dimensions, not three. The fourth row of every coordinate buffer here
+ *  Distance geometry embeds in @b four dimensions, not three. The fourth axis of every coordinate buffer here
  *  is a real coordinate — the one the crush penalty drives toward zero before the structure is read back as
- *  3D — so a view that fixes the row count at three cannot describe these buffers at all. The row count
- *  therefore lives in the view's type, `coordinates_soa<4>`, and only the transposition to and from
+ *  3D — so a view that fixes the axis count at three cannot describe these buffers at all. The axis count
+ *  therefore lives in the view's type, `sft::embedding_soa_t`, and only the transposition to and from
  *  RDKit's interleaved `(atom, 3)` layout is three-dimensional.
  *
  *  The device quantizes the bounds matrix to int8 over the molecule's whole bound range before it reads a
@@ -48,6 +48,7 @@ namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
+using sft::coordinate_role_t;
 using sftest::gpu_dg_energy;
 using sftest::gpu_dg_minimize;
 
@@ -56,66 +57,33 @@ static constexpr std::string_view test_name_k = "test_dg_energy";
 #pragma region Coordinate Views
 
 /**
- *  @brief Coordinates as `(dimension, atom)`, the layout every kernel reached from this file reads.
+ *  @brief The four-axis buffer the energy, gradient, and minimization kernels all operate on.
  *
- *  The row count is a template parameter rather than a runtime extent because it is a property of the
- *  algorithm, not of the molecule: distance geometry works at four, everything downstream at three, and the
- *  two must not be interchangeable at a call site. A dynamic row count would also make this alias the same
- *  type as `packed_matrix<float>`, so a bounds matrix would pass where coordinates were expected.
+ *  Addressed `(atom, axis)`: axes zero through two are x, y, and z, and axis three is the w the crush penalty
+ *  flattens before the structure is projected back to three dimensions. Every buffer this file hands a kernel
+ *  carries all four.
  */
-template <std::size_t dimensions_>
-using coordinates_soa =
-    sft::mdspan_ns::mdspan<float, sft::mdspan_ns::extents<std::uint32_t, dimensions_, sft::mdspan_ns::dynamic_extent>>;
+using embedding_t = sft::embedding_soa_t;
 
-/** How many rows a distance-geometry embedding carries: x, y, z, and the w the crush penalty flattens. */
-static constexpr std::size_t embedding_dimensions_k = 4;
-
-/** The four-row buffer the energy, gradient, and minimization kernels all operate on. */
-using embedding_t = coordinates_soa<embedding_dimensions_k>;
+/** A gradient over the same four axes; nothing but the role separates it from an embedding. */
+using gradient_t = sft::coordinates_soa<coordinate_role_t::gradient_k, float, sft::embedding_dimensions_k>;
 
 /** Coordinates as `(atom, axis)` over three axes, the layout RDKit's conformer API speaks. */
-using interleaved_t =
-    sft::mdspan_ns::mdspan<float, sft::mdspan_ns::extents<std::uint32_t, sft::mdspan_ns::dynamic_extent, 3>>;
+using interleaved_t = sft::conformer_aos_t;
 
-/** Grow @p storage to hold one molecule's SoA coordinates, zero it, and view it. */
-template <std::size_t dimensions_>
-static coordinates_soa<dimensions_> reset_coordinates_soa_(std::vector<float> &storage, std::uint32_t num_atoms) {
-    storage.assign(dimensions_ * num_atoms, 0.0f);
-    return coordinates_soa<dimensions_> {storage.data(), static_cast<std::uint32_t>(dimensions_), num_atoms};
+/** Grow @p storage to a four-axis embedding over @p num_atoms atoms, zero it, and view it. */
+static embedding_t reset_embedding_(std::vector<float> &storage, std::uint32_t num_atoms) {
+    return sft::reset_coordinates_soa<coordinate_role_t::embedding_k, sft::embedding_dimensions_k>(storage, num_atoms);
 }
 
-/** Grow @p storage to hold one molecule's interleaved coordinates, zero it, and view it. */
-static interleaved_t reset_coordinates_interleaved_(std::vector<float> &storage, std::uint32_t num_atoms) {
-    storage.assign(static_cast<std::size_t>(num_atoms) * 3u, 0.0f);
-    return interleaved_t {storage.data(), num_atoms, 3u};
+/** Grow @p storage to a gradient over a four-axis embedding, zero it, and view it. */
+static gradient_t reset_gradient_(std::vector<float> &storage, std::uint32_t num_atoms) {
+    return sft::reset_coordinates_soa<coordinate_role_t::gradient_k, sft::embedding_dimensions_k>(storage, num_atoms);
 }
 
-/**
- *  @brief Copy the three spatial rows of an SoA embedding into an interleaved `(atom, 3)` block.
- *
- *  Rows past the third have no interleaved counterpart and are not read; the embedding's w is dropped here
- *  on purpose, which is the projection that turns a four-dimensional embedding into a conformer.
- */
-template <std::size_t dimensions_>
-static void gather_spatial_into_interleaved_(coordinates_soa<dimensions_> soa, interleaved_t interleaved) {
-    static_assert(dimensions_ >= 3, "an SoA coordinate view carries at least the three spatial rows");
-    sf_verify_(soa.extent(1) == interleaved.extent(0), "coordinate views disagree on the atom count");
-    for (std::uint32_t atom = 0; atom < interleaved.extent(0); ++atom)
-        for (std::uint32_t axis = 0; axis < 3u; ++axis) interleaved(atom, axis) = soa(axis, atom);
-}
-
-/**
- *  @brief Copy an interleaved `(atom, 3)` block into the three spatial rows of an SoA embedding.
- *
- *  Rows past the third keep whatever they already held, so a caller that fills w first and the spatial rows
- *  second gets the same buffer as one that does it the other way round.
- */
-template <std::size_t dimensions_>
-static void scatter_interleaved_into_spatial_(interleaved_t interleaved, coordinates_soa<dimensions_> soa) {
-    static_assert(dimensions_ >= 3, "an SoA coordinate view carries at least the three spatial rows");
-    sf_verify_(soa.extent(1) == interleaved.extent(0), "coordinate views disagree on the atom count");
-    for (std::uint32_t atom = 0; atom < interleaved.extent(0); ++atom)
-        for (std::uint32_t axis = 0; axis < 3u; ++axis) soa(axis, atom) = interleaved(atom, axis);
+/** Grow @p storage to @p num_atoms atom-major triples, zero it, and view it. */
+static interleaved_t reset_interleaved_(std::vector<float> &storage, std::uint32_t num_atoms) {
+    return sft::reset_coordinates_aos<coordinate_role_t::position_k>(storage, num_atoms);
 }
 
 /** Read a molecule's conformer straight into caller-owned interleaved storage. */
@@ -204,20 +172,20 @@ static quantized_bounds_t quantize_bounds_(sft::packed_matrix<float const> bound
 /**
  *  @brief Host mirror of `evaluate_distance_geometry_energy` for one molecule, in double precision.
  *
- *  @param[in] coordinates Four-row SoA embedding; every row participates in the pair distances.
+ *  @param[in] coordinates Four-axis SoA embedding; every axis participates in the pair distances.
  *  @param[in] read_bound Called as `read_bound(row, column)`, upper above the diagonal and lower below.
  *  @param[in] weights Penalty weights, matching what the kernel was handed.
  *  @return Total energy.
  */
 template <typename bound_reader_>
 static double reference_dg_energy_(embedding_t coordinates, bound_reader_ read_bound, dg_weights_t weights) {
-    std::uint32_t const num_atoms = coordinates.extent(1);
+    std::uint32_t const num_atoms = coordinates.extent(0);
     double energy = 0.0;
     for (std::uint32_t first_atom = 0; first_atom < num_atoms; ++first_atom) {
         for (std::uint32_t second_atom = first_atom + 1; second_atom < num_atoms; ++second_atom) {
             double distance_squared = 0.0;
-            for (std::uint32_t dimension = 0; dimension < coordinates.extent(0); ++dimension) {
-                double const delta = coordinates(dimension, second_atom) - coordinates(dimension, first_atom);
+            for (std::uint32_t dimension = 0; dimension < coordinates.extent(1); ++dimension) {
+                double const delta = coordinates(second_atom, dimension) - coordinates(first_atom, dimension);
                 distance_squared += delta * delta;
             }
             double const distance = std::sqrt(std::max(distance_squared, 1e-12));
@@ -229,10 +197,10 @@ static double reference_dg_energy_(embedding_t coordinates, bound_reader_ read_b
         }
     }
 
-    // The crush penalty is per atom rather than per pair, and only the fourth row feels it.
+    // The crush penalty is per atom rather than per pair, and only the fourth axis feels it.
     if (weights.fourth_dimension > 0.0f)
         for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-            double const fourth = coordinates(3, atom);
+            double const fourth = coordinates(atom, 3);
             energy += weights.fourth_dimension * fourth * fourth;
         }
     return energy;
@@ -240,13 +208,13 @@ static double reference_dg_energy_(embedding_t coordinates, bound_reader_ read_b
 
 /** The largest amount, in angstroms, by which any pair sits outside its bounds. */
 static float max_bound_violation_(embedding_t coordinates, sft::packed_matrix<float const> bounds) {
-    std::uint32_t const num_atoms = coordinates.extent(1);
+    std::uint32_t const num_atoms = coordinates.extent(0);
     float worst = 0.0f;
     for (std::uint32_t first_atom = 0; first_atom < num_atoms; ++first_atom)
         for (std::uint32_t second_atom = first_atom + 1; second_atom < num_atoms; ++second_atom) {
             float distance_squared = 0.0f;
-            for (std::uint32_t dimension = 0; dimension < coordinates.extent(0); ++dimension) {
-                float const delta = coordinates(dimension, second_atom) - coordinates(dimension, first_atom);
+            for (std::uint32_t dimension = 0; dimension < coordinates.extent(1); ++dimension) {
+                float const delta = coordinates(second_atom, dimension) - coordinates(first_atom, dimension);
                 distance_squared += delta * delta;
             }
             float const distance = std::sqrt(distance_squared);
@@ -256,24 +224,24 @@ static float max_bound_violation_(embedding_t coordinates, sft::packed_matrix<fl
     return std::max(worst, 0.0f);
 }
 
-/** Mean magnitude of the embedding's fourth row — the quantity the crush penalty exists to shrink. */
+/** Mean magnitude of the embedding's fourth axis — the quantity the crush penalty exists to shrink. */
 static float mean_fourth_dimension_magnitude_(embedding_t coordinates) {
-    std::uint32_t const num_atoms = coordinates.extent(1);
+    std::uint32_t const num_atoms = coordinates.extent(0);
     double total = 0.0;
-    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) total += std::fabs(coordinates(3, atom));
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) total += std::fabs(coordinates(atom, 3));
     return static_cast<float>(total / std::max(1u, num_atoms));
 }
 
 /**
- *  @brief Fill the embedding's fourth row with small deterministic offsets.
+ *  @brief Fill the embedding's fourth axis with small deterministic offsets.
  *
  *  The arithmetic is signed on purpose: `atom % 3 - 1` on an unsigned atom index wraps to 4294967295 for
  *  every third atom, which is how this file once fed the kernel coordinates near 4e8 and compared two
  *  reference implementations of the same nonsense.
  */
 static void fill_fourth_dimension_(embedding_t coordinates) {
-    for (std::uint32_t atom = 0; atom < coordinates.extent(1); ++atom)
-        coordinates(3, atom) = 0.1f * (static_cast<float>(atom % 3u) - 1.0f);
+    for (std::uint32_t atom = 0; atom < coordinates.extent(0); ++atom)
+        coordinates(atom, 3) = 0.1f * (static_cast<float>(atom % 3u) - 1.0f);
 }
 
 #pragma endregion Host Reference
@@ -396,23 +364,24 @@ static void check_energy_(sftest::diagnostic_reporter_t &reporter, sftest::diagn
                           std::string const &smiles, RDKit::ROMol const &molecule,
                           sft::packed_matrix<float const> bounds, dg_weights_t weights, molecule_scratch_t &scratch) {
     std::uint32_t const num_atoms = bounds.extent(0);
-    auto const coordinates = reset_coordinates_soa_<embedding_dimensions_k>(scratch.embedding, num_atoms);
-    auto const gradient = reset_coordinates_soa_<embedding_dimensions_k>(scratch.gradient, num_atoms);
-    auto const interleaved = reset_coordinates_interleaved_(scratch.interleaved, num_atoms);
+    auto const coordinates = reset_embedding_(scratch.embedding, num_atoms);
+    auto const gradient = reset_gradient_(scratch.gradient, num_atoms);
+    auto const interleaved = reset_interleaved_(scratch.interleaved, num_atoms);
 
     read_conformer_into_(molecule, interleaved);
-    scatter_interleaved_into_spatial_(interleaved, coordinates);
+    sft::transpose_into(interleaved, coordinates);
     fill_fourth_dimension_(coordinates);
 
     float relaxed_energy = 0.0f;
     gpu_dg_energy(coordinates.data_handle(), gradient.data_handle(), bounds.data_handle(), num_atoms,
-                  coordinates.extent(0), weights.upper, weights.lower, weights.fourth_dimension, &relaxed_energy);
+                  coordinates.extent(1), weights.upper, weights.lower, weights.fourth_dimension, &relaxed_energy);
 
+    // Push atom zero along x, far enough that the upper-bound penalty is on its active branch.
     coordinates(0, 0) += known_shift_angstrom_k;
 
     float gpu_energy = 0.0f;
     gpu_dg_energy(coordinates.data_handle(), gradient.data_handle(), bounds.data_handle(), num_atoms,
-                  coordinates.extent(0), weights.upper, weights.lower, weights.fourth_dimension, &gpu_energy);
+                  coordinates.extent(1), weights.upper, weights.lower, weights.fourth_dimension, &gpu_energy);
 
     auto const quantized = quantize_bounds_(bounds, scratch.bound_levels);
     double const quantized_reference = reference_dg_energy_(
@@ -436,52 +405,52 @@ static void check_energy_(sftest::diagnostic_reporter_t &reporter, sftest::diagn
 /**
  *  @brief Gate the analytic gradient against a central difference of the same kernel's energy.
  *
- *  Every one of the four rows is swept, and the fourth-dimension weight is non-zero so the crush term's
- *  contribution to the w row is covered rather than multiplied away.
+ *  Every one of the four axes is swept, and the fourth-dimension weight is non-zero so the crush term's
+ *  contribution to the w axis is covered rather than multiplied away.
  */
 static void check_gradient_(sftest::diagnostic_reporter_t &reporter, std::string const &smiles,
                             RDKit::ROMol const &molecule, sft::packed_matrix<float const> bounds, dg_weights_t weights,
                             molecule_scratch_t &scratch) {
     std::uint32_t const num_atoms = bounds.extent(0);
-    auto const coordinates = reset_coordinates_soa_<embedding_dimensions_k>(scratch.embedding, num_atoms);
-    auto const analytical = reset_coordinates_soa_<embedding_dimensions_k>(scratch.gradient, num_atoms);
-    auto const spare = reset_coordinates_soa_<embedding_dimensions_k>(scratch.spare_gradient, num_atoms);
-    auto const interleaved = reset_coordinates_interleaved_(scratch.interleaved, num_atoms);
+    auto const coordinates = reset_embedding_(scratch.embedding, num_atoms);
+    auto const analytical = reset_gradient_(scratch.gradient, num_atoms);
+    auto const spare = reset_gradient_(scratch.spare_gradient, num_atoms);
+    auto const interleaved = reset_interleaved_(scratch.interleaved, num_atoms);
 
     read_conformer_into_(molecule, interleaved);
-    scatter_interleaved_into_spatial_(interleaved, coordinates);
+    sft::transpose_into(interleaved, coordinates);
 
     // A conformer sits close to its bounds, and a gradient of exact zeros compares equal to anything.
     // Displacing every component by up to 0.3 angstroms puts the penalty terms on their active branch.
     std::mt19937 generator(123);
     std::uniform_real_distribution<float> displacement(-0.3f, 0.3f);
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-        for (std::uint32_t dimension = 0; dimension < coordinates.extent(0); ++dimension)
-            coordinates(dimension, atom) += displacement(generator);
+        for (std::uint32_t dimension = 0; dimension < coordinates.extent(1); ++dimension)
+            coordinates(atom, dimension) += displacement(generator);
 
     float energy_at_center = 0.0f;
     gpu_dg_energy(coordinates.data_handle(), analytical.data_handle(), bounds.data_handle(), num_atoms,
-                  coordinates.extent(0), weights.upper, weights.lower, weights.fourth_dimension, &energy_at_center);
+                  coordinates.extent(1), weights.upper, weights.lower, weights.fourth_dimension, &energy_at_center);
 
-    for (std::uint32_t dimension = 0; dimension < coordinates.extent(0); ++dimension) {
+    for (std::uint32_t dimension = 0; dimension < coordinates.extent(1); ++dimension) {
         for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-            float const original = coordinates(dimension, atom);
+            float const original = coordinates(atom, dimension);
 
-            coordinates(dimension, atom) = original + finite_difference_step_k;
+            coordinates(atom, dimension) = original + finite_difference_step_k;
             float energy_plus = 0.0f;
             gpu_dg_energy(coordinates.data_handle(), spare.data_handle(), bounds.data_handle(), num_atoms,
-                          coordinates.extent(0), weights.upper, weights.lower, weights.fourth_dimension, &energy_plus);
+                          coordinates.extent(1), weights.upper, weights.lower, weights.fourth_dimension, &energy_plus);
 
-            coordinates(dimension, atom) = original - finite_difference_step_k;
+            coordinates(atom, dimension) = original - finite_difference_step_k;
             float energy_minus = 0.0f;
             gpu_dg_energy(coordinates.data_handle(), spare.data_handle(), bounds.data_handle(), num_atoms,
-                          coordinates.extent(0), weights.upper, weights.lower, weights.fourth_dimension, &energy_minus);
+                          coordinates.extent(1), weights.upper, weights.lower, weights.fourth_dimension, &energy_minus);
 
-            coordinates(dimension, atom) = original;
+            coordinates(atom, dimension) = original;
 
             float const finite_difference = (energy_plus - energy_minus) / (2.0f * finite_difference_step_k);
             reporter.mismatch("dg_gradient", "smiles={} atom={} dimension={}", smiles, atom, dimension)
-                .field("gradient", finite_difference, analytical(dimension, atom), gradients_agree_);
+                .field("gradient", finite_difference, analytical(atom, dimension), gradients_agree_);
         }
     }
 }
@@ -499,34 +468,34 @@ static void check_minimization_(sftest::diagnostic_reporter_t &reporter, std::st
                                 RDKit::RWMol &molecule, sft::packed_matrix<float const> bounds, dg_weights_t weights,
                                 molecule_scratch_t &scratch) {
     std::uint32_t const num_atoms = bounds.extent(0);
-    auto const coordinates = reset_coordinates_soa_<embedding_dimensions_k>(scratch.embedding, num_atoms);
-    auto const gradient = reset_coordinates_soa_<embedding_dimensions_k>(scratch.gradient, num_atoms);
-    auto const interleaved = reset_coordinates_interleaved_(scratch.interleaved, num_atoms);
+    auto const coordinates = reset_embedding_(scratch.embedding, num_atoms);
+    auto const gradient = reset_gradient_(scratch.gradient, num_atoms);
+    auto const interleaved = reset_interleaved_(scratch.interleaved, num_atoms);
 
     std::mt19937 generator(42);
     std::uniform_real_distribution<float> position(-random_start_span_k, random_start_span_k);
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-        for (std::uint32_t dimension = 0; dimension < coordinates.extent(0); ++dimension)
-            coordinates(dimension, atom) = position(generator);
+        for (std::uint32_t dimension = 0; dimension < coordinates.extent(1); ++dimension)
+            coordinates(atom, dimension) = position(generator);
 
     double const mmff_at_embedding = sftest::rdkit_mmff94_energy(molecule);
 
     float start_energy = 0.0f;
     gpu_dg_energy(coordinates.data_handle(), gradient.data_handle(), bounds.data_handle(), num_atoms,
-                  coordinates.extent(0), weights.upper, weights.lower, weights.fourth_dimension, &start_energy);
+                  coordinates.extent(1), weights.upper, weights.lower, weights.fourth_dimension, &start_energy);
     float const start_violation = max_bound_violation_(coordinates, bounds);
     float const start_fourth = mean_fourth_dimension_magnitude_(coordinates);
 
     float final_energy = 0.0f;
     std::int32_t iterations = 0, status = 0;
-    gpu_dg_minimize(coordinates.data_handle(), bounds.data_handle(), num_atoms, coordinates.extent(0), weights.upper,
+    gpu_dg_minimize(coordinates.data_handle(), bounds.data_handle(), num_atoms, coordinates.extent(1), weights.upper,
                     weights.lower, weights.fourth_dimension, max_iterations_k, gradient_threshold_k, &final_energy,
                     &iterations, &status);
 
     float const final_violation = max_bound_violation_(coordinates, bounds);
     float const final_fourth = mean_fourth_dimension_magnitude_(coordinates);
 
-    gather_spatial_into_interleaved_(coordinates, interleaved);
+    sft::transpose_into(coordinates, interleaved);
     sftest::set_coords_interleaved(molecule, interleaved.data_handle());
     double const mmff_at_dg_coords = sftest::rdkit_mmff94_energy(molecule);
 
@@ -571,7 +540,7 @@ int main(int argc, char **argv) {
     std::unique_ptr<RDKit::RWMol> molecule;
     std::size_t ready_molecules = 0, skipped_molecules = 0, gradient_molecules = 0;
 
-    // Without the crush penalty the fourth row only enters through the pair distances; with it, the term
+    // Without the crush penalty the fourth axis only enters through the pair distances; with it, the term
     // that collapses the embedding is live. Both are gated, because the kernel branches on the weight.
     dg_weights_t const flat_weights {1.0f, 1.0f, 0.0f};
     dg_weights_t const crushed_weights {1.0f, 1.0f, fourth_dimension_weight_k};

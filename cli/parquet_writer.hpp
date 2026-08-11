@@ -39,10 +39,8 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`, `std::uint32_t`
-#include <cstring> // `std::memcpy`
 
-#include <filesystem>  // `std::filesystem::path`
-#include <span>        // `std::span`
+#include <filesystem> // `std::filesystem::path`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 
@@ -50,55 +48,9 @@
 
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/log.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::cli {
-
-#pragma region Coordinate Slot Transposition
-
-/* Move one coordinate component across the boundary the two layouts meet at: a numeric conversion
- * where one side is a host `float`, and a bit copy where both sides already hold half-precision
- * patterns. The overload set is what lets one transposition body serve every caller. */
-inline void assign_coordinate_(__half &destination, float source) noexcept { destination = __float2half(source); }
-inline void assign_coordinate_(float &destination, __half source) noexcept { destination = __half2float(source); }
-inline void assign_coordinate_(__half &destination, std::uint16_t source) noexcept {
-    std::memcpy(&destination, &source, sizeof(destination));
-}
-inline void assign_coordinate_(std::uint16_t &destination, std::uint16_t source) noexcept { destination = source; }
-
-/**
- *  @brief Read one conformer slot's structure-of-arrays components into a tight interleaved `(atom, 3)` block.
- *
- *  @param[in] slot Base of the slot inside the coordinate pool, `pool.data() + layout.slot_offset(...)`.
- *  @param[in] layout Addressing contract the producers and the writer all agree on.
- *  @param[in] num_atoms Atoms the molecule actually has; the slot's padding atoms are not read.
- *  @param[out] interleaved Destination for `3 * num_atoms` components, atom-major.
- */
-template <typename slot_type_, typename interleaved_type_>
-inline void gather_slot_into_interleaved(slot_type_ const *slot, api::conformer_slot_layout_t const &layout,
-                                         std::uint32_t num_atoms, interleaved_type_ *interleaved) noexcept {
-    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-        for (std::uint32_t axis = 0; axis < 3u; ++axis)
-            assign_coordinate_(interleaved[atom * 3u + axis], slot[layout.component_offset(axis, atom)]);
-}
-
-/**
- *  @brief Write a tight interleaved `(atom, 3)` block back into one conformer slot.
- *
- *  @param[in] interleaved Source of `3 * num_atoms` components, atom-major.
- *  @param[in] layout Addressing contract the producers and the writer all agree on.
- *  @param[in] num_atoms Atoms the molecule actually has; the slot's padding atoms are left alone.
- *  @param[out] slot Base of the slot inside the coordinate pool, `pool.data() + layout.slot_offset(...)`.
- */
-template <typename interleaved_type_, typename slot_type_>
-inline void scatter_interleaved_into_slot(interleaved_type_ const *interleaved,
-                                          api::conformer_slot_layout_t const &layout, std::uint32_t num_atoms,
-                                          slot_type_ *slot) noexcept {
-    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-        for (std::uint32_t axis = 0; axis < 3u; ++axis)
-            assign_coordinate_(slot[layout.component_offset(axis, atom)], interleaved[atom * 3u + axis]);
-}
-
-#pragma endregion Coordinate Slot Transposition
 
 struct writer_inputs_t {
     std::string input_shard_stem;
@@ -110,7 +62,7 @@ struct writer_inputs_t {
     std::uint32_t max_conformers = 0;
     /** Per-conformer coord stride = max_atoms * 3. */
     std::uint32_t max_atoms = 0;
-    std::span<std::string_view const> smiles;
+    custd::span<std::string_view const> smiles;
 
     /**
      *  @brief Per-molecule scalar readbacks, each of length `num_molecules`.
@@ -119,12 +71,12 @@ struct writer_inputs_t {
      *  `n_atoms` is a `uint8` in the public API, capped at 128, and widens to `uint16` in the canonical
      *  schema so the format stays forward-compatible.
      */
-    std::span<std::uint8_t const> num_atoms_per_molecule;
-    std::span<std::uint16_t const> num_heavy_atoms_per_molecule;
-    std::span<std::uint16_t const> num_bonds_per_molecule;
-    std::span<float const> molecular_weight_per_molecule;
+    custd::span<std::uint8_t const> num_atoms_per_molecule;
+    custd::span<std::uint16_t const> num_heavy_atoms_per_molecule;
+    custd::span<std::uint16_t const> num_bonds_per_molecule;
+    custd::span<float const> molecular_weight_per_molecule;
     /** M, post-Kabsch (0 if preprocess failed). */
-    std::span<std::uint8_t const> n_conformers_per_molecule;
+    custd::span<std::uint8_t const> n_conformers_per_molecule;
 
     /**
      *  @brief Per-conformer slot arrays, each of length `num_molecules * max_conformers`.
@@ -132,15 +84,15 @@ struct writer_inputs_t {
      *  The writer reads only the first `n_conformers_per_molecule[molecule_index]` slots of each molecule, so
      *  the trailing slots are unused.
      */
-    std::span<std::uint8_t const> status;
+    custd::span<std::uint8_t const> status;
     /**
      *  @brief Per-conformer coordinates.
      *
      *  Slot-addressed via `smallfield::api::conformer_slot_layout_t{max_atoms, max_conformers}`;
      *  structure-of-arrays within each slot, filled by either the GPU or the RDKit fallback.
      */
-    std::span<__half const> coordinates;
-    std::span<float const> energies;
+    custd::span<__half const> coordinates;
+    custd::span<float const> energies;
 
     /**
      *  @brief Per-conformer USRCAT shape descriptor, 60 doubles per slot, stored as `list<float16>`.
@@ -151,7 +103,7 @@ struct writer_inputs_t {
      *  opts the column out, marking it all-null; non-success slots are written null. The 12-dim USR descriptor
      *  is not stored separately — it is exactly the first 12 values of USRCAT.
      */
-    std::span<double const> usrcat;
+    custd::span<double const> usrcat;
 };
 
 #pragma region Refusals

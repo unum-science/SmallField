@@ -38,7 +38,6 @@
 #include <chrono>        // `std::chrono::steady_clock`
 #include <filesystem>    // `std::filesystem::path`
 #include <memory>        // `std::shared_ptr`
-#include <span>          // `std::span`
 #include <stdexcept>     // `std::runtime_error`
 #include <string>        // `std::string`
 #include <string_view>   // `std::string_view`
@@ -58,6 +57,7 @@
 #include "smallfield/log.hpp"
 #include "smallfield/postprocess/fragment_separation.hpp"
 #include "smallfield/postprocess/shape_descriptors.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "cli/parquet_writer.hpp"
 
@@ -723,8 +723,8 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
         std::uint64_t const rows_begin = buffers.molecule_row_offsets[molecule_index];
         std::uint64_t const rows_end = buffers.molecule_row_offsets[molecule_index + 1];
         if (rows_begin == rows_end) continue; // contiguous input guarantees this never fires; defensive only
-        std::span<std::int64_t const> const rows {buffers.molecule_rows.data() + rows_begin,
-                                                  static_cast<std::size_t>(rows_end - rows_begin)};
+        custd::span<std::int64_t const> const rows {buffers.molecule_rows.data() + rows_begin,
+                                                    static_cast<std::size_t>(rows_end - rows_begin)};
         std::int64_t const first_row = rows.front();
         std::string_view const stem = shard.input_shard->GetView(first_row);
         std::uint64_t const input_row = shard.input_row->Value(first_row);
@@ -754,7 +754,11 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
                 if (conformer.coord_bits.size() < static_cast<std::size_t>(num_atoms) * 3u) continue;
                 std::size_t const slot_base = slot_layout.slot_offset(molecule_index,
                                                                       static_cast<std::uint32_t>(conformer_slot));
-                sfcli::scatter_interleaved_into_slot(conformer.coord_bits.data(), slot_layout, num_atoms,
+                // `coord_bits` holds the row's float16 patterns exactly as Arrow stored them, which is the
+                // pool's own storage; naming them `__half` keeps the transposition a verbatim copy instead
+                // of a numeric conversion of the bit pattern.
+                auto const *coordinate_halves = reinterpret_cast<__half const *>(conformer.coord_bits.data());
+                sfapi::scatter_interleaved_into_slot(coordinate_halves, slot_layout, num_atoms,
                                                      buffers.coordinates.data() + slot_base);
                 std::copy(conformer.usrcat.begin(), conformer.usrcat.end(), buffers.usrcat.data() + flat * 60u);
             }
@@ -813,7 +817,7 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
 
             std::size_t const slot_base = slot_layout.slot_offset(molecule_index,
                                                                   static_cast<std::uint32_t>(conformer_slot));
-            std::span<float> coords_view {interleaved.data(), wanted};
+            custd::span<float> coords_view {interleaved.data(), wanted};
 
             // Multi-fragment safety net: separate disconnected components and write the corrected
             // geometry back, mirroring the producer. Only when the context is usable (needs labels).
@@ -822,7 +826,7 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
                 stats.fragments_separated.fetch_add(1, std::memory_order_relaxed);
             }
 
-            sfcli::scatter_interleaved_into_slot(interleaved.data(), slot_layout, num_atoms,
+            sfapi::scatter_interleaved_into_slot(interleaved.data(), slot_layout, num_atoms,
                                                  buffers.coordinates.data() + slot_base);
 
             if (context_usable) {
@@ -844,19 +848,20 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
         .num_molecules = num_molecules,
         .max_conformers = max_conformers,
         .max_atoms = max_atoms,
-        .smiles = std::span<std::string_view const>(buffers.smiles.data(), num_molecules),
-        .num_atoms_per_molecule = std::span<std::uint8_t const>(buffers.num_atoms_per_molecule.data(), num_molecules),
-        .num_heavy_atoms_per_molecule = std::span<std::uint16_t const>(buffers.num_heavy_atoms_per_molecule.data(),
-                                                                       num_molecules),
-        .num_bonds_per_molecule = std::span<std::uint16_t const>(buffers.num_bonds_per_molecule.data(), num_molecules),
-        .molecular_weight_per_molecule = std::span<float const>(buffers.molecular_weight_per_molecule.data(),
-                                                                num_molecules),
-        .n_conformers_per_molecule = std::span<std::uint8_t const>(buffers.n_conformers_per_molecule.data(),
+        .smiles = custd::span<std::string_view const>(buffers.smiles.data(), num_molecules),
+        .num_atoms_per_molecule = custd::span<std::uint8_t const>(buffers.num_atoms_per_molecule.data(), num_molecules),
+        .num_heavy_atoms_per_molecule = custd::span<std::uint16_t const>(buffers.num_heavy_atoms_per_molecule.data(),
+                                                                         num_molecules),
+        .num_bonds_per_molecule = custd::span<std::uint16_t const>(buffers.num_bonds_per_molecule.data(),
                                                                    num_molecules),
-        .status = std::span<std::uint8_t const>(buffers.status_codes.data(), total_slots),
-        .coordinates = std::span<__half const>(buffers.coordinates.data(), total_slots * slot_layout.slot_stride()),
-        .energies = std::span<float const>(buffers.energies.data(), total_slots),
-        .usrcat = std::span<double const>(buffers.usrcat.data(), total_slots * 60u),
+        .molecular_weight_per_molecule = custd::span<float const>(buffers.molecular_weight_per_molecule.data(),
+                                                                  num_molecules),
+        .n_conformers_per_molecule = custd::span<std::uint8_t const>(buffers.n_conformers_per_molecule.data(),
+                                                                     num_molecules),
+        .status = custd::span<std::uint8_t const>(buffers.status_codes.data(), total_slots),
+        .coordinates = custd::span<__half const>(buffers.coordinates.data(), total_slots * slot_layout.slot_stride()),
+        .energies = custd::span<float const>(buffers.energies.data(), total_slots),
+        .usrcat = custd::span<double const>(buffers.usrcat.data(), total_slots * 60u),
     };
     // `write_shard` names its own refusal in the log, so the outcome only has to survive the return.
     sfcli::shard_write_report_t const report = sfcli::write_shard(output_path, writer_inputs, &logger);
@@ -949,7 +954,7 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
  *  The slot buffers are declared above the loop and reused, so the run's widest shard is the only one that
  *  allocates. A stop signal is honoured between shards, where the last output and its sentinel agree.
  */
-void augment_shards_(std::span<fs::path const> inputs, cli_config_t const &config, reembed_store_t const &reembed,
+void augment_shards_(custd::span<fs::path const> inputs, cli_config_t const &config, reembed_store_t const &reembed,
                      logger_t const &logger, run_tally_t &tally) {
     shard_buffers_t buffers;
     for (auto const &input_path : inputs) {
@@ -1007,7 +1012,7 @@ int main(int argc, char **argv) {
 
     run_tally_t tally;
     auto const start = std::chrono::steady_clock::now();
-    augment_shards_(std::span<fs::path const>(inputs), config, reembed, logger, tally);
+    augment_shards_(inputs, config, reembed, logger, tally);
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     logger.info("complete  {} augmented, {} skipped, {} failed  in {:.0f}s  (ctx-mismatch {}, separated {})",

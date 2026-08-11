@@ -11,7 +11,7 @@
  *    1. `prepare_molecule_batch` computes `wave_slice_layout_t` from the per-molecule prefix-scanned sizes,
  *       resizes one pinned host buffer, and memcpys per-molecule arrays at their byte offsets.
  *    2. `launch_gpu_pipeline` issues a single `cudaMemcpyAsync` of the host buffer into a per-GPU persistent
- *       device mirror owned by `context_t`, then carves typed `std::span<T>` views over the device pool via
+ *       device mirror owned by `context_t`, then carves typed `custd::span<T>` views over the device pool via
  *       the same layout.
  */
 
@@ -20,7 +20,6 @@
 #include <cstddef> // `std::byte`, `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
-#include <span>    // `std::span`
 #include <utility> // `std::exchange`
 #include <vector>  // `std::vector`
 
@@ -30,6 +29,9 @@
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/storage.hpp"
+#include "smallfield/types/views.hpp"
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::api {
 
@@ -63,81 +65,10 @@ using smallfield::types::mmff94_torsion_t;
 using smallfield::types::mmff94_typing_patch_t;
 using smallfield::types::molecule_descriptor_t;
 
-/** Grow-only RAII byte buffer — used for both pinned-host and device memory pools. */
-template <typename allocator_, typename deallocator_>
-class byte_buffer {
-    std::byte *pointer_ = nullptr;
-    std::size_t bytes_ = 0;
-    [[no_unique_address]] allocator_ alloc_;
-    [[no_unique_address]] deallocator_ dealloc_;
-
-  public:
-    byte_buffer() noexcept = default;
-    ~byte_buffer() noexcept {
-        if (pointer_) dealloc_(pointer_);
-    }
-    byte_buffer(byte_buffer const &) = delete;
-    byte_buffer &operator=(byte_buffer const &) = delete;
-    byte_buffer(byte_buffer &&other) noexcept
-        : pointer_(std::exchange(other.pointer_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
-    byte_buffer &operator=(byte_buffer &&other) noexcept {
-        if (this != &other) {
-            if (pointer_) dealloc_(pointer_);
-            pointer_ = std::exchange(other.pointer_, nullptr);
-            bytes_ = std::exchange(other.bytes_, 0);
-        }
-        return *this;
-    }
-
-    /** Grow to at least @p bytes. No-op if already large enough. Contents may be invalidated on growth. */
-    bool ensure_capacity(std::size_t bytes) noexcept {
-        if (bytes <= bytes_) return true;
-        if (pointer_) dealloc_(pointer_);
-        void *raw = alloc_(bytes);
-        if (!raw) {
-            pointer_ = nullptr;
-            bytes_ = 0;
-            return false;
-        }
-        pointer_ = static_cast<std::byte *>(raw);
-        bytes_ = bytes;
-        return true;
-    }
-
-    std::byte *data() noexcept { return pointer_; }
-    std::byte const *data() const noexcept { return pointer_; }
-    std::size_t size() const noexcept { return bytes_; }
-};
-
-/** CUDA pinned-host memory allocator functor for `byte_buffer`. */
-struct pinned_alloc_t {
-    void *operator()(std::size_t bytes) const noexcept {
-        void *raw = nullptr;
-        return cudaHostAlloc(&raw, bytes, cudaHostAllocDefault) == cudaSuccess ? raw : nullptr;
-    }
-};
-/** CUDA pinned-host memory deallocator functor for `byte_buffer`. */
-struct pinned_dealloc_t {
-    void operator()(void *pointer) const noexcept { cudaFreeHost(pointer); }
-};
-
-/** CUDA device memory allocator functor for `byte_buffer`. */
-struct device_alloc_t {
-    void *operator()(std::size_t bytes) const noexcept {
-        void *raw = nullptr;
-        return cudaMalloc(&raw, bytes) == cudaSuccess ? raw : nullptr;
-    }
-};
-/** CUDA device memory deallocator functor for `byte_buffer`. */
-struct device_dealloc_t {
-    void operator()(void *pointer) const noexcept { cudaFree(pointer); }
-};
-
-/** RAII wrapper for a grow-only pinned host allocation. */
-using pinned_byte_buffer_t = byte_buffer<pinned_alloc_t, pinned_dealloc_t>;
-
-/** RAII wrapper for a grow-only device allocation. */
-using device_byte_buffer_t = byte_buffer<device_alloc_t, device_dealloc_t>;
+using smallfield::types::device_allocator_t;
+using smallfield::types::device_bytes_t;
+using smallfield::types::pinned_bytes_t;
+using smallfield::types::reserve_outcome_t;
 
 /**
  *  @brief Byte-level layout of the 16 per-molecule sub-regions inside a `wave_slice_pool_t`.
@@ -227,17 +158,13 @@ struct wave_slice_layout_t {
     std::size_t num_torsion_counts = 0; // std::uint32_t (one per molecule)
 };
 
-constexpr std::size_t align_up_bytes_(std::size_t value, std::size_t alignment) noexcept {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
-
 /**
  *  @brief Place one region starting at the aligned @p running_offset, advance the cursor, return the aligned
  *  offset. The caller assigns this into the layout's `offset_*` field.
  */
 template <typename element_>
 constexpr std::size_t place_region_(std::size_t &running_offset, std::size_t count) noexcept {
-    running_offset = align_up_bytes_(running_offset, wave_slice_layout_t::region_alignment_k);
+    running_offset = align_up_(running_offset, wave_slice_layout_t::region_alignment_k);
     std::size_t const here = running_offset;
     running_offset += count * sizeof(element_);
     return here;
@@ -245,12 +172,12 @@ constexpr std::size_t place_region_(std::size_t &running_offset, std::size_t cou
 
 /** View a sub-region of a byte buffer as a typed span. */
 template <typename element_, typename buffer_>
-std::span<element_> span_at_(buffer_ &buffer, std::size_t byte_offset, std::size_t count) noexcept {
+custd::span<element_> span_at_(buffer_ &buffer, std::size_t byte_offset, std::size_t count) noexcept {
     return {reinterpret_cast<element_ *>(buffer.data() + byte_offset), count};
 }
 
 template <typename element_, typename buffer_>
-std::span<element_ const> span_at_(buffer_ const &buffer, std::size_t byte_offset, std::size_t count) noexcept {
+custd::span<element_ const> span_at_(buffer_ const &buffer, std::size_t byte_offset, std::size_t count) noexcept {
     return {reinterpret_cast<element_ const *>(buffer.data() + byte_offset), count};
 }
 
@@ -262,91 +189,91 @@ struct batch_pool_view_t {
     wave_slice_layout_t const *layout = nullptr;
 
     template <typename element_>
-    std::span<element_> region(std::size_t byte_offset, std::size_t count) const noexcept {
+    custd::span<element_> region(std::size_t byte_offset, std::size_t count) const noexcept {
         if (!base) return {};
         return {reinterpret_cast<element_ *>(base + byte_offset), count};
     }
 
-    std::span<float> bounds_matrices() const noexcept {
+    custd::span<float> bounds_matrices() const noexcept {
         return region<float>(layout->bounds_byte_offset, layout->num_bounds);
     }
-    std::span<chiral_center_descriptor_t> chiral_centers() const noexcept {
+    custd::span<chiral_center_descriptor_t> chiral_centers() const noexcept {
         return region<chiral_center_descriptor_t>(layout->chirals_byte_offset, layout->num_chirals);
     }
-    std::span<etk_torsion_descriptor_t> etk_torsions() const noexcept {
+    custd::span<etk_torsion_descriptor_t> etk_torsions() const noexcept {
         return region<etk_torsion_descriptor_t>(layout->torsions_byte_offset, layout->num_torsions);
     }
-    std::span<distance_constraint_t> distance_constraints() const noexcept {
+    custd::span<distance_constraint_t> distance_constraints() const noexcept {
         return region<distance_constraint_t>(layout->distance_constraints_byte_offset,
                                              layout->num_distance_constraints);
     }
-    std::span<mmff94_atom_vdw_params_t> mmff_atom_vdw() const noexcept {
+    custd::span<mmff94_atom_vdw_params_t> mmff_atom_vdw() const noexcept {
         return region<mmff94_atom_vdw_params_t>(layout->mmff_atom_vdw_byte_offset, layout->num_mmff_atom_vdw);
     }
-    std::span<float> mmff_atom_charge() const noexcept {
+    custd::span<float> mmff_atom_charge() const noexcept {
         return region<float>(layout->mmff_atom_charge_byte_offset, layout->num_mmff_atom_charge);
     }
-    std::span<std::uint8_t> bond_distance() const noexcept {
+    custd::span<std::uint8_t> bond_distance() const noexcept {
         return region<std::uint8_t>(layout->bond_distance_byte_offset, layout->num_bond_distance);
     }
-    std::span<mmff94_bond_t> mmff_bonds() const noexcept {
+    custd::span<mmff94_bond_t> mmff_bonds() const noexcept {
         return region<mmff94_bond_t>(layout->mmff_bonds_byte_offset, layout->num_mmff_bonds);
     }
-    std::span<mmff94_angle_t> mmff_angles() const noexcept {
+    custd::span<mmff94_angle_t> mmff_angles() const noexcept {
         return region<mmff94_angle_t>(layout->mmff_angles_byte_offset, layout->num_mmff_angles);
     }
-    std::span<mmff94_torsion_t> mmff_torsions() const noexcept {
+    custd::span<mmff94_torsion_t> mmff_torsions() const noexcept {
         return region<mmff94_torsion_t>(layout->mmff_torsions_byte_offset, layout->num_mmff_torsions);
     }
-    std::span<mmff94_oop_t> mmff_oops() const noexcept {
+    custd::span<mmff94_oop_t> mmff_oops() const noexcept {
         return region<mmff94_oop_t>(layout->mmff_oops_byte_offset, layout->num_mmff_oops);
     }
-    std::span<mmff94_stretchbend_t> mmff_stretchbends() const noexcept {
+    custd::span<mmff94_stretchbend_t> mmff_stretchbends() const noexcept {
         return region<mmff94_stretchbend_t>(layout->mmff_stretchbends_byte_offset, layout->num_mmff_stretchbends);
     }
-    std::span<mmff94_atom_interaction_t> mmff_interactions() const noexcept {
+    custd::span<mmff94_atom_interaction_t> mmff_interactions() const noexcept {
         return region<mmff94_atom_interaction_t>(layout->mmff_interactions_byte_offset, layout->num_mmff_interactions);
     }
-    std::span<mmff94_atom_offsets_t> mmff_atom_offsets() const noexcept {
+    custd::span<mmff94_atom_offsets_t> mmff_atom_offsets() const noexcept {
         return region<mmff94_atom_offsets_t>(layout->mmff_atom_offsets_byte_offset, layout->num_mmff_atom_offsets);
     }
-    std::span<etk_atom_interaction_t> etk_interactions() const noexcept {
+    custd::span<etk_atom_interaction_t> etk_interactions() const noexcept {
         return region<etk_atom_interaction_t>(layout->etk_interactions_byte_offset, layout->num_etk_interactions);
     }
-    std::span<etk_atom_offsets_t> etk_atom_offsets() const noexcept {
+    custd::span<etk_atom_offsets_t> etk_atom_offsets() const noexcept {
         return region<etk_atom_offsets_t>(layout->etk_atom_offsets_byte_offset, layout->num_etk_atom_offsets);
     }
-    std::span<etkdg_molecule_metadata_t> molecule_metadata() const noexcept {
+    custd::span<etkdg_molecule_metadata_t> molecule_metadata() const noexcept {
         return region<etkdg_molecule_metadata_t>(layout->metadata_byte_offset, layout->num_metadata);
     }
-    std::span<std::uint32_t> input_indices() const noexcept {
+    custd::span<std::uint32_t> input_indices() const noexcept {
         return region<std::uint32_t>(layout->input_indices_byte_offset, layout->num_input_indices);
     }
-    std::span<molecule_descriptor_t> descriptors() const noexcept {
+    custd::span<molecule_descriptor_t> descriptors() const noexcept {
         return region<molecule_descriptor_t>(layout->descriptors_byte_offset, layout->num_descriptors);
     }
-    std::span<std::uint32_t> atom_bases() const noexcept {
+    custd::span<std::uint32_t> atom_bases() const noexcept {
         return region<std::uint32_t>(layout->atom_bases_byte_offset, layout->num_atom_bases);
     }
-    std::span<mmff94_packed_offsets_t> mmff_bases() const noexcept {
+    custd::span<mmff94_packed_offsets_t> mmff_bases() const noexcept {
         return region<mmff94_packed_offsets_t>(layout->mmff_bases_byte_offset, layout->num_mmff_bases);
     }
-    std::span<mmff94_typing_patch_t> typing_patches() const noexcept {
+    custd::span<mmff94_typing_patch_t> typing_patches() const noexcept {
         return region<mmff94_typing_patch_t>(layout->typing_patches_byte_offset, layout->num_typing_patches);
     }
-    std::span<std::uint8_t> patch_atom_types() const noexcept {
+    custd::span<std::uint8_t> patch_atom_types() const noexcept {
         return region<std::uint8_t>(layout->patch_atom_types_byte_offset, layout->num_patch_atom_types);
     }
-    std::span<float> patch_atom_charges() const noexcept {
+    custd::span<float> patch_atom_charges() const noexcept {
         return region<float>(layout->patch_atom_charges_byte_offset, layout->num_patch_atom_charges);
     }
-    std::span<std::uint8_t> atom_types() const noexcept {
+    custd::span<std::uint8_t> atom_types() const noexcept {
         return region<std::uint8_t>(layout->atom_types_byte_offset, layout->num_atom_types);
     }
-    std::span<std::uint8_t> typing_status() const noexcept {
+    custd::span<std::uint8_t> typing_status() const noexcept {
         return region<std::uint8_t>(layout->typing_status_byte_offset, layout->num_typing_status);
     }
-    std::span<std::uint32_t> torsion_counts() const noexcept {
+    custd::span<std::uint32_t> torsion_counts() const noexcept {
         return region<std::uint32_t>(layout->torsion_counts_byte_offset, layout->num_torsion_counts);
     }
 };
@@ -359,7 +286,7 @@ struct batch_pool_view_t {
  *  whole host buffer to the device mirror.
  */
 struct wave_slice_pool_t {
-    pinned_byte_buffer_t host;
+    pinned_bytes_t host;
     wave_slice_layout_t layout;
     std::uint32_t num_molecules = 0;
     /** The largest atom count actually present in this slice — an observation, not the cap.
@@ -376,36 +303,36 @@ struct wave_slice_pool_t {
     batch_pool_view_t host_view() const noexcept { return {const_cast<std::byte *>(host.data()), &layout}; }
 
     // Thin forwarders so call sites can use `pool.foo()` directly. Equivalent to `host_view().foo()`.
-    std::span<float> bounds_matrices() noexcept { return host_view().bounds_matrices(); }
-    std::span<chiral_center_descriptor_t> chiral_centers() noexcept { return host_view().chiral_centers(); }
-    std::span<etk_torsion_descriptor_t> etk_torsions() noexcept { return host_view().etk_torsions(); }
-    std::span<distance_constraint_t> distance_constraints() noexcept { return host_view().distance_constraints(); }
-    std::span<mmff94_atom_vdw_params_t> mmff_atom_vdw() noexcept { return host_view().mmff_atom_vdw(); }
-    std::span<float> mmff_atom_charge() noexcept { return host_view().mmff_atom_charge(); }
-    std::span<std::uint8_t> bond_distance() noexcept { return host_view().bond_distance(); }
-    std::span<mmff94_bond_t> mmff_bonds() noexcept { return host_view().mmff_bonds(); }
-    std::span<mmff94_angle_t> mmff_angles() noexcept { return host_view().mmff_angles(); }
-    std::span<mmff94_torsion_t> mmff_torsions() noexcept { return host_view().mmff_torsions(); }
-    std::span<mmff94_oop_t> mmff_oops() noexcept { return host_view().mmff_oops(); }
-    std::span<mmff94_stretchbend_t> mmff_stretchbends() noexcept { return host_view().mmff_stretchbends(); }
-    std::span<mmff94_atom_interaction_t> mmff_interactions() noexcept { return host_view().mmff_interactions(); }
-    std::span<mmff94_atom_offsets_t> mmff_atom_offsets() noexcept { return host_view().mmff_atom_offsets(); }
-    std::span<etk_atom_interaction_t> etk_interactions() noexcept { return host_view().etk_interactions(); }
-    std::span<etk_atom_offsets_t> etk_atom_offsets() noexcept { return host_view().etk_atom_offsets(); }
-    std::span<etkdg_molecule_metadata_t> molecule_metadata() noexcept { return host_view().molecule_metadata(); }
-    std::span<std::uint32_t> input_indices() noexcept { return host_view().input_indices(); }
-    std::span<molecule_descriptor_t> descriptors() noexcept { return host_view().descriptors(); }
-    std::span<std::uint32_t> atom_bases() noexcept { return host_view().atom_bases(); }
-    std::span<mmff94_packed_offsets_t> mmff_bases() noexcept { return host_view().mmff_bases(); }
-    std::span<mmff94_typing_patch_t> typing_patches() noexcept { return host_view().typing_patches(); }
-    std::span<std::uint8_t> patch_atom_types() noexcept { return host_view().patch_atom_types(); }
-    std::span<float> patch_atom_charges() noexcept { return host_view().patch_atom_charges(); }
+    custd::span<float> bounds_matrices() noexcept { return host_view().bounds_matrices(); }
+    custd::span<chiral_center_descriptor_t> chiral_centers() noexcept { return host_view().chiral_centers(); }
+    custd::span<etk_torsion_descriptor_t> etk_torsions() noexcept { return host_view().etk_torsions(); }
+    custd::span<distance_constraint_t> distance_constraints() noexcept { return host_view().distance_constraints(); }
+    custd::span<mmff94_atom_vdw_params_t> mmff_atom_vdw() noexcept { return host_view().mmff_atom_vdw(); }
+    custd::span<float> mmff_atom_charge() noexcept { return host_view().mmff_atom_charge(); }
+    custd::span<std::uint8_t> bond_distance() noexcept { return host_view().bond_distance(); }
+    custd::span<mmff94_bond_t> mmff_bonds() noexcept { return host_view().mmff_bonds(); }
+    custd::span<mmff94_angle_t> mmff_angles() noexcept { return host_view().mmff_angles(); }
+    custd::span<mmff94_torsion_t> mmff_torsions() noexcept { return host_view().mmff_torsions(); }
+    custd::span<mmff94_oop_t> mmff_oops() noexcept { return host_view().mmff_oops(); }
+    custd::span<mmff94_stretchbend_t> mmff_stretchbends() noexcept { return host_view().mmff_stretchbends(); }
+    custd::span<mmff94_atom_interaction_t> mmff_interactions() noexcept { return host_view().mmff_interactions(); }
+    custd::span<mmff94_atom_offsets_t> mmff_atom_offsets() noexcept { return host_view().mmff_atom_offsets(); }
+    custd::span<etk_atom_interaction_t> etk_interactions() noexcept { return host_view().etk_interactions(); }
+    custd::span<etk_atom_offsets_t> etk_atom_offsets() noexcept { return host_view().etk_atom_offsets(); }
+    custd::span<etkdg_molecule_metadata_t> molecule_metadata() noexcept { return host_view().molecule_metadata(); }
+    custd::span<std::uint32_t> input_indices() noexcept { return host_view().input_indices(); }
+    custd::span<molecule_descriptor_t> descriptors() noexcept { return host_view().descriptors(); }
+    custd::span<std::uint32_t> atom_bases() noexcept { return host_view().atom_bases(); }
+    custd::span<mmff94_packed_offsets_t> mmff_bases() noexcept { return host_view().mmff_bases(); }
+    custd::span<mmff94_typing_patch_t> typing_patches() noexcept { return host_view().typing_patches(); }
+    custd::span<std::uint8_t> patch_atom_types() noexcept { return host_view().patch_atom_types(); }
+    custd::span<float> patch_atom_charges() noexcept { return host_view().patch_atom_charges(); }
 
-    std::span<etkdg_molecule_metadata_t const> molecule_metadata() const noexcept {
+    custd::span<etkdg_molecule_metadata_t const> molecule_metadata() const noexcept {
         return {reinterpret_cast<etkdg_molecule_metadata_t const *>(host.data() + layout.metadata_byte_offset),
                 layout.num_metadata};
     }
-    std::span<std::uint32_t const> input_indices() const noexcept {
+    custd::span<std::uint32_t const> input_indices() const noexcept {
         return {reinterpret_cast<std::uint32_t const *>(host.data() + layout.input_indices_byte_offset),
                 layout.num_input_indices};
     }

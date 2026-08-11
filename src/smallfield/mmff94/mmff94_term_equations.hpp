@@ -34,11 +34,11 @@
 #include <cstdint> // `std::uint8_t`, `std::int32_t`
 
 #include <array>   // `std::array`
-#include <span>    // `std::span`
 #include <utility> // `std::pair`
 
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
+#include "smallfield/types/views.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
@@ -163,7 +163,7 @@ constexpr unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const 
  *  aromatic atoms. Otherwise returns 0. */
 constexpr std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &descriptor,
                                                  mmff94_tables_view_t const &tables,
-                                                 std::span<std::uint8_t const> atom_types,
+                                                 custd::span<std::uint8_t const> atom_types,
                                                  std::uint32_t bond_index) noexcept {
     std::uint8_t const bond_order = descriptor.bond_order[bond_index];
     bool const aromatic_bond = (descriptor.bond_flags[bond_index] & bond_flag_aromatic_k) != 0;
@@ -183,7 +183,7 @@ constexpr std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &de
 
 /** Native port of `MMFFMolProperties::getMMFFAngleType`. */
 constexpr std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &descriptor,
-                                                  std::span<std::uint8_t const> bond_types, std::uint32_t atom_i,
+                                                  custd::span<std::uint8_t const> bond_types, std::uint32_t atom_i,
                                                   std::uint32_t atom_j, std::uint32_t atom_k) noexcept {
     std::int32_t const bond_index_ij = find_bond_index(descriptor, atom_i, atom_j);
     std::int32_t const bond_index_jk = find_bond_index(descriptor, atom_j, atom_k);
@@ -201,8 +201,8 @@ constexpr std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &d
 /** Native port of `MMFFMolProperties::getMMFFTorsionType`, returning (primary, secondary) matching
  *  RDKit's pair. */
 constexpr std::pair<std::uint8_t, std::uint8_t> native_get_mmff_torsion_type(molecule_descriptor_t const &descriptor,
-                                                                             std::span<std::uint8_t const> atom_types,
-                                                                             std::span<std::uint8_t const> bond_types,
+                                                                             custd::span<std::uint8_t const> atom_types,
+                                                                             custd::span<std::uint8_t const> bond_types,
                                                                              std::uint32_t atom_i, std::uint32_t atom_j,
                                                                              std::uint32_t atom_k,
                                                                              std::uint32_t atom_l) noexcept {
@@ -305,7 +305,7 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_bond_empirical(mmff94_tabl
  *  table entry exists with ka=0, where RDKit keeps the table's θ₀ and recomputes ka empirically. */
 SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_descriptor_t const &descriptor,
                                                                       mmff94_tables_view_t const &tables,
-                                                                      std::span<std::uint8_t const> atom_types,
+                                                                      custd::span<std::uint8_t const> atom_types,
                                                                       std::uint32_t atom_i, std::uint32_t atom_j,
                                                                       std::uint32_t atom_k, float r0_ij, float r0_kj,
                                                                       float theta0_override_deg = -1.0f) noexcept {
@@ -380,7 +380,7 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_d
  *  Returns (V1, V2, V3). The central bond's type is passed in so it is not looked up twice. */
 SF_HOST_DEVICE_ inline std::array<float, 3> native_torsion_empirical(molecule_descriptor_t const &descriptor,
                                                                      mmff94_tables_view_t const &tables,
-                                                                     std::span<std::uint8_t const> atom_types,
+                                                                     custd::span<std::uint8_t const> atom_types,
                                                                      std::uint32_t atom_j, std::uint32_t atom_k,
                                                                      std::int32_t bond_jk_index) noexcept {
     auto const *properties_j = lookup_prop(tables, atom_types[atom_j]);

@@ -32,8 +32,8 @@ void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &ta
                                          float *total_gpu_ms) {
     // Upload tables once.
     sfparam::mmff94_tables_device_t tables_dev;
-    sfparam::upload_mmff94_tables_to_device(tables_host, tables_dev);
-    if (tables_dev.arena.data() == nullptr) {
+    sfparam::upload_mmff94_tables_to_device(tables_host, tables_dev, nullptr);
+    if (tables_dev.view.vdw.empty()) {
         fmt::println(stderr, "table upload failed");
         *type_and_charge_ms = *extract_terms_ms = *build_csr_ms = *total_gpu_ms = -1.0f;
         return;

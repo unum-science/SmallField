@@ -10,7 +10,6 @@
 #include <algorithm>   // `std::min`, `std::stable_sort`
 #include <array>       // `std::array`
 #include <memory>      // `std::shared_ptr`, `std::make_shared`
-#include <span>        // `std::span`
 #include <string>      // `std::string`, `std::to_string`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`, `std::pair`
@@ -32,6 +31,7 @@
 #include <parquet/arrow/writer.h>
 
 #include "smallfield/api/conformer_layout.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "cli/parquet_writer.hpp"
 
@@ -113,11 +113,11 @@ enum class row_outcome_t : std::uint8_t {
  *  @param[out] array A nullable `List<float16>` array with one element per output row, untouched on refusal.
  *  @return `written_k`, or the refusal that stopped the pack.
  */
-static shard_write_report_t pack_coordinates_as_list(std::span<__half const> coordinates,
-                                                     std::span<std::uint8_t const> num_atoms_per_molecule,
-                                                     std::span<row_outcome_t const> row_outcomes,
-                                                     std::span<std::uint64_t const> molecule_index_per_row,
-                                                     std::span<std::uint32_t const> conformer_slot_per_row,
+static shard_write_report_t pack_coordinates_as_list(custd::span<__half const> coordinates,
+                                                     custd::span<std::uint8_t const> num_atoms_per_molecule,
+                                                     custd::span<row_outcome_t const> row_outcomes,
+                                                     custd::span<std::uint64_t const> molecule_index_per_row,
+                                                     custd::span<std::uint32_t const> conformer_slot_per_row,
                                                      std::uint32_t max_conformers, std::uint32_t stride_halves,
                                                      std::shared_ptr<arrow::Array> &array) {
 
@@ -188,7 +188,7 @@ static shard_write_report_t pack_coordinates_as_list(std::span<__half const> coo
                 // Transpose the structure-of-arrays slot into the tight interleaved
                 // `(atom_count, 3)` block a Parquet row exposes. See
                 // `conformer_slot_layout_t` for why a contiguous copy is not valid here.
-                gather_slot_into_interleaved(source, slot_layout, atom_count, values + running);
+                api::gather_slot_into_interleaved(source, slot_layout, atom_count, values + running);
                 running += static_cast<std::int32_t>(atom_count * 3u);
             }
             validity[row >> 3] |= static_cast<std::uint8_t>(1u << (row & 7));
@@ -219,10 +219,10 @@ static shard_write_report_t pack_coordinates_as_list(std::span<__half const> coo
  *  @param[out] array A nullable `List<float16>` array with one element per output row, untouched on refusal.
  *  @return `written_k`, or the refusal that stopped the pack.
  */
-static shard_write_report_t pack_usrcat_as_fp16_list(std::span<double const> values, std::uint32_t stride,
-                                                     std::span<row_outcome_t const> row_outcomes,
-                                                     std::span<std::uint64_t const> molecule_index_per_row,
-                                                     std::span<std::uint32_t const> conformer_slot_per_row,
+static shard_write_report_t pack_usrcat_as_fp16_list(custd::span<double const> values, std::uint32_t stride,
+                                                     custd::span<row_outcome_t const> row_outcomes,
+                                                     custd::span<std::uint64_t const> molecule_index_per_row,
+                                                     custd::span<std::uint32_t const> conformer_slot_per_row,
                                                      std::uint32_t max_conformers,
                                                      std::shared_ptr<arrow::Array> &array) {
 
@@ -501,20 +501,17 @@ shard_write_report_t write_shard(fs::path const &path, writer_inputs_t const &in
     finish_column_("conformer_energy", conformer_energy_builder, conformer_energy_array);
     if (finish_report.status != shard_write_t::written_k) return finish_report;
 
-    std::span<row_outcome_t const> const outcomes {row_outcomes};
-    std::span<std::uint64_t const> const molecule_indices {molecule_index_per_row};
-    std::span<std::uint32_t const> const conformer_slots {conformer_slot_per_row};
-
     std::shared_ptr<arrow::Array> coord_array;
-    if (shard_write_report_t const report = pack_coordinates_as_list(inputs.coordinates, inputs.num_atoms_per_molecule,
-                                                                     outcomes, molecule_indices, conformer_slots,
-                                                                     max_conformers, coord_stride_halves, coord_array);
+    if (shard_write_report_t const report = pack_coordinates_as_list(
+            inputs.coordinates, inputs.num_atoms_per_molecule, row_outcomes, molecule_index_per_row,
+            conformer_slot_per_row, max_conformers, coord_stride_halves, coord_array);
         report.status != shard_write_t::written_k)
         return refuse_(report);
 
     std::shared_ptr<arrow::Array> usrcat_array;
-    if (shard_write_report_t const report = pack_usrcat_as_fp16_list(inputs.usrcat, 60u, outcomes, molecule_indices,
-                                                                     conformer_slots, max_conformers, usrcat_array);
+    if (shard_write_report_t const report = pack_usrcat_as_fp16_list(inputs.usrcat, 60u, row_outcomes,
+                                                                     molecule_index_per_row, conformer_slot_per_row,
+                                                                     max_conformers, usrcat_array);
         report.status != shard_write_t::written_k)
         return refuse_(report);
 

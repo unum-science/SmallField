@@ -14,7 +14,6 @@
 #include <algorithm>   // `std::min`
 #include <array>       // `std::array`
 #include <limits>      // `std::numeric_limits`
-#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -24,6 +23,7 @@
 #include <cuda_fp16.h>
 
 #include "smallfield/api/smallfield.hpp"
+#include "smallfield/types/views.hpp"
 
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
@@ -237,7 +237,7 @@ struct conformer_outputs_t {
  *  @return The batch-level status `generate_conformers` answered with.
  */
 static conformer_status_t generate_capturing_timeline_(api::context_t &context,
-                                                       std::span<std::string_view const> smiles,
+                                                       custd::span<std::string_view const> smiles,
                                                        api::config_t const &config, std::uint32_t max_atoms,
                                                        conformer_outputs_t &outputs, std::string &log_text) {
     std::FILE *const capture = std::tmpfile();
@@ -294,7 +294,7 @@ static void check_empty_wave_timings(diagnostic_reporter_t &reporter) {
     outputs.reset_for(static_cast<std::uint32_t>(smiles.size()), layout);
 
     int const device_id = 0;
-    api::context_t context(std::span<int const>(&device_id, 1));
+    api::context_t context(custd::span<int const>(&device_id, 1));
     std::string log_text;
     [[maybe_unused]] conformer_status_t const batch_status = generate_capturing_timeline_(
         context, smiles, config, layout.max_atoms, outputs, log_text);
@@ -362,25 +362,6 @@ static double closest_atom_pair_(float const *interleaved, std::uint32_t num_ato
     return closest;
 }
 
-/**
- *  @brief Read one conformer slot's structure-of-arrays components into a tight interleaved `(atom, 3)` block.
- *
- *  The named twin of `gather_slot_into_interleaved` in `cli/parquet_writer.hpp`, which a test cannot
- *  call because it does not link the CLI. Both go through `layout.component_offset`, so the two
- *  spellings can only drift if the layout itself does.
- *
- *  @param[in] slot Base of the slot inside the coordinate pool, `pool.data() + layout.slot_offset(...)`.
- *  @param[in] layout Addressing contract every producer of the pool agrees on.
- *  @param[in] num_atoms Atoms the molecule actually has; the slot's padding atoms are not read.
- *  @param[out] interleaved Destination for `3 * num_atoms` floats, atom-major.
- */
-static void gather_slot_into_interleaved_(__half const *slot, api::conformer_slot_layout_t const &layout,
-                                          std::uint32_t num_atoms, float *interleaved) noexcept {
-    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-        for (std::uint32_t axis = 0; axis < 3u; ++axis)
-            interleaved[atom * 3u + axis] = __half2float(slot[layout.component_offset(axis, atom)]);
-}
-
 /** What one cross-validation pass counted, threaded by reference so the pass owns no module state. */
 struct cross_validation_tally_t {
     std::uint32_t molecules_compared = 0;
@@ -415,7 +396,7 @@ struct cross_validation_tally_t {
  *  @param[inout] energies Reporter that narrates the reference energy beside ours.
  *  @param[out] tally Counts the summary is printed from.
  */
-static void check_generation_against_rdkit(std::span<std::string_view const> corpus, diagnostic_reporter_t &checks,
+static void check_generation_against_rdkit(custd::span<std::string_view const> corpus, diagnostic_reporter_t &checks,
                                            diagnostic_reporter_t &energies, cross_validation_tally_t &tally) {
     constexpr std::uint32_t num_conformers_k = 5;
     api::conformer_slot_layout_t const layout {128u, num_conformers_k};
@@ -431,7 +412,7 @@ static void check_generation_against_rdkit(std::span<std::string_view const> cor
 
     // One GPU: the arithmetic that splits a wave across several is checked directly above.
     int const device_id = 0;
-    api::context_t context(std::span<int const>(&device_id, 1));
+    api::context_t context(custd::span<int const>(&device_id, 1));
     conformer_status_t const batch_status = context.generate_conformers(
         corpus, config, layout.max_atoms, outputs.coordinates, outputs.energies, outputs.status, outputs.num_atoms);
     fmt::println("  batch status: {}", static_cast<unsigned>(batch_status));
@@ -482,8 +463,8 @@ static void check_generation_against_rdkit(std::span<std::string_view const> cor
             }
             ++tally.conformers_succeeded;
 
-            gather_slot_into_interleaved_(outputs.coordinates.data() + layout.slot_offset(molecule, conformer), layout,
-                                          num_atoms, interleaved.data());
+            api::gather_slot_into_interleaved(outputs.coordinates.data() + layout.slot_offset(molecule, conformer),
+                                              layout, num_atoms, interleaved.data());
             double const closest_pair = closest_atom_pair_(interleaved.data(), num_atoms);
             if (closest_pair < clash_distance_angstrom_k) ++tally.conformers_clashing;
             if (closest_pair < tally.closest_atom_pair) {

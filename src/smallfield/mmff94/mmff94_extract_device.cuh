@@ -35,6 +35,7 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
+#include "smallfield/types/views.hpp"
 #include "smallfield/utilities.hpp"
 
 namespace smallfield::mmff94 {
@@ -255,8 +256,8 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     // Angle terms (and angle-scratch for stretch-bend reuse).
     std::uint32_t angle_scratch_count = 0;
 
-    std::span<std::uint8_t const> bond_types {bond_type_arr, num_bonds};
-    std::span<std::uint8_t const> at_span {atom_types, num_atoms};
+    custd::span<std::uint8_t const> bond_types {bond_type_arr, num_bonds};
+    custd::span<std::uint8_t const> at_span {atom_types, num_atoms};
     for (std::uint32_t atom_j = 0; atom_j < num_atoms; ++atom_j) {
         std::uint16_t const nstart = descriptor.neighbor_offset[atom_j];
         std::uint16_t const nend = descriptor.neighbor_offset[atom_j + 1];

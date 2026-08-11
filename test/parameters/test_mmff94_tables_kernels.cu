@@ -161,8 +161,11 @@ void launch_device_stbn_lookup(sf::parameters::mmff94_tables_view_t view, stbn_q
 void *device_tables_create(sf::parameters::mmff94_tables_host_t const &host_tables,
                            sf::parameters::mmff94_tables_view_t &out_view) {
     auto *device_tables = new sf::parameters::mmff94_tables_device_t;
-    sf::parameters::upload_mmff94_tables_to_device(host_tables, *device_tables);
-    if (device_tables->arena.data() == nullptr) {
+    // The legacy default stream is the one stream guaranteed to outlive the buffers it frees against, which
+    // is what a suite that owns no pipeline needs; the synchronization is what makes the tables readable.
+    cudaStream_t const stream = nullptr;
+    sf::parameters::upload_mmff94_tables_to_device(host_tables, *device_tables, stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess || device_tables->view.vdw.empty()) {
         delete device_tables;
         return nullptr;
     }

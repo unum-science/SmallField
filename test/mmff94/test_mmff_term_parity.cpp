@@ -28,7 +28,6 @@
 #include <array>       // `std::array`
 #include <iostream>    // RDKit's `AtomTyper.h` needs it but does not include it
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <sstream>     // RDKit's `AtomTyper.h` needs it but does not include it
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
@@ -92,73 +91,24 @@ namespace smallfield::tests {
 
 #pragma region Coordinate Layouts
 
-/* `smallfield/types/views.hpp` owns the matrix half of the extent-inside-the-view rule; these are the coordinate
-   half, kept beside their first consumer until a second one asks for them. A layout is a type here rather than an
-   index expression, so handing an atom-major buffer to an axis-major reader stops compiling instead of quietly
-   addressing another atom's coordinates. */
+/* `smallfield/types/views.hpp` owns the whole extent-inside-the-view vocabulary, matrices and coordinates
+   alike. A layout is a type there rather than an index expression, so handing an atom-major buffer to an
+   axis-major reader stops compiling instead of quietly addressing another atom's coordinates. */
 
-/** Coordinates as three contiguous axis planes, addressed `(axis, atom)`; the layout every kernel takes. */
-template <typename value_type_>
-using coordinates_soa =
-    sft::mdspan_ns::mdspan<value_type_, sft::mdspan_ns::extents<std::uint32_t, 3, sft::mdspan_ns::dynamic_extent>>;
+using sft::conformer_aos_t;
+using sft::conformer_soa_t;
+using sft::coordinate_role_t;
+using sft::coordinates_aos;
+using sft::coordinates_soa;
+using sft::reset_coordinates_aos;
+using sft::reset_coordinates_soa;
+using sft::transpose_into;
 
-/** Coordinates as one xyz triple per atom, addressed `(atom, axis)`; the layout RDKit reads and writes. */
-template <typename value_type_>
-using coordinates_aos =
-    sft::mdspan_ns::mdspan<value_type_, sft::mdspan_ns::extents<std::uint32_t, sft::mdspan_ns::dynamic_extent, 3>>;
+/** The kernel's gradient, axis-major over the three spatial axes. */
+using gradient_soa_t = coordinates_soa<coordinate_role_t::gradient_k, float, sft::conformer_dimensions_k>;
 
-using coordinates_soa_t = coordinates_soa<float>;
-using coordinates_aos_t = coordinates_aos<float>;
-
-/**
- *  @brief Grow @p storage to hold @p num_atoms axis-major coordinates, zero it, and view it.
- *
- *  @param[inout] storage Caller-owned buffer, reused across molecules so growth happens once.
- *  @param[in] num_atoms Atoms the view spans.
- *  @return View over @p storage.
- */
-template <typename value_type_>
-inline coordinates_soa<value_type_> reset_coordinates_soa(std::vector<value_type_> &storage, std::uint32_t num_atoms) {
-    storage.assign(static_cast<std::size_t>(num_atoms) * 3, value_type_ {});
-    return coordinates_soa<value_type_> {storage.data(), num_atoms};
-}
-
-/**
- *  @brief Grow @p storage to hold @p num_atoms atom-major coordinates, zero it, and view it.
- *
- *  @param[inout] storage Caller-owned buffer, reused across molecules so growth happens once.
- *  @param[in] num_atoms Atoms the view spans.
- *  @return View over @p storage.
- */
-template <typename value_type_>
-inline coordinates_aos<value_type_> reset_coordinates_aos(std::vector<value_type_> &storage, std::uint32_t num_atoms) {
-    storage.assign(static_cast<std::size_t>(num_atoms) * 3, value_type_ {});
-    return coordinates_aos<value_type_> {storage.data(), num_atoms};
-}
-
-/**
- *  @brief Scatter atom-major triples into axis-major planes.
- *
- *  @param[in] atom_major Source, one xyz triple per atom.
- *  @param[out] axis_major Destination, three planes over the same atoms.
- */
-inline void transpose_into(coordinates_aos<float const> atom_major, coordinates_soa_t axis_major) {
-    sf_verify_(atom_major.extent(0) == axis_major.extent(1), "transposed coordinate views must span the same atoms");
-    for (std::uint32_t atom = 0; atom < atom_major.extent(0); ++atom)
-        for (std::uint32_t axis = 0; axis < 3; ++axis) axis_major(axis, atom) = atom_major(atom, axis);
-}
-
-/**
- *  @brief Gather axis-major planes back into atom-major triples.
- *
- *  @param[in] axis_major Source, three planes over the atoms.
- *  @param[out] atom_major Destination, one xyz triple per atom.
- */
-inline void transpose_into(coordinates_soa<float const> axis_major, coordinates_aos_t atom_major) {
-    sf_verify_(atom_major.extent(0) == axis_major.extent(1), "transposed coordinate views must span the same atoms");
-    for (std::uint32_t atom = 0; atom < atom_major.extent(0); ++atom)
-        for (std::uint32_t axis = 0; axis < 3; ++axis) atom_major(atom, axis) = axis_major(axis, atom);
-}
+/** RDKit's gradient, atom-major and double-precision, which is what `calcGrad` accumulates into. */
+using gradient_aos_t = coordinates_aos<coordinate_role_t::gradient_k, double>;
 
 /**
  *  @brief Read @p molecule's conformer into @p atom_major without allocating.
@@ -166,7 +116,7 @@ inline void transpose_into(coordinates_soa<float const> axis_major, coordinates_
  *  @param[in] molecule Molecule carrying at least one conformer.
  *  @param[out] atom_major Destination, whose extent decides how many atoms are read.
  */
-static void read_coordinates_into_(RDKit::ROMol const &molecule, coordinates_aos_t atom_major) {
+static void read_coordinates_into_(RDKit::ROMol const &molecule, conformer_aos_t atom_major) {
     sf_verify_(atom_major.extent(0) == molecule.getNumAtoms(), "coordinate view must span the molecule's atoms");
     auto const &conformer = molecule.getConformer();
     for (std::uint32_t atom = 0; atom < atom_major.extent(0); ++atom) {
@@ -253,7 +203,7 @@ enum class reference_state_t {
  *  @param[out] energy Receives the term's energy in kcal/mol; untouched unless `evaluated_k` is returned.
  *  @return Whether a reference was produced.
  */
-static reference_state_t rdkit_single_term_(RDKit::RWMol &molecule, term_kind_t kind, coordinates_aos<double> gradient,
+static reference_state_t rdkit_single_term_(RDKit::RWMol &molecule, term_kind_t kind, gradient_aos_t gradient,
                                             double &energy) {
     RDKit::MMFF::MMFFMolProperties props(molecule);
     if (!props.isValid()) return reference_state_t::untypable_k;
@@ -284,13 +234,15 @@ static reference_state_t rdkit_single_term_(RDKit::RWMol &molecule, term_kind_t 
  *  @param[inout] positions Coordinates displaced in place; the walk order fixes the sequence.
  *  @param[in] amplitude Half-width of the per-component displacement, in angstroms.
  */
-static void perturb_(coordinates_soa_t positions, float amplitude) {
+static void perturb_(conformer_soa_t positions, float amplitude) {
     std::uint32_t state = 0x9E3779B9u;
-    for (std::uint32_t axis = 0; axis < 3; ++axis)
-        for (std::uint32_t atom = 0; atom < positions.extent(1); ++atom) {
+    // The walk is axis-outer because the sequence it draws has to stay what it was; the view is addressed
+    // atom-first, so the two orders differ and only the subscript follows the layout.
+    for (std::uint32_t axis = 0; axis < sft::conformer_dimensions_k; ++axis)
+        for (std::uint32_t atom = 0; atom < positions.extent(0); ++atom) {
             state = state * 1664525u + 1013904223u;
             float const unit = static_cast<float>(state >> 8) * (1.0f / 16777216.0f) - 0.5f;
-            positions(axis, atom) += 2.0f * amplitude * unit;
+            positions(atom, axis) += 2.0f * amplitude * unit;
         }
 }
 
@@ -518,8 +470,9 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
     ++tally.compared;
     std::size_t const mismatches_before = reporters.mismatch_count();
 
-    auto const interleaved = reset_coordinates_aos(scratch.interleaved, num_atoms);
-    auto const positions = reset_coordinates_soa(scratch.positions, num_atoms);
+    auto const interleaved = reset_coordinates_aos<coordinate_role_t::position_k>(scratch.interleaved, num_atoms);
+    auto const positions = reset_coordinates_soa<coordinate_role_t::position_k, sft::conformer_dimensions_k>(
+        scratch.positions, num_atoms);
     read_coordinates_into_(molecule, interleaved);
     transpose_into(interleaved, positions);
     if (probe.perturbation > 0.0f) {
@@ -539,7 +492,8 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
     for (term_kind_t kind : term_kinds_k) {
         isolate_term_into_(scratch.prepared, kind, scratch.isolated);
         auto const &single = scratch.isolated;
-        auto const gpu_gradient = reset_coordinates_soa(scratch.gpu_gradient, num_atoms);
+        auto const gpu_gradient = reset_coordinates_soa<coordinate_role_t::gradient_k, sft::conformer_dimensions_k>(
+            scratch.gpu_gradient, num_atoms);
         float gpu_energy = 0.0f;
         gpu_mmff_energy(positions.data_handle(), single.num_atoms,
                         single.mmff_atom_vdw.empty() ? nullptr : single.mmff_atom_vdw.data(),
@@ -561,7 +515,8 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
                         static_cast<std::uint32_t>(single.mmff_atom_offsets.size()), gpu_gradient.data_handle(),
                         &gpu_energy);
 
-        auto const rdkit_gradient = reset_coordinates_aos(scratch.rdkit_gradient, num_atoms);
+        auto const rdkit_gradient = reset_coordinates_aos<coordinate_role_t::gradient_k>(scratch.rdkit_gradient,
+                                                                                         num_atoms);
         double rdkit_energy = 0.0;
         if (rdkit_single_term_(molecule, kind, rdkit_gradient, rdkit_energy) != reference_state_t::evaluated_k) {
             ++tally.reference_unavailable;
@@ -581,13 +536,14 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
             .field("energy", rdkit_energy, static_cast<double>(gpu_energy), energies_agree_);
 
         // The two gradients are compared through their own layouts rather than through a shared buffer:
-        // RDKit fills atom-major triples, the kernel fills axis-major planes, and each view is read by name.
+        // RDKit fills atom-major triples and the kernel fills axis-major planes, but both views are addressed
+        // `(atom, axis)` and the layout supplies the stride, so the two reads look alike and cannot be crossed.
         for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
             auto group = reporters[kind].mismatch("mmff_term", "smiles={} distortion={:.2f} term={} atom={}",
                                                   probe.smiles, probe.perturbation, term_name_(kind), atom);
-            for (std::uint32_t axis = 0; axis < 3; ++axis)
+            for (std::uint32_t axis = 0; axis < sft::conformer_dimensions_k; ++axis)
                 group.field(gradient_field_names_k[axis], rdkit_gradient(atom, axis),
-                            static_cast<double>(gpu_gradient(axis, atom)), gradient_components_agree_);
+                            static_cast<double>(gpu_gradient(atom, axis)), gradient_components_agree_);
         }
     }
     if (reporters.mismatch_count() != mismatches_before) ++tally.cases_differing;
@@ -605,7 +561,7 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
  *  @param[inout] reporters Sinks that count and print, one per term.
  *  @param[inout] tally Counters for the cases that never reached a comparison.
  */
-static void sweep_(std::span<term_parity_case_t const> probes, narration_t narration, molecule_scratch_t &scratch,
+static void sweep_(custd::span<term_parity_case_t const> probes, narration_t narration, molecule_scratch_t &scratch,
                    term_reporters_t &reporters, intake_tally_t &tally) {
     for (auto const &probe : probes) compare_case_(probe, narration, scratch, reporters, tally);
 }
@@ -659,7 +615,7 @@ static std::vector<term_parity_case_t> curated_cases_() {
  *  @param[in] corpus SMILES as loaded, in order.
  *  @param[out] probes Cleared, then filled with two cases per SMILES.
  */
-static void fill_corpus_cases_into_(std::span<std::string const> corpus, std::vector<term_parity_case_t> &probes) {
+static void fill_corpus_cases_into_(custd::span<std::string const> corpus, std::vector<term_parity_case_t> &probes) {
     probes.clear();
     probes.reserve(corpus.size() * 2);
     for (auto const &smiles : corpus) {

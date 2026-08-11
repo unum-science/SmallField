@@ -16,10 +16,10 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
 
-#include <span>   // `std::span`
 #include <vector> // `std::vector`
 
 #include "smallfield/postprocess/shape_descriptors.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::postprocess {
 
@@ -30,7 +30,7 @@ namespace smallfield::postprocess {
  *  their bounding-sphere radii plus a fixed margin. Each component's atoms move by the same delta, a pure
  *  translation, so intra-component distances are preserved. Single-component molecules are left untouched.
  */
-inline void separate_fragments(std::span<float> coords_interleaved, molecule_shape_context_t const &context) {
+inline void separate_fragments(custd::span<float> coords_interleaved, molecule_shape_context_t const &context) {
     if (context.num_components <= 1) return;
 
     constexpr double margin_k = 2.0;

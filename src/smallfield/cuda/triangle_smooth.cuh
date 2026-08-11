@@ -21,8 +21,12 @@
 #if defined(__CUDACC__)
 
 #include "smallfield/cuda/warp_primitives.cuh"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::cuda {
+using smallfield::types::lower_distance_bound_at;
+using smallfield::types::packed_matrix;
+using smallfield::types::upper_distance_bound_at;
 
 /**
  *  @brief Float-precision Floyd-Warshall triangle smoothing.
@@ -32,6 +36,10 @@ namespace smallfield::cuda {
  *  @param[in] lane Warp lane index (0-31).
  */
 __device__ __forceinline__ void triangle_smooth_warp_(float *bounds, std::uint32_t num_atoms, std::uint32_t lane) {
+    // A read view over the same storage the loop writes through `bounds`. The element type is `const`
+    // because both accessors only read; it carries no aliasing promise, so the in-place update below stays
+    // visible through it.
+    packed_matrix<float const> const matrix {bounds, num_atoms, num_atoms};
     std::uint32_t const total_pairs = num_atoms * num_atoms;
 
     for (std::uint32_t via_atom = 0; via_atom < num_atoms; ++via_atom) {
@@ -40,16 +48,14 @@ __device__ __forceinline__ void triangle_smooth_warp_(float *bounds, std::uint32
             std::uint32_t const column = linear_index % num_atoms;
             if (row == column || row == via_atom || column == via_atom) continue;
 
-            auto read_upper = [&](std::uint32_t first_atom, std::uint32_t second_atom) -> float {
-                return bounds[min(first_atom, second_atom) * num_atoms + max(first_atom, second_atom)];
-            };
-            auto read_lower = [&](std::uint32_t first_atom, std::uint32_t second_atom) -> float {
-                return bounds[max(first_atom, second_atom) * num_atoms + min(first_atom, second_atom)];
-            };
+            float const upper_row_via = upper_distance_bound_at(matrix, row, via_atom);
+            float const upper_via_column = upper_distance_bound_at(matrix, via_atom, column);
 
-            float const upper_row_via = read_upper(row, via_atom);
-            float const upper_via_column = read_upper(via_atom, column);
-
+            // Above the diagonal the cell is the pair's upper bound, below it the lower one, so the branch
+            // picks which of the two inequalities applies rather than which cell to touch. Only the lower
+            // bounds move inside the branch that consults them; both this split and the second read below
+            // are what hold the kernel at its measured register count, so re-check `cuobjdump` before
+            // rearranging either.
             if (row < column) {
                 float const current = bounds[row * num_atoms + column];
                 float const candidate = upper_row_via + upper_via_column;
@@ -57,9 +63,9 @@ __device__ __forceinline__ void triangle_smooth_warp_(float *bounds, std::uint32
             }
             else {
                 float const current = bounds[row * num_atoms + column];
-                float const lower_row_via = read_lower(row, via_atom);
-                float const lower_via_column = read_lower(via_atom, column);
-                float const upper_row_via_reread = read_upper(row, via_atom);
+                float const lower_row_via = lower_distance_bound_at(matrix, row, via_atom);
+                float const lower_via_column = lower_distance_bound_at(matrix, via_atom, column);
+                float const upper_row_via_reread = upper_distance_bound_at(matrix, row, via_atom);
 
                 float candidate = current;
                 float const candidate_row_leg = lower_row_via - upper_via_column;

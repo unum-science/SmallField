@@ -17,7 +17,6 @@
 #include <fstream>      // `std::ifstream`
 #include <limits>       // `std::numeric_limits`
 #include <memory>       // `std::unique_ptr`
-#include <span>         // `std::span`
 #include <string>       // `std::string`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
@@ -339,7 +338,7 @@ inline std::vector<std::string> standard_test_smiles() {
  *  @param[in] bonds Bond terms, each exposing `atom_i` and `atom_j`.
  *  @param[out] matrix Square view over caller-owned storage, filled row-major.
  */
-inline void fill_bond_hops_into(std::span<mmff94_bond_t const> bonds, hop_matrix_t matrix) {
+inline void fill_bond_hops_into(custd::span<mmff94_bond_t const> bonds, hop_matrix_t matrix) {
     std::uint32_t const num_atoms = matrix.extent(0);
     for (std::uint32_t source = 0; source < num_atoms; ++source)
         for (std::uint32_t target = 0; target < num_atoms; ++target) matrix(source, target) = unreachable_hops_k;

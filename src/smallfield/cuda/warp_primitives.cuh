@@ -2,7 +2,8 @@
  *  @file src/smallfield/cuda/warp_primitives.cuh
  *  @brief Shared warp-level constants, reduction primitives, and float3 vector helpers.
  *
- *  Multi-dimensional views live in `smallfield/types/views.hpp`, which host code can include too.
+ *  Multi-dimensional views live in `smallfield/types/views.hpp`, which host code can include too, and
+ *  `sf_assert_` lives in `smallfield/utilities.hpp` for the same reason.
  */
 
 #pragma once
@@ -10,31 +11,10 @@
 #if defined(__CUDACC__)
 
 #include <cstdint> // `std::uint32_t`
+
 #include <cuda_runtime.h>
 
-/**
- *  @brief Debug-only assertion that compiles to nothing in Release.
- *
- *  Guards pointer-math accesses so out-of-bounds derefs trap immediately under compute-sanitizer or a
- *  debugger instead of silently corrupting memory and crashing later somewhere unrelated. Note that
- *  `cuda::std::mdspan` performs no such check of its own, even with `CCCL_ENABLE_ASSERTIONS` set, so raw
- *  index arithmetic still wants this. The device path calls `__trap()` so compute-sanitizer reports
- *  the offending thread and block coordinates; the host path calls `__builtin_trap()` so gdb or a
- *  core dump points at the bad caller; Release, under `NDEBUG`, compiles to nothing.
- */
-#if defined(NDEBUG)
-#define sf_assert_(cond) ((void)0)
-#elif defined(__CUDA_ARCH__)
-#define sf_assert_(cond)           \
-    do {                           \
-        if (!(cond)) { __trap(); } \
-    } while (0)
-#else
-#define sf_assert_(cond)                   \
-    do {                                   \
-        if (!(cond)) { __builtin_trap(); } \
-    } while (0)
-#endif
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::cuda {
 

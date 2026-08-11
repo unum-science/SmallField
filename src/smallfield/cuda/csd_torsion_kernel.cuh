@@ -5,8 +5,8 @@
  *  The CSD torsion preferences compile to 470 stack-only patterns whose matcher, in
  *  `preprocess/csd_torsion_native.hpp`, is a pure function of `molecule_descriptor_t`. This
  *  header carries that matcher to the GPU: it flattens the compiled patterns into POD mirrors,
- *  uploads them into one device arena the way `parameters/mmff94_tables_device.cuh` uploads the
- *  MMFF tables, and runs one warp per molecule over the result.
+ *  uploads each of the three arrays into its own stream-ordered device buffer, and runs one warp
+ *  per molecule over the result.
  *
  *  Two members of the host pattern cannot cross. A `recursive_pool_t` is a fixed 40-node pool
  *  even though the widest body in the corpus spends seven nodes, and a `simple_ring_closure_t`
@@ -34,17 +34,15 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/cuda/warp_primitives.cuh"
-#include "smallfield/log.hpp"
+#include "smallfield/cuda_error.hpp"
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
-#include "smallfield/utilities.hpp"
+#include "smallfield/types/storage.hpp"
 
 namespace smallfield::cuda {
 
-using smallfield::api::device_byte_buffer_t;
 using smallfield::preprocess::bond_excluded_by_ring_fusion;
 using smallfield::preprocess::bond_ring_count;
 using smallfield::preprocess::build_molecule_gate;
@@ -59,10 +57,14 @@ using smallfield::preprocess::ring_atom_count;
 using smallfield::preprocess::simple_atom_constraint_t;
 using smallfield::preprocess::simple_bond_constraint_t;
 using smallfield::preprocess::simple_ring_closure_t;
+using smallfield::types::buffer;
+using smallfield::types::device_allocator_t;
 using smallfield::types::etk_torsion_descriptor_t;
 using smallfield::types::hybridization_sp2_k;
 using smallfield::types::max_bonds_k;
 using smallfield::types::molecule_descriptor_t;
+using smallfield::types::reserve_outcome_t;
+using smallfield::types::upload_into;
 
 /**
  *  @brief Per-thread device stack the matcher needs. Sub-query evaluation still recurses, bounded by the
@@ -169,29 +171,52 @@ inline void build_csd_torsion_table(csd_torsion_table_host_t &out) {
     }
 }
 
-/** Per-GPU device-resident table. Owns one grow-only arena holding all three arrays. */
+/**
+ *  @brief Per-GPU device-resident table: one stream-ordered buffer per array, plus the view over them.
+ *
+ *  There is no shared arena. Sub-allocation would be worth its bookkeeping only if it collapsed the upload
+ *  into a single `cudaMemcpyAsync`, and the three element types differ, so it is three copies either way.
+ *  Each buffer carries the stream that allocated it, which is also the stream its free is ordered against,
+ *  so the moves are defaulted and no destructor is written by hand.
+ */
 struct csd_torsion_table_device_t {
-    /** Single device allocation, RAII-managed. */
-    device_byte_buffer_t arena;
-    /** Pointers into `arena`. */
+    /** The POD patterns the matcher walks in file order. */
+    buffer<csd_device_pattern_t, device_allocator_t> patterns;
+    /** Sub-query nodes, indexed through `csd_device_pattern_t::pool_offset`. */
+    buffer<recursive_node_t, device_allocator_t> nodes;
+    /** Ring closures, indexed through `csd_device_pattern_t::closure_offset`. */
+    buffer<simple_ring_closure_t, device_allocator_t> closures;
+    /** Raw handles on the three buffers, passed to the kernel by value. */
     csd_torsion_table_view_t view;
-    /** Bytes actually placed, padding included. */
-    std::size_t arena_bytes = 0;
 
     csd_torsion_table_device_t() = default;
     csd_torsion_table_device_t(csd_torsion_table_device_t const &) = delete;
     csd_torsion_table_device_t &operator=(csd_torsion_table_device_t const &) = delete;
+    csd_torsion_table_device_t(csd_torsion_table_device_t &&) noexcept = default;
+    csd_torsion_table_device_t &operator=(csd_torsion_table_device_t &&) noexcept = default;
 };
 
-/** Copy one host array into the arena at the next 256-byte boundary and return its address. */
+/**
+ *  @brief Rebind one device array to @p stream, grow it to hold @p source, and enqueue the copy.
+ *
+ *  The buffer is rebound rather than merely reserved, because the stream carries the device both the
+ *  allocation and its eventual free belong to, and the table is staged once per device at start-up.
+ *
+ *  @param[out] destination Device buffer to fill; any prior contents and their allocation are dropped.
+ *  @param[in] source Host array to copy.
+ *  @param[in] stream Orders the allocation and the copy, and names the device they land on.
+ *  @param[in] sink Routes a refused allocation or copy to the logger and the error counter.
+ *  @return Whether the array is resident. On failure the stream carries the reason.
+ */
 template <typename element_>
-element_ *place_array_(std::byte *arena_base, std::size_t &offset, std::vector<element_> const &source) {
-    if (source.empty()) return nullptr;
-    offset = align_up_(offset, 256);
-    element_ *destination = reinterpret_cast<element_ *>(arena_base + offset);
-    cudaMemcpy(destination, source.data(), source.size() * sizeof(element_), cudaMemcpyHostToDevice);
-    offset += source.size() * sizeof(element_);
-    return destination;
+[[nodiscard]] bool upload_table_array_(buffer<element_, device_allocator_t> &destination,
+                                       std::vector<element_> const &source, cudaStream_t stream,
+                                       cuda_error_sink_t const &sink) {
+    destination = buffer<element_, device_allocator_t>(device_allocator_t {.stream = stream});
+    if (source.empty()) return true;
+    if (destination.try_reserve(source.size()) == reserve_outcome_t::failed_k)
+        return sink.check(cudaErrorMemoryAllocation, "upload_csd_torsion_table_to_device");
+    return upload_into<element_>(destination.view(), {source.data(), source.size()}, stream, sink);
 }
 
 /** Raise the per-thread device stack to `csd_torsion_stack_bytes_k` when it sits lower. */
@@ -202,30 +227,30 @@ inline void ensure_csd_torsion_device_stack() {
 }
 
 /**
- *  @brief Upload the staged table into one device arena and fill in the view that indexes it.
+ *  @brief Upload the staged table into the device buffers and fill in the view that indexes them.
+ *
+ *  The view is cleared first and only rebuilt once all three arrays are resident, so a caller that
+ *  finds `csd_torsion_table_view_t::patterns` null knows no kernel may read the table. Nothing waits
+ *  here: the copies ride @p stream, which is the same stream the matcher launches on.
  *
  *  @param[in] host Staging buffers filled by `build_csd_torsion_table`.
- *  @param[out] table Device arena and view; the caller keeps it alive for every kernel that reads it.
- *  @param[in] log Logger the allocation failure is reported through; null falls back to a default one.
+ *  @param[out] device Device buffers and view; the caller keeps them alive for every kernel that reads them.
+ *  @param[in] stream Orders the allocations and the copies, and outlives the buffers they produce.
+ *  @param[in] sink Routes a refused allocation or copy to the logger and the error counter.
  */
-inline void upload_csd_torsion_table_to_device(csd_torsion_table_host_t const &host,
-                                               csd_torsion_table_device_t &table, logger_t const *log = nullptr) {
+inline void upload_csd_torsion_table_to_device(csd_torsion_table_host_t const &host, csd_torsion_table_device_t &device,
+                                               cudaStream_t stream, cuda_error_sink_t const &sink = {}) {
     ensure_csd_torsion_device_stack();
-    std::size_t const total = host.byte_size() + 3 * 256;
-    if (!table.arena.ensure_capacity(total)) {
-        logger_t const fallback;
-        (log != nullptr ? *log : fallback)
-            .error("upload_csd_torsion_table_to_device: device arena allocation ({} bytes) failed", total);
-        return;
-    }
-    std::byte *const arena_base = table.arena.data();
-    std::size_t offset = 0;
-    table.view.patterns = place_array_(arena_base, offset, host.patterns);
-    table.view.nodes = place_array_(arena_base, offset, host.nodes);
-    table.view.closures = place_array_(arena_base, offset, host.closures);
-    table.view.num_patterns = static_cast<std::uint32_t>(host.patterns.size());
-    table.arena_bytes = offset;
-    cudaDeviceSynchronize();
+    device.view = {};
+    if (!upload_table_array_(device.patterns, host.patterns, stream, sink)) return;
+    if (!upload_table_array_(device.nodes, host.nodes, stream, sink)) return;
+    if (!upload_table_array_(device.closures, host.closures, stream, sink)) return;
+
+    custd::span<csd_device_pattern_t const> const patterns = device.patterns.view();
+    device.view.patterns = patterns.data();
+    device.view.nodes = device.nodes.data();
+    device.view.closures = device.closures.data();
+    device.view.num_patterns = static_cast<std::uint32_t>(patterns.size());
 }
 
 /** Assemble the matcher's read handle on one device pattern. */

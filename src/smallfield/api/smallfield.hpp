@@ -34,15 +34,15 @@ using cudaStream_t = void *;
 #include <atomic>      // `std::atomic`
 #include <cstdint>     // `std::uint32_t`, `std::uint64_t`
 #include <memory>      // `std::unique_ptr`
-#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
 
-#include "smallfield/api/wave_slice_pool.hpp"
-#include "smallfield/types/atom_limited_bins.hpp"
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/api/conformer_status.hpp"
+#include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/log.hpp"
+#include "smallfield/types/atom_limited_bins.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::api {
 
@@ -96,11 +96,11 @@ struct device_launch_config_t {
  *  the maximum supported atom count.
  */
 struct metric_scratch_t {
-    /** Owning grow-only device buffer. */
-    device_byte_buffer_t pool;
+    /** Owning grow-only device buffer, allocated and released along this device's stream. */
+    device_bytes_t pool;
     /** Non-owning span into `pool`, sized `[max_group_size]` — rebound in
      *  `ensure_metric_scratch` on growth. */
-    std::span<std::uint32_t> group_indices {};
+    custd::span<std::uint32_t> group_indices {};
     std::size_t max_group_size = 0;
     std::uint32_t max_atoms = 0;
     /*  `embed_4d_power_iter_kernel` holds the Gram matrix, means, eigenvectors and reduction scratch
@@ -166,7 +166,7 @@ struct context_t {
      *
      *  @param[in] devices GPU device IDs. Empty span = all available GPUs.
      */
-    explicit context_t(std::span<int const> devices = {});
+    explicit context_t(custd::span<int const> devices = {});
     ~context_t();
 
     context_t(context_t const &) = delete;
@@ -205,10 +205,11 @@ struct context_t {
      *  @return Batch-level status (success if at least one conformer succeeded).
      */
     [[nodiscard]] conformer_status_t generate_conformers(
-        std::span<std::string_view const> smiles, config_t const &config, std::uint32_t max_atoms_per_molecule,
-        std::span<__half> coordinates_out, std::span<float> energies_out, std::span<conformer_status_t> status_out,
-        std::span<std::uint8_t> num_atoms_out = {}, std::span<std::uint16_t> num_heavy_atoms_out = {},
-        std::span<std::uint16_t> num_bonds_out = {}, std::span<float> molecular_weight_out = {});
+        custd::span<std::string_view const> smiles, config_t const &config, std::uint32_t max_atoms_per_molecule,
+        custd::span<__half> coordinates_out, custd::span<float> energies_out,
+        custd::span<conformer_status_t> status_out, custd::span<std::uint8_t> num_atoms_out = {},
+        custd::span<std::uint16_t> num_heavy_atoms_out = {}, custd::span<std::uint16_t> num_bonds_out = {},
+        custd::span<float> molecular_weight_out = {});
 };
 
 } // namespace smallfield::api
