@@ -7,9 +7,10 @@
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
-#include <cstdio>  // `fprintf`, `stderr`
+#include <cstdio>  // `stderr`
 
 #include <cuda_runtime.h>
+#include <fmt/format.h>
 
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"
@@ -33,7 +34,7 @@ void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &ta
     sfparam::mmff94_tables_device_t tables_dev;
     sfparam::upload_mmff94_tables_to_device(tables_host, tables_dev);
     if (tables_dev.arena.data() == nullptr) {
-        std::fprintf(stderr, "table upload failed\n");
+        fmt::println(stderr, "table upload failed");
         *type_and_charge_ms = *extract_terms_ms = *build_csr_ms = *total_gpu_ms = -1.0f;
         return;
     }
@@ -68,20 +69,22 @@ void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &ta
                                               sft::max_mmff_interactions_per_mol_k *
                                               sizeof(sft::mmff94_atom_interaction_t);
 
+    // Host-side reporting only — `{fmt}` never appears inside a `__device__` or `__global__` body in this
+    // translation unit, and must not start to.
     auto const print_gpu_memory_usage = [&](char const *label) {
         size_t free_memory = 0, total_memory = 0;
         cudaMemGetInfo(&free_memory, &total_memory);
-        std::fprintf(stderr, "%s: GPU free=%.1f GB / total=%.1f GB\n", label, free_memory / 1.0e9,
-                     total_memory / 1.0e9);
+        fmt::println(stderr, "{}: GPU free={:.1f} GB / total={:.1f} GB", label,
+                     static_cast<double>(free_memory) / 1.0e9, static_cast<double>(total_memory) / 1.0e9);
     };
+    auto const gigabytes = [](std::size_t bytes) { return static_cast<double>(bytes) / 1.0e9; };
     print_gpu_memory_usage("before alloc");
-    std::fprintf( //
-        stderr,
-        "alloc plan: descriptor=%.2f GB bonds=%.2f GB angles=%.2f GB tors=%.2f GB oops=%.2f GB stbn=%.2f GB " //
-        "inter=%.2f GB\n",
-        num_molecules * sizeof(sft::molecule_descriptor_t) / 1.0e9, per_bond_bytes / 1.0e9, per_angle_bytes / 1.0e9,
-        per_torsion_bytes / 1.0e9, per_out_of_plane_bytes / 1.0e9, per_stretch_bend_bytes / 1.0e9,
-        per_interaction_bytes / 1.0e9);
+    fmt::println(stderr,
+                 "alloc plan: descriptor={:.2f} GB bonds={:.2f} GB angles={:.2f} GB tors={:.2f} GB oops={:.2f} GB "
+                 "stbn={:.2f} GB inter={:.2f} GB",
+                 gigabytes(num_molecules * sizeof(sft::molecule_descriptor_t)), gigabytes(per_bond_bytes),
+                 gigabytes(per_angle_bytes), gigabytes(per_torsion_bytes), gigabytes(per_out_of_plane_bytes),
+                 gigabytes(per_stretch_bend_bytes), gigabytes(per_interaction_bytes));
 
     cudaMalloc(&d_descriptors, num_molecules * sizeof(sft::molecule_descriptor_t));
     cudaMalloc(&d_atom_offsets, num_molecules * sizeof(std::uint32_t));
@@ -100,7 +103,7 @@ void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &ta
     cudaMalloc(&d_atom_offsets_lookup, total_atom_count * sizeof(sft::mmff94_atom_offsets_t));
     cudaError_t const allocation_error = cudaGetLastError();
     if (allocation_error != cudaSuccess) {
-        std::fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(allocation_error));
+        fmt::println(stderr, "cudaMalloc failed: {}", cudaGetErrorString(allocation_error));
         *type_and_charge_ms = *extract_terms_ms = *build_csr_ms = *total_gpu_ms = -1.0f;
         return;
     }
@@ -138,7 +141,7 @@ void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &ta
 
     cudaError_t kernel_error = cudaGetLastError();
     if (kernel_error != cudaSuccess) {
-        std::fprintf(stderr, "kernel error: %s\n", cudaGetErrorString(kernel_error));
+        fmt::println(stderr, "kernel error: {}", cudaGetErrorString(kernel_error));
         *type_and_charge_ms = *extract_terms_ms = *build_csr_ms = *total_gpu_ms = -1.0f;
         goto cleanup;
     }
