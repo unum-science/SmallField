@@ -5,8 +5,8 @@ platforms = ["linux-64"]
 
 [dependencies]
 python = "3.14.*"
-rdkit = "2025.09.*"
-librdkit-dev = "2025.09.*"
+rdkit = "2026.03.*"
+librdkit-dev = "2026.03.*"
 fmt = ">=12"
 jemalloc = ">=5"
 libarrow = ">=24,<25"
