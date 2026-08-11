@@ -4,6 +4,11 @@ __SmallField__ generates 3D conformers from SMILES strings using [ETKDG](https:/
 One CUDA warp processes one molecule and runs all pipeline stages in shared memory with no global-memory atomics.
 CPU preprocessing uses [RDKit](https://github.com/rdkit/rdkit) for SMILES parsing, bounds matrices, CSD torsion lookup, and MMFF94 parameter extraction.
 
+> [!WARNING]
+> Much of this project is AI-generated, and its correctness was defined by agreement with RDKit.
+> RDKit carries its own mistakes and numerical instabilities, so exact agreement is neither always achievable nor always desirable.
+> Validate on your own corpus before you depend on it.
+
 ## Project Goals & FAQ
 
 SmallField is a 3D conformer generator, not a chemical-identity toolkit.
