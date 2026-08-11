@@ -510,6 +510,39 @@ check_split_literals() {
     [ -z "$shredded" ] || fail "$shredded" \
         "$file splits a string literal mid-word - break it yourself and pin each line with a trailing //:"
 }
+
+#pragma region Shipped tooling
+
+# A run of three or more dashes, equals or hashes inside a string literal is a decorative banner. It
+# carries nothing the announcement beside it does not, and it makes two runs of the same binary diff
+# noisily. `check_rulers` above covers the comment form; it anchors the whole line and requires a
+# comment marker, so it reaches none of these.
+#
+# Comments are blanked so a Doxygen table drawn with `|---|---|` stays legal; literals are kept,
+# because the literal IS what this looks for.
+check_output_banners() {
+    local banners
+    banners=$(printf '%s\n' "$added" |
+        strip_comments |
+        grep -E '"[^"]*(===|---|###)' || true)
+    [ -z "$banners" ] || fail "$banners" \
+        "$file prints a decorative banner - one line naming the executable is the whole header:"
+}
+
+# Lazy initialization is a function-local `static const`, and nothing else. A magic static already
+# runs once, is thread-safe, and retries if the initializer throws, so `call_once` adds a flag and
+# no guarantee. Warming third-party state is not an exception: bind the side effect to a
+# `static const`. Two near-duplicate RDKit warm-ups each carried their own flag, so the warm-up ran
+# twice in one binary -- which is what a second mechanism buys.
+check_once_flag() {
+    local flags
+    flags=$(printf '%s\n' "$added" |
+        code_only |
+        grep -E 'std::(once_flag|call_once)\b' || true)
+    [ -z "$flags" ] || fail "$flags" \
+        "$file guards initialization with a once_flag - use a function-local static const:"
+}
+
 # An absolute path is a claim about one filesystem, true on the machine that wrote it and silently
 # wrong on the next. Every dataset is reached through `data/<name>`, whose entries are symlinks each
 # machine makes for itself, so nothing in the tree needs to name a root.
@@ -529,6 +562,7 @@ check_absolute_paths() {
         "$file names an absolute path - take it as an argument, or reach the share through data/:"
 }
 
+#pragma endregion Shipped tooling
 
 #pragma region Markdown
 
@@ -566,6 +600,8 @@ while IFS= read -r -d '' file; do
         check_void_discards
         check_backward_references
         check_rulers
+        check_output_banners
+        check_once_flag
         check_absolute_paths
         check_param_directions
         check_markdown_doxygen
@@ -601,7 +637,7 @@ while IFS= read -r -d '' file; do
         esac
         ;;
     *.md)
-check_markdown_asterisks
+        check_markdown_asterisks
         check_absolute_paths
         ;;
     # An absolute path is wrong in a build file, a script or a config for the same reason it is wrong

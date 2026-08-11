@@ -8,7 +8,6 @@
 
 #include <atomic>  // `std::atomic`
 #include <memory>  // `std::unique_ptr`
-#include <mutex>   // `std::once_flag`, `std::call_once`
 #include <sstream> // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
 #include <vector>  // `std::vector`
 
@@ -36,8 +35,7 @@ namespace smallfield::cli {
  *  populate its caches before the pool of ~188 fallback threads starts racing on first access. See matching
  *  `warm_up_rdkit_globals_once_` in `etkdg_prepare_batch.hpp`. */
 static void warm_up_rdkit_globals_for_fallback_() {
-    static std::once_flag flag;
-    std::call_once(flag, [] {
+    [[maybe_unused]] static bool const warmed = [] {
         try {
             auto warm = RDKit::SmilesToMol("C[C@H](O)[C@@H](Cl)c1ccccc1");
             if (warm) {
@@ -52,7 +50,8 @@ static void warm_up_rdkit_globals_for_fallback_() {
         catch (...) {
             // Best-effort.
         }
-    });
+        return true;
+    }();
 }
 
 std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallback_outputs_t &outputs) {

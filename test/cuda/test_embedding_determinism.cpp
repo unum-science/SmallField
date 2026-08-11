@@ -13,6 +13,7 @@
 #include <cmath>   // `std::sqrt`
 #include <cstring> // `std::memcmp`
 
+#include <algorithm>   // `std::any_of`
 #include <random>      // `std::mt19937`, `std::uniform_real_distribution`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -49,8 +50,19 @@ static std::vector<float> synthetic_bounds(std::uint32_t num_atoms) {
     return bounds;
 }
 
+/**
+ *  @brief How many replicated copies diverged, and which one diverged first.
+ *
+ *  `count` is the "nothing found" answer, so `first_copy` never has to double as one: an index
+ *  standing in for its own absence is read correctly once and misread thereafter.
+ */
+struct divergence_t {
+    std::uint32_t count = 0;
+    std::uint32_t first_copy = 0;
+};
+
 int main() {
-    fmt::println("test_embedding_determinism: bitwise reproducibility of the 4D metric embedding");
+    fmt::println("{}: bitwise reproducibility of the 4D metric embedding", test_name_k);
 
     constexpr std::uint32_t num_atoms_k = 128;
     constexpr std::uint32_t num_molecules_k = 4096;
@@ -66,9 +78,8 @@ int main() {
     sf_verify_(second_status == 0, "second embedding launch must succeed");
 
     std::size_t const molecule_bytes = coordinates_per_molecule * sizeof(float);
-    bool any_nonzero = false;
-    for (std::size_t component = 0; component < coordinates_per_molecule; ++component)
-        if (first_run[component] != 0.0f) any_nonzero = true;
+    bool const any_nonzero = std::any_of(first_run.begin(), first_run.begin() + coordinates_per_molecule,
+                                         [](float component) { return component != 0.0f; });
     sf_verify_(any_nonzero, "the embedding must not be all zeros, or the comparison proves nothing");
 
     // Reports up to four differing components so a failure names the magnitude, not just a count.
@@ -82,36 +93,34 @@ int main() {
             }
     };
 
-    std::uint32_t across_launches = 0;
-    std::uint32_t within_launch = 0;
-    std::uint32_t first_across_launches = num_molecules_k;
-    std::uint32_t first_within_launch = num_molecules_k;
+    divergence_t across_launches;
+    divergence_t within_launch;
     for (std::uint32_t molecule = 0; molecule < num_molecules_k; ++molecule) {
         float const *first_copy = first_run.data() + molecule * coordinates_per_molecule;
         float const *second_copy = second_run.data() + molecule * coordinates_per_molecule;
         if (std::memcmp(first_copy, second_copy, molecule_bytes) != 0) {
-            ++across_launches;
-            if (first_across_launches == num_molecules_k) first_across_launches = molecule;
+            if (across_launches.count == 0) across_launches.first_copy = molecule;
+            ++across_launches.count;
         }
         if (std::memcmp(first_run.data(), first_copy, molecule_bytes) != 0) {
-            ++within_launch;
-            if (first_within_launch == num_molecules_k) first_within_launch = molecule;
+            if (within_launch.count == 0) within_launch.first_copy = molecule;
+            ++within_launch.count;
         }
     }
 
     fmt::println("  atoms: {}, identical copies per launch: {}", num_atoms_k, fmt::group_digits(num_molecules_k));
-    fmt::println("  copies differing between the two launches: {}", fmt::group_digits(across_launches));
-    fmt::println("  copies differing from copy 0 inside one launch: {}", fmt::group_digits(within_launch));
-    if (first_across_launches != num_molecules_k)
-        report_divergence("across_launch", first_across_launches,
-                          first_run.data() + first_across_launches * coordinates_per_molecule,
-                          second_run.data() + first_across_launches * coordinates_per_molecule);
-    if (first_within_launch != num_molecules_k)
-        report_divergence("within_launch", first_within_launch, first_run.data(),
-                          first_run.data() + first_within_launch * coordinates_per_molecule);
+    fmt::println("  copies differing between the two launches: {}", fmt::group_digits(across_launches.count));
+    fmt::println("  copies differing from copy 0 inside one launch: {}", fmt::group_digits(within_launch.count));
+    if (across_launches.count != 0)
+        report_divergence("across_launch", across_launches.first_copy,
+                          first_run.data() + across_launches.first_copy * coordinates_per_molecule,
+                          second_run.data() + across_launches.first_copy * coordinates_per_molecule);
+    if (within_launch.count != 0)
+        report_divergence("within_launch", within_launch.first_copy, first_run.data(),
+                          first_run.data() + within_launch.first_copy * coordinates_per_molecule);
 
-    sf_verify_(across_launches == 0, "two launches over the same bounds must produce identical coordinates");
-    sf_verify_(within_launch == 0, "identical molecules in one launch must produce identical coordinates");
+    sf_verify_(across_launches.count == 0, "two launches over the same bounds must produce identical coordinates");
+    sf_verify_(within_launch.count == 0, "identical molecules in one launch must produce identical coordinates");
 
     return sftest::report_pass(test_name_k);
 }

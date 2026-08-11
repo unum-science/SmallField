@@ -18,7 +18,7 @@
 
 #include <csignal>
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
-#include <cstdio>  // `stderr`, `fprintf`
+#include <cstdio>  // `stderr`, `std::fopen`, `std::fwrite`
 #include <cstdlib> // `std::strtol`
 
 #include <algorithm>          // `std::max`
@@ -28,6 +28,7 @@
 #include <chrono>             // `std::chrono::steady_clock`, `std::chrono::duration`
 #include <condition_variable> // `std::condition_variable`
 #include <filesystem>         // `std::filesystem::path`, `std::filesystem::create_directories`
+#include <limits>             // `std::numeric_limits`
 #include <mutex>              // `std::mutex`, `std::unique_lock`
 #include <span>               // `std::span`
 #include <stdexcept>          // `std::runtime_error`
@@ -68,9 +69,21 @@ namespace smallfield::cli {
  *  `handle_stop_signal_` keeps C language linkage for `std::signal`, which an ordinary `static`
  *  function cannot combine with, so the unnamed namespace supplies the internal linkage here. */
 namespace {
-std::atomic<bool> g_stop_requested_ {false};
-extern "C" void handle_stop_signal_(int) { g_stop_requested_.store(true, std::memory_order_relaxed); }
+std::atomic<bool> stop_requested_ {false};
+extern "C" void handle_stop_signal_(int) { stop_requested_.store(true, std::memory_order_relaxed); }
 } // namespace
+
+/** Ceiling on `--rdkit-fallback-threads` and `--gpu-runner-threads`: an OpenMP team wider than this is a
+ *  mistyped token, not a machine. */
+constexpr int max_threads_k = 4096;
+
+/** Ceiling on `--batch-size` in molecules. Six batches are in flight at once at roughly 100 KB of pinned
+ *  host memory per molecule per slot — 70 GB per slot at 700 K — so a larger target names a batch no
+ *  machine this runs on can hold. */
+constexpr std::uint32_t max_batch_size_k = 4'000'000;
+
+/** Highest tier `--verbose` names: 1 is the per-`embedding-wave` summary, 2 adds the per-device breakdown. */
+constexpr int max_verbose_level_k = 2;
 
 /** All CLI flags. Immutable after parse. */
 struct cli_config_t {
@@ -87,7 +100,7 @@ struct cli_config_t {
     int rdkit_fallback_threads = 0;
     /** 0 = auto split vs fallback-role, non-zero overrides. */
     int gpu_runner_threads = 0;
-    bool resume = true;
+    restart_policy_t restart_policy = restart_policy_t::resume_k;
     std::uint64_t random_seed = 42;
     /** Library verbose tier: 0 silent, 1 per-`embedding-wave` summary, 2 + per-device breakdown. */
     int verbose_level = 0;
@@ -100,8 +113,8 @@ static void print_usage_() {
                               (default: same as --input — sister files alongside)
   --smiles-column NAME        input column name (default: smiles)
   --dataset NAME              provenance dataset name embedded in output metadata (e.g. gdb13)
-  --num-conformers K          conformers per molecule (default: 3)
-  --max-atoms N               per-molecule atom cap (default: 128)
+  --num-conformers K          conformers per molecule, 1 to 16 (default: 3)
+  --max-atoms N               per-molecule atom cap, 1 to 192 (default: 128)
   --batch-size N              molecules per coprocessed-batch (default: auto = 100K per GPU)
   --coprocessed-batch-size N         alias for --batch-size
   --chunk-size N              alias for --batch-size
@@ -121,17 +134,54 @@ enum class cli_parse_t {
     invalid_k,
 };
 
+/** Why a command-line token was accepted or refused as a number. */
+enum class number_parse_t {
+    /** The whole token is a number inside the accepted range. */
+    parsed_k,
+    /** The token is not a number, or carries trailing characters. */
+    malformed_k,
+    /** The token is a number the destination type cannot hold. */
+    out_of_range_k,
+    /** The token parses but falls under the caller's floor. */
+    below_minimum_k,
+    /** The token parses but exceeds the caller's ceiling. */
+    above_maximum_k,
+};
+
 /**
- *  @brief Parse one whole numeric token, rejecting an empty token, trailing characters and overflow.
+ *  @brief Parse @p text whole as a number in `[minimum, maximum]`, leaving @p number untouched on refusal.
+ *
+ *  Partial parses are refusals: `12x` is malformed, not twelve. The destination keeps its prior value unless
+ *  the token is accepted, so a caller may seed it with the default and read it back either way.
  *
  *  @param[in] text Token as it appeared on the command line.
- *  @param[out] number Value the token denotes; untouched unless the whole token parses.
- *  @return True when the entire token is a number of @p number 's type.
+ *  @param[in] minimum Smallest value the flag accepts.
+ *  @param[in] maximum Largest value the flag accepts.
+ *  @param[out] number Value the token denotes; untouched unless the whole token parses inside the bounds.
  */
 template <typename number_type_>
-static bool parse_number_(std::string_view text, number_type_ &number) {
-    auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), number);
-    return error == std::errc {} && unparsed == text.data() + text.size();
+static number_parse_t parse_number_(std::string_view text, number_type_ minimum, number_type_ maximum,
+                                    number_type_ &number) {
+    number_type_ parsed {};
+    auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+    if (error == std::errc::result_out_of_range) return number_parse_t::out_of_range_k;
+    if (error != std::errc {} || unparsed != text.data() + text.size()) return number_parse_t::malformed_k;
+    if (parsed < minimum) return number_parse_t::below_minimum_k;
+    if (parsed > maximum) return number_parse_t::above_maximum_k;
+    number = parsed;
+    return number_parse_t::parsed_k;
+}
+
+/** Sentence fragment naming the refusal, meant to follow the flag name in a diagnostic. */
+static char const *describe_number_parse_(number_parse_t status) {
+    switch (status) {
+    case number_parse_t::parsed_k: return "parsed";
+    case number_parse_t::malformed_k: return "is not a whole number";
+    case number_parse_t::out_of_range_k: return "does not fit the destination type";
+    case number_parse_t::below_minimum_k: return "is below the accepted minimum";
+    case number_parse_t::above_maximum_k: return "is above the accepted maximum";
+    }
+    return "was refused";
 }
 
 static bool parse_int_list_(char const *spec, std::vector<int> &out) {
@@ -159,16 +209,18 @@ static void add_string_(argparse::ArgumentParser &parser, char const *flag, stri
 }
 
 /**
- *  @brief Bind a numeric flag, refusing a token that does not parse whole rather than silently taking it as zero.
+ *  @brief Bind a numeric flag bounded by `[minimum, maximum]`, naming both the flag and the reason on refusal.
  *
  *  The conversion stays ours rather than `argparse`'s `scan`, whose diagnostic is `pattern 'abc' does not match to
- *  the end` — it never names the flag the operator actually typed.
+ *  the end` — it never names the flag the operator actually typed, and it has no bounds to enforce.
  */
 template <typename number_type_>
-static void add_number_(argparse::ArgumentParser &parser, char const *flag, number_type_ &number) {
-    parser.add_argument(flag).append().action([flag, &number](std::string const &text) {
-        if (!parse_number_(text, number))
-            throw std::runtime_error(fmt::format("{} requires a number, got: {}", flag, text));
+static void add_number_(argparse::ArgumentParser &parser, char const *flag, number_type_ minimum, number_type_ maximum,
+                        number_type_ &number) {
+    parser.add_argument(flag).append().action([flag, minimum, maximum, &number](std::string const &text) {
+        number_parse_t const status = parse_number_(text, minimum, maximum, number);
+        if (status != number_parse_t::parsed_k)
+            throw std::runtime_error(fmt::format("{} {}, got: {}", flag, describe_number_parse_(status), text));
     });
 }
 
@@ -183,16 +235,23 @@ static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
     add_string_(parser, "--output", config.output_dir);
     add_string_(parser, "--smiles-column", config.smiles_column);
     add_string_(parser, "--dataset", config.dataset);
-    add_number_(parser, "--num-conformers", config.num_conformers);
-    add_number_(parser, "--max-atoms", config.max_atoms);
+    // Bounds are enforced in the parse, so a refused token never reaches a `resize` or a kernel launch. Zero
+    // conformers asks the library for a wave of nothing, which it reports as a CUDA fault — and the fault path
+    // parks the operator's input shards. Zero atoms makes the conformer slot stride zero, and an atom cap above
+    // the library's own cap lets a molecule overrun the interleaved scratch the descriptor pass gathers into.
+    add_number_(parser, "--num-conformers", 1u, sfapi::max_conformer_count_k, config.num_conformers);
+    add_number_(parser, "--max-atoms", 1u, sfapi::max_atoms_per_molecule_k, config.max_atoms);
     // Three names for one field, registered separately rather than as aliases of one option, so a rejected value is
-    // reported under the name the operator typed.
-    add_number_(parser, "--batch-size", config.batch_size);
-    add_number_(parser, "--coprocessed-batch-size", config.batch_size);
-    add_number_(parser, "--chunk-size", config.batch_size);
-    add_number_(parser, "--rdkit-fallback-threads", config.rdkit_fallback_threads);
-    add_number_(parser, "--gpu-runner-threads", config.gpu_runner_threads);
-    add_number_(parser, "--seed", config.random_seed);
+    // reported under the name the operator typed. Zero is the documented "auto", so it is the floor rather than a
+    // refusal.
+    add_number_(parser, "--batch-size", 0u, max_batch_size_k, config.batch_size);
+    add_number_(parser, "--coprocessed-batch-size", 0u, max_batch_size_k, config.batch_size);
+    add_number_(parser, "--chunk-size", 0u, max_batch_size_k, config.batch_size);
+    // Zero threads is the documented "auto split", and a negative team is a typo rather than a smaller one.
+    add_number_(parser, "--rdkit-fallback-threads", 0, max_threads_k, config.rdkit_fallback_threads);
+    add_number_(parser, "--gpu-runner-threads", 0, max_threads_k, config.gpu_runner_threads);
+    // Every 64-bit value is a seed, so the bounds only reject a token that is not one.
+    add_number_(parser, "--seed", std::uint64_t {0}, std::numeric_limits<std::uint64_t>::max(), config.random_seed);
     // The comma-separated device list fills the caller's vector; nothing is returned by value.
     parser.add_argument("--gpus").append().action([&config](std::string const &text) {
         if (!parse_int_list_(text.c_str(), config.gpu_ids))
@@ -200,14 +259,19 @@ static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
     });
     // `--restart` and `--resume` write the same field, so each is an action rather than a queried flag: that is what
     // makes the last one on the command line win.
-    parser.add_argument("--restart").flag().append().action([&config](std::string const &) { config.resume = false; });
-    parser.add_argument("--resume").flag().append().action([&config](std::string const &) { config.resume = true; });
+    parser.add_argument("--restart").flag().append().action([&config](std::string const &) {
+        config.restart_policy = restart_policy_t::restart_k;
+    });
+    parser.add_argument("--resume").flag().append().action([&config](std::string const &) {
+        config.restart_policy = restart_policy_t::resume_k;
+    });
     // `--verbose` alone is level 1 and `--verbose=LEVEL` names it. `nargs(0, 1)` consumes nothing in the first case,
     // so the action never fires, which is how the two are told apart.
     bool verbose_level_given = false;
     parser.add_argument("--verbose").nargs(0, 1).append().action([&](std::string const &text) {
-        if (!parse_number_(text, config.verbose_level))
-            throw std::runtime_error(fmt::format("--verbose requires a number, got: {}", text));
+        number_parse_t const status = parse_number_(text, 0, max_verbose_level_k, config.verbose_level);
+        if (status != number_parse_t::parsed_k)
+            throw std::runtime_error(fmt::format("--verbose {}, got: {}", describe_number_parse_(status), text));
         verbose_level_given = true;
     });
     parser.add_argument("-h", "--help").flag().append().action([&](std::string const &) {
@@ -444,7 +508,7 @@ static void reader_loop_(std::vector<sfcli::shard_pair_t const *> const &pending
     for (auto const *pair : pending) {
         // Graceful pre-emption: stop enqueuing new shards at this boundary; already-accumulated and
         // in-flight batches still drain and get written below, then the pipeline exits cleanly.
-        if (g_stop_requested_.load(std::memory_order_relaxed)) {
+        if (stop_requested_.load(std::memory_order_relaxed)) {
             logger.info("stop requested — draining in-flight work and exiting");
             break;
         }
@@ -468,19 +532,30 @@ static void reader_loop_(std::vector<sfcli::shard_pair_t const *> const &pending
     output_queue.send(std::move(sentinel));
 }
 
-static void gpu_runner_loop_(sfapi::context_t &gpu_context, cli_config_t const &config, thread_budget_t const &budget,
-                             handoff<coprocessed_batch_accumulator_t> &input_queue,
-                             handoff<coprocessed_batch_result_t> &output_queue, buffer_pool_t &pool,
-                             [[maybe_unused]] progress_counters_t &counters) {
+/** How the `gpu-runner-role` left its loop: normally, or with the driver context poisoned. */
+enum class gpu_runner_outcome_t {
+    completed_k,
+    cuda_fault_k,
+};
+
+static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_config_t const &config,
+                                             thread_budget_t const &budget, logger_t const &logger,
+                                             handoff<coprocessed_batch_accumulator_t> &input_queue,
+                                             handoff<coprocessed_batch_result_t> &output_queue, buffer_pool_t &pool,
+                                             [[maybe_unused]] progress_counters_t &counters) {
     omp_set_num_threads(budget.gpu_runner);
 
     sfapi::config_t generation_config;
     generation_config.num_conformers = config.num_conformers;
     generation_config.random_seed = config.random_seed;
+    gpu_runner_outcome_t outcome = gpu_runner_outcome_t::completed_k;
 
     for (;;) {
         auto accumulator = input_queue.receive();
         if (accumulator.done) break;
+        // Once the driver context is poisoned nothing further is launched, but the loop keeps draining so
+        // the reader-role never blocks on a full ring and the whole pipeline can shut down in order.
+        if (outcome == gpu_runner_outcome_t::cuda_fault_k) continue;
         SF_NVTX_RANGE_COLORED("gpu_runner: preprocess+launch", 0x2E86C1);
 
         std::uint64_t const num_molecules = accumulator.total_molecules;
@@ -509,9 +584,10 @@ static void gpu_runner_loop_(sfapi::context_t &gpu_context, cli_config_t const &
         // Kernel-OOB guardrail: any CUDA error during this batch poisons the driver context on every device,
         // and every subsequent shard would also silently produce garbage. Park the shards that contributed
         // to this batch into `{input_dir}/../{input_dir_name}_skip/` so the wrapper's next invocation skips
-        // them, and exit non-zero so the wrapper relaunches with a fresh CUDA context. One bad shard out of
-        // N in the batch gets collateral-parked; in practice each batch has one shard because
-        // Enamine/PubChem shards exceed the 800 K target.
+        // them, then stop feeding the GPU and let the pipeline drain so `main` can return non-zero and the
+        // wrapper relaunches with a fresh CUDA context. One bad shard out of N in the batch gets
+        // collateral-parked; in practice each batch has one shard because Enamine/PubChem shards exceed the
+        // 800 K target.
         if (gpu_context.cuda_error_count.load() > 0) {
             std::filesystem::path const input_dir = accumulator.input_file_pairs.front()->input_path.parent_path();
             std::filesystem::path const skip_dir = input_dir.parent_path() / (input_dir.filename().string() + "_skip");
@@ -520,14 +596,16 @@ static void gpu_runner_loop_(sfapi::context_t &gpu_context, cli_config_t const &
             for (auto const *pair : accumulator.input_file_pairs) {
                 std::filesystem::path const destination = skip_dir / pair->input_path.filename();
                 std::filesystem::rename(pair->input_path, destination, error_code);
-                std::fprintf(stderr, "[smallfield_batch] CUDA error — parked shard %s -> %s (%s)\n",
-                             pair->input_path.string().c_str(), destination.string().c_str(),
-                             error_code ? error_code.message().c_str() : "ok");
+                logger.error("CUDA error — parked shard {} -> {} ({})", pair->input_path.string(), destination.string(),
+                             error_code ? error_code.message() : "ok");
             }
-            std::fprintf(stderr,
-                         "[smallfield_batch] aborting invocation after %llu CUDA errors; wrapper will relaunch\n",
-                         static_cast<unsigned long long>(gpu_context.cuda_error_count.load()));
-            std::_Exit(2);
+            logger.error("aborting invocation after {} CUDA errors; wrapper will relaunch",
+                         fmt::group_digits(gpu_context.cuda_error_count.load()));
+            // Ask the reader-role to stop at its next shard boundary; this batch's output is discarded.
+            stop_requested_.store(true, std::memory_order_relaxed);
+            pool.release(buffer);
+            outcome = gpu_runner_outcome_t::cuda_fault_k;
+            continue;
         }
 
         std::fill_n(buffer->solver_codes.data(), total_conformers, static_cast<std::uint8_t>(0));
@@ -538,6 +616,11 @@ static void gpu_runner_loop_(sfapi::context_t &gpu_context, cli_config_t const &
         buffer->retry_indices.clear();
         for (std::uint64_t molecule = 0; molecule < num_molecules; ++molecule) {
             bool has_failure = false;
+            // Deliberately non-short-circuiting: every conformer slot of this molecule is written here, and
+            // both arrays were just zero-filled, where zero encodes `success_k` in `status_codes` and a GPU
+            // success in `solver_codes`. Breaking on the first failure would therefore leave the later slots
+            // reading as successful conformers, and the writer would emit them to parquet with the all-zero
+            // coordinates they still hold. `has_failure` is the summary; it is not a reason to stop.
             for (std::uint32_t conformer = 0; conformer < config.num_conformers; ++conformer) {
                 std::uint64_t const slot = molecule * config.num_conformers + conformer;
                 buffer->status_codes[slot] = static_cast<std::uint8_t>(buffer->status[slot]);
@@ -560,6 +643,7 @@ static void gpu_runner_loop_(sfapi::context_t &gpu_context, cli_config_t const &
     coprocessed_batch_result_t sentinel;
     sentinel.done = true;
     output_queue.send(std::move(sentinel));
+    return outcome;
 }
 
 /** Compute USR/USRCAT shape descriptors and separate disconnected fragments on the finished
@@ -595,18 +679,14 @@ static void compute_shape_descriptors_(cli_config_t const &config, thread_budget
             std::uint64_t const flat = molecule_index * num_conformers + conformer;
             if (buffer->status_codes[flat] != static_cast<std::uint8_t>(sfapi::conformer_status_t::success_k)) continue;
             std::size_t const slot_base = slot_layout.slot_offset(molecule_index, conformer);
-            for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-                for (std::uint32_t axis = 0; axis < 3u; ++axis)
-                    interleaved[atom * 3u + axis] = __half2float(
-                        buffer->coordinates[slot_base + slot_layout.component_offset(axis, atom)]);
+            sfcli::gather_slot_into_interleaved(buffer->coordinates.data() + slot_base, slot_layout, num_atoms,
+                                                interleaved.data());
 
             std::span<float> coords_view {interleaved.data(), static_cast<std::size_t>(num_atoms) * 3u};
             if (context.num_components > 1) {
                 sfpost::separate_fragments(coords_view, context);
-                for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
-                    for (std::uint32_t axis = 0; axis < 3u; ++axis)
-                        buffer->coordinates[slot_base + slot_layout.component_offset(axis, atom)] = __float2half(
-                            interleaved[atom * 3u + axis]);
+                sfcli::scatter_interleaved_into_slot(interleaved.data(), slot_layout, num_atoms,
+                                                     buffer->coordinates.data() + slot_base);
             }
 
             std::array<double, 60> usrcat {};
@@ -718,10 +798,11 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
             };
 
             auto const &output_path = accumulator.input_file_pairs[file_index]->output_path;
-            if (!sfcli::write_shard(output_path, writer_inputs)) {
-                logger.error("write failed: {}", output_path.string());
-            }
-            else {
+            // `write_shard` names the column or the file that stopped it in the log, so a second generic
+            // "write failed" line here would bury the reason it already reported. The sentinel a `--resume`
+            // run keys on is only written on the success path, so a refused write never leaves one behind.
+            sfcli::shard_write_report_t const report = sfcli::write_shard(output_path, writer_inputs, &logger);
+            if (report.status == sfcli::shard_write_t::written_k) {
                 // Touch a 3-byte ".encoded" sentinel so resume runs can skip without
                 // re-opening the parquet to count rows.
                 std::filesystem::path sentinel = output_path;
@@ -795,7 +876,7 @@ int main(int argc, char **argv) {
     logger_t logger;
     logger.verbose_level = config.verbose_level;
 
-    auto shard_pairs = sfcli::inventory_shards(config.input_dir, config.output_dir, config.resume);
+    auto shard_pairs = sfcli::inventory_shards(config.input_dir, config.output_dir, config.restart_policy);
     if (shard_pairs.empty()) {
         logger.error("no input-files found in {}", config.input_dir.string());
         return 1;
@@ -848,12 +929,17 @@ int main(int argc, char **argv) {
     sfcli::handoff<sfcli::coprocessed_batch_result_t> gpu_to_fallback {pipeline_depth_k};
     sfcli::handoff<sfcli::coprocessed_batch_result_t> fallback_to_writer {pipeline_depth_k};
 
+    auto gpu_runner_outcome = sfcli::gpu_runner_outcome_t::completed_k;
+
 #pragma omp parallel sections num_threads(4)
     {
 #pragma omp section
         { sfcli::reader_loop_(pending, config, batch_target, budget, logger, reader_to_gpu); }
 #pragma omp section
-        { sfcli::gpu_runner_loop_(gpu_context, config, budget, reader_to_gpu, gpu_to_fallback, pool, counters); }
+        {
+            gpu_runner_outcome = sfcli::gpu_runner_loop_(gpu_context, config, budget, logger, reader_to_gpu,
+                                                         gpu_to_fallback, pool, counters);
+        }
 #pragma omp section
         { sfcli::fallback_loop_(config, budget, gpu_to_fallback, fallback_to_writer); }
 #pragma omp section
@@ -864,10 +950,12 @@ int main(int argc, char **argv) {
     std::uint64_t const done = counters.molecules_completed.load();
     logger.info("complete  {} mols  {} mol/s", fmt::group_digits(done),
                 fmt::group_digits(static_cast<std::uint64_t>(done / std::max(total, 0.001))));
+    // Exit codes mean one thing each: 1 is a run that failed, 2 is reserved for a refused command line.
+    if (gpu_runner_outcome == sfcli::gpu_runner_outcome_t::cuda_fault_k) return 1;
     std::uint64_t const cuda_errors = gpu_context.cuda_error_count.load();
     if (cuda_errors > 0) {
         logger.error("{} CUDA errors reported by the library — output is unreliable", fmt::group_digits(cuda_errors));
-        return 2;
+        return 1;
     }
     return 0;
 }

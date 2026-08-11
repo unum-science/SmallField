@@ -1,10 +1,10 @@
 /**
  *  @file bench/bench_arguments.hpp
- *  @brief Whole-token numeric parsing shared by the benchmark drivers.
+ *  @brief Command-line and corpus plumbing shared by the benchmark drivers.
  *
  *  `std::atoi` and `std::strtoull` both answer a malformed token with zero, so `--conformers abc` reads as
  *  `--conformers 0` and the run continues on a number nobody typed. Every benchmark flag goes through
- *  @ref parse_number instead, which reports why a token was refused and enforces the caller's bounds in the
+ *  `parse_number` instead, which reports why a token was refused and enforces the caller's bounds in the
  *  same pass — the ceiling is what stops a four-billion conformer count from reaching `std::vector::resize`.
  *
  *  @code{.cpp}
@@ -13,23 +13,39 @@
  *  if (status != smallfield::bench::number_parse_t::parsed_k)
  *      fmt::println(stderr, "--conformers {}", smallfield::bench::describe_number_parse(status));
  *  @endcode
+ *
+ *  `load_corpus_into` is the single SMILES reader behind all three benchmarks. It separates a path that
+ *  never opened from one that opened and held nothing, because a corpus read as zero molecules is a run that
+ *  measures nothing and still exits clean.
  */
 
 #pragma once
 
+#include <cstddef> // `std::size_t`
+#include <cstdlib> // `std::getenv`
+
+#include <algorithm>    // `std::min`
 #include <charconv>     // `std::from_chars`
+#include <fstream>      // `std::ifstream`
+#include <string>       // `std::string`, `std::getline`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
+#include <vector>       // `std::vector`
 
 namespace smallfield::bench {
 
-/** @brief Why a command-line token was accepted or refused as a number. */
+/** Why a command-line token was accepted or refused as a number. */
 enum class number_parse_t {
-    parsed_k,        ///< The whole token is a number inside the accepted range.
-    malformed_k,     ///< The token is not a number, or carries trailing characters.
-    out_of_range_k,  ///< The token is a number the destination type cannot hold.
-    below_minimum_k, ///< The token parses but falls under the caller's floor.
-    above_maximum_k, ///< The token parses but exceeds the caller's ceiling.
+    /** The whole token is a number inside the accepted range. */
+    parsed_k,
+    /** The token is not a number, or carries trailing characters. */
+    malformed_k,
+    /** The token is a number the destination type cannot hold. */
+    out_of_range_k,
+    /** The token parses but falls under the caller's floor. */
+    below_minimum_k,
+    /** The token parses but exceeds the caller's ceiling. */
+    above_maximum_k,
 };
 
 /**
@@ -51,7 +67,7 @@ number_parse_t parse_number(std::string_view text, number_type_ minimum, number_
     return number_parse_t::parsed_k;
 }
 
-/** @brief Sentence fragment naming the refusal, meant to follow the flag name in a diagnostic. */
+/** Sentence fragment naming the refusal, meant to follow the flag name in a diagnostic. */
 inline char const *describe_number_parse(number_parse_t status) {
     switch (status) {
     case number_parse_t::parsed_k: return "parsed";
@@ -61,6 +77,65 @@ inline char const *describe_number_parse(number_parse_t status) {
     case number_parse_t::above_maximum_k: return "is above the accepted maximum";
     }
     return "was refused";
+}
+
+/** Environment variable naming a corpus when no `--smi` flag is given. */
+inline constexpr char const *corpus_environment_variable_k = "SMALLFIELD_TEST_CORPUS";
+
+/** Why a SMILES corpus was accepted or refused. */
+enum class corpus_load_t {
+    /** The file opened and yielded at least one SMILES. */
+    loaded_k,
+    /** Neither a flag nor the environment named a corpus. */
+    unnamed_k,
+    /** The named path did not open. */
+    cannot_open_k,
+    /** The file opened and held no SMILES. */
+    empty_k,
+};
+
+/**
+ *  @brief Read up to @p capacity SMILES from @p path into @p smiles, one per line, first whitespace field only.
+ *
+ *  Lines that are empty or start with `#` are skipped, and each kept line is truncated at its first run of
+ *  whitespace, which drops a trailing name field along with any `\r`.
+ *
+ *  @param[in] path File to read, empty when nothing named a corpus.
+ *  @param[in] capacity Upper bound on how many lines to keep.
+ *  @param[out] smiles Caller-owned destination, cleared before the first line is appended.
+ *  @return Whether the corpus loaded, and if not, which of the three refusals applies.
+ */
+inline corpus_load_t load_corpus_into(std::string_view path, std::size_t capacity, std::vector<std::string> &smiles) {
+    smiles.clear();
+    if (path.empty()) return corpus_load_t::unnamed_k;
+    std::ifstream input_stream {std::string {path}};
+    if (!input_stream) return corpus_load_t::cannot_open_k;
+    smiles.reserve(std::min<std::size_t>(capacity, 1'000'000));
+    std::string line;
+    while (smiles.size() < capacity && std::getline(input_stream, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::size_t const separator_index = line.find_first_of(" \t\r");
+        if (separator_index != std::string::npos) line.resize(separator_index);
+        if (!line.empty()) smiles.push_back(std::move(line));
+    }
+    return smiles.empty() ? corpus_load_t::empty_k : corpus_load_t::loaded_k;
+}
+
+/** Sentence fragment naming the refusal, meant to follow the corpus path in a diagnostic. */
+inline char const *describe_corpus_load(corpus_load_t status) {
+    switch (status) {
+    case corpus_load_t::loaded_k: return "loaded";
+    case corpus_load_t::unnamed_k: return "was never named — pass --smi PATH or set SMALLFIELD_TEST_CORPUS";
+    case corpus_load_t::cannot_open_k: return "cannot be opened";
+    case corpus_load_t::empty_k: return "holds no SMILES";
+    }
+    return "was refused";
+}
+
+/** Corpus path named by the environment, or an empty view when the variable is unset. */
+inline std::string_view corpus_path_from_environment() {
+    char const *const named = std::getenv(corpus_environment_variable_k);
+    return named != nullptr ? std::string_view {named} : std::string_view {};
 }
 
 } // namespace smallfield::bench

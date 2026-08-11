@@ -13,12 +13,13 @@
  *  seventeen probes is a molecule whose perception moves.
  */
 
-#include <cmath> // `std::fabs`
+#include <cmath>   // `std::fabs`
+#include <cstddef> // `std::size_t`
+#include <cstdio>  // `std::fflush`
 
-#include <fstream>     // `std::ifstream`
 #include <memory>      // `std::unique_ptr`
 #include <sstream>     // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
-#include <string>      // `std::string`, `std::to_string`
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
 
@@ -38,6 +39,7 @@
 #include "smallfield/mmff94/mmff94_typer.hpp"
 
 #include "test/test_helpers.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfparam = smallfield::parameters;
 namespace sfmmff = smallfield::mmff94;
@@ -47,31 +49,67 @@ namespace sftest = smallfield::tests;
 static constexpr std::string_view test_name_k = "test_mmff_typer";
 
 namespace smallfield::tests {
-static sfparam::mmff94_tables_host_t tables_host_;
-static sfparam::mmff94_tables_view_t tables_;
-static int n_atoms_checked_ = 0;
-static int n_atoms_mismatch_ = 0;
-static int n_charges_checked_ = 0;
-static int n_charges_mismatch_ = 0;
-static int n_mols_tested_ = 0;
-static int n_mols_mismatch_ = 0;
 
-/** How many mismatching atoms to describe before going silent. A cap of three or ten turned a
- *  thirteen-molecule structural class into what read as a single stray molecule, so the default is
- *  generous; lower it locally when triaging a single molecule. A shared knobs header is on its way and
- *  will own this, at which point the constant here becomes its default. */
-static std::size_t max_reported_mismatches_ = 64;
-
-struct summary_t {
-    int element = 0;
-    std::uint8_t expected = 0;
-    std::uint8_t got = 0;
-    std::string smiles;
+/*  `comparison_group_t::field` invokes its predicate as `equals(reference, observed)`. An atom type is
+ *  an index and must agree exactly; a partial charge is summed in `float` here against RDKit's
+ *  `double`, so it carries the absolute 1e-3 tolerance this suite has always applied. */
+static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
+static constexpr auto charge_within_tolerance_ = [](float rdkit_value, float native_value) {
+    return std::fabs(rdkit_value - native_value) <= 1e-3f;
 };
 
-static std::vector<summary_t> mismatches_;
+/** How many mismatching fields either section prints before the rest are only counted. A cap of three
+ *  or ten turned a thirteen-molecule structural class into what read as a single stray molecule, so
+ *  the budget is generous; lower it locally when triaging one molecule. */
+static constexpr std::size_t max_reported_mismatches_k = 64;
 
-static void test_one_(std::string const &smiles, bool verbose) {
+/** One reporter per compared section, so each closes with its own `compared=` count. */
+struct typer_reporters_t {
+    diagnostic_reporter_t atom_type {"rdkit", "native"};
+    diagnostic_reporter_t partial_charge {"rdkit", "native"};
+
+    /** Cap what each section prints, so one pathological corpus cannot bury the log. */
+    void limit_printed_lines(std::size_t maximum) noexcept {
+        atom_type.limit_printed_lines(maximum);
+        partial_charge.limit_printed_lines(maximum);
+    }
+
+    /** Close both sections; true when each compared something and every field agreed. */
+    bool summarize_sections() {
+        atom_type.summarize("atom_type");
+        partial_charge.summarize("partial_charge");
+        return atom_type.passed() && partial_charge.passed();
+    }
+};
+
+/** Molecule counts for the sweep, threaded by reference so the probe and the corpus aggregate into one. */
+struct typer_tally_t {
+    std::uint64_t molecules = 0;
+    std::uint64_t molecules_mismatched = 0;
+};
+
+/** Reusable per-molecule scratch for the native typer, so the sweep allocates once rather than per molecule. */
+struct native_typing_scratch_t {
+    std::vector<std::uint8_t> atom_types;
+    std::vector<float> formal_charges;
+    std::vector<float> partial_charges;
+
+    void resize(std::uint32_t num_atoms) {
+        atom_types.assign(num_atoms, std::uint8_t {0});
+        formal_charges.assign(num_atoms, 0.0f);
+        partial_charges.assign(num_atoms, 0.0f);
+    }
+};
+
+/**
+ *  @brief Type one SMILES both ways and fold the outcome into @p tally.
+ *
+ *  A molecule RDKit itself cannot type is not a disagreement, so it leaves no trace in the tally.
+ *  The charge section compares only the atoms whose type already agrees, which is why its `compared=`
+ *  count is smaller than the atom section's and cannot be derived from it.
+ */
+static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t const &tables,
+                      typer_reporters_t &reporters, native_typing_scratch_t &scratch, typer_tally_t &tally) {
     std::unique_ptr<RDKit::RWMol> molecule;
     try {
         RDKit::SmilesParserParams parser_params;
@@ -83,96 +121,69 @@ static void test_one_(std::string const &smiles, bool verbose) {
     catch (...) {
         return;
     }
-    if (!molecule) return;
+    if (!molecule) return; // the parser refused it
     try {
         RDKit::MolOps::addHs(*molecule);
     }
     catch (...) {
         return;
     }
-    if (molecule->getNumAtoms() > 128) return;
+    if (molecule->getNumAtoms() > 128) return; // beyond the descriptor's fixed capacity
 
-    // RDKit baseline (uses MMFF-specific aromaticity internally).
+    // RDKit baseline, which uses MMFF-specific aromaticity internally.
     if (!molecule->hasProp(RDKit::common_properties::_MMFFSanitized))
         molecule->setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
     RDKit::MMFF::MMFFMolProperties props(*molecule);
-    if (!props.isValid()) return;
+    if (!props.isValid()) return; // RDKit cannot type it either, so there is nothing to compare
 
     sft::molecule_descriptor_t descriptor;
-    if (!sft::build_descriptor(*molecule, descriptor)) return;
-    std::vector<std::uint8_t> native_atom_types(descriptor.num_atoms);
-    sfmmff::native_compute_mmff_atom_types(descriptor, native_atom_types);
-    std::vector<float> native_formal_charges(descriptor.num_atoms), native_partial_charges(descriptor.num_atoms);
-    sfmmff::native_compute_mmff_formal_charges(descriptor, native_atom_types, native_formal_charges);
-    sfmmff::native_compute_mmff_partial_charges(descriptor, tables_, native_atom_types, native_formal_charges,
-                                                native_partial_charges);
+    if (!sft::build_descriptor(*molecule, descriptor)) return; // an element or a bond order we do not carry
+    scratch.resize(descriptor.num_atoms);
+    sfmmff::native_compute_mmff_atom_types(descriptor, scratch.atom_types);
+    sfmmff::native_compute_mmff_formal_charges(descriptor, scratch.atom_types, scratch.formal_charges);
+    sfmmff::native_compute_mmff_partial_charges(descriptor, tables, scratch.atom_types, scratch.formal_charges,
+                                                scratch.partial_charges);
 
-    ++n_mols_tested_;
-    bool this_mol_ok = true;
+    ++tally.molecules;
+    std::size_t mismatching_atoms = 0;
     for (std::uint32_t atom_index = 0; atom_index < descriptor.num_atoms; ++atom_index) {
-        ++n_atoms_checked_;
         std::uint8_t const rdkit_atom_type = props.getMMFFAtomType(atom_index);
-        if (rdkit_atom_type != native_atom_types[atom_index]) {
-            ++n_atoms_mismatch_;
-            this_mol_ok = false;
-            if (verbose && mismatches_.size() < max_reported_mismatches_)
-                mismatches_.push_back(summary_t {(int)descriptor.element[atom_index], rdkit_atom_type,
-                                                 native_atom_types[atom_index], smiles});
-        }
-        if (rdkit_atom_type == native_atom_types[atom_index]) {
-            ++n_charges_checked_;
-            float const rdkit_partial_charge = (float)props.getMMFFPartialCharge(atom_index);
-            float const diff = std::fabs(rdkit_partial_charge - native_partial_charges[atom_index]);
-            if (diff > 1e-3f) {
-                ++n_charges_mismatch_;
-                this_mol_ok = false;
-                if (verbose && mismatches_.size() < max_reported_mismatches_) {
-                    summary_t mismatch;
-                    mismatch.element = (int)descriptor.element[atom_index];
-                    mismatch.smiles = std::string("chg ") + smiles + " (rdk=" + std::to_string(rdkit_partial_charge) +
-                                      " nat=" + std::to_string(native_partial_charges[atom_index]) + ")";
-                    mismatches_.push_back(mismatch);
-                }
-            }
-        }
+        auto atom = reporters.atom_type.mismatch("mmff_typer", "smiles={} atom={} element={}", smiles, atom_index,
+                                                 descriptor.element[atom_index]);
+        atom.field("atom_type", rdkit_atom_type, scratch.atom_types[atom_index], exactly_equal_);
+        bool const types_agree = atom.reported_field_count() == 0;
+        mismatching_atoms += !types_agree;
+        if (!types_agree) continue; // a wrong type gives a wrong charge, so the charge says nothing
+
+        auto charge = reporters.partial_charge.mismatch("mmff_typer", "smiles={} atom={} element={}", smiles,
+                                                        atom_index, descriptor.element[atom_index]);
+        charge.field("partial_charge", static_cast<float>(props.getMMFFPartialCharge(atom_index)),
+                     scratch.partial_charges[atom_index], charge_within_tolerance_);
+        mismatching_atoms += charge.reported_field_count() != 0;
     }
-    if (!this_mol_ok) ++n_mols_mismatch_;
+    if (mismatching_atoms != 0) ++tally.molecules_mismatched;
 }
+
 } // namespace smallfield::tests
 
-namespace sftest = smallfield::tests;
-
-using sftest::max_reported_mismatches_;
-using sftest::mismatches_;
-using sftest::n_atoms_checked_;
-using sftest::n_atoms_mismatch_;
-using sftest::n_charges_checked_;
-using sftest::n_charges_mismatch_;
-using sftest::n_mols_mismatch_;
-using sftest::n_mols_tested_;
-using sftest::tables_;
-using sftest::tables_host_;
-using sftest::test_one_;
-
 int main(int argc, char **argv) {
-    fmt::println("test_mmff_typer: native MMFF atom-typer + BCI charge gate vs RDKit");
-    sfparam::extract_mmff94_tables_from_rdkit(tables_host_);
-    tables_ = tables_host_.view();
+    fmt::println("{}: native MMFF atom-typer + BCI charge gate vs RDKit", test_name_k);
 
-    std::vector<std::string> probe = {
-        "CC(=O)OC1=CC=CC=C1C(=O)O",
-        "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
-        "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O",
-        "CC(=O)NC1=CC=C(O)C=C1",
-        "[NH2+]=C(N)N",
-        "CC(=O)[O-]",
-        "c1cc[nH+]c(c1)",
-        "C1CCOC1",
-        "C1CC1",
-        "c1ccc2[nH]ccc2c1",
-        "O=N(=O)c1ccccc1",
-        "CCO",
-        "c1ccsc1",
+    auto const corpus = sftest::select_corpus(argc, argv, 5000);
+    if (corpus.knob == sftest::corpus_knob_t::refused_k) {
+        std::fflush(stdout);
+        fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", test_name_k);
+        return 2;
+    }
+
+    sfparam::mmff94_tables_host_t tables_host;
+    sfparam::extract_mmff94_tables_from_rdkit(tables_host);
+    sfparam::mmff94_tables_view_t const tables = tables_host.view();
+
+    std::vector<std::string> const probe = {
+        "CC(=O)OC1=CC=CC=C1C(=O)O", "CN1C=NC2=C1C(=O)N(C(=O)N2C)C", "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O",
+        "CC(=O)NC1=CC=C(O)C=C1", "[NH2+]=C(N)N", "CC(=O)[O-]", "c1cc[nH+]c(c1)", "C1CCOC1", "C1CC1", "c1ccc2[nH]ccc2c1",
+        "O=N(=O)c1ccccc1", "CCO", "c1ccsc1",
         // Regression witnesses, one per way the typer used to read the descriptor wrong.
         "CC1=CC=CC=[N+]1[O-]",                                              // aromatic N-oxide: O is 32, not 35
         "CC1=C(C=CN=C1C2=CC(=CC(=C2)Cl)[NH+](O)[O-])CC#N",                  // hydroxylammonium O the typer refused
@@ -181,49 +192,57 @@ int main(int argc, char **argv) {
         "CC(C)NC(=O)C1=CC(=C(C=C1)C2=C3C=CC(=O)C=C3OC4=C2C=CC(=C4)O)C(=O)O" // quinoid single bond, fused system
     };
 
-    std::size_t const capacity = (argc > 2) ? std::strtoull(argv[2], nullptr, 10) : 5000;
-    for (auto const &smiles : probe) test_one_(smiles, true);
-    if (argc > 1) {
-        std::ifstream corpus_file(argv[1]);
-        std::string line;
-        std::size_t loaded = 0;
-        while (std::getline(corpus_file, line) && loaded < capacity) {
-            if (line.empty() || line[0] == '#') continue;
-            auto separator_position = line.find_first_of(" \t");
-            if (separator_position != std::string::npos) line.resize(separator_position);
-            if (!line.empty()) {
-                test_one_(line, mismatches_.size() < max_reported_mismatches_);
-                ++loaded;
-            }
-        }
+    // A named corpus that does not open is a failure, never an empty run: the ppm gate below is
+    // loosened for external structures, and loosening it while comparing nothing passes everything.
+    std::vector<std::string> external;
+    if (corpus.knob == sftest::corpus_knob_t::named_k) {
+        auto const outcome = sftest::load_smiles_into(corpus.path, corpus.max_molecules, external);
+        if (outcome != sftest::smiles_load_t::loaded_k)
+            return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), corpus.path);
     }
+    fmt::println("probing {} curated + {} external SMILES", fmt::group_digits(probe.size()),
+                 fmt::group_digits(external.size()));
+
+    sftest::typer_reporters_t reporters;
+    reporters.limit_printed_lines(sftest::max_reported_mismatches_k);
+    sftest::typer_tally_t tally;
+    sftest::native_typing_scratch_t scratch;
+    for (auto const &smiles : probe) sftest::test_one_(smiles, tables, reporters, scratch, tally);
+    for (auto const &smiles : external) sftest::test_one_(smiles, tables, reporters, scratch, tally);
 
     fmt::println("molecules: {} tested, {} with at least one type or charge mismatch",
-                 fmt::group_digits(n_mols_tested_), fmt::group_digits(n_mols_mismatch_));
-    fmt::println("atoms: {} checked, {} type mismatches", fmt::group_digits(n_atoms_checked_),
-                 fmt::group_digits(n_atoms_mismatch_));
-    fmt::println("charges: {} checked, {} mismatches (> 1e-3)", fmt::group_digits(n_charges_checked_),
-                 fmt::group_digits(n_charges_mismatch_));
-    double const atom_match = n_atoms_checked_ ? 100.0 * (1.0 - (double)n_atoms_mismatch_ / n_atoms_checked_) : 100.0;
-    double const molecule_match = n_mols_tested_ ? 100.0 * (1.0 - (double)n_mols_mismatch_ / n_mols_tested_) : 100.0;
-    double const charge_match = n_charges_checked_ ? 100.0 * (1.0 - (double)n_charges_mismatch_ / n_charges_checked_)
-                                                   : 100.0;
+                 fmt::group_digits(tally.molecules), fmt::group_digits(tally.molecules_mismatched));
+    bool const sections_passed = reporters.summarize_sections();
+
+    std::size_t const atoms_checked = reporters.atom_type.comparison_count();
+    std::size_t const charges_checked = reporters.partial_charge.comparison_count();
+    double const atom_match = atoms_checked
+                                  ? 100.0 * (1.0 - (double)reporters.atom_type.mismatch_count() / (double)atoms_checked)
+                                  : 100.0;
+    double const charge_match = charges_checked ? 100.0 * (1.0 - (double)reporters.partial_charge.mismatch_count() /
+                                                                     (double)charges_checked)
+                                                : 100.0;
+    double const molecule_match = tally.molecules
+                                      ? 100.0 * (1.0 - (double)tally.molecules_mismatched / (double)tally.molecules)
+                                      : 100.0;
     fmt::println("atom match: {:.3f} %, charge match: {:.3f} %, molecule match: {:.3f} %", atom_match, charge_match,
                  molecule_match);
-    if (!mismatches_.empty()) std::fflush(stdout);
-    for (auto const &mismatch : mismatches_)
-        fmt::println(stderr, "MISMATCH mmff_typer smiles={} element={} field=atom_type rdkit={} native={}",
-                     mismatch.smiles, mismatch.element, mismatch.expected, mismatch.got);
-    double const molecule_mismatch_ppm = n_mols_tested_ ? 1.0e6 * (double)n_mols_mismatch_ / (double)n_mols_tested_
-                                                        : 0.0;
+
+    double const molecule_mismatch_ppm = tally.molecules
+                                             ? 1.0e6 * (double)tally.molecules_mismatched / (double)tally.molecules
+                                             : 0.0;
     fmt::println("molecule mismatch: {:.3f} ppm", molecule_mismatch_ppm);
     // Gate on molecules. The curated probe set carries a witness for every known typing hazard and must be
-    // exact; an external corpus gets 100 ppm of slack for structures nobody has triaged yet, which is still
-    // tight enough that a single structural class — the smallest seen was five molecules in 18 344 — fails it.
-    double const max_molecule_mismatch_ppm = (argc > 1) ? 100.0 : 0.0;
+    // exact; a corpus that actually loaded gets 100 ppm of slack for structures nobody has triaged yet,
+    // which is still tight enough that a single structural class — the smallest seen was five molecules in
+    // 18 344 — fails it. Keying the slack on whether molecules arrived rather than on `argc` is what stops
+    // a mistyped path from buying the slack while comparing no external molecule at all.
+    double const max_molecule_mismatch_ppm = external.empty() ? 0.0 : 100.0;
     if (molecule_mismatch_ppm > max_molecule_mismatch_ppm)
         return sftest::report_fail(test_name_k, "{} of {} molecules mismatched, {:.3f} ppm > {:.3f} ppm",
-                                   n_mols_mismatch_, n_mols_tested_, molecule_mismatch_ppm,
+                                   tally.molecules_mismatched, tally.molecules, molecule_mismatch_ppm,
                                    max_molecule_mismatch_ppm);
+    if (!sections_passed)
+        return sftest::report_fail(test_name_k, "a comparison section mismatched or compared nothing at all");
     return sftest::report_pass(test_name_k);
 }

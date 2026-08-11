@@ -39,8 +39,8 @@ static bool is_output_shard(fs::path const &path) {
            filename.compare(filename.size() - suffix_k.size(), suffix_k.size(), suffix_k) == 0;
 }
 
-std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path const &output_dir, bool resume,
-                                           logger_t const *log) {
+std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path const &output_dir,
+                                           restart_policy_t restart_policy, logger_t const *log) {
     std::vector<shard_pair_t> shards;
     logger_t const fallback;
     logger_t const &logger = log != nullptr ? *log : fallback;
@@ -63,7 +63,7 @@ std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path c
         pair.output_path = output_dir / (out_stem + ".parquet");
         pair.input_num_rows = parquet_row_count(pair.input_path);
         pair.already_complete = false;
-        if (resume) {
+        if (restart_policy == restart_policy_t::resume_k) {
             fs::path const sentinel = pair.output_path;
             std::string sentinel_string = sentinel.string() + ".encoded";
             pair.already_complete = fs::exists(fs::path(sentinel_string), error_code);

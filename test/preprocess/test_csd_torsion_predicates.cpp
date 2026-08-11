@@ -11,24 +11,30 @@
  *     the set of `(atom_1,atom_2,atom_3,atom_4)` torsion indices and considered as an unordered multi-set modulo
  *     endpoint swap, since the central bond is symmetric.
  *
- *  Molecule corpus is tiered via env-var:
- *   - default: ChEMBL 200-molecule smoke set, <1 s runtime.
- *   - `SMALLFIELD_TEST_CORPUS=/path/to.smi`: stream SMILES from the file.
- *   - `SMALLFIELD_TEST_MAX_MOLS=<N>`: cap molecules per corpus.
+ *  Molecule corpus:
+ *   - default: the builtin standards, which already reach every predicate, so a fresh clone stays green.
+ *   - `argv[1]`, or `SMALLFIELD_TEST_CORPUS`: stream SMILES from a `.smi` file. A named path that does not
+ *     open is a failure, never an empty run.
+ *   - `argv[2]`, or `SMALLFIELD_TEST_MAX_MOLS`: cap molecules per corpus.
  *
  *  Divergence means the native implementation's semantics differ from RDKit — always debug the native side, never
  *  weaken the assertion.
  */
 
-#include <cstdlib> // `std::exit`, `std::getenv`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint8_t`, `std::uint32_t`
+#include <cstdio>  // `std::fflush`, `stdout`
 #include <cstring> // `std::memset`
 
-#include <algorithm>     // `std::unique`, `std::min`
+#include <algorithm>     // `std::min`
+#include <iterator>      // `std::size`
 #include <memory>        // `std::unique_ptr`
 #include <set>           // `std::set`
 #include <string>        // `std::string`
 #include <string_view>   // `std::string_view`
+#include <tuple>         // `std::tuple`
 #include <unordered_set> // `std::unordered_set`
+#include <utility>       // `std::move`, `std::swap`
 #include <vector>        // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
@@ -52,48 +58,138 @@ namespace sftest = smallfield::tests;
 
 static constexpr std::string_view test_name_k = "test_csd_torsion_predicates";
 
-namespace smallfield::tests {
-
-/** One recursive sub-query body, as it appears between `$(` and its matching `)`. */
-struct recursive_case_t {
-    char const *body;
-    sfp::recursive_pool_t pool;
-    std::uint8_t root;
+/**
+ *  @brief Every distinct `$(...)` body the CSD torsion corpus writes, as it appears between `$(` and `)`.
+ *
+ *  Each is compiled through the same path the pattern compiler uses and cross-checked atom by atom
+ *  against RDKit. The single characters carry the chemistry: `H` counts hydrogens, `X` the connection
+ *  count, `r` ring membership, a lower-case element symbol aromaticity, and `@` ring closure.
+ */
+static constexpr std::string_view recursive_bodies_k[] = {
+    "C([F])([F])[F]",
+    "C([NX3])N",
+    "C([NX3])n",
+    "C=O",
+    "N(C)[!#1]",
+    "N(C)~[!#1]",
+    "N[CX4]",
+    "S(=O)(=O)",
+    "S(=O)=O",
+    "[CX3](=[!O])",
+    "[CX3]([C])([H])",
+    "[CX3](a)=O",
+    "[CX3]=O",
+    "[CX4&r]([C;r])([C;r])",
+    "[CX4H1]C(=O)O",
+    "[C](=O)",
+    "[C](=O)([$([NX3H1]),$([NX3H2])])[NX3H1]",
+    "[NH0][CX4]",
+    "[NH1,NH2,CH2]",
+    "[NH1]",
+    "[NX3H1,NX3H2]",
+    "[NX3H1]",
+    "[NX3H1]C",
+    "[NX3H2]",
+    "[NX3](c([nH1])n)",
+    "[NX3](c([nX2H0])([nX2H0]))",
+    "[NX3](cn)",
+    "[NX3]c[nH0]",
+    "[N][!#1]",
+    "[N][CX4]",
+    "[aH0](!@O)",
+    "[a]([cH1])",
+    "[a]([nH0,o])",
+    "[c&r6](c[OH])",
+    "[cH0]!@;-[*^2]",
+    "[cH0](=O)",
+    "[cH0](Cl)",
+    "[cH0](F)",
+    "[cH0]([$([NX3H2]),$([NX3H1])])",
+    "[cH0]([CX3])",
+    "[cH0]@;-[*^2]",
+    "[cH0]Cl",
+    "[cH0]F",
+    "[cH0][NH1,NH2]",
+    "[cH0][OH0]",
+    "[cH0][OH1]",
+    "[c]([NH1,NH2])",
+    "[c]([cH,nX2H0])[cH,nX2H0]",
+    "[n,N](-a)",
+    "a([!nX2H0])([nX2H0])!@;-[NX3H1]",
+    "a([!nX2H0])([nX2H0])@;-[NX3H1]",
+    "aC(=O)(O)",
+    "a[NH1,NH2]",
+    "a[OH1]",
+    "c!@c",
+    "c([nX2H0])([nX2H0])",
+    "c([nX2H0])(a(a)(a))!@;-c[nX2H0]",
+    "c([nX2H0])(a(a)(a))@;-c[nX2H0]",
+    "cO",
 };
 
-/** Return the set of root-atom indices hit by `SubstructMatch(query)` in `molecule`. */
-static std::unordered_set<std::uint32_t> rdkit_root_match_set_(RDKit::ROMol const &molecule,
-                                                               RDKit::ROMol const &query) {
+namespace smallfield::tests {
+
+/** One torsion, as the four atom indices its pattern labelled `:1 :2 :3 :4`. */
+using torsion_tuple_t = std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>;
+
+/**
+ *  @brief One recursive sub-query body, compiled by both of the matchers under comparison.
+ *
+ *  Both sides compile once for the whole sweep rather than once per molecule, so what the corpus
+ *  loop exercises is matching rather than parsing.
+ */
+struct recursive_case_t {
+    std::string_view body;
+    sfp::recursive_pool_t pool;
+    std::uint8_t root;
+    std::unique_ptr<RDKit::ROMol const> query;
+};
+
+/**
+ *  @brief Comparison buffers the sweep owns, cleared at each use rather than rebuilt.
+ *
+ *  `matches` and `rdkit_roots` keep their capacity across molecules, so the inner loop over the
+ *  pattern corpus stops growing them after the first few.
+ */
+struct match_scratch_t {
     std::vector<RDKit::MatchVectType> matches;
+    std::unordered_set<std::uint32_t> rdkit_roots;
+    std::set<torsion_tuple_t> rdkit_tuples;
+    std::set<torsion_tuple_t> native_tuples;
+};
+
+/** Collect into @p roots the root-atom indices `SubstructMatch(query)` hits in `molecule`. */
+static void fill_rdkit_root_matches_into_(RDKit::ROMol const &molecule, RDKit::ROMol const &query,
+                                          std::vector<RDKit::MatchVectType> &matches,
+                                          std::unordered_set<std::uint32_t> &roots) {
+    matches.clear();
+    roots.clear();
     RDKit::SubstructMatch(molecule, query, matches, /*uniquify=*/false, /*recursionPossible=*/true);
-    std::unordered_set<std::uint32_t> roots;
     for (auto const &match : matches) {
         if (match.empty()) continue;
         roots.insert(static_cast<std::uint32_t>(match[0].second));
     }
-    return roots;
 }
 
 /** Cross-validate one compiled sub-query against RDKit on one molecule. */
 static void validate_recursive_for_molecule_(recursive_case_t const &compiled, RDKit::ROMol const &molecule,
-                                             sft::molecule_descriptor_t const &descriptor, std::string const &smiles) {
-    std::unique_ptr<RDKit::ROMol const> query(RDKit::SmartsToMol(compiled.body));
-    sf_verify_(query != nullptr, compiled.body);
-
-    auto const rdkit_roots = rdkit_root_match_set_(molecule, *query);
+                                             sft::molecule_descriptor_t const &descriptor, std::string const &smiles,
+                                             match_scratch_t &scratch) {
+    fill_rdkit_root_matches_into_(molecule, *compiled.query, scratch.matches, scratch.rdkit_roots);
 
     std::uint32_t const num_atoms = descriptor.num_atoms;
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
         bool const native_hit = sfp::recursive_query_match(descriptor, atom, compiled.pool, compiled.root);
-        bool const rdkit_hit = (rdkit_roots.count(atom) != 0);
+        bool const rdkit_hit = (scratch.rdkit_roots.count(atom) != 0);
         if (native_hit != rdkit_hit) {
             std::fflush(stdout);
-            fmt::println(stderr, "MISMATCH csd_subquery body=$({}) smiles={} atom={} field=root_match rdkit={} native={}",
+            fmt::println(stderr,
+                         "MISMATCH csd_subquery body=$({}) smiles={} atom={} field=root_match rdkit={} native={}",
                          compiled.body, smiles, atom, rdkit_hit ? 1 : 0, native_hit ? 1 : 0);
-            fmt::println(stderr, "NOTE csd_subquery atom={} element={} aromatic={} degree={} num_hydrogens={} hybridization={}",
-                         atom, descriptor.element[atom],
-                         sft::atom_has_flag(descriptor, atom, sft::atom_flag_aromatic_k) ? 1 : 0,
-                         descriptor.degree[atom], descriptor.num_hydrogens[atom], descriptor.hybridization[atom]);
+            fmt::println(
+                stderr, "NOTE csd_subquery atom={} element={} aromatic={} degree={} num_hydrogens={} hybridization={}",
+                atom, descriptor.element[atom], sft::atom_has_flag(descriptor, atom, sft::atom_flag_aromatic_k) ? 1 : 0,
+                descriptor.degree[atom], descriptor.num_hydrogens[atom], descriptor.hybridization[atom]);
             sf_verify_(false, "sub-query mismatch vs RDKit");
         }
     }
@@ -105,12 +201,14 @@ static void validate_recursive_for_molecule_(recursive_case_t const &compiled, R
  *  atom_2↔atom_3) yields the same canonical form — the native matcher and RDKit may emit the two
  *  orientations in different order, but the torsion semantics is symmetric.
  */
-static std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>> rdkit_torsion_tuples_(
-    RDKit::ROMol const &molecule, sfp::csd_compiled_pattern_t const &compiled_pattern) {
-    std::vector<RDKit::MatchVectType> matches;
+static void fill_rdkit_torsion_tuples_into_(RDKit::ROMol const &molecule,
+                                            sfp::csd_compiled_pattern_t const &compiled_pattern,
+                                            std::vector<RDKit::MatchVectType> &matches,
+                                            std::set<torsion_tuple_t> &out) {
+    matches.clear();
+    out.clear();
     RDKit::SubstructMatch(molecule, *compiled_pattern.pattern, matches, /*uniquify=*/false,
                           /*recursionPossible=*/true);
-    std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>> out;
     for (auto const &match : matches) {
         std::uint32_t atom_1 = static_cast<std::uint32_t>(match[compiled_pattern.index[0]].second);
         std::uint32_t atom_2 = static_cast<std::uint32_t>(match[compiled_pattern.index[1]].second);
@@ -123,7 +221,6 @@ static std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_
         out.emplace(static_cast<std::uint8_t>(atom_1), static_cast<std::uint8_t>(atom_2),
                     static_cast<std::uint8_t>(atom_3), static_cast<std::uint8_t>(atom_4));
     }
-    return out;
 }
 
 /**
@@ -133,7 +230,8 @@ static std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_
 static std::size_t validate_patterns_for_molecule_(RDKit::ROMol const &molecule,
                                                    sft::molecule_descriptor_t const &descriptor,
                                                    std::string const &smiles,
-                                                   std::vector<sfp::csd_compiled_pattern_t> const &patterns) {
+                                                   std::vector<sfp::csd_compiled_pattern_t> const &patterns,
+                                                   match_scratch_t &scratch) {
     std::uint8_t done_bonds_u8[sft::max_bonds_k] = {};
     std::size_t ok = 0;
     for (auto const &compiled_pattern : patterns) {
@@ -142,7 +240,8 @@ static std::size_t validate_patterns_for_molecule_(RDKit::ROMol const &molecule,
         // Collect native matches. We cannot use the dispatcher's `done_bonds`
         // shortcut here because we want @b every emission, not just the first
         // per bond; use a fresh stub that never marks the bond done.
-        std::set<std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t>> native_tuples;
+        std::set<torsion_tuple_t> &native_tuples = scratch.native_tuples;
+        native_tuples.clear();
         std::memset(done_bonds_u8, 0, sizeof(done_bonds_u8));
         sfp::match_linear_pattern(
             descriptor, compiled_pattern.native_form, done_bonds_u8,
@@ -157,7 +256,8 @@ static std::size_t validate_patterns_for_molecule_(RDKit::ROMol const &molecule,
                 return false; // keep scanning — we want every emission
             });
 
-        auto const rdkit_tuples = rdkit_torsion_tuples_(molecule, compiled_pattern);
+        std::set<torsion_tuple_t> const &rdkit_tuples = scratch.rdkit_tuples;
+        fill_rdkit_torsion_tuples_into_(molecule, compiled_pattern, scratch.matches, scratch.rdkit_tuples);
         if (native_tuples != rdkit_tuples) {
             std::fflush(stdout);
             fmt::println(stderr,
@@ -172,176 +272,171 @@ static std::size_t validate_patterns_for_molecule_(RDKit::ROMol const &molecule,
     return ok;
 }
 
-} // namespace smallfield::tests
-
-using sftest::recursive_case_t;
-using sftest::validate_patterns_for_molecule_;
-using sftest::validate_recursive_for_molecule_;
-
-int main() {
-    fmt::println("test_csd_torsion_predicates: native CSD predicates and patterns vs RDKit SubstructMatch");
-
-    // Every distinct `$(...)` body the CSD torsion corpus writes, compiled through the
-    // same path the pattern compiler uses and cross-checked atom by atom against RDKit.
-    recursive_case_t cases[] = {
-        {.body = "C([F])([F])[F]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "C([NX3])N", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "C([NX3])n", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "C=O", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "N(C)[!#1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "N(C)~[!#1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "N[CX4]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "S(=O)(=O)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "S(=O)=O", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[CX3](=[!O])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[CX3]([C])([H])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[CX3](a)=O", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[CX3]=O", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[CX4&r]([C;r])([C;r])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[CX4H1]C(=O)O", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[C](=O)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[C](=O)([$([NX3H1]),$([NX3H2])])[NX3H1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NH0][CX4]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NH1,NH2,CH2]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NH1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NX3H1,NX3H2]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NX3H1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NX3H1]C", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NX3H2]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NX3](c([nH1])n)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NX3](c([nX2H0])([nX2H0]))", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NX3](cn)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[NX3]c[nH0]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[N][!#1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[N][CX4]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[aH0](!@O)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[a]([cH1])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[a]([nH0,o])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[c&r6](c[OH])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0]!@;-[*^2]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0](=O)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0](Cl)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0](F)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0]([$([NX3H2]),$([NX3H1])])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0]([CX3])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0]@;-[*^2]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0]Cl", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0]F", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0][NH1,NH2]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0][OH0]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[cH0][OH1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[c]([NH1,NH2])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[c]([cH,nX2H0])[cH,nX2H0]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "[n,N](-a)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "a([!nX2H0])([nX2H0])!@;-[NX3H1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "a([!nX2H0])([nX2H0])@;-[NX3H1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "aC(=O)(O)", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "a[NH1,NH2]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "a[OH1]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "c!@c", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "c([nX2H0])([nX2H0])", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "c([nX2H0])(a(a)(a))!@;-c[nX2H0]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "c([nX2H0])(a(a)(a))@;-c[nX2H0]", .pool = {}, .root = sfp::no_recursive_node_k},
-        {.body = "cO", .pool = {}, .root = sfp::no_recursive_node_k},
-    };
-    for (auto &compiled : cases) {
+/**
+ *  @brief Compile every body in `recursive_bodies_k` on both sides of the comparison.
+ *
+ *  The native side goes through the path the pattern compiler itself takes; the RDKit side is
+ *  built once here so no molecule in the sweep pays to reparse it.
+ */
+static void compile_recursive_cases_into_(std::vector<recursive_case_t> &cases) {
+    cases.clear();
+    cases.reserve(std::size(recursive_bodies_k));
+    for (std::string_view const body : recursive_bodies_k) {
+        recursive_case_t compiled {.body = body,
+                                   .pool = {},
+                                   .root = sfp::no_recursive_node_k,
+                                   .query = std::unique_ptr<RDKit::ROMol const>(RDKit::SmartsToMol(std::string(body)))};
         compiled.pool.num_nodes = 0;
-        sf_verify_(sfp::compile_recursive_body(compiled.body, 0, compiled.pool, compiled.root), compiled.body);
+        sf_verify_(compiled.query != nullptr, fmt::format("RDKit could not compile the sub-query $({})", body));
+        sf_verify_(sfp::compile_recursive_body(compiled.body, 0, compiled.pool, compiled.root),
+                   fmt::format("the native compiler rejected the sub-query $({})", body));
+        cases.push_back(std::move(compiled));
     }
+}
 
-    // Corpus selection: env-var override → tier-1/tier-2; default → built-in
-    // standard molecules + ChEMBL valid set.
-    char const *corpus_path = std::getenv("SMALLFIELD_TEST_CORPUS");
-    char const *max_mols_env = std::getenv("SMALLFIELD_TEST_MAX_MOLS");
-    std::size_t const max_mols = max_mols_env ? static_cast<std::size_t>(std::atoll(max_mols_env)) : 200;
-
-    std::vector<std::string> smiles_list;
-    if (corpus_path) {
-        smiles_list = sftest::load_smiles(corpus_path, max_mols, sftest::smiles_missing_file_t::aborts_k);
-        fmt::println("Corpus: {} (up to {} molecules)", corpus_path, fmt::group_digits(max_mols));
-    }
-    else {
-        // The extended corpus is a convenience, not a prerequisite: absent it the builtin
-        // standards still exercise every predicate, so the suite stays green on a fresh clone
-        // instead of reporting a failure that hides real ones.
-        smiles_list = sftest::standard_test_smiles();
-        auto extended = sftest::load_smiles("/tmp/chembl_valid.smi", max_mols * 2,
-                                            sftest::smiles_missing_file_t::returns_empty_k);
-        bool const have_extended = !extended.empty();
-        for (auto &entry : extended) smiles_list.push_back(std::move(entry));
-        if (have_extended)
-            fmt::println("Corpus: builtin standards + /tmp/chembl_valid.smi (up to {} molecules)",
-                         fmt::group_digits(max_mols));
-        else fmt::println("Corpus: builtin standards only; set SMALLFIELD_TEST_CORPUS for a wider sweep");
-    }
-
-    auto const &patterns = sfp::csd_patterns();
+/** Announce the pattern corpus, and report how many of its patterns the native matcher parses. */
+static std::size_t announce_pattern_corpus_(std::vector<sfp::csd_compiled_pattern_t> const &patterns) {
     std::size_t native_patterns = 0;
     for (auto const &pattern : patterns)
         if (pattern.native) ++native_patterns;
+    double const native_percent = 100.0 * static_cast<double>(native_patterns) / static_cast<double>(patterns.size());
     fmt::println("CSD patterns: {} total, {} native ({:.3f}%)", fmt::group_digits(patterns.size()),
-                 fmt::group_digits(native_patterns), 100.0 * native_patterns / static_cast<double>(patterns.size()));
+                 fmt::group_digits(native_patterns), native_percent);
+    return native_patterns;
+}
 
-    std::size_t total_validated = 0;
+/** Why a corpus molecule was left out of the sweep, or that it was not. */
+enum class molecule_admission_t {
+    /** Parsed, hydrogenated, and inside every descriptor capacity. */
+    admitted_k,
+    /** `SmilesToMol` refused it, or `addHs` threw on it. */
+    unparsable_k,
+    /** Beyond `max_atoms_per_molecule_k` or `max_bonds_k`. */
+    exceeds_atom_or_bond_capacity_k,
+    /** More SSSR rings than `max_rings_k`. */
+    exceeds_ring_capacity_k,
+    /** `build_descriptor` refused it. */
+    no_descriptor_k,
+};
+
+/**
+ *  @brief Parse @p smiles, add hydrogens, and build the flat descriptor both matchers read.
+ *
+ *  @param[in] smiles Molecule to rebuild, as it appears in the corpus.
+ *  @param[out] molecule Reset to the parsed, hydrogenated molecule when it is admitted.
+ *  @param[out] descriptor Filled when the molecule is admitted, untouched otherwise.
+ *  @return Whether the molecule joins the sweep, and why it does not when it does not.
+ */
+static molecule_admission_t admit_molecule_(std::string const &smiles, std::unique_ptr<RDKit::RWMol> &molecule,
+                                            sft::molecule_descriptor_t &descriptor) {
+    molecule.reset(RDKit::SmilesToMol(smiles));
+    if (!molecule) return molecule_admission_t::unparsable_k;
+    try {
+        RDKit::MolOps::addHs(*molecule);
+    }
+    catch (...) {
+        return molecule_admission_t::unparsable_k;
+    }
+    if (molecule->getNumAtoms() > sft::max_atoms_per_molecule_k || molecule->getNumBonds() > sft::max_bonds_k)
+        return molecule_admission_t::exceeds_atom_or_bond_capacity_k;
+
+    // Ring-based pattern constraints silently under-match past the descriptor's ring capacity,
+    // because `atom_ring_bitmap` and `smallest_ring` are only populated for rings [0, max_rings_k).
+    // Pathological polycyclic cages -- the fused-cyclopropane P+ scaffold in USearch, say -- are the
+    // only inputs that reach it, and the production preprocess rejects them upstream via the
+    // 128-atom cap for everything except spiro cages.
+    auto const *ring_info = molecule->getRingInfo();
+    if (ring_info != nullptr && ring_info->isInitialized() && ring_info->atomRings().size() > sft::max_rings_k)
+        return molecule_admission_t::exceeds_ring_capacity_k;
+
+    if (!sft::build_descriptor(*molecule, descriptor)) return molecule_admission_t::no_descriptor_k;
+    return molecule_admission_t::admitted_k;
+}
+
+/** What one sweep over a SMILES corpus compared. */
+struct predicate_tally_t {
+    std::size_t validated = 0;
     std::size_t skipped = 0;
-    std::size_t total_pattern_checks = 0;
-    std::size_t validated_sub_queries = 0;
+    std::size_t sub_query_checks = 0;
+    std::size_t pattern_checks = 0;
+};
 
+/**
+ *  @brief Sweep a corpus: every sub-query at every atom, then every native pattern, molecule by molecule.
+ *
+ *  @param[in] smiles_list Corpus to walk, in order.
+ *  @param[in] cases Compiled sub-queries to cross-check.
+ *  @param[in] patterns Compiled CSD torsion patterns; only the natively parsed ones are compared.
+ *  @param[in] max_molecules Stop once this many molecules have been validated.
+ *  @param[inout] tally Counters advanced by every molecule.
+ */
+static void validate_corpus_(std::vector<std::string> const &smiles_list, std::vector<recursive_case_t> const &cases,
+                             std::vector<sfp::csd_compiled_pattern_t> const &patterns, std::size_t max_molecules,
+                             predicate_tally_t &tally) {
+    std::unique_ptr<RDKit::RWMol> molecule;
+    sft::molecule_descriptor_t descriptor;
+    match_scratch_t scratch;
     for (auto const &smiles : smiles_list) {
-        std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
-        if (!molecule) {
-            ++skipped;
-            continue;
-        }
-        try {
-            RDKit::MolOps::addHs(*molecule);
-        }
-        catch (...) {
-            ++skipped;
-            continue;
-        }
-        if (molecule->getNumAtoms() > sft::max_atoms_per_molecule_k || molecule->getNumBonds() > sft::max_bonds_k) {
-            ++skipped;
-            continue;
-        }
-
-        // Skip molecules whose SSSR exceeds the descriptor's ring capacity
-        // (`max_rings_k = 32`). Ring-based pattern constraints silently
-        // under-match for such inputs because `atom_ring_bitmap` / `smallest_ring`
-        // are only populated for rings [0, max_rings_k). Pathological
-        // polycyclic cages (e.g. fused-cyclopropane P+-scaffold in USearch)
-        // are the only inputs that trigger this — the production pipeline
-        // rarely encounters them, and the preprocess rejects them upstream
-        // via the 128-atom cap for everything except spiro cages.
-        auto const *ring_info = molecule->getRingInfo();
-        if (ring_info != nullptr && ring_info->isInitialized() && ring_info->atomRings().size() > sft::max_rings_k) {
-            ++skipped;
-            continue;
-        }
-
-        sft::molecule_descriptor_t descriptor;
-        if (!sft::build_descriptor(*molecule, descriptor)) {
-            ++skipped;
+        if (admit_molecule_(smiles, molecule, descriptor) != molecule_admission_t::admitted_k) {
+            ++tally.skipped;
             continue;
         }
 
         for (auto const &compiled : cases) {
-            validate_recursive_for_molecule_(compiled, *molecule, descriptor, smiles);
-            ++validated_sub_queries;
+            validate_recursive_for_molecule_(compiled, *molecule, descriptor, smiles, scratch);
+            ++tally.sub_query_checks;
         }
 
         // Full-pattern byte-equivalence pass across every native pattern.
-        total_pattern_checks += validate_patterns_for_molecule_(*molecule, descriptor, smiles, patterns);
+        tally.pattern_checks += validate_patterns_for_molecule_(*molecule, descriptor, smiles, patterns, scratch);
 
-        ++total_validated;
-        if (total_validated >= max_mols) break;
+        ++tally.validated;
+        if (tally.validated >= max_molecules) break;
+    }
+}
+
+} // namespace smallfield::tests
+
+using sftest::recursive_case_t;
+
+int main(int argc, char **argv) {
+    fmt::println("{}: native CSD predicates and patterns vs RDKit SubstructMatch", test_name_k);
+
+    auto const selection = sftest::select_corpus(argc, argv, 200);
+    if (selection.knob == sftest::corpus_knob_t::refused_k) {
+        fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", argv[0]);
+        return 2;
     }
 
-    fmt::println("Validated {} molecules (skipped {}), {} sub-query checks", fmt::group_digits(total_validated),
-                 fmt::group_digits(skipped), fmt::group_digits(validated_sub_queries));
-    fmt::println("Pattern checks: {} (= {} molecules x {} native patterns)", fmt::group_digits(total_pattern_checks),
-                 fmt::group_digits(total_validated), fmt::group_digits(native_patterns));
-    std::size_t const expected_min = std::min<std::size_t>(max_mols, 8);
-    sf_verify_(total_validated >= expected_min, "fewer molecules validated than the corpus floor — bad test data?");
+    std::vector<recursive_case_t> cases;
+    sftest::compile_recursive_cases_into_(cases);
+
+    std::vector<std::string> smiles_list;
+    if (selection.knob == sftest::corpus_knob_t::named_k) {
+        auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, smiles_list);
+        if (outcome != sftest::smiles_load_t::loaded_k)
+            return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), selection.path);
+        fmt::println("Corpus: {} ({} molecules)", selection.path, fmt::group_digits(smiles_list.size()));
+    }
+    else {
+        // The builtin standards already exercise every predicate, so a fresh clone with no corpus
+        // to hand stays green rather than reporting a failure that would hide the real ones.
+        smiles_list = sftest::standard_test_smiles();
+        fmt::println("Corpus: builtin standards only; name a .smi file on the command line " //
+                     "or in SMALLFIELD_TEST_CORPUS for a wider sweep");
+    }
+
+    auto const &patterns = sfp::csd_patterns();
+    std::size_t const native_patterns = sftest::announce_pattern_corpus_(patterns);
+
+    sftest::predicate_tally_t tally;
+    sftest::validate_corpus_(smiles_list, cases, patterns, selection.max_molecules, tally);
+
+    fmt::println("Validated {} molecules (skipped {}), {} sub-query checks", fmt::group_digits(tally.validated),
+                 fmt::group_digits(tally.skipped), fmt::group_digits(tally.sub_query_checks));
+    fmt::println("Pattern checks: {} (= {} molecules x {} native patterns)", fmt::group_digits(tally.pattern_checks),
+                 fmt::group_digits(tally.validated), fmt::group_digits(native_patterns));
+    std::size_t const expected_min = std::min<std::size_t>(selection.max_molecules, 8);
+    sf_verify_(tally.validated >= expected_min, "fewer molecules validated than the corpus floor — bad test data?");
     return sftest::report_pass(test_name_k);
 }

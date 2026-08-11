@@ -30,17 +30,25 @@ struct shard_pair_t {
     bool already_complete;
 };
 
+/** Whether an output shard that already carries its `.encoded` sentinel is kept or produced again. */
+enum class restart_policy_t {
+    /** A shard whose sentinel exists is complete, so the run skips it. */
+    resume_k,
+    /** Every shard is pending, so the run overwrites the outputs it finds. */
+    restart_k,
+};
+
 /**
  *  @brief Inventory every `*.parquet` file in @p input_dir, excluding any `*.3D.parquet` siblings, compute
  *  the matching output path in @p output_dir, and mark shards whose `<output>.encoded` sentinel exists as
  *  `already_complete`.
  *
- *  @param[in] resume when true, already-complete shards are flagged; when false,
- *         all outputs are considered pending (caller will overwrite).
+ *  @param[in] restart_policy Whether an existing sentinel marks a shard complete, or is ignored so the
+ *         caller reproduces every output.
  *  @param[in] log Logger diagnostics are reported through; null falls back to a default one.
  */
 std::vector<shard_pair_t> inventory_shards(std::filesystem::path const &input_dir,
-                                           std::filesystem::path const &output_dir, bool resume,
+                                           std::filesystem::path const &output_dir, restart_policy_t restart_policy,
                                            logger_t const *log = nullptr);
 
 /**

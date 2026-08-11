@@ -26,43 +26,62 @@ namespace sftest = smallfield::tests;
 
 static constexpr std::string_view test_name_k = "test_ez_stereo";
 
+/**
+ *  @brief A double bond's configuration, including the answer "the geometry carries none".
+ *
+ *  The third state is the point. Split across a `bool` return and a `bool` out-parameter, "not cis"
+ *  and "nothing to perceive" render identically, so a caller that consults only the return classifies
+ *  every unperceived conformer as trans and the suite silently stops testing what it was written for.
+ */
+enum class bond_stereo_t {
+    /** Z / cis. */
+    cis_k,
+    /** E / trans. */
+    trans_k,
+    /** No double bond in the molecule carried assignable stereo. */
+    unperceived_k,
+};
+
+/** The literal a bond stereo prints as. */
+static std::string_view bond_stereo_name(bond_stereo_t stereo) noexcept {
+    switch (stereo) {
+    case bond_stereo_t::cis_k: return "cis";
+    case bond_stereo_t::trans_k: return "trans";
+    default: return "unperceived";
+    }
+}
+
 /** One isomer under test and the bond stereo its SMILES declares. */
 struct ez_case_t {
     char const *smiles;
-    /** True for Z / cis, false for E / trans. */
-    bool expect_cis;
+    bond_stereo_t declared;
 };
 
-/** Perceive bond stereo from 3D and report whether any double bond is cis. */
-static bool perceived_any_cis(RDKit::RWMol &molecule, bool &found_stereo) {
+/** Perceive bond stereo from 3D; the first double bond RDKit can assign decides the answer. */
+static bond_stereo_t perceived_bond_stereo(RDKit::RWMol &molecule) {
     RDKit::MolOps::assignStereochemistryFrom3D(molecule);
-    found_stereo = false;
     for (auto const *bond : molecule.bonds()) {
         auto const stereo = bond->getStereo();
-        if (stereo == RDKit::Bond::STEREOZ || stereo == RDKit::Bond::STEREOCIS) {
-            found_stereo = true;
-            return true;
-        }
-        if (stereo == RDKit::Bond::STEREOE || stereo == RDKit::Bond::STEREOTRANS) {
-            found_stereo = true;
-            return false;
-        }
+        if (stereo == RDKit::Bond::STEREOZ || stereo == RDKit::Bond::STEREOCIS) return bond_stereo_t::cis_k;
+        if (stereo == RDKit::Bond::STEREOE || stereo == RDKit::Bond::STEREOTRANS) return bond_stereo_t::trans_k;
     }
-    return false;
+    return bond_stereo_t::unperceived_k;
 }
 
 int main() {
+    fmt::println("{}: generated conformers round-tripped through RDKit against their declared E/Z", test_name_k);
+
     // Each pair differs only in double-bond configuration, so a stereo-blind bounds
     // envelope produces indistinguishable geometry for both members.
     std::vector<ez_case_t> const cases = {
-        {"C/C=C/C", false},        // trans-2-butene
-        {"C/C=C\\C", true},        // cis-2-butene
-        {"C/C=C/CC", false},       // trans-2-pentene
-        {"C/C=C\\CC", true},       // cis-2-pentene
-        {"Cl/C=C/Cl", false},      // trans-1,2-dichloroethene
-        {"Cl/C=C\\Cl", true},      // cis-1,2-dichloroethene
-        {"C/C=C/c1ccccc1", false}, // trans-beta-methylstyrene
-        {"C/C=C\\c1ccccc1", true}, // cis-beta-methylstyrene
+        {"C/C=C/C", bond_stereo_t::trans_k},        // trans-2-butene
+        {"C/C=C\\C", bond_stereo_t::cis_k},         // cis-2-butene
+        {"C/C=C/CC", bond_stereo_t::trans_k},       // trans-2-pentene
+        {"C/C=C\\CC", bond_stereo_t::cis_k},        // cis-2-pentene
+        {"Cl/C=C/Cl", bond_stereo_t::trans_k},      // trans-1,2-dichloroethene
+        {"Cl/C=C\\Cl", bond_stereo_t::cis_k},       // cis-1,2-dichloroethene
+        {"C/C=C/c1ccccc1", bond_stereo_t::trans_k}, // trans-beta-methylstyrene
+        {"C/C=C\\c1ccccc1", bond_stereo_t::cis_k},  // cis-beta-methylstyrene
     };
 
     std::vector<std::string> smiles_storage;
@@ -107,19 +126,19 @@ int main() {
                     interleaved[atom * 3 + axis] = __half2float(coords[base + axis * max_atoms + atom]);
             sftest::set_coords_interleaved(*molecule, interleaved.data());
 
-            bool found_stereo = false;
-            bool const is_cis = perceived_any_cis(*molecule, found_stereo);
+            bond_stereo_t const perceived = perceived_bond_stereo(*molecule);
             ++checked;
-            if (!found_stereo) {
+            if (perceived == bond_stereo_t::unperceived_k) {
                 ++unperceived;
                 continue;
             }
-            if (is_cis == cases[mol_index].expect_cis) ++matched;
+            if (perceived == cases[mol_index].declared) ++matched;
             else {
                 std::fflush(stdout);
-                fmt::println(stderr, "MISMATCH ez_stereo smiles={} conformer={} field=bond_stereo declared={} perceived={}",
-                             cases[mol_index].smiles, conformer, cases[mol_index].expect_cis ? "cis" : "trans",
-                             is_cis ? "cis" : "trans");
+                fmt::println(stderr,
+                             "MISMATCH ez_stereo smiles={} conformer={} field=bond_stereo declared={} perceived={}",
+                             cases[mol_index].smiles, conformer, bond_stereo_name(cases[mol_index].declared),
+                             bond_stereo_name(perceived));
             }
         }
     }

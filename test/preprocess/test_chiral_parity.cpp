@@ -24,6 +24,7 @@
  */
 
 #include <cmath>   // `std::fabs`
+#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`, `std::uint8_t`
 
 #include <algorithm>   // `std::find`, `std::min`, `std::sort`
@@ -42,6 +43,7 @@
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
+#include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
@@ -50,22 +52,47 @@ namespace sftest = smallfield::tests;
 
 static constexpr std::string_view test_name_k = "test_chiral_parity";
 
+/** A stereo-rich corpus can disagree at thousands of centers, and ten lines already name the pattern. */
+static constexpr std::size_t max_printed_lines_k = 10;
+
 namespace smallfield::tests {
 
-/** Running tally of both oracles, shared by every corpus this test walks. */
+/**
+ *  @brief Census of the centers each oracle saw and of the ones it had to decline.
+ *
+ *  Only what the reporters below do not already hold: they own every comparison and every
+ *  mismatch, and `summarize` prints those, so counting them a second time here would be two
+ *  bookkeeping schemes for one fact.
+ */
 struct oracle_tally_t {
     std::uint64_t molecules = 0;
     std::uint64_t centers = 0;
     std::uint64_t three_coordinate = 0;
-    std::uint64_t cip_compared = 0;
-    std::uint64_t cip_mismatches = 0;
     std::uint64_t rank_ties = 0;
     std::uint64_t unlabeled = 0;
-    std::uint64_t geometry_compared = 0;
     std::uint64_t geometry_three_coordinate = 0;
-    std::uint64_t geometry_mismatches = 0;
     std::uint64_t embed_failures = 0;
 };
+
+/**
+ *  @brief One diagnostic sink per oracle, so each closes its own `compared=` section.
+ *
+ *  The two speak for different populations - the CIP oracle declines ties and three-coordinate
+ *  centers, the geometric one declines near-planar arrangements - so a single shared count could
+ *  never say which oracle a comparison came from.
+ */
+struct oracle_reporters_t {
+    diagnostic_reporter_t cip {"cip", "derived"};
+    diagnostic_reporter_t geometry {"embedded", "derived"};
+
+    void limit_printed_lines(std::size_t maximum) noexcept {
+        cip.limit_printed_lines(maximum);
+        geometry.limit_printed_lines(maximum);
+    }
+};
+
+/** Both oracles answer with a signed-volume sign, and a sign agrees only exactly. */
+static bool signs_agree_(int reference, int observed) noexcept { return reference == observed; }
 
 /**
  *  @brief Parity of the permutation carrying @p from onto @p to.
@@ -113,11 +140,12 @@ static bool any_rank_tie_(RDKit::UINT_VECT const &cip_ranks, std::span<std::uint
  *  @param[in] descriptor Flat descriptor the centers were extracted from.
  *  @param[in] centers Extracted chiral center descriptors.
  *  @param[in] label Printed alongside any mismatch so the offender is identifiable.
+ *  @param[inout] reporters Sink that counts and prints the CIP oracle's comparisons.
  *  @param[inout] tally Counters advanced by this molecule.
  */
 static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
                                std::vector<sft::chiral_center_descriptor_t> const &centers, std::string const &label,
-                               oracle_tally_t &tally) {
+                               oracle_reporters_t &reporters, oracle_tally_t &tally) {
     RDKit::UINT_VECT cip_ranks(molecule.getNumAtoms(), 0);
     RDKit::Chirality::assignAtomCIPRanks(molecule, cip_ranks);
 
@@ -168,17 +196,8 @@ static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descr
         sf_verify_(parity != 0, "emitted neighbors must be a permutation of the CIP-ordered neighbors");
         int const expected_sign = reference_sign * parity;
 
-        ++tally.cip_compared;
-        if (center.target_sign != expected_sign) {
-            ++tally.cip_mismatches;
-            if (tally.cip_mismatches <= 10) {
-                std::fflush(stdout);
-                fmt::println(stderr,
-                             "MISMATCH chiral_parity oracle=cip molecule={} atom={} cip_code={} field=target_sign "
-                             "oracle={:+} derived={:+}",
-                             label, atom, cip_code, expected_sign, static_cast<int>(center.target_sign));
-            }
-        }
+        reporters.cip.mismatch("chiral_parity", "oracle=cip molecule={} atom={} cip_code={}", label, atom, cip_code)
+            .field("target_sign", expected_sign, static_cast<int>(center.target_sign), signs_agree_);
     }
 }
 
@@ -189,11 +208,12 @@ static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descr
  *  @param[in] descriptor Flat descriptor the centers were extracted from.
  *  @param[in] centers Extracted chiral center descriptors.
  *  @param[in] label Printed alongside any mismatch so the offender is identifiable.
+ *  @param[inout] reporters Sink that counts and prints the geometric oracle's comparisons.
  *  @param[inout] tally Counters advanced by this molecule.
  */
 static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
                                     std::vector<sft::chiral_center_descriptor_t> const &centers,
-                                    std::string const &label, oracle_tally_t &tally) {
+                                    std::string const &label, oracle_reporters_t &reporters, oracle_tally_t &tally) {
     RDKit::RWMol embedded(molecule);
     if (!sftest::embed_molecule(embedded)) {
         ++tally.embed_failures;
@@ -218,20 +238,12 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
         // A near-planar arrangement carries no handedness to compare against.
         if (std::fabs(volume) < 0.5) continue;
 
-        ++tally.geometry_compared;
         if (descriptor.degree[center.center_atom] < 4) ++tally.geometry_three_coordinate;
         int const realized_sign = (volume > 0.0) ? 1 : -1;
-        if (center.target_sign != realized_sign) {
-            ++tally.geometry_mismatches;
-            if (tally.geometry_mismatches <= 10) {
-                std::fflush(stdout);
-                fmt::println(stderr,
-                             "MISMATCH chiral_parity oracle=geometry molecule={} atom={} field=target_sign "
-                             "embedded={:+} target={:+} signed_volume={:.3f}",
-                             label, static_cast<unsigned>(center.center_atom), realized_sign,
-                             static_cast<int>(center.target_sign), volume);
-            }
-        }
+        reporters.geometry
+            .mismatch("chiral_parity", "oracle=geometry molecule={} atom={} signed_volume={}", label,
+                      static_cast<unsigned>(center.center_atom), volume)
+            .field("target_sign", realized_sign, static_cast<int>(center.target_sign), signs_agree_);
     }
 }
 
@@ -249,10 +261,11 @@ enum class chiral_oracles_t {
  *  @param[inout] molecule Molecule with explicit hydrogens; stereochemistry is assigned in place.
  *  @param[in] label Printed alongside any mismatch.
  *  @param[in] oracles Which oracles to run; embedding is what makes the geometric one expensive.
+ *  @param[inout] reporters Sinks the requested oracles report through.
  *  @param[inout] tally Counters advanced by this molecule.
  */
 static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, chiral_oracles_t oracles,
-                            oracle_tally_t &tally) {
+                            oracle_reporters_t &reporters, oracle_tally_t &tally) {
     if (molecule.getNumAtoms() > sft::max_atoms_per_molecule_k || molecule.getNumBonds() > sft::max_bonds_k) return;
 
     sft::molecule_descriptor_t descriptor;
@@ -265,9 +278,9 @@ static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, ch
 
     // The extraction has already run `assignStereochemistry`, so the CIP labels and ranks
     // below describe exactly the molecule the descriptors were derived from.
-    check_against_cip_(molecule, descriptor, centers, label, tally);
+    check_against_cip_(molecule, descriptor, centers, label, reporters, tally);
     if (oracles == chiral_oracles_t::cip_and_geometry_k)
-        check_against_geometry_(molecule, descriptor, centers, label, tally);
+        check_against_geometry_(molecule, descriptor, centers, label, reporters, tally);
 }
 
 /**
@@ -312,9 +325,10 @@ static std::vector<std::string> stereo_test_smiles_() {
  *  so the oracle stays honest across the whole stereoisomer family.
  *
  *  @param[in] smiles Molecule to expand.
+ *  @param[inout] reporters Sinks both oracles report through.
  *  @param[inout] tally Counters advanced by every variant.
  */
-static void check_stereoisomers_(std::string const &smiles, oracle_tally_t &tally) {
+static void check_stereoisomers_(std::string const &smiles, oracle_reporters_t &reporters, oracle_tally_t &tally) {
     auto base = sftest::mol_from_smiles(smiles);
     sf_verify_(base != nullptr, "curated SMILES must parse");
 
@@ -336,12 +350,12 @@ static void check_stereoisomers_(std::string const &smiles, oracle_tally_t &tall
             variant.getAtomWithIdx(tagged_atoms[position])
                 ->setChiralTag(clockwise ? RDKit::Atom::CHI_TETRAHEDRAL_CW : RDKit::Atom::CHI_TETRAHEDRAL_CCW);
         }
-        check_molecule_(variant, smiles, chiral_oracles_t::cip_and_geometry_k, tally);
+        check_molecule_(variant, smiles, chiral_oracles_t::cip_and_geometry_k, reporters, tally);
     }
 }
 
 /**
- *  @brief Print one tally block.
+ *  @brief Print one census block; the comparison counts belong to the reporters' own sections.
  *
  *  @param[in] heading Line printed above the counters.
  *  @param[in] tally Counters to report.
@@ -350,29 +364,31 @@ static void report_(std::string_view heading, oracle_tally_t const &tally) {
     fmt::println("  {}", heading);
     fmt::println("    molecules {}, centers {} ({} three-coordinate)", fmt::group_digits(tally.molecules),
                  fmt::group_digits(tally.centers), fmt::group_digits(tally.three_coordinate));
-    fmt::println("    CIP oracle: {} compared, {} mismatches, {} skipped on rank ties, {} unlabeled",
-                 fmt::group_digits(tally.cip_compared), fmt::group_digits(tally.cip_mismatches),
-                 fmt::group_digits(tally.rank_ties), fmt::group_digits(tally.unlabeled));
-    fmt::println("    geometry oracle: {} compared ({} three-coordinate), {} mismatches, {} embeddings failed",
-                 fmt::group_digits(tally.geometry_compared), fmt::group_digits(tally.geometry_three_coordinate),
-                 fmt::group_digits(tally.geometry_mismatches), fmt::group_digits(tally.embed_failures));
+    fmt::println("    CIP oracle: {} skipped on rank ties, {} unlabeled", fmt::group_digits(tally.rank_ties),
+                 fmt::group_digits(tally.unlabeled));
+    fmt::println("    geometry oracle: {} three-coordinate centers reached, {} embeddings failed",
+                 fmt::group_digits(tally.geometry_three_coordinate), fmt::group_digits(tally.embed_failures));
 }
 
 } // namespace smallfield::tests
 
 int main(int argc, char **argv) {
     sftest::oracle_tally_t curated;
+    sftest::oracle_reporters_t reporters;
+    reporters.limit_printed_lines(max_printed_lines_k);
 
-    fmt::println("test_chiral_parity: curated stereo set with exhaustive tag enumeration");
-    for (auto const &smiles : sftest::stereo_test_smiles_()) sftest::check_stereoisomers_(smiles, curated);
+    fmt::println("{}: curated stereo set with exhaustive tag enumeration", test_name_k);
+    for (auto const &smiles : sftest::stereo_test_smiles_()) sftest::check_stereoisomers_(smiles, reporters, curated);
     sftest::report_("curated", curated);
-    sf_verify_(curated.cip_compared >= 400, "curated set must reach several hundred CIP comparisons");
+    reporters.cip.summarize("curated_cip");
+    reporters.geometry.summarize("curated_geometry");
+    sf_verify_(reporters.cip.comparison_count() >= 400, "curated set must reach several hundred CIP comparisons");
     sf_verify_(curated.three_coordinate > 0, "curated set must exercise three-coordinate centers");
     sf_verify_(curated.rank_ties > 0, "curated set must exercise a pseudo-asymmetric center");
-    sf_verify_(curated.geometry_compared >= 50, "curated set must reach the geometric oracle");
+    sf_verify_(reporters.geometry.comparison_count() >= 50, "curated set must reach the geometric oracle");
     sf_verify_(curated.geometry_three_coordinate > 0, "geometric oracle must reach a three-coordinate center");
-    sf_verify_(curated.cip_mismatches == 0, "every curated stereocenter must match the CIP oracle");
-    sf_verify_(curated.geometry_mismatches == 0, "every curated stereocenter must match its embedded geometry");
+    sf_verify_(reporters.cip.passed(), "every curated stereocenter must match the CIP oracle");
+    sf_verify_(reporters.geometry.passed(), "every curated stereocenter must match its embedded geometry");
 
     auto const selection = sftest::select_corpus(argc, argv, 20000);
     if (selection.knob == sftest::corpus_knob_t::refused_k) {
@@ -391,6 +407,7 @@ int main(int argc, char **argv) {
         fmt::println("{}: corpus {}, {} SMILES", test_name_k, selection.path, fmt::group_digits(corpus.size()));
 
         sftest::oracle_tally_t corpus_tally;
+        std::size_t const cip_before_corpus = reporters.cip.comparison_count();
         for (auto const &smiles : corpus) {
             // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs
             // inside the guard alongside `addHs`.
@@ -398,19 +415,21 @@ int main(int argc, char **argv) {
                 std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
                 if (!molecule) continue;
                 RDKit::MolOps::addHs(*molecule);
-                sftest::check_molecule_(*molecule, smiles, sftest::chiral_oracles_t::cip_only_k, corpus_tally);
+                sftest::check_molecule_(*molecule, smiles, sftest::chiral_oracles_t::cip_only_k, reporters,
+                                        corpus_tally);
             }
             catch (...) {
                 continue;
             }
         }
         sftest::report_("corpus", corpus_tally);
-        // The same reasoning one level down: every molecule may have been skipped, and a tally of zero
-        // comparisons is indistinguishable from a tally of zero mismatches.
-        if (corpus_tally.cip_compared == 0)
+        reporters.cip.summarize("corpus_cip");
+        // The same reasoning one level down: every molecule may have been skipped, and a section of zero
+        // comparisons is indistinguishable from a section of zero mismatches.
+        if (reporters.cip.comparison_count() == cip_before_corpus)
             return sftest::report_fail(test_name_k, "corpus {} produced no CIP comparisons over {} SMILES",
                                        selection.path, corpus.size());
-        sf_verify_(corpus_tally.cip_mismatches == 0, "every corpus stereocenter must match the CIP oracle");
+        sf_verify_(reporters.cip.passed(), "every corpus stereocenter must match the CIP oracle");
     }
 
     return sftest::report_pass(test_name_k);

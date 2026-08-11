@@ -150,6 +150,25 @@ assert_rejects "a real decorative ruler" src/smallfield/note.hpp \
 assert_rejects "a real backward-looking comment" src/smallfield/note.hpp \
     '/* This field is no longer used by the packer. */' "carries backward-looking prose"
 
+# The banner rule reaches the string-literal form that `check_rulers` cannot: that one anchors the
+# whole line and requires a comment marker, so every banner a binary actually prints slips past it.
+assert_rejects "a decorative banner in printed output" bench/note.cpp \
+    '    fmt::println("=== System B: SmallField GPU ===");' "prints a decorative banner"
+assert_accepts "a Doxygen table drawn with dashes" cli/note.hpp \
+    ' *  |----------|-------|'
+assert_rejects "a once_flag guarding initialization" cli/note.cpp \
+    '    static std::once_flag flag;' "guards initialization with a once_flag"
+assert_accepts "a comment explaining why once_flag is banned" cli/note.cpp \
+    '    // A std::call_once here would add a flag and no guarantee a magic static lacks.'
+assert_rejects "an absolute path in a source file" bench/note.cpp \
+    '    std::string corpus = "/tmp/chembl_valid.smi";' "names an absolute path"
+# A docstring example teaches the next reader the wrong habit as effectively as a default does, so
+# this rule is the one that does NOT blank comments before matching.
+assert_rejects "an absolute path in a docstring example" bench/note.py \
+    '#     python validate_parquet.py --input /tmp/usearch_10M_3D' "names an absolute path"
+assert_accepts "a relative path under data/" bench/note.py \
+    '#     python validate_parquet.py --input data/usearch-molecules/pubchem/3d'
+
 # A violation sharing a line with a leading comment must still be caught. Blanking comment text
 # rather than dropping the whole line is what makes this reachable.
 assert_rejects "a violation behind a leading comment" src/smallfield/note.hpp \
@@ -171,7 +190,7 @@ assert_accepts "an adversarial but clean header" src/smallfield/clean.hpp \
 
 namespace smallfield {
 
-/** Reads the corpus at `/tmp/corpus.smi` and matches `[O:1]=[C:2]!@;-[O:3]`. */
+/** Reads the corpus at `data/corpus.smi` and matches `[O:1]=[C:2]!@;-[O:3]`. */
 template <typename allocator_>
 class byte_buffer {
     std::size_t count = 0;

@@ -7,12 +7,13 @@
  *  must agree exactly — same four atom indices in the same order, same six Fourier coefficients bit for bit.
  *  Anything less means the POD mirror of a pattern lost something on the way to the device.
  *
- *  Corpus: the built-in standards by default, so a fresh clone stays green; point `SMALLFIELD_TEST_CORPUS` at a
- *  `.smi` file, colon-separated for several, for a wide sweep.
+ *  Corpus: the built-in standards by default, so a fresh clone stays green; name a `.smi` file in `argv[1]` or in
+ *  `SMALLFIELD_TEST_CORPUS`, colon-separated for several, for a wide sweep. A named path that does not open is a
+ *  failure, never an empty run.
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
-#include <cstdlib> // `std::exit`, `std::getenv`
+#include <cstdlib> // `std::exit`
 #include <cstring> // `std::memcpy`
 
 #include <chrono>      // `std::chrono::steady_clock`, `std::chrono::duration`
@@ -72,15 +73,15 @@ static torsion_key_t torsion_key_(sft::etk_torsion_descriptor_t const &torsion) 
 /** Split a colon-separated corpus list into its paths.
  *  @param[in] value Colon-separated list.
  *  @return The individual paths. */
-static std::vector<std::string> split_paths_(char const *value) {
+static std::vector<std::string> split_paths_(std::string_view value) {
     std::vector<std::string> paths;
     std::string current;
-    for (char const *cursor = value; *cursor != '\0'; ++cursor) {
-        if (*cursor == ':') {
+    for (char const character : value) {
+        if (character == ':') {
             if (!current.empty()) paths.push_back(current);
             current.clear();
         }
-        else { current.push_back(*cursor); }
+        else { current.push_back(character); }
     }
     if (!current.empty()) paths.push_back(current);
     return paths;
@@ -119,21 +120,25 @@ using sftest::torsion_key_;
 using sftest::torsion_key_t;
 using sftest::torsion_stride_k;
 
-int main() {
-    fmt::println("test_csd_torsion_device: device CSD torsion matcher vs host extractor");
+int main(int argc, char **argv) {
+    fmt::println("{}: device CSD torsion matcher vs host extractor", test_name_k);
 
     std::vector<std::string> smiles_list = sftest::standard_test_smiles();
-    char const *corpus_env = std::getenv("SMALLFIELD_TEST_CORPUS");
-    char const *max_molecules_env = std::getenv("SMALLFIELD_TEST_MAX_MOLS");
-    std::size_t const max_molecules = max_molecules_env ? static_cast<std::size_t>(std::atoll(max_molecules_env))
-                                                        : 100000;
-    if (corpus_env != nullptr)
-        for (auto const &path : split_paths_(corpus_env)) {
-            auto loaded = sftest::load_smiles(path, max_molecules, sftest::smiles_missing_file_t::aborts_k);
+    auto const selection = sftest::select_corpus(argc, argv, 100000);
+    if (selection.knob == sftest::corpus_knob_t::refused_k) {
+        fmt::println(stderr, "usage: {} [corpus.smi[:corpus.smi...]] [max_molecules]", argv[0]);
+        return 2;
+    }
+    if (selection.knob == sftest::corpus_knob_t::named_k)
+        for (auto const &path : split_paths_(selection.path)) {
+            std::vector<std::string> loaded;
+            auto const outcome = sftest::load_smiles_into(path, selection.max_molecules, loaded);
+            if (outcome != sftest::smiles_load_t::loaded_k)
+                return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), path);
             fmt::println("Corpus: {} ({} molecules)", path, fmt::group_digits(loaded.size()));
             for (auto &smiles : loaded) smiles_list.push_back(std::move(smiles));
         }
-    else fmt::println("Corpus: builtin standards only; set SMALLFIELD_TEST_CORPUS for a wider sweep");
+    else fmt::println("Corpus: builtin standards only; name one on the command line or in SMALLFIELD_TEST_CORPUS");
 
     std::size_t table_bytes = 0;
     void *table_handle = sftest::create_csd_torsion_device_table(table_bytes);

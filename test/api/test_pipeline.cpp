@@ -6,12 +6,15 @@
  *  arithmetic and the per-wave timing bookkeeping that surround it.
  */
 
-#include <cmath>   // `std::isfinite`
+#include <cmath>   // `std::isfinite`, `std::fabs`, `std::sqrt`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
 #include <cstdio>  // `std::tmpfile`, `std::sscanf` -- the wave-table capture below reads a `FILE *`
 
+#include <algorithm>   // `std::min`
 #include <array>       // `std::array`
+#include <limits>      // `std::numeric_limits`
+#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -25,10 +28,15 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;
 
 static constexpr std::string_view test_name_k = "test_pipeline";
+
+/** Molecules taken from a named corpus when no cap is given; the built-in molecules are always included. */
+static constexpr std::size_t default_max_molecules_k = 100;
+
+/** Printed mismatch lines one corpus may spend; the rest are counted and reported as `suppressed`. */
+static constexpr std::size_t max_reported_mismatches_k = 20;
 
 namespace smallfield::api {
 
@@ -45,6 +53,110 @@ std::uint32_t reserve_molecules_per_device(std::uint32_t wave_size, std::uint32_
 
 namespace smallfield::tests {
 
+using api::conformer_status_t;
+
+/** Every field compared here is an exact quantity, so one predicate serves the whole file. */
+static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
+
+#pragma region Wave Sizing Arithmetic
+
+/**
+ *  @brief The tightest-slot budget must survive a total probe failure.
+ *
+ *  With no free-VRAM reading at all the sizer used to fall through to zero and then to its
+ *  hardcoded 50'000 default, because the only assignment to the total-VRAM census sat inside the
+ *  branch that a successful free reading guards.
+ */
+static void check_wave_budget_arithmetic(diagnostic_reporter_t &reporter) {
+    constexpr std::size_t gigabyte_k = 1024ull * 1024ull * 1024ull;
+
+    /** One `wave_budget_bytes` census and the budget the sizer owes it. */
+    struct budget_case_t {
+        std::size_t free_probe_count;
+        std::size_t free_per_slot_bytes;
+        std::size_t total_per_slot_bytes;
+        std::size_t expected_budget_bytes;
+    };
+    constexpr std::array<budget_case_t, 5> cases {{
+        // At least one device answered: 75 % of the tightest free slot, headroom for peak allocation,
+        // and that tightest slot binds however many devices answered.
+        {.free_probe_count = 1,
+         .free_per_slot_bytes = 8 * gigabyte_k,
+         .total_per_slot_bytes = 80 * gigabyte_k,
+         .expected_budget_bytes = 6 * gigabyte_k},
+        {.free_probe_count = 4,
+         .free_per_slot_bytes = 8 * gigabyte_k,
+         .total_per_slot_bytes = 80 * gigabyte_k,
+         .expected_budget_bytes = 6 * gigabyte_k},
+        // No device answered: half of the tightest total slot, which is the degraded estimate — not
+        // zero, and not the free reading, which is meaningless in this arm and may not leak into it.
+        {.free_probe_count = 0,
+         .free_per_slot_bytes = 0,
+         .total_per_slot_bytes = 80 * gigabyte_k,
+         .expected_budget_bytes = 40 * gigabyte_k},
+        {.free_probe_count = 0,
+         .free_per_slot_bytes = 8 * gigabyte_k,
+         .total_per_slot_bytes = 80 * gigabyte_k,
+         .expected_budget_bytes = 40 * gigabyte_k},
+        // Nothing known about the hardware at all: zero, which is what drops the sizer onto its default.
+        {.free_probe_count = 0, .free_per_slot_bytes = 0, .total_per_slot_bytes = 0, .expected_budget_bytes = 0},
+    }};
+
+    for (auto const &budget_case : cases)
+        reporter
+            .mismatch("wave_budget", "free_probes={} free_per_slot={} total_per_slot={}", budget_case.free_probe_count,
+                      budget_case.free_per_slot_bytes, budget_case.total_per_slot_bytes)
+            .field("budget_bytes", budget_case.expected_budget_bytes,
+                   api::wave_budget_bytes(budget_case.free_probe_count, budget_case.free_per_slot_bytes,
+                                          budget_case.total_per_slot_bytes),
+                   exactly_equal_);
+    reporter.summarize("wave_budget");
+}
+
+/**
+ *  @brief The per-device reservation must reach its answer by arithmetic, not by two wraps.
+ *
+ *  Checks the quotient as well as the reservation: the zero-device case used to underflow to
+ *  `0xFFFFFFFF`, divide by one, and wrap back to zero, landing on the right final number for
+ *  entirely the wrong reason.
+ */
+static void check_per_device_reservation(diagnostic_reporter_t &reporter) {
+    /** One wave spread over one device count, with both numbers the split owes it. */
+    struct division_case_t {
+        std::uint32_t wave_size;
+        std::uint32_t device_count;
+        std::uint32_t expected_quotient;
+        std::uint32_t expected_reservation;
+    };
+    constexpr std::array<division_case_t, 5> cases {{
+        // No devices and no wave: nothing to divide, and the floor is one slot.
+        {.wave_size = 0u, .device_count = 0u, .expected_quotient = 0u, .expected_reservation = 1u},
+        // One device, empty wave: the slack molecule alone.
+        {.wave_size = 0u, .device_count = 1u, .expected_quotient = 0u, .expected_reservation = 1u},
+        // No devices to spread a molecule over.
+        {.wave_size = 1u, .device_count = 0u, .expected_quotient = 0u, .expected_reservation = 1u},
+        // The ordinary case: an exact split plus slack.
+        {.wave_size = 50'000u, .device_count = 8u, .expected_quotient = 6'250u, .expected_reservation = 6'251u},
+        // Rounding up is what the reservation rests on: an uneven split may not leave a device short.
+        {.wave_size = 50'001u, .device_count = 8u, .expected_quotient = 6'251u, .expected_reservation = 6'252u},
+    }};
+
+    for (auto const &division_case : cases)
+        reporter
+            .mismatch("wave_sizing", "wave_size={} device_count={}", division_case.wave_size,
+                      division_case.device_count)
+            .field("quotient", division_case.expected_quotient,
+                   api::divide_rounding_up(division_case.wave_size, division_case.device_count), exactly_equal_)
+            .field("reservation", division_case.expected_reservation,
+                   api::reserve_molecules_per_device(division_case.wave_size, division_case.device_count),
+                   exactly_equal_);
+    reporter.summarize("wave_sizing");
+}
+
+#pragma endregion Wave Sizing Arithmetic
+
+#pragma region Wave Timeline Capture
+
 /** One row of the verbose per-wave timing table `print_wave_timeline_` emits. */
 struct wave_row_t {
     std::uint32_t wave_index;
@@ -54,75 +166,17 @@ struct wave_row_t {
 };
 
 /**
- *  @brief The tightest-slot budget must survive a total probe failure.
+ *  @brief Parse the verbose wave table out of captured logger output; ignores every other line.
  *
- *  With no free-VRAM reading at all the sizer used to fall through to zero and then to its
- *  hardcoded 50'000 default, because the only assignment to the total-VRAM census sat inside the
- *  branch that a successful free reading guards.
- */
-static void check_wave_budget_arithmetic() {
-    constexpr std::size_t gigabyte = 1024ull * 1024ull * 1024ull;
-
-    // At least one device answered: 75 % of the tightest free slot, headroom for peak allocation.
-    sf_verify_(sfapi::wave_budget_bytes(1, 8 * gigabyte, 80 * gigabyte) == 6 * gigabyte,
-               "one free probe must yield 75% of the tightest free slot");
-    sf_verify_(sfapi::wave_budget_bytes(4, 8 * gigabyte, 80 * gigabyte) == 6 * gigabyte,
-               "the tightest free slot binds regardless of how many devices answered");
-
-    // No device answered: half of the tightest total slot, which is the degraded estimate — not
-    // zero, and not the smallest_free argument, which is meaningless in this arm.
-    sf_verify_(sfapi::wave_budget_bytes(0, 0, 80 * gigabyte) == 40 * gigabyte,
-               "zero free probes must fall back to half of total VRAM");
-    sf_verify_(sfapi::wave_budget_bytes(0, 8 * gigabyte, 80 * gigabyte) == 40 * gigabyte,
-               "the free reading must not leak into the total-only arm");
-
-    // Nothing known about the hardware at all: zero, which is what drops the sizer onto its default.
-    sf_verify_(sfapi::wave_budget_bytes(0, 0, 0) == 0, "an empty census must yield a zero budget");
-}
-
-/**
- *  @brief The per-device reservation must reach its answer by arithmetic, not by two wraps.
+ *  The scan is a contract with `print_wave_timeline_` in `src/smallfield/api/smallfield.cu`, and both
+ *  halves of it are load-bearing: every logger line opens with a `[wall | +elapsed] ` prefix that the
+ *  payload starts after, and the row itself is two counts, four millisecond columns, then a literal
+ *  ` / ` before the per-wave maximum. Change either there and every row silently stops parsing, which
+ *  reads here as a timeline with no waves in it rather than as a failure.
  *
- *  Asserts the quotient as well as the reservation: the zero-device case used to underflow to
- *  `0xFFFFFFFF`, divide by one, and wrap back to zero, landing on the right final number for
- *  entirely the wrong reason.
+ *  @param[in] log_text Captured logger output, however many lines of it.
+ *  @return One entry per parsed row, in the order the table printed them.
  */
-static void check_per_device_reservation() {
-    struct division_case_t {
-        std::uint32_t wave_size;
-        std::uint32_t device_count;
-        std::uint32_t expected_quotient;
-        std::uint32_t expected_reservation;
-    };
-    constexpr std::array<division_case_t, 4> cases {{
-        {0u, 0u, 0u, 1u},              // no devices, no wave: nothing to divide, floor of one slot
-        {0u, 1u, 0u, 1u},              // one device, empty wave: the slack molecule alone
-        {1u, 0u, 0u, 1u},              // no devices to spread a molecule over
-        {50'000u, 8u, 6'250u, 6'251u}, // the ordinary case: an exact split plus slack
-    }};
-    for (auto const &division_case : cases) {
-        std::uint32_t const quotient = sfapi::divide_rounding_up(division_case.wave_size, division_case.device_count);
-        std::uint32_t const reservation = sfapi::reserve_molecules_per_device(division_case.wave_size,
-                                                                              division_case.device_count);
-        if (quotient != division_case.expected_quotient || reservation != division_case.expected_reservation) {
-            std::fflush(stdout);
-            fmt::println(stderr,
-                         "MISMATCH wave_sizing wave_size={} device_count={} field=quotient expected={} observed={}",
-                         division_case.wave_size, division_case.device_count, division_case.expected_quotient,
-                         quotient);
-            fmt::println(stderr,
-                         "MISMATCH wave_sizing wave_size={} device_count={} field=reservation expected={} observed={}",
-                         division_case.wave_size, division_case.device_count, division_case.expected_reservation,
-                         reservation);
-        }
-        sf_verify_(quotient == division_case.expected_quotient, "per-device quotient wrapped or rounded wrongly");
-        sf_verify_(reservation == division_case.expected_reservation, "per-device reservation is wrong");
-    }
-    // Rounding up is what the reservation rests on: an uneven split may not leave a device short.
-    sf_verify_(sfapi::divide_rounding_up(50'001u, 8u) == 6'251u, "an uneven split must round up");
-}
-
-/** Parse the verbose wave table out of captured logger output; ignores every other line. */
 static std::vector<wave_row_t> parse_wave_rows(std::string const &log_text) {
     std::vector<wave_row_t> rows;
     for (std::size_t line_start = 0; line_start < log_text.size();) {
@@ -145,6 +199,68 @@ static std::vector<wave_row_t> parse_wave_rows(std::string const &log_text) {
     return rows;
 }
 
+/** Every per-conformer array `generate_conformers` fills, owned together so no loop below allocates. */
+struct conformer_outputs_t {
+    std::vector<__half> coordinates;
+    std::vector<float> energies;
+    std::vector<conformer_status_t> status;
+    std::vector<std::uint8_t> num_atoms;
+
+    /**
+     *  @brief Size every array for @p num_molecules molecules addressed through @p layout.
+     *
+     *  @param[in] num_molecules Molecules the batch will carry.
+     *  @param[in] layout Slot addressing the pool and the readers of it agree on.
+     */
+    void reset_for(std::uint32_t num_molecules, api::conformer_slot_layout_t const &layout) {
+        std::size_t const slots = static_cast<std::size_t>(num_molecules) * layout.num_conformers;
+        coordinates.assign(slots * layout.slot_stride(), __half {});
+        energies.assign(slots, 0.f);
+        // Poisoned rather than zeroed, so a slot the pipeline never wrote cannot read as `success_k`.
+        status.assign(slots, conformer_status_t::invalid_smiles_k);
+        num_atoms.assign(num_molecules, std::uint8_t {0});
+    }
+};
+
+/**
+ *  @brief Generate one batch with the verbose timeline captured into @p log_text.
+ *
+ *  The logger writes to a `FILE *`, so the capture is a `std::tmpfile` rather than a string stream;
+ *  the context's own stream and verbosity are restored before returning.
+ *
+ *  @param[inout] context Context whose logger is redirected for the duration of the call.
+ *  @param[in] smiles Molecules to generate for.
+ *  @param[in] config Pipeline configuration, wave size included.
+ *  @param[in] max_atoms Atom-count cap the slots are sized against.
+ *  @param[out] outputs Coordinate, energy, status and atom-count arrays, already sized.
+ *  @param[out] log_text Cleared, then filled with everything the logger emitted.
+ *  @return The batch-level status `generate_conformers` answered with.
+ */
+static conformer_status_t generate_capturing_timeline_(api::context_t &context,
+                                                       std::span<std::string_view const> smiles,
+                                                       api::config_t const &config, std::uint32_t max_atoms,
+                                                       conformer_outputs_t &outputs, std::string &log_text) {
+    std::FILE *const capture = std::tmpfile();
+    sf_verify_(capture != nullptr, "could not open a capture stream for the wave timeline");
+    context.logger.verbose_level = 1;
+    context.logger.color_enabled = false;
+    context.logger.info_stream = capture;
+    conformer_status_t const batch_status = context.generate_conformers(
+        smiles, config, max_atoms, outputs.coordinates, outputs.energies, outputs.status, outputs.num_atoms);
+    context.logger.info_stream = stdout;
+    context.logger.verbose_level = 0;
+
+    log_text.clear();
+    std::rewind(capture);
+    for (char buffer[4096];;) {
+        std::size_t const read_bytes = std::fread(buffer, 1, sizeof(buffer), capture);
+        if (read_bytes == 0) break;
+        log_text.append(buffer, read_bytes);
+    }
+    std::fclose(capture);
+    return batch_status;
+}
+
 /**
  *  @brief A wave whose molecules preprocess rejected wholesale must report no GPU time.
  *
@@ -153,7 +269,7 @@ static std::vector<wave_row_t> parse_wave_rows(std::string const &log_text) {
  *  same two timing vectors round a 2-slot ring, so wave 2 reads the slot wave 0 wrote; a launch
  *  that returns before resetting that slot republishes wave 0's numbers as wave 2's.
  */
-static void check_empty_wave_timings() {
+static void check_empty_wave_timings(diagnostic_reporter_t &reporter) {
     std::vector<std::string_view> const smiles = {
         "CC(=O)Oc1ccccc1C(=O)O", // 21 chars
         "c1ccccc1",              // 8
@@ -162,165 +278,313 @@ static void check_empty_wave_timings() {
         "[Fe]",                  // 4 — no MMFF94 atom type, rejected by the element gate
         "[La]",                  // 4 — likewise
     };
+    /* The two rejects are the last two entries above and the status loop below walks exactly them.
+     * These bounds are a property of this fixed corpus, not a cap on how much of it is examined. */
+    constexpr std::uint32_t first_rejected_molecule_k = 4, past_last_rejected_molecule_k = 6;
 
-    constexpr std::uint32_t num_conformers = 2;
-    constexpr std::uint32_t max_atoms = 128;
-    sfapi::config_t config;
-    config.num_conformers = num_conformers;
+    constexpr std::uint32_t num_conformers_k = 2;
+    api::conformer_slot_layout_t const layout {128u, num_conformers_k};
+
+    api::config_t config;
+    config.num_conformers = num_conformers_k;
     config.wave_size = 2; // three waves over six molecules, and the pipelined path with it
     config.random_seed = 7;
 
-    std::uint32_t const total_conformers = static_cast<std::uint32_t>(smiles.size()) * num_conformers;
-    std::vector<__half> coordinates(static_cast<std::size_t>(total_conformers) * max_atoms * 3);
-    std::vector<float> energies(total_conformers);
-    std::vector<sfapi::conformer_status_t> status(total_conformers, sfapi::conformer_status_t::invalid_smiles_k);
+    conformer_outputs_t outputs;
+    outputs.reset_for(static_cast<std::uint32_t>(smiles.size()), layout);
 
     int const device_id = 0;
-    sfapi::context_t context(std::span<int const>(&device_id, 1));
-
-    std::FILE *const capture = std::tmpfile();
-    sf_verify_(capture != nullptr, "could not open a capture stream for the wave timeline");
-    context.logger.verbose_level = 1;
-    context.logger.color_enabled = false;
-    context.logger.info_stream = capture;
-    [[maybe_unused]] sfapi::conformer_status_t const batch_status = context.generate_conformers(
-        smiles, config, max_atoms, coordinates, energies, status);
-    context.logger.info_stream = stdout;
-    context.logger.verbose_level = 0;
-
+    api::context_t context(std::span<int const>(&device_id, 1));
     std::string log_text;
-    std::rewind(capture);
-    for (char buffer[4096];;) {
-        std::size_t const read_bytes = std::fread(buffer, 1, sizeof(buffer), capture);
-        if (read_bytes == 0) break;
-        log_text.append(buffer, read_bytes);
-    }
-    std::fclose(capture);
+    [[maybe_unused]] conformer_status_t const batch_status = generate_capturing_timeline_(
+        context, smiles, config, layout.max_atoms, outputs, log_text);
 
     std::vector<wave_row_t> const rows = parse_wave_rows(log_text);
     sf_verify_(rows.size() == 3, "expected three wave rows in the verbose timeline");
-
-    // The rejected molecules never reach a GPU pool, so the last wave is empty by construction.
-    sf_verify_(rows[2].molecule_count == 2, "the last wave must still carry its two rejected molecules");
+    // Waves 0 and 1 carry real molecules, and their GPU time is what keeps the empty-wave comparison
+    // below from passing on a timeline where nothing ever recorded a non-zero millisecond.
     sf_verify_(rows[0].gpu_max_ms > 0.f, "wave 0 must record real GPU time, or the check below is vacuous");
     sf_verify_(rows[1].gpu_max_ms > 0.f, "wave 1 must record real GPU time");
-    sf_verify_(rows[2].gpu_max_ms == 0.f, "an empty wave must not inherit wave 0's GPU timings");
-    sf_verify_(rows[2].gpu_average_ms == 0.f, "an empty wave must not inherit wave 0's GPU timings");
 
-    for (std::uint32_t molecule = 4; molecule < 6; ++molecule)
-        for (std::uint32_t conformer = 0; conformer < num_conformers; ++conformer)
-            sf_verify_(
-                status[molecule * num_conformers + conformer] == sfapi::conformer_status_t::unsupported_element_k,
-                "the last wave's molecules must be rejected by the element gate");
+    // The rejected molecules never reach a GPU pool, so the last wave is empty by construction.
+    reporter.mismatch("empty_wave", "wave={}", rows[2].wave_index)
+        .field("molecule_count", 2u, rows[2].molecule_count, exactly_equal_)
+        .field("gpu_max_ms", 0.f, rows[2].gpu_max_ms, exactly_equal_)
+        .field("gpu_average_ms", 0.f, rows[2].gpu_average_ms, exactly_equal_);
+    reporter.summarize("empty_wave");
 
-    fmt::println("  empty-wave timings: wave0 gpu_max={:.1f} ms, wave2 gpu_max={:.1f} ms (must be 0)",
-                 rows[0].gpu_max_ms, rows[2].gpu_max_ms);
+    for (std::uint32_t molecule = first_rejected_molecule_k; molecule < past_last_rejected_molecule_k; ++molecule)
+        for (std::uint32_t conformer = 0; conformer < num_conformers_k; ++conformer)
+            reporter
+                .mismatch("element_gate", "molecule={} conformer={} smiles={}", molecule, conformer, smiles[molecule])
+                .field("status", static_cast<unsigned>(conformer_status_t::unsupported_element_k),
+                       static_cast<unsigned>(outputs.status[molecule * num_conformers_k + conformer]), exactly_equal_);
+    reporter.summarize("element_gate");
+
+    fmt::println("  empty-wave timings: {} rows parsed, wave0 gpu_max={:.1f} ms, wave2 gpu_max={:.1f} ms (must be 0)",
+                 rows.size(), rows[0].gpu_max_ms, rows[2].gpu_max_ms);
 }
 
-} // namespace smallfield::tests
+#pragma endregion Wave Timeline Capture
 
-int main() {
-    sftest::check_wave_budget_arithmetic();
-    sftest::check_per_device_reservation();
-    sftest::check_empty_wave_timings();
-    fmt::println("test_pipeline: wave sizing + empty-wave timing checks passed");
+#pragma region RDKit Cross Validation
 
-    fmt::println("test_pipeline: end-to-end ETKDG conformer generation via library API");
+/** Beyond this the two MMFF94 implementations are counted as diverging; nothing gates on the count. */
+static constexpr double energy_agreement_kcal_k = 0.012;
 
-    auto test_smiles_str = sftest::standard_test_smiles();
-    std::vector<std::string_view> test_smiles(test_smiles_str.begin(), test_smiles_str.end());
+/**
+ *  @brief Below this an atom pair is closer than any real bond, so the geometry that carries it is not one.
+ *
+ *  The shortest bond MMFF94 parameterises is around 0.95 Å, and a returned conformer holding a pair
+ *  under half that cannot be the geometry its own energy was evaluated at. Counted rather than gated:
+ *  the divergent MMFF94 energies a clash produces are read off the same conformers.
+ */
+static constexpr double clash_distance_angstrom_k = 0.5;
 
-    constexpr std::uint32_t num_conformers = 5;
-    constexpr std::uint32_t max_atoms = 128;
+/**
+ *  @brief Distance between the two closest atoms of an interleaved `(atom, 3)` block.
+ *
+ *  @param[in] interleaved Coordinates of @p num_atoms atoms, atom-major.
+ *  @param[in] num_atoms Atoms the block carries; fewer than two has no pair and answers infinity.
+ *  @return The smallest interatomic distance in angstroms.
+ */
+static double closest_atom_pair_(float const *interleaved, std::uint32_t num_atoms) noexcept {
+    double closest = std::numeric_limits<double>::infinity();
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
+        for (std::uint32_t neighbor = atom + 1; neighbor < num_atoms; ++neighbor) {
+            double squared = 0.0;
+            for (std::uint32_t axis = 0; axis < 3u; ++axis) {
+                double const difference = interleaved[atom * 3u + axis] - interleaved[neighbor * 3u + axis];
+                squared += difference * difference;
+            }
+            closest = std::min(closest, std::sqrt(squared));
+        }
+    return closest;
+}
 
-    sfapi::config_t config;
-    config.num_conformers = num_conformers;
+/**
+ *  @brief Read one conformer slot's structure-of-arrays components into a tight interleaved `(atom, 3)` block.
+ *
+ *  The named twin of `gather_slot_into_interleaved` in `cli/parquet_writer.hpp`, which a test cannot
+ *  call because it does not link the CLI. Both go through `layout.component_offset`, so the two
+ *  spellings can only drift if the layout itself does.
+ *
+ *  @param[in] slot Base of the slot inside the coordinate pool, `pool.data() + layout.slot_offset(...)`.
+ *  @param[in] layout Addressing contract every producer of the pool agrees on.
+ *  @param[in] num_atoms Atoms the molecule actually has; the slot's padding atoms are not read.
+ *  @param[out] interleaved Destination for `3 * num_atoms` floats, atom-major.
+ */
+static void gather_slot_into_interleaved_(__half const *slot, api::conformer_slot_layout_t const &layout,
+                                          std::uint32_t num_atoms, float *interleaved) noexcept {
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
+        for (std::uint32_t axis = 0; axis < 3u; ++axis)
+            interleaved[atom * 3u + axis] = __half2float(slot[layout.component_offset(axis, atom)]);
+}
+
+/** What one cross-validation pass counted, threaded by reference so the pass owns no module state. */
+struct cross_validation_tally_t {
+    std::uint32_t molecules_compared = 0;
+    std::uint32_t molecules_unparsed = 0;
+    std::uint32_t molecules_multi_fragment = 0;
+    std::uint32_t molecules_rejected = 0;
+    std::uint32_t conformers_attempted = 0;
+    std::uint32_t conformers_succeeded = 0;
+    std::uint32_t energies_finite = 0;
+    std::uint32_t energies_reasonable = 0;
+    std::uint32_t energies_diverged = 0;
+    std::uint32_t conformers_clashing = 0;
+    double worst_energy_delta = 0.0;
+    std::uint32_t worst_molecule = 0;
+    std::uint32_t worst_conformer = 0;
+    double closest_atom_pair = std::numeric_limits<double>::infinity();
+    std::uint32_t closest_molecule = 0;
+};
+
+/**
+ *  @brief Generate conformers for @p corpus and read every successful one back through RDKit.
+ *
+ *  One quantity is compared and two are narrated. The post-preprocess atom count must equal RDKit's
+ *  own count with hydrogens added, which is what makes the gather address this molecule's atoms
+ *  rather than a neighbouring slot's padding. RDKit's MMFF94 energy at our own coordinates is then
+ *  printed beside ours — the two implementations agree to about 0.01 kcal/mol — and the returned
+ *  geometry is measured for atom pairs closer than any bond, which is what a divergent energy
+ *  usually turns out to be. Both are counted and reported rather than gated.
+ *
+ *  @param[in] corpus Molecules to generate for, built-ins plus whatever corpus was named.
+ *  @param[inout] checks Reporter that owns the atom-count comparison section.
+ *  @param[inout] energies Reporter that narrates the reference energy beside ours.
+ *  @param[out] tally Counts the summary is printed from.
+ */
+static void check_generation_against_rdkit(std::span<std::string_view const> corpus, diagnostic_reporter_t &checks,
+                                           diagnostic_reporter_t &energies, cross_validation_tally_t &tally) {
+    constexpr std::uint32_t num_conformers_k = 5;
+    api::conformer_slot_layout_t const layout {128u, num_conformers_k};
+
+    api::config_t config;
+    config.num_conformers = num_conformers_k;
     config.max_stereo_attempts = 20;
     config.random_seed = 42;
 
-    std::uint32_t const num_molecules = static_cast<std::uint32_t>(test_smiles.size());
-    std::uint32_t const total_conformers = num_molecules * num_conformers;
-    std::uint32_t const total_coords = total_conformers * max_atoms * 3;
+    auto const num_molecules = static_cast<std::uint32_t>(corpus.size());
+    conformer_outputs_t outputs;
+    outputs.reset_for(num_molecules, layout);
 
-    std::vector<__half> coordinates(total_coords);
-    std::vector<float> energies(total_conformers);
-    std::vector<sfapi::conformer_status_t> status(total_conformers, sfapi::conformer_status_t::invalid_smiles_k);
-
-    // use a single GPU for the test
+    // One GPU: the arithmetic that splits a wave across several is checked directly above.
     int const device_id = 0;
-    sfapi::context_t context(std::span<int const>(&device_id, 1));
-
-    sfapi::conformer_status_t const batch_status = context.generate_conformers(test_smiles, config, max_atoms,
-                                                                               coordinates, energies, status);
-
+    api::context_t context(std::span<int const>(&device_id, 1));
+    conformer_status_t const batch_status = context.generate_conformers(
+        corpus, config, layout.max_atoms, outputs.coordinates, outputs.energies, outputs.status, outputs.num_atoms);
     fmt::println("  batch status: {}", static_cast<unsigned>(batch_status));
 
-    // cross-validate against RDKit, which is the reference the conformer energies are narrated against
-    sftest::diagnostic_reporter_t energy_reporter {"rdkit", "smallfield"};
-    std::uint32_t total_attempted = 0;
-    std::uint32_t total_successful = 0;
-    std::uint32_t total_finite_energy = 0;
-    std::uint32_t total_reasonable_energy = 0;
+    // Scratch the molecule loop reuses: both buffers grow to the widest molecule once and stay there.
+    std::vector<float> interleaved;
+    std::vector<int> fragment_mapping;
 
-    for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
-        fmt::println("  molecule {} ({}):", molecule_index, test_smiles[molecule_index]);
-
-        auto rdkit_mol = sftest::mol_from_smiles(std::string(test_smiles[molecule_index]));
-        if (!rdkit_mol) {
-            fmt::println("    skipped (RDKit parse failure)");
+    for (std::uint32_t molecule = 0; molecule < num_molecules; ++molecule) {
+        auto rdkit_molecule = mol_from_smiles(std::string(corpus[molecule]));
+        if (!rdkit_molecule) { // RDKit refused the SMILES, so there is no reference to compare against
+            ++tally.molecules_unparsed;
             continue;
         }
-        bool const embedded = sftest::embed_molecule(*rdkit_mol);
-        if (!embedded) {
-            fmt::println("    skipped (RDKit embed failure)");
+        if (RDKit::MolOps::getMolFrags(*rdkit_molecule, fragment_mapping) != 1) {
+            // Preprocess keeps only the largest fragment, so the two atom counts describe different
+            // molecules and the coordinates cannot be read back into this one.
+            ++tally.molecules_multi_fragment;
             continue;
         }
 
-        std::uint32_t const num_atoms = rdkit_mol->getNumAtoms();
+        if (outputs.num_atoms[molecule] == 0) {
+            // Preprocess refused the molecule — too many atoms, or an element MMFF94 cannot type — and
+            // says so in every one of its conformer statuses. There is no geometry to read back.
+            fmt::println("  no geometry molecule={} status={} smiles={}", molecule,
+                         static_cast<unsigned>(outputs.status[static_cast<std::size_t>(molecule) * num_conformers_k]),
+                         corpus[molecule]);
+            ++tally.molecules_rejected;
+            continue;
+        }
 
-        for (std::uint32_t conformer = 0; conformer < num_conformers; ++conformer) {
-            total_attempted++;
-            std::uint32_t const slot = molecule_index * num_conformers + conformer;
+        std::uint32_t const num_atoms = rdkit_molecule->getNumAtoms();
+        checks.mismatch("atom_count", "molecule={} smiles={}", molecule, corpus[molecule])
+            .field("num_atoms", num_atoms, static_cast<std::uint32_t>(outputs.num_atoms[molecule]), exactly_equal_);
+        if (outputs.num_atoms[molecule] != num_atoms) continue; // gathering past our own count reads padding
+        ++tally.molecules_compared;
 
-            if (status[slot] != sfapi::conformer_status_t::success_k) {
-                fmt::println("    conformer {}: status={}", conformer, static_cast<unsigned>(status[slot]));
+        attach_empty_conformer(*rdkit_molecule); // the slot `set_coords_interleaved` overwrites
+        interleaved.resize(static_cast<std::size_t>(num_atoms) * 3u);
+
+        for (std::uint32_t conformer = 0; conformer < num_conformers_k; ++conformer) {
+            ++tally.conformers_attempted;
+            std::size_t const slot = static_cast<std::size_t>(molecule) * num_conformers_k + conformer;
+            if (outputs.status[slot] != conformer_status_t::success_k) {
+                fmt::println("  no conformer molecule={} conformer={} status={}", molecule, conformer,
+                             static_cast<unsigned>(outputs.status[slot]));
                 continue;
             }
-            total_successful++;
+            ++tally.conformers_succeeded;
 
-            // convert half-precision SoA coordinates to float interleaved for RDKit
-            std::uint32_t const coord_offset = slot * max_atoms * 3;
-            std::vector<float> interleaved(num_atoms * 3);
-            for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-                interleaved[atom * 3 + 0] = __half2float(coordinates[coord_offset + 0 * max_atoms + atom]);
-                interleaved[atom * 3 + 1] = __half2float(coordinates[coord_offset + 1 * max_atoms + atom]);
-                interleaved[atom * 3 + 2] = __half2float(coordinates[coord_offset + 2 * max_atoms + atom]);
+            gather_slot_into_interleaved_(outputs.coordinates.data() + layout.slot_offset(molecule, conformer), layout,
+                                          num_atoms, interleaved.data());
+            double const closest_pair = closest_atom_pair_(interleaved.data(), num_atoms);
+            if (closest_pair < clash_distance_angstrom_k) ++tally.conformers_clashing;
+            if (closest_pair < tally.closest_atom_pair) {
+                tally.closest_atom_pair = closest_pair;
+                tally.closest_molecule = molecule;
             }
 
-            sftest::set_coords_interleaved(*rdkit_mol, interleaved.data());
-            double const rdkit_energy = sftest::rdkit_mmff94_energy(*rdkit_mol);
-
+            set_coords_interleaved(*rdkit_molecule, interleaved.data());
+            double const rdkit_energy = rdkit_mmff94_energy(*rdkit_molecule);
             if (std::isfinite(rdkit_energy)) {
-                total_finite_energy++;
-                if (rdkit_energy < 500.0) total_reasonable_energy++;
+                ++tally.energies_finite;
+                if (rdkit_energy < 500.0) ++tally.energies_reasonable;
             }
 
+            double const delta = static_cast<double>(outputs.energies[slot]) - rdkit_energy;
+            if (std::fabs(delta) > energy_agreement_kcal_k) ++tally.energies_diverged;
+            if (std::fabs(delta) > std::fabs(tally.worst_energy_delta)) {
+                tally.worst_energy_delta = delta;
+                tally.worst_molecule = molecule;
+                tally.worst_conformer = conformer;
+            }
             if (conformer == 0)
-                energy_reporter.note("conformer_energy", "molecule={} conformer={}", molecule_index, conformer)
-                    .field("mmff94_energy_kcal_per_mol", rdkit_energy, energies[slot]);
+                energies
+                    .note("conformer_energy", "molecule={} conformer={} smiles={}", molecule, conformer,
+                          corpus[molecule])
+                    .field("mmff94_energy_kcal_per_mol", rdkit_energy, outputs.energies[slot]);
         }
     }
+    checks.summarize("atom_count");
+}
 
-    double const success_rate = total_attempted > 0 ? 100.0 * total_successful / total_attempted : 0.0;
+/** Print what the cross-validation counted, divergence included, since nothing gates on that one. */
+static void print_cross_validation_summary(cross_validation_tally_t const &tally, double success_rate) {
     fmt::println("\n  summary:");
-    fmt::println("    conformers attempted:  {}", fmt::group_digits(total_attempted));
-    fmt::println("    conformers succeeded:  {} ({:.3f}%)", fmt::group_digits(total_successful), success_rate);
-    fmt::println("    finite MMFF94 energy:  {} ({:.3f}% of successes)", fmt::group_digits(total_finite_energy),
-                 total_successful > 0 ? 100.0 * total_finite_energy / total_successful : 0.0);
-    fmt::println("    reasonable energy:     {} (< 500 kcal/mol)", fmt::group_digits(total_reasonable_energy));
+    fmt::println("    molecules compared:    {} ({} unparsed, {} multi-fragment, {} rejected by preprocess)",
+                 fmt::group_digits(tally.molecules_compared), fmt::group_digits(tally.molecules_unparsed),
+                 fmt::group_digits(tally.molecules_multi_fragment), fmt::group_digits(tally.molecules_rejected));
+    fmt::println("    conformers attempted:  {}", fmt::group_digits(tally.conformers_attempted));
+    fmt::println("    conformers succeeded:  {} ({:.3f}%)", fmt::group_digits(tally.conformers_succeeded),
+                 success_rate);
+    fmt::println("    finite MMFF94 energy:  {} ({:.3f}% of successes)", fmt::group_digits(tally.energies_finite),
+                 tally.conformers_succeeded > 0 ? 100.0 * tally.energies_finite / tally.conformers_succeeded : 0.0);
+    fmt::println("    reasonable energy:     {} (< 500 kcal/mol)", fmt::group_digits(tally.energies_reasonable));
+    fmt::println("    energy divergence:     {} conformers beyond {:.3g} kcal/mol, " //
+                 "worst {:+.3g} at molecule={} conformer={}",
+                 fmt::group_digits(tally.energies_diverged), energy_agreement_kcal_k, tally.worst_energy_delta,
+                 tally.worst_molecule, tally.worst_conformer);
+    fmt::println("    clashing geometry:     {} conformers under {:.3g} A, closest pair {:.3g} A at molecule={}",
+                 fmt::group_digits(tally.conformers_clashing), clash_distance_angstrom_k, tally.closest_atom_pair,
+                 tally.closest_molecule);
+}
 
-    sf_verify_(total_successful > 0, "at least one conformer must succeed");
-    sf_verify_(success_rate >= 50.0, "success rate must be at least 50%");
+#pragma endregion RDKit Cross Validation
 
+} // namespace smallfield::tests
+
+int main(int argc, char **argv) {
+    fmt::println("{}: wave sizing, empty-wave timings, and end-to-end ETKDG generation via the library API",
+                 test_name_k);
+
+    auto const selection = sftest::select_corpus(argc, argv, default_max_molecules_k);
+    if (selection.knob == sftest::corpus_knob_t::refused_k) {
+        std::fflush(stdout);
+        fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", test_name_k);
+        return 2;
+    }
+
+    sftest::diagnostic_reporter_t checks {"expected", "observed"};
+    checks.limit_printed_lines(max_reported_mismatches_k);
+    sftest::check_wave_budget_arithmetic(checks);
+    sftest::check_per_device_reservation(checks);
+    sftest::check_empty_wave_timings(checks);
+
+    std::vector<std::string> corpus_storage = sftest::standard_test_smiles();
+    if (selection.knob == sftest::corpus_knob_t::named_k) {
+        std::vector<std::string> streamed;
+        auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, streamed);
+        if (outcome != sftest::smiles_load_t::loaded_k)
+            return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), selection.path);
+        fmt::println("  corpus: {} ({} molecules) plus the built-ins", selection.path,
+                     fmt::group_digits(streamed.size()));
+        for (auto &smiles : streamed) corpus_storage.push_back(std::move(smiles));
+    }
+    else fmt::println("  corpus: built-ins only; name one on the command line or in SMALLFIELD_TEST_CORPUS");
+    std::vector<std::string_view> const corpus(corpus_storage.begin(), corpus_storage.end());
+
+    sftest::diagnostic_reporter_t energies {"rdkit", "smallfield"};
+    sftest::cross_validation_tally_t tally;
+    sftest::check_generation_against_rdkit(corpus, checks, energies, tally);
+
+    double const success_rate = tally.conformers_attempted > 0
+                                    ? 100.0 * tally.conformers_succeeded / tally.conformers_attempted
+                                    : 0.0;
+    sftest::print_cross_validation_summary(tally, success_rate);
+
+    if (!checks.passed())
+        return sftest::report_fail(test_name_k, "{} mismatches over {} comparisons", checks.mismatch_count(),
+                                   checks.comparison_count());
+    if (tally.conformers_succeeded == 0)
+        return sftest::report_fail(test_name_k, "no conformer succeeded over {} attempts", tally.conformers_attempted);
+    if (success_rate < 50.0)
+        return sftest::report_fail(test_name_k, "success rate {:.3f}% is below the 50% floor", success_rate);
     return sftest::report_pass(test_name_k);
 }

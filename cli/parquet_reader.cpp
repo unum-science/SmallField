@@ -75,9 +75,13 @@ bool read_shard(fs::path const &path, std::string const &smiles_column, shard_da
     out.smiles.reserve(num_rows);
 
     for (int chunk_index = 0; chunk_index < column->num_chunks(); ++chunk_index) {
-        auto chunk = std::static_pointer_cast<arrow::StringArray>(column->chunk(chunk_index));
+        // A checked cast, because a `static_pointer_cast` of a non-null pointer is never null: the
+        // diagnostic below would be unreachable and a column of some other type would be reinterpreted
+        // as UTF-8 rather than refused.
+        auto chunk = std::dynamic_pointer_cast<arrow::StringArray>(column->chunk(chunk_index));
         if (!chunk) {
-            logger.error("column {} is not string in {}", smiles_column, path);
+            logger.error("column {} is not string in {}: {}", smiles_column, path,
+                         column->chunk(chunk_index)->type()->ToString());
             return false;
         }
         for (int64_t local_index = 0; local_index < chunk->length(); ++local_index) {

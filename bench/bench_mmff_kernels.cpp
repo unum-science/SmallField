@@ -7,19 +7,22 @@
  *
  *  Usage:
  *  @code
- *    bench_mmff_kernels /path/to/chembl.smi [max_mols] [--warmup N]
+ *    bench_mmff_kernels --smi /path/to/corpus.smi [--max-molecules N]
  *  @endcode
  *
- *  Default max_mols = 10K. ChEMBL-scale inputs, 240K, use ~12 GB of GPU memory for the per-molecule fixed-stride
- *  output arrays; chunk internally if you need more.
+ *  Default `--max-molecules` is 10K. ChEMBL-scale inputs, 240K, use ~12 GB of GPU memory for the per-molecule
+ *  fixed-stride output arrays; chunk internally if you need more. The device launcher warms the driver with one
+ *  untimed launch of the first kernel, so there is no warm-up count to pass.
  */
 
-#include <algorithm>   // `std::min`, `std::unique`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint32_t`
+#include <cstdio>  // `stderr`
+
+#include <array>       // `std::array`
 #include <chrono>      // `std::chrono::high_resolution_clock`, `std::chrono::duration`
-#include <fstream>     // `std::ifstream`
-#include <istream>     // `std::istream`
 #include <memory>      // `std::unique_ptr`
-#include <string>      // `std::string`, `std::getline`
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
 
@@ -56,27 +59,48 @@ static double elapsed_ms_(clock_type_t::time_point start, clock_type_t::time_poi
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-/** Read up to @p capacity SMILES from an already-open @p input_stream, so a failed open cannot pass as an empty file. */
-static std::vector<std::string> load_smiles_batch_(std::istream &input_stream, std::size_t capacity) {
-    std::vector<std::string> smiles_batch;
-    smiles_batch.reserve(std::min<std::size_t>(capacity, 1'000'000));
-    std::string line;
-    while (std::getline(input_stream, line) && smiles_batch.size() < capacity) {
-        if (line.empty() || line[0] == '#') continue;
-        auto const separator_index = line.find_first_of(" \t");
-        if (separator_index != std::string::npos) line.resize(separator_index);
-        if (!line.empty()) smiles_batch.push_back(line);
+/**
+ *  @brief Atom ceiling this benchmark admits.
+ *
+ *  Held at 128 rather than at `sft::max_atoms_per_molecule_k` so the batch composition — and therefore every
+ *  published mol/s figure — stays comparable across runs when the library's dispatch tiers move.
+ */
+static constexpr std::uint32_t benchmark_atom_ceiling_k = 128;
+
+/** How far a SMILES got before the timed section, so the batch can report what it dropped and why. */
+enum class parse_outcome_t {
+    /** Sanitized, hydrogenated, within the atom ceiling, and described. */
+    parsed_k,
+    /** `SmilesToMol` returned nothing, or threw. */
+    unparseable_k,
+    /** `MolOps::addHs` threw. */
+    hydrogenation_failed_k,
+    /** Above `benchmark_atom_ceiling_k` once hydrogens are explicit. */
+    too_many_atoms_k,
+    /** `build_descriptor` refused the molecule. */
+    no_descriptor_k,
+};
+
+/** Column label naming the outcome in the parse histogram. */
+static char const *describe_parse_outcome_(parse_outcome_t outcome) {
+    switch (outcome) {
+    case parse_outcome_t::parsed_k: return "parsed";
+    case parse_outcome_t::unparseable_k: return "unparseable";
+    case parse_outcome_t::hydrogenation_failed_k: return "hydrogenation_failed";
+    case parse_outcome_t::too_many_atoms_k: return "too_many_atoms";
+    case parse_outcome_t::no_descriptor_k: return "no_descriptor";
     }
-    return smiles_batch;
+    return "other";
 }
 
 struct parsed_molecule_t {
     std::unique_ptr<RDKit::RWMol> rdkit_molecule;
     sft::molecule_descriptor_t descriptor;
-    bool is_valid = false;
+    /** Only `parsed_k` carries a usable `descriptor`; the other four name the reason it is absent. */
+    parse_outcome_t outcome = parse_outcome_t::unparseable_k;
 };
 
-/** Parse SMILES + build descriptor. OpenMP-parallel. */
+/** Parse SMILES and build descriptors, recording per-molecule outcomes. OpenMP-parallel. */
 static std::vector<parsed_molecule_t> parse_smiles_batch_(std::vector<std::string> const &smiles_batch) {
     std::vector<parsed_molecule_t> parsed_molecules(smiles_batch.size());
 #pragma omp parallel for schedule(dynamic, 64)
@@ -90,7 +114,7 @@ static std::vector<parsed_molecule_t> parse_smiles_batch_(std::vector<std::strin
             parsed.rdkit_molecule.reset(RDKit::SmilesToMol(smiles_batch[molecule_index], parser_params));
         }
         catch (...) {
-            continue;
+            continue; // The default outcome already reads `unparseable_k`.
         }
         if (!parsed.rdkit_molecule) continue;
         try {
@@ -98,34 +122,59 @@ static std::vector<parsed_molecule_t> parse_smiles_batch_(std::vector<std::strin
         }
         catch (...) {
             parsed.rdkit_molecule.reset();
+            parsed.outcome = parse_outcome_t::hydrogenation_failed_k;
             continue;
         }
-        if (parsed.rdkit_molecule->getNumAtoms() > 128) {
+        if (parsed.rdkit_molecule->getNumAtoms() > benchmark_atom_ceiling_k) {
             parsed.rdkit_molecule.reset();
+            parsed.outcome = parse_outcome_t::too_many_atoms_k;
             continue;
         }
         if (!sft::build_descriptor(*parsed.rdkit_molecule, parsed.descriptor)) {
             parsed.rdkit_molecule.reset();
+            parsed.outcome = parse_outcome_t::no_descriptor_k;
             continue;
         }
-        parsed.is_valid = true;
+        parsed.outcome = parse_outcome_t::parsed_k;
     }
     return parsed_molecules;
+}
+
+/** Molecules per parse outcome, indexed by the enumerator's own value. */
+using parse_outcome_histogram_t = std::array<std::size_t, 5>;
+
+/** Tally @p parsed_molecules by outcome in one pass. */
+static parse_outcome_histogram_t parse_outcome_histogram_of_(std::vector<parsed_molecule_t> const &parsed_molecules) {
+    parse_outcome_histogram_t histogram {};
+    for (auto const &parsed_molecule : parsed_molecules) ++histogram[static_cast<std::size_t>(parsed_molecule.outcome)];
+    return histogram;
+}
+
+/** Print one line per non-empty parse outcome, so a rejection class cannot grow behind the mol/s number. */
+static void print_parse_outcomes_(parse_outcome_histogram_t const &histogram, std::size_t total_molecules) {
+    if (total_molecules == 0) return;
+    for (std::size_t code = 0; code < histogram.size(); ++code) {
+        if (histogram[code] == 0) continue;
+        fmt::println("  {:<22} {:>12}  {:.3f} %", describe_parse_outcome_(static_cast<parse_outcome_t>(code)),
+                     fmt::group_digits(histogram[code]),
+                     100.0 * static_cast<double>(histogram[code]) / static_cast<double>(total_molecules));
+    }
 }
 
 } // namespace smallfield::bench
 
 using sfbench::clock_type_t;
 using sfbench::elapsed_ms_;
-using sfbench::load_smiles_batch_;
+using sfbench::parse_outcome_t;
 using sfbench::parse_smiles_batch_;
 using sfbench::parsed_molecule_t;
+using sfbench::print_parse_outcomes_;
 
 /** Name printed on every throughput line so a concatenated CI log stays attributable. */
 static constexpr char const *executable_name_k = "bench_mmff_kernels";
 
 /**
- *  @brief Ceiling on `[max_mols]`.
+ *  @brief Ceiling on `--max-molecules`.
  *
  *  Every term array is allocated at the per-molecule maximum stride, so device memory grows at roughly 50 kB per
  *  molecule — 240 K already takes ~12 GB. The cap turns a mistyped count into a diagnostic instead of a
@@ -133,25 +182,82 @@ static constexpr char const *executable_name_k = "bench_mmff_kernels";
  */
 static constexpr std::size_t max_molecules_per_run_k = 1'000'000;
 
-int main(int argc, char **argv) {
-    if (argc < 2) {
-        fmt::println(stderr, "Usage: {} <smi_file> [max_mols=10000]", executable_name_k);
-        return 2;
-    }
-    std::string const smiles_path = argv[1];
-    std::size_t capacity = 10'000;
-    if (argc > 2) {
-        auto const status = sfbench::parse_number(std::string_view {argv[2]}, std::size_t {1},
-                                                  max_molecules_per_run_k, capacity);
-        if (status != sfbench::number_parse_t::parsed_k) {
-            fmt::println(stderr, "{}: max_mols '{}' {} (accepted range 1..{})", executable_name_k, argv[2],
-                         sfbench::describe_number_parse(status), fmt::group_digits(max_molecules_per_run_k));
-            return 2;
+#pragma region Command Line
+
+/** Everything this driver takes from the command line. */
+struct kernel_bench_arguments_t {
+    /** Corpus to time over, from `--smi` or from `SMALLFIELD_TEST_CORPUS`. There is no default. */
+    std::string_view smiles_path;
+    /** Upper bound on molecules read from the corpus. */
+    std::size_t max_molecules = 10'000;
+};
+
+/** Whether the command line was accepted or refused. */
+enum class arguments_parse_t { accepted_k, refused_k };
+
+/** Print the one usage line, naming every flag this driver understands. */
+static void print_usage_(char const *invocation) {
+    fmt::println(stderr, "usage: {} --smi PATH [--max-molecules N]", invocation);
+}
+
+/** Fill @p arguments from `argv`, or explain on `stderr` why the command line was refused. */
+static arguments_parse_t parse_arguments_(int argc, char **argv, kernel_bench_arguments_t &arguments) {
+    for (int argument_index = 1; argument_index < argc; ++argument_index) {
+        std::string_view const flag = argv[argument_index];
+        if (flag == "--smi") {
+            if (argument_index + 1 >= argc) {
+                fmt::println(stderr, "{}: --smi takes a value, and none followed it", executable_name_k);
+                return arguments_parse_t::refused_k;
+            }
+            arguments.smiles_path = argv[++argument_index];
+        }
+        else if (flag == "--max-molecules") {
+            if (argument_index + 1 >= argc) {
+                fmt::println(stderr, "{}: --max-molecules takes a value, and none followed it", executable_name_k);
+                return arguments_parse_t::refused_k;
+            }
+            std::string_view const text = argv[++argument_index];
+            auto const status = sfbench::parse_number(text, std::size_t {1}, max_molecules_per_run_k,
+                                                      arguments.max_molecules);
+            if (status != sfbench::number_parse_t::parsed_k) {
+                fmt::println(stderr, "{}: --max-molecules value '{}' {} (accepted range 1..{})", executable_name_k,
+                             text, sfbench::describe_number_parse(status), fmt::group_digits(max_molecules_per_run_k));
+                return arguments_parse_t::refused_k;
+            }
+        }
+        else {
+            fmt::println(stderr, "{}: unknown argument '{}'", executable_name_k, flag);
+            print_usage_(argv[0]);
+            return arguments_parse_t::refused_k;
         }
     }
+    if (arguments.smiles_path.empty()) arguments.smiles_path = sfbench::corpus_path_from_environment();
+    return arguments_parse_t::accepted_k;
+}
 
-    fmt::println("=== bench_mmff_kernels: GPU MMFF scaling benchmark ===");
-    fmt::println("input: {} (cap {})", smiles_path, fmt::group_digits(capacity));
+#pragma endregion Command Line
+
+int main(int argc, char **argv) {
+    kernel_bench_arguments_t arguments;
+    if (parse_arguments_(argc, argv, arguments) != arguments_parse_t::accepted_k) return 2;
+
+    fmt::println("{}: GPU MMFF kernel trio against the CPU native path", executable_name_k);
+    fmt::println("input: {} (cap {})", arguments.smiles_path, fmt::group_digits(arguments.max_molecules));
+
+    // A corpus that never opened must not read as an empty corpus. It is read before the parameter tables are
+    // extracted, so a refused path costs nothing.
+    std::vector<std::string> smiles_batch;
+    auto const load_start = clock_type_t::now();
+    auto const load_status = sfbench::load_corpus_into(arguments.smiles_path, arguments.max_molecules, smiles_batch);
+    auto const load_end = clock_type_t::now();
+    if (load_status != sfbench::corpus_load_t::loaded_k) {
+        fmt::println(stderr, "{}: corpus '{}' {}", executable_name_k, arguments.smiles_path,
+                     sfbench::describe_corpus_load(load_status));
+        print_usage_(argv[0]);
+        return 2;
+    }
+    fmt::println("SMILES loaded: {} lines in {:.1f} ms", fmt::group_digits(smiles_batch.size()),
+                 elapsed_ms_(load_start, load_end));
 
     // Table extraction once.
     sfparam::mmff94_tables_host_t tables_host;
@@ -159,18 +265,6 @@ int main(int argc, char **argv) {
     auto const tables_view = tables_host.view();
     fmt::println("tables extracted: vdw={} bond={} angle={} tor={}", tables_host.vdw.size(), tables_host.bond.size(),
                  tables_host.angle.size(), tables_host.torsion.size());
-
-    // A corpus that never opened must not read as an empty corpus.
-    std::ifstream input_stream(smiles_path);
-    if (!input_stream) {
-        fmt::println(stderr, "{}: cannot open corpus '{}'", executable_name_k, smiles_path);
-        return 2;
-    }
-    auto const load_start = clock_type_t::now();
-    auto const smiles_batch = load_smiles_batch_(input_stream, capacity);
-    auto const load_end = clock_type_t::now();
-    fmt::println("SMILES loaded: {} lines in {:.1f} ms", fmt::group_digits(smiles_batch.size()),
-                 elapsed_ms_(load_start, load_end));
 
     auto const parse_start = clock_type_t::now();
     auto const parsed_molecules = parse_smiles_batch_(smiles_batch);
@@ -182,7 +276,7 @@ int main(int argc, char **argv) {
     atom_offsets.reserve(parsed_molecules.size());
     std::uint32_t total_atom_count = 0;
     for (auto const &parsed_molecule : parsed_molecules) {
-        if (!parsed_molecule.is_valid) continue;
+        if (parsed_molecule.outcome != parse_outcome_t::parsed_k) continue; // no descriptor was built
         atom_offsets.push_back(total_atom_count);
         total_atom_count += parsed_molecule.descriptor.num_atoms;
         descriptors.push_back(parsed_molecule.descriptor);
@@ -190,6 +284,7 @@ int main(int argc, char **argv) {
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(descriptors.size());
     fmt::println("parsed: {} valid molecules / {} total atoms in {:.1f} ms", fmt::group_digits(num_molecules),
                  fmt::group_digits(total_atom_count), elapsed_ms_(parse_start, parse_end));
+    print_parse_outcomes_(sfbench::parse_outcome_histogram_of_(parsed_molecules), parsed_molecules.size());
 
     if (num_molecules == 0) {
         fmt::println(stderr, "{}: no molecules — aborting", executable_name_k);

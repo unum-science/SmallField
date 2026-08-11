@@ -14,7 +14,8 @@ namespace smallfield::tests {
 /**
  *  @brief Validate every chiral center of one molecule on the device from its 3D coordinates.
  *
- *  @param[in] host_coords Flat interleaved xyz coordinates, `3 * num_atoms` entries.
+ *  @param[in] host_coords Coordinates as `(axis, atom)`, `3 * num_atoms` entries, which is the layout
+ *      `validate_chirality_` indexes; an interleaved block passed here validates a different molecule.
  *  @param[in] host_chirals Chiral centers to check.
  *  @param[in] num_atoms Atom count.
  *  @param[in] num_chirals Number of entries in @p host_chirals.

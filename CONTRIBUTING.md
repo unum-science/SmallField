@@ -129,9 +129,219 @@ Hidden global state is not a style preference here: the file-scope scratch in `e
 __Fill a caller-owned output rather than returning a container.__
 Write `fill_x_into(input, std::vector<T> &out)` with `out.clear()`, not `std::vector<T> compute_x(input)`, and declare the scratch above the loop that consumes it so a growth phase happens once.
 
+The test that matters is not whether a function returns a container, but where it is called from: __a container returned by value from a function called inside a loop is a per-iteration allocation with a name that hides it.__
+A one-shot builder returning a `std::vector` at start-up is fine and should stay.
+
+```cpp
+// no — two allocations per molecule, and the inner one is discarded on the same line
+static std::vector<float> interleaved_to_soa_(std::vector<float> const &interleaved);
+std::vector<float> positions = interleaved_to_soa_(extract_coords_interleaved(*molecule));
+
+// yes — the buffers outlive the loop and grow once
+std::vector<float> interleaved, positions;
+for (auto const &smiles : corpus) {
+    extract_coords_into(*molecule, interleaved);
+    transpose_into(interleaved, positions);
+}
+```
+
+The shape to copy already exists in `cli/`: a struct owning every output array with one `resize_for` that only ever grows, so nothing on the hot path allocates or frees.
+
+__An extent belongs inside the view, not beside it.__
+A flat buffer plus a separately carried count is three parameters describing one thing, and it lets the count disagree with the storage undetected.
+`src/smallfield/types/views.hpp` holds the aliases; `reset_square_matrix` is the builder that grows caller storage and hands back a view over it, so sizing never drifts from the extent.
+`fill_bond_hops_into(std::span<mmff94_bond_t const>, hop_matrix_t)` is the API shape to copy: a span in, a view out, and the storage owned by whoever called.
+
+Count the occurrences before deciding this is cosmetic:
+
+```cpp
+// no — `num_atoms` appears five times in fifteen lines, and nothing compares them
+perturb_(positions, prepared.num_atoms, perturbation);
+std::vector<float> interleaved(static_cast<std::size_t>(prepared.num_atoms) * 3, 0.0f);
+for (std::uint32_t atom = 0; atom < prepared.num_atoms; ++atom)
+    for (std::uint32_t axis = 0; axis < 3; ++axis)
+        interleaved[atom * 3 + axis] = positions[axis * prepared.num_atoms + atom];
+set_coords_interleaved(*molecule, interleaved.data());
+
+// yes — twice, both times constructing a view, and the loops are gone
+auto const aos = reset_coordinates_aos(scratch.interleaved, prepared.num_atoms);
+auto const soa = reset_coordinates_soa(scratch.positions, prepared.num_atoms);
+perturb_(soa, perturbation);                 // the extent travels with the data
+transpose_into(soa, aos);
+set_coords_interleaved(*molecule, aos.data_handle());
+```
+
+__A memory layout is a type, not an index expression.__
+`positions[axis * num_atoms + atom]` and `interleaved[atom * 3 + axis]` are two different layouts written as arithmetic a reader has to decode, and passing one where the other is expected compiles.
+Name them, and the compiler separates them.
+
+The matrix half of this is done — `packed_matrix` and `hop_matrix_t` are in use.
+The coordinate half is not, and the aliases below are what it should become; 40 sites across 12 files still spell the transposition by hand, in three spellings:
+
+```cpp
+// The row count is a template parameter, so `coordinates_soa<3>` and `coordinates_soa<4>` are distinct
+// types and neither collides with `packed_matrix<float>`. A dynamic row extent would make them the same
+// type, and a bounds matrix would pass where coordinates were expected.
+template <std::size_t dimensions_>
+using coordinates_soa = mdspan_ns::mdspan<float, mdspan_ns::extents<std::uint32_t, dimensions_, mdspan_ns::dynamic_extent>>;
+using coordinates_aos_t = mdspan_ns::mdspan<float, mdspan_ns::extents<std::uint32_t, mdspan_ns::dynamic_extent, 3>>;
+```
+
+The transposition between them is one named function, overloaded on direction so a call site cannot invert it.
+Writing it inline is how the same three lines came to exist in twelve files in three spellings.
+
+__`mdspan_ns` is `cuda::std`, and that is not a preference.__
+`std::mdspan` needs C++23, and `nvcc` 12.8 and 12.9 reject `-std=c++23` outright, so it cannot enter any translation unit `nvcc` touches.
+libcu++ ships the same interface at C++20 for host and device alike and arrives with `CUDA::cudart`, already a `PUBLIC` dependency.
+The alias names the namespace once so the swap is a single `#if` when `nvcc` 13 and libstdc++ 16 land together.
+
+Three constraints come with it.
+Extents are `std::uint32_t`, which is a claim about scope: these view one molecule, and a packed view is 16 bytes at `std::uint32_t` against 24 at `std::size_t`, per kernel argument.
+__Never view the conformer pool through them__ — a 10 M-molecule run at three conformers passes `UINT32_MAX` elements around conformer 11.2 M, and a 32-bit offset wraps into another molecule's coordinates.
+And `cuda::std::mdspan` performs __no bounds checking__, even with `CCCL_ENABLE_ASSERTIONS`, so a `(9, 9)` access on a four-by-four view reads whatever was there; raw arithmetic that survives keeps its `sf_assert_`.
+
+__An alias arrives with its first consumer, never ahead of it.__
+The two view types this header replaced sat unused long enough for one of them to acquire a docblock that misstated its own size.
+
 __No pointers inside containers.__
 `std::vector<T *>` and `std::vector<std::unique_ptr<T>>` are a pointer chase plus an allocation per element for something whose count is usually known and small.
 Store values, or store indices into a flat arena.
+
+__Lazy initialization is a function-local `static const`. There is no second mechanism.__
+
+A `static const` whose initializer is an immediately-invoked lambda is not a different mechanism — it is the same one, spelled for an initializer that needs statements.
+And `std::call_once` buys nothing a magic static does not already guarantee: both run once, both are thread-safe, both retry if the initializer throws.
+
+```cpp
+// no
+static std::once_flag flag;
+std::call_once(flag, [] { … });
+
+// yes — same guarantee, no flag, and it reads as what it is
+[[maybe_unused]] static bool const warmed = [] { …; return true; }();
+```
+
+`std::once_flag` and `std::call_once` are banned.
+Warming third-party state is not an exception: bind the side effect to a `static const` and the contract is identical.
+Two near-duplicate RDKit warm-ups each carried their own flag, so the warm-up ran twice in one binary — which is what having two mechanisms buys.
+
+__A test counts through a caller-owned tally, not module state.__
+
+Eighteen of twenty-two test files hold no mutable file-scope object.
+The four that do are the ones that became hard to read: one counts mismatches three ways inside a single `main` — module-scope integers, a caller-owned `lookup_mismatch_counts_t`, and a reporter with its own internal counters — and gates on two of the three independently.
+
+```cpp
+// no — module state, reachable only through `using` re-exports so `main` can see it
+static int host_failure_count_ = 0;
+
+// yes — a tally threaded by reference, which also aggregates across corpora for free
+struct oracle_tally_t { std::uint64_t molecules = 0; std::uint64_t centers = 0; };
+```
+
+Where a `matching_` / `mismatched_` counter pair is genuinely not redundant — because one side of the comparison is conditionally skipped, so the denominators differ — keep the pair and say so in a comment.
+Otherwise `compared` minus `mismatches` is the same number and cannot drift from its partner.
+
+__A trailing underscore already marks internal linkage; `g_` adds nothing.__
+Carrying both is two conventions for one fact, and `g_` is a poor thing to grep for in a codebase where `g_factor` is the MMFF94 Slater-Kirkwood term.
+
+## Control Flow
+
+__A `bool` that steers behavior is an enum.__
+Already stated under Naming for parameters; it applies equally to a `bool` return, which throws away the reason.
+
+```cpp
+// no — five distinguishable refusals fold into one `false`, and the caller cannot tell
+//      "not a number" from "does not fit uint32_t" from "above the ceiling"
+static bool parse_number_(std::string_view text, number_type_ &number);
+
+// yes
+enum class number_parse_t { parsed_k, malformed_k, out_of_range_k, below_minimum_k, above_maximum_k };
+```
+
+Both spellings are live in this tree, written for the same job.
+The extreme case is a shard writer with twenty-four distinct failure modes, all collapsed to `false`, whose callers can only print `write failed`.
+
+__A three-state answer is an enum, never a bool pair and never a sentinel.__
+
+```cpp
+// no — cis / trans / no-perceivable-stereo, spread across a return and a reference.
+//      `is_cis == false` is meaningless unless `found_stereo` is separately consulted, so a caller
+//      that forgets silently classifies every unperceived conformer as trans.
+static bool perceived_any_cis(RDKit::RWMol &molecule, bool &found_stereo);
+
+// no — the enum is written out, in a comment
+std::vector<std::int8_t> row_outcomes;  // 1: success, 0: conformer failure, -1: molecule failure
+
+// yes — the omission the bool pair allows becomes a compile error
+enum class bond_stereo_t { cis_k, trans_k, unperceived_k };
+switch (perceive_bond_stereo(molecule)) {
+case bond_stereo_t::unperceived_k: ++unperceived; continue;
+…
+}
+```
+
+__One name, one meaning.__
+A flag used as both "something failed" and "no header printed yet" is two variables sharing a declaration — and in the one function that does this, the header-once idiom is implemented properly nine lines below, with its own flag.
+
+__One fact, one encoding.__
+Two fields that are equal by construction are an invariant maintained by hand at every write site, and the compiler will not help.
+A `bool is_valid` beside a `std::unique_ptr` that is null on exactly the same paths is five hand-maintained agreements waiting for a sixth failure path to forget one.
+Where the failure modes are already distinguished and then discarded, an enum keeps them and costs nothing.
+
+__An accumulator boolean far from its test is a counting function.__
+Eight writes spread over two hundred lines to a single read is not a flag, it is a report.
+Return counts from named predicates and sum them; the flag disappears and the counters stay.
+
+```cpp
+// no — and the write below is dead: every caller `continue`s past the only read
+bool molecule_matches = true;
+auto const require_count_match = [&](…) {
+    if (cpu_count != gpu_count) { molecule_matches = false; return false; }
+    return true;
+};
+if (!require_count_match("bond", …)) { ++mismatched_molecule_count; continue; }
+…                                    // 201 lines
+if (molecule_matches) ++matching_molecule_count;
+
+// yes
+std::size_t const mismatches = compare_bonds(…) + compare_angles(…) + compare_torsions(…);
+```
+
+Two bookkeeping schemes for one fact is what makes a dead write invisible.
+Note the loop must still run to completion — those counters are the output — so the fix is extraction, never a `break`.
+
+__A trailing `if` that wraps the rest of the body is a guard.__
+
+```cpp
+// no
+for (…) {
+    …two statements…
+    if (has_coords && status == 0 && num_atoms > 0) { …ten lines, two nested loops… }
+}
+
+// yes — each guard names one reason to skip, at the point the reason is known
+if (num_atoms_u8 == 0) continue;                                  // preprocess failed
+if (!context.ok || context.num_atoms != num_atoms_u8) continue;   // parse must reproduce atom order
+if (status_codes[flat] != success_k) continue;
+```
+
+Comment each guard with why it skips.
+That is the part worth copying, not the `continue`.
+
+__Write a cross product once.__
+The `atom` by `axis` transposition between the coordinate pool and an interleaved buffer is written six times across the tooling, twice inside one loop body — gather, then scatter back twenty lines later — and once hand-unrolled into three copies.
+Two named helpers delete all six and put the direction in the name.
+
+__A loop that re-scans its input once per bucket is one pass.__
+Looping bins on the outside and every sample on the inside is quadratic where bucketing is linear, and it usually hides the previous antipattern inside it.
+
+__Some loops must run to completion, and they look exactly like the ones that should not.__
+Before converting a flag to a `break`, establish what the loop's later iterations still write.
+The riskiest instance here fills a per-conformer status array; breaking on the first failure leaves the later slots unwritten.
+Where a loop is deliberately non-short-circuiting, say so in a comment, because the next reader will try to simplify it.
+
+Likewise, a bound of `< 8`, `< 4` or `< 2` in term-construction code is an arity or a buffer size, not a reporting cap.
+Display budgets belong to the reporter, which preserves and prints the suppressed count.
 
 ## Aggregates
 
@@ -259,6 +469,38 @@ __Three sinks, chosen by who reads the output.__
 `bench/` is read as a report, so it uses bare `fmt::println`.
 `test/` uses the reporter and __not__ the logger, because a 34-character varying timestamp destroys column alignment and makes two runs undiffable, and ctest already timestamps.
 
+## Tooling Entry Points
+
+These govern `cli/`, `bench/` and `test/` — the twenty-seven shipped binaries.
+They differ enough in nature that there is no shared scaffolding to inherit, so they are held to rules rather than to a base class.
+
+__One announcement, naming the executable, before any work starts.__
+
+```cpp
+// no — a banner, and it does not even match the binary's name
+fmt::println("bench_chembl: SmallField GPU vs RDKit CPU");
+fmt::println("==========================================");
+
+// yes
+fmt::println("{}: device warp BFS vs host CSR BFS over the packed hop matrix", executable_name_k);
+```
+
+__Decorative rules are banned in output as well as in comments.__
+A run of `===`, `---` or `###` inside a string literal carries nothing the sentence beside it does not, and it makes two runs of the same binary diff noisily.
+The name a binary prints must be the name of the binary.
+
+__`main` is a driver.__
+The body should read as the outline of what the program does, with the steps as named functions.
+A `main` carrying its own comparison loops, or declaring a sixty-entry table inline, has stopped being an outline.
+
+__Exit codes mean one thing each.__
+`0` success, `1` a check failed, `2` the command line was refused.
+A binary that prints a failure and returns `0` is worse than one that says nothing, because a log filtered on `^FAIL` and a shell testing `$?` then disagree.
+
+__Prefer returning a failure to exiting from inside a helper.__
+`std::exit` from deep in a call chain skips flushes and unwinding.
+The assertion macro in `test_helpers.hpp` is the deliberate exception — it is the suite's primary failure path, and unwinding would only obscure the site.
+
 ## Datasets
 
 __Every dataset is reached through `./data/<name>`.__
@@ -270,6 +512,11 @@ __No absolute path appears anywhere in the tree.__
 Not in a source file, not in a default, not in a docstring example, and not in this document.
 An absolute path is a claim about one filesystem that the next machine falsifies silently: three binaries here defaulted to corpora under `/tmp` that exist on nobody's disk, and nothing reported it because a missing corpus read as an empty one.
 
+__A corpus arrives by flag__, with `SMALLFIELD_TEST_CORPUS` as the fallback, and no built-in default.
+
+__A named path that does not open is a failure, never an empty run.__
+Treating a missing corpus as zero molecules produces a validator that passes because it compared nothing.
+That shape has now been found five times in this project; it is the reason every comparison section prints its `compared=` count.
 
 ## Performance Claims
 

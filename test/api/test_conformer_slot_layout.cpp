@@ -8,7 +8,6 @@
  *  still looked plausible; only a degeneracy check exposes it, so that is what this test asserts.
  */
 
-#include <cassert> // `assert`
 #include <cmath>   // `std::abs`
 #include <cstdint> // `std::uint32_t`
 
@@ -74,6 +73,8 @@ using smallfield::tests::coordinate_rank_;
 using smallfield::tests::pack_row_;
 
 int main() {
+    fmt::println("{}: structure-of-arrays slot transpose and slot offset arithmetic", test_name_k);
+
     // A tetrahedron: genuinely three-dimensional, so any layout error collapses its rank.
     constexpr std::uint32_t atom_count = 4;
     float const reference[atom_count][3] = {{0.000f, 0.000f, 0.000f},
@@ -94,7 +95,7 @@ int main() {
     // Round-trip fidelity.
     for (std::uint32_t atom = 0; atom < atom_count; ++atom)
         for (std::uint32_t axis = 0; axis < 3u; ++axis)
-            assert(row[atom * 3u + axis] == reference[atom][axis] && "slot transpose lost a component");
+            sf_verify_(row[atom * 3u + axis] == reference[atom][axis], "the slot transpose lost a component");
 
     // A contiguous read collapses every point onto the x axis and so yields rank 1, while a correct
     // transpose yields rank 3. This is the assertion that separates the two.
@@ -103,8 +104,10 @@ int main() {
         return sftest::report_fail(test_name_k, "coordinate rank {}, expected 3 -- the geometry is degenerate", rank);
 
     // Slot offsets must not overlap, or conformers would alias each other.
-    assert(layout.slot_offset(0u, 1u) - layout.slot_offset(0u, 0u) == layout.slot_stride());
-    assert(layout.slot_offset(1u, 0u) == layout.slot_offset(0u, 0u) + 3u * layout.slot_stride());
+    sf_verify_(layout.slot_offset(0u, 1u) - layout.slot_offset(0u, 0u) == layout.slot_stride(),
+               "two conformers of one molecule must sit one slot stride apart");
+    sf_verify_(layout.slot_offset(1u, 0u) == layout.slot_offset(0u, 0u) + 3u * layout.slot_stride(),
+               "the next molecule must start num_conformers slot strides on");
 
     fmt::println("  rank={} atoms={}", rank, atom_count);
     return sftest::report_pass(test_name_k);

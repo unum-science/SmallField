@@ -33,9 +33,11 @@
  */
 #pragma once
 
+#include <cmath>   // `std::fabs`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`
 #include <cstdio>  // `std::FILE`, `std::fwrite`, `stdout`, `stderr`
+#include <cstdlib> // `std::exit`
 
 #include <iterator>    // `std::back_inserter`
 #include <limits>      // `std::numeric_limits`
@@ -52,10 +54,14 @@ namespace smallfield::tests {
 
 /** The verb that opens a diagnostic line, at column zero so `^MISMATCH` filters a CI log. */
 enum class diagnostic_verb_t : std::uint8_t {
-    mismatch_k, //!< Two operands expected to agree do not.
-    pass_k,     //!< A section closed with every comparison satisfied.
-    fail_k,     //!< A section closed with mismatches, or with nothing compared at all.
-    note_k,     //!< Narration: an operand pair worth printing whether or not it differs.
+    /** Two operands expected to agree do not. */
+    mismatch_k,
+    /** A section closed with every comparison satisfied. */
+    pass_k,
+    /** A section closed with mismatches, or with nothing compared at all. */
+    fail_k,
+    /** Narration: an operand pair worth printing whether or not it differs. */
+    note_k,
 };
 
 /** The literal a verb prints as. */
@@ -347,3 +353,37 @@ inline int report_fail(std::string_view test_name, fmt::format_string<reason_typ
 #pragma endregion Verdict
 
 } // namespace smallfield::tests
+
+#pragma region Assertions
+
+/**
+ *  @brief Fail the test with a message and the source location when @p condition is false.
+ *
+ *  Carries the `sf_` prefix so it cannot collide with RDKit's own `TEST_ASSERT`, which keeps the
+ *  tests free of any framework dependency.
+ *
+ *  Aborting still spends the test's one verdict, so this prints the same `FAIL <test_name>: <reason>`
+ *  a `main` would have returned -- otherwise `grep '^FAIL test_'` would list every test that returned
+ *  a failure and silently omit every test that asserted its way out. The name comes from the
+ *  `test_name_k` each test declares beside its `main`.
+ *
+ *  @p message is a reason, not an operand: it says what the code expected, so a path, a SMILES or a
+ *  SMARTS belongs inside a sentence rather than standing in for one. It is evaluated only on the
+ *  failing branch, so composing it with `fmt::format` costs a passing run nothing.
+ */
+#define sf_verify_(condition, message)                                                                            \
+    do {                                                                                                          \
+        if (!(condition)) {                                                                                       \
+            [[maybe_unused]] int const exit_code = smallfield::tests::report_fail(test_name_k, "{} at {}:{}",     \
+                                                                                  (message), __FILE__, __LINE__); \
+            std::exit(1);                                                                                         \
+        }                                                                                                         \
+    } while (0)
+
+/** `sf_verify_` for a floating comparison, with the absolute error taken against @p tolerance. */
+#define sf_verify_near_(actual, expected, tolerance, message)                                                    \
+    sf_verify_(                                                                                                  \
+        std::fabs(static_cast<double>(actual) - static_cast<double>(expected)) < static_cast<double>(tolerance), \
+        (message))
+
+#pragma endregion Assertions

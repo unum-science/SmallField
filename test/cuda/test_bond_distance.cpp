@@ -7,16 +7,13 @@
  *  different encodings of the same graph, so the check is exact equality over every byte of every molecule — a
  *  single differing entry silently changes which pairs the sweep treats as 1-4 or as excluded.
  *
- *  Corpus: `SMALLFIELD_TEST_CORPUS=/path/to.smi` streams real molecules, capped by `SMALLFIELD_TEST_MAX_MOLS`
- *  (default 300). Absent it the built-in list runs, which carries its own multi-fragment salts so the 255
- *  unreachable sentinel is covered either way.
+ *  Corpus: a `.smi` path in `argv[1]` or in `SMALLFIELD_TEST_CORPUS` streams real molecules, capped by `argv[2]`
+ *  or `SMALLFIELD_TEST_MAX_MOLS` (default 300). Absent both the built-in list runs, which carries its own
+ *  multi-fragment salts so the 255 unreachable sentinel is covered either way.
  */
 
-#include <cstdlib> // `std::getenv`
-
-#include <fstream>     // `std::ifstream`
 #include <memory>      // `std::unique_ptr`
-#include <string>      // `std::string`, `std::getline`
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
 
@@ -39,20 +36,6 @@ namespace sftest = smallfield::tests;
 static constexpr std::string_view test_name_k = "test_bond_distance";
 
 namespace smallfield::tests {
-
-/** Load up to @p max_count SMILES strings from @p path, one per line, first field only. */
-static std::vector<std::string> load_smiles_(char const *path, std::size_t max_count) {
-    std::vector<std::string> smiles_list;
-    std::ifstream file(path);
-    if (!file) return smiles_list;
-    std::string line;
-    while (smiles_list.size() < max_count && std::getline(file, line)) {
-        std::size_t const end = line.find_first_of(" \t\r");
-        if (end != std::string::npos) line.resize(end);
-        if (!line.empty()) smiles_list.push_back(line);
-    }
-    return smiles_list;
-}
 
 /**
  *  @brief Multi-fragment molecules whose halves have no bonded path between them.
@@ -118,7 +101,9 @@ static void test_device_matches_host_(std::vector<std::string> const &smiles_lis
         auto const &meta = metadata[molecule];
         std::string const &smiles = smiles_list[input_indices[molecule]];
         std::uint32_t const num_atoms = host_bond_hops_(smiles, reference);
-        sf_verify_(num_atoms == meta.num_atoms, smiles.c_str());
+        sf_verify_(num_atoms == meta.num_atoms,
+                   fmt::format("the host rebuild of {} carries {} atoms against the batch's {}", smiles, num_atoms,
+                               meta.num_atoms));
 
         std::uint8_t const *device_block = device_matrix.data() + meta.bond_distance_offset;
         std::size_t local_unreachable = 0;
@@ -147,22 +132,26 @@ static void test_device_matches_host_(std::vector<std::string> const &smiles_lis
 
 } // namespace smallfield::tests
 
-int main() {
-    fmt::println("test_bond_distance: device warp BFS vs host CSR BFS over the packed hop matrix");
+int main(int argc, char **argv) {
+    fmt::println("{}: device warp BFS vs host CSR BFS over the packed hop matrix", test_name_k);
 
-    char const *corpus_path = std::getenv("SMALLFIELD_TEST_CORPUS");
-    char const *max_molecules_env = std::getenv("SMALLFIELD_TEST_MAX_MOLS");
-    std::size_t const max_molecules = max_molecules_env ? static_cast<std::size_t>(std::atoll(max_molecules_env)) : 300;
+    auto const selection = sftest::select_corpus(argc, argv, 300);
+    if (selection.knob == sftest::corpus_knob_t::refused_k) {
+        fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", argv[0]);
+        return 2;
+    }
 
     std::vector<std::string> smiles_list = sftest::builtin_multi_fragment_smiles_();
     for (auto &smiles : sftest::standard_test_smiles()) smiles_list.push_back(std::move(smiles));
-    if (corpus_path) {
-        auto streamed = sftest::load_smiles_(corpus_path, max_molecules);
-        sf_verify_(!streamed.empty(), corpus_path);
-        fmt::println("Corpus: {} (up to {} molecules) plus built-ins", corpus_path, fmt::group_digits(max_molecules));
+    if (selection.knob == sftest::corpus_knob_t::named_k) {
+        std::vector<std::string> streamed;
+        auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, streamed);
+        if (outcome != sftest::smiles_load_t::loaded_k)
+            return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), selection.path);
+        fmt::println("Corpus: {} ({} molecules) plus built-ins", selection.path, fmt::group_digits(streamed.size()));
         for (auto &smiles : streamed) smiles_list.push_back(std::move(smiles));
     }
-    else fmt::println("Corpus: built-ins only; set SMALLFIELD_TEST_CORPUS for a wider sweep");
+    else fmt::println("Corpus: built-ins only; name one on the command line or in SMALLFIELD_TEST_CORPUS");
 
     sftest::test_device_matches_host_(smiles_list);
     return sftest::report_pass(test_name_k);

@@ -13,14 +13,20 @@
  */
 
 #include <cmath>   // `std::fabs`
+#include <cstdint> // `std::uint8_t`, `std::uint64_t`
+#include <cstdio>  // `std::fflush`, `stderr`
 #include <cstring> // `std::memcpy`
 
+#include <algorithm>   // `std::binary_search`, `std::max`, `std::sort`
+#include <array>       // `std::array`
+#include <memory>      // `std::unique_ptr`
+#include <span>        // `std::span`
 #include <sstream>     // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
 
-#include <fmt/format.h> // `fmt::print`, `fmt::println`, `fmt::group_digits`
+#include <fmt/format.h> // `fmt::print`, `fmt::println`
 
 #include <boost/shared_ptr.hpp>
 #include <RDGeneral/types.h>
@@ -45,27 +51,87 @@ namespace sfmmff = smallfield::mmff94;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-using sftest::load_smiles;
-
 static constexpr std::string_view test_name_k = "test_mmff_cpu_port";
 
 namespace smallfield::tests {
 
-static int n_checks_ = 0;
-static int n_fails_ = 0;
-static int n_mol_pass_ = 0;
-static int n_mol_fail_ = 0;
-static int n_mol_with_any_fail_ = 0;
-
 /** How many failing molecules to describe before going silent. A cap of three turned a thirteen-molecule
  *  structural class into what read as a single stray molecule, so the default is generous; lower it locally
- *  when triaging one molecule. A shared knobs header is on its way and will own this, at which point the
- *  constant here becomes its default. */
-static int max_reported_failing_molecules_ = 32;
+ *  when triaging one molecule. */
+static int constexpr max_reported_failing_molecules_k = 32;
 
 /** Ceiling on molecules whose native terms differ in value from the RDKit oracle, in parts per million.
- *  Structural differences — a term count that does not match — are never tolerated, see `n_mol_fail_`. */
+ *  Structural differences — a term count that does not match — are never tolerated. */
 static double constexpr max_molecule_value_mismatch_ppm_k = 100.0;
+
+/** Atom ceiling this comparison holds itself to, below `types::max_atoms_per_molecule_k`; a larger
+ *  molecule is skipped rather than compared. */
+static std::uint32_t constexpr max_atoms_compared_k = 128;
+
+/**
+ *  @brief How one molecule compared against the RDKit oracle.
+ *
+ *  The three verdicts partition the molecules tested, which is the point of naming them: counting a
+ *  structural failure and a value failure in two independent buckets double-counts any molecule that is
+ *  both, and every ppm below is a fraction of that total.
+ */
+enum class molecule_verdict_t : std::uint8_t {
+    matched_k,
+    value_differs_k,
+    structure_differs_k,
+};
+
+/** Whether the two term sets have the same shape: the same atom count and the same number of each term. */
+enum class term_structure_t : std::uint8_t {
+    matches_k,
+    differs_k,
+};
+
+/** Whether a comparison narrates the differences it finds, or only counts them. */
+enum class narration_t : std::uint8_t {
+    silent_k,
+    narrated_k,
+};
+
+/** Whether a sweep narrates every molecule it compares, or only the first molecules that differ. */
+enum class narration_policy_t : std::uint8_t {
+    every_molecule_k,
+    first_failures_k,
+};
+
+/**
+ *  @brief Why a SMILES never reached the comparison, or that it did.
+ *
+ *  Each refusal names a molecule about which nothing was measured, so it stays out of the ppm
+ *  denominator instead of counting as a match and diluting the rate.
+ */
+enum class molecule_intake_t : std::uint8_t {
+    comparable_k,
+    /** RDKit refused the SMILES, or refused to add hydrogens to it. */
+    unparsable_k,
+    /** More atoms than `max_atoms_compared_k`. */
+    above_atom_ceiling_k,
+    /** `build_descriptor` refused the molecule. */
+    undescribable_k,
+    /** `MMFFMolProperties` came back invalid, so there are no reference atom types or charges. */
+    untypable_k,
+};
+
+/** Counts for one sweep, threaded by reference so the curated probe and the external corpus aggregate. */
+struct port_tally_t {
+    std::uint64_t term_checks = 0;
+    std::uint64_t term_failures = 0;
+    /** Molecules per `molecule_verdict_t`, so the three buckets sum to the number tested. */
+    std::array<std::uint64_t, 3> molecules {};
+    /** Molecules a `molecule_intake_t` refusal kept out of the comparison, and out of every ppm below. */
+    std::uint64_t molecules_skipped = 0;
+
+    std::uint64_t &molecules_with(molecule_verdict_t verdict) { return molecules[static_cast<std::size_t>(verdict)]; }
+    std::uint64_t molecules_with(molecule_verdict_t verdict) const {
+        return molecules[static_cast<std::size_t>(verdict)];
+    }
+    std::uint64_t total_molecules() const { return molecules[0] + molecules[1] + molecules[2]; }
+};
 
 /** Bitwise-identical float comparison (allowing NaN != NaN). */
 static bool bit_eq_(float left, float right) {
@@ -93,19 +159,62 @@ static char const *name_of_(native_extractor_t extractor) {
     return extractor == native_extractor_t::hybrid_k ? "hybrid" : "fully-native";
 }
 
-static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
-                         sfp::etkdg_prepared_molecule_t const &rdkit_result,
-                         sfp::etkdg_prepared_molecule_t const &native_result, bool verbose) {
+/** How many one-sided torsions the structural diagnostic names before it only counts them. */
+static int constexpr max_reported_one_sided_torsions_k = 3;
+
+/** Pack a torsion's four atom positions into one sortable key. */
+template <typename torsion_type_>
+static std::uint32_t packed_ijkl_of_(torsion_type_ const &torsion) {
+    return static_cast<std::uint32_t>(torsion.atom_i) | (static_cast<std::uint32_t>(torsion.atom_j) << 8) |
+           (static_cast<std::uint32_t>(torsion.atom_k) << 16) | (static_cast<std::uint32_t>(torsion.atom_l) << 24);
+}
+
+/**
+ *  @brief Name the torsions @p present enumerated and @p absent did not, one line each.
+ *
+ *  The scan runs to completion and the budget decides only what is printed, so the trailing count is
+ *  the true number of one-sided torsions rather than the number that fit on screen.
+ *
+ *  @param[in] label Which extractor the listed torsions came from.
+ *  @param[in] present Sorted packed keys from that extractor.
+ *  @param[in] absent Sorted packed keys from the other one.
+ */
+static void report_one_sided_torsions_(std::string_view label, std::vector<std::uint32_t> const &present,
+                                       std::vector<std::uint32_t> const &absent) {
+    int one_sided = 0, printed = 0;
+    for (auto packed_ijkl : present) {
+        if (std::binary_search(absent.begin(), absent.end(), packed_ijkl)) continue;
+        ++one_sided;
+        if (printed >= max_reported_one_sided_torsions_k) continue;
+        fmt::println("    torsion {}-only ijkl={}-{}-{}-{}", label, packed_ijkl & 0xff, (packed_ijkl >> 8) & 0xff,
+                     (packed_ijkl >> 16) & 0xff, (packed_ijkl >> 24) & 0xff);
+        ++printed;
+    }
+    fmt::println("    torsion {}-only count={} suppressed={}", label, one_sided, one_sided - printed);
+}
+
+static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t extractor,
+                                     sfp::etkdg_prepared_molecule_t const &rdkit_result,
+                                     sfp::etkdg_prepared_molecule_t const &native_result, narration_t narration,
+                                     port_tally_t &tally) {
     char const *native_path_label = name_of_(extractor);
-    bool ok = true;
+    bool const verbose = narration == narration_t::narrated_k;
+    term_structure_t structure = term_structure_t::matches_k;
+
+    // Printed once, ahead of the first differing count, so the run of names that follows is
+    // attributable to a molecule and to the extractor that produced it.
+    bool structure_header_printed = false;
     auto complain = [&](std::string_view what) {
-        if (verbose && ok) fmt::print("  [{}] {} MISMATCH: ", smiles, native_path_label);
-        if (verbose) fmt::print("{} ", what);
-        ok = false;
+        structure = term_structure_t::differs_k;
+        if (!verbose) return;
+        if (!structure_header_printed) {
+            fmt::print("  [{}] {} MISMATCH: ", smiles, native_path_label);
+            structure_header_printed = true;
+        }
+        fmt::print("{} ", what);
     };
 
-    // Printed once, ahead of the first per-term value mismatch, so every value line below is
-    // attributable to a molecule and to the extractor that produced it.
+    // The same idiom for the value section, which is reached only when the shapes agree.
     bool value_header_printed = false;
     auto value_header = [&]() {
         if (!verbose || value_header_printed) return;
@@ -119,41 +228,22 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
     if (rdkit_result.mmff_torsions.size() != native_result.mmff_torsions.size()) {
         complain("torsion_count");
         if (verbose) {
-            // Dump first few torsions present in rdk but missing from nat
-            // and vice versa — index them by (i, j, k, l).
-            auto ijkl_of = [](auto const &torsion) {
-                return (std::uint32_t)torsion.atom_i | ((std::uint32_t)torsion.atom_j << 8) |
-                       ((std::uint32_t)torsion.atom_k << 16) | ((std::uint32_t)torsion.atom_l << 24);
-            };
+            // Which torsions one extractor enumerated and the other did not, keyed by (i, j, k, l).
             std::vector<std::uint32_t> rdkit_torsion_keys, native_torsion_keys;
-            for (auto const &torsion : rdkit_result.mmff_torsions) rdkit_torsion_keys.push_back(ijkl_of(torsion));
-            for (auto const &torsion : native_result.mmff_torsions) native_torsion_keys.push_back(ijkl_of(torsion));
+            for (auto const &torsion : rdkit_result.mmff_torsions)
+                rdkit_torsion_keys.push_back(packed_ijkl_of_(torsion));
+            for (auto const &torsion : native_result.mmff_torsions)
+                native_torsion_keys.push_back(packed_ijkl_of_(torsion));
             std::sort(rdkit_torsion_keys.begin(), rdkit_torsion_keys.end());
             std::sort(native_torsion_keys.begin(), native_torsion_keys.end());
-            int printed = 0;
-            for (auto packed_ijkl : rdkit_torsion_keys) {
-                if (!std::binary_search(native_torsion_keys.begin(), native_torsion_keys.end(), packed_ijkl) &&
-                    printed < 3) {
-                    fmt::println("    rdk-only tor: {}-{}-{}-{}", packed_ijkl & 0xff, (packed_ijkl >> 8) & 0xff,
-                                 (packed_ijkl >> 16) & 0xff, (packed_ijkl >> 24) & 0xff);
-                    ++printed;
-                }
-            }
-            printed = 0;
-            for (auto packed_ijkl : native_torsion_keys) {
-                if (!std::binary_search(rdkit_torsion_keys.begin(), rdkit_torsion_keys.end(), packed_ijkl) &&
-                    printed < 3) {
-                    fmt::println("    nat-only tor: {}-{}-{}-{}", packed_ijkl & 0xff, (packed_ijkl >> 8) & 0xff,
-                                 (packed_ijkl >> 16) & 0xff, (packed_ijkl >> 24) & 0xff);
-                    ++printed;
-                }
-            }
+            report_one_sided_torsions_("rdkit", rdkit_torsion_keys, native_torsion_keys);
+            report_one_sided_torsions_("native", native_torsion_keys, rdkit_torsion_keys);
         }
     }
     if (rdkit_result.mmff_oops.size() != native_result.mmff_oops.size()) complain("oop_count");
     if (rdkit_result.mmff_stretchbends.size() != native_result.mmff_stretchbends.size()) complain("stbn_count");
 
-    if (!ok) {
+    if (structure == term_structure_t::differs_k) {
         if (verbose)
             fmt::println("\n    sizes: bond {}/{}, ang {}/{}, tor {}/{}, oop {}/{}, sb {}/{}",
                          rdkit_result.mmff_bonds.size(), native_result.mmff_bonds.size(),
@@ -161,7 +251,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                          rdkit_result.mmff_torsions.size(), native_result.mmff_torsions.size(),
                          rdkit_result.mmff_oops.size(), native_result.mmff_oops.size(),
                          rdkit_result.mmff_stretchbends.size(), native_result.mmff_stretchbends.size());
-        return ok;
+        return structure;
     }
 
     // Per-atom VdW + charge
@@ -178,7 +268,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                 fmt::println("    vdw[{}] rdk α={:.4f} r*={:.4f}; nat α={:.4f} r*={:.4f}", atom, rdkit_term.alpha,
                              rdkit_term.r_star, native_term.alpha, native_term.r_star);
             }
-            ++n_fails_;
+            ++tally.term_failures;
         }
         // The hybrid path is handed RDKit's own `double` charges, so it must reproduce them bit for bit.
         // The fully-native path sums bond-charge increments in `float` where RDKit sums in `double`, so it
@@ -194,7 +284,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                              native_result.mmff_atom_charge[atom],
                              native_result.mmff_atom_charge[atom] - rdkit_result.mmff_atom_charge[atom]);
             }
-            ++n_fails_;
+            ++tally.term_failures;
         }
     }
 
@@ -202,14 +292,14 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
     for (std::size_t term = 0; term < rdkit_result.mmff_bonds.size(); ++term) {
         auto const &rdkit_term = rdkit_result.mmff_bonds[term];
         auto const &native_term = native_result.mmff_bonds[term];
-        ++n_checks_;
+        ++tally.term_checks;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j) {
             if (verbose) {
                 value_header();
                 fmt::println("    bond[{}] ij rdk={}-{} nat={}-{}", term, rdkit_term.atom_i, rdkit_term.atom_j,
                              native_term.atom_i, native_term.atom_j);
             }
-            ++n_fails_;
+            ++tally.term_failures;
             continue;
         }
         if (!near_(rdkit_term.force_constant, native_term.force_constant) ||
@@ -220,7 +310,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                              rdkit_term.force_constant, native_term.force_constant, rdkit_term.equilibrium_distance,
                              native_term.equilibrium_distance);
             }
-            ++n_fails_;
+            ++tally.term_failures;
         }
     }
 
@@ -228,7 +318,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
     for (std::size_t term = 0; term < rdkit_result.mmff_angles.size(); ++term) {
         auto const &rdkit_term = rdkit_result.mmff_angles[term];
         auto const &native_term = native_result.mmff_angles[term];
-        ++n_checks_;
+        ++tally.term_checks;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j ||
             rdkit_term.atom_k != native_term.atom_k) {
             if (verbose) {
@@ -237,7 +327,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                              rdkit_term.atom_j, rdkit_term.atom_k, native_term.atom_i, native_term.atom_j,
                              native_term.atom_k);
             }
-            ++n_fails_;
+            ++tally.term_failures;
             continue;
         }
         if (!near_(rdkit_term.force_constant, native_term.force_constant) ||
@@ -248,7 +338,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                              rdkit_term.force_constant, native_term.force_constant, rdkit_term.equilibrium_angle,
                              native_term.equilibrium_angle);
             }
-            ++n_fails_;
+            ++tally.term_failures;
         }
     }
 
@@ -256,7 +346,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
     for (std::size_t term = 0; term < rdkit_result.mmff_torsions.size(); ++term) {
         auto const &rdkit_term = rdkit_result.mmff_torsions[term];
         auto const &native_term = native_result.mmff_torsions[term];
-        ++n_checks_;
+        ++tally.term_checks;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j ||
             rdkit_term.atom_k != native_term.atom_k || rdkit_term.atom_l != native_term.atom_l) {
             if (verbose) {
@@ -265,7 +355,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                              rdkit_term.atom_j, rdkit_term.atom_k, rdkit_term.atom_l, native_term.atom_i,
                              native_term.atom_j, native_term.atom_k, native_term.atom_l);
             }
-            ++n_fails_;
+            ++tally.term_failures;
             continue;
         }
         if (!near_(rdkit_term.torsion_v1, native_term.torsion_v1) ||
@@ -278,7 +368,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                              rdkit_term.torsion_v1, rdkit_term.torsion_v2, rdkit_term.torsion_v3,
                              native_term.torsion_v1, native_term.torsion_v2, native_term.torsion_v3);
             }
-            ++n_fails_;
+            ++tally.term_failures;
         }
     }
 
@@ -286,7 +376,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
     for (std::size_t term = 0; term < rdkit_result.mmff_oops.size(); ++term) {
         auto const &rdkit_term = rdkit_result.mmff_oops[term];
         auto const &native_term = native_result.mmff_oops[term];
-        ++n_checks_;
+        ++tally.term_checks;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j ||
             rdkit_term.atom_k != native_term.atom_k || rdkit_term.atom_l != native_term.atom_l) {
             if (verbose) {
@@ -295,7 +385,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                              rdkit_term.atom_j, rdkit_term.atom_k, rdkit_term.atom_l, native_term.atom_i,
                              native_term.atom_j, native_term.atom_k, native_term.atom_l);
             }
-            ++n_fails_;
+            ++tally.term_failures;
             continue;
         }
         if (!near_(rdkit_term.force_constant, native_term.force_constant)) {
@@ -305,7 +395,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                              rdkit_term.atom_j, rdkit_term.atom_k, rdkit_term.atom_l, rdkit_term.force_constant,
                              native_term.force_constant);
             }
-            ++n_fails_;
+            ++tally.term_failures;
         }
     }
 
@@ -313,7 +403,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
     for (std::size_t term = 0; term < rdkit_result.mmff_stretchbends.size(); ++term) {
         auto const &rdkit_term = rdkit_result.mmff_stretchbends[term];
         auto const &native_term = native_result.mmff_stretchbends[term];
-        ++n_checks_;
+        ++tally.term_checks;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j ||
             rdkit_term.atom_k != native_term.atom_k) {
             if (verbose) {
@@ -321,7 +411,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                 fmt::println("    sb[{}] ijk rdk={}-{}-{} nat={}-{}-{}", term, rdkit_term.atom_i, rdkit_term.atom_j,
                              rdkit_term.atom_k, native_term.atom_i, native_term.atom_j, native_term.atom_k);
             }
-            ++n_fails_;
+            ++tally.term_failures;
             continue;
         }
         if (!near_(rdkit_term.kba_ijk, native_term.kba_ijk) || !near_(rdkit_term.kba_kji, native_term.kba_kji) ||
@@ -338,7 +428,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
                              native_term.equilibrium_angle, native_term.equilibrium_distance_ij,
                              native_term.equilibrium_distance_kj);
             }
-            ++n_fails_;
+            ++tally.term_failures;
         }
     }
 
@@ -347,7 +437,9 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
     // comparison — the native CSR is validated implicitly by the bonded
     // term counts above plus cross-checks in downstream ETKDG kernels.
 
-    return ok;
+    // Every value difference above went into the tally rather than into this answer. Reaching here
+    // means the two term sets have the same shape, which is all this function decides.
+    return term_structure_t::matches_k;
 }
 
 /** Build a "ground truth" prepared molecule by calling RDKit's per-term
@@ -357,6 +449,14 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
  *  any latent cache bugs don't contaminate the comparison. */
 static void rdkit_direct_extract_(RDKit::ROMol &molecule, sft::molecule_descriptor_t const &descriptor,
                                   sfp::etkdg_prepared_molecule_t &out) {
+    // `out` is caller-owned scratch reused across the sweep, so every array this function appends to is
+    // emptied first; the two it resizes are covered by the resize.
+    out.mmff_bonds.clear();
+    out.mmff_angles.clear();
+    out.mmff_torsions.clear();
+    out.mmff_oops.clear();
+    out.mmff_stretchbends.clear();
+
     if (!molecule.hasProp(RDKit::common_properties::_MMFFSanitized)) {
         molecule.setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
     }
@@ -509,97 +609,213 @@ static void rdkit_direct_extract_(RDKit::ROMol &molecule, sft::molecule_descript
     }
 }
 
-static void run_one_(std::string_view smiles, sfparam::mmff94_tables_view_t const &tables, bool verbose) {
-    // Native + RDKit preprocessing share the same SmilesToMol/addHs/build_descriptor path.
+/**
+ *  @brief Everything both extractors read for one molecule, plus the three term sets they are judged by.
+ *
+ *  Owned by the sweep and reused across molecules, so the growth phase happens once rather than eleven
+ *  vectors per SMILES. Every array is refilled from scratch by the extractor that owns it.
+ */
+struct molecule_under_test_t {
     std::unique_ptr<RDKit::RWMol> molecule;
+    sft::molecule_descriptor_t descriptor {};
+    /** Atom types RDKit assigned, which the hybrid extractor is handed. */
+    std::vector<std::uint8_t> atom_types;
+    /** Partial charges RDKit assigned, which the hybrid extractor is handed. */
+    std::vector<float> charges;
+    /** The oracle: RDKit's own per-term answer, built without the parameter cache. */
+    sfp::etkdg_prepared_molecule_t rdkit_result;
+    /** `extract_mmff94_params_native`, handed RDKit's atom types and charges. */
+    sfp::etkdg_prepared_molecule_t hybrid_result;
+    /** `extract_mmff94_params_fully_native`, deriving atom types and charges itself. */
+    sfp::etkdg_prepared_molecule_t fully_native_result;
+};
+
+/**
+ *  @brief Parse one SMILES and fill everything the comparison consumes, or name why it cannot.
+ *
+ *  Native and RDKit preprocessing share this one `SmilesToMol` / `addHs` / `build_descriptor` path, so a
+ *  difference the comparison reports is a difference between the extractors and never in how the
+ *  molecule was read.
+ *
+ *  @param[in] smiles Molecule to read.
+ *  @param[out] subject Overwritten with the parsed molecule, its descriptor, and RDKit's types and charges.
+ *  @return Whether the molecule is comparable, and if not, which stage refused it.
+ */
+static molecule_intake_t prepare_one_(std::string_view smiles, molecule_under_test_t &subject) {
     try {
-        std::string smiles_string {smiles};
+        std::string const smiles_string {smiles};
         RDKit::SmilesParserParams params;
         params.sanitize = true;
         params.removeHs = false;
         params.strictCXSMILES = false;
-        molecule.reset(RDKit::SmilesToMol(smiles_string, params));
+        subject.molecule.reset(RDKit::SmilesToMol(smiles_string, params));
+        if (!subject.molecule) return molecule_intake_t::unparsable_k;
+        RDKit::MolOps::addHs(*subject.molecule);
     }
     catch (...) {
-        return;
+        return molecule_intake_t::unparsable_k; // RDKit throws out of sanitization and out of `addHs`
     }
-    if (!molecule) return;
-    try {
-        RDKit::MolOps::addHs(*molecule);
-    }
-    catch (...) {
-        return;
-    }
-    std::uint32_t const num_atoms = molecule->getNumAtoms();
-    if (num_atoms > 128) return;
 
-    sft::molecule_descriptor_t descriptor;
-    if (!sft::build_descriptor(*molecule, descriptor)) return;
+    std::uint32_t const num_atoms = subject.molecule->getNumAtoms();
+    if (num_atoms > max_atoms_compared_k) return molecule_intake_t::above_atom_ceiling_k;
+    if (!sft::build_descriptor(*subject.molecule, subject.descriptor)) return molecule_intake_t::undescribable_k;
 
-    // RDKit direct (cache-free) baseline.
-    sfp::etkdg_prepared_molecule_t rdk_result;
-    rdk_result.num_atoms = num_atoms;
-    rdkit_direct_extract_(*molecule, descriptor, rdk_result);
+    // Both the oracle and the hybrid path read their atom types and charges here, so a molecule MMFF94
+    // cannot type has no reference to compare the native tables against.
+    if (!subject.molecule->hasProp(RDKit::common_properties::_MMFFSanitized))
+        subject.molecule->setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
+    RDKit::MMFF::MMFFMolProperties props(*subject.molecule);
+    if (!props.isValid()) return molecule_intake_t::untypable_k;
 
-    // Native path — pull atom types + charges from MMFFMolProperties (same
-    // source as the RDKit path).
-    if (!molecule->hasProp(RDKit::common_properties::_MMFFSanitized)) {
-        molecule->setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
-    }
-    RDKit::MMFF::MMFFMolProperties props(*molecule);
-    if (!props.isValid()) return;
-
-    std::vector<std::uint8_t> atom_types(num_atoms);
-    std::vector<float> charges(num_atoms);
+    subject.atom_types.assign(num_atoms, std::uint8_t {0});
+    subject.charges.assign(num_atoms, 0.0f);
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-        atom_types[atom] = static_cast<std::uint8_t>(props.getMMFFAtomType(atom));
-        charges[atom] = static_cast<float>(props.getMMFFPartialCharge(atom));
+        subject.atom_types[atom] = static_cast<std::uint8_t>(props.getMMFFAtomType(atom));
+        subject.charges[atom] = static_cast<float>(props.getMMFFPartialCharge(atom));
     }
+    return molecule_intake_t::comparable_k;
+}
 
-    sfp::etkdg_prepared_molecule_t nat_result;
-    nat_result.num_atoms = num_atoms;
-    sfmmff::extract_mmff94_params_native(descriptor, atom_types, charges, tables, nat_result);
+/**
+ *  @brief Compare both native extractors for one prepared molecule against the RDKit oracle.
+ *
+ *  Both extractors always run, and every value difference lands in @p tally rather than in the verdict,
+ *  so a molecule that differs in one term still contributes its remaining term checks to the totals.
+ *
+ *  @param[in] smiles Molecule under test, for the narration only.
+ *  @param[in] tables MMFF94 parameter tables both native extractors read.
+ *  @param[in] narration Whether the differences found are described or only counted.
+ *  @param[inout] subject Prepared molecule; its three term sets are overwritten.
+ *  @param[inout] tally Term checks and term failures, accumulated across molecules.
+ *  @return How this one molecule compared, as one of three verdicts that partition the corpus.
+ */
+static molecule_verdict_t run_one_(std::string_view smiles, sfparam::mmff94_tables_view_t const &tables,
+                                   narration_t narration, molecule_under_test_t &subject, port_tally_t &tally) {
+    std::uint64_t const term_failures_before = tally.term_failures;
+    std::uint32_t const num_atoms = subject.descriptor.num_atoms;
 
-    // Fully-native: zero runtime RDKit. Its terms are held to the same
-    // RDKit-derived oracle as the hybrid path.
-    sfp::etkdg_prepared_molecule_t fully_native_result;
-    fully_native_result.num_atoms = num_atoms;
-    bool const extracted = sfmmff::extract_mmff94_params_fully_native(descriptor, tables, fully_native_result);
+    subject.rdkit_result.num_atoms = num_atoms;
+    rdkit_direct_extract_(*subject.molecule, subject.descriptor, subject.rdkit_result);
 
-    int const fails_before = n_fails_;
-    bool ok = compare_mol_(smiles, sftest::native_extractor_t::hybrid_k, rdk_result, nat_result, verbose);
-    if (!extracted) {
-        if (verbose) fmt::println("  [{}] fully-native extraction REFUSED (typer failure)", smiles);
-        ok = false;
+    subject.hybrid_result.num_atoms = num_atoms;
+    sfmmff::extract_mmff94_params_native(subject.descriptor, subject.atom_types, subject.charges, tables,
+                                         subject.hybrid_result);
+    term_structure_t structure = compare_mol_(smiles, native_extractor_t::hybrid_k, subject.rdkit_result,
+                                              subject.hybrid_result, narration, tally);
+
+    // Zero runtime RDKit, held to the same oracle. A typer refusal is a structural difference rather
+    // than a value one, because the terms it would have produced do not exist at all.
+    subject.fully_native_result.num_atoms = num_atoms;
+    if (!sfmmff::extract_mmff94_params_fully_native(subject.descriptor, tables, subject.fully_native_result)) {
+        if (narration == narration_t::narrated_k)
+            fmt::println("  [{}] fully-native extraction REFUSED (typer failure)", smiles);
+        structure = term_structure_t::differs_k;
     }
-    else if (!compare_mol_(smiles, sftest::native_extractor_t::fully_native_k, rdk_result, fully_native_result,
-                           verbose))
-        ok = false;
-    if (ok && n_fails_ == fails_before) ++n_mol_pass_;
-    else if (!ok) ++n_mol_fail_;
-    if (n_fails_ > fails_before) ++n_mol_with_any_fail_;
+    else if (compare_mol_(smiles, native_extractor_t::fully_native_k, subject.rdkit_result, subject.fully_native_result,
+                          narration, tally) == term_structure_t::differs_k)
+        structure = term_structure_t::differs_k;
+
+    // Structure is decided first because a molecule that is both is still one molecule: the three
+    // verdicts have to partition the corpus for the ppm computed over them to be a fraction of anything.
+    if (structure == term_structure_t::differs_k) return molecule_verdict_t::structure_differs_k;
+    if (tally.term_failures != term_failures_before) return molecule_verdict_t::value_differs_k;
+    return molecule_verdict_t::matched_k;
+}
+
+/**
+ *  @brief Run every SMILES in @p corpus through both extractors, accumulating into @p tally.
+ *
+ *  The loop is deliberately non-short-circuiting: its counters are the test's output and feed the gate,
+ *  so a differing molecule is described and then walked past rather than ending the sweep.
+ *
+ *  @param[in] corpus SMILES to compare, in order.
+ *  @param[in] tables MMFF94 parameter tables both native extractors read.
+ *  @param[in] policy Whether every molecule is narrated, or only the first molecules that differ.
+ *  @param[inout] tally Molecule verdicts and term counts, accumulated across sweeps.
+ */
+static void sweep_(std::span<std::string const> corpus, sfparam::mmff94_tables_view_t const &tables,
+                   narration_policy_t policy, port_tally_t &tally) {
+    molecule_under_test_t subject;
+    int narrated_failures = 0;
+    for (auto const &smiles : corpus) {
+        // A molecule RDKit cannot parse, size, describe or type measures nothing about the port, so it
+        // stays out of the denominator instead of counting as a match.
+        if (prepare_one_(smiles, subject) != molecule_intake_t::comparable_k) {
+            ++tally.molecules_skipped;
+            continue;
+        }
+        bool const within_narration_budget = narrated_failures < max_reported_failing_molecules_k;
+        narration_t const narration = policy == narration_policy_t::every_molecule_k || within_narration_budget
+                                          ? narration_t::narrated_k
+                                          : narration_t::silent_k;
+        molecule_verdict_t const verdict = run_one_(smiles, tables, narration, subject, tally);
+        ++tally.molecules_with(verdict);
+
+        if (verdict == molecule_verdict_t::matched_k) continue;       // nothing to attribute
+        if (policy != narration_policy_t::first_failures_k) continue; // the probe already names itself
+        if (!within_narration_budget) continue;                       // budget spent, and still counted
+        fmt::println("  (above is from SMILES: {})", smiles);
+        ++narrated_failures;
+    }
+}
+
+/**
+ *  @brief Print what the sweeps counted and answer `main` with the exit code the gate decided.
+ *
+ *  @param[in] tally Aggregated counts from every sweep.
+ *  @return `0` when the port matches within budget, `1` otherwise.
+ */
+static int report_(port_tally_t const &tally) {
+    std::uint64_t const compared = tally.total_molecules();
+    std::uint64_t const value_differs = tally.molecules_with(molecule_verdict_t::value_differs_k);
+    std::uint64_t const structure_differs = tally.molecules_with(molecule_verdict_t::structure_differs_k);
+    fmt::println("molecules compared={} matched={} value_differs={} structure_differs={} skipped={}", compared,
+                 tally.molecules_with(molecule_verdict_t::matched_k), value_differs, structure_differs,
+                 tally.molecules_skipped);
+    fmt::println("terms compared={} failures={}", tally.term_checks, tally.term_failures);
+
+    // A validator that compared nothing passes every run, so an empty sweep is a failure and not a pass.
+    if (compared == 0) return report_fail(test_name_k, "no molecule reached the comparison");
+
+    double const molecule_ppm = 1.0e6 * static_cast<double>(value_differs + structure_differs) /
+                                static_cast<double>(compared);
+    double const value_ppm = 1.0e6 * static_cast<double>(value_differs) / static_cast<double>(compared);
+    double const term_ppm = tally.term_checks > 0 ? 1.0e6 * static_cast<double>(tally.term_failures) /
+                                                        static_cast<double>(tally.term_checks)
+                                                  : 0.0;
+    fmt::println("ppm molecules_differing={:.3f} molecules_value_differing={:.3f} terms_differing={:.3f} budget={:.3f}",
+                 molecule_ppm, value_ppm, term_ppm, max_molecule_value_mismatch_ppm_k);
+
+    // Structural mismatches are never tolerated; value differences get the ppm budget the file header
+    // documents. Exotic structures — pentacoordinate P, porphyrins — can exceed it and should be triaged
+    // on the full 10M USearch set rather than absorbed by loosening this.
+    if (structure_differs > 0)
+        return report_fail(test_name_k, "{} of {} molecules differ structurally from the RDKit baseline",
+                           structure_differs, compared);
+    if (value_ppm > max_molecule_value_mismatch_ppm_k)
+        return report_fail(test_name_k, "{} of {} molecules differ in value, {:.3f} ppm > {:.3f} ppm", value_differs,
+                           compared, value_ppm, max_molecule_value_mismatch_ppm_k);
+    return report_pass(test_name_k);
 }
 
 } // namespace smallfield::tests
 
-using sftest::n_checks_;
-using sftest::n_fails_;
-using sftest::n_mol_fail_;
-using sftest::n_mol_pass_;
-using sftest::n_mol_with_any_fail_;
-using sftest::run_one_;
-
 int main(int argc, char **argv) {
-    fmt::println("test_mmff_cpu_port: native MMFF term extractor vs the RDKit-backed baseline");
+    fmt::println("{}: native MMFF term extractor vs the RDKit-backed baseline", test_name_k);
+
+    auto const corpus = sftest::select_corpus(argc, argv, 5000);
+    if (corpus.knob == sftest::corpus_knob_t::refused_k) {
+        std::fflush(stdout);
+        fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", test_name_k);
+        return 2;
+    }
 
     sfparam::mmff94_tables_host_t tables_host;
     sfparam::extract_mmff94_tables_from_rdkit(tables_host);
     sfparam::mmff94_tables_view_t const tables = tables_host.view();
-    fmt::println("extracted tables: vdw={} bond={} angle={} tor={} oop={} stbn={} dfsb={}",
-                 fmt::group_digits(tables_host.vdw.size()), fmt::group_digits(tables_host.bond.size()),
-                 fmt::group_digits(tables_host.angle.size()), fmt::group_digits(tables_host.torsion.size()),
-                 fmt::group_digits(tables_host.oop.size()), fmt::group_digits(tables_host.stbn.size()),
-                 fmt::group_digits(tables_host.dfsb.size()));
+    fmt::println("tables vdw={} bond={} angle={} torsion={} oop={} stbn={} dfsb={}", tables_host.vdw.size(),
+                 tables_host.bond.size(), tables_host.angle.size(), tables_host.torsion.size(), tables_host.oop.size(),
+                 tables_host.stbn.size(), tables_host.dfsb.size());
 
     // Curated handful of drug-like SMILES (aspirin, caffeine, ibuprofen,
     // paracetamol, benzodiazepine, adenine, imidazolium, carboxylate).
@@ -625,49 +841,18 @@ int main(int argc, char **argv) {
         "CC(C)NC(=O)C1=CC(=C(C=C1)C2=C3C=CC(=O)C=C3OC4=C2C=CC(=C4)O)C(=O)O" // quinoid single bond, fused system
     };
 
-    // Optional: a SMILES file for larger coverage
+    // A corpus arrives by flag or by `SMALLFIELD_TEST_CORPUS`, and a path that does not open is a
+    // failure rather than an empty run that passes because it compared nothing.
     std::vector<std::string> extra;
-    std::size_t const max_smiles_to_load = (argc > 2) ? std::strtoull(argv[2], nullptr, 10) : 5000;
-    if (argc > 1) extra = load_smiles(argv[1], max_smiles_to_load);
-    fmt::println("probing {} curated + {} external SMILES", fmt::group_digits(probe.size()),
-                 fmt::group_digits(extra.size()));
-
-    bool const verbose = (argc <= 1);
-    for (auto const &smiles : probe) run_one_(smiles, tables, verbose);
-    // Print first few failures for triage, then go silent.
-    int fail_prints = 0;
-    for (auto const &smiles : extra) {
-        int const fail_before = n_fails_;
-        int const mfail_before = n_mol_fail_;
-        bool const verbose_for_molecule = (fail_prints < sftest::max_reported_failing_molecules_);
-        run_one_(smiles, tables, verbose_for_molecule);
-        bool const had_fail = n_fails_ > fail_before || n_mol_fail_ > mfail_before;
-        if (had_fail && fail_prints < sftest::max_reported_failing_molecules_) {
-            fmt::println("  (above is from SMILES: {})", smiles);
-            ++fail_prints;
-        }
+    if (corpus.knob == sftest::corpus_knob_t::named_k) {
+        auto const outcome = sftest::load_smiles_into(corpus.path, corpus.max_molecules, extra);
+        if (outcome != sftest::smiles_load_t::loaded_k)
+            return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), corpus.path);
     }
+    fmt::println("smiles curated={} external={}", probe.size(), extra.size());
 
-    std::size_t const total_mols = n_mol_pass_ + n_mol_fail_ + n_mol_with_any_fail_;
-    fmt::println("molecules: {} size-pass / {} size-fail / {} value-fail (checks={}, term failures={})",
-                 fmt::group_digits(n_mol_pass_ + n_mol_with_any_fail_), fmt::group_digits(n_mol_fail_),
-                 fmt::group_digits(n_mol_with_any_fail_), fmt::group_digits(n_checks_), fmt::group_digits(n_fails_));
-    if (total_mols > 0) {
-        double const mol_fail_ppm = 1.0e6 * (double)(n_mol_fail_ + n_mol_with_any_fail_) / (double)total_mols;
-        double const term_fail_ppm = (n_checks_ > 0) ? 1.0e6 * (double)n_fails_ / (double)n_checks_ : 0.0;
-        fmt::println("ppm: molecules with any failure={:.3f}, term failures={:.3f}", mol_fail_ppm, term_fail_ppm);
-    }
-    // Structural mismatches are never tolerated; value differences get the ppm budget the file header
-    // documents. Exotic structures — pentacoordinate P, porphyrins — can exceed it and should be triaged
-    // on the full 10M USearch set rather than absorbed by loosening this.
-    if (n_mol_fail_ > 0)
-        return sftest::report_fail(test_name_k, "{} of {} molecules differ structurally from the RDKit baseline",
-                                   n_mol_fail_, total_mols);
-    double const value_mismatch_ppm = (total_mols > 0) ? 1.0e6 * (double)n_mol_with_any_fail_ / (double)total_mols
-                                                       : 0.0;
-    if (value_mismatch_ppm > sftest::max_molecule_value_mismatch_ppm_k)
-        return sftest::report_fail(test_name_k, "{} of {} molecules differ in value, {:.3f} ppm > {:.3f} ppm",
-                                   n_mol_with_any_fail_, total_mols, value_mismatch_ppm,
-                                   sftest::max_molecule_value_mismatch_ppm_k);
-    return sftest::report_pass(test_name_k);
+    sftest::port_tally_t tally;
+    sftest::sweep_(probe, tables, sftest::narration_policy_t::every_molecule_k, tally);
+    sftest::sweep_(extra, tables, sftest::narration_policy_t::first_failures_k, tally);
+    return sftest::report_(tally);
 }

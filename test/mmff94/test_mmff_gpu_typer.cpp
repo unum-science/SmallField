@@ -5,9 +5,10 @@
  *  Gate: byte-identical atom types and per-atom partial charges.
  */
 
-#include <cmath> // `std::fabs`
+#include <cstddef> // `std::size_t`
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdio>  // `std::fflush`
 
-#include <algorithm>   // `std::max`, `std::unique`
 #include <iostream>    // RDKit's `AtomTyper.h` needs it but does not include it
 #include <memory>      // `std::unique_ptr`
 #include <span>        // `std::span`
@@ -31,50 +32,108 @@
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test/test_rdkit_reference_helpers.hpp"
 #include "test/mmff94/test_mmff_gpu_typer_kernels.hpp"
+#include "test/test_helpers.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-using sftest::approximately_equal;
-using sftest::load_smiles;
-
 static constexpr std::string_view test_name_k = "test_mmff_gpu_typer";
 
-int main(int argc, char **argv) {
-    fmt::println("test_mmff_gpu_typer: GPU vs CPU MMFF typer byte-equality gate");
+namespace smallfield::tests {
 
-    sfparam::mmff94_tables_host_t tables_host {};
-    sfparam::extract_mmff94_tables_from_rdkit(tables_host);
-    sfparam::mmff94_tables_view_t host_view = tables_host.view();
+/*  `comparison_group_t::field` invokes its predicate as `equals(reference, observed)`. An atom type
+ *  is an index and must agree exactly; a partial charge carries the file's magnitude-scaled
+ *  tolerance, which is the predicate the hand-rolled `if` chain applied. */
+static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
+static constexpr auto within_tolerance_ = [](float cpu_value, float gpu_value) {
+    return approximately_equal(cpu_value, gpu_value);
+};
 
-    sfparam::mmff94_tables_view_t device_view {};
-    void *device_tables_handle = smallfield::tests::create_mmff94_device_tables_view(tables_host, device_view);
-    if (!device_tables_handle) return sftest::report_fail(test_name_k, "device MMFF94 table upload failed");
+/** How many mismatching fields either section prints before the rest are only counted. */
+static constexpr std::size_t max_printed_lines_k = 32;
 
-    // Assemble a batch of descriptors.
-    std::vector<std::string> smiles_batch = {
-        "CC(=O)OC1=CC=CC=C1C(=O)O",
-        "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
-        "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O",
-        "CC(=O)NC1=CC=C(O)C=C1",
-        "[NH2+]=C(N)N",
-        "CC(=O)[O-]",
-        "c1cc[nH+]c(c1)",
-        "C1CCOC1",
-        "C1CC1",
-        "c1ccc2[nH]ccc2c1",
-    };
-    if (argc > 1) {
-        auto extra_smiles = load_smiles(argv[1], argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 500);
-        for (auto &smiles : extra_smiles) smiles_batch.push_back(std::move(smiles));
+/**
+ *  @brief Widest molecule this sweep samples, which is not the descriptor's capacity.
+ *
+ *  `sft::build_descriptor` refuses anything above `sft::max_atoms_per_molecule_k` on its own, so nothing
+ *  here guards the storage. This bound only keeps the compared population drug-like, and raising it up to
+ *  the capacity would widen that population rather than fix an overflow.
+ */
+static constexpr std::uint32_t sampled_atom_ceiling_k = 128;
+static_assert(sampled_atom_ceiling_k <= sft::max_atoms_per_molecule_k, "the sample ceiling sits under capacity");
+
+/** Whether this molecule's GPU charges are meaningful, or were zeroed for the CPU fallback path. */
+enum class charge_comparison_t : std::uint8_t {
+    compared_k,
+    skipped_for_fallback_k,
+};
+
+/**
+ *  @brief One reporter per compared section, so each closes with its own `compared=` count.
+ *
+ *  The two counts are deliberately not derivable from one another; see `compare_molecule_`.
+ */
+struct typer_reporters_t {
+    diagnostic_reporter_t atom_type {"cpu", "gpu"};
+    diagnostic_reporter_t partial_charge {"cpu", "gpu"};
+
+    /** Cap what each section prints, so one pathological molecule cannot bury the log. */
+    void limit_printed_lines(std::size_t maximum) noexcept {
+        atom_type.limit_printed_lines(maximum);
+        partial_charge.limit_printed_lines(maximum);
     }
 
-    std::vector<sft::molecule_descriptor_t> descriptors;
-    std::vector<std::uint32_t> atom_offsets;
+    /** Close both sections; true when each compared something and every field agreed. */
+    bool summarize_sections() {
+        atom_type.summarize("atom_type");
+        partial_charge.summarize("partial_charge");
+        return atom_type.passed() && partial_charge.passed();
+    }
+};
+
+/** Per-molecule outcomes of the sweep. */
+struct typer_tally_t {
+    /*  The pair is not redundant with the SMILES count it is read against: `build_descriptor_batch_` drops a
+     *  molecule it cannot parse, cannot hydrogenate, cannot fit under `sampled_atom_ceiling_k`, or cannot
+     *  describe, and those never reach this tally. So `matched` plus `mismatched` closes over the descriptors
+     *  alone, and the gap up to `smiles_batch.size()` is what the sweep never compared — a cleanup deriving
+     *  either counter from the input size would report molecules as matching that were never typed. */
+    std::uint32_t matched = 0;
+    std::uint32_t mismatched = 0;
+    /** Molecules the GPU flagged for CPU fallback. Their atom types are still compared, so this
+     *  overlaps the two buckets above rather than partitioning the batch with them. */
+    std::uint32_t fallback_flagged = 0;
+};
+
+/** Reusable per-molecule scratch for the CPU typer, so the sweep allocates once rather than per molecule. */
+struct cpu_typing_scratch_t {
+    std::vector<std::uint8_t> atom_types;
+    std::vector<float> formal_charges;
+    std::vector<float> partial_charges;
+
+    void resize(std::uint32_t num_atoms) {
+        atom_types.assign(num_atoms, std::uint8_t {0});
+        formal_charges.assign(num_atoms, 0.0f);
+        partial_charges.assign(num_atoms, 0.0f);
+    }
+};
+
+/**
+ *  @brief Parse the batch into descriptors, filling caller-owned outputs, and answer the atom total.
+ *
+ *  A SMILES that will not parse, will not take hydrogens, exceeds `sampled_atom_ceiling_k`, or carries an
+ *  element or bond order the descriptor does not model is dropped, so the descriptor count is not the
+ *  SMILES count.
+ */
+static std::uint32_t build_descriptor_batch_(std::vector<std::string> const &smiles_batch,
+                                             std::vector<sft::molecule_descriptor_t> &descriptors,
+                                             std::vector<std::uint32_t> &atom_offsets) {
+    descriptors.clear();
+    atom_offsets.clear();
     descriptors.reserve(smiles_batch.size());
     atom_offsets.reserve(smiles_batch.size());
     std::uint32_t total_atoms = 0;
@@ -91,114 +150,155 @@ int main(int argc, char **argv) {
         catch (...) {
             continue;
         }
-        if (!molecule) continue;
+        if (!molecule) continue; // the parser refused it
         try {
             RDKit::MolOps::addHs(*molecule);
         }
         catch (...) {
             continue;
         }
-        if (molecule->getNumAtoms() > 128) continue;
+        if (molecule->getNumAtoms() > sampled_atom_ceiling_k) continue; // wider than this sweep samples
 
         sft::molecule_descriptor_t descriptor;
-        if (!sft::build_descriptor(*molecule, descriptor)) continue;
+        if (!sft::build_descriptor(*molecule, descriptor)) continue; // an element or a bond order we do not carry
         atom_offsets.push_back(total_atoms);
         total_atoms += descriptor.num_atoms;
         descriptors.push_back(descriptor);
     }
+    return total_atoms;
+}
 
-    fmt::println("descriptors: {} molecules, {} total atoms", fmt::group_digits(descriptors.size()),
+/**
+ *  @brief Compare one molecule atom by atom, answering how many of its atoms disagree.
+ *
+ *  The charge section's denominator is deliberately smaller than the atom section's, and neither is
+ *  recoverable from the other: a molecule flagged for CPU fallback has its GPU charges zeroed on
+ *  purpose, and an atom whose type already differs, or whose type is zero, has no charge worth
+ *  comparing. `compared` minus `mismatches` on the atom section is therefore not the charge section's
+ *  count, and a cleanup that assumes it is would silently compare charges that mean nothing.
+ */
+static std::size_t compare_molecule_(typer_reporters_t &reporters, cpu_typing_scratch_t &scratch,
+                                     std::size_t molecule_index, sft::molecule_descriptor_t const &descriptor,
+                                     sfparam::mmff94_tables_view_t const &host_view, std::uint32_t atom_offset,
+                                     std::uint8_t const *gpu_atom_types, float const *gpu_atom_charges,
+                                     charge_comparison_t charges) {
+    std::uint32_t const num_atoms = descriptor.num_atoms;
+    scratch.resize(num_atoms);
+    std::span<std::uint8_t> atom_types_view(scratch.atom_types);
+    sfmmff::native_compute_mmff_atom_types(descriptor, atom_types_view);
+    std::span<std::uint8_t const> const_atom_types_view(scratch.atom_types);
+    std::span<float> formal_charge_view(scratch.formal_charges);
+    sfmmff::native_compute_mmff_formal_charges(descriptor, const_atom_types_view, formal_charge_view);
+    std::span<float const> const_formal_charge_view(scratch.formal_charges);
+    std::span<float> partial_charge_view(scratch.partial_charges);
+    sfmmff::native_compute_mmff_partial_charges(descriptor, host_view, const_atom_types_view, const_formal_charge_view,
+                                                partial_charge_view);
+
+    std::size_t mismatching_atoms = 0;
+    for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
+        auto atom = reporters.atom_type.mismatch("mmff_typer", "molecule={} atom={} element={}", molecule_index,
+                                                 atom_index, descriptor.element[atom_index]);
+        atom.field("atom_type", scratch.atom_types[atom_index], gpu_atom_types[atom_offset + atom_index],
+                   exactly_equal_);
+        bool const types_agree = atom.reported_field_count() == 0;
+        mismatching_atoms += !types_agree;
+
+        if (charges == charge_comparison_t::skipped_for_fallback_k) continue; // GPU zeroed these charges
+        if (!types_agree) continue;                                           // a wrong type gives a wrong charge
+        if (scratch.atom_types[atom_index] == 0) continue;                    // untyped atom, no charge to compare
+        auto charge = reporters.partial_charge.mismatch("mmff_typer", "molecule={} atom={}", molecule_index,
+                                                        atom_index);
+        charge.field("partial_charge", scratch.partial_charges[atom_index], gpu_atom_charges[atom_offset + atom_index],
+                     within_tolerance_);
+        mismatching_atoms += charge.reported_field_count() != 0;
+    }
+    return mismatching_atoms;
+}
+
+} // namespace smallfield::tests
+
+int main(int argc, char **argv) {
+    fmt::println("{}: GPU vs CPU MMFF typer byte-equality gate", test_name_k);
+
+    auto const corpus = sftest::select_corpus(argc, argv, 500);
+    if (corpus.knob == sftest::corpus_knob_t::refused_k) {
+        std::fflush(stdout);
+        fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", test_name_k);
+        return 2;
+    }
+
+    std::vector<std::string> smiles_batch = {
+        "CC(=O)OC1=CC=CC=C1C(=O)O",
+        "CN1C=NC2=C1C(=O)N(C(=O)N2C)C",
+        "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O",
+        "CC(=O)NC1=CC=C(O)C=C1",
+        "[NH2+]=C(N)N",
+        "CC(=O)[O-]",
+        "c1cc[nH+]c(c1)",
+        "C1CCOC1",
+        "C1CC1",
+        "c1ccc2[nH]ccc2c1",
+    };
+    if (corpus.knob == sftest::corpus_knob_t::named_k) {
+        std::vector<std::string> extra_smiles;
+        auto const outcome = sftest::load_smiles_into(corpus.path, corpus.max_molecules, extra_smiles);
+        if (outcome != sftest::smiles_load_t::loaded_k)
+            return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), corpus.path);
+        for (auto &smiles : extra_smiles) smiles_batch.push_back(std::move(smiles));
+    }
+
+    sfparam::mmff94_tables_host_t tables_host {};
+    sfparam::extract_mmff94_tables_from_rdkit(tables_host);
+    sfparam::mmff94_tables_view_t host_view = tables_host.view();
+
+    sfparam::mmff94_tables_view_t device_view {};
+    void *device_tables_handle = sftest::create_mmff94_device_tables_view(tables_host, device_view);
+    if (!device_tables_handle) return sftest::report_fail(test_name_k, "device MMFF94 table upload failed");
+
+    std::vector<sft::molecule_descriptor_t> descriptors;
+    std::vector<std::uint32_t> atom_offsets;
+    std::uint32_t const total_atoms = sftest::build_descriptor_batch_(smiles_batch, descriptors, atom_offsets);
+    std::uint32_t const num_molecules = static_cast<std::uint32_t>(descriptors.size());
+
+    fmt::println("descriptors: {} molecules, {} total atoms", fmt::group_digits(num_molecules),
                  fmt::group_digits(total_atoms));
 
     std::vector<std::uint8_t> gpu_atom_types(total_atoms);
     std::vector<float> gpu_atom_charges(total_atoms);
-    std::vector<std::uint8_t> gpu_typing_status(descriptors.size());
+    std::vector<std::uint8_t> gpu_typing_status(num_molecules);
 
-    smallfield::tests::launch_mmff94_gpu_typer_batch(
-        device_view, descriptors.data(), static_cast<std::uint32_t>(descriptors.size()), atom_offsets.data(),
-        total_atoms, gpu_atom_types.data(), gpu_atom_charges.data(), gpu_typing_status.data());
+    sftest::launch_mmff94_gpu_typer_batch(device_view, descriptors.data(), num_molecules, atom_offsets.data(),
+                                          total_atoms, gpu_atom_types.data(), gpu_atom_charges.data(),
+                                          gpu_typing_status.data());
 
-    // Compare against CPU native.
-    int matching_atom_count = 0;
-    int mismatched_atom_count = 0;
-    int matching_charge_count = 0;
-    int mismatched_charge_count = 0;
-    int matching_molecule_count = 0;
-    int mismatched_molecule_count = 0;
-    int fallback_molecule_count = 0;
+    sftest::typer_reporters_t reporters;
+    reporters.limit_printed_lines(sftest::max_printed_lines_k);
+    sftest::typer_tally_t tally;
+    sftest::cpu_typing_scratch_t scratch;
 
-    for (std::size_t molecule_index = 0; molecule_index < descriptors.size(); ++molecule_index) {
-        auto const &descriptor = descriptors[molecule_index];
-        std::uint32_t const atom_offset = atom_offsets[molecule_index];
-        std::uint32_t const num_atoms = descriptor.num_atoms;
-
-        std::vector<std::uint8_t> cpu_atom_types(num_atoms);
-        std::vector<float> cpu_formal_charges(num_atoms), cpu_partial_charges(num_atoms);
-        std::span<std::uint8_t> atom_types_view(cpu_atom_types);
-        sfmmff::native_compute_mmff_atom_types(descriptor, atom_types_view);
-        std::span<std::uint8_t const> const_atom_types_view(cpu_atom_types);
-        std::span<float> formal_charge_view(cpu_formal_charges);
-        sfmmff::native_compute_mmff_formal_charges(descriptor, const_atom_types_view, formal_charge_view);
-        std::span<float const> const_formal_charge_view(cpu_formal_charges);
-        std::span<float> partial_charge_view(cpu_partial_charges);
-        sfmmff::native_compute_mmff_partial_charges(descriptor, host_view, const_atom_types_view,
-                                                    const_formal_charge_view, partial_charge_view);
-
-        bool const requires_cpu_fallback = (gpu_typing_status[molecule_index] != 0);
-        if (requires_cpu_fallback) ++fallback_molecule_count;
-
-        bool molecule_matches = true;
-        for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
-            if (cpu_atom_types[atom_index] == gpu_atom_types[atom_offset + atom_index]) { ++matching_atom_count; }
-            else {
-                ++mismatched_atom_count;
-                if (mismatched_atom_count < 10) {
-                    std::fflush(stdout);
-                    fmt::println(stderr,
-                                 "MISMATCH mmff_typer molecule={} atom={} element={} field=atom_type cpu={} gpu={}",
-                                 molecule_index, atom_index, descriptor.element[atom_index],
-                                 cpu_atom_types[atom_index], gpu_atom_types[atom_offset + atom_index]);
-                }
-                molecule_matches = false;
-            }
-
-            // Skip charge comparison when the molecule is flagged for CPU
-            // fallback — GPU intentionally zeroed its charges there, the
-            // real value will come from the OpenMP CPU fallback.
-            if (!requires_cpu_fallback && cpu_atom_types[atom_index] == gpu_atom_types[atom_offset + atom_index] &&
-                cpu_atom_types[atom_index] != 0) {
-                if (approximately_equal(cpu_partial_charges[atom_index], gpu_atom_charges[atom_offset + atom_index])) {
-                    ++matching_charge_count;
-                }
-                else {
-                    ++mismatched_charge_count;
-                    if (mismatched_charge_count < 10) {
-                        std::fflush(stdout);
-                        fmt::println(stderr,
-                                     "MISMATCH mmff_typer molecule={} atom={} field=partial_charge cpu={} gpu={}",
-                                     molecule_index, atom_index, cpu_partial_charges[atom_index],
-                                     gpu_atom_charges[atom_offset + atom_index]);
-                    }
-                    molecule_matches = false;
-                }
-            }
-        }
-        if (molecule_matches) ++matching_molecule_count;
-        else ++mismatched_molecule_count;
+    for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
+        bool const flagged_for_fallback = gpu_typing_status[molecule_index] != 0;
+        if (flagged_for_fallback) ++tally.fallback_flagged;
+        auto const charges = flagged_for_fallback ? sftest::charge_comparison_t::skipped_for_fallback_k
+                                                  : sftest::charge_comparison_t::compared_k;
+        std::size_t const mismatching_atoms = sftest::compare_molecule_(
+            reporters, scratch, molecule_index, descriptors[molecule_index], host_view, atom_offsets[molecule_index],
+            gpu_atom_types.data(), gpu_atom_charges.data(), charges);
+        if (mismatching_atoms == 0) ++tally.matched;
+        else ++tally.mismatched;
     }
-    fmt::println("fallback-flagged molecules (typing_status != 0): {} / {}",
-                 fmt::group_digits(fallback_molecule_count), fmt::group_digits(descriptors.size()));
 
-    fmt::println("atoms: {} match / {} mismatch", fmt::group_digits(matching_atom_count),
-                 fmt::group_digits(mismatched_atom_count));
-    fmt::println("charges: {} match / {} mismatch", fmt::group_digits(matching_charge_count),
-                 fmt::group_digits(mismatched_charge_count));
-    fmt::println("molecules: {} match / {} mismatch", fmt::group_digits(matching_molecule_count),
-                 fmt::group_digits(mismatched_molecule_count));
+    fmt::println("fallback-flagged molecules (typing_status != 0): {} / {}", fmt::group_digits(tally.fallback_flagged),
+                 fmt::group_digits(num_molecules));
+    fmt::println("molecules: {} match / {} mismatch", fmt::group_digits(tally.matched),
+                 fmt::group_digits(tally.mismatched));
+    bool const sections_passed = reporters.summarize_sections();
 
-    smallfield::tests::destroy_mmff94_device_tables_view(device_tables_handle);
-    if (mismatched_atom_count > 0 || mismatched_charge_count > 0)
-        return sftest::report_fail(test_name_k, "{} atom-type and {} partial-charge mismatches vs the CPU typer",
-                                   mismatched_atom_count, mismatched_charge_count);
+    sftest::destroy_mmff94_device_tables_view(device_tables_handle);
+    if (tally.mismatched > 0)
+        return sftest::report_fail(test_name_k, "{} of {} molecules diverge from the CPU typer", tally.mismatched,
+                                   num_molecules);
+    if (!sections_passed)
+        return sftest::report_fail(test_name_k, "a comparison section mismatched or compared nothing at all");
     return sftest::report_pass(test_name_k);
 }
