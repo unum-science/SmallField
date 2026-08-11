@@ -37,6 +37,7 @@ namespace py = pybind11;
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/nvtx.hpp"
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::api {
 using smallfield::cuda::build_csd_torsion_table;
@@ -58,7 +59,6 @@ using smallfield::mmff94::launch_mmff94_compact_terms;
 using smallfield::mmff94::launch_mmff94_extract_terms;
 using smallfield::mmff94::launch_mmff94_type_and_charge;
 using smallfield::mmff94::mmff94_per_mol_counts_t;
-using smallfield::parameters::align_up_;
 using smallfield::parameters::extract_mmff94_tables_from_rdkit;
 using smallfield::parameters::mmff94_tables_device_t;
 using smallfield::parameters::mmff94_tables_host_t;
@@ -294,49 +294,99 @@ static pipeline_pool_layout_t compute_pipeline_pool_layout_(std::size_t batch_by
 }
 
 /**
- *  @brief Derive a worst-case wave size at context construction.
+ *  @brief Bytes one virtual slot may spend on a wave, given the tightest per-slot VRAM census.
  *
- *  Probes each *physical* device's free VRAM (deduping repeated device-ids in
- *  `device_ids`, which the `virtual-device` pattern uses to run K streams on
- *  one physical GPU as K virtual devices). Each virtual slot's budget is
- *  `physical_free / replicas_for_this_physical`. Applies a 75 % VRAM
- *  fraction, divides by the per-molecule pinned-host + device coords footprint
- *  at `max_atoms_per_molecule = max_atoms_per_molecule_k` and `conformer_count = max_conformer_count_k`.
- *  Clamps to `[10K, 400K]` for kernel-launch-amortisation and pinned-host
- *  sanity respectively. `embed_4d_power_iter_kernel`'s surviving scratch
- *  (`group_indices`) is KB-scale, so no per-GPU cap is needed to bound it.
+ *  Leaves 25 % of the free pool untouched for peak-allocation headroom. When @p free_probe_count
+ *  is zero — every `cudaMemGetInfo` on every device failed — degrades to half of the smallest
+ *  per-slot *total* VRAM instead of to nothing, which would drop the sizer onto its hardcoded
+ *  default. Both arms yield zero only when nothing at all is known about the hardware.
+ *
+ *  Deliberately not `static`: the probe that feeds it cannot be steered from a test, so
+ *  `test/api/test_pipeline.cpp` drives this arithmetic directly.
  */
-static std::uint32_t compute_worst_case_wave_size_(std::span<int const> device_ids,
-                                                   std::uint32_t max_atoms_per_molecule,
-                                                   std::uint32_t conformer_count) noexcept {
-    std::size_t const device_count = device_ids.size();
-    if (device_count == 0) return 0;
+std::size_t wave_budget_bytes(std::size_t free_probe_count, std::size_t smallest_free_per_slot,
+                              std::size_t smallest_total_per_slot) noexcept {
+    if (free_probe_count > 0) return smallest_free_per_slot * 3u / 4u;
+    return smallest_total_per_slot / 2u;
+}
 
+/**
+ *  @brief Ceiling of @p numerator divided by @p denominator, zero when there is nothing to divide by.
+ *
+ *  Split out of `reserve_molecules_per_device` so the zero-denominator edge is one named,
+ *  test-visible answer rather than an unsigned wrap that a second wrap happens to undo.
+ */
+std::uint32_t divide_rounding_up(std::uint32_t numerator, std::uint32_t denominator) noexcept {
+    if (denominator == 0) return 0;
+    return (numerator + denominator - 1u) / denominator;
+}
+
+/**
+ *  @brief Molecules to pre-reserve on each device for a @p wave_size wave spread over
+ *  @p device_count devices.
+ *
+ *  Adds one slack molecule so a wave whose remainder lands unevenly never leaves a device one
+ *  slot short. With no devices there is nothing to spread and the reservation is the floor of one.
+ *
+ *  Deliberately not `static`: see `wave_budget_bytes`.
+ */
+std::uint32_t reserve_molecules_per_device(std::uint32_t wave_size, std::uint32_t device_count) noexcept {
+    if (device_count == 0) return 1u;
+    return divide_rounding_up(wave_size, device_count) + 1u;
+}
+
+/**
+ *  @brief Size an `embedding-wave` in molecules against the tightest per-virtual-slot VRAM.
+ *
+ *  Probes each *physical* device once, deduping repeated device-ids in @p device_ids — the
+ *  `virtual-device` pattern runs K streams on one physical GPU as K virtual devices — and divides
+ *  by that device's replica count on the spot, so each virtual slot's budget is
+ *  `physical_free / replicas_for_this_physical`. Applies the `wave_budget_bytes` VRAM fraction,
+ *  divides by the per-molecule pinned-host + device coords footprint at @p max_atoms_per_molecule
+ *  and @p conformer_count, and clamps to `[10K, 400K]` for kernel-launch amortisation and
+ *  pinned-host sanity respectively. `embed_4d_power_iter_kernel`'s surviving scratch
+ *  (`group_indices`) is KB-scale, so no per-GPU cap is needed to bound it.
+ *
+ *  Both callers share this. The constructor sizes its worst-case pre-allocation at
+ *  `max_conformer_count_k`; `generate_conformers` sizes the actual wave at the caller's K. The
+ *  concerns that differ between them — honouring `config.wave_size` and clamping to what the
+ *  constructor reserved — live in `generate_conformers`, not here.
+ */
+static std::uint32_t compute_wave_size_(std::span<int const> device_ids, std::uint32_t max_atoms_per_molecule,
+                                        std::uint32_t conformer_count, cuda_error_sink_t const &sink) {
     // Count replicas per physical device-id and probe each unique device once. The probe divides
-    // by the replica count on the spot, so the slot budget below reads one map instead of two.
+    // by the replica count on the spot, so the slot budget below reads the maps directly.
     std::unordered_map<int, std::uint32_t> replicas;
     std::unordered_map<int, std::size_t> free_bytes_per_slot;
+    std::unordered_map<int, std::size_t> total_bytes_per_slot;
     for (int const device_id : device_ids) replicas[device_id]++;
     for (auto const &[device_id, replica_count] : replicas) {
-        if (cudaSetDevice(device_id) != cudaSuccess) continue;
         std::size_t free_bytes = 0, total_bytes = 0;
-        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) continue;
-        free_bytes_per_slot[device_id] = free_bytes / replica_count;
+        if (sink.check(cudaSetDevice(device_id), "cudaSetDevice(memgetinfo)") &&
+            sink.check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo")) {
+            free_bytes_per_slot[device_id] = free_bytes / replica_count;
+            total_bytes_per_slot[device_id] = total_bytes / replica_count;
+            continue;
+        }
+        // `cudaGetDeviceProperties` reads the device's static description and needs no current
+        // context, so it still answers for a device whose `cudaMemGetInfo` did not. That is what
+        // keeps the half-of-total arm of `wave_budget_bytes` reachable rather than dead.
+        cudaDeviceProp properties {};
+        if (sink.check(cudaGetDeviceProperties(&properties, device_id), "cudaGetDeviceProperties"))
+            total_bytes_per_slot[device_id] = properties.totalGlobalMem / replica_count;
     }
 
-    // The smallest *per-virtual-slot* budget across all virtual slots is the
-    // binding constraint: each slot in this context owns a 1/replicas share of
-    // its physical device's VRAM.
-    std::size_t smallest_free_per_slot = 0;
-    bool have_any = false;
-    for (int const device_id : device_ids) {
-        auto free_entry = free_bytes_per_slot.find(device_id);
-        if (free_entry == free_bytes_per_slot.end()) continue;
-        std::size_t const slot_free = free_entry->second;
-        if (!have_any || slot_free < smallest_free_per_slot) smallest_free_per_slot = slot_free;
-        have_any = true;
-    }
-    std::size_t const budget_bytes = have_any ? (smallest_free_per_slot * 3u / 4u) : 0;
+    // The smallest per-virtual-slot budget binds: each slot owns a 1/replicas share of its
+    // physical device's VRAM. Every key came from `device_ids`, so folding the map folds the slots.
+    auto smallest_of = [](std::unordered_map<int, std::size_t> const &per_slot) noexcept -> std::size_t {
+        if (per_slot.empty()) return 0;
+        std::size_t smallest = per_slot.begin()->second;
+        for (auto const &[device_id, slot_bytes] : per_slot) smallest = std::min(smallest, slot_bytes);
+        return smallest;
+    };
+    std::size_t const budget_bytes = wave_budget_bytes(free_bytes_per_slot.size(), smallest_of(free_bytes_per_slot),
+                                                       smallest_of(total_bytes_per_slot));
+
     std::size_t const bytes_per_molecule = estimate_per_molecule_batch_bytes(max_atoms_per_molecule) +
                                            static_cast<std::size_t>(max_atoms_per_molecule) * conformer_count * 3u *
                                                sizeof(float) * 6u;
@@ -433,20 +483,18 @@ context_t::context_t(std::span<int const> devices) {
     // Pre-allocate every per-device pool to a worst-case wave so the hot path
     // never grows (no mid-pipeline cudaMalloc / cudaHostAlloc, no driver-lock
     // contention from eight OMP worker threads hitting ensure_capacity at once).
-    std::uint32_t const worst_case_wave_size = compute_worst_case_wave_size_(device_ids, max_atoms_per_molecule_k,
-                                                                             max_conformer_count_k);
-    std::uint32_t const per_device_worst_case_count = std::max<std::uint32_t>(
-        1u, (worst_case_wave_size + static_cast<std::uint32_t>(device_count) - 1u) /
-                    std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(device_count)) +
-                1u);
+    cuda_error_sink_t const sink {&this->logger, &this->cuda_error_count};
+    std::uint32_t const worst_case_wave_size = compute_wave_size_(device_ids, max_atoms_per_molecule_k,
+                                                                  max_conformer_count_k, sink);
+    std::uint32_t const per_device_worst_case_count = reserve_molecules_per_device(
+        worst_case_wave_size, static_cast<std::uint32_t>(device_count));
     std::size_t const per_device_batch_bytes = estimate_per_molecule_batch_bytes(max_atoms_per_molecule_k) *
                                                per_device_worst_case_count;
     pipeline_pool_layout_t const worst_case_layout = compute_pipeline_pool_layout_(
         per_device_batch_bytes, per_device_worst_case_count, max_conformer_count_k, max_atoms_per_molecule_k);
-    // Published so `compute_wave_size_` cannot hand back a wave larger than what was
-    // just reserved. The two sizers disagree otherwise: this one assumes the worst-case
-    // `max_conformer_count_k`, while the runtime one uses the caller's actual K, which at
-    // K=3 halves the per-molecule estimate and doubles the wave it is willing to return.
+    // Published so `generate_conformers` cannot run a wave larger than what was just reserved:
+    // the same sizer answers again there at the caller's K, which at K=3 halves the per-molecule
+    // estimate and doubles the wave, so the ceiling is what keeps the two answers compatible.
     per_device_reserved_molecules = per_device_worst_case_count;
 
     for (std::size_t device_index = 0; device_index < device_count; ++device_index) {
@@ -1004,77 +1052,6 @@ struct wave_record_t {
 };
 
 /**
- *  @brief Compute the target `embedding-wave` size in molecules.
- *
- *  Honours `config.wave_size` when non-zero; otherwise auto-sizes against the
- *  tightest *per-virtual-slot* free VRAM. Each virtual slot owns a
- *  1/replicas-on-its-physical-device share when `device_ids` contains
- *  duplicates — the `virtual-device` pattern that runs N streams on one
- *  physical GPU as N virtual devices. Applies a 75 % VRAM fraction, divides
- *  by the per-molecule pinned-host + device coords footprint estimate. Clamps to
- *  [10 K, 400 K] for kernel-launch-amortisation and pinned-host-sanity
- *  respectively. `embed_4d_power_iter_kernel`'s surviving scratch is
- *  KB-scale, so no per-GPU cap is needed to bound it.
- */
-static std::uint32_t compute_wave_size_(context_t const &context, config_t const &config,
-                                        std::uint32_t max_atoms_per_molecule, cuda_error_sink_t const &sink) {
-    if (config.wave_size != 0) return config.wave_size;
-
-    std::uint32_t const num_conformers = config.num_conformers;
-
-    // Count replicas per physical device-id and probe each unique device once. The probe divides
-    // by the replica count on the spot, so the slot budget below reads one map instead of two.
-    std::unordered_map<int, std::uint32_t> replicas;
-    std::unordered_map<int, std::size_t> free_bytes_per_slot;
-    std::unordered_map<int, std::size_t> total_bytes_per_slot;
-    for (int const device_id : context.device_ids) replicas[device_id]++;
-    for (auto const &[device_id, replica_count] : replicas) {
-        if (!sink.check(cudaSetDevice(device_id), "cudaSetDevice(memgetinfo)")) continue;
-        std::size_t free_bytes = 0, total_bytes = 0;
-        if (!sink.check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo")) continue;
-        free_bytes_per_slot[device_id] = free_bytes / replica_count;
-        total_bytes_per_slot[device_id] = total_bytes / replica_count;
-    }
-
-    // Smallest per-virtual-slot budget binds: each duplicate of a physical
-    // device-id shares that device's free VRAM with its siblings.
-    std::size_t smallest_free_per_slot = 0;
-    std::size_t smallest_total_per_slot = 0;
-    bool have_any = false;
-    for (int const device_id : context.device_ids) {
-        auto free_entry = free_bytes_per_slot.find(device_id);
-        if (free_entry == free_bytes_per_slot.end()) continue;
-        std::size_t const slot_free = free_entry->second;
-        std::size_t const slot_total = total_bytes_per_slot[device_id];
-        if (!have_any || slot_free < smallest_free_per_slot) smallest_free_per_slot = slot_free;
-        if (!have_any || slot_total < smallest_total_per_slot) smallest_total_per_slot = slot_total;
-        have_any = true;
-    }
-
-    // Leave 25 % of the free pool untouched for peak-allocation headroom.
-    std::size_t const budget_bytes = have_any ? smallest_free_per_slot * 3u / 4u
-                                              : (smallest_total_per_slot > 0 ? smallest_total_per_slot / 2u : 0u);
-
-    std::size_t const bytes_per_molecule = estimate_per_molecule_batch_bytes(max_atoms_per_molecule) +
-                                           static_cast<std::size_t>(max_atoms_per_molecule) * num_conformers * 3u *
-                                               sizeof(float) * 6u;
-
-    std::uint64_t auto_wave = 50'000;
-    if (bytes_per_molecule > 0 && budget_bytes > 0) auto_wave = budget_bytes / bytes_per_molecule;
-    if (auto_wave < 10'000u) auto_wave = 10'000u;
-    if (auto_wave > 400'000u) auto_wave = 400'000u;
-
-    // Never exceed what the constructor reserved. Pools are pre-grown per device, so the
-    // ceiling is `per_device_reserved_molecules` times the device count; going past it would
-    // fire `ensure_capacity` from inside the per-device OMP fan-out, which is the driver-lock
-    // contention the pre-allocation exists to avoid.
-    std::uint64_t const reserved_ceiling = static_cast<std::uint64_t>(context.per_device_reserved_molecules) *
-                                           std::max<std::size_t>(1u, context.device_ids.size());
-    if (reserved_ceiling > 0 && auto_wave > reserved_ceiling) auto_wave = reserved_ceiling;
-    return static_cast<std::uint32_t>(auto_wave);
-}
-
-/**
  *  @brief Build a descending-by-SMILES-length permutation of the input and
  *  write the reordered SMILES views into @p sorted_smiles_storage.
  *
@@ -1186,7 +1163,21 @@ conformer_status_t context_t::generate_conformers(
     std::span<std::uint32_t const> const sort_perm_view = sort_perm;
 
     std::uint32_t const num_devices = static_cast<std::uint32_t>(device_ids.size());
-    std::uint32_t const wave_size_target = compute_wave_size_(*this, config, max_atoms_per_molecule, sink);
+    // A non-zero `config.wave_size` is taken as given; an auto-sized wave additionally may never
+    // exceed what the constructor reserved. Pools are pre-grown per device, so that ceiling is
+    // `per_device_reserved_molecules` times the device count; going past it would fire
+    // `ensure_capacity` from inside the per-device OMP fan-out, which is exactly the driver-lock
+    // contention the pre-allocation exists to avoid. The two sizings disagree otherwise: the
+    // constructor assumes the worst-case `max_conformer_count_k`, while this one uses the caller's
+    // actual K, which at K=3 halves the per-molecule estimate and doubles the wave it would return.
+    std::uint32_t const wave_size_target = [&]() -> std::uint32_t {
+        if (config.wave_size != 0) return config.wave_size;
+        std::uint64_t const auto_wave = compute_wave_size_(device_ids, max_atoms_per_molecule, num_conformers, sink);
+        std::uint64_t const reserved_ceiling = static_cast<std::uint64_t>(per_device_reserved_molecules) *
+                                               std::max<std::size_t>(1u, device_ids.size());
+        if (reserved_ceiling > 0 && auto_wave > reserved_ceiling) return static_cast<std::uint32_t>(reserved_ceiling);
+        return static_cast<std::uint32_t>(auto_wave);
+    }();
     this->logger.trace("generate_conformers: n={} K={} wave={} pipeline={}", num_input, num_conformers,
                        wave_size_target, num_input > wave_size_target * 3 / 2 ? "yes" : "no");
 
@@ -1213,6 +1204,11 @@ conformer_status_t context_t::generate_conformers(
     auto launch_wave = [&](std::span<wave_slice_pool_t const> per_device_batches, std::uint32_t wave_base,
                            std::vector<gpu_pipeline_handle_t> &handles_out, std::vector<gpu_phase_ms_t> &timings_out) {
         SF_NVTX_RANGE_COLORED("launch: gpu dispatch", 0x2E86C1);
+        // Zero the caller's timing slot before anything else. The pipelined path hands the same
+        // two vectors round a 2-slot ring, so a wave that preprocess emptied would otherwise be
+        // reported with wave N-2's numbers still sitting in its slot.
+        timings_out.assign(num_devices, gpu_phase_ms_t {});
+
         bool any_molecules = false;
         for (std::uint32_t device_index = 0; device_index < num_devices; ++device_index)
             if (per_device_batches[device_index].num_molecules > 0) {
@@ -1233,7 +1229,6 @@ conformer_status_t context_t::generate_conformers(
                                       max_atoms_per_molecule_k);
 
         handles_out.resize(num_devices);
-        timings_out.assign(num_devices, gpu_phase_ms_t {});
 #pragma omp parallel for num_threads(num_devices) schedule(static, 1)
         for (std::uint32_t device_index = 0; device_index < num_devices; ++device_index) {
             if (per_device_batches[device_index].num_molecules == 0) continue;
