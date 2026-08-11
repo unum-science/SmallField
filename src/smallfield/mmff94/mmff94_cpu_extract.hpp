@@ -10,10 +10,10 @@
 
 #include "smallfield/mmff94/mmff94_cpu.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::mmff94 {
 using smallfield::parameters::mmff94_tables_view_t;
-using smallfield::parameters::swap_;
 using smallfield::preprocess::etkdg_prepared_molecule_t;
 using smallfield::types::atom_role_first_k;
 using smallfield::types::atom_role_fourth_k;
@@ -71,7 +71,6 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor
     std::span<std::uint8_t const> bond_types {bond_type_arr.data(), num_bonds};
 
     std::array<float, max_bonds_k> bond_r0 {};
-    std::array<float, max_bonds_k> bond_kb {};
     for (std::uint32_t bond = 0; bond < num_bonds; ++bond) {
         std::uint8_t const atom_i = descriptor.bond_atom_i[bond];
         std::uint8_t const atom_j = descriptor.bond_atom_j[bond];
@@ -89,7 +88,6 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor
             equilibrium_distance = empirical_bond.second;
         }
         bond_r0[bond] = equilibrium_distance;
-        bond_kb[bond] = force_constant;
         result.mmff_bonds.push_back({.atom_i = static_cast<std::uint8_t>(atom_i),
                                      .atom_j = static_cast<std::uint8_t>(atom_j),
                                      .padding = {0, 0},
@@ -101,10 +99,9 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor
     struct angle_scratch_t {
         std::uint8_t atom_i, atom_j, atom_k;
         std::uint8_t angle_type;
-        std::uint8_t bond_type_ij, bond_type_jk;
-        std::int32_t bond_index_ij, bond_index_jk;
+        std::uint8_t bond_type_ij, bond_type_kj;
+        std::int32_t bond_index_ij, bond_index_kj;
         float theta0_deg;
-        float force_constant;
     };
     std::array<angle_scratch_t, max_mmff_angles_per_mol_k> angles_scratch;
     std::uint32_t num_angles_scratch = 0;
@@ -118,24 +115,24 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor
                 std::uint32_t const atom_i = descriptor.neighbor_atom[first_neighbor_slot];
                 std::uint32_t const atom_k = descriptor.neighbor_atom[second_neighbor_slot];
                 std::int32_t const bond_index_ij = find_bond_index(descriptor, atom_i, atom_j);
-                std::int32_t const bond_index_jk = find_bond_index(descriptor, atom_j, atom_k);
-                if (bond_index_ij < 0 || bond_index_jk < 0) continue;
+                std::int32_t const bond_index_kj = find_bond_index(descriptor, atom_j, atom_k);
+                if (bond_index_ij < 0 || bond_index_kj < 0) continue;
                 std::uint8_t const angle_type = native_get_mmff_angle_type(descriptor, bond_types, atom_i, atom_j,
                                                                            atom_k);
                 auto const *angle_parameters = lookup_angle(tables, angle_type, atom_types[atom_i], atom_types[atom_j],
                                                             atom_types[atom_k]);
                 float force_constant = 0.0f, theta0_deg = 0.0f;
-                bool use_empirical = (!angle_parameters || native_is_zero(angle_parameters->force_constant));
-                if (angle_parameters && !native_is_zero(angle_parameters->force_constant)) {
+                bool const use_empirical = !angle_parameters || native_is_zero(angle_parameters->force_constant);
+                if (!use_empirical) {
                     force_constant = angle_parameters->force_constant;
                     theta0_deg = angle_parameters->theta0_deg;
                 }
-                if (use_empirical) {
+                else {
                     float const r0_ij = bond_r0[bond_index_ij];
-                    float const r0_jk = bond_r0[bond_index_jk];
+                    float const r0_kj = bond_r0[bond_index_kj];
                     float const theta_override = angle_parameters ? angle_parameters->theta0_deg : -1.0f;
                     auto const empirical_angle = native_angle_empirical(descriptor, tables, atom_types, atom_i, atom_j,
-                                                                        atom_k, r0_ij, r0_jk, theta_override);
+                                                                        atom_k, r0_ij, r0_kj, theta_override);
                     force_constant = empirical_angle.first;
                     theta0_deg = empirical_angle.second;
                 }
@@ -154,11 +151,10 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor
                                                         .atom_k = static_cast<std::uint8_t>(atom_k),
                                                         .angle_type = angle_type,
                                                         .bond_type_ij = bond_types[bond_index_ij],
-                                                        .bond_type_jk = bond_types[bond_index_jk],
+                                                        .bond_type_kj = bond_types[bond_index_kj],
                                                         .bond_index_ij = bond_index_ij,
-                                                        .bond_index_jk = bond_index_jk,
-                                                        .theta0_deg = theta0_deg,
-                                                        .force_constant = force_constant};
+                                                        .bond_index_kj = bond_index_kj,
+                                                        .theta0_deg = theta0_deg};
             }
         }
     }
@@ -243,14 +239,15 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor
         auto const *prop_j = lookup_prop(tables, atom_types[scratch_angle.atom_j]);
         if (prop_j && prop_j->linear) continue;
 
+        // `<=` versus `<` is verbatim RDKit `getMMFFStretchBendType`: equal atom types pick the same bond type twice.
         std::uint8_t const stretch_bend_type = native_get_mmff_stretch_bend_type(
             scratch_angle.angle_type,
             (atom_types[scratch_angle.atom_i] <= atom_types[scratch_angle.atom_k]) ? scratch_angle.bond_type_ij
-                                                                                   : scratch_angle.bond_type_jk,
-            (atom_types[scratch_angle.atom_i] < atom_types[scratch_angle.atom_k]) ? scratch_angle.bond_type_jk
+                                                                                   : scratch_angle.bond_type_kj,
+            (atom_types[scratch_angle.atom_i] < atom_types[scratch_angle.atom_k]) ? scratch_angle.bond_type_kj
                                                                                   : scratch_angle.bond_type_ij);
         auto const [stretch_bend_swap, stretch_bend_entry] = lookup_stbn(
-            tables, stretch_bend_type, scratch_angle.bond_type_ij, scratch_angle.bond_type_jk,
+            tables, stretch_bend_type, scratch_angle.bond_type_ij, scratch_angle.bond_type_kj,
             atom_types[scratch_angle.atom_i], atom_types[scratch_angle.atom_j], atom_types[scratch_angle.atom_k]);
         float kba_ijk = 0.0f, kba_kji = 0.0f;
         bool swap_flag = false;
@@ -273,7 +270,7 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor
         if (swap_flag) swap_(kba_ijk, kba_kji);
         float const theta0_rad = scratch_angle.theta0_deg * static_cast<float>(M_PI) / 180.0f;
         float const r0_ij = bond_r0[scratch_angle.bond_index_ij];
-        float const r0_jk = bond_r0[scratch_angle.bond_index_jk];
+        float const r0_kj = bond_r0[scratch_angle.bond_index_kj];
         result.mmff_stretchbends.push_back({.atom_i = scratch_angle.atom_i,
                                             .atom_j = scratch_angle.atom_j,
                                             .atom_k = scratch_angle.atom_k,
@@ -282,7 +279,7 @@ inline void extract_mmff94_params_native(molecule_descriptor_t const &descriptor
                                             .kba_kji = kba_kji,
                                             .equilibrium_angle = theta0_rad,
                                             .equilibrium_distance_ij = r0_ij,
-                                            .equilibrium_distance_kj = r0_jk,
+                                            .equilibrium_distance_kj = r0_kj,
                                             .padding_float = 0.0f});
     }
 

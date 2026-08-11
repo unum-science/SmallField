@@ -365,7 +365,6 @@ struct shard_stats_t {
     /** Molecules whose SMILES parse did not match stored n_atoms. */
     std::atomic<std::uint64_t> context_mismatch {0};
     std::atomic<std::uint64_t> fragments_separated {0};
-    std::uint64_t from_reembed = 0;
 };
 
 /**

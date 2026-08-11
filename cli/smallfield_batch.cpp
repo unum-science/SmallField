@@ -21,7 +21,7 @@
 #include <cstdio>  // `stderr`, `fprintf`
 #include <cstdlib> // `std::strtol`
 
-#include <algorithm>          // `std::unique`, `std::max`
+#include <algorithm>          // `std::max`
 #include <array>              // `std::array`
 #include <atomic>             // `std::atomic`
 #include <chrono>             // `std::chrono::steady_clock`, `std::chrono::duration`
@@ -704,7 +704,6 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
             else {
                 // Touch a 3-byte ".encoded" sentinel so resume runs can skip without
                 // re-opening the parquet to count rows.
-                std::error_code sentinel_error_code;
                 std::filesystem::path sentinel = output_path;
                 sentinel += ".encoded";
                 FILE *sentinel_file = std::fopen(sentinel.string().c_str(), "wb");

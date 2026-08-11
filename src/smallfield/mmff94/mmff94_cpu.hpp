@@ -112,7 +112,7 @@ constexpr bool angle_has_common_neighbor(molecule_descriptor_t const &descriptor
          ++neighbor_offset_i) {
         std::uint32_t const candidate_atom = descriptor.neighbor_atom[neighbor_offset_i];
         if (candidate_atom == atom_j) continue;
-        if (find_bond_index(descriptor, candidate_atom, atom_k) >= 0 && candidate_atom != atom_j) return true;
+        if (find_bond_index(descriptor, candidate_atom, atom_k) >= 0) return true;
     }
     return false;
 }
@@ -308,7 +308,7 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_d
                                                                       mmff94_tables_view_t const &tables,
                                                                       std::span<std::uint8_t const> atom_types,
                                                                       std::uint32_t atom_i, std::uint32_t atom_j,
-                                                                      std::uint32_t atom_k, float r0_ij, float r0_jk,
+                                                                      std::uint32_t atom_k, float r0_ij, float r0_kj,
                                                                       float theta0_override_deg = -1.0f) noexcept {
     std::uint8_t const atomic_number_i = descriptor.element[atom_i], atomic_number_j = descriptor.element[atom_j],
                        atomic_number_k = descriptor.element[atom_k];
@@ -336,7 +336,7 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_d
     else if (ring_size == 4) theta0_deg = 90.0f;
     if (theta0_override_deg >= 0.0f) theta0_deg = theta0_override_deg;
 
-    // Force constant `ka` — atomic_constant_i * period_constant_j * atomic_constant_k * r0_ij * r0_jk ...
+    // Force constant `ka` — atomic_constant_i * period_constant_j * atomic_constant_k * r0_ij * r0_kj ...
     auto lookup_angle_bend_constants = [](std::uint8_t atomic_num) -> std::pair<double, double> {
         // Table VI — MMFF.V, page 628; RDKit `AtomTyper.cpp` lines 2787-2854.
         // Returns (atomic_constant "Z", period_constant "C").
@@ -368,9 +368,9 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_d
     // double so the squared asymmetry keeps its precision, which is what the float parameters
     // were promoted for in the first place.
     double const bond_length_ij = r0_ij;
-    double const bond_length_jk = r0_jk;
-    double const bond_length_sum = bond_length_ij + bond_length_jk;
-    double const bond_length_asymmetry = (bond_length_ij - bond_length_jk) * (bond_length_ij - bond_length_jk) /
+    double const bond_length_kj = r0_kj;
+    double const bond_length_sum = bond_length_ij + bond_length_kj;
+    double const bond_length_asymmetry = (bond_length_ij - bond_length_kj) * (bond_length_ij - bond_length_kj) /
                                          (bond_length_sum * bond_length_sum);
     double const force_constant = beta * atomic_constant_i * period_constant_j * atomic_constant_k /
                                   (bond_length_sum * theta0_rad * theta0_rad * std::exp(2.0 * bond_length_asymmetry));
@@ -545,12 +545,12 @@ SF_HOST_DEVICE_ inline std::array<float, 3> native_torsion_empirical(molecule_de
 
 #pragma endregion Empirical Fallback Rules
 
-#pragma region Native Extractor
+#pragma region Numeric Predicates
 
-/** `isDoubleZero` predicate matching RDKit's 1e-10 threshold. Used by the angle-bend + torsion
+/** `isDoubleZero` predicate matching RDKit's 1e-10 threshold. Used by the angle-bend and torsion
  *  fallback logic. */
 SF_HOST_DEVICE_ inline bool native_is_zero(float value) noexcept { return std::fabs(value) < 1.0e-10f; }
 
-#pragma endregion Native Extractor
+#pragma endregion Numeric Predicates
 
 } // namespace smallfield::mmff94

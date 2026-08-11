@@ -36,6 +36,7 @@
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::mmff94 {
 using smallfield::parameters::lookup_angle;
@@ -50,7 +51,6 @@ using smallfield::parameters::lookup_stbn;
 using smallfield::parameters::lookup_torsion;
 using smallfield::parameters::lookup_vdw;
 using smallfield::parameters::mmff94_tables_view_t;
-using smallfield::parameters::swap_;
 using smallfield::types::atom_role_first_k;
 using smallfield::types::atom_role_fourth_k;
 using smallfield::types::atom_role_second_k;
@@ -121,8 +121,8 @@ inline constexpr std::uint32_t mmff94_scan_block_k = 512;
 struct mmff94_angle_scratch_t {
     std::uint8_t atom_i, atom_j, atom_k;
     std::uint8_t angle_type;
-    std::uint8_t bond_type_ij, bond_type_jk;
-    std::int16_t bond_index_ij, bond_index_jk;
+    std::uint8_t bond_type_ij, bond_type_kj;
+    std::int16_t bond_index_ij, bond_index_kj;
     float theta0_deg;
 };
 
@@ -267,8 +267,8 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
                 std::uint32_t const atom_i = descriptor.neighbor_atom[first_neighbor_slot];
                 std::uint32_t const atom_k = descriptor.neighbor_atom[second_neighbor_slot];
                 std::int32_t const bond_index_ij = find_bond_index(descriptor, atom_i, atom_j);
-                std::int32_t const bond_index_jk = find_bond_index(descriptor, atom_j, atom_k);
-                if (bond_index_ij < 0 || bond_index_jk < 0) continue;
+                std::int32_t const bond_index_kj = find_bond_index(descriptor, atom_j, atom_k);
+                if (bond_index_ij < 0 || bond_index_kj < 0) continue;
                 std::uint8_t const at_code = native_get_mmff_angle_type(descriptor, bond_types, atom_i, atom_j, atom_k);
                 auto const *angle_params = lookup_angle(tables, at_code, atom_types[atom_i], atom_types[atom_j],
                                                         atom_types[atom_k]);
@@ -280,11 +280,11 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
                 }
                 if (use_empirical) {
                     float const equilibrium_distance_ij = bond_equilibrium_distance[bond_index_ij];
-                    float const equilibrium_distance_jk = bond_equilibrium_distance[bond_index_jk];
+                    float const equilibrium_distance_kj = bond_equilibrium_distance[bond_index_kj];
                     float const override_deg = angle_params ? angle_params->theta0_deg : -1.0f;
                     auto const [empirical_force_constant, empirical_theta0_deg] = native_angle_empirical(
                         descriptor, tables, at_span, atom_i, atom_j, atom_k, equilibrium_distance_ij,
-                        equilibrium_distance_jk, override_deg);
+                        equilibrium_distance_kj, override_deg);
                     force_constant = empirical_force_constant;
                     theta0_deg = empirical_theta0_deg;
                 }
@@ -307,9 +307,9 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
                                                                    .atom_k = (std::uint8_t)atom_k,
                                                                    .angle_type = at_code,
                                                                    .bond_type_ij = bond_type_arr[bond_index_ij],
-                                                                   .bond_type_jk = bond_type_arr[bond_index_jk],
+                                                                   .bond_type_kj = bond_type_arr[bond_index_kj],
                                                                    .bond_index_ij = (std::int16_t)bond_index_ij,
-                                                                   .bond_index_jk = (std::int16_t)bond_index_jk,
+                                                                   .bond_index_kj = (std::int16_t)bond_index_kj,
                                                                    .theta0_deg = theta0_deg};
                 }
             }
@@ -402,9 +402,9 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
         if (prop_j && prop_j->linear) continue;
         std::uint8_t const stretch_bend_type = native_get_mmff_stretch_bend_type(
             angle.angle_type,
-            (atom_types[angle.atom_i] <= atom_types[angle.atom_k]) ? angle.bond_type_ij : angle.bond_type_jk,
-            (atom_types[angle.atom_i] < atom_types[angle.atom_k]) ? angle.bond_type_jk : angle.bond_type_ij);
-        auto stbn = lookup_stbn(tables, stretch_bend_type, angle.bond_type_ij, angle.bond_type_jk,
+            (atom_types[angle.atom_i] <= atom_types[angle.atom_k]) ? angle.bond_type_ij : angle.bond_type_kj,
+            (atom_types[angle.atom_i] < atom_types[angle.atom_k]) ? angle.bond_type_kj : angle.bond_type_ij);
+        auto stbn = lookup_stbn(tables, stretch_bend_type, angle.bond_type_ij, angle.bond_type_kj,
                                 atom_types[angle.atom_i], atom_types[angle.atom_j], atom_types[angle.atom_k]);
         float kba_ijk = 0.0f, kba_kji = 0.0f;
         bool swap_flag = false;
@@ -426,7 +426,7 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
         if (swap_flag) swap_(kba_ijk, kba_kji);
         float const theta0_rad = angle.theta0_deg * (float)M_PI / 180.0f;
         float const equilibrium_distance_ij = bond_equilibrium_distance[angle.bond_index_ij];
-        float const equilibrium_distance_jk = bond_equilibrium_distance[angle.bond_index_jk];
+        float const equilibrium_distance_kj = bond_equilibrium_distance[angle.bond_index_kj];
         if (stbn_count < max_mmff_stretchbends_per_mol_k) {
             stbns_out[stbn_count++] = {.atom_i = angle.atom_i,
                                        .atom_j = angle.atom_j,
@@ -436,7 +436,7 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
                                        .kba_kji = kba_kji,
                                        .equilibrium_angle = theta0_rad,
                                        .equilibrium_distance_ij = equilibrium_distance_ij,
-                                       .equilibrium_distance_kj = equilibrium_distance_jk,
+                                       .equilibrium_distance_kj = equilibrium_distance_kj,
                                        .padding_float = 0.0f};
         }
         else { overflow = 1; }

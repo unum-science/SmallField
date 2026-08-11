@@ -742,6 +742,40 @@ inline void reset_atom_disjunct(atom_disjunct_t &disjunct) {
     disjunct.recursive_root = no_recursive_node_k;
     disjunct.formal_charge = std::numeric_limits<std::int8_t>::min();
 }
+
+/**
+ *  @brief Split @p text on every @p separator sitting at parenthesis depth zero.
+ *
+ *  Separators inside a recursive `$(...)` body belong to that sub-query, so
+ *  `[$(C,N);X3]` has one top-level `;` and no top-level `,`.
+ *
+ *  @param[in] text Bracket interior or bond operator to split.
+ *  @param[in] separator Top-level delimiter, `;` between conjuncts and `,` between alternatives.
+ *  @param[out] fields Receives the pieces with the separators dropped.
+ *  @param[in] max_fields Capacity of @p fields.
+ *  @return Piece count, or 0 when a piece came out empty or the capacity was exceeded.
+ */
+inline std::size_t split_top_level(std::string_view text, char separator, std::string_view *fields,
+                                   std::size_t max_fields) {
+    std::size_t num_fields = 0;
+    std::size_t position = 0;
+    while (position < text.size()) {
+        std::size_t const start = position;
+        int depth = 0;
+        while (position < text.size() && !(text[position] == separator && depth == 0)) {
+            if (text[position] == '(') ++depth;
+            else if (text[position] == ')') --depth;
+            ++position;
+        }
+        if (num_fields >= max_fields) return 0;
+        std::string_view const field = text.substr(start, position - start);
+        if (field.empty()) return 0;
+        fields[num_fields++] = field;
+        if (position < text.size()) ++position; // skip the separator
+    }
+    return num_fields;
+}
+
 /**
  *  @brief Parse the content of a SMARTS atom bracket (`[...]`) into a fully populated
  *  `simple_atom_constraint_t`.
@@ -780,24 +814,7 @@ inline bool parse_atom_spec(std::string_view spec, std::uint8_t nesting, simple_
     // conjunct is later split on top-level `,` into OR-alternatives.
     constexpr std::size_t max_conjuncts_k = 6;
     std::string_view conjuncts[max_conjuncts_k];
-    std::size_t num_conjuncts = 0;
-    {
-        std::size_t position = 0;
-        while (position < working_spec.size()) {
-            std::size_t start = position;
-            int depth = 0;
-            while (position < working_spec.size() && !(working_spec[position] == ';' && depth == 0)) {
-                if (working_spec[position] == '(') ++depth;
-                else if (working_spec[position] == ')') --depth;
-                ++position;
-            }
-            if (num_conjuncts >= max_conjuncts_k) return false;
-            std::string_view term = working_spec.substr(start, position - start);
-            if (term.empty()) return false;
-            conjuncts[num_conjuncts++] = term;
-            if (position < working_spec.size()) ++position; // skip ';'
-        }
-    }
+    std::size_t const num_conjuncts = split_top_level(working_spec, ';', conjuncts, max_conjuncts_k);
     if (num_conjuncts == 0) return false;
 
     // Step 2: for each conjunct, split on top-level `,` into OR-alternatives.
@@ -805,22 +822,7 @@ inline bool parse_atom_spec(std::string_view spec, std::uint8_t nesting, simple_
     std::string_view alts[max_conjuncts_k][max_alts_per_conjunct_k];
     std::size_t num_alts[max_conjuncts_k] = {};
     for (std::size_t conjunct = 0; conjunct < num_conjuncts; ++conjunct) {
-        std::string_view conjunct_text = conjuncts[conjunct];
-        std::size_t position = 0;
-        while (position < conjunct_text.size()) {
-            std::size_t start = position;
-            int depth = 0;
-            while (position < conjunct_text.size() && !(conjunct_text[position] == ',' && depth == 0)) {
-                if (conjunct_text[position] == '(') ++depth;
-                else if (conjunct_text[position] == ')') --depth;
-                ++position;
-            }
-            if (num_alts[conjunct] >= max_alts_per_conjunct_k) return false;
-            std::string_view alternative = conjunct_text.substr(start, position - start);
-            if (alternative.empty()) return false;
-            alts[conjunct][num_alts[conjunct]++] = alternative;
-            if (position < conjunct_text.size()) ++position; // skip ','
-        }
+        num_alts[conjunct] = split_top_level(conjuncts[conjunct], ',', alts[conjunct], max_alts_per_conjunct_k);
         if (num_alts[conjunct] == 0) return false;
     }
 
@@ -964,35 +966,13 @@ inline bool parse_bond_op(std::string_view bond_operator, simple_bond_constraint
     constexpr std::size_t max_conjuncts_k = 4;
     constexpr std::size_t max_alts_per_conjunct_k = 4;
     std::string_view conjuncts[max_conjuncts_k];
-    std::size_t num_conjuncts = 0;
-    {
-        std::size_t position = 0;
-        while (position < bond_operator.size()) {
-            std::size_t start = position;
-            while (position < bond_operator.size() && bond_operator[position] != ';') ++position;
-            if (num_conjuncts >= max_conjuncts_k) return false;
-            std::string_view term = bond_operator.substr(start, position - start);
-            if (term.empty()) return false;
-            conjuncts[num_conjuncts++] = term;
-            if (position < bond_operator.size()) ++position;
-        }
-    }
+    std::size_t const num_conjuncts = split_top_level(bond_operator, ';', conjuncts, max_conjuncts_k);
     if (num_conjuncts == 0) return false;
 
     std::string_view alts[max_conjuncts_k][max_alts_per_conjunct_k];
     std::size_t num_alts[max_conjuncts_k] = {};
     for (std::size_t conjunct = 0; conjunct < num_conjuncts; ++conjunct) {
-        std::string_view conjunct_text = conjuncts[conjunct];
-        std::size_t position = 0;
-        while (position < conjunct_text.size()) {
-            std::size_t start = position;
-            while (position < conjunct_text.size() && conjunct_text[position] != ',') ++position;
-            if (num_alts[conjunct] >= max_alts_per_conjunct_k) return false;
-            std::string_view alternative = conjunct_text.substr(start, position - start);
-            if (alternative.empty()) return false;
-            alts[conjunct][num_alts[conjunct]++] = alternative;
-            if (position < conjunct_text.size()) ++position;
-        }
+        num_alts[conjunct] = split_top_level(conjuncts[conjunct], ',', alts[conjunct], max_alts_per_conjunct_k);
         if (num_alts[conjunct] == 0) return false;
     }
 
