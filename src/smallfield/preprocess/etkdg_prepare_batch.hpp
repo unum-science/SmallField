@@ -20,10 +20,10 @@
 
 #include <algorithm>   // `std::max`, `std::min`
 #include <array>       // `std::array`
+#include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
 #include <mutex>       // `std::call_once`, `std::once_flag`
 #include <optional>    // `std::optional`, `std::nullopt`
-#include <span>        // `std::span`
 #include <sstream>     // RDKit's `AtomTyper.h` needs it but does not include it
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
@@ -51,6 +51,8 @@
 #include "smallfield/molecule_parse.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/storage.hpp"
+#include "smallfield/types/views.hpp"
 #include "smallfield/preprocess/bounds_matrix_tables.hpp"
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/preprocess/device_capacities.hpp"
@@ -62,6 +64,7 @@
 namespace smallfield::preprocess {
 using smallfield::api::conformer_status_t;
 using smallfield::api::place_region_;
+using smallfield::api::reserve_outcome_t;
 using smallfield::api::wave_slice_layout_t;
 using smallfield::api::wave_slice_pool_t;
 using smallfield::mmff94::make_angle_key_;
@@ -1172,9 +1175,16 @@ inline smallfield::api::conformer_status_t extract_mmff94_typing_via_rdkit_(RDKi
  *
  *  Sets `result.num_atoms` to zero on rejection and returns the reason; on success returns
  *  `conformer_status_t::success_k`.
+ *
+ *  @param[in] smiles Input string; not required to be null-terminated.
+ *  @param[in] salt_policy Whether a multi-fragment input keeps its largest fragment.
+ *  @param[in] output_atom_capacity Atoms the caller's per-molecule coordinate slot holds. Zero
+ *             means the caller imposes no limit of its own and only the pipeline cap applies.
+ *  @param[out] result Caller-owned buffer, cleared on entry and refilled.
  */
 inline smallfield::api::conformer_status_t prepare_molecule_topology_into(std::string_view smiles,
                                                                           smallfield::salt_policy_t salt_policy,
+                                                                          std::uint32_t output_atom_capacity,
                                                                           etkdg_prepared_molecule_t &result) {
     using smallfield::mmff94::native_compute_mmff_atom_types;
 
@@ -1186,8 +1196,15 @@ inline smallfield::api::conformer_status_t prepare_molecule_topology_into(std::s
     result.patch_atom_charges.clear();
     result.capacities = device_capacities_t {};
 
+    // Two independent ceilings, and a molecule has to clear both. `max_atoms_per_molecule_k` is what
+    // the single-warp pipeline and the flat descriptor hold; `output_atom_capacity` is how wide the
+    // caller's coordinate slot is. Gating on the smaller here turns an oversized molecule into a
+    // `too_many_atoms_k` rejection at the parse, which is the only place that can refuse it — past
+    // this point the wave's slot stride rises to cover it and every molecule in the wave is then
+    // written at offsets the caller's buffer does not have.
     smallfield::parse_options_t parse_options;
-    parse_options.max_atoms = max_atoms_per_molecule_k; // single-warp pipeline cap
+    parse_options.max_atoms = output_atom_capacity == 0 ? max_atoms_per_molecule_k
+                                                        : std::min(output_atom_capacity, max_atoms_per_molecule_k);
     parse_options.metadata_policy = smallfield::compute_metadata_k;
     parse_options.salt_policy = salt_policy;
     smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
@@ -1210,7 +1227,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_topology_into(std::s
         // The device typer runs the same code on the same descriptor, so deciding here which
         // molecules it will reject needs no readback: the answer is already computable.
         std::array<std::uint8_t, max_atoms_per_molecule_k> atom_types_scratch {};
-        std::span<std::uint8_t> atom_types_span {atom_types_scratch.data(), num_atoms};
+        custd::span<std::uint8_t> atom_types_span {atom_types_scratch.data(), num_atoms};
         if (!native_compute_mmff_atom_types(result.descriptor, atom_types_span))
             typing_status = extract_mmff94_typing_via_rdkit_(*molecule, num_atoms, result.patch_atom_types,
                                                              result.patch_atom_charges);
@@ -1251,20 +1268,67 @@ inline smallfield::api::conformer_status_t prepare_molecule_topology_into(std::s
 using etkdg_molecule_batch_t = wave_slice_pool_t;
 
 /**
+ *  @brief Molecules one batch may carry at @p atom_capacity atoms each, set by the width of the
+ *  per-molecule region offsets rather than by memory.
+ *
+ *  The widest region a molecule claims is its N × N bounds matrix, so the bound is quadratic in the
+ *  capacity the caller declares: 4 194 303 molecules at 32 atoms against 116 508 at 192. A wrapped
+ *  offset aliases another molecule's rows rather than failing, which is why this is a refusal.
+ *
+ *  @param[in] atom_capacity The caller's own cap. Zero means none, so the pipeline's cap applies.
+ */
+inline constexpr std::uint32_t max_molecules_for_atom_capacity(std::uint32_t atom_capacity) noexcept {
+    std::uint32_t const effective = atom_capacity == 0 || atom_capacity > max_atoms_per_molecule_k
+                                        ? max_atoms_per_molecule_k
+                                        : atom_capacity;
+    return static_cast<std::uint32_t>(std::numeric_limits<std::uint32_t>::max() /
+                                      (static_cast<std::uint64_t>(effective) * effective));
+}
+
+/** The bound at the pipeline's own cap, which is the smallest it ever takes. */
+inline constexpr std::uint32_t max_molecules_per_batch_k = max_molecules_for_atom_capacity(max_atoms_per_molecule_k);
+static_assert(static_cast<std::uint64_t>(max_molecules_per_batch_k) * max_mmff_interactions_per_mol_k <=
+                  std::numeric_limits<std::uint32_t>::max(),
+              "the bounds matrix must stay the widest per-molecule region the cap is derived from");
+
+/**
+ *  @brief Narrow a batch-wide element count to the `std::uint32_t` a per-molecule region offset
+ *  carries.
+ *
+ *  `max_molecules_per_batch_k` is what makes the narrowing lossless, so the assertion names the
+ *  invariant the cap exists to hold rather than restating the cast.
+ *
+ *  @param[in] element_count Elements between the start of the region and this molecule's share.
+ */
+inline std::uint32_t as_region_offset_(std::uint64_t element_count) noexcept {
+    assert(element_count <= std::numeric_limits<std::uint32_t>::max() &&
+           "region offset outgrew its 32-bit field; max_molecules_per_batch_k was not honoured");
+    return static_cast<std::uint32_t>(element_count);
+}
+
+/**
  *  @brief Per-molecule element counts of every region a batch carries.
  *
  *  Packed into one cache-line-aligned struct so the prefix scan over per-molecule sizes is one
  *  pass over a single struct rather than a dozen parallel accumulator chains. The device-filled
  *  regions contribute their capacity rather than their eventual content, since that is what the
  *  host reserves for them. The `valid` field doubles as the dense-output compaction counter.
+ *
+ *  The two N × N regions lead because they are the only counts quadratic in the atom count, and
+ *  a `std::uint32_t` running total of them wraps inside one wave: 104 atoms is 10816 elements per
+ *  molecule, so the sum reaches 2^32 at 397094 molecules, under the 400000-molecule wave clamp.
+ *  Every remaining region is linear and bounded by `max_mmff_interactions_per_mol_k` per molecule,
+ *  which `max_molecules_per_batch_k` covers with room to spare.
  */
 struct alignas(64) per_mol_sizes_t {
-    std::uint32_t bounds;
+    /** N × N floats, one row-major bounds matrix per molecule. */
+    std::uint64_t bounds;
+    /** N × N bytes, one hop-count matrix per molecule. */
+    std::uint64_t bond_distance;
     std::uint32_t chirals;
     std::uint32_t distance_constraints;
     /** Per-atom regions: types, charges, VdW params, and both CSR offset arrays. */
     std::uint32_t atoms;
-    std::uint32_t bond_distance;
     std::uint32_t etk_interactions;
     std::uint32_t mmff_bonds;
     std::uint32_t mmff_angles;
@@ -1276,19 +1340,21 @@ struct alignas(64) per_mol_sizes_t {
     std::uint32_t patch_records;
     /** 0 if the molecule failed preprocessing, 1 otherwise. */
     std::uint32_t valid;
-    std::uint32_t padding;
 };
-static_assert(sizeof(per_mol_sizes_t) == 64, "per_mol_sizes_t must be one cache line");
+static_assert(sizeof(per_mol_sizes_t) == 128, "per_mol_sizes_t must be a whole number of cache lines");
 
 /** Accumulate one molecule's capacities into a running total. */
 inline void accumulate_sizes(per_mol_sizes_t &totals, etkdg_molecule_metadata_t const &metadata,
                              device_capacities_t const &capacities) {
     std::uint32_t const num_atoms = metadata.num_atoms;
-    totals.bounds += num_atoms * num_atoms;
+    // The bounds matrix and the hop-count matrix are the same N × N shape at different element
+    // widths, so one square serves both and the two can never disagree.
+    std::uint64_t const square_elements = static_cast<std::uint64_t>(num_atoms) * num_atoms;
+    totals.bounds += square_elements;
     totals.chirals += metadata.num_chiral_centers;
     totals.distance_constraints += metadata.num_distance_constraints;
     totals.atoms += num_atoms;
-    totals.bond_distance += num_atoms * num_atoms;
+    totals.bond_distance += square_elements;
     totals.etk_interactions += capacities.etk_interactions;
     totals.mmff_bonds += capacities.mmff_bonds;
     totals.mmff_angles += capacities.mmff_angles;
@@ -1488,9 +1554,16 @@ inline void warm_up_rdkit_globals_once_() {
  *
  *  After return, each thread's contribution carries its share of the input molecules with
  *  thread-local metadata offsets.
+ *
+ *  @param[in] smiles_list Slice of input SMILES to prepare.
+ *  @param[in] salt_policy Whether a multi-fragment input keeps its largest fragment.
+ *  @param[in] output_atom_capacity Atoms the caller's per-molecule coordinate slot holds; a wider
+ *             molecule is rejected rather than admitted at a stride the caller cannot address.
+ *  @param[inout] contribs One entry per OpenMP thread, grown and cleared here.
  */
-static inline void prepare_per_thread_contribs_(std::span<std::string_view const> smiles_list,
+static inline void prepare_per_thread_contribs_(custd::span<std::string_view const> smiles_list,
                                                 smallfield::salt_policy_t salt_policy,
+                                                std::uint32_t output_atom_capacity,
                                                 std::vector<batch_prep_thread_contribution_t> &contribs) {
     warm_up_rdkit_globals_once_();
     int const n_threads_max = omp_get_max_threads();
@@ -1529,7 +1602,7 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
         auto &contribution = contribs[thread_rank];
 #pragma omp for schedule(dynamic, 64)
         for (std::size_t molecule = 0; molecule < molecule_count; ++molecule) {
-            auto const status = prepare_molecule_topology_into(smiles_list[molecule], salt_policy,
+            auto const status = prepare_molecule_topology_into(smiles_list[molecule], salt_policy, output_atom_capacity,
                                                                contribution.scratch);
             auto const &prepared = contribution.scratch;
             if (prepared.num_atoms == 0) {
@@ -1659,7 +1732,7 @@ static inline void scan_per_region_offsets_(std::vector<batch_prep_thread_contri
  *  @brief Third stage of the preprocess-step: parallel per-thread memcpy of every byte accumulator
  *  into the batch's pinned pool, plus metadata rebase from thread-local to pool-wide offsets.
  *
- *  @pre `batch.host.ensure_capacity(batch.layout.bytes_uploaded)` has succeeded;
+ *  @pre `batch.host.try_reserve(batch.layout.bytes_uploaded)` did not answer `failed_k`;
  *       `batch.num_molecules`, `batch.observed_max_atoms`, and `batch.layout` are populated.
  */
 static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribution_t> const &contribs,
@@ -1715,14 +1788,14 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
             auto const &record = contribution.mols[molecule];
             etkdg_molecule_metadata_t meta = record.metadata;
             std::size_t const slot = base.dense_slot + molecule;
-            meta.bounds_offset += static_cast<std::uint32_t>(base.bounds);
+            meta.bounds_offset += as_region_offset_(base.bounds);
             meta.chiral_offset += static_cast<std::uint32_t>(base.chirals);
             meta.constraint_offset += static_cast<std::uint32_t>(base.distance_constraints);
             meta.mmff_atom_vdw_offset += static_cast<std::uint32_t>(base.atoms);
             meta.mmff_atom_charge_offset += static_cast<std::uint32_t>(base.atoms);
             meta.mmff_atom_csr_offset += static_cast<std::uint32_t>(base.atoms);
             meta.etk_atom_csr_offset += static_cast<std::uint32_t>(base.atoms);
-            meta.bond_distance_offset += static_cast<std::uint32_t>(base.bond_distance);
+            meta.bond_distance_offset += as_region_offset_(base.bond_distance);
             meta.etk_interaction_offset += static_cast<std::uint32_t>(base.etk_interactions);
             meta.mmff_bond_offset += static_cast<std::uint32_t>(base.mmff_bonds);
             meta.mmff_angle_offset += static_cast<std::uint32_t>(base.mmff_angles);
@@ -1752,18 +1825,33 @@ static inline void pack_into_batch_pool_(std::vector<batch_prep_thread_contribut
  *  allocator contention at 8-GPU scale — `cudaHostAlloc`/`cudaFreeHost` serialize on a driver
  *  lock. The `static` contribs vector persists capacities across calls so the allocator's fast
  *  path handles every call after the first.
+ *
+ *  @param[in] smiles_list Slice of input SMILES to prepare, at most `max_molecules_per_batch_k` of
+ *             which are admitted; the tail past that is refused with `too_many_atoms_k`.
+ *  @param[in] output_atom_capacity Atoms the caller's per-molecule coordinate slot holds; a wider
+ *             molecule is refused rather than raising the whole wave's slot stride past it.
+ *  @param[out] batch Pinned pool, refilled in place.
+ *  @param[in] salt_policy Whether a multi-fragment input keeps its largest fragment.
  */
-inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles_list, etkdg_molecule_batch_t &batch,
+inline void prepare_molecule_batch_into(custd::span<std::string_view const> smiles_list,
+                                        std::uint32_t output_atom_capacity, etkdg_molecule_batch_t &batch,
                                         smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
     batch.num_molecules = 0;
     batch.observed_max_atoms = 0;
     batch.layout = wave_slice_layout_t {};
 
+    // Past this many, a molecule's own region offsets stop fitting the 32-bit fields that carry
+    // them, so the tail is refused here rather than packed at a wrapped offset that aliases an
+    // earlier molecule's rows. Whoever sizes the wave applies the same bound, so reaching this is a
+    // caller that did not.
+    std::size_t const admitted_count = std::min<std::size_t>(smiles_list.size(),
+                                                             max_molecules_for_atom_capacity(output_atom_capacity));
+
     // Persistent per-call scratch. Safe as long as this function is not called concurrently from
     // multiple outer threads. The CLI's 4-role pipeline guarantees this — `preprocess-step` runs
     // only on the gpu-runner-role thread.
     static std::vector<batch_prep_thread_contribution_t> contribs;
-    prepare_per_thread_contribs_(smiles_list, salt_policy, contribs);
+    prepare_per_thread_contribs_(smiles_list.first(admitted_count), salt_policy, output_atom_capacity, contribs);
 
     std::vector<batch_prep_thread_bases_t> bases;
     per_mol_sizes_t totals {};
@@ -1775,7 +1863,11 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
     batch.num_molecules = n_valid;
     batch.observed_max_atoms = max_atoms_reduction;
     batch.layout = compute_batch_layout(totals, n_valid, std::max<std::uint32_t>(max_bonds_reduction, 1u));
-    if (batch.layout.bytes_uploaded > 0 && !batch.host.ensure_capacity(batch.layout.bytes_uploaded)) {
+    // This pool carries no pre-reservation of any kind and sizes itself from the first wave, so
+    // `grown_k` is expected here rather than a breach of the pre-allocation discipline; the call
+    // is also serial, outside the per-device fan-out. Only `failed_k` is an error.
+    if (batch.layout.bytes_uploaded > 0 &&
+        batch.host.try_reserve(batch.layout.bytes_uploaded) == reserve_outcome_t::failed_k) {
         batch.num_molecules = 0;
         batch.layout = wave_slice_layout_t {};
         return;
@@ -1788,6 +1880,11 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
         batch.rejected_input_indices.insert(batch.rejected_input_indices.end(),
                                             contribution.rejected_input_indices.begin(),
                                             contribution.rejected_input_indices.end());
+    // The refused tail carries the same reason as a single oversized molecule: the batch cannot
+    // address that many atoms, so the caller's `fallback-role` sees it on the path it already has.
+    for (std::size_t molecule = admitted_count; molecule < smiles_list.size(); ++molecule)
+        batch.rejected_input_indices.push_back(
+            {static_cast<std::uint32_t>(molecule), conformer_status_t::too_many_atoms_k});
 
     pack_into_batch_pool_(contribs, bases, batch);
 }
@@ -1796,13 +1893,15 @@ inline void prepare_molecule_batch_into(std::span<std::string_view const> smiles
  *  @brief Convenience wrapper returning a fresh batch, allocating a new pinned buffer every call.
  *
  *  Serves call sites outside the pipelined dispatcher, such as tests and one-shot invocations. The
- *  hot path should prefer `prepare_molecule_batch_into`.
+ *  hot path should prefer `prepare_molecule_batch_into`. The default @p output_atom_capacity is the
+ *  pipeline's own cap, which is what a call site with no coordinate buffer of its own wants.
  */
 inline etkdg_molecule_batch_t prepare_molecule_batch(
-    std::span<std::string_view const> smiles_list,
-    smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
+    custd::span<std::string_view const> smiles_list,
+    smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k,
+    std::uint32_t output_atom_capacity = max_atoms_per_molecule_k) {
     etkdg_molecule_batch_t batch {};
-    prepare_molecule_batch_into(smiles_list, batch, salt_policy);
+    prepare_molecule_batch_into(smiles_list, output_atom_capacity, batch, salt_policy);
     return batch;
 }
 
@@ -1850,7 +1949,7 @@ struct distribute_scratch_t {
  *  @param[inout] scratch Grow-only caller-owned scratch; see `distribute_scratch_t`.
  */
 inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &shared, std::uint32_t device_count,
-                                                  std::span<etkdg_molecule_batch_t> per_device_out,
+                                                  custd::span<etkdg_molecule_batch_t> per_device_out,
                                                   distribute_scratch_t &scratch) {
 
     std::uint32_t const total_mol_count = shared.num_molecules;
@@ -1907,7 +2006,7 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
 
 #pragma omp parallel for num_threads(static_cast<int>(device_count)) schedule(static, 1)
     for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
-        std::span<std::uint32_t const> const mol_list {
+        custd::span<std::uint32_t const> const mol_list {
             scratch.per_device_flat.data() + scratch.per_device_offsets[device_index],
             scratch.per_device_offsets[device_index + 1u] - scratch.per_device_offsets[device_index],
         };
@@ -1940,7 +2039,12 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
         out.num_molecules = device_mol_count;
         out.observed_max_atoms = max_atoms_seen;
         out.layout = device_layout;
-        if (device_layout.bytes_uploaded > 0 && !out.host.ensure_capacity(device_layout.bytes_uploaded)) {
+        // This runs inside the per-device fan-out, where the pre-allocation discipline wants
+        // `unchanged_k`. The per-device pinned pools are the one exception the pipeline documents:
+        // they carry no constructor reservation and size themselves from the first wave, which is
+        // the largest, so `grown_k` fires once per pool and never again.
+        if (device_layout.bytes_uploaded > 0 &&
+            out.host.try_reserve(device_layout.bytes_uploaded) == reserve_outcome_t::failed_k) {
             out.num_molecules = 0;
             out.layout = wave_slice_layout_t {};
             continue;
@@ -1999,7 +2103,7 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
             }
 
             etkdg_molecule_metadata_t destination_meta = source_meta;
-            destination_meta.bounds_offset = running.bounds;
+            destination_meta.bounds_offset = as_region_offset_(running.bounds);
             destination_meta.chiral_offset = running.chirals;
             destination_meta.constraint_offset = running.distance_constraints;
             destination_meta.torsion_offset = position * device_layout.torsion_stride;
@@ -2007,7 +2111,7 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
             destination_meta.mmff_atom_charge_offset = running.atoms;
             destination_meta.mmff_atom_csr_offset = running.atoms;
             destination_meta.etk_atom_csr_offset = running.atoms;
-            destination_meta.bond_distance_offset = running.bond_distance;
+            destination_meta.bond_distance_offset = as_region_offset_(running.bond_distance);
             destination_meta.etk_interaction_offset = running.etk_interactions;
             destination_meta.mmff_bond_offset = running.mmff_bonds;
             destination_meta.mmff_angle_offset = running.mmff_angles;
@@ -2037,16 +2141,19 @@ inline void distribute_batch_to_per_device_pools_(etkdg_molecule_batch_t const &
  *
  *  @param[in] smiles_list Slice of input SMILES to prepare.
  *  @param[in] device_count Devices to partition across.
+ *  @param[in] output_atom_capacity Atoms the caller's per-molecule coordinate slot holds. Every
+ *             admitted molecule fits it, so a slice's `observed_max_atoms` — the stride the launch
+ *             path derives its coordinate buffers from — can never outgrow the caller's own.
  *  @param[out] per_device_out One pinned pool per device.
  *  @param[out] rejected_input_indices_out Optional sink for the slice-local rejection records.
  */
 inline void prepare_per_device_batches_into(
-    std::span<std::string_view const> smiles_list, std::uint32_t device_count,
-    std::span<etkdg_molecule_batch_t> per_device_out,
+    custd::span<std::string_view const> smiles_list, std::uint32_t device_count, std::uint32_t output_atom_capacity,
+    custd::span<etkdg_molecule_batch_t> per_device_out,
     std::vector<smallfield::api::rejected_mol_t> *rejected_input_indices_out = nullptr) {
     static etkdg_molecule_batch_t shared_scratch;
     static distribute_scratch_t distribute_scratch;
-    prepare_molecule_batch_into(smiles_list, shared_scratch);
+    prepare_molecule_batch_into(smiles_list, output_atom_capacity, shared_scratch);
     distribute_batch_to_per_device_pools_(shared_scratch, device_count, per_device_out, distribute_scratch);
     if (rejected_input_indices_out != nullptr) {
         rejected_input_indices_out->assign(shared_scratch.rejected_input_indices.begin(),

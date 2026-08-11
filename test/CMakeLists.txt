@@ -43,6 +43,7 @@ define_smallfield_test(preprocess descriptor)
 define_smallfield_test(preprocess csd_torsion_predicates)
 define_smallfield_test(preprocess element_gate)
 define_smallfield_test(preprocess chiral_parity)
+define_smallfield_test(preprocess batch_layout)
 
 define_smallfield_test(postprocess shape_descriptors)
 

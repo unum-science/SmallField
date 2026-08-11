@@ -9,6 +9,19 @@ An experiment that was tried and rejected without landing is dated by the commit
 Every number names the hardware it was measured on, because this project targets Hopper and Blackwell alike and at every tier from one GPU to a multi-node cluster.
 A number without that label is unlabelled, not implicitly the machine `BENCH.md` happens to use — entries here span single-H100 kernel work and 8-GPU Blackwell throughput runs, and the two do not transfer.
 
+## 2026-08-11 — Batch Region Offsets Past the 32-Bit Ceiling
+
+`per_mol_sizes_t::bounds` and `::bond_distance` summed `num_atoms * num_atoms` across a batch in `std::uint32_t`, and that sum sized the pinned allocation.
+At a uniform 104 atoms it wrapped at 397 094 molecules, under the 400 000-molecule wave clamp; at the clamp itself the 17.3 GB of bounds data reserved 125 MB.
+Both accumulators are now 64-bit.
+
+Widening them alone would have moved the wrap into `etkdg_molecule_metadata_t`, whose region offsets stay `std::uint32_t` because they are read per molecule on the device.
+So the batch is bounded by what those offsets can address, and the bound is quadratic in the atom capacity the caller declares rather than in the pipeline's own cap — 4 194 303 molecules at 32 atoms, 262 143 at 128, 116 508 at 192.
+Deriving it from `max_atoms_per_molecule_k` alone would have charged a corpus of small molecules for the largest one the pipeline admits, a 36× ceiling.
+The wave sizer applies the same bound, which leaves preprocess's own refusal unreachable for callers that size their waves through it.
+
+`test_batch_layout` covers the cap either side of its boundary and the layout at 120 000 molecules of 192 atoms, needs no GPU, and fails on exactly this defect when the two fields are narrowed back.
+
 ## 2026-08-03 — Reproducible Output at a Fixed Seed — `dd22f2e`
 
 Philox was keyed off the molecule's offset inside its device batch, which varies with host-thread timing under `schedule(dynamic, 64)`, so a fixed `random_seed` did not reproduce.
