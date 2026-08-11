@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_embedding_determinism.cpp
+ *  @file test/cuda/test_embedding_determinism.cpp
  *  @brief Assert that the 4D metric embedding is bitwise reproducible.
  *
  *  The metric prepass seeds every later ETKDG stage, so an order-dependent block reduction inside it — a
@@ -17,8 +17,8 @@
 #include <random> // `std::mt19937`, `std::uniform_real_distribution`
 #include <vector> // `std::vector`
 
-#include "test_embedding_determinism_kernels.hpp"
-#include "test_helpers.hpp"
+#include "test/cuda/test_embedding_determinism_kernels.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sftest = smallfield::tests;
 

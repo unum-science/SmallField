@@ -38,7 +38,7 @@ For the post-CSD-work numbers see `CHANGELOG.md` § round 1 / round 2.
 | `boost::detail::VF2SubState<…>::match`                 | 10.38 % | RDKit VF2 subgraph-isomorphism backend, invoked from `SubstructMatch` fallback in the CSD-torsion matcher. |
 | `match_linear_pattern<extract_etk_torsions_native::…>` |  6.86 % | Our native CSD torsion matcher — first-path for ~49 % of patterns.                                         |
 | `RDKit::detail::MatchSubqueries`                       |  6.20 % | Part of the VF2 subquery walk.                                                                             |
-| `extract_mmff94_params`                                |  4.67 % | MMFF term extraction (native).                                                                             |
+| `extract_mmff94_params_via_rdkit`                      |  4.67 % | MMFF term extraction (native).                                                                             |
 | libc malloc / mutex hotspot                            |  2.82 % | Allocator + mutex contention.                                                                              |
 | `gomp_barrier_wait_end` + team variant                 |  5.17 % | OpenMP load-imbalance at `prepare_per_thread_contribs_` barrier.                                           |
 | `RDKit::SubstructMatch`                                |  1.83 % | Fallback entry.                                                                                            |
@@ -54,19 +54,19 @@ For the post-CSD-work numbers see `CHANGELOG.md` § round 1 / round 2.
 
 GPU per-bin occupancy — 100 K ChEMBL, K=1, 1-GPU, captured with `ncu --set basic --launch-skip 32 --launch-count 16` so each row is a steady-state launch (not bootstrap).
 
-| Atom-limited-bin | Theoretical occupancy | Achieved | Stall reason (top)               |
-| ---------------: | --------------------: | -------: | :------------------------------- |
-|             ≤ 16 |                 100 % |     32 % | Launch latency (small grid)      |
-|               32 |                 100 % |     28 % | Launch latency                   |
-|               48 |                  75 % |     25 % | Long scoreboard (positions[])    |
-|               64 |                  50 % |     23 % | Long scoreboard                  |
-|               80 |                  40 % |     20 % | Long scoreboard, register cap    |
-|               96 |                  30 % |     17 % | Register cap (95 regs / thread)  |
-|              112 |                  25 % |     14 % | Register cap                     |
-|              128 |                  20 % |     12 % | Register cap, shared-memory cap  |
+| Atom-limited-bin | Theoretical occupancy | Achieved | Stall reason (top)              |
+| ---------------: | --------------------: | -------: | :------------------------------ |
+|             ≤ 16 |                 100 % |     32 % | Launch latency (small grid)     |
+|               32 |                 100 % |     28 % | Launch latency                  |
+|               48 |                  75 % |     25 % | Long scoreboard (positions[])   |
+|               64 |                  50 % |     23 % | Long scoreboard                 |
+|               80 |                  40 % |     20 % | Long scoreboard, register cap   |
+|               96 |                  30 % |     17 % | Register cap (95 regs / thread) |
+|              112 |                  25 % |     14 % | Register cap                    |
+|              128 |                  20 % |     12 % | Register cap, shared-memory cap |
 
 What this means for a fresh planner: at 8-GPU K=1, this workload is host-bound — the CPU `preprocess-step` and the RDKit fallback path together dominate.
-The CSD-torsion native matcher (round-1 + round-2) addressed the biggest single CPU symbol, but `extract_mmff94_params`, the OpenMP barrier wait, and SMILES parse remain as CPU-side opportunities.
+The CSD-torsion native matcher (round-1 + round-2) addressed the biggest single CPU symbol, but `extract_mmff94_params_via_rdkit`, the OpenMP barrier wait, and SMILES parse remain as CPU-side opportunities.
 On the GPU side, occupancy at production bin sizes (~ 23–32 % on the medium bins) is healthy; the residual is launch parallelism rather than per-kernel resource pressure, so kernel restructuring has limited headroom unless it widens the launch grid.
 
 ## Software Roadmap
@@ -139,14 +139,14 @@ And shared memory binds only at N=128, which is 1 % of PubChem and __0 % of Enam
 ### 5. Allocator Pressure Reduction
 
 jemalloc 4.10 % + libc malloc 2.82 % = ~6.9 % of CPU in allocation.
-Scattered across small-vector warmups in the hot loop (`build_descriptor`, `extract_mmff94_params`, per-thread contribs).
+Scattered across small-vector warmups in the hot loop (`build_descriptor`, `extract_mmff94_params_via_rdkit`, per-thread contribs).
 
 Audit `prepare_molecule_batch_into` for temp-alloc sites; promote short-lived `std::vector` to per-thread scratch with grow-only capacity; pre-size the known-bounded containers.
 Expected gain 3–5 % host prep.
 Effort medium.
 Risk low — RAII scratch is a well-understood pattern and the project already uses it for batch pools.
 
-`extract_mmff94_params` and the per-thread contribs are gone from the host path, which is where most of this allocation sat, so the 6.9 % is stale and needs a fresh profile before the audit is worth running.
+`extract_mmff94_params_via_rdkit` and the per-thread contribs are gone from the host path, which is where most of this allocation sat, so the 6.9 % is stale and needs a fresh profile before the audit is worth running.
 
 ### 6. Attribute the Fixed Context-Construction Cost
 
@@ -161,7 +161,7 @@ Attribute it before optimizing anything else in the startup path.
 
 ### 7. Widen the ETK CSR Build Past One Lane
 
-`etk_build_csr_kernel` in `device_preprocess.cuh` launches a warp per molecule and then returns every lane but the first, so the counting pass, the prefix sum over the per-atom cursors and the scatter all run serially on lane 0.
+`etk_build_csr_kernel` in `preprocess_kernel.cuh` launches a warp per molecule and then returns every lane but the first, so the counting pass, the prefix sum over the per-atom cursors and the scatter all run serially on lane 0.
 The work is a single pass over the molecule's torsions and constraints, so it is small next to the ETKDG kernel and was not worth blocking the device-preprocessing merge on.
 A lane-strided count with a warp-scan over the cursors is the natural fix.
 Measure the kernel in isolation first — if it is under a percent of the wave it stays a note.

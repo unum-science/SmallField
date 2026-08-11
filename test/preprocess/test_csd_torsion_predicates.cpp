@@ -41,7 +41,7 @@
 #include "smallfield/preprocess/csd_torsion_predicates.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test_helpers.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;

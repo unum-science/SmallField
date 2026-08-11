@@ -1,7 +1,8 @@
 /**
  *  @file src/smallfield/types/mmff94_bounds.hpp
  *  @brief Per-molecule MMFF94 term-count upper bounds shared between the CPU extractor
- *  (`src/smallfield/mmff94/mmff94_cpu.hpp`) and the GPU extractor (`src/smallfield/mmff94/mmff94_extract_device.cuh`).
+ *  (`src/smallfield/mmff94/mmff94_extract.hpp`) and the GPU extractor
+ * (`src/smallfield/mmff94/mmff94_extract_device.cuh`).
  *
  *  Drug-like molecules with 128 heavy+H atoms never approach these limits;
  *  they exist so every stack-sized scratch array has a compile-time
@@ -12,8 +13,6 @@
 #pragma once
 
 #include <cstdint> // `std::uint32_t`
-
-#include "smallfield/module_fwd.hpp"
 
 namespace smallfield::types {
 

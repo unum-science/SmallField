@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_bond_distance_kernels.cu
+ *  @file test/cuda/test_bond_distance_kernels.cu
  *  @brief Device-side driver for the hop-count BFS parity test.
  */
 
@@ -9,7 +9,7 @@
 
 #include "smallfield/cuda/bond_distance_kernel.cuh"
 
-#include "test_bond_distance_kernels.hpp"
+#include "test/cuda/test_bond_distance_kernels.hpp"
 
 namespace sfa = smallfield::api;
 namespace sfc = smallfield::cuda;

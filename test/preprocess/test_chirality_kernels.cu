@@ -9,7 +9,7 @@
 
 #include "smallfield/cuda/dg_kernel.cuh"
 
-#include "test_chirality_kernels.hpp"
+#include "test/preprocess/test_chirality_kernels.hpp"
 
 namespace sft = smallfield::types;
 namespace sfc = smallfield::cuda;

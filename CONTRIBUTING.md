@@ -102,6 +102,25 @@ A namespace alias spells its target out; `sfp` bound to two different namespaces
 
 `#pragma region <name>` and `#pragma endregion <name>` mark sections, with plain words in the name — a dash makes `clang-format` reflow around it and the markers drift out of pairing.
 
+## Includes
+
+__Every quoted include is anchored at a root on the include path, never at the includer's own directory.__
+The roots are `src/` and the repository root, so the allowed prefixes are `smallfield/`, `csd_data/`, `test/`, `bench/` and `cli/`.
+A sibling header in the same directory is written out in full like any other.
+
+```cpp
+#include "smallfield/preprocess/csd_torsion_native.hpp" // sibling of the includer, still spelled out
+#include "test/cuda/test_mmff_gradient_kernels.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
+```
+
+The bare form resolves only because `""` searches the includer's own directory first, so the path a reader sees is not the path the compiler used.
+Worse, two includes sitting next to each other then anchor at different roots with nothing to distinguish them, and moving a file changes the meaning of an unmoved line.
+`check_include_anchors` in `.githooks/pre-commit` rejects the bare form on added lines.
+
+Group `<c*>` C-library trampolines first, then pure C++ headers, then third-party, then project includes, with a blank line between groups and alphabetical order inside the standard groups.
+Third-party groups keep their own required order — RDKit's headers are not self-contained and sorting them breaks the build.
+
 ## State and Memory
 
 __Per-worker state is an explicit rank into caller-owned scratch, never `thread_local`.__

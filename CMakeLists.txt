@@ -150,8 +150,24 @@ endif()
 # The conda rdkit-config.cmake requires Boost "headers" component which
 # confuses CMake < 3.30's FindBoost. Instead of fighting cmake, we set up
 # the required imported targets manually when RDKIT_PREFIX is given.
+#
+# Resolve the environment prefix in priority order: an explicit `-DRDKIT_PREFIX=`,
+# then an activated conda/micromamba environment, then the in-tree pixi environment
+# that `pixi install` creates. Testing the value rather than `DEFINED` matters:
+# `-DRDKIT_PREFIX=$CONDA_PREFIX` with no environment active passes the empty string,
+# which `DEFINED` accepts and which then searches `/include/rdkit`.
+if(NOT RDKIT_PREFIX)
+    if(DEFINED ENV{CONDA_PREFIX})
+        set(RDKIT_PREFIX "$ENV{CONDA_PREFIX}")
+    elseif(EXISTS "${CMAKE_SOURCE_DIR}/.pixi/envs/default/include/rdkit/GraphMol/GraphMol.h")
+        set(RDKIT_PREFIX "${CMAKE_SOURCE_DIR}/.pixi/envs/default")
+    endif()
+endif()
+set(RDKIT_PREFIX "${RDKIT_PREFIX}" CACHE PATH
+    "Environment prefix providing RDKit headers and libraries")
+
 set(RDKit_FOUND FALSE)
-if(DEFINED RDKIT_PREFIX)
+if(RDKIT_PREFIX)
     set(_rdkit_inc "${RDKIT_PREFIX}/include/rdkit")
     set(_rdkit_lib "${RDKIT_PREFIX}/lib")
     set(_boost_inc "${RDKIT_PREFIX}/include")
@@ -197,16 +213,19 @@ if(DEFINED RDKIT_PREFIX)
             "Install rdkit-dev: micromamba install -c conda-forge rdkit-dev")
     endif()
 endif()
+# Both libraries and every subdirectory sit behind `RDKit_FOUND`, so a missing RDKit
+# does not degrade the build — it generates one that produces nothing at all. Fail
+# here rather than hand back an empty build tree and a zero exit code.
 if(NOT RDKit_FOUND)
-    message(WARNING "RDKit not found. C++ tests will not be built. "
-        "Pass -DRDKIT_PREFIX=/path/to/conda/env")
+    message(FATAL_ERROR "RDKit not found. Run `pixi install`, or pass "
+        "-DRDKIT_PREFIX=/path/to/environment.")
 endif()
 
 # `{fmt}` — used everywhere for formatted and colored logging.  The same
 # conda-forge environment that supplies RDKit ships it, so search there first.
 # A system `libfmt` whose headers disagree with the RDKit prefix otherwise wins
 # and the mismatch only surfaces as an undefined `fmt::v*::vprint` at link time.
-if(DEFINED RDKIT_PREFIX)
+if(RDKIT_PREFIX)
     list(PREPEND CMAKE_PREFIX_PATH "${RDKIT_PREFIX}")
 endif()
 find_package(fmt REQUIRED CONFIG)

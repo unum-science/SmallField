@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_csd_torsion_device.cpp
+ *  @file test/cuda/test_csd_torsion_device.cpp
  *  @brief Gate the device CSD torsion matcher against the host extractor, molecule for molecule.
  *
  *  The device kernel and `extract_etk_torsions_native` read the same flat descriptor and the same compiled
@@ -17,11 +17,11 @@
 #include <cstring> // `std::memcpy`
 
 #include <chrono> // `std::chrono::steady_clock`, `std::chrono::duration`
-#include <memory>  // `std::unique_ptr`
-#include <set>     // `std::set`
-#include <string>  // `std::string`
-#include <tuple>   // `std::tuple`
-#include <vector>  // `std::vector`
+#include <memory> // `std::unique_ptr`
+#include <set>    // `std::set`
+#include <string> // `std::string`
+#include <tuple>  // `std::tuple`
+#include <vector> // `std::vector`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -31,8 +31,8 @@
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test_csd_torsion_device_kernels.hpp"
-#include "test_helpers.hpp"
+#include "test/cuda/test_csd_torsion_device_kernels.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;

@@ -1,6 +1,10 @@
 /**
- *  @file src/smallfield/parameters/forcefield_tables.hpp
- *  @brief Minimal force-field lookup tables for the native bounds-matrix builder.
+ *  @file src/smallfield/preprocess/bounds_matrix_tables.hpp
+ *  @brief Element-keyed geometry tables the native distance-bounds builder reads.
+ *
+ *  These are covalent radii, van der Waals radii, and ideal angles — the inputs to
+ *  `build_bounds_matrix`, not MMFF94 parameters. The MMFF94 tables are a separate
+ *  thing entirely and live in `parameters/mmff94_tables.hpp`.
  *
  *  Covers the drug-like subset of the periodic table — H, C, N, O, F, P, S, Cl, Br, I and a few
  *  others. Elements outside the table fall back to generic carbon-like values; in practice
@@ -17,10 +21,9 @@
 
 #include <array> // `std::array`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-namespace smallfield::parameters {
+namespace smallfield::preprocess {
 using smallfield::types::hybridization_sp2_k;
 using smallfield::types::hybridization_sp3_k;
 using smallfield::types::hybridization_sp3d2_k;
@@ -118,4 +121,4 @@ inline float ideal_angle_radians(std::uint8_t hybridization) noexcept {
     }
 }
 
-} // namespace smallfield::parameters
+} // namespace smallfield::preprocess

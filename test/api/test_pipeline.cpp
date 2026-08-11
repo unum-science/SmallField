@@ -20,7 +20,7 @@
 
 #include "smallfield/api/smallfield.hpp"
 
-#include "test_helpers.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;

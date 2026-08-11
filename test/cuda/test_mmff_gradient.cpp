@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_mmff_gradient.cpp
+ *  @file test/cuda/test_mmff_gradient.cpp
  *  @brief Validate MMFF94 energy and gradient for OOP and full-stage terms.
  */
 
@@ -11,8 +11,8 @@
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
-#include "test_helpers.hpp"
-#include "test_mmff_gradient_kernels.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/test_mmff_gradient_kernels.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;

@@ -50,9 +50,10 @@
 
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/log.hpp"
-#include "smallfield/postprocess.hpp"
+#include "smallfield/postprocess/fragment_separation.hpp"
+#include "smallfield/postprocess/shape_descriptors.hpp"
 
-#include "parquet_writer.hpp"
+#include "cli/parquet_writer.hpp"
 
 namespace fs = std::filesystem;
 namespace sfapi = smallfield::api;

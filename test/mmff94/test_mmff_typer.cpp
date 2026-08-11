@@ -31,7 +31,6 @@
 namespace sfparam = smallfield::parameters;
 namespace sfmmff = smallfield::mmff94;
 namespace sft = smallfield::types;
-namespace sftest = smallfield::tests;
 
 namespace smallfield::tests {
 static sfparam::mmff94_tables_host_t tables_host_;
@@ -120,6 +119,8 @@ static void test_one_(std::string const &smiles, bool verbose) {
     if (!this_mol_ok) ++n_mols_mismatch_;
 }
 } // namespace smallfield::tests
+
+namespace sftest = smallfield::tests;
 
 using sftest::mismatches_;
 using sftest::n_atoms_checked_;

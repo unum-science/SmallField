@@ -26,7 +26,6 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/api/conformer_status.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"

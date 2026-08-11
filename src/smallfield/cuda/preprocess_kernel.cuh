@@ -1,5 +1,5 @@
 /**
- *  @file src/smallfield/cuda/device_preprocess.cuh
+ *  @file src/smallfield/cuda/preprocess_kernel.cuh
  *  @brief The two device passes that close the gap between the preprocessing kernels and the pipeline that
  *  consumes their output.
  *
@@ -14,8 +14,6 @@
  */
 
 #pragma once
-
-#include "smallfield/module_fwd.hpp"
 
 #if defined(__CUDACC__)
 

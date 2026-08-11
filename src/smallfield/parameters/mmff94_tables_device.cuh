@@ -28,7 +28,6 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/utilities.hpp"

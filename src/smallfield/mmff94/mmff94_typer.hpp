@@ -33,7 +33,6 @@
 #include <array> // `std::array`
 #include <span>  // `std::span`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 

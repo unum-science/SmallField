@@ -11,7 +11,7 @@
 
 #include <cuda_runtime.h>
 
-#include "test_mmff94_tables_kernels.hpp"
+#include "test/parameters/test_mmff94_tables_kernels.hpp"
 
 namespace sf = smallfield;
 

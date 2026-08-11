@@ -28,7 +28,6 @@
 
 #include <limits> // `std::numeric_limits`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
 /*  `SF_HOST_DEVICE_` resolves to `__host__ __device__` under nvcc and to nothing otherwise, so the

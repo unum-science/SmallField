@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_embedding_determinism_kernels.cu
+ *  @file test/cuda/test_embedding_determinism_kernels.cu
  *  @brief CUDA driver for the metric-embedding reproducibility test.
  *
  *  Compiled by nvcc. The host test logic is in test_embedding_determinism.cpp, compiled by g++.
@@ -13,7 +13,7 @@
 
 #include "smallfield/cuda/metric_embedding_prepass.cuh"
 
-#include "test_embedding_determinism_kernels.hpp"
+#include "test/cuda/test_embedding_determinism_kernels.hpp"
 
 namespace sfc = smallfield::cuda;
 using smallfield::types::etkdg_molecule_metadata_t;

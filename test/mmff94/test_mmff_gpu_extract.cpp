@@ -22,17 +22,17 @@
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
-#include "smallfield/mmff94/mmff94_cpu.hpp"
-#include "smallfield/mmff94/mmff94_cpu_extract.hpp"
+#include "smallfield/mmff94/mmff94_extract.hpp"
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
+#include "smallfield/mmff94/mmff94_term_equations.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test_helpers.hpp"
-#include "test_mmff_gpu_extract_kernels.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/mmff94/test_mmff_gpu_extract_kernels.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;

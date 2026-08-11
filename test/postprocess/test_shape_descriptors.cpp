@@ -28,9 +28,10 @@
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
-#include "smallfield/postprocess.hpp"
+#include "smallfield/postprocess/fragment_separation.hpp"
+#include "smallfield/postprocess/shape_descriptors.hpp"
 
-#include "test_helpers.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfp = smallfield::postprocess;
 

@@ -29,7 +29,7 @@
 
 #include "smallfield/api/conformer_layout.hpp"
 
-#include "parquet_writer.hpp"
+#include "cli/parquet_writer.hpp"
 
 namespace fs = std::filesystem;
 

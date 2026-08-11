@@ -6,8 +6,6 @@
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
-
 #if defined(__CUDACC__)
 
 #include <cstdint> // `std::uint32_t`

@@ -1,15 +1,18 @@
 # C++ / CUDA test executables linking against RDKit for cross-validation. Each
 # test is a standalone executable with its own main().  Tests are organised into
-# subfolders mirroring src/: api, parameters, preprocess, mmff94, kernels.
+# subfolders mirroring src/: api, cuda, parameters, preprocess, mmff94, postprocess.
 
-# shared test utilities (header-only)
+# Shared test utilities (header-only).  Only two anchors are exposed: the repo
+# root, so a cross-directory include reads "test/cuda/foo.hpp", and src/, so a
+# library include reads "smallfield/...".  The test directory itself is
+# deliberately absent — a bare "foo.hpp" must resolve as the includer's own
+# sidecar and nothing else.
 add_library(test_helpers INTERFACE)
 target_include_directories(
-  test_helpers INTERFACE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR})
+  test_helpers INTERFACE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 
 # Mixed .cpp/.cu test: given a base name like "triangle_smooth" and a subfolder
-# like "kernels", builds an executable from test_<base>.cpp +
+# like "cuda", builds an executable from test_<base>.cpp +
 # test_<base>_kernels.cu.
 macro(add_mixed_test subfolder base_name)
   set(test_name test_${base_name})
@@ -41,20 +44,20 @@ macro(add_cpp_test subfolder base_name)
   add_test(NAME ${test_name} COMMAND ${test_name})
 endmacro()
 
-# --- kernels/ ---
-add_mixed_test(kernels triangle_smooth)
-add_mixed_test(kernels dg_energy)
-add_mixed_test(kernels mmff_gradient)
-add_mixed_test(kernels bond_distance)
-add_mixed_test(kernels csd_torsion_device)
+# --- cuda/ ---
+add_mixed_test(cuda triangle_smooth)
+add_mixed_test(cuda dg_energy)
+add_mixed_test(cuda mmff_gradient)
+add_mixed_test(cuda bond_distance)
+add_mixed_test(cuda csd_torsion_device)
 
 # The reproducibility check compiles metric_embedding_prepass.cuh itself so it can drive the
 # embed kernel over thousands of identical blocks. It therefore must not also link
 # smallfield_lib, which carries its own device copy of that kernel: nvlink would see the symbol
-# defined twice. RDKit comes in only for the test_helpers.hpp assertion macros.
-add_executable(test_embedding_determinism kernels/test_embedding_determinism.cpp
-  kernels/test_embedding_determinism_kernels.cu)
-set_source_files_properties(kernels/test_embedding_determinism.cpp PROPERTIES
+# defined twice. RDKit comes in only for the test_rdkit_reference_helpers.hpp assertion macros.
+add_executable(test_embedding_determinism cuda/test_embedding_determinism.cpp
+  cuda/test_embedding_determinism_kernels.cu)
+set_source_files_properties(cuda/test_embedding_determinism.cpp PROPERTIES
   LANGUAGE CXX)
 target_link_libraries(test_embedding_determinism PRIVATE test_helpers
   ${RDKIT_LIBS} fmt::fmt)
@@ -89,7 +92,7 @@ add_cpp_test(mmff94 mmff_typer)
 # Per-term parity reuses the single-molecule energy entry point that the gradient
 # test's kernel wrapper already exposes.
 add_executable(test_mmff_term_parity mmff94/test_mmff_term_parity.cpp
-  kernels/test_mmff_gradient_kernels.cu)
+  cuda/test_mmff_gradient_kernels.cu)
 set_source_files_properties(mmff94/test_mmff_term_parity.cpp PROPERTIES LANGUAGE
   CXX)
 target_link_libraries(test_mmff_term_parity PRIVATE test_helpers smallfield_lib
@@ -102,24 +105,6 @@ set_target_properties(test_mmff_term_parity PROPERTIES
 add_test(NAME test_mmff_term_parity COMMAND test_mmff_term_parity)
 
 # --- api/ ---
-add_executable(test_pipeline api/test_pipeline.cpp)
-set_source_files_properties(api/test_pipeline.cpp PROPERTIES LANGUAGE CXX)
-target_link_libraries(test_pipeline PRIVATE test_helpers smallfield_lib
-  OpenMP::OpenMP_CXX)
-target_include_directories(
-  test_pipeline PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src
-  ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_pipeline PROPERTIES LINKER_LANGUAGE CUDA)
-add_test(NAME test_pipeline COMMAND test_pipeline)
-
+add_cpp_test(api pipeline)
 add_cpp_test(api seed_determinism)
-
-add_executable(test_ez_stereo api/test_ez_stereo.cpp)
-set_source_files_properties(api/test_ez_stereo.cpp PROPERTIES LANGUAGE CXX)
-target_link_libraries(test_ez_stereo PRIVATE test_helpers smallfield_lib
-  OpenMP::OpenMP_CXX)
-target_include_directories(
-  test_ez_stereo PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src
-  ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(test_ez_stereo PROPERTIES LINKER_LANGUAGE CUDA)
-add_test(NAME test_ez_stereo COMMAND test_ez_stereo)
+add_cpp_test(api ez_stereo)

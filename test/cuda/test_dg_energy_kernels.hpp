@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_dg_energy_kernels.hpp
+ *  @file test/cuda/test_dg_energy_kernels.hpp
  *  @brief Device harness for distance-geometry energy and FIRE minimization, for use by its unit tests.
  */
 

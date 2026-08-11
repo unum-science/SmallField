@@ -11,7 +11,7 @@
  *  when a fresh parse reproduces the atom count the GPU path recorded, so two sites that disagree
  *  about how a SMILES becomes a molecule silently cost that molecule its shape descriptors.
  *
- *  Deliberately free of CUDA and of the batch pool, so `cli/` and `postprocess.hpp` can include
+ *  Deliberately free of CUDA and of the batch pool, so `cli/` and `postprocess/` can include
  *  it without pulling in `cuda_runtime.h`.
  */
 
@@ -29,7 +29,6 @@
 #include <GraphMol/MolStandardize/Fragment.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/api/conformer_status.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 

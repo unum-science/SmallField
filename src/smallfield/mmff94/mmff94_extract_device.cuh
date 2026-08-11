@@ -29,8 +29,7 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/module_fwd.hpp"
-#include "smallfield/mmff94/mmff94_cpu.hpp"
+#include "smallfield/mmff94/mmff94_term_equations.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
@@ -453,7 +452,7 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
 }
 
 /** Build the MMFF per-atom CSR interaction list from emitted terms.
- *  Mirrors `mmff94_cpu.hpp:731-802` — two-pass count + write. One
+ *  Mirrors the host CSR build in `mmff94_extract.hpp` — two-pass count + write. One
  *  block per molecule, lane-0-only (the CSR-build cost is tiny
  *  relative to the term extractor and cross-molecule parallelism
  *  dominates). */

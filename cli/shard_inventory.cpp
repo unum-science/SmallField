@@ -14,7 +14,7 @@
 #include <parquet/arrow/reader.h>
 #include <parquet/file_reader.h>
 
-#include "shard_inventory.hpp"
+#include "cli/shard_inventory.hpp"
 
 namespace fs = std::filesystem;
 

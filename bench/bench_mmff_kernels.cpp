@@ -32,14 +32,14 @@
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
-#include "smallfield/mmff94/mmff94_cpu.hpp"
-#include "smallfield/mmff94/mmff94_cpu_extract.hpp"
+#include "smallfield/mmff94/mmff94_extract.hpp"
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
+#include "smallfield/mmff94/mmff94_term_equations.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "bench_mmff_kernels_device.hpp"
+#include "bench/bench_mmff_kernels_device.hpp"
 
 namespace sfbench = smallfield::bench;
 namespace sfmmff = smallfield::mmff94;

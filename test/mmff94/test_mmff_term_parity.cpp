@@ -28,8 +28,8 @@
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
-#include "kernels/test_mmff_gradient_kernels.hpp"
-#include "test_helpers.hpp"
+#include "test/cuda/test_mmff_gradient_kernels.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;

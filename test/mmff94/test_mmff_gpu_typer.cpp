@@ -29,8 +29,8 @@
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test_helpers.hpp"
-#include "test_mmff_gpu_typer_kernels.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/mmff94/test_mmff_gpu_typer_kernels.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;

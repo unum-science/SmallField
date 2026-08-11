@@ -1,16 +1,18 @@
 # Benchmark executables linking against the SmallField library + RDKit for cross-validation.
 
-add_executable(bench_conformers bench_conformers.cpp)
-set_source_files_properties(bench_conformers.cpp PROPERTIES LANGUAGE CXX)
-target_link_libraries(bench_conformers PRIVATE
+add_executable(bench_conformer_backends bench_conformer_backends.cpp)
+set_source_files_properties(bench_conformer_backends.cpp PROPERTIES LANGUAGE CXX)
+target_link_libraries(bench_conformer_backends PRIVATE
     smallfield_lib
     OpenMP::OpenMP_CXX
     $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
-target_include_directories(bench_conformers PRIVATE
+# The repo root is on the path for `test/test_rdkit_reference_helpers.hpp`, which
+# this benchmark shares with the test suite.
+target_include_directories(bench_conformer_backends PRIVATE
+    ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_SOURCE_DIR}/test
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-set_target_properties(bench_conformers PROPERTIES
+set_target_properties(bench_conformer_backends PROPERTIES
     LINKER_LANGUAGE CUDA)
 
 add_executable(bench_profile bench_profile.cpp)

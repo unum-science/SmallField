@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_triangle_smooth.cpp
+ *  @file test/cuda/test_triangle_smooth.cpp
  *  @brief Test GPU triangle smoothing against the RDKit reference.
  *
  *  Compiled with g++ (not nvcc) to avoid RDKit C++20 header conflicts. CUDA kernel calls are in
@@ -15,8 +15,8 @@
 #include <DistGeom/TriangleSmooth.h>
 #include <GraphMol/DistGeomHelpers/BoundsMatrixBuilder.h>
 
-#include "test_helpers.hpp"
-#include "test_triangle_smooth_kernels.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/cuda/test_triangle_smooth_kernels.hpp"
 
 namespace sftest = smallfield::tests;
 

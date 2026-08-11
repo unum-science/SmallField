@@ -20,7 +20,6 @@
 
 #include <cstdint> // `std::uint64_t`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::preprocess {

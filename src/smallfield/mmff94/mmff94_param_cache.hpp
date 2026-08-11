@@ -2,8 +2,8 @@
  *  @file src/smallfield/mmff94/mmff94_param_cache.hpp
  *  @brief Global cache for MMFF94 per-term parameter lookups.
  *
- *  Once the native MMFF port replaced the RDKit parameter calls, `extract_mmff94_params` still accounted for 23
- *  % of prep CPU. The bulk is in `getMMFFTorsionParams` (6.2 %), `getMMFFStretchBendParams` (5.3 %),
+ *  Once the native MMFF port replaced the RDKit parameter calls, `extract_mmff94_params_via_rdkit` still
+ *  accounted for 23 % of prep CPU. The bulk is in `getMMFFTorsionParams` (6.2 %), `getMMFFStretchBendParams` (5.3 %),
  *  `getMMFFAngleBendParams` (3.7 %), and ancillary type-determination (`getMMFFBondType`, `getMMFFAngleType`,
  *  `getMMFFTorsionType`). The `MMFFMolProperties` constructor itself is only 2.6 %.
  *
@@ -28,7 +28,6 @@
 
 #include <unordered_map> // `std::unordered_map`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/utilities.hpp"
 
@@ -68,7 +67,7 @@ struct mmff_oop_cached_t {
 
 /** Per-stretch-bend parameter: couples a 3-atom angle with its two bonds.
  *  The four floats we actually consume downstream (see `mmff_stretchbends`
- *  assembly in `extract_mmff94_params`). */
+ *  assembly in `extract_mmff94_params_via_rdkit`). */
 struct mmff_stretchbend_cached_t {
     /** Stretch-bend force const (bond IJ side). */
     float kba_ijk;

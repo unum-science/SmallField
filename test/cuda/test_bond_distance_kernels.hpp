@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_bond_distance_kernels.hpp
+ *  @file test/cuda/test_bond_distance_kernels.hpp
  *  @brief Device harness for the bond-distance BFS kernel, for use by its unit tests.
  */
 

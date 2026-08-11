@@ -25,7 +25,6 @@
 
 #include <algorithm> // `std::min`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 

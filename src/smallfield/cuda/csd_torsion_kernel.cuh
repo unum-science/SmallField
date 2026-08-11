@@ -1,5 +1,5 @@
 /**
- *  @file src/smallfield/cuda/csd_torsion_device.cuh
+ *  @file src/smallfield/cuda/csd_torsion_kernel.cuh
  *  @brief Device-resident CSD torsion table and the warp-per-molecule matcher that reads it.
  *
  *  The CSD torsion preferences compile to 470 stack-only patterns whose matcher, in
@@ -21,12 +21,10 @@
  *  RDKit's `useBasicKnowledge` adds are order-dependent between rings and run on lane 0.
  *
  *  Correctness: identical torsion set per molecule to `extract_etk_torsions_native`, checked
- *  molecule by molecule in `test/kernels/test_csd_torsion_device.cpp`.
+ *  molecule by molecule in `test/cuda/test_csd_torsion_device.cpp`.
  */
 
 #pragma once
-
-#include "smallfield/module_fwd.hpp"
 
 #if defined(__CUDACC__)
 

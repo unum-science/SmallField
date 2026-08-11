@@ -14,8 +14,6 @@
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
-
 #if defined(__CUDACC__)
 
 #include "smallfield/cuda/warp_primitives.cuh"

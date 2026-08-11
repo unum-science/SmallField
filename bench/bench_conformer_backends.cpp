@@ -1,5 +1,5 @@
 /**
- *  @file bench/bench_conformers.cpp
+ *  @file bench/bench_conformer_backends.cpp
  *  @brief Unified benchmark: RDKit CPU vs SmallField GPU on ChEMBL dataset.
  *
  *  Measures:
@@ -27,7 +27,7 @@
 
 #include "smallfield/api/smallfield.hpp"
 
-#include "test_helpers.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;

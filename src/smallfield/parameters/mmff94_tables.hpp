@@ -31,7 +31,6 @@
 #include <utility> // `std::pair`
 #include <vector>  // `std::vector`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/utilities.hpp"
 
 /*  `SF_HOST_DEVICE_` resolves to `__host__ __device__` when compiled by nvcc, empty otherwise, so a
@@ -394,7 +393,7 @@ constexpr std::size_t lower_bound_(element_ const *base, std::size_t count, key_
  *
  *  This and the lookups below match RDKit's `operator()` behaviour, byte-identical to RDKit, and
  *  serve two callers: the cross-validation test, which sanity-checks that the extraction produced
- *  sorted data correctly, and the native CPU port of `extract_mmff94_params`.
+ *  sorted data correctly, and the native CPU port of `extract_mmff94_params_via_rdkit`.
  */
 constexpr mmff94_vdw_entry_t const *lookup_vdw(mmff94_tables_view_t const &tables, std::uint8_t atom_type) noexcept {
     std::size_t const index = lower_bound_(tables.vdw.data(), tables.vdw.size(), atom_type,

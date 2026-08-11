@@ -17,12 +17,15 @@ enable_openmp = not is_macos
 enable_cuda = is_linux and is_nvcc_available
 
 # RDKit ships no pkg-config, so probe the usual prefixes most-explicit first.
-# RDKIT_PREFIX mirrors the CMake flag, CONDA_PREFIX covers an active conda or
-# pixi environment, and sys.prefix covers an install run from inside one.
+# RDKIT_PREFIX mirrors the CMake flag, CONDA_PREFIX covers an activated conda or
+# micromamba environment, sys.prefix covers an install run from inside one, and the
+# last entry is the in-tree environment `pixi install` creates. Same order as the
+# resolution in CMakeLists.txt — the two must not drift.
 rdkit_prefix_candidates = [
     os.environ.get("RDKIT_PREFIX"),
     os.environ.get("CONDA_PREFIX"),
     sys.prefix,
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pixi", "envs", "default"),
 ]
 rdkit_prefix = next(
     (
@@ -35,8 +38,9 @@ rdkit_prefix = next(
 if not rdkit_prefix:
     raise SystemExit(
         "SmallField needs the RDKit development headers to build.\n"
-        "Install them with `micromamba install -c conda-forge librdkit-dev`, then either\n"
-        "build from inside that environment or pass RDKIT_PREFIX=/path/to/conda/env."
+        "Run `pixi install`, or install them with `micromamba install -c conda-forge\n"
+        "librdkit-dev` and either build from inside that environment or pass\n"
+        "RDKIT_PREFIX=/path/to/environment."
     )
 
 rdkit_include_root = os.path.join(rdkit_prefix, "include")

@@ -1,5 +1,5 @@
 /**
- *  @file test/test_helpers.hpp
+ *  @file test/test_rdkit_reference_helpers.hpp
  *  @brief Shared utilities for C++ ETKDG tests.
  *
  *  Provides molecule loading, coordinate extraction/injection, and RDKit MMFF94 energy evaluation for

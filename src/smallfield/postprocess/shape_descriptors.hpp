@@ -1,6 +1,6 @@
 /**
- *  @file src/smallfield/postprocess.hpp
- *  @brief Native USR / USRCAT molecular shape descriptors and fragment separation.
+ *  @file src/smallfield/postprocess/shape_descriptors.hpp
+ *  @brief Native USR / USRCAT molecular shape descriptors.
  *
  *  Implements the 12-number Ultrafast Shape Recognition descriptor, USR, and its 60-number CREDO-pharmacophore
  *  extension, USRCAT, so the conformer pipeline can emit shape fingerprints without a round trip through RDKit
@@ -15,6 +15,10 @@
  *  RDKit's `GetUSRCAT` re-types the four CREDO pharmacophore subsets on every call. A molecule with `k`
  *  conformers therefore pays for `k` substructure searches. Here `build_shape_context` types the subsets and
  *  labels connected components exactly once; `usrcat_descriptor` then consumes that context per conformer.
+ *
+ *  This header also owns `molecule_shape_context_t` and the coordinate primitives, because
+ *  `build_shape_context` is the only producer of the connected-component labels that
+ *  `postprocess/fragment_separation.hpp` consumes.
  *
  *  @code{.cpp}
  *  auto context = smallfield::postprocess::build_shape_context("CC(=O)Oc1ccccc1C(=O)O");
@@ -66,7 +70,7 @@ struct molecule_shape_context_t {
 
 #pragma endregion Shape Context
 
-#pragma region Internal
+#pragma region Coordinate Primitives
 
 /** A double-precision 3D point read out of the caller's float coordinate buffer. */
 struct point3_t {
@@ -90,6 +94,10 @@ inline double point_distance_(point3_t const &first, point3_t const &second) {
     double const dz = first.z - second.z;
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
+
+#pragma endregion Coordinate Primitives
+
+#pragma region Internal
 
 /**
  *  @brief The four USR reference points, in RDKit order.
@@ -334,64 +342,6 @@ inline void usrcat_descriptor(std::span<float const> coords_interleaved, molecul
     for (std::size_t subset_index = 0; subset_index < 4; ++subset_index) {
         moments_for_subset_(coords_interleaved, points, context.credo_subsets[subset_index], out.data(), out_offset);
         out_offset += 12;
-    }
-}
-
-/**
- *  @brief Rigidly translates each connected component so bounding spheres do not overlap.
- *
- *  Lays every component's centroid on the +x axis in label order, spacing consecutive centroids by the sum of
- *  their bounding-sphere radii plus a fixed margin. Each component's atoms move by the same delta, a pure
- *  translation, so intra-component distances are preserved. Single-component molecules are left untouched.
- */
-inline void separate_fragments(std::span<float> coords_interleaved, molecule_shape_context_t const &context) {
-    if (context.num_components <= 1) return;
-
-    constexpr double margin_k = 2.0;
-    std::uint32_t const num_components = context.num_components;
-
-    // Per-component centroid and count.
-    std::vector<point3_t> centroid(num_components);
-    std::vector<std::uint32_t> count(num_components, 0);
-    for (std::uint32_t atom_index = 0; atom_index < context.num_atoms; ++atom_index) {
-        std::uint8_t const label = context.component_label[atom_index];
-        std::size_t const base = static_cast<std::size_t>(atom_index) * 3u;
-        centroid[label].x += coords_interleaved[base + 0u];
-        centroid[label].y += coords_interleaved[base + 1u];
-        centroid[label].z += coords_interleaved[base + 2u];
-        ++count[label];
-    }
-    for (std::uint32_t component = 0; component < num_components; ++component) {
-        if (count[component] > 0) {
-            centroid[component].x /= count[component];
-            centroid[component].y /= count[component];
-            centroid[component].z /= count[component];
-        }
-    }
-
-    // Bounding-sphere radius of each component about its centroid.
-    std::vector<double> radius(num_components, 0.0);
-    for (std::uint32_t atom_index = 0; atom_index < context.num_atoms; ++atom_index) {
-        std::uint8_t const label = context.component_label[atom_index];
-        double const distance = point_distance_(read_point_(coords_interleaved, atom_index), centroid[label]);
-        if (distance > radius[label]) radius[label] = distance;
-    }
-
-    // Target centroids strung along +x so consecutive spheres clear each other.
-    double cursor = 0.0;
-    for (std::uint32_t component = 0; component < num_components; ++component) {
-        double const target_x = cursor + radius[component];
-        double const delta_x = target_x - centroid[component].x;
-        double const delta_y = -centroid[component].y;
-        double const delta_z = -centroid[component].z;
-        for (std::uint32_t atom_index = 0; atom_index < context.num_atoms; ++atom_index) {
-            if (context.component_label[atom_index] != component) continue;
-            std::size_t const base = static_cast<std::size_t>(atom_index) * 3u;
-            coords_interleaved[base + 0u] += static_cast<float>(delta_x);
-            coords_interleaved[base + 1u] += static_cast<float>(delta_y);
-            coords_interleaved[base + 2u] += static_cast<float>(delta_z);
-        }
-        cursor = target_x + radius[component] + margin_k;
     }
 }
 

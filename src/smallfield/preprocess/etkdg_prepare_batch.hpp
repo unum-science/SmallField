@@ -29,8 +29,6 @@
 #include <utility>     // `std::move`
 #include <vector>      // `std::vector`
 
-#include "smallfield/module_fwd.hpp"
-
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -52,8 +50,8 @@
 #include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/molecule_parse.hpp"
 #include "smallfield/types/etkdg_types.hpp"
-#include "smallfield/parameters/forcefield_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/preprocess/bounds_matrix_tables.hpp"
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/preprocess/device_capacities.hpp"
 #include "smallfield/preprocess/molecule_complexity.hpp"
@@ -83,9 +81,6 @@ using smallfield::mmff94::mmff_stretchbend_cached_t;
 using smallfield::mmff94::mmff_torsion_cache;
 using smallfield::mmff94::mmff_torsion_cached_t;
 using smallfield::mmff94::pack_bond_signature_;
-using smallfield::parameters::ideal_angle_radians;
-using smallfield::parameters::ideal_bond_length_angstrom;
-using smallfield::parameters::vdw_lower_bound_angstrom;
 using smallfield::types::atom_flag_aromatic_k;
 using smallfield::types::atom_has_flag;
 using smallfield::types::atom_role_first_k;
@@ -211,10 +206,10 @@ inline float stereo_one_four_distance(molecule_descriptor_t const &descriptor, s
  *  Replaces RDKit's `setTopolBounds`, which allocates a fresh `DistGeom::BoundsMatrix` plus two
  *  `boost::shared_array<>` per molecule and walks RDKit's atom typer, roughly 140 KB of throwaway
  *  heap per call. This version reads only from the flat `molecule_descriptor_t` and the small
- *  `forcefield_tables.hpp`, and writes directly into `bounds`.
+ *  `bounds_matrix_tables.hpp`, and writes directly into `bounds`.
  *
  *  The values are close but not bit-identical to `setTopolBounds`'s output. Downstream triangle
- *  smoothing and FIRE refinement, both on the GPU, absorb the small residual; `bench_conformers`
+ *  smoothing and FIRE refinement, both on the GPU, absorb the small residual; `bench_conformer_backends`
  *  reports the paired energy distribution against the RDKit baseline.
  *
  *  Output layout, N × N row-major:
@@ -598,9 +593,9 @@ inline std::optional<cached_type_> cache_or_compute_(mmff_cache<cached_type_> &c
  *          `MMFFMolProperties` constructor otherwise reports the
  *          molecule as not parametrizable.
  */
-inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol const &molecule,
-                                                                 molecule_descriptor_t const &descriptor,
-                                                                 etkdg_prepared_molecule_t &result) {
+inline smallfield::api::conformer_status_t extract_mmff94_params_via_rdkit(RDKit::ROMol const &molecule,
+                                                                           molecule_descriptor_t const &descriptor,
+                                                                           etkdg_prepared_molecule_t &result) {
     result.mmff_atom_vdw.clear();
     result.mmff_atom_charge.clear();
     result.mmff_bonds.clear();
@@ -623,7 +618,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
     // `getMMFFAtomType` returns 0 for atoms outside the MMFF94 parameter set — yttrium,
     // lanthanides, transition metals and the like. Detect that here on the host so the molecule
     // never reaches the GPU pipeline: without this gate, `etkdg_pipeline_warp_kernel` does an OOB
-    // write through element-keyed parameter LUTs in `forcefield_tables.hpp` and poisons every
+    // write through element-keyed parameter LUTs in `bounds_matrix_tables.hpp` and poisons every
     // subsequent CUDA call on every device.
     std::uint8_t atom_type[max_atoms_per_molecule_k];
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
@@ -995,7 +990,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params(RDKit::ROMol co
  *  @brief Fill a caller-owned @p result with the full preprocessing output for one SMILES.
  *
  *  Reached through `prepare_molecule`; the batched path runs
- *  `prepare_molecule_for_device_into` instead. The caller-owned `result` is meant
+ *  `prepare_molecule_topology_into` instead. The caller-owned `result` is meant
  *  to be reused across molecules — each molecule's vectors keep their capacity
  *  from the previous call, so `push_back` stays on the hot path without heap
  *  allocation after the first few molecules. Sets
@@ -1050,7 +1045,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
         extract_etk_torsions_native(descriptor, result.etk_torsions);
         extract_distance_constraints(descriptor, result.bounds_matrix, result.distance_constraints);
         build_etk_interaction_lists(result);
-        mmff_status = extract_mmff94_params(*molecule, descriptor, result);
+        mmff_status = extract_mmff94_params_via_rdkit(*molecule, descriptor, result);
     }
     catch (...) {
         result.num_atoms = 0;
@@ -1059,7 +1054,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
     if (mmff_status != conformer_status_t::success_k) {
         // MMFF could not parametrise this molecule — say, an atomic number outside the MMFF94 set.
         // The mmff_* result vectors are empty after the early return inside
-        // `extract_mmff94_params`, but ETK fields above are populated; clear num_atoms so
+        // `extract_mmff94_params_via_rdkit`, but ETK fields above are populated; clear num_atoms so
         // downstream packing skips this mol.
         result.num_atoms = 0;
         return mmff_status;
@@ -1125,9 +1120,10 @@ inline etkdg_prepared_molecule_t prepare_molecule(std::string_view smiles) {
  *  @return `conformer_status_t::success_k`, or `unsupported_element_k` when RDKit cannot type the
  *          molecule either — an atomic number outside the MMFF94 parameter set.
  */
-inline smallfield::api::conformer_status_t read_rdkit_mmff_typing(RDKit::ROMol const &molecule, std::uint32_t num_atoms,
-                                                                  std::vector<std::uint8_t> &atom_types,
-                                                                  std::vector<float> &atom_charges) {
+inline smallfield::api::conformer_status_t extract_mmff94_typing_via_rdkit_(RDKit::ROMol const &molecule,
+                                                                            std::uint32_t num_atoms,
+                                                                            std::vector<std::uint8_t> &atom_types,
+                                                                            std::vector<float> &atom_charges) {
     auto &mutable_molecule = const_cast<RDKit::ROMol &>(molecule);
     // `SmilesToMol` already sanitized, so tell `MMFFMolProperties` to skip its own Kekulize pass.
     if (!mutable_molecule.hasProp(RDKit::common_properties::_MMFFSanitized))
@@ -1158,9 +1154,9 @@ inline smallfield::api::conformer_status_t read_rdkit_mmff_typing(RDKit::ROMol c
  *  Sets `result.num_atoms` to zero on rejection and returns the reason; on success returns
  *  `conformer_status_t::success_k`.
  */
-inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std::string_view smiles,
-                                                                            smallfield::salt_policy_t salt_policy,
-                                                                            etkdg_prepared_molecule_t &result) {
+inline smallfield::api::conformer_status_t prepare_molecule_topology_into(std::string_view smiles,
+                                                                          smallfield::salt_policy_t salt_policy,
+                                                                          etkdg_prepared_molecule_t &result) {
     using smallfield::mmff94::native_compute_mmff_atom_types;
 
     result.num_atoms = 0;
@@ -1197,8 +1193,8 @@ inline smallfield::api::conformer_status_t prepare_molecule_for_device_into(std:
         std::array<std::uint8_t, max_atoms_per_molecule_k> atom_types_scratch {};
         std::span<std::uint8_t> atom_types_span {atom_types_scratch.data(), num_atoms};
         if (!native_compute_mmff_atom_types(result.descriptor, atom_types_span))
-            typing_status = read_rdkit_mmff_typing(*molecule, num_atoms, result.patch_atom_types,
-                                                   result.patch_atom_charges);
+            typing_status = extract_mmff94_typing_via_rdkit_(*molecule, num_atoms, result.patch_atom_types,
+                                                             result.patch_atom_charges);
     }
     catch (...) {
         return conformer_status_t::invalid_smiles_k;
@@ -1514,8 +1510,8 @@ static inline void prepare_per_thread_contribs_(std::span<std::string_view const
         auto &contribution = contribs[thread_rank];
 #pragma omp for schedule(dynamic, 64)
         for (std::size_t molecule = 0; molecule < molecule_count; ++molecule) {
-            auto const status = prepare_molecule_for_device_into(smiles_list[molecule], salt_policy,
-                                                                 contribution.scratch);
+            auto const status = prepare_molecule_topology_into(smiles_list[molecule], salt_policy,
+                                                               contribution.scratch);
             auto const &prepared = contribution.scratch;
             if (prepared.num_atoms == 0) {
                 contribution.rejected_input_indices.push_back({static_cast<std::uint32_t>(molecule), status});

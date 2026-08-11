@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_dg_energy_kernels.cu
+ *  @file test/cuda/test_dg_energy_kernels.cu
  *  @brief CUDA kernel wrappers for DG energy test.
  */
 
@@ -11,7 +11,7 @@
 #include "smallfield/cuda/dg_kernel.cuh"
 #include "smallfield/cuda/fire_warp.cuh"
 
-#include "test_dg_energy_kernels.hpp"
+#include "test/cuda/test_dg_energy_kernels.hpp"
 
 namespace sfc = smallfield::cuda;
 

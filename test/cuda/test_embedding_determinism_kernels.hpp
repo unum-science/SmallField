@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_embedding_determinism_kernels.hpp
+ *  @file test/cuda/test_embedding_determinism_kernels.hpp
  *  @brief Device harness for the metric-embedding reproducibility test, for use by its unit tests.
  */
 

@@ -17,8 +17,8 @@ See [`GLOSSARY.md`](GLOSSARY.md) for the canonical vocabulary used below (`parqu
 
 ## Method
 
-- Build: `cmake -S . -B build -DRDKIT_PREFIX=$CONDA_PREFIX -DSMALLFIELD_BUILD_BATCH_BINARY=ON`
-- Benchmark binary: `build/bench/bench_conformers`
+- Build: `cmake -S . -B build -DSMALLFIELD_BUILD_BATCH_BINARY=ON`
+- Benchmark binary: `build/bench/bench_conformer_backends`
 - Allocator: `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2`
 - Primary dataset: USearch Molecules — 9,998,572 SMILES at `/tmp/usearch_10M.smi`, 1 M clean subset at `/tmp/usearch_1M_clean.smi`.
 - Multi-GPU runs use `--multi-gpu-only` from a fresh process.
@@ -35,10 +35,10 @@ Measured on this box, three interleaved runs per arm, `--multi-gpu-only`, spread
 | :---- | -----: | :--- |
 Both corpora, three runs per arm on an idle box, comparing `1a0bcda` against `31a1e85` — conformer parallelism, the device bond-hop BFS, and the register cut together, of which parallelism dominates.
 
-| Corpus | before | after | |
-| :----- | -----: | ----: | :-- |
-| PubChem, stratified across 116 shards | 1 924 | 4 359 | __2.27×__ |
-| Enamine REAL, stratified across 8 shards | 4 612 | 7 262 | __1.58×__ |
+| Corpus                                   | before | after |           |
+| :--------------------------------------- | -----: | ----: | :-------- |
+| PubChem, stratified across 116 shards    |  1 924 | 4 359 | __2.27×__ |
+| Enamine REAL, stratified across 8 shards |  4 612 | 7 262 | __1.58×__ |
 
 The gap between the two is the point.
 The old shape capped its grid at the molecule count, so an atom-limited bin holding fewer molecules than the grid cap could not fill the device.
@@ -60,25 +60,25 @@ The new shape holds under 1 % either way.
 
 ### SmallField — 8 GPUs, USearch 10M
 
-| System            | Input |   K |    c/s |               Succeeded | Success |    Wall |
-| :---------------- | ----: | --: | -----: | ----------------------: | ------: | ------: |
-| SmallField 8 GPUs |   10M |   1 | 20,372 |   9,859,890 / 9,998,572 |  98.6 % |   484 s |
-| SmallField 8 GPUs |   10M |   3 | 29,302 | 29,580,111 / 29,995,716 |  98.6 % | 1,010 s |
-| SmallField 8 GPUs |   10M |  10 | 27,143 | 98,601,092 / 99,985,720 |  98.6 % | 3,202 s |
+| System            | Input |    K |    c/s |               Succeeded | Success |    Wall |
+| :---------------- | ----: | ---: | -----: | ----------------------: | ------: | ------: |
+| SmallField 8 GPUs |   10M |    1 | 20,372 |   9,859,890 / 9,998,572 |  98.6 % |   484 s |
+| SmallField 8 GPUs |   10M |    3 | 29,302 | 29,580,111 / 29,995,716 |  98.6 % | 1,010 s |
+| SmallField 8 GPUs |   10M |   10 | 27,143 | 98,601,092 / 99,985,720 |  98.6 % | 3,202 s |
 
 Success rate is 98.6 % across all three K values.
 Conformer generation quality is independent of K.
 
 ### SmallField vs RDKit — 1 GPU / CPU 192T, USearch 1M
 
-| System             | Input |   K |   c/s |             Succeeded | Success |      Wall |
-| :----------------- | ----: | --: | ----: | --------------------: | ------: | --------: |
-| RDKit CPU 192T ¹   |    1M |   1 | 2,458 |           956,961 / — |  95.7 % |   389.3 s |
-| RDKit CPU 192T ¹   |    1M |   3 | 2,671 |         2,870,796 / — |  95.6 % | 1,074.6 s |
-|                    |       |     |       |                       |         |           |
-| SmallField 1 GPU   |    1M |   1 | 5,948 |   986,091 / 1,000,000 |  98.6 % |   163.6 s |
-| SmallField 1 GPU ¹ |    1M |   1 | 8,541 |   986,017 / 1,000,000 |  98.6 % |   115.4 s |
-| SmallField 1 GPU ¹ |    1M |   3 | 9,066 | 2,958,411 / 3,000,000 |  98.6 % |   326.3 s |
+| System             | Input |    K |   c/s |             Succeeded | Success |      Wall |
+| :----------------- | ----: | ---: | ----: | --------------------: | ------: | --------: |
+| RDKit CPU 192T ¹   |    1M |    1 | 2,458 |           956,961 / — |  95.7 % |   389.3 s |
+| RDKit CPU 192T ¹   |    1M |    3 | 2,671 |         2,870,796 / — |  95.6 % | 1,074.6 s |
+|                    |       |      |       |                       |         |           |
+| SmallField 1 GPU   |    1M |    1 | 5,948 |   986,091 / 1,000,000 |  98.6 % |   163.6 s |
+| SmallField 1 GPU ¹ |    1M |    1 | 8,541 |   986,017 / 1,000,000 |  98.6 % |   115.4 s |
+| SmallField 1 GPU ¹ |    1M |    3 | 9,066 | 2,958,411 / 3,000,000 |  98.6 % |   326.3 s |
 
 ¹ Archived measurement from an earlier build — same hardware, same dataset.
 The 1-GPU numbers will be refreshed on the current build.
@@ -97,14 +97,14 @@ Installed via `conda install -c conda-forge nvmolkit`.
 nvMolKit was benchmarked in 5 000-molecule chunks because it throws a hard `RuntimeError` on any batch containing a molecule it cannot prepare.
 No per-molecule graceful degradation.
 
-| System             | Input |   K |    c/s |        Succeeded | Success |      Wall |
-| :----------------- | ----: | --: | -----: | ---------------: | ------: | --------: |
-| nvMolKit 1 GPU     |    1M |   3 |    510 |   2,902,811 / 3M |  96.8 % | 5,691.8 s |
-| nvMolKit "8 GPUs"² |    1M |   3 |    755 |   2,903,363 / 3M |  96.8 % | 3,847.1 s |
-|                    |       |     |        |                  |         |           |
-| SmallField 1 GPU   |    1M |   3 |  9,226 |   2,958,359 / 3M |  98.6 % |   320.6 s |
-| SmallField 8 GPUs  |    1M |   3 | 17,715 |   2,958,295 / 3M |  98.6 % |   167.0 s |
-| SmallField 8 GPUs  |   10M |   3 | 29,302 | 29,580,111 / 30M |  98.6 % | 1,010.0 s |
+| System             | Input |    K |    c/s |        Succeeded | Success |      Wall |
+| :----------------- | ----: | ---: | -----: | ---------------: | ------: | --------: |
+| nvMolKit 1 GPU     |    1M |    3 |    510 |   2,902,811 / 3M |  96.8 % | 5,691.8 s |
+| nvMolKit "8 GPUs"² |    1M |    3 |    755 |   2,903,363 / 3M |  96.8 % | 3,847.1 s |
+|                    |       |      |        |                  |         |           |
+| SmallField 1 GPU   |    1M |    3 |  9,226 |   2,958,359 / 3M |  98.6 % |   320.6 s |
+| SmallField 8 GPUs  |    1M |    3 | 17,715 |   2,958,295 / 3M |  98.6 % |   167.0 s |
+| SmallField 8 GPUs  |   10M |    3 | 29,302 | 29,580,111 / 30M |  98.6 % | 1,010.0 s |
 
 ² `nvidia-smi` shows only GPU 0 active during the embed phase (91 % of wall time).
 The MMFF optimization phase (9 %) does distribute across devices.
@@ -150,12 +150,12 @@ Per-chunk breakdown — 10M × K=1, 8 GPUs, 1 600 chunk-device samples:
 Nsight Compute metrics for the two pipeline kernels at wave bins 64 and 128.
 Captures under `bench/profiling/ncu/2026-04-16-phase3/`.
 
-| Kernel                       | Bin | Regs | Dyn Shmem | Block Limit Shmem / Regs | Theoretical Occ |
-| :--------------------------- | --: | ---: | --------: | -----------------------: | --------------: |
-| `etkdg_pipeline_warp_kernel` |  64 |   95 |   7.17 KB |                  12 / 20 |         25.00 % |
-| `etkdg_pipeline_warp_kernel` | 128 |   95 |  22.53 KB |                   4 / 20 |          8.33 % |
-| `mmff_polish_warp_kernel`    |  64 |   96 |   2.30 KB |                  30 / 20 |         41.67 % |
-| `mmff_polish_warp_kernel`    | 128 |   96 |   4.61 KB |                  18 / 20 |         37.50 % |
+| Kernel                       |  Bin | Regs | Dyn Shmem | Block Limit Shmem / Regs | Theoretical Occ |
+| :--------------------------- | ---: | ---: | --------: | -----------------------: | --------------: |
+| `etkdg_pipeline_warp_kernel` |   64 |   95 |   7.17 KB |                  12 / 20 |         25.00 % |
+| `etkdg_pipeline_warp_kernel` |  128 |   95 |  22.53 KB |                   4 / 20 |          8.33 % |
+| `mmff_polish_warp_kernel`    |   64 |   96 |   2.30 KB |                  30 / 20 |         41.67 % |
+| `mmff_polish_warp_kernel`    |  128 |   96 |   4.61 KB |                  18 / 20 |         37.50 % |
 
 Those figures are sm_120.
 On this H100, `cuobjdump --dump-resource-usage` reports `etkdg_pipeline_warp_kernel` at __80 regs__ and `mmff_polish_warp_kernel` at 72, no spills.
@@ -175,13 +175,13 @@ Percentiles of the two energy distributions taken separately do not: a uniform o
 
 Quality check from PubChem 5,000 molecules / 3 conformers each, sampled on 512 successful conformers:
 
-| Metric                             |                Value |
-| ---------------------------------- | -------------------: |
-| Finite RDKit MMFF94 evaluations    |    509 / 512 = 99.4% |
-| SmallField − RDKit, paired P50     |      −0.0 kcal/mol   |
+| Metric                              |                 Value |
+| ----------------------------------- | --------------------: |
+| Finite RDKit MMFF94 evaluations     |     509 / 512 = 99.4% |
+| SmallField − RDKit, paired P50      |         −0.0 kcal/mol |
 | SmallField − RDKit, paired P5 / P95 | −55.8 / +0.8 kcal/mol |
-| SmallField − RDKit, paired minimum  |    −137.2 kcal/mol   |
-| Heavy-bin gate, 100–128 atoms      |                 FAIL |
+| SmallField − RDKit, paired minimum  |       −137.2 kcal/mol |
+| Heavy-bin gate, 100–128 atoms       |                  FAIL |
 
 Paired per-bin deltas from the same quality sample:
 
@@ -211,7 +211,7 @@ The 100–128 bin carries only 9 samples here, so its `FAIL` reflects one outlie
 # USearch 10M production-scale sweep — 8 GPUs
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
 LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
-  ./build/bench/bench_conformers \
+  ./build/bench/bench_conformer_backends \
   --smi /tmp/usearch_10M.smi \
   --conformers 3 \
   --multi-gpu-only
@@ -220,14 +220,14 @@ LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
 CUDA_VISIBLE_DEVICES=0 \
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
 LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
-  ./build/bench/bench_conformers \
+  ./build/bench/bench_conformer_backends \
   --smi /tmp/usearch_1M_clean.smi \
   --conformers 1 \
   --multi-gpu-only
 
 # Quality check — ChEMBL 9K, 3 conformers, 256 samples
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
-  ./build/bench/bench_conformers \
+  ./build/bench/bench_conformer_backends \
   --smi /tmp/chembl_valid.smi \
   --conformers 3 \
   --quality-samples 256

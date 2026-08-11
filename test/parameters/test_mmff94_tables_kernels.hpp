@@ -10,7 +10,7 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_device.cuh"
 
-#include "mmff94_lookup_probes.hpp"
+#include "test/parameters/mmff94_lookup_probes.hpp"
 
 namespace smallfield::tests {
 

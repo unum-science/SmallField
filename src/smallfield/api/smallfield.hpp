@@ -21,8 +21,6 @@
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
-
 #if defined(__CUDACC__) || defined(__CUDA_RUNTIME_H__) || defined(__CUDA_RUNTIME_API_H__)
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

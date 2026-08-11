@@ -25,8 +25,6 @@
 
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
 
-#include "smallfield/module_fwd.hpp"
-
 namespace smallfield::types {
 
 /**

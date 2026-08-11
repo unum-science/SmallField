@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_dg_energy.cpp
+ *  @file test/cuda/test_dg_energy.cpp
  *  @brief Test DG energy evaluation, gradient correctness, and L-BFGS convergence.
  *
  *  Compiled with g++, C++20. CUDA kernels in test_dg_energy_kernels.cu.
@@ -13,8 +13,8 @@
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
-#include "test_dg_energy_kernels.hpp"
-#include "test_helpers.hpp"
+#include "test/cuda/test_dg_energy_kernels.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;

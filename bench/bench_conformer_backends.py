@@ -14,10 +14,10 @@ Systems:
 
 Usage::
 
-    python bench_conformers.py --input /tmp/usearch_1M_clean.smi \\
+    python bench_conformer_backends.py --input /tmp/usearch_1M_clean.smi \\
         --max-mol 100000 --num-conformers 3 --gpus 0,1,2,3
 
-    python bench_conformers.py --input ... --skip-nvmolkit --skip-rdkit
+    python bench_conformer_backends.py --input ... --skip-nvmolkit --skip-rdkit
 """
 
 from __future__ import annotations

@@ -28,13 +28,13 @@
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
-#include "smallfield/mmff94/mmff94_cpu.hpp"
-#include "smallfield/mmff94/mmff94_cpu_extract.hpp"
+#include "smallfield/mmff94/mmff94_extract.hpp"
+#include "smallfield/mmff94/mmff94_term_equations.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test_helpers.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sfparam = smallfield::parameters;
@@ -339,7 +339,7 @@ static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
 /** Build a "ground truth" prepared molecule by calling RDKit's per-term
  *  `getMMFF*Params` directly — bypasses the `mmff_param_cache`, whose
  *  torsion/angle/stbn keys miss ring context. The native CPU port is
- *  validated against this, not against `extract_mmff94_params`, so that
+ *  validated against this, not against `extract_mmff94_params_via_rdkit`, so that
  *  any latent cache bugs don't contaminate the comparison. */
 static void rdkit_direct_extract_(RDKit::ROMol &molecule, sft::molecule_descriptor_t const &descriptor,
                                   sfp::etkdg_prepared_molecule_t &out) {

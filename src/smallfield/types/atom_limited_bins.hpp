@@ -19,7 +19,6 @@
 
 #include <array> // `std::array`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield::types {

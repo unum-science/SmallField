@@ -14,7 +14,7 @@
 #include <parquet/arrow/reader.h>
 #include <parquet/file_reader.h>
 
-#include "parquet_reader.hpp"
+#include "cli/parquet_reader.hpp"
 
 namespace fs = std::filesystem;
 

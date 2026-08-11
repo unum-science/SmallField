@@ -14,7 +14,7 @@ endif()
 
 # Locate Arrow / Parquet. conda-forge libraries ship cmake config files under
 # ${RDKIT_PREFIX}/lib/cmake/Arrow and Parquet.
-if(DEFINED RDKIT_PREFIX)
+if(RDKIT_PREFIX)
     list(PREPEND CMAKE_PREFIX_PATH "${RDKIT_PREFIX}")
 endif()
 

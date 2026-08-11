@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_triangle_smooth_kernels.hpp
+ *  @file test/cuda/test_triangle_smooth_kernels.hpp
  *  @brief Device harness for the shared-memory triangle-smoothing kernel, for use by its unit tests.
  */
 

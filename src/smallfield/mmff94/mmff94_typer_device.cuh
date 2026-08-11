@@ -27,7 +27,6 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"

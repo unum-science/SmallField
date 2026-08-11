@@ -25,7 +25,6 @@
 #include <limits>      // `std::numeric_limits`
 #include <string_view> // `std::string_view`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/preprocess/csd_torsion_predicates.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 

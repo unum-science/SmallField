@@ -26,7 +26,7 @@
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/molecule_parse.hpp"
 
-#include "rdkit_fallback.hpp"
+#include "cli/rdkit_fallback.hpp"
 
 namespace sfapi = smallfield::api;
 

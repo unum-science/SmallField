@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_csd_torsion_device_kernels.cu
+ *  @file test/cuda/test_csd_torsion_device_kernels.cu
  *  @brief Device-side half of the CSD torsion parity test.
  *
  *  Uploads the pattern table, runs the warp-per-molecule matcher over a batch of descriptors, and hands the
@@ -11,9 +11,9 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/cuda/csd_torsion_device.cuh"
+#include "smallfield/cuda/csd_torsion_kernel.cuh"
 
-#include "test_csd_torsion_device_kernels.hpp"
+#include "test/cuda/test_csd_torsion_device_kernels.hpp"
 
 namespace sfc = smallfield::cuda;
 namespace sft = smallfield::types;

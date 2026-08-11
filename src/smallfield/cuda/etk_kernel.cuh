@@ -17,8 +17,6 @@
 
 #pragma once
 
-#include "smallfield/module_fwd.hpp"
-
 #if defined(__CUDACC__)
 
 #include "smallfield/types/etkdg_types.hpp"

@@ -74,17 +74,17 @@ CPU side, parallelised over molecules with OpenMP: SMILES parse with `addHs` →
 
 GPU side, one warp per molecule, all data resident in shared memory:
 
-| #   | Stage                | Method                                                    |
-| :-- | :------------------- | :-------------------------------------------------------- |
-| 1   | Bounds quantisation  | fp32 → `__half` distance bounds upload                    |
-| 2   | Triangle smoothing   | Floyd-Warshall on half-precision bounds                   |
-| 3   | Native metric init   | SmallField classical MDS embedding + mirrored retries     |
-| 4   | DG minimize          | FIRE optimizer, 4D, atom-centric                          |
-| 5   | Stereo check         | Chiral volume sign validation                             |
-| 6   | 4th-dim crush        | FIRE with w&#8324; penalty                                |
-| 7   | ETK torsion refine   | FIRE, 3D, 6-term Fourier + distance constraints           |
-| 8   | Final validation     | Repeat stereo check                                       |
-| 9   | MMFF94 polish        | FIRE, 3D, full force field (VdW + electrostatic + bonded) |
+| #    | Stage               | Method                                                    |
+| :--- | :------------------ | :-------------------------------------------------------- |
+| 1    | Bounds quantisation | fp32 → `__half` distance bounds upload                    |
+| 2    | Triangle smoothing  | Floyd-Warshall on half-precision bounds                   |
+| 3    | Native metric init  | SmallField classical MDS embedding + mirrored retries     |
+| 4    | DG minimize         | FIRE optimizer, 4D, atom-centric                          |
+| 5    | Stereo check        | Chiral volume sign validation                             |
+| 6    | 4th-dim crush       | FIRE with w&#8324; penalty                                |
+| 7    | ETK torsion refine  | FIRE, 3D, 6-term Fourier + distance constraints           |
+| 8    | Final validation    | Repeat stereo check                                       |
+| 9    | MMFF94 polish       | FIRE, 3D, full force field (VdW + electrostatic + bonded) |
 
 ## Architecture
 
@@ -164,7 +164,7 @@ C++ tests and benchmarks need RDKit from conda-forge:
 
 ```bash
 micromamba install -c conda-forge rdkit-dev
-cmake -S . -B build -DRDKIT_PREFIX=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
@@ -172,13 +172,13 @@ ctest --test-dir build --output-on-failure
 ## C++ Benchmarks
 
 ```bash
-cmake --build build -j$(nproc) --target bench_conformers
+cmake --build build -j$(nproc) --target bench_conformer_backends
 
 # ETKDG + MMFF94 throughput (RDKit CPU vs SmallField GPU)
-./build/bench/bench_conformers --smi /path/to/chembl.smi
+./build/bench/bench_conformer_backends --smi /path/to/chembl.smi
 ```
 
-`--multi-gpu-only` on `bench_conformers` reports isolated 1/2/4/8-GPU scaling.
+`--multi-gpu-only` on `bench_conformer_backends` reports isolated 1/2/4/8-GPU scaling.
 
 ## Project Layout
 
@@ -191,7 +191,7 @@ src/smallfield/mmff94/      native MMFF94 typer, charge, term extractor (CPU + G
 src/smallfield/cuda/        CUDA kernels: metric embedding, DG, ETK, MMFF, FIRE
 cli/                        smallfield_batch (gen) — Parquet → Parquet
 test/                       C++ and Python tests cross-validated against RDKit
-bench/                      bench_conformers + bench_mmff_kernels + bench_profile
+bench/                      bench_conformer_backends + bench_mmff_kernels + bench_profile
 python/smallfield/          Python package: api.py (generate)
 ```
 

@@ -16,7 +16,7 @@
 #include "smallfield/parameters/mmff94_tables_device.cuh"
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
 
-#include "bench_mmff_kernels_device.hpp"
+#include "bench/bench_mmff_kernels_device.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;

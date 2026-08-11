@@ -213,6 +213,21 @@ check_pointer_containers() {
         "$file holds pointers inside a container - store values, or indices into a flat arena:"
 }
 
+# Every quoted include is anchored at a root on the include path, never at the includer's own
+# directory. `src/` already works this way, so a sibling header still reads
+# `smallfield/preprocess/csd_torsion_native.hpp`. The bare form resolves through the C++ rule that
+# `""` searches the includer's directory first, which means the path a reader sees is not the path
+# the compiler used, and two includes sitting next to each other silently anchor at different roots.
+# Allowed roots: smallfield/ and csd_data/ under src/, plus test/, bench/ and cli/ under the repo.
+check_include_anchors() {
+    local unanchored
+    unanchored=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*#[[:space:]]*include[[:space:]]*"' |
+        grep -vE '#[[:space:]]*include[[:space:]]*"(smallfield|csd_data|test|bench|cli)/' || true)
+    [ -z "$unanchored" ] || fail "$unanchored" \
+        "$file includes a header by a path relative to itself - anchor it at src/ or the repo root:"
+}
+
 # Per-worker state is an explicit rank into caller-owned scratch, not implicit per-thread storage.
 # Hidden global state is why prepare_molecule_batch_into cannot be called concurrently today.
 check_thread_local() {
@@ -471,6 +486,7 @@ while IFS= read -r -d '' file; do
         check_backtick_math
         check_region_dashes
         check_formatter_off
+        check_include_anchors
         check_pointer_containers
         check_thread_local
         check_positional_aggregates

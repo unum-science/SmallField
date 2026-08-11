@@ -39,7 +39,6 @@
 #include <GraphMol/ChemTransforms/ChemTransforms.h>
 #include <GraphMol/SmilesParse/SmilesWrite.h>
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/preprocess/csd_torsion_native.hpp"
@@ -222,7 +221,7 @@ inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
  *
  *  Also handles the "basic knowledge" torsions (flat aromatic rings, sp2 centers with 3 neighbors)
  *  that getExperimentalTorsions produces. Everything reads the flat descriptor, so the same
- *  answer comes out of the device kernel in `smallfield/cuda/csd_torsion_device.cuh`.
+ *  answer comes out of the device kernel in `smallfield/cuda/csd_torsion_kernel.cuh`.
  *
  *  @param[in] descriptor Molecule descriptor with topology, property and ring arrays.
  *  @param[out] torsions Extracted torsions; any prior contents are dropped.

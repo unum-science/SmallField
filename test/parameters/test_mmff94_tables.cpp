@@ -23,7 +23,7 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 
-#include "test_mmff94_tables_kernels.hpp"
+#include "test/parameters/test_mmff94_tables_kernels.hpp"
 
 namespace sf = smallfield;
 namespace sftest = smallfield::tests;

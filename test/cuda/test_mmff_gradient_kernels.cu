@@ -1,5 +1,5 @@
 /**
- *  @file test/kernels/test_mmff_gradient_kernels.cu
+ *  @file test/cuda/test_mmff_gradient_kernels.cu
  *  @brief CUDA kernel wrapper for MMFF94 energy and gradient tests.
  */
 
@@ -11,7 +11,7 @@
 
 #include "smallfield/cuda/mmff94_energy_kernel.cuh"
 
-#include "test_mmff_gradient_kernels.hpp"
+#include "test/cuda/test_mmff_gradient_kernels.hpp"
 
 namespace sfc = smallfield::cuda;
 namespace sft = smallfield::types;

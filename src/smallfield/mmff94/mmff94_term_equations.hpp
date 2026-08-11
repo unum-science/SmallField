@@ -1,5 +1,5 @@
 /**
- *  @file src/smallfield/mmff94/mmff94_cpu.hpp
+ *  @file src/smallfield/mmff94/mmff94_term_equations.hpp
  *  @brief MMFF94 term classification and empirical rules, shared by the host and device extractors.
  *
  *  Reads `molecule_descriptor_t` plus caller-supplied per-atom MMFF types and answers, term by term,
@@ -15,7 +15,7 @@
  *
  *  Nothing here touches `etkdg_prepared_molecule_t` or the preprocessing batch header, which is what
  *  lets a CUDA translation unit include it. Both extractors do:
- *  `mmff94/mmff94_cpu_extract.hpp` on the host, `mmff94/mmff94_extract_device.cuh` on the device.
+ *  `mmff94/mmff94_extract.hpp` on the host, `mmff94/mmff94_extract_device.cuh` on the device.
  *  Sharing this layer is what keeps the two in step — `test/mmff94/test_mmff_gpu_extract.cpp`
  *  requires byte identity across them for every bonded term.
  *
@@ -25,7 +25,7 @@
  *
  *  Atom types and partial charges are caller-provided. The native atom typer and BCI charge
  *  perception live in the GPU kernel; where it leaves a molecule untyped, the host supplies RDKit's
- *  answer through `preprocess/etkdg_prepare_batch.hpp::read_rdkit_mmff_typing`.
+ *  answer through `preprocess/etkdg_prepare_batch.hpp::extract_mmff94_typing_via_rdkit_`.
  */
 
 #pragma once
@@ -37,7 +37,6 @@
 #include <span>    // `std::span`
 #include <utility> // `std::pair`
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"

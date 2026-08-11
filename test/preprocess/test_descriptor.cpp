@@ -18,7 +18,7 @@
 
 #include "smallfield/types/molecule_descriptor.hpp"
 
-#include "test_helpers.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;

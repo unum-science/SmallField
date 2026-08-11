@@ -25,8 +25,6 @@
 #include <GraphMol/RingInfo.h>
 #include <GraphMol/MolOps.h>
 
-#include "smallfield/module_fwd.hpp"
-
 namespace smallfield::types {
 
 /** Maximum atom count supported by the single-warp GPU pipeline. */

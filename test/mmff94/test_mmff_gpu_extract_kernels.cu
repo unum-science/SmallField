@@ -15,7 +15,7 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/parameters/mmff94_tables_device.cuh"
 
-#include "test_mmff_gpu_extract_kernels.hpp"
+#include "test/mmff94/test_mmff_gpu_extract_kernels.hpp"
 
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;

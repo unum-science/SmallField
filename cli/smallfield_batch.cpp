@@ -40,12 +40,13 @@
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/log.hpp"
 #include "smallfield/nvtx.hpp"
-#include "smallfield/postprocess.hpp"
+#include "smallfield/postprocess/fragment_separation.hpp"
+#include "smallfield/postprocess/shape_descriptors.hpp"
 
-#include "parquet_reader.hpp"
-#include "parquet_writer.hpp"
-#include "rdkit_fallback.hpp"
-#include "shard_inventory.hpp"
+#include "cli/parquet_reader.hpp"
+#include "cli/parquet_writer.hpp"
+#include "cli/rdkit_fallback.hpp"
+#include "cli/shard_inventory.hpp"
 
 namespace fs = std::filesystem;
 namespace sfapi = smallfield::api;
