@@ -1,8 +1,10 @@
+# SmallField
+
 ![SmallField conformer generation library](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/SmallField.jpg?raw=true)
 
-__SmallField__ generates 3D conformers from SMILES strings using [ETKDG](https://doi.org/10.1021/acs.jcim.5b00654) distance geometry with experimental torsion preferences followed by [MMFF94](https://doi.org/10.1006/jcat.1996.0027) force field optimization, entirely on the GPU.
+__SmallField__ generates 3D conformers from _"Simplified Molecular-Input Line-Entry System"_ SMILES strings using _"Experimental-Torsion Basic-Knowledge Distance Geometry"_ [ETKDG](https://doi.org/10.1021/acs.jcim.5b00654), followed by _"Merck Molecular Force Field"_ [MMFF94](https://doi.org/10.1006/jcat.1996.0027) optimization, entirely on the GPU.
 One CUDA warp processes one molecule and runs all pipeline stages in shared memory with no global-memory atomics.
-CPU preprocessing uses [RDKit](https://github.com/rdkit/rdkit) for SMILES parsing, bounds matrices, CSD torsion lookup, and MMFF94 parameter extraction.
+CPU preprocessing uses [RDKit](https://github.com/rdkit/rdkit) for SMILES parsing, bounds matrices, _"Cambridge Structural Database"_ CSD torsion lookup, and MMFF94 parameter extraction.
 
 > [!WARNING]
 > Much of this project is AI-generated, and its correctness was defined by agreement with RDKit.
@@ -34,6 +36,12 @@ Sampling shows axial chirality in 0.28–0.44 % of molecules and helical chirali
 These are corner cases but real: a user counting on both enantiomers of a given atropisomer will get only one.
 Flagged future work is to detect and tag such molecules in the output so downstream consumers can re-embed them with constrained stereo, not to silently double the row count.
 
+__What happens to salts and multi-fragment SMILES?__
+A SMILES naming several disconnected fragments is reduced to its largest one by default, and the counterions are dropped.
+This is the one place SmallField does not hand the whole input to the embedder, and it is not a canonicalisation preference: a counterion has no meaningful conformer, and MMFF94 cannot type an isolated `HCl`, so keeping the fragment would reject the parent along with it.
+`salt_policy_t::keep_all_fragments_k` restores the literal reading for callers who want it.
+Conformers of a genuine multi-fragment system are laid out along the +x axis by rigid translation, so components do not interpenetrate and shape descriptors stay meaningful.
+
 __What is in scope?__
 Parsing any valid SMILES that RDKit accepts.
 Producing K 3D conformers per input, filtered by stereo validity (for defined stereocentres) and MMFF94 convergence.
@@ -55,46 +63,59 @@ __One CUDA warp per molecule, all pipeline stages in shared memory, no global-me
 Each thread of a warp owns `ceil(N/32)` atoms and accumulates gradients in registers via `__shfl_sync`; there is no `atomicAdd` and no pair-index scanning anywhere on the device.
 
 __Int8 distance-bounds matrix.__
-The N×N bounds live in shared memory as `uint8_t` with a per-molecule linear dequantization, halving the footprint against `__half` — 32 KB to 16 KB at 128 atoms — so more molecules stay resident per multiprocessor.
+The N×N bounds live in shared memory as `uint8_t` with a per-molecule linear dequantization, halving the footprint against `__half` — 74 KB to 37 KB at 192 atoms — so more molecules stay resident per multiprocessor.
+Quantization runs inside the pipeline kernel rather than on the wire, because the scale has to be derived from the post-smoothed values the metric prepass writes.
 
-__Native classical-MDS metric embedding warm start.__
+__Native classical _"multidimensional scaling"_ MDS metric embedding warm start.__
 The metric-embedding stage starts from a SmallField-owned bounds-matrix embedding instead of RDKit's coordinate generator, which removes the largest preprocess step from the host critical path.
 
-__FIRE optimizer instead of L-BFGS.__
+__The _"Fast Inertial Relaxation Engine"_ FIRE optimizer instead of _"limited-memory Broyden–Fletcher–Goldfarb–Shanno"_ L-BFGS.__
 Three shared arrays (positions, velocities, gradient) carry the entire optimiser state vs the fifteen L-BFGS would need; the saved shared memory pays for the warp residency above.
 
 __Native CSD torsion matcher.__
-All 470 SMARTS patterns shipped with RDKit's experimental-torsion library parse natively and run via a stack-only matcher, byte-equivalent to `RDKit::SubstructMatch` over a 1 M USearch sample.
+All 470 _"SMILES Arbitrary Target Specification"_ SMARTS patterns shipped with RDKit's experimental-torsion library parse natively and run via a stack-only matcher, byte-equivalent to `RDKit::SubstructMatch` over a 1 M USearch sample.
 There is no VF2 fallback: a pattern the compiler cannot read is a load-time error rather than a silent runtime detour.
 This removed the VF2 + query-chain CPU hot-spot at 10 M scale entirely.
 
+__Preprocessing on the device, not just embedding.__
+Everything downstream of `build_descriptor` runs on the GPU: the bond-hop BFS, MMFF94 typing, MMFF94 term extraction with compaction, CSD torsion matching, and the ETK per-atom CSR build.
+The host keeps only the RDKit front-end — parse, sanitize, `addHs`, stereo — plus the bounds matrix and chiral centres, all of which are pure over `molecule_descriptor_t`.
+CSD torsion matching alone dropped by more than an order of magnitude per molecule, and the pipeline is GPU-bound for the first time.
+Moving the extractor also closed a silent quality hole: the host path dropped any term whose RDKit parameter lookup failed and shipped the molecule anyway, where the device path falls back to the empirical rules MMFF94 defines for that case.
+
 __Per-atom interaction lists.__
-Built in two passes (count, then fill) on the CPU; the GPU iterates only the relevant terms per atom rather than scanning the full pair list.
+Built in two passes — count, then fill — on the device alongside the term extraction that feeds them, so the GPU iterates only the relevant terms per atom rather than scanning the full pair list.
 
 ## Pipeline
 
 > See [`GLOSSARY.md`](GLOSSARY.md) for the canonical vocabulary — `parquet-shard` / `coprocessed-batch` / `embedding-wave` / `atom-limited-bin` at the data-granularity level, and `pipeline-role` (CLI outer pipeline) vs `wave-step` (library inner pipeline) for the pipelining layers.
 
-CPU side, parallelised over molecules with OpenMP: SMILES parse with `addHs` → bounds matrix → chiral centres → CSD torsion Fourier coefficients → MMFF94 params + per-atom interaction lists.
+CPU side, parallelised over molecules with OpenMP: SMILES parse with `addHs` → molecule descriptor → bounds matrix → chiral centres → 1-2 and 1-3 distance constraints.
+MMFF94 typing runs on the host only as a check, and only the molecules the native typer rejects pay for an RDKit patch.
 
-GPU side, one warp per molecule, all data resident in shared memory:
+Device side, everything downstream of the descriptor: bond-hop BFS → MMFF94 typing → MMFF94 term extraction with compaction → CSD torsion matching → ETK per-atom CSR build.
+Nothing in that chain returns to the CPU; the host uploads a descriptor, a bounds matrix, chiral centres, the constraints and the per-molecule bases, and reads back coordinates.
 
-| #    | Stage               | Method                                                    |
-| :--- | :------------------ | :-------------------------------------------------------- |
-| 1    | Bounds quantisation | fp32 → `__half` distance bounds upload                    |
-| 2    | Triangle smoothing  | Floyd-Warshall on half-precision bounds                   |
-| 3    | Native metric init  | SmallField classical MDS embedding + mirrored retries     |
-| 4    | DG minimize         | FIRE optimizer, 4D, atom-centric                          |
-| 5    | Stereo check        | Chiral volume sign validation                             |
-| 6    | 4th-dim crush       | FIRE with w&#8324; penalty                                |
-| 7    | ETK torsion refine  | FIRE, 3D, 6-term Fourier + distance constraints           |
-| 8    | Final validation    | Repeat stereo check                                       |
-| 9    | MMFF94 polish       | FIRE, 3D, full force field (VdW + electrostatic + bonded) |
+Then the embedding itself, one warp per molecule, all data resident in shared memory:
+
+| #    | Stage                      | Method                                                             |
+| :--- | :------------------------- | :----------------------------------------------------------------- |
+| 1    | Bounds upload              | fp32 host → device, unquantized on the wire                        |
+| 2    | Triangle smoothing         | Floyd-Warshall on float bounds, fused into the prepass             |
+| 3    | Native metric init         | SmallField classical MDS embedding + mirrored retries              |
+| 4    | Bounds quantization        | int8 into shared memory, per-molecule linear scale                 |
+| 5    | Distance-geometry minimize | FIRE optimizer, 4D, atom-centric                                   |
+| 6    | Stereo check               | Chiral volume sign validation                                      |
+| 7    | 4th-dim crush              | FIRE with w&#8324; penalty                                         |
+| 8    | ETK torsion refine         | FIRE, 3D, 6-term Fourier + distance constraints                    |
+| 9    | Final validation           | Repeat stereo check                                                |
+| 10   | MMFF94 polish              | FIRE, 3D, full force field: van der Waals + electrostatic + bonded |
 
 ## Architecture
 
-Wave dispatch sorts molecules by atom count and launches them in eight waves capped at 16, 32, 48, 64, 80, 96, 112, and 128 atoms.
-Small-molecule waves run up to twenty blocks per SM; the two largest get one each.
+Wave dispatch sorts molecules by atom count and launches them in nine waves capped at 16, 32, 48, 64, 80, 96, 112, 128, and 192 atoms.
+The ladder is even to 128 and then jumps, because molecules past 128 atoms are rare enough that a tighter step would buy empty bins.
+A 32-thread block occupies at most 32 of a _"streaming multiprocessor"_'s 64 warp slots, so that is the ceiling this shape can reach at any register count; `__launch_bounds__(32, 4)` sets a floor and nvcc fits well past it on the small bins.
 The persistent warp loop keeps the same kernel resident across all stages, avoiding launch overhead between FIRE iterations and between phases.
 
 The CPU pipeline runs in two layers.
@@ -126,10 +147,12 @@ The GPU pipeline context is also available directly:
 ```python
 context = sf.Context()
 coordinates_flat, energies, status = context.generate_conformers(
-    ["CCO", "c1ccccc1"], num_conformers=3, max_atoms_per_molecule=128,
+    ["CCO", "c1ccccc1"], num_conformers=3, max_atoms_per_molecule=192,
     max_stereo_attempts=10, random_seed=42,
 )
 ```
+
+`max_atoms_per_molecule` is the output stride as well as the cap, so lowering it to the largest molecule you actually feed in saves proportional host memory; 192 is the compile-time ceiling the warp pipeline supports.
 
 Requires RDKit for preprocessing — `pip install rdkit`.
 
@@ -152,6 +175,13 @@ smallfield_batch --input chembl_smi/ --output chembl_3d_mmff/ \
     --num-conformers 1 --gpus 0,1,2,3,4,5,6,7
 ```
 
+`smallfield_descriptors` augments shards that already hold 3D conformers, computing USR and USRCAT shape descriptors from the stored fp16 coordinates instead of re-running the GPU.
+It rounds through fp16 exactly as the producer does, so a re-generated shard and an augmented one agree byte for byte.
+
+```bash
+smallfield_descriptors --input chembl_3d_mmff/ --output chembl_3d_usrcat/
+```
+
 ## Installation
 
 There are no wheels: SmallField compiles CUDA and links RDKit, so every install builds from source and needs `nvcc`, CMake, and the RDKit development headers already present.
@@ -163,7 +193,7 @@ pip install --no-build-isolation "git+https://github.com/unum-science/SmallField
 `--no-build-isolation` matters — under build isolation `pip` cannot see the RDKit and CUDA installation the build shells out to.
 From a clone, `pip install --no-build-isolation -e .` does the same thing.
 
-`pixi.toml` pins the environment this is developed and tested in — Python 3.14, RDKit 2025.09, Arrow 24 — and `pixi install` reproduces it.
+`pixi.toml` pins the environment this is developed and tested in — Python 3.14, RDKit 2026.03, Arrow 24 — and `pixi install` reproduces it.
 
 C++ tests and benchmarks need RDKit, which `pixi install` already provides — the build finds the in-tree environment on its own, and `-DRDKIT_PREFIX=` is only needed to point at some other one.
 
@@ -210,13 +240,14 @@ cmake --build build --parallel --target bench_conformer_backends
 src/smallfield/api/         public C++ API (smallfield.hpp)
 src/smallfield/types/       plain data structures shared host + device
 src/smallfield/parameters/  MMFF94 parameter tables
-src/smallfield/preprocess/  CPU preprocessing: SMILES parse, bounds, CIP, CSD torsions
+src/smallfield/preprocess/  host preprocessing: SMILES parse, bounds, Cahn-Ingold-Prelog, torsion tables
 src/smallfield/mmff94/      native MMFF94 typer, charge, term extractor (CPU + GPU)
-src/smallfield/cuda/        CUDA kernels: metric embedding, DG, ETK, MMFF, FIRE
-cli/                        smallfield_batch (gen) — Parquet → Parquet
+src/smallfield/cuda/        CUDA kernels: preprocess, metric embedding, DG, ETK, MMFF, FIRE
+src/smallfield/postprocess/ USR / USRCAT shape descriptors, fragment separation
+cli/                        smallfield_batch (generate) + smallfield_descriptors (augment)
 test/                       C++ and Python tests cross-validated against RDKit
 bench/                      bench_conformer_backends + bench_mmff_kernels + bench_profile
-python/smallfield/          Python package: api.py (generate)
+python/smallfield/          Python package: api.py (generate), tools/ (shard preparation)
 ```
 
 There are no dependencies beyond CUDA 12+ and RDKit for preprocessing.
