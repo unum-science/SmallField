@@ -4,9 +4,13 @@
  *
  *  On drug-like SMILES. The gate counts @b molecules, not atoms: a wrong type is a wrong molecule, and
  *  averaging six bad atoms over the ~889 000 in a 20 000-molecule sweep hides a whole structural class
- *  behind four nines. Both typers read RDKit's default aromaticity perception — `MMFFMolProperties` skips
- *  `MolOps::setMMFFAromaticity` on a molecule already marked `_MMFFSanitized`, which this test sets — so
- *  there is no aromaticity model difference to excuse a mismatch, and the curated set must come out exact.
+ *  behind four nines.
+ *
+ *  The two typers do @b not automatically read the same aromaticity. `MMFFMolProperties` guards only its
+ *  Kekulize behind `_MMFFSanitized` and calls `MolOps::setMMFFAromaticity` unconditionally, so marking a
+ *  molecule sanitized suppresses the Kekulize and nothing else. Whichever side snapshots the molecule
+ *  before that call sees a different one, and the curated set comes out exact only because none of its
+ *  seventeen probes is a molecule whose perception moves.
  */
 
 #include <cmath> // `std::fabs`

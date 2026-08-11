@@ -20,10 +20,16 @@
  *  RDKit's abbreviations, so a merge still needs the renames re-applied by hand.
  *
  *  Aromaticity input consumes the descriptor's aromatic flags, which are set by RDKit's default aromaticity
- *  perception during `SmilesToMol(...sanitize=true...)`. That is the same perception RDKit's own typer sees:
- *  `MMFFMolProperties` only runs `MolOps::setMMFFAromaticity` on a molecule that lacks the `_MMFFSanitized`
- *  property, and every caller here sets it first. So the two typers agree by construction, and neither one
- *  applies MMFF-specific aromaticity.
+ *  perception during `SmilesToMol(...sanitize=true...)`. That is @b not always the perception RDKit's own
+ *  typer sees. `MMFFMolProperties` guards only its Kekulize behind `_MMFFSanitized`; it calls
+ *  `MolOps::setMMFFAromaticity` unconditionally, so presetting that property suppresses the Kekulize and
+ *  nothing else. MMFF perceives aromaticity with its own pi-electron count, and it only ever adds.
+ *
+ *  So a caller that snapshots the descriptor before constructing `MMFFMolProperties` types from RDKit's
+ *  default perception while RDKit types from MMFF's, and the two disagree on roughly 400 molecules per
+ *  million — N-oxides and fused heterocycles, where the extra perception changes an atom type outright.
+ *  Applying MMFF's perception before the snapshot removes the difference, since a second application is a
+ *  no-op.
  */
 
 #pragma once
