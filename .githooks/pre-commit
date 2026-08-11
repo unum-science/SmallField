@@ -295,7 +295,10 @@ check_abbreviations() {
 # a rule stops catching the thing it was written for.
 check_short_identifiers() {
     local short
+    # Comment lines are excluded, as in check_pointer_containers: the pattern reads ordinary English
+    # as a declaration, so "rewrites them from it, so ..." trips a rule about identifiers.
     short=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*(//|\*|/\*|#)' |
         grep -vE '^\+[[:space:]]*namespace[[:space:]]+[a-z_]+[[:space:]]*=' |
         grep -E '^\+.*\b((std::)?[a-z_0-9:]+|auto)[[:space:]]+(const[[:space:]]+)?\*?&?[a-z][a-z0-9_]{0,2}[[:space:]]*(=|;|\)|,)' |
         grep -vwE 'out|end|key|row|dim|hit|ok|top|sum|max|min|raw|bin|tag|on|bit|log|got|now|arg|sha|oop|arc|cis|lhs|rhs|dx|dy|dz|atom_i|atom_j|atom_k|atom_l' || true)

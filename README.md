@@ -164,17 +164,34 @@ C++ tests and benchmarks need RDKit, which `pixi install` already provides — t
 
 ```bash
 cmake --preset dev                     # one architecture, detected from the local GPU
-cmake --build build -j$(nproc)
+cmake --build build --parallel
 ctest --preset dev
 ```
 
 `--preset release` builds the full `80/89/90/100/120` fatbin into `build-release/`, which is what ships and what CI compiles.
 It is several times slower, so keep it for release checks rather than the inner loop.
 
+Every knob is `SMALLFIELD_`-prefixed and listed at the top of `CMakeLists.txt`; `cmake -LH build | grep SMALLFIELD` prints them with their descriptions.
+`SMALLFIELD_BUILD_TESTS` and `SMALLFIELD_BUILD_BENCHMARKS` default to on only when this is the top-level project, so vendoring the tree gets the library alone.
+
+## Using SmallField From Another Project
+
+The same target spelling works whether the tree is vendored or installed:
+
+```cmake
+find_package(smallfield REQUIRED)   # after `cmake --install build --prefix ...`
+add_subdirectory(smallfield)        # or vendored in place
+
+target_link_libraries(app PRIVATE smallfield::smallfield)
+```
+
+The installed package records the RDKit environment it was built against, so a consumer on the same machine needs no `-DRDKIT_PREFIX=`.
+Because the library is header-only apart from one translation unit, the headers install alongside the archive and both are needed.
+
 ## C++ Benchmarks
 
 ```bash
-cmake --build build -j$(nproc) --target bench_conformer_backends
+cmake --build build --parallel --target bench_conformer_backends
 
 # ETKDG + MMFF94 throughput (RDKit CPU vs SmallField GPU)
 ./build/bench/bench_conformer_backends --smi /path/to/chembl.smi

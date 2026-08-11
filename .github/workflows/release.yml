@@ -33,6 +33,12 @@ jobs:
           update-version-in: |
             CITATION.cff:^version: (\d+\.\d+\.\d+)
             python/smallfield/__init__.py:^__version__ = "(\d+\.\d+\.\d+)"
+          update-major-version-in: |
+            src/smallfield/version.hpp:^#define SMALLFIELD_VERSION_MAJOR (\d+)
+          update-minor-version-in: |
+            src/smallfield/version.hpp:^#define SMALLFIELD_VERSION_MINOR (\d+)
+          update-patch-version-in: |
+            src/smallfield/version.hpp:^#define SMALLFIELD_VERSION_PATCH (\d+)
           push: "true"
           create-release: "true"
           github-token: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}

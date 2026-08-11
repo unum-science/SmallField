@@ -16,6 +16,15 @@ with section("format"):
     # parenthesis on its own line.
     dangle_parens = True
 
+
+# Comments are left exactly as written. With markup enabled, cmake-format treats a comment as prose
+# and reflows it to the column limit, which collapses an aligned option table into a paragraph and
+# joins the lines of an example block together. Same failure as clang-format re-splitting a string
+# literal: the tool cannot tell authored layout from accidental line breaks, so it does not get to
+# guess.
+with section("markup"):
+    enable_markup = False
+
 # Without these the project's own commands are parsed as a flat argument list, and every
 # argument lands on its own line rather than grouping under the keyword it belongs to.
 with section("parse"):

@@ -1,0 +1,20 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(OpenMP)
+find_dependency(CUDAToolkit)
+find_dependency(fmt CONFIG)
+
+# RDKit's imported targets are hand-rolled rather than found, so the export set references names that
+# do not exist until this recreates them. `RDKIT_PREFIX` resolves the same way it does in the build:
+# an explicit value first, then an activated conda or micromamba environment, and failing both, the
+# environment this library was compiled against -- which is the only one its headers are known to
+# agree with.
+if (NOT RDKIT_PREFIX AND NOT DEFINED ENV{CONDA_PREFIX})
+    set(RDKIT_PREFIX "@RDKIT_PREFIX@")
+endif ()
+include("${CMAKE_CURRENT_LIST_DIR}/rdkit.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/smallfieldTargets.cmake")
+
+check_required_components(smallfield)

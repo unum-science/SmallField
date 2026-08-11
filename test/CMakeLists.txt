@@ -34,7 +34,7 @@ define_smallfield_test(cuda csd_torsion_device MIXED)
 define_smallfield_test(
     cuda embedding_determinism
     MIXED
-    LINK ${SMALLFIELD_RDKIT_TARGETS} fmt::fmt
+    LINK smallfield_rdkit fmt::fmt
 )
 
 define_smallfield_test(preprocess chirality MIXED)

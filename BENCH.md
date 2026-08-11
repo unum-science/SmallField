@@ -17,7 +17,7 @@ See [`GLOSSARY.md`](GLOSSARY.md) for the canonical vocabulary used below (`parqu
 
 ## Method
 
-- Build: `cmake --preset release -DSMALLFIELD_BUILD_BATCH_BINARY=ON`
+- Build: `cmake --preset release -DSMALLFIELD_BUILD_CLI=ON`
 - Benchmark binary: `build/bench/bench_conformer_backends`
 - Allocator: `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2`
 - Primary dataset: USearch Molecules — 9,998,572 SMILES at `/tmp/usearch_10M.smi`, 1 M clean subset at `/tmp/usearch_1M_clean.smi`.

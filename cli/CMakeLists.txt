@@ -1,15 +1,6 @@
 # SmallField batch binary: a restartable Parquet folder of SMILES in, a Parquet folder of 3D conformer coordinates,
 # energies and per-conformer status out.  Three-tier fallback: GPU, then RDKit, then NULL.
 
-option(SMALLFIELD_BUILD_BATCH_BINARY "Build the smallfield_batch CLI (requires Apache Arrow)" OFF)
-# Opt-in host-side NVTX ranges for `nsys` timelines.  Header-only, since NVTX3 ships with the CUDA toolkit, and compiles
-# to nothing when OFF, so shipping builds are unaffected.
-option(SMALLFIELD_ENABLE_NVTX "Annotate batch pipeline roles with NVTX ranges" OFF)
-
-if (NOT SMALLFIELD_BUILD_BATCH_BINARY)
-    return()
-endif ()
-
 # conda-forge ships the Arrow and Parquet config files under the RDKit prefix, which the root already prepended to
 # CMAKE_PREFIX_PATH -- subdirectories inherit it.
 find_package(Arrow CONFIG REQUIRED)
@@ -44,7 +35,6 @@ define_smallfield_target(
     SOURCES smallfield_batch.cpp parquet_reader.cpp shard_inventory.cpp rdkit_fallback.cpp
     LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared argparse::argparse
     DEFINES SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}"
-            $<$<BOOL:${SMALLFIELD_ENABLE_NVTX}>:SMALLFIELD_ENABLE_NVTX>
 )
 
 # Descriptor augmentation rewrites existing *.3D.parquet shards into the canonical 13-column schema by computing
@@ -55,7 +45,6 @@ define_smallfield_target(
     SOURCES smallfield_descriptors.cpp
     LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared argparse::argparse
     DEFINES SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}"
-            $<$<BOOL:${SMALLFIELD_ENABLE_NVTX}>:SMALLFIELD_ENABLE_NVTX>
 )
 
 message(STATUS "SmallField batch binary: ENABLED (git ${SMALLFIELD_GIT_SHA_VALUE})")
