@@ -431,6 +431,17 @@ context_t::context_t(std::span<int const> devices) {
     }
     else { device_ids.assign(devices.begin(), devices.end()); }
 
+    // `batch_slots_per_device` holds `max_devices_k` slots per parity and reaches
+    // `prepare_per_device_batches_into` as a dynamic-extent span, so the fixed extent is erased at the
+    // call and the callee indexes it by this count alone.  An unclamped list writes past the array, and
+    // the default constructor enumerates every visible GPU, so nothing unusual on the caller's side is
+    // needed to reach it.
+    if (device_ids.size() > max_devices_k) {
+        this->logger.error("context_t: {} devices visible, using the first {}; raise max_devices_k to use the rest",
+                           device_ids.size(), max_devices_k);
+        device_ids.resize(max_devices_k);
+    }
+
     std::size_t const device_count = device_ids.size();
     streams.resize(device_count);
     metric_scratch.resize(device_count);
