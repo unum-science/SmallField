@@ -1,16 +1,18 @@
 /**
  *  @file   src/smallfield/types/views.hpp
- *  @brief  Non-owning multi-dimensional views over caller-owned molecule buffers.
+ *  @brief  The libcu++ namespace alias, and non-owning views over caller-owned molecule buffers.
  *
  *  Every matrix in this project is a flat buffer plus an extent the caller carries separately, which is
  *  three parameters where the data is one thing and lets an extent disagree with its storage undetected.
  *  These aliases put the extent inside the view.
  *
- *  `std::mdspan` is the type we want and cannot have yet: it needs C++23, and `nvcc` 12.8 and 12.9 both
- *  reject `-std=c++23` outright, so it cannot enter any translation unit `nvcc` touches. libcu++ ships the
- *  same interface, works at C++20 in host and device code alike, and arrives with `CUDA::cudart`, which is
- *  already a `PUBLIC` dependency of `smallfield_objects`. `mdspan_ns` names the namespace once so the swap
- *  is one `#if` when `nvcc` 13 and libstdc++ 16 land together.
+ *  The standard library's own types cannot serve here. `std::mdspan` needs C++23, and `nvcc` 12.8 and 12.9
+ *  both reject `-std=c++23` outright, so it cannot enter any translation unit `nvcc` touches; and
+ *  `std::span`'s members are not `__host__ __device__`, so a device helper cannot take one. libcu++ ships
+ *  both interfaces at C++20 for host and device alike and arrives with `CUDA::cudart`, which is already a
+ *  `PUBLIC` dependency of `smallfield_objects`. `custd` names the namespace once — the namespace rather
+ *  than one type in it, because it carries the span as well as the views — so the swap is one `#if` here
+ *  when `nvcc` 13 and libstdc++ 16 land together.
  *
  *  @section indexing Index width
  *
@@ -32,15 +34,26 @@
 
 #pragma once
 
+#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
-#include <vector> // `std::vector`
+#include <concepts> // `std::convertible_to`
+#include <vector>   // `std::vector`
 
 #include <cuda/std/mdspan>
+#include <cuda/std/span>
+
+#include "smallfield/utilities.hpp"
+
+/*
+ *  At global scope on purpose. Every subsystem spells `custd::span`, and so does the pybind module, which
+ *  sits outside `smallfield` entirely — an alias inside the project namespace would force that translation
+ *  unit and every other global-scope consumer to write the prefix back out. One short, distinctive name in
+ *  the global namespace is the price of the type being spellable everywhere it is used.
+ */
+namespace custd = cuda::std;
 
 namespace smallfield::types {
-
-namespace mdspan_ns = cuda::std;
 
 #pragma region Aliases
 
@@ -51,16 +64,101 @@ namespace mdspan_ns = cuda::std;
  *  no padding between rows.
  */
 template <typename value_type_>
-using packed_matrix = mdspan_ns::mdspan<value_type_, mdspan_ns::dextents<std::uint32_t, 2>>;
+using packed_matrix = custd::mdspan<value_type_, custd::dextents<std::uint32_t, 2>>;
 
 /** All-pairs bond-hop counts, one row per source atom, `unreachable_hops_k` where no path exists. */
 using hop_matrix_t = packed_matrix<std::uint8_t>;
 
-/* The device bounds matrix wants a third alias over `mdspan_ns::layout_stride`, because
-   `compute_bounds_row_stride` pads rows to an odd multiple of four so all 32 lanes of a warp land on
-   distinct shared-memory banks. It arrives with its first consumer rather than ahead of it: the two view
-   types this header replaced sat unused long enough for one of them to acquire a docblock that misstated
-   its own size. */
+/** Rows a conformer carries: x, y and z. */
+inline constexpr std::size_t conformer_dimensions_k = 3;
+
+/** Rows a metric embedding carries: the three spatial ones plus the w the crush penalty flattens. */
+inline constexpr std::size_t embedding_dimensions_k = 4;
+
+/**
+ *  @brief What a coordinate view holds.
+ *
+ *  Positions, velocities and a gradient are identical in shape and layout and ride adjacent through the
+ *  FIRE driver, so nothing but this separates them and any two of them are mutually assignable without it.
+ */
+enum class coordinate_role_t : std::uint8_t { position_k, velocity_k, gradient_k, embedding_k };
+
+/**
+ *  @brief Empty accessor carrying the role, so two roles are distinct types.
+ *
+ *  `custd::mdspan`'s converting constructor requires the accessors be constructible from one another, and
+ *  the accessor is already one of its four template parameters, so the role costs no bytes and needs no
+ *  wrapper class. It also closes what the layout policy alone cannot: an atom-major view is `layout_right`
+ *  like `packed_matrix`, and a static extent always converts to a dynamic one.
+ *
+ *  It restates `custd::default_accessor`'s three members rather than deriving from it, and the difference
+ *  is load-bearing. A derived empty struct is still an aggregate, so `role_accessor<gradient_k, float>` is
+ *  aggregate-initializable from any sibling's base subobject, `is_constructible` reports true, and every
+ *  role converts to every other — which is the whole guarantee, lost. Standing alone, only the one
+ *  conversion below exists.
+ */
+template <coordinate_role_t role_, typename value_type_>
+struct role_accessor {
+    using offset_policy = role_accessor;
+    using element_type = value_type_;
+    using reference = value_type_ &;
+    using data_handle_type = value_type_ *;
+
+    constexpr role_accessor() noexcept = default;
+
+    /** Adding `const` to the element type keeps the role, so a mutable view still passes as a reader. */
+    template <typename other_type_>
+        requires std::convertible_to<other_type_ (*)[], value_type_ (*)[]>
+    constexpr role_accessor(role_accessor<role_, other_type_> const &) noexcept {}
+
+    constexpr reference access(data_handle_type handle, std::size_t index) const noexcept { return handle[index]; }
+    constexpr data_handle_type offset(data_handle_type handle, std::size_t index) const noexcept {
+        return handle + index;
+    }
+};
+
+/**
+ *  @brief Coordinates over one molecule, always addressed `(atom, axis)`.
+ *
+ *  The layout policy says where the elements sit, so a call site reads the same whichever storage it holds
+ *  and the compiler performs the stride arithmetic that would otherwise be written by hand. Distinguishing
+ *  the two layouts by which extent is static does not work: a static extent converts implicitly to a
+ *  dynamic one, so both would pass where a `packed_matrix` was expected. `custd::layout_left` against
+ *  `custd::layout_right` blocks that in both directions, because the cross-layout mapping constructor is
+ *  constrained to rank one or lower and these are rank two.
+ *
+ *  The dimension count is a template parameter because it is a property of the algorithm rather than of the
+ *  molecule: distance geometry works at four rows and everything downstream at three, and the two must not
+ *  be interchangeable at a call site.
+ */
+template <coordinate_role_t role_, typename value_type_, std::size_t dimensions_, typename layout_type_>
+using coordinates = custd::mdspan<value_type_, custd::extents<std::uint32_t, custd::dynamic_extent, dimensions_>,
+                                  layout_type_, role_accessor<role_, value_type_>>;
+
+/** Contiguous axis planes, so `stride(atom)` is one and `stride(axis)` is the atom count. */
+template <coordinate_role_t role_, typename value_type_, std::size_t dimensions_>
+using coordinates_soa = coordinates<role_, value_type_, dimensions_, custd::layout_left>;
+
+/** One xyz triple per atom, the layout RDKit reads and writes. */
+template <coordinate_role_t role_, typename value_type_>
+using coordinates_aos = coordinates<role_, value_type_, conformer_dimensions_k, custd::layout_right>;
+
+/** A conformer: three spatial rows over one molecule's atoms. */
+using conformer_soa_t = coordinates_soa<coordinate_role_t::position_k, float, conformer_dimensions_k>;
+
+/** A metric embedding, which distance geometry works in before projecting down to a conformer. */
+using embedding_soa_t = coordinates_soa<coordinate_role_t::embedding_k, float, embedding_dimensions_k>;
+
+/** A conformer in RDKit's order. */
+using conformer_aos_t = coordinates_aos<coordinate_role_t::position_k, float>;
+
+/*
+ *  The device bounds matrix wants a third alias over `custd::layout_stride`, because
+ *  `compute_bounds_row_stride` pads rows to an odd multiple of four so all 32 lanes of a warp land on
+ *  distinct shared-memory banks. It arrives with its first consumer rather than ahead of it: the two view
+ *  types this header replaced sat unused long enough for one of them to acquire a docblock that misstated
+ *  its own size.
+ */
 
 #pragma endregion Aliases
 
@@ -84,6 +182,83 @@ inline packed_matrix<value_type_> reset_square_matrix(std::vector<value_type_> &
     return packed_matrix<value_type_> {storage.data(), extent, extent};
 }
 
+/**
+ *  @brief Grow @p storage to hold @p num_atoms axis-major coordinates, zero it, and view it.
+ *
+ *  @param[inout] storage Caller-owned buffer, reused across molecules so growth happens once.
+ *  @param[in] num_atoms Atoms the view spans.
+ *  @return View over @p storage.
+ */
+template <coordinate_role_t role_, std::size_t dimensions_, typename value_type_>
+inline coordinates_soa<role_, value_type_, dimensions_> reset_coordinates_soa(std::vector<value_type_> &storage,
+                                                                              std::uint32_t num_atoms) {
+    storage.assign(dimensions_ * num_atoms, value_type_ {});
+    return coordinates_soa<role_, value_type_, dimensions_> {storage.data(), num_atoms};
+}
+
+/**
+ *  @brief Grow @p storage to hold @p num_atoms atom-major coordinates, zero it, and view it.
+ *
+ *  @param[inout] storage Caller-owned buffer, reused across molecules so growth happens once.
+ *  @param[in] num_atoms Atoms the view spans.
+ *  @return View over @p storage.
+ */
+template <coordinate_role_t role_, typename value_type_>
+inline coordinates_aos<role_, value_type_> reset_coordinates_aos(std::vector<value_type_> &storage,
+                                                                 std::uint32_t num_atoms) {
+    storage.assign(static_cast<std::size_t>(num_atoms) * conformer_dimensions_k, value_type_ {});
+    return coordinates_aos<role_, value_type_> {storage.data(), num_atoms};
+}
+
 #pragma endregion Builders
+
+#pragma region Transposition
+
+/**
+ *  @brief Scatter atom-major triples into the three spatial columns of an axis-major view.
+ *
+ *  Columns past the third keep whatever they already held, so a caller that fills the fourth first and the
+ *  spatial three second gets the same buffer as one that does it the other way round.
+ *
+ *  Both views are addressed `(atom, axis)` and the layout supplies the stride, so the body says what it
+ *  does rather than which storage order it assumes.
+ *
+ *  @param[in] atom_major Source, one xyz triple per atom.
+ *  @param[out] axis_major Destination, at least three columns over the same atoms.
+ */
+template <coordinate_role_t source_role_, typename source_type_, coordinate_role_t destination_role_,
+          typename destination_type_, std::size_t dimensions_>
+inline void transpose_into(coordinates_aos<source_role_, source_type_> atom_major,
+                           coordinates_soa<destination_role_, destination_type_, dimensions_> axis_major) {
+    static_assert(dimensions_ >= conformer_dimensions_k,
+                  "an axis-major coordinate view carries at least the three spatial columns");
+    sf_assert_(atom_major.extent(0) == axis_major.extent(0));
+    for (std::uint32_t atom = 0; atom < atom_major.extent(0); ++atom)
+        for (std::uint32_t axis = 0; axis < conformer_dimensions_k; ++axis)
+            axis_major(atom, axis) = atom_major(atom, axis);
+}
+
+/**
+ *  @brief Gather the three spatial columns of an axis-major view back into atom-major triples.
+ *
+ *  Columns past the third have no atom-major counterpart and are not read; dropping the fourth is the
+ *  projection that turns a metric embedding into a conformer.
+ *
+ *  @param[in] axis_major Source, at least three columns over the atoms.
+ *  @param[out] atom_major Destination, one xyz triple per atom.
+ */
+template <coordinate_role_t source_role_, typename source_type_, std::size_t dimensions_,
+          coordinate_role_t destination_role_, typename destination_type_>
+inline void transpose_into(coordinates_soa<source_role_, source_type_, dimensions_> axis_major,
+                           coordinates_aos<destination_role_, destination_type_> atom_major) {
+    static_assert(dimensions_ >= conformer_dimensions_k,
+                  "an axis-major coordinate view carries at least the three spatial columns");
+    sf_assert_(atom_major.extent(0) == axis_major.extent(0));
+    for (std::uint32_t atom = 0; atom < atom_major.extent(0); ++atom)
+        for (std::uint32_t axis = 0; axis < conformer_dimensions_k; ++axis)
+            atom_major(atom, axis) = axis_major(atom, axis);
+}
+
+#pragma endregion Transposition
 
 } // namespace smallfield::types

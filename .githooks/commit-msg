@@ -4,7 +4,8 @@
 #   1. The subject starts with an approved verb prefix followed by a capitalized summary, so the
 #      history reads as a consistent changelog. Add / Improve / Fix carry almost everything;
 #      Make / Docs / Chore exist for build-system adaptations, documentation, and mechanical
-#      behavior-preserving churn. Merge commits are exempt - Git writes their subject.
+#      behavior-preserving churn. Break marks a vocabulary landing ahead of its consumers, where
+#      the tree deliberately does not build. Merge commits are exempt - Git writes their subject.
 #   2. No AI-assistant attribution: no `Co-authored-by` bot trailer, no "Generated with/by
 #      <assistant>", no assistant name or vendor URL, no robot emoji. Authorship is the human
 #      who committed.
@@ -26,9 +27,9 @@ failed=0
 case "$subject" in
 Merge*) ;;
 *)
-    if ! printf '%s\n' "$subject" | grep -qE '^(Add|Improve|Fix|Make|Docs|Chore): [A-Z]'; then
+    if ! printf '%s\n' "$subject" | grep -qE '^(Add|Improve|Fix|Make|Docs|Chore|Break): [A-Z]'; then
         echo "commit-msg: the subject must be '<Verb>: <Capitalized summary>' with an approved verb -"
-        echo "            Add Improve Fix, and rarely Make Docs Chore."
+        echo "            Add Improve Fix, and rarely Make Docs Chore Break."
         echo "            Got: ${subject:-<empty>}"
         failed=1
     fi

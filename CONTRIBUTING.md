@@ -33,6 +33,8 @@ Outside a release sweep, format only the lines you changed — `git clang-format
 The subject is `<Verb>: <Capitalized summary>`.
 `Add`, `Improve`, and `Fix` carry almost everything.
 `Make` is for build-system adaptations, `Docs` for documentation, and `Chore` for mechanical behavior-preserving churn — all three are rare.
+`Break` is rarer still, and marks a commit that lands a vocabulary its consumers do not yet spell: the tree does not build at that commit, on purpose, because the alternative is one reviewable change spread across every file that mentions the old name.
+A `Break` says so in its last line and names the commits that finish the propagation.
 `Merge` commits are exempt because Git writes their subject.
 
 The body describes the semantic change.
@@ -52,11 +54,12 @@ __A class or struct template takes no `_t`, because it is not a type.__
 A template is the thing that makes those, so it wears the bare noun and its specializations wear the suffix:
 
 ```cpp
-template <typename allocator_, typename deallocator_>
-class byte_buffer { … };
+template <typename value_type_, memory_allocator allocator_type_>
+class buffer { … };
 
-using pinned_byte_buffer_t = byte_buffer<pinned_alloc_t, pinned_dealloc_t>;
-using device_byte_buffer_t = byte_buffer<device_alloc_t, device_dealloc_t>;
+using pinned_bytes_t = buffer<std::byte, pinned_allocator_t>;
+using device_bytes_t = buffer<std::byte, device_allocator_t>;
+using device_indices_t = buffer<std::uint32_t, device_allocator_t>;
 ```
 
 Concept names take neither suffix for the same reason.
@@ -176,24 +179,42 @@ __A memory layout is a type, not an index expression.__
 Name them, and the compiler separates them.
 
 The matrix half of this is done — `packed_matrix` and `hop_matrix_t` are in use.
-The coordinate half is not, and the aliases below are what it should become; 40 sites across 12 files still spell the transposition by hand, in three spellings:
+The coordinate half is `coordinates_soa` and `coordinates_aos`, and __the layout policy carries the storage order while the accessor carries the role__:
 
 ```cpp
-// The row count is a template parameter, so `coordinates_soa<3>` and `coordinates_soa<4>` are distinct
-// types and neither collides with `packed_matrix<float>`. A dynamic row extent would make them the same
-// type, and a bounds matrix would pass where coordinates were expected.
-template <std::size_t dimensions_>
-using coordinates_soa = mdspan_ns::mdspan<float, mdspan_ns::extents<std::uint32_t, dimensions_, mdspan_ns::dynamic_extent>>;
-using coordinates_aos_t = mdspan_ns::mdspan<float, mdspan_ns::extents<std::uint32_t, mdspan_ns::dynamic_extent, 3>>;
+template <coordinate_role_t role_, typename value_type_, std::size_t dimensions_, typename layout_type_>
+using coordinates = custd::mdspan<value_type_, custd::extents<std::uint32_t, custd::dynamic_extent, dimensions_>,
+                                  layout_type_, role_accessor<role_, value_type_>>;
+
+template <coordinate_role_t role_, typename value_type_, std::size_t dimensions_>
+using coordinates_soa = coordinates<role_, value_type_, dimensions_, custd::layout_left>;
+template <coordinate_role_t role_, typename value_type_>
+using coordinates_aos = coordinates<role_, value_type_, conformer_dimensions_k, custd::layout_right>;
 ```
 
-The transposition between them is one named function, overloaded on direction so a call site cannot invert it.
-Writing it inline is how the same three lines came to exist in twelve files in three spellings.
+Both are addressed `(atom, axis)` and the mapping supplies the stride, so a reader never decodes an index expression and `transpose_into`'s body is layout-agnostic.
 
-__`mdspan_ns` is `cuda::std`, and that is not a preference.__
+__Distinguishing the two by which extent is static does not work, and that is measured rather than argued.__
+A static extent is always convertible to a dynamic one, so `extents<u32, 3, dyn>` and `extents<u32, dyn, 3>` both convert implicitly to `packed_matrix`'s `extents<u32, dyn, dyn>` — a conformer passed as a bounds matrix, compiling silently.
+`layout_left` against `layout_right` blocks it in both directions, because mdspan's cross-layout mapping constructor is constrained to rank one or lower and these are rank two.
+
+__The role is an accessor, not a wrapper.__
+Positions, velocities and a gradient are identical in shape and layout and ride adjacent through the FIRE driver, so nothing but the role separates them.
+mdspan's converting constructor requires the accessors be constructible from one another, and the accessor is already one of mdspan's four template parameters, so the role costs no bytes and needs no new class.
+One scoped `coordinate_role_t` names the closed set in one place rather than scattering empty tag structs.
+
+The transposition between the two layouts is one named function, overloaded on direction so a call site cannot invert it.
+Writing it inline is how the same three lines came to exist in four files in four spellings, two of them sharing a name with different signatures.
+
+__`custd` is `cuda::std`, and that is not a preference.__
 `std::mdspan` needs C++23, and `nvcc` 12.8 and 12.9 reject `-std=c++23` outright, so it cannot enter any translation unit `nvcc` touches.
 libcu++ ships the same interface at C++20 for host and device alike and arrives with `CUDA::cudart`, already a `PUBLIC` dependency.
 The alias names the namespace once so the swap is a single `#if` when `nvcc` 13 and libstdc++ 16 land together.
+It is spelled for the namespace rather than for one type in it, because it names the span as well as the views.
+
+__One span type, and it is `custd::span`.__
+`std::span`'s members are not `__host__ __device__`, which is the whole reason `parameters/mmff94_tables.hpp` once carried a twelve-line `mmff94_span` reimplementing it.
+`custd::span` is, so a host helper and a device helper share one signature and the hand-rolled copy is deleted.
 
 Three constraints come with it.
 Extents are `std::uint32_t`, which is a claim about scope: these view one molecule, and a packed view is 16 bytes at `std::uint32_t` against 24 at `std::size_t`, per kernel argument.
@@ -202,6 +223,45 @@ And `cuda::std::mdspan` performs __no bounds checking__, even with `CCCL_ENABLE_
 
 __An alias arrives with its first consumer, never ahead of it.__
 The two view types this header replaced sat unused long enough for one of them to acquire a docblock that misstated its own size.
+
+__Owning storage is one template, and the allocator is one parameter.__
+`buffer<value_type_, allocator_type_>` in `types/storage.hpp` owns every allocation the project makes.
+Two policy parameters let `byte_buffer<pinned_alloc_t, device_dealloc_t>` compile, which is a use-after-free the type system was in a position to refuse.
+
+`capacity()` is always in elements, so a byte arena's elements are bytes and the unit never has to be inferred.
+
+__Device memory is allocated and released in stream order.__
+`device_allocator_t` holds a `cudaStream_t` and goes through `cudaMallocAsync` and `cudaFreeAsync`.
+`cudaMalloc` and `cudaFree` both synchronize the whole device, so under the per-device fan-out every allocation on any device serializes against every other device's in-flight work — the contention that pre-allocation postpones rather than removes.
+The stream also carries the device, so a free reaches the context that made the allocation without anyone storing a device id and switching to it by hand; that is what lets every owner of a device buffer default its destructor and its move operations.
+The stream must outlive the buffer, which is the lifetime rule every other stream-ordered resource in the pipeline already follows.
+
+`pinned_allocator_t` carries no stream, and that is not an omission.
+`cudaHostAlloc` has no stream-ordered form, so a stream there would suggest an ordering the call does not have.
+
+Sub-allocation survives only where the single allocation is what makes an upload one `cudaMemcpyAsync` rather than N, which is true of the wave pool and of nothing else here.
+An arena carved by hand exists mostly to amortize `cudaMalloc`, and stream-ordered allocation removes that cost — so a table that used to be placed into a shared slab is now simply its own `buffer`.
+
+__A grow allocates before it releases, and reports what it did.__
+
+```cpp
+enum class reserve_outcome_t : std::uint8_t { unchanged_k, grown_k, failed_k };
+```
+
+`unchanged_k` against `grown_k` is not pedantry: the constructor pre-reserves so that no allocation fires inside the per-device fan-out, and that invariant is only assertable if the two are distinguishable.
+`failed_k` carries no reason because a stream-ordered allocation's reason belongs to the stream, and is read at the sync point the caller already has rather than copied into a return value at every call site that cannot act on it.
+
+__A transfer names both extents and the stream it rides.__
+
+```cpp
+template <typename element_>
+[[nodiscard]] bool upload_into(custd::span<element_> destination, custd::span<element_ const> source,
+                               cudaStream_t stream, cuda_error_sink_t const &sink = {}) noexcept;
+```
+
+Both extents come from the spans, so a caller cannot restate one and get it wrong, and a destination smaller than its source is refused rather than truncated.
+The stream is required, never defaulted: the legacy default stream serializes against every other stream on the device.
+A pageable source silently degrades the copy to a blocking staged one inside the driver, which is why anything on the wave path stages through `pinned_bytes_t`.
 
 __No pointers inside containers.__
 `std::vector<T *>` and `std::vector<std::unique_ptr<T>>` are a pointer chase plus an allocation per element for something whose count is usually known and small.
@@ -539,6 +599,13 @@ So:
 
 `pixi.toml` pins the only environment this is built and tested in, and `pyproject.toml`'s floors follow it rather than claiming a wider range.
 
+__`cmake --preset dev` is the inner loop__ — one architecture detected from the local GPU, `RelWithDebInfo`.
+`release` is the shipped fatbin and `profile` adds line info for `ncu`.
+
+__`sf_assert_` is live only under `cmake --preset debug`.__
+The other three presets define `NDEBUG`, where it compiles to nothing, so a check written with it is a check the `debug` build runs and the inner loop does not.
+Anything that must hold in a shipped build belongs in the code rather than in that macro.
+
 __A user site-packages directory silently shadows the pixi environment.__
 `~/.local/lib/python3.X/site-packages` takes precedence, so `import numpy` inside the pixi Python can resolve to a different version than the one pinned.
 Check a version with `PYTHONNOUSERSITE=1` before believing it.
@@ -549,6 +616,20 @@ One host thread orchestrates devices, with per-device non-blocking streams and e
 Kernel launches are already asynchronous, cross-device ordering is `cudaStreamWaitEvent`, and completion is an event-sync loop, so a host thread adds only scheduling noise.
 
 `__restrict__` on every pointer a kernel takes.
+
+__A `__global__` parameter is a raw `__restrict__` pointer, and the view vocabulary stops at the launch.__
+`custd::default_accessor`'s handle type is a plain `element_type *`, and the aliasing guarantee `nvcc` acts on is the one it derives from a kernel formal parameter, so an mdspan cannot carry `__restrict__` across that boundary.
+The boundary is the launch and not the file: a `__device__ __forceinline__` helper inlined into a kernel body is not covered, because it has no formal parameter of its own by the time `ptxas` sees it.
+
+The budget is why, and there is none to spare: on the Blackwell targets this project aims at, the largest pipeline kernel already carries a stack frame, so it is spilling before anything is added.
+
+`CHANGELOG.md` records both directions of that sensitivity, and the asymmetry is the point.
+Two added pointer parameters and an early-return guard cost half again the registers, a third of the occupancy and most of a factor of throughput — with the compiler's schedule across the body degrading __despite the new code paths being tiny__.
+The kernel split that went the other way bought a quarter more throughput.
+Register pressure here converts into wall time in both directions, and it does so for reasons that do not follow from reading the diff.
+
+So anything that could reach a kernel is measured with `cuobjdump --dump-resource-usage` against the recorded per-architecture baseline before it lands, and any movement in `REG`, `STACK` or `LOCAL` on the Blackwell targets is a revert rather than a discussion.
+The baseline itself is not reproduced here — it is a measurement of today's binary, not a rule, and a number pasted into a rulebook is a comment asserting a measurable fact that nothing re-checks.
 
 Name hardware constants once rather than spelling `32` for the warp size at each site.
 
