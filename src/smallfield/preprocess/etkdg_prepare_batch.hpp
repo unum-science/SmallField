@@ -256,11 +256,16 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::ve
 
     // set13 — one 1-3 bound per pair of neighbors around every center atom.
     // Loop is O(N × d²) where d is the typical degree (small).
+    //
+    // A 1-3 write must never land on a pair an earlier, lower-order sweep already answered. Two neighbours
+    // of a center are themselves bonded in every three-membered ring, and the law of cosines below would
+    // replace an exact bond length with a 109.47°-derived distance — cyclopropane's C-C going from 1.51 Å
+    // to 2.51 Å, with triangle smoothing finding that perfectly consistent. RDKit carried the same defect
+    // for years; see `c5de9f884357` (#9184) and `bb18fd56f294` (#9412), which introduced the visited-bound
+    // discipline upstream. The hop matrix already distinguishes the orders, so it is the guard here.
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
         std::uint32_t const nbegin = descriptor.neighbor_offset[center];
         std::uint32_t const nend = descriptor.neighbor_offset[center + 1];
-        float const theta = ideal_angle_radians(descriptor.hybridization[center]);
-        float const cos_theta = std::cos(theta);
         for (std::uint32_t first_entry = nbegin; first_entry < nend; ++first_entry) {
             std::uint32_t const first_neighbor = descriptor.neighbor_atom[first_entry];
             std::uint32_t const bond_ci = descriptor.neighbor_bond[first_entry];
@@ -274,6 +279,20 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::ve
                 float const d_cj = ideal_bond_length_angstrom(descriptor.element[center],
                                                               descriptor.element[second_neighbor],
                                                               descriptor.bond_order[bond_cj], ar_cj);
+                if (bond_hops[first_neighbor * num_atoms + second_neighbor] != 2) continue;
+
+                // Inside a ring the closure fixes the angle, not the center's hybridization.
+                std::uint32_t const shared_rings = descriptor.atom_ring_bitmap[center] &
+                                                   descriptor.atom_ring_bitmap[first_neighbor] &
+                                                   descriptor.atom_ring_bitmap[second_neighbor];
+                std::uint32_t smallest_shared_ring = 0;
+                for (std::uint32_t ring = 0; ring < descriptor.num_rings; ++ring) {
+                    if ((shared_rings & (1u << ring)) == 0) continue;
+                    std::uint32_t const ring_size = descriptor.ring_offset[ring + 1] - descriptor.ring_offset[ring];
+                    if (smallest_shared_ring == 0 || ring_size < smallest_shared_ring) smallest_shared_ring = ring_size;
+                }
+                float const theta = ring_interior_angle_radians(descriptor.hybridization[center], smallest_shared_ring);
+                float const cos_theta = std::cos(theta);
                 float const d_ij = std::sqrt(
                     std::max(0.0f, d_ci * d_ci + d_cj * d_cj - 2.0f * d_ci * d_cj * cos_theta));
                 // ± 3% tolerance — 1-3 distances tend to have slightly more slack.

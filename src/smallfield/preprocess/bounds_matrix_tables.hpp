@@ -121,4 +121,29 @@ inline float ideal_angle_radians(std::uint8_t hybridization) noexcept {
     }
 }
 
+/**
+ *  @brief Ideal 1-3 angle in radians for a center whose two neighbours share a ring of @p ring_size with it.
+ *
+ *  Hybridization alone answers for an open chain and is wrong inside a small ring, where the ring closure
+ *  fixes the angle whatever the center prefers: cyclobutane's cross-ring 1-3 comes out 2.45 Å from the
+ *  tetrahedral 109.47° against 2.12 Å from the polygon's 90°. Ported from RDKit's `_getRingAngle`,
+ *  `Code/GraphMol/DistGeomHelpers/BoundsMatrixBuilder.cpp:487`.
+ *
+ *  @param[in] hybridization Center atom's hybridization.
+ *  @param[in] ring_size Size of the ring all three atoms share; 0 selects the open-chain answer.
+ *  @return Angle in radians.
+ */
+inline float ring_interior_angle_radians(std::uint8_t hybridization, std::uint32_t ring_size) noexcept {
+    if (ring_size == 0) return ideal_angle_radians(hybridization);
+    // A three- or four-membered ring leaves no freedom, and an sp2 center in a ring up to eight is
+    // likewise pinned by the closure rather than by its preferred 120°.
+    bool const closure_decides = ring_size == 3 || ring_size == 4 ||
+                                 (hybridization == hybridization_sp2_k && ring_size <= 8);
+    if (closure_decides) return 3.14159265f * (1.0f - 2.0f / static_cast<float>(ring_size));
+    if (hybridization == hybridization_sp3_k) return ring_size == 5 ? 1.81514242f : 1.91063324f; // 104° or 109.47°
+    if (hybridization == hybridization_sp3d_k) return 1.83259571f;                               // 105°
+    if (hybridization == hybridization_sp3d2_k) return 1.57079633f;                              // 90°
+    return 2.09439510f;                                                                          // 120°
+}
+
 } // namespace smallfield::preprocess
