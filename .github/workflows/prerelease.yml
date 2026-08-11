@@ -1,0 +1,95 @@
+name: "Pre-Release"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main*"]
+
+# One group per source branch, so a `main*` branch with an open PR is not built twice - `push` no
+# longer matches it, and `head_ref` folds any number of PRs from that branch into the same group.
+# Superseded PR runs are cancelled; `main` runs are not, so a build feeding the release pipeline is
+# never killed midway.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Correctness only. Style is enforced by `.githooks/pre-commit`, not here.
+env:
+  BUILD_TYPE: Release
+  CUDA_VERSION: "12.8.0"
+  PIXI_VERSION: v0.62.1
+
+permissions:
+  contents: read
+
+jobs:
+  versioning:
+    name: Check Version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Run TinySemVer
+        uses: ashvardanian/tinysemver@v3
+        with:
+          verbose: "true"
+          version-file: "VERSION"
+          update-version-in: |
+            CITATION.cff:^version: (\d+\.\d+\.\d+)
+            python/smallfield/__init__.py:^__version__ = "(\d+\.\d+\.\d+)"
+          dry-run: "true"
+
+  build_cuda:
+    name: CUDA Build, Every Architecture
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+
+      - name: Install RDKit and the build toolchain
+        uses: prefix-dev/setup-pixi@v0.9.0
+        with:
+          pixi-version: ${{ env.PIXI_VERSION }}
+          cache: true
+
+      # Hosted runners have no GPU, so this proves the sources compile for every architecture the
+      # project ships. `SMALLFIELD_CUDA_ARCH` is left at its default, which is the full fatbin -
+      # locally the `dev` preset narrows it to `native`, and that is the guarantee this job restores.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Report the architectures being built
+        run: grep -E '^CMAKE_CUDA_ARCHITECTURES' build/CMakeCache.txt
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # Unrolled rather than looped so a missing architecture names itself in the job summary. sm_89
+      # is the one an edit to the list would silently drop, and the one the L40S target needs.
+      - name: Confirm sm_80 reached the binary
+        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_80
+      - name: Confirm sm_89 reached the binary
+        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_89
+      - name: Confirm sm_90 reached the binary
+        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_90
+      - name: Confirm sm_100 reached the binary
+        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_100
+      - name: Confirm sm_120 reached the binary
+        run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_120
+
+      # Deliberately no test job. Every test here links the CUDA library and opens a device, and the
+      # Python suite additionally needs the compiled `_smallfield` extension, so a hosted runner
+      # cannot run any of it. Test results come from the hardware runs recorded in BENCH.md.
+      # What CI can prove is that the sources compile for hardware this project has never touched,
+      # which is the failure a developer building `--preset dev` will never see.

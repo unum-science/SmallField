@@ -1,0 +1,38 @@
+name: "Release"
+
+on:
+  push:
+    branches: ["main"]
+
+# Correctness only. Style is enforced by `.githooks/pre-commit`, not here.
+env:
+  BUILD_TYPE: Release
+  GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+
+permissions:
+  contents: write
+
+jobs:
+  versioning:
+    name: Update Version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      # `VERSION` is the single source of truth; every other copy is rewritten from it here, which is
+      # why nothing asserts they agree - they cannot drift if only one hand writes them.
+      - name: Run TinySemVer
+        uses: ashvardanian/tinysemver@v3
+        with:
+          verbose: "true"
+          version-file: "VERSION"
+          update-version-in: |
+            CITATION.cff:^version: (\d+\.\d+\.\d+)
+            python/smallfield/__init__.py:^__version__ = "(\d+\.\d+\.\d+)"
+          push: "true"
+          create-release: "true"
+          github-token: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}

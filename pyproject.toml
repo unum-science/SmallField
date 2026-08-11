@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "smallfield"
 dynamic = ["version"]
-description = "GPU conformer generation from SMILES: ETKDG distance geometry and MMFF94 optimization, entirely in shared memory"
+description = "SmallField: GPU conformer generation with ETKDG and MMFF94"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
@@ -48,10 +48,16 @@ dev = ["pytest", "pytest-benchmark", "rdkit", "pybind11", "black", "ruff"]
 # binding. It falls back to `nvidia-smi`, so this is a convenience, not a requirement.
 gpu-autodetect = ["pycuda"]
 
-# The VERSION file is the single source of truth: `setup.py` reads it, and
-# `python/smallfield/__init__.py` carries a literal that a test asserts against it.
+# The VERSION file is the single source of truth. The release workflow rewrites every other copy
+# from it, so nothing needs to assert that they agree.
 [tool.setuptools.dynamic]
 version = { file = "VERSION" }
+
+# `python/` on the path so `import smallfield` resolves from a clone without an install step, which
+# is what lets the CPU test job run before anything is built.
+[tool.pytest.ini_options]
+pythonpath = ["python"]
+testpaths = ["test"]
 
 [tool.black]
 line-length = 120

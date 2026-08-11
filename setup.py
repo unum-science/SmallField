@@ -255,13 +255,6 @@ class BuildExt(build_ext):
             raise RuntimeError(f"nvcc compilation of {source} failed")
 
 
-__version__ = open("VERSION", "r").read().strip()
-
-long_description = ""
-this_directory = os.path.abspath(os.path.dirname(__file__))
-with open(os.path.join(this_directory, "README.md"), "r", encoding="utf-8") as f:
-    long_description = f.read()
-
 # Get Python library path dynamically
 python_lib_dir = get_python_lib(standard_lib=True)
 python_lib_name = os.path.basename(python_lib_dir).replace(".so", "")
@@ -287,16 +280,11 @@ ext_modules = [
         + boost_libraries
         + (["cudart", "cuda", "curand", "cusolver"] if enable_cuda else [])
         + (["gomp"] if enable_openmp else []),
-        extra_compile_args=[
-            "-std=c++20",
-            "-fPIC",
-            "-mavx512f",
-            "-mavx512bw",
-            "-mavx512dq",
-            "-mavx512vl",
-            "-mavx512bf16",  # Sapphire Rapids / Genoa BF16
-            "-mavx512fp16",  # Sapphire Rapids / Turin FP16
-        ]
+        # `-march=native` rather than a hardcoded AVX-512 list: the list named `-mavx512fp16`, which
+        # only Sapphire Rapids and Turin carry, so the binding failed to build on any older host and
+        # would have faulted on one that compiled it and ran elsewhere. Native matches what CMake
+        # gives the library, and both make the result non-redistributable in the same way.
+        extra_compile_args=["-std=c++20", "-fPIC", "-march=native"]
         + (["-fopenmp"] if enable_openmp else []),
         extra_link_args=[f"-Wl,-rpath,{python_lib_dir}"]
         + [f"-Wl,-rpath,{os.path.abspath('build')}"]
@@ -306,22 +294,14 @@ ext_modules = [
     ),
 ]
 
+# Name, version, description, authors, URLs, dependencies and the Python floor are declared in
+# `pyproject.toml` and read from there. Only what PEP 621 cannot express belongs here: the CUDA
+# extension module and the build_ext subclass that drives CMake and nvcc. Restating a field in both
+# places is how `python_requires` came to say 3.10 while `pyproject.toml` said 3.12.
 setup(
-    name="smallfield",
-    version=__version__,
-    author="Ash Vardanian",
-    author_email="1983160+ashvardanian@users.noreply.github.com",
-    url="https://github.com/unum-science/SmallField",
-    description="GPU conformer generation: ETKDG distance geometry followed by MMFF94 optimization.",
-    long_description=long_description,
     ext_modules=ext_modules,
     packages=["smallfield", "smallfield.tools"],
     package_dir={"smallfield": "python/smallfield"},
-    extras_require={
-        "test": ["pytest", "pytest-benchmark", "rdkit"],
-        "gpu-autodetect": ["pycuda"],
-    },
     cmdclass={"build_ext": BuildExt},
     zip_safe=False,
-    python_requires=">=3.10",
 )

@@ -1,4 +1,4 @@
-"""Python package for SmallField."""
+"""SmallField: GPU conformer generation with ETKDG and MMFF94."""
 
 from . import api
 
