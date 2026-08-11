@@ -23,13 +23,16 @@
 
 #include <cmath>   // `std::fabs`
 #include <cstdint> // `std::uint64_t`, `std::uint8_t`
-#include <cstdio>  // `printf`
+#include <cstdio>  // `printf`, `fprintf`
 
-#include <algorithm> // `std::sort`, `std::min`
-#include <fstream>   // `std::ifstream`
-#include <memory>    // `std::unique_ptr`
-#include <string>    // `std::string`, `std::getline`
-#include <vector>    // `std::vector`
+#include <algorithm>    // `std::sort`, `std::min`
+#include <charconv>     // `std::from_chars`
+#include <fstream>      // `std::ifstream`
+#include <memory>       // `std::unique_ptr`
+#include <string>       // `std::string`, `std::getline`
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::errc`
+#include <vector>       // `std::vector`
 
 #include <GraphMol/Chirality.h>
 #include <GraphMol/GraphMol.h>
@@ -370,7 +373,15 @@ int main(int argc, char **argv) {
 
     char const *corpus_path = argc > 1 ? argv[1] : nullptr;
     if (corpus_path != nullptr) {
-        std::size_t const limit = argc > 2 ? std::stoul(argv[2]) : 20000;
+        std::size_t limit = 20000;
+        if (argc > 2) {
+            std::string_view const text {argv[2]};
+            auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), limit);
+            if (error != std::errc {} || unparsed != text.data() + text.size()) {
+                std::fprintf(stderr, "usage: %s <corpus.smi> [max_molecules]\n", argv[0]);
+                return 2;
+            }
+        }
         auto const corpus = sftest::load_corpus_(corpus_path, limit);
         std::printf("test_chiral_parity: corpus %s, %zu SMILES\n", corpus_path, corpus.size());
         sftest::oracle_tally_t corpus_tally;

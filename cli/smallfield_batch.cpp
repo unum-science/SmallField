@@ -24,6 +24,7 @@
 #include <algorithm>          // `std::max`
 #include <array>              // `std::array`
 #include <atomic>             // `std::atomic`
+#include <charconv>           // `std::from_chars`
 #include <chrono>             // `std::chrono::steady_clock`, `std::chrono::duration`
 #include <condition_variable> // `std::condition_variable`
 #include <filesystem>         // `std::filesystem::path`, `std::filesystem::create_directories`
@@ -31,6 +32,7 @@
 #include <span>               // `std::span`
 #include <string>             // `std::string`
 #include <string_view>        // `std::string_view`
+#include <system_error>       // `std::errc`
 #include <vector>             // `std::vector`
 
 #include <omp.h>
@@ -53,7 +55,6 @@ namespace sfapi = smallfield::api;
 namespace sfcli = smallfield::cli;
 namespace sfpost = smallfield::postprocess;
 using smallfield::logger_t;
-using smallfield::thousands;
 
 namespace smallfield::cli {
 
@@ -111,6 +112,26 @@ static void print_usage_() {
 )");
 }
 
+/** Outcome of a command line: a usable configuration, a help request, or a rejected command line. */
+enum class cli_parse_t {
+    parsed_k,
+    help_requested_k,
+    invalid_k,
+};
+
+/**
+ *  @brief Parse one whole numeric token, rejecting an empty token, trailing characters and overflow.
+ *
+ *  @param[in] text Token as it appeared on the command line.
+ *  @param[out] number Value the token denotes; untouched unless the whole token parses.
+ *  @return True when the entire token is a number of @p number 's type.
+ */
+template <typename number_type_>
+static bool parse_number_(std::string_view text, number_type_ &number) {
+    auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), number);
+    return error == std::errc {} && unparsed == text.data() + text.size();
+}
+
 static bool parse_int_list_(char const *spec, std::vector<int> &out) {
     out.clear();
     while (*spec) {
@@ -124,7 +145,7 @@ static bool parse_int_list_(char const *spec, std::vector<int> &out) {
     return true;
 }
 
-static bool parse_cli_(int argc, char **argv, cli_config_t &config) {
+static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
     for (int argument_index = 1; argument_index < argc; ++argument_index) {
         std::string_view flag = argv[argument_index];
         auto require_value = [&](char const *flag_name) -> char const * {
@@ -134,89 +155,89 @@ static bool parse_cli_(int argc, char **argv, cli_config_t &config) {
             }
             return argv[++argument_index];
         };
+        // A number that does not parse whole is refused rather than silently taken as zero.
+        auto require_number = [&](char const *flag_name, auto &number) -> bool {
+            char const *value = require_value(flag_name);
+            if (!value) return false;
+            if (parse_number_(value, number)) return true;
+            fmt::print(stderr, "--{} requires a number, got: {}\n", flag_name, value);
+            return false;
+        };
         if (flag == "--input") {
             auto value = require_value("input");
-            if (!value) return false;
+            if (!value) return cli_parse_t::invalid_k;
             config.input_dir = value;
         }
         else if (flag == "--output") {
             auto value = require_value("output");
-            if (!value) return false;
+            if (!value) return cli_parse_t::invalid_k;
             config.output_dir = value;
         }
         else if (flag == "--smiles-column") {
             auto value = require_value("smiles-column");
-            if (!value) return false;
+            if (!value) return cli_parse_t::invalid_k;
             config.smiles_column = value;
         }
         else if (flag == "--dataset") {
             auto value = require_value("dataset");
-            if (!value) return false;
+            if (!value) return cli_parse_t::invalid_k;
             config.dataset = value;
         }
         else if (flag == "--num-conformers") {
-            auto value = require_value("num-conformers");
-            if (!value) return false;
-            config.num_conformers = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            if (!require_number("num-conformers", config.num_conformers)) return cli_parse_t::invalid_k;
         }
         else if (flag == "--max-atoms") {
-            auto value = require_value("max-atoms");
-            if (!value) return false;
-            config.max_atoms = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            if (!require_number("max-atoms", config.max_atoms)) return cli_parse_t::invalid_k;
         }
         else if (flag == "--batch-size" || flag == "--coprocessed-batch-size") {
-            auto value = require_value(flag == "--batch-size" ? "batch-size" : "coprocessed-batch-size");
-            if (!value) return false;
-            config.batch_size = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            char const *flag_name = flag == "--batch-size" ? "batch-size" : "coprocessed-batch-size";
+            if (!require_number(flag_name, config.batch_size)) return cli_parse_t::invalid_k;
         }
         else if (flag == "--gpus") {
             auto value = require_value("gpus");
-            if (!value) return false;
-            if (!parse_int_list_(value, config.gpu_ids)) return false;
+            if (!value) return cli_parse_t::invalid_k;
+            if (!parse_int_list_(value, config.gpu_ids)) return cli_parse_t::invalid_k;
         }
         else if (flag == "--rdkit-fallback-threads") {
-            auto value = require_value("rdkit-fallback-threads");
-            if (!value) return false;
-            config.rdkit_fallback_threads = static_cast<int>(std::strtol(value, nullptr, 10));
+            if (!require_number("rdkit-fallback-threads", config.rdkit_fallback_threads))
+                return cli_parse_t::invalid_k;
         }
         else if (flag == "--gpu-runner-threads") {
-            auto value = require_value("gpu-runner-threads");
-            if (!value) return false;
-            config.gpu_runner_threads = static_cast<int>(std::strtol(value, nullptr, 10));
+            if (!require_number("gpu-runner-threads", config.gpu_runner_threads)) return cli_parse_t::invalid_k;
         }
         else if (flag == "--chunk-size") {
-            auto value = require_value("chunk-size");
-            if (!value) return false;
-            config.batch_size = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
+            if (!require_number("chunk-size", config.batch_size)) return cli_parse_t::invalid_k;
         }
         else if (flag == "--restart") { config.resume = false; }
         else if (flag == "--resume") { config.resume = true; }
         else if (flag == "--seed") {
-            auto value = require_value("seed");
-            if (!value) return false;
-            config.random_seed = std::strtoull(value, nullptr, 10);
+            if (!require_number("seed", config.random_seed)) return cli_parse_t::invalid_k;
         }
         else if (flag == "--verbose") { config.verbose_level = 1; }
         else if (flag.starts_with("--verbose=")) {
-            config.verbose_level = static_cast<int>(std::strtol(flag.data() + 10, nullptr, 10));
+            std::string_view const level = flag.substr(std::string_view("--verbose=").size());
+            if (!parse_number_(level, config.verbose_level)) {
+                fmt::print(stderr, "--verbose= requires a number, got: {}\n", level);
+                return cli_parse_t::invalid_k;
+            }
         }
         else if (flag == "--help" || flag == "-h") {
             print_usage_();
-            return false;
+            return cli_parse_t::help_requested_k;
         }
         else {
             fmt::print(stderr, "unknown flag: {}\n", flag);
-            return false;
+            return cli_parse_t::invalid_k;
         }
     }
     if (config.input_dir.empty()) {
         print_usage_();
-        return false;
+        return cli_parse_t::invalid_k;
     }
     // --output defaults to --input: the *.3D.parquet sister files live next to the
     // sources unless the caller explicitly redirects them elsewhere.
     if (config.output_dir.empty()) config.output_dir = config.input_dir;
-    return true;
+    return cli_parse_t::parsed_k;
 }
 
 /** Pre-allocated coordinate/energy/status arrays, owned by the buffer pool. Never freed on the hot path —
@@ -745,13 +766,14 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
         // fragment is omitted when no molecule needed RDKit recovery.
         std::string fallback_fragment;
         if (result.fallback_attempted > 0)
-            fallback_fragment = fmt::format("  fallback {}→{} rec", thousands(result.fallback_attempted),
-                                            thousands(result.fallback_recovered));
+            fallback_fragment = fmt::format("  fallback {}→{} rec", fmt::group_digits(result.fallback_attempted),
+                                            fmt::group_digits(result.fallback_recovered));
 
-        logger.info("{:>4}/{:<4} done {:.0f}s  {} mol/s{}  cumulative {}  avg {} mol/s  ETA {}", thousands(files_done),
-                    thousands(counters.total_input_files), batch_seconds,
-                    thousands(static_cast<std::uint64_t>(num_molecules / std::max(batch_seconds, 0.001))),
-                    fallback_fragment, thousands(cumul_mol), thousands(static_cast<std::uint64_t>(cumul_rate)),
+        logger.info("{:>4}/{:<4} done {:.0f}s  {} mol/s{}  cumulative {}  avg {} mol/s  ETA {}",
+                    fmt::group_digits(files_done), fmt::group_digits(counters.total_input_files), batch_seconds,
+                    fmt::group_digits(static_cast<std::uint64_t>(num_molecules / std::max(batch_seconds, 0.001))),
+                    fallback_fragment, fmt::group_digits(cumul_mol),
+                    fmt::group_digits(static_cast<std::uint64_t>(cumul_rate)),
                     smallfield::format_wall_time(eta_wall));
     }
 }
@@ -760,7 +782,11 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
 
 int main(int argc, char **argv) {
     sfcli::cli_config_t config;
-    if (!sfcli::parse_cli_(argc, argv, config)) return 2;
+    switch (sfcli::parse_cli_(argc, argv, config)) {
+    case sfcli::cli_parse_t::parsed_k: break;
+    case sfcli::cli_parse_t::help_requested_k: return 0;
+    case sfcli::cli_parse_t::invalid_k: return 2;
+    }
 
     // Graceful pre-emption: SIGINT/SIGTERM ask the reader to stop at the next shard boundary so
     // in-flight shards finish and write. A runner wrapper pairs this with a pause sentinel to hold
@@ -784,8 +810,8 @@ int main(int argc, char **argv) {
         else { pending.push_back(&pair); }
     }
 
-    logger.info("smallfield_batch: {} input-files, {} pending, {} complete", thousands(shard_pairs.size()),
-                thousands(pending.size()), thousands(skipped));
+    logger.info("smallfield_batch: {} input-files, {} pending, {} complete", fmt::group_digits(shard_pairs.size()),
+                fmt::group_digits(pending.size()), fmt::group_digits(skipped));
 
     if (pending.empty()) {
         logger.info("nothing to do");
@@ -804,7 +830,8 @@ int main(int argc, char **argv) {
     sfcli::thread_budget_t const budget = sfcli::compute_thread_budget_(config.rdkit_fallback_threads,
                                                                         config.gpu_runner_threads);
     logger.info("  {} GPUs, coprocessed-batch target {} mols, threads reader={} gpu_runner={} fallback={} writer={}",
-                num_gpus, thousands(batch_target), budget.reader, budget.gpu_runner, budget.fallback, budget.writer);
+                num_gpus, fmt::group_digits(batch_target), budget.reader, budget.gpu_runner, budget.fallback,
+                budget.writer);
 
     omp_set_max_active_levels(2);
 
@@ -837,11 +864,11 @@ int main(int argc, char **argv) {
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - counters.start_time).count();
     std::uint64_t const done = counters.molecules_completed.load();
-    logger.info("complete  {} mols  {} mol/s", thousands(done),
-                thousands(static_cast<std::uint64_t>(done / std::max(total, 0.001))));
+    logger.info("complete  {} mols  {} mol/s", fmt::group_digits(done),
+                fmt::group_digits(static_cast<std::uint64_t>(done / std::max(total, 0.001))));
     std::uint64_t const cuda_errors = gpu_context.cuda_error_count.load();
     if (cuda_errors > 0) {
-        logger.error("{} CUDA errors reported by the library — output is unreliable", thousands(cuda_errors));
+        logger.error("{} CUDA errors reported by the library — output is unreliable", fmt::group_digits(cuda_errors));
         return 2;
     }
     return 0;

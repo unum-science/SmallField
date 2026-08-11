@@ -12,13 +12,14 @@
 #include <cmath>  // `std::isfinite`, `std::fabs`
 #include <cstdio> // `printf`, `fprintf`
 
-#include <algorithm> // `std::min`, `std::sort`
-#include <array>     // `std::array`
-#include <chrono>    // `std::chrono::high_resolution_clock`, `std::chrono::duration`
-#include <limits>    // `std::numeric_limits`
-#include <random>    // `std::mt19937`
-#include <string>    // `std::string`
-#include <vector>    // `std::vector`
+#include <algorithm>   // `std::min`, `std::sort`
+#include <array>       // `std::array`
+#include <chrono>      // `std::chrono::high_resolution_clock`, `std::chrono::duration`
+#include <limits>      // `std::numeric_limits`
+#include <random>      // `std::mt19937`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <cuda_fp16.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
@@ -394,7 +395,7 @@ int main(int argc, char **argv) {
     // Parse the command line.
     bool multi_gpu_only = false;
     for (int argument_index = 1; argument_index < argc; ++argument_index) {
-        std::string arg = argv[argument_index];
+        std::string_view const arg = argv[argument_index];
         if (arg == "--smi" && argument_index + 1 < argc) smiles_path = argv[++argument_index];
         else if (arg == "--conformers" && argument_index + 1 < argc)
             num_conformers = static_cast<std::uint32_t>(std::atoi(argv[++argument_index]));

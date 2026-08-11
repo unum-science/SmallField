@@ -5,13 +5,16 @@
  *  No RDKit CPU baseline, no cross-validation, no warmup — lets perf record focus on prep CPU only.
  */
 
-#include <cstdio> // `printf`
+#include <cstdio> // `printf`, `fprintf`
 
-#include <array>   // `std::array`
-#include <chrono>  // `std::chrono::steady_clock`, `std::chrono::duration`
-#include <fstream> // `std::ifstream`
-#include <string>  // `std::string`, `std::getline`
-#include <vector>  // `std::vector`
+#include <array>        // `std::array`
+#include <charconv>     // `std::from_chars`
+#include <chrono>       // `std::chrono::steady_clock`, `std::chrono::duration`
+#include <fstream>      // `std::ifstream`
+#include <string>       // `std::string`, `std::getline`
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::errc`
+#include <vector>       // `std::vector`
 
 #include <cuda_fp16.h>
 
@@ -21,7 +24,15 @@ namespace sfapi = smallfield::api;
 
 int main(int argc, char **argv) {
     char const *path = argc > 1 ? argv[1] : "/tmp/chembl_240k.smi";
-    std::uint32_t const n_conf_arg = argc > 2 ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 1;
+    std::uint32_t n_conf_arg = 1;
+    if (argc > 2) {
+        std::string_view const text {argv[2]};
+        auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), n_conf_arg);
+        if (error != std::errc {} || unparsed != text.data() + text.size()) {
+            std::fprintf(stderr, "usage: %s <corpus.smi> [conformers_per_molecule]\n", argv[0]);
+            return 2;
+        }
+    }
     std::vector<std::string> storage;
     std::ifstream input_stream(path);
     std::string line;

@@ -60,7 +60,6 @@ namespace sfapi = smallfield::api;
 namespace sfcli = smallfield::cli;
 namespace sfpost = smallfield::postprocess;
 using smallfield::logger_t;
-using smallfield::thousands;
 
 namespace {
 
@@ -353,7 +352,8 @@ reembed_index_t build_reembed_index(fs::path const &reembed_dir, logger_t const 
         }
         load_reembed_shard(shard, index);
     }
-    logger.info("reembed index: {} molecules from {} shards", thousands(index.size()), thousands(shards.size()));
+    logger.info("reembed index: {} molecules from {} shards", fmt::group_digits(index.size()),
+                fmt::group_digits(shards.size()));
     return index;
 }
 
@@ -596,7 +596,7 @@ int main(int argc, char **argv) {
     reembed_index_t reembed;
     if (!config.reembed_dir.empty()) reembed = build_reembed_index(config.reembed_dir, logger);
 
-    logger.info("smallfield_descriptors: {} input shards, dataset='{}', reembed={}", thousands(inputs.size()),
+    logger.info("smallfield_descriptors: {} input shards, dataset='{}', reembed={}", fmt::group_digits(inputs.size()),
                 config.dataset, config.reembed_dir.empty() ? "off" : config.reembed_dir.string());
 
     std::uint64_t completed = 0, skipped = 0, failed = 0;
@@ -653,15 +653,16 @@ int main(int argc, char **argv) {
         int const threads = config.threads > 0 ? config.threads : omp_get_max_threads();
         double const rows_per_second = rows / std::max(shard_seconds, 1e-3);
         logger.info("{:>4}/{:<4} {}  {:.1f}s  {} rows/s ({} rows/s/core)  ctx-mismatch {}  separated {}",
-                    thousands(completed + skipped), thousands(inputs.size()), input_path.filename().string(),
-                    shard_seconds, thousands(static_cast<std::uint64_t>(rows_per_second)),
-                    thousands(static_cast<std::uint64_t>(rows_per_second / std::max(threads, 1))),
-                    thousands(context_mismatch), thousands(separated));
+                    fmt::group_digits(completed + skipped), fmt::group_digits(inputs.size()),
+                    input_path.filename().string(), shard_seconds,
+                    fmt::group_digits(static_cast<std::uint64_t>(rows_per_second)),
+                    fmt::group_digits(static_cast<std::uint64_t>(rows_per_second / std::max(threads, 1))),
+                    fmt::group_digits(context_mismatch), fmt::group_digits(separated));
     }
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     logger.info("complete  {} augmented, {} skipped, {} failed  in {:.0f}s  (ctx-mismatch {}, separated {})",
-                thousands(completed), thousands(skipped), thousands(failed), total, thousands(total_context_mismatch),
-                thousands(total_separated));
+                fmt::group_digits(completed), fmt::group_digits(skipped), fmt::group_digits(failed), total,
+                fmt::group_digits(total_context_mismatch), fmt::group_digits(total_separated));
     return failed > 0 ? 1 : 0;
 }
