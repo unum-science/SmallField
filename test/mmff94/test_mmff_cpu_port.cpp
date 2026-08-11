@@ -8,6 +8,8 @@
  *  byte-identical MMFF term arrays on a curated SMILES set; small numerical deltas ≤ 1e-3 are allowed on
  *  empirical-rule fallback terms due to float/double rounding in MMFF.V eqs 18-19 and the torsion rules, and on
  *  the fully-native partial charges, which sum bond-charge increments in `float` where RDKit sums in `double`.
+ *  A term count that does not match fails outright; molecules whose terms differ only in value get the ppm
+ *  budget of `max_molecule_value_mismatch_ppm_k`.
  */
 
 #include <cmath>   // `std::fabs`
@@ -51,6 +53,16 @@ static int n_fails_ = 0;
 static int n_mol_pass_ = 0;
 static int n_mol_fail_ = 0;
 static int n_mol_with_any_fail_ = 0;
+
+/** How many failing molecules to describe before going silent. A cap of three turned a thirteen-molecule
+ *  structural class into what read as a single stray molecule, so the default is generous; lower it locally
+ *  when triaging one molecule. A shared knobs header is on its way and will own this, at which point the
+ *  constant here becomes its default. */
+static int max_reported_failing_molecules_ = 32;
+
+/** Ceiling on molecules whose native terms differ in value from the RDKit oracle, in parts per million.
+ *  Structural differences — a term count that does not match — are never tolerated, see `n_mol_fail_`. */
+static double constexpr max_molecule_value_mismatch_ppm_k = 100.0;
 
 /** Bitwise-identical float comparison (allowing NaN != NaN). */
 static bool bit_eq_(float left, float right) {
@@ -602,6 +614,13 @@ int main(int argc, char **argv) {
         "C1CCOC1",                       // tetrahydrofuran
         "C1CC1",                         // cyclopropane
         "c1ccc2[nH]ccc2c1",              // indole
+        // Regression witnesses, one per way the typer used to read the descriptor wrong. Terms derived from
+        // a wrong atom type are wrong terms, so the fully-native extractor fails these before the fix too.
+        "CC1=CC=CC=[N+]1[O-]",                                              // aromatic N-oxide: O is 32, not 35
+        "CC1=C(C=CN=C1C2=CC(=CC(=C2)Cl)[NH+](O)[O-])CC#N",                  // hydroxylammonium O the typer refused
+        "C1=CC=C2C=C(C=CC2=C1)NC3=CC#CC=C3",                                // triple bond inside an aromatic ring
+        "COC(=O)C(CC1=CC=CC=C1)N=C2N[N+]#CS2",                              // the same, in a five-ring
+        "CC(C)NC(=O)C1=CC(=C(C=C1)C2=C3C=CC(=O)C=C3OC4=C2C=CC(=C4)O)C(=O)O" // quinoid single bond, fused system
     };
 
     // Optional: a SMILES file for larger coverage
@@ -617,10 +636,10 @@ int main(int argc, char **argv) {
     for (auto const &smiles : extra) {
         int const fail_before = n_fails_;
         int const mfail_before = n_mol_fail_;
-        bool const verbose_for_molecule = (fail_prints < 3);
+        bool const verbose_for_molecule = (fail_prints < sftest::max_reported_failing_molecules_);
         run_one_(smiles, tables, verbose_for_molecule);
         bool const had_fail = n_fails_ > fail_before || n_mol_fail_ > mfail_before;
-        if (had_fail && fail_prints < 3) {
+        if (had_fail && fail_prints < sftest::max_reported_failing_molecules_) {
             std::printf("  (above is from SMILES: %s)\n", smiles.c_str());
             ++fail_prints;
         }
@@ -634,16 +653,18 @@ int main(int argc, char **argv) {
         double const term_fail_ppm = (n_checks_ > 0) ? 1.0e6 * (double)n_fails_ / (double)n_checks_ : 0.0;
         std::printf("ppm: molecules with any failure=%.1f, term failures=%.1f\n", mol_fail_ppm, term_fail_ppm);
     }
-    // Gate: ≤ 100 ppm mol-level failures, ≤ 500 ppm term failures on
-    // drug-like ChEMBL. Exotic structures (pentacoordinate P porphyrins,
-    // etc.) can exceed this and should be triaged on the full 10M USearch set.
+    // Structural mismatches are never tolerated; value differences get the ppm budget the file header
+    // documents. Exotic structures — pentacoordinate P, porphyrins — can exceed it and should be triaged
+    // on the full 10M USearch set rather than absorbed by loosening this.
     if (n_mol_fail_ > 0) {
         std::printf("FAIL (structural mismatches)\n");
         return 1;
     }
-    double const fail_frac = (total_mols > 0) ? (double)n_mol_with_any_fail_ / (double)total_mols : 0.0;
-    if (fail_frac > 0.001) {
-        std::printf("FAIL (too many molecules with value differences: %.3f %%)\n", fail_frac * 100.0);
+    double const value_mismatch_ppm = (total_mols > 0) ? 1.0e6 * (double)n_mol_with_any_fail_ / (double)total_mols
+                                                       : 0.0;
+    if (value_mismatch_ppm > sftest::max_molecule_value_mismatch_ppm_k) {
+        std::printf("FAIL (%d of %zu molecules differ in value, %.1f ppm > %.1f ppm)\n", n_mol_with_any_fail_,
+                    total_mols, value_mismatch_ppm, sftest::max_molecule_value_mismatch_ppm_k);
         return 1;
     }
     std::printf("ALL TESTS PASSED\n");

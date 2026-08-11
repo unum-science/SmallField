@@ -2,8 +2,11 @@
  *  @file test/mmff94/test_mmff_typer.cpp
  *  @brief Cross-validate the native MMFF atom typer against RDKit's `MMFFMolProperties::getMMFFAtomType`.
  *
- *  On drug-like SMILES. Target: ≥ 99 % per-atom match on ChEMBL 20K. Some discrepancy is expected because the
- *  native typer does not yet invoke MMFF-specific aromaticity.
+ *  On drug-like SMILES. The gate counts @b molecules, not atoms: a wrong type is a wrong molecule, and
+ *  averaging six bad atoms over the ~889 000 in a 20 000-molecule sweep hides a whole structural class
+ *  behind four nines. Both typers read RDKit's default aromaticity perception — `MMFFMolProperties` skips
+ *  `MolOps::setMMFFAromaticity` on a molecule already marked `_MMFFSanitized`, which this test sets — so
+ *  there is no aromaticity model difference to excuse a mismatch, and the curated set must come out exact.
  */
 
 #include <cmath>  // `std::fabs`
@@ -41,6 +44,12 @@ static int n_charges_checked_ = 0;
 static int n_charges_mismatch_ = 0;
 static int n_mols_tested_ = 0;
 static int n_mols_mismatch_ = 0;
+
+/** How many mismatching atoms to describe before going silent. A cap of three or ten turned a
+ *  thirteen-molecule structural class into what read as a single stray molecule, so the default is
+ *  generous; lower it locally when triaging a single molecule. A shared knobs header is on its way and
+ *  will own this, at which point the constant here becomes its default. */
+static std::size_t max_reported_mismatches_ = 64;
 
 struct summary_t {
     int element = 0;
@@ -95,7 +104,7 @@ static void test_one_(std::string const &smiles, bool verbose) {
         if (rdkit_atom_type != native_atom_types[atom_index]) {
             ++n_atoms_mismatch_;
             this_mol_ok = false;
-            if (verbose && mismatches_.size() < 20)
+            if (verbose && mismatches_.size() < max_reported_mismatches_)
                 mismatches_.push_back(summary_t {(int)descriptor.element[atom_index], rdkit_atom_type,
                                                  native_atom_types[atom_index], smiles});
         }
@@ -106,7 +115,7 @@ static void test_one_(std::string const &smiles, bool verbose) {
             if (diff > 1e-3f) {
                 ++n_charges_mismatch_;
                 this_mol_ok = false;
-                if (verbose && mismatches_.size() < 20) {
+                if (verbose && mismatches_.size() < max_reported_mismatches_) {
                     summary_t mismatch;
                     mismatch.element = (int)descriptor.element[atom_index];
                     mismatch.smiles = std::string("chg ") + smiles + " (rdk=" + std::to_string(rdkit_partial_charge) +
@@ -122,6 +131,7 @@ static void test_one_(std::string const &smiles, bool verbose) {
 
 namespace sftest = smallfield::tests;
 
+using sftest::max_reported_mismatches_;
 using sftest::mismatches_;
 using sftest::n_atoms_checked_;
 using sftest::n_atoms_mismatch_;
@@ -152,6 +162,12 @@ int main(int argc, char **argv) {
         "O=N(=O)c1ccccc1",
         "CCO",
         "c1ccsc1",
+        // Regression witnesses, one per way the typer used to read the descriptor wrong.
+        "CC1=CC=CC=[N+]1[O-]",                                              // aromatic N-oxide: O is 32, not 35
+        "CC1=C(C=CN=C1C2=CC(=CC(=C2)Cl)[NH+](O)[O-])CC#N",                  // hydroxylammonium O the typer refused
+        "C1=CC=C2C=C(C=CC2=C1)NC3=CC#CC=C3",                                // triple bond inside an aromatic ring
+        "COC(=O)C(CC1=CC=CC=C1)N=C2N[N+]#CS2",                              // the same, in a five-ring
+        "CC(C)NC(=O)C1=CC(=C(C=C1)C2=C3C=CC(=O)C=C3OC4=C2C=CC(=C4)O)C(=O)O" // quinoid single bond, fused system
     };
 
     std::size_t const capacity = (argc > 2) ? std::strtoull(argv[2], nullptr, 10) : 5000;
@@ -165,7 +181,7 @@ int main(int argc, char **argv) {
             auto separator_position = line.find_first_of(" \t");
             if (separator_position != std::string::npos) line.resize(separator_position);
             if (!line.empty()) {
-                test_one_(line, mismatches_.size() < 10);
+                test_one_(line, mismatches_.size() < max_reported_mismatches_);
                 ++loaded;
             }
         }
@@ -184,10 +200,16 @@ int main(int argc, char **argv) {
         std::printf("  element=%d rdk=%u nat=%u  [%s]\n", mismatch.element, mismatch.expected, mismatch.got,
                     mismatch.smiles.c_str());
     }
-    // Gate: 99.9 % atom-level match for curated + 95 % for full ChEMBL.
-    double const min_match = (argc > 1) ? 95.0 : 99.9;
-    if (atom_match < min_match) {
-        std::printf("FAIL (atom match %.3f%% < %.1f%%)\n", atom_match, min_match);
+    double const molecule_mismatch_ppm = n_mols_tested_ ? 1.0e6 * (double)n_mols_mismatch_ / (double)n_mols_tested_
+                                                        : 0.0;
+    std::printf("molecule mismatch: %.1f ppm\n", molecule_mismatch_ppm);
+    // Gate on molecules. The curated probe set carries a witness for every known typing hazard and must be
+    // exact; an external corpus gets 100 ppm of slack for structures nobody has triaged yet, which is still
+    // tight enough that a single structural class — the smallest seen was five molecules in 18 344 — fails it.
+    double const max_molecule_mismatch_ppm = (argc > 1) ? 100.0 : 0.0;
+    if (molecule_mismatch_ppm > max_molecule_mismatch_ppm) {
+        std::printf("FAIL (%d of %d molecules mismatched, %.1f ppm > %.1f ppm)\n", n_mols_mismatch_, n_mols_tested_,
+                    molecule_mismatch_ppm, max_molecule_mismatch_ppm);
         return 1;
     }
     std::printf("PASS\n");

@@ -64,6 +64,8 @@ enum atom_flag_t : std::uint8_t {
 
 /** Per-bond boolean flags packed into a single byte. */
 enum bond_flag_t : std::uint8_t {
+    /** `Bond::getIsAromatic()`. A bond that sits in an aromatic ring carries this even when it keeps a
+     *  Kekulé order, which is how an in-ring triple bond reaches the descriptor as order 3 and aromatic. */
     bond_flag_aromatic_k = 1u << 0,
     bond_flag_in_ring_k = 1u << 1,
     bond_flag_conjugated_k = 1u << 2,
@@ -71,6 +73,9 @@ enum bond_flag_t : std::uint8_t {
     bond_flag_stereo_e_k = 1u << 3,
     /** Z / cis. */
     bond_flag_stereo_z_k = 1u << 4,
+    /** `Bond::getBondType() == Bond::AROMATIC`: the bond has no Kekulé order at all. Strictly narrower
+     *  than `bond_flag_aromatic_k`, and the flag RDKit's MMFF ring queries test. */
+    bond_flag_order_aromatic_k = 1u << 5,
 };
 
 /** Sentinel in `bond_stereo_atom_i` / `_j` for a bond with no E/Z assignment. */
@@ -94,6 +99,11 @@ struct alignas(8) molecule_descriptor_t {
     std::uint8_t degree[max_atoms_per_molecule_k];
     /** Total H count, implicit plus explicit. */
     std::uint8_t num_hydrogens[max_atoms_per_molecule_k];
+    /** Explicit bond-order sum plus still-implicit hydrogens, exactly RDKit's
+     *  `getValence(EXPLICIT) + getNumImplicitHs()`. Not recoverable from `bond_order`: RDKit counts an
+     *  aromatic bond as 1.5 and then clamps an aromatic atom's sum down to the element's nearest
+     *  permitted valence, so pyrrole's nitrogen reads 3 rather than 4. */
+    std::uint8_t total_valence[max_atoms_per_molecule_k];
     std::int8_t formal_charge[max_atoms_per_molecule_k];
     /** Bitwise OR of `atom_flag_t`. */
     std::uint8_t atom_flags[max_atoms_per_molecule_k];
@@ -112,7 +122,9 @@ struct alignas(8) molecule_descriptor_t {
 
     std::uint8_t bond_atom_i[max_bonds_k];
     std::uint8_t bond_atom_j[max_bonds_k];
-    /** 1, 2, or 3. An aromatic bond reports 1 and carries `bond_flag_aromatic_k` instead. */
+    /** 1, 2, or 3. A bond RDKit types `Bond::AROMATIC` has no Kekulé order to report, so it reports 1 and
+     *  carries `bond_flag_order_aromatic_k`; ask for that flag, never for `bond_order == 1` alone, when the
+     *  question is whether the bond is aromatic. */
     std::uint8_t bond_order[max_bonds_k];
     /** Bitwise OR of `bond_flag_t`. */
     std::uint8_t bond_flags[max_bonds_k];
@@ -171,6 +183,8 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
         descriptor.hybridization[atom_index] = static_cast<std::uint8_t>(atom->getHybridization());
         descriptor.degree[atom_index] = static_cast<std::uint8_t>(atom->getDegree());
         descriptor.num_hydrogens[atom_index] = static_cast<std::uint8_t>(atom->getTotalNumHs(true));
+        descriptor.total_valence[atom_index] = static_cast<std::uint8_t>(
+            atom->getValence(RDKit::Atom::ValenceType::EXPLICIT) + atom->getNumImplicitHs());
         descriptor.formal_charge[atom_index] = static_cast<std::int8_t>(atom->getFormalCharge());
         descriptor.isotope[atom_index] = static_cast<std::uint8_t>(std::min<unsigned>(atom->getIsotope(), 255));
         descriptor.smallest_ring[atom_index] = 0;
@@ -202,18 +216,18 @@ inline bool build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t
         auto const *bond = molecule.getBondWithIdx(bond_index);
         descriptor.bond_atom_i[bond_index] = static_cast<std::uint8_t>(bond->getBeginAtomIdx());
         descriptor.bond_atom_j[bond_index] = static_cast<std::uint8_t>(bond->getEndAtomIdx());
-        // Aromatic bonds report order 1.5 — the integer representation is encoded here and the
-        // aromatic flag is set separately.
+        // An aromatic bond has no integer order; it reports 1 for topology and announces itself through
+        // `bond_flag_order_aromatic_k` below.
         auto order = bond->getBondType();
         std::uint8_t bond_order_u8 = 1;
         if (order == RDKit::Bond::SINGLE) bond_order_u8 = 1;
         else if (order == RDKit::Bond::DOUBLE) bond_order_u8 = 2;
         else if (order == RDKit::Bond::TRIPLE) bond_order_u8 = 3;
-        else if (order == RDKit::Bond::AROMATIC) bond_order_u8 = 1; // aromatic → treat as single for topology
         descriptor.bond_order[bond_index] = bond_order_u8;
 
         std::uint8_t flags = 0;
         if (bond->getIsAromatic()) flags |= bond_flag_aromatic_k;
+        if (order == RDKit::Bond::AROMATIC) flags |= bond_flag_order_aromatic_k;
         if (bond->getIsConjugated()) flags |= bond_flag_conjugated_k;
         auto stereo = bond->getStereo();
         if (stereo == RDKit::Bond::STEREOE || stereo == RDKit::Bond::STEREOTRANS) flags |= bond_flag_stereo_e_k;
