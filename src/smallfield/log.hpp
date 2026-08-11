@@ -6,9 +6,13 @@
  *  owns its own for shard progress, each bench constructs a local one. No process-wide singletons, no
  *  thread_locals.
  *
- *  Formatting is layered on `{fmt}`: `fmt::format`, `fmt::print`, and `fmt::text_style` for color. The built-in
- *  `fmt::print(stream, style, ...)` auto-disables ANSI escapes when the stream is not a terminal, and the logger
+ *  Formatting is layered on `{fmt}`: `fmt::format`, `fmt::println`, and `fmt::text_style` for color. The built-in
+ *  `fmt::println(stream, style, ...)` auto-disables ANSI escapes when the stream is not a terminal, and the logger
  *  further gates on `NO_COLOR` via `detect_color_enabled`.
+ *
+ *  Digit grouping is `fmt::group_digits`, not a locale: `log.info("{} mols", fmt::group_digits(count))` prints
+ *  `16,826` on every machine. A `"{:L}"` locale facet would print `16826` wherever `en_US.UTF-8` is not
+ *  generated — a minimal CI container, most notably — and say nothing about it.
  *
  *  @code{.cpp}
  *  smallfield::logger_t log;
@@ -24,12 +28,9 @@
 #include <cstdlib> // `std::getenv`
 #include <ctime>
 
-#include <chrono> // `std::chrono::system_clock`, `std::chrono::steady_clock`
-#include <concepts>
-#include <locale>
-#include <stdexcept> // `std::runtime_error`
-#include <string>    // `std::string`
-#include <utility>   // `std::forward`
+#include <chrono>  // `std::chrono::system_clock`, `std::chrono::steady_clock`
+#include <string>  // `std::string`
+#include <utility> // `std::forward`
 
 #include <unistd.h>
 #include <fmt/chrono.h>
@@ -39,33 +40,12 @@
 namespace smallfield {
 
 /**
- *  @brief Returns a locale with thousands grouping for use with `"{:L}"`.
+ *  @brief Wall-clock `time_point` formatted as "YYYY-MM-DD HH:MM:SS" in local time.
  *
- *  Constructed lazily on first call; defaults to `en_US.UTF-8` with comma grouping, falling back to
- *  `std::locale::classic()` if that locale is unavailable.
+ *  Spelled out through `localtime_r` on purpose, and it must stay that way: `{fmt}`'s chrono
+ *  formatter renders a `system_clock::time_point` under `"{:%F %T}"` in UTC, so the obvious
+ *  one-line replacement would silently shift every log line by the machine's UTC offset.
  */
-inline std::locale const &grouping_locale() {
-    static std::locale const locale = []() {
-        try {
-            return std::locale("en_US.UTF-8");
-        }
-        catch (std::runtime_error const &) {
-            return std::locale::classic();
-        }
-    }();
-    return locale;
-}
-
-/** Formats `1234567` as `"1,234,567"`. Uses `grouping_locale`. */
-template <typename integer_>
-    requires std::integral<integer_>
-inline std::string thousands(integer_ value) {
-    if constexpr (std::is_signed_v<integer_>)
-        return fmt::format(grouping_locale(), "{:L}", static_cast<std::int64_t>(value));
-    else return fmt::format(grouping_locale(), "{:L}", static_cast<std::uint64_t>(value));
-}
-
-/** Wall-clock `time_point` formatted as "YYYY-MM-DD HH:MM:SS" in local time. */
 inline std::string format_wall_time(std::chrono::system_clock::time_point const &time_point) {
     std::time_t const seconds_since_epoch = std::chrono::system_clock::to_time_t(time_point);
     std::tm tm_local {};
@@ -74,7 +54,12 @@ inline std::string format_wall_time(std::chrono::system_clock::time_point const 
                        tm_local.tm_mday, tm_local.tm_hour, tm_local.tm_min, tm_local.tm_sec);
 }
 
-/** Elapsed `duration` formatted as "HH:MM:SS" for pairing with wall clock. */
+/**
+ *  @brief Elapsed `duration` formatted as "HH:MM:SS" for pairing with wall clock.
+ *
+ *  Hand-rolled for the same reason as `format_wall_time`: `"{:%T}"` on a duration wraps at 24
+ *  hours, while a multi-day run must keep counting hours past 24.
+ */
 inline std::string format_hms(std::chrono::steady_clock::duration const &duration) {
     auto const total_seconds = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
     return fmt::format("{:02}:{:02}:{:02}", total_seconds / 3600, (total_seconds / 60) % 60, total_seconds % 60);
@@ -152,10 +137,10 @@ struct logger_t {
     template <typename... args_types_>
     void write_(std::FILE *stream, fmt::text_style style, fmt::format_string<args_types_...> fmt_string,
                 args_types_ &&...args) const {
-        // `fmt::print(stream, style, fmt, args...)` with an empty style emits no ANSI escapes; no need to branch.
+        // `fmt::println(stream, style, fmt, args...)` with an empty style emits no ANSI escapes; no need to
+        // branch. The prefix goes out unstyled so the color spans only the payload.
         fmt::print(stream, "{} ", timestamp_prefix());
-        fmt::print(stream, style, fmt_string, std::forward<args_types_>(args)...);
-        std::fputc('\n', stream);
+        fmt::println(stream, style, fmt_string, std::forward<args_types_>(args)...);
         // `fflush` here so redirected-to-file log tails are live and long-running jobs expose progress
         // mid-shard. Cost is one syscall per line; with hundreds of lines over a multi-hour run this is
         // negligible.

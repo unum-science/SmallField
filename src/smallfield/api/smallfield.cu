@@ -1081,7 +1081,18 @@ static void sort_input_by_smiles_length_(std::span<std::string_view const> smile
 static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record_t> const &wave_records,
                                  double total_wall_ms) {
     if (logger.verbose_level < 1) return;
-    logger.trace("wave   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / download");
+
+    // One width per column kind, shared by the header and every row through `{:>{}}` dynamic width, so the
+    // two cannot drift apart. `time_width_k` is 8 because the widest header word — `finalize`, `download` —
+    // is 8 characters, and a width narrower than its own label is what silently misaligned this table before.
+    constexpr int wave_width_k = 4;
+    constexpr int mols_width_k = 7;
+    constexpr int time_width_k = 8;
+
+    logger.trace("{:>{}} {:>{}} {:>{}} {:>{}} {:>{}} {:>{}} / {:>{}} {:>{}} / {:>{}} / {:>{}} / {:>{}}", //
+                 "wave", wave_width_k, "mols", mols_width_k, "prep", time_width_k, "launch", time_width_k, "finalize",
+                 time_width_k, "gpu avg", time_width_k, "max", time_width_k, "upload", time_width_k, "metric",
+                 time_width_k, "kernels", time_width_k, "download", time_width_k);
     for (auto const &wave_record : wave_records) {
         float gpu_max = 0.f, gpu_sum = 0.f, upload = 0.f, metric = 0.f, kernels = 0.f, download = 0.f;
         std::uint32_t n_active = 0;
@@ -1096,23 +1107,25 @@ static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record
             ++n_active;
         }
         float const inverse_active_count = n_active > 0 ? 1.f / static_cast<float>(n_active) : 0.f;
-        logger.trace(
-            "{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / {:>6.1f} / " //
-            "{:>6.1f}",
-            wave_record.wave_index, wave_record.n_mol, wave_record.prep_end_ms - wave_record.prep_start_ms,
-            wave_record.launch_end_ms - wave_record.launch_start_ms,
-            wave_record.finalize_end_ms - wave_record.finalize_start_ms, gpu_sum * inverse_active_count, gpu_max,
-            upload * inverse_active_count, metric * inverse_active_count, kernels * inverse_active_count,
-            download * inverse_active_count);
+        logger.trace("{:>{}} {:>{}} {:>{}.1f} {:>{}.1f} {:>{}.1f} {:>{}.1f} / {:>{}.1f} {:>{}.1f} / {:>{}.1f} / " //
+                     "{:>{}.1f} / {:>{}.1f}",
+                     wave_record.wave_index, wave_width_k, wave_record.n_mol, mols_width_k,
+                     wave_record.prep_end_ms - wave_record.prep_start_ms, time_width_k,
+                     wave_record.launch_end_ms - wave_record.launch_start_ms, time_width_k,
+                     wave_record.finalize_end_ms - wave_record.finalize_start_ms, time_width_k,
+                     gpu_sum * inverse_active_count, time_width_k, gpu_max, time_width_k, upload * inverse_active_count,
+                     time_width_k, metric * inverse_active_count, time_width_k, kernels * inverse_active_count,
+                     time_width_k, download * inverse_active_count, time_width_k);
     }
     logger.trace("wall {:.1f} ms", total_wall_ms);
     for (auto const &wave_record : wave_records) {
         for (std::uint32_t device_index = 0; device_index < wave_record.per_device_gpu.size(); ++device_index) {
             auto const &device_timing = wave_record.per_device_gpu[device_index];
             if (device_timing.total_ms <= 0.f) continue;
-            logger.trace2("  ck={} dev={}  upload={:.1f}  metric={:.1f}  kernels={:.1f}  download={:.1f}  total={:.1f}",
-                          wave_record.wave_index, device_index, device_timing.upload_ms, device_timing.metric_ms,
-                          device_timing.kernels_ms, device_timing.download_ms, device_timing.total_ms);
+            logger.trace2(
+                "  wave={} dev={}  upload={:.1f}  metric={:.1f}  kernels={:.1f}  download={:.1f}  total={:.1f}",
+                wave_record.wave_index, device_index, device_timing.upload_ms, device_timing.metric_ms,
+                device_timing.kernels_ms, device_timing.download_ms, device_timing.total_ms);
         }
     }
 }
