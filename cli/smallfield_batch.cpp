@@ -30,11 +30,13 @@
 #include <filesystem>         // `std::filesystem::path`, `std::filesystem::create_directories`
 #include <mutex>              // `std::mutex`, `std::unique_lock`
 #include <span>               // `std::span`
+#include <stdexcept>          // `std::runtime_error`
 #include <string>             // `std::string`
 #include <string_view>        // `std::string_view`
 #include <system_error>       // `std::errc`
 #include <vector>             // `std::vector`
 
+#include <argparse/argparse.hpp>
 #include <omp.h>
 #include <cuda_fp16.h>
 
@@ -145,91 +147,87 @@ static bool parse_int_list_(char const *spec, std::vector<int> &out) {
     return true;
 }
 
+/**
+ *  @brief Bind a string flag straight to its destination, so the parsed value never sits anywhere but the config.
+ *
+ *  `append` marks the flag repeatable, which is what keeps the last occurrence winning: without it `argparse` rejects
+ *  a second occurrence outright, and a wrapper that appends an override to a fixed prefix stops working.
+ */
+template <typename string_type_>
+static void add_string_(argparse::ArgumentParser &parser, char const *flag, string_type_ &destination) {
+    parser.add_argument(flag).append().action([&destination](std::string const &text) { destination = text; });
+}
+
+/**
+ *  @brief Bind a numeric flag, refusing a token that does not parse whole rather than silently taking it as zero.
+ *
+ *  The conversion stays ours rather than `argparse`'s `scan`, whose diagnostic is `pattern 'abc' does not match to
+ *  the end` — it never names the flag the operator actually typed.
+ */
+template <typename number_type_>
+static void add_number_(argparse::ArgumentParser &parser, char const *flag, number_type_ &number) {
+    parser.add_argument(flag).append().action([flag, &number](std::string const &text) {
+        if (!parse_number_(text, number))
+            throw std::runtime_error(fmt::format("{} requires a number, got: {}", flag, text));
+    });
+}
+
 static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
-    for (int argument_index = 1; argument_index < argc; ++argument_index) {
-        std::string_view flag = argv[argument_index];
-        auto require_value = [&](char const *flag_name) -> char const * {
-            if (argument_index + 1 >= argc) {
-                fmt::print(stderr, "--{} requires a value\n", flag_name);
-                return nullptr;
-            }
-            return argv[++argument_index];
-        };
-        // A number that does not parse whole is refused rather than silently taken as zero.
-        auto require_number = [&](char const *flag_name, auto &number) -> bool {
-            char const *value = require_value(flag_name);
-            if (!value) return false;
-            if (parse_number_(value, number)) return true;
-            fmt::print(stderr, "--{} requires a number, got: {}\n", flag_name, value);
-            return false;
-        };
-        if (flag == "--input") {
-            auto value = require_value("input");
-            if (!value) return cli_parse_t::invalid_k;
-            config.input_dir = value;
-        }
-        else if (flag == "--output") {
-            auto value = require_value("output");
-            if (!value) return cli_parse_t::invalid_k;
-            config.output_dir = value;
-        }
-        else if (flag == "--smiles-column") {
-            auto value = require_value("smiles-column");
-            if (!value) return cli_parse_t::invalid_k;
-            config.smiles_column = value;
-        }
-        else if (flag == "--dataset") {
-            auto value = require_value("dataset");
-            if (!value) return cli_parse_t::invalid_k;
-            config.dataset = value;
-        }
-        else if (flag == "--num-conformers") {
-            if (!require_number("num-conformers", config.num_conformers)) return cli_parse_t::invalid_k;
-        }
-        else if (flag == "--max-atoms") {
-            if (!require_number("max-atoms", config.max_atoms)) return cli_parse_t::invalid_k;
-        }
-        else if (flag == "--batch-size" || flag == "--coprocessed-batch-size") {
-            char const *flag_name = flag == "--batch-size" ? "batch-size" : "coprocessed-batch-size";
-            if (!require_number(flag_name, config.batch_size)) return cli_parse_t::invalid_k;
-        }
-        else if (flag == "--gpus") {
-            auto value = require_value("gpus");
-            if (!value) return cli_parse_t::invalid_k;
-            if (!parse_int_list_(value, config.gpu_ids)) return cli_parse_t::invalid_k;
-        }
-        else if (flag == "--rdkit-fallback-threads") {
-            if (!require_number("rdkit-fallback-threads", config.rdkit_fallback_threads))
-                return cli_parse_t::invalid_k;
-        }
-        else if (flag == "--gpu-runner-threads") {
-            if (!require_number("gpu-runner-threads", config.gpu_runner_threads)) return cli_parse_t::invalid_k;
-        }
-        else if (flag == "--chunk-size") {
-            if (!require_number("chunk-size", config.batch_size)) return cli_parse_t::invalid_k;
-        }
-        else if (flag == "--restart") { config.resume = false; }
-        else if (flag == "--resume") { config.resume = true; }
-        else if (flag == "--seed") {
-            if (!require_number("seed", config.random_seed)) return cli_parse_t::invalid_k;
-        }
-        else if (flag == "--verbose") { config.verbose_level = 1; }
-        else if (flag.starts_with("--verbose=")) {
-            std::string_view const level = flag.substr(std::string_view("--verbose=").size());
-            if (!parse_number_(level, config.verbose_level)) {
-                fmt::print(stderr, "--verbose= requires a number, got: {}\n", level);
-                return cli_parse_t::invalid_k;
-            }
-        }
-        else if (flag == "--help" || flag == "-h") {
-            print_usage_();
-            return cli_parse_t::help_requested_k;
-        }
-        else {
-            fmt::print(stderr, "unknown flag: {}\n", flag);
-            return cli_parse_t::invalid_k;
-        }
+    // `default_arguments::none` suppresses the `-h` and `--version` that `argparse` would otherwise add: its own
+    // generated help cannot express `--verbose[=LEVEL]` or the three names sharing one field, so `print_usage_`
+    // stays the help text and `-h` is bound by hand below.
+    argparse::ArgumentParser parser {"smallfield_batch", "", argparse::default_arguments::none};
+    bool help_requested = false;
+
+    add_string_(parser, "--input", config.input_dir);
+    add_string_(parser, "--output", config.output_dir);
+    add_string_(parser, "--smiles-column", config.smiles_column);
+    add_string_(parser, "--dataset", config.dataset);
+    add_number_(parser, "--num-conformers", config.num_conformers);
+    add_number_(parser, "--max-atoms", config.max_atoms);
+    // Three names for one field, registered separately rather than as aliases of one option, so a rejected value is
+    // reported under the name the operator typed.
+    add_number_(parser, "--batch-size", config.batch_size);
+    add_number_(parser, "--coprocessed-batch-size", config.batch_size);
+    add_number_(parser, "--chunk-size", config.batch_size);
+    add_number_(parser, "--rdkit-fallback-threads", config.rdkit_fallback_threads);
+    add_number_(parser, "--gpu-runner-threads", config.gpu_runner_threads);
+    add_number_(parser, "--seed", config.random_seed);
+    // The comma-separated device list fills the caller's vector; nothing is returned by value.
+    parser.add_argument("--gpus").append().action([&config](std::string const &text) {
+        if (!parse_int_list_(text.c_str(), config.gpu_ids))
+            throw std::runtime_error(fmt::format("--gpus requires comma-separated device IDs, got: {}", text));
+    });
+    // `--restart` and `--resume` write the same field, so each is an action rather than a queried flag: that is what
+    // makes the last one on the command line win.
+    parser.add_argument("--restart").flag().append().action([&config](std::string const &) { config.resume = false; });
+    parser.add_argument("--resume").flag().append().action([&config](std::string const &) { config.resume = true; });
+    // `--verbose` alone is level 1 and `--verbose=LEVEL` names it. `nargs(0, 1)` consumes nothing in the first case,
+    // so the action never fires, which is how the two are told apart.
+    bool verbose_level_given = false;
+    parser.add_argument("--verbose").nargs(0, 1).append().action([&](std::string const &text) {
+        if (!parse_number_(text, config.verbose_level))
+            throw std::runtime_error(fmt::format("--verbose requires a number, got: {}", text));
+        verbose_level_given = true;
+    });
+    parser.add_argument("-h", "--help").flag().append().action([&](std::string const &) {
+        print_usage_();
+        help_requested = true;
+    });
+
+    try {
+        parser.parse_args(argc, argv);
+        if (help_requested) return cli_parse_t::help_requested_k;
+        if (parser.is_used("--verbose") && !verbose_level_given) config.verbose_level = 1;
     }
+    catch (std::exception const &error) {
+        // `argparse` reports every rejection by throwing, so this is the only place a bad command line surfaces.
+        // `--help` alongside a rejected flag is still a help request, since the usage is what the operator asked for.
+        if (help_requested) return cli_parse_t::help_requested_k;
+        fmt::print(stderr, "{}\n", error.what());
+        return cli_parse_t::invalid_k;
+    }
+
     if (config.input_dir.empty()) {
         print_usage_();
         return cli_parse_t::invalid_k;

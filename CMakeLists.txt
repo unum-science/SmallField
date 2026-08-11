@@ -158,6 +158,22 @@ else ()
     message(STATUS "jemalloc not found -- consider installing it for better allocation performance")
 endif ()
 
+# `argparse` -- the command-line grammar shared by `smallfield_batch` and `smallfield_descriptors`, and nothing else.
+# Three costs, none of them fixable from this side:
+#
+# * It reports every error by throwing, with no macro to disable that, so both `main`s wrap `parse_args` in a `try` and
+#   convert the exception into an exit code.
+# * It copies `argv`, which the OS already owns and which outlives `main`, and parks the parsed values in `std::any`,
+#   against the caller-owned-scratch rule in `CONTRIBUTING.md`.
+# * It adds about 3.4 s to every consuming translation unit: 8.3 s to 11.9 s for `smallfield_batch.cpp` and 8.9 s to
+#   12.2 s for `smallfield_descriptors.cpp`.  Only 0.4 s of that is the front end -- the header parses in 1.0 s alone,
+#   but both files already included most of what it drags in, `<any>`, `<variant>`, `<sstream>`, `<iostream>`,
+#   `<filesystem>`, `<list>` and `<map>`.  The rest is `-O2` on the instantiated parser.
+#
+# Resolved from `pixi` as `cpp-argparse`, like every other dependency here, so a fresh clone needs no network fetch
+# beyond the environment it already installs.
+find_package(argparse CONFIG REQUIRED)
+
 # Build settings are interface targets rather than mutations of `CMAKE_<LANG>_FLAGS`.  Global flag variables leak into
 # every subdirectory including future dependencies, and the config-conditional forms are invisible to multi-config
 # generators, where `CMAKE_BUILD_TYPE` is empty and an `if(CMAKE_BUILD_TYPE STREQUAL "Release")` guard silently drops

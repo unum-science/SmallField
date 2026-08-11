@@ -42,7 +42,7 @@ target_compile_definitions(smallfield_parquet_writer PRIVATE SMALLFIELD_GIT_SHA=
 define_smallfield_target(
     smallfield_batch
     SOURCES smallfield_batch.cpp parquet_reader.cpp shard_inventory.cpp rdkit_fallback.cpp
-    LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared
+    LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared argparse::argparse
     DEFINES SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}"
             $<$<BOOL:${SMALLFIELD_ENABLE_NVTX}>:SMALLFIELD_ENABLE_NVTX>
 )
@@ -53,7 +53,7 @@ define_smallfield_target(
 define_smallfield_target(
     smallfield_descriptors
     SOURCES smallfield_descriptors.cpp
-    LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared
+    LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared argparse::argparse
     DEFINES SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}"
             $<$<BOOL:${SMALLFIELD_ENABLE_NVTX}>:SMALLFIELD_ENABLE_NVTX>
 )

@@ -26,21 +26,24 @@
 
 #include <cstdint> // `std::uint32_t`
 #include <cstdio>  // `std::fopen`
-#include <cstdlib> // `std::strtoul`
 #include <cstring> // `std::memcpy`
 
 #include <algorithm>     // `std::max`
 #include <array>         // `std::array`
 #include <atomic>        // `std::atomic`
+#include <charconv>      // `std::from_chars`
 #include <chrono>        // `std::chrono::steady_clock`
 #include <filesystem>    // `std::filesystem::path`
 #include <memory>        // `std::shared_ptr`
 #include <span>          // `std::span`
+#include <stdexcept>     // `std::runtime_error`
 #include <string>        // `std::string`
 #include <string_view>   // `std::string_view`
+#include <system_error>  // `std::errc`
 #include <unordered_map> // `std::unordered_map`
 #include <vector>        // `std::vector`
 
+#include <argparse/argparse.hpp>
 #include <omp.h>
 #include <cuda_fp16.h>
 #include <arrow/array.h>
@@ -94,61 +97,85 @@ void print_usage() {
 )");
 }
 
-bool parse_cli(int argc, char **argv, cli_config_t &config) {
-    for (int argument_index = 1; argument_index < argc; ++argument_index) {
-        std::string_view flag = argv[argument_index];
-        auto require_value = [&](char const *flag_name) -> char const * {
-            if (argument_index + 1 >= argc) {
-                fmt::print(stderr, "--{} requires a value\n", flag_name);
-                return nullptr;
-            }
-            return argv[++argument_index];
-        };
-        if (flag == "--input") {
-            auto value = require_value("input");
-            if (!value) return false;
-            config.input_dir = value;
-        }
-        else if (flag == "--output") {
-            auto value = require_value("output");
-            if (!value) return false;
-            config.output_dir = value;
-        }
-        else if (flag == "--reembed") {
-            auto value = require_value("reembed");
-            if (!value) return false;
-            config.reembed_dir = value;
-        }
-        else if (flag == "--dataset") {
-            auto value = require_value("dataset");
-            if (!value) return false;
-            config.dataset = value;
-        }
-        else if (flag == "--threads") {
-            auto value = require_value("threads");
-            if (!value) return false;
-            config.threads = static_cast<int>(std::strtol(value, nullptr, 10));
-        }
-        else if (flag == "--max-atoms") {
-            auto value = require_value("max-atoms");
-            if (!value) return false;
-            config.max_atoms = static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10));
-        }
-        else if (flag == "--restart") { config.resume = false; }
-        else if (flag == "--help" || flag == "-h") {
-            print_usage();
-            return false;
-        }
-        else {
-            fmt::print(stderr, "unknown flag: {}\n", flag);
-            return false;
-        }
+/** Outcome of a command line: a usable configuration, a help request, or a rejected command line. */
+enum class cli_parse_t {
+    parsed_k,
+    help_requested_k,
+    invalid_k,
+};
+
+/**
+ *  @brief Parse one whole numeric token, rejecting an empty token, trailing characters and overflow.
+ *
+ *  @param[in] text Token as it appeared on the command line.
+ *  @param[out] number Value the token denotes; untouched unless the whole token parses.
+ *  @return True when the entire token is a number of @p number 's type.
+ */
+template <typename number_type_>
+bool parse_number_(std::string_view text, number_type_ &number) {
+    auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), number);
+    return error == std::errc {} && unparsed == text.data() + text.size();
+}
+
+/**
+ *  @brief Bind a string flag straight to its destination, so the parsed value never sits anywhere but the config.
+ *
+ *  `append` marks the flag repeatable, which is what keeps the last occurrence winning: without it `argparse` rejects
+ *  a second occurrence outright, and a wrapper that appends an override to a fixed prefix stops working.
+ */
+template <typename string_type_>
+void add_string_(argparse::ArgumentParser &parser, char const *flag, string_type_ &destination) {
+    parser.add_argument(flag).append().action([&destination](std::string const &text) { destination = text; });
+}
+
+/**
+ *  @brief Bind a numeric flag, refusing a token that does not parse whole rather than silently taking it as zero.
+ *
+ *  The conversion stays ours rather than `argparse`'s `scan`, whose diagnostic is `pattern 'abc' does not match to
+ *  the end` — it never names the flag the operator actually typed.
+ */
+template <typename number_type_>
+void add_number_(argparse::ArgumentParser &parser, char const *flag, number_type_ &number) {
+    parser.add_argument(flag).append().action([flag, &number](std::string const &text) {
+        if (!parse_number_(text, number))
+            throw std::runtime_error(fmt::format("{} requires a number, got: {}", flag, text));
+    });
+}
+
+cli_parse_t parse_cli(int argc, char **argv, cli_config_t &config) {
+    // `default_arguments::none` suppresses the `-h` and `--version` that `argparse` would otherwise supply, so
+    // `print_usage` stays the one help text and `-h` is bound by hand below.
+    argparse::ArgumentParser parser {"smallfield_descriptors", "", argparse::default_arguments::none};
+    bool help_requested = false;
+
+    add_string_(parser, "--input", config.input_dir);
+    add_string_(parser, "--output", config.output_dir);
+    add_string_(parser, "--reembed", config.reembed_dir);
+    add_string_(parser, "--dataset", config.dataset);
+    add_number_(parser, "--threads", config.threads);
+    add_number_(parser, "--max-atoms", config.max_atoms);
+    parser.add_argument("--restart").flag().append().action([&config](std::string const &) { config.resume = false; });
+    parser.add_argument("-h", "--help").flag().append().action([&](std::string const &) {
+        print_usage();
+        help_requested = true;
+    });
+
+    try {
+        parser.parse_args(argc, argv);
     }
+    catch (std::exception const &error) {
+        // `argparse` reports every rejection by throwing, so this is the only place a bad command line surfaces.
+        if (help_requested) return cli_parse_t::help_requested_k;
+        fmt::print(stderr, "{}\n", error.what());
+        return cli_parse_t::invalid_k;
+    }
+    if (help_requested) return cli_parse_t::help_requested_k;
+
     if (config.input_dir.empty() || config.output_dir.empty()) {
         print_usage();
-        return false;
+        return cli_parse_t::invalid_k;
     }
-    return true;
+    return cli_parse_t::parsed_k;
 }
 
 #pragma endregion Configuration
@@ -574,7 +601,11 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
 
 int main(int argc, char **argv) {
     cli_config_t config;
-    if (!parse_cli(argc, argv, config)) return 2;
+    switch (parse_cli(argc, argv, config)) {
+    case cli_parse_t::parsed_k: break;
+    case cli_parse_t::help_requested_k: return 0;
+    case cli_parse_t::invalid_k: return 2;
+    }
 
     logger_t logger;
     std::error_code error_code;
