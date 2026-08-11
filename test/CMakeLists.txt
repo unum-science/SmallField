@@ -30,11 +30,12 @@ define_smallfield_test(cuda csd_torsion_device MIXED)
 # The reproducibility check compiles `metric_embedding_prepass.cuh` itself so it can drive the embed kernel over
 # thousands of identical blocks.  It therefore must not also link `smallfield_lib`, which carries its own copy of that
 # kernel: the launch stub is a non-inline symbol defined in a header, so the linker would see it twice.  RDKit comes in
-# only for the assertion macros.
+# only for the assertion macros, and `CUDA::cudart` only for its include directories, which carry the libcu++ headers
+# behind `smallfield/types/views.hpp`.
 define_smallfield_test(
     cuda embedding_determinism
     MIXED
-    LINK smallfield_rdkit fmt::fmt
+    LINK smallfield_rdkit fmt::fmt CUDA::cudart
 )
 
 define_smallfield_test(preprocess chirality MIXED)

@@ -43,7 +43,7 @@ using smallfield::types::molecule_descriptor_t;
 inline constexpr std::uint32_t bond_distance_mask_words_k = max_atoms_per_molecule_k / 32u;
 
 /** Hop count written for a pair with no bonded path between its atoms. */
-inline constexpr std::uint8_t bond_distance_unreachable_k = 255u;
+inline constexpr std::uint8_t bond_distance_unreachable_k = types::unreachable_hops_k;
 
 /**
  *  @brief Fill the batch pool's per-molecule N x N hop-count blocks.

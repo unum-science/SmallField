@@ -156,9 +156,9 @@ static void compare_terms_(std::string const &smiles, std::string_view label, fl
     // it from the bond list, and hands the sweep an all-unreachable matrix whenever the
     // comparison isolates some other term.
     std::vector<std::uint8_t> bond_hops;
-    sftest::fill_bond_hops(prepared_full.mmff_bonds.data(), static_cast<std::uint32_t>(prepared_full.mmff_bonds.size()),
-                           prepared_full.num_atoms, bond_hops);
-    std::vector<std::uint8_t> const unreachable_hops(bond_hops.size(), std::uint8_t {255});
+    sftest::fill_bond_hops_into(prepared_full.mmff_bonds,
+                                sft::reset_square_matrix(bond_hops, prepared_full.num_atoms, sft::unreachable_hops_k));
+    std::vector<std::uint8_t> const unreachable_hops(bond_hops.size(), sft::unreachable_hops_k);
 
     term_kind_t const kinds[] = {term_kind_t::bond_k, term_kind_t::angle_k,   term_kind_t::stretchbend_k,
                                  term_kind_t::oop_k,  term_kind_t::torsion_k, term_kind_t::nonbonded_k};

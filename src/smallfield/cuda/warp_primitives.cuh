@@ -1,7 +1,8 @@
 /**
  *  @file src/smallfield/cuda/warp_primitives.cuh
- *  @brief Shared warp-level constants, reduction primitives, float3 vector helpers, and tiny tensor-view
- *  types with debug-mode bounds checking.
+ *  @brief Shared warp-level constants, reduction primitives, and float3 vector helpers.
+ *
+ *  Multi-dimensional views live in `smallfield/types/views.hpp`, which host code can include too.
  */
 
 #pragma once
@@ -14,9 +15,10 @@
 /**
  *  @brief Debug-only assertion that compiles to nothing in Release.
  *
- *  Guards pointer-math accesses, such as `matrix_view_2d::operator()`, so out-of-bounds derefs trap
- *  immediately under compute-sanitizer or a debugger instead of silently corrupting memory and
- *  crashing later somewhere unrelated. The device path calls `__trap()` so compute-sanitizer reports
+ *  Guards pointer-math accesses so out-of-bounds derefs trap immediately under compute-sanitizer or a
+ *  debugger instead of silently corrupting memory and crashing later somewhere unrelated. Note that
+ *  `cuda::std::mdspan` performs no such check of its own, even with `CCCL_ENABLE_ASSERTIONS` set, so raw
+ *  index arithmetic still wants this. The device path calls `__trap()` so compute-sanitizer reports
  *  the offending thread and block coordinates; the host path calls `__builtin_trap()` so gdb or a
  *  core dump points at the bad caller; Release, under `NDEBUG`, compiles to nothing.
  */
@@ -38,50 +40,6 @@ namespace smallfield::cuda {
 
 constexpr std::uint32_t warp_size_k = 32;
 constexpr unsigned int full_mask_k = 0xFFFFFFFF;
-
-/**
- *  @brief Type-safe view of a row-major N×N matrix.
- *
- *  12 bytes — a pointer plus a `std::uint32_t` stride. Trivially copyable, so it passes through
- *  `__global__` kernel arguments without a dance. In Release `operator()` compiles to the same SASS as a
- *  raw `data[row * side_length + column]`; in Debug it asserts `row < side_length && column < side_length`
- *  and traps on an out-of-bounds access. That is the guardrail catching stride and offset bugs before they
- *  silently corrupt neighbouring memory.
- */
-template <typename value_type_>
-struct matrix_view_2d {
-    value_type_ *data = nullptr;
-    std::uint32_t side_length = 0;
-
-    constexpr matrix_view_2d() noexcept = default;
-    __host__ __device__ constexpr matrix_view_2d(value_type_ *data_pointer, std::uint32_t side_length_) noexcept
-        : data(data_pointer), side_length(side_length_) {}
-
-    __host__ __device__ __forceinline__ value_type_ &operator()(std::uint32_t row,
-                                                                std::uint32_t column) const noexcept {
-        sf_assert_(row < side_length && column < side_length);
-        return data[row * side_length + column];
-    }
-};
-
-/**
- *  @brief Type-safe view of a SoA `[x0..xN, y0..yN, z0..zN]` 3-component buffer. Mirrors the semantics of
- *  `load_position_` and `store_gradient_`, with the same Debug-mode bounds check as `matrix_view_2d`.
- */
-template <typename value_type_>
-struct soa_view_3d {
-    value_type_ *data = nullptr;
-    std::uint32_t num_atoms = 0;
-
-    constexpr soa_view_3d() noexcept = default;
-    __host__ __device__ constexpr soa_view_3d(value_type_ *data_pointer, std::uint32_t num_atoms_) noexcept
-        : data(data_pointer), num_atoms(num_atoms_) {}
-
-    __host__ __device__ __forceinline__ value_type_ &component(std::uint32_t dim, std::uint32_t atom) const noexcept {
-        sf_assert_(dim < 3u && atom < num_atoms);
-        return data[dim * num_atoms + atom];
-    }
-};
 
 __device__ __forceinline__ float dot_float3_(float3 const &lhs, float3 const &rhs) {
     return fmaf(lhs.x, rhs.x, fmaf(lhs.y, rhs.y, lhs.z * rhs.z));

@@ -18,20 +18,20 @@
  *  center, tie or not.
  *
  *  Coverage comes from a curated set of stereo-rich molecules, an exhaustive enumeration of tetrahedral tag
- *  assignments over those molecules, and an optional SMILES corpus named by argv[1].
+ *  assignments over those molecules, and an optional SMILES corpus named by `argv[1]` or by
+ *  `SMALLFIELD_TEST_CORPUS`, capped by `argv[2]` or `SMALLFIELD_TEST_MAX_MOLS`. A named corpus that
+ *  does not open is a failure, never an empty run.
  */
 
 #include <cmath>   // `std::fabs`
 #include <cstdint> // `std::uint64_t`, `std::uint8_t`
 
-#include <algorithm>    // `std::sort`, `std::min`
-#include <charconv>     // `std::from_chars`
-#include <fstream>      // `std::ifstream`
-#include <memory>       // `std::unique_ptr`
-#include <string>       // `std::string`, `std::getline`
-#include <string_view>  // `std::string_view`
-#include <system_error> // `std::errc`
-#include <vector>       // `std::vector`
+#include <algorithm>   // `std::find`, `std::min`, `std::sort`
+#include <memory>      // `std::unique_ptr`
+#include <span>        // `std::span`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
@@ -76,25 +76,34 @@ struct oracle_tally_t {
  *
  *  @param[in] from Source ordering of atom indices.
  *  @param[in] to Target ordering, a permutation of @p from.
- *  @param[in] count Number of leading entries to consider.
  *  @return +1 for an even permutation, -1 for an odd one, 0 when the two disagree.
  */
-static int permutation_parity_(std::uint8_t const *from, std::uint8_t const *to, std::uint32_t count) {
+static int permutation_parity_(std::span<std::uint8_t const> from, std::span<std::uint8_t const> to) {
     std::uint32_t positions[4] = {0, 0, 0, 0};
-    for (std::uint32_t target = 0; target < count; ++target) {
-        bool found = false;
-        for (std::uint32_t source = 0; source < count && !found; ++source)
-            if (from[source] == to[target]) {
-                positions[target] = source;
-                found = true;
-            }
-        if (!found) return 0;
+    for (std::size_t target = 0; target < to.size(); ++target) {
+        auto const source = std::find(from.begin(), from.end(), to[target]);
+        if (source == from.end()) return 0;
+        positions[target] = static_cast<std::uint32_t>(source - from.begin());
     }
     std::uint32_t inversions = 0;
-    for (std::uint32_t left = 0; left < count; ++left)
-        for (std::uint32_t right = left + 1; right < count; ++right)
+    for (std::size_t left = 0; left < to.size(); ++left)
+        for (std::size_t right = left + 1; right < to.size(); ++right)
             if (positions[left] > positions[right]) ++inversions;
     return (inversions % 2 == 0) ? 1 : -1;
+}
+
+/**
+ *  @brief Whether any two entries of @p order share a CIP rank.
+ *
+ *  @param[in] cip_ranks CIP rank per atom index, as `assignAtomCIPRanks` filled it.
+ *  @param[in] order Neighbor atom indices to inspect.
+ *  @return True as soon as one repeated rank is found.
+ */
+static bool any_rank_tie_(RDKit::UINT_VECT const &cip_ranks, std::span<std::uint8_t const> order) {
+    for (std::size_t left = 0; left < order.size(); ++left)
+        for (std::size_t right = left + 1; right < order.size(); ++right)
+            if (cip_ranks[order[left]] == cip_ranks[order[right]]) return true;
+    return false;
 }
 
 /**
@@ -140,16 +149,13 @@ static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descr
 
         // A repeated rank leaves the CIP ordering, and with it the sign that ordering
         // implies, undetermined. The geometric oracle covers these centers instead.
-        bool tied = false;
-        for (std::uint32_t left = 0; left < count; ++left)
-            for (std::uint32_t right = left + 1; right < count; ++right)
-                if (cip_ranks[reference_order[left]] == cip_ranks[reference_order[right]]) tied = true;
-        if (tied) {
+        std::span<std::uint8_t> const cip_ordered {reference_order, count};
+        if (any_rank_tie_(cip_ranks, cip_ordered)) {
             ++tally.rank_ties;
             continue;
         }
 
-        std::sort(reference_order, reference_order + count, [&](std::uint8_t left, std::uint8_t right) {
+        std::sort(cip_ordered.begin(), cip_ordered.end(), [&](std::uint8_t left, std::uint8_t right) {
             if (cip_ranks[left] != cip_ranks[right]) return cip_ranks[left] > cip_ranks[right];
             return left < right;
         });
@@ -158,7 +164,7 @@ static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descr
         rdkit_atom->getProp("_CIPCode", cip_code);
         int const reference_sign = (cip_code == "S") ? 1 : -1;
 
-        int const parity = permutation_parity_(reference_order, center.neighbor_atoms, count);
+        int const parity = permutation_parity_(cip_ordered, {center.neighbor_atoms, count});
         sf_verify_(parity != 0, "emitted neighbors must be a permutation of the CIP-ordered neighbors");
         int const expected_sign = reference_sign * parity;
 
@@ -229,15 +235,23 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
     }
 }
 
+/** Which oracles a molecule's extracted centers are put to. */
+enum class chiral_oracles_t {
+    /** The CIP oracle alone, for a corpus too large to embed. */
+    cip_only_k,
+    /** Both oracles, which is what the curated set is small enough to afford. */
+    cip_and_geometry_k,
+};
+
 /**
  *  @brief Extract one molecule's stereocenters and hand them to the requested oracles.
  *
  *  @param[inout] molecule Molecule with explicit hydrogens; stereochemistry is assigned in place.
  *  @param[in] label Printed alongside any mismatch.
- *  @param[in] with_geometry True to additionally embed the molecule and check the realized volumes.
+ *  @param[in] oracles Which oracles to run; embedding is what makes the geometric one expensive.
  *  @param[inout] tally Counters advanced by this molecule.
  */
-static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, bool with_geometry,
+static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, chiral_oracles_t oracles,
                             oracle_tally_t &tally) {
     if (molecule.getNumAtoms() > sft::max_atoms_per_molecule_k || molecule.getNumBonds() > sft::max_bonds_k) return;
 
@@ -252,7 +266,8 @@ static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, bo
     // The extraction has already run `assignStereochemistry`, so the CIP labels and ranks
     // below describe exactly the molecule the descriptors were derived from.
     check_against_cip_(molecule, descriptor, centers, label, tally);
-    if (with_geometry) check_against_geometry_(molecule, descriptor, centers, label, tally);
+    if (oracles == chiral_oracles_t::cip_and_geometry_k)
+        check_against_geometry_(molecule, descriptor, centers, label, tally);
 }
 
 /**
@@ -321,7 +336,7 @@ static void check_stereoisomers_(std::string const &smiles, oracle_tally_t &tall
             variant.getAtomWithIdx(tagged_atoms[position])
                 ->setChiralTag(clockwise ? RDKit::Atom::CHI_TETRAHEDRAL_CW : RDKit::Atom::CHI_TETRAHEDRAL_CCW);
         }
-        check_molecule_(variant, smiles, true, tally);
+        check_molecule_(variant, smiles, chiral_oracles_t::cip_and_geometry_k, tally);
     }
 }
 
@@ -359,28 +374,22 @@ int main(int argc, char **argv) {
     sf_verify_(curated.cip_mismatches == 0, "every curated stereocenter must match the CIP oracle");
     sf_verify_(curated.geometry_mismatches == 0, "every curated stereocenter must match its embedded geometry");
 
-    char const *corpus_path = argc > 1 ? argv[1] : nullptr;
-    if (corpus_path != nullptr) {
-        std::size_t limit = 20000;
-        if (argc > 2) {
-            std::string_view const text {argv[2]};
-            auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), limit);
-            if (error != std::errc {} || unparsed != text.data() + text.size()) {
-                fmt::println(stderr, "usage: {} <corpus.smi> [max_molecules]", argv[0]);
-                return 2;
-            }
-        }
+    auto const selection = sftest::select_corpus(argc, argv, 20000);
+    if (selection.knob == sftest::corpus_knob_t::refused_k) {
+        fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", argv[0]);
+        return 2;
+    }
+    if (selection.knob == sftest::corpus_knob_t::named_k) {
         // Naming a corpus is a request to validate against it, so an empty result is a failure and not an
         // empty corpus: it would otherwise run zero comparisons and satisfy `cip_mismatches == 0`
-        // vacuously, reporting a pass for work that never happened.  The reason distinguishes the two ways
-        // to get there, and costs a second open only on the path that is already failing.
-        auto const corpus = sftest::load_smiles(corpus_path, limit);
-        fmt::println("test_chiral_parity: corpus {}, {} SMILES", corpus_path, fmt::group_digits(corpus.size()));
-        if (corpus.empty()) {
-            std::ifstream probe(corpus_path);
-            if (!probe) return sftest::report_fail(test_name_k, "cannot open corpus {}", corpus_path);
-            return sftest::report_fail(test_name_k, "corpus {} opened but yielded no SMILES", corpus_path);
-        }
+        // vacuously, reporting a pass for work that never happened. The outcome distinguishes the two
+        // ways to get there without a second open.
+        std::vector<std::string> corpus;
+        auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, corpus);
+        if (outcome != sftest::smiles_load_t::loaded_k)
+            return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), selection.path);
+        fmt::println("{}: corpus {}, {} SMILES", test_name_k, selection.path, fmt::group_digits(corpus.size()));
+
         sftest::oracle_tally_t corpus_tally;
         for (auto const &smiles : corpus) {
             // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs
@@ -389,7 +398,7 @@ int main(int argc, char **argv) {
                 std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
                 if (!molecule) continue;
                 RDKit::MolOps::addHs(*molecule);
-                sftest::check_molecule_(*molecule, smiles, false, corpus_tally);
+                sftest::check_molecule_(*molecule, smiles, sftest::chiral_oracles_t::cip_only_k, corpus_tally);
             }
             catch (...) {
                 continue;
@@ -400,7 +409,7 @@ int main(int argc, char **argv) {
         // comparisons is indistinguishable from a tally of zero mismatches.
         if (corpus_tally.cip_compared == 0)
             return sftest::report_fail(test_name_k, "corpus {} produced no CIP comparisons over {} SMILES",
-                                       corpus_path, corpus.size());
+                                       selection.path, corpus.size());
         sf_verify_(corpus_tally.cip_mismatches == 0, "every corpus stereocenter must match the CIP oracle");
     }
 

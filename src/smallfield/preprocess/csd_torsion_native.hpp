@@ -23,6 +23,7 @@
 #include <cstdint> // `std::uint8_t`, `std::int8_t`
 
 #include <limits>      // `std::numeric_limits`
+#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
 #include "smallfield/preprocess/csd_torsion_predicates.hpp"
@@ -1089,7 +1090,6 @@ inline bool scan_recursive_chain(std::string_view text, std::uint8_t parent, sca
  *  @brief Turn one scanned atom and everything hanging off it into pool nodes.
  *
  *  @param[in] atoms Flat tree produced by `scan_recursive_chain`.
- *  @param[in] atom_count Entries in @p atoms.
  *  @param[in] scanned_index Atom to compile.
  *  @param[in] nesting How many `$(...)` levels enclose the body being compiled.
  *  @param[in] hops Distance in bonds from the body's root atom.
@@ -1097,7 +1097,7 @@ inline bool scan_recursive_chain(std::string_view text, std::uint8_t parent, sca
  *  @param[out] node Index of the node @p scanned_index compiled to.
  *  @return True when the whole subtree fits the compiler's vocabulary.
  */
-inline bool build_recursive_nodes(scanned_atom_t const *atoms, std::size_t atom_count, std::uint8_t scanned_index,
+inline bool build_recursive_nodes(std::span<scanned_atom_t const> atoms, std::uint8_t scanned_index,
                                   std::uint8_t nesting, std::uint8_t hops, recursive_pool_t &pool, std::uint8_t &node) {
     if (hops > max_recursive_hops_k) return false;
     if (pool.num_nodes >= max_recursive_nodes_k) return false;
@@ -1121,10 +1121,10 @@ inline bool build_recursive_nodes(scanned_atom_t const *atoms, std::size_t atom_
         pool.nodes[node_index].bond_disjuncts[slot] = bond.disjuncts[slot];
 
     std::uint8_t previous_child = no_recursive_node_k;
-    for (std::size_t index = 0; index < atom_count; ++index) {
+    for (std::size_t index = 0; index < atoms.size(); ++index) {
         if (atoms[index].parent != scanned_index) continue;
         std::uint8_t child = no_recursive_node_k;
-        if (!build_recursive_nodes(atoms, atom_count, static_cast<std::uint8_t>(index), nesting,
+        if (!build_recursive_nodes(atoms, static_cast<std::uint8_t>(index), nesting,
                                    static_cast<std::uint8_t>(hops + 1), pool, child))
             return false;
         if (previous_child == no_recursive_node_k) pool.nodes[node_index].first_child = child;
@@ -1143,7 +1143,7 @@ inline bool compile_recursive_body(std::string_view body, std::uint8_t nesting, 
     std::size_t atom_count = 0;
     if (!scan_recursive_chain(body, no_atom_k, atoms, atom_count)) return false;
     if (atom_count == 0) return false;
-    return build_recursive_nodes(atoms, atom_count, 0, nesting, 0, pool, root);
+    return build_recursive_nodes({atoms, atom_count}, 0, nesting, 0, pool, root);
 }
 
 /**
@@ -1204,29 +1204,28 @@ struct scanned_edge_t {
  *  `:4` back to `:1` is the rest of that cycle and nothing else reaches it.
  *
  *  @param[in] edges Every edge of the scanned pattern, path edges already struck out.
- *  @param[in] edge_count Number of entries in @p edges.
  *  @param[in] target Scanned index of `:1`, where the walk stops.
- *  @param[in] node_limit Largest route the closure representation can hold, endpoints included.
- *  @param[inout] route Scanned indices walked so far; the caller seeds it with `:4`.
+ *  @param[inout] route Scanned indices walked so far, seeded by the caller with `:4`; its extent is the
+ *                      largest route the closure representation can hold, endpoints included.
  *  @param[inout] route_length Entries currently in @p route.
  *  @return True when @p route ends on @p target.
  */
-inline bool walk_closure_arc(scanned_edge_t const *edges, std::size_t edge_count, std::uint8_t target,
-                             std::uint8_t node_limit, std::uint8_t *route, std::uint8_t &route_length) {
+inline bool walk_closure_arc(std::span<scanned_edge_t const> edges, std::uint8_t target, std::span<std::uint8_t> route,
+                             std::uint8_t &route_length) {
     std::uint8_t const current = route[route_length - 1];
     if (current == target) return true;
-    if (route_length >= node_limit) return false;
-    for (std::size_t edge = 0; edge < edge_count; ++edge) {
-        if (edges[edge].forbidden) continue;
+    if (route_length >= route.size()) return false;
+    for (auto const &edge : edges) {
+        if (edge.forbidden) continue;
         std::uint8_t next = no_atom_k;
-        if (edges[edge].first == current) next = edges[edge].second;
-        else if (edges[edge].second == current) next = edges[edge].first;
+        if (edge.first == current) next = edge.second;
+        else if (edge.second == current) next = edge.first;
         else continue;
         bool seen = false;
         for (std::uint8_t step = 0; step < route_length; ++step) seen = seen || route[step] == next;
         if (seen) continue;
         route[route_length++] = next;
-        if (walk_closure_arc(edges, edge_count, target, node_limit, route, route_length)) return true;
+        if (walk_closure_arc(edges, target, route, route_length)) return true;
         --route_length;
     }
     return false;
@@ -1428,9 +1427,7 @@ inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern
 
         arc[0] = path[3];
         arc_length = 1;
-        if (!walk_closure_arc(edges, edge_count, path[0], static_cast<std::uint8_t>(max_ring_closure_atoms_k + 2), arc,
-                              arc_length))
-            return false;
+        if (!walk_closure_arc({edges, edge_count}, path[0], arc, arc_length)) return false;
 
         pattern.closure.active = 1;
         pattern.closure.num_atoms = static_cast<std::uint8_t>(arc_length - 2);

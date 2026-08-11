@@ -40,6 +40,14 @@ inline constexpr std::uint32_t max_neighbor_entries_k = max_bonds_k * 2;
 /** Maximum SSSR rings supported. Drug-like molecules rarely exceed 8. */
 inline constexpr std::uint32_t max_rings_k = 32;
 
+/**
+ *  @brief Bond-hop count for a pair with no bonded path — the two halves of a salt, a solvate's water.
+ *
+ *  Also the saturation value, and unreachable as a real distance because the longest simple path across
+ *  `max_atoms_per_molecule_k` atoms is 191 hops.
+ */
+inline constexpr std::uint8_t unreachable_hops_k = 255u;
+
 /** Flat bit representation of hybridization. Matches `RDKit::Atom::HybridizationType` ordering. */
 enum hybridization_t : std::uint8_t {
     hybridization_unspecified_k = 0,

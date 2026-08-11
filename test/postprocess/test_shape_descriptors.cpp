@@ -17,6 +17,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
 #include <memory>      // `std::unique_ptr`
+#include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -62,9 +63,9 @@ static std::unique_ptr<RDKit::RWMol> prepare_mol_(std::string const &smiles, int
     return molecule;
 }
 
-static double max_abs_diff_(std::vector<double> const &reference, double const *native, std::size_t count) {
+static double max_abs_diff_(std::span<double const> reference, std::span<double const> native) {
     double worst = 0.0;
-    for (std::size_t element = 0; element < count; ++element) {
+    for (std::size_t element = 0; element < native.size(); ++element) {
         double const difference = std::fabs(reference[element] - native[element]);
         if (difference > worst) worst = difference;
     }
@@ -91,7 +92,7 @@ static void validate_descriptors_(std::string const &smiles) {
     sfp::usr_descriptor(std::span<float const>(coords.data(), coords.size()), num_atoms, native_usr);
     std::vector<double> rdkit_usr(12, 0.0);
     RDKit::Descriptors::USR(*molecule, rdkit_usr);
-    double const usr_deviation = max_abs_diff_(rdkit_usr, native_usr.data(), 12);
+    double const usr_deviation = max_abs_diff_(rdkit_usr, native_usr);
 
     // USRCAT.
     std::array<double, 60> native_usrcat {};
@@ -99,7 +100,7 @@ static void validate_descriptors_(std::string const &smiles) {
     std::vector<double> rdkit_usrcat(60, 0.0);
     std::vector<std::vector<unsigned int>> atom_ids;
     RDKit::Descriptors::USRCAT(*molecule, rdkit_usrcat, atom_ids);
-    double const usrcat_deviation = max_abs_diff_(rdkit_usrcat, native_usrcat.data(), 60);
+    double const usrcat_deviation = max_abs_diff_(rdkit_usrcat, native_usrcat);
 
     double const tolerance = 1e-4;
     fmt::println("  NOTE shape_descriptors smiles={:<34} usr_max_deviation={:.3g} usrcat_max_deviation={:.3g}", smiles,

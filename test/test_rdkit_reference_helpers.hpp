@@ -10,14 +10,18 @@
 
 #include <cmath>   // `std::fabs`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
-#include <cstdlib> // `std::exit`
+#include <cstdlib> // `std::getenv`
 
-#include <algorithm> // `std::max`
-#include <fstream>   // `std::ifstream`
-#include <limits>    // `std::numeric_limits`
-#include <memory>    // `std::unique_ptr`
-#include <string>    // `std::string`
-#include <vector>    // `std::vector`
+#include <algorithm>    // `std::max`
+#include <charconv>     // `std::from_chars`
+#include <fstream>      // `std::ifstream`
+#include <limits>       // `std::numeric_limits`
+#include <memory>       // `std::unique_ptr`
+#include <span>         // `std::span`
+#include <string>       // `std::string`
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::errc`
+#include <vector>       // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`
 
@@ -32,35 +36,17 @@
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
+#include "smallfield/types/etkdg_types.hpp"
+#include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/views.hpp"
+
 #include "test/test_helpers.hpp"
 
-/**
- *  @brief Fail the test with a message and the source location when @p condition is false.
- *
- *  Carries the `sf_` prefix so it cannot collide with RDKit's own `TEST_ASSERT`, which keeps the
- *  tests free of any framework dependency.
- *
- *  Aborting still spends the test's one verdict, so this prints the same `FAIL <test_name>: <reason>`
- *  a `main` would have returned -- otherwise `grep '^FAIL test_'` would list every test that returned
- *  a failure and silently omit every test that asserted its way out.  The name comes from the
- *  `test_name_k` each test declares beside its `main`.
- */
-#define sf_verify_(condition, message)                                                                       \
-    do {                                                                                                     \
-        if (!(condition)) {                                                                                  \
-            [[maybe_unused]] int const exit_code = smallfield::tests::report_fail(test_name_k, "{} at {}:{}", \
-                                                                                  (message), __FILE__,       \
-                                                                                  __LINE__);                 \
-            std::exit(1);                                                                                    \
-        }                                                                                                    \
-    } while (0)
-
-#define sf_verify_near_(actual, expected, tolerance, message)                                                    \
-    sf_verify_(                                                                                                  \
-        std::fabs(static_cast<double>(actual) - static_cast<double>(expected)) < static_cast<double>(tolerance), \
-        (message))
-
 namespace smallfield::tests {
+
+using smallfield::types::hop_matrix_t;
+using smallfield::types::mmff94_bond_t;
+using smallfield::types::unreachable_hops_k;
 
 /**
  *  @brief Create a molecule from SMILES with explicit hydrogens added.
@@ -90,6 +76,24 @@ inline bool embed_molecule(RDKit::RWMol &molecule, int seed = 42) {
     params.randomSeed = seed;
     int conformer_id = RDKit::DGeomHelpers::EmbedMolecule(molecule, params);
     return conformer_id >= 0;
+}
+
+/**
+ *  @brief Attach an all-zero 3D conformer sized to the molecule, without embedding it.
+ *
+ *  `set_coords_interleaved` needs a conformer to overwrite, and a caller that is about to supply its own
+ *  coordinates has no use for ETKDG's. Embedding to obtain the slot also discards whichever molecules ETKDG
+ *  refuses, and those are not drawn uniformly: over a 4,788-molecule drug-like corpus ETKDGv3 at seed 42
+ *  refuses 0.46 % overall but 5.2 % of the 100-128 atom bin, so the discard thins the very bin a size-binned
+ *  comparison judges.
+ *
+ *  @param[inout] molecule Molecule to receive the conformer.
+ *  @return Identifier of the conformer just attached.
+ */
+inline unsigned int attach_empty_conformer(RDKit::RWMol &molecule) {
+    auto conformer = std::make_unique<RDKit::Conformer>(molecule.getNumAtoms());
+    conformer->set3D(true);
+    return molecule.addConformer(conformer.release(), true);
 }
 
 /**
@@ -173,42 +177,118 @@ inline std::vector<double> rdkit_bounds_matrix(RDKit::RWMol &molecule) {
     return flat;
 }
 
-/** What happens when a SMILES corpus file passed to `load_smiles` cannot be opened. */
-enum class smiles_missing_file_t {
-    returns_empty_k,
-    aborts_k,
+/** How a `load_smiles_into` call ended; a named path that does not open is never an empty run. */
+enum class smiles_load_t {
+    /** The file opened and yielded at least one SMILES. */
+    loaded_k,
+    /** The path could not be opened at all. */
+    missing_file_k,
+    /** The file opened but held no SMILES line. */
+    empty_file_k,
 };
 
+/** The sentence a `smiles_load_t` reads as, for the caller's own `FAIL <test_name>: <reason>`. */
+inline std::string_view smiles_load_reason(smiles_load_t outcome) noexcept {
+    switch (outcome) {
+    case smiles_load_t::missing_file_k: return "cannot open corpus";
+    case smiles_load_t::empty_file_k: return "corpus opened but yielded no SMILES";
+    default: return "corpus loaded";
+    }
+}
+
 /**
- *  @brief Load up to @p max_count SMILES strings from @p path, one per line, first field only.
+ *  @brief Load up to @p max_count SMILES strings from @p path into @p out, one per line, first field only.
  *
  *  Lines starting with `#` are skipped, and each kept line is truncated at its first run of
  *  whitespace, which drops a trailing name field along with any `\r`.
  *
+ *  The outcome is returned rather than exited on, so the failure is reported by the caller under its
+ *  own `test_name_k` and answers `grep '^FAIL test_'`; a helper that exits reports under whatever
+ *  literal it was written with and is invisible to that filter.
+ *
  *  @param[in] path File to read.
  *  @param[in] max_count Upper bound on how many lines to keep.
- *  @param[in] on_missing Whether a missing @p path aborts the process or yields an empty list.
- *  @return The loaded SMILES; empty when the file cannot be opened and @p on_missing allows it.
+ *  @param[out] out Cleared, then filled with the loaded SMILES.
+ *  @return Whether the file opened, and whether it held anything.
  */
-inline std::vector<std::string> load_smiles(std::string const &path, std::size_t max_count,
-                                            smiles_missing_file_t on_missing = smiles_missing_file_t::returns_empty_k) {
-    std::vector<std::string> smiles_list;
+inline smiles_load_t load_smiles_into(std::string const &path, std::size_t max_count, std::vector<std::string> &out) {
+    out.clear();
     std::ifstream file(path);
-    if (!file) {
-        if (on_missing == smiles_missing_file_t::aborts_k) {
-            [[maybe_unused]] int const exit_code = report_fail("corpus", "cannot open {}", path);
-            std::exit(1);
-        }
-        return smiles_list;
-    }
+    if (!file) return smiles_load_t::missing_file_k;
     std::string line;
-    while (smiles_list.size() < max_count && std::getline(file, line)) {
+    while (out.size() < max_count && std::getline(file, line)) {
         if (line.empty() || line[0] == '#') continue;
         std::size_t const end = line.find_first_of(" \t\r");
         if (end != std::string::npos) line.resize(end);
-        if (!line.empty()) smiles_list.push_back(std::move(line));
+        if (!line.empty()) out.push_back(std::move(line));
     }
+    return out.empty() ? smiles_load_t::empty_file_k : smiles_load_t::loaded_k;
+}
+
+/**
+ *  @brief `load_smiles_into` for a caller that treats an unreadable @p path as an empty corpus.
+ *
+ *  Prefer `load_smiles_into` wherever the path was named by a flag or an environment variable: a
+ *  corpus nobody can open then fails loudly instead of passing a validator that compared nothing.
+ */
+inline std::vector<std::string> load_smiles(std::string const &path, std::size_t max_count) {
+    std::vector<std::string> smiles_list;
+    [[maybe_unused]] smiles_load_t const outcome = load_smiles_into(path, max_count, smiles_list);
     return smiles_list;
+}
+
+/** Whether a test was pointed at a corpus, and whether its command line made sense. */
+enum class corpus_knob_t {
+    /** Neither knob was given, so the built-in molecules are the whole corpus. */
+    unset_k,
+    /** A path was named, by `argv[1]` or by `SMALLFIELD_TEST_CORPUS`. */
+    named_k,
+    /** An argument could not be understood; the caller prints a usage line and exits 2. */
+    refused_k,
+};
+
+/** The corpus a test walks, as resolved from its command line and environment. */
+struct corpus_selection_t {
+    corpus_knob_t knob = corpus_knob_t::unset_k;
+    std::string path;
+    std::size_t max_molecules = 0;
+};
+
+/**
+ *  @brief Resolve the corpus knobs every corpus-driven test shares.
+ *
+ *  The path comes from `argv[1]`, falling back to `SMALLFIELD_TEST_CORPUS`; the cap comes from
+ *  `argv[2]`, falling back to `SMALLFIELD_TEST_MAX_MOLS`, and finally to @p default_max_molecules.
+ *  No corpus path is ever a literal in a test, so a binary that names one names it here.
+ *
+ *  @param[in] argc Argument count as `main` received it.
+ *  @param[in] argv Argument vector as `main` received it.
+ *  @param[in] default_max_molecules Cap applied when neither cap knob is set.
+ *  @return The resolved corpus, or `refused_k` when a cap argument is not a number.
+ */
+inline corpus_selection_t select_corpus(int argc, char const *const *argv, std::size_t default_max_molecules) {
+    corpus_selection_t selection;
+    selection.max_molecules = default_max_molecules;
+
+    char const *const path_from_environment = std::getenv("SMALLFIELD_TEST_CORPUS");
+    if (argc > 1 && argv[1][0] != '\0') selection.path = argv[1];
+    else if (path_from_environment != nullptr && path_from_environment[0] != '\0')
+        selection.path = path_from_environment;
+    if (!selection.path.empty()) selection.knob = corpus_knob_t::named_k;
+
+    char const *const cap_from_environment = std::getenv("SMALLFIELD_TEST_MAX_MOLS");
+    char const *cap_text = nullptr;
+    if (argc > 2) cap_text = argv[2];
+    else if (cap_from_environment != nullptr && cap_from_environment[0] != '\0') cap_text = cap_from_environment;
+    if (cap_text != nullptr) {
+        std::string_view const text {cap_text};
+        std::size_t ceiling = 0;
+        auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), ceiling);
+        if (error != std::errc {} || unparsed != text.data() + text.size() || ceiling == 0)
+            selection.knob = corpus_knob_t::refused_k;
+        else selection.max_molecules = ceiling;
+    }
+    return selection;
 }
 
 /**
@@ -253,31 +333,32 @@ inline std::vector<std::string> standard_test_smiles() {
  *  kernel derive it here from the same bond list, breadth-first from every source atom.
  *  Pairs with no bonded path keep 255, which the nonbonded sweep reads as unreachable.
  *
+ *  The atom count is not a parameter: @p matrix carries its own extent, so it cannot disagree with the
+ *  storage behind it.
+ *
  *  @param[in] bonds Bond terms, each exposing `atom_i` and `atom_j`.
- *  @param[in] bond_count Number of bonds.
- *  @param[in] num_atoms Atom count; the matrix is @p num_atoms squared entries.
- *  @param[out] matrix Resized to @p num_atoms squared and filled row-major.
+ *  @param[out] matrix Square view over caller-owned storage, filled row-major.
  */
-template <typename bond_>
-inline void fill_bond_hops(bond_ const *bonds, std::uint32_t bond_count, std::uint32_t num_atoms,
-                           std::vector<std::uint8_t> &matrix) {
-    matrix.assign(static_cast<std::size_t>(num_atoms) * num_atoms, std::uint8_t {255});
+inline void fill_bond_hops_into(std::span<mmff94_bond_t const> bonds, hop_matrix_t matrix) {
+    std::uint32_t const num_atoms = matrix.extent(0);
+    for (std::uint32_t source = 0; source < num_atoms; ++source)
+        for (std::uint32_t target = 0; target < num_atoms; ++target) matrix(source, target) = unreachable_hops_k;
+
     std::vector<std::uint8_t> queue(num_atoms, std::uint8_t {0});
     for (std::uint32_t source = 0; source < num_atoms; ++source) {
-        std::uint8_t *const row = matrix.data() + static_cast<std::size_t>(source) * num_atoms;
-        row[source] = 0;
+        matrix(source, source) = 0;
         std::uint32_t head = 0, tail = 0;
         queue[tail++] = static_cast<std::uint8_t>(source);
         while (head < tail) {
             std::uint8_t const current = queue[head++];
-            std::uint8_t const next_distance = static_cast<std::uint8_t>(row[current] + 1);
-            for (std::uint32_t bond = 0; bond < bond_count; ++bond) {
-                std::uint8_t neighbor = 255;
-                if (bonds[bond].atom_i == current) neighbor = bonds[bond].atom_j;
-                else if (bonds[bond].atom_j == current) neighbor = bonds[bond].atom_i;
+            auto const next_distance = static_cast<std::uint8_t>(matrix(source, current) + 1);
+            for (auto const &bond : bonds) {
+                std::uint8_t neighbor = unreachable_hops_k;
+                if (bond.atom_i == current) neighbor = bond.atom_j;
+                else if (bond.atom_j == current) neighbor = bond.atom_i;
                 else continue;
-                if (row[neighbor] > next_distance) {
-                    row[neighbor] = next_distance;
+                if (matrix(source, neighbor) > next_distance) {
+                    matrix(source, neighbor) = next_distance;
                     queue[tail++] = neighbor;
                 }
             }
