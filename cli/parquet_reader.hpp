@@ -17,6 +17,8 @@
 
 #include <arrow/table.h>
 
+#include "smallfield/log.hpp"
+
 namespace smallfield::cli {
 
 /** Zero-copy SMILES views backed by an Arrow table; the table must outlive the views. */
@@ -28,6 +30,8 @@ struct shard_data_t {
     std::uint64_t num_rows() const noexcept { return smiles.size(); }
 };
 
-[[nodiscard]] bool read_shard(std::filesystem::path const &path, std::string const &smiles_column, shard_data_t &out);
+/** @param[in] log Logger read failures are reported through; null falls back to a default one. */
+[[nodiscard]] bool read_shard(std::filesystem::path const &path, std::string const &smiles_column, shard_data_t &out,
+                              logger_t const *log = nullptr);
 
 } // namespace smallfield::cli

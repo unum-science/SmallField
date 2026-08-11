@@ -4,7 +4,6 @@
  *  as a single ZSTD-compressed Parquet shard matching the schema declared in `parquet_writer.hpp`.
  */
 
-#include <cstdio>  // `fprintf`, `stderr`
 #include <cstring> // `std::memset`, `std::memcpy`
 
 #include <algorithm> // `std::min`, `std::stable_sort`
@@ -25,6 +24,7 @@
 #include <arrow/type.h>
 #include <arrow/util/float16.h>
 #include <arrow/util/key_value_metadata.h>
+#include <fmt/std.h> // formats `std::filesystem::path`
 #include <parquet/arrow/writer.h>
 
 #include "smallfield/api/conformer_layout.hpp"
@@ -192,13 +192,15 @@ static std::shared_ptr<arrow::Array> pack_usrcat_as_fp16_list(std::span<double c
     return out;
 }
 
-bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
+bool write_shard(fs::path const &path, writer_inputs_t const &inputs, logger_t const *log) {
     std::uint64_t const num_molecules = inputs.num_molecules;
     std::uint32_t const max_conformers = inputs.max_conformers;
     std::uint32_t const coord_stride_halves = inputs.max_atoms * 3u;
+    logger_t const fallback;
+    logger_t const &logger = log != nullptr ? *log : fallback;
 
     if (inputs.num_atoms_per_molecule.empty() || inputs.n_conformers_per_molecule.empty()) {
-        std::fprintf(stderr, "[smallfield_batch] write_shard: per-molecule arrays missing\n");
+        logger.error("write_shard: per-molecule arrays missing");
         return false;
     }
 
@@ -208,10 +210,9 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     // coordinate packer.
     std::size_t const total_slots = static_cast<std::size_t>(num_molecules) * max_conformers;
     auto fail_size_ = [&](char const *what, std::size_t got, std::size_t want) {
-        std::fprintf(stderr,                                                                            //
-                     "[smallfield_batch] write_shard: %s size %zu < expected %zu (num_molecules=%llu, " //
-                     "max_conformers=%u, max_atoms=%u)\n",                                              //
-                     what, got, want, static_cast<unsigned long long>(num_molecules), max_conformers, inputs.max_atoms);
+        logger.error("write_shard: {} size {} < expected {} (num_molecules={}, max_conformers={}, max_atoms={})", what,
+                     fmt::group_digits(got), fmt::group_digits(want), fmt::group_digits(num_molecules), max_conformers,
+                     inputs.max_atoms);
         return false;
     };
     if (inputs.num_atoms_per_molecule.size() < num_molecules)
@@ -401,7 +402,7 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
         std::span<std::uint64_t const>(mol_per_row), std::span<std::uint32_t const>(slot_per_row), max_conformers,
         coord_stride_halves);
     if (!coord_array) {
-        std::fprintf(stderr, "[smallfield_batch] coordinate buffer allocation failed\n");
+        logger.error("coordinate buffer allocation failed");
         return false;
     }
 
@@ -409,7 +410,7 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
         inputs.usrcat, 60u, std::span<std::int8_t const>(row_outcomes), std::span<std::uint64_t const>(mol_per_row),
         std::span<std::uint32_t const>(slot_per_row), max_conformers);
     if (!usrcat_array) {
-        std::fprintf(stderr, "[smallfield_batch] descriptor buffer build failed\n");
+        logger.error("descriptor buffer build failed");
         return false;
     }
 
@@ -467,8 +468,7 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
 
     auto outfile_result = arrow::io::FileOutputStream::Open(path.string());
     if (!outfile_result.ok()) {
-        std::fprintf(stderr, "[smallfield_batch] output open failed: %s: %s\n", path.string().c_str(),
-                     outfile_result.status().message().c_str());
+        logger.error("output open failed: {}: {}", path, outfile_result.status().message());
         return false;
     }
     auto outfile = outfile_result.ValueOrDie();
@@ -479,8 +479,7 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     auto write_status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile, 65536, writer_props,
                                                    arrow_props);
     if (!write_status.ok()) {
-        std::fprintf(stderr, "[smallfield_batch] write failed: %s: %s\n", path.string().c_str(),
-                     write_status.message().c_str());
+        logger.error("write failed: {}: {}", path, write_status.message());
         return false;
     }
 

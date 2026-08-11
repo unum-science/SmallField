@@ -21,7 +21,6 @@
 #pragma once
 
 #include <cstdint> // `std::int8_t`, `std::uint32_t`
-#include <cstdio>  // `std::fprintf`
 #include <cstdlib> // `std::abort`
 
 #include <memory> // `std::unique_ptr`
@@ -39,6 +38,7 @@
 #include <GraphMol/ChemTransforms/ChemTransforms.h>
 #include <GraphMol/SmilesParse/SmilesWrite.h>
 
+#include "smallfield/log.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/preprocess/csd_torsion_native.hpp"
@@ -204,10 +204,12 @@ inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
         auto compiled = compile_patterns(combined);
         for (auto const &pattern : compiled)
             if (!pattern.native) {
-                std::fprintf(
-                    stderr,
-                    "smallfield: CSD torsion pattern does not compile natively and there is no fallback:\n  %s\n",
-                    pattern.smarts.c_str());
+                // Static init has no caller to borrow a logger from, so this one-shot fatal path owns a
+                // default-configured one.
+                logger_t const logger;
+                logger.error("smallfield: CSD torsion pattern does not compile natively and there is no fallback:\n"
+                             "  {}",
+                             pattern.smarts);
                 std::abort();
             }
         return compiled;

@@ -89,7 +89,7 @@ __MMFF term positions keep the specification's letter as a suffix.__
 MMFF94 defines a bond over atoms i-j, an angle over i-j-k and a torsion over i-j-k-l, so `atom_i` maps onto the published equations where `first_atom` does not — and `mmff94_bond_t::atom_i` already spells it that way.
 The exemption is narrow: it holds only where the letter genuinely is a term position.
 A matrix walk names `row` and `column`, and a cursor that merely happens to be spelled `i` names its axis like any other.
-Getting this backwards is not cosmetic — `aj` in four files held the MMFF **k** atom, so the obvious rename would have been wrong and would have compiled.
+Getting this backwards is not cosmetic — `aj` in four files held the MMFF __k__ atom, so the obvious rename would have been wrong and would have compiled.
 
 __Directory trees stay flat.__
 The maximum depth is `src/smallfield/<subsystem>/<file>`.
@@ -209,6 +209,56 @@ __Split a long string literal yourself and pin each fragment with a trailing `//
 Left alone, clang-format chops a literal that overruns the column limit and chops the pieces again on the next run, until a word reads `"a" "r" "r" "a" "y" "s"` — which is what the Python binding's docstring had decayed into.
 The pin holds the split where you put it.
 
+## Diagnostics
+
+__The printed precision of a comparison diagnostic must be at least as fine as the predicate that decided it was a mismatch.__
+
+A diagnostic that can render two failing values identically converts a caught bug into a confusing one.
+Both instances found here were in tests written to catch single-bit divergence:
+
+- a __bitwise__ equality predicate reporting its operands at `%.4f`, so any one-ULP host versus device difference — exactly what the test exists to catch — printed as two identical numbers
+- a `1e-5` tolerance also reporting at `%.4f`, where a failing pair is __guaranteed__ to render identically, because the threshold sits an order of magnitude below the print resolution
+
+`{}` in `{fmt}` is shortest-round-trip, the minimum digits that reconstruct the value, so two distinct floats can never print alike.
+Unlike `%.9g` it is not float-versus-double specific.
+
+__The house grammar is one line per differing field, a verb at column zero, ASCII keys, and `key=value` throughout.__
+
+```
+MISMATCH vdw atom_type=7 field=alpha host=0.65 device=0.65000004 delta=+5.96e-08
+PASS vdw compared=570 mismatches=0 suppressed=0
+```
+
+Four properties earn their keep.
+One line per differing field, so the failing field names itself rather than the reader diffing four numbers.
+ASCII keys — `alpha`, not `α` — because keys are what you grep.
+`key=value` throughout, so `awk -F'[ =]'` and `grep 'field=alpha'` both work.
+A verb at column zero, so `^MISMATCH` filters alongside `^PASS` and `^FAIL`.
+
+Precision is keyed to what the number __is__, not chosen per site:
+
+| role | spec | why |
+|---|---|---|
+| a compared value | `{}` | shortest round-trip, so two distinct floats never print alike |
+| a delta | `{:+.3g}` | sign always visible, three digits shows the magnitude |
+| a tolerance | `{:.3g}` | matches the delta it is compared against |
+| a duration in milliseconds | `{:.1f}` | 0.1 ms is the meaningful resolution |
+| a percentage | `{:.3f}` | gate and report must agree, and one pair here did not |
+| a count | `{}`, or `fmt::group_digits` when a human reads it | never group a number a script might parse |
+
+__The reporter in `test/test_helpers.hpp` owns the grammar, so a call site passes values and never a format string.__
+It formats and never compares.
+`field` takes the caller's predicate, because the live ones disagree at exactly `error == tolerance` and a built-in tolerance would move a boundary by stealth.
+
+__Every section ends with its comparison count.__
+`PASS vdw compared=0` and a real pass must not read alike.
+A validator that silently compares nothing is the defect this convention was written after: one aliased its reference to our own entry and compared 5000 values against themselves, and another bound its result to an unused variable and checked nothing at all.
+
+__Three sinks, chosen by who reads the output.__
+`src/` and `cli/` are operator-facing and long-running, so they use `logger_t` and want the wall clock.
+`bench/` is read as a report, so it uses bare `fmt::println`.
+`test/` uses the reporter and __not__ the logger, because a 34-character varying timestamp destroys column alignment and makes two runs undiffable, and ctest already timestamps.
+
 ## Performance Claims
 
 __A performance number states its corpus, its sample size, and its weighting.__
@@ -259,6 +309,14 @@ __Precompiled headers cannot work for `.cu` files.__
 nvcc preprocesses to a synthetic flat file before the host compiler runs, so no `#include` directive survives for a `.gch` to match.
 Measured on the C++ half alone it was 111 s against 109 s, and nvcc `--threads` measured slower than none, 380 s against 366 s, because `-j` already saturates the machine.
 A linker swap is equally pointless: the host link is 0.64 s, and the bytes come from `ptxas`, which no host linker replaces.
+
+__Never add `#include <fmt/…>` to a header under `cuda/`, to any `*_device.cuh`, or to `mmff94_tables_device.cuh`, and never use `{fmt}` inside a `__device__`, `__global__` or `__host__ __device__` body.__
+
+The boundary is not the file extension, and getting that wrong costs work in both directions.
+`{fmt}` is already compiled by nvcc here — `smallfield.cu` is forced to `LANGUAGE CUDA` and reaches `fmt/chrono.h` transitively, with consteval-checked `logger.*` calls that build.
+And there is no device-side `printf` anywhere in this repository; every `printf` in a `.cu` or `.cuh` is host-side, in a launch wrapper or an allocation-failure path, so all of it is migratable.
+So the exclusion is a list of function bodies, enforced by a rule about includes.
+A host-side failure path inside one of those headers takes a `logger_t const *` instead, as `cuda_error.hpp` already does.
 
 Build settings are interface targets, never `CMAKE_<LANG>_FLAGS` mutations.
 A global flag variable reaches every target in every subdirectory, and the `if(CMAKE_BUILD_TYPE STREQUAL "Release")` guard around one is invisible to multi-config generators, where that variable is empty — which silently dropped every optimization flag under Ninja Multi-Config and dropped `--expt-relaxed-constexpr` from every test `.cu` in Debug.

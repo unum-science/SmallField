@@ -18,6 +18,8 @@
 #include <filesystem> // `std::filesystem::path`
 #include <vector>     // `std::vector`
 
+#include "smallfield/log.hpp"
+
 namespace smallfield::cli {
 
 /** One input/output Parquet shard with its row count and completion flag. */
@@ -35,13 +37,18 @@ struct shard_pair_t {
  *
  *  @param[in] resume when true, already-complete shards are flagged; when false,
  *         all outputs are considered pending (caller will overwrite).
+ *  @param[in] log Logger diagnostics are reported through; null falls back to a default one.
  */
 std::vector<shard_pair_t> inventory_shards(std::filesystem::path const &input_dir,
-                                           std::filesystem::path const &output_dir, bool resume);
+                                           std::filesystem::path const &output_dir, bool resume,
+                                           logger_t const *log = nullptr);
 
 /**
  *  @brief List every `*.parquet` file in @p input_dir, excluding `*.3D.parquet`, sorted lexicographically.
+ *
+ *  @param[in] log Logger diagnostics are reported through; null falls back to a default one.
  */
-std::vector<std::filesystem::path> list_input_shards(std::filesystem::path const &input_dir);
+std::vector<std::filesystem::path> list_input_shards(std::filesystem::path const &input_dir,
+                                                     logger_t const *log = nullptr);
 
 } // namespace smallfield::cli

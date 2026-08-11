@@ -4,13 +4,12 @@
  *  the retained table.
  */
 
-#include <cstdio> // `fprintf`, `stderr`
-
 #include <memory> // `std::shared_ptr`
 
 #include <arrow/array.h>
 #include <arrow/io/file.h>
 #include <arrow/table.h>
+#include <fmt/std.h> // formats `std::filesystem::path`
 #include <parquet/arrow/reader.h>
 #include <parquet/file_reader.h>
 
@@ -20,14 +19,15 @@ namespace fs = std::filesystem;
 
 namespace smallfield::cli {
 
-bool read_shard(fs::path const &path, std::string const &smiles_column, shard_data_t &out) {
+bool read_shard(fs::path const &path, std::string const &smiles_column, shard_data_t &out, logger_t const *log) {
     out.table.reset();
     out.smiles.clear();
+    logger_t const fallback;
+    logger_t const &logger = log != nullptr ? *log : fallback;
 
     auto open_result = arrow::io::ReadableFile::Open(path.string(), arrow::default_memory_pool());
     if (!open_result.ok()) {
-        std::fprintf(stderr, "  read failed (open): %s: %s\n", path.string().c_str(),
-                     open_result.status().message().c_str());
+        logger.error("read failed (open): {}: {}", path, open_result.status().message());
         return false;
     }
     auto infile = open_result.ValueOrDie();
@@ -37,8 +37,7 @@ bool read_shard(fs::path const &path, std::string const &smiles_column, shard_da
     parquet::arrow::FileReaderBuilder builder;
     auto builder_open_status = builder.Open(infile);
     if (!builder_open_status.ok()) {
-        std::fprintf(stderr, "  read failed (parquet): %s: %s\n", path.string().c_str(),
-                     builder_open_status.message().c_str());
+        logger.error("read failed (parquet): {}: {}", path, builder_open_status.message());
         return false;
     }
     parquet::ArrowReaderProperties arrow_props;
@@ -46,8 +45,7 @@ bool read_shard(fs::path const &path, std::string const &smiles_column, shard_da
     builder.properties(arrow_props);
     auto reader_result = builder.Build();
     if (!reader_result.ok()) {
-        std::fprintf(stderr, "  read failed (parquet): %s: %s\n", path.string().c_str(),
-                     reader_result.status().message().c_str());
+        logger.error("read failed (parquet): {}: {}", path, reader_result.status().message());
         return false;
     }
     auto reader = std::move(reader_result).ValueOrDie();
@@ -61,14 +59,14 @@ bool read_shard(fs::path const &path, std::string const &smiles_column, shard_da
         }
     }
     if (smiles_column_index < 0) {
-        std::fprintf(stderr, "  column %s not found in %s\n", smiles_column.c_str(), path.string().c_str());
+        logger.error("column {} not found in {}", smiles_column, path);
         return false;
     }
 
     std::shared_ptr<arrow::Table> table;
     auto read_status = reader->ReadTable({smiles_column_index}, &table);
     if (!read_status.ok() || !table) {
-        std::fprintf(stderr, "  read failed: %s: %s\n", path.string().c_str(), read_status.message().c_str());
+        logger.error("read failed: {}: {}", path, read_status.message());
         return false;
     }
 
@@ -79,7 +77,7 @@ bool read_shard(fs::path const &path, std::string const &smiles_column, shard_da
     for (int chunk_index = 0; chunk_index < column->num_chunks(); ++chunk_index) {
         auto chunk = std::static_pointer_cast<arrow::StringArray>(column->chunk(chunk_index));
         if (!chunk) {
-            std::fprintf(stderr, "  column %s is not string in %s\n", smiles_column.c_str(), path.string().c_str());
+            logger.error("column {} is not string in {}", smiles_column, path);
             return false;
         }
         for (int64_t local_index = 0; local_index < chunk->length(); ++local_index) {

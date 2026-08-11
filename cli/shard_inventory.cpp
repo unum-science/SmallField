@@ -4,13 +4,12 @@
  *  `.encoded` sentinels to find already-complete shards.
  */
 
-#include <cstdio> // `fprintf`, `stderr`
-
 #include <algorithm>   // `std::sort`
 #include <string_view> // `std::string_view`
 #include <system_error>
 
 #include <arrow/io/file.h>
+#include <fmt/std.h> // formats `std::filesystem::path`
 #include <parquet/arrow/reader.h>
 #include <parquet/file_reader.h>
 
@@ -40,12 +39,15 @@ static bool is_output_shard(fs::path const &path) {
            filename.compare(filename.size() - suffix_k.size(), suffix_k.size(), suffix_k) == 0;
 }
 
-std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path const &output_dir, bool resume) {
+std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path const &output_dir, bool resume,
+                                           logger_t const *log) {
     std::vector<shard_pair_t> shards;
+    logger_t const fallback;
+    logger_t const &logger = log != nullptr ? *log : fallback;
 
     std::error_code error_code;
     if (!fs::is_directory(input_dir, error_code)) {
-        std::fprintf(stderr, "[smallfield_batch] input dir does not exist: %s\n", input_dir.string().c_str());
+        logger.error("input dir does not exist: {}", input_dir);
         return shards;
     }
     fs::create_directories(output_dir, error_code);
@@ -74,11 +76,14 @@ std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path c
     return shards;
 }
 
-std::vector<fs::path> list_input_shards(fs::path const &input_dir) {
+std::vector<fs::path> list_input_shards(fs::path const &input_dir, logger_t const *log) {
     std::vector<fs::path> paths;
+    logger_t const fallback;
+    logger_t const &logger = log != nullptr ? *log : fallback;
+
     std::error_code error_code;
     if (!fs::is_directory(input_dir, error_code)) {
-        std::fprintf(stderr, "[shard_inventory] input dir does not exist: %s\n", input_dir.string().c_str());
+        logger.error("input dir does not exist: {}", input_dir);
         return paths;
     }
     for (auto const &entry : fs::directory_iterator(input_dir, error_code)) {

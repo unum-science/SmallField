@@ -29,7 +29,6 @@
 #if defined(__CUDACC__)
 
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
-#include <cstdio>  // `std::fprintf`
 
 #include <vector> // `std::vector`
 
@@ -37,6 +36,7 @@
 
 #include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/cuda/warp_primitives.cuh"
+#include "smallfield/log.hpp"
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
@@ -206,13 +206,16 @@ inline void ensure_csd_torsion_device_stack() {
  *
  *  @param[in] host Staging buffers filled by `build_csd_torsion_table`.
  *  @param[out] table Device arena and view; the caller keeps it alive for every kernel that reads it.
+ *  @param[in] log Logger the allocation failure is reported through; null falls back to a default one.
  */
 inline void upload_csd_torsion_table_to_device(csd_torsion_table_host_t const &host,
-                                               csd_torsion_table_device_t &table) {
+                                               csd_torsion_table_device_t &table, logger_t const *log = nullptr) {
     ensure_csd_torsion_device_stack();
     std::size_t const total = host.byte_size() + 3 * 256;
     if (!table.arena.ensure_capacity(total)) {
-        std::fprintf(stderr, "upload_csd_torsion_table_to_device: device arena allocation (%zu bytes) failed\n", total);
+        logger_t const fallback;
+        (log != nullptr ? *log : fallback)
+            .error("upload_csd_torsion_table_to_device: device arena allocation ({} bytes) failed", total);
         return;
     }
     std::byte *const arena_base = table.arena.data();

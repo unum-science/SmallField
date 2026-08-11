@@ -46,6 +46,8 @@
 
 #include <cuda_fp16.h>
 
+#include "smallfield/log.hpp"
+
 namespace smallfield::cli {
 
 struct writer_inputs_t {
@@ -102,6 +104,8 @@ struct writer_inputs_t {
     std::span<double const> usrcat;
 };
 
-[[nodiscard]] bool write_shard(std::filesystem::path const &path, writer_inputs_t const &inputs);
+/** @param[in] log Logger write failures are reported through; null falls back to a default one. */
+[[nodiscard]] bool write_shard(std::filesystem::path const &path, writer_inputs_t const &inputs,
+                               logger_t const *log = nullptr);
 
 } // namespace smallfield::cli

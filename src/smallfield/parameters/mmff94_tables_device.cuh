@@ -21,7 +21,6 @@
 #pragma once
 
 #include <cstddef> // `std::byte`
-#include <cstdio>  // `fprintf`, `stderr`
 
 #include <utility> // `std::move`
 #include <vector>  // `std::vector`
@@ -29,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include "smallfield/api/wave_slice_pool.hpp"
+#include "smallfield/log.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/utilities.hpp"
 
@@ -141,8 +141,9 @@ mmff94_span<element_> place_const_or_global_(std::byte *arena_base, std::size_t 
 
 /** Upload every MMFF94 table in `host` to device memory. `out` is filled with device pointers;
  *  caller owns it and must keep it alive for the lifetime of any kernel launch that reads via
- *  `out.view`. */
-inline void upload_mmff94_tables_to_device(mmff94_tables_host_t const &host, mmff94_tables_device_t &out) {
+ *  `out.view`. The allocation failure is reported through `log`; null falls back to a default one. */
+inline void upload_mmff94_tables_to_device(mmff94_tables_host_t const &host, mmff94_tables_device_t &out,
+                                           logger_t const *log = nullptr) {
     cudaGetDevice(&out.device_id);
     // Upper-bound arena size: sum of all table bytes + 14 × 256-byte padding.
     std::size_t total = 0;
@@ -162,7 +163,9 @@ inline void upload_mmff94_tables_to_device(mmff94_tables_host_t const &host, mmf
     total += host.covrad.size() * sizeof(mmff94_covrad_entry_t) + 256;
 
     if (!out.arena.ensure_capacity(total)) {
-        std::fprintf(stderr, "upload_mmff94_tables_to_device: device arena allocation (%zu bytes) failed\n", total);
+        logger_t const fallback;
+        (log != nullptr ? *log : fallback)
+            .error("upload_mmff94_tables_to_device: device arena allocation ({} bytes) failed", total);
         return;
     }
     std::byte *const arena_base = out.arena.data();
