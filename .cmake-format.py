@@ -15,3 +15,19 @@ with section("format"):
     # If a statement is wrapped to more than one line, than dangle the closing
     # parenthesis on its own line.
     dangle_parens = True
+
+# Without these the project's own commands are parsed as a flat argument list, and every
+# argument lands on its own line rather than grouping under the keyword it belongs to.
+with section("parse"):
+    additional_commands = {
+        "define_smallfield_target": {
+            "pargs": 1,
+            "kwargs": {"SOURCES": "*", "LINK": "*", "DEFINES": "*"},
+        },
+        "define_smallfield_test": {
+            "pargs": 2,
+            "flags": ["MIXED"],
+            "kwargs": {"LINK": "*"},
+        },
+        "define_rdkit_library": {"pargs": 2},
+    }

@@ -160,14 +160,16 @@ From a clone, `pip install --no-build-isolation -e .` does the same thing.
 
 `pixi.toml` pins the environment this is developed and tested in — Python 3.14, RDKit 2025.09, Arrow 24 — and `pixi install` reproduces it.
 
-C++ tests and benchmarks need RDKit from conda-forge:
+C++ tests and benchmarks need RDKit, which `pixi install` already provides — the build finds the in-tree environment on its own, and `-DRDKIT_PREFIX=` is only needed to point at some other one.
 
 ```bash
-micromamba install -c conda-forge rdkit-dev
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --preset dev                     # one architecture, detected from the local GPU
 cmake --build build -j$(nproc)
-ctest --test-dir build --output-on-failure
+ctest --preset dev
 ```
+
+`--preset release` builds the full `80/89/90/100/120` fatbin into `build-release/`, which is what ships and what CI compiles.
+It is several times slower, so keep it for release checks rather than the inner loop.
 
 ## C++ Benchmarks
 

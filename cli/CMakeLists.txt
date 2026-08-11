@@ -1,96 +1,61 @@
-# SmallField batch binary: restartable Parquet folder → conformer Parquet folder.
-# Builds a CLI executable that processes a folder of Parquet files (one `smiles`
-# column) and emits 3D conformer coordinates + energies + status for K conformers
-# per molecule. Three-tier fallback: GPU → RDKit → NULL.
+# SmallField batch binary: a restartable Parquet folder of SMILES in, a Parquet folder of 3D conformer coordinates,
+# energies and per-conformer status out.  Three-tier fallback: GPU, then RDKit, then NULL.
 
-option(SMALLFIELD_BUILD_BATCH_BINARY "Build smallfield_batch CLI (requires Apache Arrow)" OFF)
-# Opt-in host-side NVTX ranges for `nsys` timelines. Header-only (NVTX3 ships with
-# the CUDA toolkit); compiles to nothing when OFF, so shipping builds are unaffected.
+option(SMALLFIELD_BUILD_BATCH_BINARY "Build the smallfield_batch CLI (requires Apache Arrow)" OFF)
+# Opt-in host-side NVTX ranges for `nsys` timelines.  Header-only, since NVTX3 ships with the CUDA toolkit, and compiles
+# to nothing when OFF, so shipping builds are unaffected.
 option(SMALLFIELD_ENABLE_NVTX "Annotate batch pipeline roles with NVTX ranges" OFF)
 
-if(NOT SMALLFIELD_BUILD_BATCH_BINARY)
+if (NOT SMALLFIELD_BUILD_BATCH_BINARY)
     return()
-endif()
+endif ()
 
-# Locate Arrow / Parquet. conda-forge libraries ship cmake config files under
-# ${RDKIT_PREFIX}/lib/cmake/Arrow and Parquet.
-if(RDKIT_PREFIX)
-    list(PREPEND CMAKE_PREFIX_PATH "${RDKIT_PREFIX}")
-endif()
-
+# conda-forge ships the Arrow and Parquet config files under the RDKit prefix, which the root already prepended to
+# CMAKE_PREFIX_PATH -- subdirectories inherit it.
 find_package(Arrow CONFIG REQUIRED)
 find_package(Parquet CONFIG REQUIRED)
 
-add_executable(smallfield_batch
-    smallfield_batch.cpp
-    parquet_reader.cpp
-    parquet_writer.cpp
-    shard_inventory.cpp
-    rdkit_fallback.cpp)
-
-set_source_files_properties(
-    smallfield_batch.cpp parquet_reader.cpp parquet_writer.cpp
-    shard_inventory.cpp rdkit_fallback.cpp
-    PROPERTIES LANGUAGE CXX)
-
-target_link_libraries(smallfield_batch PRIVATE
-    smallfield_lib
-    OpenMP::OpenMP_CXX
-    Arrow::arrow_shared
-    Parquet::parquet_shared
-    $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
-
-target_include_directories(smallfield_batch PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-
-set_target_properties(smallfield_batch PROPERTIES
-    LINKER_LANGUAGE CUDA)
-
-# Embed the producer git SHA so output shards are self-describing in a content-addressed
-# store (see the provenance key-value metadata in parquet_writer.cpp).
+# The producer git SHA is stamped into every shard's key-value metadata, so a shard stays self-describing in a
+# content-addressed store.  Reading it at configure time alone would go stale on the next commit and report a revision
+# that did not produce the file, so HEAD is registered as a configure dependency and moving it re-runs cmake.
+set_property(
+    DIRECTORY "${PROJECT_SOURCE_DIR}"
+    APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/.git/HEAD"
+)
 execute_process(
-    COMMAND git -C ${CMAKE_SOURCE_DIR} rev-parse --short=12 HEAD
+    COMMAND git -C "${PROJECT_SOURCE_DIR}" rev-parse --short=12 HEAD
     OUTPUT_VARIABLE SMALLFIELD_GIT_SHA_VALUE
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
-if(NOT SMALLFIELD_GIT_SHA_VALUE)
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+)
+if (NOT SMALLFIELD_GIT_SHA_VALUE)
     set(SMALLFIELD_GIT_SHA_VALUE "unknown")
-endif()
-target_compile_definitions(smallfield_batch PRIVATE SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}")
+endif ()
+
+# Both binaries emit through the same writer, so it is compiled once rather than once per binary.
+add_library(smallfield_parquet_writer OBJECT parquet_writer.cpp)
+target_link_libraries(
+    smallfield_parquet_writer PUBLIC smallfield_settings smallfield_lib Arrow::arrow_shared Parquet::parquet_shared
+)
+target_compile_definitions(smallfield_parquet_writer PRIVATE SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}")
+
+define_smallfield_target(
+    smallfield_batch
+    SOURCES smallfield_batch.cpp parquet_reader.cpp shard_inventory.cpp rdkit_fallback.cpp
+    LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared
+    DEFINES SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}"
+            $<$<BOOL:${SMALLFIELD_ENABLE_NVTX}>:SMALLFIELD_ENABLE_NVTX>
+)
+
+# Descriptor augmentation rewrites existing *.3D.parquet shards into the canonical 13-column schema by computing
+# USR/USRCAT from the stored fp16 coordinates and re-emitting through the same writer, so its output is byte-identical
+# to the batch producer's.  CPU-only.
+define_smallfield_target(
+    smallfield_descriptors
+    SOURCES smallfield_descriptors.cpp
+    LINK smallfield_lib smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared
+    DEFINES SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}"
+            $<$<BOOL:${SMALLFIELD_ENABLE_NVTX}>:SMALLFIELD_ENABLE_NVTX>
+)
 
 message(STATUS "SmallField batch binary: ENABLED (git ${SMALLFIELD_GIT_SHA_VALUE})")
-
-if(SMALLFIELD_ENABLE_NVTX)
-    target_compile_definitions(smallfield_batch PRIVATE SMALLFIELD_ENABLE_NVTX)
-endif()
-
-# Descriptor-augmentation binary: rewrites existing *.3D.parquet shards into the
-# canonical 13-column schema by computing USR/USRCAT from the stored fp16 coordinates
-# and re-emitting through the shared writer (parquet_writer.cpp) — byte-identical to the
-# batch producer's output. CPU-only; reuses the producer's writer + descriptor code.
-add_executable(smallfield_descriptors
-    smallfield_descriptors.cpp
-    parquet_writer.cpp)
-
-set_source_files_properties(
-    smallfield_descriptors.cpp parquet_writer.cpp
-    PROPERTIES LANGUAGE CXX)
-
-target_link_libraries(smallfield_descriptors PRIVATE
-    smallfield_lib
-    OpenMP::OpenMP_CXX
-    Arrow::arrow_shared
-    Parquet::parquet_shared
-    $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>)
-
-target_include_directories(smallfield_descriptors PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-
-set_target_properties(smallfield_descriptors PROPERTIES
-    LINKER_LANGUAGE CUDA)
-
-# Same provenance SHA as the batch producer so augmented shards report an identical
-# producer_git_sha in their key-value metadata.
-target_compile_definitions(smallfield_descriptors PRIVATE SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}")

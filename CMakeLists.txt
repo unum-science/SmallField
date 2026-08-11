@@ -1,309 +1,257 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.24)
 
-# Default CUDA architectures.  Each entry is a device the project is
-# expected to run on, so the fatbin carries real SASS for it: Ampere
-# (sm_80), Ada / L40S (sm_89), Hopper (sm_90), Blackwell datacenter
-# (sm_100), and Blackwell consumer / RTX PRO (sm_120).
+# Default CUDA architectures.  Each entry is a device the project is expected to run on, so the fatbin carries real SASS
+# for it: Ampere (sm_80), Ada / L40S (sm_89), Hopper (sm_90), Blackwell datacenter (sm_100), and Blackwell consumer /
+# RTX PRO (sm_120).
 #
-# `120` (vs `120-real`) is the only entry emitting PTX as well as SASS.
-# PTX JIT is forward-only — it never lowers onto an older architecture —
-# so PTX from the newest entry covers hardware that hasn't shipped yet
-# and covers nothing already on this list.  A device missing from the
-# list therefore finds no cubin and no JIT path, and simply fails to run.
+# `120` (vs `120-real`) is the only entry emitting PTX as well as SASS.  PTX JIT is forward-only -- it never lowers onto
+# an older architecture -- so PTX from the newest entry covers hardware that hasn't shipped yet and covers nothing
+# already on this list.  A device missing from the list therefore finds no cubin and no JIT path, and simply fails to
+# run.
 #
-# For fast dev-iteration on a single known GPU, pass
-# -DSMALLFIELD_NATIVE_CUDA_ARCH=ON or an explicit
-# -DCMAKE_CUDA_ARCHITECTURES=... — then the build collapses to a
-# single-arch native compile.  Multi-arch fatbin compile is ~3× longer.
+# `native` compiles for the local GPU alone and is what the `dev` preset selects: a single architecture is roughly 2.5x
+# faster to compile, and a build that never leaves this machine has no use for the other four.  The multi-architecture
+# fatbin is what ships and what CI proves.
 #
-# These two settings must run BEFORE project() so the CUDA toolkit
-# auto-detect at project-time doesn't override us with sm_75 default.
-set(SMALLFIELD_DEFAULT_CUDA_ARCH "80-real;89-real;90-real;100-real;120"
-    CACHE STRING "Default fatbin CUDA architectures")
-option(SMALLFIELD_NATIVE_CUDA_ARCH
-    "Detect a single native CUDA arch via nvidia-smi instead of the multi-arch fatbin"
-    OFF)
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    if(SMALLFIELD_NATIVE_CUDA_ARCH)
-        execute_process(
-            COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
-            OUTPUT_VARIABLE _gpu_caps OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET RESULT_VARIABLE _smi_result)
-        if(_smi_result EQUAL 0 AND _gpu_caps)
-            string(REGEX MATCH "[0-9]+\\.[0-9]+" _cap_match "${_gpu_caps}")
-            if(_cap_match)
-                string(REPLACE "." "" _arch_code "${_cap_match}")
-                set(CMAKE_CUDA_ARCHITECTURES "${_arch_code}")
-            else()
-                set(CMAKE_CUDA_ARCHITECTURES "120")
-            endif()
-        else()
-            set(CMAKE_CUDA_ARCHITECTURES "120")
-        endif()
-    else()
-        set(CMAKE_CUDA_ARCHITECTURES "${SMALLFIELD_DEFAULT_CUDA_ARCH}")
-    endif()
-endif()
+# This must run BEFORE project() so the CUDA toolkit auto-detect at project-time doesn't override it with an sm_75
+# default.
+set(SMALLFIELD_CUDA_ARCH
+    "80-real;89-real;90-real;100-real;120"
+    CACHE STRING "CUDA architectures to compile for, or `native` for the local GPU alone"
+)
+if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "${SMALLFIELD_CUDA_ARCH}")
+endif ()
 
-project(SmallField LANGUAGES CXX CUDA)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" SMALLFIELD_VERSION)
+string(STRIP "${SMALLFIELD_VERSION}" SMALLFIELD_VERSION)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+project(
+    SmallField
+    VERSION ${SMALLFIELD_VERSION}
+    DESCRIPTION "SmallField: GPU conformer generation with ETKDG and MMFF94"
+    HOMEPAGE_URL "https://github.com/unum-science/SmallField"
+    LANGUAGES CXX CUDA
+)
 
-message(STATUS "CMAKE_CUDA_ARCHITECTURES = ${CMAKE_CUDA_ARCHITECTURES}")
+enable_testing()
 
-# Compiler cache, when one is installed.  Unchanged translation units then cost
-# nothing on rebuilds, branch switches and CI restores, which dominates the
-# inner loop far more than any one-off compile-speed flag.
+message(STATUS "SmallField ${SMALLFIELD_VERSION}, CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE
+        Release
+        CACHE STRING "Build type"
+    )
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+    message(STATUS "Defaulting to Release build (use -DCMAKE_BUILD_TYPE=... to override)")
+endif ()
+
+# Compiler cache, when one is installed.  Unchanged translation units then cost nothing on rebuilds, branch switches and
+# CI restores, which dominates the inner loop far more than any one-off compile-speed flag.  This only pays off because
+# the CUDA targets emit SASS at compile time -- see the interprocedural-optimization note below, since `ccache` can
+# never cache a device link.
 find_program(SMALLFIELD_COMPILER_CACHE NAMES ccache sccache)
-if(SMALLFIELD_COMPILER_CACHE)
+if (SMALLFIELD_COMPILER_CACHE)
     message(STATUS "Using compiler cache: ${SMALLFIELD_COMPILER_CACHE}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${SMALLFIELD_COMPILER_CACHE}")
     set(CMAKE_CUDA_COMPILER_LAUNCHER "${SMALLFIELD_COMPILER_CACHE}")
-endif()
+endif ()
 
-# Deliberately not passing nvcc `--threads`: it makes one invocation compile its
-# architectures concurrently, which is 55 % faster in isolation but no faster here,
-# because `-j` already saturates the machine across targets and the two layers of
-# parallelism then contend.  Measured 366 s without against 380 s with, 5 arches,
-# 16 cores.  Likewise no precompiled header — nvcc flattens `#include` directives
-# away before the host compiler runs, so a `.gch` can never be consulted.
-
-# Point `core.hooksPath` at `.githooks` here — configuring the build arms the `pre-commit` /
-# `commit-msg` checks, each of which carries its own rationale in that file.  Skipped when built
-# as a subproject, since mutating a consumer's Git config is not this project's business, and
-# without `.git`, as in a tarball build.
-if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+# Point `core.hooksPath` at `.githooks` here -- configuring the build arms the `pre-commit` / `commit-msg` checks, each
+# of which carries its own rationale in that file.  Skipped when built as a subproject, since mutating a consumer's Git
+# config is not this project's business, and without `.git`, as in a tarball build.
+if (PROJECT_IS_TOP_LEVEL AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
     execute_process(
         COMMAND git config core.hooksPath .githooks
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        RESULT_VARIABLE _smallfield_hooks_status OUTPUT_QUIET ERROR_QUIET)
-    if(_smallfield_hooks_status EQUAL 0)
-        message(STATUS "smallfield: Git hooks enabled (core.hooksPath -> .githooks)")
-    endif()
-endif()
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+        RESULT_VARIABLE _hooks_status
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if (_hooks_status EQUAL 0)
+        message(STATUS "Git hooks enabled (core.hooksPath -> .githooks)")
+    endif ()
+endif ()
 
-# Enable -Wall -Wextra globally on non-MSVC toolchains.
-# CUDA device code gets the host warnings forwarded through -Xcompiler.
-# We intentionally avoid -Werror: warnings should surface but not block builds.
-if(NOT MSVC)
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall>
-        $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
-        $<$<COMPILE_LANGUAGE:CXX>:-Wconversion>
-        $<$<COMPILE_LANGUAGE:CXX>:-Wsign-conversion>
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wconversion,-Wsign-conversion>)
-endif()
-
-# Default build type: Release with host-native vectorization and CUDA fast-math.
-# The default CMake `Release` uses `-O3 -DNDEBUG` for CXX; we additionally enable
-# `-march=native` so the AVX-512 on Xeon 6776P is actually used, and
-# `--use_fast_math` on nvcc which maps `expf`/`logf`/`sqrtf`/etc. to their hardware
-# intrinsic variants.  Users can override with `-DCMAKE_BUILD_TYPE=Debug` or by
-# passing their own `-DCMAKE_CXX_FLAGS_RELEASE=...`.
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
-    message(STATUS "Defaulting to Release build (use -DCMAKE_BUILD_TYPE=... to override)")
-endif()
-# Append our performance flags to the Release preset without clobbering any the
-# user may have set.  AppendStringsToCache would be cleaner; we do the explicit
-# form because CMake doesn't provide it for language flag variables.
-foreach(_lang CXX CUDA)
-    # CMake-supplied default for *_FLAGS_RELEASE is already "-O3 -DNDEBUG" for CXX
-    # and "-O3 -DNDEBUG" passed through to host for CUDA.  We add -march=native
-    # (CXX + forwarded to host via -Xcompiler for CUDA) and --use_fast_math (CUDA only).
-endforeach()
-if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    if(NOT CMAKE_CXX_FLAGS_RELEASE MATCHES "-march=")
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
-    endif()
-    if(NOT CMAKE_CXX_FLAGS_RELWITHDEBINFO MATCHES "-march=")
-        set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -march=native")
-    endif()
-    # `--generate-line-info` (= -lineinfo) is workstream GP-0: makes ncu's
-    # source-counter attribution map stalls back to specific source lines in
-    # etkdg_pipeline.cuh / dg_forcefield.cuh / mmff94_functor.cuh.  No
-    # optimisation impact — pure debug info that survives -O3.
-    # `--expt-relaxed-constexpr` lets device code call `constexpr` functions that are not
-    # themselves annotated `__host__ __device__`, which a concurrent pass relies on to drop
-    # those annotations from `constexpr` helpers. It does not rescue libstdc++'s <algorithm>
-    # facilities: `std::lower_bound` silently miscompiles on device, which is why the MMFF
-    # device lookups use a hand-rolled binary search instead (see `lower_bound_u8_` in
-    # `mmff94_tables.hpp`). `--extended-lambda` enables lambdas passed as comparators inside
-    # those lookups. Required for the MG-2/3 GPU kernels.
-    if(NOT CMAKE_CUDA_FLAGS_RELEASE MATCHES "use_fast_math")
-        set(CMAKE_CUDA_FLAGS_RELEASE
-            "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3 --generate-line-info --expt-relaxed-constexpr --extended-lambda")
-    endif()
-    if(NOT CMAKE_CUDA_FLAGS_RELWITHDEBINFO MATCHES "use_fast_math")
-        set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO
-            "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3 --generate-line-info --expt-relaxed-constexpr --extended-lambda")
-    endif()
-    if(NOT CMAKE_CUDA_FLAGS MATCHES "expt-relaxed-constexpr")
-        set(CMAKE_CUDA_FLAGS
-            "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr --extended-lambda")
-    endif()
-endif()
-
-# RDKit from conda-forge.
-# The conda rdkit-config.cmake requires Boost "headers" component which
-# confuses CMake < 3.30's FindBoost. Instead of fighting cmake, we set up
-# the required imported targets manually when RDKIT_PREFIX is given.
+# RDKit from conda-forge or pixi.  The conda `rdkit-config.cmake` requires a Boost "headers" component that confuses
+# CMake < 3.30's FindBoost, so the imported targets are set up by hand.
 #
-# Resolve the environment prefix in priority order: an explicit `-DRDKIT_PREFIX=`,
-# then an activated conda/micromamba environment, then the in-tree pixi environment
-# that `pixi install` creates. Testing the value rather than `DEFINED` matters:
-# `-DRDKIT_PREFIX=$CONDA_PREFIX` with no environment active passes the empty string,
-# which `DEFINED` accepts and which then searches `/include/rdkit`.
-if(NOT RDKIT_PREFIX)
-    if(DEFINED ENV{CONDA_PREFIX})
+# The prefix is resolved in priority order: an explicit `-DRDKIT_PREFIX=`, then an activated conda/micromamba
+# environment, then the in-tree pixi environment that `pixi install` creates. Testing the value rather than `DEFINED`
+# matters: `-DRDKIT_PREFIX=$CONDA_PREFIX` with no environment active passes the empty string, which `DEFINED` accepts
+# and which then searches `/include/rdkit`.
+if (NOT RDKIT_PREFIX)
+    if (DEFINED ENV{CONDA_PREFIX})
         set(RDKIT_PREFIX "$ENV{CONDA_PREFIX}")
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/.pixi/envs/default/include/rdkit/GraphMol/GraphMol.h")
-        set(RDKIT_PREFIX "${CMAKE_SOURCE_DIR}/.pixi/envs/default")
-    endif()
-endif()
-set(RDKIT_PREFIX "${RDKIT_PREFIX}" CACHE PATH
-    "Environment prefix providing RDKit headers and libraries")
+    elseif (EXISTS "${PROJECT_SOURCE_DIR}/.pixi/envs/default/include/rdkit/GraphMol/GraphMol.h")
+        set(RDKIT_PREFIX "${PROJECT_SOURCE_DIR}/.pixi/envs/default")
+    endif ()
+endif ()
+set(RDKIT_PREFIX
+    "${RDKIT_PREFIX}"
+    CACHE PATH "Environment prefix providing RDKit headers and libraries"
+)
 
-set(RDKit_FOUND FALSE)
-if(RDKIT_PREFIX)
-    set(_rdkit_inc "${RDKIT_PREFIX}/include/rdkit")
-    set(_rdkit_lib "${RDKIT_PREFIX}/lib")
-    set(_boost_inc "${RDKIT_PREFIX}/include")
+if (NOT EXISTS "${RDKIT_PREFIX}/include/rdkit/GraphMol/GraphMol.h")
+    message(FATAL_ERROR "RDKit headers not found under '${RDKIT_PREFIX}'.  Run `pixi install`, or pass "
+                        "-DRDKIT_PREFIX=/path/to/environment."
+    )
+endif ()
+message(STATUS "Using RDKit from ${RDKIT_PREFIX}")
 
-    if(EXISTS "${_rdkit_inc}/GraphMol/GraphMol.h")
-        set(RDKit_FOUND TRUE)
-        message(STATUS "Using RDKit from ${RDKIT_PREFIX}")
+# One imported shared-library target per RDKit component.
+function (define_rdkit_library target_name library_name)
+    find_library(
+        ${library_name}_PATH
+        NAMES ${library_name}
+        PATHS "${RDKIT_PREFIX}/lib"
+        NO_DEFAULT_PATH
+    )
+    if (NOT ${library_name}_PATH)
+        message(FATAL_ERROR "RDKit component ${library_name} not found in ${RDKIT_PREFIX}/lib")
+    endif ()
+    add_library(${target_name} SHARED IMPORTED GLOBAL)
+    set_target_properties(
+        ${target_name} PROPERTIES IMPORTED_LOCATION "${${library_name}_PATH}"
+                                  INTERFACE_INCLUDE_DIRECTORIES "${RDKIT_PREFIX}/include/rdkit;${RDKIT_PREFIX}/include"
+    )
+endfunction ()
 
-        # helper: create an imported shared library target for one RDKit component
-        macro(rdkit_add_lib target_name lib_name)
-            if(NOT TARGET ${target_name})
-                find_library(_${lib_name}_path NAMES ${lib_name}
-                    PATHS "${_rdkit_lib}" NO_DEFAULT_PATH)
-                if(_${lib_name}_path)
-                    add_library(${target_name} SHARED IMPORTED)
-                    set_target_properties(${target_name} PROPERTIES
-                        IMPORTED_LOCATION "${_${lib_name}_path}"
-                        INTERFACE_INCLUDE_DIRECTORIES "${_rdkit_inc};${_boost_inc}")
-                else()
-                    message(WARNING "RDKit library ${lib_name} not found in ${_rdkit_lib}")
-                endif()
-            endif()
-        endmacro()
+set(SMALLFIELD_RDKIT_COMPONENTS
+    Alignment
+    ChemTransforms
+    Depictor
+    Descriptors
+    DistGeomHelpers
+    DistGeometry
+    EigenSolvers
+    ForceField
+    ForceFieldHelpers
+    GraphMol
+    MolStandardize
+    MolTransforms
+    RDGeneral
+    SmilesParse
+    SubstructMatch
+)
+foreach (_component IN LISTS SMALLFIELD_RDKIT_COMPONENTS)
+    define_rdkit_library(RDKit::${_component} RDKit${_component})
+    list(APPEND SMALLFIELD_RDKIT_TARGETS RDKit::${_component})
+endforeach ()
 
-        rdkit_add_lib(RDKit::SmilesParse RDKitSmilesParse)
-        rdkit_add_lib(RDKit::GraphMol RDKitGraphMol)
-        rdkit_add_lib(RDKit::RDGeneral RDKitRDGeneral)
-        rdkit_add_lib(RDKit::ForceField RDKitForceField)
-        rdkit_add_lib(RDKit::ForceFieldHelpers RDKitForceFieldHelpers)
-        rdkit_add_lib(RDKit::DistGeomHelpers RDKitDistGeomHelpers)
-        rdkit_add_lib(RDKit::DistGeometry RDKitDistGeometry)
-        rdkit_add_lib(RDKit::Depictor RDKitDepictor)
-        rdkit_add_lib(RDKit::MolTransforms RDKitMolTransforms)
-        rdkit_add_lib(RDKit::SubstructMatch RDKitSubstructMatch)
-        rdkit_add_lib(RDKit::Alignment RDKitAlignment)
-        rdkit_add_lib(RDKit::EigenSolvers RDKitEigenSolvers)
-        rdkit_add_lib(RDKit::ChemTransforms RDKitChemTransforms)
-        rdkit_add_lib(RDKit::Descriptors RDKitDescriptors)
-        rdkit_add_lib(RDKit::MolStandardize RDKitMolStandardize)
-
-    else()
-        message(WARNING "RDKit headers not found at ${_rdkit_inc}. "
-            "Install rdkit-dev: micromamba install -c conda-forge rdkit-dev")
-    endif()
-endif()
-# Both libraries and every subdirectory sit behind `RDKit_FOUND`, so a missing RDKit
-# does not degrade the build — it generates one that produces nothing at all. Fail
-# here rather than hand back an empty build tree and a zero exit code.
-if(NOT RDKit_FOUND)
-    message(FATAL_ERROR "RDKit not found. Run `pixi install`, or pass "
-        "-DRDKIT_PREFIX=/path/to/environment.")
-endif()
-
-# `{fmt}` — used everywhere for formatted and colored logging.  The same
-# conda-forge environment that supplies RDKit ships it, so search there first.
-# A system `libfmt` whose headers disagree with the RDKit prefix otherwise wins
-# and the mismatch only surfaces as an undefined `fmt::v*::vprint` at link time.
-if(RDKIT_PREFIX)
-    list(PREPEND CMAKE_PREFIX_PATH "${RDKIT_PREFIX}")
-endif()
+# `{fmt}` -- the same environment that supplies RDKit ships it, so search there first.  A system `libfmt` whose headers
+# disagree with the RDKit prefix otherwise wins, and the mismatch surfaces only as an undefined `fmt::v*::vprint` at
+# link time.
+list(PREPEND CMAKE_PREFIX_PATH "${RDKIT_PREFIX}")
 find_package(fmt REQUIRED CONFIG)
-
-# OpenMP for CPU parallelism
 find_package(OpenMP REQUIRED)
 
-# jemalloc for allocation-heavy CPU paths (RDKit SMILES parsing, MMFF parameter lookups).
-find_library(JEMALLOC_LIB NAMES jemalloc)
-if(JEMALLOC_LIB)
-    message(STATUS "Found jemalloc: ${JEMALLOC_LIB}")
-else()
-    message(STATUS "jemalloc not found — consider installing for better allocation performance")
-endif()
-
-# Host-side link-time optimization for CPU-bound paths.
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
-endif()
-
-# CUDA runtime libraries via CMake's modern CUDAToolkit module.  This picks up
-# curand / cusolver / cudart wherever the active CUDA install keeps them
-# (/usr/local/cuda/lib64, /usr/local/cuda-XX.Y/targets/x86_64-linux/lib, or a
-# conda-forge prefix) and exposes them as imported targets that carry the
-# correct include paths, link ordering, and rpath.  Using CUDA::* targets
-# instead of raw find_library calls also means cross-version upgrades (13.0 →
-# 13.1 → 14.x) do not require CMakeLists edits.
+# CUDA runtime libraries via CMake's CUDAToolkit module, which exposes imported targets carrying the correct include
+# paths, link ordering and rpath wherever the active install keeps them.
 find_package(CUDAToolkit REQUIRED)
 
-if(RDKit_FOUND)
-    # RDKit targets needed by the library
-    set(RDKIT_LIBS
-        RDKit::SmilesParse RDKit::GraphMol RDKit::RDGeneral
-        RDKit::ForceFieldHelpers RDKit::ForceField
-        RDKit::DistGeomHelpers RDKit::DistGeometry
-        RDKit::Depictor RDKit::SubstructMatch
-        RDKit::Alignment RDKit::EigenSolvers RDKit::MolTransforms
-        RDKit::ChemTransforms RDKit::Descriptors
-        RDKit::MolStandardize)
+# jemalloc for allocation-heavy CPU paths -- RDKit SMILES parsing and MMFF parameter lookups.
+find_library(JEMALLOC_LIB NAMES jemalloc)
+if (JEMALLOC_LIB)
+    message(STATUS "Found jemalloc: ${JEMALLOC_LIB}")
+else ()
+    message(STATUS "jemalloc not found -- consider installing it for better allocation performance")
+endif ()
 
-    function(configure_smallfield_library target_name library_type)
-        add_library(${target_name} ${library_type}
-            src/smallfield/api/smallfield.cu)
-        set_source_files_properties(
-            src/smallfield/api/smallfield.cu
-            PROPERTIES LANGUAGE CUDA)
-        target_include_directories(${target_name} PUBLIC ${CMAKE_SOURCE_DIR}/src)
-        target_link_libraries(${target_name} PUBLIC
-            ${RDKIT_LIBS}
-            CUDA::curand
-            CUDA::cudart
-            OpenMP::OpenMP_CXX
-            fmt::fmt)
-        # Pass -fopenmp to the host compiler through nvcc so #pragma omp inside
-        # etkdg_prepare_batch.hpp (included by smallfield.cu) actually parallelizes.
-        # Without this the OpenMP pragma is silently ignored by nvcc's host pass
-        # and prepare_molecule_batch runs single-threaded.
-        #
-        # --expt-relaxed-constexpr lets `constexpr` host functions be called from
-        # `__device__` code, which is what NumKong's tensor_view / vector_view
-        # accessors rely on.  --extended-lambda permits __host__ __device__ lambdas
-        # to cross the same boundary.  Both are required to consume NumKong from
-        # any .cuh that runs on the GPU.
-        target_compile_options(${target_name} PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fopenmp>
-            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-            $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
-        set_target_properties(${target_name} PROPERTIES
-            CUDA_SEPARABLE_COMPILATION ON
-            POSITION_INDEPENDENT_CODE ON)
-    endfunction()
+# Build settings are interface targets rather than mutations of `CMAKE_<LANG>_FLAGS`.  Global flag variables leak into
+# every subdirectory including future dependencies, and the config-conditional forms are invisible to multi-config
+# generators, where `CMAKE_BUILD_TYPE` is empty and an `if(CMAKE_BUILD_TYPE STREQUAL "Release")` guard silently drops
+# every optimization flag.  Generator expressions are evaluated per configuration and do the right thing under both.
 
-    # SmallField libraries (CUDA + RDKit preprocessing)
-    configure_smallfield_library(smallfield_lib STATIC)
-    configure_smallfield_library(smallfield_python_lib SHARED)
+add_library(smallfield_warnings INTERFACE)
+if (NOT MSVC)
+    # No `-Werror`: warnings should surface without blocking a build.  CUDA device code gets the host warnings forwarded
+    # through `-Xcompiler`.
+    target_compile_options(
+        smallfield_warnings
+        INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wconversion;-Wsign-conversion>
+                  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wconversion,-Wsign-conversion>
+    )
+endif ()
 
-    enable_testing()
-    add_subdirectory(test)
-    add_subdirectory(bench)
-    add_subdirectory(cli)
-endif()
+option(SMALLFIELD_CUDA_LINEINFO "Emit CUDA line info for `ncu` source attribution" OFF)
+
+add_library(smallfield_settings INTERFACE)
+target_link_libraries(smallfield_settings INTERFACE smallfield_warnings)
+target_include_directories(smallfield_settings INTERFACE "${PROJECT_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/src")
+# C++20 in both languages. As a compile feature rather than `CMAKE_CXX_STANDARD` this travels with whatever links the
+# settings, including RDKit's headers, which use `constexpr` destructors and fail to parse under anything older.
+target_compile_features(smallfield_settings INTERFACE cxx_std_20 cuda_std_20)
+if (NOT MSVC)
+    # `-march=native` uses the host's widest ISA.  It also makes the resulting archive and `.so` non-redistributable,
+    # which is a shipping question rather than a build-speed one.
+    target_compile_options(
+        smallfield_settings INTERFACE $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release,RelWithDebInfo>>:-march=native>
+    )
+endif ()
+# `--expt-relaxed-constexpr` lets device code call `constexpr` functions not themselves annotated `__host__ __device__`.
+# It does not rescue libstdc++'s <algorithm>: `std::lower_bound` silently miscompiles on device, which is why the MMFF
+# device lookups use the hand-rolled `lower_bound_u8_` in `mmff94_tables.hpp` instead.  `--extended-lambda` permits the
+# comparator lambdas those lookups pass. Both are unconditional -- a Debug build needs them exactly as much as a Release
+# one, and scoping them to Release is what previously broke every `.cu` under `test/` and `bench/` in Debug.
+#
+# `-Xcompiler=-fopenmp` reaches the host pass, without which the `#pragma omp` in the preprocess headers is silently
+# ignored and batch preparation runs single-threaded.
+target_compile_options(
+    smallfield_settings
+    INTERFACE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;--extended-lambda;-Xcompiler=-fopenmp>
+              $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release,RelWithDebInfo>>:--use_fast_math;-Xptxas=-O3>
+              $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release,RelWithDebInfo>>:-Xcompiler=-march=native>
+              $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<BOOL:${SMALLFIELD_CUDA_LINEINFO}>>:--generate-line-info>
+)
+
+# Interprocedural optimization is deliberately absent.
+#
+# `CMAKE_INTERPROCEDURAL_OPTIMIZATION ON` combined with `CUDA_SEPARABLE_COMPILATION ON` switches nvcc from emitting SASS
+# to emitting NVVM LTO IR, which defers every architecture's `ptxas` codegen to the device-link step.  That step then
+# runs once per executable -- 26 of them -- each regenerating the whole library's SASS.  Measured at 101.9 s per device
+# link against 0.25 s for a plain `nvlink`, it was roughly 84 % of all CPU work in the build, and `ccache` cannot cache
+# a device link at all.
+#
+# Device LTO optimizes across translation units, and every target here has at most one CUDA translation unit, so it had
+# no input to work on.  Host LTO is separately unattractive: the host link measures 0.64 s, and `-fno-fat-lto-objects`
+# leaves GIMPLE rather than machine code in the static archive, which breaks any consumer on a different GCC.
+
+# Every target links the same interface settings, so this absorbs what was repeated at each site. CUDA is the linker
+# language because these targets pull in a CUDA static library.
+function (define_smallfield_target target_name)
+    cmake_parse_arguments(ARG "" "" "SOURCES;LINK;DEFINES" ${ARGN})
+    add_executable(${target_name} ${ARG_SOURCES})
+    target_link_libraries(
+        ${target_name} PRIVATE smallfield_settings OpenMP::OpenMP_CXX ${ARG_LINK}
+                               $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>
+    )
+    target_compile_definitions(${target_name} PRIVATE ${ARG_DEFINES})
+    set_target_properties(${target_name} PROPERTIES LINKER_LANGUAGE CUDA CUDA_SEPARABLE_COMPILATION OFF)
+endfunction ()
+
+# The library is header-only and funnels through one translation unit, so it is compiled once into an object library and
+# assembled into both the archive the C++ tools link and the shared object `setup.py` hands to pybind11.  Compiling it
+# twice produced byte-identical objects.
+#
+# `CUDA_SEPARABLE_COMPILATION` is off: relocatable device code is only required when a `__device__` function or
+# `__device__`/`__constant__` variable defined in one translation unit is referenced from another.  Every `__constant__`
+# here is `static`, and there is no `extern __device__` anywhere, so each target's device code is whole-program within
+# its own translation unit.
+add_library(smallfield_objects OBJECT src/smallfield/api/smallfield.cu)
+target_link_libraries(
+    smallfield_objects PUBLIC smallfield_settings ${SMALLFIELD_RDKIT_TARGETS} CUDA::curand CUDA::cudart
+                              OpenMP::OpenMP_CXX fmt::fmt
+)
+set_target_properties(smallfield_objects PROPERTIES CUDA_SEPARABLE_COMPILATION OFF POSITION_INDEPENDENT_CODE ON)
+
+add_library(smallfield_lib STATIC)
+target_link_libraries(smallfield_lib PUBLIC smallfield_objects)
+
+# Only `setup.py` consumes the shared object, so a plain `cmake --build` does not pay for it.
+add_library(smallfield_python_lib SHARED EXCLUDE_FROM_ALL )
+target_link_libraries(smallfield_python_lib PUBLIC smallfield_objects)
+
+add_subdirectory(test)
+add_subdirectory(bench)
+add_subdirectory(cli)

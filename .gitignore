@@ -14,8 +14,9 @@ bench/results/
 
 # Distribution / packaging
 .Python
-build/
-build_*/
+# Any build tree, however it is suffixed: `build`, `build_debug`, `build-baseline`, `build.asan`.
+build
+build[-_.]*/
 develop-eggs/
 dist/
 downloads/

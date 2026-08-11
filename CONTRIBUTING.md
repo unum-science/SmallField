@@ -243,13 +243,26 @@ Kernel launches are already asynchronous, cross-device ordering is `cudaStreamWa
 
 Name hardware constants once rather than spelling `32` for the warp size at each site.
 
-Every architecture the project runs on needs an entry in `SMALLFIELD_DEFAULT_CUDA_ARCH`.
+Every architecture the project runs on needs an entry in `SMALLFIELD_CUDA_ARCH`.
 PTX JIT is forward-only, so PTX from the newest entry covers future hardware and covers nothing already on the list; a device missing from it finds no cubin, no JIT path, and does not run.
+
+__Do not enable interprocedural optimization on a CUDA target.__
+Combined with `CUDA_SEPARABLE_COMPILATION`, it switches nvcc from emitting SASS to emitting NVVM LTO IR, and every architecture's `ptxas` codegen then happens at the device link — once per executable, on the whole library, 101.9 s a time against 0.25 s for a plain `nvlink`.
+It was about 84 % of the build.
+Device LTO optimizes across translation units and every target here has at most one, so it had nothing to work on.
+That is also why the compiler cache looked weak at 23 %: `ccache` caches compiles and can never cache a device link, so the dominant cost was invisible to it.
+
+Relocatable device code earns its keep only when a `__device__` function or `__device__`/`__constant__` variable defined in one translation unit is referenced from another.
+Nothing here does that, so `CUDA_SEPARABLE_COMPILATION` is off and the device link disappears entirely.
 
 __Precompiled headers cannot work for `.cu` files.__
 nvcc preprocesses to a synthetic flat file before the host compiler runs, so no `#include` directive survives for a `.gch` to match.
 Measured on the C++ half alone it was 111 s against 109 s, and nvcc `--threads` measured slower than none, 380 s against 366 s, because `-j` already saturates the machine.
-A compiler cache is the one thing that paid: 23 % on a warm multi-architecture rebuild.
+A linker swap is equally pointless: the host link is 0.64 s, and the bytes come from `ptxas`, which no host linker replaces.
+
+Build settings are interface targets, never `CMAKE_<LANG>_FLAGS` mutations.
+A global flag variable reaches every target in every subdirectory, and the `if(CMAKE_BUILD_TYPE STREQUAL "Release")` guard around one is invisible to multi-config generators, where that variable is empty — which silently dropped every optimization flag under Ninja Multi-Config and dropped `--expt-relaxed-constexpr` from every test `.cu` in Debug.
+Generator expressions are evaluated per configuration and do not have either failure mode.
 
 ## Deliberately Not Rules
 
