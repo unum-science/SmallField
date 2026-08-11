@@ -7,13 +7,15 @@
  */
 
 #include <cmath>   // `std::fabs`
-#include <cstdio>  // `printf`
 #include <cstring> // `std::memcmp`
 
-#include <algorithm> // `std::max`, `std::unique`
-#include <memory>    // `std::unique_ptr`
-#include <string>    // `std::string`
-#include <vector>    // `std::vector`
+#include <algorithm>   // `std::max`, `std::unique`
+#include <memory>      // `std::unique_ptr`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include <boost/shared_ptr.hpp>
 #include <cuda_runtime.h>
@@ -43,8 +45,10 @@ namespace sftest = smallfield::tests;
 using sftest::approximately_equal;
 using sftest::load_smiles;
 
+static constexpr std::string_view test_name_k = "test_mmff_gpu_extract";
+
 int main(int argc, char **argv) {
-    std::printf("=== test_mmff_gpu_extract: GPU vs CPU MMFF extractor byte-equality gate ===\n");
+    fmt::println("test_mmff_gpu_extract: GPU vs CPU MMFF extractor byte-equality gate");
 
     sfparam::mmff94_tables_host_t tables_host {};
     sfparam::extract_mmff94_tables_from_rdkit(tables_host);
@@ -103,7 +107,8 @@ int main(int argc, char **argv) {
     }
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(descriptors.size());
 
-    std::printf("batch: %u molecules, %u total atoms\n", num_molecules, total_atoms);
+    fmt::println("batch: {} molecules, {} total atoms", fmt::group_digits(num_molecules),
+                 fmt::group_digits(total_atoms));
 
     std::vector<sfmmff::mmff94_per_mol_counts_t> counts(num_molecules);
     std::vector<std::uint8_t> typing_status(num_molecules);
@@ -165,9 +170,11 @@ int main(int argc, char **argv) {
 
         auto const &gpu_counts = counts[molecule_index];
         bool molecule_matches = true;
-        auto const require_count_match = [&](char const *tag, std::size_t cpu_count, std::size_t gpu_count) {
+        auto const require_count_match = [&](std::string_view term, std::size_t cpu_count, std::size_t gpu_count) {
             if (cpu_count != gpu_count) {
-                std::printf("  mol=%u %s count diff: cpu=%zu gpu=%zu\n", molecule_index, tag, cpu_count, gpu_count);
+                std::fflush(stdout);
+                fmt::println(stderr, "MISMATCH mmff_extract molecule={} term={} field=term_count cpu={} gpu={}",
+                             molecule_index, term, cpu_count, gpu_count);
                 molecule_matches = false;
                 return false;
             }
@@ -295,12 +302,15 @@ int main(int argc, char **argv) {
                 ++mismatched_csr_count;
                 molecule_matches = false;
                 if (mismatched_csr_count < 5) {
-                    std::printf(
-                        "  mol=%u atom=%u CSR count diff: cpu=(b%u a%u t%u o%u s%u) gpu=(b%u a%u t%u o%u s%u)\n",
-                        molecule_index, atom_index, cpu_offset.bond_count, cpu_offset.angle_count,
-                        cpu_offset.torsion_count, cpu_offset.oop_count, cpu_offset.stretchbend_count,
-                        gpu_offset.bond_count, gpu_offset.angle_count, gpu_offset.torsion_count, gpu_offset.oop_count,
-                        gpu_offset.stretchbend_count);
+                    std::fflush(stdout);
+                    fmt::println(stderr,
+                                 "MISMATCH mmff_extract molecule={} atom={} field=csr_counts "
+                                 "cpu=(bonds={} angles={} torsions={} oops={} stretchbends={}) "
+                                 "gpu=(bonds={} angles={} torsions={} oops={} stretchbends={})",
+                                 molecule_index, atom_index, cpu_offset.bond_count, cpu_offset.angle_count,
+                                 cpu_offset.torsion_count, cpu_offset.oop_count, cpu_offset.stretchbend_count,
+                                 gpu_offset.bond_count, gpu_offset.angle_count, gpu_offset.torsion_count,
+                                 gpu_offset.oop_count, gpu_offset.stretchbend_count);
                 }
             }
             else { ++matching_csr_count; }
@@ -353,22 +363,30 @@ int main(int argc, char **argv) {
         else {
             ++mismatched_packed_count;
             molecule_matches = false;
-            if (mismatched_packed_count < 5) std::printf("  mol=%u packed layout diff\n", molecule_index);
+            if (mismatched_packed_count < 5) {
+                std::fflush(stdout);
+                fmt::println(stderr, "MISMATCH mmff_extract molecule={} field=packed_layout staged=1 packed=0",
+                             molecule_index);
+            }
         }
 
         if (molecule_matches) ++matching_molecule_count;
         else ++mismatched_molecule_count;
     }
 
-    std::printf("molecules: %d match / %d bad / %d skipped-to-fallback\n", matching_molecule_count,
-                mismatched_molecule_count, skipped_molecule_count);
-    std::printf("bonds:    %d / %d\n", matching_bond_count, mismatched_bond_count);
-    std::printf("angles:   %d / %d\n", matching_angle_count, mismatched_angle_count);
-    std::printf("torsions: %d / %d\n", matching_torsion_count, mismatched_torsion_count);
-    std::printf("oops:     %d / %d\n", matching_oop_count, mismatched_oop_count);
-    std::printf("stbns:    %d / %d\n", matching_stretch_bend_count, mismatched_stretch_bend_count);
-    std::printf("csr atoms: %d / %d\n", matching_csr_count, mismatched_csr_count);
-    std::printf("packed:   %d / %d\n", matching_packed_count, mismatched_packed_count);
+    fmt::println("molecules:  {} match / {} bad / {} skipped-to-fallback", fmt::group_digits(matching_molecule_count),
+                 fmt::group_digits(mismatched_molecule_count), fmt::group_digits(skipped_molecule_count));
+    fmt::println("bonds:      {} / {}", fmt::group_digits(matching_bond_count), fmt::group_digits(mismatched_bond_count));
+    fmt::println("angles:     {} / {}", fmt::group_digits(matching_angle_count),
+                 fmt::group_digits(mismatched_angle_count));
+    fmt::println("torsions:   {} / {}", fmt::group_digits(matching_torsion_count),
+                 fmt::group_digits(mismatched_torsion_count));
+    fmt::println("oops:       {} / {}", fmt::group_digits(matching_oop_count), fmt::group_digits(mismatched_oop_count));
+    fmt::println("stbns:      {} / {}", fmt::group_digits(matching_stretch_bend_count),
+                 fmt::group_digits(mismatched_stretch_bend_count));
+    fmt::println("csr atoms:  {} / {}", fmt::group_digits(matching_csr_count), fmt::group_digits(mismatched_csr_count));
+    fmt::println("packed:     {} / {}", fmt::group_digits(matching_packed_count),
+                 fmt::group_digits(mismatched_packed_count));
 
     // Footprint accounting: the staging arrays are fixed-stride, so their cost is
     // the same for every molecule; the packed arrays cost what the batch actually
@@ -386,17 +404,15 @@ int main(int argc, char **argv) {
                                      packed.oops.size() * sizeof(sft::mmff94_oop_t) +
                                      packed.stretchbends.size() * sizeof(sft::mmff94_stretchbend_t) +
                                      packed.interactions.size() * sizeof(sft::mmff94_atom_interaction_t);
-    std::printf("bytes/mol: staged %zu, packed %.1f (%.1fx)\n", staged_bytes_per_molecule,
-                static_cast<double>(packed_bytes) / num_molecules,
-                static_cast<double>(staged_bytes_per_molecule) * num_molecules / static_cast<double>(packed_bytes));
-    std::printf("fallback: typer %.2f %% (%d), extractor %.2f %% (%d), combined %.2f %% of %u\n",
-                100.0 * typer_fallback_count / num_molecules, typer_fallback_count,
-                100.0 * extractor_fallback_count / num_molecules, extractor_fallback_count,
-                100.0 * skipped_molecule_count / num_molecules, num_molecules);
-    if (mismatched_molecule_count > 0) {
-        std::printf("FAIL\n");
-        return 1;
-    }
-    std::printf("PASS\n");
-    return 0;
+    fmt::println("bytes/mol: staged {}, packed {:.1f} ({:.1f}x)", fmt::group_digits(staged_bytes_per_molecule),
+                 static_cast<double>(packed_bytes) / num_molecules,
+                 static_cast<double>(staged_bytes_per_molecule) * num_molecules / static_cast<double>(packed_bytes));
+    fmt::println("fallback: typer {:.3f} % ({}), extractor {:.3f} % ({}), combined {:.3f} % of {}",
+                 100.0 * typer_fallback_count / num_molecules, fmt::group_digits(typer_fallback_count),
+                 100.0 * extractor_fallback_count / num_molecules, fmt::group_digits(extractor_fallback_count),
+                 100.0 * skipped_molecule_count / num_molecules, fmt::group_digits(num_molecules));
+    if (mismatched_molecule_count > 0)
+        return sftest::report_fail(test_name_k, "{} of {} molecules diverge from the CPU extractor",
+                                   mismatched_molecule_count, num_molecules);
+    return sftest::report_pass(test_name_k);
 }

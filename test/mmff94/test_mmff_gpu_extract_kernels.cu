@@ -6,7 +6,8 @@
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
-#include <cstdio>  // `fprintf`, `stderr`
+
+#include <fmt/format.h> // `fmt::println` -- host-side only; nothing below a `__global__` uses it
 
 #include <cuda_runtime.h>
 
@@ -35,7 +36,7 @@ void launch_mmff94_gpu_extract_pipeline(
     sfparam::mmff94_tables_device_t device_tables;
     sfparam::upload_mmff94_tables_to_device(tables_host, device_tables);
     if (device_tables.arena.data() == nullptr) {
-        std::fprintf(stderr, "table upload failed\n");
+        fmt::println(stderr, "NOTE mmff_extract_kernels field=table_upload succeeded=0");
         return;
     }
 
@@ -86,7 +87,9 @@ void launch_mmff94_gpu_extract_pipeline(
     cudaDeviceSynchronize();
 
     cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) { std::fprintf(stderr, "extract kernel error: %s\n", cudaGetErrorString(error)); }
+    if (error != cudaSuccess)
+        fmt::println(stderr, "NOTE mmff_extract_kernels field=extract_launch cuda_error={}",
+                     cudaGetErrorString(error));
 
     // CSR build kernel.
     sft::mmff94_atom_interaction_t *interaction_device = nullptr;
@@ -99,7 +102,9 @@ void launch_mmff94_gpu_extract_pipeline(
                                     interaction_device, atom_offsets_device, typing_status_device);
     cudaDeviceSynchronize();
     error = cudaGetLastError();
-    if (error != cudaSuccess) { std::fprintf(stderr, "CSR build kernel error: %s\n", cudaGetErrorString(error)); }
+    if (error != cudaSuccess)
+        fmt::println(stderr, "NOTE mmff_extract_kernels field=csr_build_launch cuda_error={}",
+                     cudaGetErrorString(error));
     cudaMemcpy(out_interactions, interaction_device,
                static_cast<std::size_t>(num_mols) * sft::max_mmff_interactions_per_mol_k *
                    sizeof(sft::mmff94_atom_interaction_t),
@@ -151,7 +156,9 @@ void launch_mmff94_gpu_extract_pipeline(
         packed_interaction_device, atom_offsets_device, metadata_device, typing_status_device);
     cudaDeviceSynchronize();
     error = cudaGetLastError();
-    if (error != cudaSuccess) { std::fprintf(stderr, "compaction kernel error: %s\n", cudaGetErrorString(error)); }
+    if (error != cudaSuccess)
+        fmt::println(stderr, "NOTE mmff_extract_kernels field=compaction_launch cuda_error={}",
+                     cudaGetErrorString(error));
 
     cudaMemcpy(packed_out.bonds.data(), packed_bond_device, packed_totals.bonds * sizeof(sft::mmff94_bond_t),
                cudaMemcpyDeviceToHost);

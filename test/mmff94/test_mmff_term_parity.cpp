@@ -13,13 +13,15 @@
 
 #include <cmath>   // `std::isfinite`, `std::fabs`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
-#include <cstdio>  // `printf`
 
-#include <iostream> // RDKit's `AtomTyper.h` needs it but does not include it
-#include <memory>   // `std::unique_ptr`
-#include <sstream>  // RDKit's `AtomTyper.h` needs it but does not include it
-#include <string>   // `std::string`
-#include <vector>   // `std::vector`
+#include <iostream>    // RDKit's `AtomTyper.h` needs it but does not include it
+#include <memory>      // `std::unique_ptr`
+#include <sstream>     // RDKit's `AtomTyper.h` needs it but does not include it
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`
 
 #include <boost/shared_ptr.hpp>
 #include <GraphMol/GraphMol.h>
@@ -36,6 +38,8 @@ namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
 using sftest::gpu_mmff_energy;
+
+static constexpr std::string_view test_name_k = "test_mmff_term_parity";
 
 namespace smallfield::tests {
 
@@ -127,10 +131,10 @@ static void perturb_(std::vector<float> &positions_soa, std::uint32_t num_atoms,
     }
 }
 
-static void compare_terms_(std::string const &smiles, char const *label, float perturbation = 0.0f) {
+static void compare_terms_(std::string const &smiles, std::string_view label, float perturbation = 0.0f) {
     auto prepared_full = sfp::prepare_molecule(smiles);
     if (prepared_full.num_atoms == 0) {
-        std::printf("  %-22s SKIP (preprocess rejected)\n", label);
+        fmt::println("  {:<22} SKIP (preprocess rejected)", label);
         return;
     }
     auto molecule = sftest::mol_from_smiles(smiles);
@@ -158,8 +162,8 @@ static void compare_terms_(std::string const &smiles, char const *label, float p
 
     term_kind_t const kinds[] = {term_kind_t::bond_k, term_kind_t::angle_k,   term_kind_t::stretchbend_k,
                                  term_kind_t::oop_k,  term_kind_t::torsion_k, term_kind_t::nonbonded_k};
-    if (perturbation > 0.0f) std::printf("  %s (%s, distorted %.2f A)\n", label, smiles.c_str(), perturbation);
-    else std::printf("  %s (%s)\n", label, smiles.c_str());
+    if (perturbation > 0.0f) fmt::println("  {} ({}, distorted {:.2f} A)", label, smiles, perturbation);
+    else fmt::println("  {} ({})", label, smiles);
     for (term_kind_t kind : kinds) {
         auto const single = isolate_term_(prepared_full, kind);
         gradient.assign(positions.size(), 0.0f);
@@ -185,22 +189,28 @@ static void compare_terms_(std::string const &smiles, char const *label, float p
 
         double const reference = rdkit_single_term_energy_(*molecule, kind);
         if (!std::isfinite(reference)) {
-            std::printf("    %-14s RDKit reference unavailable\n", term_name_(kind));
+            fmt::println("    NOTE mmff_term term={:<14} rdkit_reference=unavailable", term_name_(kind));
             continue;
         }
         double const difference = static_cast<double>(gpu_energy) - reference;
         double const tolerance = 0.05 + 0.01 * std::fabs(reference);
-        bool const ok = std::fabs(difference) <= tolerance;
-        std::printf("    %-14s gpu=%12.4f  rdkit=%12.4f  delta=%+10.4f  [%s]\n", term_name_(kind),
-                    static_cast<double>(gpu_energy), reference, difference, ok ? "ok" : "FAIL");
-        if (!ok) ++failures_;
+        // Every term prints, agreeing or not, because the number is what the reader came for; a term
+        // outside tolerance additionally opens a `MISMATCH` line on stderr, which is what `grep` came for.
+        fmt::println("    NOTE mmff_term term={:<14} field=energy rdkit={:12.4f} gpu={:12.4f} delta={:+10.4f}",
+                     term_name_(kind), reference, static_cast<double>(gpu_energy), difference);
+        if (std::fabs(difference) <= tolerance) continue;
+        std::fflush(stdout);
+        fmt::println(stderr, "MISMATCH mmff_term molecule={} term={} field=energy rdkit={} gpu={} delta={:+.3g} "
+                             "tolerance={:.3g}",
+                     smiles, term_name_(kind), reference, static_cast<double>(gpu_energy), difference, tolerance);
+        ++failures_;
     }
 }
 
 } // namespace smallfield::tests
 
 int main() {
-    std::printf("MMFF94 per-term parity against RDKit\n");
+    fmt::println("test_mmff_term_parity: MMFF94 per-term energies against RDKit, one term at a time");
     // Aspirin is the general case; the rest target the terms most likely to diverge —
     // linear centers, and a disconnected salt for the nonbonded exclusion path.
     sftest::compare_terms_("CC(=O)Oc1ccccc1C(=O)O", "aspirin");
@@ -217,6 +227,5 @@ int main() {
     sftest::compare_terms_("CC(=O)Oc1ccccc1C(=O)O", "aspirin", 0.20f);
 
     sf_verify_(sftest::failures_ == 0, "every MMFF94 term must match RDKit in isolation");
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

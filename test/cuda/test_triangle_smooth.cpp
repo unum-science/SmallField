@@ -6,24 +6,29 @@
  *  test_triangle_smooth_kernels.cu.
  */
 
-#include <cmath>  // `std::fabs`
-#include <cstdio> // `printf`
+#include <cmath> // `std::fabs`
 
-#include <vector> // `std::vector`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`
 
 #include <DistGeom/BoundsMatrix.h>
 #include <DistGeom/TriangleSmooth.h>
 #include <GraphMol/DistGeomHelpers/BoundsMatrixBuilder.h>
 
-#include "test/test_rdkit_reference_helpers.hpp"
 #include "test/cuda/test_triangle_smooth_kernels.hpp"
+#include "test/test_helpers.hpp"
+#include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sftest = smallfield::tests;
 
 using sftest::gpu_triangle_smooth;
 
+static constexpr std::string_view test_name_k = "test_triangle_smooth";
+
 static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
-    std::printf("  testing: %s\n", smiles.c_str());
+    fmt::println("  testing: {}", smiles);
 
     auto molecule = sftest::mol_from_smiles(smiles);
     sf_verify_(molecule != nullptr, "failed to parse SMILES");
@@ -56,8 +61,13 @@ static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
 
     // compare against RDKit reference
     float max_error = 0.0f;
-    std::uint32_t error_count = 0;
     float const tolerance = 1e-2f; // float32 vs float64 tolerance
+
+    sftest::diagnostic_reporter_t reporter {"rdkit", "gpu"};
+    reporter.limit_printed_lines(5); // a 128-atom molecule would otherwise emit sixteen thousand lines
+    auto const within_tolerance = [tolerance](double rdkit_value, float gpu_value) {
+        return !(std::fabs(gpu_value - static_cast<float>(rdkit_value)) > tolerance);
+    };
 
     for (std::uint32_t row = 0; row < num_atoms; ++row) {
         for (std::uint32_t column = 0; column < num_atoms; ++column) {
@@ -68,18 +78,15 @@ static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
             float const error = std::fabs(gpu_value - static_cast<float>(rdkit_value));
 
             if (error > max_error) max_error = error;
-            if (error > tolerance) {
-                if (error_count < 5) {
-                    std::printf("    mismatch at (%u,%u): GPU=%.4f RDKit=%.4f err=%.4f\n", row, column, gpu_value,
-                                rdkit_value, error);
-                }
-                ++error_count;
-            }
+            // The upper triangle holds upper bounds and the lower triangle lower bounds, so the field
+            // name says which of the two disagreed rather than leaving it to be inferred from row < column.
+            reporter.mismatch("triangle_smooth", "row={} column={}", row, column)
+                .field(row < column ? "upper_bound" : "lower_bound", rdkit_value, gpu_value, within_tolerance);
         }
     }
 
-    std::printf("    atoms=%u max_error=%.6f mismatches=%u/%u\n", num_atoms, max_error, error_count,
-                num_atoms * num_atoms);
+    fmt::println("    atoms={} max_error={:.6f}", num_atoms, max_error);
+    reporter.summarize("triangle_smooth");
 
     // verify triangle inequality holds after smoothing
     for (std::uint32_t row = 0; row < num_atoms; ++row) {
@@ -101,11 +108,10 @@ static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
 }
 
 int main() {
-    std::printf("test_triangle_smooth\n");
+    fmt::println("test_triangle_smooth: GPU warp smoothing vs the RDKit reference bounds matrix");
 
     auto molecules = sftest::standard_test_smiles();
     for (auto const &smiles : molecules) { test_triangle_smoothing_single_molecule(smiles); }
 
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

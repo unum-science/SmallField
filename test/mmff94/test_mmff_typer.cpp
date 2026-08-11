@@ -9,14 +9,16 @@
  *  there is no aromaticity model difference to excuse a mismatch, and the curated set must come out exact.
  */
 
-#include <cmath>  // `std::fabs`
-#include <cstdio> // `printf`
+#include <cmath> // `std::fabs`
 
-#include <fstream> // `std::ifstream`
-#include <memory>  // `std::unique_ptr`
-#include <sstream> // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
-#include <string>  // `std::string`, `std::to_string`
-#include <vector>  // `std::vector`
+#include <fstream>     // `std::ifstream`
+#include <memory>      // `std::unique_ptr`
+#include <sstream>     // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
+#include <string>      // `std::string`, `std::to_string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include <boost/shared_ptr.hpp>
 #include <RDGeneral/types.h>
@@ -31,9 +33,14 @@
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"
 
+#include "test/test_helpers.hpp"
+
 namespace sfparam = smallfield::parameters;
 namespace sfmmff = smallfield::mmff94;
 namespace sft = smallfield::types;
+namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_mmff_typer";
 
 namespace smallfield::tests {
 static sfparam::mmff94_tables_host_t tables_host_;
@@ -144,7 +151,7 @@ using sftest::tables_host_;
 using sftest::test_one_;
 
 int main(int argc, char **argv) {
-    std::printf("=== test_mmff_typer: native MMFF atom-typer + BCI charge gate ===\n");
+    fmt::println("test_mmff_typer: native MMFF atom-typer + BCI charge gate vs RDKit");
     sfparam::extract_mmff94_tables_from_rdkit(tables_host_);
     tables_ = tables_host_.view();
 
@@ -187,31 +194,32 @@ int main(int argc, char **argv) {
         }
     }
 
-    std::printf("molecules: %d tested, %d with ≥ 1 type or charge mismatch\n", n_mols_tested_, n_mols_mismatch_);
-    std::printf("atoms: %d checked, %d type mismatches\n", n_atoms_checked_, n_atoms_mismatch_);
-    std::printf("charges: %d checked, %d mismatches (> 1e-3)\n", n_charges_checked_, n_charges_mismatch_);
+    fmt::println("molecules: {} tested, {} with at least one type or charge mismatch",
+                 fmt::group_digits(n_mols_tested_), fmt::group_digits(n_mols_mismatch_));
+    fmt::println("atoms: {} checked, {} type mismatches", fmt::group_digits(n_atoms_checked_),
+                 fmt::group_digits(n_atoms_mismatch_));
+    fmt::println("charges: {} checked, {} mismatches (> 1e-3)", fmt::group_digits(n_charges_checked_),
+                 fmt::group_digits(n_charges_mismatch_));
     double const atom_match = n_atoms_checked_ ? 100.0 * (1.0 - (double)n_atoms_mismatch_ / n_atoms_checked_) : 100.0;
     double const molecule_match = n_mols_tested_ ? 100.0 * (1.0 - (double)n_mols_mismatch_ / n_mols_tested_) : 100.0;
     double const charge_match = n_charges_checked_ ? 100.0 * (1.0 - (double)n_charges_mismatch_ / n_charges_checked_)
                                                    : 100.0;
-    std::printf("atom match: %.4f %%, charge match: %.4f %%, molecule match: %.3f %%\n", atom_match, charge_match,
-                molecule_match);
-    for (auto const &mismatch : mismatches_) {
-        std::printf("  element=%d rdk=%u nat=%u  [%s]\n", mismatch.element, mismatch.expected, mismatch.got,
-                    mismatch.smiles.c_str());
-    }
+    fmt::println("atom match: {:.3f} %, charge match: {:.3f} %, molecule match: {:.3f} %", atom_match, charge_match,
+                 molecule_match);
+    if (!mismatches_.empty()) std::fflush(stdout);
+    for (auto const &mismatch : mismatches_)
+        fmt::println(stderr, "MISMATCH mmff_typer smiles={} element={} field=atom_type rdkit={} native={}",
+                     mismatch.smiles, mismatch.element, mismatch.expected, mismatch.got);
     double const molecule_mismatch_ppm = n_mols_tested_ ? 1.0e6 * (double)n_mols_mismatch_ / (double)n_mols_tested_
                                                         : 0.0;
-    std::printf("molecule mismatch: %.1f ppm\n", molecule_mismatch_ppm);
+    fmt::println("molecule mismatch: {:.3f} ppm", molecule_mismatch_ppm);
     // Gate on molecules. The curated probe set carries a witness for every known typing hazard and must be
     // exact; an external corpus gets 100 ppm of slack for structures nobody has triaged yet, which is still
     // tight enough that a single structural class — the smallest seen was five molecules in 18 344 — fails it.
     double const max_molecule_mismatch_ppm = (argc > 1) ? 100.0 : 0.0;
-    if (molecule_mismatch_ppm > max_molecule_mismatch_ppm) {
-        std::printf("FAIL (%d of %d molecules mismatched, %.1f ppm > %.1f ppm)\n", n_mols_mismatch_, n_mols_tested_,
-                    molecule_mismatch_ppm, max_molecule_mismatch_ppm);
-        return 1;
-    }
-    std::printf("PASS\n");
-    return 0;
+    if (molecule_mismatch_ppm > max_molecule_mismatch_ppm)
+        return sftest::report_fail(test_name_k, "{} of {} molecules mismatched, {:.3f} ppm > {:.3f} ppm",
+                                   n_mols_mismatch_, n_mols_tested_, molecule_mismatch_ppm,
+                                   max_molecule_mismatch_ppm);
+    return sftest::report_pass(test_name_k);
 }

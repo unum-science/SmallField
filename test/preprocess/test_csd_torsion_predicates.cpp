@@ -20,7 +20,6 @@
  *  weaken the assertion.
  */
 
-#include <cstdio>  // `fprintf`, `stderr`
 #include <cstdlib> // `std::exit`, `std::getenv`
 #include <cstring> // `std::memset`
 
@@ -28,8 +27,12 @@
 #include <memory>        // `std::unique_ptr`
 #include <set>           // `std::set`
 #include <string>        // `std::string`
+#include <string_view>   // `std::string_view`
 #include <unordered_set> // `std::unordered_set`
 #include <vector>        // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
+#include <fmt/ranges.h> // `fmt::join`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -46,6 +49,8 @@
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_csd_torsion_predicates";
 
 namespace smallfield::tests {
 
@@ -82,12 +87,13 @@ static void validate_recursive_for_molecule_(recursive_case_t const &compiled, R
         bool const native_hit = sfp::recursive_query_match(descriptor, atom, compiled.pool, compiled.root);
         bool const rdkit_hit = (rdkit_roots.count(atom) != 0);
         if (native_hit != rdkit_hit) {
-            std::fprintf(stderr, "Sub-query mismatch: $(%s) atom=%u native=%d rdkit=%d\n", compiled.body, atom,
-                         native_hit ? 1 : 0, rdkit_hit ? 1 : 0);
-            std::fprintf(stderr, "  element=%u aromatic=%d degree=%u nH=%u hyb=%u\n", descriptor.element[atom],
+            std::fflush(stdout);
+            fmt::println(stderr, "MISMATCH csd_subquery body=$({}) smiles={} atom={} field=root_match rdkit={} native={}",
+                         compiled.body, smiles, atom, rdkit_hit ? 1 : 0, native_hit ? 1 : 0);
+            fmt::println(stderr, "NOTE csd_subquery atom={} element={} aromatic={} degree={} num_hydrogens={} hybridization={}",
+                         atom, descriptor.element[atom],
                          sft::atom_has_flag(descriptor, atom, sft::atom_flag_aromatic_k) ? 1 : 0,
                          descriptor.degree[atom], descriptor.num_hydrogens[atom], descriptor.hybridization[atom]);
-            std::fprintf(stderr, "  SMILES: %s\n", smiles.c_str());
             sf_verify_(false, "sub-query mismatch vs RDKit");
         }
     }
@@ -153,17 +159,12 @@ static std::size_t validate_patterns_for_molecule_(RDKit::ROMol const &molecule,
 
         auto const rdkit_tuples = rdkit_torsion_tuples_(molecule, compiled_pattern);
         if (native_tuples != rdkit_tuples) {
-            std::fprintf(stderr, "Pattern mismatch:\n  SMARTS: %s\n  SMILES: %s\n", compiled_pattern.smarts.c_str(),
-                         smiles.c_str());
-            std::fprintf(stderr, "  native tuples (%zu):", native_tuples.size());
-            for (auto const &tuple : native_tuples)
-                std::fprintf(stderr, " (%u,%u,%u,%u)", std::get<0>(tuple), std::get<1>(tuple), std::get<2>(tuple),
-                             std::get<3>(tuple));
-            std::fprintf(stderr, "\n  rdkit tuples  (%zu):", rdkit_tuples.size());
-            for (auto const &tuple : rdkit_tuples)
-                std::fprintf(stderr, " (%u,%u,%u,%u)", std::get<0>(tuple), std::get<1>(tuple), std::get<2>(tuple),
-                             std::get<3>(tuple));
-            std::fprintf(stderr, "\n");
+            std::fflush(stdout);
+            fmt::println(stderr,
+                         "MISMATCH csd_pattern smarts={} smiles={} field=torsion_tuple_count rdkit={} native={}",
+                         compiled_pattern.smarts, smiles, rdkit_tuples.size(), native_tuples.size());
+            fmt::println(stderr, "NOTE csd_pattern smarts={} rdkit_tuples=[{}] native_tuples=[{}]",
+                         compiled_pattern.smarts, fmt::join(rdkit_tuples, " "), fmt::join(native_tuples, " "));
             sf_verify_(false, "pattern mismatch vs RDKit");
         }
         ++ok;
@@ -178,7 +179,7 @@ using sftest::validate_patterns_for_molecule_;
 using sftest::validate_recursive_for_molecule_;
 
 int main() {
-    std::printf("Cross-validating CSD torsion predicates and patterns against RDKit...\n");
+    fmt::println("test_csd_torsion_predicates: native CSD predicates and patterns vs RDKit SubstructMatch");
 
     // Every distinct `$(...)` body the CSD torsion corpus writes, compiled through the
     // same path the pattern compiler uses and cross-checked atom by atom against RDKit.
@@ -257,7 +258,7 @@ int main() {
     std::vector<std::string> smiles_list;
     if (corpus_path) {
         smiles_list = sftest::load_smiles(corpus_path, max_mols, sftest::smiles_missing_file_t::aborts_k);
-        std::printf("Corpus: %s (up to %zu molecules)\n", corpus_path, max_mols);
+        fmt::println("Corpus: {} (up to {} molecules)", corpus_path, fmt::group_digits(max_mols));
     }
     else {
         // The extended corpus is a convenience, not a prerequisite: absent it the builtin
@@ -269,16 +270,17 @@ int main() {
         bool const have_extended = !extended.empty();
         for (auto &entry : extended) smiles_list.push_back(std::move(entry));
         if (have_extended)
-            std::printf("Corpus: builtin standards + /tmp/chembl_valid.smi (up to %zu molecules)\n", max_mols);
-        else std::printf("Corpus: builtin standards only; set SMALLFIELD_TEST_CORPUS for a wider sweep\n");
+            fmt::println("Corpus: builtin standards + /tmp/chembl_valid.smi (up to {} molecules)",
+                         fmt::group_digits(max_mols));
+        else fmt::println("Corpus: builtin standards only; set SMALLFIELD_TEST_CORPUS for a wider sweep");
     }
 
     auto const &patterns = sfp::csd_patterns();
     std::size_t native_patterns = 0;
     for (auto const &pattern : patterns)
         if (pattern.native) ++native_patterns;
-    std::printf("CSD patterns: %zu total, %zu native (%0.1f%%)\n", patterns.size(), native_patterns,
-                100.0 * native_patterns / static_cast<double>(patterns.size()));
+    fmt::println("CSD patterns: {} total, {} native ({:.3f}%)", fmt::group_digits(patterns.size()),
+                 fmt::group_digits(native_patterns), 100.0 * native_patterns / static_cast<double>(patterns.size()));
 
     std::size_t total_validated = 0;
     std::size_t skipped = 0;
@@ -335,12 +337,11 @@ int main() {
         if (total_validated >= max_mols) break;
     }
 
-    std::printf("\nValidated %zu molecules (skipped %zu), %zu sub-query checks.\n", total_validated, skipped,
-                validated_sub_queries);
-    std::printf("Pattern checks: %zu (= %zu molecules × %zu native patterns)\n", total_pattern_checks, total_validated,
-                native_patterns);
+    fmt::println("Validated {} molecules (skipped {}), {} sub-query checks", fmt::group_digits(total_validated),
+                 fmt::group_digits(skipped), fmt::group_digits(validated_sub_queries));
+    fmt::println("Pattern checks: {} (= {} molecules x {} native patterns)", fmt::group_digits(total_pattern_checks),
+                 fmt::group_digits(total_validated), fmt::group_digits(native_patterns));
     std::size_t const expected_min = std::min<std::size_t>(max_mols, 8);
     sf_verify_(total_validated >= expected_min, "fewer molecules validated than the corpus floor — bad test data?");
-    std::printf("\nAll native sub-query + pattern cross-validation tests passed.\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

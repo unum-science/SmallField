@@ -5,9 +5,10 @@
  *  Compiled with g++, C++20. CUDA kernels in test_chirality_kernels.cu.
  */
 
-#include <cstdio> // `printf`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
-#include <vector> // `std::vector`
+#include <fmt/format.h> // `fmt::println`
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
@@ -20,8 +21,10 @@ namespace sftest = smallfield::tests;
 
 using sftest::gpu_validate_chirality;
 
+static constexpr std::string_view test_name_k = "test_chirality";
+
 static void test_chirality_correct_conformer() {
-    std::printf("test_chirality_correct_conformer\n");
+    fmt::println("test_chirality_correct_conformer");
 
     // Use molecules with known chirality.
     std::vector<std::string> chiral_smiles = {
@@ -32,7 +35,7 @@ static void test_chirality_correct_conformer() {
     };
 
     for (auto const &smiles : chiral_smiles) {
-        std::printf("  testing: %s\n", smiles.c_str());
+        fmt::println("  testing: {}", smiles);
 
         auto molecule = sftest::mol_from_smiles(smiles);
         sf_verify_(molecule != nullptr, "failed to parse SMILES");
@@ -46,10 +49,10 @@ static void test_chirality_correct_conformer() {
         sft::molecule_descriptor_t descriptor;
         sft::build_descriptor(*molecule, descriptor);
         sfp::extract_chiral_centers(*molecule, descriptor, chirals);
-        std::printf("    found %zu chiral centers\n", chirals.size());
+        fmt::println("    found {} chiral centers", chirals.size());
 
         if (chirals.empty()) {
-            std::printf("    skipping (no chirals extracted)\n");
+            fmt::println("    skipping (no chirals extracted)");
             continue;
         }
 
@@ -64,13 +67,13 @@ static void test_chirality_correct_conformer() {
 
         bool result = gpu_validate_chirality(coords_soa.data(), chirals.data(), num_atoms,
                                              static_cast<std::uint32_t>(chirals.size()));
-        std::printf("    graph-based check: %s\n", result ? "PASS" : "FAIL");
+        fmt::println("    NOTE chirality smiles={} field=graph_check satisfied={}", smiles, result ? 1 : 0);
         sf_verify_(result, "embedded RDKit conformer must satisfy extracted chirality targets");
     }
 }
 
 static void test_chirality_inverted() {
-    std::printf("test_chirality_inverted\n");
+    fmt::println("test_chirality_inverted");
 
     auto molecule = sftest::mol_from_smiles("C[C@@H](O)CC");
     sf_verify_(molecule != nullptr, "failed to parse");
@@ -85,7 +88,7 @@ static void test_chirality_inverted() {
     sfp::extract_chiral_centers(*molecule, descriptor, chirals);
 
     if (chirals.empty()) {
-        std::printf("  skipping (no chirals extracted)\n");
+        fmt::println("  skipping (no chirals extracted)");
         return;
     }
 
@@ -105,7 +108,8 @@ static void test_chirality_inverted() {
                                                   static_cast<std::uint32_t>(chirals.size()));
     bool result_flipped = gpu_validate_chirality(coords_soa.data(), flipped_chirals.data(), num_atoms,
                                                  static_cast<std::uint32_t>(flipped_chirals.size()));
-    std::printf("  original: %s, flipped: %s\n", result_original ? "PASS" : "FAIL", result_flipped ? "PASS" : "FAIL");
+    fmt::println("  NOTE chirality field=target_sign original_satisfied={} flipped_satisfied={}",
+                 result_original ? 1 : 0, result_flipped ? 1 : 0);
     // The key test is that the original and flipped targets produce opposite results.
     sf_verify_(result_original != result_flipped, "flipping chiral sign must change validation outcome");
 }
@@ -113,6 +117,5 @@ static void test_chirality_inverted() {
 int main() {
     test_chirality_correct_conformer();
     test_chirality_inverted();
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

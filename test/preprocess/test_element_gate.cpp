@@ -8,32 +8,37 @@
  *  `conformer_status_t` so the caller can route to CPU fallback or surface a precise error to the user.
  */
 
-#include <cstdio>  // `fprintf`, `stderr`
 #include <cstdlib> // `std::exit`
 
-#include <string> // `std::string`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
 
 #include "smallfield/api/conformer_status.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
-#include "test/test_rdkit_reference_helpers.hpp"
+#include "test/test_helpers.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sfprep = smallfield::preprocess;
+namespace sftest = smallfield::tests;
 
-static void expect_status(std::string const &smiles, sfapi::conformer_status_t expected, char const *label) {
+static constexpr std::string_view test_name_k = "test_element_gate";
+
+static void expect_status(std::string const &smiles, sfapi::conformer_status_t expected, std::string_view label) {
     sfprep::etkdg_prepared_molecule_t scratch {};
     auto const status = sfprep::prepare_molecule_into(smiles, scratch);
     if (status != expected) {
-        std::fprintf(stderr, "FAIL [%s]: SMILES=%s expected status=%u got=%u\n", label, smiles.c_str(),
-                     static_cast<unsigned>(expected), static_cast<unsigned>(status));
+        [[maybe_unused]] int const exit_code = sftest::report_fail(
+            test_name_k, "{} smiles={} expected_status={} observed_status={}", label, smiles,
+            static_cast<unsigned>(expected), static_cast<unsigned>(status));
         std::exit(1);
     }
-    bool const expect_drop = (expected != sfapi::conformer_status_t::success_k);
-    bool const did_drop = (scratch.num_atoms == 0);
-    if (expect_drop != did_drop) {
-        std::fprintf(stderr, "FAIL [%s]: SMILES=%s num_atoms=%u (expected drop=%d)\n", label, smiles.c_str(),
-                     scratch.num_atoms, static_cast<int>(expect_drop));
+    unsigned const expected_atoms_dropped = expected != sfapi::conformer_status_t::success_k ? 1u : 0u;
+    unsigned const observed_atoms_dropped = scratch.num_atoms == 0 ? 1u : 0u;
+    if (expected_atoms_dropped != observed_atoms_dropped) {
+        [[maybe_unused]] int const exit_code = sftest::report_fail(
+            test_name_k, "{} smiles={} num_atoms={} expected_dropped={} observed_dropped={}", label, smiles,
+            scratch.num_atoms, expected_atoms_dropped, observed_atoms_dropped);
         std::exit(1);
     }
 }
@@ -57,6 +62,5 @@ int main() {
     // SMILES parse failure — clearly malformed input.
     expect_status("not-a-smiles-string-((", sfapi::conformer_status_t::invalid_smiles_k, "garbage");
 
-    std::printf("test_element_gate: PASS\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

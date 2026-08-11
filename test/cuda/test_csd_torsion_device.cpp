@@ -12,16 +12,18 @@
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
-#include <cstdio>  // `fprintf`, `stderr`
 #include <cstdlib> // `std::exit`, `std::getenv`
 #include <cstring> // `std::memcpy`
 
-#include <chrono> // `std::chrono::steady_clock`, `std::chrono::duration`
-#include <memory> // `std::unique_ptr`
-#include <set>    // `std::set`
-#include <string> // `std::string`
-#include <tuple>  // `std::tuple`
-#include <vector> // `std::vector`
+#include <chrono>      // `std::chrono::steady_clock`, `std::chrono::duration`
+#include <memory>      // `std::unique_ptr`
+#include <set>         // `std::set`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <tuple>       // `std::tuple`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -37,6 +39,8 @@
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_csd_torsion_device";
 
 namespace smallfield::tests {
 
@@ -116,7 +120,7 @@ using sftest::torsion_key_t;
 using sftest::torsion_stride_k;
 
 int main() {
-    std::printf("=== test_csd_torsion_device: device CSD torsion matcher vs host extractor ===\n");
+    fmt::println("test_csd_torsion_device: device CSD torsion matcher vs host extractor");
 
     std::vector<std::string> smiles_list = sftest::standard_test_smiles();
     char const *corpus_env = std::getenv("SMALLFIELD_TEST_CORPUS");
@@ -126,15 +130,15 @@ int main() {
     if (corpus_env != nullptr)
         for (auto const &path : split_paths_(corpus_env)) {
             auto loaded = sftest::load_smiles(path, max_molecules, sftest::smiles_missing_file_t::aborts_k);
-            std::printf("Corpus: %s (%zu molecules)\n", path.c_str(), loaded.size());
+            fmt::println("Corpus: {} ({} molecules)", path, fmt::group_digits(loaded.size()));
             for (auto &smiles : loaded) smiles_list.push_back(std::move(smiles));
         }
-    else std::printf("Corpus: builtin standards only; set SMALLFIELD_TEST_CORPUS for a wider sweep\n");
+    else fmt::println("Corpus: builtin standards only; set SMALLFIELD_TEST_CORPUS for a wider sweep");
 
     std::size_t table_bytes = 0;
     void *table_handle = sftest::create_csd_torsion_device_table(table_bytes);
     sf_verify_(table_handle != nullptr, "device torsion table upload failed");
-    std::printf("Device pattern table: %zu bytes\n", table_bytes);
+    fmt::println("Device pattern table: {} bytes", fmt::group_digits(table_bytes));
 
     std::vector<sft::molecule_descriptor_t> descriptors;
     std::vector<std::string> descriptor_smiles;
@@ -184,9 +188,11 @@ int main() {
             total_torsions += expected.size();
             if (expected == produced) continue;
             ++mismatches;
-            if (mismatches <= 5)
-                std::fprintf(stderr, "Torsion set mismatch: host=%zu device=%zu\n  SMILES: %s\n", expected.size(),
-                             produced.size(), descriptor_smiles[molecule].c_str());
+            if (mismatches <= 5) {
+                std::fflush(stdout);
+                fmt::println(stderr, "MISMATCH csd_torsion smiles={} field=torsion_count host={} device={}",
+                             descriptor_smiles[molecule], expected.size(), produced.size());
+            }
         }
         descriptors.clear();
         descriptor_smiles.clear();
@@ -203,15 +209,15 @@ int main() {
 
     sftest::destroy_csd_torsion_device_table(table_handle);
 
-    std::printf("Molecules compared: %zu, host torsions: %zu, mismatches: %zu\n", compared, total_torsions, mismatches);
+    fmt::println("Molecules compared: {}, host torsions: {}, mismatches: {}", fmt::group_digits(compared),
+                 fmt::group_digits(total_torsions), fmt::group_digits(mismatches));
     if (compared > 0) {
         double const host_per = host_microseconds / static_cast<double>(compared);
         double const device_per = device_microseconds / static_cast<double>(compared);
-        std::printf("Matching cost per molecule: host %.2f us (1 thread), device %.2f us (launch + sync), %.2fx\n",
-                    host_per, device_per, device_per > 0.0 ? host_per / device_per : 0.0);
+        fmt::println("Matching cost per molecule: host {:.2f} us (1 thread), device {:.2f} us (launch + sync), {:.2f}x",
+                     host_per, device_per, device_per > 0.0 ? host_per / device_per : 0.0);
     }
     sf_verify_(compared > 0, "no molecules were compared");
     sf_verify_(mismatches == 0, "device torsion sets diverge from the host extractor");
-    std::printf("PASS: device and host torsion sets agree on every molecule\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

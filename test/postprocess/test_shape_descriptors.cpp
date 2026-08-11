@@ -15,11 +15,13 @@
 
 #include <cmath>   // `std::fabs`, `std::sqrt`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
-#include <cstdio>  // `printf`
 
-#include <memory> // `std::unique_ptr`
-#include <string> // `std::string`
-#include <vector> // `std::vector`
+#include <memory>      // `std::unique_ptr`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`
 
 #include <GraphMol/Descriptors/USRDescriptor.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
@@ -34,6 +36,9 @@
 #include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfp = smallfield::postprocess;
+namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_shape_descriptors";
 
 namespace smallfield::tests {
 
@@ -97,9 +102,8 @@ static void validate_descriptors_(std::string const &smiles) {
     double const usrcat_deviation = max_abs_diff_(rdkit_usrcat, native_usrcat.data(), 60);
 
     double const tolerance = 1e-4;
-    bool const pass = usr_deviation < tolerance && usrcat_deviation < tolerance;
-    std::printf("  [%s] %-34s USR maxdev=%.3e  USRCAT maxdev=%.3e\n", pass ? "PASS" : "FAIL", smiles.c_str(),
-                usr_deviation, usrcat_deviation);
+    fmt::println("  NOTE shape_descriptors smiles={:<34} usr_max_deviation={:.3g} usrcat_max_deviation={:.3g}", smiles,
+                 usr_deviation, usrcat_deviation);
     sf_verify_(usr_deviation < tolerance, ("USR deviation exceeds tolerance for: " + smiles).c_str());
     sf_verify_(usrcat_deviation < tolerance, ("USRCAT deviation exceeds tolerance for: " + smiles).c_str());
 }
@@ -175,8 +179,9 @@ static void validate_fragment_separation_() {
     double const centroid_gap_after = centroid_distance_(component_centroid_(coords, context.component_label, 0),
                                                          component_centroid_(coords, context.component_label, 1));
 
-    std::printf("  [salt] centroid gap %.3f -> %.3f  intra sums (%.4f,%.4f)->(%.4f,%.4f)\n", centroid_gap_before,
-                centroid_gap_after, intra0_before, intra1_before, intra0_after, intra1_after);
+    fmt::println("  NOTE fragment_separation subject=salt centroid_gap_before={:.3f} centroid_gap_after={:.3f} "
+                 "intra_sums_before=({:.4f},{:.4f}) intra_sums_after=({:.4f},{:.4f})",
+                 centroid_gap_before, centroid_gap_after, intra0_before, intra1_before, intra0_after, intra1_after);
 
     sf_verify_(centroid_gap_after > centroid_gap_before, "separation did not push fragment centroids apart");
     sf_verify_near_(intra0_after, intra0_before, 1e-3, "component 0 intra-fragment distances changed");
@@ -186,7 +191,7 @@ static void validate_fragment_separation_() {
 } // namespace smallfield::tests
 
 int main() {
-    std::printf("Validating native USR / USRCAT against RDKit...\n");
+    fmt::println("test_shape_descriptors: native USR / USRCAT vs RDKit, then fragment separation");
 
     smallfield::tests::validate_descriptors_("CCO");
     smallfield::tests::validate_descriptors_("c1ccccc1");
@@ -195,9 +200,8 @@ int main() {
     smallfield::tests::validate_descriptors_("OC(=O)CCc1cc(O)c(O)cc1"); // multiple donors/acceptors/aromatic
     smallfield::tests::validate_descriptors_("CC(=O)Nc1ccc(O)cc1");     // paracetamol
 
-    std::printf("Validating fragment separation...\n");
+    fmt::println("Validating fragment separation...");
     smallfield::tests::validate_fragment_separation_();
 
-    std::printf("\nAll shape descriptor tests passed.\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

@@ -23,7 +23,6 @@
 
 #include <cmath>   // `std::fabs`
 #include <cstdint> // `std::uint64_t`, `std::uint8_t`
-#include <cstdio>  // `printf`, `fprintf`
 
 #include <algorithm>    // `std::sort`, `std::min`
 #include <charconv>     // `std::from_chars`
@@ -33,6 +32,8 @@
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
 #include <vector>       // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include <GraphMol/Chirality.h>
 #include <GraphMol/GraphMol.h>
@@ -46,6 +47,8 @@
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_chiral_parity";
 
 namespace smallfield::tests {
 
@@ -162,9 +165,13 @@ static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descr
         ++tally.cip_compared;
         if (center.target_sign != expected_sign) {
             ++tally.cip_mismatches;
-            if (tally.cip_mismatches <= 10)
-                std::printf("  CIP MISMATCH %s atom %u: derived %+d, oracle %+d (%s)\n", label.c_str(), atom,
-                            static_cast<int>(center.target_sign), expected_sign, cip_code.c_str());
+            if (tally.cip_mismatches <= 10) {
+                std::fflush(stdout);
+                fmt::println(stderr,
+                             "MISMATCH chiral_parity oracle=cip molecule={} atom={} cip_code={} field=target_sign "
+                             "oracle={:+} derived={:+}",
+                             label, atom, cip_code, expected_sign, static_cast<int>(center.target_sign));
+            }
         }
     }
 }
@@ -210,9 +217,14 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
         int const realized_sign = (volume > 0.0) ? 1 : -1;
         if (center.target_sign != realized_sign) {
             ++tally.geometry_mismatches;
-            if (tally.geometry_mismatches <= 10)
-                std::printf("  GEOMETRY MISMATCH %s atom %u: target %+d, embedded volume %.3f\n", label.c_str(),
-                            static_cast<unsigned>(center.center_atom), static_cast<int>(center.target_sign), volume);
+            if (tally.geometry_mismatches <= 10) {
+                std::fflush(stdout);
+                fmt::println(stderr,
+                             "MISMATCH chiral_parity oracle=geometry molecule={} atom={} field=target_sign "
+                             "embedded={:+} target={:+} signed_volume={:.3f}",
+                             label, static_cast<unsigned>(center.center_atom), realized_sign,
+                             static_cast<int>(center.target_sign), volume);
+            }
         }
     }
 }
@@ -297,7 +309,7 @@ static void check_stereoisomers_(std::string const &smiles, oracle_tally_t &tall
         if (tag == RDKit::Atom::CHI_TETRAHEDRAL_CW || tag == RDKit::Atom::CHI_TETRAHEDRAL_CCW)
             tagged_atoms.push_back(atom->getIdx());
     }
-    if (tagged_atoms.empty()) std::printf("  NO TAG SURVIVED: %s\n", smiles.c_str());
+    if (tagged_atoms.empty()) fmt::println("  NOTE chiral_parity smiles={} field=tetrahedral_tags surviving=0", smiles);
     sf_verify_(!tagged_atoms.empty(), "curated SMILES must carry at least one tetrahedral tag");
 
     std::uint32_t const enumerated_atoms = std::min<std::uint32_t>(tagged_atoms.size(), 4);
@@ -314,45 +326,21 @@ static void check_stereoisomers_(std::string const &smiles, oracle_tally_t &tall
 }
 
 /**
- *  @brief Read SMILES from a whitespace-delimited corpus file.
- *
- *  @param[in] path File to read; a missing file yields an empty list.
- *  @param[in] limit Maximum number of entries to return.
- *  @return One SMILES string per accepted line.
- */
-static std::vector<std::string> load_corpus_(char const *path, std::size_t limit) {
-    std::vector<std::string> smiles;
-    std::ifstream stream(path);
-    std::string line;
-    while (smiles.size() < limit && std::getline(stream, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        auto const separator = line.find_first_of(" \t");
-        if (separator != std::string::npos) line.resize(separator);
-        if (!line.empty()) smiles.push_back(std::move(line));
-    }
-    return smiles;
-}
-
-/**
  *  @brief Print one tally block.
  *
  *  @param[in] heading Line printed above the counters.
  *  @param[in] tally Counters to report.
  */
-static void report_(char const *heading, oracle_tally_t const &tally) {
-    std::printf("  %s\n", heading);
-    std::printf("    molecules %llu, centers %llu (%llu three-coordinate)\n",
-                static_cast<unsigned long long>(tally.molecules), static_cast<unsigned long long>(tally.centers),
-                static_cast<unsigned long long>(tally.three_coordinate));
-    std::printf("    CIP oracle: %llu compared, %llu mismatches, %llu skipped on rank ties, %llu unlabeled\n",
-                static_cast<unsigned long long>(tally.cip_compared),
-                static_cast<unsigned long long>(tally.cip_mismatches), static_cast<unsigned long long>(tally.rank_ties),
-                static_cast<unsigned long long>(tally.unlabeled));
-    std::printf("    geometry oracle: %llu compared (%llu three-coordinate), %llu mismatches, %llu embeddings failed\n",
-                static_cast<unsigned long long>(tally.geometry_compared),
-                static_cast<unsigned long long>(tally.geometry_three_coordinate),
-                static_cast<unsigned long long>(tally.geometry_mismatches),
-                static_cast<unsigned long long>(tally.embed_failures));
+static void report_(std::string_view heading, oracle_tally_t const &tally) {
+    fmt::println("  {}", heading);
+    fmt::println("    molecules {}, centers {} ({} three-coordinate)", fmt::group_digits(tally.molecules),
+                 fmt::group_digits(tally.centers), fmt::group_digits(tally.three_coordinate));
+    fmt::println("    CIP oracle: {} compared, {} mismatches, {} skipped on rank ties, {} unlabeled",
+                 fmt::group_digits(tally.cip_compared), fmt::group_digits(tally.cip_mismatches),
+                 fmt::group_digits(tally.rank_ties), fmt::group_digits(tally.unlabeled));
+    fmt::println("    geometry oracle: {} compared ({} three-coordinate), {} mismatches, {} embeddings failed",
+                 fmt::group_digits(tally.geometry_compared), fmt::group_digits(tally.geometry_three_coordinate),
+                 fmt::group_digits(tally.geometry_mismatches), fmt::group_digits(tally.embed_failures));
 }
 
 } // namespace smallfield::tests
@@ -360,7 +348,7 @@ static void report_(char const *heading, oracle_tally_t const &tally) {
 int main(int argc, char **argv) {
     sftest::oracle_tally_t curated;
 
-    std::printf("test_chiral_parity: curated stereo set with exhaustive tag enumeration\n");
+    fmt::println("test_chiral_parity: curated stereo set with exhaustive tag enumeration");
     for (auto const &smiles : sftest::stereo_test_smiles_()) sftest::check_stereoisomers_(smiles, curated);
     sftest::report_("curated", curated);
     sf_verify_(curated.cip_compared >= 400, "curated set must reach several hundred CIP comparisons");
@@ -378,17 +366,28 @@ int main(int argc, char **argv) {
             std::string_view const text {argv[2]};
             auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), limit);
             if (error != std::errc {} || unparsed != text.data() + text.size()) {
-                std::fprintf(stderr, "usage: %s <corpus.smi> [max_molecules]\n", argv[0]);
+                fmt::println(stderr, "usage: {} <corpus.smi> [max_molecules]", argv[0]);
                 return 2;
             }
         }
-        auto const corpus = sftest::load_corpus_(corpus_path, limit);
-        std::printf("test_chiral_parity: corpus %s, %zu SMILES\n", corpus_path, corpus.size());
+        // Naming a corpus is a request to validate against it, so an empty result is a failure and not an
+        // empty corpus: it would otherwise run zero comparisons and satisfy `cip_mismatches == 0`
+        // vacuously, reporting a pass for work that never happened.  The reason distinguishes the two ways
+        // to get there, and costs a second open only on the path that is already failing.
+        auto const corpus = sftest::load_smiles(corpus_path, limit);
+        fmt::println("test_chiral_parity: corpus {}, {} SMILES", corpus_path, fmt::group_digits(corpus.size()));
+        if (corpus.empty()) {
+            std::ifstream probe(corpus_path);
+            if (!probe) return sftest::report_fail(test_name_k, "cannot open corpus {}", corpus_path);
+            return sftest::report_fail(test_name_k, "corpus {} opened but yielded no SMILES", corpus_path);
+        }
         sftest::oracle_tally_t corpus_tally;
         for (auto const &smiles : corpus) {
-            std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
-            if (!molecule) continue;
+            // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs
+            // inside the guard alongside `addHs`.
             try {
+                std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
+                if (!molecule) continue;
                 RDKit::MolOps::addHs(*molecule);
                 sftest::check_molecule_(*molecule, smiles, false, corpus_tally);
             }
@@ -397,9 +396,13 @@ int main(int argc, char **argv) {
             }
         }
         sftest::report_("corpus", corpus_tally);
+        // The same reasoning one level down: every molecule may have been skipped, and a tally of zero
+        // comparisons is indistinguishable from a tally of zero mismatches.
+        if (corpus_tally.cip_compared == 0)
+            return sftest::report_fail(test_name_k, "corpus {} produced no CIP comparisons over {} SMILES",
+                                       corpus_path, corpus.size());
         sf_verify_(corpus_tally.cip_mismatches == 0, "every corpus stereocenter must match the CIP oracle");
     }
 
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

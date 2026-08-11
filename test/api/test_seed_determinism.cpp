@@ -11,13 +11,14 @@
  */
 
 #include <cstdint> // `std::uint32_t`
-#include <cstdio>  // `printf`
 #include <cstring> // `std::memcmp`
 
 #include <span>        // `std::span`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include <cuda_fp16.h>
 
@@ -26,6 +27,9 @@
 #include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfapi = smallfield::api;
+namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_seed_determinism";
 
 /**
  *  @brief Build a corpus of distinct, valid SMILES large enough to expose scheduling jitter.
@@ -54,7 +58,7 @@ static void fill_corpus_into(std::uint32_t num_molecules, std::vector<std::strin
 }
 
 int main() {
-    std::printf("test_seed_determinism: fixed random_seed reproduces conformers bit for bit\n");
+    fmt::println("test_seed_determinism: fixed random_seed reproduces conformers bit for bit");
 
     constexpr std::uint32_t num_molecules = 768;
     constexpr std::uint32_t num_conformers = 3;
@@ -87,11 +91,11 @@ int main() {
     std::uint32_t num_successful = 0;
     for (auto code : status_first)
         if (code == sfapi::conformer_status_t::success_k) ++num_successful;
-    std::printf("  %u / %zu conformers succeeded on the first run\n", num_successful, total_conformers);
-    if (num_successful == 0) {
-        std::printf("FAILED: the corpus produced no conformers, so the comparison proves nothing\n");
-        return 1;
-    }
+    fmt::println("  {} / {} conformers succeeded on the first run", fmt::group_digits(num_successful),
+                 fmt::group_digits(total_conformers));
+    if (num_successful == 0)
+        return sftest::report_fail(test_name_k,
+                                   "the corpus produced no conformers, so the comparison proves nothing");
 
     std::uint32_t status_mismatches = 0, energy_mismatches = 0, coordinate_mismatches = 0;
     for (std::size_t slot = 0; slot < total_conformers; ++slot) {
@@ -102,14 +106,14 @@ int main() {
         if (std::memcmp(&coordinates_first[element], &coordinates_second[element], sizeof(__half)) != 0)
             ++coordinate_mismatches;
 
-    std::printf("  status mismatches: %u, energy mismatches: %u, coordinate mismatches: %u\n", status_mismatches,
-                energy_mismatches, coordinate_mismatches);
+    fmt::println("  status mismatches: {}, energy mismatches: {}, coordinate mismatches: {}",
+                 fmt::group_digits(status_mismatches), fmt::group_digits(energy_mismatches),
+                 fmt::group_digits(coordinate_mismatches));
 
-    if (status_mismatches != 0 || energy_mismatches != 0 || coordinate_mismatches != 0) {
-        std::printf("FAILED: two runs at seed %llu diverged\n", static_cast<unsigned long long>(config.random_seed));
-        return 1;
-    }
+    if (status_mismatches != 0 || energy_mismatches != 0 || coordinate_mismatches != 0)
+        return sftest::report_fail(
+            test_name_k, "two runs at seed {} diverged: status={} energy={} coordinate={} mismatches",
+            config.random_seed, status_mismatches, energy_mismatches, coordinate_mismatches);
 
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

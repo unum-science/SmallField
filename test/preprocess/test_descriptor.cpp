@@ -7,10 +7,11 @@
  *  getDistanceMat() (Floyd-Warshall).
  */
 
-#include <cstdio> // `printf`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
-#include <string> // `std::string`
-#include <vector> // `std::vector`
+#include <fmt/format.h> // `fmt::println`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -22,6 +23,8 @@
 
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_descriptor";
 
 static void validate_molecule(std::string const &smiles) {
     auto molecule = sftest::mol_from_smiles(smiles);
@@ -107,12 +110,12 @@ static void validate_molecule(std::string const &smiles) {
         sf_verify_(expect_ring == actual_ring, "bond in-ring flag mismatch");
     }
 
-    std::printf("  ok: %s (num_atoms=%u, bonds=%u, rings=%u)\n", smiles.c_str(), num_atoms, descriptor.num_bonds,
-                descriptor.num_rings);
+    fmt::println("  ok: {} (num_atoms={}, bonds={}, rings={})", smiles, num_atoms, descriptor.num_bonds,
+                 descriptor.num_rings);
 }
 
 int main() {
-    std::printf("Validating molecule_descriptor_t against RDKit accessors...\n");
+    fmt::println("test_descriptor: molecule_descriptor_t vs the RDKit accessors");
 
     for (auto const &smiles : sftest::standard_test_smiles()) validate_molecule(smiles);
 
@@ -123,6 +126,5 @@ int main() {
     validate_molecule("C1CC2CC3CC1CC(C2)C3");             // bridged ring (adamantane)
     validate_molecule("c1ccc2c(c1)[nH]c3ccccc23");        // fused aromatic (carbazole)
 
-    std::printf("\nAll descriptor validation tests passed.\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

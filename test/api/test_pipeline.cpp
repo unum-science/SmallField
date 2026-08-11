@@ -9,21 +9,26 @@
 #include <cmath>   // `std::isfinite`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
-#include <cstdio>  // `printf`, `std::tmpfile`
+#include <cstdio>  // `std::tmpfile`, `std::sscanf` -- the wave-table capture below reads a `FILE *`
 
 #include <array>       // `std::array`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
 
+#include <fmt/format.h> // `fmt::println`
+
 #include <cuda_fp16.h>
 
 #include "smallfield/api/smallfield.hpp"
 
+#include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_pipeline";
 
 namespace smallfield::api {
 
@@ -99,10 +104,17 @@ static void check_per_device_reservation() {
         std::uint32_t const quotient = sfapi::divide_rounding_up(division_case.wave_size, division_case.device_count);
         std::uint32_t const reservation = sfapi::reserve_molecules_per_device(division_case.wave_size,
                                                                               division_case.device_count);
-        if (quotient != division_case.expected_quotient || reservation != division_case.expected_reservation)
-            std::fprintf(stderr, "FAIL: wave=%u devices=%u quotient=%u (want %u) reservation=%u (want %u)\n",
-                         division_case.wave_size, division_case.device_count, quotient, division_case.expected_quotient,
-                         reservation, division_case.expected_reservation);
+        if (quotient != division_case.expected_quotient || reservation != division_case.expected_reservation) {
+            std::fflush(stdout);
+            fmt::println(stderr,
+                         "MISMATCH wave_sizing wave_size={} device_count={} field=quotient expected={} observed={}",
+                         division_case.wave_size, division_case.device_count, division_case.expected_quotient,
+                         quotient);
+            fmt::println(stderr,
+                         "MISMATCH wave_sizing wave_size={} device_count={} field=reservation expected={} observed={}",
+                         division_case.wave_size, division_case.device_count, division_case.expected_reservation,
+                         reservation);
+        }
         sf_verify_(quotient == division_case.expected_quotient, "per-device quotient wrapped or rounded wrongly");
         sf_verify_(reservation == division_case.expected_reservation, "per-device reservation is wrong");
     }
@@ -201,8 +213,8 @@ static void check_empty_wave_timings() {
                 status[molecule * num_conformers + conformer] == sfapi::conformer_status_t::unsupported_element_k,
                 "the last wave's molecules must be rejected by the element gate");
 
-    std::printf("  empty-wave timings: wave0 gpu_max=%.3f ms, wave2 gpu_max=%.3f ms (must be 0)\n", rows[0].gpu_max_ms,
-                rows[2].gpu_max_ms);
+    fmt::println("  empty-wave timings: wave0 gpu_max={:.1f} ms, wave2 gpu_max={:.1f} ms (must be 0)",
+                 rows[0].gpu_max_ms, rows[2].gpu_max_ms);
 }
 
 } // namespace smallfield::tests
@@ -211,9 +223,9 @@ int main() {
     sftest::check_wave_budget_arithmetic();
     sftest::check_per_device_reservation();
     sftest::check_empty_wave_timings();
-    std::printf("test_pipeline: wave sizing + empty-wave timing checks passed\n");
+    fmt::println("test_pipeline: wave sizing + empty-wave timing checks passed");
 
-    std::printf("test_pipeline: end-to-end ETKDG conformer generation via library API\n");
+    fmt::println("test_pipeline: end-to-end ETKDG conformer generation via library API");
 
     auto test_smiles_str = sftest::standard_test_smiles();
     std::vector<std::string_view> test_smiles(test_smiles_str.begin(), test_smiles_str.end());
@@ -241,26 +253,26 @@ int main() {
     sfapi::conformer_status_t const batch_status = context.generate_conformers(test_smiles, config, max_atoms,
                                                                                coordinates, energies, status);
 
-    std::printf("  batch status: %u\n", static_cast<unsigned>(batch_status));
+    fmt::println("  batch status: {}", static_cast<unsigned>(batch_status));
 
-    // cross-validate against RDKit
+    // cross-validate against RDKit, which is the reference the conformer energies are narrated against
+    sftest::diagnostic_reporter_t energy_reporter {"rdkit", "smallfield"};
     std::uint32_t total_attempted = 0;
     std::uint32_t total_successful = 0;
     std::uint32_t total_finite_energy = 0;
     std::uint32_t total_reasonable_energy = 0;
 
     for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
-        std::printf("  molecule %u (%.*s):\n", molecule_index, static_cast<int>(test_smiles[molecule_index].size()),
-                    test_smiles[molecule_index].data());
+        fmt::println("  molecule {} ({}):", molecule_index, test_smiles[molecule_index]);
 
         auto rdkit_mol = sftest::mol_from_smiles(std::string(test_smiles[molecule_index]));
         if (!rdkit_mol) {
-            std::printf("    skipped (RDKit parse failure)\n");
+            fmt::println("    skipped (RDKit parse failure)");
             continue;
         }
         bool const embedded = sftest::embed_molecule(*rdkit_mol);
         if (!embedded) {
-            std::printf("    skipped (RDKit embed failure)\n");
+            fmt::println("    skipped (RDKit embed failure)");
             continue;
         }
 
@@ -271,7 +283,7 @@ int main() {
             std::uint32_t const slot = molecule_index * num_conformers + conformer;
 
             if (status[slot] != sfapi::conformer_status_t::success_k) {
-                std::printf("    conformer %u: status=%u\n", conformer, static_cast<unsigned>(status[slot]));
+                fmt::println("    conformer {}: status={}", conformer, static_cast<unsigned>(status[slot]));
                 continue;
             }
             total_successful++;
@@ -293,23 +305,22 @@ int main() {
                 if (rdkit_energy < 500.0) total_reasonable_energy++;
             }
 
-            if (conformer == 0) {
-                std::printf("    conformer 0: rdkit=%.2f sf=%.4f kcal/mol\n", rdkit_energy, energies[slot]);
-            }
+            if (conformer == 0)
+                energy_reporter.note("conformer_energy", "molecule={} conformer={}", molecule_index, conformer)
+                    .field("mmff94_energy_kcal_per_mol", rdkit_energy, energies[slot]);
         }
     }
 
     double const success_rate = total_attempted > 0 ? 100.0 * total_successful / total_attempted : 0.0;
-    std::printf("\n  summary:\n");
-    std::printf("    conformers attempted:  %u\n", total_attempted);
-    std::printf("    conformers succeeded:  %u (%.1f%%)\n", total_successful, success_rate);
-    std::printf("    finite MMFF94 energy:  %u (%.1f%% of successes)\n", total_finite_energy,
-                total_successful > 0 ? 100.0 * total_finite_energy / total_successful : 0.0);
-    std::printf("    reasonable energy:     %u (< 500 kcal/mol)\n", total_reasonable_energy);
+    fmt::println("\n  summary:");
+    fmt::println("    conformers attempted:  {}", fmt::group_digits(total_attempted));
+    fmt::println("    conformers succeeded:  {} ({:.3f}%)", fmt::group_digits(total_successful), success_rate);
+    fmt::println("    finite MMFF94 energy:  {} ({:.3f}% of successes)", fmt::group_digits(total_finite_energy),
+                 total_successful > 0 ? 100.0 * total_finite_energy / total_successful : 0.0);
+    fmt::println("    reasonable energy:     {} (< 500 kcal/mol)", fmt::group_digits(total_reasonable_energy));
 
     sf_verify_(total_successful > 0, "at least one conformer must succeed");
-    sf_verify_(success_rate >= 50.0, "success rate must be at least 50%%");
+    sf_verify_(success_rate >= 50.0, "success rate must be at least 50%");
 
-    std::printf("\ntest_pipeline: PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

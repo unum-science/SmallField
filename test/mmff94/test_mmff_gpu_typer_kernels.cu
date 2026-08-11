@@ -7,7 +7,8 @@
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
-#include <cstdio>  // `fprintf`, `stderr`
+
+#include <fmt/format.h> // `fmt::println` -- host-side only; nothing below a `__global__` uses it
 
 #include <cuda_runtime.h>
 
@@ -53,7 +54,8 @@ void launch_mmff94_gpu_typer_batch(sfparam::mmff94_tables_view_t tables_view,
                                           atom_types_device, atom_charges_device, typing_status_device);
     cudaDeviceSynchronize();
     cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) { std::fprintf(stderr, "GPU typer kernel error: %s\n", cudaGetErrorString(error)); }
+    if (error != cudaSuccess)
+        fmt::println(stderr, "NOTE mmff_typer_kernels field=launch cuda_error={}", cudaGetErrorString(error));
 
     cudaMemcpy(atom_types_out, atom_types_device, total_atoms * sizeof(std::uint8_t), cudaMemcpyDeviceToHost);
     cudaMemcpy(atom_charges_out, atom_charges_device, total_atoms * sizeof(float), cudaMemcpyDeviceToHost);

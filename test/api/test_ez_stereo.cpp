@@ -8,11 +8,11 @@
  *  to reach.
  */
 
-#include <cstdio> // `printf`
-
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`
 
 #include <cuda_fp16.h>
 #include <GraphMol/MolOps.h>
@@ -23,6 +23,8 @@
 
 namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_ez_stereo";
 
 /** One isomer under test and the bond stereo its SMILES declares. */
 struct ez_case_t {
@@ -113,14 +115,17 @@ int main() {
                 continue;
             }
             if (is_cis == cases[mol_index].expect_cis) ++matched;
-            else
-                std::printf("  MISMATCH %-20s expected %s, got %s\n", cases[mol_index].smiles,
-                            cases[mol_index].expect_cis ? "cis" : "trans", is_cis ? "cis" : "trans");
+            else {
+                std::fflush(stdout);
+                fmt::println(stderr, "MISMATCH ez_stereo smiles={} conformer={} field=bond_stereo declared={} perceived={}",
+                             cases[mol_index].smiles, conformer, cases[mol_index].expect_cis ? "cis" : "trans",
+                             is_cis ? "cis" : "trans");
+            }
         }
     }
 
-    std::printf("E/Z round-trip: %u conformers checked, %u matched, %u without perceivable stereo\n", checked, matched,
-                unperceived);
+    fmt::println("E/Z round-trip: {} conformers checked, {} matched, {} without perceivable stereo", checked, matched,
+                 unperceived);
 
     sf_verify_(checked > 0, "at least one conformer must be generated");
     // Allow a small share of conformers whose geometry RDKit cannot assign, but every
@@ -129,6 +134,5 @@ int main() {
     sf_verify_(perceivable > 0, "at least one conformer must have perceivable double-bond stereo");
     sf_verify_(matched == perceivable, "every perceivable conformer must match its declared E/Z");
 
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

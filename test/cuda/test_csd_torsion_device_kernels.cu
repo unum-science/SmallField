@@ -7,7 +7,8 @@
  */
 
 #include <cstdint> // `std::uint32_t`
-#include <cstdio>  // `fprintf`, `stderr`
+
+#include <fmt/format.h> // `fmt::println` -- host-side only; nothing below a `__global__` uses it
 
 #include <cuda_runtime.h>
 
@@ -67,7 +68,8 @@ bool run_csd_torsion_device_batch(void *handle, sft::molecule_descriptor_t const
                                   torsion_stride, counts_device);
     cudaDeviceSynchronize();
     cudaError_t const error = cudaGetLastError();
-    if (error != cudaSuccess) std::fprintf(stderr, "CSD torsion kernel error: %s\n", cudaGetErrorString(error));
+    if (error != cudaSuccess)
+        fmt::println(stderr, "NOTE csd_torsion_kernels field=launch cuda_error={}", cudaGetErrorString(error));
 
     cudaMemcpy(torsions_out, torsions_device, torsion_slots * sizeof(sft::etk_torsion_descriptor_t),
                cudaMemcpyDeviceToHost);

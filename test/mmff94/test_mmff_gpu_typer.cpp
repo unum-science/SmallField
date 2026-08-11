@@ -5,16 +5,18 @@
  *  Gate: byte-identical atom types and per-atom partial charges.
  */
 
-#include <cmath>  // `std::fabs`
-#include <cstdio> // `printf`
+#include <cmath> // `std::fabs`
 
-#include <algorithm> // `std::max`, `std::unique`
-#include <iostream>  // RDKit's `AtomTyper.h` needs it but does not include it
-#include <memory>    // `std::unique_ptr`
-#include <span>      // `std::span`
-#include <sstream>   // RDKit's `AtomTyper.h` needs it but does not include it
-#include <string>    // `std::string`
-#include <vector>    // `std::vector`
+#include <algorithm>   // `std::max`, `std::unique`
+#include <iostream>    // RDKit's `AtomTyper.h` needs it but does not include it
+#include <memory>      // `std::unique_ptr`
+#include <span>        // `std::span`
+#include <sstream>     // RDKit's `AtomTyper.h` needs it but does not include it
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include <boost/shared_ptr.hpp>
 #include <cuda_runtime.h>
@@ -40,8 +42,10 @@ namespace sftest = smallfield::tests;
 using sftest::approximately_equal;
 using sftest::load_smiles;
 
+static constexpr std::string_view test_name_k = "test_mmff_gpu_typer";
+
 int main(int argc, char **argv) {
-    std::printf("=== test_mmff_gpu_typer: GPU vs CPU MMFF typer byte-equality gate ===\n");
+    fmt::println("test_mmff_gpu_typer: GPU vs CPU MMFF typer byte-equality gate");
 
     sfparam::mmff94_tables_host_t tables_host {};
     sfparam::extract_mmff94_tables_from_rdkit(tables_host);
@@ -49,10 +53,7 @@ int main(int argc, char **argv) {
 
     sfparam::mmff94_tables_view_t device_view {};
     void *device_tables_handle = smallfield::tests::create_mmff94_device_tables_view(tables_host, device_view);
-    if (!device_tables_handle) {
-        std::printf("FAIL: device table upload failed\n");
-        return 1;
-    }
+    if (!device_tables_handle) return sftest::report_fail(test_name_k, "device MMFF94 table upload failed");
 
     // Assemble a batch of descriptors.
     std::vector<std::string> smiles_batch = {
@@ -106,7 +107,8 @@ int main(int argc, char **argv) {
         descriptors.push_back(descriptor);
     }
 
-    std::printf("descriptors: %zu molecules, %u total atoms\n", descriptors.size(), total_atoms);
+    fmt::println("descriptors: {} molecules, {} total atoms", fmt::group_digits(descriptors.size()),
+                 fmt::group_digits(total_atoms));
 
     std::vector<std::uint8_t> gpu_atom_types(total_atoms);
     std::vector<float> gpu_atom_charges(total_atoms);
@@ -151,9 +153,11 @@ int main(int argc, char **argv) {
             else {
                 ++mismatched_atom_count;
                 if (mismatched_atom_count < 10) {
-                    std::printf("  mol=%zu atom=%u element=%u cpu=%u gpu=%u\n", molecule_index, atom_index,
-                                descriptor.element[atom_index], cpu_atom_types[atom_index],
-                                gpu_atom_types[atom_offset + atom_index]);
+                    std::fflush(stdout);
+                    fmt::println(stderr,
+                                 "MISMATCH mmff_typer molecule={} atom={} element={} field=atom_type cpu={} gpu={}",
+                                 molecule_index, atom_index, descriptor.element[atom_index],
+                                 cpu_atom_types[atom_index], gpu_atom_types[atom_offset + atom_index]);
                 }
                 molecule_matches = false;
             }
@@ -169,8 +173,11 @@ int main(int argc, char **argv) {
                 else {
                     ++mismatched_charge_count;
                     if (mismatched_charge_count < 10) {
-                        std::printf("  mol=%zu atom=%u cpu_pc=%.4f gpu_pc=%.4f\n", molecule_index, atom_index,
-                                    cpu_partial_charges[atom_index], gpu_atom_charges[atom_offset + atom_index]);
+                        std::fflush(stdout);
+                        fmt::println(stderr,
+                                     "MISMATCH mmff_typer molecule={} atom={} field=partial_charge cpu={} gpu={}",
+                                     molecule_index, atom_index, cpu_partial_charges[atom_index],
+                                     gpu_atom_charges[atom_offset + atom_index]);
                     }
                     molecule_matches = false;
                 }
@@ -179,18 +186,19 @@ int main(int argc, char **argv) {
         if (molecule_matches) ++matching_molecule_count;
         else ++mismatched_molecule_count;
     }
-    std::printf("fallback-flagged molecules (typing_status != 0): %d / %zu\n", fallback_molecule_count,
-                descriptors.size());
+    fmt::println("fallback-flagged molecules (typing_status != 0): {} / {}",
+                 fmt::group_digits(fallback_molecule_count), fmt::group_digits(descriptors.size()));
 
-    std::printf("atoms: %d match / %d mismatch\n", matching_atom_count, mismatched_atom_count);
-    std::printf("charges: %d match / %d mismatch\n", matching_charge_count, mismatched_charge_count);
-    std::printf("molecules: %d match / %d mismatch\n", matching_molecule_count, mismatched_molecule_count);
+    fmt::println("atoms: {} match / {} mismatch", fmt::group_digits(matching_atom_count),
+                 fmt::group_digits(mismatched_atom_count));
+    fmt::println("charges: {} match / {} mismatch", fmt::group_digits(matching_charge_count),
+                 fmt::group_digits(mismatched_charge_count));
+    fmt::println("molecules: {} match / {} mismatch", fmt::group_digits(matching_molecule_count),
+                 fmt::group_digits(mismatched_molecule_count));
 
     smallfield::tests::destroy_mmff94_device_tables_view(device_tables_handle);
-    if (mismatched_atom_count > 0 || mismatched_charge_count > 0) {
-        std::printf("FAIL\n");
-        return 1;
-    }
-    std::printf("PASS\n");
-    return 0;
+    if (mismatched_atom_count > 0 || mismatched_charge_count > 0)
+        return sftest::report_fail(test_name_k, "{} atom-type and {} partial-charge mismatches vs the CPU typer",
+                                   mismatched_atom_count, mismatched_charge_count);
+    return sftest::report_pass(test_name_k);
 }

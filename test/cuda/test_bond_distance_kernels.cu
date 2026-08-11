@@ -3,7 +3,7 @@
  *  @brief Device-side driver for the hop-count BFS parity test.
  */
 
-#include <cstdio> // `fprintf`, `stderr`
+#include <fmt/format.h> // `fmt::println` -- host-side only; nothing below a `__global__` uses it
 
 #include <cuda_runtime.h>
 
@@ -22,7 +22,7 @@ void run_bond_distance_bfs_on_gpu(std::byte const *host_pool, sfa::wave_slice_la
 
     std::byte *device_pool = nullptr;
     if (cudaMalloc(&device_pool, layout.bytes_total) != cudaSuccess) {
-        std::fprintf(stderr, "cudaMalloc failed for %zu bytes\n", layout.bytes_total);
+        fmt::println(stderr, "NOTE bond_distance_kernels field=cuda_malloc bytes={} succeeded=0", layout.bytes_total);
         return;
     }
     // The uploaded prefix is exactly what production ships; the hop-count region past it is

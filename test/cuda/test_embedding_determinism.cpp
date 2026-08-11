@@ -11,11 +11,13 @@
  */
 
 #include <cmath>   // `std::sqrt`
-#include <cstdio>  // `printf`
 #include <cstring> // `std::memcmp`
 
-#include <random> // `std::mt19937`, `std::uniform_real_distribution`
-#include <vector> // `std::vector`
+#include <random>      // `std::mt19937`, `std::uniform_real_distribution`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include "test/cuda/test_embedding_determinism_kernels.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
@@ -23,6 +25,8 @@
 namespace sftest = smallfield::tests;
 
 using sftest::gpu_embed_replicated;
+
+static constexpr std::string_view test_name_k = "test_embedding_determinism";
 
 /** Builds a satisfiable bounds matrix by bracketing the distances of a random point cloud. */
 static std::vector<float> synthetic_bounds(std::uint32_t num_atoms) {
@@ -46,7 +50,7 @@ static std::vector<float> synthetic_bounds(std::uint32_t num_atoms) {
 }
 
 int main() {
-    std::printf("test_embedding_determinism: bitwise reproducibility of the 4D metric embedding\n");
+    fmt::println("test_embedding_determinism: bitwise reproducibility of the 4D metric embedding");
 
     constexpr std::uint32_t num_atoms_k = 128;
     constexpr std::uint32_t num_molecules_k = 4096;
@@ -68,11 +72,12 @@ int main() {
     sf_verify_(any_nonzero, "the embedding must not be all zeros, or the comparison proves nothing");
 
     // Reports up to four differing components so a failure names the magnitude, not just a count.
-    auto report_divergence = [&](char const *what, std::uint32_t molecule, float const *left, float const *right) {
-        std::printf("  first %s divergence at copy %u:\n", what, molecule);
+    auto report_divergence = [&](std::string_view scope, std::uint32_t molecule, float const *left, float const *right) {
+        std::fflush(stdout);
         for (std::size_t component = 0, shown = 0; component < coordinates_per_molecule && shown < 4; ++component)
             if (left[component] != right[component]) {
-                std::printf("    component %zu: %.9g vs %.9g\n", component, left[component], right[component]);
+                fmt::println(stderr, "MISMATCH embedding scope={} copy={} component={} field=coordinate left={} right={}",
+                             scope, molecule, component, left[component], right[component]);
                 ++shown;
             }
     };
@@ -94,20 +99,19 @@ int main() {
         }
     }
 
-    std::printf("  atoms: %u, identical copies per launch: %u\n", num_atoms_k, num_molecules_k);
-    std::printf("  copies differing between the two launches: %u\n", across_launches);
-    std::printf("  copies differing from copy 0 inside one launch: %u\n", within_launch);
+    fmt::println("  atoms: {}, identical copies per launch: {}", num_atoms_k, fmt::group_digits(num_molecules_k));
+    fmt::println("  copies differing between the two launches: {}", fmt::group_digits(across_launches));
+    fmt::println("  copies differing from copy 0 inside one launch: {}", fmt::group_digits(within_launch));
     if (first_across_launches != num_molecules_k)
-        report_divergence("across-launch", first_across_launches,
+        report_divergence("across_launch", first_across_launches,
                           first_run.data() + first_across_launches * coordinates_per_molecule,
                           second_run.data() + first_across_launches * coordinates_per_molecule);
     if (first_within_launch != num_molecules_k)
-        report_divergence("within-launch", first_within_launch, first_run.data(),
+        report_divergence("within_launch", first_within_launch, first_run.data(),
                           first_run.data() + first_within_launch * coordinates_per_molecule);
 
     sf_verify_(across_launches == 0, "two launches over the same bounds must produce identical coordinates");
     sf_verify_(within_launch == 0, "identical molecules in one launch must produce identical coordinates");
 
-    std::printf("\ntest_embedding_determinism: PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

@@ -6,8 +6,11 @@
 #include <cmath>   // `std::fabs`, `std::isfinite`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
-#include <algorithm> // `std::max`
-#include <vector>    // `std::vector`
+#include <algorithm>   // `std::max`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
@@ -19,6 +22,8 @@ namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
 using sftest::gpu_mmff_energy;
+
+static constexpr std::string_view test_name_k = "test_mmff_gradient";
 
 namespace smallfield::tests {
 
@@ -84,7 +89,7 @@ static auto build_single_oop_prepared_(sfp::etkdg_prepared_molecule_t const &pre
 }
 
 static void test_single_oop_gradient_finite_difference_() {
-    std::printf("test_single_oop_gradient_finite_difference\n");
+    fmt::println("test_single_oop_gradient_finite_difference");
 
     std::string const smiles = "CC(=O)Oc1ccccc1C(=O)O";
     auto prepared_full = sfp::prepare_molecule(smiles);
@@ -131,7 +136,7 @@ static void test_single_oop_gradient_finite_difference_() {
 }
 
 static void test_full_mmff_gradient_and_energy_() {
-    std::printf("test_full_mmff_gradient_and_energy\n");
+    fmt::println("test_full_mmff_gradient_and_energy");
 
     std::string const smiles = "CC(=O)Oc1ccccc1C(=O)O";
     auto prepared = sfp::prepare_molecule(smiles);
@@ -198,6 +203,5 @@ static void test_full_mmff_gradient_and_energy_() {
 int main() {
     smallfield::tests::test_single_oop_gradient_finite_difference_();
     smallfield::tests::test_full_mmff_gradient_and_energy_();
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

@@ -12,7 +12,6 @@
  *  unreachable sentinel is covered either way.
  */
 
-#include <cstdio>  // `fprintf`, `stderr`
 #include <cstdlib> // `std::getenv`
 
 #include <fstream>     // `std::ifstream`
@@ -20,6 +19,8 @@
 #include <string>      // `std::string`, `std::getline`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -34,6 +35,8 @@
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_bond_distance";
 
 namespace smallfield::tests {
 
@@ -123,8 +126,9 @@ static void test_device_matches_host_(std::vector<std::string> const &smiles_lis
             for (std::uint32_t column = 0; column < num_atoms; ++column) {
                 std::size_t const entry = static_cast<std::size_t>(row) * num_atoms + column;
                 if (device_block[entry] != reference[entry]) {
-                    std::fprintf(stderr, "FAIL: %s pair (%u,%u): device %u, host %u\n", smiles.c_str(), row, column,
-                                 device_block[entry], reference[entry]);
+                    std::fflush(stdout);
+                    fmt::println(stderr, "MISMATCH bond_distance smiles={} row={} column={} field=hops host={} device={}",
+                                 smiles, row, column, reference[entry], device_block[entry]);
                     sf_verify_(false, "device hop count differs from the host BFS");
                 }
                 if (reference[entry] == 255) ++local_unreachable;
@@ -136,14 +140,15 @@ static void test_device_matches_host_(std::vector<std::string> const &smiles_lis
     }
 
     sf_verify_(molecules_with_fragments > 0, "corpus covered no disconnected fragment");
-    std::printf("  %u molecules, %zu matrix bytes, %zu unreachable pairs across %zu multi-fragment molecules\n",
-                batch.num_molecules, compared_bytes, unreachable_pairs, molecules_with_fragments);
+    fmt::println("  {} molecules, {} matrix bytes, {} unreachable pairs across {} multi-fragment molecules",
+                 fmt::group_digits(batch.num_molecules), fmt::group_digits(compared_bytes),
+                 fmt::group_digits(unreachable_pairs), fmt::group_digits(molecules_with_fragments));
 }
 
 } // namespace smallfield::tests
 
 int main() {
-    std::printf("test_bond_distance\n");
+    fmt::println("test_bond_distance: device warp BFS vs host CSR BFS over the packed hop matrix");
 
     char const *corpus_path = std::getenv("SMALLFIELD_TEST_CORPUS");
     char const *max_molecules_env = std::getenv("SMALLFIELD_TEST_MAX_MOLS");
@@ -154,12 +159,11 @@ int main() {
     if (corpus_path) {
         auto streamed = sftest::load_smiles_(corpus_path, max_molecules);
         sf_verify_(!streamed.empty(), corpus_path);
-        std::printf("Corpus: %s (up to %zu molecules) plus built-ins\n", corpus_path, max_molecules);
+        fmt::println("Corpus: {} (up to {} molecules) plus built-ins", corpus_path, fmt::group_digits(max_molecules));
         for (auto &smiles : streamed) smiles_list.push_back(std::move(smiles));
     }
-    else std::printf("Corpus: built-ins only; set SMALLFIELD_TEST_CORPUS for a wider sweep\n");
+    else fmt::println("Corpus: built-ins only; set SMALLFIELD_TEST_CORPUS for a wider sweep");
 
     sftest::test_device_matches_host_(smiles_list);
-    std::printf("test_bond_distance: PASS\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

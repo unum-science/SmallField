@@ -5,11 +5,13 @@
  *  Compiled with g++, C++20. CUDA kernels in test_dg_energy_kernels.cu.
  */
 
-#include <cmath>  // `std::sqrt`, `std::fabs`
-#include <cstdio> // `printf`
+#include <cmath> // `std::sqrt`, `std::fabs`
 
-#include <random> // `std::mt19937`, `std::uniform_real_distribution`
-#include <vector> // `std::vector`
+#include <random>      // `std::mt19937`, `std::uniform_real_distribution`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
@@ -22,6 +24,8 @@ namespace sftest = smallfield::tests;
 
 using sftest::gpu_dg_energy;
 using sftest::gpu_dg_minimize;
+
+static constexpr std::string_view test_name_k = "test_dg_energy";
 
 /**
  *  @brief CPU reference: compute DG distance violation energy in double precision.
@@ -57,7 +61,7 @@ static double cpu_dg_energy_reference(double const *coords, float const *bounds,
 }
 
 static void test_dg_energy_known_violation() {
-    std::printf("test_dg_energy_known_violation\n");
+    fmt::println("test_dg_energy_known_violation");
 
     auto molecule = sftest::mol_from_smiles("CCO");
     sf_verify_(molecule != nullptr, "failed to parse CCO");
@@ -98,8 +102,8 @@ static void test_dg_energy_known_violation() {
     double cpu_energy = cpu_dg_energy_reference(coords_double.data(), bounds.data(), num_atoms, dim, 1.0f, 1.0f);
 
     double const relative_error = std::fabs(gpu_energy - cpu_energy) / std::max(1.0, std::fabs(cpu_energy));
-    std::printf("  GPU energy: %.6f  CPU reference: %.6f  relative_error: %.6e\n", gpu_energy, cpu_energy,
-                relative_error);
+    fmt::println("  NOTE dg_energy field=energy cpu={} gpu={} relative_error={:.3g}", cpu_energy, gpu_energy,
+                 relative_error);
 
     sf_verify_(gpu_energy > 0.0f, "energy must be positive with violations");
     // half-precision bounds introduce ~1% error per bound value, which compounds
@@ -108,7 +112,7 @@ static void test_dg_energy_known_violation() {
 }
 
 static void test_dg_gradient_finite_difference() {
-    std::printf("test_dg_gradient_finite_difference\n");
+    fmt::println("test_dg_gradient_finite_difference");
 
     auto molecule = sftest::mol_from_smiles("CCO");
     sf_verify_(molecule != nullptr, "failed to parse CCO");
@@ -173,27 +177,30 @@ static void test_dg_gradient_finite_difference() {
 
         if (relative_error > 0.05f && abs_error > 0.01f) {
             if (num_mismatches < 5) {
-                std::printf("  component %u: analytical=%.6f fd=%.6f rel_err=%.4f\n", component, analytical,
-                            finite_difference_gradient, relative_error);
+                std::fflush(stdout);
+                fmt::println(stderr,
+                             "MISMATCH dg_gradient component={} field=gradient finite_difference={} analytical={} "
+                             "relative_error={:.3g}",
+                             component, finite_difference_gradient, analytical, relative_error);
             }
             ++num_mismatches;
         }
         ++num_checked;
     }
 
-    std::printf("  checked %u components, %u mismatches, max_rel_error=%.6f\n", num_checked, num_mismatches,
-                max_relative_error);
+    fmt::println("  checked {} components, {} mismatches, max_relative_error={:.3g}", num_checked, num_mismatches,
+                 max_relative_error);
 
     sf_verify_(num_mismatches <= num_checked / 4, "too many gradient mismatches (>25%)");
 }
 
 static void test_dg_minimize_convergence() {
-    std::printf("test_dg_minimize_convergence\n");
+    fmt::println("test_dg_minimize_convergence");
 
     std::vector<std::string> test_smiles = {"CCO", "CC(=O)O", "c1ccccc1"};
 
     for (auto const &smiles : test_smiles) {
-        std::printf("  testing: %s\n", smiles.c_str());
+        fmt::println("  testing: {}", smiles);
 
         auto prepared = sfp::prepare_molecule(smiles);
         sf_verify_(prepared.num_atoms > 0, "failed to prepare molecule");
@@ -214,7 +221,7 @@ static void test_dg_minimize_convergence() {
         gpu_dg_minimize(coords.data(), prepared.bounds_matrix.data(), num_atoms, dim, 1.0f, 1.0f, 0.0f, 400, 1e-4f,
                         &energy, &iterations, &status);
 
-        std::printf("    status=%d iterations=%d energy=%.4f\n", status, iterations, energy);
+        fmt::println("    status={} iterations={} energy={:.4f}", status, iterations, energy);
 
         // check distance violations after minimization
         float max_violation = 0.0f;
@@ -234,7 +241,7 @@ static void test_dg_minimize_convergence() {
                 if (distance < lower) max_violation = std::max(max_violation, lower - distance);
             }
         }
-        std::printf("    max_violation=%.4f angstrom\n", max_violation);
+        fmt::println("    max_violation={:.4f} angstrom", max_violation);
 
         // project to 3D and check MMFF94 energy via RDKit
         auto molecule = sftest::mol_from_smiles(smiles);
@@ -251,7 +258,7 @@ static void test_dg_minimize_convergence() {
 
         sftest::set_coords_interleaved(*molecule, coords_3d.data());
         double mmff_energy = sftest::rdkit_mmff94_energy(*molecule);
-        std::printf("    MMFF94 energy at DG coords: %.2f kcal/mol\n", mmff_energy);
+        fmt::println("    MMFF94 energy at DG coords: {:.2f} kcal/mol", mmff_energy);
 
         sf_verify_(std::isfinite(mmff_energy), "MMFF94 energy must be finite after DG minimization");
     }
@@ -261,6 +268,5 @@ int main() {
     test_dg_energy_known_violation();
     test_dg_gradient_finite_difference();
     test_dg_minimize_convergence();
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
+    return sftest::report_pass(test_name_k);
 }

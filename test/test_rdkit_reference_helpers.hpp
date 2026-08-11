@@ -8,17 +8,18 @@
 
 #pragma once
 
-#include <algorithm> // `std::max`
-#include <cmath>     // `std::fabs`
-#include <cstdint>   // `std::uint32_t`, `std::uint8_t`
-#include <cstdio>    // `fprintf`, `stderr`
-#include <cstdlib>   // `std::exit`
+#include <cmath>   // `std::fabs`
+#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdlib> // `std::exit`
 
-#include <fstream> // `std::ifstream`
-#include <limits>  // `std::numeric_limits`
-#include <memory>  // `std::unique_ptr`
-#include <string>  // `std::string`
-#include <vector>  // `std::vector`
+#include <algorithm> // `std::max`
+#include <fstream>   // `std::ifstream`
+#include <limits>    // `std::numeric_limits`
+#include <memory>    // `std::unique_ptr`
+#include <string>    // `std::string`
+#include <vector>    // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`
 
 #include <DistGeom/BoundsMatrix.h>
 #include <DistGeom/TriangleSmooth.h>
@@ -31,18 +32,27 @@
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
+#include "test/test_helpers.hpp"
+
 /**
  *  @brief Fail the test with a message and the source location when @p condition is false.
  *
  *  Carries the `sf_` prefix so it cannot collide with RDKit's own `TEST_ASSERT`, which keeps the
  *  tests free of any framework dependency.
+ *
+ *  Aborting still spends the test's one verdict, so this prints the same `FAIL <test_name>: <reason>`
+ *  a `main` would have returned -- otherwise `grep '^FAIL test_'` would list every test that returned
+ *  a failure and silently omit every test that asserted its way out.  The name comes from the
+ *  `test_name_k` each test declares beside its `main`.
  */
-#define sf_verify_(condition, message)                                                     \
-    do {                                                                                   \
-        if (!(condition)) {                                                                \
-            std::fprintf(stderr, "FAIL: %s\n  at %s:%d\n", (message), __FILE__, __LINE__); \
-            std::exit(1);                                                                  \
-        }                                                                                  \
+#define sf_verify_(condition, message)                                                                       \
+    do {                                                                                                     \
+        if (!(condition)) {                                                                                  \
+            [[maybe_unused]] int const exit_code = smallfield::tests::report_fail(test_name_k, "{} at {}:{}", \
+                                                                                  (message), __FILE__,       \
+                                                                                  __LINE__);                 \
+            std::exit(1);                                                                                    \
+        }                                                                                                    \
     } while (0)
 
 #define sf_verify_near_(actual, expected, tolerance, message)                                                    \
@@ -61,7 +71,7 @@ namespace smallfield::tests {
 inline std::unique_ptr<RDKit::RWMol> mol_from_smiles(std::string const &smiles) {
     std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
     if (!molecule) {
-        std::fprintf(stderr, "Failed to parse SMILES: %s\n", smiles.c_str());
+        fmt::println(stderr, "NOTE mol_from_smiles smiles={} parsed=0", smiles);
         return nullptr;
     }
     RDKit::MolOps::addHs(*molecule);
@@ -186,7 +196,7 @@ inline std::vector<std::string> load_smiles(std::string const &path, std::size_t
     std::ifstream file(path);
     if (!file) {
         if (on_missing == smiles_missing_file_t::aborts_k) {
-            std::fprintf(stderr, "FAIL: cannot open corpus %s\n", path.c_str());
+            [[maybe_unused]] int const exit_code = report_fail("corpus", "cannot open {}", path);
             std::exit(1);
         }
         return smiles_list;

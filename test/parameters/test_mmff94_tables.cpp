@@ -6,13 +6,15 @@
  */
 
 #include <cmath>   // `std::abs`
-#include <cstdio>  // `printf`, `stdout`
 #include <cstring> // `std::memcpy`
 
-#include <iostream> // RDKit's `AtomTyper.h` needs it but does not include it
-#include <random>   // `std::mt19937`, `std::uniform_int_distribution`
-#include <sstream>  // RDKit's `AtomTyper.h` needs it but does not include it
-#include <vector>   // `std::vector`
+#include <iostream>    // RDKit's `AtomTyper.h` needs it but does not include it
+#include <random>      // `std::mt19937`, `std::uniform_int_distribution`
+#include <sstream>     // RDKit's `AtomTyper.h` needs it but does not include it
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
 #include <boost/shared_ptr.hpp>
 #include <cuda_runtime.h>
@@ -24,9 +26,12 @@
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 
 #include "test/parameters/test_mmff94_tables_kernels.hpp"
+#include "test/test_helpers.hpp"
 
 namespace sf = smallfield;
 namespace sftest = smallfield::tests;
+
+static constexpr std::string_view test_name_k = "test_mmff94_tables";
 
 namespace smallfield::tests {
 
@@ -48,6 +53,22 @@ static bool bitwise_equal_(float lhs, float rhs) {
     return lhs_bits == rhs_bits;
 }
 
+/** RDKit's live lookups are the reference; the extracted tables are what is under test. */
+static sftest::diagnostic_reporter_t host_reporter_ {"rdkit", "ours"};
+/** The host lookup is the reference; the device kernel reading the uploaded tables is under test. */
+static sftest::diagnostic_reporter_t device_reporter_ {"host", "device"};
+
+/*  `comparison_group_t::field` invokes its predicate as `equals(reference, observed)`, so each suite's
+ *  comparison is wrapped rather than reimplemented -- the tolerance and the bit test below are the same
+ *  two functions the hand-rolled `if` chains used. */
+static constexpr auto rdkit_within_tolerance_ = [](double rdkit_value, float our_value) {
+    return approximately_equal_(our_value, rdkit_value);
+};
+static constexpr auto bits_identical_ = [](float host_value, float device_value) {
+    return bitwise_equal_(host_value, device_value);
+};
+static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
+
 static void validate_vdw_lookup_(sf::parameters::mmff94_tables_host_t const &host_tables) {
     int const checks_before = host_check_count_;
     auto const host_lookup_view = host_tables.view();
@@ -59,29 +80,29 @@ static void validate_vdw_lookup_(sf::parameters::mmff94_tables_host_t const &hos
 
         ++host_check_count_;
         if (!our_entry || !rdkit_entry) {
-            std::printf("  VdW atom_type=%u: ours=%p rdkit=%p\n", atom_type, (void *)our_entry, (void *)rdkit_entry);
+            host_reporter_.mismatch("vdw", "atom_type={}", atom_type)
+                .field("present", rdkit_entry != nullptr, our_entry != nullptr, exactly_equal_);
             ++host_failure_count_;
             continue;
         }
 
-        if (!approximately_equal_(our_entry->alpha_i, rdkit_entry->alpha_i) ||
-            !approximately_equal_(our_entry->n_effective, rdkit_entry->N_i) ||
-            !approximately_equal_(our_entry->a_scale, rdkit_entry->A_i) ||
-            !approximately_equal_(our_entry->g_factor, rdkit_entry->G_i) ||
-            !approximately_equal_(our_entry->r_star, rdkit_entry->R_star)) {
-            std::printf("  VdW atom_type=%u mismatch: ours α=%.4f rdkit α=%.4f\n", atom_type, our_entry->alpha_i,
-                        rdkit_entry->alpha_i);
-            ++host_failure_count_;
-        }
+        auto entry = host_reporter_.mismatch("vdw", "atom_type={}", atom_type);
+        entry.field("alpha", rdkit_entry->alpha_i, our_entry->alpha_i, rdkit_within_tolerance_)
+            .field("n_effective", rdkit_entry->N_i, our_entry->n_effective, rdkit_within_tolerance_)
+            .field("a_scale", rdkit_entry->A_i, our_entry->a_scale, rdkit_within_tolerance_)
+            .field("g_factor", rdkit_entry->G_i, our_entry->g_factor, rdkit_within_tolerance_)
+            .field("r_star", rdkit_entry->R_star, our_entry->r_star, rdkit_within_tolerance_);
+        if (entry.reported_field_count() != 0) ++host_failure_count_;
     }
-    std::printf("  %d entries compared against RDKit\n", host_check_count_ - checks_before);
+    fmt::println("  {} entries compared against RDKit", fmt::group_digits(host_check_count_ - checks_before));
+    host_reporter_.summarize("vdw");
 }
 
 static void validate_bond_lookup_(sf::parameters::mmff94_tables_host_t const &host_tables) {
     int const checks_before = host_check_count_;
     auto const host_lookup_view = host_tables.view();
     if (host_tables.bond.empty()) {
-        std::printf("  Bond test SKIPPED (no bond table)\n");
+        fmt::println("  NOTE mmff94_tables field=bond_table entries=0 bond_checks=skipped");
         return;
     }
 
@@ -99,20 +120,20 @@ static void validate_bond_lookup_(sf::parameters::mmff94_tables_host_t const &ho
 
         ++host_check_count_;
         if (!our_entry || !rdkit_entry) {
-            std::printf("  Bond bond_type=%u atom_i=%u atom_j=%u: ours=%p rdkit=%p\n", bond_type, atom_type_i,
-                        atom_type_j, (void *)our_entry, (void *)rdkit_entry);
+            host_reporter_.mismatch("bond", "bond_type={} atom_i={} atom_j={}", bond_type, atom_type_i, atom_type_j)
+                .field("present", rdkit_entry != nullptr, our_entry != nullptr, exactly_equal_);
             ++host_failure_count_;
             continue;
         }
 
-        if (!approximately_equal_(our_entry->force_constant, rdkit_entry->kb) ||
-            !approximately_equal_(our_entry->equilibrium_distance, rdkit_entry->r0)) {
-            std::printf("  Bond bond_type=%u atom_i=%u atom_j=%u mismatch: ours kb=%.4f rdkit kb=%.4f\n", bond_type,
-                        atom_type_i, atom_type_j, our_entry->force_constant, rdkit_entry->kb);
-            ++host_failure_count_;
-        }
+        auto entry = host_reporter_.mismatch("bond", "bond_type={} atom_i={} atom_j={}", bond_type, atom_type_i,
+                                             atom_type_j);
+        entry.field("force_constant", rdkit_entry->kb, our_entry->force_constant, rdkit_within_tolerance_)
+            .field("equilibrium_distance", rdkit_entry->r0, our_entry->equilibrium_distance, rdkit_within_tolerance_);
+        if (entry.reported_field_count() != 0) ++host_failure_count_;
     }
-    std::printf("  %d entries compared against RDKit\n", host_check_count_ - checks_before);
+    fmt::println("  {} entries compared against RDKit", fmt::group_digits(host_check_count_ - checks_before));
+    host_reporter_.summarize("bond");
 }
 
 static void validate_angle_lookup_(sf::parameters::mmff94_tables_host_t const &host_tables) {
@@ -136,21 +157,22 @@ static void validate_angle_lookup_(sf::parameters::mmff94_tables_host_t const &h
 
         ++host_check_count_;
         if (!our_entry || !rdkit_entry) {
-            std::printf("  Angle angle_type=%u atom_i=%u atom_j=%u atom_k=%u: ours=%p rdkit=%p\n", angle_type,
-                        atom_type_i, atom_type_j_center, atom_type_k, (void *)our_entry, (void *)rdkit_entry);
+            host_reporter_
+                .mismatch("angle", "angle_type={} atom_i={} atom_j={} atom_k={}", angle_type, atom_type_i,
+                          atom_type_j_center, atom_type_k)
+                .field("present", rdkit_entry != nullptr, our_entry != nullptr, exactly_equal_);
             ++host_failure_count_;
             continue;
         }
 
-        if (!approximately_equal_(our_entry->force_constant, rdkit_entry->ka) ||
-            !approximately_equal_(our_entry->theta0_deg, rdkit_entry->theta0)) {
-            std::printf("  Angle angle_type=%u atom_i=%u atom_j=%u atom_k=%u mismatch: ours ka=%.4f rdkit ka=%.4f\n",
-                        angle_type, atom_type_i, atom_type_j_center, atom_type_k, our_entry->force_constant,
-                        rdkit_entry->ka);
-            ++host_failure_count_;
-        }
+        auto entry = host_reporter_.mismatch("angle", "angle_type={} atom_i={} atom_j={} atom_k={}", angle_type,
+                                             atom_type_i, atom_type_j_center, atom_type_k);
+        entry.field("force_constant", rdkit_entry->ka, our_entry->force_constant, rdkit_within_tolerance_)
+            .field("theta0_deg", rdkit_entry->theta0, our_entry->theta0_deg, rdkit_within_tolerance_);
+        if (entry.reported_field_count() != 0) ++host_failure_count_;
     }
-    std::printf("  %d entries compared against RDKit\n", host_check_count_ - checks_before);
+    fmt::println("  {} entries compared against RDKit", fmt::group_digits(host_check_count_ - checks_before));
+    host_reporter_.summarize("angle");
 }
 
 /**
@@ -161,7 +183,9 @@ static void run_device_lookup_cross_checks_(sf::parameters::mmff94_tables_host_t
     sf::parameters::mmff94_tables_view_t device_lookup_view {};
     void *device_handle = sftest::device_tables_create(host_tables, device_lookup_view);
     if (device_handle == nullptr) {
-        std::printf("  Device upload FAILED, skipping device cross-val\n");
+        // Deliberately not the word `FAILED`: this line is narration, and a CI log filtered on the verdict
+        // grammar must not answer a `FAIL` grep with a line that never decided anything.
+        fmt::println("  NOTE mmff94_tables field=device_upload available=0 device_cross_checks=skipped");
         return;
     }
 
@@ -190,20 +214,20 @@ static void run_device_lookup_cross_checks_(sf::parameters::mmff94_tables_host_t
             auto const *host_entry = sf::parameters::lookup_vdw(host_lookup_view, queries[probe_index].atom_type);
             ++device_check_count_;
             bool const host_hit = host_entry != nullptr;
+            auto probe = device_reporter_.mismatch("vdw", "atom_type={}", queries[probe_index].atom_type);
             if (host_hit != (results[probe_index].hit != 0)) {
+                probe.field("hit", host_hit, results[probe_index].hit != 0, exactly_equal_);
                 ++device_failure_count_;
                 continue;
             }
             if (!host_hit) continue;
-            if (!bitwise_equal_(host_entry->alpha_i, results[probe_index].alpha) ||
-                !bitwise_equal_(host_entry->n_effective, results[probe_index].effective_electron_count) ||
-                !bitwise_equal_(host_entry->r_star, results[probe_index].r_star)) {
-                std::printf("  DEV vdw atom_type=%u mismatch: h(%.4f, %.4f) d(%.4f, %.4f)\n",
-                            queries[probe_index].atom_type, host_entry->alpha_i, host_entry->r_star,
-                            results[probe_index].alpha, results[probe_index].r_star);
-                ++device_failure_count_;
-            }
+            probe.field("alpha", host_entry->alpha_i, results[probe_index].alpha, bits_identical_)
+                .field("n_effective", host_entry->n_effective, results[probe_index].effective_electron_count,
+                       bits_identical_)
+                .field("r_star", host_entry->r_star, results[probe_index].r_star, bits_identical_);
+            if (probe.reported_field_count() != 0) ++device_failure_count_;
         }
+        device_reporter_.summarize("vdw");
     }
 
     {
@@ -235,16 +259,24 @@ static void run_device_lookup_cross_checks_(sf::parameters::mmff94_tables_host_t
                 queries[probe_index].atom_type_j_center, queries[probe_index].atom_type_k);
             ++device_check_count_;
             bool const host_hit = host_entry != nullptr;
+            auto probe = device_reporter_.mismatch("angle", "angle_type={} atom_i={} atom_j={} atom_k={}",
+                                                   queries[probe_index].angle_type, queries[probe_index].atom_type_i,
+                                                   queries[probe_index].atom_type_j_center,
+                                                   queries[probe_index].atom_type_k);
             if (host_hit != (results[probe_index].hit != 0)) {
+                probe.field("hit", host_hit, results[probe_index].hit != 0, exactly_equal_);
                 ++device_failure_count_;
                 continue;
             }
             if (!host_hit) continue;
-            if (!bitwise_equal_(host_entry->force_constant, results[probe_index].force_constant) ||
-                !bitwise_equal_(host_entry->theta0_deg, results[probe_index].equilibrium_angle_degrees)) {
-                ++device_failure_count_;
-            }
+            probe
+                .field("force_constant", host_entry->force_constant, results[probe_index].force_constant,
+                       bits_identical_)
+                .field("theta0_deg", host_entry->theta0_deg, results[probe_index].equilibrium_angle_degrees,
+                       bits_identical_);
+            if (probe.reported_field_count() != 0) ++device_failure_count_;
         }
+        device_reporter_.summarize("angle");
     }
 
     {
@@ -280,20 +312,29 @@ static void run_device_lookup_cross_checks_(sf::parameters::mmff94_tables_host_t
                 queries[probe_index].atom_type_j, queries[probe_index].atom_type_k, queries[probe_index].atom_type_l);
             ++device_check_count_;
             bool const host_hit = lookup_result.second != nullptr;
+            auto probe = device_reporter_.mismatch(
+                "torsion", "primary_torsion_type={} secondary_torsion_type={} atom_i={} atom_j={} atom_k={} atom_l={}",
+                queries[probe_index].primary_torsion_type, queries[probe_index].secondary_torsion_type,
+                queries[probe_index].atom_type_i, queries[probe_index].atom_type_j, queries[probe_index].atom_type_k,
+                queries[probe_index].atom_type_l);
             if (host_hit != (results[probe_index].hit != 0)) {
+                probe.field("hit", host_hit, results[probe_index].hit != 0, exactly_equal_);
                 ++device_failure_count_;
                 continue;
             }
             if (!host_hit) continue;
-            if (!bitwise_equal_(lookup_result.second->torsion_v1, results[probe_index].torsion_v1) ||
-                !bitwise_equal_(lookup_result.second->torsion_v2, results[probe_index].torsion_v2) ||
-                !bitwise_equal_(lookup_result.second->torsion_v3, results[probe_index].torsion_v3)) {
-                ++device_failure_count_;
-            }
+            probe
+                .field("torsion_v1", lookup_result.second->torsion_v1, results[probe_index].torsion_v1, bits_identical_)
+                .field("torsion_v2", lookup_result.second->torsion_v2, results[probe_index].torsion_v2, bits_identical_)
+                .field("torsion_v3", lookup_result.second->torsion_v3, results[probe_index].torsion_v3,
+                       bits_identical_);
+            if (probe.reported_field_count() != 0) ++device_failure_count_;
         }
+        device_reporter_.summarize("torsion");
     }
 
-    std::printf("  device lookups: %d checks, %d mismatches\n", device_check_count_, device_failure_count_);
+    fmt::println("  device lookups: {} checks, {} mismatches", fmt::group_digits(device_check_count_),
+                 fmt::group_digits(device_failure_count_));
     sftest::device_tables_destroy(device_handle);
 }
 
@@ -330,13 +371,11 @@ static void run_device_vdw_smoke_check_(sf::parameters::mmff94_tables_host_t con
         auto const *host_entry = sf::parameters::lookup_vdw(host_lookup_view, queries[probe_index].atom_type);
         ++counts.check_count;
         bool const host_hit = host_entry != nullptr;
-        if (host_hit != (results[probe_index].hit != 0)) {
-            ++counts.failure_count;
-            std::printf("    vdw atom_type=%u host_hit=%d device_hit=%u\n", queries[probe_index].atom_type, host_hit,
-                        results[probe_index].hit);
-            continue;
-        }
+        device_reporter_.mismatch("vdw_smoke", "atom_type={}", queries[probe_index].atom_type)
+            .field("hit", host_hit, results[probe_index].hit != 0, exactly_equal_);
+        if (host_hit != (results[probe_index].hit != 0)) ++counts.failure_count;
     }
+    device_reporter_.summarize("vdw_smoke");
 
     sftest::device_tables_destroy(device_handle);
 }
@@ -344,43 +383,52 @@ static void run_device_vdw_smoke_check_(sf::parameters::mmff94_tables_host_t con
 } // namespace smallfield::tests
 
 int main() {
-    std::printf("=== test_mmff94_tables: host + device MMFF94 table-lookup gate ===\n");
+    fmt::println("test_mmff94_tables: host + device MMFF94 table-lookup gate");
     std::fflush(stdout);
 
     sf::parameters::mmff94_tables_host_t host_tables;
-    std::printf("calling extract_mmff94_tables_from_rdkit...\n");
+    fmt::println("calling extract_mmff94_tables_from_rdkit...");
     std::fflush(stdout);
     sf::parameters::extract_mmff94_tables_from_rdkit(host_tables);
-    std::printf(
-        "extract done: vdw=%zu bond=%zu angle=%zu tor=%zu oop=%zu stbn=%zu dfsb=%zu def=%zu pbci=%zu chg=%zu " //
-        "hl=%zu max_at=%u\n",
-        host_tables.vdw.size(), host_tables.bond.size(), host_tables.angle.size(), host_tables.torsion.size(),
-        host_tables.oop.size(), host_tables.stbn.size(), host_tables.dfsb.size(), host_tables.def.size(),
-        host_tables.pbci.size(), host_tables.chg.size(), host_tables.hl.size(), host_tables.max_atom_type);
+    fmt::println("extract done: vdw={} bond={} angle={} tor={} oop={} stbn={} dfsb={} def={} pbci={} chg={} " //
+                 "hl={} max_at={}",
+                 fmt::group_digits(host_tables.vdw.size()), fmt::group_digits(host_tables.bond.size()),
+                 fmt::group_digits(host_tables.angle.size()), fmt::group_digits(host_tables.torsion.size()),
+                 fmt::group_digits(host_tables.oop.size()), fmt::group_digits(host_tables.stbn.size()),
+                 fmt::group_digits(host_tables.dfsb.size()), fmt::group_digits(host_tables.def.size()),
+                 fmt::group_digits(host_tables.pbci.size()), fmt::group_digits(host_tables.chg.size()),
+                 fmt::group_digits(host_tables.hl.size()), host_tables.max_atom_type);
     std::fflush(stdout);
 
-    std::printf("  max_atom_type=%u, vdw_power=%.3f\n", host_tables.max_atom_type, host_tables.vdw_power);
+    fmt::println("  max_atom_type={}, vdw_power={:.3f}", host_tables.max_atom_type, host_tables.vdw_power);
     std::fflush(stdout);
 
-    std::printf("--- test_vdw ---\n");
+    fmt::println("--- test_vdw ---");
     std::fflush(stdout);
     sftest::validate_vdw_lookup_(host_tables);
-    std::printf("--- test_bond ---\n");
+    fmt::println("--- test_bond ---");
     std::fflush(stdout);
     sftest::validate_bond_lookup_(host_tables);
-    std::printf("--- test_angle ---\n");
+    fmt::println("--- test_angle ---");
     std::fflush(stdout);
     sftest::validate_angle_lookup_(host_tables);
-    std::printf("--- device lookups ---\n");
+    fmt::println("--- device lookups ---");
     std::fflush(stdout);
     sftest::lookup_mismatch_counts_t vdw_counts;
     sftest::run_device_vdw_smoke_check_(host_tables, vdw_counts);
-    std::printf("  VdW-only device: %d checks, %d fails\n", vdw_counts.check_count, vdw_counts.failure_count);
+    fmt::println("  VdW-only device: {} checks, {} fails", fmt::group_digits(vdw_counts.check_count),
+                 fmt::group_digits(vdw_counts.failure_count));
     sftest::run_device_lookup_cross_checks_(host_tables);
 
-    std::printf("checks=%d failures=%d device-checks=%d device-failures=%d\n", sftest::host_check_count_,
-                sftest::host_failure_count_, sftest::device_check_count_, sftest::device_failure_count_);
-    if (sftest::host_failure_count_ > 0 || sftest::device_failure_count_ > 0) return 1;
-    std::printf("ALL TESTS PASSED\n");
-    return 0;
+    fmt::println("checks={} failures={} device-checks={} device-failures={}",
+                 fmt::group_digits(sftest::host_check_count_), fmt::group_digits(sftest::host_failure_count_),
+                 fmt::group_digits(sftest::device_check_count_), fmt::group_digits(sftest::device_failure_count_));
+    if (sftest::host_failure_count_ > 0 || sftest::device_failure_count_ > 0)
+        return sftest::report_fail(test_name_k, "{} host and {} device lookup mismatches vs RDKit",
+                                   sftest::host_failure_count_, sftest::device_failure_count_);
+    // A section that compared nothing is indistinguishable from a passing one in the counters above,
+    // so the reporters gate on having actually compared something as well as on having agreed.
+    if (!sftest::host_reporter_.passed() || !sftest::device_reporter_.passed())
+        return sftest::report_fail(test_name_k, "a lookup section mismatched or compared nothing at all");
+    return sftest::report_pass(test_name_k);
 }

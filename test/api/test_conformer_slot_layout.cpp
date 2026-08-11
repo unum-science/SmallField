@@ -11,14 +11,22 @@
 #include <cassert> // `assert`
 #include <cmath>   // `std::abs`
 #include <cstdint> // `std::uint32_t`
-#include <cstdio>  // `fprintf`, `stderr`
 
-#include <array>  // `std::array`
-#include <vector> // `std::vector`
+#include <array>       // `std::array`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
+
+#include <fmt/format.h> // `fmt::println`
 
 #include "smallfield/api/conformer_layout.hpp"
 
+#include "test/test_helpers.hpp"
+
+namespace sftest = smallfield::tests;
+
 using smallfield::api::conformer_slot_layout_t;
+
+static constexpr std::string_view test_name_k = "test_conformer_slot_layout";
 
 namespace smallfield::tests {
 
@@ -91,15 +99,13 @@ int main() {
     // A contiguous read collapses every point onto the x axis and so yields rank 1, while a correct
     // transpose yields rank 3. This is the assertion that separates the two.
     std::uint32_t const rank = coordinate_rank_(row, atom_count);
-    if (rank != 3u) {
-        std::fprintf(stderr, "FAIL: coordinate rank %u, expected 3 (geometry is degenerate)\n", rank);
-        return 1;
-    }
+    if (rank != 3u)
+        return sftest::report_fail(test_name_k, "coordinate rank {}, expected 3 -- the geometry is degenerate", rank);
 
     // Slot offsets must not overlap, or conformers would alias each other.
     assert(layout.slot_offset(0u, 1u) - layout.slot_offset(0u, 0u) == layout.slot_stride());
     assert(layout.slot_offset(1u, 0u) == layout.slot_offset(0u, 0u) + 3u * layout.slot_stride());
 
-    std::printf("test_conformer_slot_layout: OK (rank=%u, %u atoms)\n", rank, atom_count);
-    return 0;
+    fmt::println("  rank={} atoms={}", rank, atom_count);
+    return sftest::report_pass(test_name_k);
 }
