@@ -105,7 +105,7 @@ A namespace alias spells its target out; `sfp` bound to two different namespaces
 ## Includes
 
 __Every quoted include is anchored at a root on the include path, never at the includer's own directory.__
-The roots are `src/` and the repository root, so the allowed prefixes are `smallfield/`, `csd_data/`, `test/`, `bench/` and `cli/`.
+The roots are `src/` and the repository root, so the allowed prefixes are `smallfield/`, `test/`, `bench/` and `cli/`.
 A sibling header in the same directory is written out in full like any other.
 
 ```cpp

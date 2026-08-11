@@ -23,10 +23,11 @@
 #include <cstdint> // `std::int8_t`, `std::uint32_t`
 #include <cstdlib> // `std::abort`
 
-#include <memory> // `std::unique_ptr`
-#include <sstream>
-#include <string> // `std::string`, `std::getline`
-#include <vector> // `std::vector`
+#include <memory>      // `std::unique_ptr`
+#include <span>        // `std::span`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/Atom.h>
@@ -42,6 +43,7 @@
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/preprocess/csd_torsion_native.hpp"
+#include "smallfield/preprocess/csd_torsion_table.hpp"
 
 namespace smallfield::preprocess {
 using smallfield::types::atom_flag_aromatic_k;
@@ -55,10 +57,9 @@ using smallfield::types::molecule_descriptor_t;
 
 /** Compiled CSD torsion pattern. */
 struct csd_compiled_pattern_t {
-    std::string smarts;
+    /** Borrowed from the static table, which outlives every caller. */
+    std::string_view smarts;
     std::unique_ptr<RDKit::ROMol const> pattern;
-    std::vector<double> fourier_magnitudes;
-    std::vector<std::int8_t> fourier_signs;
     /** Atom indices in the pattern for labels :1 through :4. */
     std::uint32_t index[4];
     /** Bitset: bit N = pattern requires element N. */
@@ -99,54 +100,17 @@ inline std::uint8_t compute_required_hybridizations(simple_torsion_pattern_t con
     return mask;
 }
 
-/** Embedded contents of the RDKit .in files for torsion preferences. */
-inline std::string const &csd_torsion_preferences_v2() {
-    static std::string const data =
-#include "csd_data/torsionPreferences_v2.in_str"
-        ;
-    return data;
-}
-inline std::string const &csd_torsion_preferences_small_rings() {
-    static std::string const data =
-#include "csd_data/torsionPreferences_smallrings.in_str"
-        ;
-    return data;
-}
-
-/** Parse one line from a .in block: "SMARTS s1 V1 s2 V2 s3 V3 s4 V4 s5 V5 s6 V6". */
-inline bool parse_pattern_line(std::string const &line, csd_compiled_pattern_t &out) {
-    std::istringstream line_stream(line);
-    if (!(line_stream >> out.smarts)) return false;
-    out.fourier_magnitudes.clear();
-    out.fourier_signs.clear();
-    out.fourier_magnitudes.reserve(6);
-    out.fourier_signs.reserve(6);
-    for (std::uint32_t term_index = 0; term_index < 6; ++term_index) {
-        int sign;
-        double fourier_magnitude;
-        if (!(line_stream >> sign >> fourier_magnitude)) return false;
-        out.fourier_signs.push_back(static_cast<std::int8_t>(sign));
-        out.fourier_magnitudes.push_back(fourier_magnitude);
-    }
-    return true;
-}
-
 /**
  *  @brief Parse the embedded .in block (one SMARTS per non-comment line) and compile each
  *  SMARTS to an ROMol. Fills required_elements bitset and the atom-label index[4].
  */
-inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &block) {
-    std::vector<csd_compiled_pattern_t> out;
-    out.reserve(400);
-    std::istringstream block_stream(block);
-    std::string line;
-    while (std::getline(block_stream, line)) {
-        if (line.empty() || line[0] == '#') continue;
-
+inline void compile_patterns_into(std::span<csd_torsion_row_t const> rows, std::vector<csd_compiled_pattern_t> &out) {
+    out.reserve(out.size() + rows.size());
+    for (csd_torsion_row_t const &row : rows) {
         csd_compiled_pattern_t compiled_pattern;
-        if (!parse_pattern_line(line, compiled_pattern)) continue;
+        compiled_pattern.smarts = row.smarts;
 
-        compiled_pattern.pattern.reset(RDKit::SmartsToMol(compiled_pattern.smarts));
+        compiled_pattern.pattern.reset(RDKit::SmartsToMol(std::string(compiled_pattern.smarts)));
         if (!compiled_pattern.pattern) continue;
 
         // Find the atoms labeled :1 through :4 via their molAtomMapNumber property.
@@ -175,20 +139,14 @@ inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &b
         compiled_pattern.native = parse_linear_torsion(compiled_pattern.smarts, compiled_pattern.native_form);
         if (compiled_pattern.native) {
             for (std::uint32_t term_index = 0; term_index < 6; ++term_index) {
-                compiled_pattern.native_form.fourier_signs[term_index] =
-                    (term_index < compiled_pattern.fourier_signs.size()) ? compiled_pattern.fourier_signs[term_index]
-                                                                         : static_cast<std::int8_t>(1);
-                compiled_pattern.native_form.fourier_magnitudes[term_index] =
-                    (term_index < compiled_pattern.fourier_magnitudes.size())
-                        ? static_cast<float>(compiled_pattern.fourier_magnitudes[term_index])
-                        : 0.0f;
+                compiled_pattern.native_form.fourier_signs[term_index] = row.signs[term_index];
+                compiled_pattern.native_form.fourier_magnitudes[term_index] = row.magnitudes[term_index];
             }
             compiled_pattern.required_hybridizations = compute_required_hybridizations(compiled_pattern.native_form);
         }
 
         out.push_back(std::move(compiled_pattern));
     }
-    return out;
 }
 
 /** Lazy-load and compile all CSD patterns once per process.
@@ -198,18 +156,18 @@ inline std::vector<csd_compiled_pattern_t> compile_patterns(std::string const &b
  *  cache, Murcko decomposition and VF2 deadline machinery along with it. */
 inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
     static std::vector<csd_compiled_pattern_t> const patterns = [] {
-        std::string combined = csd_torsion_preferences_v2();
-        combined += "\n";
-        combined += csd_torsion_preferences_small_rings();
-        auto compiled = compile_patterns(combined);
+        // v2 then small rings, in that order: a bond goes to the first pattern that claims it.
+        std::vector<csd_compiled_pattern_t> compiled;
+        compile_patterns_into(csd_torsion_rows_v2(), compiled);
+        compile_patterns_into(csd_torsion_rows_small_rings(), compiled);
         for (auto const &pattern : compiled)
             if (!pattern.native) {
                 // Static init has no caller to borrow a logger from, so this one-shot fatal path owns a
                 // default-configured one.
                 logger_t const logger;
-                logger.error("smallfield: CSD torsion pattern does not compile natively and there is no fallback:\n"
-                             "  {}",
-                             pattern.smarts);
+                logger.error(
+                    "smallfield: CSD torsion pattern does not compile natively and there is no fallback:\n" "  {}",
+                    pattern.smarts);
                 std::abort();
             }
         return compiled;

@@ -2,9 +2,9 @@
 #
 # This file defines:
 #
-# * smallfield_objects: the OBJECT compilation of the library's single translation unit. The whole library is
-#   header-only and funnels through `src/smallfield/api/smallfield.cu`, so it is compiled once here and assembled into
-#   both libraries below.
+# * smallfield_objects: the OBJECT compilation of the library. Everything but the torsion corpus is header-only and
+#   funnels through `src/smallfield/api/smallfield.cu`, so it is compiled once here and assembled into both libraries
+#   below.
 # * smallfield_lib: the static archive that the CLI, tests and benchmarks link.
 # * smallfield_python_lib: the shared object `setup.py` hands to pybind11. EXCLUDE_FROM_ALL, since nothing but the
 #   Python build wants it.
@@ -260,7 +260,10 @@ endfunction ()
 # `__device__`/`__constant__` variable defined in one translation unit is referenced from another. Every `__constant__`
 # here is `static`, and there is no `extern __device__` anywhere, so each target's device code is whole-program within
 # its own translation unit.
-add_library(smallfield_objects OBJECT src/smallfield/api/smallfield.cu)
+# `csd_torsion_table.cpp` is host-only on purpose: it carries the 470-row torsion corpus that used to arrive as escaped
+# string literals inside a header, which every CUDA translation unit then re-tokenized once per architecture for data no
+# kernel reads.
+add_library(smallfield_objects OBJECT src/smallfield/api/smallfield.cu src/smallfield/preprocess/csd_torsion_table.cpp)
 target_link_libraries(
     smallfield_objects PUBLIC smallfield_settings smallfield_rdkit CUDA::curand CUDA::cudart OpenMP::OpenMP_CXX
                               fmt::fmt
@@ -304,7 +307,6 @@ install(
     PATTERN "*.hpp"
     PATTERN "*.cuh"
 )
-install(DIRECTORY src/csd_data DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES "${PROJECT_SOURCE_DIR}/cmake/rdkit.cmake" DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/smallfield)
 install(
     EXPORT smallfieldTargets

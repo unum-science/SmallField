@@ -263,12 +263,12 @@ check_pointer_containers() {
 # `smallfield/preprocess/csd_torsion_native.hpp`. The bare form resolves through the C++ rule that
 # `""` searches the includer's directory first, which means the path a reader sees is not the path
 # the compiler used, and two includes sitting next to each other silently anchor at different roots.
-# Allowed roots: smallfield/ and csd_data/ under src/, plus test/, bench/ and cli/ under the repo.
+# Allowed roots: smallfield/ under src/, plus test/, bench/ and cli/ under the repo.
 check_include_anchors() {
     local unanchored
     unanchored=$(printf '%s\n' "$added" |
         grep -E '^\+[[:space:]]*#[[:space:]]*include[[:space:]]*"' |
-        grep -vE '#[[:space:]]*include[[:space:]]*"(smallfield|csd_data|test|bench|cli)/' || true)
+        grep -vE '#[[:space:]]*include[[:space:]]*"(smallfield|test|bench|cli)/' || true)
     [ -z "$unanchored" ] || fail "$unanchored" \
         "$file includes a header by a path relative to itself - anchor it at src/ or the repo root:"
 }
