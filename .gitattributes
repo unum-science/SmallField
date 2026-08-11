@@ -1,3 +1,10 @@
+# Normalize every text file to LF in the repository and check it out as LF on every platform.
+# Git for Windows turns `core.autocrlf` on by default, and a CRLF checkout gives `.githooks/*` a
+# shebang ending in a carriage return, at which point every hook exits 127 and no check runs at all.
+# `eol=lf` is the operative half - `text=auto` alone still yields CRLF worktrees there. Binary
+# content is detected automatically and left alone.
+* text=auto eol=lf
+
 # Force GitHub linguist to classify CUDA files as Cuda, not C++.
 *.cu  linguist-language=Cuda
 *.cuh linguist-language=Cuda

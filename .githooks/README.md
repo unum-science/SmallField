@@ -28,6 +28,25 @@ Note that `core.hooksPath` and `pre-commit install` are mutually exclusive — G
 A file that already contains a violation stays committable; a diff that introduces one does not.
 Each formatter gate is skipped when its tool is absent, so a fresh clone without `clang-format`, `cmake-format`, or `ruff` still commits.
 
+## Testing The Checks
+
+```sh
+.githooks/selftest
+```
+
+Each fixture is a throwaway repository outside this tree, and the real hook decides its fate.
+__A rejection counts only when exactly one check fired and it was the expected one__, which turns every negative case into a false-positive test as well: a fixture tripping two rules means some other check is reading text it has no business reading.
+
+Run it after touching any check.
+The recurring failure in this file is not a missed violation but a false positive on prose — the house style requires a rationale comment above each rule, and every rationale names the construct its rule bans, so a check that reads raw lines rejects its own documentation.
+That is why the code rules read `code_only`, the prose rules read `strip_literals` and keep their own comment anchors, and the few that inspect comment syntax itself read the raw line and say so where they are defined.
+
+## Portability
+
+bash 3.2 and POSIX `grep`/`sed` are enough, so a stock macOS shell and Git for Windows both run these unchanged.
+No `mapfile`, no associative arrays, no `${var,,}`, and no `;;&` case fallthrough — that one is bash 4, and on the bash 3.2 macOS still ships it is a parse error that kills the whole script rather than one check.
+Diff text is stripped of CR before matching, and `* text=auto eol=lf` in `.gitattributes` is load-bearing: Git for Windows turns `core.autocrlf` on by default, and a CRLF checkout gives these files a shebang ending in a carriage return, at which point every hook exits 127 and nothing runs at all.
+
 ## Bypassing
 
 ```sh

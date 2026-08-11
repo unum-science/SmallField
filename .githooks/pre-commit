@@ -32,21 +32,54 @@
 #   only the median. Say what you could not measure.
 #
 # Bypass knowingly (you almost never should) with: git commit --no-verify
+#
+# Portability: bash 3.2 and POSIX grep/sed are enough, so a stock macOS shell and Git for Windows
+# both run this unchanged. No `mapfile`, no associative arrays, no `${var,,}`, and no `;;&` case
+# fallthrough - that one is bash 4, and macOS has shipped bash 3.2 since 2007, where it is a parse
+# error that kills the whole script rather than one check. Diff text is stripped of CR before
+# matching, so a CRLF worktree cannot defeat the `$`-anchored patterns even where `.gitattributes`
+# is ignored. Process substitution is avoided in favour of a plain file redirect, since `/dev/fd`
+# is the flakiest part of MSYS.
+#
+# `.githooks/selftest` feeds known-good and known-bad fixtures through this file and asserts the
+# verdict. Run it after touching any check; a rule that rejects prose describing it is the failure
+# mode these checks keep having.
 
 set -u
-LC_ALL=C # ? Byte-wise regexes, immune to the committer's locale
+# Exported so child greps actually see it - a bare assignment sets a shell variable that no
+# subprocess inherits, which made the byte-wise claim below false for every check in this file.
+export LC_ALL=C
 
-failed=0
+failures=0
 
-# Prints the reason and the first offending lines, and marks the commit rejected.
+# Prints the reason and the first offending lines, and marks the commit rejected. The count is what
+# `selftest` reads to assert that exactly one check fired, which is what turns a rejection test into
+# a false-positive test as well.
 fail() { # fail <matches> <message-line>...
     local matches=$1
     shift
     local line
     for line in "$@"; do echo "pre-commit: $line"; done
     printf '%s\n' "$matches" | head -5
-    failed=1
+    failures=$((failures + 1))
 }
+
+# Input hygiene. Every check reads `+`-prefixed diff text, and the `+` is preserved by all three so
+# the anchored patterns keep working.
+#
+# The split matters because the house style requires a rationale comment above each rule, and every
+# rationale names the construct its rule bans: a comment reading "a thread_local cache would hide
+# the state" is an explanation, not a declaration. Equally, a string literal holding "@param out" is
+# a test fixture, not documentation. Checks that police code read `code_only`, checks that police
+# prose read `strip_literals` and keep their own comment anchors, and the handful that inspect
+# comment syntax itself read the raw line - each of those is marked where it is defined.
+strip_literals() { sed -E 's,"[^"]*","",g'; }
+
+strip_comments() {
+    sed -E -e 's,//.*$,,' -e 's,/\*([^*]|\*+[^*/])*\*+/,,g' -e 's,^(\+[[:space:]]*)(\*|/\*).*$,\1,'
+}
+
+code_only() { strip_literals | strip_comments; }
 
 #pragma region C, C++, and CUDA
 
@@ -54,7 +87,9 @@ fail() { # fail <matches> <message-line>...
 # not compose with `[[nodiscard]]`. Bind the value and mark it, or consume it in an if-init.
 check_void_discards() {
     local discards
-    discards=$(printf '%s\n' "$added" | grep -E '\(void\)[[:space:]]*[a-z_]' || true)
+    discards=$(printf '%s\n' "$added" |
+        code_only |
+        grep -E '\(void\)[[:space:]]*[a-z_]' || true)
     [ -z "$discards" ] || fail "$discards" \
         "$file discards a value through a (void) cast - bind it with [[maybe_unused]] or" \
         "            consume it in an if-init statement:"
@@ -71,6 +106,7 @@ check_void_discards() {
 check_backward_references() {
     local history
     history=$(printf '%s\n' "$added" |
+        strip_literals |
         grep -inE '(//|/\*|^\+[[:space:]]*\*).*\b(previously|used to (be|do|work)|no longer|formerly|was replaced|the (old|previous) (design|implementation|version|approach|chain|form)|prior attempt|Phase [0-9])\b' || true)
     [ -z "$history" ] || fail "$history" \
         "$file carries backward-looking prose in a comment - describe the present behavior;" \
@@ -93,6 +129,7 @@ check_rulers() {
 check_param_directions() {
     local params
     params=$(printf '%s\n' "$added" |
+        strip_literals |
         grep -E '@param([[:space:]]+[a-zA-Z_]|\[[[:space:]]*(in[[:space:]]*,|out[[:space:]]*,))' || true)
     [ -z "$params" ] || fail "$params" \
         "$file has an @param without a direction, or uses the comma form - write @param[in]," \
@@ -107,6 +144,7 @@ check_param_directions() {
 check_markdown_doxygen() {
     local emphasis
     emphasis=$(printf '%s\n' "$added" |
+        strip_literals |
         grep -E '(//|/\*|^\+[[:space:]]*\*)[^*_]*(\*\*[^*]+\*\*|__[a-zA-Z][^_]*[[:space:]][^_]*__)' || true)
     [ -z "$emphasis" ] || fail "$emphasis" \
         "$file uses Markdown emphasis inside a Doxygen comment - use @b for one or two tokens:"
@@ -136,7 +174,9 @@ check_trailing_member_docs() {
 # is what @c foo == bar always got wrong.
 check_doxygen_symbol_markup() {
     local markup
-    markup=$(printf '%s\n' "$added" | grep -E '@(c|ref|a)[[:space:]]+[A-Za-z_`]' || true)
+    markup=$(printf '%s\n' "$added" |
+        strip_literals |
+        grep -E '@(c|ref|a)[[:space:]]+[A-Za-z_`]' || true)
     [ -z "$markup" ] || fail "$markup" \
         "$file uses @c, @ref, or @a - inline code and symbol names take backticks:"
 }
@@ -146,7 +186,9 @@ check_doxygen_symbol_markup() {
 # a comment is left alone.
 check_sentence_spacing() {
     local spacing
-    spacing=$(printf '%s\n' "$added" | grep -E '(//|/\*|^\+[[:space:]]*\*).*[a-z0-9)]\.  [A-Z@`]' || true)
+    spacing=$(printf '%s\n' "$added" |
+        strip_literals |
+        grep -E '(//|/\*|^\+[[:space:]]*\*).*[a-z0-9)]\.  [A-Z@`]' || true)
     [ -z "$spacing" ] || fail "$spacing" \
         "$file separates sentences with two spaces in a comment - one is enough:"
 }
@@ -176,7 +218,9 @@ check_scope_comments() {
 # excluded: they are a real language and none of these characters appear in one.
 check_backtick_math() {
     local math
-    math=$(printf '%s\n' "$added" | grep -E '`[^`]*[·×−‖²³][^`]*`' || true)
+    math=$(printf '%s\n' "$added" |
+        strip_literals |
+        grep -E '`[^`]*(·|×|−|‖|²|³)[^`]*`' || true)
     [ -z "$math" ] || fail "$math" \
         "$file puts math inside backticks - backticks are for code, state the maths as prose:"
 }
@@ -195,6 +239,7 @@ check_region_dashes() {
 check_formatter_off() {
     local directives
     directives=$(printf '%s\n' "$added" |
+        code_only |
         grep -E '(//[[:space:]]*clang-format[[:space:]]+(on|off)|#[[:space:]]*cmake-format:[[:space:]]*(on|off))' || true)
     [ -z "$directives" ] || fail "$directives" \
         "$file disables a formatter in-band - the checked-in profiles are the law:"
@@ -204,10 +249,10 @@ check_formatter_off() {
 # count is usually known and small. Store values, or store indices into a flat arena.
 check_pointer_containers() {
     local containers
-    # Comment lines are excluded: a docstring naming RDKit's `std::vector<MMFF*>` parameter column is
-    # describing someone else's layout, not declaring ours, and the rule is about what we declare.
+    # Reads code only: a docstring naming RDKit's `std::vector<MMFF*>` parameter column describes
+    # someone else's layout rather than declaring ours, and the rule is about what we declare.
     containers=$(printf '%s\n' "$added" |
-        grep -vE '^\+[[:space:]]*(//|\*|/\*)' |
+        code_only |
         grep -E '(std::)?(vector|array)[[:space:]]*<[[:space:]]*(std::)?(unique_ptr|shared_ptr)|(std::)?(vector|array)[[:space:]]*<[[:space:]]*[A-Za-z_][A-Za-z_0-9:]*[[:space:]]*\*' || true)
     [ -z "$containers" ] || fail "$containers" \
         "$file holds pointers inside a container - store values, or indices into a flat arena:"
@@ -232,7 +277,9 @@ check_include_anchors() {
 # Hidden global state is why prepare_molecule_batch_into cannot be called concurrently today.
 check_thread_local() {
     local locals
-    locals=$(printf '%s\n' "$added" | grep -E '\bthread_local\b' || true)
+    locals=$(printf '%s\n' "$added" |
+        code_only |
+        grep -E '\bthread_local\b' || true)
     [ -z "$locals" ] || fail "$locals" \
         "$file declares thread_local state - pass a caller-owned scratch and a thread rank:"
 }
@@ -242,6 +289,7 @@ check_thread_local() {
 check_positional_aggregates() {
     local aggregates
     aggregates=$(printf '%s\n' "$added" |
+        code_only |
         grep -E '(push_back|emplace_back|emplace)[[:space:]]*\([[:space:]]*\{[^}.]*,[^}.]*,[^}.]*,[^}.]*\}' || true)
     [ -z "$aggregates" ] || fail "$aggregates" \
         "$file initializes an aggregate positionally past three fields - use designated" \
@@ -270,6 +318,7 @@ check_positional_aggregates() {
 check_abbreviations() {
     local abbreviations
     abbreviations=$(printf '%s\n' "$added" |
+        code_only |
         grep -E '(^|[^/.>`[:alnum:]_])(idx|cfg|tbl|cnt|tmp|buf|ptr|src|dst|nbr|desc|conf|calc|crd|mltb|pilp|linh|sbmb)([^/`[:alnum:]_]|$)' || true)
     [ -z "$abbreviations" ] || fail "$abbreviations" \
         "$file uses an abbreviated identifier - spell it out (index, config, table, count," \
@@ -295,10 +344,11 @@ check_abbreviations() {
 # a rule stops catching the thing it was written for.
 check_short_identifiers() {
     local short
-    # Comment lines are excluded, as in check_pointer_containers: the pattern reads ordinary English
-    # as a declaration, so "rewrites them from it, so ..." trips a rule about identifiers.
+    # Reads code only: the pattern takes ordinary English for a declaration, so a comment reading
+    # "rewrites them from it, so ..." tripped a rule about identifiers. Blanking the comment text
+    # rather than dropping the line also keeps `/* fast path */ int n = 0;` in scope.
     short=$(printf '%s\n' "$added" |
-        grep -vE '^\+[[:space:]]*(//|\*|/\*|#)' |
+        code_only |
         grep -vE '^\+[[:space:]]*namespace[[:space:]]+[a-z_]+[[:space:]]*=' |
         grep -E '^\+.*\b((std::)?[a-z_0-9:]+|auto)[[:space:]]+(const[[:space:]]+)?\*?&?[a-z][a-z0-9_]{0,2}[[:space:]]*(=|;|\)|,)' |
         grep -vwE 'out|end|key|row|dim|hit|ok|top|sum|max|min|raw|bin|tag|on|bit|log|got|now|arg|sha|oop|arc|cis|lhs|rhs|dx|dy|dz|atom_i|atom_j|atom_k|atom_l' || true)
@@ -318,6 +368,7 @@ check_short_identifiers() {
 check_identifier_case() {
     local cased
     cased=$(printf '%s\n' "$added" |
+        code_only |
         grep -E '^\+[[:space:]]*(static |inline |constexpr |const )*(bool|char|short|int|unsigned|float|double|auto|std::[a-z_0-9]+_t|std::size_t)[[:space:]]+(const[[:space:]]+)?([a-z][a-z0-9_]*[A-Z]|[A-Z])[A-Za-z0-9_]*[[:space:]]*[=;,)]' |
         grep -vE '_[A-Z][[:space:]]*[=;,)]' || true)
     [ -z "$cased" ] || fail "$cased" \
@@ -338,9 +389,9 @@ check_identifier_case() {
 # rule exists to permit. Both suffix checks therefore look the declaration up in the working file.
 declared_under_template_head() { # declared_under_template_head <added-line>
     local text=${1#+} number
-    number=$(grep -nxF -- "$text" "$file" 2>/dev/null | head -1 | cut -d: -f1)
+    number=$(tr -d '\015' < "$file" 2>/dev/null | grep -nxF -- "$text" | head -1 | cut -d: -f1)
     [ -n "$number" ] && [ "$number" -gt 1 ] || return 1
-    sed -n "$((number - 1))p" "$file" | grep -qE '^[[:space:]]*template[[:space:]]*<'
+    tr -d '\015' < "$file" | sed -n "$((number - 1))p" | grep -qE '^[[:space:]]*template[[:space:]]*<'
 }
 
 check_type_suffix() {
@@ -388,7 +439,8 @@ check_constant_suffix() {
 # navigate to. An internal helper lives in the file's own namespace with a trailing underscore.
 check_detail_namespace() {
     local namespaces
-    namespaces=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*namespace[[:space:]]+detail' || true)
+    namespaces=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*namespace[[:space:]]+detail' || true)
     [ -z "$namespaces" ] || fail "$namespaces" \
         "$file opens a detail namespace - they are banned; give the helper a trailing underscore" \
         "            in the file's own namespace:"
@@ -404,6 +456,7 @@ check_detail_namespace() {
 check_host_threads() {
     local threads
     threads=$(printf '%s\n' "$added" |
+        code_only |
         grep -E '\bstd::(thread|jthread|async)\b|#include[[:space:]]*<thread>|\bpthread_' || true)
     [ -z "$threads" ] || fail "$threads" \
         "$file spawns host threads in a CUDA source - orchestrate devices with per-device" \
@@ -418,7 +471,9 @@ check_host_threads() {
 # A recurring two-state axis earns a two-value enum.
 check_boolean_parameters() {
     local booleans
-    booleans=$(printf '%s\n' "$added" | grep -E '[(,][[:space:]]*bool[[:space:]]+[a-z_]+[[:space:]]*[,)]' || true)
+    booleans=$(printf '%s\n' "$added" |
+        code_only |
+        grep -E '[(,][[:space:]]*bool[[:space:]]+[a-z_]+[[:space:]]*[,)]' || true)
     [ -z "$booleans" ] || fail "$booleans" \
         "$file takes a bare bool parameter - name the choice with a two-value enum:"
 }
@@ -434,6 +489,7 @@ check_boolean_parameters() {
 check_iostreams() {
     local streams
     streams=$(printf '%s\n' "$added" |
+        code_only |
         grep -E '\bstd::(cout|cerr|clog|i?fstream|o?fstream|[io]?stringstream)\b' || true)
     [ -z "$streams" ] || fail "$streams" \
         "$file uses an iostream in a library header - print through fmt:: or the project logger:"
@@ -441,21 +497,24 @@ check_iostreams() {
 
 #pragma endregion Library headers
 
-#pragma region Markdown
-
-# Emphasis is __bold__ and _italic_, never the asterisk forms, so the rendered and raw text agree
-# across every renderer these documents pass through.
-# clang-format splits a string literal that overruns the column limit, and splits the
-# pieces again on the next run, until a word reads "a" "r" "r" "a" "y" "s". Split long
-# literals yourself at a sensible boundary and pin each fragment with a trailing `//`.
+# clang-format splits a string literal that overruns the column limit, and splits the pieces again
+# on the next run, until a word reads "a" "r" "r" "a" "y" "s". Split long literals yourself at a
+# sensible boundary and pin each fragment with a trailing `//`.
+#
+# Comments are blanked but literals are not, since the adjacency this looks for IS the literal.
 check_split_literals() {
     local shredded
     shredded=$(printf '%s\n' "$added" |
+        strip_comments |
         grep -E '"[A-Za-z0-9_]"[[:space:]]+"|[A-Za-z0-9_]"[[:space:]]+"[A-Za-z0-9_]' || true)
     [ -z "$shredded" ] || fail "$shredded" \
         "$file splits a string literal mid-word - break it yourself and pin each line with a trailing //:"
 }
 
+#pragma region Markdown
+
+# Emphasis is __bold__ and _italic_, never the asterisk forms, so the rendered and raw text agree
+# across every renderer these documents pass through.
 check_markdown_asterisks() {
     local emphasis
     # Inline code spans are stripped first: a document that explains this very rule has to
@@ -468,10 +527,20 @@ check_markdown_asterisks() {
 
 #pragma endregion Markdown
 
-# One pass: enumerate the staged files once, diff each once, and dispatch by extension. The list is
-# NUL-delimited so a filename with spaces can never split.
+# The staged list is computed once and read from a plain file by all three loops below. NUL
+# delimiters keep a filename with spaces from splitting, and a file redirect rather than process
+# substitution keeps the loop body in this shell without leaning on `/dev/fd`, which is the least
+# reliable corner of MSYS.
+staged_files=$(mktemp "${TMPDIR:-/tmp}/smallfield-staged-XXXXXX") || exit 0
+trap 'rm -f "$staged_files"' EXIT
+git diff --cached --name-only --diff-filter=ACM -z > "$staged_files"
+
+# One pass: diff every staged file once and dispatch by extension. Nested `case` rather than the
+# `;;&` fallthrough terminator, which is bash 4 and a parse error on the bash 3.2 macOS still ships.
 while IFS= read -r -d '' file; do
-    added=$(git diff --cached --unified=0 -- "$file" | grep '^+' | grep -v '^+++' || true)
+    # CR is stripped so a CRLF worktree cannot defeat the `$`-anchored patterns. `.gitattributes`
+    # pins this repository to LF, but a consumer can override that and the checks should not care.
+    added=$(git diff --cached --unified=0 -- "$file" | grep '^+' | grep -v '^+++' | tr -d '\015' || true)
     [ -n "$added" ] || continue
     case "$file" in
     *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx | *.cu | *.cuh)
@@ -501,28 +570,35 @@ while IFS= read -r -d '' file; do
         check_constant_suffix
         check_detail_namespace
         check_split_literals
-        ;;&
-    *.cu | *.cuh)
-        check_host_threads
-        ;;&
-    src/*.hpp | src/*.cuh)
-        check_boolean_parameters
-        check_iostreams
+        case "$file" in
+        *.cu | *.cuh) check_host_threads ;;
+        esac
+        case "$file" in
+        src/*.hpp | src/*.cuh)
+            check_boolean_parameters
+            check_iostreams
+            ;;
+        esac
         ;;
     *.md) check_markdown_asterisks ;;
     esac
-done < <(git diff --cached --name-only --diff-filter=ACM -z)
+done < "$staged_files"
 
 # Formatter gates. `git clang-format` scores only the changed lines, so legacy formatting is left
 # alone and a fresh clone without the tool still commits. cmake-format has no changed-lines mode,
 # so it runs whole-file against the checked-in profile.
 if command -v git-clang-format > /dev/null 2>&1 && [ -f .clang-format ]; then
+    if ! clang-format --version > /dev/null 2>&1; then
+        # A toolchain fault is not a lint. `git-clang-format` is a Python script that shells out to
+        # `clang-format`, so either half can be missing while the other is on PATH, and reporting
+        # that as unformatted code sends the committer hunting for a diagnostic never emitted.
+        echo "pre-commit: git-clang-format is installed but clang-format could not run - format gate skipped"
     # Scope it to the languages this profile describes. `git clang-format` also claims
     # `.json` by default, and a `.clang-format` without a Json section makes it exit
     # non-zero on any staged JSON file, which reads here as a formatting failure.
-    if ! git clang-format --staged --diff --quiet --extensions c,h,cc,cpp,hpp,cu,cuh > /dev/null 2>&1; then
+    elif ! git clang-format --staged --diff --quiet --extensions c,h,cc,cpp,hpp,cu,cuh > /dev/null 2>&1; then
         echo "pre-commit: staged C/C++/CUDA lines are not clang-format clean - run \`git clang-format --staged\`"
-        failed=1
+        failures=$((failures + 1))
     fi
 fi
 
@@ -558,9 +634,9 @@ if command -v cmake-format > /dev/null 2>&1 && [ -f .cmake-format.py ]; then
         was_clean_at_head "$file" cmake-format --check || continue
         if ! cmake-format --check "$file" > /dev/null 2>&1; then
             echo "pre-commit: $file was cmake-format clean and no longer is - run \`cmake-format -i\`"
-            failed=1
+            failures=$((failures + 1))
         fi
-    done < <(git diff --cached --name-only --diff-filter=ACM -z)
+    done < "$staged_files"
 fi
 
 if command -v ruff > /dev/null 2>&1; then
@@ -572,13 +648,14 @@ if command -v ruff > /dev/null 2>&1; then
         was_clean_at_head "$file" ruff format --check || continue
         if ! ruff format --check "$file" > /dev/null 2>&1; then
             echo "pre-commit: $file was ruff-format clean and no longer is - run \`ruff format\`"
-            failed=1
+            failures=$((failures + 1))
         fi
-    done < <(git diff --cached --name-only --diff-filter=ACM -z)
+    done < "$staged_files"
 fi
 
-if [ "$failed" -ne 0 ]; then
+if [ "$failures" -ne 0 ]; then
     echo ""
+    echo "pre-commit: $failures check(s) failed."
     echo "Fix the staged changes and commit again. Bypass knowingly with: git commit --no-verify"
     exit 1
 fi

@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+#
+# Feeds known-good and known-bad fixtures through the real `pre-commit` and `commit-msg` and asserts
+# the verdict. Run it after touching any check:
+#
+#     .githooks/selftest
+#
+# Every check in this file polices text with a regex, and the recurring failure is not a missed
+# violation but a false positive on prose: the house style requires a rationale comment above each
+# rule, and every rationale names the construct its rule bans. So each rule gets both a fixture that
+# must be rejected and a fixture -- usually a comment describing the rule -- that must be accepted.
+#
+# A rejection only counts when EXACTLY ONE check fired and it was the expected one. Counting is what
+# turns the negative cases into false-positive tests too: a fixture tripping two rules means some
+# other check is matching text it has no business reading. That is why `pre-commit` prints a count.
+
+set -u
+export LC_ALL=C
+
+hooks_dir=$(cd "$(dirname "$0")" && pwd)
+scratch_root=${SMALLFIELD_SELFTEST_DIR:-${TMPDIR:-/tmp}/smallfield-selftest}
+rm -rf "$scratch_root"
+mkdir -p "$scratch_root"
+trap 'rm -rf "$scratch_root"' EXIT
+
+passed=0
+failed=0
+
+# Each fixture is a throwaway repository outside this tree, with one empty commit so that
+# `git diff --cached` has a HEAD to compare against.
+new_fixture() {
+    local fixture
+    fixture=$(mktemp -d "$scratch_root/fixture.XXXXXX")
+    git -C "$fixture" init -q
+    git -C "$fixture" config user.email selftest@example.com
+    git -C "$fixture" config user.name Selftest
+    git -C "$fixture" commit -q --allow-empty -m "Add: Baseline"
+    mkdir -p "$fixture/src/smallfield" "$fixture/test"
+    printf '%s\n' "$fixture"
+}
+
+run_precommit() { (cd "$1" && git add -A && "$hooks_dir/pre-commit" 2>&1); }
+
+# Writes one staged file and asserts the hook rejects it for exactly the expected reason.
+assert_rejects() { # assert_rejects <title> <path> <content> <expected-substring>
+    local title=$1 path=$2 content=$3 expected=$4 fixture output status count
+    fixture=$(new_fixture)
+    mkdir -p "$fixture/$(dirname "$path")"
+    printf '%s\n' "$content" > "$fixture/$path"
+    output=$(run_precommit "$fixture")
+    status=$?
+    count=$(printf '%s\n' "$output" | sed -n 's/^pre-commit: \([0-9]*\) check(s) failed.*/\1/p')
+    if [ "$status" -eq 0 ]; then
+        printf 'FAIL  %s -- accepted a violation\n' "$title"
+        failed=$((failed + 1))
+    elif ! printf '%s\n' "$output" | grep -qF "$expected"; then
+        printf 'FAIL  %s -- rejected for the wrong reason:\n%s\n' "$title" "$output"
+        failed=$((failed + 1))
+    elif [ "$count" != "1" ]; then
+        printf 'FAIL  %s -- %s checks fired, expected 1:\n%s\n' "$title" "${count:-?}" "$output"
+        failed=$((failed + 1))
+    else
+        printf 'ok    %s\n' "$title"
+        passed=$((passed + 1))
+    fi
+}
+
+assert_accepts() { # assert_accepts <title> <path> <content>
+    local title=$1 path=$2 content=$3 fixture output
+    fixture=$(new_fixture)
+    mkdir -p "$fixture/$(dirname "$path")"
+    printf '%s\n' "$content" > "$fixture/$path"
+    if output=$(run_precommit "$fixture"); then
+        printf 'ok    %s\n' "$title"
+        passed=$((passed + 1))
+    else
+        printf 'FAIL  %s -- rejected clean content:\n%s\n' "$title" "$output"
+        failed=$((failed + 1))
+    fi
+}
+
+assert_message_rejects() { # assert_message_rejects <title> <message> <expected-substring>
+    local title=$1 message=$2 expected=$3 path output
+    path="$scratch_root/message.$$"
+    printf '%s\n' "$message" > "$path"
+    output=$("$hooks_dir/commit-msg" "$path" 2>&1)
+    if [ $? -eq 0 ]; then
+        printf 'FAIL  %s -- accepted a bad message\n' "$title"
+        failed=$((failed + 1))
+    elif ! printf '%s\n' "$output" | grep -qF "$expected"; then
+        printf 'FAIL  %s -- rejected for the wrong reason:\n%s\n' "$title" "$output"
+        failed=$((failed + 1))
+    else
+        printf 'ok    %s\n' "$title"
+        passed=$((passed + 1))
+    fi
+}
+
+assert_message_accepts() { # assert_message_accepts <title> <message>
+    local title=$1 message=$2 path output
+    path="$scratch_root/message.$$"
+    printf '%s\n' "$message" > "$path"
+    if output=$("$hooks_dir/commit-msg" "$path" 2>&1); then
+        printf 'ok    %s\n' "$title"
+        passed=$((passed + 1))
+    else
+        printf 'FAIL  %s -- rejected a good message:\n%s\n' "$title" "$output"
+        failed=$((failed + 1))
+    fi
+}
+
+# Every rationale comment in the hook names the construct its rule bans, so each of these was a
+# verified false positive before the checks read `code_only`.
+assert_accepts "a comment naming thread_local" src/smallfield/note.hpp \
+    '/* A thread_local cache would hide the state, so a rank into caller-owned scratch is passed. */'
+assert_accepts "a comment naming std::cout" src/smallfield/note.hpp \
+    '/* RDKit prints its warnings through std::cerr, which the caller redirects. */'
+assert_accepts "a comment naming a (void) cast" src/smallfield/note.hpp \
+    '/* A (void) cast hides the failure, so the value is bound instead. */'
+assert_accepts "a comment naming std::thread" src/smallfield/note.cu \
+    '/* Device fleets avoid std::thread; per-device streams carry the ordering. */'
+assert_accepts "a comment naming a bool parameter" src/smallfield/note.hpp \
+    '/* Never write generate(count, bool strict) - name the choice with an enum. */'
+assert_accepts "a string literal holding @param" src/smallfield/note.hpp \
+    'char const *doc_fixture = "@param out the result";'
+assert_accepts "a string literal holding @c markup" src/smallfield/note.hpp \
+    'parser.parse("@c value");'
+assert_accepts "a comment naming an abbreviation" src/smallfield/note.hpp \
+    '/* Spell it out: idx becomes index and tmp becomes scratch. */'
+assert_accepts "prose that reads as a declaration" src/smallfield/note.hpp \
+    '/* The workflow rewrites them from it, so nothing here is edited by hand. */'
+
+# The same rules must still fire on real code.
+assert_rejects "a real thread_local declaration" src/smallfield/note.hpp \
+    'thread_local int counter = 0;' "declares thread_local state"
+assert_rejects "a real (void) discard" src/smallfield/note.hpp \
+    '(void) compute_something();' "discards a value through a (void) cast"
+assert_rejects "a real iostream use" src/smallfield/note.hpp \
+    'std::cout << value;' "uses an iostream in a library header"
+assert_rejects "a real bare bool parameter" src/smallfield/note.hpp \
+    'void generate(int count, bool strict);' "takes a bare bool parameter"
+assert_rejects "a real abbreviated identifier" src/smallfield/note.hpp \
+    'int desc = 0;' "uses an abbreviated identifier"
+assert_rejects "a real detail namespace" src/smallfield/note.hpp \
+    'namespace detail {' "opens a detail namespace"
+assert_rejects "a real unanchored include" src/smallfield/note.hpp \
+    '#include "sibling.hpp"' "includes a header by a path relative to itself"
+assert_rejects "a real decorative ruler" src/smallfield/note.hpp \
+    '    // =========================' "draws a decorative ruler"
+assert_rejects "a real backward-looking comment" src/smallfield/note.hpp \
+    '/* This field is no longer used by the packer. */' "carries backward-looking prose"
+
+# A violation sharing a line with a leading comment must still be caught. Blanking comment text
+# rather than dropping the whole line is what makes this reachable.
+assert_rejects "a violation behind a leading comment" src/smallfield/note.hpp \
+    '/* fast path */ thread_local int counter = 0;' "declares thread_local state"
+
+# Markdown emphasis, and the document that has to name the banned form to ban it.
+assert_rejects "asterisk emphasis in Markdown" NOTES.md \
+    'This is **bold** text.' "uses asterisk emphasis"
+assert_accepts "a Markdown document naming the banned form" NOTES.md \
+    'Bold is `**bold**` in other dialects; here it is __bold__.'
+
+# A clean tree must commit untouched. Deliberately adversarial: a path that looks like an
+# abbreviation, a SMARTS pattern, an RDKit column name behind the adapter boundary, and a template
+# whose bare name is correct precisely because it is a template.
+assert_accepts "an adversarial but clean header" src/smallfield/clean.hpp \
+    '#pragma once
+
+#include "smallfield/types/molecule_descriptor.hpp"
+
+namespace smallfield {
+
+/** Reads the corpus at `/tmp/corpus.smi` and matches `[O:1]=[C:2]!@;-[O:3]`. */
+template <typename allocator_>
+class byte_buffer {
+    std::size_t count = 0;
+};
+
+using pinned_byte_buffer_t = byte_buffer<pinned_alloc_t>;
+
+inline constexpr int max_atoms_k = 128;
+
+} // namespace smallfield'
+
+assert_message_accepts "a conforming subject" "Improve: Split the preprocess headers by consumer"
+assert_message_rejects "an assistant trailer" \
+    "Add: Something
+
+Co-authored-by: Claude <noreply@anthropic.com>" "AI-assistant attribution"
+
+printf '\n%d passed, %d failed\n' "$passed" "$failed"
+[ "$failed" -eq 0 ]
