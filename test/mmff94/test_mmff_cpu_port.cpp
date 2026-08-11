@@ -2,9 +2,12 @@
  *  @file test/mmff94/test_mmff_cpu_port.cpp
  *  @brief Cross-validate the native MMFF CPU port against the existing RDKit-backed path.
  *
- *  `extract_mmff94_params_native` is compared against `extract_mmff94_params`. Must produce byte-identical MMFF
- *  term arrays on a curated SMILES set; small numerical deltas ≤ 1e-3 are allowed on empirical-rule fallback terms
- *  due to float/double rounding in MMFF.V eqs 18-19 and the torsion rules.
+ *  Both native extractors are held to the same oracle: a cache-free baseline built from RDKit's own per-term
+ *  `getMMFF*Params`. `extract_mmff94_params_native` takes atom types and charges from RDKit, while
+ *  `extract_mmff94_params_fully_native` derives them itself with zero runtime RDKit. Both must produce
+ *  byte-identical MMFF term arrays on a curated SMILES set; small numerical deltas ≤ 1e-3 are allowed on
+ *  empirical-rule fallback terms due to float/double rounding in MMFF.V eqs 18-19 and the torsion rules, and on
+ *  the fully-native partial charges, which sum bond-charge increments in `float` where RDKit sums in `double`.
  */
 
 #include <cmath>   // `std::fabs`
@@ -63,13 +66,37 @@ static bool near_(float left, float right, float tolerance = 1e-3f) {
     return std::fabs(left - right) <= tolerance * std::max(1.0f, std::max(std::fabs(left), std::fabs(right)));
 }
 
-static bool compare_mol_(std::string_view smiles, sfp::etkdg_prepared_molecule_t const &rdkit_result,
+/** Which native extractor produced the terms under test. */
+enum class native_extractor_t : std::uint8_t {
+    /** `extract_mmff94_params_native` — atom types and partial charges handed in from RDKit. */
+    hybrid_k,
+    /** `extract_mmff94_params_fully_native` — types and charges derived with zero runtime RDKit. */
+    fully_native_k,
+};
+
+static char const *name_of_(native_extractor_t extractor) {
+    return extractor == native_extractor_t::hybrid_k ? "hybrid" : "fully-native";
+}
+
+static bool compare_mol_(std::string_view smiles, native_extractor_t extractor,
+                         sfp::etkdg_prepared_molecule_t const &rdkit_result,
                          sfp::etkdg_prepared_molecule_t const &native_result, bool verbose) {
+    char const *native_path_label = name_of_(extractor);
     bool ok = true;
     auto complain = [&](char const *what) {
-        if (verbose && ok) std::printf("  [%.*s] MISMATCH: ", (int)smiles.size(), smiles.data());
+        if (verbose && ok)
+            std::printf("  [%.*s] %s MISMATCH: ", (int)smiles.size(), smiles.data(), native_path_label);
         if (verbose) std::printf("%s ", what);
         ok = false;
+    };
+
+    // Printed once, ahead of the first per-term value mismatch, so every value line below is
+    // attributable to a molecule and to the extractor that produced it.
+    bool value_header_printed = false;
+    auto value_header = [&]() {
+        if (!verbose || value_header_printed) return;
+        std::printf("  [%.*s] %s value mismatches:\n", (int)smiles.size(), smiles.data(), native_path_label);
+        value_header_printed = true;
     };
 
     if (rdkit_result.num_atoms != native_result.num_atoms) complain("num_atoms");
@@ -132,15 +159,27 @@ static bool compare_mol_(std::string_view smiles, sfp::etkdg_prepared_molecule_t
               bit_eq_(rdkit_term.a_scale, native_term.a_scale) && bit_eq_(rdkit_term.g_factor, native_term.g_factor) &&
               bit_eq_(rdkit_term.r_star, native_term.r_star) &&
               rdkit_term.donor_acceptor == native_term.donor_acceptor)) {
-            if (verbose)
+            if (verbose) {
+                value_header();
                 std::printf("    vdw[%zu] rdk α=%.4f r*=%.4f; nat α=%.4f r*=%.4f\n", atom, rdkit_term.alpha,
                             rdkit_term.r_star, native_term.alpha, native_term.r_star);
+            }
             ++n_fails_;
         }
-        if (!bit_eq_(rdkit_result.mmff_atom_charge[atom], native_result.mmff_atom_charge[atom])) {
-            if (verbose)
-                std::printf("    charge[%zu] rdk=%.5f nat=%.5f\n", atom, rdkit_result.mmff_atom_charge[atom],
-                            native_result.mmff_atom_charge[atom]);
+        // The hybrid path is handed RDKit's own `double` charges, so it must reproduce them bit for bit.
+        // The fully-native path sums bond-charge increments in `float` where RDKit sums in `double`, so it
+        // earns the same 1e-3 tolerance every other natively-computed term in this file already gets.
+        bool const charge_matches =
+            extractor == native_extractor_t::hybrid_k
+                ? bit_eq_(rdkit_result.mmff_atom_charge[atom], native_result.mmff_atom_charge[atom])
+                : near_(rdkit_result.mmff_atom_charge[atom], native_result.mmff_atom_charge[atom]);
+        if (!charge_matches) {
+            if (verbose) {
+                value_header();
+                std::printf("    charge[%zu] rdk=%.9g nat=%.9g Δ=%.3g\n", atom, rdkit_result.mmff_atom_charge[atom],
+                            native_result.mmff_atom_charge[atom],
+                            native_result.mmff_atom_charge[atom] - rdkit_result.mmff_atom_charge[atom]);
+            }
             ++n_fails_;
         }
     }
@@ -151,18 +190,22 @@ static bool compare_mol_(std::string_view smiles, sfp::etkdg_prepared_molecule_t
         auto const &native_term = native_result.mmff_bonds[term];
         ++n_checks_;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j) {
-            if (verbose)
+            if (verbose) {
+                value_header();
                 std::printf("    bond[%zu] ij rdk=%u-%u nat=%u-%u\n", term, rdkit_term.atom_i, rdkit_term.atom_j,
                             native_term.atom_i, native_term.atom_j);
+            }
             ++n_fails_;
             continue;
         }
         if (!near_(rdkit_term.force_constant, native_term.force_constant) ||
             !near_(rdkit_term.equilibrium_distance, native_term.equilibrium_distance)) {
-            if (verbose)
+            if (verbose) {
+                value_header();
                 std::printf("    bond[%zu] kb rdk=%.4f nat=%.4f  r0 rdk=%.4f nat=%.4f\n", term,
                             rdkit_term.force_constant, native_term.force_constant, rdkit_term.equilibrium_distance,
                             native_term.equilibrium_distance);
+            }
             ++n_fails_;
         }
     }
@@ -174,19 +217,23 @@ static bool compare_mol_(std::string_view smiles, sfp::etkdg_prepared_molecule_t
         ++n_checks_;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j ||
             rdkit_term.atom_k != native_term.atom_k) {
-            if (verbose)
+            if (verbose) {
+                value_header();
                 std::printf("    angle[%zu] ijk rdk=%u-%u-%u nat=%u-%u-%u\n", term, rdkit_term.atom_i,
                             rdkit_term.atom_j, rdkit_term.atom_k, native_term.atom_i, native_term.atom_j,
                             native_term.atom_k);
+            }
             ++n_fails_;
             continue;
         }
         if (!near_(rdkit_term.force_constant, native_term.force_constant) ||
             !near_(rdkit_term.equilibrium_angle, native_term.equilibrium_angle)) {
-            if (verbose)
+            if (verbose) {
+                value_header();
                 std::printf("    angle[%zu] ka rdk=%.4f nat=%.4f θ₀ rdk=%.4f nat=%.4f\n", term,
                             rdkit_term.force_constant, native_term.force_constant, rdkit_term.equilibrium_angle,
                             native_term.equilibrium_angle);
+            }
             ++n_fails_;
         }
     }
@@ -198,21 +245,25 @@ static bool compare_mol_(std::string_view smiles, sfp::etkdg_prepared_molecule_t
         ++n_checks_;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j ||
             rdkit_term.atom_k != native_term.atom_k || rdkit_term.atom_l != native_term.atom_l) {
-            if (verbose)
+            if (verbose) {
+                value_header();
                 std::printf("    tor[%zu] ijkl rdk=%u-%u-%u-%u nat=%u-%u-%u-%u\n", term, rdkit_term.atom_i,
                             rdkit_term.atom_j, rdkit_term.atom_k, rdkit_term.atom_l, native_term.atom_i,
                             native_term.atom_j, native_term.atom_k, native_term.atom_l);
+            }
             ++n_fails_;
             continue;
         }
         if (!near_(rdkit_term.torsion_v1, native_term.torsion_v1) ||
             !near_(rdkit_term.torsion_v2, native_term.torsion_v2) ||
             !near_(rdkit_term.torsion_v3, native_term.torsion_v3)) {
-            if (verbose)
+            if (verbose) {
+                value_header();
                 std::printf("    tor[%zu] ijkl=%u-%u-%u-%u V rdk=(%.4f, %.4f, %.4f) nat=(%.4f, %.4f, %.4f)\n", term,
                             rdkit_term.atom_i, rdkit_term.atom_j, rdkit_term.atom_k, rdkit_term.atom_l,
                             rdkit_term.torsion_v1, rdkit_term.torsion_v2, rdkit_term.torsion_v3, native_term.torsion_v1,
                             native_term.torsion_v2, native_term.torsion_v3);
+            }
             ++n_fails_;
         }
     }
@@ -224,10 +275,24 @@ static bool compare_mol_(std::string_view smiles, sfp::etkdg_prepared_molecule_t
         ++n_checks_;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j ||
             rdkit_term.atom_k != native_term.atom_k || rdkit_term.atom_l != native_term.atom_l) {
+            if (verbose) {
+                value_header();
+                std::printf("    oop[%zu] ijkl rdk=%u-%u-%u-%u nat=%u-%u-%u-%u\n", term, rdkit_term.atom_i,
+                            rdkit_term.atom_j, rdkit_term.atom_k, rdkit_term.atom_l, native_term.atom_i,
+                            native_term.atom_j, native_term.atom_k, native_term.atom_l);
+            }
             ++n_fails_;
             continue;
         }
-        if (!near_(rdkit_term.force_constant, native_term.force_constant)) ++n_fails_;
+        if (!near_(rdkit_term.force_constant, native_term.force_constant)) {
+            if (verbose) {
+                value_header();
+                std::printf("    oop[%zu] ijkl=%u-%u-%u-%u koop rdk=%.4f nat=%.4f\n", term, rdkit_term.atom_i,
+                            rdkit_term.atom_j, rdkit_term.atom_k, rdkit_term.atom_l, rdkit_term.force_constant,
+                            native_term.force_constant);
+            }
+            ++n_fails_;
+        }
     }
 
     // Stretch-bends
@@ -237,7 +302,11 @@ static bool compare_mol_(std::string_view smiles, sfp::etkdg_prepared_molecule_t
         ++n_checks_;
         if (rdkit_term.atom_i != native_term.atom_i || rdkit_term.atom_j != native_term.atom_j ||
             rdkit_term.atom_k != native_term.atom_k) {
-            if (verbose) std::printf("    sb[%zu] ijk mismatch\n", term);
+            if (verbose) {
+                value_header();
+                std::printf("    sb[%zu] ijk rdk=%u-%u-%u nat=%u-%u-%u\n", term, rdkit_term.atom_i, rdkit_term.atom_j,
+                            rdkit_term.atom_k, native_term.atom_i, native_term.atom_j, native_term.atom_k);
+            }
             ++n_fails_;
             continue;
         }
@@ -245,7 +314,8 @@ static bool compare_mol_(std::string_view smiles, sfp::etkdg_prepared_molecule_t
             !near_(rdkit_term.equilibrium_angle, native_term.equilibrium_angle) ||
             !near_(rdkit_term.equilibrium_distance_ij, native_term.equilibrium_distance_ij) ||
             !near_(rdkit_term.equilibrium_distance_kj, native_term.equilibrium_distance_kj)) {
-            if (verbose)
+            if (verbose) {
+                value_header();
                 std::printf("    sb[%zu] ijk=%u-%u-%u rdk k=(%.4f, %.4f) θ₀=%.4f r0=(%.4f, %.4f) nat k=(%.4f, %.4f) " //
                             "θ₀=%.4f r0=(%.4f, %.4f)\n",
                             term, rdkit_term.atom_i, rdkit_term.atom_j, rdkit_term.atom_k, rdkit_term.kba_ijk,
@@ -253,6 +323,7 @@ static bool compare_mol_(std::string_view smiles, sfp::etkdg_prepared_molecule_t
                             rdkit_term.equilibrium_distance_kj, native_term.kba_ijk, native_term.kba_kji,
                             native_term.equilibrium_angle, native_term.equilibrium_distance_ij,
                             native_term.equilibrium_distance_kj);
+            }
             ++n_fails_;
         }
     }
@@ -475,15 +546,23 @@ static void run_one_(std::string_view smiles, sfparam::mmff94_tables_view_t cons
     nat_result.num_atoms = num_atoms;
     sfmmff::extract_mmff94_params_native(descriptor, atom_types, charges, tables, nat_result);
 
-    // Fully-native: zero runtime RDKit. Term counts should match the
-    // hybrid path on molecules where our typer agrees with RDKit.
+    // Fully-native: zero runtime RDKit. Its terms are held to the same
+    // RDKit-derived oracle as the hybrid path.
     sfp::etkdg_prepared_molecule_t fully_native_result;
     fully_native_result.num_atoms = num_atoms;
-    [[maybe_unused]] bool const extracted = sfmmff::extract_mmff94_params_fully_native(descriptor, tables,
-                                                                                       fully_native_result);
+    bool const extracted = sfmmff::extract_mmff94_params_fully_native(descriptor, tables, fully_native_result);
 
     int const fails_before = n_fails_;
-    bool const ok = compare_mol_(smiles, rdk_result, nat_result, verbose);
+    bool ok = compare_mol_(smiles, sftest::native_extractor_t::hybrid_k, rdk_result, nat_result, verbose);
+    if (!extracted) {
+        if (verbose)
+            std::printf("  [%.*s] fully-native extraction REFUSED (typer failure)\n", (int)smiles.size(),
+                        smiles.data());
+        ok = false;
+    }
+    else if (!compare_mol_(smiles, sftest::native_extractor_t::fully_native_k, rdk_result, fully_native_result,
+                           verbose))
+        ok = false;
     if (ok && n_fails_ == fails_before) ++n_mol_pass_;
     else if (!ok) ++n_mol_fail_;
     if (n_fails_ > fails_before) ++n_mol_with_any_fail_;

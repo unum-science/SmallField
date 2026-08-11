@@ -49,6 +49,7 @@ static bool bitwise_equal_(float lhs, float rhs) {
 }
 
 static void validate_vdw_lookup_(sf::parameters::mmff94_tables_host_t const &host_tables) {
+    int const checks_before = host_check_count_;
     auto const host_lookup_view = host_tables.view();
     auto const *vdw_collection = RDKit::MMFF::DefaultParameters::getMMFFVdW();
     for (std::uint8_t atom_type = 1; atom_type <= host_tables.max_atom_type; ++atom_type) {
@@ -73,15 +74,18 @@ static void validate_vdw_lookup_(sf::parameters::mmff94_tables_host_t const &hos
             ++host_failure_count_;
         }
     }
+    std::printf("  %d entries compared against RDKit\n", host_check_count_ - checks_before);
 }
 
 static void validate_bond_lookup_(sf::parameters::mmff94_tables_host_t const &host_tables) {
+    int const checks_before = host_check_count_;
     auto const host_lookup_view = host_tables.view();
     if (host_tables.bond.empty()) {
         std::printf("  Bond test SKIPPED (no bond table)\n");
         return;
     }
 
+    auto const *bond_collection = RDKit::MMFF::DefaultParameters::getMMFFBond();
     std::mt19937 generator(42);
     std::uniform_int_distribution<std::uint32_t> atom_type_dist(1, host_tables.max_atom_type);
     std::uniform_int_distribution<std::uint32_t> bond_type_dist(0, 1);
@@ -90,27 +94,29 @@ static void validate_bond_lookup_(sf::parameters::mmff94_tables_host_t const &ho
         std::uint8_t atom_type_j = static_cast<std::uint8_t>(atom_type_dist(generator));
         std::uint8_t bond_type = static_cast<std::uint8_t>(bond_type_dist(generator));
         auto const *our_entry = sf::parameters::lookup_bond(host_lookup_view, bond_type, atom_type_i, atom_type_j);
-        auto const *reference_entry = our_entry;
-        if (!our_entry && !reference_entry) continue;
+        auto const *rdkit_entry = (*bond_collection)(bond_type, atom_type_i, atom_type_j);
+        if (!our_entry && !rdkit_entry) continue;
 
         ++host_check_count_;
-        if (!our_entry || !reference_entry) {
-            std::printf("  Bond bond_type=%u atom_i=%u atom_j=%u: ours=%p reference=%p\n", bond_type, atom_type_i,
-                        atom_type_j, (void *)our_entry, (void *)reference_entry);
+        if (!our_entry || !rdkit_entry) {
+            std::printf("  Bond bond_type=%u atom_i=%u atom_j=%u: ours=%p rdkit=%p\n", bond_type, atom_type_i,
+                        atom_type_j, (void *)our_entry, (void *)rdkit_entry);
             ++host_failure_count_;
             continue;
         }
 
-        if (!approximately_equal_(our_entry->force_constant, reference_entry->force_constant) ||
-            !approximately_equal_(our_entry->equilibrium_distance, reference_entry->equilibrium_distance)) {
-            std::printf("  Bond bond_type=%u atom_i=%u atom_j=%u mismatch: ours kb=%.4f reference kb=%.4f\n", bond_type,
-                        atom_type_i, atom_type_j, our_entry->force_constant, reference_entry->force_constant);
+        if (!approximately_equal_(our_entry->force_constant, rdkit_entry->kb) ||
+            !approximately_equal_(our_entry->equilibrium_distance, rdkit_entry->r0)) {
+            std::printf("  Bond bond_type=%u atom_i=%u atom_j=%u mismatch: ours kb=%.4f rdkit kb=%.4f\n", bond_type,
+                        atom_type_i, atom_type_j, our_entry->force_constant, rdkit_entry->kb);
             ++host_failure_count_;
         }
     }
+    std::printf("  %d entries compared against RDKit\n", host_check_count_ - checks_before);
 }
 
 static void validate_angle_lookup_(sf::parameters::mmff94_tables_host_t const &host_tables) {
+    int const checks_before = host_check_count_;
     auto const host_lookup_view = host_tables.view();
     auto const *angle_collection = RDKit::MMFF::DefaultParameters::getMMFFAngle();
     auto const *definition_collection = RDKit::MMFF::DefaultParameters::getMMFFDef();
@@ -144,6 +150,7 @@ static void validate_angle_lookup_(sf::parameters::mmff94_tables_host_t const &h
             ++host_failure_count_;
         }
     }
+    std::printf("  %d entries compared against RDKit\n", host_check_count_ - checks_before);
 }
 
 /**
