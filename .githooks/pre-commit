@@ -510,6 +510,25 @@ check_split_literals() {
     [ -z "$shredded" ] || fail "$shredded" \
         "$file splits a string literal mid-word - break it yourself and pin each line with a trailing //:"
 }
+# An absolute path is a claim about one filesystem, true on the machine that wrote it and silently
+# wrong on the next. Every dataset is reached through `data/<name>`, whose entries are symlinks each
+# machine makes for itself, so nothing in the tree needs to name a root.
+#
+# The three binaries that defaulted to corpora under /tmp all defaulted to files that exist on
+# nobody's disk, and nothing reported it because a missing corpus read as an empty one.
+#
+# Comments are NOT blanked here: a docstring example teaches the next reader the wrong habit just as
+# effectively as a default does. `${TMPDIR:-/tmp}` is exempt -- that is a portable fallback naming a
+# variable, not a path someone typed.
+check_absolute_paths() {
+    local paths
+    paths=$(printf '%s\n' "$added" |
+        grep -E '(/mnt/|/home/|/tmp/)' |
+        grep -vE 'TMPDIR:-/tmp' || true)
+    [ -z "$paths" ] || fail "$paths" \
+        "$file names an absolute path - take it as an argument, or reach the share through data/:"
+}
+
 
 #pragma region Markdown
 
@@ -547,6 +566,7 @@ while IFS= read -r -d '' file; do
         check_void_discards
         check_backward_references
         check_rulers
+        check_absolute_paths
         check_param_directions
         check_markdown_doxygen
         check_doc_comment_forms
@@ -580,7 +600,15 @@ while IFS= read -r -d '' file; do
             ;;
         esac
         ;;
-    *.md) check_markdown_asterisks ;;
+    *.md)
+check_markdown_asterisks
+        check_absolute_paths
+        ;;
+    # An absolute path is wrong in a build file, a script or a config for the same reason it is wrong
+    # in a source file, so this one rule reaches every text file the project ships.
+    *.py | *.sh | *.toml | *.json | *.yml | *.yaml | *.cmake | CMakeLists.txt)
+        check_absolute_paths
+        ;;
     esac
 done < "$staged_files"
 

@@ -29,7 +29,7 @@ The scaffold cache it references is deleted, so its hit rate no longer means any
 Re-profile before using any share below to justify work.
 
 CPU hotspots — 10 M USearch, K=1, 8-GPU, scaffold-cache hit 33.4 %, captured before the round-1 / round-2 CSD-torsion work landed.
-`perf record -F 199 --call-graph dwarf,8192 bench_profile /tmp/usearch_10M.smi 1`.
+`perf record -F 199 --call-graph dwarf,8192 bench_profile data/usearch-molecules/pubchem/smiles/10m.smi 1`.
 493 s wall, 20 283 mol/s, 98.6 % success, 2.9 M samples.
 For the post-CSD-work numbers see `CHANGELOG.md` § round 1 / round 2.
 
@@ -102,11 +102,11 @@ Those stages are on the device now, so the loop this item targets is a fraction 
 
 ### 2b. Multi-`parquet-shard` Invocation for Full 4-Role Overlap
 
-The `smallfield_batch` CLI runs a persistent 4-role pipeline — `reader-role → gpu-runner-role → fallback-role → writer-role`, with depth-3 ring handoffs between them — but the historical wrapper (`/tmp/pubchem_per_shard_loop.sh`) invoked `smallfield_batch` once per `parquet-shard`.
+The `smallfield_batch` CLI runs a persistent 4-role pipeline — `reader-role → gpu-runner-role → fallback-role → writer-role`, with depth-3 ring handoffs between them — but the historical shell wrapper invoked `smallfield_batch` once per `parquet-shard`.
 At 1 M molecules per `parquet-shard` and ~800 K target `coprocessed-batch` size on 8 GPUs, that means each invocation saw ~1.25 `coprocessed-batches` in flight, so the ring stayed near-empty and the role overlap never materialised.
 GPU aggregate utilisation measured 12.5 % across a wave's wall; `top -bn1 -H -p <pid>` showed one role burning 1–27 cores while the others sat in `futex_wait`.
 
-The current wrapper (`/tmp/pubchem_multi_shard_loop.sh`) invokes `smallfield_batch` _once_ on the entire `parquet-shard` input directory.
+The current wrapper invokes `smallfield_batch` _once_ on the entire `parquet-shard` input directory.
 `--resume` (CLI default) auto-skips any `parquet-shard` whose `*_3D.parquet` output already exists, so relaunching on crash picks up exactly where the previous process left off.
 One process sees all pending `parquet-shards` as a stream, the ring genuinely fills, and `fallback-role` on `coprocessed-batch` N overlaps `gpu-runner-role` on `coprocessed-batch` N+1 as the glossary diagram always promised.
 

@@ -20,7 +20,7 @@ See [`GLOSSARY.md`](GLOSSARY.md) for the canonical vocabulary used below (`parqu
 - Build: `cmake --preset release -DSMALLFIELD_BUILD_CLI=ON`
 - Benchmark binary: `build/bench/bench_conformer_backends`
 - Allocator: `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2`
-- Primary dataset: USearch Molecules — 9,998,572 SMILES at `/tmp/usearch_10M.smi`, 1 M clean subset at `/tmp/usearch_1M_clean.smi`.
+- Primary dataset: USearch Molecules — 9,998,572 SMILES at `data/usearch-molecules/pubchem/smiles/10m.smi`, 1 M clean subset at `data/usearch-molecules/pubchem/smiles/1m.smi`.
 - Multi-GPU runs use `--multi-gpu-only` from a fresh process.
 
 ## End-to-End Throughput
@@ -212,7 +212,7 @@ The 100–128 bin carries only 9 samples here, so its `FAIL` reflects one outlie
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
 LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
   ./build/bench/bench_conformer_backends \
-  --smi /tmp/usearch_10M.smi \
+  --smi data/usearch-molecules/pubchem/smiles/10m.smi \
   --conformers 3 \
   --multi-gpu-only
 
@@ -221,14 +221,14 @@ CUDA_VISIBLE_DEVICES=0 \
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
 LD_LIBRARY_PATH=$CONDA_PREFIX/lib \
   ./build/bench/bench_conformer_backends \
-  --smi /tmp/usearch_1M_clean.smi \
+  --smi data/usearch-molecules/pubchem/smiles/1m.smi \
   --conformers 1 \
   --multi-gpu-only
 
 # Quality check — ChEMBL 9K, 3 conformers, 256 samples
 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 \
   ./build/bench/bench_conformer_backends \
-  --smi /tmp/chembl_valid.smi \
+  --smi data/chembl/chembl_valid.smi \
   --conformers 3 \
   --quality-samples 256
 ```

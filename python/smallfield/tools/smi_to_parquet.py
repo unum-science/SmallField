@@ -14,8 +14,8 @@ shard writes across N processes (I/O bound above ~4 workers).
 Example::
 
     python -m smallfield.tools.smi_to_parquet \\
-        --input /tmp/usearch_10M.smi \\
-        --output /data/usearch_10M_pq \\
+        --input data/usearch-molecules/pubchem/smiles \\
+        --output data/usearch-molecules/pubchem/parquet \\
         --rows-per-shard 1000000 \\
         --workers 8
 """

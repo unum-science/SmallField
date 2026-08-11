@@ -259,6 +259,18 @@ __Three sinks, chosen by who reads the output.__
 `bench/` is read as a report, so it uses bare `fmt::println`.
 `test/` uses the reporter and __not__ the logger, because a 34-character varying timestamp destroys column alignment and makes two runs undiffable, and ctest already timestamps.
 
+## Datasets
+
+__Every dataset is reached through `./data/<name>`.__
+`data/.gitkeep` is tracked and `data/*` is ignored, so the entries under it are symlinks each machine makes for itself.
+Where they point is a property of the machine, not of the project, and belongs in a shell profile or a setup note rather than here.
+Never copy a dataset into the repository.
+
+__No absolute path appears anywhere in the tree.__
+Not in a source file, not in a default, not in a docstring example, and not in this document.
+An absolute path is a claim about one filesystem that the next machine falsifies silently: three binaries here defaulted to corpora under `/tmp` that exist on nobody's disk, and nothing reported it because a missing corpus read as an empty one.
+
+
 ## Performance Claims
 
 __A performance number states its corpus, its sample size, and its weighting.__
@@ -270,7 +282,7 @@ Weighted by the measured atom-count distribution the same change is 2.47×, and 
 
 So:
 
-- Name the corpus and the sample size. `../USearchMolecules/data/pubchem` and `data/gdb13` are the standing ones; they have different molecule-size distributions and a blended figure hides which half moved.
+- Name the corpus and the sample size. `data/usearch-molecules/pubchem` and `data/usearch-molecules/gdb13` are the standing ones; they have different molecule-size distributions and a blended figure hides which half moved.
 - Weight any distribution-sensitive number by the measured distribution before quoting it.
 - Compare A against B within one run. Absolute throughput drifts by 10–15 % on a loaded machine while the ratio inside a single run stays stable.
 - Report the tail, not only the median. A shifted median and a heavy one-sided tail look identical otherwise, which is how an unpaired energy comparison hid a real defect here for months.

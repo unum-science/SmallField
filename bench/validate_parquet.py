@@ -3,7 +3,7 @@
 
 Run as a script::
 
-    python validate_parquet.py --input /tmp/usearch_10M_3D \\
+    python validate_parquet.py --input data/usearch-molecules/pubchem/3d \\
         --num-samples 500 --shard-limit 100
 
 Reports:
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate SmallField output parquet-shards.")
     parser.add_argument(
         "--input",
-        default="/tmp/usearch_10M_3D",
+        required=True,
         help="Directory containing output parquet-shards (*.parquet).",
     )
     parser.add_argument(

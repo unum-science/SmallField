@@ -14,7 +14,7 @@ Systems:
 
 Usage::
 
-    python bench_conformer_backends.py --input /tmp/usearch_1M_clean.smi \\
+    python bench_conformer_backends.py --input data/usearch-molecules/example/smiles/shard.smi \\
         --max-mol 100000 --num-conformers 3 --gpus 0,1,2,3
 
     python bench_conformer_backends.py --input ... --skip-nvmolkit --skip-rdkit

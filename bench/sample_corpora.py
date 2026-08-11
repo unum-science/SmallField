@@ -6,10 +6,10 @@ deposition or by enumeration index, so neighbouring rows share a submission, a s
 or a reagent set. This walks every shard, takes a random row group from each, and draws evenly,
 so the result reflects the corpus rather than one neighbourhood of it.
 
-    ./sample_corpora.py --corpus pubchem --count 20000 --out /tmp/pubchem-20k.smi
+    ./sample_corpora.py --corpus pubchem --count 20000 --out pubchem-20k.smi
 
-Corpora are resolved through `../USearchMolecules/data`, except `real`, whose regeneration tree
-is passed explicitly with --root.
+Corpora are resolved under `data/`, whose entries are symlinks each machine makes for itself, so
+nothing here names a path outside the repository. `--root` overrides the lookup entirely.
 """
 
 import argparse
@@ -21,11 +21,16 @@ import sys
 import numpy as np
 import pyarrow.parquet as pq
 
+# Relative to the repository root, which is this script's parent directory. An absolute path here
+# would be a claim about one filesystem, true on the machine that wrote it and silently wrong on
+# the next.
 CORPUS_ROOTS = {
     "pubchem": "data/usearch-molecules/pubchem/parquet",
     "gdb13": "data/usearch-molecules/gdb13/parquet",
     "real": "data/usearch-molecules/real/parquet",
 }
+
+REPOSITORY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def shard_paths(root: str) -> list:
@@ -65,7 +70,9 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     arguments = parser.parse_args()
 
-    root = arguments.root or CORPUS_ROOTS[arguments.corpus]
+    # A `--root` is taken as the caller typed it; a named corpus resolves under the repository, so
+    # the script works from any working directory without naming one.
+    root = arguments.root or os.path.join(REPOSITORY_ROOT, CORPUS_ROOTS[arguments.corpus])
     paths = shard_paths(root)
     if not paths:
         print(f"no input shards under {root}", file=sys.stderr)
