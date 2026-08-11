@@ -1,5 +1,5 @@
 /**
- *  @file test_mmff_gpu_typer_kernels.cu
+ *  @file test/mmff94/test_mmff_gpu_typer_kernels.cu
  *  @brief Validate the GPU MMFF typer kernel.
  *
  *  Runs it on a batch of descriptors and hands results back to the host .cpp for byte-level comparison vs the
@@ -21,6 +21,8 @@
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sft = smallfield::types;
+
+namespace smallfield::tests {
 
 /** Takes an array of N host-side descriptors, uploads them, runs the
  *  kernel, returns atom types + charges + statuses via out-parameters.
@@ -77,3 +79,5 @@ void *create_mmff94_device_tables_view(sfparam::mmff94_tables_host_t const &host
 }
 
 void destroy_mmff94_device_tables_view(void *handle) { delete static_cast<sfparam::mmff94_tables_device_t *>(handle); }
+
+} // namespace smallfield::tests

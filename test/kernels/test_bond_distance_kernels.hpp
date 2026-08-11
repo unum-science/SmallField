@@ -1,5 +1,5 @@
 /**
- *  @file test_bond_distance_kernels.hpp
+ *  @file test/kernels/test_bond_distance_kernels.hpp
  *  @brief Device harness for the bond-distance BFS kernel, for use by its unit tests.
  */
 
@@ -9,6 +9,8 @@
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
 #include "smallfield/api/wave_slice_pool.hpp"
+
+namespace smallfield::tests {
 
 /**
  *  @brief Mirror a prepared batch onto the device and run the warp BFS over it.
@@ -25,3 +27,5 @@
  */
 void run_bond_distance_bfs_on_gpu(std::byte const *host_pool, smallfield::api::wave_slice_layout_t const &layout,
                                   std::uint32_t molecule_count, std::uint8_t *bond_distance_out);
+
+} // namespace smallfield::tests

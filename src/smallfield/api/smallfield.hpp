@@ -1,21 +1,21 @@
 /**
- *  @file smallfield.hpp
+ *  @file src/smallfield/api/smallfield.hpp
  *  @brief Public C++ API for SmallField conformer generation.
  *
  *  Single header for C++ users. Provides batch GPU conformer generation with automatic multi-GPU dispatch,
  *  wave-based scheduling, and half-precision coordinate output.
  *
  *  @code{.cpp}
- *  smallfield::context_t ctx;  // all GPUs
+ *  smallfield::context_t context;  // all GPUs
  *  smallfield::config_t config;
  *  config.num_conformers = 10;
  *
  *  std::vector<std::string_view> smiles = {"CCO", "c1ccccc1", ...};
- *  std::vector<__half> coords(smiles.size() * config.num_conformers * 128 * 3);
+ *  std::vector<__half> coordinates(smiles.size() * config.num_conformers * 128 * 3);
  *  std::vector<float> energies(smiles.size() * config.num_conformers);
  *  std::vector<smallfield::conformer_status_t> status(smiles.size() * config.num_conformers);
  *
- *  ctx.generate_conformers(smiles, config, 128, coords, energies, status);
+ *  context.generate_conformers(smiles, config, 128, coordinates, energies, status);
  *  @endcode
  */
 
@@ -49,7 +49,7 @@ using cudaStream_t = void *;
 namespace smallfield::api {
 
 /*  `conformer_status_t` is defined in `smallfield/api/conformer_status.hpp`, transitively included
- *  above, so `batch_pool.hpp` can name it without a cyclic dependency on this header. */
+ *  above, so `wave_slice_pool.hpp` can name it without a cyclic dependency on this header. */
 
 /**
  *  @brief Pipeline configuration.
@@ -72,7 +72,7 @@ using types::atom_limited_bin_count_k;
 
 /*  `max_atoms_per_molecule_k` lives in `conformer_layout.hpp`, included above. It matches
  *  `molecule_descriptor_t::max_atoms_per_molecule_k`, and larger molecules are rejected by
- *  preprocess with `conformer_status_t::too_many_atoms`. */
+ *  preprocess with `conformer_status_t::too_many_atoms_k`. */
 
 /** Worst-case conformer count used for pre-allocation at construction. */
 inline constexpr std::uint32_t max_conformer_count_k = 16;
@@ -149,21 +149,17 @@ struct context_t {
     std::uint32_t per_device_reserved_molecules = 0;
 
     /**
-     *  @brief Owned per-context logger. Tune verbosity via
-     *  `ctx.logger.verbose_level = 1;` before calling `generate_conformers`.
-     *  Library diagnostics (wave timing table, per-device breakdown) route
-     *  through `logger.trace` / `logger.trace2`; CUDA errors through
-     *  `logger.error`.
+     *  @brief Owned per-context logger. Tune verbosity via `context.logger.verbose_level = 1;`
+     *  before calling `generate_conformers`. Library diagnostics — wave timing table, per-device breakdown —
+     *  route through `logger.trace` / `logger.trace2`; CUDA errors through `logger.error`.
      */
     smallfield::logger_t logger;
 
     /**
-     *  @brief Per-context CUDA error accumulator, incremented by
-     *  `check_cuda_status_` every time a CUDA / cuSOLVER API call returns a
-     *  non-success status. Production callers read this after each
-     *  `generate_conformers` call and exit non-zero if it is positive,
-     *  catching silent failures that would otherwise hide behind per-wave
-     *  zero-filled outputs. Reset via `ctx.cuda_error_count.store(0)`.
+     *  @brief Per-context CUDA error accumulator, incremented by `check_cuda_status_` every time a CUDA /
+     *  cuSOLVER API call returns a non-success status. Production callers read this after each
+     *  `generate_conformers` call and exit non-zero if it is positive, catching silent failures that would
+     *  otherwise hide behind per-wave zero-filled outputs. Reset via `context.cuda_error_count.store(0)`.
      */
     std::atomic<std::uint64_t> cuda_error_count {0};
 

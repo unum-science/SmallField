@@ -1,16 +1,15 @@
 /**
- *  @file test_bond_distance.cpp
- *  @brief Byte-for-byte parity between the device hop-count BFS and the host all-pairs BFS.
+ *  @file test/kernels/test_bond_distance.cpp
+ *  @brief Gate byte-for-byte parity between the device hop-count BFS and the host all-pairs BFS.
  *
- *  A warp BFS rebuilds the N × N hop matrix the MMFF nonbonded sweep reads, on the device,
- *  from the batch's bond list; the host builds the same matrix from the descriptor's CSR
- *  adjacency. Two different traversals over two different encodings of the
- *  same graph, so the check is exact equality over every byte of every molecule — a single
- *  differing entry silently changes which pairs the sweep treats as 1-4 or as excluded.
+ *  A warp BFS rebuilds the N × N hop matrix the MMFF nonbonded sweep reads, on the device, from the batch's bond
+ *  list; the host builds the same matrix from the descriptor's CSR adjacency. Two different traversals over two
+ *  different encodings of the same graph, so the check is exact equality over every byte of every molecule — a
+ *  single differing entry silently changes which pairs the sweep treats as 1-4 or as excluded.
  *
- *  Corpus: `SMALLFIELD_TEST_CORPUS=/path/to.smi` streams real molecules, capped by
- *  `SMALLFIELD_TEST_MAX_MOLS` (default 300). Absent it the built-in list runs, which carries
- *  its own multi-fragment salts so the 255 unreachable sentinel is covered either way.
+ *  Corpus: `SMALLFIELD_TEST_CORPUS=/path/to.smi` streams real molecules, capped by `SMALLFIELD_TEST_MAX_MOLS`
+ *  (default 300). Absent it the built-in list runs, which carries its own multi-fragment salts so the 255
+ *  unreachable sentinel is covered either way.
  */
 
 #include <cstdio>  // `fprintf`, `stderr`
@@ -36,10 +35,10 @@ namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-namespace {
+namespace smallfield::tests {
 
 /** Load up to @p max_count SMILES strings from @p path, one per line, first field only. */
-std::vector<std::string> load_smiles(char const *path, std::size_t max_count) {
+static std::vector<std::string> load_smiles_(char const *path, std::size_t max_count) {
     std::vector<std::string> smiles_list;
     std::ifstream file(path);
     if (!file) return smiles_list;
@@ -58,7 +57,7 @@ std::vector<std::string> load_smiles(char const *path, std::size_t max_count) {
  *  A salt is the only way the 255 sentinel appears, and the sweep's exclusion logic hinges on
  *  it, so the corpus always carries some regardless of what the caller streams in.
  */
-std::vector<std::string> builtin_multi_fragment_smiles() {
+static std::vector<std::string> builtin_multi_fragment_smiles_() {
     return {
         "CC(=O)Oc1ccccc1C(=O)O.CCO",               // aspirin with an ethanol solvate
         "CC(C)Cc1ccc(cc1)[C@@H](C)C(=O)O.OCCO",    // ibuprofen with ethylene glycol
@@ -75,7 +74,7 @@ std::vector<std::string> builtin_multi_fragment_smiles() {
  *  @param[out] reference Resized to N squared and filled with the packed hop matrix.
  *  @return Atom count, or 0 if the molecule could not be rebuilt.
  */
-std::uint32_t host_bond_hops(std::string const &smiles, std::vector<std::uint8_t> &reference) {
+static std::uint32_t host_bond_hops_(std::string const &smiles, std::vector<std::uint8_t> &reference) {
     RDKit::SmilesParserParams params;
     params.sanitize = true;
     params.removeHs = false;
@@ -92,7 +91,7 @@ std::uint32_t host_bond_hops(std::string const &smiles, std::vector<std::uint8_t
     return num_atoms;
 }
 
-void test_device_matches_host(std::vector<std::string> const &smiles_list) {
+static void test_device_matches_host_(std::vector<std::string> const &smiles_list) {
     std::vector<std::string_view> views;
     views.reserve(smiles_list.size());
     for (auto const &smiles : smiles_list) views.emplace_back(smiles);
@@ -103,7 +102,7 @@ void test_device_matches_host(std::vector<std::string> const &smiles_list) {
     sf_verify_(batch.num_molecules > 0, "no molecule survived preprocessing");
 
     std::vector<std::uint8_t> device_matrix(batch.layout.num_bond_distance, std::uint8_t {0});
-    run_bond_distance_bfs_on_gpu(batch.host.data(), batch.layout, batch.num_molecules, device_matrix.data());
+    sftest::run_bond_distance_bfs_on_gpu(batch.host.data(), batch.layout, batch.num_molecules, device_matrix.data());
 
     auto const metadata = batch.molecule_metadata();
     auto const input_indices = batch.input_indices();
@@ -115,16 +114,16 @@ void test_device_matches_host(std::vector<std::string> const &smiles_list) {
     for (std::uint32_t molecule = 0; molecule < batch.num_molecules; ++molecule) {
         auto const &meta = metadata[molecule];
         std::string const &smiles = smiles_list[input_indices[molecule]];
-        std::uint32_t const num_atoms = host_bond_hops(smiles, reference);
+        std::uint32_t const num_atoms = host_bond_hops_(smiles, reference);
         sf_verify_(num_atoms == meta.num_atoms, smiles.c_str());
 
         std::uint8_t const *device_block = device_matrix.data() + meta.bond_distance_offset;
         std::size_t local_unreachable = 0;
-        for (std::uint32_t i = 0; i < num_atoms; ++i) {
-            for (std::uint32_t j = 0; j < num_atoms; ++j) {
-                std::size_t const entry = static_cast<std::size_t>(i) * num_atoms + j;
+        for (std::uint32_t row = 0; row < num_atoms; ++row) {
+            for (std::uint32_t column = 0; column < num_atoms; ++column) {
+                std::size_t const entry = static_cast<std::size_t>(row) * num_atoms + column;
                 if (device_block[entry] != reference[entry]) {
-                    std::fprintf(stderr, "FAIL: %s pair (%u,%u): device %u, host %u\n", smiles.c_str(), i, j,
+                    std::fprintf(stderr, "FAIL: %s pair (%u,%u): device %u, host %u\n", smiles.c_str(), row, column,
                                  device_block[entry], reference[entry]);
                     sf_verify_(false, "device hop count differs from the host BFS");
                 }
@@ -141,7 +140,7 @@ void test_device_matches_host(std::vector<std::string> const &smiles_list) {
                 batch.num_molecules, compared_bytes, unreachable_pairs, molecules_with_fragments);
 }
 
-} // namespace
+} // namespace smallfield::tests
 
 int main() {
     std::printf("test_bond_distance\n");
@@ -150,17 +149,17 @@ int main() {
     char const *max_molecules_env = std::getenv("SMALLFIELD_TEST_MAX_MOLS");
     std::size_t const max_molecules = max_molecules_env ? static_cast<std::size_t>(std::atoll(max_molecules_env)) : 300;
 
-    std::vector<std::string> smiles_list = builtin_multi_fragment_smiles();
+    std::vector<std::string> smiles_list = sftest::builtin_multi_fragment_smiles_();
     for (auto &smiles : sftest::standard_test_smiles()) smiles_list.push_back(std::move(smiles));
     if (corpus_path) {
-        auto streamed = load_smiles(corpus_path, max_molecules);
+        auto streamed = sftest::load_smiles_(corpus_path, max_molecules);
         sf_verify_(!streamed.empty(), corpus_path);
         std::printf("Corpus: %s (up to %zu molecules) plus built-ins\n", corpus_path, max_molecules);
         for (auto &smiles : streamed) smiles_list.push_back(std::move(smiles));
     }
     else std::printf("Corpus: built-ins only; set SMALLFIELD_TEST_CORPUS for a wider sweep\n");
 
-    test_device_matches_host(smiles_list);
+    sftest::test_device_matches_host_(smiles_list);
     std::printf("test_bond_distance: PASS\n");
     return 0;
 }

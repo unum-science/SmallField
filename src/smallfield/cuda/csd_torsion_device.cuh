@@ -1,5 +1,5 @@
 /**
- *  @file csd_torsion_device.cuh
+ *  @file src/smallfield/cuda/csd_torsion_device.cuh
  *  @brief Device-resident CSD torsion table and the warp-per-molecule matcher that reads it.
  *
  *  The CSD torsion preferences compile to 470 stack-only patterns whose matcher, in
@@ -26,6 +26,10 @@
 
 #pragma once
 
+#include "smallfield/module_fwd.hpp"
+
+#if defined(__CUDACC__)
+
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstdio>  // `std::fprintf`
 
@@ -33,12 +37,12 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::cuda {
 
@@ -78,8 +82,9 @@ inline constexpr std::uint32_t no_closure_offset_k = 0xFFFFFFFFu;
 /**
  *  @brief POD mirror of one compiled torsion pattern. Everything the matcher reads is either inline here
  *  or reachable through an offset into the table's node and closure arenas, so the whole struct is
- *  memcpy-able to the device. The six Fourier coefficients are the host's `signs[i] * V[i]`
- *  products, folded at upload time because the kernel never needs the two factors apart.
+ *  memcpy-able to the device. The six Fourier coefficients are the host's `fourier_signs[i] *
+ *  fourier_magnitudes[i]` products, folded at upload time because the kernel never needs the two
+ *  factors apart.
  */
 struct alignas(8) csd_device_pattern_t {
     /** The labelled atoms `:1` through `:4`. */
@@ -149,7 +154,8 @@ inline void build_csd_torsion_table(csd_torsion_table_host_t &out) {
         pattern.required_hybridizations = source.required_hybridizations;
         pattern.requires_aromatic = source.requires_aromatic ? 1u : 0u;
         for (std::uint32_t term = 0; term < 6; ++term)
-            pattern.fourier_coefficients[term] = static_cast<float>(native.signs[term]) * native.V[term];
+            pattern.fourier_coefficients[term] = static_cast<float>(native.fourier_signs[term]) *
+                                                 native.fourier_magnitudes[term];
 
         pattern.pool_offset = static_cast<std::uint32_t>(out.nodes.size());
         for (std::uint32_t node_index = 0; node_index < native.pool.num_nodes; ++node_index)
@@ -179,24 +185,16 @@ struct csd_torsion_table_device_t {
     csd_torsion_table_device_t &operator=(csd_torsion_table_device_t const &) = delete;
 };
 
-namespace detail_csd_torsion {
-
-inline std::size_t align_up(std::size_t value, std::size_t alignment) {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
-
 /** Copy one host array into the arena at the next 256-byte boundary and return its address. */
 template <typename element_>
-element_ *place_array(std::byte *arena_base, std::size_t &offset, std::vector<element_> const &source) {
+element_ *place_array_(std::byte *arena_base, std::size_t &offset, std::vector<element_> const &source) {
     if (source.empty()) return nullptr;
-    offset = align_up(offset, 256);
+    offset = align_up_(offset, 256);
     element_ *destination = reinterpret_cast<element_ *>(arena_base + offset);
     cudaMemcpy(destination, source.data(), source.size() * sizeof(element_), cudaMemcpyHostToDevice);
     offset += source.size() * sizeof(element_);
     return destination;
 }
-
-} // namespace detail_csd_torsion
 
 /** Raise the per-thread device stack to `csd_torsion_stack_bytes_k` when it sits lower. */
 inline void ensure_csd_torsion_device_stack() {
@@ -221,9 +219,9 @@ inline void upload_csd_torsion_table_to_device(csd_torsion_table_host_t const &h
     }
     std::byte *const arena_base = table.arena.data();
     std::size_t offset = 0;
-    table.view.patterns = detail_csd_torsion::place_array(arena_base, offset, host.patterns);
-    table.view.nodes = detail_csd_torsion::place_array(arena_base, offset, host.nodes);
-    table.view.closures = detail_csd_torsion::place_array(arena_base, offset, host.closures);
+    table.view.patterns = place_array_(arena_base, offset, host.patterns);
+    table.view.nodes = place_array_(arena_base, offset, host.nodes);
+    table.view.closures = place_array_(arena_base, offset, host.closures);
     table.view.num_patterns = static_cast<std::uint32_t>(host.patterns.size());
     table.arena_bytes = offset;
     cudaDeviceSynchronize();
@@ -288,11 +286,12 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
             csd_pattern_view_t const view = device_pattern_view(table, pattern);
             bool const bound = match_pattern_at_bond(
                 descriptor, view, bond_index,
-                [&](std::uint8_t a1, std::uint8_t a2, std::uint8_t a3, std::uint8_t a4, std::uint32_t) -> bool {
-                    matched_atoms[0] = a1;
-                    matched_atoms[1] = a2;
-                    matched_atoms[2] = a3;
-                    matched_atoms[3] = a4;
+                [&](std::uint8_t atom_first, std::uint8_t atom_second, std::uint8_t atom_third,
+                    std::uint8_t atom_fourth, std::uint32_t) -> bool {
+                    matched_atoms[0] = atom_first;
+                    matched_atoms[1] = atom_second;
+                    matched_atoms[2] = atom_third;
+                    matched_atoms[3] = atom_fourth;
                     return true;
                 });
             if (!bound) continue;
@@ -334,27 +333,29 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
             if (size < 4 || size > 6) continue;
             std::uint16_t const start = descriptor.ring_offset[ring_index];
             for (std::uint32_t position = 0; position < size; ++position) {
-                std::uint8_t const a1 = descriptor.ring_atoms[start + position];
-                std::uint8_t const a2 = descriptor.ring_atoms[start + (position + 1) % size];
-                std::uint8_t const a3 = descriptor.ring_atoms[start + (position + 2) % size];
-                std::uint8_t const a4 = descriptor.ring_atoms[start + (position + 3) % size];
-                std::uint32_t const bond_index = find_bond_between(descriptor, a2, a3);
+                std::uint8_t const atom_first = descriptor.ring_atoms[start + position];
+                std::uint8_t const atom_second = descriptor.ring_atoms[start + (position + 1) % size];
+                std::uint8_t const atom_third = descriptor.ring_atoms[start + (position + 2) % size];
+                std::uint8_t const atom_fourth = descriptor.ring_atoms[start + (position + 3) % size];
+                std::uint32_t const bond_index = find_bond_between(descriptor, atom_second, atom_third);
                 if (bond_index == no_bond_index_k) continue;
                 std::uint32_t const word = bond_index / warp_size_k;
-                std::uint32_t const bit = 1u << (bond_index % warp_size_k);
-                if ((claimed_words[word] & bit) != 0) continue;
+                std::uint32_t const bit_mask = 1u << (bond_index % warp_size_k);
+                if ((claimed_words[word] & bit_mask) != 0) continue;
                 constexpr std::uint8_t planar_k = hybridization_sp2_k;
-                if (descriptor.hybridization[a1] != planar_k || descriptor.hybridization[a2] != planar_k ||
-                    descriptor.hybridization[a3] != planar_k || descriptor.hybridization[a4] != planar_k)
+                if (descriptor.hybridization[atom_first] != planar_k ||
+                    descriptor.hybridization[atom_second] != planar_k ||
+                    descriptor.hybridization[atom_third] != planar_k ||
+                    descriptor.hybridization[atom_fourth] != planar_k)
                     continue;
 
-                claimed_words[word] |= bit;
+                claimed_words[word] |= bit_mask;
                 if (written < torsion_stride) {
                     etk_torsion_descriptor_t torsion {};
-                    torsion.atom_indices[0] = a1;
-                    torsion.atom_indices[1] = a2;
-                    torsion.atom_indices[2] = a3;
-                    torsion.atom_indices[3] = a4;
+                    torsion.atom_indices[0] = atom_first;
+                    torsion.atom_indices[1] = atom_second;
+                    torsion.atom_indices[2] = atom_third;
+                    torsion.atom_indices[3] = atom_fourth;
                     // Flat-ring signature: signs[1]=-1, V[1]=100.0 (from RDKit's hardcoded values).
                     for (std::uint32_t term = 0; term < 6; ++term) torsion.fourier_coefficients[term] = 0.0f;
                     torsion.fourier_coefficients[1] = -100.0f;
@@ -388,3 +389,5 @@ inline void launch_csd_torsion_match(molecule_descriptor_t const *descriptors, s
 }
 
 } // namespace smallfield::cuda
+
+#endif // __CUDACC__

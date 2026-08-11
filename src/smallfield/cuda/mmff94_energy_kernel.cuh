@@ -1,10 +1,10 @@
 /**
- *  @file mmff94_energy_kernel.cuh
+ *  @file src/smallfield/cuda/mmff94_energy_kernel.cuh
  *  @brief MMFF94 energy and gradient functor for ETKDG pipeline stage 9.
  *
- *  Uses per-atom interaction lists for zero-waste iteration.
- *  Full analytical gradients for VdW, electrostatic, bond, angle, torsion, OOP, and stretch-bend terms.
- *  Compatible with fire_minimize_ (same functor interface).
+ *  Uses per-atom interaction lists for zero-waste iteration. Full analytical gradients for VdW,
+ *  electrostatic, bond, angle, torsion, OOP, and stretch-bend terms. Compatible with `fire_minimize_`
+ *  (same functor interface).
  *
  *  Positions in SoA float: [x₀..xₙ, y₀..yₙ, z₀..zₙ].
  */
@@ -19,7 +19,19 @@
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::cuda {
-using namespace smallfield::types;
+using smallfield::types::atom_role_first_k;
+using smallfield::types::atom_role_fourth_k;
+using smallfield::types::atom_role_second_k;
+using smallfield::types::atom_role_t;
+using smallfield::types::atom_role_third_k;
+using smallfield::types::mmff94_angle_t;
+using smallfield::types::mmff94_atom_interaction_t;
+using smallfield::types::mmff94_atom_offsets_t;
+using smallfield::types::mmff94_atom_vdw_params_t;
+using smallfield::types::mmff94_bond_t;
+using smallfield::types::mmff94_oop_t;
+using smallfield::types::mmff94_stretchbend_t;
+using smallfield::types::mmff94_torsion_t;
 
 constexpr float mmff_coulomb_k = 332.0716f;
 constexpr float mmff_electrostatic_buffer_k = 0.05f;
@@ -293,7 +305,8 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
     float const cos_2phi = 2.0f * cos_phi * cos_phi - 1.0f;
     float const cos_3phi = cos_phi * (4.0f * cos_phi * cos_phi - 3.0f);
     float const tor_energy = mmff_torsion_prefactor_k *
-                             (tor.v1 * (1.0f + cos_phi) + tor.v2 * (1.0f - cos_2phi) + tor.v3 * (1.0f + cos_3phi));
+                             (tor.torsion_v1 * (1.0f + cos_phi) + tor.torsion_v2 * (1.0f - cos_2phi) +
+                              tor.torsion_v3 * (1.0f + cos_3phi));
 
     if (role == atom_role_first_k) *energy += tor_energy;
 
@@ -301,7 +314,8 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
     float const sin_2phi = 2.0f * sin_phi * cos_phi;
     float const sin_3phi = sin_phi * (3.0f - 4.0f * sin_phi * sin_phi);
     float const energy_gradient_dihedral = mmff_torsion_prefactor_k *
-                                           (-tor.v1 * sin_phi + 2.0f * tor.v2 * sin_2phi - 3.0f * tor.v3 * sin_3phi);
+                                           (-tor.torsion_v1 * sin_phi + 2.0f * tor.torsion_v2 * sin_2phi -
+                                            3.0f * tor.torsion_v3 * sin_3phi);
 
     float const abs_sin = fabsf(sin_phi);
     if (fabsf(cos_phi) < 1e-8f && abs_sin < 1e-8f) return;
@@ -437,9 +451,6 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
     if (role == atom_role_first_k) *energy += mmff_stretch_bend_prefactor_k * stretch_term * delta_theta;
 
     // gradient has two parts: ∂E/∂r (stretch) and ∂E/∂θ (bend)
-    //
-    // ∂E/∂r_ij = 2.5121 * kba_ijk * Δθ * (r_ij_hat)
-    // ∂E/∂θ    = 2.5121 * stretch_term * rad2deg * (-1/sin(θ)) * ∂cos/∂r
     float3 const unit_ij = scale_float3_(bond_ij, inverse_distance_ij);
     float3 const unit_kj = scale_float3_(bond_kj, inverse_distance_kj);
 
@@ -479,10 +490,10 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
  *  pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) — those terms
  *  are small and not worth packing out.
  *
- *  @tparam write_gradient When true, computes and writes gradient; when false, energy only.
+ *  @tparam write_gradient_ When true, computes and writes gradient; when false, energy only.
  *  @see fire_minimize_
  */
-template <bool write_gradient>
+template <bool write_gradient_>
 __device__ __forceinline__ float evaluate_mmff94_energy(
     mmff94_atom_vdw_params_t const *__restrict__ atom_vdw_params, float const *__restrict__ atom_charge,
     std::uint8_t const *__restrict__ bond_distance, mmff94_bond_t const *__restrict__ bond_params,
@@ -491,7 +502,7 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
     mmff94_atom_interaction_t const *__restrict__ interactions, mmff94_atom_offsets_t const *__restrict__ atom_offsets,
     std::uint32_t num_atoms, float const *positions, float *gradient, std::uint32_t num_elements, std::uint32_t lane) {
 
-    if constexpr (write_gradient) {
+    if constexpr (write_gradient_) {
         for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) gradient[i] = 0.0f;
         __syncwarp(full_mask_k);
     }
@@ -507,7 +518,7 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
         // Nonbonded pairs, enumerated from bond_distance, which a warp BFS over the
         // undirected bond graph fills (cuda/bond_distance_kernel.cuh) — so it is
         // symmetric: bond_distance[atom*N+j] == bond_distance[j*N+atom].
-        // We sweep j in a single contiguous row read; whichever endpoint has the
+        // The sweep reads j in a single contiguous row; whichever endpoint has the
         // lower index owns the pair's energy, the other endpoint contributes its
         // gradient as the mirror endpoint.
         for (std::uint32_t j = 0; j < num_atoms; ++j) {
@@ -543,7 +554,7 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
                                            stretchbend_params[interactions[index].term_index], interactions[index].role,
                                            &total_energy, &gradient_acc);
 
-        if constexpr (write_gradient) store_gradient_(gradient, num_atoms, atom, gradient_acc);
+        if constexpr (write_gradient_) store_gradient_(gradient, num_atoms, atom, gradient_acc);
     }
 
     return warp_reduce_sum_f32_(total_energy);
@@ -552,8 +563,8 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
 /**
  *  @brief MMFF94 energy and gradient functor using per-atom interaction lists.
  *
- *  Thin wrapper around evaluate_mmff94_energy that provides the
- *  operator() / energy_only() interface expected by fire_minimize_.
+ *  Thin wrapper around `evaluate_mmff94_energy` that provides the
+ *  `operator()` / `energy_only()` interface expected by `fire_minimize_`.
  */
 struct mmff94_energy_functor_t {
     mmff94_atom_vdw_params_t const *__restrict__ atom_vdw_params;

@@ -1,25 +1,28 @@
 /**
- *  @file device_preprocess.cuh
- *  @brief The two device passes that close the gap between the preprocessing kernels and the
- *  pipeline that consumes their output.
+ *  @file src/smallfield/cuda/device_preprocess.cuh
+ *  @brief The two device passes that close the gap between the preprocessing kernels and the pipeline that
+ *  consumes their output.
  *
- *  `mmff94_type_and_charge_kernel` leaves a per-molecule status behind, and the molecules it
- *  flags need atom types and charges from somewhere else before the extractor runs;
- *  `mmff94_apply_typing_patch_kernel` writes the host's answer for exactly those molecules.
+ *  `mmff94_type_and_charge_kernel` leaves a per-molecule status behind, and the molecules it flags need
+ *  atom types and charges from somewhere else before the extractor runs; `mmff94_apply_typing_patch_kernel`
+ *  writes the host's answer for exactly those molecules.
  *
- *  `csd_torsion_match_kernel` emits a torsion list per molecule, and
- *  `etkdg_pipeline_warp_kernel` reads those torsions through a per-atom CSR;
- *  `etk_build_csr_kernel` builds that CSR on the device from the torsions the matcher wrote
- *  and the 1-2 / 1-3 constraints the host emitted, mirroring `build_etk_interaction_lists`.
+ *  `csd_torsion_match_kernel` emits a torsion list per molecule, and `etkdg_pipeline_warp_kernel` reads
+ *  those torsions through a per-atom CSR; `etk_build_csr_kernel` builds that CSR on the device from the
+ *  torsions the matcher wrote and the 1-2 / 1-3 constraints the host emitted, mirroring
+ *  `build_etk_interaction_lists`.
  */
 
 #pragma once
+
+#include "smallfield/module_fwd.hpp"
+
+#if defined(__CUDACC__)
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
 #include <cuda_runtime.h>
 
-#include "smallfield/module_fwd.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
@@ -38,8 +41,6 @@ using smallfield::types::etk_torsion_k;
 using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::mmff94_typing_patch_t;
-
-#if defined(__CUDACC__)
 
 /**
  *  @brief Overwrite the typer's output for the molecules the host already knows it cannot type.
@@ -96,21 +97,21 @@ static __global__ __launch_bounds__(32, 8) void etk_build_csr_kernel(
 
     __shared__ std::uint32_t cursors[max_atoms_per_molecule_k];
 
-    std::uint32_t const mol = blockIdx.x;
-    if (mol >= num_molecules) return;
+    std::uint32_t const molecule_index = blockIdx.x;
+    if (molecule_index >= num_molecules) return;
     if (threadIdx.x != 0) return;
 
-    auto &meta = metadata[mol];
+    auto &meta = metadata[molecule_index];
     std::uint32_t const num_atoms = meta.num_atoms;
     std::uint32_t const num_constraints = meta.num_distance_constraints;
     // The matcher reports what it matched; the reservation is what fits. They agree for every
     // molecule whose torsion set stays inside its bond list, which is every molecule the matcher
     // can produce, and the clamp keeps a future widening of the rule from writing out of bounds.
-    std::uint32_t torsion_count = torsion_counts[mol];
+    std::uint32_t torsion_count = torsion_counts[molecule_index];
     if (torsion_count > torsion_stride) torsion_count = torsion_stride;
     meta.num_etk_torsions = torsion_count;
 
-    etk_torsion_descriptor_t const *mol_torsions = torsions + (std::size_t)mol * torsion_stride;
+    etk_torsion_descriptor_t const *mol_torsions = torsions + (std::size_t)molecule_index * torsion_stride;
     distance_constraint_t const *mol_constraints = constraints + meta.constraint_offset;
     etk_atom_offsets_t *mol_atom_offsets = atom_offsets + meta.etk_atom_csr_offset;
     etk_atom_interaction_t *mol_interactions = interactions + meta.etk_interaction_offset;
@@ -166,6 +167,6 @@ inline void launch_etk_build_csr(etk_torsion_descriptor_t const *torsions, std::
                                                            num_molecules, interactions, atom_offsets, metadata);
 }
 
-#endif // __CUDACC__
-
 } // namespace smallfield::cuda
+
+#endif // __CUDACC__

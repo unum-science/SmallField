@@ -49,27 +49,28 @@ MMFF_OOP_PREFACTOR = 0.5 * 0.043844  # 0.5 * c2 = 0.5 * 143.9325 * DEG2RAD^2
 MMFF_STBN_PREFACTOR = 143.9325 * np.pi / 180.0  # c5 = MDYNE_A_TO_KCAL_MOL * DEG2RAD
 
 
-def bond_energy(r: float, r0: float, kb: float) -> float:
+def bond_energy(bond_length: float, equilibrium_distance: float, force_constant: float) -> float:
     """MMFF94 bond stretching energy, quartic-with-cubic-correction form.
 
     ``E = ½ · 143.9325 · kb · (r − r0)² · [1 + cs·(r − r0) + (7/12)·cs²·(r − r0)²]``
     with ``cs = −2.0 Å⁻¹`` (the MMFF94 cubic stretch constant).
 
     Args:
-        r: Current bond length in Å.
-        r0: Equilibrium bond length in Å.
-        kb: Bond-stretching force constant in mdyn/Å.
+        bond_length: Current bond length in Å, MMFF ``r``.
+        equilibrium_distance: Equilibrium bond length in Å, MMFF ``r0``.
+        force_constant: Bond-stretching force constant in mdyn/Å, MMFF ``kb``.
 
     Returns:
         Energy in kcal/mol.
     """
-    dr = r - r0
-    dr2 = dr * dr
-    cs = MMFF_CUBIC_STRETCH
-    return 0.5 * MMFF_BOND_PREFACTOR * kb * dr2 * (1.0 + cs * dr + (7.0 / 12.0) * cs * cs * dr2)
+    deviation = bond_length - equilibrium_distance
+    deviation_squared = deviation * deviation
+    cubic_stretch = MMFF_CUBIC_STRETCH
+    return (0.5 * MMFF_BOND_PREFACTOR * force_constant * deviation_squared *
+            (1.0 + cubic_stretch * deviation + (7.0 / 12.0) * cubic_stretch * cubic_stretch * deviation_squared))
 
 
-def angle_energy(theta_rad: float, theta0_rad: float, ka: float) -> float:
+def angle_energy(theta_rad: float, theta0_rad: float, force_constant: float) -> float:
     """MMFF94 angle-bending energy, quadratic-with-cubic-correction in degrees.
 
     ``E = 0.021922 · ka · Δθ² · (1 + cb · Δθ)`` where ``Δθ`` is ``(θ − θ0)`` in
@@ -78,26 +79,26 @@ def angle_energy(theta_rad: float, theta0_rad: float, ka: float) -> float:
     Args:
         theta_rad: Current angle i-j-k in radians.
         theta0_rad: Equilibrium angle i-j-k in radians.
-        ka: Angle-bending force constant in mdyn·Å/rad².
+        force_constant: Angle-bending force constant in mdyn·Å/rad², MMFF ``ka``.
 
     Returns:
         Energy in kcal/mol.
     """
     dtheta_deg = (theta_rad - theta0_rad) * 180.0 / np.pi
     dtheta_deg2 = dtheta_deg * dtheta_deg
-    return MMFF_ANGLE_PREFACTOR * ka * dtheta_deg2 * (1.0 + MMFF_ANGLE_CUBIC * dtheta_deg)
+    return MMFF_ANGLE_PREFACTOR * force_constant * dtheta_deg2 * (1.0 + MMFF_ANGLE_CUBIC * dtheta_deg)
 
 
-def torsion_energy(phi_rad: float, v1: float, v2: float, v3: float) -> float:
+def torsion_energy(phi_rad: float, torsion_v1: float, torsion_v2: float, torsion_v3: float) -> float:
     """MMFF94 three-term torsion energy.
 
     ``E = ½ · [V1·(1 + cos φ) + V2·(1 − cos 2φ) + V3·(1 + cos 3φ)]``.
 
     Args:
         phi_rad: Dihedral angle i-j-k-l in radians.
-        v1: 1-fold Fourier coefficient (kcal/mol).
-        v2: 2-fold Fourier coefficient (kcal/mol).
-        v3: 3-fold Fourier coefficient (kcal/mol).
+        torsion_v1: 1-fold Fourier coefficient (kcal/mol), MMFF ``V1``.
+        torsion_v2: 2-fold Fourier coefficient (kcal/mol), MMFF ``V2``.
+        torsion_v3: 3-fold Fourier coefficient (kcal/mol), MMFF ``V3``.
 
     Returns:
         Energy in kcal/mol.
@@ -105,17 +106,18 @@ def torsion_energy(phi_rad: float, v1: float, v2: float, v3: float) -> float:
     cos_phi = np.cos(phi_rad)
     cos_2phi = np.cos(2.0 * phi_rad)
     cos_3phi = np.cos(3.0 * phi_rad)
-    return MMFF_TORSION_PREFACTOR * (v1 * (1.0 + cos_phi) + v2 * (1.0 - cos_2phi) + v3 * (1.0 + cos_3phi))
+    return MMFF_TORSION_PREFACTOR * (torsion_v1 * (1.0 + cos_phi) + torsion_v2 * (1.0 - cos_2phi) +
+                                     torsion_v3 * (1.0 + cos_3phi))
 
 
-def vdw_energy(r: float, epsilon: float, r_star: float) -> float:
+def vdw_energy(distance: float, epsilon: float, r_star: float) -> float:
     """MMFF94 buffered 14-7 van der Waals energy.
 
     ``E = ε · [(1+δ)·R* / (r + δ·R*)]⁷ · [(1+γ)·R*⁷ / (r⁷ + γ·R*⁷) − 2]``
     with buffering constants ``δ = 0.07`` and ``γ = 0.12``.
 
     Args:
-        r: Distance between the two atoms in Å.
+        distance: Distance between the two atoms in Å.
         epsilon: Well depth ε in kcal/mol.
         r_star: Minimum-energy separation R* in Å.
 
@@ -127,19 +129,19 @@ def vdw_energy(r: float, epsilon: float, r_star: float) -> float:
 
     # Repulsive term: (1.07 * R* / (R + 0.07*R*))^7
     r_star_7 = r_star**7
-    denom_rep = r + delta * r_star
+    denom_rep = distance + delta * r_star
     ratio_rep = (1.0 + delta) * r_star / denom_rep
     rep_term = ratio_rep**7
 
     # Attractive term: (1.12*R*^7)/(R^7 + 0.12*R*^7) - 2
-    r_7 = r**7
-    denom_att = r_7 + gamma * r_star_7
+    distance_7 = distance**7
+    denom_att = distance_7 + gamma * r_star_7
     att_term = (1.0 + gamma) * r_star_7 / denom_att - 2.0
 
     return epsilon * rep_term * att_term
 
 
-def elec_energy(r: float, qi: float, qj: float, dielectric: float = 1.0) -> float:
+def elec_energy(distance: float, charge_i: float, charge_j: float, dielectric: float = 1.0) -> float:
     """MMFF94 buffered Coulomb electrostatic energy.
 
     ``E = 332.0716 · qi · qj / [dielectric · (r + 0.05)]``. The 0.05 Å buffer
@@ -147,16 +149,16 @@ def elec_energy(r: float, qi: float, qj: float, dielectric: float = 1.0) -> floa
     kcal·Å/mol.
 
     Args:
-        r: Distance between the two atoms in Å.
-        qi: Partial charge on atom i in electron units.
-        qj: Partial charge on atom j in electron units.
+        distance: Distance between the two atoms in Å.
+        charge_i: Partial charge on atom i in electron units.
+        charge_j: Partial charge on atom j in electron units.
         dielectric: Dielectric constant (default 1.0 for gas-phase).
 
     Returns:
         Energy in kcal/mol.
     """
-    r_eff = r + MMFF_ELEC_BUFFER
-    return MMFF_ELEC_CONSTANT * qi * qj / (dielectric * r_eff)
+    r_eff = distance + MMFF_ELEC_BUFFER
+    return MMFF_ELEC_CONSTANT * charge_i * charge_j / (dielectric * r_eff)
 
 
 def oop_energy(chi_deg: float, koop: float) -> float:
@@ -176,7 +178,8 @@ def oop_energy(chi_deg: float, koop: float) -> float:
     return MMFF_OOP_PREFACTOR * koop * chi_deg * chi_deg
 
 
-def stretch_bend_energy(dr1: float, dr2: float, dtheta_deg: float, kba_ijk: float, kba_kji: float) -> float:
+def stretch_bend_energy(deviation_ij: float, deviation_jk: float, dtheta_deg: float, kba_ijk: float,
+                        kba_kji: float) -> float:
     """MMFF94 stretch-bend coupling energy.
 
     ``E = c5 · Δθ · (kba_ijk · Δr_ij + kba_kji · Δr_jk)`` where
@@ -184,8 +187,8 @@ def stretch_bend_energy(dr1: float, dr2: float, dtheta_deg: float, kba_ijk: floa
     into kcal/mol.
 
     Args:
-        dr1: Bond-length deviation Δr_ij = r_ij − r0_ij for the i-j bond, in Å.
-        dr2: Bond-length deviation Δr_jk = r_jk − r0_jk for the j-k bond, in Å.
+        deviation_ij: Bond-length deviation Δr_ij = r_ij − r0_ij for the i-j bond, in Å.
+        deviation_jk: Bond-length deviation Δr_jk = r_jk − r0_jk for the j-k bond, in Å.
         dtheta_deg: Angle deviation Δθ = θ_ijk − θ0_ijk in degrees.
         kba_ijk: Stretch-bend force constant coupling the i-j bond to the
             i-j-k angle, in mdyn/rad.
@@ -195,18 +198,18 @@ def stretch_bend_energy(dr1: float, dr2: float, dtheta_deg: float, kba_ijk: floa
     Returns:
         Energy in kcal/mol.
     """
-    return MMFF_STBN_PREFACTOR * dtheta_deg * (kba_ijk * dr1 + kba_kji * dr2)
+    return MMFF_STBN_PREFACTOR * dtheta_deg * (kba_ijk * deviation_ij + kba_kji * deviation_jk)
 
 
-def compute_oop_angle(pos: np.ndarray, i: int, j: int, k: int, l: int) -> float:
+def compute_oop_angle(positions: np.ndarray, atom_i: int, atom_j: int, atom_k: int, atom_l: int) -> float:
     """Compute out-of-plane angle chi in degrees.
 
     Atom j is the central sp2 atom, with i, k, l as neighbors.
     chi is the angle between the j-l bond and the plane defined by i-j-k.
     """
-    r_ji = pos[i] - pos[j]
-    r_jk = pos[k] - pos[j]
-    r_jl = pos[l] - pos[j]
+    r_ji = positions[atom_i] - positions[atom_j]
+    r_jk = positions[atom_k] - positions[atom_j]
+    r_jl = positions[atom_l] - positions[atom_j]
 
     # Normalize
     n_ji = np.linalg.norm(r_ji)
@@ -234,67 +237,67 @@ def compute_oop_angle(pos: np.ndarray, i: int, j: int, k: int, l: int) -> float:
     return np.degrees(np.arcsin(sin_chi))
 
 
-def get_atom_positions(mol, conf_id: int = -1) -> np.ndarray:
+def get_atom_positions(molecule, conf_id: int = -1) -> np.ndarray:
     """Get atom positions as numpy array."""
-    conf = mol.GetConformer(conf_id)
-    n = mol.GetNumAtoms()
-    pos = np.zeros((n, 3))
-    for i in range(n):
-        p = conf.GetAtomPosition(i)
-        pos[i] = [p.x, p.y, p.z]
-    return pos
+    conf = molecule.GetConformer(conf_id)
+    atom_count = molecule.GetNumAtoms()
+    positions = np.zeros((atom_count, 3))
+    for atom_index in range(atom_count):
+        position = conf.GetAtomPosition(atom_index)
+        positions[atom_index] = [position.x, position.y, position.z]
+    return positions
 
 
-def compute_distance(pos: np.ndarray, i: int, j: int) -> float:
+def compute_distance(positions: np.ndarray, atom_i: int, atom_j: int) -> float:
     """Compute distance between two atoms."""
-    diff = pos[j] - pos[i]
+    diff = positions[atom_j] - positions[atom_i]
     return np.sqrt(np.sum(diff * diff))
 
 
-def compute_angle(pos: np.ndarray, i: int, j: int, k: int) -> float:
+def compute_angle(positions: np.ndarray, atom_i: int, atom_j: int, atom_k: int) -> float:
     """Compute angle i-j-k (j is central) in radians."""
-    v1 = pos[i] - pos[j]
-    v2 = pos[k] - pos[j]
-    r1 = np.sqrt(np.sum(v1 * v1))
-    r2 = np.sqrt(np.sum(v2 * v2))
-    if r1 < 1e-10 or r2 < 1e-10:
+    edge_ji = positions[atom_i] - positions[atom_j]
+    edge_jk = positions[atom_k] - positions[atom_j]
+    length_ji = np.sqrt(np.sum(edge_ji * edge_ji))
+    length_jk = np.sqrt(np.sum(edge_jk * edge_jk))
+    if length_ji < 1e-10 or length_jk < 1e-10:
         return 0.0
-    cos_theta = np.dot(v1, v2) / (r1 * r2)
+    cos_theta = np.dot(edge_ji, edge_jk) / (length_ji * length_jk)
     cos_theta = np.clip(cos_theta, -1.0, 1.0)
     return np.arccos(cos_theta)
 
 
-def compute_torsion(pos: np.ndarray, i: int, j: int, k: int, l: int) -> float:
+def compute_torsion(positions: np.ndarray, atom_i: int, atom_j: int, atom_k: int, atom_l: int) -> float:
     """Compute torsion angle i-j-k-l in radians."""
-    b1 = pos[j] - pos[i]
-    b2 = pos[k] - pos[j]
-    b3 = pos[l] - pos[k]
+    bond_ij = positions[atom_j] - positions[atom_i]
+    bond_jk = positions[atom_k] - positions[atom_j]
+    bond_kl = positions[atom_l] - positions[atom_k]
 
-    n1 = np.cross(b1, b2)
-    n2 = np.cross(b2, b3)
+    normal_ijk = np.cross(bond_ij, bond_jk)
+    normal_jkl = np.cross(bond_jk, bond_kl)
 
-    n1_norm = np.sqrt(np.sum(n1 * n1))
-    n2_norm = np.sqrt(np.sum(n2 * n2))
+    normal_ijk_length = np.sqrt(np.sum(normal_ijk * normal_ijk))
+    normal_jkl_length = np.sqrt(np.sum(normal_jkl * normal_jkl))
 
-    if n1_norm < 1e-10 or n2_norm < 1e-10:
+    if normal_ijk_length < 1e-10 or normal_jkl_length < 1e-10:
         return 0.0
 
-    n1 = n1 / n1_norm
-    n2 = n2 / n2_norm
+    normal_ijk = normal_ijk / normal_ijk_length
+    normal_jkl = normal_jkl / normal_jkl_length
 
-    cos_phi = np.dot(n1, n2)
+    cos_phi = np.dot(normal_ijk, normal_jkl)
     cos_phi = np.clip(cos_phi, -1.0, 1.0)
 
     # Sign from cross product
-    b2_norm = np.sqrt(np.sum(b2 * b2))
-    if b2_norm > 1e-10:
-        m1 = np.cross(n1, b2 / b2_norm)
-        sin_phi = np.dot(m1, n2)
-        phi = np.arctan2(sin_phi, cos_phi)
+    bond_jk_length = np.sqrt(np.sum(bond_jk * bond_jk))
+    if bond_jk_length > 1e-10:
+        reference_axis = np.cross(normal_ijk, bond_jk / bond_jk_length)
+        sin_phi = np.dot(reference_axis, normal_jkl)
+        phi_rad = np.arctan2(sin_phi, cos_phi)
     else:
-        phi = np.arccos(cos_phi)
+        phi_rad = np.arccos(cos_phi)
 
-    return phi
+    return phi_rad
 
 
 def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
@@ -303,48 +306,48 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
 
     Returns dict with per-term comparison results.
     """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:
         return {"error": f"Invalid SMILES: {smiles}"}
 
-    mol = Chem.AddHs(mol)
+    molecule = Chem.AddHs(molecule)
 
     # Generate conformer
     params = AllChem.ETKDGv3()
     params.randomSeed = 42
-    if AllChem.EmbedMolecule(mol, params) == -1:
+    if AllChem.EmbedMolecule(molecule, params) == -1:
         return {"error": "Could not embed molecule"}
 
     # Get MMFF properties
-    mmff_props = AllChem.MMFFGetMoleculeProperties(mol)
+    mmff_props = AllChem.MMFFGetMoleculeProperties(molecule)
     if mmff_props is None:
         return {"error": "Could not get MMFF properties"}
 
     # Get RDKit force field for reference total
-    ff = AllChem.MMFFGetMoleculeForceField(mol, mmff_props)
-    rdkit_total = ff.CalcEnergy()
+    force_field = AllChem.MMFFGetMoleculeForceField(molecule, mmff_props)
+    rdkit_total = force_field.CalcEnergy()
 
     # Get positions
-    pos = get_atom_positions(mol)
-    n_atoms = mol.GetNumAtoms()
+    positions = get_atom_positions(molecule)
+    n_atoms = molecule.GetNumAtoms()
 
     # region Bond Stretching
     smallfield_bond = 0.0
     rdkit_bond = 0.0
     n_bonds = 0
 
-    for bond in mol.GetBonds():
-        i = bond.GetBeginAtomIdx()
-        j = bond.GetEndAtomIdx()
+    for bond in molecule.GetBonds():
+        atom_i = bond.GetBeginAtomIdx()
+        atom_j = bond.GetEndAtomIdx()
 
-        r = compute_distance(pos, i, j)
+        distance = compute_distance(positions, atom_i, atom_j)
 
         # Get MMFF parameters
-        params = mmff_props.GetMMFFBondStretchParams(mol, i, j)
+        params = mmff_props.GetMMFFBondStretchParams(molecule, atom_i, atom_j)
         if params:
-            _, kb, r0 = params
-            e = bond_energy(r, r0, kb)
-            smallfield_bond += e
+            _, force_constant, equilibrium_distance = params
+            energy = bond_energy(distance, equilibrium_distance, force_constant)
+            smallfield_bond += energy
             n_bonds += 1
 
     # RDKit doesn't expose per-term energies directly, but we can estimate
@@ -357,23 +360,23 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
 
     # Find all angles from bond connectivity
     angles_seen = set()
-    for atom in mol.GetAtoms():
-        j = atom.GetIdx()
-        neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
-        for idx1, i in enumerate(neighbors):
-            for k in neighbors[idx1 + 1 :]:
-                if (i, j, k) not in angles_seen and (k, j, i) not in angles_seen:
-                    angles_seen.add((i, j, k))
+    for atom in molecule.GetAtoms():
+        atom_j = atom.GetIdx()
+        neighbors = [neighbor.GetIdx() for neighbor in atom.GetNeighbors()]
+        for idx1, atom_i in enumerate(neighbors):
+            for atom_k in neighbors[idx1 + 1 :]:
+                if (atom_i, atom_j, atom_k) not in angles_seen and (atom_k, atom_j, atom_i) not in angles_seen:
+                    angles_seen.add((atom_i, atom_j, atom_k))
 
-                    theta = compute_angle(pos, i, j, k)
+                    theta = compute_angle(positions, atom_i, atom_j, atom_k)
 
                     # Get MMFF angle parameters
-                    params = mmff_props.GetMMFFAngleBendParams(mol, i, j, k)
+                    params = mmff_props.GetMMFFAngleBendParams(molecule, atom_i, atom_j, atom_k)
                     if params:
-                        _, ka, theta0_deg = params
+                        _, force_constant, theta0_deg = params
                         theta0_rad = theta0_deg * np.pi / 180.0
-                        e = angle_energy(theta, theta0_rad, ka)
-                        smallfield_angle += e
+                        energy = angle_energy(theta, theta0_rad, force_constant)
+                        smallfield_angle += energy
                         n_angles += 1
 
     # endregion Angle Bending
@@ -383,24 +386,26 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
     n_torsions = 0
 
     # Find all torsions
-    for bond in mol.GetBonds():
-        j = bond.GetBeginAtomIdx()
-        k = bond.GetEndAtomIdx()
+    for bond in molecule.GetBonds():
+        atom_j = bond.GetBeginAtomIdx()
+        atom_k = bond.GetEndAtomIdx()
 
-        neighbors_j = [n.GetIdx() for n in mol.GetAtomWithIdx(j).GetNeighbors() if n.GetIdx() != k]
-        neighbors_k = [n.GetIdx() for n in mol.GetAtomWithIdx(k).GetNeighbors() if n.GetIdx() != j]
+        neighbors_j = [neighbor.GetIdx() for neighbor in molecule.GetAtomWithIdx(atom_j).GetNeighbors()
+                       if neighbor.GetIdx() != atom_k]
+        neighbors_k = [neighbor.GetIdx() for neighbor in molecule.GetAtomWithIdx(atom_k).GetNeighbors()
+                       if neighbor.GetIdx() != atom_j]
 
-        for i in neighbors_j:
-            for l in neighbors_k:
-                if i != l:
-                    phi = compute_torsion(pos, i, j, k, l)
+        for atom_i in neighbors_j:
+            for atom_l in neighbors_k:
+                if atom_i != atom_l:
+                    phi_rad = compute_torsion(positions, atom_i, atom_j, atom_k, atom_l)
 
                     # Get MMFF torsion parameters
-                    params = mmff_props.GetMMFFTorsionParams(mol, i, j, k, l)
+                    params = mmff_props.GetMMFFTorsionParams(molecule, atom_i, atom_j, atom_k, atom_l)
                     if params:
-                        _, v1, v2, v3 = params
-                        e = torsion_energy(phi, v1, v2, v3)
-                        smallfield_torsion += e
+                        _, torsion_v1, torsion_v2, torsion_v3 = params
+                        energy = torsion_energy(phi_rad, torsion_v1, torsion_v2, torsion_v3)
+                        smallfield_torsion += energy
                         n_torsions += 1
 
     # endregion Torsion
@@ -410,47 +415,47 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
     n_vdw = 0
 
     # Build bonded neighbor sets for exclusions
-    bonded_1_2 = {i: set() for i in range(n_atoms)}
-    for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        bonded_1_2[i].add(j)
-        bonded_1_2[j].add(i)
+    bonded_1_2 = {atom_index: set() for atom_index in range(n_atoms)}
+    for bond in molecule.GetBonds():
+        atom_i, atom_j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        bonded_1_2[atom_i].add(atom_j)
+        bonded_1_2[atom_j].add(atom_i)
 
     # 1-3 neighbors
-    bonded_1_3 = {i: set() for i in range(n_atoms)}
-    for i in range(n_atoms):
-        for j in bonded_1_2[i]:
-            for k in bonded_1_2[j]:
-                if k != i:
-                    bonded_1_3[i].add(k)
+    bonded_1_3 = {atom_index: set() for atom_index in range(n_atoms)}
+    for atom_i in range(n_atoms):
+        for atom_j in bonded_1_2[atom_i]:
+            for atom_k in bonded_1_2[atom_j]:
+                if atom_k != atom_i:
+                    bonded_1_3[atom_i].add(atom_k)
 
     # 1-4 neighbors
-    bonded_1_4 = {i: set() for i in range(n_atoms)}
-    for i in range(n_atoms):
-        for j in bonded_1_3[i]:
-            for k in bonded_1_2[j]:
-                if k != i and k not in bonded_1_2[i] and k not in bonded_1_3[i]:
-                    bonded_1_4[i].add(k)
+    bonded_1_4 = {atom_index: set() for atom_index in range(n_atoms)}
+    for atom_i in range(n_atoms):
+        for atom_j in bonded_1_3[atom_i]:
+            for atom_k in bonded_1_2[atom_j]:
+                if atom_k != atom_i and atom_k not in bonded_1_2[atom_i] and atom_k not in bonded_1_3[atom_i]:
+                    bonded_1_4[atom_i].add(atom_k)
 
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
+    for atom_i in range(n_atoms):
+        for atom_j in range(atom_i + 1, n_atoms):
             # Skip 1-2 and 1-3
-            if j in bonded_1_2[i] or j in bonded_1_3[i]:
+            if atom_j in bonded_1_2[atom_i] or atom_j in bonded_1_3[atom_i]:
                 continue
 
-            r = compute_distance(pos, i, j)
-            if r < 0.1:
+            distance = compute_distance(positions, atom_i, atom_j)
+            if distance < 0.1:
                 continue
 
             # Get vdW parameters (no 1-4 scaling for vdW in MMFF94)
-            params = mmff_props.GetMMFFVdWParams(i, j)
+            params = mmff_props.GetMMFFVdWParams(atom_i, atom_j)
             if params:
                 r_star_ij, epsilon_ij = params[0], params[1]
 
                 # Note: MMFF94 does NOT apply 1-4 scaling to vdW energy
                 # 1-4 scaling (0.75) is only for electrostatic interactions
-                e = vdw_energy(r, epsilon_ij, r_star_ij)
-                smallfield_vdw += e
+                energy = vdw_energy(distance, epsilon_ij, r_star_ij)
+                smallfield_vdw += energy
                 n_vdw += 1
 
     # endregion Van Der Waals
@@ -459,27 +464,27 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
     smallfield_elec = 0.0
     n_elec = 0
 
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
+    for atom_i in range(n_atoms):
+        for atom_j in range(atom_i + 1, n_atoms):
             # Skip 1-2 and 1-3
-            if j in bonded_1_2[i] or j in bonded_1_3[i]:
+            if atom_j in bonded_1_2[atom_i] or atom_j in bonded_1_3[atom_i]:
                 continue
 
-            qi = mmff_props.GetMMFFPartialCharge(i)
-            qj = mmff_props.GetMMFFPartialCharge(j)
+            charge_i = mmff_props.GetMMFFPartialCharge(atom_i)
+            charge_j = mmff_props.GetMMFFPartialCharge(atom_j)
 
-            if abs(qi) < 1e-10 or abs(qj) < 1e-10:
+            if abs(charge_i) < 1e-10 or abs(charge_j) < 1e-10:
                 continue
 
-            r = compute_distance(pos, i, j)
-            if r < 0.1:
+            distance = compute_distance(positions, atom_i, atom_j)
+            if distance < 0.1:
                 continue
 
             # 1-4 scaling
-            scale = 0.75 if j in bonded_1_4[i] else 1.0
+            scale = 0.75 if atom_j in bonded_1_4[atom_i] else 1.0
 
-            e = elec_energy(r, qi, qj) * scale
-            smallfield_elec += e
+            energy = elec_energy(distance, charge_i, charge_j) * scale
+            smallfield_elec += energy
             n_elec += 1
 
     # endregion Electrostatic
@@ -489,37 +494,37 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
     n_stbn = 0
 
     # Recompute angles with bond deviations for stretch-bend
-    for atom in mol.GetAtoms():
-        j = atom.GetIdx()
-        neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
-        for idx1, i in enumerate(neighbors):
-            for k in neighbors[idx1 + 1 :]:
+    for atom in molecule.GetAtoms():
+        atom_j = atom.GetIdx()
+        neighbors = [neighbor.GetIdx() for neighbor in atom.GetNeighbors()]
+        for idx1, atom_i in enumerate(neighbors):
+            for atom_k in neighbors[idx1 + 1 :]:
                 # Get stretch-bend parameters
-                stbn_params = mmff_props.GetMMFFStretchBendParams(mol, i, j, k)
+                stbn_params = mmff_props.GetMMFFStretchBendParams(molecule, atom_i, atom_j, atom_k)
                 if stbn_params:
                     _, kba_ijk, kba_kji = stbn_params
 
                     # Get bond parameters for the two bonds
-                    bond_params1 = mmff_props.GetMMFFBondStretchParams(mol, i, j)
-                    bond_params2 = mmff_props.GetMMFFBondStretchParams(mol, j, k)
-                    angle_params = mmff_props.GetMMFFAngleBendParams(mol, i, j, k)
+                    bond_params1 = mmff_props.GetMMFFBondStretchParams(molecule, atom_i, atom_j)
+                    bond_params2 = mmff_props.GetMMFFBondStretchParams(molecule, atom_j, atom_k)
+                    angle_params = mmff_props.GetMMFFAngleBendParams(molecule, atom_i, atom_j, atom_k)
 
                     if bond_params1 and bond_params2 and angle_params:
-                        _, kb1, r0_1 = bond_params1
-                        _, kb2, r0_2 = bond_params2
-                        _, ka, theta0_deg = angle_params
+                        _, force_constant_ij, equilibrium_distance_ij = bond_params1
+                        _, force_constant_jk, equilibrium_distance_jk = bond_params2
+                        _, force_constant_angle, theta0_deg = angle_params
 
-                        r1 = compute_distance(pos, i, j)
-                        r2 = compute_distance(pos, j, k)
-                        theta = compute_angle(pos, i, j, k)
+                        distance_ij = compute_distance(positions, atom_i, atom_j)
+                        distance_jk = compute_distance(positions, atom_j, atom_k)
+                        theta = compute_angle(positions, atom_i, atom_j, atom_k)
                         theta_deg = np.degrees(theta)
 
-                        dr1 = r1 - r0_1
-                        dr2 = r2 - r0_2
+                        deviation_ij = distance_ij - equilibrium_distance_ij
+                        deviation_jk = distance_jk - equilibrium_distance_jk
                         dtheta_deg = theta_deg - theta0_deg
 
-                        e = stretch_bend_energy(dr1, dr2, dtheta_deg, kba_ijk, kba_kji)
-                        smallfield_stbn += e
+                        energy = stretch_bend_energy(deviation_ij, deviation_jk, dtheta_deg, kba_ijk, kba_kji)
+                        smallfield_stbn += energy
                         n_stbn += 1
 
     # endregion Stretch-Bend Coupling
@@ -529,13 +534,13 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
     n_oop = 0
 
     # Find trigonal (sp2) atoms with 3 neighbors
-    for atom in mol.GetAtoms():
-        j = atom.GetIdx()
-        neighbors = [n.GetIdx() for n in atom.GetNeighbors()]
+    for atom in molecule.GetAtoms():
+        atom_j = atom.GetIdx()
+        neighbors = [neighbor.GetIdx() for neighbor in atom.GetNeighbors()]
 
         if len(neighbors) == 3:
             # Try all permutations of i, k, l around central atom j
-            for perm_idx, (i, k, l) in enumerate(
+            for perm_idx, (atom_i, atom_k, atom_l) in enumerate(
                 [
                     (neighbors[0], neighbors[1], neighbors[2]),
                     (neighbors[0], neighbors[2], neighbors[1]),
@@ -546,13 +551,13 @@ def validate_molecule(smiles: str, verbose: bool = True) -> Dict:
                 ]
             ):
                 # Get OOP parameters
-                oop_params = mmff_props.GetMMFFOopBendParams(mol, i, j, k, l)
+                oop_params = mmff_props.GetMMFFOopBendParams(molecule, atom_i, atom_j, atom_k, atom_l)
                 if oop_params:
                     koop = oop_params
 
-                    chi = compute_oop_angle(pos, i, j, k, l)
-                    e = oop_energy(chi, koop)
-                    smallfield_oop += e
+                    chi_deg = compute_oop_angle(positions, atom_i, atom_j, atom_k, atom_l)
+                    energy = oop_energy(chi_deg, koop)
+                    smallfield_oop += energy
                     n_oop += 1
 
     # endregion Out-Of-Plane Bending (For sp2 Centers)
@@ -625,8 +630,8 @@ def load_usearch_molecules(filepath: str, n_samples: int = 50, seed: int = 42) -
     random.seed(seed)
 
     molecules = []
-    with open(filepath, "r") as f:
-        for line in f:
+    with open(filepath, "r") as stream:
+        for line in stream:
             # Each line may contain multiple molecules separated by '.'
             # Take the first molecule from each line
             smiles = line.strip().split(".")[0]
@@ -686,19 +691,19 @@ def main():
     summary.add_column("SF total", justify="right")
     summary.add_column("RDKit", justify="right")
     summary.add_column("Error %", justify="right")
-    for r in results:
+    for result in results:
         summary.add_row(
-            r["smiles"],
-            str(r["n_atoms"]),
-            f"{r['smallfield']['total']:.4f}",
-            f"{r['rdkit_total']:.4f}",
-            f"{r['relative_error']*100:.2f}",
+            result["smiles"],
+            str(result["n_atoms"]),
+            f"{result['smallfield']['total']:.4f}",
+            f"{result['rdkit_total']:.4f}",
+            f"{result['relative_error']*100:.2f}",
         )
     log.console.print(summary)
 
     # Overall accuracy assessment
-    avg_error = np.mean([r["relative_error"] for r in results]) * 100
-    max_error = np.max([r["relative_error"] for r in results]) * 100
+    avg_error = np.mean([result["relative_error"] for result in results]) * 100
+    max_error = np.max([result["relative_error"] for result in results]) * 100
 
     log.info("average relative error: {:.2f}%", avg_error)
     log.info("maximum relative error: {:.2f}%", max_error)

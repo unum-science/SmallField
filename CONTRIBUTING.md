@@ -1,0 +1,240 @@
+# Contributing To SmallField
+
+Rules for `src/`, `cli/`, `bench/`, `test/`, and `python/`.
+Where tooling can enforce a rule it does, in `.githooks/pre-commit`; where it cannot, this document is the source of truth.
+When you change a rule, change it here first.
+
+## Enforcement
+
+Configuring the CMake build arms the hooks:
+
+```sh
+cmake -B build .        # runs `git config core.hooksPath .githooks`
+git config core.hooksPath   # should print .githooks
+```
+
+__Every check inspects only the added lines of a staged file.__
+Legacy code migrates on its own schedule, cost scales with the size of the diff rather than the size of the tree, and no flag-day refactor is needed to adopt a rule.
+A file that already contains a violation stays committable; a diff that introduces one does not.
+
+External tools are guarded, so a fresh clone without `clang-format`, `cmake-format`, or `ruff` still commits.
+
+There is deliberately no in-band escape comment.
+If a rule needs to bend for a legitimate one-off, edit the rule here and document the bend.
+`git commit --no-verify` exists and you should almost never reach for it.
+
+__The public release of 2026-08 was the one deliberate exception to the added-lines discipline.__
+A whole-tree sweep corrected documentation that contradicted the code, deleted dead code, and normalised includes.
+Reformatting whole files turns every legacy line into an added line, so the hook then reports violations the file has carried for months; that is the cost of a flag day and the reason the rule exists.
+Outside a release sweep, format only the lines you changed — `git clang-format --staged` does exactly that.
+
+## Commit Messages
+
+The subject is `<Verb>: <Capitalized summary>`.
+`Add`, `Improve`, and `Fix` carry almost everything.
+`Make` is for build-system adaptations, `Docs` for documentation, and `Chore` for mechanical behavior-preserving churn — all three are rare.
+`Merge` commits are exempt because Git writes their subject.
+
+The body describes the semantic change.
+Filename moves, naming tweaks, and comment polish are noise; keep the first paragraph for what actually landed.
+
+Documentation folds into the commit that makes it true rather than landing on its own.
+
+__History stays human-authored.__
+No `Co-authored-by` bot trailer, no "generated with" line, no assistant name, vendor URL, or robot emoji.
+
+## Naming
+
+Types carry `_t`, compile-time constants and enumerators carry `_k`, internal free functions and private members carry a trailing underscore, and template parameters carry a trailing underscore with type slots ending `_type_`.
+
+__A class or struct template takes no `_t`, because it is not a type.__
+`_t` marks something you can declare a variable of — a non-template class, an alias, a concrete specialization.
+A template is the thing that makes those, so it wears the bare noun and its specializations wear the suffix:
+
+```cpp
+template <typename allocator_, typename deallocator_>
+class byte_buffer { … };
+
+using pinned_byte_buffer_t = byte_buffer<pinned_alloc_t, pinned_dealloc_t>;
+using device_byte_buffer_t = byte_buffer<device_alloc_t, device_dealloc_t>;
+```
+
+Concept names take neither suffix for the same reason.
+
+__Everything this project declares is snake_case.__
+No camelCase, no leading capital, no `SCREAMING_SNAKE` outside a macro, no `kPrefixed` constant.
+
+__A name reached through a library object keeps that library's spelling.__
+`sc->d_params[k].kbaIJK` is RDKit's field and renaming it does not compile, while the `kba_ijk` it is assigned into is ours.
+The adapter in `parameters/mmff94_tables_rdkit.hpp` is the boundary: library spelling on the right, ours on the left.
+
+Spell concepts out.
+`index` not `idx`, `config` not `cfg`, `source` and `destination` not `src` and `dst`, `scratch` not `tmp`, `count` not `cnt`.
+
+__A physics symbol is spelled out, and the symbol itself goes in the docstring.__
+`mmff94_bond_t::force_constant` documented as `kb` in mdyn per angstrom, never a bare `kb` in our own code.
+The published MMFF94 parameter-table columns are spelled out too: `coordination_number` rather than `crd`, `valence` rather than `val`.
+
+__A loop variable names the axis it walks__ — `atom`, `bond`, `molecule`, `conformer`, `neighbor`, `term`, `row`, `device`, `bin`.
+Never a bare letter, even where the letter matches the specification's own index notation.
+
+__No binding under four characters.__
+`check_short_identifiers` enforces it, because the alternative scales badly and this tree proved how badly: `a` once meant an atom, a neighbour slot, an apex, a loop counter and an angle record inside one file, `c` was both the current SMARTS character and a conjunct index inside one parser, and `n` was a CSR cursor in one function and MMFF.V equation 18's electronegativity exponent in the next.
+
+The exempt words are short because they are whole words, not because they are abbreviations: `out`, `end`, `key`, `row`, `dim`, `hit`, `ok`, `top`, `sum`, `max`, `min`, `raw`, `bin`, `tag`, `on`, `bit`, `log`, `got`, `now`, `arg`, `sha`, `oop`, `arc`, `cis`.
+`lhs` and `rhs` name an operator's two operands; `dx`, `dy` and `dz` are axes.
+Namespace aliases are exempt outright.
+
+__MMFF term positions keep the specification's letter as a suffix.__
+MMFF94 defines a bond over atoms i-j, an angle over i-j-k and a torsion over i-j-k-l, so `atom_i` maps onto the published equations where `first_atom` does not — and `mmff94_bond_t::atom_i` already spells it that way.
+The exemption is narrow: it holds only where the letter genuinely is a term position.
+A matrix walk names `row` and `column`, and a cursor that merely happens to be spelled `i` names its axis like any other.
+Getting this backwards is not cosmetic — `aj` in four files held the MMFF **k** atom, so the obvious rename would have been wrong and would have compiled.
+
+__Directory trees stay flat.__
+The maximum depth is `src/smallfield/<subsystem>/<file>`.
+A shared helper that is generic over its operand type, depends on nothing outside the standard headers, and is used by two or more subsystems goes in `src/smallfield/utilities.hpp`; anything failing all three goes to the subsystem that owns it.
+No catch-all directory families.
+
+__Namespaces mirror the directory structure, and `detail` namespaces do not exist.__
+An internal helper lives in the file's own namespace with a trailing underscore.
+A namespace alias spells its target out; `sfp` bound to two different namespaces in one test suite is what the short forms cost.
+
+`#pragma region <name>` and `#pragma endregion <name>` mark sections, with plain words in the name — a dash makes `clang-format` reflow around it and the markers drift out of pairing.
+
+## State and Memory
+
+__Per-worker state is an explicit rank into caller-owned scratch, never `thread_local`.__
+Hidden global state is not a style preference here: the file-scope scratch in `etkdg_prepare_batch.hpp` is precisely why `prepare_molecule_batch_into` cannot be called concurrently, which blocks the deeper pipeline ring.
+
+__Fill a caller-owned output rather than returning a container.__
+Write `fill_x_into(input, std::vector<T> &out)` with `out.clear()`, not `std::vector<T> compute_x(input)`, and declare the scratch above the loop that consumes it so a growth phase happens once.
+
+__No pointers inside containers.__
+`std::vector<T *>` and `std::vector<std::unique_ptr<T>>` are a pointer chase plus an allocation per element for something whose count is usually known and small.
+Store values, or store indices into a flat arena.
+
+## Aggregates
+
+__Past three fields, initialize by name.__
+
+Positional aggregate initialization silently survives a field insertion or rename: the literal keeps compiling and means something else.
+This has cost this project twice.
+Renaming `mmff94_angle_t::padding` to `is_linear` compiled clean at all four construction sites and meant "not linear" at every one.
+Inserting `bounds_row_stride` into `distance_geometry_energy_functor_t` shifted every later field in a test's positional initializer and broke `test_dg_energy`, caught only by bisecting against the baseline.
+
+Add a `static_assert` on `sizeof` for any struct whose layout the GPU depends on.
+
+## Comments
+
+Documentation is `/** ... */`.
+Every file opens with `@file` carrying the project-relative path, then `@brief`.
+The path rather than the bare basename, because eleven pairs of files differ only by extension and three of those pairs carry a byte-identical `@brief`, so the basename alone cannot tell a reader which half of the pair they are in.
+
+A block that fits on one line is just the sentence, with no `@brief` to announce it.
+A block long enough to need detail opens with `@brief` on its own line, then a bare star line, then the detail.
+`//` is for implementation notes inside a function body.
+Continuation lines inside a block are a star and two spaces.
+
+__A member is documented above it, never beside it.__
+A trailing `///<` ties the declaration column to the longest comment in the struct, so editing one comment re-pads every neighbour.
+An identifier that opens a comment keeps its own case and takes backticks, so `atom_flag_t` never becomes `Atom_flag_t`.
+
+__Anything describing one symbol is `/** ... */`.__
+__A label over a run of members is `/* ... */`__, because Doxygen would bind it to the first member alone and silently mis-document the rest.
+`/* ... */` also covers prose that documents nothing, such as the rationale above a macro guard.
+Both carry the same star-and-two-spaces continuation as everything else.
+A run of consecutive `//` lines at namespace or class scope collapses into one block of whichever kind applies.
+A standalone line that names the declarations beneath it is a section, so it becomes `#pragma region` rather than a banner comment.
+A trailing `//` on an `#include`, an `#endif`, or a closing brace is an idiom and stays.
+
+Every `@param` declares its direction as `[in]`, `[out]`, or `[inout]` — the comma form is not a spelling of the last one.
+
+__Inline code and symbol names take backticks, and neither `@c` nor `@ref` is used.__
+`@b` remains for emphasis of a word that is not code, because `**bold**` inside a comment prints literally.
+Emphasis is `@b`, never capitals: `bits that must @b not be set` rather than `bits that MUST NOT be set`.
+Backticks promise something a compiler would accept, so they never wrap prose, punctuation, a bare numeral, or math.
+The vocabulary in `GLOSSARY.md` is the deliberate exception, and SMARTS patterns are backticked because SMARTS is a language.
+
+Sentences are separated by a single space.
+
+Display math and layout diagrams are fenced with `@verbatim`.
+Nothing in this tree runs Doxygen, so LaTeX would be markup no reader ever sees, and `@code` cross-links identifiers and mangles the notation.
+An existing `@code` block holding a real usage example stays as it is.
+
+__Inside a fence the notation is ASCII, and Greek letters are the one exception.__
+Write `d_ij` and `^2` and `*`, not `dᵢⱼ` and `²` and `·`.
+A fence is a maths context, so `^` cannot be mistaken for exclusive-or; and a typographic subscript is missing from half the monospace fonts in use, so its fallback glyph destroys the column alignment the fence exists to preserve.
+`d_ij` is also the only one of the two a reader can grep for.
+
+One spelling per quantity in prose: `×` for a dimension, `θ` and `φ` for angles, `→` for a mapping, `²` for a square, `—` for a prose dash.
+
+__Comments describe what the code is and does now.__
+No "previously", "used to", "no longer", "the old design", no phase numbers.
+History lives in commit messages and `ROADMAP.md`.
+
+__A comment that asserts a measurable fact is a test.__
+
+If a comment states a property, either the code enforces it or the comment goes.
+Every instance found in this codebase redirected real work:
+
+- a comment claiming the MMFF angle scratch lives in shared memory, above a declaration that made it a kernel-local array — ten kilobytes of local memory per thread, hidden by the comment
+- a docstring describing a three-stream pipeline, above code that creates one stream
+- a header claiming 84 % native pattern coverage against a measured 86.8 %
+- a roadmap table quoting a theoretical occupancy unreachable on any GPU this project targets
+- a benchmark document naming shared memory as the binding occupancy constraint, when at the real molecule-size distribution it is registers
+
+Decorative rulers carry no information the sentence beneath them does not already carry.
+
+__Split a long string literal yourself and pin each fragment with a trailing `//`.__
+Left alone, clang-format chops a literal that overruns the column limit and chops the pieces again on the next run, until a word reads `"a" "r" "r" "a" "y" "s"` — which is what the Python binding's docstring had decayed into.
+The pin holds the split where you put it.
+
+## Performance Claims
+
+__A performance number states its corpus, its sample size, and its weighting.__
+
+A microbenchmark of an isolated access pattern is not an expected result.
+This project measured a 6.9× improvement on the distance-geometry bounds read and quoted it as the headline.
+It was real — at 128 atoms, which is __0.1 % of PubChem__.
+Weighted by the measured atom-count distribution the same change is 2.47×, and end to end it was under 3 %.
+
+So:
+
+- Name the corpus and the sample size. `../USearchMolecules/data/pubchem` and `data/gdb13` are the standing ones; they have different molecule-size distributions and a blended figure hides which half moved.
+- Weight any distribution-sensitive number by the measured distribution before quoting it.
+- Compare A against B within one run. Absolute throughput drifts by 10–15 % on a loaded machine while the ratio inside a single run stays stable.
+- Report the tail, not only the median. A shifted median and a heavy one-sided tail look identical otherwise, which is how an unpaired energy comparison hid a real defect here for months.
+- Say what you could not measure. An 8-GPU claim from a single-GPU box is a projection, and should read as one.
+
+## Environment
+
+`pixi.toml` pins the only environment this is built and tested in, and `pyproject.toml`'s floors follow it rather than claiming a wider range.
+
+__A user site-packages directory silently shadows the pixi environment.__
+`~/.local/lib/python3.X/site-packages` takes precedence, so `import numpy` inside the pixi Python can resolve to a different version than the one pinned.
+Check a version with `PYTHONNOUSERSITE=1` before believing it.
+
+## CUDA
+
+One host thread orchestrates devices, with per-device non-blocking streams and events.
+Kernel launches are already asynchronous, cross-device ordering is `cudaStreamWaitEvent`, and completion is an event-sync loop, so a host thread adds only scheduling noise.
+
+`__restrict__` on every pointer a kernel takes.
+
+Name hardware constants once rather than spelling `32` for the warp size at each site.
+
+Every architecture the project runs on needs an entry in `SMALLFIELD_DEFAULT_CUDA_ARCH`.
+PTX JIT is forward-only, so PTX from the newest entry covers future hardware and covers nothing already on the list; a device missing from it finds no cubin, no JIT path, and does not run.
+
+__Precompiled headers cannot work for `.cu` files.__
+nvcc preprocesses to a synthetic flat file before the host compiler runs, so no `#include` directive survives for a `.gch` to match.
+Measured on the C++ half alone it was 111 s against 109 s, and nvcc `--threads` measured slower than none, 380 s against 366 s, because `-j` already saturates the machine.
+A compiler cache is the one thing that paid: 23 % on a warm multi-architecture rebuild.
+
+## Deliberately Not Rules
+
+- __STL containers in headers.__ Other projects in this family ban them in public headers and route to a house container. SmallField is an application pipeline consuming RDKit, whose API returns `std::vector` throughout, so the boundary is already impure and there is nothing to migrate to.
+- __`PointerAlignment`.__ This repo carries `Right`, the C-idiomatic form, in a C++ project where the family heuristic says `Left`. Changing it reformats the whole tree for no functional gain.
+- __`clang-tidy` as a gate.__ Shipped advisory in `.clang-tidy`, deny-by-default so `__device__` code and intrinsics do not drown it. Too slow for a hook.
+- __Style checks in CI.__ CI is for correctness. Hooks are for style.

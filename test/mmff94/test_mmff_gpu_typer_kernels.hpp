@@ -1,5 +1,5 @@
 /**
- *  @file test_mmff_gpu_typer_kernels.hpp
+ *  @file test/mmff94/test_mmff_gpu_typer_kernels.hpp
  *  @brief Device harness for the MMFF94 GPU atom typer, for use by its unit tests.
  */
 
@@ -9,6 +9,8 @@
 
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+
+namespace smallfield::tests {
 
 void *create_mmff94_device_tables_view(smallfield::parameters::mmff94_tables_host_t const &host,
                                        smallfield::parameters::mmff94_tables_view_t &out_view);
@@ -20,3 +22,5 @@ void launch_mmff94_gpu_typer_batch(smallfield::parameters::mmff94_tables_view_t 
                                    std::uint32_t num_molecules, std::uint32_t const *atom_offsets,
                                    std::uint32_t total_atoms, std::uint8_t *atom_types_out, float *atom_charges_out,
                                    std::uint8_t *typing_status_out);
+
+} // namespace smallfield::tests

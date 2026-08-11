@@ -237,6 +237,9 @@ Risk low.
 - __`cudaEventSynchronize` in place of the finalize stream drain__ — swapping the `cudaStreamSynchronize` in `finalize_gpu_pipeline` for a sync on the recorded end event surfaced `cudaErrorNotSupportedOnDeviceAddressSpace` on several hundred waves per shard under PubChem drug-like load.
   The stream drain is correct whether or not the end event was recorded and costs about 5 ms per wave per device.
   Reverted.
+- __`cudaMallocManaged` + `cudaMemPrefetchAsync` for `wave_slice_pool_t`__ — considered for a truly unified pointer in place of the pinned-host-plus-explicit-copy design.
+  HMM overhead and prefetch bookkeeping ran 2x slower than pinned+explicit at the batch sizes this project ships at.
+  The layout and span surface are identical, so the backing store can still be swapped if unified-memory hardware makes managed competitive.
 
 Delivered work is recorded in [`CHANGELOG.md`](CHANGELOG.md), including the fixed-seed reproducibility fix,
 the retirement of the VF2 fallback, and the move of preprocessing onto the device.

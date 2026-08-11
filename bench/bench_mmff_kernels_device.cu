@@ -1,5 +1,5 @@
 /**
- *  @file bench_mmff_kernels_device.cu
+ *  @file bench/bench_mmff_kernels_device.cu
  *  @brief Device-side launcher for the MMFF GPU kernel trio.
  *
  *  Times each kernel with `cudaEvent`s and reports the totals back to the host benchmark driver. Drops the output
@@ -22,7 +22,7 @@ namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sft = smallfield::types;
 
-namespace bench_mmff {
+namespace smallfield::bench {
 
 void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &tables_host,
                                          sft::molecule_descriptor_t const *descriptors, std::uint32_t num_molecules,
@@ -98,9 +98,9 @@ void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &ta
     cudaMalloc(&d_counts_per_molecule, num_molecules * sizeof(sfmmff::mmff94_per_mol_counts_t));
     cudaMalloc(&d_interactions, per_interaction_bytes);
     cudaMalloc(&d_atom_offsets_lookup, total_atom_count * sizeof(sft::mmff94_atom_offsets_t));
-    cudaError_t const alloc_err = cudaGetLastError();
-    if (alloc_err != cudaSuccess) {
-        std::fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(alloc_err));
+    cudaError_t const allocation_error = cudaGetLastError();
+    if (allocation_error != cudaSuccess) {
+        std::fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(allocation_error));
         *type_and_charge_ms = *extract_terms_ms = *build_csr_ms = *total_gpu_ms = -1.0f;
         return;
     }
@@ -136,9 +136,9 @@ void launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t const &ta
     cudaEventRecord(event_after_build_csr);
     cudaEventSynchronize(event_after_build_csr);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::fprintf(stderr, "kernel error: %s\n", cudaGetErrorString(err));
+    cudaError_t kernel_error = cudaGetLastError();
+    if (kernel_error != cudaSuccess) {
+        std::fprintf(stderr, "kernel error: %s\n", cudaGetErrorString(kernel_error));
         *type_and_charge_ms = *extract_terms_ms = *build_csr_ms = *total_gpu_ms = -1.0f;
         goto cleanup;
     }
@@ -171,4 +171,4 @@ cleanup:
     cudaFree(d_atom_offsets_lookup);
 }
 
-} // namespace bench_mmff
+} // namespace smallfield::bench

@@ -1,5 +1,5 @@
 /**
- *  @file test_mmff94_tables_kernels.hpp
+ *  @file test/parameters/test_mmff94_tables_kernels.hpp
  *  @brief Device launchers for the MMFF94 parameter table lookups, for use by their unit tests.
  */
 
@@ -11,6 +11,8 @@
 #include "smallfield/parameters/mmff94_tables_device.cuh"
 
 #include "mmff94_lookup_probes.hpp"
+
+namespace smallfield::tests {
 
 void launch_device_vdw_lookup(smallfield::parameters::mmff94_tables_view_t view, vdw_query_t const *queries,
                               vdw_result_t *results, std::uint32_t query_count);
@@ -28,3 +30,5 @@ void launch_device_stbn_lookup(smallfield::parameters::mmff94_tables_view_t view
 void *device_tables_create(smallfield::parameters::mmff94_tables_host_t const &host_tables,
                            smallfield::parameters::mmff94_tables_view_t &out_view);
 void device_tables_destroy(void *handle);
+
+} // namespace smallfield::tests

@@ -1,23 +1,18 @@
 /**
- *  @file wave_slice_pool.hpp
+ *  @file src/smallfield/api/wave_slice_pool.hpp
  *  @brief Unified per-wave-slice pool: one pinned host allocation + a shared `wave_slice_layout_t` describing every
  *  per-molecule array.
  *
- *  Replaces the pre-existing design where `etkdg_molecule_batch_t` held 14 separate `std::vector<T>` fields and
- *  the launch path did 14 pageable `cudaMemcpyAsync` calls (which silently degrade to synchronous).
+ *  One pinned host allocation carries every per-molecule array, so the launch path issues a single
+ *  `cudaMemcpyAsync` instead of one call per field — a multi-vector layout would copy each field through
+ *  pageable memory, which silently degrades to a synchronous transfer.
  *
  *  Flow:
- *    1. `prepare_molecule_batch` computes `wave_slice_layout_t` from the per-molecule prefix-scanned
- *       sizes, resizes one pinned host buffer, and memcpys per-molecule arrays at their byte
- *       offsets.
- *    2. `launch_gpu_pipeline` issues ONE `cudaMemcpyAsync` of the host
- *       buffer into a per-GPU persistent device mirror (owned by
- *       `context_t`), then carves typed `std::span<T>` views over the
- *       device pool via the same layout.
- *
- *  We considered `cudaMallocManaged` + `cudaMemPrefetchAsync` for a truly unified pointer, but HMM overhead and
- *  prefetch bookkeeping were 2× slower than pinned+explicit for the batch sizes this project ships at. The layout
- *  and span surface are identical — swap the backing store if unified-memory hardware makes managed competitive.
+ *    1. `prepare_molecule_batch` computes `wave_slice_layout_t` from the per-molecule prefix-scanned sizes,
+ *       resizes one pinned host buffer, and memcpys per-molecule arrays at their byte offsets.
+ *    2. `launch_gpu_pipeline` issues a single `cudaMemcpyAsync` of the host buffer into a per-GPU persistent
+ *       device mirror owned by `context_t`, then carves typed `std::span<T>` views over the device pool via
+ *       the same layout.
  */
 
 #pragma once
@@ -42,13 +37,10 @@ namespace smallfield::api {
 /**
  *  @brief Tagged rejection record: which slice-local input was dropped, and why.
  *
- *  Replaces the prior parallel-vector design (one vector per rejection
- *  reason). Every preprocess-step rejection — `invalid_smiles` (parse fail,
- *  addHs fail, descriptor build fail), `too_many_atoms`, `unsupported_element`
- *  (no MMFF94 atom type), `preprocess_timeout` (deadline tripped) — flows
- *  through one `std::vector<rejected_mol_t>` and the caller stamps
- *  `entry.reason` directly into `status_out`. Packs to 8 bytes
- *  (4-byte index + 1-byte reason + 3 bytes padding).
+ *  Every preprocess-step rejection — `invalid_smiles_k` (parse fail, addHs fail, descriptor build fail),
+ *  `too_many_atoms_k`, `unsupported_element_k` (no MMFF94 atom type), `preprocess_timeout_k` (deadline
+ *  tripped) — flows through one `std::vector<rejected_mol_t>` and the caller stamps `entry.reason`
+ *  directly into `status_out`. Packs to 8 bytes: a 4-byte index, a 1-byte reason, 3 bytes of padding.
  */
 struct rejected_mol_t {
     std::uint32_t slice_local_index;
@@ -74,25 +66,25 @@ using smallfield::types::molecule_descriptor_t;
 
 /** Grow-only RAII byte buffer — used for both pinned-host and device memory pools. */
 template <typename allocator_, typename deallocator_>
-class byte_buffer_t {
-    std::byte *ptr_ = nullptr;
+class byte_buffer {
+    std::byte *pointer_ = nullptr;
     std::size_t bytes_ = 0;
     [[no_unique_address]] allocator_ alloc_;
     [[no_unique_address]] deallocator_ dealloc_;
 
   public:
-    byte_buffer_t() noexcept = default;
-    ~byte_buffer_t() noexcept {
-        if (ptr_) dealloc_(ptr_);
+    byte_buffer() noexcept = default;
+    ~byte_buffer() noexcept {
+        if (pointer_) dealloc_(pointer_);
     }
-    byte_buffer_t(byte_buffer_t const &) = delete;
-    byte_buffer_t &operator=(byte_buffer_t const &) = delete;
-    byte_buffer_t(byte_buffer_t &&other) noexcept
-        : ptr_(std::exchange(other.ptr_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
-    byte_buffer_t &operator=(byte_buffer_t &&other) noexcept {
+    byte_buffer(byte_buffer const &) = delete;
+    byte_buffer &operator=(byte_buffer const &) = delete;
+    byte_buffer(byte_buffer &&other) noexcept
+        : pointer_(std::exchange(other.pointer_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
+    byte_buffer &operator=(byte_buffer &&other) noexcept {
         if (this != &other) {
-            if (ptr_) dealloc_(ptr_);
-            ptr_ = std::exchange(other.ptr_, nullptr);
+            if (pointer_) dealloc_(pointer_);
+            pointer_ = std::exchange(other.pointer_, nullptr);
             bytes_ = std::exchange(other.bytes_, 0);
         }
         return *this;
@@ -101,71 +93,66 @@ class byte_buffer_t {
     /** Grow to at least @p bytes. No-op if already large enough. Contents may be invalidated on growth. */
     bool ensure_capacity(std::size_t bytes) noexcept {
         if (bytes <= bytes_) return true;
-        if (ptr_) dealloc_(ptr_);
+        if (pointer_) dealloc_(pointer_);
         void *raw = alloc_(bytes);
         if (!raw) {
-            ptr_ = nullptr;
+            pointer_ = nullptr;
             bytes_ = 0;
             return false;
         }
-        ptr_ = static_cast<std::byte *>(raw);
+        pointer_ = static_cast<std::byte *>(raw);
         bytes_ = bytes;
         return true;
     }
 
-    std::byte *data() noexcept { return ptr_; }
-    std::byte const *data() const noexcept { return ptr_; }
+    std::byte *data() noexcept { return pointer_; }
+    std::byte const *data() const noexcept { return pointer_; }
     std::size_t size() const noexcept { return bytes_; }
 };
 
-/** CUDA pinned-host memory allocator functor for byte_buffer_t. */
+/** CUDA pinned-host memory allocator functor for `byte_buffer`. */
 struct pinned_alloc_t {
     void *operator()(std::size_t bytes) const noexcept {
         void *raw = nullptr;
         return cudaHostAlloc(&raw, bytes, cudaHostAllocDefault) == cudaSuccess ? raw : nullptr;
     }
 };
-/** CUDA pinned-host memory deallocator functor for byte_buffer_t. */
+/** CUDA pinned-host memory deallocator functor for `byte_buffer`. */
 struct pinned_dealloc_t {
-    void operator()(void *ptr) const noexcept { cudaFreeHost(ptr); }
+    void operator()(void *pointer) const noexcept { cudaFreeHost(pointer); }
 };
 
-/** CUDA device memory allocator functor for byte_buffer_t. */
+/** CUDA device memory allocator functor for `byte_buffer`. */
 struct device_alloc_t {
     void *operator()(std::size_t bytes) const noexcept {
         void *raw = nullptr;
         return cudaMalloc(&raw, bytes) == cudaSuccess ? raw : nullptr;
     }
 };
-/** CUDA device memory deallocator functor for byte_buffer_t. */
+/** CUDA device memory deallocator functor for `byte_buffer`. */
 struct device_dealloc_t {
-    void operator()(void *ptr) const noexcept { cudaFree(ptr); }
+    void operator()(void *pointer) const noexcept { cudaFree(pointer); }
 };
 
 /** RAII wrapper for a grow-only pinned host allocation. */
-using pinned_byte_buffer_t = byte_buffer_t<pinned_alloc_t, pinned_dealloc_t>;
+using pinned_byte_buffer_t = byte_buffer<pinned_alloc_t, pinned_dealloc_t>;
 
 /** RAII wrapper for a grow-only device allocation. */
-using device_byte_buffer_t = byte_buffer_t<device_alloc_t, device_dealloc_t>;
+using device_byte_buffer_t = byte_buffer<device_alloc_t, device_dealloc_t>;
 
 /**
- *  @brief Byte-level layout of the 16 per-molecule sub-regions inside a
- *  `wave_slice_pool_t`.
+ *  @brief Byte-level layout of the 16 per-molecule sub-regions inside a `wave_slice_pool_t`.
  *
- *  Every region is `(byte_offset, element_count)` — offsets here count @b bytes, while the
- *  per-molecule offsets in `smallfield::types::etkdg_molecule_metadata_t` count @b elements;
- *  the byte size is derived
- *  from `count * sizeof(T)` at the call site. All offsets are aligned to
- *  `region_alignment` (256 bytes by default — matches the CUDA alignment
- *  convention the old `launch_gpu_pipeline` used when carving its pool).
+ *  Every region is `(byte_offset, element_count)` — offsets here count @b bytes, while the per-molecule
+ *  offsets in `smallfield::types::etkdg_molecule_metadata_t` count @b elements; the byte size is derived
+ *  from `count * sizeof(T)` at the call site. All offsets are aligned to `region_alignment_k`, 256 bytes
+ *  by default, matching the CUDA alignment convention `launch_gpu_pipeline` uses when carving its pool.
  *
  *  `bytes_uploaded` vs `bytes_total`:
- *  - Uploaded regions (offsets in `[0, bytes_uploaded)`) live in both the
- *    host buffer and the device buffer; one single `cudaMemcpyAsync` copies
- *    the uploaded prefix H→D.
- *  - Device-only regions (offsets in `[bytes_uploaded, bytes_total)`) are
- *    written by GPU kernels; the host buffer does not allocate space for
- *    them.
+ *  - Uploaded regions, at offsets in `[0, bytes_uploaded)`, live in both the host buffer and the device
+ *    buffer; one single `cudaMemcpyAsync` copies the uploaded prefix H→D.
+ *  - Device-only regions, at offsets in `[bytes_uploaded, bytes_total)`, are written by GPU kernels; the
+ *    host buffer does not allocate space for them.
  *
  *  Everything the device preprocessing kernels produce is device-only: the ETK torsions and their
  *  per-atom CSR, every MMFF term array and its CSR, the per-atom types and charges, and the
@@ -176,7 +163,7 @@ using device_byte_buffer_t = byte_buffer_t<device_alloc_t, device_dealloc_t>;
  *  those regions, and the host buffer stops at `bytes_uploaded`.
  */
 struct wave_slice_layout_t {
-    static constexpr std::size_t region_alignment = 256;
+    static constexpr std::size_t region_alignment_k = 256;
 
     std::size_t bytes_uploaded = 0;
     std::size_t bytes_total = 0;
@@ -246,13 +233,12 @@ constexpr std::size_t align_up_bytes_(std::size_t value, std::size_t alignment) 
 }
 
 /**
- *  @brief Place one region starting at @p running_offset (aligned), advance the
- *  cursor, return the aligned offset. The caller assigns this into the
- *  layout's `offset_*` field.
+ *  @brief Place one region starting at the aligned @p running_offset, advance the cursor, return the aligned
+ *  offset. The caller assigns this into the layout's `offset_*` field.
  */
 template <typename element_>
 constexpr std::size_t place_region_(std::size_t &running_offset, std::size_t count) noexcept {
-    running_offset = align_up_bytes_(running_offset, wave_slice_layout_t::region_alignment);
+    running_offset = align_up_bytes_(running_offset, wave_slice_layout_t::region_alignment_k);
     std::size_t const here = running_offset;
     running_offset += count * sizeof(element_);
     return here;
@@ -271,11 +257,6 @@ std::span<element_ const> span_at_(buffer_ const &buffer, std::size_t byte_offse
 
 /**
  *  @brief Byte-level view onto a batch pool.
- *
- *  Parameterized by a raw `std::byte *` base (pinned host memory, device
- *  memory, or any mirror) plus a layout pointer. Every sub-array is
- *  exposed as a `std::span<T>` through this view. Same class for host
- *  and device sides because the layout is identical.
  */
 struct batch_pool_view_t {
     std::byte *base = nullptr;
@@ -374,31 +355,28 @@ struct batch_pool_view_t {
 /**
  *  @brief Per-wave-slice pool: one pinned host allocation + layout.
  *
- *  `prepare_molecule_batch` fills the pool on the CPU. The launch path
- *  uses a device-side mirror (inside `launch_scratch_t`) carved by the
- *  same `wave_slice_layout_t`, and issues one `cudaMemcpyAsync` of the whole
- *  host buffer to the device mirror.
+ *  `prepare_molecule_batch` fills the pool on the CPU. The launch path uses a device-side mirror inside
+ *  `launch_scratch_t`, carved by the same `wave_slice_layout_t`, and issues one `cudaMemcpyAsync` of the
+ *  whole host buffer to the device mirror.
  */
 struct wave_slice_pool_t {
     pinned_byte_buffer_t host;
     wave_slice_layout_t layout;
     std::uint32_t num_molecules = 0;
     /** The largest atom count actually present in this slice — an observation, not the cap.
-     *  `smallfield::types::max_atoms_per_molecule_k` is the cap; conflating the two is what
-     *  sized a kernel stride from one wave and a caller's buffer from the other. */
+     *  `smallfield::types::max_atoms_per_molecule_k` is the cap; conflating the two sizes a kernel stride
+     *  from one wave and a caller's buffer from the other. */
     std::uint32_t observed_max_atoms = 0;
-    /** Slice-local indices for every molecule rejected by the
-     *  `preprocess-step`, tagged with the rejection reason. Populated by
-     *  `prepare_molecule_batch_into`; consumed by the caller to stamp
-     *  `conformer_status_t` per molecule and route rejected mols to the
-     *  `fallback-role`. Grow-only across calls. */
+    /** Slice-local indices for every molecule rejected by the `preprocess-step`, tagged with the rejection
+     *  reason. Populated by `prepare_molecule_batch_into`; consumed by the caller to stamp
+     *  `conformer_status_t` per molecule and route rejected mols to the `fallback-role`. Grow-only across
+     *  calls. */
     std::vector<rejected_mol_t> rejected_input_indices;
 
     batch_pool_view_t host_view() noexcept { return {host.data(), &layout}; }
     batch_pool_view_t host_view() const noexcept { return {const_cast<std::byte *>(host.data()), &layout}; }
 
-    // Thin forwarders so call sites can keep using `pool.foo()` as with the
-    // prior std::vector<T>-backed design. Equivalent to `host_view().foo()`.
+    // Thin forwarders so call sites can use `pool.foo()` directly. Equivalent to `host_view().foo()`.
     std::span<float> bounds_matrices() noexcept { return host_view().bounds_matrices(); }
     std::span<chiral_center_descriptor_t> chiral_centers() noexcept { return host_view().chiral_centers(); }
     std::span<etk_torsion_descriptor_t> etk_torsions() noexcept { return host_view().etk_torsions(); }

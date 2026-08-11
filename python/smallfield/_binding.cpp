@@ -1,5 +1,5 @@
 /**
- *  @file _binding.cpp
+ *  @file python/smallfield/_binding.cpp
  *  @brief pybind11 bindings exposing the SmallField C++ API as the `_smallfield` Python module.
  */
 
@@ -23,21 +23,21 @@
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(_smallfield, m) {
-    m.doc() = "SmallField Python bindings";
+PYBIND11_MODULE(_smallfield, smallfield_module) {
+    smallfield_module.doc() = "SmallField Python bindings";
 
-    m.def("supports_cuda", []() { return true; });
+    smallfield_module.def("supports_cuda", []() { return true; });
 
-    py::enum_<smallfield::api::conformer_status_t>(m, "ConformerStatus")
-        .value("success", smallfield::api::conformer_status_t::success)
-        .value("stereo_failure", smallfield::api::conformer_status_t::stereo_failure)
-        .value("mmff_unconverged", smallfield::api::conformer_status_t::mmff_unconverged)
-        .value("invalid_smiles", smallfield::api::conformer_status_t::invalid_smiles)
-        .value("too_many_atoms", smallfield::api::conformer_status_t::too_many_atoms)
-        .value("preprocess_timeout", smallfield::api::conformer_status_t::preprocess_timeout)
-        .value("unsupported_element", smallfield::api::conformer_status_t::unsupported_element);
+    py::enum_<smallfield::api::conformer_status_t>(smallfield_module, "ConformerStatus")
+        .value("SUCCESS", smallfield::api::conformer_status_t::success_k)
+        .value("STEREO_FAILURE", smallfield::api::conformer_status_t::stereo_failure_k)
+        .value("MMFF_UNCONVERGED", smallfield::api::conformer_status_t::mmff_unconverged_k)
+        .value("INVALID_SMILES", smallfield::api::conformer_status_t::invalid_smiles_k)
+        .value("TOO_MANY_ATOMS", smallfield::api::conformer_status_t::too_many_atoms_k)
+        .value("PREPROCESS_TIMEOUT", smallfield::api::conformer_status_t::preprocess_timeout_k)
+        .value("UNSUPPORTED_ELEMENT", smallfield::api::conformer_status_t::unsupported_element_k);
 
-    py::class_<smallfield::api::context_t>(m, "Context", "GPU context managing CUDA resources.")
+    py::class_<smallfield::api::context_t>(smallfield_module, "Context", "GPU context managing CUDA resources.")
         .def(py::init([](std::vector<int> device_ids) {
                  std::span<int const> device_span(device_ids.data(), device_ids.size());
                  return std::make_unique<smallfield::api::context_t>(device_span);
@@ -83,58 +83,59 @@ PYBIND11_MODULE(_smallfield, m) {
                                                 energies_span, status_span, num_atoms_span, num_heavy_atoms_span,
                                                 num_bonds_span, molecular_weight_span);
 
-                // Per-molecule sort by energy ascending. Failed conformers (status != success)
-                // sort last so that successful conformers fill the lowest indices. Tie-break on
-                // original index for stability. K is small (3 typical, 16 max) so an N²-style
-                // permutation pass is cheap; coords are temp-buffered to avoid in-place swap
-                // hazards with the SoA layout.
+                // Per-molecule sort by energy ascending. Failed conformers (status != success) sort last so
+                // that successful conformers fill the lowest indices. Tie-break on original index for
+                // stability. K is small (3 typical, 16 max) so an N²-style permutation pass is cheap; coords
+                // are temp-buffered to avoid in-place swap hazards with the SoA layout.
                 float *energies_ptr = energies_array.mutable_data();
                 if (num_conformers > 1 && num_molecules > 0) {
                     std::vector<std::uint32_t> permutation(num_conformers);
                     std::vector<__half> coord_temp(static_cast<std::size_t>(num_conformers) * coordinate_stride);
                     std::vector<float> energy_temp(num_conformers);
                     std::vector<smallfield::api::conformer_status_t> status_temp(num_conformers);
-                    constexpr float failed_sentinel = std::numeric_limits<float>::infinity();
+                    constexpr float failed_sentinel_k = std::numeric_limits<float>::infinity();
 
-                    for (std::uint32_t m = 0; m < num_molecules; ++m) {
-                        std::uint32_t const base_conf = m * num_conformers;
+                    for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
+                        std::uint32_t const base_conf = molecule_index * num_conformers;
                         std::size_t const base_coord = static_cast<std::size_t>(base_conf) * coordinate_stride;
-                        for (std::uint32_t k = 0; k < num_conformers; ++k) permutation[k] = k;
-                        std::stable_sort(permutation.begin(), permutation.end(), [&](std::uint32_t a, std::uint32_t b) {
-                            float const ea = (status_buffer[base_conf + a] ==
-                                              smallfield::api::conformer_status_t::success)
-                                                 ? energies_ptr[base_conf + a]
-                                                 : failed_sentinel;
-                            float const eb = (status_buffer[base_conf + b] ==
-                                              smallfield::api::conformer_status_t::success)
-                                                 ? energies_ptr[base_conf + b]
-                                                 : failed_sentinel;
-                            return ea < eb;
-                        });
+                        for (std::uint32_t conformer_rank = 0; conformer_rank < num_conformers; ++conformer_rank)
+                            permutation[conformer_rank] = conformer_rank;
+                        std::stable_sort(permutation.begin(), permutation.end(),
+                                         [&](std::uint32_t left, std::uint32_t right) {
+                                             float const left_energy = (status_buffer[base_conf + left] ==
+                                                                        smallfield::api::conformer_status_t::success_k)
+                                                                           ? energies_ptr[base_conf + left]
+                                                                           : failed_sentinel_k;
+                                             float const right_energy = (status_buffer[base_conf + right] ==
+                                                                         smallfield::api::conformer_status_t::success_k)
+                                                                            ? energies_ptr[base_conf + right]
+                                                                            : failed_sentinel_k;
+                                             return left_energy < right_energy;
+                                         });
 
                         bool identity = true;
-                        for (std::uint32_t k = 0; k < num_conformers; ++k) {
-                            if (permutation[k] != k) {
+                        for (std::uint32_t conformer_rank = 0; conformer_rank < num_conformers; ++conformer_rank) {
+                            if (permutation[conformer_rank] != conformer_rank) {
                                 identity = false;
                                 break;
                             }
                         }
                         if (identity) continue;
 
-                        for (std::uint32_t k = 0; k < num_conformers; ++k) {
-                            std::uint32_t const src = permutation[k];
+                        for (std::uint32_t conformer_rank = 0; conformer_rank < num_conformers; ++conformer_rank) {
+                            std::uint32_t const source = permutation[conformer_rank];
                             std::memcpy(
-                                &coord_temp[static_cast<std::size_t>(k) * coordinate_stride],
-                                &half_coordinates[base_coord + static_cast<std::size_t>(src) * coordinate_stride],
+                                &coord_temp[static_cast<std::size_t>(conformer_rank) * coordinate_stride],
+                                &half_coordinates[base_coord + static_cast<std::size_t>(source) * coordinate_stride],
                                 coordinate_stride * sizeof(__half));
-                            energy_temp[k] = energies_ptr[base_conf + src];
-                            status_temp[k] = status_buffer[base_conf + src];
+                            energy_temp[conformer_rank] = energies_ptr[base_conf + source];
+                            status_temp[conformer_rank] = status_buffer[base_conf + source];
                         }
                         std::memcpy(&half_coordinates[base_coord], coord_temp.data(),
                                     static_cast<std::size_t>(num_conformers) * coordinate_stride * sizeof(__half));
-                        for (std::uint32_t k = 0; k < num_conformers; ++k) {
-                            energies_ptr[base_conf + k] = energy_temp[k];
-                            status_buffer[base_conf + k] = status_temp[k];
+                        for (std::uint32_t conformer_rank = 0; conformer_rank < num_conformers; ++conformer_rank) {
+                            energies_ptr[base_conf + conformer_rank] = energy_temp[conformer_rank];
+                            status_buffer[base_conf + conformer_rank] = status_temp[conformer_rank];
                         }
                     }
                 }

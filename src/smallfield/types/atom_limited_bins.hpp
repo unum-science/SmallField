@@ -1,5 +1,5 @@
 /**
- *  @file atom_limited_bins.hpp
+ *  @file src/smallfield/types/atom_limited_bins.hpp
  *  @brief The atom-count ladder every size-dependent dispatch shares.
  *
  *  Molecules are sorted by atom count and grouped into bins whose members all fit under one cap.

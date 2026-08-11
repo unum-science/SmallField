@@ -204,7 +204,10 @@ check_formatter_off() {
 # count is usually known and small. Store values, or store indices into a flat arena.
 check_pointer_containers() {
     local containers
+    # Comment lines are excluded: a docstring naming RDKit's `std::vector<MMFF*>` parameter column is
+    # describing someone else's layout, not declaring ours, and the rule is about what we declare.
     containers=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*(//|\*|/\*)' |
         grep -E '(std::)?(vector|array)[[:space:]]*<[[:space:]]*(std::)?(unique_ptr|shared_ptr)|(std::)?(vector|array)[[:space:]]*<[[:space:]]*[A-Za-z_][A-Za-z_0-9:]*[[:space:]]*\*' || true)
     [ -z "$containers" ] || fail "$containers" \
         "$file holds pointers inside a container - store values, or indices into a flat arena:"
@@ -237,13 +240,140 @@ check_positional_aggregates() {
 # A `/` on either side excludes it: `/tmp/corpus.smi` and `src/smallfield/...` are filesystem
 # paths, not identifiers, and this project names both constantly. Matching them taught nothing and
 # would have pushed every path string through a bypass.
+#
+# A preceding `.` or `>` excludes it too, so a member read through a library object is never flagged.
+# `crd`, `mltb`, `pilp`, `linh`, and `sbmb` are RDKit's own MMFFProp column names, and CONTRIBUTING.md
+# requires that a name reached through a library object keep that library's spelling - so `p.sbmb` is
+# mandatory on the right of the adapter boundary while `e.single_bond_multiple_bond` is ours on the
+# left. Without this exclusion the rule forbade the only correct way to write that line. The check
+# loses nothing by it: a field we declare is caught at its declaration, which is where the name is
+# actually chosen, and flagging all 60 downstream reads only buried that one site in noise.
+#
+# A backtick on either side excludes it for the same reason: `linh` inside a comment is citing the
+# MMFFProp column by its published name, which is the informative thing to write, and the field it
+# maps onto is already spelled `linear`. Naming a foreign symbol is a citation, not a naming choice.
 check_abbreviations() {
     local abbreviations
     abbreviations=$(printf '%s\n' "$added" |
-        grep -E '(^|[^/[:alnum:]_])(idx|cfg|tbl|cnt|rng|tmp|buf|ptr|src|dst|nbr)([^/[:alnum:]_]|$)' || true)
+        grep -E '(^|[^/.>`[:alnum:]_])(idx|cfg|tbl|cnt|tmp|buf|ptr|src|dst|nbr|desc|conf|calc|crd|mltb|pilp|linh|sbmb)([^/`[:alnum:]_]|$)' || true)
     [ -z "$abbreviations" ] || fail "$abbreviations" \
         "$file uses an abbreviated identifier - spell it out (index, config, table, count," \
-        "            generator, scratch, buffer, pointer, source, destination, neighbor):"
+        "            scratch, buffer, pointer, source, destination, neighbor, descriptor, conformer," \
+        "            calculate, coordination_number, multiple_bond_designator, pi_lone_pair, linear):"
+}
+
+# A binding under four characters makes the reader reconstruct its meaning from context, and this
+# tree proved how badly that scales: before the sweep, `a` meant an atom, a neighbour slot, an apex,
+# a loop counter and an angle record in one file; `c` was both the current SMARTS character and a
+# conjunct index in one parser; `n` was a CSR cursor in one function and MMFF.V equation 18's
+# electronegativity exponent in the next. A loop counter names the axis it walks and a contraction
+# spells out.
+#
+# The allowlist holds short words that are not contractions of anything, plus the MMFF spec letters
+# that carry meaning the spelled-out form loses: MMFF94 defines a bond over atoms i-j and a torsion
+# over i-j-k-l, so `atom_i` maps onto the published equations where `first_atom` does not. Namespace
+# aliases are exempt outright - `sft`, `sfp`, `sfc` and their siblings are deliberate, and `fs` and
+# `py` are conventional. `lhs`/`rhs` name an operator's two operands, and `dx`/`dy`/`dz` are axes
+# rather than abbreviations.
+#
+# Every addition to this list needs a reason written beside it. A silently growing allowlist is how
+# a rule stops catching the thing it was written for.
+check_short_identifiers() {
+    local short
+    short=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*namespace[[:space:]]+[a-z_]+[[:space:]]*=' |
+        grep -E '^\+.*\b((std::)?[a-z_0-9:]+|auto)[[:space:]]+(const[[:space:]]+)?\*?&?[a-z][a-z0-9_]{0,2}[[:space:]]*(=|;|\)|,)' |
+        grep -vwE 'out|end|key|row|dim|hit|ok|top|sum|max|min|raw|bin|tag|on|bit|log|got|now|arg|sha|oop|arc|cis|lhs|rhs|dx|dy|dz|atom_i|atom_j|atom_k|atom_l' || true)
+    [ -z "$short" ] || fail "$short" \
+        "$file binds a name under four characters - name a loop counter for the axis it walks and" \
+        "            spell a contraction out; see CONTRIBUTING.md for the exempt words:"
+}
+
+# Everything this project declares is snake_case. A camelCase or leading-capital name is either a
+# library spelling that leaked into our own declaration, or a habit from another codebase. Library
+# names reached through an RDKit, CUDA, or Arrow object keep their spelling and are not matched
+# here, because this only inspects a declaration - a type keyword followed by the name it declares.
+#
+# A name ending in underscore-then-one-capital is an element symbol, not camelCase: this is a
+# chemistry codebase and `saw_bare_H` means hydrogen. Spelling it `saw_bare_hydrogen` would be wrong,
+# because the parser it belongs to is matching the literal character `H` in a SMARTS token.
+check_identifier_case() {
+    local cased
+    cased=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*(static |inline |constexpr |const )*(bool|char|short|int|unsigned|float|double|auto|std::[a-z_0-9]+_t|std::size_t)[[:space:]]+(const[[:space:]]+)?([a-z][a-z0-9_]*[A-Z]|[A-Z])[A-Za-z0-9_]*[[:space:]]*[=;,)]' |
+        grep -vE '_[A-Z][[:space:]]*[=;,)]' || true)
+    [ -z "$cased" ] || fail "$cased" \
+        "$file declares a camelCase or leading-capital identifier - everything we declare is" \
+        "            snake_case; only names reached through a library object keep their spelling:"
+}
+
+# Types carry _t. Without the suffix a reader cannot tell a type from a variable at the use site,
+# which is the whole point of carrying one.
+#
+# A class or struct template is exempt, because it is not a type - it is the thing that makes types.
+# The bare noun goes on the template and the _t goes on each concrete specialization, so
+# `byte_buffer` yields `pinned_byte_buffer_t` and `device_byte_buffer_t`.
+#
+# Deciding that needs the line above the declaration, and the added lines alone cannot supply it:
+# renaming `byte_buffer_t` to `byte_buffer` stages the `class` line while its `template <...>` head
+# stays unchanged context, so a scan of the diff sees a bare type and rejects the very rename this
+# rule exists to permit. Both suffix checks therefore look the declaration up in the working file.
+declared_under_template_head() { # declared_under_template_head <added-line>
+    local text=${1#+} number
+    number=$(grep -nxF -- "$text" "$file" 2>/dev/null | head -1 | cut -d: -f1)
+    [ -n "$number" ] && [ "$number" -gt 1 ] || return 1
+    sed -n "$((number - 1))p" "$file" | grep -qE '^[[:space:]]*template[[:space:]]*<'
+}
+
+check_type_suffix() {
+    local candidates line offenders=""
+    candidates=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*(struct|class|enum([[:space:]]+class)?)[[:space:]]+[a-z][a-z0-9_]*[[:space:]]*(:|\{|$)' |
+        grep -vE '_t[[:space:]]*(:|\{|$)' || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        declared_under_template_head "$line" && continue
+        offenders="${offenders}${line}"$'\n'
+    done <<<"$candidates"
+    [ -z "$offenders" ] || fail "$offenders" \
+        "$file declares a type without the _t suffix:"
+}
+
+# The other half of the same rule. A class or struct template wearing _t promises a type you can
+# declare a variable of, and delivers something you have to supply arguments to first. Name the
+# template for what it makes and let each specialization carry the suffix.
+check_template_suffix() {
+    local candidates line templates=""
+    candidates=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*(struct|class)[[:space:]]+[a-z][a-z0-9_]*_t[[:space:]]*(:|\{|$)' || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        declared_under_template_head "$line" || continue
+        templates="${templates}${line}"$'\n'
+    done <<<"$candidates"
+    [ -z "$templates" ] || fail "$templates" \
+        "$file suffixes a class template with _t - _t marks a concrete type, so name the template" \
+        "            for what it makes and put the suffix on its specializations:"
+}
+
+# Compile-time constants and enumerators carry _k. The Google kFoo prefix is a different project's
+# convention and mixing the two means neither reads as a signal.
+check_constant_suffix() {
+    local constants
+    constants=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*(inline[[:space:]]+|static[[:space:]]+)*constexpr[[:space:]]+[A-Za-z_][A-Za-z0-9_:<>, ]*[[:space:]]+k[A-Z][A-Za-z0-9_]*[[:space:]]*=' || true)
+    [ -z "$constants" ] || fail "$constants" \
+        "$file names a constant with the Google kFoo prefix - this project suffixes with _k:"
+}
+
+# Namespaces mirror the directory structure, so a `detail` namespace names nothing a reader can
+# navigate to. An internal helper lives in the file's own namespace with a trailing underscore.
+check_detail_namespace() {
+    local namespaces
+    namespaces=$(printf '%s\n' "$added" | grep -E '^\+[[:space:]]*namespace[[:space:]]+detail' || true)
+    [ -z "$namespaces" ] || fail "$namespaces" \
+        "$file opens a detail namespace - they are banned; give the helper a trailing underscore" \
+        "            in the file's own namespace:"
 }
 
 #pragma endregion C, C++, and CUDA
@@ -345,6 +475,12 @@ while IFS= read -r -d '' file; do
         check_thread_local
         check_positional_aggregates
         check_abbreviations
+        check_identifier_case
+        check_short_identifiers
+        check_type_suffix
+        check_template_suffix
+        check_constant_suffix
+        check_detail_namespace
         check_split_literals
         ;;&
     *.cu | *.cuh)

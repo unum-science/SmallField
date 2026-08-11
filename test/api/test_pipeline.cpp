@@ -1,6 +1,6 @@
 /**
- *  @file test_pipeline.cpp
- *  @brief End-to-end ETKDG pipeline test using the SmallField library API.
+ *  @file test/api/test_pipeline.cpp
+ *  @brief Test the end-to-end ETKDG pipeline using the SmallField library API.
  *
  *  Tests: SMILES → context_t::generate_conformers → RDKit cross-validation.
  */
@@ -41,14 +41,14 @@ int main() {
 
     std::vector<__half> coordinates(total_coords);
     std::vector<float> energies(total_conformers);
-    std::vector<sfapi::conformer_status_t> status(total_conformers, sfapi::conformer_status_t::invalid_smiles);
+    std::vector<sfapi::conformer_status_t> status(total_conformers, sfapi::conformer_status_t::invalid_smiles_k);
 
     // use a single GPU for the test
     int const device_id = 0;
-    sfapi::context_t ctx(std::span<int const>(&device_id, 1));
+    sfapi::context_t context(std::span<int const>(&device_id, 1));
 
-    sfapi::conformer_status_t const batch_status = ctx.generate_conformers(test_smiles, config, max_atoms, coordinates,
-                                                                           energies, status);
+    sfapi::conformer_status_t const batch_status = context.generate_conformers(test_smiles, config, max_atoms,
+                                                                               coordinates, energies, status);
 
     std::printf("  batch status: %u\n", static_cast<unsigned>(batch_status));
 
@@ -79,7 +79,7 @@ int main() {
             total_attempted++;
             std::uint32_t const slot = molecule_index * num_conformers + conformer;
 
-            if (status[slot] != sfapi::conformer_status_t::success) {
+            if (status[slot] != sfapi::conformer_status_t::success_k) {
                 std::printf("    conformer %u: status=%u\n", conformer, static_cast<unsigned>(status[slot]));
                 continue;
             }

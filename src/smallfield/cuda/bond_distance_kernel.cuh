@@ -1,5 +1,5 @@
 /**
- *  @file bond_distance_kernel.cuh
+ *  @file src/smallfield/cuda/bond_distance_kernel.cuh
  *  @brief Warp-parallel all-pairs bond-hop matrix over the batch pool's bond list.
  *
  *  The MMFF nonbonded sweep enumerates pairs on the fly and needs the hop count between
@@ -120,9 +120,9 @@ static __global__ void bond_distance_bfs_kernel(molecule_descriptor_t const *__r
                 for (std::uint32_t word = 0; word < words; ++word) {
                     std::uint32_t bits = next[word];
                     while (bits != 0) {
-                        std::uint32_t const bit = __ffs(static_cast<int>(bits)) - 1;
+                        std::uint32_t const bit_index = __ffs(static_cast<int>(bits)) - 1;
                         bits &= bits - 1u;
-                        row[word * 32u + bit] = value;
+                        row[word * 32u + bit_index] = value;
                     }
                 }
             }

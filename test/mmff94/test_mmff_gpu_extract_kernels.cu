@@ -1,5 +1,5 @@
 /**
- *  @file test_mmff_gpu_extract_kernels.cu
+ *  @file test/mmff94/test_mmff_gpu_extract_kernels.cu
  *  @brief Validate the GPU MMFF term-extractor kernel.
  *
  *  Runs it and hands results back to the host for byte-level diff vs the CPU native extractor.
@@ -20,6 +20,8 @@
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sft = smallfield::types;
+
+namespace smallfield::tests {
 
 void launch_mmff94_gpu_extract_pipeline(
     sfparam::mmff94_tables_host_t const &tables_host, sft::molecule_descriptor_t const *descriptors,
@@ -211,3 +213,5 @@ void launch_mmff94_gpu_extract_pipeline(
     cudaFree(stretch_bend_device);
     cudaFree(per_molecule_counts_device);
 }
+
+} // namespace smallfield::tests

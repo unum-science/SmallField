@@ -1,5 +1,5 @@
 /**
- *  @file test_bond_distance_kernels.cu
+ *  @file test/kernels/test_bond_distance_kernels.cu
  *  @brief Device-side driver for the hop-count BFS parity test.
  */
 
@@ -13,6 +13,8 @@
 
 namespace sfa = smallfield::api;
 namespace sfc = smallfield::cuda;
+
+namespace smallfield::tests {
 
 void run_bond_distance_bfs_on_gpu(std::byte const *host_pool, sfa::wave_slice_layout_t const &layout,
                                   std::uint32_t molecule_count, std::uint8_t *bond_distance_out) {
@@ -36,3 +38,5 @@ void run_bond_distance_bfs_on_gpu(std::byte const *host_pool, sfa::wave_slice_la
                cudaMemcpyDeviceToHost);
     cudaFree(device_pool);
 }
+
+} // namespace smallfield::tests

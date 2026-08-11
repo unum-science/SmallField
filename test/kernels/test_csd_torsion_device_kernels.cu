@@ -1,5 +1,5 @@
 /**
- *  @file test_csd_torsion_device_kernels.cu
+ *  @file test/kernels/test_csd_torsion_device_kernels.cu
  *  @brief Device-side half of the CSD torsion parity test.
  *
  *  Uploads the pattern table, runs the warp-per-molecule matcher over a batch of descriptors, and hands the
@@ -15,23 +15,25 @@
 
 #include "test_csd_torsion_device_kernels.hpp"
 
-namespace sfcuda = smallfield::cuda;
+namespace sfc = smallfield::cuda;
 namespace sft = smallfield::types;
+
+namespace smallfield::tests {
 
 namespace {
 
 /** Owns the staged and uploaded copies of the table for the lifetime of the test. */
 struct csd_torsion_test_table_t {
-    sfcuda::csd_torsion_table_host_t host;
-    sfcuda::csd_torsion_table_device_t device;
+    sfc::csd_torsion_table_host_t host;
+    sfc::csd_torsion_table_device_t device;
 };
 
 } // namespace
 
 void *create_csd_torsion_device_table(std::size_t &table_bytes) {
     auto *table = new csd_torsion_test_table_t;
-    sfcuda::build_csd_torsion_table(table->host);
-    sfcuda::upload_csd_torsion_table_to_device(table->host, table->device);
+    sfc::build_csd_torsion_table(table->host);
+    sfc::upload_csd_torsion_table_to_device(table->host, table->device);
     if (table->device.view.patterns == nullptr) {
         delete table;
         return nullptr;
@@ -61,8 +63,8 @@ bool run_csd_torsion_device_batch(void *handle, sft::molecule_descriptor_t const
                cudaMemcpyHostToDevice);
     cudaMemset(counts_device, 0, num_molecules * sizeof(std::uint32_t));
 
-    sfcuda::launch_csd_torsion_match(descriptors_device, num_molecules, table->device.view, torsions_device,
-                                     torsion_stride, counts_device);
+    sfc::launch_csd_torsion_match(descriptors_device, num_molecules, table->device.view, torsions_device,
+                                  torsion_stride, counts_device);
     cudaDeviceSynchronize();
     cudaError_t const error = cudaGetLastError();
     if (error != cudaSuccess) std::fprintf(stderr, "CSD torsion kernel error: %s\n", cudaGetErrorString(error));
@@ -76,3 +78,5 @@ bool run_csd_torsion_device_batch(void *handle, sft::molecule_descriptor_t const
     cudaFree(counts_device);
     return error == cudaSuccess;
 }
+
+} // namespace smallfield::tests

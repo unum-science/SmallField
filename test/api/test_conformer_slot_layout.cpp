@@ -1,12 +1,11 @@
 /**
- *  @file test_conformer_slot_layout.cpp
- *  @brief Guards the structure-of-arrays conformer slot contract.
+ *  @file test/api/test_conformer_slot_layout.cpp
+ *  @brief Guard the structure-of-arrays conformer slot contract.
  *
- *  A shipped writer once copied `3 * num_atoms` contiguous halves from a slot base,
- *  which reads x for the real atoms and then inter-component padding -- so y and z
- *  were dropped for every molecule with `3 * num_atoms <= max_atoms`, and the stored
- *  geometry collapsed onto the x axis. Bond lengths and energies both still looked
- *  plausible; only a degeneracy check exposes it, so that is what this test asserts.
+ *  A shipped writer once copied `3 * num_atoms` contiguous halves from a slot base, which reads x for the real
+ *  atoms and then inter-component padding -- so y and z were dropped for every molecule with
+ *  `3 * num_atoms <= max_atoms`, and the stored geometry collapsed onto the x axis. Bond lengths and energies both
+ *  still looked plausible; only a degeneracy check exposes it, so that is what this test asserts.
  */
 
 #include <cassert> // `assert`
@@ -21,11 +20,11 @@
 
 using smallfield::api::conformer_slot_layout_t;
 
-namespace {
+namespace smallfield::tests {
 
 /** Emulates the writer's slot-to-row transpose without the Arrow machinery. */
-std::vector<float> pack_row(std::vector<float> const &slot, conformer_slot_layout_t const &layout,
-                            std::uint32_t atom_count) {
+static std::vector<float> pack_row_(std::vector<float> const &slot, conformer_slot_layout_t const &layout,
+                                    std::uint32_t atom_count) {
     std::vector<float> row(static_cast<std::size_t>(atom_count) * 3u);
     for (std::uint32_t atom = 0; atom < atom_count; ++atom)
         for (std::uint32_t axis = 0; axis < 3u; ++axis)
@@ -34,7 +33,7 @@ std::vector<float> pack_row(std::vector<float> const &slot, conformer_slot_layou
 }
 
 /** Rank of the centered coordinate cloud; a real conformer spans 3 dimensions. */
-std::uint32_t coordinate_rank(std::vector<float> const &row, std::uint32_t atom_count) {
+static std::uint32_t coordinate_rank_(std::vector<float> const &row, std::uint32_t atom_count) {
     float center[3] = {0.0f, 0.0f, 0.0f};
     for (std::uint32_t atom = 0; atom < atom_count; ++atom)
         for (std::uint32_t axis = 0; axis < 3u; ++axis) center[axis] += row[atom * 3u + axis];
@@ -61,7 +60,10 @@ std::uint32_t coordinate_rank(std::vector<float> const &row, std::uint32_t atom_
     return rank;
 }
 
-} // namespace
+} // namespace smallfield::tests
+
+using smallfield::tests::coordinate_rank_;
+using smallfield::tests::pack_row_;
 
 int main() {
     // A tetrahedron: genuinely three-dimensional, so any layout error collapses its rank.
@@ -79,7 +81,7 @@ int main() {
         for (std::uint32_t axis = 0; axis < 3u; ++axis)
             buffer[layout.component_offset(axis, atom)] = reference[atom][axis];
 
-    std::vector<float> const row = pack_row(buffer, layout, atom_count);
+    std::vector<float> const row = pack_row_(buffer, layout, atom_count);
 
     // Round-trip fidelity.
     for (std::uint32_t atom = 0; atom < atom_count; ++atom)
@@ -88,7 +90,7 @@ int main() {
 
     // A contiguous read collapses every point onto the x axis and so yields rank 1, while a correct
     // transpose yields rank 3. This is the assertion that separates the two.
-    std::uint32_t const rank = coordinate_rank(row, atom_count);
+    std::uint32_t const rank = coordinate_rank_(row, atom_count);
     if (rank != 3u) {
         std::fprintf(stderr, "FAIL: coordinate rank %u, expected 3 (geometry is degenerate)\n", rank);
         return 1;

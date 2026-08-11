@@ -1,14 +1,15 @@
 /**
- *  @file fire_warp.cuh
- *  @brief FIRE (Fast Inertial Relaxation Engine) warp-level optimizer.
+ *  @file src/smallfield/cuda/fire_warp.cuh
+ *  @brief FIRE, Fast Inertial Relaxation Engine, warp-level optimizer.
  *
- *  Bitzek et al., PRL 97, 170201 (2006).
- *  Gradient descent with adaptive momentum. Much lighter than L-BFGS:
- *  needs only positions + velocities + gradient (3 arrays, no history).
+ *  Bitzek et al., PRL 97, 170201 (2006). Gradient descent with adaptive momentum. Much lighter than
+ *  L-BFGS: needs only positions, velocities and gradient, three arrays, no history.
  *
  *  Functor interface:
- *   float functor(positions, gradient, num_elements, lane)
- *   float functor.energy_only(positions, num_elements, lane)
+ *  @code
+ *    float functor(positions, gradient, num_elements, lane)
+ *    float functor.energy_only(positions, num_elements, lane)
+ *  @endcode
  */
 
 #pragma once
@@ -72,7 +73,7 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
     float last_rms_gradient = 0.0f;
 
     // zero velocities
-    for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) velocities[i] = 0.0f;
+    for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) velocities[element] = 0.0f;
     __syncwarp(full_mask_k);
 
     for (std::int32_t iteration = 0; iteration < max_iterations; ++iteration) {
@@ -84,9 +85,9 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
         float gradient_dot_gradient = 0.0f;
         float gradient_dot_velocity = 0.0f;
         float velocity_dot_velocity = 0.0f;
-        for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) {
-            float const gradient_value = gradient[i];
-            float const velocity_value = velocities[i];
+        for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
+            float const gradient_value = gradient[element];
+            float const velocity_value = velocities[element];
             gradient_dot_gradient = fmaf(gradient_value, gradient_value, gradient_dot_gradient);
             gradient_dot_velocity = fmaf(gradient_value, velocity_value, gradient_dot_velocity);
             velocity_dot_velocity = fmaf(velocity_value, velocity_value, velocity_dot_velocity);
@@ -111,8 +112,9 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
             float const velocity_over_force_ratio = velocity_norm * inverse_force_norm;
 
             // v = (1-α)·v + α·|v|·(F / |F|)  where F = -gradient
-            for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) {
-                velocities[i] = (1.0f - alpha) * velocities[i] - alpha * velocity_over_force_ratio * gradient[i];
+            for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
+                velocities[element] = (1.0f - alpha) * velocities[element] -
+                                      alpha * velocity_over_force_ratio * gradient[element];
             }
 
             if (steps_since_reset > min_steps_before_acceleration_k) {
@@ -123,7 +125,8 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
         }
         else {
             // decelerating: reset velocity, shrink step
-            for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) velocities[i] = 0.0f;
+            for (std::uint32_t element = lane; element < num_elements; element += warp_size_k)
+                velocities[element] = 0.0f;
             timestep *= timestep_decrease_factor_k;
             alpha = initial_alpha_k;
             steps_since_reset = 0;
@@ -132,11 +135,11 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
 
         // velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt
         float const half_timestep_squared = 0.5f * timestep * timestep;
-        for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) {
-            float displacement = fmaf(velocities[i], timestep, -gradient[i] * half_timestep_squared);
+        for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
+            float displacement = fmaf(velocities[element], timestep, -gradient[element] * half_timestep_squared);
             displacement = fmaxf(-0.5f, fminf(0.5f, displacement));
-            positions[i] += displacement;
-            velocities[i] = fmaf(gradient[i], -timestep, velocities[i]);
+            positions[element] += displacement;
+            velocities[element] = fmaf(gradient[element], -timestep, velocities[element]);
         }
         __syncwarp(full_mask_k);
     }

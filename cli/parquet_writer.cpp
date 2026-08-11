@@ -1,6 +1,7 @@
 /**
- *  @file parquet_writer.cpp
- *  @brief Write a single per-conformer-row 3D Parquet shard ("*.3D.parquet").
+ *  @file cli/parquet_writer.cpp
+ *  @brief Packs per-molecule and per-conformer output arrays into Arrow builders and writes them
+ *  as a single ZSTD-compressed Parquet shard matching the schema declared in `parquet_writer.hpp`.
  */
 
 #include <cstdio>  // `fprintf`, `stderr`
@@ -30,31 +31,30 @@
 
 #include "parquet_writer.hpp"
 
-namespace smallfield::cli {
-
 namespace fs = std::filesystem;
 
+namespace smallfield::cli {
+
 /**
- *  @brief Pack fp16 coordinates from a strided GPU output buffer into a tight
- *  Arrow `List<float16>` array, one element per OUTPUT row.
+ *  @brief Pack fp16 coordinates from a strided GPU output buffer into a tight Arrow `List<float16>` array,
+ *  one element per output row.
  *
- *  Input layout: `coordinates` is a strided fp16 buffer of
- *  `num_molecules * max_conformers * stride_halves` halves, where `stride_halves = max_atoms * 3`.
- *  For molecule `m`, slot `c`, the coordinate block starts at offset
- *  `(m * max_conformers + c) * stride_halves`.
+ *  Input layout: `coordinates` is a strided fp16 buffer of `num_molecules * max_conformers * stride_halves`
+ *  halves, where `stride_halves = max_atoms * 3`. For a `molecule_index` and a `conformer_slot`, the coordinate
+ *  block starts at offset `(molecule_index * max_conformers + conformer_slot) * stride_halves`.
  *
- *  Output layout: one row per surviving conformer, walked in molecule-major then
- *  conformer-index order, copying only the first `num_atoms_per_molecule[m] * 3`
- *  halves per row. `n_conformers_per_molecule[m]` (post-Kabsch) tells us how
- *  many slots [0..M) to emit for molecule m. Failed molecules (M = 0) emit one
- *  null row; conformers whose status is non-success emit null lists.
+ *  Output layout: one row per surviving conformer, walked in molecule-major then conformer-index order,
+ *  copying only the first `num_atoms_per_molecule[molecule_index] * 3` halves per row. Post-Kabsch,
+ *  `n_conformers_per_molecule[molecule_index]` gives the number of slots [0..surviving_conformers) to emit
+ *  for that molecule. Failed molecules (surviving_conformers = 0) emit one null row; conformers whose
+ *  status is non-success emit null lists.
  *
  *  @param[in] row_outcomes Per-output-row indicator: 0 = null row (no coords), 1 = success row
  *      (copy num_atoms × 3 halves), -1 = full-mol-failure null row (also empty list, but
  *      the column is null rather than empty). Length = num_output_rows.
  *  @param[in] molecule_index_per_row Maps output row index back to its source molecule.
  *  @param[in] conformer_slot_per_row Maps output row index to which K-slot it came from.
- *  @return A nullable List<float16> array with one element per output row.
+ *  @return A nullable `List<float16>` array with one element per output row.
  */
 static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
     std::span<__half const> coordinates, std::span<std::uint8_t const> num_atoms_per_molecule,
@@ -64,7 +64,6 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
     std::int64_t const num_rows = static_cast<std::int64_t>(row_outcomes.size());
     smallfield::api::conformer_slot_layout_t const slot_layout {stride_halves / 3u, max_conformers};
 
-    // Prefix-scan total halves needed (only success rows contribute > 0).
     // Caller (write_shard) is responsible for the size invariants on
     // num_atoms_per_molecule and coordinates; the parallel index sidecars
     // (mol_per_row, slot_per_row) are populated locally so their lengths
@@ -75,13 +74,13 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
         conformer_slot_per_row.size() < static_cast<std::size_t>(num_rows))
         return nullptr;
     std::int64_t total_halves = 0;
-    for (std::int64_t r = 0; r < num_rows; ++r) {
-        if (row_outcomes[r] != 1) continue;
-        std::uint64_t const m = molecule_index_per_row[r];
-        if (m >= num_atoms_per_molecule.size()) return nullptr; // caller-contract violation
+    for (std::int64_t row = 0; row < num_rows; ++row) {
+        if (row_outcomes[row] != 1) continue;
+        std::uint64_t const molecule_index = molecule_index_per_row[row];
+        if (molecule_index >= num_atoms_per_molecule.size()) return nullptr; // caller-contract violation
         // Clamp exactly as the emit loop below does, so the allocation and the
         // offsets stay in agreement when a caller reports more atoms than fit.
-        std::uint32_t atom_count = static_cast<std::uint32_t>(num_atoms_per_molecule[m]);
+        std::uint32_t atom_count = static_cast<std::uint32_t>(num_atoms_per_molecule[molecule_index]);
         if (atom_count > slot_layout.max_atoms) atom_count = slot_layout.max_atoms;
         total_halves += static_cast<std::int64_t>(atom_count) * 3;
     }
@@ -96,7 +95,7 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
     auto values_buffer = std::move(values_buffer_result).ValueOrDie();
     std::uint16_t *values = reinterpret_cast<std::uint16_t *>(values_buffer->mutable_data());
 
-    // Validity bitmap: bit r = 1 if row has data, 0 if null.
+    // Validity bitmap: bit `row` = 1 if the row has data, 0 if null.
     std::int64_t const bitmap_bytes = (num_rows + 7) / 8;
     auto validity_buffer_result = arrow::AllocateBuffer(bitmap_bytes);
     if (!validity_buffer_result.ok()) return nullptr;
@@ -106,21 +105,22 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
 
     std::int32_t running = 0;
     std::int64_t null_count = 0;
-    for (std::int64_t r = 0; r < num_rows; ++r) {
-        offsets[r] = running;
-        if (row_outcomes[r] == 1) {
-            std::uint64_t const m = molecule_index_per_row[r];
-            std::uint32_t const c = conformer_slot_per_row[r];
+    for (std::int64_t row = 0; row < num_rows; ++row) {
+        offsets[row] = running;
+        if (row_outcomes[row] == 1) {
+            std::uint64_t const molecule_index = molecule_index_per_row[row];
+            std::uint32_t const conformer_slot = conformer_slot_per_row[row];
             std::uint32_t const max_atoms = slot_layout.max_atoms;
             // Defence against a contract-violating caller: per-mol num_atoms must
             // fit in the stride. Clamp rather than OOB; the slot's coords beyond
             // stride_halves don't exist in `coordinates` regardless.
-            std::uint32_t atom_count = static_cast<std::uint32_t>(num_atoms_per_molecule[m]);
+            std::uint32_t atom_count = static_cast<std::uint32_t>(num_atoms_per_molecule[molecule_index]);
             if (atom_count > max_atoms) atom_count = max_atoms;
             if (atom_count > 0) {
-                std::size_t const src_offset = slot_layout.slot_offset(m, c);
-                if (src_offset + stride_halves > coordinates.size()) return nullptr;
-                std::uint16_t const *source = reinterpret_cast<std::uint16_t const *>(coordinates.data()) + src_offset;
+                std::size_t const source_offset = slot_layout.slot_offset(molecule_index, conformer_slot);
+                if (source_offset + stride_halves > coordinates.size()) return nullptr;
+                std::uint16_t const *source = reinterpret_cast<std::uint16_t const *>(coordinates.data()) +
+                                              source_offset;
                 // Transpose the structure-of-arrays slot into the tight interleaved
                 // `(atom_count, 3)` block a Parquet row exposes. See
                 // `conformer_slot_layout_t` for why a contiguous copy is not valid here.
@@ -129,7 +129,7 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
                         values[running + atom * 3u + axis] = source[slot_layout.component_offset(axis, atom)];
                 running += static_cast<std::int32_t>(atom_count * 3u);
             }
-            validity[r >> 3] |= static_cast<std::uint8_t>(1u << (r & 7));
+            validity[row >> 3] |= static_cast<std::uint8_t>(1u << (row & 7));
         }
         else { ++null_count; }
     }
@@ -146,12 +146,12 @@ static std::shared_ptr<arrow::Array> pack_coordinates_as_list(
 }
 
 /**
- *  @brief Pack a per-slot USRCAT descriptor (60 doubles per slot) into a nullable `List<float16>`,
- *  one element per output row, downcasting each value to half precision on write. A row emits its
- *  `stride` values only when it is a success row and `values` is non-empty; otherwise it is null.
- *  Slot addressing matches the coord packer: `flat = mol * max_conformers + slot`, values live at
- *  `[flat*stride, flat*stride+stride)`. fp16 is honest precision here: USRCAT's value range is small
- *  and it is derived from fp16 coordinates, so storing float64 would be illusory precision.
+ *  @brief Pack a per-slot USRCAT descriptor (60 doubles per slot) into a nullable `List<float16>`, one
+ *  element per output row, downcasting each value to half precision on write. A row emits its `stride`
+ *  values only when it is a success row and `values` is non-empty; otherwise it is null. Slot addressing
+ *  matches the coord packer: `flat = molecule_index * max_conformers + conformer_slot`, values live at
+ *  `[flat*stride, flat*stride+stride)`. fp16 is honest precision here: USRCAT's value range is small and
+ *  it is derived from fp16 coordinates, so storing float64 would be illusory precision.
  */
 static std::shared_ptr<arrow::Array> pack_usrcat_as_fp16_list(std::span<double const> values, std::uint32_t stride,
                                                               std::span<std::int8_t const> row_outcomes,
@@ -164,18 +164,19 @@ static std::shared_ptr<arrow::Array> pack_usrcat_as_fp16_list(std::span<double c
     std::int64_t const num_rows = static_cast<std::int64_t>(row_outcomes.size());
     bool const have_values = !values.empty();
 
-    for (std::int64_t r = 0; r < num_rows; ++r) {
-        if (have_values && row_outcomes[r] == 1) {
-            std::uint64_t const m = molecule_index_per_row[r];
-            std::uint32_t const c = conformer_slot_per_row[r];
-            std::size_t const base = (static_cast<std::size_t>(m) * max_conformers + c) * stride;
+    for (std::int64_t row = 0; row < num_rows; ++row) {
+        if (have_values && row_outcomes[row] == 1) {
+            std::uint64_t const molecule_index = molecule_index_per_row[row];
+            std::uint32_t const conformer_slot = conformer_slot_per_row[row];
+            std::size_t const base = (static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot) *
+                                     stride;
             if (base + stride > values.size()) {
                 if (!list_builder.AppendNull().ok()) return nullptr;
                 continue;
             }
             if (!list_builder.Append().ok()) return nullptr;
-            for (std::uint32_t k = 0; k < stride; ++k) {
-                __half const half_value = __float2half(static_cast<float>(values[base + k]));
+            for (std::uint32_t component = 0; component < stride; ++component) {
+                __half const half_value = __float2half(static_cast<float>(values[base + component]));
                 std::uint16_t bits;
                 std::memcpy(&bits, &half_value, sizeof(bits));
                 if (!value_builder->Append(bits).ok()) return nullptr;
@@ -201,8 +202,7 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
         return false;
     }
 
-    // Document the size invariants enforced by callers (see writer_inputs_t in
-    // parquet_writer.hpp). Every code path below indexes these spans
+    // Every code path below indexes these spans
     // unguarded; if a caller violates the contract, a single early failure
     // here is preferable to OOB memory reads inside Arrow builders or the
     // coordinate packer.
@@ -232,18 +232,19 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     if (!inputs.molecular_weight_per_molecule.empty() && inputs.molecular_weight_per_molecule.size() < num_molecules)
         return fail_size_("molecular_weight_per_molecule", inputs.molecular_weight_per_molecule.size(), num_molecules);
 
-    // Determine total output rows. For each molecule, M = n_conformers_per_molecule[m] surviving
-    // conformers (post-Kabsch). M = 0 indicates the molecule failed preprocess entirely; we still
-    // emit one row with all-null per-mol fields so every input row has at least one output row.
+    // Determine total output rows. For each molecule, surviving_conformers =
+    // n_conformers_per_molecule[molecule_index] surviving conformers (post-Kabsch). surviving_conformers = 0
+    // indicates the molecule failed preprocess entirely; the writer still emits one row with all-null per-mol
+    // fields so every input row has at least one output row.
     std::uint64_t total_rows = 0;
-    for (std::uint64_t m = 0; m < num_molecules; ++m) {
-        std::uint8_t const M = inputs.n_conformers_per_molecule[m];
-        total_rows += (M == 0) ? 1u : static_cast<std::uint64_t>(M);
+    for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
+        std::uint8_t const surviving_conformers = inputs.n_conformers_per_molecule[molecule_index];
+        total_rows += (surviving_conformers == 0) ? 1u : static_cast<std::uint64_t>(surviving_conformers);
     }
 
     // Build per-output-row index sidecars used by the coord packer + the row-loop.
-    // row_outcomes[r] ∈ {1: success row, 0: per-conformer failure (status != success), -1: full
-    // molecule failure (M == 0)}.
+    // row_outcomes[row] ∈ {1: success row, 0: per-conformer failure (status != success), -1: full
+    // molecule failure (surviving_conformers == 0)}.
     std::vector<std::int8_t> row_outcomes;
     row_outcomes.reserve(total_rows);
     std::vector<std::uint64_t> mol_per_row;
@@ -259,11 +260,11 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     // the hot path. Molecules with more slots than this fall back to unsorted emission.
     constexpr std::uint32_t max_sortable_conformers_k = 64;
 
-    for (std::uint64_t m = 0; m < num_molecules; ++m) {
-        std::uint8_t const M = inputs.n_conformers_per_molecule[m];
-        if (M == 0) {
+    for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
+        std::uint8_t const surviving_conformers = inputs.n_conformers_per_molecule[molecule_index];
+        if (surviving_conformers == 0) {
             row_outcomes.push_back(-1);
-            mol_per_row.push_back(m);
+            mol_per_row.push_back(molecule_index);
             slot_per_row.push_back(0);
             conf_index_per_row.push_back(0);
             continue;
@@ -271,25 +272,26 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
 
         // Energy-sort this molecule's slots: successful conformers first (ascending energy), failed
         // slots (null energy) trail in slot order. conformer_index then reads as an energy rank.
-        auto slot_key = [&](std::uint32_t c) -> std::pair<int, float> {
-            std::size_t const flat = static_cast<std::size_t>(m) * max_conformers + c;
+        auto slot_key = [&](std::uint32_t conformer_slot) -> std::pair<int, float> {
+            std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
             std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 1;
             float const energy = (flat < inputs.energies.size()) ? inputs.energies[flat] : 0.0f;
             return {status_code == 0 ? 0 : 1, energy};
         };
         std::array<std::uint32_t, max_sortable_conformers_k> order {};
-        std::uint32_t const sortable = std::min<std::uint32_t>(M, max_sortable_conformers_k);
-        for (std::uint32_t c = 0; c < sortable; ++c) order[c] = c;
+        std::uint32_t const sortable = std::min<std::uint32_t>(surviving_conformers, max_sortable_conformers_k);
+        for (std::uint32_t conformer_slot = 0; conformer_slot < sortable; ++conformer_slot)
+            order[conformer_slot] = conformer_slot;
         std::stable_sort(order.begin(), order.begin() + sortable,
-                         [&](std::uint32_t a, std::uint32_t b) { return slot_key(a) < slot_key(b); });
+                         [&](std::uint32_t left, std::uint32_t right) { return slot_key(left) < slot_key(right); });
 
-        for (std::uint32_t rank = 0; rank < M; ++rank) {
-            std::uint32_t const c = rank < sortable ? order[rank] : rank; // overflow: unsorted tail
-            std::size_t const flat = static_cast<std::size_t>(m) * max_conformers + c;
+        for (std::uint32_t rank = 0; rank < surviving_conformers; ++rank) {
+            std::uint32_t const conformer_slot = rank < sortable ? order[rank] : rank; // overflow: unsorted tail
+            std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
             std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 0;
             row_outcomes.push_back(status_code == 0 ? 1 : 0);
-            mol_per_row.push_back(m);
-            slot_per_row.push_back(c);
+            mol_per_row.push_back(molecule_index);
+            slot_per_row.push_back(conformer_slot);
             conf_index_per_row.push_back(static_cast<std::uint8_t>(rank));
         }
     }
@@ -320,8 +322,10 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     if (!reserve_or_fail(n_conformers_builder)) return false;
     if (!reserve_or_fail(conformer_energy_builder)) return false;
 
-    // Helper: bool indicating whether mol m's preprocess succeeded (n_atoms > 0).
-    auto mol_ok = [&](std::uint64_t m) -> bool { return inputs.num_atoms_per_molecule[m] != 0; };
+    // Helper: bool indicating whether a molecule's preprocess succeeded (n_atoms > 0).
+    auto molecule_ok = [&](std::uint64_t molecule_index) -> bool {
+        return inputs.num_atoms_per_molecule[molecule_index] != 0;
+    };
 
     // Every builder above is reserved for `total_rows`, so the fixed-width appends below cannot
     // fail on capacity. `smiles_builder` is the exception: `Reserve` sizes the offset array, not
@@ -332,31 +336,34 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
         if (append_status.ok() && !status.ok()) append_status = std::move(status);
     };
 
-    for (std::uint64_t r = 0; r < total_rows; ++r) {
-        std::uint64_t const m = mol_per_row[r];
-        std::uint32_t const c = slot_per_row[r];
-        std::int8_t const outcome = row_outcomes[r];
+    for (std::uint64_t row = 0; row < total_rows; ++row) {
+        std::uint64_t const molecule_index = mol_per_row[row];
+        std::uint32_t const conformer_slot = slot_per_row[row];
+        std::int8_t const outcome = row_outcomes[row];
 
-        std::uint64_t const input_row = inputs.base_row_index + m;
-        std::string_view const smi = m < inputs.smiles.size() ? inputs.smiles[m] : "";
-        std::size_t const flat = static_cast<std::size_t>(m) * max_conformers + c;
+        std::uint64_t const input_row = inputs.base_row_index + molecule_index;
+        std::string_view const smiles = molecule_index < inputs.smiles.size() ? inputs.smiles[molecule_index] : "";
+        std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
         std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 0;
 
         record_append(input_shard_builder.Append(inputs.input_shard_stem));
         record_append(input_row_builder.Append(input_row));
-        record_append(smiles_builder.Append(smi.data(), static_cast<std::int32_t>(smi.size())));
-        record_append(conformer_index_builder.Append(conf_index_per_row[r]));
+        record_append(smiles_builder.Append(smiles.data(), static_cast<std::int32_t>(smiles.size())));
+        record_append(conformer_index_builder.Append(conf_index_per_row[row]));
         record_append(status_builder.Append(status_code));
 
-        if (mol_ok(m)) {
-            record_append(n_heavy_atoms_builder.Append(
-                inputs.num_heavy_atoms_per_molecule.empty() ? 0u : inputs.num_heavy_atoms_per_molecule[m]));
-            record_append(n_atoms_builder.Append(static_cast<std::uint16_t>(inputs.num_atoms_per_molecule[m])));
+        if (molecule_ok(molecule_index)) {
+            record_append(n_heavy_atoms_builder.Append(inputs.num_heavy_atoms_per_molecule.empty()
+                                                           ? 0u
+                                                           : inputs.num_heavy_atoms_per_molecule[molecule_index]));
             record_append(
-                n_bonds_builder.Append(inputs.num_bonds_per_molecule.empty() ? 0u : inputs.num_bonds_per_molecule[m]));
-            record_append(molecular_weight_builder.Append(
-                inputs.molecular_weight_per_molecule.empty() ? 0.0f : inputs.molecular_weight_per_molecule[m]));
-            record_append(n_conformers_builder.Append(inputs.n_conformers_per_molecule[m]));
+                n_atoms_builder.Append(static_cast<std::uint16_t>(inputs.num_atoms_per_molecule[molecule_index])));
+            record_append(n_bonds_builder.Append(
+                inputs.num_bonds_per_molecule.empty() ? 0u : inputs.num_bonds_per_molecule[molecule_index]));
+            record_append(molecular_weight_builder.Append(inputs.molecular_weight_per_molecule.empty()
+                                                              ? 0.0f
+                                                              : inputs.molecular_weight_per_molecule[molecule_index]));
+            record_append(n_conformers_builder.Append(inputs.n_conformers_per_molecule[molecule_index]));
         }
         else {
             record_append(n_heavy_atoms_builder.AppendNull());
@@ -416,10 +423,10 @@ bool write_shard(fs::path const &path, writer_inputs_t const &inputs) {
     provenance->Append("num_conformers", std::to_string(max_conformers));
     provenance->Append("max_atoms", std::to_string(inputs.max_atoms));
     if (!inputs.dataset.empty()) provenance->Append("dataset", inputs.dataset);
-    // Coordinates are centroid-centered but orientation is not canonicalized: the metric
-    // embedding aligns to principal axes, but the subsequent FIRE/MMFF relaxation drifts the
-    // pose off that frame. Report the frame we actually ship. A true canonical principal-axis
-    // pose (a final reframe with a fixed sign convention) is a possible future enhancement.
+    // Coordinates are centroid-centered but orientation is not canonicalized: the metric embedding aligns to
+    // principal axes, but the subsequent FIRE/MMFF relaxation drifts the pose off that frame. Report the
+    // frame actually shipped. A true canonical principal-axis pose, a final reframe with a fixed sign
+    // convention, is a possible future enhancement.
     provenance->Append("coordinate_frame", "centered");
     provenance->Append("schema_version", "2");
     provenance->Append("dedup", "none");

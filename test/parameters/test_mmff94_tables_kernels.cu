@@ -1,11 +1,10 @@
 /**
- *  @file test_mmff94_tables_kernels.cu
+ *  @file test/parameters/test_mmff94_tables_kernels.cu
  *  @brief Device-side validation kernels for test_mmff94_tables.
  *
- *  Launches one device lookup per probe key (vdw / bond / angle / torsion
- *  / oop / stbn) and writes the resolved parameters into a device output
- *  buffer. The host then bit-equals the device result against the
- *  host-side lookup over the same inputs.
+ *  Launches one device lookup per probe key (vdw / bond / angle / torsion / oop / stbn) and writes the resolved
+ *  parameters into a device output buffer. The host then bit-equals the device result against the host-side lookup
+ *  over the same inputs.
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
@@ -15,6 +14,8 @@
 #include "test_mmff94_tables_kernels.hpp"
 
 namespace sf = smallfield;
+
+namespace smallfield::tests {
 
 __global__ void vdw_lookup_kernel(sf::parameters::mmff94_tables_view_t view, vdw_query_t const *queries,
                                   vdw_result_t *results, std::uint32_t query_count) {
@@ -26,9 +27,9 @@ __global__ void vdw_lookup_kernel(sf::parameters::mmff94_tables_view_t view, vdw
     if (lookup_entry) {
         result.hit = 1;
         result.alpha = lookup_entry->alpha_i;
-        result.effective_electron_count = lookup_entry->n_i;
-        result.polarizability_scale = lookup_entry->a_i;
-        result.slater_kirkwood_factor = lookup_entry->g_i;
+        result.effective_electron_count = lookup_entry->n_effective;
+        result.polarizability_scale = lookup_entry->a_scale;
+        result.slater_kirkwood_factor = lookup_entry->g_factor;
         result.r_star = lookup_entry->r_star;
         result.donor_acceptor = lookup_entry->donor_acceptor;
     }
@@ -45,8 +46,8 @@ __global__ void bond_lookup_kernel(sf::parameters::mmff94_tables_view_t view, bo
     bond_result_t result {};
     if (lookup_entry) {
         result.hit = 1;
-        result.kb = lookup_entry->kb;
-        result.r0 = lookup_entry->r0;
+        result.force_constant = lookup_entry->force_constant;
+        result.equilibrium_distance = lookup_entry->equilibrium_distance;
     }
     results[probe_index] = result;
 }
@@ -62,8 +63,8 @@ __global__ void angle_lookup_kernel(sf::parameters::mmff94_tables_view_t view, a
     angle_result_t result {};
     if (lookup_entry) {
         result.hit = 1;
-        result.ka = lookup_entry->ka;
-        result.theta0_deg = lookup_entry->theta0_deg;
+        result.force_constant = lookup_entry->force_constant;
+        result.equilibrium_angle_degrees = lookup_entry->theta0_deg;
     }
     results[probe_index] = result;
 }
@@ -80,9 +81,9 @@ __global__ void torsion_lookup_kernel(sf::parameters::mmff94_tables_view_t view,
     torsion_result_t result {};
     if (lookup_result.second) {
         result.hit = 1;
-        result.v1 = lookup_result.second->v1;
-        result.v2 = lookup_result.second->v2;
-        result.v3 = lookup_result.second->v3;
+        result.torsion_v1 = lookup_result.second->torsion_v1;
+        result.torsion_v2 = lookup_result.second->torsion_v2;
+        result.torsion_v3 = lookup_result.second->torsion_v3;
         result.canonical_torsion_type = static_cast<std::uint8_t>(lookup_result.first);
     }
     results[probe_index] = result;
@@ -99,7 +100,7 @@ __global__ void oop_lookup_kernel(sf::parameters::mmff94_tables_view_t view, oop
     oop_result_t result {};
     if (lookup_entry) {
         result.hit = 1;
-        result.koop = lookup_entry->koop;
+        result.force_constant = lookup_entry->force_constant;
     }
     results[probe_index] = result;
 }
@@ -170,3 +171,5 @@ void *device_tables_create(sf::parameters::mmff94_tables_host_t const &host_tabl
 }
 
 void device_tables_destroy(void *handle) { delete static_cast<sf::parameters::mmff94_tables_device_t *>(handle); }
+
+} // namespace smallfield::tests

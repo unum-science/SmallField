@@ -1,5 +1,5 @@
 /**
- *  @file bench_conformers.cpp
+ *  @file bench/bench_conformers.cpp
  *  @brief Unified benchmark: RDKit CPU vs SmallField GPU on ChEMBL dataset.
  *
  *  Measures:
@@ -15,9 +15,9 @@
 #include <algorithm> // `std::min`, `std::sort`
 #include <array>     // `std::array`
 #include <chrono>    // `std::chrono::high_resolution_clock`, `std::chrono::duration`
-#include <fstream>   // `std::ifstream`
+#include <limits>    // `std::numeric_limits`
 #include <random>    // `std::mt19937`
-#include <string>    // `std::string`, `std::getline`
+#include <string>    // `std::string`
 #include <vector>    // `std::vector`
 
 #include <cuda_fp16.h>
@@ -29,34 +29,17 @@
 
 #include "test_helpers.hpp"
 
-namespace sf = smallfield;
 namespace sfapi = smallfield::api;
 namespace sftest = smallfield::tests;
-using clock_type = std::chrono::high_resolution_clock;
+using clock_type_t = std::chrono::high_resolution_clock;
 
-/** Load SMILES from a file, one per line. */
-static std::vector<std::string> load_smiles(std::string const &path, std::uint32_t max_count = 0) {
-    std::vector<std::string> result;
-    std::ifstream file(path);
-    std::string line;
-    while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        // Take the first whitespace-delimited token because the line may also contain a molecule name.
-        auto end = line.find_first_of(" \t");
-        if (end != std::string::npos) line = line.substr(0, end);
-        result.push_back(line);
-        if (max_count > 0 && result.size() >= max_count) break;
-    }
-    return result;
-}
-
-static double percentile(std::vector<double> &sorted_values, double p) {
+static double percentile(std::vector<double> &sorted_values, double percent) {
     if (sorted_values.empty()) return 0.0;
-    double index = p / 100.0 * static_cast<double>(sorted_values.size() - 1);
-    std::size_t lo = static_cast<std::size_t>(index);
-    std::size_t hi = std::min(lo + 1, sorted_values.size() - 1);
-    double frac = index - static_cast<double>(lo);
-    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac;
+    double index = percent / 100.0 * static_cast<double>(sorted_values.size() - 1);
+    std::size_t lower_index = static_cast<std::size_t>(index);
+    std::size_t upper_index = std::min(lower_index + 1, sorted_values.size() - 1);
+    double fraction = index - static_cast<double>(lower_index);
+    return sorted_values[lower_index] * (1.0 - fraction) + sorted_values[upper_index] * fraction;
 }
 
 /** Fill @p delta with sorted per-conformer differences, smallfield minus rdkit.
@@ -95,7 +78,7 @@ static void bench_rdkit_cpu(std::vector<std::string> const &smiles, std::uint32_
 
     // Time EmbedMultipleConfs followed by MMFFOptimize.
     std::printf("  Running ETKDG + MMFF94 (%u conformers each)...\n", num_conformers);
-    auto const start_time = clock_type::now();
+    auto const start_time = clock_type_t::now();
     std::uint32_t num_successful_conformers = 0;
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : num_successful_conformers)
     for (std::uint32_t molecule_index = 0; molecule_index < num_smiles; ++molecule_index) {
@@ -117,7 +100,7 @@ static void bench_rdkit_cpu(std::vector<std::string> const &smiles, std::uint32_
             // Skip molecules that fail RDKit processing.
         }
     }
-    auto const end_time = clock_type::now();
+    auto const end_time = clock_type_t::now();
     double const elapsed_ms_value = std::chrono::duration<double, std::milli>(end_time - start_time).count();
     double const mol_per_sec = num_parsed / (elapsed_ms_value / 1000.0);
     double const conf_per_sec = num_successful_conformers / (elapsed_ms_value / 1000.0);
@@ -152,10 +135,10 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     int const device_id = 0;
     sfapi::context_t gpu_context(std::span<int const>(&device_id, 1));
 
-    auto const start_time = clock_type::now();
+    auto const start_time = clock_type_t::now();
     [[maybe_unused]] auto const batch_status = gpu_context.generate_conformers(
         smiles_views, generation_config, max_atoms, coords_out, energies_out, status_out);
-    auto const end_time = clock_type::now();
+    auto const end_time = clock_type_t::now();
 
     double const elapsed_ms_value = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
@@ -165,7 +148,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     std::uint32_t num_successful_conformers = 0;
     std::array<std::uint64_t, 8> conformers_by_status {};
     for (auto status_code : status_out) {
-        if (status_code == sfapi::conformer_status_t::success) num_successful_conformers++;
+        if (status_code == sfapi::conformer_status_t::success_k) num_successful_conformers++;
         auto const code = static_cast<std::size_t>(status_code);
         if (code < conformers_by_status.size()) ++conformers_by_status[code];
     }
@@ -208,11 +191,10 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     std::vector<float> energies(total_conformers);
     std::vector<sfapi::conformer_status_t> status(total_conformers);
 
-    // All GPUs (empty device span).
+    // All GPUs — an empty device span.
     sfapi::context_t gpu_context;
-    // Opt in to scaffold-based SubstructMatch caching.
-    // Amortises RDKit fallback cost across molecules sharing the same Murcko
-    // scaffold; safe no-op if disabled or for acyclic molecules.
+    // Opt in to scaffold-based SubstructMatch caching. Amortises RDKit fallback cost across molecules sharing
+    // the same Murcko scaffold; safe no-op if disabled or for acyclic molecules.
 
     // Allow single-GPU runs via `--multi-gpu-only`, which scaling sweeps use when they control the
     // GPU count through `CUDA_VISIBLE_DEVICES`. The flag says "multi" but the path runs correctly
@@ -223,17 +205,17 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     }
     std::printf("  Using %zu GPUs\n", gpu_context.device_ids.size());
 
-    auto const start_time = clock_type::now();
+    auto const start_time = clock_type_t::now();
     [[maybe_unused]] auto const batch_status = gpu_context.generate_conformers(smiles_views, generation_config,
                                                                                max_atoms, coords, energies, status);
-    auto const end_time = clock_type::now();
+    auto const end_time = clock_type_t::now();
 
     double const elapsed_ms_value = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
     // Count successes.
     std::uint32_t num_successful_conformers = 0;
     for (auto status_code : status)
-        if (status_code == sfapi::conformer_status_t::success) num_successful_conformers++;
+        if (status_code == sfapi::conformer_status_t::success_k) num_successful_conformers++;
 
     double const mol_per_sec = num_smiles / (elapsed_ms_value / 1000.0);
     double const conf_per_sec = num_successful_conformers / (elapsed_ms_value / 1000.0);
@@ -256,15 +238,15 @@ static void cross_validate(std::vector<std::string> const &smiles, std::vector<_
     for (std::uint32_t molecule_index = 0; molecule_index < num_smiles; ++molecule_index) {
         for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index) {
             std::uint32_t const flat_index = molecule_index * num_conformers + conformer_index;
-            if (status[flat_index] == sfapi::conformer_status_t::success)
+            if (status[flat_index] == sfapi::conformer_status_t::success_k)
                 successful_conformers.push_back({molecule_index, conformer_index});
         }
     }
 
     // Select a random sample.
-    std::mt19937 rng(42);
+    std::mt19937 random_engine(42);
     if (successful_conformers.size() > max_samples) {
-        std::shuffle(successful_conformers.begin(), successful_conformers.end(), rng);
+        std::shuffle(successful_conformers.begin(), successful_conformers.end(), random_engine);
         successful_conformers.resize(max_samples);
     }
     std::printf("  Evaluating %zu conformers via RDKit MMFF94...\n", successful_conformers.size());
@@ -403,7 +385,7 @@ int main(int argc, char **argv) {
     std::printf("==========================================\n");
 
     // Set defaults.
-    std::string smi_path = "/tmp/chembl_valid.smi";
+    std::string smiles_path = "/tmp/chembl_valid.smi";
     std::uint32_t num_conformers = 3;
     std::uint32_t max_stereo_attempts = 10;
     std::uint32_t max_atoms = 128;
@@ -411,24 +393,24 @@ int main(int argc, char **argv) {
 
     // Parse the command line.
     bool multi_gpu_only = false;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--smi" && i + 1 < argc) smi_path = argv[++i];
-        else if (arg == "--conformers" && i + 1 < argc)
-            num_conformers = static_cast<std::uint32_t>(std::atoi(argv[++i]));
-        else if (arg == "--quality-samples" && i + 1 < argc)
-            quality_samples = static_cast<std::uint32_t>(std::atoi(argv[++i]));
+    for (int argument_index = 1; argument_index < argc; ++argument_index) {
+        std::string arg = argv[argument_index];
+        if (arg == "--smi" && argument_index + 1 < argc) smiles_path = argv[++argument_index];
+        else if (arg == "--conformers" && argument_index + 1 < argc)
+            num_conformers = static_cast<std::uint32_t>(std::atoi(argv[++argument_index]));
+        else if (arg == "--quality-samples" && argument_index + 1 < argc)
+            quality_samples = static_cast<std::uint32_t>(std::atoi(argv[++argument_index]));
         else if (arg == "--multi-gpu-only") multi_gpu_only = true;
     }
 
-    std::printf("Dataset:     %s\n", smi_path.c_str());
+    std::printf("Dataset:     %s\n", smiles_path.c_str());
     std::printf("Conformers:  %u per molecule\n", num_conformers);
     std::printf("CPU threads: %d\n", omp_get_max_threads());
 
-    auto all_smiles = load_smiles(smi_path);
+    auto all_smiles = sftest::load_smiles(smiles_path, std::numeric_limits<std::size_t>::max());
     std::printf("Loaded:      %zu SMILES\n", all_smiles.size());
     if (all_smiles.empty()) {
-        std::fprintf(stderr, "No SMILES loaded from %s\n", smi_path.c_str());
+        std::fprintf(stderr, "No SMILES loaded from %s\n", smiles_path.c_str());
         return 1;
     }
 
@@ -457,10 +439,9 @@ int main(int argc, char **argv) {
         std::vector<sfapi::conformer_status_t> status;
         bench_smallfield_gpu(smiles, num_conformers, max_stereo_attempts, coords, energies, status);
 
-        // Multi-GPU scaling is measured through a dedicated fresh process via
-        // --multi-gpu-only. Keeping the mixed CPU + 1-GPU default path in a
-        // single process avoids state bleed between the 1-GPU and 8-GPU runs
-        // on the largest batches.
+        // Multi-GPU scaling is measured through a dedicated fresh process via `--multi-gpu-only`. Keeping the
+        // mixed CPU + 1-GPU default path in a single process avoids state bleed between the 1-GPU and 8-GPU
+        // runs on the largest batches.
         if (batch_size == batch_sizes.back()) {
             std::printf("\n=== System B: SmallField multi-GPU (all GPUs) ===\n");
             std::printf("  Skipped in mixed mode. Re-run with --multi-gpu-only for isolated multi-GPU numbers.\n");

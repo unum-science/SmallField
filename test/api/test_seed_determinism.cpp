@@ -1,14 +1,13 @@
 /**
- *  @file test_seed_determinism.cpp
- *  @brief Asserts that a fixed `random_seed` reproduces conformers bit for bit.
+ *  @file test/api/test_seed_determinism.cpp
+ *  @brief Assert that a fixed `random_seed` reproduces conformers bit for bit.
  *
- *  Two `generate_conformers` calls in one process, same input, same seed, default OpenMP
- *  thread count. The threading matters: preprocess hands molecules to host threads with a
- *  dynamic schedule and then atom-count-sorts them per device, so a molecule's offset inside
- *  the device batch is a function of thread timing. Seeding the pipeline off that offset made
- *  the pipeline irreproducible in a way that pinning to one thread would hide, which is why
- *  this test deliberately leaves OpenMP at its default width and uses enough molecules for the
- *  dynamic chunks to interleave differently between the two calls.
+ *  Two `generate_conformers` calls in one process, same input, same seed, default OpenMP thread count. The
+ *  threading matters: preprocess hands molecules to host threads with a dynamic schedule and then
+ *  atom-count-sorts them per device, so a molecule's offset inside the device batch is a function of thread
+ *  timing. Seeding the pipeline off that offset made the pipeline irreproducible in a way that pinning to one
+ *  thread would hide, which is why this test deliberately leaves OpenMP at its default width and uses enough
+ *  molecules for the dynamic chunks to interleave differently between the two calls.
  */
 
 #include <cstdint> // `std::uint32_t`
@@ -87,7 +86,7 @@ int main() {
 
     std::uint32_t num_successful = 0;
     for (auto code : status_first)
-        if (code == sfapi::conformer_status_t::success) ++num_successful;
+        if (code == sfapi::conformer_status_t::success_k) ++num_successful;
     std::printf("  %u / %zu conformers succeeded on the first run\n", num_successful, total_conformers);
     if (num_successful == 0) {
         std::printf("FAILED: the corpus produced no conformers, so the comparison proves nothing\n");

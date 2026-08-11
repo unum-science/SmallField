@@ -60,7 +60,7 @@ def test_batch_generation_returns_flat_buffers_and_status_codes():
     assert np.asarray(energies).shape == (expected_conformer_count,)
     assert np.asarray(status_codes).shape == (expected_conformer_count,)
     assert np.isfinite(np.asarray(energies)).all()
-    assert any(int(code) == int(sfa.ConformerStatus.success) for code in status_codes)
+    assert any(int(code) == int(sfa.ConformerStatus.SUCCESS) for code in status_codes)
 
 
 def test_invalid_smiles_raises_value_error():

@@ -1,6 +1,6 @@
 /**
- *  @file test_dg_energy_kernels.cu
- *  @brief CUDA kernel wrappers for DG energy test. Compiled by nvcc.
+ *  @file test/kernels/test_dg_energy_kernels.cu
+ *  @brief CUDA kernel wrappers for DG energy test.
  */
 
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
@@ -10,6 +10,8 @@
 
 #include "smallfield/cuda/dg_kernel.cuh"
 #include "smallfield/cuda/fire_warp.cuh"
+
+#include "test_dg_energy_kernels.hpp"
 
 namespace sfc = smallfield::cuda;
 
@@ -28,21 +30,21 @@ __device__ __forceinline__ void quantize_bounds_into_shared_(float const *bounds
     std::uint32_t const bounds_row_stride = sfc::compute_bounds_row_stride(num_atoms);
     float lane_min = __FLT_MAX__;
     float lane_max = -__FLT_MAX__;
-    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size_k) {
-        float const v = bounds_float[i];
-        lane_min = fminf(lane_min, v);
-        lane_max = fmaxf(lane_max, v);
+    for (std::uint32_t entry = lane; entry < bounds_size; entry += sfc::warp_size_k) {
+        float const value = bounds_float[entry];
+        lane_min = fminf(lane_min, value);
+        lane_max = fmaxf(lane_max, value);
     }
     float const mol_min = sfc::warp_reduce_min_f32_(lane_min);
     float const mol_max = sfc::warp_reduce_max_f32_(lane_max);
     float const range = fmaxf(mol_max - mol_min, 1e-6f);
     float const scale_quantize = 255.0f / range;
-    for (std::uint32_t i = lane; i < bounds_size; i += sfc::warp_size_k) {
-        int q = __float2int_rn((bounds_float[i] - mol_min) * scale_quantize);
-        q = max(0, min(255, q));
-        std::uint32_t const row = i / num_atoms;
-        std::uint32_t const column = i - row * num_atoms;
-        shared_bounds[row * bounds_row_stride + column] = static_cast<std::uint8_t>(q);
+    for (std::uint32_t entry = lane; entry < bounds_size; entry += sfc::warp_size_k) {
+        int quantized = __float2int_rn((bounds_float[entry] - mol_min) * scale_quantize);
+        quantized = max(0, min(255, quantized));
+        std::uint32_t const row = entry / num_atoms;
+        std::uint32_t const column = entry - row * num_atoms;
+        shared_bounds[row * bounds_row_stride + column] = static_cast<std::uint8_t>(quantized);
     }
     __syncwarp(sfc::full_mask_k);
     *out_mol_min = mol_min;
@@ -115,7 +117,7 @@ __global__ void dg_minimize_kernel(float *positions, float const *bounds_float, 
     }
 }
 
-extern "C" {
+namespace smallfield::tests {
 
 void gpu_dg_energy(float const *host_coords, float *host_gradient, float const *host_bounds, std::uint32_t num_atoms,
                    std::uint32_t spatial_dimension, float upper_weight, float lower_weight, float fourth_dim_weight,
@@ -190,4 +192,4 @@ void gpu_dg_minimize(float *host_coords, float const *host_bounds, std::uint32_t
     cudaFree(device_status);
 }
 
-} // extern "C"
+} // namespace smallfield::tests

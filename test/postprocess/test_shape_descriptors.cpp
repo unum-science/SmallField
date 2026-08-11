@@ -1,13 +1,13 @@
 /**
- *  @file test_shape_descriptors.cpp
- *  @brief Golden test: native USR / USRCAT match RDKit within tolerance.
+ *  @file test/postprocess/test_shape_descriptors.cpp
+ *  @brief Confirm native USR / USRCAT match RDKit within tolerance, the suite's golden test.
  *
- *  Fragment separation is a non-overlapping rigid layout. For a spread of molecules we parse with the library's
- *  parse contract, embed one ETKDGv3 conformer with a fixed seed, MMFF-optimize, then feed that conformer's float
- *  coordinates to both the native descriptors and RDKit's reference `Descriptors::USR` / `USRCAT`. To compare like
- *  with like, the RDKit conformer is overwritten with the same float-rounded coordinates the native path sees, so
- *  any residual difference is accumulation order only. Gate: max abs difference < 1e-4 on all 12 USR elements and
- *  all 60 USRCAT elements.
+ *  Fragment separation is a non-overlapping rigid layout. For a spread of molecules, each is parsed with the
+ *  library's parse contract, embedded as one ETKDGv3 conformer with a fixed seed, MMFF-optimized, then that
+ *  conformer's float coordinates feed both the native descriptors and RDKit's reference `Descriptors::USR` /
+ *  `USRCAT`. To compare like with like, the RDKit conformer is overwritten with the same float-rounded coordinates
+ *  the native path sees, so any residual difference is accumulation order only. Gate: max abs difference < 1e-4 on
+ *  all 12 USR elements and all 60 USRCAT elements.
  *
  *  Also checks that the acetate/sodium salt is two components and that `separate_fragments` pushes the two fragment
  *  centroids apart while leaving intra-fragment distances unchanged — a rigid translation.
@@ -34,47 +34,47 @@
 
 namespace sfp = smallfield::postprocess;
 
-namespace {
+namespace smallfield::tests {
 
 /**
  *  @brief Parse with the same contract `build_shape_context` uses, add Hs, embed one
  *  ETKDGv3 conformer with a fixed seed, and MMFF-optimize it.
  */
-std::unique_ptr<RDKit::RWMol> prepare_mol(std::string const &smiles, int seed = 0xC0FFEE) {
+static std::unique_ptr<RDKit::RWMol> prepare_mol_(std::string const &smiles, int seed = 0xC0FFEE) {
     RDKit::SmilesParserParams params;
     params.sanitize = true;
     params.removeHs = false;
     params.strictCXSMILES = false;
-    std::unique_ptr<RDKit::RWMol> mol(RDKit::SmilesToMol(smiles, params));
-    if (!mol) return nullptr;
-    RDKit::MolOps::addHs(*mol);
+    std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles, params));
+    if (!molecule) return nullptr;
+    RDKit::MolOps::addHs(*molecule);
     RDKit::DGeomHelpers::EmbedParameters embed_params = RDKit::DGeomHelpers::ETKDGv3;
     embed_params.randomSeed = seed;
-    int const conformer_id = RDKit::DGeomHelpers::EmbedMolecule(*mol, embed_params);
+    int const conformer_id = RDKit::DGeomHelpers::EmbedMolecule(*molecule, embed_params);
     if (conformer_id < 0) return nullptr;
-    RDKit::MMFF::MMFFOptimizeMolecule(*mol);
-    return mol;
+    RDKit::MMFF::MMFFOptimizeMolecule(*molecule);
+    return molecule;
 }
 
-double max_abs_diff(std::vector<double> const &reference, double const *native, std::size_t count) {
+static double max_abs_diff_(std::vector<double> const &reference, double const *native, std::size_t count) {
     double worst = 0.0;
-    for (std::size_t i = 0; i < count; ++i) {
-        double const d = std::fabs(reference[i] - native[i]);
-        if (d > worst) worst = d;
+    for (std::size_t element = 0; element < count; ++element) {
+        double const difference = std::fabs(reference[element] - native[element]);
+        if (difference > worst) worst = difference;
     }
     return worst;
 }
 
-void validate_descriptors(std::string const &smiles) {
-    std::unique_ptr<RDKit::RWMol> mol = prepare_mol(smiles);
-    sf_verify_(mol != nullptr, ("prepare_mol failed for: " + smiles).c_str());
+static void validate_descriptors_(std::string const &smiles) {
+    std::unique_ptr<RDKit::RWMol> molecule = prepare_mol_(smiles);
+    sf_verify_(molecule != nullptr, ("prepare_mol failed for: " + smiles).c_str());
 
-    std::uint32_t const num_atoms = mol->getNumAtoms();
-    std::vector<float> coords = smallfield::tests::extract_coords_interleaved(*mol);
+    std::uint32_t const num_atoms = molecule->getNumAtoms();
+    std::vector<float> coords = smallfield::tests::extract_coords_interleaved(*molecule);
 
     // Overwrite the RDKit conformer with the float-rounded coordinates so the
     // reference computation and the native one operate on identical inputs.
-    smallfield::tests::set_coords_interleaved(*mol, coords.data());
+    smallfield::tests::set_coords_interleaved(*molecule, coords.data());
 
     sfp::molecule_shape_context_t const context = sfp::build_shape_context(smiles);
     sf_verify_(context.ok, ("build_shape_context failed for: " + smiles).c_str());
@@ -84,16 +84,16 @@ void validate_descriptors(std::string const &smiles) {
     std::array<double, 12> native_usr {};
     sfp::usr_descriptor(std::span<float const>(coords.data(), coords.size()), num_atoms, native_usr);
     std::vector<double> rdkit_usr(12, 0.0);
-    RDKit::Descriptors::USR(*mol, rdkit_usr);
-    double const usr_deviation = max_abs_diff(rdkit_usr, native_usr.data(), 12);
+    RDKit::Descriptors::USR(*molecule, rdkit_usr);
+    double const usr_deviation = max_abs_diff_(rdkit_usr, native_usr.data(), 12);
 
     // USRCAT.
     std::array<double, 60> native_usrcat {};
     sfp::usrcat_descriptor(std::span<float const>(coords.data(), coords.size()), context, native_usrcat);
     std::vector<double> rdkit_usrcat(60, 0.0);
     std::vector<std::vector<unsigned int>> atom_ids;
-    RDKit::Descriptors::USRCAT(*mol, rdkit_usrcat, atom_ids);
-    double const usrcat_deviation = max_abs_diff(rdkit_usrcat, native_usrcat.data(), 60);
+    RDKit::Descriptors::USRCAT(*molecule, rdkit_usrcat, atom_ids);
+    double const usrcat_deviation = max_abs_diff_(rdkit_usrcat, native_usrcat.data(), 60);
 
     double const tolerance = 1e-4;
     bool const pass = usr_deviation < tolerance && usrcat_deviation < tolerance;
@@ -104,26 +104,26 @@ void validate_descriptors(std::string const &smiles) {
 }
 
 /** Sum of pairwise distances within one component — rigid translation invariant. */
-double intra_component_distance_sum(std::vector<float> const &coords, std::vector<std::uint8_t> const &label,
-                                    std::uint8_t component) {
+static double intra_component_distance_sum_(std::vector<float> const &coords, std::vector<std::uint8_t> const &label,
+                                            std::uint8_t component) {
     std::vector<std::uint32_t> atoms;
     for (std::uint32_t atom_index = 0; atom_index < label.size(); ++atom_index)
         if (label[atom_index] == component) atoms.push_back(atom_index);
     double total = 0.0;
-    for (std::size_t a = 0; a < atoms.size(); ++a)
-        for (std::size_t b = a + 1; b < atoms.size(); ++b) {
-            std::size_t const ia = static_cast<std::size_t>(atoms[a]) * 3u;
-            std::size_t const ib = static_cast<std::size_t>(atoms[b]) * 3u;
-            double const dx = static_cast<double>(coords[ia + 0]) - coords[ib + 0];
-            double const dy = static_cast<double>(coords[ia + 1]) - coords[ib + 1];
-            double const dz = static_cast<double>(coords[ia + 2]) - coords[ib + 2];
-            total += std::sqrt(dx * dx + dy * dy + dz * dz);
+    for (std::size_t first = 0; first < atoms.size(); ++first)
+        for (std::size_t second = first + 1; second < atoms.size(); ++second) {
+            std::size_t const first_base = static_cast<std::size_t>(atoms[first]) * 3u;
+            std::size_t const second_base = static_cast<std::size_t>(atoms[second]) * 3u;
+            double const delta_x = static_cast<double>(coords[first_base + 0]) - coords[second_base + 0];
+            double const delta_y = static_cast<double>(coords[first_base + 1]) - coords[second_base + 1];
+            double const delta_z = static_cast<double>(coords[first_base + 2]) - coords[second_base + 2];
+            total += std::sqrt(delta_x * delta_x + delta_y * delta_y + delta_z * delta_z);
         }
     return total;
 }
 
-std::array<double, 3> component_centroid(std::vector<float> const &coords, std::vector<std::uint8_t> const &label,
-                                         std::uint8_t component) {
+static std::array<double, 3> component_centroid_(std::vector<float> const &coords,
+                                                 std::vector<std::uint8_t> const &label, std::uint8_t component) {
     std::array<double, 3> centroid {0.0, 0.0, 0.0};
     std::uint32_t count = 0;
     for (std::uint32_t atom_index = 0; atom_index < label.size(); ++atom_index) {
@@ -142,17 +142,17 @@ std::array<double, 3> component_centroid(std::vector<float> const &coords, std::
     return centroid;
 }
 
-double centroid_distance(std::array<double, 3> const &a, std::array<double, 3> const &b) {
-    double const dx = a[0] - b[0];
-    double const dy = a[1] - b[1];
-    double const dz = a[2] - b[2];
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
+static double centroid_distance_(std::array<double, 3> const &first, std::array<double, 3> const &second) {
+    double const delta_x = first[0] - second[0];
+    double const delta_y = first[1] - second[1];
+    double const delta_z = first[2] - second[2];
+    return std::sqrt(delta_x * delta_x + delta_y * delta_y + delta_z * delta_z);
 }
 
-void validate_fragment_separation() {
+static void validate_fragment_separation_() {
     std::string const salt = "CC(=O)[O-].[Na+]";
-    std::unique_ptr<RDKit::RWMol> mol = prepare_mol(salt);
-    sf_verify_(mol != nullptr, "prepare_mol failed for salt");
+    std::unique_ptr<RDKit::RWMol> molecule = prepare_mol_(salt);
+    sf_verify_(molecule != nullptr, "prepare_mol failed for salt");
 
     // `separate_fragments` is a geometric utility over a multi-component context; the production
     // path strips counterions before it can ever see one, so the test builds the context itself.
@@ -160,19 +160,19 @@ void validate_fragment_separation() {
     sf_verify_(context.ok, "build_shape_context failed for salt");
     sf_verify_(context.num_components == 2, "salt should have exactly two components");
 
-    std::vector<float> coords = smallfield::tests::extract_coords_interleaved(*mol);
+    std::vector<float> coords = smallfield::tests::extract_coords_interleaved(*molecule);
 
-    double const intra0_before = intra_component_distance_sum(coords, context.component_label, 0);
-    double const intra1_before = intra_component_distance_sum(coords, context.component_label, 1);
-    double const centroid_gap_before = centroid_distance(component_centroid(coords, context.component_label, 0),
-                                                         component_centroid(coords, context.component_label, 1));
+    double const intra0_before = intra_component_distance_sum_(coords, context.component_label, 0);
+    double const intra1_before = intra_component_distance_sum_(coords, context.component_label, 1);
+    double const centroid_gap_before = centroid_distance_(component_centroid_(coords, context.component_label, 0),
+                                                          component_centroid_(coords, context.component_label, 1));
 
     sfp::separate_fragments(std::span<float>(coords.data(), coords.size()), context);
 
-    double const intra0_after = intra_component_distance_sum(coords, context.component_label, 0);
-    double const intra1_after = intra_component_distance_sum(coords, context.component_label, 1);
-    double const centroid_gap_after = centroid_distance(component_centroid(coords, context.component_label, 0),
-                                                        component_centroid(coords, context.component_label, 1));
+    double const intra0_after = intra_component_distance_sum_(coords, context.component_label, 0);
+    double const intra1_after = intra_component_distance_sum_(coords, context.component_label, 1);
+    double const centroid_gap_after = centroid_distance_(component_centroid_(coords, context.component_label, 0),
+                                                         component_centroid_(coords, context.component_label, 1));
 
     std::printf("  [salt] centroid gap %.3f -> %.3f  intra sums (%.4f,%.4f)->(%.4f,%.4f)\n", centroid_gap_before,
                 centroid_gap_after, intra0_before, intra1_before, intra0_after, intra1_after);
@@ -182,20 +182,20 @@ void validate_fragment_separation() {
     sf_verify_near_(intra1_after, intra1_before, 1e-3, "component 1 intra-fragment distances changed");
 }
 
-} // namespace
+} // namespace smallfield::tests
 
 int main() {
     std::printf("Validating native USR / USRCAT against RDKit...\n");
 
-    validate_descriptors("CCO");
-    validate_descriptors("c1ccccc1");
-    validate_descriptors("CC(=O)Oc1ccccc1C(=O)O");  // aspirin
-    validate_descriptors("Nc1ccc(cc1)S(=O)(=O)N");  // sulfanilamide: donors + acceptors
-    validate_descriptors("OC(=O)CCc1cc(O)c(O)cc1"); // multiple donors/acceptors/aromatic
-    validate_descriptors("CC(=O)Nc1ccc(O)cc1");     // paracetamol
+    smallfield::tests::validate_descriptors_("CCO");
+    smallfield::tests::validate_descriptors_("c1ccccc1");
+    smallfield::tests::validate_descriptors_("CC(=O)Oc1ccccc1C(=O)O");  // aspirin
+    smallfield::tests::validate_descriptors_("Nc1ccc(cc1)S(=O)(=O)N");  // sulfanilamide: donors + acceptors
+    smallfield::tests::validate_descriptors_("OC(=O)CCc1cc(O)c(O)cc1"); // multiple donors/acceptors/aromatic
+    smallfield::tests::validate_descriptors_("CC(=O)Nc1ccc(O)cc1");     // paracetamol
 
     std::printf("Validating fragment separation...\n");
-    validate_fragment_separation();
+    smallfield::tests::validate_fragment_separation_();
 
     std::printf("\nAll shape descriptor tests passed.\n");
     return 0;

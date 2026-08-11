@@ -1,6 +1,7 @@
 /**
- *  @file rdkit_fallback.cpp
- *  @brief RDKit-based conformer generation for molecules the GPU pipeline failed on.
+ *  @file cli/rdkit_fallback.cpp
+ *  @brief Runs RDKit ETKDG embedding and MMFF minimization, in an OpenMP-parallel loop, over the
+ *  conformer slots the GPU pipeline could not fill.
  */
 
 #include <cstring> // `std::memset`
@@ -27,13 +28,12 @@
 
 #include "rdkit_fallback.hpp"
 
-namespace smallfield::cli {
-
 namespace sfapi = smallfield::api;
 
-/** Single-threaded warm-up that forces every RDKit lazy-init singleton we
- *  touch in the fallback OMP loop to populate its caches before the pool of
- *  ~188 fallback threads starts racing on first access. See matching
+namespace smallfield::cli {
+
+/** Single-threaded warm-up that forces every RDKit lazy-init singleton the fallback OMP loop touches to
+ *  populate its caches before the pool of ~188 fallback threads starts racing on first access. See matching
  *  `warm_up_rdkit_globals_once_` in `etkdg_prepare_batch.hpp`. */
 static void warm_up_rdkit_globals_for_fallback_() {
     static std::once_flag flag;
@@ -75,23 +75,21 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         std::uint32_t const molecule_index = inputs.retry_indices[retry_entry];
         std::string_view const smiles = inputs.smiles[molecule_index];
 
-        // Conformer-granular fallback: count per-slot failures and only re-embed
-        // for the slots that actually need attention. Successful GPU conformers
-        // (solver==0, status==success) are preserved untouched — they keep their
-        // GPU coordinates, energy, and status. Anything not flipped to success
-        // by this loop keeps its existing failed status; the solver code below
-        // is only updated when we successfully recover a slot.
+        // Successful GPU conformers (solver==0, status==success) are preserved untouched — they keep
+        // their GPU coordinates, energy, and status. Anything not flipped to success by this loop keeps
+        // its existing failed status; the solver code below is only updated when a slot is successfully
+        // recovered.
         std::uint32_t needed_slots = 0;
         for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index) {
             std::uint8_t const slot_status = outputs.status[molecule_index * num_conformers + conformer_index];
-            if (slot_status != static_cast<std::uint8_t>(sfapi::conformer_status_t::success)) ++needed_slots;
+            if (slot_status != static_cast<std::uint8_t>(sfapi::conformer_status_t::success_k)) ++needed_slots;
         }
         if (needed_slots == 0) continue;
 
         if (smiles.empty()) {
             for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
                 outputs.status[molecule_index * num_conformers + conformer_index] = static_cast<std::uint8_t>(
-                    sfapi::conformer_status_t::invalid_smiles);
+                    sfapi::conformer_status_t::invalid_smiles_k);
             continue;
         }
 
@@ -100,21 +98,21 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         smallfield::parse_options_t parse_options;
         parse_options.max_atoms = max_atoms;
         smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
-        if (parsed.status != sfapi::conformer_status_t::success) {
+        if (parsed.status != sfapi::conformer_status_t::success_k) {
             for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
                 outputs.status[molecule_index * num_conformers + conformer_index] = static_cast<std::uint8_t>(
                     parsed.status);
             continue;
         }
-        std::unique_ptr<RDKit::RWMol> mol = std::move(parsed.molecule);
+        std::unique_ptr<RDKit::RWMol> molecule = std::move(parsed.molecule);
 
         // Embedding is the dominant CPU cost here, and it is wasted on a molecule the force field
         // cannot type: `constructForceField` throws below and every conformer fails anyway. Ask
         // first, so an untypeable molecule costs a typing check instead of K embeddings.
-        if (!RDKit::MMFF::MMFFMolProperties(*mol).isValid()) {
+        if (!RDKit::MMFF::MMFFMolProperties(*molecule).isValid()) {
             for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
                 outputs.status[molecule_index * num_conformers + conformer_index] = static_cast<std::uint8_t>(
-                    sfapi::conformer_status_t::unsupported_element);
+                    sfapi::conformer_status_t::unsupported_element_k);
             continue;
         }
 
@@ -122,13 +120,12 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         embed_params.randomSeed = static_cast<int>(inputs.random_seed);
         embed_params.maxIterations = 200;
 
-        // Only embed as many fresh conformers as we actually need to fill in.
-        // EmbedMultipleConfs is the dominant CPU cost in this path; halving the
-        // count halves the per-molecule fallback wall when failures cluster in
-        // one of K (the common case).
+        // Only embed as many fresh conformers as are still needed. EmbedMultipleConfs is the dominant CPU
+        // cost in this path; halving the count halves the per-molecule fallback wall when failures cluster
+        // in one of K, the common case.
         std::vector<int> conformer_ids;
         try {
-            conformer_ids = RDKit::DGeomHelpers::EmbedMultipleConfs(*mol, static_cast<unsigned int>(needed_slots),
+            conformer_ids = RDKit::DGeomHelpers::EmbedMultipleConfs(*molecule, static_cast<unsigned int>(needed_slots),
                                                                     embed_params);
         }
         catch (...) { /* ignore */
@@ -140,7 +137,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         std::uint32_t fresh_index = 0;
         for (std::uint32_t conformer_slot = 0; conformer_slot < num_conformers; ++conformer_slot) {
             std::uint8_t const slot_status = outputs.status[molecule_index * num_conformers + conformer_slot];
-            if (slot_status == static_cast<std::uint8_t>(sfapi::conformer_status_t::success)) continue;
+            if (slot_status == static_cast<std::uint8_t>(sfapi::conformer_status_t::success_k)) continue;
             if (fresh_index >= conformer_ids.size()) break;
             int const rdkit_conformer_id = conformer_ids[fresh_index++];
 
@@ -148,7 +145,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
             float energy_kcal_per_mol = 0.0f;
             try {
                 auto force_field = std::unique_ptr<ForceFields::ForceField>(
-                    RDKit::MMFF::constructForceField(*mol, /*nonBondedThresh=*/100.0, rdkit_conformer_id));
+                    RDKit::MMFF::constructForceField(*molecule, /*nonBondedThresh=*/100.0, rdkit_conformer_id));
                 if (!force_field) continue;
                 force_field->initialize();
                 force_field->minimize(200, 1e-4, 1e-6);
@@ -158,7 +155,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
                 continue;
             }
 
-            auto const &conformer = mol->getConformer(rdkit_conformer_id);
+            auto const &conformer = molecule->getConformer(rdkit_conformer_id);
             std::size_t const coord_base =
                 (static_cast<std::size_t>(molecule_index) * num_conformers + conformer_slot) * coordinate_stride;
             // Zero the trailing atoms (pad region).
@@ -166,7 +163,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
                         sizeof(__half) * coordinate_stride);
 
             // Slot layout is shared with the GPU producer — see `conformer_slot_layout_t`.
-            for (unsigned int atom_index = 0; atom_index < mol->getNumAtoms(); ++atom_index) {
+            for (unsigned int atom_index = 0; atom_index < molecule->getNumAtoms(); ++atom_index) {
                 auto const &position = conformer.getAtomPos(atom_index);
                 outputs.coordinates[coord_base + slot_layout.component_offset(0u, atom_index)] = __float2half(
                     static_cast<float>(position.x));
@@ -178,7 +175,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
 
             outputs.energies[molecule_index * num_conformers + conformer_slot] = energy_kcal_per_mol;
             outputs.status[molecule_index * num_conformers + conformer_slot] = static_cast<std::uint8_t>(
-                sfapi::conformer_status_t::success);
+                sfapi::conformer_status_t::success_k);
             outputs.solver[molecule_index * num_conformers + conformer_slot] = 1;
             recovered_any = true;
         }
@@ -187,7 +184,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         // which defeats the `num_atoms == 0` guard downstream and buys them a full shape-context
         // parse plus four substructure searches for a row that has no geometry.
         if (recovered_any) {
-            outputs.num_atoms_per_molecule[molecule_index] = static_cast<std::uint8_t>(mol->getNumAtoms());
+            outputs.num_atoms_per_molecule[molecule_index] = static_cast<std::uint8_t>(molecule->getNumAtoms());
             num_recovered.fetch_add(1, std::memory_order_relaxed);
         }
     }

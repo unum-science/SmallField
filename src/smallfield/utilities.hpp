@@ -1,0 +1,47 @@
+/**
+ *  @file src/smallfield/utilities.hpp
+ *  @brief Type-generic helpers shared by more than one SmallField subsystem.
+ *
+ *  Admission rule, applied to every candidate before it lands here. A helper belongs in this header only
+ *  when all three hold:
+ *   - it is generic over its operand type rather than tied to one struct or one table layout,
+ *   - it depends on nothing outside the standard headers — no CUDA runtime, no RDKit, no project types,
+ *   - it has two or more subsystems as consumers.
+ *  A helper failing any of the three belongs to the subsystem that owns it, where its name sits next to
+ *  the data it serves. `lower_bound_` in `parameters/mmff94_tables.hpp` is the worked example: generic and
+ *  standalone, but read by that one header, so it stays there. Without the rule a file named "utilities"
+ *  becomes the junk drawer every subsystem reaches into and nobody prunes.
+ *
+ *  Neither helper is marked `__host__ __device__`. `parameters/mmff94_tables.hpp` pulls this header in and
+ *  is compiled as plain C++ by `test/parameters/test_mmff94_tables.cpp` and `test/mmff94/test_mmff_typer.cpp`,
+ *  where a CUDA attribute is not a keyword g++ knows. Device code reaches both helpers as `constexpr`
+ *  through `--expt-relaxed-constexpr`, the same route the `lookup_*` cascades take.
+ */
+
+#pragma once
+
+namespace smallfield {
+
+/**
+ *  @brief Round `value` up to the next multiple of `alignment`, which must be a power of two.
+ *
+ *  Two template parameters rather than one, because every call site mixes widths: the shared-memory layout
+ *  in `cuda/etkdg_pipeline.cuh` passes `(std::uint32_t, std::size_t)` via `alignof`, and the pool layouts in
+ *  `api/smallfield.cu` pass `(std::size_t, int)`. A single deduced parameter would fail to deduce at all of
+ *  them. The result takes the width of `value`, so a `std::uint32_t` offset stays a `std::uint32_t`.
+ */
+template <typename value_, typename alignment_>
+constexpr auto align_up_(value_ value, alignment_ alignment) noexcept {
+    value_ const step = static_cast<value_>(alignment);
+    return static_cast<value_>((value + step - 1) & ~(step - 1));
+}
+
+/** Exchange two values. Used by the MMFF94 key canonicalisation steps, on host and device alike. */
+template <typename value_>
+constexpr void swap_(value_ &first, value_ &second) noexcept {
+    value_ const held = first;
+    first = second;
+    second = held;
+}
+
+} // namespace smallfield

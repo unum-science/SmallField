@@ -1,17 +1,18 @@
 /**
- *  @file etkdg_types.hpp
+ *  @file src/smallfield/types/etkdg_types.hpp
  *  @brief Data structures for the GPU ETKDG conformer generation pipeline.
  *
  *  Defines the types used to pass preprocessed molecular data from CPU to GPU:
- *  - Molecule metadata (atom counts, offsets into batched arrays)
- *  - Chiral center descriptors (CIP-ordered neighbors, target sign)
- *  - ETK torsion descriptors (CSD Fourier coefficients)
- *  - Distance constraints (1-2 bond, 1-3 angle-derived bounds)
+ *  - Molecule metadata — atom counts, offsets into batched arrays
+ *  - Chiral center descriptors — index-ordered neighbors, target volume sign
+ *  - ETK torsion descriptors — CSD Fourier coefficients
+ *  - Distance constraints — 1-2 bond and 1-3 angle-derived bounds
  *
- *  All structs use `alignas` for portable alignment.
+ *  The parameter and constraint structs carry an explicit `alignas`; the metadata, per-atom CSR, and
+ *  typing-patch structs take their natural alignment.
  *
- *  The bounds matrix is a full N × N float matrix in row-major order, matching RDKit's
- *  `DistGeom::BoundsMatrix` convention. Distances are in angstroms.
+ *  The bounds matrix is a full N × N float matrix in row-major order, matching RDKit's `DistGeom::BoundsMatrix`
+ *  convention. Distances are in angstroms.
  *
  *  @verbatim
  *  bounds[i * N + j], i < j   upper bound distance
@@ -99,12 +100,11 @@ struct etkdg_molecule_metadata_t {
     /**
      *  @brief Reserved for a future host-side bounds quantisation step.
      *
-     *  The current pipeline computes per-molecule (mol_min, inv_scale) inside
-     *  etkdg_pipeline_warp_kernel because the metric prepass smooths bounds in
-     *  global memory and the quantise step must scan the *post-smoothed*
-     *  values. If smoothing ever moves host-side these slots can carry the
-     *  pre-quantised range — until then they are unused (set to {0, 1} by
-     *  prepare_molecule_into) and the kernel ignores them.
+     *  The pipeline computes per-molecule (mol_min, inv_scale) inside `etkdg_pipeline_warp_kernel`
+     *  because the metric prepass smooths bounds in global memory and the quantise step must scan
+     *  the @b post-smoothed values. If smoothing ever moves host-side these slots can carry the
+     *  pre-quantised range — until then they are unused, `prepare_molecule_into` sets them to
+     *  {0, 1}, and the kernel ignores them.
      */
     float bounds_min;
     float bounds_inv_scale;
@@ -149,7 +149,7 @@ struct alignas(8) chiral_center_descriptor_t {
 };
 
 /**
- *  ETK torsion term from CSD (Cambridge Structural Database) preferences.
+ *  ETK torsion term from CSD preferences — the Cambridge Structural Database.
  *
  *  @verbatim
  *  E_torsion = Σ_{n=1..6} V_n * cos(n * φ)
@@ -160,7 +160,7 @@ struct alignas(32) etk_torsion_descriptor_t {
     /** Dihedral atoms i-j-k-l within molecule. */
     std::uint8_t atom_indices[4];
     std::uint8_t padding[4];
-    /** V₁ through V₆ (kcal/mol). */
+    /** V₁ through V₆ in kcal/mol. */
     float fourier_coefficients[6];
 };
 
@@ -191,24 +191,23 @@ struct alignas(16) distance_constraint_t {
 /**
  *  @brief Per-atom MMFF94 VdW parameters.
  *
- *  Stored once per atom; combined pairwise inside the kernel via Halgren's
- *  combining rule (R*_ij) and Slater-Kirkwood (epsilon_ij). The kernel
- *  enumerates nonbonded pairs on the fly from the descriptor's
- *  `bond_distance` matrix rather than reading a materialized pair array.
+ *  Stored once per atom; combined pairwise inside the kernel via Halgren's combining rule for
+ *  R*_ij and Slater-Kirkwood for epsilon_ij. The kernel enumerates nonbonded pairs on the fly
+ *  from the descriptor's `bond_distance` matrix rather than reading a materialized pair array.
  *
- *  Matches the atom-level data surfaced by RDKit's MMFFVdW entry plus
- *  the donor-acceptor flag used by `scaleVdWParams`.
+ *  Matches the atom-level data surfaced by RDKit's `MMFFVdW` entry plus the donor-acceptor flag
+ *  used by `scaleVdWParams`.
  */
 struct alignas(8) mmff94_atom_vdw_params_t {
-    /** Polarizability (α). */
+    /** Polarizability α. */
     float alpha;
-    /** Effective number of valence electrons (N). */
+    /** Effective number of valence electrons N. */
     float n_effective;
     /** A_i — preserved for parity with other MMFF variants. */
     float a_scale;
-    /** G_i (Slater-Kirkwood factor). */
+    /** G_i, the Slater-Kirkwood factor. */
     float g_factor;
-    /** This atom's VdW radius (R*). */
+    /** This atom's VdW radius R*. */
     float r_star;
     /** 0 = '-', 1 = 'A' acceptor, 2 = 'D' donor. */
     std::uint8_t donor_acceptor;
@@ -234,6 +233,8 @@ struct alignas(16) mmff94_bond_t {
     float padding_float;
 };
 
+static_assert(sizeof(mmff94_bond_t) == 16);
+
 /**
  *  @brief MMFF94 angle bending term.
  *
@@ -250,7 +251,7 @@ struct alignas(16) mmff94_angle_t {
     std::uint8_t is_linear;
     /** `ka` in mdyn·angstrom per rad². */
     float force_constant;
-    /** θ₀ (radians). */
+    /** θ₀ in radians. */
     float equilibrium_angle;
     float padding_float;
 };
@@ -268,13 +269,15 @@ struct alignas(16) mmff94_torsion_t {
     std::uint8_t atom_j;
     std::uint8_t atom_k;
     std::uint8_t atom_l;
-    /** First barrier height (kcal/mol). */
-    float v1;
-    /** Second barrier height (kcal/mol). */
-    float v2;
-    /** Third barrier height (kcal/mol). */
-    float v3;
+    /** MMFF94 `V1`, the first barrier height in kcal/mol. */
+    float torsion_v1;
+    /** MMFF94 `V2`, the second barrier height in kcal/mol. */
+    float torsion_v2;
+    /** MMFF94 `V3`, the third barrier height in kcal/mol. */
+    float torsion_v3;
 };
+
+static_assert(sizeof(mmff94_torsion_t) == 16);
 
 /**
  *  MMFF94 out-of-plane bending.
@@ -298,6 +301,8 @@ struct alignas(16) mmff94_oop_t {
     float padding[2];
 };
 
+static_assert(sizeof(mmff94_oop_t) == 16);
+
 /**
  *  @brief MMFF94 stretch-bend coupling term.
  *
@@ -313,23 +318,24 @@ struct alignas(32) mmff94_stretchbend_t {
     /** End atom 2. */
     std::uint8_t atom_k;
     std::uint8_t padding;
-    /** Stretch-bend force constant (bond i-j). */
+    /** Stretch-bend force constant for bond i-j. */
     float kba_ijk;
-    /** Stretch-bend force constant (bond k-j). */
+    /** Stretch-bend force constant for bond k-j. */
     float kba_kji;
-    /** θ₀ (radians). */
+    /** θ₀ in radians. */
     float equilibrium_angle;
-    /** r₀_ij (angstroms). */
+    /** r₀_ij in angstroms. */
     float equilibrium_distance_ij;
-    /** r₀_kj (angstroms). */
+    /** r₀_kj in angstroms. */
     float equilibrium_distance_kj;
     float padding_float;
 };
 
+static_assert(sizeof(mmff94_stretchbend_t) == 32);
+
 /**
  *  @brief Per-atom MMFF94 interaction descriptor for the per-atom adjacency list.
  *  Each entry says: "atom X participates in term Y with role Z".
- *  interaction_type: mmff94_nonbonded_k through mmff94_stretch_bend_k
  */
 struct mmff94_atom_interaction_t {
     /** Index into the type-specific parameter array. */
@@ -342,8 +348,8 @@ struct mmff94_atom_interaction_t {
 /**
  *  @brief Per-atom per-type offsets into the MMFF94 interaction list.
  *
- *  No `nonbonded_*` fields — the nonbonded kernel loop enumerates pairs
- *  on the fly from the `bond_distance` matrix.
+ *  No `nonbonded_*` fields — the nonbonded kernel loop enumerates pairs on the fly from the
+ *  `bond_distance` matrix.
  *
  *  The counts are `uint32_t` because a central atom in a large drug-like molecule can participate
  *  in more than 255 torsions. A narrower counter wraps, the torsion writes overflow into the next
@@ -366,8 +372,6 @@ struct mmff94_atom_offsets_t {
 
 /**
  *  @brief Per-atom ETK interaction descriptor.
- *
- *  interaction_type: etk_torsion_k or etk_distance_constraint_k.
  */
 struct etk_atom_interaction_t {
     std::uint32_t term_index;
@@ -393,9 +397,9 @@ struct etk_atom_offsets_t {
  *  without a readback; where RDKit can parametrise one, its atom types and partial charges are
  *  staged here, a device pass writes them over the typer's output and clears the molecule's typing
  *  status, and the extractor treats the molecule as typed. Where RDKit cannot parametrise it
- *  either, the molecule is rejected with `unsupported_element` as it always was. On both samples
- *  above that second case covers every untyped molecule and this array stays empty, so the patch is
- *  a guard against a corpus where the two typers disagree rather than a hot path.
+ *  either, the molecule is rejected with `unsupported_element_k`. On both samples above that second
+ *  case covers every untyped molecule and this array stays empty, so the patch is a guard against a
+ *  corpus where the two typers disagree rather than a hot path.
  */
 struct mmff94_typing_patch_t {
     /** Position of the molecule inside the batch. */

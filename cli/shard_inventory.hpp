@@ -1,5 +1,5 @@
 /**
- *  @file shard_inventory.hpp
+ *  @file cli/shard_inventory.hpp
  *  @brief Glob input Parquet shards and decide which outputs already exist so a `--resume` run skips finished shards.
  *
  *  Restart policy: each input shard `<name>.parquet` deterministically maps to output `<name>.3D.parquet`, note the
@@ -29,9 +29,8 @@ struct shard_pair_t {
 };
 
 /**
- *  @brief Inventory every *.parquet file in @p input_dir (excluding any
- *  *.3D.parquet siblings), compute the matching output path in @p output_dir,
- *  and mark shards whose `<output>.encoded` sentinel exists as
+ *  @brief Inventory every `*.parquet` file in @p input_dir, excluding any `*.3D.parquet` siblings, compute
+ *  the matching output path in @p output_dir, and mark shards whose `<output>.encoded` sentinel exists as
  *  `already_complete`.
  *
  *  @param[in] resume when true, already-complete shards are flagged; when false,
@@ -41,8 +40,7 @@ std::vector<shard_pair_t> inventory_shards(std::filesystem::path const &input_di
                                            std::filesystem::path const &output_dir, bool resume);
 
 /**
- *  @brief List every `*.parquet` file in @p input_dir (excluding *.3D.parquet),
- *  sorted lexicographically.
+ *  @brief List every `*.parquet` file in @p input_dir, excluding `*.3D.parquet`, sorted lexicographically.
  */
 std::vector<std::filesystem::path> list_input_shards(std::filesystem::path const &input_dir);
 

@@ -1,31 +1,25 @@
 /**
- *  @file mmff94_param_cache.hpp
+ *  @file src/smallfield/mmff94/mmff94_param_cache.hpp
  *  @brief Global cache for MMFF94 per-term parameter lookups.
  *
- *  Once the native MMFF port replaced the RDKit parameter calls, `extract_mmff94_params` still
- *  accounted for 23 % of prep CPU. The bulk is in
- *  `getMMFFTorsionParams` (6.2 %), `getMMFFStretchBendParams` (5.3 %),
- *  `getMMFFAngleBendParams` (3.7 %), and ancillary type-determination
- *  (`getMMFFBondType`, `getMMFFAngleType`, `getMMFFTorsionType`). The
- *  `MMFFMolProperties` constructor itself is only 2.6 %.
+ *  Once the native MMFF port replaced the RDKit parameter calls, `extract_mmff94_params` still accounted for 23
+ *  % of prep CPU. The bulk is in `getMMFFTorsionParams` (6.2 %), `getMMFFStretchBendParams` (5.3 %),
+ *  `getMMFFAngleBendParams` (3.7 %), and ancillary type-determination (`getMMFFBondType`, `getMMFFAngleType`,
+ *  `getMMFFTorsionType`). The `MMFFMolProperties` constructor itself is only 2.6 %.
  *
- *  Key observation: these per-term calls are pure functions of the atom
- *  types + bond classifications. MMFF94 has ~92 atom types and a handful
- *  of bond-type codes, so the effective tuple space is small (a few
- *  thousand unique keys across drug-like ChEMBL) and warms up within the
- *  first hundred molecules. From then on, each call becomes an O(1) hash
- *  lookup instead of an O(log N) std::map search through RDKit's global
- *  parameter tables plus the type-determination work.
+ *  Key observation: these per-term calls are pure functions of the atom types + bond classifications. MMFF94
+ *  has ~92 atom types and a handful of bond-type codes, so the effective tuple space is small (a few thousand
+ *  unique keys across drug-like ChEMBL) and warms up within the first hundred molecules. From then on, each
+ *  call becomes an O(1) hash lookup instead of an O(log N) std::map search through RDKit's global parameter
+ *  tables plus the type-determination work.
  *
- *  The cache is keyed on the RDKit-assigned MMFF atom types (obtained
- *  cheaply via `mmff_props.getMMFFAtomType(atom_index)` — array access) plus
- *  bond order / aromaticity / ring flags of the relevant bonds. This is
- *  the same information RDKit's internal classification uses, so a cache
- *  hit is byte-identical to calling the RDKit function.
+ *  The cache is keyed on the RDKit-assigned MMFF atom types (obtained cheaply via
+ *  `mmff_props.getMMFFAtomType(atom_index)` — array access) plus bond order / aromaticity / ring flags of the
+ *  relevant bonds. This is the same information RDKit's internal classification uses, so a cache hit is
+ *  byte-identical to calling the RDKit function.
  *
- *  Thread-safety: 64 shards, each guarded by `std::shared_mutex`. Lookups
- *  take shared locks (no contention between readers); inserts take
- *  exclusive locks (rare after warmup).
+ *  Thread-safety: 64 shards, each guarded by `std::shared_mutex`. Lookups take shared locks (no contention
+ *  between readers); inserts take exclusive locks (rare after warmup).
  */
 
 #pragma once
@@ -35,31 +29,41 @@
 #include <unordered_map> // `std::unordered_map`
 
 #include "smallfield/module_fwd.hpp"
+#include "smallfield/parameters/mmff94_tables.hpp"
+#include "smallfield/utilities.hpp"
 
 namespace smallfield::mmff94 {
 
 /** Per-bond stretch parameter (MMFFBond in RDKit). */
 struct mmff_bond_cached_t {
-    float kb;
-    float r0;
+    /** MMFF94 `kb`, in mdyn per angstrom. */
+    float force_constant;
+    /** MMFF94 `r0`, in angstroms. */
+    float equilibrium_distance;
 };
 
 /** Per-angle bend parameter (MMFFAngle.ka + theta0 pre-converted to radians). */
 struct mmff_angle_cached_t {
-    float ka;
-    float theta0_rad;
+    /** MMFF94 `ka`, in mdyn·angstrom per rad². */
+    float force_constant;
+    /** MMFF94 `theta0`, in radians. */
+    float equilibrium_angle_radians;
 };
 
 /** Per-torsion parameter (MMFFTor V1/V2/V3). */
 struct mmff_torsion_cached_t {
-    float V1;
-    float V2;
-    float V3;
+    /** MMFF94 `V1`, the first barrier height in kcal/mol. */
+    float torsion_v1;
+    /** MMFF94 `V2`, the second barrier height in kcal/mol. */
+    float torsion_v2;
+    /** MMFF94 `V3`, the third barrier height in kcal/mol. */
+    float torsion_v3;
 };
 
 /** Per-OOP parameter (MMFFOop koop). */
 struct mmff_oop_cached_t {
-    float koop;
+    /** MMFF94 `koop`, in mdyn·angstrom per rad². */
+    float force_constant;
 };
 
 /** Per-stretch-bend parameter: couples a 3-atom angle with its two bonds.
@@ -67,15 +71,15 @@ struct mmff_oop_cached_t {
  *  assembly in `extract_mmff94_params`). */
 struct mmff_stretchbend_cached_t {
     /** Stretch-bend force const (bond IJ side). */
-    float kbaIJK;
+    float kba_ijk;
     /** Stretch-bend force const (bond KJ side). */
-    float kbaKJI;
-    /** Equilibrium angle (from inner MMFFAngle). */
-    float theta0_rad;
+    float kba_kji;
+    /** MMFF94 `theta0` of the inner MMFFAngle, in radians. */
+    float equilibrium_angle_radians;
     /** Equilibrium bond length IJ (from inner MMFFBond[0]). */
     float r0_ij;
-    /** Equilibrium bond length JK (from inner MMFFBond[1]). */
-    float r0_jk;
+    /** Equilibrium bond length KJ (from inner MMFFBond[1]). */
+    float r0_kj;
 };
 
 /** Thread-local MMFF94 parameter cache — one `std::unordered_map` per OpenMP thread, no mutexes.
@@ -84,7 +88,7 @@ struct mmff_stretchbend_cached_t {
  *  Memory overhead is modest — a few KB per thread for typical drug-like inputs.
  */
 template <typename value_>
-class mmff_cache_t {
+class mmff_cache {
   public:
     value_ const *find(std::uint64_t key) const noexcept {
         auto it = map_.find(key);
@@ -106,25 +110,25 @@ class mmff_cache_t {
  *  Caches are process-local and thread-local and persist for the thread's lifetime, so warmup cost
  *  amortises across every molecule that thread handles via OpenMP's persistent pool.
  */
-inline mmff_cache_t<mmff_bond_cached_t> &mmff_bond_cache() {
-    thread_local mmff_cache_t<mmff_bond_cached_t> c;
-    return c;
+inline mmff_cache<mmff_bond_cached_t> &mmff_bond_cache() {
+    thread_local mmff_cache<mmff_bond_cached_t> cache;
+    return cache;
 }
-inline mmff_cache_t<mmff_angle_cached_t> &mmff_angle_cache() {
-    thread_local mmff_cache_t<mmff_angle_cached_t> c;
-    return c;
+inline mmff_cache<mmff_angle_cached_t> &mmff_angle_cache() {
+    thread_local mmff_cache<mmff_angle_cached_t> cache;
+    return cache;
 }
-inline mmff_cache_t<mmff_torsion_cached_t> &mmff_torsion_cache() {
-    thread_local mmff_cache_t<mmff_torsion_cached_t> c;
-    return c;
+inline mmff_cache<mmff_torsion_cached_t> &mmff_torsion_cache() {
+    thread_local mmff_cache<mmff_torsion_cached_t> cache;
+    return cache;
 }
-inline mmff_cache_t<mmff_oop_cached_t> &mmff_oop_cache() {
-    thread_local mmff_cache_t<mmff_oop_cached_t> c;
-    return c;
+inline mmff_cache<mmff_oop_cached_t> &mmff_oop_cache() {
+    thread_local mmff_cache<mmff_oop_cached_t> cache;
+    return cache;
 }
-inline mmff_cache_t<mmff_stretchbend_cached_t> &mmff_stretchbend_cache() {
-    thread_local mmff_cache_t<mmff_stretchbend_cached_t> c;
-    return c;
+inline mmff_cache<mmff_stretchbend_cached_t> &mmff_stretchbend_cache() {
+    thread_local mmff_cache<mmff_stretchbend_cached_t> cache;
+    return cache;
 }
 
 /**
@@ -150,7 +154,7 @@ inline std::uint8_t pack_bond_signature_(std::uint8_t bond_order, bool aromatic,
 /** Build the full uint64 cache key for an MMFF94 bond-stretch parameter lookup. */
 inline std::uint64_t make_bond_stretch_key_(std::uint8_t at_i, std::uint8_t at_j, std::uint8_t bond_sig) noexcept {
     // Commutative under (i, j) swap.
-    if (at_i > at_j) std::swap(at_i, at_j);
+    if (at_i > at_j) swap_(at_i, at_j);
     return (mmff_key_kind_bond_stretch_k << 60) | (static_cast<std::uint64_t>(at_i) << 16) |
            (static_cast<std::uint64_t>(at_j) << 8) | bond_sig;
 }
@@ -168,8 +172,8 @@ inline std::uint64_t make_angle_key_(std::uint8_t at_i, std::uint8_t at_center, 
                                      std::uint8_t bsig_cj) noexcept {
     // Commutative under (i, j)↔(j, i) with paired bond-signature swap.
     if (at_i > at_j || (at_i == at_j && bsig_ic > bsig_cj)) {
-        std::swap(at_i, at_j);
-        std::swap(bsig_ic, bsig_cj);
+        swap_(at_i, at_j);
+        swap_(bsig_ic, bsig_cj);
     }
     return (mmff_key_kind_angle_bend_k << 60) | (static_cast<std::uint64_t>(at_i) << 32) |
            (static_cast<std::uint64_t>(at_center) << 24) | (static_cast<std::uint64_t>(at_j) << 16) |
@@ -197,9 +201,9 @@ inline std::uint64_t make_torsion_key_(std::uint8_t at_i, std::uint8_t at_j, std
     else if (at_j == at_k && at_i > at_l) flip = true;
     else if (at_j == at_k && at_i == at_l && bsig_ij > bsig_kl) flip = true;
     if (flip) {
-        std::swap(at_i, at_l);
-        std::swap(at_j, at_k);
-        std::swap(bsig_ij, bsig_kl);
+        swap_(at_i, at_l);
+        swap_(at_j, at_k);
+        swap_(bsig_ij, bsig_kl);
     }
     return (mmff_key_kind_torsion_k << 60) | (static_cast<std::uint64_t>(at_i) << 48) |
            (static_cast<std::uint64_t>(at_j) << 40) | (static_cast<std::uint64_t>(at_k) << 32) |
@@ -220,13 +224,13 @@ inline std::uint64_t make_oop_key_(std::uint8_t at_center, std::uint8_t at_a, st
                                    std::uint8_t at_c) noexcept {
     // Out-of-plane: center is fixed, the three planar neighbors are
     // interchangeable. Sort (a, b, c) ascending.
-    std::uint8_t nbrs[3] = {at_a, at_b, at_c};
-    if (nbrs[0] > nbrs[1]) std::swap(nbrs[0], nbrs[1]);
-    if (nbrs[1] > nbrs[2]) std::swap(nbrs[1], nbrs[2]);
-    if (nbrs[0] > nbrs[1]) std::swap(nbrs[0], nbrs[1]);
+    std::uint8_t neighbors[3] = {at_a, at_b, at_c};
+    if (neighbors[0] > neighbors[1]) swap_(neighbors[0], neighbors[1]);
+    if (neighbors[1] > neighbors[2]) swap_(neighbors[1], neighbors[2]);
+    if (neighbors[0] > neighbors[1]) swap_(neighbors[0], neighbors[1]);
     return (mmff_key_kind_oop_k << 60) | (static_cast<std::uint64_t>(at_center) << 32) |
-           (static_cast<std::uint64_t>(nbrs[0]) << 24) | (static_cast<std::uint64_t>(nbrs[1]) << 16) |
-           (static_cast<std::uint64_t>(nbrs[2]) << 8);
+           (static_cast<std::uint64_t>(neighbors[0]) << 24) | (static_cast<std::uint64_t>(neighbors[1]) << 16) |
+           (static_cast<std::uint64_t>(neighbors[2]) << 8);
 }
 
 /**
@@ -241,7 +245,7 @@ inline std::uint64_t make_oop_key_(std::uint8_t at_center, std::uint8_t at_a, st
  */
 inline std::uint64_t make_stretchbend_key_(std::uint8_t at_i, std::uint8_t at_center, std::uint8_t at_j,
                                            std::uint8_t bsig_ic, std::uint8_t bsig_cj) noexcept {
-    // Stretch-bend is directional (kbaIJK ≠ kbaKJI in general). Do @b not
+    // Stretch-bend is directional (kba_ijk ≠ kba_kji in general). Do @b not
     // canonicalize endpoint order.
     return (mmff_key_kind_stretchbend_k << 60) | (static_cast<std::uint64_t>(at_i) << 32) |
            (static_cast<std::uint64_t>(at_center) << 24) | (static_cast<std::uint64_t>(at_j) << 16) |

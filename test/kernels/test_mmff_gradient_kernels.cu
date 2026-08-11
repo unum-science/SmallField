@@ -1,5 +1,5 @@
 /**
- *  @file test_mmff_gradient_kernels.cu
+ *  @file test/kernels/test_mmff_gradient_kernels.cu
  *  @brief CUDA kernel wrapper for MMFF94 energy and gradient tests.
  */
 
@@ -10,6 +10,8 @@
 #include <cuda_runtime.h>
 
 #include "smallfield/cuda/mmff94_energy_kernel.cuh"
+
+#include "test_mmff_gradient_kernels.hpp"
 
 namespace sfc = smallfield::cuda;
 namespace sft = smallfield::types;
@@ -34,7 +36,7 @@ __global__ void mmff_energy_eval_kernel(
 
 } // namespace
 
-extern "C" {
+namespace smallfield::tests {
 
 void gpu_mmff_energy(float const *host_positions, std::uint32_t num_atoms,
                      sft::mmff94_atom_vdw_params_t const *host_atom_vdw, float const *host_atom_charge,
@@ -138,4 +140,4 @@ void gpu_mmff_energy(float const *host_positions, std::uint32_t num_atoms,
     cudaFree(device_atom_offsets);
 }
 
-} // extern "C"
+} // namespace smallfield::tests

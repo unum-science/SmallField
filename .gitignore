@@ -144,7 +144,5 @@ Testing/
 *.dylib
 *.o
 *.png
-build_debug
-build_release
 .DS_Store
 .claude/

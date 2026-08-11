@@ -34,7 +34,7 @@ def _reshape_single_molecule(
 ) -> Optional[np.ndarray]:
     successful_conformers = []
     for conformer_index in range(num_conformers):
-        if int(status_codes[conformer_index]) != int(ConformerStatus.success):
+        if int(status_codes[conformer_index]) != int(ConformerStatus.SUCCESS):
             continue
         conformer_offset = conformer_index * max_atoms_per_molecule * 3
         soa_coordinates = coordinates_flat[

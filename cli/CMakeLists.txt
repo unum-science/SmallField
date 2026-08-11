@@ -1,10 +1,10 @@
 # SmallField batch binary: restartable Parquet folder → conformer Parquet folder.
 # Builds a CLI executable that processes a folder of Parquet files (one `smiles`
 # column) and emits 3D conformer coordinates + energies + status for K conformers
-# per molecule.  Three-tier fallback: GPU → RDKit → NULL.
+# per molecule. Three-tier fallback: GPU → RDKit → NULL.
 
 option(SMALLFIELD_BUILD_BATCH_BINARY "Build smallfield_batch CLI (requires Apache Arrow)" OFF)
-# Opt-in host-side NVTX ranges for `nsys` timelines.  Header-only (NVTX3 ships with
+# Opt-in host-side NVTX ranges for `nsys` timelines. Header-only (NVTX3 ships with
 # the CUDA toolkit); compiles to nothing when OFF, so shipping builds are unaffected.
 option(SMALLFIELD_ENABLE_NVTX "Annotate batch pipeline roles with NVTX ranges" OFF)
 
@@ -12,7 +12,7 @@ if(NOT SMALLFIELD_BUILD_BATCH_BINARY)
     return()
 endif()
 
-# Locate Arrow / Parquet.  conda-forge libraries ship cmake config files under
+# Locate Arrow / Parquet. conda-forge libraries ship cmake config files under
 # ${RDKIT_PREFIX}/lib/cmake/Arrow and Parquet.
 if(DEFINED RDKIT_PREFIX)
     list(PREPEND CMAKE_PREFIX_PATH "${RDKIT_PREFIX}")
@@ -68,7 +68,7 @@ endif()
 # Descriptor-augmentation binary: rewrites existing *.3D.parquet shards into the
 # canonical 13-column schema by computing USR/USRCAT from the stored fp16 coordinates
 # and re-emitting through the shared writer (parquet_writer.cpp) — byte-identical to the
-# batch producer's output.  CPU-only; reuses the producer's writer + descriptor code.
+# batch producer's output. CPU-only; reuses the producer's writer + descriptor code.
 add_executable(smallfield_descriptors
     smallfield_descriptors.cpp
     parquet_writer.cpp)

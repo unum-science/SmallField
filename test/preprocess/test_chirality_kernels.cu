@@ -1,6 +1,6 @@
 /**
- *  @file test_chirality_kernels.cu
- *  @brief CUDA kernel wrappers for chirality validation test. Compiled by nvcc.
+ *  @file test/preprocess/test_chirality_kernels.cu
+ *  @brief CUDA kernel wrappers for chirality validation test.
  */
 
 #include <cstdint> // `std::uint32_t`
@@ -9,19 +9,21 @@
 
 #include "smallfield/cuda/dg_kernel.cuh"
 
+#include "test_chirality_kernels.hpp"
+
 namespace sft = smallfield::types;
-namespace sfcuda = smallfield::cuda;
+namespace sfc = smallfield::cuda;
 
 __global__ void chirality_check_kernel(float const *positions, std::uint32_t num_atoms,
                                        sft::chiral_center_descriptor_t const *chirals, std::uint32_t num_chirals,
                                        bool *out_result) {
 
     std::uint32_t const lane = threadIdx.x;
-    bool const result = sfcuda::validate_chirality_(positions, num_atoms, chirals, num_chirals, lane);
+    bool const result = sfc::validate_chirality_(positions, num_atoms, chirals, num_chirals, lane);
     if (lane == 0) { *out_result = result; }
 }
 
-extern "C" {
+namespace smallfield::tests {
 
 bool gpu_validate_chirality(float const *host_coords, sft::chiral_center_descriptor_t const *host_chirals,
                             std::uint32_t num_atoms, std::uint32_t num_chirals) {
@@ -52,4 +54,4 @@ bool gpu_validate_chirality(float const *host_coords, sft::chiral_center_descrip
     return result;
 }
 
-} // extern "C"
+} // namespace smallfield::tests

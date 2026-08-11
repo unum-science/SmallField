@@ -1,6 +1,6 @@
 /**
- *  @file test_dg_energy.cpp
- *  @brief Tests for DG energy evaluation, gradient correctness, and L-BFGS convergence.
+ *  @file test/kernels/test_dg_energy.cpp
+ *  @brief Test DG energy evaluation, gradient correctness, and L-BFGS convergence.
  *
  *  Compiled with g++, C++20. CUDA kernels in test_dg_energy_kernels.cu.
  */
@@ -13,20 +13,15 @@
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
+#include "test_dg_energy_kernels.hpp"
 #include "test_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-extern "C" void gpu_dg_energy(float const *host_coords, float *host_gradient, float const *host_bounds,
-                              std::uint32_t num_atoms, std::uint32_t spatial_dimension, float upper_weight,
-                              float lower_weight, float fourth_dim_weight, float *out_energy);
-
-extern "C" void gpu_dg_minimize(float *host_coords, float const *host_bounds, std::uint32_t num_atoms,
-                                std::uint32_t spatial_dimension, float upper_weight, float lower_weight,
-                                float fourth_dim_weight, std::int32_t max_iterations, float gradient_threshold,
-                                float *out_energy, std::int32_t *out_iterations, std::int32_t *out_status);
+using sftest::gpu_dg_energy;
+using sftest::gpu_dg_minimize;
 
 /**
  *  @brief CPU reference: compute DG distance violation energy in double precision.
@@ -36,17 +31,17 @@ extern "C" void gpu_dg_minimize(float *host_coords, float const *host_bounds, st
 static double cpu_dg_energy_reference(double const *coords, float const *bounds, std::uint32_t num_atoms,
                                       std::uint32_t dim, float upper_weight, float lower_weight) {
     double energy = 0.0;
-    for (std::uint32_t i = 0; i < num_atoms; ++i) {
-        for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
+    for (std::uint32_t first_atom = 0; first_atom < num_atoms; ++first_atom) {
+        for (std::uint32_t second_atom = first_atom + 1; second_atom < num_atoms; ++second_atom) {
             double dist_sq = 0.0;
-            for (std::uint32_t d = 0; d < dim; ++d) {
-                double delta = coords[d * num_atoms + j] - coords[d * num_atoms + i];
+            for (std::uint32_t dimension = 0; dimension < dim; ++dimension) {
+                double delta = coords[dimension * num_atoms + second_atom] - coords[dimension * num_atoms + first_atom];
                 dist_sq += delta * delta;
             }
             double dist = std::sqrt(std::max(dist_sq, 1e-12));
 
-            double upper = static_cast<double>(bounds[i * num_atoms + j]);
-            double lower = static_cast<double>(bounds[j * num_atoms + i]);
+            double upper = static_cast<double>(bounds[first_atom * num_atoms + second_atom]);
+            double lower = static_cast<double>(bounds[second_atom * num_atoms + first_atom]);
 
             if (dist > upper) {
                 double violation = dist - upper;
@@ -64,30 +59,30 @@ static double cpu_dg_energy_reference(double const *coords, float const *bounds,
 static void test_dg_energy_known_violation() {
     std::printf("test_dg_energy_known_violation\n");
 
-    auto mol = sftest::mol_from_smiles("CCO");
-    sf_verify_(mol != nullptr, "failed to parse CCO");
+    auto molecule = sftest::mol_from_smiles("CCO");
+    sf_verify_(molecule != nullptr, "failed to parse CCO");
 
-    bool ok = sftest::embed_molecule(*mol);
+    bool ok = sftest::embed_molecule(*molecule);
     sf_verify_(ok, "failed to embed CCO");
 
-    std::uint32_t const num_atoms = mol->getNumAtoms();
+    std::uint32_t const num_atoms = molecule->getNumAtoms();
     std::uint32_t const dim = 4;
     std::uint32_t const num_elements = dim * num_atoms;
 
     // get smoothed bounds matrix
     std::vector<float> bounds;
     sft::molecule_descriptor_t descriptor;
-    sft::build_descriptor(*mol, descriptor);
+    sft::build_descriptor(*molecule, descriptor);
     sfp::build_bounds_matrix(descriptor, bounds);
 
     // create 4D coords from RDKit 3D coords + random 4th dim
-    auto coords_3d = sftest::extract_coords_interleaved(*mol);
+    auto coords_3d = sftest::extract_coords_interleaved(*molecule);
     std::vector<float> coords_soa(num_elements, 0.0f);
-    for (std::uint32_t i = 0; i < num_atoms; ++i) {
-        coords_soa[0 * num_atoms + i] = coords_3d[i * 3 + 0];
-        coords_soa[1 * num_atoms + i] = coords_3d[i * 3 + 1];
-        coords_soa[2 * num_atoms + i] = coords_3d[i * 3 + 2];
-        coords_soa[3 * num_atoms + i] = 0.1f * (i % 3 - 1); // small 4th dim
+    for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
+        coords_soa[0 * num_atoms + atom_index] = coords_3d[atom_index * 3 + 0];
+        coords_soa[1 * num_atoms + atom_index] = coords_3d[atom_index * 3 + 1];
+        coords_soa[2 * num_atoms + atom_index] = coords_3d[atom_index * 3 + 2];
+        coords_soa[3 * num_atoms + atom_index] = 0.1f * (atom_index % 3 - 1); // small 4th dim
     }
 
     // perturb some coordinates to create moderate violations
@@ -115,31 +110,31 @@ static void test_dg_energy_known_violation() {
 static void test_dg_gradient_finite_difference() {
     std::printf("test_dg_gradient_finite_difference\n");
 
-    auto mol = sftest::mol_from_smiles("CCO");
-    sf_verify_(mol != nullptr, "failed to parse CCO");
+    auto molecule = sftest::mol_from_smiles("CCO");
+    sf_verify_(molecule != nullptr, "failed to parse CCO");
 
-    bool ok = sftest::embed_molecule(*mol);
+    bool ok = sftest::embed_molecule(*molecule);
     sf_verify_(ok, "failed to embed CCO");
 
-    std::uint32_t const num_atoms = mol->getNumAtoms();
+    std::uint32_t const num_atoms = molecule->getNumAtoms();
     std::uint32_t const dim = 4;
     std::uint32_t const num_elements = dim * num_atoms;
 
     std::vector<float> bounds;
     sft::molecule_descriptor_t descriptor;
-    sft::build_descriptor(*mol, descriptor);
+    sft::build_descriptor(*molecule, descriptor);
     sfp::build_bounds_matrix(descriptor, bounds);
 
     // create SoA coords with small perturbation (moderate violations)
-    auto coords_3d = sftest::extract_coords_interleaved(*mol);
+    auto coords_3d = sftest::extract_coords_interleaved(*molecule);
     std::vector<float> coords(num_elements, 0.0f);
-    std::mt19937 rng_grad(123);
+    std::mt19937 gradient_generator(123);
     std::uniform_real_distribution<float> perturb(-0.3f, 0.3f);
-    for (std::uint32_t i = 0; i < num_atoms; ++i) {
-        coords[0 * num_atoms + i] = coords_3d[i * 3 + 0] + perturb(rng_grad);
-        coords[1 * num_atoms + i] = coords_3d[i * 3 + 1] + perturb(rng_grad);
-        coords[2 * num_atoms + i] = coords_3d[i * 3 + 2] + perturb(rng_grad);
-        coords[3 * num_atoms + i] = perturb(rng_grad) * 0.5f;
+    for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
+        coords[0 * num_atoms + atom_index] = coords_3d[atom_index * 3 + 0] + perturb(gradient_generator);
+        coords[1 * num_atoms + atom_index] = coords_3d[atom_index * 3 + 1] + perturb(gradient_generator);
+        coords[2 * num_atoms + atom_index] = coords_3d[atom_index * 3 + 2] + perturb(gradient_generator);
+        coords[3 * num_atoms + atom_index] = perturb(gradient_generator) * 0.5f;
     }
 
     // get analytical gradient from GPU
@@ -154,13 +149,13 @@ static void test_dg_gradient_finite_difference() {
     std::uint32_t num_mismatches = 0;
     float max_relative_error = 0.0f;
 
-    for (std::uint32_t k = 0; k < num_elements; ++k) {
+    for (std::uint32_t component = 0; component < num_elements; ++component) {
         std::vector<float> coords_plus = coords;
         std::vector<float> coords_minus = coords;
         std::vector<float> dummy_grad(num_elements);
 
-        coords_plus[k] += epsilon;
-        coords_minus[k] -= epsilon;
+        coords_plus[component] += epsilon;
+        coords_minus[component] -= epsilon;
 
         float energy_plus = 0.0f, energy_minus = 0.0f;
         gpu_dg_energy(coords_plus.data(), dummy_grad.data(), bounds.data(), num_atoms, dim, 1.0f, 1.0f, 0.0f,
@@ -168,9 +163,9 @@ static void test_dg_gradient_finite_difference() {
         gpu_dg_energy(coords_minus.data(), dummy_grad.data(), bounds.data(), num_atoms, dim, 1.0f, 1.0f, 0.0f,
                       &energy_minus);
 
-        float const fd_gradient = (energy_plus - energy_minus) / (2.0f * epsilon);
-        float const analytical = analytical_gradient[k];
-        float const abs_error = std::fabs(analytical - fd_gradient);
+        float const finite_difference_gradient = (energy_plus - energy_minus) / (2.0f * epsilon);
+        float const analytical = analytical_gradient[component];
+        float const abs_error = std::fabs(analytical - finite_difference_gradient);
         float const denom = std::max(1.0f, std::fabs(analytical));
         float const relative_error = abs_error / denom;
 
@@ -178,8 +173,8 @@ static void test_dg_gradient_finite_difference() {
 
         if (relative_error > 0.05f && abs_error > 0.01f) {
             if (num_mismatches < 5) {
-                std::printf("  component %u: analytical=%.6f fd=%.6f rel_err=%.4f\n", k, analytical, fd_gradient,
-                            relative_error);
+                std::printf("  component %u: analytical=%.6f fd=%.6f rel_err=%.4f\n", component, analytical,
+                            finite_difference_gradient, relative_error);
             }
             ++num_mismatches;
         }
@@ -208,10 +203,10 @@ static void test_dg_minimize_convergence() {
         std::uint32_t const num_elements = dim * num_atoms;
 
         // random 4D starting coordinates
-        std::mt19937 rng(42);
+        std::mt19937 generator(42);
         std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
         std::vector<float> coords(num_elements);
-        for (auto &c : coords) c = dist(rng);
+        for (auto &coordinate : coords) coordinate = dist(generator);
 
         // run DG minimization
         float energy = 0.0f;
@@ -223,16 +218,17 @@ static void test_dg_minimize_convergence() {
 
         // check distance violations after minimization
         float max_violation = 0.0f;
-        for (std::uint32_t i = 0; i < num_atoms; ++i) {
-            for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
+        for (std::uint32_t first_atom = 0; first_atom < num_atoms; ++first_atom) {
+            for (std::uint32_t second_atom = first_atom + 1; second_atom < num_atoms; ++second_atom) {
                 float dist_sq = 0.0f;
-                for (std::uint32_t d = 0; d < dim; ++d) {
-                    float delta = coords[d * num_atoms + j] - coords[d * num_atoms + i];
+                for (std::uint32_t dimension = 0; dimension < dim; ++dimension) {
+                    float delta = coords[dimension * num_atoms + second_atom] -
+                                  coords[dimension * num_atoms + first_atom];
                     dist_sq += delta * delta;
                 }
                 float distance = std::sqrt(dist_sq);
-                float upper = prepared.bounds_matrix[i * num_atoms + j];
-                float lower = prepared.bounds_matrix[j * num_atoms + i];
+                float upper = prepared.bounds_matrix[first_atom * num_atoms + second_atom];
+                float lower = prepared.bounds_matrix[second_atom * num_atoms + first_atom];
 
                 if (distance > upper) max_violation = std::max(max_violation, distance - upper);
                 if (distance < lower) max_violation = std::max(max_violation, lower - distance);
@@ -241,20 +237,20 @@ static void test_dg_minimize_convergence() {
         std::printf("    max_violation=%.4f angstrom\n", max_violation);
 
         // project to 3D and check MMFF94 energy via RDKit
-        auto mol = sftest::mol_from_smiles(smiles);
-        bool embedded = sftest::embed_molecule(*mol);
+        auto molecule = sftest::mol_from_smiles(smiles);
+        bool embedded = sftest::embed_molecule(*molecule);
         sf_verify_(embedded, "failed to embed for cross-reference");
 
         // extract 3D from SoA (first 3 dimensions)
         std::vector<float> coords_3d(num_atoms * 3);
-        for (std::uint32_t i = 0; i < num_atoms; ++i) {
-            coords_3d[i * 3 + 0] = coords[0 * num_atoms + i];
-            coords_3d[i * 3 + 1] = coords[1 * num_atoms + i];
-            coords_3d[i * 3 + 2] = coords[2 * num_atoms + i];
+        for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
+            coords_3d[atom_index * 3 + 0] = coords[0 * num_atoms + atom_index];
+            coords_3d[atom_index * 3 + 1] = coords[1 * num_atoms + atom_index];
+            coords_3d[atom_index * 3 + 2] = coords[2 * num_atoms + atom_index];
         }
 
-        sftest::set_coords_interleaved(*mol, coords_3d.data());
-        double mmff_energy = sftest::rdkit_mmff94_energy(*mol);
+        sftest::set_coords_interleaved(*molecule, coords_3d.data());
+        double mmff_energy = sftest::rdkit_mmff94_energy(*molecule);
         std::printf("    MMFF94 energy at DG coords: %.2f kcal/mol\n", mmff_energy);
 
         sf_verify_(std::isfinite(mmff_energy), "MMFF94 energy must be finite after DG minimization");

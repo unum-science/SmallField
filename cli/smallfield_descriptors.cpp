@@ -1,30 +1,27 @@
 /**
- *  @file smallfield_descriptors.cpp
+ *  @file cli/smallfield_descriptors.cpp
  *  @brief Augment existing 3D conformer parquet-shards in place with shape descriptors.
  *
- *  The batch producer `smallfield_batch` emits the canonical `*.3D.parquet`
- *  schema: per-conformer USRCAT shape vectors, energy-sorted conformers, and
- *  provenance metadata. Older shards lack this schema entirely, with no
- *  `usrcat` column and conformers not energy-sorted. Re-running the GPU to
- *  regenerate them would be wasteful and would perturb coordinates; instead this tool
- *  reads each old shard, computes the missing descriptors from the ALREADY-STORED
- *  (fp16-rounded) coordinates using the exact same native descriptor code the producer
- *  uses (`smallfield::postprocess`), and re-emits the full canonical schema through
- *  the producer's own writer (`smallfield::cli::write_shard`). Output is therefore
- *  identical to what the batch producer would have written for the same geometry.
+ *  The batch producer `smallfield_batch` emits the canonical `*.3D.parquet` schema: per-conformer USRCAT
+ *  shape vectors, energy-sorted conformers, and provenance metadata. Older shards lack this schema entirely,
+ *  with no `usrcat` column and conformers not energy-sorted. Re-running the GPU to regenerate them would be
+ *  wasteful and would perturb coordinates; instead this tool reads each old shard, computes the missing
+ *  descriptors from the @b already-stored (fp16-rounded) coordinates using the exact same native descriptor
+ *  code the producer uses (`smallfield::postprocess`), and re-emits the full canonical schema through the
+ *  producer's own writer (`smallfield::cli::write_shard`). Output is therefore identical to what the batch
+ *  producer would have written for the same geometry.
  *
- *  Because the input coordinates in a 3D shard are already a tight interleaved
- *  `(num_atoms, 3)` fp16 list — one list per conformer row — the descriptor path here
- *  matches the producer's byte for byte: the producer also reads its fp16 buffer back
- *  before computing descriptors, so both round through fp16 identically.
+ *  Because the input coordinates in a 3D shard are already a tight interleaved `(num_atoms, 3)` fp16 list,
+ *  one list per conformer row, the descriptor path here matches the producer's byte for byte: the producer
+ *  also reads its fp16 buffer back before computing descriptors, so both round through fp16 identically.
  *
  *  Usage:
  *  @code
  *    smallfield_descriptors --input DIR --output DIR [--reembed DIR] [--dataset NAME] [--threads N]
  *  @endcode
  *
- *  Resumable exactly like `smallfield_batch`: a `<output>.encoded` sentinel is written
- *  after each shard closes, and a resume run skips shards whose sentinel already exists.
+ *  Resumable exactly like `smallfield_batch`: a `<output>.encoded` sentinel is written after each shard
+ *  closes, and a resume run skips shards whose sentinel already exists.
  */
 
 #include <cstdint> // `std::uint32_t`
@@ -322,16 +319,17 @@ void load_reembed_shard(input_shard_t const &shard, reembed_index_t &index) {
             std::int64_t const begin = coords_list.value_offset(row);
             std::int64_t const end = coords_list.value_offset(row + 1);
             conformer.coord_bits.reserve(static_cast<std::size_t>(end - begin));
-            for (std::int64_t k = begin; k < end; ++k) conformer.coord_bits.push_back(coords_values.Value(k));
+            for (std::int64_t value_index = begin; value_index < end; ++value_index)
+                conformer.coord_bits.push_back(coords_values.Value(value_index));
         }
         if (shard.conformer_energy->IsValid(row)) conformer.energy = shard.conformer_energy->Value(row);
 
         if (usrcat_values && usrcat_column->IsValid(row)) {
             std::int64_t const begin = usrcat_column->value_offset(row);
             if (usrcat_column->value_offset(row + 1) - begin >= 60)
-                for (std::size_t d = 0; d < 60; ++d)
-                    conformer.usrcat[d] = half_bits_to_float(
-                        usrcat_values->Value(begin + static_cast<std::int64_t>(d)));
+                for (std::size_t component = 0; component < 60; ++component)
+                    conformer.usrcat[component] = half_bits_to_float(
+                        usrcat_values->Value(begin + static_cast<std::int64_t>(component)));
         }
 
         molecule.conformers.push_back(std::move(conformer));
@@ -365,7 +363,7 @@ reembed_index_t build_reembed_index(fs::path const &reembed_dir, logger_t const 
 /** Per-shard counters folded into the progress log. */
 struct shard_stats_t {
     /** Molecules whose SMILES parse did not match stored n_atoms. */
-    std::atomic<std::uint64_t> ctx_mismatch {0};
+    std::atomic<std::uint64_t> context_mismatch {0};
     std::atomic<std::uint64_t> fragments_separated {0};
     std::uint64_t from_reembed = 0;
 };
@@ -373,15 +371,12 @@ struct shard_stats_t {
 /**
  *  @brief Augment one input shard and write the canonical output shard.
  *
- *  Rows are grouped by `input_row`; molecules are contiguous, so molecule index
- *  `m` maps to `input_row = base_row_index + m`. Every molecule's conformer rows
- *  are laid into structure-of-arrays conformer slots exactly as the GPU producer
- *  would, so the producer's own `sfcli::write_shard` can energy-sort, rank
- *  `conformer_index`, couple nulls, and pack descriptors — guaranteeing identical
- *  output bytes. Descriptors are computed from the stored fp16 coordinates via the
- *  native `sfpost` path; multi-fragment molecules are `separate_fragments`'d and
- *  their corrected coordinates written back. Molecules found in @p reembed are
- *  copied verbatim from there instead.
+ *  Rows are grouped by `input_row`; molecules are contiguous, so `input_row = base_row_index + molecule_index`.
+ *  Every molecule's conformer rows are laid into structure-of-arrays conformer slots exactly as the GPU
+ *  producer would, so the producer's own `sfcli::write_shard` can energy-sort, rank `conformer_index`, couple
+ *  nulls, and pack descriptors — guaranteeing identical output bytes. Descriptors are computed from the stored
+ *  fp16 coordinates via the native `sfpost` path; multi-fragment molecules are `separate_fragments`'d and their
+ *  corrected coordinates written back. Molecules found in @p reembed are copied verbatim from there instead.
  */
 bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reembed_index_t const &reembed,
                    fs::path const &output_path, logger_t const &logger, shard_stats_t &stats) {
@@ -390,8 +385,8 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
         return false;
     }
 
-    // Contiguous molecule span: m -> input_row = base + m. The 3D schema guarantees
-    // rows are grouped and input_row is contiguous, so every m owns at least one row.
+    // Contiguous molecule span: input_row = base_row + molecule_index. The 3D schema guarantees rows are
+    // grouped and input_row is contiguous, so every molecule owns at least one row.
     std::uint64_t base_row = shard.input_row->Value(0);
     std::uint64_t max_row = base_row;
     for (std::int64_t row = 0; row < shard.num_rows; ++row) {
@@ -405,10 +400,10 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
     std::vector<std::vector<std::int64_t>> rows_for_molecule(num_molecules);
     std::uint32_t observed_conformers = 1;
     for (std::int64_t row = 0; row < shard.num_rows; ++row) {
-        std::uint64_t const m = shard.input_row->Value(row) - base_row;
-        rows_for_molecule[m].push_back(row);
-        observed_conformers = std::max<std::uint32_t>(observed_conformers,
-                                                      static_cast<std::uint32_t>(rows_for_molecule[m].size()));
+        std::uint64_t const molecule_index = shard.input_row->Value(row) - base_row;
+        rows_for_molecule[molecule_index].push_back(row);
+        observed_conformers = std::max<std::uint32_t>(
+            observed_conformers, static_cast<std::uint32_t>(rows_for_molecule[molecule_index].size()));
     }
     // The slot stride K must cover the widest molecule (original or reembed) and match the
     // producer's `num_conformers` provenance value. Reembed molecules can only add rows.
@@ -441,8 +436,8 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
     int const threads = config.threads > 0 ? config.threads : omp_get_max_threads();
 
 #pragma omp parallel for schedule(dynamic, 256) num_threads(threads) if (threads > 1)
-    for (std::uint64_t m = 0; m < num_molecules; ++m) {
-        auto const &rows = rows_for_molecule[m];
+    for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
+        auto const &rows = rows_for_molecule[molecule_index];
         if (rows.empty()) continue; // contiguous input guarantees this never fires; defensive only
         std::int64_t const first_row = rows.front();
         std::string_view const stem = shard.input_shard->GetView(first_row);
@@ -452,20 +447,22 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
         std::string const key = reembed_key(stem, input_row);
         if (auto found = reembed.find(key); found != reembed.end()) {
             reembed_molecule_t const &molecule = found->second;
-            smiles[m] = molecule.smiles; // string_view into the reembed table's persistent storage
-            num_atoms_per_molecule[m] = molecule.num_atoms;
-            num_heavy_atoms_per_molecule[m] = molecule.n_heavy_atoms;
-            num_bonds_per_molecule[m] = molecule.n_bonds;
-            molecular_weight_per_molecule[m] = molecule.molecular_weight;
-            n_conformers_per_molecule[m] = molecule.n_conformers;
+            smiles[molecule_index] = molecule.smiles; // string_view into the reembed table's persistent storage
+            num_atoms_per_molecule[molecule_index] = molecule.num_atoms;
+            num_heavy_atoms_per_molecule[molecule_index] = molecule.n_heavy_atoms;
+            num_bonds_per_molecule[molecule_index] = molecule.n_bonds;
+            molecular_weight_per_molecule[molecule_index] = molecule.molecular_weight;
+            n_conformers_per_molecule[molecule_index] = molecule.n_conformers;
             std::uint32_t const num_atoms = molecule.num_atoms;
-            for (std::size_t c = 0; c < molecule.conformers.size() && c < max_conformers; ++c) {
-                reembed_conformer_t const &conformer = molecule.conformers[c];
-                std::size_t const flat = static_cast<std::size_t>(m) * max_conformers + c;
+            for (std::size_t conformer_slot = 0;
+                 conformer_slot < molecule.conformers.size() && conformer_slot < max_conformers; ++conformer_slot) {
+                reembed_conformer_t const &conformer = molecule.conformers[conformer_slot];
+                std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
                 status_codes[flat] = conformer.status;
                 energies[flat] = conformer.energy;
                 if (conformer.has_coords && conformer.status == 0 && num_atoms > 0) {
-                    std::size_t const slot_base = slot_layout.slot_offset(m, static_cast<std::uint32_t>(c));
+                    std::size_t const slot_base = slot_layout.slot_offset(molecule_index,
+                                                                          static_cast<std::uint32_t>(conformer_slot));
                     for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
                         for (std::uint32_t axis = 0; axis < 3u; ++axis)
                             coordinates[slot_base + slot_layout.component_offset(axis, atom)] = half_from_bits(
@@ -477,37 +474,41 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
         }
 
         // Augment path: per-molecule scalars come straight from the original shard.
-        smiles[m] = shard.smiles->GetView(first_row);
+        smiles[molecule_index] = shard.smiles->GetView(first_row);
         std::uint8_t const num_atoms_u8 = shard.n_atoms->IsValid(first_row)
                                               ? static_cast<std::uint8_t>(shard.n_atoms->Value(first_row))
                                               : 0;
-        num_atoms_per_molecule[m] = num_atoms_u8;
-        num_heavy_atoms_per_molecule[m] = shard.n_heavy_atoms && shard.n_heavy_atoms->IsValid(first_row)
-                                              ? shard.n_heavy_atoms->Value(first_row)
-                                              : 0;
-        num_bonds_per_molecule[m] = shard.n_bonds && shard.n_bonds->IsValid(first_row) ? shard.n_bonds->Value(first_row)
-                                                                                       : 0;
-        molecular_weight_per_molecule[m] = shard.molecular_weight && shard.molecular_weight->IsValid(first_row)
-                                               ? shard.molecular_weight->Value(first_row)
-                                               : 0.0f;
-        n_conformers_per_molecule[m] = shard.n_conformers->IsValid(first_row) ? shard.n_conformers->Value(first_row)
-                                                                              : 0;
+        num_atoms_per_molecule[molecule_index] = num_atoms_u8;
+        num_heavy_atoms_per_molecule[molecule_index] = shard.n_heavy_atoms && shard.n_heavy_atoms->IsValid(first_row)
+                                                           ? shard.n_heavy_atoms->Value(first_row)
+                                                           : 0;
+        num_bonds_per_molecule[molecule_index] = shard.n_bonds && shard.n_bonds->IsValid(first_row)
+                                                     ? shard.n_bonds->Value(first_row)
+                                                     : 0;
+        molecular_weight_per_molecule[molecule_index] = shard.molecular_weight &&
+                                                                shard.molecular_weight->IsValid(first_row)
+                                                            ? shard.molecular_weight->Value(first_row)
+                                                            : 0.0f;
+        n_conformers_per_molecule[molecule_index] = shard.n_conformers->IsValid(first_row)
+                                                        ? shard.n_conformers->Value(first_row)
+                                                        : 0;
 
         if (num_atoms_u8 == 0) continue; // preprocess-failed molecule: single null row, no coords
 
         // Type the molecule once (same parse contract the producer uses). A mismatch between
         // the reparsed atom count and the stored n_atoms means the coordinate order can't be
         // trusted for descriptors — keep the coordinates, emit zero-filled descriptors, and count.
-        sfpost::molecule_shape_context_t const context = sfpost::build_shape_context(smiles[m]);
+        sfpost::molecule_shape_context_t const context = sfpost::build_shape_context(smiles[molecule_index]);
         bool const context_usable = context.ok && context.num_atoms == num_atoms_u8;
-        if (!context_usable) stats.ctx_mismatch.fetch_add(1, std::memory_order_relaxed);
+        if (!context_usable) stats.context_mismatch.fetch_add(1, std::memory_order_relaxed);
         std::uint32_t const num_atoms = num_atoms_u8;
 
         std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
-        for (std::size_t c = 0; c < rows.size() && c < max_conformers; ++c) {
-            std::int64_t const row = rows[c];
+        for (std::size_t conformer_slot = 0; conformer_slot < rows.size() && conformer_slot < max_conformers;
+             ++conformer_slot) {
+            std::int64_t const row = rows[conformer_slot];
             std::uint8_t const row_status = shard.status->Value(row);
-            std::size_t const flat = static_cast<std::size_t>(m) * max_conformers + c;
+            std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
             status_codes[flat] = row_status;
             if (shard.conformer_energy->IsValid(row)) energies[flat] = shard.conformer_energy->Value(row);
             if (row_status != 0 || !coords_list.IsValid(row)) continue; // failure row stays null
@@ -516,10 +517,12 @@ bool augment_shard(input_shard_t const &shard, cli_config_t const &config, reemb
             std::size_t const stored = static_cast<std::size_t>(coords_list.value_offset(row + 1)) - begin;
             std::size_t const wanted = static_cast<std::size_t>(num_atoms) * 3u;
             std::size_t const copy = std::min(stored, wanted);
-            for (std::size_t k = 0; k < copy; ++k)
-                interleaved[k] = half_bits_to_float(coords_values.Value(static_cast<std::int64_t>(begin + k)));
+            for (std::size_t value_index = 0; value_index < copy; ++value_index)
+                interleaved[value_index] = half_bits_to_float(
+                    coords_values.Value(static_cast<std::int64_t>(begin + value_index)));
 
-            std::size_t const slot_base = slot_layout.slot_offset(m, static_cast<std::uint32_t>(c));
+            std::size_t const slot_base = slot_layout.slot_offset(molecule_index,
+                                                                  static_cast<std::uint32_t>(conformer_slot));
             std::span<float> coords_view {interleaved.data(), wanted};
 
             // Multi-fragment safety net: separate disconnected components and write the corrected
@@ -574,8 +577,8 @@ int main(int argc, char **argv) {
     if (!parse_cli(argc, argv, config)) return 2;
 
     logger_t logger;
-    std::error_code ec;
-    fs::create_directories(config.output_dir, ec);
+    std::error_code error_code;
+    fs::create_directories(config.output_dir, error_code);
 
     // Inventory: every *.3D.parquet in --input is an input here (unlike smallfield_batch,
     // where *.3D.parquet names are outputs). Skip the .encoded sentinels themselves.
@@ -597,7 +600,7 @@ int main(int argc, char **argv) {
                 config.dataset, config.reembed_dir.empty() ? "off" : config.reembed_dir.string());
 
     std::uint64_t completed = 0, skipped = 0, failed = 0;
-    std::uint64_t total_ctx_mismatch = 0, total_separated = 0;
+    std::uint64_t total_context_mismatch = 0, total_separated = 0;
     auto const start = std::chrono::steady_clock::now();
 
     for (auto const &input_path : inputs) {
@@ -624,12 +627,12 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        FILE *fp = std::fopen(sentinel.string().c_str(), "wb");
-        if (fp) {
+        FILE *sentinel_file = std::fopen(sentinel.string().c_str(), "wb");
+        if (sentinel_file) {
             // `--resume` skips any shard whose sentinel exists, so a short write would leave a
             // file that makes the next run skip an unprocessed shard.
-            std::size_t const written = std::fwrite("v1\n", 1, 3, fp);
-            std::fclose(fp);
+            std::size_t const written = std::fwrite("v1\n", 1, 3, sentinel_file);
+            std::fclose(sentinel_file);
             if (written != 3) {
                 std::error_code remove_error;
                 std::filesystem::remove(sentinel, remove_error);
@@ -641,9 +644,9 @@ int main(int argc, char **argv) {
         double const shard_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - shard_start).count();
         std::uint64_t const rows = static_cast<std::uint64_t>(shard.num_rows);
-        std::uint64_t const ctx_mismatch = stats.ctx_mismatch.load();
+        std::uint64_t const context_mismatch = stats.context_mismatch.load();
         std::uint64_t const separated = stats.fragments_separated.load();
-        total_ctx_mismatch += ctx_mismatch;
+        total_context_mismatch += context_mismatch;
         total_separated += separated;
         ++completed;
 
@@ -653,12 +656,12 @@ int main(int argc, char **argv) {
                     thousands(completed + skipped), thousands(inputs.size()), input_path.filename().string(),
                     shard_seconds, thousands(static_cast<std::uint64_t>(rows_per_second)),
                     thousands(static_cast<std::uint64_t>(rows_per_second / std::max(threads, 1))),
-                    thousands(ctx_mismatch), thousands(separated));
+                    thousands(context_mismatch), thousands(separated));
     }
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     logger.info("complete  {} augmented, {} skipped, {} failed  in {:.0f}s  (ctx-mismatch {}, separated {})",
-                thousands(completed), thousands(skipped), thousands(failed), total, thousands(total_ctx_mismatch),
+                thousands(completed), thousands(skipped), thousands(failed), total, thousands(total_context_mismatch),
                 thousands(total_separated));
     return failed > 0 ? 1 : 0;
 }

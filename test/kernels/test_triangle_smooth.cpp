@@ -1,9 +1,9 @@
 /**
- *  @file test_triangle_smooth.cpp
- *  @brief Tests for GPU triangle smoothing vs RDKit reference.
+ *  @file test/kernels/test_triangle_smooth.cpp
+ *  @brief Test GPU triangle smoothing against the RDKit reference.
  *
- *  Compiled with g++ (not nvcc) to avoid RDKit C++20 header conflicts.
- *  CUDA kernel calls are in test_triangle_smooth_kernels.cu.
+ *  Compiled with g++ (not nvcc) to avoid RDKit C++20 header conflicts. CUDA kernel calls are in
+ *  test_triangle_smooth_kernels.cu.
  */
 
 #include <cmath>  // `std::fabs`
@@ -16,23 +16,23 @@
 #include <GraphMol/DistGeomHelpers/BoundsMatrixBuilder.h>
 
 #include "test_helpers.hpp"
+#include "test_triangle_smooth_kernels.hpp"
 
 namespace sftest = smallfield::tests;
 
-/** Defined in `test_triangle_smooth_kernels.cu`, compiled by nvcc. */
-extern "C" void gpu_triangle_smooth(float *host_bounds, std::uint32_t num_atoms);
+using sftest::gpu_triangle_smooth;
 
 static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
     std::printf("  testing: %s\n", smiles.c_str());
 
-    auto mol = sftest::mol_from_smiles(smiles);
-    sf_verify_(mol != nullptr, "failed to parse SMILES");
+    auto molecule = sftest::mol_from_smiles(smiles);
+    sf_verify_(molecule != nullptr, "failed to parse SMILES");
 
-    std::uint32_t const num_atoms = mol->getNumAtoms();
+    std::uint32_t const num_atoms = molecule->getNumAtoms();
     sf_verify_(num_atoms <= 128, "molecule too large for warp-level smoothing");
 
     // get RDKit reference bounds matrix (already smoothed)
-    auto rdkit_bounds = sftest::rdkit_bounds_matrix(*mol);
+    auto rdkit_bounds = sftest::rdkit_bounds_matrix(*molecule);
 
     // build our unsmoothed bounds matrix, then smooth on GPU
     std::vector<float> gpu_bounds(num_atoms * num_atoms, 0.0f);
@@ -40,13 +40,13 @@ static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
         auto *bounds_raw = new DistGeom::BoundsMatrix(num_atoms);
         DistGeom::BoundsMatPtr bounds_mat(bounds_raw);
         RDKit::DGeomHelpers::initBoundsMat(bounds_raw);
-        RDKit::DGeomHelpers::setTopolBounds(*mol, bounds_mat);
+        RDKit::DGeomHelpers::setTopolBounds(*molecule, bounds_mat);
         // do @b not smooth on CPU — the GPU kernel does that
 
-        for (std::uint32_t i = 0; i < num_atoms; ++i) {
-            for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
-                gpu_bounds[i * num_atoms + j] = static_cast<float>(bounds_mat->getUpperBound(i, j));
-                gpu_bounds[j * num_atoms + i] = static_cast<float>(bounds_mat->getLowerBound(i, j));
+        for (std::uint32_t row = 0; row < num_atoms; ++row) {
+            for (std::uint32_t column = row + 1; column < num_atoms; ++column) {
+                gpu_bounds[row * num_atoms + column] = static_cast<float>(bounds_mat->getUpperBound(row, column));
+                gpu_bounds[column * num_atoms + row] = static_cast<float>(bounds_mat->getLowerBound(row, column));
             }
         }
     }
@@ -59,19 +59,19 @@ static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
     std::uint32_t error_count = 0;
     float const tolerance = 1e-2f; // float32 vs float64 tolerance
 
-    for (std::uint32_t i = 0; i < num_atoms; ++i) {
-        for (std::uint32_t j = 0; j < num_atoms; ++j) {
-            if (i == j) continue;
+    for (std::uint32_t row = 0; row < num_atoms; ++row) {
+        for (std::uint32_t column = 0; column < num_atoms; ++column) {
+            if (row == column) continue;
 
-            float const gpu_value = gpu_bounds[i * num_atoms + j];
-            double const rdkit_value = rdkit_bounds[i * num_atoms + j];
+            float const gpu_value = gpu_bounds[row * num_atoms + column];
+            double const rdkit_value = rdkit_bounds[row * num_atoms + column];
             float const error = std::fabs(gpu_value - static_cast<float>(rdkit_value));
 
             if (error > max_error) max_error = error;
             if (error > tolerance) {
                 if (error_count < 5) {
-                    std::printf("    mismatch at (%u,%u): GPU=%.4f RDKit=%.4f err=%.4f\n", i, j, gpu_value, rdkit_value,
-                                error);
+                    std::printf("    mismatch at (%u,%u): GPU=%.4f RDKit=%.4f err=%.4f\n", row, column, gpu_value,
+                                rdkit_value, error);
                 }
                 ++error_count;
             }
@@ -82,16 +82,19 @@ static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
                 num_atoms * num_atoms);
 
     // verify triangle inequality holds after smoothing
-    for (std::uint32_t i = 0; i < num_atoms; ++i) {
-        for (std::uint32_t j = i + 1; j < num_atoms; ++j) {
-            float const upper_ij = gpu_bounds[i * num_atoms + j];
-            for (std::uint32_t k = 0; k < num_atoms; ++k) {
-                if (k == i || k == j) continue;
+    for (std::uint32_t row = 0; row < num_atoms; ++row) {
+        for (std::uint32_t column = row + 1; column < num_atoms; ++column) {
+            float const upper_row_column = gpu_bounds[row * num_atoms + column];
+            for (std::uint32_t via_atom = 0; via_atom < num_atoms; ++via_atom) {
+                if (via_atom == row || via_atom == column) continue;
 
-                float const u_ik = (i < k) ? gpu_bounds[i * num_atoms + k] : gpu_bounds[k * num_atoms + i];
-                float const u_kj = (k < j) ? gpu_bounds[k * num_atoms + j] : gpu_bounds[j * num_atoms + k];
+                float const upper_row_via = (row < via_atom) ? gpu_bounds[row * num_atoms + via_atom]
+                                                             : gpu_bounds[via_atom * num_atoms + row];
+                float const upper_via_column = (via_atom < column) ? gpu_bounds[via_atom * num_atoms + column]
+                                                                   : gpu_bounds[column * num_atoms + via_atom];
 
-                sf_verify_(upper_ij <= u_ik + u_kj + 0.01f, "triangle inequality violation for upper bounds");
+                sf_verify_(upper_row_column <= upper_row_via + upper_via_column + 0.01f,
+                           "triangle inequality violation for upper bounds");
             }
         }
     }

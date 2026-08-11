@@ -1,5 +1,5 @@
 /**
- *  @file bench_mmff_kernels_device.hpp
+ *  @file bench/bench_mmff_kernels_device.hpp
  *  @brief Device-side launcher for the GPU MMFF kernel-trio scaling benchmark.
  */
 
@@ -10,7 +10,7 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
-namespace bench_mmff {
+namespace smallfield::bench {
 
 void launch_mmff94_kernel_trio_benchmark(smallfield::parameters::mmff94_tables_host_t const &tables_host,
                                          smallfield::types::molecule_descriptor_t const *descriptors,
@@ -18,4 +18,4 @@ void launch_mmff94_kernel_trio_benchmark(smallfield::parameters::mmff94_tables_h
                                          std::uint32_t total_atom_count, float *type_and_charge_ms,
                                          float *extract_terms_ms, float *build_csr_ms, float *total_gpu_ms);
 
-} // namespace bench_mmff
+} // namespace smallfield::bench

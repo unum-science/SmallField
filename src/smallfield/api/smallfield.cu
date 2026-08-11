@@ -1,9 +1,9 @@
 /**
- *  @file smallfield.cu
+ *  @file src/smallfield/api/smallfield.cu
  *  @brief Library implementation of the SmallField public API and pybind11 bindings.
  *
- *  Implements context_t (multi-GPU CUDA stream/cuSOLVER management) and generate_conformers() (CPU
- *  preprocessing, wave-based GPU dispatch, half-precision output). Exposes a minimal Python module at the
+ *  Implements `context_t`, multi-GPU CUDA stream/cuSOLVER management, and `generate_conformers()`, CPU
+ *  preprocessing, wave-based GPU dispatch, half-precision output. Exposes a minimal Python module at the
  *  bottom.
  */
 
@@ -39,17 +39,51 @@ namespace py = pybind11;
 #include "smallfield/nvtx.hpp"
 
 namespace smallfield::api {
-using namespace smallfield::cuda;
-using namespace smallfield::mmff94;
-using namespace smallfield::parameters;
-using namespace smallfield::preprocess;
-using namespace smallfield::types;
+using smallfield::cuda::build_csd_torsion_table;
+using smallfield::cuda::build_metric_initial_coordinates_on_gpu;
+using smallfield::cuda::compute_mmff_polish_shared_memory_bytes;
+using smallfield::cuda::compute_pipeline_shared_memory_bytes;
+using smallfield::cuda::convert_coords_fp32_to_fp16_kernel;
+using smallfield::cuda::csd_torsion_table_device_t;
+using smallfield::cuda::csd_torsion_table_host_t;
+using smallfield::cuda::etkdg_pipeline_warp_kernel;
+using smallfield::cuda::launch_bond_distance_bfs;
+using smallfield::cuda::launch_csd_torsion_match;
+using smallfield::cuda::launch_etk_build_csr;
+using smallfield::cuda::launch_mmff94_apply_typing_patch;
+using smallfield::cuda::mmff_polish_warp_kernel;
+using smallfield::cuda::upload_csd_torsion_table_to_device;
+using smallfield::mmff94::launch_mmff94_build_csr;
+using smallfield::mmff94::launch_mmff94_compact_terms;
+using smallfield::mmff94::launch_mmff94_extract_terms;
+using smallfield::mmff94::launch_mmff94_type_and_charge;
+using smallfield::mmff94::mmff94_per_mol_counts_t;
+using smallfield::parameters::align_up_;
+using smallfield::parameters::extract_mmff94_tables_from_rdkit;
+using smallfield::parameters::mmff94_tables_device_t;
+using smallfield::parameters::mmff94_tables_host_t;
+using smallfield::parameters::upload_mmff94_tables_to_device;
+using smallfield::preprocess::prepare_per_device_batches_into;
+using smallfield::types::atom_limited_bin_caps_k;
+using smallfield::types::atom_limited_bin_count_k;
+using smallfield::types::etk_torsion_descriptor_t;
+using smallfield::types::etkdg_molecule_metadata_t;
+using smallfield::types::max_atoms_per_molecule_k;
+using smallfield::types::max_mmff_angles_per_mol_k;
+using smallfield::types::max_mmff_bonds_per_mol_k;
+using smallfield::types::max_mmff_interactions_per_mol_k;
+using smallfield::types::max_mmff_oops_per_mol_k;
+using smallfield::types::max_mmff_stretchbends_per_mol_k;
+using smallfield::types::max_mmff_torsions_per_mol_k;
+using smallfield::types::mmff94_angle_t;
+using smallfield::types::mmff94_atom_interaction_t;
+using smallfield::types::mmff94_bond_t;
+using smallfield::types::mmff94_oop_t;
+using smallfield::types::mmff94_stretchbend_t;
+using smallfield::types::mmff94_torsion_t;
+using smallfield::types::molecule_descriptor_t;
 
 using smallfield::cuda_error_sink_t;
-
-static inline std::size_t align_up(std::size_t value, std::size_t alignment) {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
 
 /**
  *  @brief Rough upper bound on the per-molecule bytes a wave stages in pinned host memory.
@@ -65,10 +99,10 @@ static inline std::size_t align_up(std::size_t value, std::size_t alignment) {
  *  @return Bytes to reserve per molecule in a pinned host slot.
  */
 static inline std::size_t estimate_per_molecule_uploaded_bytes(std::uint32_t max_atoms) noexcept {
-    std::size_t const n = max_atoms;
-    std::size_t const bounds_bytes = n * n * sizeof(float);
+    std::size_t const atom_count = max_atoms;
+    std::size_t const bounds_bytes = atom_count * atom_count * sizeof(float);
     std::size_t const descriptor_bytes = sizeof(molecule_descriptor_t);
-    std::size_t const per_atom_slack = n * 128u;
+    std::size_t const per_atom_slack = atom_count * 128u;
     std::size_t const per_mol_fixed = 1024u;
     return bounds_bytes + descriptor_bytes + per_atom_slack + per_mol_fixed;
 }
@@ -89,11 +123,11 @@ static inline std::size_t estimate_per_molecule_uploaded_bytes(std::uint32_t max
  *  @return Bytes to reserve per molecule across the device pool and the uploaded prefix together.
  */
 static inline std::size_t estimate_per_molecule_batch_bytes(std::uint32_t max_atoms) noexcept {
-    std::size_t const n = max_atoms;
-    std::size_t const bond_distance_bytes = n * n * sizeof(std::uint8_t);
+    std::size_t const atom_count = max_atoms;
+    std::size_t const bond_distance_bytes = atom_count * atom_count * sizeof(std::uint8_t);
     // A molecule with explicit hydrogens carries roughly (atom count + 16) bonds; the term
     // reservations scale with that bond count and with the neighbour-pair count around each atom.
-    std::size_t const bonds = n + 16u;
+    std::size_t const bonds = atom_count + 16u;
     std::size_t const torsion_bytes = bonds * sizeof(etk_torsion_descriptor_t);
     std::size_t const mmff_term_bytes = 4u * bonds *
                                         (sizeof(mmff94_bond_t) + sizeof(mmff94_angle_t) + sizeof(mmff94_torsion_t) +
@@ -132,7 +166,7 @@ static mmff_staging_layout_t compute_mmff_staging_layout_() noexcept {
     mmff_staging_layout_t layout {};
     std::size_t running = 0;
     auto place = [&](std::size_t bytes) {
-        std::size_t const here = align_up(running, 256);
+        std::size_t const here = align_up_(running, 256);
         running = here + bytes;
         return here;
     };
@@ -185,7 +219,7 @@ struct launch_scratch_t {
  *  per-device metric scratch at construction time so the first user call
  *  doesn't pay a `cudaMalloc` on the hot path.
  */
-void ensure_metric_scratch(context_t &ctx, std::size_t device_index, std::size_t max_group_size,
+void ensure_metric_scratch(context_t &context, std::size_t device_index, std::size_t max_group_size,
                            std::uint32_t max_atoms);
 
 /**
@@ -193,15 +227,16 @@ void ensure_metric_scratch(context_t &ctx, std::size_t device_index, std::size_t
  *  device pool and pinned host staging, for one `embedding-step`.
  *
  *  Device pool regions, in order:
- *    - batch-input mirror (target of the single H2D)
- *    - sorted metadata subset (tiny H2D from the persistent host scratch)
- *    - coords_fp32 (kernel output, fp32)
- *    - coords_fp16 (post-convert, D2H source; halves DMA bandwidth)
- *    - energies_out (fp32)
- *    - status_out (u8)
- *    - 4D metric-embedding scratch (GPU-only, consumed by the prepass)
+ *    - batch-input mirror — target of the single H2D
+ *    - sorted metadata subset — tiny H2D from the persistent host scratch
+ *    - coords_fp32 — kernel output, fp32
+ *    - coords_fp16 — post-convert, D2H source; halves DMA bandwidth
+ *    - energies_out — fp32
+ *    - status_out — u8
+ *    - 4D metric-embedding scratch — GPU-only, consumed by the prepass
+ *
  *  Host staging regions, in order:
- *    - coords_fp16 / energies / status (pinned D2H destinations)
+ *    - coords_fp16 / energies / status — pinned D2H destinations
  */
 struct pipeline_pool_layout_t {
     std::size_t device_off_batch;
@@ -230,30 +265,30 @@ static pipeline_pool_layout_t compute_pipeline_pool_layout_(std::size_t batch_by
 
     pipeline_pool_layout_t layout {};
     std::size_t device_offset = 0;
-    layout.device_off_batch = align_up(device_offset, 256);
-    device_offset = layout.device_off_batch + align_up(batch_bytes_total, 256);
+    layout.device_off_batch = align_up_(device_offset, 256);
+    device_offset = layout.device_off_batch + align_up_(batch_bytes_total, 256);
     layout.device_off_sorted_meta = device_offset;
-    device_offset += align_up(per_device_molecule_count * sizeof_meta, 256);
+    device_offset += align_up_(per_device_molecule_count * sizeof_meta, 256);
     layout.device_off_coords_fp32 = device_offset;
-    device_offset += align_up(total_coords * sizeof(float), 256);
+    device_offset += align_up_(total_coords * sizeof(float), 256);
     layout.device_off_coords_fp16 = device_offset;
-    device_offset += align_up(total_coords * sizeof(__half), 256);
+    device_offset += align_up_(total_coords * sizeof(__half), 256);
     layout.device_off_energies = device_offset;
-    device_offset += align_up(total_conformer_slots * sizeof(float), 256);
+    device_offset += align_up_(total_conformer_slots * sizeof(float), 256);
     layout.device_off_status = device_offset;
-    device_offset += align_up(total_conformer_slots * sizeof(std::uint8_t), 256);
+    device_offset += align_up_(total_conformer_slots * sizeof(std::uint8_t), 256);
     layout.device_off_initial = device_offset;
-    device_offset += align_up(
+    device_offset += align_up_(
         static_cast<std::size_t>(per_device_molecule_count) * max_atoms_per_molecule * 4 * sizeof(float), 256);
     layout.device_pool_bytes = device_offset;
 
     std::size_t host_offset = 0;
-    layout.host_off_coords = align_up(host_offset, 256);
-    host_offset = layout.host_off_coords + align_up(total_coords * sizeof(__half), 256);
+    layout.host_off_coords = align_up_(host_offset, 256);
+    host_offset = layout.host_off_coords + align_up_(total_coords * sizeof(__half), 256);
     layout.host_off_energies = host_offset;
-    host_offset += align_up(total_conformer_slots * sizeof(float), 256);
+    host_offset += align_up_(total_conformer_slots * sizeof(float), 256);
     layout.host_off_status = host_offset;
-    host_offset += align_up(total_conformer_slots * sizeof(std::uint8_t), 256);
+    host_offset += align_up_(total_conformer_slots * sizeof(std::uint8_t), 256);
     layout.host_pool_bytes = host_offset;
     return layout;
 }
@@ -277,15 +312,16 @@ static std::uint32_t compute_worst_case_wave_size_(std::span<int const> device_i
     std::size_t const device_count = device_ids.size();
     if (device_count == 0) return 0;
 
-    // Count replicas per physical device-id and probe each unique device once.
+    // Count replicas per physical device-id and probe each unique device once. The probe divides
+    // by the replica count on the spot, so the slot budget below reads one map instead of two.
     std::unordered_map<int, std::uint32_t> replicas;
-    std::unordered_map<int, std::size_t> physical_free;
+    std::unordered_map<int, std::size_t> free_bytes_per_slot;
     for (int const device_id : device_ids) replicas[device_id]++;
-    for (auto const &[device_id, _] : replicas) {
+    for (auto const &[device_id, replica_count] : replicas) {
         if (cudaSetDevice(device_id) != cudaSuccess) continue;
         std::size_t free_bytes = 0, total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) continue;
-        physical_free[device_id] = free_bytes;
+        free_bytes_per_slot[device_id] = free_bytes / replica_count;
     }
 
     // The smallest *per-virtual-slot* budget across all virtual slots is the
@@ -294,9 +330,9 @@ static std::uint32_t compute_worst_case_wave_size_(std::span<int const> device_i
     std::size_t smallest_free_per_slot = 0;
     bool have_any = false;
     for (int const device_id : device_ids) {
-        auto it = physical_free.find(device_id);
-        if (it == physical_free.end()) continue;
-        std::size_t const slot_free = it->second / replicas[device_id];
+        auto free_entry = free_bytes_per_slot.find(device_id);
+        if (free_entry == free_bytes_per_slot.end()) continue;
+        std::size_t const slot_free = free_entry->second;
         if (!have_any || slot_free < smallest_free_per_slot) smallest_free_per_slot = slot_free;
         have_any = true;
     }
@@ -341,7 +377,7 @@ context_t::context_t(std::span<int const> devices) {
     if (devices.empty()) {
         int count = 0;
         cudaGetDeviceCount(&count);
-        for (int i = 0; i < count; ++i) device_ids.push_back(i);
+        for (int device_index = 0; device_index < count; ++device_index) device_ids.push_back(device_index);
     }
     else { device_ids.assign(devices.begin(), devices.end()); }
 
@@ -384,14 +420,14 @@ context_t::context_t(std::span<int const> devices) {
     // `cudaFuncAttributeMaxDynamicSharedMemorySize` on the embed kernel stays
     // in effect for the lifetime of each device's primary context. At the
     // `max_atoms_per_molecule_k` cap the kernel needs ~148.5 KB shared, above the 48 KB default.
-    constexpr std::uint32_t max_bin_n = max_atoms_per_molecule_k;
-    constexpr std::size_t max_embed_shared_bytes = static_cast<std::size_t>(max_bin_n * max_bin_n + max_bin_n + 1 +
-                                                                            4 * max_bin_n + max_bin_n + 4 + 1) *
-                                                   sizeof(float);
+    constexpr std::uint32_t max_bin_n_k = max_atoms_per_molecule_k;
+    constexpr std::size_t max_embed_shared_bytes_k =
+        static_cast<std::size_t>(max_bin_n_k * max_bin_n_k + max_bin_n_k + 1 + 4 * max_bin_n_k + max_bin_n_k + 4 + 1) *
+        sizeof(float);
     for (int const device_id : device_ids) {
         cudaSetDevice(device_id);
         cudaFuncSetAttribute(smallfield::cuda::embed_4d_power_iter_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(max_embed_shared_bytes));
+                             static_cast<int>(max_embed_shared_bytes_k));
     }
 
     // Pre-allocate every per-device pool to a worst-case wave so the hot path
@@ -415,7 +451,7 @@ context_t::context_t(std::span<int const> devices) {
 
     for (std::size_t device_index = 0; device_index < device_count; ++device_index) {
         cudaSetDevice(device_ids[device_index]);
-        // Probes at `per_device_worst_case_count` molecules × `max_atoms_per_molecule_k` atoms.
+        // Probes at `per_device_worst_case_count` molecules of `max_atoms_per_molecule_k` atoms each.
         ensure_metric_scratch(*this, device_index, per_device_worst_case_count, max_atoms_per_molecule_k);
         auto &scratch = *launch_scratch[device_index];
         scratch.device_pool.ensure_capacity(worst_case_layout.device_pool_bytes);
@@ -451,31 +487,32 @@ context_t::~context_t() {
  *  the first wave of a workload pays the allocation cost and subsequent
  *  waves reuse it.
  */
-void ensure_metric_scratch(context_t &ctx, std::size_t device_index, std::size_t max_group_size,
+void ensure_metric_scratch(context_t &context, std::size_t device_index, std::size_t max_group_size,
                            std::uint32_t max_atoms) {
-    auto &s = ctx.metric_scratch[device_index];
-    if (max_group_size <= s.max_group_size && max_atoms <= s.max_atoms && s.pool.data() != nullptr) return;
+    auto &scratch = context.metric_scratch[device_index];
+    if (max_group_size <= scratch.max_group_size && max_atoms <= scratch.max_atoms && scratch.pool.data() != nullptr)
+        return;
 
     // Grow to at least the new request, but round up a bit to avoid thrashing
     // across similarly-sized waves.
-    std::size_t const new_group = std::max(s.max_group_size, max_group_size);
-    std::uint32_t const new_atoms = std::max<std::uint32_t>(s.max_atoms, max_atoms);
+    std::size_t const new_group = std::max(scratch.max_group_size, max_group_size);
+    std::uint32_t const new_atoms = std::max<std::uint32_t>(scratch.max_atoms, max_atoms);
 
-    cudaSetDevice(ctx.device_ids[device_index]);
+    cudaSetDevice(context.device_ids[device_index]);
 
     // `embed_4d_power_iter_kernel` runs entirely out of shared memory — Gram matrix, means,
     // eigenvectors and reduction scratch all live there for the kernel's lifetime — so the only
     // persistent device scratch is the `group_indices` uint32 list of which molecule goes into
     // which bin, which is KB-scale.
-    std::size_t const group_bytes = align_up(new_group * sizeof(std::uint32_t), 256);
-    if (!s.pool.ensure_capacity(group_bytes)) {
-        ctx.logger.error("ensure_metric_scratch: device allocation ({} bytes) failed", group_bytes);
+    std::size_t const group_bytes = align_up_(new_group * sizeof(std::uint32_t), 256);
+    if (!scratch.pool.ensure_capacity(group_bytes)) {
+        context.logger.error("ensure_metric_scratch: device allocation ({} bytes) failed", group_bytes);
         return;
     }
-    auto *base = reinterpret_cast<char *>(s.pool.data());
-    s.group_indices = {reinterpret_cast<std::uint32_t *>(base), new_group};
-    s.max_group_size = new_group;
-    s.max_atoms = new_atoms;
+    auto *base = reinterpret_cast<char *>(scratch.pool.data());
+    scratch.group_indices = {reinterpret_cast<std::uint32_t *>(base), new_group};
+    scratch.max_group_size = new_group;
+    scratch.max_atoms = new_atoms;
 }
 
 /**
@@ -775,9 +812,9 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
 
     cudaEventRecord(handle.event_metric_start, stream);
 
-    // Kernels read metadata directly from the H2D'd batch mirror; preprocess
-    // wrote mols in atom-count ASCENDING order per device, so the per-bin
-    // slicing below can index the batch's metadata region with `bin_start`.
+    // Kernels read metadata directly from the H2D'd batch mirror; preprocess wrote mols in atom-count
+    // ascending order per device, so the per-bin slicing below can index the batch's metadata region
+    // with `bin_start`.
     auto *device_metadata_sorted = device_view.molecule_metadata().data();
 
     build_metric_initial_coordinates_on_gpu(device_view.bounds_matrices().data(), device_metadata_sorted, host_metadata,
@@ -843,10 +880,10 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
     }
 
     if (total_coords > 0) {
-        constexpr std::uint32_t convert_block = 256;
+        constexpr std::uint32_t convert_block_k = 256;
         std::uint32_t const num_elements = static_cast<std::uint32_t>(total_coords);
-        std::uint32_t const convert_grid = (num_elements + convert_block - 1) / convert_block;
-        convert_coords_fp32_to_fp16_kernel<<<convert_grid, convert_block, 0, stream>>>(
+        std::uint32_t const convert_grid = (num_elements + convert_block_k - 1) / convert_block_k;
+        convert_coords_fp32_to_fp16_kernel<<<convert_grid, convert_block_k, 0, stream>>>(
             handle.device_coords_fp32.data(), handle.device_coords_fp16.data(), num_elements);
         sink.check(cudaPeekAtLastError(), "convert_coords_fp32_to_fp16_kernel launch");
     }
@@ -869,7 +906,7 @@ gpu_pipeline_handle_t launch_gpu_pipeline(int device_id, cudaStream_t stream, me
 }
 
 /**
- *  @brief Wait for a previously-launched wave to finish and permute results into
+ *  @brief Wait for an already-launched wave to finish and permute results into
  *  the caller's output arrays. All three D2H transfers were already enqueued by
  *  `launch_gpu_pipeline` into pinned host staging; this just drains the stream
  *  and does a permutation memcpy.
@@ -906,7 +943,7 @@ void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
     // This loop runs between the stream drain above and the next wave's launch, so
     // every GPU is idle for its duration — at 400K molecules and K=3 it is millions of
     // scattered 256-byte copies. `input_indices` is a permutation and `destination_slot`
-    // is a pure function of `sorted_index` and `conf`, so no two iterations touch the
+    // is a pure function of `sorted_index` and `conformer`, so no two iterations touch the
     // same output bytes and the loop parallelises as written. Devices are still
     // finalized one at a time: they were launched together and carry equal work, so the
     // later stream drains return immediately, and keeping the fan-out on this loop lets
@@ -915,14 +952,14 @@ void finalize_gpu_pipeline(gpu_pipeline_handle_t handle) {
     for (std::uint32_t sorted_index = 0; sorted_index < handle.per_device_molecule_count; ++sorted_index) {
         std::uint32_t const input_index = input_indices[sorted_index];
         std::uint32_t const caller_index = has_perm ? handle.sort_perm[handle.wave_base + input_index] : input_index;
-        for (std::uint32_t conf = 0; conf < conformer_count; ++conf) {
-            std::uint32_t const source_slot = sorted_index * conformer_count + conf;
-            std::uint32_t const destination_slot = caller_index * conformer_count + conf;
+        for (std::uint32_t conformer = 0; conformer < conformer_count; ++conformer) {
+            std::uint32_t const source_slot = sorted_index * conformer_count + conformer;
+            std::uint32_t const destination_slot = caller_index * conformer_count + conformer;
             handle.host_energies_out[destination_slot] = handle.host_energies_sorted[source_slot];
             std::uint8_t const raw = handle.host_status_sorted[source_slot];
-            handle.host_status_out[destination_slot] = raw == 0   ? conformer_status_t::success
-                                                       : raw == 1 ? conformer_status_t::stereo_failure
-                                                                  : conformer_status_t::mmff_unconverged;
+            handle.host_status_out[destination_slot] = raw == 0   ? conformer_status_t::success_k
+                                                       : raw == 1 ? conformer_status_t::stereo_failure_k
+                                                                  : conformer_status_t::mmff_unconverged_k;
             // Per-slot layout is SoA: `[x_0..x_{stride-1}, y_0..y_{stride-1}, z_0..z_{stride-1}]`
             // (see write_conformer_output_ in etkdg_pipeline.cuh). Source uses
             // `gpu_max_atoms` stride; destination uses `host_max_atoms` stride.
@@ -970,32 +1007,33 @@ struct wave_record_t {
  *  @brief Compute the target `embedding-wave` size in molecules.
  *
  *  Honours `config.wave_size` when non-zero; otherwise auto-sizes against the
- *  tightest *per-virtual-slot* free VRAM (each virtual slot owns a
- *  1/replicas-on-its-physical-device share when device_ids contains
+ *  tightest *per-virtual-slot* free VRAM. Each virtual slot owns a
+ *  1/replicas-on-its-physical-device share when `device_ids` contains
  *  duplicates — the `virtual-device` pattern that runs N streams on one
- *  physical GPU as N virtual devices).  75 % VRAM fraction, divides by the
- *  per-molecule pinned-host + device coords footprint estimate. Clamps to
+ *  physical GPU as N virtual devices. Applies a 75 % VRAM fraction, divides
+ *  by the per-molecule pinned-host + device coords footprint estimate. Clamps to
  *  [10 K, 400 K] for kernel-launch-amortisation and pinned-host-sanity
  *  respectively. `embed_4d_power_iter_kernel`'s surviving scratch is
  *  KB-scale, so no per-GPU cap is needed to bound it.
  */
-static std::uint32_t compute_wave_size_(context_t const &ctx, config_t const &config,
+static std::uint32_t compute_wave_size_(context_t const &context, config_t const &config,
                                         std::uint32_t max_atoms_per_molecule, cuda_error_sink_t const &sink) {
     if (config.wave_size != 0) return config.wave_size;
 
     std::uint32_t const num_conformers = config.num_conformers;
 
-    // Count replicas per physical device-id and probe each unique device once.
+    // Count replicas per physical device-id and probe each unique device once. The probe divides
+    // by the replica count on the spot, so the slot budget below reads one map instead of two.
     std::unordered_map<int, std::uint32_t> replicas;
-    std::unordered_map<int, std::size_t> physical_free;
-    std::unordered_map<int, std::size_t> physical_total;
-    for (int const device_id : ctx.device_ids) replicas[device_id]++;
-    for (auto const &[device_id, _] : replicas) {
+    std::unordered_map<int, std::size_t> free_bytes_per_slot;
+    std::unordered_map<int, std::size_t> total_bytes_per_slot;
+    for (int const device_id : context.device_ids) replicas[device_id]++;
+    for (auto const &[device_id, replica_count] : replicas) {
         if (!sink.check(cudaSetDevice(device_id), "cudaSetDevice(memgetinfo)")) continue;
-        std::size_t free_b = 0, total_b = 0;
-        if (!sink.check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo")) continue;
-        physical_free[device_id] = free_b;
-        physical_total[device_id] = total_b;
+        std::size_t free_bytes = 0, total_bytes = 0;
+        if (!sink.check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo")) continue;
+        free_bytes_per_slot[device_id] = free_bytes / replica_count;
+        total_bytes_per_slot[device_id] = total_bytes / replica_count;
     }
 
     // Smallest per-virtual-slot budget binds: each duplicate of a physical
@@ -1003,11 +1041,11 @@ static std::uint32_t compute_wave_size_(context_t const &ctx, config_t const &co
     std::size_t smallest_free_per_slot = 0;
     std::size_t smallest_total_per_slot = 0;
     bool have_any = false;
-    for (int const device_id : ctx.device_ids) {
-        auto fit = physical_free.find(device_id);
-        if (fit == physical_free.end()) continue;
-        std::size_t const slot_free = fit->second / replicas[device_id];
-        std::size_t const slot_total = physical_total[device_id] / replicas[device_id];
+    for (int const device_id : context.device_ids) {
+        auto free_entry = free_bytes_per_slot.find(device_id);
+        if (free_entry == free_bytes_per_slot.end()) continue;
+        std::size_t const slot_free = free_entry->second;
+        std::size_t const slot_total = total_bytes_per_slot[device_id];
         if (!have_any || slot_free < smallest_free_per_slot) smallest_free_per_slot = slot_free;
         if (!have_any || slot_total < smallest_total_per_slot) smallest_total_per_slot = slot_total;
         have_any = true;
@@ -1030,8 +1068,8 @@ static std::uint32_t compute_wave_size_(context_t const &ctx, config_t const &co
     // ceiling is `per_device_reserved_molecules` times the device count; going past it would
     // fire `ensure_capacity` from inside the per-device OMP fan-out, which is the driver-lock
     // contention the pre-allocation exists to avoid.
-    std::uint64_t const reserved_ceiling = static_cast<std::uint64_t>(ctx.per_device_reserved_molecules) *
-                                           std::max<std::size_t>(1u, ctx.device_ids.size());
+    std::uint64_t const reserved_ceiling = static_cast<std::uint64_t>(context.per_device_reserved_molecules) *
+                                           std::max<std::size_t>(1u, context.device_ids.size());
     if (reserved_ceiling > 0 && auto_wave > reserved_ceiling) auto_wave = reserved_ceiling;
     return static_cast<std::uint32_t>(auto_wave);
 }
@@ -1053,9 +1091,10 @@ static void sort_input_by_smiles_length_(std::span<std::string_view const> smile
     sort_perm.resize(num_input);
     std::iota(sort_perm.begin(), sort_perm.end(), 0u);
     std::sort(sort_perm.begin(), sort_perm.end(),
-              [smiles](std::uint32_t a, std::uint32_t b) { return smiles[a].size() > smiles[b].size(); });
+              [smiles](std::uint32_t left, std::uint32_t right) { return smiles[left].size() > smiles[right].size(); });
     sorted_smiles_storage.resize(num_input);
-    for (std::uint32_t k = 0; k < num_input; ++k) sorted_smiles_storage[k] = smiles[sort_perm[k]];
+    for (std::uint32_t position = 0; position < num_input; ++position)
+        sorted_smiles_storage[position] = smiles[sort_perm[position]];
 }
 
 /**
@@ -1066,37 +1105,51 @@ static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record
                                  double total_wall_ms) {
     if (logger.verbose_level < 1) return;
     logger.trace("wave   mols     prep   launch  finalize    gpu avg /    max   upload / metric / kernels / download");
-    for (auto const &cr : wave_records) {
+    for (auto const &wave_record : wave_records) {
         float gpu_max = 0.f, gpu_sum = 0.f, upload = 0.f, metric = 0.f, kernels = 0.f, download = 0.f;
         std::uint32_t n_active = 0;
-        for (auto const &pd : cr.per_device_gpu) {
-            if (pd.total_ms <= 0.f) continue;
-            gpu_max = std::max(gpu_max, pd.total_ms);
-            gpu_sum += pd.total_ms;
-            upload += pd.upload_ms;
-            metric += pd.metric_ms;
-            kernels += pd.kernels_ms;
-            download += pd.download_ms;
+        for (auto const &device_timing : wave_record.per_device_gpu) {
+            if (device_timing.total_ms <= 0.f) continue;
+            gpu_max = std::max(gpu_max, device_timing.total_ms);
+            gpu_sum += device_timing.total_ms;
+            upload += device_timing.upload_ms;
+            metric += device_timing.metric_ms;
+            kernels += device_timing.kernels_ms;
+            download += device_timing.download_ms;
             ++n_active;
         }
-        float const inv = n_active > 0 ? 1.f / static_cast<float>(n_active) : 0.f;
+        float const inverse_active_count = n_active > 0 ? 1.f / static_cast<float>(n_active) : 0.f;
         logger.trace(
             "{:>5} {:>6}  {:>6.1f}  {:>6.1f}   {:>6.1f}  {:>6.1f} / {:>6.1f}  {:>5.1f} / {:>5.1f} / {:>6.1f} / " //
             "{:>6.1f}",
-            cr.wave_index, cr.n_mol, cr.prep_end_ms - cr.prep_start_ms, cr.launch_end_ms - cr.launch_start_ms,
-            cr.finalize_end_ms - cr.finalize_start_ms, gpu_sum * inv, gpu_max, upload * inv, metric * inv,
-            kernels * inv, download * inv);
+            wave_record.wave_index, wave_record.n_mol, wave_record.prep_end_ms - wave_record.prep_start_ms,
+            wave_record.launch_end_ms - wave_record.launch_start_ms,
+            wave_record.finalize_end_ms - wave_record.finalize_start_ms, gpu_sum * inverse_active_count, gpu_max,
+            upload * inverse_active_count, metric * inverse_active_count, kernels * inverse_active_count,
+            download * inverse_active_count);
     }
     logger.trace("wall {:.1f} ms", total_wall_ms);
-    for (auto const &cr : wave_records) {
-        for (std::uint32_t d = 0; d < cr.per_device_gpu.size(); ++d) {
-            auto const &pd = cr.per_device_gpu[d];
-            if (pd.total_ms <= 0.f) continue;
+    for (auto const &wave_record : wave_records) {
+        for (std::uint32_t device_index = 0; device_index < wave_record.per_device_gpu.size(); ++device_index) {
+            auto const &device_timing = wave_record.per_device_gpu[device_index];
+            if (device_timing.total_ms <= 0.f) continue;
             logger.trace2("  ck={} dev={}  upload={:.1f}  metric={:.1f}  kernels={:.1f}  download={:.1f}  total={:.1f}",
-                          cr.wave_index, d, pd.upload_ms, pd.metric_ms, pd.kernels_ms, pd.download_ms, pd.total_ms);
+                          wave_record.wave_index, device_index, device_timing.upload_ms, device_timing.metric_ms,
+                          device_timing.kernels_ms, device_timing.download_ms, device_timing.total_ms);
         }
     }
 }
+
+/**
+ *  @brief Half-open `[begin, end)` slice of the sorted input that one `embedding-wave` covers.
+ *
+ *  Indices are positions in the SMILES-length-sorted view, not in the caller's array; `begin`
+ *  doubles as the wave base `finalize_gpu_pipeline` adds before consulting the sort permutation.
+ */
+struct wave_range_t {
+    std::uint32_t begin;
+    std::uint32_t end;
+};
 
 conformer_status_t context_t::generate_conformers(
     std::span<std::string_view const> smiles, config_t const &config, std::uint32_t max_atoms_per_molecule,
@@ -1112,7 +1165,7 @@ conformer_status_t context_t::generate_conformers(
     // Pre-initialize caller output buffers. `finalize_gpu_pipeline` writes only
     // into the slots whose molecules made it through preprocessing; the rest
     // stay at these defaults (invalid_smiles / zero coords / zero energy).
-    std::fill_n(status_out.begin(), status_out.size(), conformer_status_t::invalid_smiles);
+    std::fill_n(status_out.begin(), status_out.size(), conformer_status_t::invalid_smiles_k);
     std::fill_n(energies_out.begin(), energies_out.size(), 0.0f);
     {
         __half const zero = __float2half_rn(0.0f);
@@ -1148,8 +1201,8 @@ conformer_status_t context_t::generate_conformers(
 
     std::vector<wave_record_t> wave_records;
     auto const t_call_start = std::chrono::high_resolution_clock::now();
-    auto host_ms = [&](std::chrono::high_resolution_clock::time_point t) {
-        return std::chrono::duration<double, std::milli>(t - t_call_start).count();
+    auto host_ms = [&](std::chrono::high_resolution_clock::time_point timestamp) {
+        return std::chrono::duration<double, std::milli>(timestamp - t_call_start).count();
     };
 
     // Launch fans out across GPUs with an OMP parallel-for; each worker enqueues
@@ -1161,8 +1214,8 @@ conformer_status_t context_t::generate_conformers(
                            std::vector<gpu_pipeline_handle_t> &handles_out, std::vector<gpu_phase_ms_t> &timings_out) {
         SF_NVTX_RANGE_COLORED("launch: gpu dispatch", 0x2E86C1);
         bool any_molecules = false;
-        for (std::uint32_t d = 0; d < num_devices; ++d)
-            if (per_device_batches[d].num_molecules > 0) {
+        for (std::uint32_t device_index = 0; device_index < num_devices; ++device_index)
+            if (per_device_batches[device_index].num_molecules > 0) {
                 any_molecules = true;
                 break;
             }
@@ -1174,20 +1227,22 @@ conformer_status_t context_t::generate_conformers(
         // this wave's per-device molecule count first. It is grow-only (a no-op after the first
         // oversized wave) and the buffer is a uint32 per molecule (~KB-MB scale), so this is cheap;
         // done serially here to keep the one-time cudaMalloc out of the per-device launch fan-out.
-        for (std::uint32_t d = 0; d < num_devices; ++d)
-            if (per_device_batches[d].num_molecules > 0)
-                ensure_metric_scratch(*this, d, per_device_batches[d].num_molecules, max_atoms_per_molecule_k);
+        for (std::uint32_t device_index = 0; device_index < num_devices; ++device_index)
+            if (per_device_batches[device_index].num_molecules > 0)
+                ensure_metric_scratch(*this, device_index, per_device_batches[device_index].num_molecules,
+                                      max_atoms_per_molecule_k);
 
         handles_out.resize(num_devices);
         timings_out.assign(num_devices, gpu_phase_ms_t {});
 #pragma omp parallel for num_threads(num_devices) schedule(static, 1)
-        for (std::uint32_t d = 0; d < num_devices; ++d) {
-            if (per_device_batches[d].num_molecules == 0) continue;
-            handles_out[d] = launch_gpu_pipeline(
-                device_ids[d], streams[d], metric_scratch[d], *launch_scratch[d], per_device_batches[d],
-                launch_configs[d], num_conformers, config.max_stereo_attempts, max_atoms_per_molecule,
-                config.random_seed, wave_base, sort_perm_view, coordinates_out, energies_out, status_out, sink);
-            handles_out[d].timings_out = &timings_out[d];
+        for (std::uint32_t device_index = 0; device_index < num_devices; ++device_index) {
+            if (per_device_batches[device_index].num_molecules == 0) continue;
+            handles_out[device_index] = launch_gpu_pipeline(
+                device_ids[device_index], streams[device_index], metric_scratch[device_index],
+                *launch_scratch[device_index], per_device_batches[device_index], launch_configs[device_index],
+                num_conformers, config.max_stereo_attempts, max_atoms_per_molecule, config.random_seed, wave_base,
+                sort_perm_view, coordinates_out, energies_out, status_out, sink);
+            handles_out[device_index].timings_out = &timings_out[device_index];
         }
     };
 
@@ -1197,22 +1252,22 @@ conformer_status_t context_t::generate_conformers(
     // within microseconds of each other and have the same work), so the remaining
     // finalize calls are near-instant.
     auto finalize_wave = [&](std::vector<gpu_pipeline_handle_t> &handles) {
-        for (auto &h : handles)
-            if (h.device_id >= 0) finalize_gpu_pipeline(std::move(h));
+        for (auto &handle : handles)
+            if (handle.device_id >= 0) finalize_gpu_pipeline(std::move(handle));
         handles.clear();
     };
 
     auto finalize_wave_timed = [&](std::vector<gpu_pipeline_handle_t> &handles, std::uint32_t wave_index) {
-        auto t0 = std::chrono::high_resolution_clock::now();
+        auto finalize_start = std::chrono::high_resolution_clock::now();
         finalize_wave(handles);
-        auto t1 = std::chrono::high_resolution_clock::now();
+        auto finalize_end = std::chrono::high_resolution_clock::now();
         if (wave_index < wave_records.size()) {
-            wave_records[wave_index].finalize_start_ms = host_ms(t0);
-            wave_records[wave_index].finalize_end_ms = host_ms(t1);
-            // Pull the per-device timings out of the handles' slots — finalize_wave
-            // already invoked finalize_gpu_pipeline which wrote into each timings_out.
-            // The slots live in launch_wave's `timings_out` argument which the caller
-            // owns; we read them back from there via a separate vector below.
+            wave_records[wave_index].finalize_start_ms = host_ms(finalize_start);
+            wave_records[wave_index].finalize_end_ms = host_ms(finalize_end);
+            // Pull the per-device timings out of the handles' slots — finalize_wave already invoked
+            // finalize_gpu_pipeline which wrote into each timings_out. The slots live in launch_wave's
+            // `timings_out` argument which the caller owns; the read-back happens through a separate
+            // vector below.
         }
     };
 
@@ -1236,8 +1291,8 @@ conformer_status_t context_t::generate_conformers(
         for (rejected_mol_t const &entry : rejected_buf) {
             std::uint32_t const sorted_index = begin + entry.slice_local_index;
             std::uint32_t const caller_index = sort_perm_view[sorted_index];
-            for (std::uint32_t k = 0; k < num_conformers; ++k)
-                status_out[static_cast<std::size_t>(caller_index) * num_conformers + k] = entry.reason;
+            for (std::uint32_t conformer = 0; conformer < num_conformers; ++conformer)
+                status_out[static_cast<std::size_t>(caller_index) * num_conformers + conformer] = entry.reason;
         }
         // Fill caller's num_atoms_out for every molecule that survived preprocess.
         // Sorted-slice → caller-unsorted via sort_perm. Invalid / too_many / timeout
@@ -1245,21 +1300,22 @@ conformer_status_t context_t::generate_conformers(
         bool const want_extras = !num_atoms_out.empty() || !num_heavy_atoms_out.empty() || !num_bonds_out.empty() ||
                                  !molecular_weight_out.empty();
         if (want_extras) {
-            for (std::uint32_t d = 0; d < num_devices; ++d) {
-                auto const &batch = batch_slots_per_device[slot][d];
+            for (std::uint32_t device_index = 0; device_index < num_devices; ++device_index) {
+                auto const &batch = batch_slots_per_device[slot][device_index];
                 auto const metadata = batch.molecule_metadata();
                 auto const input_indices = batch.input_indices();
-                for (std::uint32_t k = 0; k < batch.num_molecules; ++k) {
-                    std::uint32_t const sorted_index = begin + input_indices[k];
+                for (std::uint32_t molecule = 0; molecule < batch.num_molecules; ++molecule) {
+                    std::uint32_t const sorted_index = begin + input_indices[molecule];
                     std::uint32_t const caller_index = sort_perm_view[sorted_index];
                     if (!num_atoms_out.empty())
-                        num_atoms_out[caller_index] = static_cast<std::uint8_t>(metadata[k].num_atoms);
+                        num_atoms_out[caller_index] = static_cast<std::uint8_t>(metadata[molecule].num_atoms);
                     if (!num_heavy_atoms_out.empty())
-                        num_heavy_atoms_out[caller_index] = static_cast<std::uint16_t>(metadata[k].num_heavy_atoms);
+                        num_heavy_atoms_out[caller_index] = static_cast<std::uint16_t>(
+                            metadata[molecule].num_heavy_atoms);
                     if (!num_bonds_out.empty())
-                        num_bonds_out[caller_index] = static_cast<std::uint16_t>(metadata[k].num_bonds);
+                        num_bonds_out[caller_index] = static_cast<std::uint16_t>(metadata[molecule].num_bonds);
                     if (!molecular_weight_out.empty())
-                        molecular_weight_out[caller_index] = metadata[k].molecular_weight;
+                        molecular_weight_out[caller_index] = metadata[molecule].molecular_weight;
                 }
             }
         }
@@ -1271,7 +1327,15 @@ conformer_status_t context_t::generate_conformers(
     };
 
     if (!pipeline) {
-        wave_records.push_back({0, num_input, 0, 0, 0, 0, 0, 0, {}});
+        wave_records.push_back({.wave_index = 0,
+                                .n_mol = num_input,
+                                .prep_start_ms = 0,
+                                .prep_end_ms = 0,
+                                .launch_start_ms = 0,
+                                .launch_end_ms = 0,
+                                .finalize_start_ms = 0,
+                                .finalize_end_ms = 0,
+                                .per_device_gpu = {}});
         wave_records.back().prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
         prep_slice_into_slot(0, 0u, num_input);
         wave_records.back().prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
@@ -1285,15 +1349,15 @@ conformer_status_t context_t::generate_conformers(
     }
     else {
         // Pipelined: split input into waves, use the persistent context-level
-        // 2-slot ring of per-device pinned pools. Slot `i % 2` alternates;
-        // prep(i) writes to the opposite slot from the wave still in flight.
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> waves;
-        for (std::uint32_t i = 0; i < num_input; i += wave_size_target)
-            waves.emplace_back(i, std::min(i + wave_size_target, num_input));
+        // 2-slot ring of per-device pinned pools. Slot `wave % 2` alternates;
+        // prep(wave) writes to the opposite slot from the wave still in flight.
+        std::vector<wave_range_t> waves;
+        for (std::uint32_t wave_start = 0; wave_start < num_input; wave_start += wave_size_target)
+            waves.push_back({wave_start, std::min(wave_start + wave_size_target, num_input)});
         wave_records.resize(waves.size());
-        for (std::uint32_t i = 0; i < waves.size(); ++i) {
-            wave_records[i].wave_index = i;
-            wave_records[i].n_mol = waves[i].second - waves[i].first;
+        for (std::uint32_t wave = 0; wave < waves.size(); ++wave) {
+            wave_records[wave].wave_index = wave;
+            wave_records[wave].n_mol = waves[wave].end - waves[wave].begin;
         }
 
         std::array<std::vector<gpu_pipeline_handle_t>, 2> in_flight {};
@@ -1302,21 +1366,21 @@ conformer_status_t context_t::generate_conformers(
         in_flight[1].resize(num_devices);
 
         wave_records[0].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-        prep_slice_into_slot(0, waves[0].first, waves[0].second);
+        prep_slice_into_slot(0, waves[0].begin, waves[0].end);
         wave_records[0].prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
         wave_records[0].launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-        launch_wave(slot_view(0), waves[0].first, in_flight[0], timing_slots[0]);
+        launch_wave(slot_view(0), waves[0].begin, in_flight[0], timing_slots[0]);
         wave_records[0].launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
 
-        for (std::size_t i = 1; i < waves.size(); ++i) {
-            wave_records[i].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-            prep_slice_into_slot(i % 2, waves[i].first, waves[i].second);
-            wave_records[i].prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
-            finalize_wave_timed(in_flight[(i - 1) % 2], static_cast<std::uint32_t>(i - 1));
-            wave_records[i - 1].per_device_gpu = timing_slots[(i - 1) % 2];
-            wave_records[i].launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
-            launch_wave(slot_view(i % 2), waves[i].first, in_flight[i % 2], timing_slots[i % 2]);
-            wave_records[i].launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
+        for (std::size_t wave = 1; wave < waves.size(); ++wave) {
+            wave_records[wave].prep_start_ms = host_ms(std::chrono::high_resolution_clock::now());
+            prep_slice_into_slot(wave % 2, waves[wave].begin, waves[wave].end);
+            wave_records[wave].prep_end_ms = host_ms(std::chrono::high_resolution_clock::now());
+            finalize_wave_timed(in_flight[(wave - 1) % 2], static_cast<std::uint32_t>(wave - 1));
+            wave_records[wave - 1].per_device_gpu = timing_slots[(wave - 1) % 2];
+            wave_records[wave].launch_start_ms = host_ms(std::chrono::high_resolution_clock::now());
+            launch_wave(slot_view(wave % 2), waves[wave].begin, in_flight[wave % 2], timing_slots[wave % 2]);
+            wave_records[wave].launch_end_ms = host_ms(std::chrono::high_resolution_clock::now());
         }
         std::uint32_t const last_index = static_cast<std::uint32_t>(waves.size() - 1);
         finalize_wave_timed(in_flight[last_index % 2], last_index);
@@ -1325,39 +1389,40 @@ conformer_status_t context_t::generate_conformers(
 
     print_wave_timeline_(this->logger, wave_records, host_ms(std::chrono::high_resolution_clock::now()));
 
-    // All output permutation already happened inside `finalize_gpu_pipeline`:
-    // each wave's per-GPU sort + the outer SMILES-length sort are folded into
-    // one reorder that writes directly into caller_index space. Here we just scan
-    // the already-permuted status buffer to derive the aggregate return code.
+    // All output permutation already happened inside `finalize_gpu_pipeline`: each wave's per-GPU sort
+    // + the outer SMILES-length sort are folded into one reorder that writes directly into caller_index
+    // space. What remains here is a scan of the already-permuted status buffer to derive the aggregate
+    // return code.
     bool any_success = false;
-    for (auto s : status_out)
-        if (s == conformer_status_t::success) {
+    for (auto status : status_out)
+        if (status == conformer_status_t::success_k) {
             any_success = true;
             break;
         }
 
-    return any_success ? conformer_status_t::success : conformer_status_t::mmff_unconverged;
+    return any_success ? conformer_status_t::success_k : conformer_status_t::mmff_unconverged_k;
 }
 
 } // namespace smallfield::api
 
 #if defined(SMALLFIELD_BUILD_PYTHON)
 
-PYBIND11_MODULE(_smallfield, m) {
-    m.doc() = "SmallField: GPU ETKDG + MMFF94 conformer generation";
+PYBIND11_MODULE(_smallfield, smallfield_module) {
+    smallfield_module.doc() = "SmallField: GPU ETKDG + MMFF94 conformer generation";
 
-    m.def("supports_cuda", []() { return true; });
+    smallfield_module.def("supports_cuda", []() { return true; });
 
-    py::enum_<smallfield::api::conformer_status_t>(m, "ConformerStatus")
-        .value("success", smallfield::api::conformer_status_t::success)
-        .value("stereo_failure", smallfield::api::conformer_status_t::stereo_failure)
-        .value("mmff_unconverged", smallfield::api::conformer_status_t::mmff_unconverged)
-        .value("invalid_smiles", smallfield::api::conformer_status_t::invalid_smiles)
-        .value("too_many_atoms", smallfield::api::conformer_status_t::too_many_atoms)
-        .value("preprocess_timeout", smallfield::api::conformer_status_t::preprocess_timeout)
-        .value("unsupported_element", smallfield::api::conformer_status_t::unsupported_element);
+    py::enum_<smallfield::api::conformer_status_t>(smallfield_module, "ConformerStatus")
+        .value("success", smallfield::api::conformer_status_t::success_k)
+        .value("stereo_failure", smallfield::api::conformer_status_t::stereo_failure_k)
+        .value("mmff_unconverged", smallfield::api::conformer_status_t::mmff_unconverged_k)
+        .value("invalid_smiles", smallfield::api::conformer_status_t::invalid_smiles_k)
+        .value("too_many_atoms", smallfield::api::conformer_status_t::too_many_atoms_k)
+        .value("preprocess_timeout", smallfield::api::conformer_status_t::preprocess_timeout_k)
+        .value("unsupported_element", smallfield::api::conformer_status_t::unsupported_element_k);
 
-    py::class_<smallfield::api::context_t>(m, "Context", "GPU context managing CUDA streams and cuSOLVER handles.")
+    py::class_<smallfield::api::context_t>(smallfield_module, "Context",
+                                           "GPU context managing CUDA streams and cuSOLVER handles.")
         .def(py::init([](std::vector<int> device_ids) {
                  std::span<int const> span(device_ids.data(), device_ids.size());
                  return std::make_unique<smallfield::api::context_t>(span);
@@ -1365,7 +1430,7 @@ PYBIND11_MODULE(_smallfield, m) {
              py::arg("device_ids") = std::vector<int> {})
         .def(
             "generate_conformers",
-            [](smallfield::api::context_t &ctx, std::vector<std::string> const &smiles_list,
+            [](smallfield::api::context_t &context, std::vector<std::string> const &smiles_list,
                std::uint32_t num_conformers, std::uint32_t max_atoms_per_molecule, std::uint32_t max_stereo_attempts,
                std::uint64_t random_seed) {
                 // Build config.
@@ -1403,17 +1468,19 @@ PYBIND11_MODULE(_smallfield, m) {
                     // C++ — so holding the interpreter lock would freeze every other thread in the
                     // process for the whole run.
                     py::gil_scoped_release const unlocked;
-                    ctx.generate_conformers(smiles_span, config, max_atoms_per_molecule, coords_span, energies_span,
-                                            status_span);
+                    context.generate_conformers(smiles_span, config, max_atoms_per_molecule, coords_span, energies_span,
+                                                status_span);
                 }
 
                 // Convert __half coordinates back to float for Python.
                 float *coords_ptr = coords_np.mutable_data();
-                for (std::size_t i = 0; i < total_coords; ++i) coords_ptr[i] = __half2float(half_coords[i]);
+                for (std::size_t element = 0; element < total_coords; ++element)
+                    coords_ptr[element] = __half2float(half_coords[element]);
 
                 // Copy status enum values to uint8_t numpy array.
                 std::uint8_t *status_ptr = status_np.mutable_data();
-                for (std::uint32_t i = 0; i < total_conf; ++i) status_ptr[i] = static_cast<std::uint8_t>(status_buf[i]);
+                for (std::uint32_t slot = 0; slot < total_conf; ++slot)
+                    status_ptr[slot] = static_cast<std::uint8_t>(status_buf[slot]);
 
                 return py::make_tuple(coords_np, energies_np, status_np);
             },

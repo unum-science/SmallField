@@ -1,28 +1,24 @@
 /**
- *  @file mmff94_typer_device.cuh
- *  @brief `mmff94_type_and_charge_kernel` runs the native MMFF atom typer and charge computation
- *  on the GPU.
+ *  @file src/smallfield/mmff94/mmff94_typer_device.cuh
+ *  @brief `mmff94_type_and_charge_kernel` runs the native MMFF atom typer and charge computation on the GPU.
  *
- *  Each block = one warp = one molecule. Inside the block, atoms are
- *  assigned lane-strided (lane `l` handles atoms `l, l+32, ...`) for the
- *  heavy-atom and hydrogen-typer passes. The BCI flood fill (needed for
- *  carboxylate / imidazolium / guanidinium charge sharing) has cross-atom
- *  dependencies; it runs lane-0-only with the rest of the warp idle.
- *  On drug-like ChEMBL that's ≤ 3 atoms per molecule — amortised cost is
- *  negligible vs the typer + partial-charge passes, which @b are parallel.
+ *  Each block = one warp = one molecule. Inside the block, atoms are assigned lane-strided for the heavy-atom
+ *  and hydrogen-typer passes, with lane `lane` handling atoms `lane, lane + 32, ...`. The BCI flood fill
+ *  needed for carboxylate, imidazolium and guanidinium charge sharing has cross-atom dependencies; it runs
+ *  lane-0-only with the rest of the warp idle. On drug-like ChEMBL that's ≤ 3 atoms per molecule — amortised
+ *  cost is negligible vs the typer + partial-charge passes, which @b are parallel.
  *
  *  Inputs:
- *   - `descriptors[mol_index]` — device-resident `molecule_descriptor_t`
- *     (22 KB per mol). Uploaded by the pipeline caller.
- *   - `tables_view` — `mmff94_tables_view_t` with device-pointer spans
- *     (built by `upload_mmff94_tables_to_device`, see
- *     `mmff94_tables_device.cuh`).
+ *   - `descriptors[mol_index]` — device-resident `molecule_descriptor_t` at 22 KB per molecule, uploaded by the
+ *     pipeline caller.
+ *   - `tables_view` — `mmff94_tables_view_t` carrying device-pointer spans, built by
+ *     `upload_mmff94_tables_to_device`; see `mmff94_tables_device.cuh`.
  *
  *  Outputs:
- *   - `atom_types[mol_atom_offset ...]` — u8 per atom.
- *   - `atom_charges[mol_atom_offset ...]` — f32 per atom.
- *   - `typing_status[mol_index]` — 0 on full success, non-zero if any atom
- *     failed to type. Non-zero molecules route to the CPU fallback.
+ *   - `atom_types[mol_atom_offset ...]` — one `std::uint8_t` per atom.
+ *   - `atom_charges[mol_atom_offset ...]` — one `float` per atom.
+ *   - `typing_status[mol_index]` — zero on full success, non-zero if any atom failed to type. Non-zero molecules
+ *     route to the CPU fallback.
  */
 
 #pragma once
@@ -54,31 +50,31 @@ static __launch_bounds__(32, 8) __global__
                                        mmff94_tables_view_t tables_view, std::uint8_t *__restrict__ atom_types_out,
                                        float *__restrict__ atom_charges_out, std::uint8_t *__restrict__ typing_status) {
 
-    std::uint32_t const mol = blockIdx.x;
-    if (mol >= num_molecules) return;
+    std::uint32_t const molecule = blockIdx.x;
+    if (molecule >= num_molecules) return;
     std::uint32_t const lane = threadIdx.x;
 
-    molecule_descriptor_t const &descriptor = descriptors[mol];
-    std::uint32_t const atom_off = atom_offsets[mol];
+    molecule_descriptor_t const &descriptor = descriptors[molecule];
+    std::uint32_t const atom_off = atom_offsets[molecule];
     std::uint32_t const num_atoms = descriptor.num_atoms;
     std::uint8_t *types = atom_types_out + atom_off;
     float *charges = atom_charges_out + atom_off;
 
     // Heavy atoms, lane-strided.
-    for (std::uint32_t a = lane; a < num_atoms; a += warp_size_k) {
-        if (descriptor.element[a] == 1) {
-            types[a] = 0;
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
+        if (descriptor.element[atom] == 1) {
+            types[atom] = 0;
             continue;
         }
-        types[a] = native_set_mmff_heavy_atom_type(descriptor, a);
+        types[atom] = native_set_mmff_heavy_atom_type(descriptor, atom);
     }
     __syncwarp();
 
     // Hydrogens, keyed on heavy-atom types, so must run after the heavy-atom pass.
     std::span<std::uint8_t const> types_span(types, num_atoms);
-    for (std::uint32_t a = lane; a < num_atoms; a += warp_size_k) {
-        if (descriptor.element[a] != 1) continue;
-        types[a] = native_set_mmff_hydrogen_type(descriptor, a, types_span);
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
+        if (descriptor.element[atom] != 1) continue;
+        types[atom] = native_set_mmff_hydrogen_type(descriptor, atom, types_span);
     }
     __syncwarp();
 
@@ -89,12 +85,12 @@ static __launch_bounds__(32, 8) __global__
     if (lane == 0) {
         // Status: if any atom type is 0, this molecule failed typing.
         std::uint8_t status = 0;
-        for (std::uint32_t a = 0; a < num_atoms; ++a)
-            if (types[a] == 0) {
+        for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
+            if (types[atom] == 0) {
                 status = 1;
                 break;
             }
-        typing_status[mol] = status;
+        typing_status[molecule] = status;
         if (status == 0) {
             std::span<std::uint8_t const> at_const(types, num_atoms);
             std::span<float> fc_span(formal_charges_shared, num_atoms);
@@ -106,7 +102,7 @@ static __launch_bounds__(32, 8) __global__
         else {
             // Failed — zero charges as a defensive default. CPU fallback
             // will overwrite with the full native pipeline.
-            for (std::uint32_t a = 0; a < num_atoms; ++a) charges[a] = 0.0f;
+            for (std::uint32_t atom = 0; atom < num_atoms; ++atom) charges[atom] = 0.0f;
         }
     }
 }

@@ -1,15 +1,14 @@
 /**
- *  @file test_csd_torsion_device.cpp
+ *  @file test/kernels/test_csd_torsion_device.cpp
  *  @brief Gate the device CSD torsion matcher against the host extractor, molecule for molecule.
  *
- *  The device kernel and `extract_etk_torsions_native` read the same flat descriptor and the same
- *  compiled pattern corpus, one through a device arena and one through the host pattern objects,
- *  so their torsion sets must agree exactly — same four atom indices in the same order, same six
- *  Fourier coefficients bit for bit. Anything less means the POD mirror of a pattern lost
- *  something on the way to the device.
+ *  The device kernel and `extract_etk_torsions_native` read the same flat descriptor and the same compiled
+ *  pattern corpus, one through a device arena and one through the host pattern objects, so their torsion sets
+ *  must agree exactly — same four atom indices in the same order, same six Fourier coefficients bit for bit.
+ *  Anything less means the POD mirror of a pattern lost something on the way to the device.
  *
- *  Corpus: the built-in standards by default, so a fresh clone stays green; point
- *  `SMALLFIELD_TEST_CORPUS` at a `.smi` file, colon-separated for several, for a wide sweep.
+ *  Corpus: the built-in standards by default, so a fresh clone stays green; point `SMALLFIELD_TEST_CORPUS` at a
+ *  `.smi` file, colon-separated for several, for a wide sweep.
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
@@ -17,11 +16,10 @@
 #include <cstdlib> // `std::exit`, `std::getenv`
 #include <cstring> // `std::memcpy`
 
-#include <chrono>  // `std::chrono::steady_clock`, `std::chrono::duration`
-#include <fstream> // `std::ifstream`
+#include <chrono> // `std::chrono::steady_clock`, `std::chrono::duration`
 #include <memory>  // `std::unique_ptr`
 #include <set>     // `std::set`
-#include <string>  // `std::string`, `std::getline`
+#include <string>  // `std::string`
 #include <tuple>   // `std::tuple`
 #include <vector>  // `std::vector`
 
@@ -40,7 +38,7 @@ namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-namespace {
+namespace smallfield::tests {
 
 /** Molecules uploaded in one launch; keeps the device staging buffers comfortably small. */
 constexpr std::uint32_t batch_capacity_k = 1024;
@@ -52,7 +50,7 @@ constexpr std::uint32_t torsion_stride_k = sft::max_bonds_k;
 using torsion_key_t = std::tuple<std::uint8_t, std::uint8_t, std::uint8_t, std::uint8_t, std::uint32_t, std::uint32_t,
                                  std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
 
-torsion_key_t torsion_key(sft::etk_torsion_descriptor_t const &torsion) {
+static torsion_key_t torsion_key_(sft::etk_torsion_descriptor_t const &torsion) {
     std::uint32_t bits[6];
     for (std::uint32_t term = 0; term < 6; ++term) std::memcpy(&bits[term], &torsion.fourier_coefficients[term], 4);
     return torsion_key_t {torsion.atom_indices[0],
@@ -67,31 +65,10 @@ torsion_key_t torsion_key(sft::etk_torsion_descriptor_t const &torsion) {
                           bits[5]};
 }
 
-/** Load SMILES from one file, one per line, keeping at most @p max_count of them.
- *  @param[in] path File to read.
- *  @param[in] max_count Upper bound on lines kept.
- *  @return The loaded SMILES; empty when the file cannot be opened. */
-std::vector<std::string> load_smiles(std::string const &path, std::size_t max_count) {
-    std::vector<std::string> loaded;
-    std::ifstream input(path);
-    if (!input) {
-        std::fprintf(stderr, "FAIL: cannot open corpus %s\n", path.c_str());
-        std::exit(1);
-    }
-    std::string line;
-    while (loaded.size() < max_count && std::getline(input, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        std::size_t const separator = line.find_first_of(" \t\r");
-        if (separator != std::string::npos) line.resize(separator);
-        if (!line.empty()) loaded.push_back(line);
-    }
-    return loaded;
-}
-
 /** Split a colon-separated corpus list into its paths.
  *  @param[in] value Colon-separated list.
  *  @return The individual paths. */
-std::vector<std::string> split_paths(char const *value) {
+static std::vector<std::string> split_paths_(char const *value) {
     std::vector<std::string> paths;
     std::string current;
     for (char const *cursor = value; *cursor != '\0'; ++cursor) {
@@ -109,7 +86,7 @@ std::vector<std::string> split_paths(char const *value) {
  *  @param[in] smiles Molecule to build.
  *  @param[out] descriptor Filled on success.
  *  @return True when the molecule parsed and fits the descriptor's capacity. */
-bool build_descriptor_from_smiles(std::string const &smiles, sft::molecule_descriptor_t &descriptor) {
+static bool build_descriptor_from_smiles_(std::string const &smiles, sft::molecule_descriptor_t &descriptor) {
     std::unique_ptr<RDKit::RWMol> molecule;
     try {
         molecule.reset(RDKit::SmilesToMol(smiles));
@@ -129,7 +106,14 @@ bool build_descriptor_from_smiles(std::string const &smiles, sft::molecule_descr
     return sft::build_descriptor(*molecule, descriptor);
 }
 
-} // namespace
+} // namespace smallfield::tests
+
+using sftest::batch_capacity_k;
+using sftest::build_descriptor_from_smiles_;
+using sftest::split_paths_;
+using sftest::torsion_key_;
+using sftest::torsion_key_t;
+using sftest::torsion_stride_k;
 
 int main() {
     std::printf("=== test_csd_torsion_device: device CSD torsion matcher vs host extractor ===\n");
@@ -140,15 +124,15 @@ int main() {
     std::size_t const max_molecules = max_molecules_env ? static_cast<std::size_t>(std::atoll(max_molecules_env))
                                                         : 100000;
     if (corpus_env != nullptr)
-        for (auto const &path : split_paths(corpus_env)) {
-            auto loaded = load_smiles(path, max_molecules);
+        for (auto const &path : split_paths_(corpus_env)) {
+            auto loaded = sftest::load_smiles(path, max_molecules, sftest::smiles_missing_file_t::aborts_k);
             std::printf("Corpus: %s (%zu molecules)\n", path.c_str(), loaded.size());
             for (auto &smiles : loaded) smiles_list.push_back(std::move(smiles));
         }
     else std::printf("Corpus: builtin standards only; set SMALLFIELD_TEST_CORPUS for a wider sweep\n");
 
     std::size_t table_bytes = 0;
-    void *table_handle = create_csd_torsion_device_table(table_bytes);
+    void *table_handle = sftest::create_csd_torsion_device_table(table_bytes);
     sf_verify_(table_handle != nullptr, "device torsion table upload failed");
     std::printf("Device pattern table: %zu bytes\n", table_bytes);
 
@@ -175,8 +159,8 @@ int main() {
         if (descriptors.empty()) return;
         std::uint32_t const count = static_cast<std::uint32_t>(descriptors.size());
         auto const device_start = std::chrono::steady_clock::now();
-        bool const launched = run_csd_torsion_device_batch(table_handle, descriptors.data(), count, torsion_stride_k,
-                                                           device_torsions.data(), device_counts.data());
+        bool const launched = sftest::run_csd_torsion_device_batch(
+            table_handle, descriptors.data(), count, torsion_stride_k, device_torsions.data(), device_counts.data());
         device_microseconds +=
             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - device_start).count();
         sf_verify_(launched, "device torsion kernel failed");
@@ -187,14 +171,14 @@ int main() {
             host_microseconds +=
                 std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - host_start).count();
             std::set<torsion_key_t> expected;
-            for (auto const &torsion : host_torsions) expected.insert(torsion_key(torsion));
+            for (auto const &torsion : host_torsions) expected.insert(torsion_key_(torsion));
 
             std::uint32_t const produced_count = device_counts[molecule];
             sf_verify_(produced_count <= torsion_stride_k, "device torsion count overflowed the output slots");
             std::set<torsion_key_t> produced;
             sft::etk_torsion_descriptor_t const *slots = device_torsions.data() +
                                                          static_cast<std::size_t>(molecule) * torsion_stride_k;
-            for (std::uint32_t entry = 0; entry < produced_count; ++entry) produced.insert(torsion_key(slots[entry]));
+            for (std::uint32_t entry = 0; entry < produced_count; ++entry) produced.insert(torsion_key_(slots[entry]));
 
             ++compared;
             total_torsions += expected.size();
@@ -210,14 +194,14 @@ int main() {
 
     for (auto const &smiles : smiles_list) {
         sft::molecule_descriptor_t descriptor;
-        if (!build_descriptor_from_smiles(smiles, descriptor)) continue;
+        if (!build_descriptor_from_smiles_(smiles, descriptor)) continue;
         descriptors.push_back(descriptor);
         descriptor_smiles.push_back(smiles);
         if (descriptors.size() == batch_capacity_k) flush_batch();
     }
     flush_batch();
 
-    destroy_csd_torsion_device_table(table_handle);
+    sftest::destroy_csd_torsion_device_table(table_handle);
 
     std::printf("Molecules compared: %zu, host torsions: %zu, mismatches: %zu\n", compared, total_torsions, mismatches);
     if (compared > 0) {

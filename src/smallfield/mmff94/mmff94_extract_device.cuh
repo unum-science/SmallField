@@ -1,30 +1,26 @@
 /**
- *  @file mmff94_extract_device.cuh
+ *  @file src/smallfield/mmff94/mmff94_extract_device.cuh
  *  @brief `mmff94_extract_terms_kernel` runs the native MMFF term extractor on the GPU.
  *
- *  Layout decisions (initial pass, optimisable later):
- *   - One block per molecule; lane-0 does all the work within a
- *     molecule. Atom typing + lookup enumeration is an inherently
- *     graph-walking algorithm with short-lived per-molecule state
- *     (angle_scratch etc.) — SIMT parallelism across atoms / bonds is
- *     possible but adds substantial complexity for modest per-molecule
- *     speedup (drug-like mols average < 30 atoms / 30 bonds). The win
- *     is in the cross-molecule dimension: 50 K molecules × 132 SMs ×
- *     8 blocks/SM = ~1000 molecules in flight at steady state.
- *   - The extractor and the CSR builder write into per-molecule slots of
- *     fixed stride (`max_mmff_*_per_mol` constants), which costs 116 KB of
- *     staging per molecule, and report their actual per-term-type counts
- *     to the `per_mol_counts` array.
- *   - `mmff94_scan_counts_kernel` + `mmff94_compact_terms_kernel` turn that
- *     staging into the packed variable-length layout `wave_slice_pool_t` and
- *     `mmff_polish_warp_kernel` consume: one contiguous array per term type,
- *     per-molecule bases stamped into `etkdg_molecule_metadata_t`, and the
- *     per-atom CSR starts rebased from molecule-relative to batch-global.
- *     `test_mmff_gpu_extract` prints both footprints per molecule and gates
- *     the packed arrays byte for byte against the staging; it measures 17.2 KB
- *     per molecule over 19 167 PubChem molecules and 19.4 KB over 20 009
- *     Enamine REAL molecules, so compaction buys 6.1x to 6.9x on those corpora
- *     and the packed arrays are the ones a 50 K-molecule wave allocates.
+ *  Layout:
+ *   - One block per molecule, with lane 0 doing all the work inside it. Atom typing and lookup
+ *     enumeration is an inherently graph-walking algorithm carrying short-lived per-molecule state
+ *     such as `mmff94_angle_scratch_t`, so SIMT parallelism across atoms and bonds is possible but
+ *     adds substantial complexity for a modest per-molecule speedup — drug-like molecules average
+ *     under 30 atoms and 30 bonds. The win is in the cross-molecule dimension instead: 50 K
+ *     molecules over the 132 SMs of an H100, at 8 blocks per SM, keeps roughly 1000 molecules in
+ *     flight at steady state.
+ *   - The extractor and the CSR builder write into per-molecule slots of fixed stride, sized by the
+ *     `max_mmff_*_per_mol_k` constants, which costs 116 KB of staging per molecule. Each reports its
+ *     actual per-term-type counts to the `per_mol_counts` array.
+ *   - `mmff94_scan_counts_kernel` and `mmff94_compact_terms_kernel` turn that staging into the packed
+ *     variable-length layout `wave_slice_pool_t` and `mmff_polish_warp_kernel` consume: one contiguous
+ *     array per term type, per-molecule bases stamped into `etkdg_molecule_metadata_t`, and per-atom
+ *     CSR starts rebased from molecule-relative to batch-global. `test_mmff_gpu_extract` prints both
+ *     footprints per molecule and gates the packed arrays byte for byte against the staging; it
+ *     measures 17.2 KB per molecule over 19 167 PubChem molecules and 19.4 KB over 20 009 Enamine REAL
+ *     molecules, so compaction buys 6.1x to 6.9x on those corpora, and the packed arrays are the ones
+ *     a 50 K-molecule wave allocates.
  */
 
 #pragma once
@@ -54,6 +50,7 @@ using smallfield::parameters::lookup_stbn;
 using smallfield::parameters::lookup_torsion;
 using smallfield::parameters::lookup_vdw;
 using smallfield::parameters::mmff94_tables_view_t;
+using smallfield::parameters::swap_;
 using smallfield::types::atom_role_first_k;
 using smallfield::types::atom_role_fourth_k;
 using smallfield::types::atom_role_second_k;
@@ -116,31 +113,28 @@ inline constexpr std::uint32_t mmff94_packed_components_k = 6;
 /** Thread count of the single-block scan that turns per-molecule counts into packed offsets. */
 inline constexpr std::uint32_t mmff94_scan_block_k = 512;
 
-namespace detail_extract {
-
 /** Angle scratch — populated during the angle pass and consumed by the
  *  stretch-bend pass. Sized at `max_mmff_angles_per_mol_k` slots per
  *  molecule and held in shared memory, one array per block rather than
  *  one per thread: 16 B × 512 = 8 KB per block, which the static
  *  `__shared__` assertion below pins to the struct layout. */
-struct angle_scratch_t {
-    std::uint8_t i, j, k;
+struct mmff94_angle_scratch_t {
+    std::uint8_t atom_i, atom_j, atom_k;
     std::uint8_t angle_type;
     std::uint8_t bond_type_ij, bond_type_jk;
     std::int16_t bond_index_ij, bond_index_jk;
     float theta0_deg;
 };
 
-static_assert(sizeof(angle_scratch_t) == 16, "angle scratch must stay at 8 KB per block");
-
-} // namespace detail_extract
+static_assert(sizeof(mmff94_angle_scratch_t) == 16, "angle scratch must stay at 8 KB per block");
 
 #if defined(__CUDACC__)
 /** Single-kernel MMFF94 term extractor. One block per molecule; lane 0
  *  of the block does all enumeration + classification + lookup. Outputs
  *  are written into the per-molecule fixed-stride slots of the output
  *  arrays. Blockers on this kernel are avoided by keeping per-molecule
- *  state in shared memory (angle_scratch + per-bond scratch). */
+ *  state in shared memory: `shared_angle_scratch` plus the per-bond
+ *  `shared_bond_type` and `shared_bond_equilibrium_distance`. */
 static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     // Inputs
     molecule_descriptor_t const *__restrict__ descriptors, std::uint8_t const *__restrict__ atom_types_all,
@@ -153,19 +147,19 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     mmff94_stretchbend_t *__restrict__ out_stbns, mmff94_per_mol_counts_t *__restrict__ per_mol_counts,
     std::uint8_t const *__restrict__ typing_status) {
 
-    std::uint32_t const mol = blockIdx.x;
-    if (mol >= num_molecules) return;
+    std::uint32_t const molecule = blockIdx.x;
+    if (molecule >= num_molecules) return;
 
     // Early-exit status check runs on all 32 lanes so they all
     // agree to fall out together (no warp divergence afterwards).
-    if (typing_status[mol] != 0) {
-        if (threadIdx.x == 0) per_mol_counts[mol] = {};
+    if (typing_status[molecule] != 0) {
+        if (threadIdx.x == 0) per_mol_counts[molecule] = {};
         return;
     }
 
     std::uint32_t const lane = threadIdx.x;
-    molecule_descriptor_t const &descriptor = descriptors[mol];
-    std::uint32_t const atom_off = atom_offsets[mol];
+    molecule_descriptor_t const &descriptor = descriptors[molecule];
+    std::uint32_t const atom_off = atom_offsets[molecule];
     std::uint8_t const *atom_types = atom_types_all + atom_off;
     float const *charges = atom_charges_all + atom_off;
     std::uint32_t const num_atoms = descriptor.num_atoms;
@@ -174,75 +168,86 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
     // Per-molecule output bases.
     mmff94_atom_vdw_params_t *vdw_out = out_atom_vdw + atom_off;
     float *charge_out = out_atom_charge + atom_off;
-    mmff94_bond_t *bonds_out = out_bonds + (std::size_t)mol * max_mmff_bonds_per_mol_k;
-    mmff94_angle_t *angles_out = out_angles + (std::size_t)mol * max_mmff_angles_per_mol_k;
-    mmff94_torsion_t *torsions_out = out_torsions + (std::size_t)mol * max_mmff_torsions_per_mol_k;
-    mmff94_oop_t *oops_out = out_oops + (std::size_t)mol * max_mmff_oops_per_mol_k;
-    mmff94_stretchbend_t *stbns_out = out_stbns + (std::size_t)mol * max_mmff_stretchbends_per_mol_k;
+    mmff94_bond_t *bonds_out = out_bonds + (std::size_t)molecule * max_mmff_bonds_per_mol_k;
+    mmff94_angle_t *angles_out = out_angles + (std::size_t)molecule * max_mmff_angles_per_mol_k;
+    mmff94_torsion_t *torsions_out = out_torsions + (std::size_t)molecule * max_mmff_torsions_per_mol_k;
+    mmff94_oop_t *oops_out = out_oops + (std::size_t)molecule * max_mmff_oops_per_mol_k;
+    mmff94_stretchbend_t *stbns_out = out_stbns + (std::size_t)molecule * max_mmff_stretchbends_per_mol_k;
 
     // Atom VdW + charge — lane-parallel over atoms (each atom's work
     // is independent and written to its own slot).
-    for (std::uint32_t a = lane; a < num_atoms; a += 32) {
-        auto const *vdw = lookup_vdw(tables, atom_types[a]);
-        mmff94_atom_vdw_params_t p {};
-        if (vdw) {
-            p.alpha = vdw->alpha_i;
-            p.n_effective = vdw->n_i;
-            p.a_scale = vdw->a_i;
-            p.g_factor = vdw->g_i;
-            p.r_star = vdw->r_star;
-            p.donor_acceptor = vdw->donor_acceptor;
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += 32) {
+        auto const *vdw_entry = lookup_vdw(tables, atom_types[atom]);
+        mmff94_atom_vdw_params_t vdw_params {};
+        if (vdw_entry) {
+            vdw_params.alpha = vdw_entry->alpha_i;
+            vdw_params.n_effective = vdw_entry->n_effective;
+            vdw_params.a_scale = vdw_entry->a_scale;
+            vdw_params.g_factor = vdw_entry->g_factor;
+            vdw_params.r_star = vdw_entry->r_star;
+            vdw_params.donor_acceptor = vdw_entry->donor_acceptor;
         }
-        vdw_out[a] = p;
-        charge_out[a] = charges[a];
+        vdw_out[atom] = vdw_params;
+        charge_out[atom] = charges[atom];
     }
 
     // Precompute per-bond bond_type + bond-stretch params — lane-parallel
     // over bonds. Shared-memory scratch for downstream angle/stbn reuse.
-    __shared__ std::uint8_t s_bond_type[max_bonds_k];
-    __shared__ float s_bond_r0[max_bonds_k];
-    for (std::uint32_t b = lane; b < num_bonds; b += 32) {
-        std::uint8_t const i = descriptor.bond_atom_i[b];
-        std::uint8_t const j = descriptor.bond_atom_j[b];
-        std::uint8_t bt = 0;
-        bool const arom_bond = (descriptor.bond_flags[b] & bond_flag_aromatic_k) != 0;
-        if (descriptor.bond_order[b] == 1 && !arom_bond) {
-            auto const *pi = lookup_prop(tables, atom_types[i]);
-            auto const *pj = lookup_prop(tables, atom_types[j]);
-            if (pi && pj && ((pi->sbmb && pj->sbmb) || (pi->arom && pj->arom))) bt = 1;
+    __shared__ std::uint8_t shared_bond_type[max_bonds_k];
+    __shared__ float shared_bond_equilibrium_distance[max_bonds_k];
+    for (std::uint32_t bond = lane; bond < num_bonds; bond += 32) {
+        std::uint8_t const atom_i = descriptor.bond_atom_i[bond];
+        std::uint8_t const atom_j = descriptor.bond_atom_j[bond];
+        std::uint8_t bond_type = 0;
+        bool const arom_bond = (descriptor.bond_flags[bond] & bond_flag_aromatic_k) != 0;
+        if (descriptor.bond_order[bond] == 1 && !arom_bond) {
+            auto const *prop_i = lookup_prop(tables, atom_types[atom_i]);
+            auto const *prop_j = lookup_prop(tables, atom_types[atom_j]);
+            if (prop_i && prop_j &&
+                ((prop_i->single_bond_multiple_bond && prop_j->single_bond_multiple_bond) ||
+                 (prop_i->aromatic && prop_j->aromatic)))
+                bond_type = 1;
         }
-        s_bond_type[b] = bt;
-        auto const *bp = lookup_bond(tables, bt, atom_types[i], atom_types[j]);
-        float kb = 0.0f, r0 = 0.0f;
-        if (bp) {
-            kb = bp->kb;
-            r0 = bp->r0;
+        shared_bond_type[bond] = bond_type;
+        auto const *bond_parameters = lookup_bond(tables, bond_type, atom_types[atom_i], atom_types[atom_j]);
+        float force_constant = 0.0f, equilibrium_distance = 0.0f;
+        if (bond_parameters) {
+            force_constant = bond_parameters->force_constant;
+            equilibrium_distance = bond_parameters->equilibrium_distance;
         }
         else {
-            auto const emp = native_bond_empirical(tables, descriptor.element[i], descriptor.element[j]);
-            kb = emp.first;
-            r0 = emp.second;
+            auto const [empirical_force_constant, empirical_equilibrium_distance] = native_bond_empirical(
+                tables, descriptor.element[atom_i], descriptor.element[atom_j]);
+            force_constant = empirical_force_constant;
+            equilibrium_distance = empirical_equilibrium_distance;
         }
-        s_bond_r0[b] = r0;
-        // Emit bond at deterministic position = original bond index `b`
+        shared_bond_equilibrium_distance[bond] = equilibrium_distance;
+        // Emit bond at deterministic position = original bond index `bond`
         // so output ordering matches the CPU (which also iterates bonds
         // in index order and push_backs in order).
-        if (b < max_mmff_bonds_per_mol_k) { bonds_out[b] = {i, j, {0, 0}, kb, r0, 0.0f}; }
+        if (bond < max_mmff_bonds_per_mol_k) {
+            bonds_out[bond] = {.atom_i = atom_i,
+                               .atom_j = atom_j,
+                               .padding = {0, 0},
+                               .force_constant = force_constant,
+                               .equilibrium_distance = equilibrium_distance,
+                               .padding_float = 0.0f};
+        }
     }
     __syncwarp();
 
     // Angle scratch — populated by the angle pass, consumed by the stretch-bend
     // pass. Block-scoped, so the cost is 8 KB per warp rather than per thread.
-    __shared__ detail_extract::angle_scratch_t shared_angle_scratch[max_mmff_angles_per_mol_k];
+    __shared__ mmff94_angle_scratch_t shared_angle_scratch[max_mmff_angles_per_mol_k];
 
     // From here on the passes with atomic cursors must run on lane-0
     // only to preserve deterministic ordering for byte-equality with CPU.
     if (lane != 0) return;
 
-    // Wire the shared scratch back into the rest of the kernel body via
-    // the existing names — avoid renaming the remaining 200+ LOC.
-    std::uint8_t const *bond_type_arr = s_bond_type;
-    float const *bond_r0 = s_bond_r0;
+    // Both arrays are indexed by original bond index: the MMFF bond type of every bond, and the
+    // equilibrium bond length the angle and stretch-bend passes read back.
+    std::uint8_t const *bond_type_arr = shared_bond_type;
+    float const *bond_equilibrium_distance = shared_bond_equilibrium_distance;
 
     std::uint32_t bond_count = num_bonds < max_mmff_bonds_per_mol_k ? num_bonds : max_mmff_bonds_per_mol_k;
     std::uint32_t angle_count = 0, torsion_count = 0, oop_count = 0, stbn_count = 0;
@@ -253,89 +258,105 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
 
     std::span<std::uint8_t const> bond_types {bond_type_arr, num_bonds};
     std::span<std::uint8_t const> at_span {atom_types, num_atoms};
-    for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint16_t const nstart = descriptor.neighbor_offset[center];
-        std::uint16_t const nend = descriptor.neighbor_offset[center + 1];
-        for (std::uint16_t a = nstart; a < nend; ++a) {
-            for (std::uint16_t b = a + 1; b < nend; ++b) {
-                std::uint32_t const ai = descriptor.neighbor_atom[a];
-                std::uint32_t const aj = descriptor.neighbor_atom[b];
-                std::int32_t const bond_index_ic = find_bond_index(descriptor, ai, center);
-                std::int32_t const bond_index_cj = find_bond_index(descriptor, center, aj);
-                if (bond_index_ic < 0 || bond_index_cj < 0) continue;
-                std::uint8_t const at_code = native_get_mmff_angle_type(descriptor, bond_types, ai, center, aj);
-                auto const *ap = lookup_angle(tables, at_code, atom_types[ai], atom_types[center], atom_types[aj]);
-                float ka = 0.0f, theta0_deg = 0.0f;
-                bool use_empirical = !ap || native_is_zero(ap->ka);
+    for (std::uint32_t atom_j = 0; atom_j < num_atoms; ++atom_j) {
+        std::uint16_t const nstart = descriptor.neighbor_offset[atom_j];
+        std::uint16_t const nend = descriptor.neighbor_offset[atom_j + 1];
+        for (std::uint16_t first_neighbor_slot = nstart; first_neighbor_slot < nend; ++first_neighbor_slot) {
+            for (std::uint16_t second_neighbor_slot = first_neighbor_slot + 1; second_neighbor_slot < nend;
+                 ++second_neighbor_slot) {
+                std::uint32_t const atom_i = descriptor.neighbor_atom[first_neighbor_slot];
+                std::uint32_t const atom_k = descriptor.neighbor_atom[second_neighbor_slot];
+                std::int32_t const bond_index_ij = find_bond_index(descriptor, atom_i, atom_j);
+                std::int32_t const bond_index_jk = find_bond_index(descriptor, atom_j, atom_k);
+                if (bond_index_ij < 0 || bond_index_jk < 0) continue;
+                std::uint8_t const at_code = native_get_mmff_angle_type(descriptor, bond_types, atom_i, atom_j, atom_k);
+                auto const *angle_params = lookup_angle(tables, at_code, atom_types[atom_i], atom_types[atom_j],
+                                                        atom_types[atom_k]);
+                float force_constant = 0.0f, theta0_deg = 0.0f;
+                bool use_empirical = !angle_params || native_is_zero(angle_params->force_constant);
                 if (!use_empirical) {
-                    ka = ap->ka;
-                    theta0_deg = ap->theta0_deg;
+                    force_constant = angle_params->force_constant;
+                    theta0_deg = angle_params->theta0_deg;
                 }
                 if (use_empirical) {
-                    float const r0_ic = bond_r0[bond_index_ic];
-                    float const r0_cj = bond_r0[bond_index_cj];
-                    float const override_deg = ap ? ap->theta0_deg : -1.0f;
-                    auto const emp = native_angle_empirical(descriptor, tables, at_span, ai, center, aj, r0_ic, r0_cj,
-                                                            override_deg);
-                    ka = emp.first;
-                    theta0_deg = emp.second;
+                    float const equilibrium_distance_ij = bond_equilibrium_distance[bond_index_ij];
+                    float const equilibrium_distance_jk = bond_equilibrium_distance[bond_index_jk];
+                    float const override_deg = angle_params ? angle_params->theta0_deg : -1.0f;
+                    auto const [empirical_force_constant, empirical_theta0_deg] = native_angle_empirical(
+                        descriptor, tables, at_span, atom_i, atom_j, atom_k, equilibrium_distance_ij,
+                        equilibrium_distance_jk, override_deg);
+                    force_constant = empirical_force_constant;
+                    theta0_deg = empirical_theta0_deg;
                 }
                 float const theta0_rad = theta0_deg * (float)M_PI / 180.0f;
-                auto const *prop_center = lookup_prop(tables, at_span[center]);
-                std::uint8_t const is_linear = (prop_center && prop_center->linh) ? 1u : 0u;
+                auto const *prop_center = lookup_prop(tables, at_span[atom_j]);
+                std::uint8_t const is_linear = (prop_center && prop_center->linear) ? 1u : 0u;
                 if (angle_count < max_mmff_angles_per_mol_k) {
-                    angles_out[angle_count++] = {
-                        (std::uint8_t)ai, (std::uint8_t)center, (std::uint8_t)aj, is_linear, ka, theta0_rad, 0.0f};
+                    angles_out[angle_count++] = {.atom_i = (std::uint8_t)atom_i,
+                                                 .atom_j = (std::uint8_t)atom_j,
+                                                 .atom_k = (std::uint8_t)atom_k,
+                                                 .is_linear = is_linear,
+                                                 .force_constant = force_constant,
+                                                 .equilibrium_angle = theta0_rad,
+                                                 .padding_float = 0.0f};
                 }
                 else { overflow = 1; }
                 if (angle_scratch_count < max_mmff_angles_per_mol_k) {
-                    shared_angle_scratch[angle_scratch_count++] = {(std::uint8_t)ai,
-                                                                   (std::uint8_t)center,
-                                                                   (std::uint8_t)aj,
-                                                                   at_code,
-                                                                   bond_type_arr[bond_index_ic],
-                                                                   bond_type_arr[bond_index_cj],
-                                                                   (std::int16_t)bond_index_ic,
-                                                                   (std::int16_t)bond_index_cj,
-                                                                   theta0_deg};
+                    shared_angle_scratch[angle_scratch_count++] = {.atom_i = (std::uint8_t)atom_i,
+                                                                   .atom_j = (std::uint8_t)atom_j,
+                                                                   .atom_k = (std::uint8_t)atom_k,
+                                                                   .angle_type = at_code,
+                                                                   .bond_type_ij = bond_type_arr[bond_index_ij],
+                                                                   .bond_type_jk = bond_type_arr[bond_index_jk],
+                                                                   .bond_index_ij = (std::int16_t)bond_index_ij,
+                                                                   .bond_index_jk = (std::int16_t)bond_index_jk,
+                                                                   .theta0_deg = theta0_deg};
                 }
             }
         }
     }
 
     // Torsion terms.
-    for (std::uint32_t b = 0; b < num_bonds; ++b) {
-        std::uint32_t const j = descriptor.bond_atom_i[b];
-        std::uint32_t const k = descriptor.bond_atom_j[b];
-        std::uint16_t const jstart = descriptor.neighbor_offset[j];
-        std::uint16_t const jend = descriptor.neighbor_offset[j + 1];
-        std::uint16_t const kstart = descriptor.neighbor_offset[k];
-        std::uint16_t const kend = descriptor.neighbor_offset[k + 1];
-        for (std::uint16_t nj = jstart; nj < jend; ++nj) {
-            std::uint32_t const i = descriptor.neighbor_atom[nj];
-            if (i == k) continue;
-            for (std::uint16_t nk = kstart; nk < kend; ++nk) {
-                std::uint32_t const l = descriptor.neighbor_atom[nk];
-                if (l == j) continue;
-                auto const tt = native_get_mmff_torsion_type(descriptor, at_span, bond_types, i, j, k, l);
-                auto const hit = lookup_torsion(tables, tt.first, tt.second, atom_types[i], atom_types[j],
-                                                atom_types[k], atom_types[l]);
-                float v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
-                if (hit.second) {
-                    v1 = hit.second->v1;
-                    v2 = hit.second->v2;
-                    v3 = hit.second->v3;
+    for (std::uint32_t bond = 0; bond < num_bonds; ++bond) {
+        std::uint32_t const atom_j = descriptor.bond_atom_i[bond];
+        std::uint32_t const atom_k = descriptor.bond_atom_j[bond];
+        std::uint16_t const jstart = descriptor.neighbor_offset[atom_j];
+        std::uint16_t const jend = descriptor.neighbor_offset[atom_j + 1];
+        std::uint16_t const kstart = descriptor.neighbor_offset[atom_k];
+        std::uint16_t const kend = descriptor.neighbor_offset[atom_k + 1];
+        for (std::uint16_t j_neighbor_slot = jstart; j_neighbor_slot < jend; ++j_neighbor_slot) {
+            std::uint32_t const atom_i = descriptor.neighbor_atom[j_neighbor_slot];
+            if (atom_i == atom_k) continue;
+            for (std::uint16_t k_neighbor_slot = kstart; k_neighbor_slot < kend; ++k_neighbor_slot) {
+                std::uint32_t const atom_l = descriptor.neighbor_atom[k_neighbor_slot];
+                if (atom_l == atom_j) continue;
+                auto const [torsion_type_primary, torsion_type_secondary] = native_get_mmff_torsion_type(
+                    descriptor, at_span, bond_types, atom_i, atom_j, atom_k, atom_l);
+                [[maybe_unused]] auto const [canonical_torsion_type, torsion_entry] = lookup_torsion(
+                    tables, torsion_type_primary, torsion_type_secondary, atom_types[atom_i], atom_types[atom_j],
+                    atom_types[atom_k], atom_types[atom_l]);
+                float torsion_v1 = 0.0f, torsion_v2 = 0.0f, torsion_v3 = 0.0f;
+                if (torsion_entry) {
+                    torsion_v1 = torsion_entry->torsion_v1;
+                    torsion_v2 = torsion_entry->torsion_v2;
+                    torsion_v3 = torsion_entry->torsion_v3;
                 }
                 else {
-                    auto const emp = native_torsion_empirical(descriptor, tables, at_span, j, k, (std::int32_t)b);
-                    v1 = emp[0];
-                    v2 = emp[1];
-                    v3 = emp[2];
+                    auto const [empirical_v1, empirical_v2, empirical_v3] = native_torsion_empirical(
+                        descriptor, tables, at_span, atom_j, atom_k, (std::int32_t)bond);
+                    torsion_v1 = empirical_v1;
+                    torsion_v2 = empirical_v2;
+                    torsion_v3 = empirical_v3;
                 }
-                if (native_is_zero(v1) && native_is_zero(v2) && native_is_zero(v3)) continue;
+                if (native_is_zero(torsion_v1) && native_is_zero(torsion_v2) && native_is_zero(torsion_v3)) continue;
                 if (torsion_count < max_mmff_torsions_per_mol_k) {
-                    torsions_out[torsion_count++] = {
-                        (std::uint8_t)i, (std::uint8_t)j, (std::uint8_t)k, (std::uint8_t)l, v1, v2, v3};
+                    torsions_out[torsion_count++] = {.atom_i = (std::uint8_t)atom_i,
+                                                     .atom_j = (std::uint8_t)atom_j,
+                                                     .atom_k = (std::uint8_t)atom_k,
+                                                     .atom_l = (std::uint8_t)atom_l,
+                                                     .torsion_v1 = torsion_v1,
+                                                     .torsion_v2 = torsion_v2,
+                                                     .torsion_v3 = torsion_v3};
                 }
                 else { overflow = 1; }
             }
@@ -344,40 +365,47 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
 
     // OOP terms.
     for (std::uint32_t center = 0; center < num_atoms; ++center) {
-        std::uint32_t const deg = descriptor.degree[center];
-        if (deg < 3) continue;
+        std::uint32_t const degree = descriptor.degree[center];
+        if (degree < 3) continue;
         std::uint16_t const nstart = descriptor.neighbor_offset[center];
         std::uint8_t neighbor_cache[8];
         std::uint32_t neighbor_count = 0;
-        for (std::uint16_t nn = nstart; nn < descriptor.neighbor_offset[center + 1] && neighbor_count < 8; ++nn)
-            neighbor_cache[neighbor_count++] = descriptor.neighbor_atom[nn];
-        for (std::uint32_t a = 0; a < neighbor_count; ++a) {
+        for (std::uint16_t neighbor_slot = nstart;
+             neighbor_slot < descriptor.neighbor_offset[center + 1] && neighbor_count < 8; ++neighbor_slot)
+            neighbor_cache[neighbor_count++] = descriptor.neighbor_atom[neighbor_slot];
+        for (std::uint32_t apex_neighbor = 0; apex_neighbor < neighbor_count; ++apex_neighbor) {
             std::uint8_t plane[2];
             std::uint32_t plane_count = 0;
-            for (std::uint32_t c = 0; c < neighbor_count && plane_count < 2; ++c)
-                if (c != a) plane[plane_count++] = neighbor_cache[c];
+            for (std::uint32_t plane_candidate = 0; plane_candidate < neighbor_count && plane_count < 2;
+                 ++plane_candidate)
+                if (plane_candidate != apex_neighbor) plane[plane_count++] = neighbor_cache[plane_candidate];
             if (plane_count < 2) continue;
-            auto const *op = lookup_oop(tables, atom_types[neighbor_cache[a]], atom_types[center], atom_types[plane[0]],
-                                        atom_types[plane[1]]);
-            if (!op) continue;
+            auto const *oop_params = lookup_oop(tables, atom_types[neighbor_cache[apex_neighbor]], atom_types[center],
+                                                atom_types[plane[0]], atom_types[plane[1]]);
+            if (!oop_params) continue;
             if (oop_count < max_mmff_oops_per_mol_k) {
-                oops_out[oop_count++] = {neighbor_cache[a], (std::uint8_t)center, plane[0], plane[1],
-                                         op->koop,          {0.0f, 0.0f}};
+                oops_out[oop_count++] = {.atom_i = neighbor_cache[apex_neighbor],
+                                         .atom_j = (std::uint8_t)center,
+                                         .atom_k = plane[0],
+                                         .atom_l = plane[1],
+                                         .force_constant = oop_params->force_constant,
+                                         .padding = {0.0f, 0.0f}};
             }
             else { overflow = 1; }
         }
     }
 
     // Stretch-bend terms (reuse angle scratch).
-    for (std::uint32_t i = 0; i < angle_scratch_count; ++i) {
-        auto const &a = shared_angle_scratch[i];
-        auto const *prop_j = lookup_prop(tables, atom_types[a.j]);
-        if (prop_j && prop_j->linh) continue;
-        std::uint8_t const sbt = native_get_mmff_stretch_bend_type(
-            a.angle_type, (atom_types[a.i] <= atom_types[a.k]) ? a.bond_type_ij : a.bond_type_jk,
-            (atom_types[a.i] < atom_types[a.k]) ? a.bond_type_jk : a.bond_type_ij);
-        auto stbn = lookup_stbn(tables, sbt, a.bond_type_ij, a.bond_type_jk, atom_types[a.i], atom_types[a.j],
-                                atom_types[a.k]);
+    for (std::uint32_t angle_index = 0; angle_index < angle_scratch_count; ++angle_index) {
+        auto const &angle = shared_angle_scratch[angle_index];
+        auto const *prop_j = lookup_prop(tables, atom_types[angle.atom_j]);
+        if (prop_j && prop_j->linear) continue;
+        std::uint8_t const stretch_bend_type = native_get_mmff_stretch_bend_type(
+            angle.angle_type,
+            (atom_types[angle.atom_i] <= atom_types[angle.atom_k]) ? angle.bond_type_ij : angle.bond_type_jk,
+            (atom_types[angle.atom_i] < atom_types[angle.atom_k]) ? angle.bond_type_jk : angle.bond_type_ij);
+        auto stbn = lookup_stbn(tables, stretch_bend_type, angle.bond_type_ij, angle.bond_type_jk,
+                                atom_types[angle.atom_i], atom_types[angle.atom_j], atom_types[angle.atom_k]);
         float kba_ijk = 0.0f, kba_kji = 0.0f;
         bool swap_flag = false;
         if (stbn.second) {
@@ -386,37 +414,42 @@ static __launch_bounds__(32, 4) __global__ void mmff94_extract_terms_kernel(
             swap_flag = stbn.first;
         }
         else {
-            auto dfsb = lookup_dfsb(tables, periodic_table_row(descriptor.element[a.i]),
-                                    periodic_table_row(descriptor.element[a.j]),
-                                    periodic_table_row(descriptor.element[a.k]));
+            auto dfsb = lookup_dfsb(tables, periodic_table_row(descriptor.element[angle.atom_i]),
+                                    periodic_table_row(descriptor.element[angle.atom_j]),
+                                    periodic_table_row(descriptor.element[angle.atom_k]));
             if (!dfsb.second) continue;
             kba_ijk = dfsb.second->kba_ijk;
             kba_kji = dfsb.second->kba_kji;
             swap_flag = dfsb.first;
         }
         if (native_is_zero(kba_ijk) && native_is_zero(kba_kji)) continue;
-        if (swap_flag) {
-            float tmp = kba_ijk;
-            kba_ijk = kba_kji;
-            kba_kji = tmp;
-        }
-        float const theta0_rad = a.theta0_deg * (float)M_PI / 180.0f;
-        float const r0_ij = bond_r0[a.bond_index_ij];
-        float const r0_jk = bond_r0[a.bond_index_jk];
+        if (swap_flag) swap_(kba_ijk, kba_kji);
+        float const theta0_rad = angle.theta0_deg * (float)M_PI / 180.0f;
+        float const equilibrium_distance_ij = bond_equilibrium_distance[angle.bond_index_ij];
+        float const equilibrium_distance_jk = bond_equilibrium_distance[angle.bond_index_jk];
         if (stbn_count < max_mmff_stretchbends_per_mol_k) {
-            stbns_out[stbn_count++] = {a.i, a.j, a.k, 0, kba_ijk, kba_kji, theta0_rad, r0_ij, r0_jk, 0.0f};
+            stbns_out[stbn_count++] = {.atom_i = angle.atom_i,
+                                       .atom_j = angle.atom_j,
+                                       .atom_k = angle.atom_k,
+                                       .padding = 0,
+                                       .kba_ijk = kba_ijk,
+                                       .kba_kji = kba_kji,
+                                       .equilibrium_angle = theta0_rad,
+                                       .equilibrium_distance_ij = equilibrium_distance_ij,
+                                       .equilibrium_distance_kj = equilibrium_distance_jk,
+                                       .padding_float = 0.0f};
         }
         else { overflow = 1; }
     }
 
-    per_mol_counts[mol] = {(std::uint16_t)bond_count,
-                           (std::uint16_t)angle_count,
-                           (std::uint16_t)torsion_count,
-                           (std::uint16_t)oop_count,
-                           (std::uint16_t)stbn_count,
-                           0,
-                           overflow,
-                           0};
+    per_mol_counts[molecule] = {.bonds = (std::uint16_t)bond_count,
+                                .angles = (std::uint16_t)angle_count,
+                                .torsions = (std::uint16_t)torsion_count,
+                                .oops = (std::uint16_t)oop_count,
+                                .stretchbends = (std::uint16_t)stbn_count,
+                                .interactions = 0, // Stamped by `mmff94_build_csr_kernel`.
+                                .overflow = overflow,
+                                .padding = 0};
 }
 
 /** Build the MMFF per-atom CSR interaction list from emitted terms.
@@ -440,109 +473,141 @@ static __launch_bounds__(32, 8) __global__ void mmff94_build_csr_kernel(
     __shared__ std::uint32_t cursors_oop[max_atoms_per_molecule_k];
     __shared__ std::uint32_t cursors_stretchbend[max_atoms_per_molecule_k];
 
-    std::uint32_t const mol = blockIdx.x;
-    if (mol >= num_molecules) return;
+    std::uint32_t const molecule = blockIdx.x;
+    if (molecule >= num_molecules) return;
     if (threadIdx.x != 0) return;
-    if (typing_status[mol] != 0) return;
+    if (typing_status[molecule] != 0) return;
 
-    auto const &descriptor = descriptors[mol];
+    auto const &descriptor = descriptors[molecule];
     std::uint32_t const num_atoms = descriptor.num_atoms;
-    std::uint32_t const ao = atom_offsets[mol];
-    auto const &c = per_mol_counts[mol];
+    std::uint32_t const atom_base = atom_offsets[molecule];
+    auto const &counts = per_mol_counts[molecule];
 
-    mmff94_bond_t const *bonds = bonds_all + (std::size_t)mol * max_mmff_bonds_per_mol_k;
-    mmff94_angle_t const *angles = angles_all + (std::size_t)mol * max_mmff_angles_per_mol_k;
-    mmff94_torsion_t const *torsions = torsions_all + (std::size_t)mol * max_mmff_torsions_per_mol_k;
-    mmff94_oop_t const *oops = oops_all + (std::size_t)mol * max_mmff_oops_per_mol_k;
-    mmff94_stretchbend_t const *stbns = stbns_all + (std::size_t)mol * max_mmff_stretchbends_per_mol_k;
+    mmff94_bond_t const *bonds = bonds_all + (std::size_t)molecule * max_mmff_bonds_per_mol_k;
+    mmff94_angle_t const *angles = angles_all + (std::size_t)molecule * max_mmff_angles_per_mol_k;
+    mmff94_torsion_t const *torsions = torsions_all + (std::size_t)molecule * max_mmff_torsions_per_mol_k;
+    mmff94_oop_t const *oops = oops_all + (std::size_t)molecule * max_mmff_oops_per_mol_k;
+    mmff94_stretchbend_t const *stbns = stbns_all + (std::size_t)molecule * max_mmff_stretchbends_per_mol_k;
 
-    std::uint32_t const ints_base = (std::uint32_t)mol * max_mmff_interactions_per_mol_k;
+    std::uint32_t const ints_base = (std::uint32_t)molecule * max_mmff_interactions_per_mol_k;
     mmff94_atom_interaction_t *interactions = interactions_all + ints_base;
-    mmff94_atom_offsets_t *offsets = atom_offsets_all + ao;
+    mmff94_atom_offsets_t *offsets = atom_offsets_all + atom_base;
 
     // Pass 1 — count per-atom per-term-type.
-    for (std::uint32_t a = 0; a < num_atoms; ++a) offsets[a] = {};
-    for (std::uint32_t t = 0; t < c.bonds; ++t) {
-        offsets[bonds[t].atom_i].bond_count++;
-        offsets[bonds[t].atom_j].bond_count++;
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) offsets[atom] = {};
+    for (std::uint32_t bond = 0; bond < counts.bonds; ++bond) {
+        offsets[bonds[bond].atom_i].bond_count++;
+        offsets[bonds[bond].atom_j].bond_count++;
     }
-    for (std::uint32_t t = 0; t < c.angles; ++t) {
-        offsets[angles[t].atom_i].angle_count++;
-        offsets[angles[t].atom_j].angle_count++;
-        offsets[angles[t].atom_k].angle_count++;
+    for (std::uint32_t angle = 0; angle < counts.angles; ++angle) {
+        offsets[angles[angle].atom_i].angle_count++;
+        offsets[angles[angle].atom_j].angle_count++;
+        offsets[angles[angle].atom_k].angle_count++;
     }
-    for (std::uint32_t t = 0; t < c.torsions; ++t) {
-        offsets[torsions[t].atom_i].torsion_count++;
-        offsets[torsions[t].atom_j].torsion_count++;
-        offsets[torsions[t].atom_k].torsion_count++;
-        offsets[torsions[t].atom_l].torsion_count++;
+    for (std::uint32_t torsion = 0; torsion < counts.torsions; ++torsion) {
+        offsets[torsions[torsion].atom_i].torsion_count++;
+        offsets[torsions[torsion].atom_j].torsion_count++;
+        offsets[torsions[torsion].atom_k].torsion_count++;
+        offsets[torsions[torsion].atom_l].torsion_count++;
     }
-    for (std::uint32_t t = 0; t < c.oops; ++t) {
-        offsets[oops[t].atom_i].oop_count++;
-        offsets[oops[t].atom_j].oop_count++;
-        offsets[oops[t].atom_k].oop_count++;
-        offsets[oops[t].atom_l].oop_count++;
+    for (std::uint32_t oop_term = 0; oop_term < counts.oops; ++oop_term) {
+        offsets[oops[oop_term].atom_i].oop_count++;
+        offsets[oops[oop_term].atom_j].oop_count++;
+        offsets[oops[oop_term].atom_k].oop_count++;
+        offsets[oops[oop_term].atom_l].oop_count++;
     }
-    for (std::uint32_t t = 0; t < c.stretchbends; ++t) {
-        offsets[stbns[t].atom_i].stretchbend_count++;
-        offsets[stbns[t].atom_j].stretchbend_count++;
-        offsets[stbns[t].atom_k].stretchbend_count++;
+    for (std::uint32_t stretch_bend = 0; stretch_bend < counts.stretchbends; ++stretch_bend) {
+        offsets[stbns[stretch_bend].atom_i].stretchbend_count++;
+        offsets[stbns[stretch_bend].atom_j].stretchbend_count++;
+        offsets[stbns[stretch_bend].atom_k].stretchbend_count++;
     }
 
     // Compute per-type offsets + running total.
     std::uint32_t running = 0;
-    for (std::uint32_t a = 0; a < num_atoms; ++a) {
-        auto &off = offsets[a];
-        off.bond_offset = running;
-        running += off.bond_count;
-        off.angle_offset = running;
-        running += off.angle_count;
-        off.torsion_offset = running;
-        running += off.torsion_count;
-        off.oop_offset = running;
-        running += off.oop_count;
-        off.stretchbend_offset = running;
-        running += off.stretchbend_count;
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
+        auto &atom_offset_entry = offsets[atom];
+        atom_offset_entry.bond_offset = running;
+        running += atom_offset_entry.bond_count;
+        atom_offset_entry.angle_offset = running;
+        running += atom_offset_entry.angle_count;
+        atom_offset_entry.torsion_offset = running;
+        running += atom_offset_entry.torsion_count;
+        atom_offset_entry.oop_offset = running;
+        running += atom_offset_entry.oop_count;
+        atom_offset_entry.stretchbend_offset = running;
+        running += atom_offset_entry.stretchbend_count;
     }
     // Running is the total interactions for this molecule. Store in
     // per_mol_counts for downstream CSR consumers.
-    per_mol_counts[mol].interactions = (std::uint16_t)running;
+    per_mol_counts[molecule].interactions = (std::uint16_t)running;
 
-    // Seed the write cursors from the `_start` fields just computed.
-    for (std::uint32_t a = 0; a < num_atoms; ++a) {
-        cursors_bond[a] = offsets[a].bond_offset;
-        cursors_angle[a] = offsets[a].angle_offset;
-        cursors_torsion[a] = offsets[a].torsion_offset;
-        cursors_oop[a] = offsets[a].oop_offset;
-        cursors_stretchbend[a] = offsets[a].stretchbend_offset;
+    // Seed the write cursors from the `_offset` fields just computed.
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
+        cursors_bond[atom] = offsets[atom].bond_offset;
+        cursors_angle[atom] = offsets[atom].angle_offset;
+        cursors_torsion[atom] = offsets[atom].torsion_offset;
+        cursors_oop[atom] = offsets[atom].oop_offset;
+        cursors_stretchbend[atom] = offsets[atom].stretchbend_offset;
     }
 
     // Pass 2 — write interactions.
-    for (std::uint32_t t = 0; t < c.bonds; ++t) {
-        interactions[cursors_bond[bonds[t].atom_i]++] = {t, mmff94_bond_k, atom_role_first_k};
-        interactions[cursors_bond[bonds[t].atom_j]++] = {t, mmff94_bond_k, atom_role_second_k};
+    for (std::uint32_t bond = 0; bond < counts.bonds; ++bond) {
+        interactions[cursors_bond[bonds[bond].atom_i]++] = {.term_index = bond,
+                                                            .interaction_type = mmff94_bond_k,
+                                                            .role = atom_role_first_k};
+        interactions[cursors_bond[bonds[bond].atom_j]++] = {.term_index = bond,
+                                                            .interaction_type = mmff94_bond_k,
+                                                            .role = atom_role_second_k};
     }
-    for (std::uint32_t t = 0; t < c.angles; ++t) {
-        interactions[cursors_angle[angles[t].atom_i]++] = {t, mmff94_angle_end_k, atom_role_first_k};
-        interactions[cursors_angle[angles[t].atom_j]++] = {t, mmff94_angle_center_k, atom_role_second_k};
-        interactions[cursors_angle[angles[t].atom_k]++] = {t, mmff94_angle_end_k, atom_role_third_k};
+    for (std::uint32_t angle = 0; angle < counts.angles; ++angle) {
+        interactions[cursors_angle[angles[angle].atom_i]++] = {.term_index = angle,
+                                                               .interaction_type = mmff94_angle_end_k,
+                                                               .role = atom_role_first_k};
+        interactions[cursors_angle[angles[angle].atom_j]++] = {.term_index = angle,
+                                                               .interaction_type = mmff94_angle_center_k,
+                                                               .role = atom_role_second_k};
+        interactions[cursors_angle[angles[angle].atom_k]++] = {.term_index = angle,
+                                                               .interaction_type = mmff94_angle_end_k,
+                                                               .role = atom_role_third_k};
     }
-    for (std::uint32_t t = 0; t < c.torsions; ++t) {
-        interactions[cursors_torsion[torsions[t].atom_i]++] = {t, mmff94_torsion_k, atom_role_first_k};
-        interactions[cursors_torsion[torsions[t].atom_j]++] = {t, mmff94_torsion_k, atom_role_second_k};
-        interactions[cursors_torsion[torsions[t].atom_k]++] = {t, mmff94_torsion_k, atom_role_third_k};
-        interactions[cursors_torsion[torsions[t].atom_l]++] = {t, mmff94_torsion_k, atom_role_fourth_k};
+    for (std::uint32_t torsion = 0; torsion < counts.torsions; ++torsion) {
+        interactions[cursors_torsion[torsions[torsion].atom_i]++] = {.term_index = torsion,
+                                                                     .interaction_type = mmff94_torsion_k,
+                                                                     .role = atom_role_first_k};
+        interactions[cursors_torsion[torsions[torsion].atom_j]++] = {.term_index = torsion,
+                                                                     .interaction_type = mmff94_torsion_k,
+                                                                     .role = atom_role_second_k};
+        interactions[cursors_torsion[torsions[torsion].atom_k]++] = {.term_index = torsion,
+                                                                     .interaction_type = mmff94_torsion_k,
+                                                                     .role = atom_role_third_k};
+        interactions[cursors_torsion[torsions[torsion].atom_l]++] = {.term_index = torsion,
+                                                                     .interaction_type = mmff94_torsion_k,
+                                                                     .role = atom_role_fourth_k};
     }
-    for (std::uint32_t t = 0; t < c.oops; ++t) {
-        interactions[cursors_oop[oops[t].atom_i]++] = {t, mmff94_out_of_plane_k, atom_role_first_k};
-        interactions[cursors_oop[oops[t].atom_j]++] = {t, mmff94_out_of_plane_k, atom_role_second_k};
-        interactions[cursors_oop[oops[t].atom_k]++] = {t, mmff94_out_of_plane_k, atom_role_third_k};
-        interactions[cursors_oop[oops[t].atom_l]++] = {t, mmff94_out_of_plane_k, atom_role_fourth_k};
+    for (std::uint32_t oop_term = 0; oop_term < counts.oops; ++oop_term) {
+        interactions[cursors_oop[oops[oop_term].atom_i]++] = {.term_index = oop_term,
+                                                              .interaction_type = mmff94_out_of_plane_k,
+                                                              .role = atom_role_first_k};
+        interactions[cursors_oop[oops[oop_term].atom_j]++] = {.term_index = oop_term,
+                                                              .interaction_type = mmff94_out_of_plane_k,
+                                                              .role = atom_role_second_k};
+        interactions[cursors_oop[oops[oop_term].atom_k]++] = {.term_index = oop_term,
+                                                              .interaction_type = mmff94_out_of_plane_k,
+                                                              .role = atom_role_third_k};
+        interactions[cursors_oop[oops[oop_term].atom_l]++] = {.term_index = oop_term,
+                                                              .interaction_type = mmff94_out_of_plane_k,
+                                                              .role = atom_role_fourth_k};
     }
-    for (std::uint32_t t = 0; t < c.stretchbends; ++t) {
-        interactions[cursors_stretchbend[stbns[t].atom_i]++] = {t, mmff94_stretch_bend_k, atom_role_first_k};
-        interactions[cursors_stretchbend[stbns[t].atom_j]++] = {t, mmff94_stretch_bend_k, atom_role_second_k};
-        interactions[cursors_stretchbend[stbns[t].atom_k]++] = {t, mmff94_stretch_bend_k, atom_role_third_k};
+    for (std::uint32_t stretch_bend = 0; stretch_bend < counts.stretchbends; ++stretch_bend) {
+        interactions[cursors_stretchbend[stbns[stretch_bend].atom_i]++] = {.term_index = stretch_bend,
+                                                                           .interaction_type = mmff94_stretch_bend_k,
+                                                                           .role = atom_role_first_k};
+        interactions[cursors_stretchbend[stbns[stretch_bend].atom_j]++] = {.term_index = stretch_bend,
+                                                                           .interaction_type = mmff94_stretch_bend_k,
+                                                                           .role = atom_role_second_k};
+        interactions[cursors_stretchbend[stbns[stretch_bend].atom_k]++] = {.term_index = stretch_bend,
+                                                                           .interaction_type = mmff94_stretch_bend_k,
+                                                                           .role = atom_role_third_k};
     }
 }
 
@@ -570,18 +635,18 @@ static __launch_bounds__(mmff94_scan_block_k, 1) __global__
 
     for (std::uint32_t tile_base = 0; tile_base < num_molecules; tile_base += mmff94_scan_block_k) {
         std::uint32_t const molecule = tile_base + slot;
-        std::uint32_t own[mmff94_packed_components_k] = {0, 0, 0, 0, 0, 0};
+        std::uint32_t own_counts[mmff94_packed_components_k] = {0, 0, 0, 0, 0, 0};
         if (molecule < num_molecules) {
             auto const counts = per_mol_counts[molecule];
-            own[0] = counts.bonds;
-            own[1] = counts.angles;
-            own[2] = counts.torsions;
-            own[3] = counts.oops;
-            own[4] = counts.stretchbends;
-            own[5] = counts.interactions;
+            own_counts[0] = counts.bonds;
+            own_counts[1] = counts.angles;
+            own_counts[2] = counts.torsions;
+            own_counts[3] = counts.oops;
+            own_counts[4] = counts.stretchbends;
+            own_counts[5] = counts.interactions;
         }
         for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
-            partial_sums[component][slot] = own[component];
+            partial_sums[component][slot] = own_counts[component];
         __syncthreads();
 
         for (std::uint32_t stride = 1; stride < mmff94_scan_block_k; stride <<= 1) {
@@ -595,16 +660,24 @@ static __launch_bounds__(mmff94_scan_block_k, 1) __global__
         }
 
         if (molecule < num_molecules)
-            per_mol_offsets[molecule] = {
-                carry[0] + partial_sums[0][slot] - own[0], carry[1] + partial_sums[1][slot] - own[1],
-                carry[2] + partial_sums[2][slot] - own[2], carry[3] + partial_sums[3][slot] - own[3],
-                carry[4] + partial_sums[4][slot] - own[4], carry[5] + partial_sums[5][slot] - own[5]};
+            per_mol_offsets[molecule] = {.bonds = carry[0] + partial_sums[0][slot] - own_counts[0],
+                                         .angles = carry[1] + partial_sums[1][slot] - own_counts[1],
+                                         .torsions = carry[2] + partial_sums[2][slot] - own_counts[2],
+                                         .oops = carry[3] + partial_sums[3][slot] - own_counts[3],
+                                         .stretchbends = carry[4] + partial_sums[4][slot] - own_counts[4],
+                                         .interactions = carry[5] + partial_sums[5][slot] - own_counts[5]};
         for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
             carry[component] += partial_sums[component][mmff94_scan_block_k - 1];
         __syncthreads();
     }
 
-    if (slot == 0) *totals = {carry[0], carry[1], carry[2], carry[3], carry[4], carry[5]};
+    if (slot == 0)
+        *totals = {.bonds = carry[0],
+                   .angles = carry[1],
+                   .torsions = carry[2],
+                   .oops = carry[3],
+                   .stretchbends = carry[4],
+                   .interactions = carry[5]};
 }
 
 /** Lane-strided copy of @p count elements from the staging slot into the packed array. */
@@ -659,32 +732,32 @@ static __launch_bounds__(32, 8) __global__ void mmff94_compact_terms_kernel(
     mmff94_atom_offsets_t *__restrict__ atom_interaction_offsets, etkdg_molecule_metadata_t *__restrict__ metadata,
     std::uint8_t const *__restrict__ typing_status) {
 
-    std::uint32_t const mol = blockIdx.x;
-    if (mol >= num_molecules) return;
+    std::uint32_t const molecule = blockIdx.x;
+    if (molecule >= num_molecules) return;
     std::uint32_t const lane = threadIdx.x;
 
-    auto const counts = per_mol_counts[mol];
-    auto const bases = per_mol_offsets[mol];
-    std::uint32_t const atom_base = atom_offsets[mol];
+    auto const counts = per_mol_counts[molecule];
+    auto const bases = per_mol_offsets[molecule];
+    std::uint32_t const atom_base = atom_offsets[molecule];
 
-    copy_packed_terms_(staged_bonds + (std::size_t)mol * max_mmff_bonds_per_mol_k, packed_bonds + bases.bonds,
+    copy_packed_terms_(staged_bonds + (std::size_t)molecule * max_mmff_bonds_per_mol_k, packed_bonds + bases.bonds,
                        counts.bonds, lane);
-    copy_packed_terms_(staged_angles + (std::size_t)mol * max_mmff_angles_per_mol_k, packed_angles + bases.angles,
+    copy_packed_terms_(staged_angles + (std::size_t)molecule * max_mmff_angles_per_mol_k, packed_angles + bases.angles,
                        counts.angles, lane);
-    copy_packed_terms_(staged_torsions + (std::size_t)mol * max_mmff_torsions_per_mol_k,
+    copy_packed_terms_(staged_torsions + (std::size_t)molecule * max_mmff_torsions_per_mol_k,
                        packed_torsions + bases.torsions, counts.torsions, lane);
-    copy_packed_terms_(staged_oops + (std::size_t)mol * max_mmff_oops_per_mol_k, packed_oops + bases.oops, counts.oops,
-                       lane);
-    copy_packed_terms_(staged_stbns + (std::size_t)mol * max_mmff_stretchbends_per_mol_k,
+    copy_packed_terms_(staged_oops + (std::size_t)molecule * max_mmff_oops_per_mol_k, packed_oops + bases.oops,
+                       counts.oops, lane);
+    copy_packed_terms_(staged_stbns + (std::size_t)molecule * max_mmff_stretchbends_per_mol_k,
                        packed_stbns + bases.stretchbends, counts.stretchbends, lane);
-    copy_packed_terms_(staged_interactions + (std::size_t)mol * max_mmff_interactions_per_mol_k,
+    copy_packed_terms_(staged_interactions + (std::size_t)molecule * max_mmff_interactions_per_mol_k,
                        packed_interactions + bases.interactions, counts.interactions, lane);
 
     // The CSR builder wrote molecule-relative starts; the consumers index one
     // batch-global interaction array, so shift every start by this molecule's base.
     // A fallback molecule never entered the CSR builder, so its slots start empty.
-    bool const typed = typing_status[mol] == 0;
-    std::uint32_t const num_atoms = descriptors[mol].num_atoms;
+    bool const typed = typing_status[molecule] == 0;
+    std::uint32_t const num_atoms = descriptors[molecule].num_atoms;
     for (std::uint32_t atom = lane; atom < num_atoms; atom += 32) {
         auto entry = typed ? atom_interaction_offsets[atom_base + atom] : mmff94_atom_offsets_t {};
         entry.bond_offset += bases.interactions;
@@ -696,7 +769,7 @@ static __launch_bounds__(32, 8) __global__ void mmff94_compact_terms_kernel(
     }
 
     if (lane != 0) return;
-    auto &entry = metadata[mol];
+    auto &entry = metadata[molecule];
     entry.num_mmff_bonds = counts.bonds;
     entry.num_mmff_angles = counts.angles;
     entry.num_mmff_torsions = counts.torsions;

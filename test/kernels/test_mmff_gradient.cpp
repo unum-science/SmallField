@@ -1,6 +1,6 @@
 /**
- *  @file test_mmff_gradient.cpp
- *  @brief MMFF94 energy and gradient validation for OOP and full-stage terms.
+ *  @file test/kernels/test_mmff_gradient.cpp
+ *  @brief Validate MMFF94 energy and gradient for OOP and full-stage terms.
  */
 
 #include <cmath>   // `std::fabs`, `std::isfinite`
@@ -12,39 +12,30 @@
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
 #include "test_helpers.hpp"
+#include "test_mmff_gradient_kernels.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-extern "C" void gpu_mmff_energy(float const *host_positions, std::uint32_t num_atoms,
-                                sft::mmff94_atom_vdw_params_t const *host_atom_vdw, float const *host_atom_charge,
-                                std::uint8_t const *host_bond_distance, sft::mmff94_bond_t const *host_bond_params,
-                                std::uint32_t num_bond_params, sft::mmff94_angle_t const *host_angle_params,
-                                std::uint32_t num_angle_params, sft::mmff94_torsion_t const *host_torsion_params,
-                                std::uint32_t num_torsion_params, sft::mmff94_oop_t const *host_oop_params,
-                                std::uint32_t num_oop_params, sft::mmff94_stretchbend_t const *host_stretchbend_params,
-                                std::uint32_t num_stretchbend_params,
-                                sft::mmff94_atom_interaction_t const *host_interactions, std::uint32_t num_interactions,
-                                sft::mmff94_atom_offsets_t const *host_atom_offsets, std::uint32_t num_atom_offsets,
-                                float *host_gradient, float *out_energy);
+using sftest::gpu_mmff_energy;
 
-namespace {
+namespace smallfield::tests {
 
-std::vector<float> interleaved_to_soa(std::vector<float> const &interleaved) {
+static std::vector<float> interleaved_to_soa_(std::vector<float> const &interleaved) {
     std::uint32_t const num_atoms = static_cast<std::uint32_t>(interleaved.size() / 3);
-    std::vector<float> soa(3 * num_atoms, 0.0f);
+    std::vector<float> soa_positions(3 * num_atoms, 0.0f);
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-        soa[atom] = interleaved[3 * atom + 0];
-        soa[num_atoms + atom] = interleaved[3 * atom + 1];
-        soa[2 * num_atoms + atom] = interleaved[3 * atom + 2];
+        soa_positions[atom] = interleaved[3 * atom + 0];
+        soa_positions[num_atoms + atom] = interleaved[3 * atom + 1];
+        soa_positions[2 * num_atoms + atom] = interleaved[3 * atom + 2];
     }
-    return soa;
+    return soa_positions;
 }
 
-void evaluate_mmff_energy_and_gradient(sfp::etkdg_prepared_molecule_t const &prepared,
-                                       std::vector<float> const &positions_soa, float *out_energy,
-                                       std::vector<float> &gradient_out) {
+static void evaluate_mmff_energy_and_gradient_(sfp::etkdg_prepared_molecule_t const &prepared,
+                                               std::vector<float> const &positions_soa, float *out_energy,
+                                               std::vector<float> &gradient_out) {
     gradient_out.assign(positions_soa.size(), 0.0f);
     // The pool ships no hop matrix: the device rebuilds it per wave from the bond list, and this
     // single-molecule harness does the same so the nonbonded sweep sees production's exclusions.
@@ -71,7 +62,7 @@ void evaluate_mmff_energy_and_gradient(sfp::etkdg_prepared_molecule_t const &pre
                     static_cast<std::uint32_t>(prepared.mmff_atom_offsets.size()), gradient_out.data(), out_energy);
 }
 
-auto build_single_oop_prepared(sfp::etkdg_prepared_molecule_t const &prepared) {
+static auto build_single_oop_prepared_(sfp::etkdg_prepared_molecule_t const &prepared) {
     sf_verify_(!prepared.mmff_oops.empty(), "prepared molecule must contain at least one OOP term");
 
     sfp::etkdg_prepared_molecule_t single {};
@@ -92,7 +83,7 @@ auto build_single_oop_prepared(sfp::etkdg_prepared_molecule_t const &prepared) {
     return single;
 }
 
-void test_single_oop_gradient_finite_difference() {
+static void test_single_oop_gradient_finite_difference_() {
     std::printf("test_single_oop_gradient_finite_difference\n");
 
     std::string const smiles = "CC(=O)Oc1ccccc1C(=O)O";
@@ -100,15 +91,15 @@ void test_single_oop_gradient_finite_difference() {
     sf_verify_(prepared_full.num_atoms > 0, "failed to prepare molecule");
     sf_verify_(!prepared_full.mmff_oops.empty(), "test molecule must contain OOP terms");
 
-    auto prepared = build_single_oop_prepared(prepared_full);
-    auto mol = sftest::mol_from_smiles(smiles);
-    sf_verify_(mol != nullptr, "failed to build RDKit molecule");
-    sf_verify_(sftest::embed_molecule(*mol), "failed to embed RDKit molecule");
+    auto prepared = build_single_oop_prepared_(prepared_full);
+    auto molecule = sftest::mol_from_smiles(smiles);
+    sf_verify_(molecule != nullptr, "failed to build RDKit molecule");
+    sf_verify_(sftest::embed_molecule(*molecule), "failed to embed RDKit molecule");
 
-    std::vector<float> positions = interleaved_to_soa(sftest::extract_coords_interleaved(*mol));
+    std::vector<float> positions = interleaved_to_soa_(sftest::extract_coords_interleaved(*molecule));
     std::vector<float> analytical_gradient;
     float analytical_energy = 0.0f;
-    evaluate_mmff_energy_and_gradient(prepared, positions, &analytical_energy, analytical_gradient);
+    evaluate_mmff_energy_and_gradient_(prepared, positions, &analytical_energy, analytical_gradient);
 
     sft::mmff94_oop_t const &oop = prepared.mmff_oops.front();
     std::uint32_t const oop_atoms[] = {oop.atom_i, oop.atom_j, oop.atom_k, oop.atom_l};
@@ -125,8 +116,8 @@ void test_single_oop_gradient_finite_difference() {
             std::vector<float> scratch_gradient;
             float energy_plus = 0.0f;
             float energy_minus = 0.0f;
-            evaluate_mmff_energy_and_gradient(prepared, plus, &energy_plus, scratch_gradient);
-            evaluate_mmff_energy_and_gradient(prepared, minus, &energy_minus, scratch_gradient);
+            evaluate_mmff_energy_and_gradient_(prepared, plus, &energy_plus, scratch_gradient);
+            evaluate_mmff_energy_and_gradient_(prepared, minus, &energy_minus, scratch_gradient);
 
             float const finite_difference = (energy_plus - energy_minus) / (2.0f * epsilon);
             float const analytical = analytical_gradient[component];
@@ -139,7 +130,7 @@ void test_single_oop_gradient_finite_difference() {
     }
 }
 
-void test_full_mmff_gradient_and_energy() {
+static void test_full_mmff_gradient_and_energy_() {
     std::printf("test_full_mmff_gradient_and_energy\n");
 
     std::string const smiles = "CC(=O)Oc1ccccc1C(=O)O";
@@ -148,18 +139,18 @@ void test_full_mmff_gradient_and_energy() {
     sf_verify_(!prepared.mmff_oops.empty(), "test molecule must contain OOP terms");
     sf_verify_(!prepared.mmff_stretchbends.empty(), "test molecule must contain stretch-bend terms");
 
-    auto mol = sftest::mol_from_smiles(smiles);
-    sf_verify_(mol != nullptr, "failed to build RDKit molecule");
-    sf_verify_(sftest::embed_molecule(*mol), "failed to embed RDKit molecule");
+    auto molecule = sftest::mol_from_smiles(smiles);
+    sf_verify_(molecule != nullptr, "failed to build RDKit molecule");
+    sf_verify_(sftest::embed_molecule(*molecule), "failed to embed RDKit molecule");
 
-    auto interleaved = sftest::extract_coords_interleaved(*mol);
-    auto positions = interleaved_to_soa(interleaved);
+    auto interleaved = sftest::extract_coords_interleaved(*molecule);
+    auto positions = interleaved_to_soa_(interleaved);
 
     float gpu_energy = 0.0f;
     std::vector<float> gradient;
-    evaluate_mmff_energy_and_gradient(prepared, positions, &gpu_energy, gradient);
+    evaluate_mmff_energy_and_gradient_(prepared, positions, &gpu_energy, gradient);
 
-    double const rdkit_energy = sftest::rdkit_mmff94_energy(*mol);
+    double const rdkit_energy = sftest::rdkit_mmff94_energy(*molecule);
     sf_verify_(std::isfinite(rdkit_energy), "RDKit MMFF energy must be finite");
     sf_verify_(std::fabs(static_cast<double>(gpu_energy) - rdkit_energy) < 1.0,
                "MMFF stage energy must match RDKit at the same coordinates");
@@ -190,8 +181,8 @@ void test_full_mmff_gradient_and_energy() {
 
         float energy_plus = 0.0f;
         float energy_minus = 0.0f;
-        evaluate_mmff_energy_and_gradient(prepared, plus, &energy_plus, scratch_gradient);
-        evaluate_mmff_energy_and_gradient(prepared, minus, &energy_minus, scratch_gradient);
+        evaluate_mmff_energy_and_gradient_(prepared, plus, &energy_plus, scratch_gradient);
+        evaluate_mmff_energy_and_gradient_(prepared, minus, &energy_minus, scratch_gradient);
 
         float const finite_difference = (energy_plus - energy_minus) / (2.0f * epsilon);
         float const analytical = gradient[component];
@@ -202,11 +193,11 @@ void test_full_mmff_gradient_and_energy() {
     }
 }
 
-} // namespace
+} // namespace smallfield::tests
 
 int main() {
-    test_single_oop_gradient_finite_difference();
-    test_full_mmff_gradient_and_energy();
+    smallfield::tests::test_single_oop_gradient_finite_difference_();
+    smallfield::tests::test_full_mmff_gradient_and_energy_();
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

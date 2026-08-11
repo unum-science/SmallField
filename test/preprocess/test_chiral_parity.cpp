@@ -1,28 +1,24 @@
 /**
- *  @file test_chiral_parity.cpp
- *  @brief Exact oracle for the tag-and-parity derivation of the chiral volume sign.
+ *  @file test/preprocess/test_chiral_parity.cpp
+ *  @brief Police the tag-and-parity derivation of the chiral volume sign with two exact oracles.
  *
- *  `extract_chiral_centers` derives the target signed-volume sign from the atom's
- *  tetrahedral tag and the parity of the stored neighbor order. Two independent
- *  oracles police that derivation, and both demand exact agreement:
+ *  `extract_chiral_centers` derives the target signed-volume sign from the atom's tetrahedral tag and the parity
+ *  of the stored neighbor order. Two independent oracles police that derivation, and both demand exact agreement:
  *
- *  The CIP oracle rebuilds the answer straight from RDKit - `assignAtomCIPRanks` for
- *  the neighbor ordering, the `_CIPCode` property for the R/S label - and transports
- *  that sign onto the neighbor order the production code emits. It speaks for
- *  four-coordinate centers whose neighbors carry four distinct CIP ranks. A tie leaves
- *  the CIP ordering, and therefore the sign it implies, undetermined - the C3 of a
- *  tropane is exactly such a pseudo-asymmetric case. A three-coordinate center hides
- *  its lone pair from the ranking entirely, and RDKit's R/S label there does not
- *  compose with a triple product over the three bonded neighbors, as the sulfoxides
- *  in the curated set demonstrate against their own embedded geometry.
+ *  The CIP oracle rebuilds the answer straight from RDKit - `assignAtomCIPRanks` for the neighbor ordering, the
+ *  `_CIPCode` property for the R/S label - and transports that sign onto the neighbor order the production code
+ *  emits. It speaks for four-coordinate centers whose neighbors carry four distinct CIP ranks. A tie leaves the
+ *  CIP ordering, and therefore the sign it implies, undetermined - the C3 of a tropane is exactly such a
+ *  pseudo-asymmetric case. A three-coordinate center hides its lone pair from the ranking entirely, and RDKit's
+ *  R/S label there does not compose with a triple product over the three bonded neighbors, as the sulfoxides in
+ *  the curated set demonstrate against their own embedded geometry.
  *
- *  The geometric oracle embeds the molecule with ETKDG, which builds its chiral
- *  volume constraints from the same tetrahedral tags, and compares the sign of the
- *  realized tetrahedron against the target. It speaks at every center, tie or not.
+ *  The geometric oracle embeds the molecule with ETKDG, which builds its chiral volume constraints from the same
+ *  tetrahedral tags, and compares the sign of the realized tetrahedron against the target. It speaks at every
+ *  center, tie or not.
  *
- *  Coverage comes from a curated set of stereo-rich molecules, an exhaustive
- *  enumeration of tetrahedral tag assignments over those molecules, and an optional
- *  SMILES corpus named by argv[1].
+ *  Coverage comes from a curated set of stereo-rich molecules, an exhaustive enumeration of tetrahedral tag
+ *  assignments over those molecules, and an optional SMILES corpus named by argv[1].
  */
 
 #include <cmath>   // `std::fabs`
@@ -48,7 +44,7 @@ namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-namespace {
+namespace smallfield::tests {
 
 /** Running tally of both oracles, shared by every corpus this test walks. */
 struct oracle_tally_t {
@@ -77,7 +73,7 @@ struct oracle_tally_t {
  *  @param[in] count Number of leading entries to consider.
  *  @return +1 for an even permutation, -1 for an odd one, 0 when the two disagree.
  */
-int permutation_parity(std::uint8_t const *from, std::uint8_t const *to, std::uint32_t count) {
+static int permutation_parity_(std::uint8_t const *from, std::uint8_t const *to, std::uint32_t count) {
     std::uint32_t positions[4] = {0, 0, 0, 0};
     for (std::uint32_t target = 0; target < count; ++target) {
         bool found = false;
@@ -104,9 +100,9 @@ int permutation_parity(std::uint8_t const *from, std::uint8_t const *to, std::ui
  *  @param[in] label Printed alongside any mismatch so the offender is identifiable.
  *  @param[inout] tally Counters advanced by this molecule.
  */
-void check_against_cip(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
-                       std::vector<sft::chiral_center_descriptor_t> const &centers, std::string const &label,
-                       oracle_tally_t &tally) {
+static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
+                               std::vector<sft::chiral_center_descriptor_t> const &centers, std::string const &label,
+                               oracle_tally_t &tally) {
     RDKit::UINT_VECT cip_ranks(molecule.getNumAtoms(), 0);
     RDKit::Chirality::assignAtomCIPRanks(molecule, cip_ranks);
 
@@ -156,7 +152,7 @@ void check_against_cip(RDKit::ROMol const &molecule, sft::molecule_descriptor_t 
         rdkit_atom->getProp("_CIPCode", cip_code);
         int const reference_sign = (cip_code == "S") ? 1 : -1;
 
-        int const parity = permutation_parity(reference_order, center.neighbor_atoms, count);
+        int const parity = permutation_parity_(reference_order, center.neighbor_atoms, count);
         sf_verify_(parity != 0, "emitted neighbors must be a permutation of the CIP-ordered neighbors");
         int const expected_sign = reference_sign * parity;
 
@@ -179,9 +175,9 @@ void check_against_cip(RDKit::ROMol const &molecule, sft::molecule_descriptor_t 
  *  @param[in] label Printed alongside any mismatch so the offender is identifiable.
  *  @param[inout] tally Counters advanced by this molecule.
  */
-void check_against_geometry(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
-                            std::vector<sft::chiral_center_descriptor_t> const &centers, std::string const &label,
-                            oracle_tally_t &tally) {
+static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
+                                    std::vector<sft::chiral_center_descriptor_t> const &centers,
+                                    std::string const &label, oracle_tally_t &tally) {
     RDKit::RWMol embedded(molecule);
     if (!sftest::embed_molecule(embedded)) {
         ++tally.embed_failures;
@@ -226,7 +222,8 @@ void check_against_geometry(RDKit::ROMol const &molecule, sft::molecule_descript
  *  @param[in] with_geometry True to additionally embed the molecule and check the realized volumes.
  *  @param[inout] tally Counters advanced by this molecule.
  */
-void check_molecule(RDKit::RWMol &molecule, std::string const &label, bool with_geometry, oracle_tally_t &tally) {
+static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, bool with_geometry,
+                            oracle_tally_t &tally) {
     if (molecule.getNumAtoms() > sft::max_atoms_per_molecule_k || molecule.getNumBonds() > sft::max_bonds_k) return;
 
     sft::molecule_descriptor_t descriptor;
@@ -239,8 +236,8 @@ void check_molecule(RDKit::RWMol &molecule, std::string const &label, bool with_
 
     // The extraction has already run `assignStereochemistry`, so the CIP labels and ranks
     // below describe exactly the molecule the descriptors were derived from.
-    check_against_cip(molecule, descriptor, centers, label, tally);
-    if (with_geometry) check_against_geometry(molecule, descriptor, centers, label, tally);
+    check_against_cip_(molecule, descriptor, centers, label, tally);
+    if (with_geometry) check_against_geometry_(molecule, descriptor, centers, label, tally);
 }
 
 /**
@@ -250,7 +247,7 @@ void check_molecule(RDKit::RWMol &molecule, std::string const &label, bool with_
  *          drugs, plus the three-coordinate sulfoxide and phosphine cases where a
  *          lone pair takes the fourth substituent slot.
  */
-std::vector<std::string> stereo_test_smiles() {
+static std::vector<std::string> stereo_test_smiles_() {
     return {
         "C[C@@H](N)C(=O)O",                                                               // L-alanine
         "C[C@H](N)C(=O)O",                                                                // D-alanine
@@ -287,7 +284,7 @@ std::vector<std::string> stereo_test_smiles() {
  *  @param[in] smiles Molecule to expand.
  *  @param[inout] tally Counters advanced by every variant.
  */
-void check_stereoisomers(std::string const &smiles, oracle_tally_t &tally) {
+static void check_stereoisomers_(std::string const &smiles, oracle_tally_t &tally) {
     auto base = sftest::mol_from_smiles(smiles);
     sf_verify_(base != nullptr, "curated SMILES must parse");
 
@@ -309,7 +306,7 @@ void check_stereoisomers(std::string const &smiles, oracle_tally_t &tally) {
             variant.getAtomWithIdx(tagged_atoms[position])
                 ->setChiralTag(clockwise ? RDKit::Atom::CHI_TETRAHEDRAL_CW : RDKit::Atom::CHI_TETRAHEDRAL_CCW);
         }
-        check_molecule(variant, smiles, true, tally);
+        check_molecule_(variant, smiles, true, tally);
     }
 }
 
@@ -320,7 +317,7 @@ void check_stereoisomers(std::string const &smiles, oracle_tally_t &tally) {
  *  @param[in] limit Maximum number of entries to return.
  *  @return One SMILES string per accepted line.
  */
-std::vector<std::string> load_corpus(char const *path, std::size_t limit) {
+static std::vector<std::string> load_corpus_(char const *path, std::size_t limit) {
     std::vector<std::string> smiles;
     std::ifstream stream(path);
     std::string line;
@@ -339,7 +336,7 @@ std::vector<std::string> load_corpus(char const *path, std::size_t limit) {
  *  @param[in] heading Line printed above the counters.
  *  @param[in] tally Counters to report.
  */
-void report(char const *heading, oracle_tally_t const &tally) {
+static void report_(char const *heading, oracle_tally_t const &tally) {
     std::printf("  %s\n", heading);
     std::printf("    molecules %llu, centers %llu (%llu three-coordinate)\n",
                 static_cast<unsigned long long>(tally.molecules), static_cast<unsigned long long>(tally.centers),
@@ -355,14 +352,14 @@ void report(char const *heading, oracle_tally_t const &tally) {
                 static_cast<unsigned long long>(tally.embed_failures));
 }
 
-} // namespace
+} // namespace smallfield::tests
 
 int main(int argc, char **argv) {
-    oracle_tally_t curated;
+    sftest::oracle_tally_t curated;
 
     std::printf("test_chiral_parity: curated stereo set with exhaustive tag enumeration\n");
-    for (auto const &smiles : stereo_test_smiles()) check_stereoisomers(smiles, curated);
-    report("curated", curated);
+    for (auto const &smiles : sftest::stereo_test_smiles_()) sftest::check_stereoisomers_(smiles, curated);
+    sftest::report_("curated", curated);
     sf_verify_(curated.cip_compared >= 400, "curated set must reach several hundred CIP comparisons");
     sf_verify_(curated.three_coordinate > 0, "curated set must exercise three-coordinate centers");
     sf_verify_(curated.rank_ties > 0, "curated set must exercise a pseudo-asymmetric center");
@@ -374,21 +371,21 @@ int main(int argc, char **argv) {
     char const *corpus_path = argc > 1 ? argv[1] : nullptr;
     if (corpus_path != nullptr) {
         std::size_t const limit = argc > 2 ? std::stoul(argv[2]) : 20000;
-        auto const corpus = load_corpus(corpus_path, limit);
+        auto const corpus = sftest::load_corpus_(corpus_path, limit);
         std::printf("test_chiral_parity: corpus %s, %zu SMILES\n", corpus_path, corpus.size());
-        oracle_tally_t corpus_tally;
+        sftest::oracle_tally_t corpus_tally;
         for (auto const &smiles : corpus) {
             std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
             if (!molecule) continue;
             try {
                 RDKit::MolOps::addHs(*molecule);
-                check_molecule(*molecule, smiles, false, corpus_tally);
+                sftest::check_molecule_(*molecule, smiles, false, corpus_tally);
             }
             catch (...) {
                 continue;
             }
         }
-        report("corpus", corpus_tally);
+        sftest::report_("corpus", corpus_tally);
         sf_verify_(corpus_tally.cip_mismatches == 0, "every corpus stereocenter must match the CIP oracle");
     }
 

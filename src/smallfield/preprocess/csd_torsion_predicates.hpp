@@ -1,5 +1,5 @@
 /**
- *  @file csd_torsion_predicates.hpp
+ *  @file src/smallfield/preprocess/csd_torsion_predicates.hpp
  *  @brief Bounded representation and evaluator for recursive SMARTS sub-queries.
  *
  *  Roughly a quarter of the CSD torsion preference patterns hang a `$(...)` recursive
@@ -172,8 +172,8 @@ struct recursive_pool_view_t {
     recursive_node_t const *nodes = nullptr;
 
     recursive_pool_view_t() = default;
-    SF_HOST_DEVICE_ recursive_pool_view_t(recursive_node_t const *node_arena) : nodes(node_arena) {}
-    SF_HOST_DEVICE_ recursive_pool_view_t(recursive_pool_t const &pool) : nodes(pool.nodes) {}
+    constexpr recursive_pool_view_t(recursive_node_t const *node_arena) : nodes(node_arena) {}
+    constexpr recursive_pool_view_t(recursive_pool_t const &pool) : nodes(pool.nodes) {}
 };
 
 /**
@@ -187,9 +187,8 @@ struct recursive_visit_t {
 };
 
 /** Test whether a bond satisfies one `bond_disjunct_t`. */
-[[gnu::hot]] SF_HOST_DEVICE_ inline bool bond_disjunct_match(molecule_descriptor_t const &descriptor,
-                                                             std::uint32_t bond_index,
-                                                             bond_disjunct_t const &disjunct) {
+[[gnu::hot]] inline constexpr bool bond_disjunct_match(molecule_descriptor_t const &descriptor,
+                                                       std::uint32_t bond_index, bond_disjunct_t const &disjunct) {
     if (disjunct.bond_order != 0 && descriptor.bond_order[bond_index] != disjunct.bond_order) return false;
     std::uint8_t const flags = descriptor.bond_flags[bond_index];
     if ((flags & disjunct.require_flags) != disjunct.require_flags) return false;
@@ -197,9 +196,9 @@ struct recursive_visit_t {
     return true;
 }
 
-SF_HOST_DEVICE_ inline bool recursive_match_node(molecule_descriptor_t const &descriptor, recursive_pool_view_t pool,
-                                                 std::uint8_t node_index, std::uint32_t atom_index,
-                                                 recursive_visit_t &visited);
+inline constexpr bool recursive_match_node(molecule_descriptor_t const &descriptor, recursive_pool_view_t pool,
+                                           std::uint8_t node_index, std::uint32_t atom_index,
+                                           recursive_visit_t &visited);
 
 /**
  *  @brief Test whether a single atom satisfies one `atom_disjunct_t` — one OR branch
@@ -211,9 +210,9 @@ SF_HOST_DEVICE_ inline bool recursive_match_node(molecule_descriptor_t const &de
  *  @param[in] pool Sub-query nodes the disjunct's recursive guard indexes into.
  *  @return True when every primitive holds.
  */
-[[gnu::hot]] SF_HOST_DEVICE_ inline bool atom_disjunct_match(molecule_descriptor_t const &descriptor,
-                                                             std::uint32_t atom_index, atom_disjunct_t const &disjunct,
-                                                             recursive_pool_view_t pool) {
+[[gnu::hot]] inline constexpr bool atom_disjunct_match(molecule_descriptor_t const &descriptor,
+                                                       std::uint32_t atom_index, atom_disjunct_t const &disjunct,
+                                                       recursive_pool_view_t pool) {
     std::uint8_t const element = descriptor.element[atom_index];
     if (disjunct.element_mask != 0) {
         if (disjunct.element_mask_exclusive) {
@@ -284,9 +283,9 @@ SF_HOST_DEVICE_ inline bool recursive_match_node(molecule_descriptor_t const &de
  *  @param[inout] visited Atoms already claimed by this walk; restored on every failed branch.
  *  @return True when the whole sibling list binds.
  */
-SF_HOST_DEVICE_ inline bool recursive_match_children(molecule_descriptor_t const &descriptor,
-                                                     recursive_pool_view_t pool, std::uint8_t child_index,
-                                                     std::uint32_t parent_atom, recursive_visit_t &visited) {
+inline constexpr bool recursive_match_children(molecule_descriptor_t const &descriptor, recursive_pool_view_t pool,
+                                               std::uint8_t child_index, std::uint32_t parent_atom,
+                                               recursive_visit_t &visited) {
     if (child_index == no_recursive_node_k) return true;
     recursive_node_t const &child = pool.nodes[child_index];
     std::uint16_t const start = descriptor.neighbor_offset[parent_atom];
@@ -323,9 +322,9 @@ SF_HOST_DEVICE_ inline bool recursive_match_children(molecule_descriptor_t const
  *  @param[inout] visited Atoms already claimed by this walk; @p atom_index joins them on success.
  *  @return True when the node and its subtree bind.
  */
-SF_HOST_DEVICE_ inline bool recursive_match_node(molecule_descriptor_t const &descriptor, recursive_pool_view_t pool,
-                                                 std::uint8_t node_index, std::uint32_t atom_index,
-                                                 recursive_visit_t &visited) {
+inline constexpr bool recursive_match_node(molecule_descriptor_t const &descriptor, recursive_pool_view_t pool,
+                                           std::uint8_t node_index, std::uint32_t atom_index,
+                                           recursive_visit_t &visited) {
     recursive_node_t const &node = pool.nodes[node_index];
     bool any_disjunct = false;
     for (std::uint8_t slot = 0; slot < node.num_atom_disjuncts && !any_disjunct; ++slot)
@@ -345,8 +344,8 @@ SF_HOST_DEVICE_ inline bool recursive_match_node(molecule_descriptor_t const &de
  *  @param[in] root Node the sub-query is rooted at, or `no_recursive_node_k` for "no constraint".
  *  @return True when @p atom_index satisfies the sub-query.
  */
-SF_HOST_DEVICE_ inline bool recursive_query_match(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
-                                                  recursive_pool_view_t pool, std::uint8_t root) {
+inline constexpr bool recursive_query_match(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
+                                            recursive_pool_view_t pool, std::uint8_t root) {
     if (root == no_recursive_node_k) return true;
     recursive_visit_t visited;
     visited.count = 0;

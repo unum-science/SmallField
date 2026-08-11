@@ -1,9 +1,9 @@
 /**
- *  @file test_mmff_typer.cpp
+ *  @file test/mmff94/test_mmff_typer.cpp
  *  @brief Cross-validate the native MMFF atom typer against RDKit's `MMFFMolProperties::getMMFFAtomType`.
  *
- *  On drug-like SMILES. Target: ≥ 99 % per-atom match on ChEMBL 20K. Some discrepancy is expected because we don't
- *  yet invoke MMFF-specific aromaticity.
+ *  On drug-like SMILES. Target: ≥ 99 % per-atom match on ChEMBL 20K. Some discrepancy is expected because the
+ *  native typer does not yet invoke MMFF-specific aromaticity.
  */
 
 #include <cmath>  // `std::fabs`
@@ -31,16 +31,17 @@
 namespace sfparam = smallfield::parameters;
 namespace sfmmff = smallfield::mmff94;
 namespace sft = smallfield::types;
+namespace sftest = smallfield::tests;
 
-namespace {
-sfparam::mmff94_tables_host_t tables_host;
-sfparam::mmff94_tables_view_t tables;
-int n_atoms_checked = 0;
-int n_atoms_mismatch = 0;
-int n_charges_checked = 0;
-int n_charges_mismatch = 0;
-int n_mols_tested = 0;
-int n_mols_mismatch = 0;
+namespace smallfield::tests {
+static sfparam::mmff94_tables_host_t tables_host_;
+static sfparam::mmff94_tables_view_t tables_;
+static int n_atoms_checked_ = 0;
+static int n_atoms_mismatch_ = 0;
+static int n_charges_checked_ = 0;
+static int n_charges_mismatch_ = 0;
+static int n_mols_tested_ = 0;
+static int n_mols_mismatch_ = 0;
 
 struct summary_t {
     int element = 0;
@@ -49,79 +50,92 @@ struct summary_t {
     std::string smiles;
 };
 
-std::vector<summary_t> mismatches;
+static std::vector<summary_t> mismatches_;
 
-void test_one(std::string const &smiles, bool verbose) {
-    std::unique_ptr<RDKit::RWMol> mol;
+static void test_one_(std::string const &smiles, bool verbose) {
+    std::unique_ptr<RDKit::RWMol> molecule;
     try {
-        RDKit::SmilesParserParams p;
-        p.sanitize = true;
-        p.removeHs = false;
-        p.strictCXSMILES = false;
-        mol.reset(RDKit::SmilesToMol(smiles, p));
+        RDKit::SmilesParserParams parser_params;
+        parser_params.sanitize = true;
+        parser_params.removeHs = false;
+        parser_params.strictCXSMILES = false;
+        molecule.reset(RDKit::SmilesToMol(smiles, parser_params));
     }
     catch (...) {
         return;
     }
-    if (!mol) return;
+    if (!molecule) return;
     try {
-        RDKit::MolOps::addHs(*mol);
+        RDKit::MolOps::addHs(*molecule);
     }
     catch (...) {
         return;
     }
-    if (mol->getNumAtoms() > 128) return;
+    if (molecule->getNumAtoms() > 128) return;
 
     // RDKit baseline (uses MMFF-specific aromaticity internally).
-    if (!mol->hasProp(RDKit::common_properties::_MMFFSanitized))
-        mol->setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
-    RDKit::MMFF::MMFFMolProperties props(*mol);
+    if (!molecule->hasProp(RDKit::common_properties::_MMFFSanitized))
+        molecule->setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
+    RDKit::MMFF::MMFFMolProperties props(*molecule);
     if (!props.isValid()) return;
 
     sft::molecule_descriptor_t descriptor;
-    if (!sft::build_descriptor(*mol, descriptor)) return;
-    std::vector<std::uint8_t> nat(descriptor.num_atoms);
-    sfmmff::native_compute_mmff_atom_types(descriptor, nat);
-    std::vector<float> nat_fc(descriptor.num_atoms), nat_pc(descriptor.num_atoms);
-    sfmmff::native_compute_mmff_formal_charges(descriptor, nat, nat_fc);
-    sfmmff::native_compute_mmff_partial_charges(descriptor, tables, nat, nat_fc, nat_pc);
+    if (!sft::build_descriptor(*molecule, descriptor)) return;
+    std::vector<std::uint8_t> native_atom_types(descriptor.num_atoms);
+    sfmmff::native_compute_mmff_atom_types(descriptor, native_atom_types);
+    std::vector<float> native_formal_charges(descriptor.num_atoms), native_partial_charges(descriptor.num_atoms);
+    sfmmff::native_compute_mmff_formal_charges(descriptor, native_atom_types, native_formal_charges);
+    sfmmff::native_compute_mmff_partial_charges(descriptor, tables_, native_atom_types, native_formal_charges,
+                                                native_partial_charges);
 
-    ++n_mols_tested;
+    ++n_mols_tested_;
     bool this_mol_ok = true;
-    for (std::uint32_t a = 0; a < descriptor.num_atoms; ++a) {
-        ++n_atoms_checked;
-        std::uint8_t const rdk_t = props.getMMFFAtomType(a);
-        if (rdk_t != nat[a]) {
-            ++n_atoms_mismatch;
+    for (std::uint32_t atom_index = 0; atom_index < descriptor.num_atoms; ++atom_index) {
+        ++n_atoms_checked_;
+        std::uint8_t const rdkit_atom_type = props.getMMFFAtomType(atom_index);
+        if (rdkit_atom_type != native_atom_types[atom_index]) {
+            ++n_atoms_mismatch_;
             this_mol_ok = false;
-            if (verbose && mismatches.size() < 20)
-                mismatches.push_back(summary_t {(int)descriptor.element[a], rdk_t, nat[a], smiles});
+            if (verbose && mismatches_.size() < 20)
+                mismatches_.push_back(summary_t {(int)descriptor.element[atom_index], rdkit_atom_type,
+                                                 native_atom_types[atom_index], smiles});
         }
-        if (rdk_t == nat[a]) {
-            ++n_charges_checked;
-            float const rdk_pc = (float)props.getMMFFPartialCharge(a);
-            float const diff = std::fabs(rdk_pc - nat_pc[a]);
+        if (rdkit_atom_type == native_atom_types[atom_index]) {
+            ++n_charges_checked_;
+            float const rdkit_partial_charge = (float)props.getMMFFPartialCharge(atom_index);
+            float const diff = std::fabs(rdkit_partial_charge - native_partial_charges[atom_index]);
             if (diff > 1e-3f) {
-                ++n_charges_mismatch;
+                ++n_charges_mismatch_;
                 this_mol_ok = false;
-                if (verbose && mismatches.size() < 20) {
-                    summary_t m;
-                    m.element = (int)descriptor.element[a];
-                    m.smiles = std::string("chg ") + smiles + " (rdk=" + std::to_string(rdk_pc) +
-                               " nat=" + std::to_string(nat_pc[a]) + ")";
-                    mismatches.push_back(m);
+                if (verbose && mismatches_.size() < 20) {
+                    summary_t mismatch;
+                    mismatch.element = (int)descriptor.element[atom_index];
+                    mismatch.smiles = std::string("chg ") + smiles + " (rdk=" + std::to_string(rdkit_partial_charge) +
+                                      " nat=" + std::to_string(native_partial_charges[atom_index]) + ")";
+                    mismatches_.push_back(mismatch);
                 }
             }
         }
     }
-    if (!this_mol_ok) ++n_mols_mismatch;
+    if (!this_mol_ok) ++n_mols_mismatch_;
 }
-} // namespace
+} // namespace smallfield::tests
+
+using sftest::mismatches_;
+using sftest::n_atoms_checked_;
+using sftest::n_atoms_mismatch_;
+using sftest::n_charges_checked_;
+using sftest::n_charges_mismatch_;
+using sftest::n_mols_mismatch_;
+using sftest::n_mols_tested_;
+using sftest::tables_;
+using sftest::tables_host_;
+using sftest::test_one_;
 
 int main(int argc, char **argv) {
     std::printf("=== test_mmff_typer: native MMFF atom-typer + BCI charge gate ===\n");
-    sfparam::extract_mmff94_tables_from_rdkit(tables_host);
-    tables = tables_host.view();
+    sfparam::extract_mmff94_tables_from_rdkit(tables_host_);
+    tables_ = tables_host_.view();
 
     std::vector<std::string> probe = {
         "CC(=O)OC1=CC=CC=C1C(=O)O",
@@ -139,33 +153,35 @@ int main(int argc, char **argv) {
         "c1ccsc1",
     };
 
-    std::size_t const cap = (argc > 2) ? std::strtoull(argv[2], nullptr, 10) : 5000;
-    for (auto const &s : probe) test_one(s, true);
+    std::size_t const capacity = (argc > 2) ? std::strtoull(argv[2], nullptr, 10) : 5000;
+    for (auto const &smiles : probe) test_one_(smiles, true);
     if (argc > 1) {
-        std::ifstream ifs(argv[1]);
+        std::ifstream corpus_file(argv[1]);
         std::string line;
         std::size_t loaded = 0;
-        while (std::getline(ifs, line) && loaded < cap) {
+        while (std::getline(corpus_file, line) && loaded < capacity) {
             if (line.empty() || line[0] == '#') continue;
-            auto sp = line.find_first_of(" \t");
-            if (sp != std::string::npos) line.resize(sp);
+            auto separator_position = line.find_first_of(" \t");
+            if (separator_position != std::string::npos) line.resize(separator_position);
             if (!line.empty()) {
-                test_one(line, mismatches.size() < 10);
+                test_one_(line, mismatches_.size() < 10);
                 ++loaded;
             }
         }
     }
 
-    std::printf("molecules: %d tested, %d with ≥ 1 type or charge mismatch\n", n_mols_tested, n_mols_mismatch);
-    std::printf("atoms: %d checked, %d type mismatches\n", n_atoms_checked, n_atoms_mismatch);
-    std::printf("charges: %d checked, %d mismatches (> 1e-3)\n", n_charges_checked, n_charges_mismatch);
-    double const atom_match = n_atoms_checked ? 100.0 * (1.0 - (double)n_atoms_mismatch / n_atoms_checked) : 100.0;
-    double const mol_match = n_mols_tested ? 100.0 * (1.0 - (double)n_mols_mismatch / n_mols_tested) : 100.0;
-    double const chg_match = n_charges_checked ? 100.0 * (1.0 - (double)n_charges_mismatch / n_charges_checked) : 100.0;
-    std::printf("atom match: %.4f %%, charge match: %.4f %%, molecule match: %.3f %%\n", atom_match, chg_match,
-                mol_match);
-    for (auto const &m : mismatches) {
-        std::printf("  element=%d rdk=%u nat=%u  [%s]\n", m.element, m.expected, m.got, m.smiles.c_str());
+    std::printf("molecules: %d tested, %d with ≥ 1 type or charge mismatch\n", n_mols_tested_, n_mols_mismatch_);
+    std::printf("atoms: %d checked, %d type mismatches\n", n_atoms_checked_, n_atoms_mismatch_);
+    std::printf("charges: %d checked, %d mismatches (> 1e-3)\n", n_charges_checked_, n_charges_mismatch_);
+    double const atom_match = n_atoms_checked_ ? 100.0 * (1.0 - (double)n_atoms_mismatch_ / n_atoms_checked_) : 100.0;
+    double const molecule_match = n_mols_tested_ ? 100.0 * (1.0 - (double)n_mols_mismatch_ / n_mols_tested_) : 100.0;
+    double const charge_match = n_charges_checked_ ? 100.0 * (1.0 - (double)n_charges_mismatch_ / n_charges_checked_)
+                                                   : 100.0;
+    std::printf("atom match: %.4f %%, charge match: %.4f %%, molecule match: %.3f %%\n", atom_match, charge_match,
+                molecule_match);
+    for (auto const &mismatch : mismatches_) {
+        std::printf("  element=%d rdk=%u nat=%u  [%s]\n", mismatch.element, mismatch.expected, mismatch.got,
+                    mismatch.smiles.c_str());
     }
     // Gate: 99.9 % atom-level match for curated + 95 % for full ChEMBL.
     double const min_match = (argc > 1) ? 95.0 : 99.9;

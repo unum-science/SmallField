@@ -1,38 +1,38 @@
 /**
- *  @file parquet_writer.hpp
- *  @brief Write a single per-conformer-row 3D Parquet shard ("*.3D.parquet").
+ *  @file cli/parquet_writer.hpp
+ *  @brief Declares `write_shard` and the canonical schema of a per-conformer-row 3D Parquet
+ *  shard ("*.3D.parquet").
  *
  *  Output schema (canonical, 13 fields):
  *
- *  | Field                | Type             | Nullable | Per   | Notes                                      |
- *  |----------------------|------------------|----------|-------|--------------------------------------------|
- *  | input_shard          | utf8             | no       | row   | source parquet stem                        |
- *  | input_row            | uint64           | no       | row   | 0-based row in source                      |
- *  | smiles               | utf8             | no       | row   | the input SMILES, salt form included       |
- *  | conformer_index      | uint8            | no       | row   | 0..M-1, energy rank (0 = lowest energy)    |
- *  | status               | uint8            | no       | row   | conformer_status_t enum                    |
- *  | n_heavy_atoms        | uint16           | yes      | mol   | null if mol failed preprocess              |
- *  | n_atoms              | uint16           | yes      | mol   | atoms incl. H; null on preprocess failure  |
- *  | n_bonds              | uint16           | yes      | mol   | bonds incl. H; null on preprocess failure  |
- *  | molecular_weight     | float32          | yes      | mol   | exact MW in Daltons; null on failure       |
- *  | n_conformers         | uint8            | yes      | mol   | K (no dedup); null on preprocess failure   |
- *  | conformer_coords     | List<float16>    | yes      | row   | 3*n_atoms halves; null if status != success|
- *  | conformer_energy     | float32          | yes      | row   | this row's MMFF94 energy; null on failure  |
- *  | usrcat               | List<float16>    | yes      | row   | 60-dim USRCAT shape vector; null if !success|
+ *  | Field                | Type             | Nullable | Per   | Notes                                       |
+ *  |----------------------|------------------|----------|-------|---------------------------------------------|
+ *  | input_shard          | utf8             | no       | row   | source parquet stem                         |
+ *  | input_row            | uint64           | no       | row   | 0-based row in source                       |
+ *  | smiles               | utf8             | no       | row   | the input SMILES, salt form included        |
+ *  | conformer_index      | uint8            | no       | row   | 0..M-1, energy rank (0 = lowest energy)     |
+ *  | status               | uint8            | no       | row   | conformer_status_t enum                     |
+ *  | n_heavy_atoms        | uint16           | yes      | mol   | null if mol failed preprocess               |
+ *  | n_atoms              | uint16           | yes      | mol   | atoms incl. H; null on preprocess failure   |
+ *  | n_bonds              | uint16           | yes      | mol   | bonds incl. H; null on preprocess failure   |
+ *  | molecular_weight     | float32          | yes      | mol   | exact MW in Daltons; null on failure        |
+ *  | n_conformers         | uint8            | yes      | mol   | K (no dedup); null on preprocess failure    |
+ *  | conformer_coords     | List<float16>    | yes      | row   | 3*n_atoms halves; null if status != success |
+ *  | conformer_energy     | float32          | yes      | row   | this row's MMFF94 energy; null on failure   |
+ *  | usrcat               | List<float16>    | yes      | row   | 60-dim USRCAT shape; null if !success       |
  *
- *  USRCAT's first 12 values @b are the USR descriptor, so USR is not stored separately. USRCAT is
- *  fp16 (its value range is small and it is derived from fp16 coordinates, so higher precision
- *  would be illusory).
+ *  USRCAT's first 12 values @b are the USR descriptor, so USR is not stored separately. USRCAT is fp16 (its
+ *  value range is small and it is derived from fp16 coordinates, so higher precision would be illusory).
  *
- *  Preprocessing keeps only a molecule's largest fragment, so every column derived from the
- *  geometry — n_atoms, n_heavy_atoms, n_bonds, molecular_weight, conformer_coords, usrcat —
- *  describes that parent fragment, while `smiles` is the input as given and may name a salt.
- *  Re-parsing `smiles` through `smallfield::parse_smiles` reproduces the parent, which is what
- *  keeps the two consistent; computing a property from `smiles` without that step will not agree.
+ *  Preprocessing keeps only a molecule's largest fragment, so every column derived from the geometry —
+ *  n_atoms, n_heavy_atoms, n_bonds, molecular_weight, conformer_coords, usrcat — describes that parent
+ *  fragment, while `smiles` is the input as given and may name a salt. Re-parsing `smiles` through
+ *  `smallfield::parse_smiles` reproduces the parent, which is what keeps the two consistent; computing a
+ *  property from `smiles` without that step will not agree.
  *
- *  Rows within a molecule are emitted energy-sorted (lowest first); conformer_index
- *  is the energy rank. Schema-level key-value metadata records provenance (producer
- *  git sha, num_conformers, max_atoms, dataset, coordinate frame, schema version).
+ *  Rows within a molecule are emitted energy-sorted (lowest first); conformer_index is the energy rank.
+ *  Schema-level key-value metadata records provenance (producer git sha, num_conformers, max_atoms, dataset,
+ *  coordinate frame, schema version).
  */
 
 #pragma once
@@ -63,9 +63,9 @@ struct writer_inputs_t {
     /**
      *  @brief Per-molecule scalar readbacks, each of length `num_molecules`.
      *
-     *  A zero means preprocessing failed, which the writer translates into a null on the output
-     *  column. `n_atoms` is a `uint8` in the public API, capped at 128, and widens to `uint16` in
-     *  the canonical schema so the format stays forward-compatible.
+     *  A zero means preprocessing failed, which the writer translates into a null on the output column.
+     *  `n_atoms` is a `uint8` in the public API, capped at 128, and widens to `uint16` in the canonical
+     *  schema so the format stays forward-compatible.
      */
     std::span<std::uint8_t const> num_atoms_per_molecule;
     std::span<std::uint16_t const> num_heavy_atoms_per_molecule;
@@ -77,7 +77,7 @@ struct writer_inputs_t {
     /**
      *  @brief Per-conformer slot arrays, each of length `num_molecules * max_conformers`.
      *
-     *  The writer reads only the first `n_conformers_per_molecule[m]` slots of each molecule, so
+     *  The writer reads only the first `n_conformers_per_molecule[molecule_index]` slots of each molecule, so
      *  the trailing slots are unused.
      */
     std::span<std::uint8_t const> status;
@@ -93,11 +93,11 @@ struct writer_inputs_t {
     /**
      *  @brief Per-conformer USRCAT shape descriptor, 60 doubles per slot, stored as `list<float16>`.
      *
-     *  Slot-addressed like `energies` but with a stride of 60: slot `s = m*max_conformers + c`
-     *  occupies `usrcat[s*60 .. s*60+60)`. Supplied as float64, the precision it is computed at,
-     *  and downcast to float16 on write. An empty span opts the column out, marking it all-null;
-     *  non-success slots are written null. The 12-dim USR descriptor is not stored separately —
-     *  it is exactly the first 12 values of USRCAT.
+     *  With a stride of 60 rather than 1, this is slot-addressed exactly like `energies`: slot
+     *  `flat = molecule_index * max_conformers + conformer_slot` occupies `usrcat[flat*60 .. flat*60+60)`.
+     *  Supplied as float64, the precision it is computed at, and downcast to float16 on write. An empty span
+     *  opts the column out, marking it all-null; non-success slots are written null. The 12-dim USR descriptor
+     *  is not stored separately — it is exactly the first 12 values of USRCAT.
      */
     std::span<double const> usrcat;
 };

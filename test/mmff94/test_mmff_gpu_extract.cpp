@@ -1,5 +1,5 @@
 /**
- *  @file test_mmff_gpu_extract.cpp
+ *  @file test/mmff94/test_mmff_gpu_extract.cpp
  *  @brief Compare the GPU MMFF term extractor against the CPU native extractor.
  *
  *  Runs a batch of drug-like SMILES through both paths. Byte identity is required for every bonded
@@ -11,9 +11,8 @@
 #include <cstring> // `std::memcmp`
 
 #include <algorithm> // `std::max`, `std::unique`
-#include <fstream>   // `std::ifstream`
 #include <memory>    // `std::unique_ptr`
-#include <string>    // `std::string`, `std::getline`
+#include <string>    // `std::string`
 #include <vector>    // `std::vector`
 
 #include <boost/shared_ptr.hpp>
@@ -32,37 +31,17 @@
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
+#include "test_helpers.hpp"
 #include "test_mmff_gpu_extract_kernels.hpp"
 
-namespace sf = smallfield;
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
+namespace sftest = smallfield::tests;
 
-namespace {
-
-bool approximately_equal(float lhs, float rhs, float eps = 1e-3f) {
-    if (std::fabs(lhs - rhs) <= eps) return true;
-    float const scale = std::max(1.0f, std::max(std::fabs(lhs), std::fabs(rhs)));
-    return std::fabs(lhs - rhs) <= eps * scale;
-}
-
-std::vector<std::string> load_smiles(std::string const &path, std::size_t cap) {
-    std::vector<std::string> smiles;
-    std::ifstream input_stream(path);
-    if (!input_stream) return smiles;
-    std::string line;
-    while (std::getline(input_stream, line) && smiles.size() < cap) {
-        if (line.empty() || line[0] == '#') continue;
-        auto const separator = line.find_first_of(" \t");
-        if (separator != std::string::npos) line.resize(separator);
-        if (!line.empty()) smiles.push_back(line);
-    }
-    return smiles;
-}
-
-} // namespace
+using sftest::approximately_equal;
+using sftest::load_smiles;
 
 int main(int argc, char **argv) {
     std::printf("=== test_mmff_gpu_extract: GPU vs CPU MMFF extractor byte-equality gate ===\n");
@@ -139,13 +118,13 @@ int main(int argc, char **argv) {
                                                              sft::max_mmff_interactions_per_mol_k);
     std::vector<sft::mmff94_atom_offsets_t> atom_offsets_out(total_atoms);
 
-    mmff94_packed_host_result_t packed;
-    launch_mmff94_gpu_extract_pipeline(tables_host, descriptors.data(), num_molecules, atom_offsets.data(), total_atoms,
-                                       counts.data(), typing_status.data(), bonds.data(), sft::max_mmff_bonds_per_mol_k,
-                                       angles.data(), sft::max_mmff_angles_per_mol_k, torsions.data(),
-                                       sft::max_mmff_torsions_per_mol_k, oops.data(), sft::max_mmff_oops_per_mol_k,
-                                       stretch_bend_terms.data(), sft::max_mmff_stretchbends_per_mol_k,
-                                       interactions.data(), atom_offsets_out.data(), packed);
+    smallfield::tests::mmff94_packed_host_result_t packed;
+    smallfield::tests::launch_mmff94_gpu_extract_pipeline(
+        tables_host, descriptors.data(), num_molecules, atom_offsets.data(), total_atoms, counts.data(),
+        typing_status.data(), bonds.data(), sft::max_mmff_bonds_per_mol_k, angles.data(),
+        sft::max_mmff_angles_per_mol_k, torsions.data(), sft::max_mmff_torsions_per_mol_k, oops.data(),
+        sft::max_mmff_oops_per_mol_k, stretch_bend_terms.data(), sft::max_mmff_stretchbends_per_mol_k,
+        interactions.data(), atom_offsets_out.data(), packed);
 
     // CPU reference via extract_mmff94_params_fully_native.
     int matching_molecule_count = 0;
@@ -256,8 +235,9 @@ int main(int argc, char **argv) {
             auto const &gpu_term = torsion_terms[term_index];
             if (cpu_term.atom_i == gpu_term.atom_i && cpu_term.atom_j == gpu_term.atom_j &&
                 cpu_term.atom_k == gpu_term.atom_k && cpu_term.atom_l == gpu_term.atom_l &&
-                approximately_equal(cpu_term.v1, gpu_term.v1) && approximately_equal(cpu_term.v2, gpu_term.v2) &&
-                approximately_equal(cpu_term.v3, gpu_term.v3)) {
+                approximately_equal(cpu_term.torsion_v1, gpu_term.torsion_v1) &&
+                approximately_equal(cpu_term.torsion_v2, gpu_term.torsion_v2) &&
+                approximately_equal(cpu_term.torsion_v3, gpu_term.torsion_v3)) {
                 ++matching_torsion_count;
             }
             else {

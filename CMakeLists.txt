@@ -125,11 +125,13 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     # source-counter attribution map stalls back to specific source lines in
     # etkdg_pipeline.cuh / dg_forcefield.cuh / mmff94_functor.cuh.  No
     # optimisation impact — pure debug info that survives -O3.
-    # `--expt-relaxed-constexpr` lets `__host__ __device__` functions call any
-    # `constexpr` function including the libstdc++ <algorithm> facilities
-    # (`std::lower_bound`, `std::equal_range`) we use in the MMFF device
-    # lookups.  `--extended-lambda` enables lambdas passed as comparators
-    # inside those same lookups.  Required for the MG-2/3 GPU kernels.
+    # `--expt-relaxed-constexpr` lets device code call `constexpr` functions that are not
+    # themselves annotated `__host__ __device__`, which a concurrent pass relies on to drop
+    # those annotations from `constexpr` helpers. It does not rescue libstdc++'s <algorithm>
+    # facilities: `std::lower_bound` silently miscompiles on device, which is why the MMFF
+    # device lookups use a hand-rolled binary search instead (see `lower_bound_u8_` in
+    # `mmff94_tables.hpp`). `--extended-lambda` enables lambdas passed as comparators inside
+    # those lookups. Required for the MG-2/3 GPU kernels.
     if(NOT CMAKE_CUDA_FLAGS_RELEASE MATCHES "use_fast_math")
         set(CMAKE_CUDA_FLAGS_RELEASE
             "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math -Xcompiler=-march=native -Xptxas=-O3 --generate-line-info --expt-relaxed-constexpr --extended-lambda")

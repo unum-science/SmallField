@@ -1,11 +1,13 @@
 /**
- *  @file mmff94_lookup_probes.hpp
+ *  @file test/parameters/mmff94_lookup_probes.hpp
  *  @brief Query/result structs for probing each MMFF94 parameter table lookup in isolation.
  */
 
 #pragma once
 
 #include <cstdint> // `std::uint8_t`
+
+namespace smallfield::tests {
 
 struct vdw_query_t {
     std::uint8_t atom_type;
@@ -29,8 +31,8 @@ struct bond_query_t {
 
 struct bond_result_t {
     std::uint8_t hit;
-    float kb;
-    float r0;
+    float force_constant;
+    float equilibrium_distance;
 };
 
 struct angle_query_t {
@@ -42,8 +44,8 @@ struct angle_query_t {
 
 struct angle_result_t {
     std::uint8_t hit;
-    float ka;
-    float theta0_deg;
+    float force_constant;
+    float equilibrium_angle_degrees;
 };
 
 struct torsion_query_t {
@@ -57,9 +59,9 @@ struct torsion_query_t {
 
 struct torsion_result_t {
     std::uint8_t hit;
-    float v1;
-    float v2;
-    float v3;
+    float torsion_v1;
+    float torsion_v2;
+    float torsion_v3;
     std::uint8_t canonical_torsion_type;
 };
 
@@ -72,7 +74,7 @@ struct oop_query_t {
 
 struct oop_result_t {
     std::uint8_t hit;
-    float koop;
+    float force_constant;
 };
 
 struct stbn_query_t {
@@ -90,3 +92,5 @@ struct stbn_result_t {
     float kba_ijk;
     float kba_kji;
 };
+
+} // namespace smallfield::tests

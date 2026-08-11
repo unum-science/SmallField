@@ -1,6 +1,6 @@
 /**
- *  @file test_chirality.cpp
- *  @brief Tests for GPU chirality validation vs RDKit reference.
+ *  @file test/preprocess/test_chirality.cpp
+ *  @brief Test GPU chirality validation against the RDKit reference.
  *
  *  Compiled with g++, C++20. CUDA kernels in test_chirality_kernels.cu.
  */
@@ -11,14 +11,14 @@
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 
+#include "test_chirality_kernels.hpp"
 #include "test_helpers.hpp"
 
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
-extern "C" bool gpu_validate_chirality(float const *host_coords, sft::chiral_center_descriptor_t const *host_chirals,
-                                       std::uint32_t num_atoms, std::uint32_t num_chirals);
+using sftest::gpu_validate_chirality;
 
 static void test_chirality_correct_conformer() {
     std::printf("test_chirality_correct_conformer\n");
@@ -34,18 +34,18 @@ static void test_chirality_correct_conformer() {
     for (auto const &smiles : chiral_smiles) {
         std::printf("  testing: %s\n", smiles.c_str());
 
-        auto mol = sftest::mol_from_smiles(smiles);
-        sf_verify_(mol != nullptr, "failed to parse SMILES");
+        auto molecule = sftest::mol_from_smiles(smiles);
+        sf_verify_(molecule != nullptr, "failed to parse SMILES");
 
-        bool embedded = sftest::embed_molecule(*mol);
+        bool embedded = sftest::embed_molecule(*molecule);
         sf_verify_(embedded, "failed to embed molecule");
-        std::uint32_t const num_atoms = mol->getNumAtoms();
+        std::uint32_t const num_atoms = molecule->getNumAtoms();
 
         // Extract graph-only chiral targets from the molecular graph.
         std::vector<sft::chiral_center_descriptor_t> chirals;
         sft::molecule_descriptor_t descriptor;
-        sft::build_descriptor(*mol, descriptor);
-        sfp::extract_chiral_centers(*mol, descriptor, chirals);
+        sft::build_descriptor(*molecule, descriptor);
+        sfp::extract_chiral_centers(*molecule, descriptor, chirals);
         std::printf("    found %zu chiral centers\n", chirals.size());
 
         if (chirals.empty()) {
@@ -54,12 +54,12 @@ static void test_chirality_correct_conformer() {
         }
 
         // Extract coordinates in 3D SoA layout.
-        auto coords_interleaved = sftest::extract_coords_interleaved(*mol);
+        auto coords_interleaved = sftest::extract_coords_interleaved(*molecule);
         std::vector<float> coords_soa(3 * num_atoms);
-        for (std::uint32_t i = 0; i < num_atoms; ++i) {
-            coords_soa[0 * num_atoms + i] = coords_interleaved[i * 3 + 0];
-            coords_soa[1 * num_atoms + i] = coords_interleaved[i * 3 + 1];
-            coords_soa[2 * num_atoms + i] = coords_interleaved[i * 3 + 2];
+        for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
+            coords_soa[0 * num_atoms + atom_index] = coords_interleaved[atom_index * 3 + 0];
+            coords_soa[1 * num_atoms + atom_index] = coords_interleaved[atom_index * 3 + 1];
+            coords_soa[2 * num_atoms + atom_index] = coords_interleaved[atom_index * 3 + 2];
         }
 
         bool result = gpu_validate_chirality(coords_soa.data(), chirals.data(), num_atoms,
@@ -72,34 +72,34 @@ static void test_chirality_correct_conformer() {
 static void test_chirality_inverted() {
     std::printf("test_chirality_inverted\n");
 
-    auto mol = sftest::mol_from_smiles("C[C@@H](O)CC");
-    sf_verify_(mol != nullptr, "failed to parse");
+    auto molecule = sftest::mol_from_smiles("C[C@@H](O)CC");
+    sf_verify_(molecule != nullptr, "failed to parse");
 
-    bool embedded = sftest::embed_molecule(*mol);
+    bool embedded = sftest::embed_molecule(*molecule);
     sf_verify_(embedded, "failed to embed");
-    std::uint32_t const num_atoms = mol->getNumAtoms();
+    std::uint32_t const num_atoms = molecule->getNumAtoms();
 
     std::vector<sft::chiral_center_descriptor_t> chirals;
     sft::molecule_descriptor_t descriptor;
-    sft::build_descriptor(*mol, descriptor);
-    sfp::extract_chiral_centers(*mol, descriptor, chirals);
+    sft::build_descriptor(*molecule, descriptor);
+    sfp::extract_chiral_centers(*molecule, descriptor, chirals);
 
     if (chirals.empty()) {
         std::printf("  skipping (no chirals extracted)\n");
         return;
     }
 
-    auto coords_interleaved = sftest::extract_coords_interleaved(*mol);
+    auto coords_interleaved = sftest::extract_coords_interleaved(*molecule);
     std::vector<float> coords_soa(3 * num_atoms);
-    for (std::uint32_t i = 0; i < num_atoms; ++i) {
-        coords_soa[0 * num_atoms + i] = coords_interleaved[i * 3 + 0];
-        coords_soa[1 * num_atoms + i] = coords_interleaved[i * 3 + 1];
-        coords_soa[2 * num_atoms + i] = coords_interleaved[i * 3 + 2];
+    for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
+        coords_soa[0 * num_atoms + atom_index] = coords_interleaved[atom_index * 3 + 0];
+        coords_soa[1 * num_atoms + atom_index] = coords_interleaved[atom_index * 3 + 1];
+        coords_soa[2 * num_atoms + atom_index] = coords_interleaved[atom_index * 3 + 2];
     }
 
     // Flip the target sign. The validation should now fail.
     std::vector<sft::chiral_center_descriptor_t> flipped_chirals = chirals;
-    for (auto &c : flipped_chirals) { c.target_sign = -c.target_sign; }
+    for (auto &center : flipped_chirals) { center.target_sign = -center.target_sign; }
 
     bool result_original = gpu_validate_chirality(coords_soa.data(), chirals.data(), num_atoms,
                                                   static_cast<std::uint32_t>(chirals.size()));

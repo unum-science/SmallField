@@ -1,5 +1,5 @@
 /**
- *  @file test_csd_torsion_device_kernels.hpp
+ *  @file test/kernels/test_csd_torsion_device_kernels.hpp
  *  @brief Device harness for the CSD torsion matcher, for use by its unit tests.
  */
 
@@ -10,6 +10,8 @@
 
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+
+namespace smallfield::tests {
 
 /** Compile the CSD pattern corpus, upload it, and return an opaque owner handle.
  *  @param[out] table_bytes Bytes the uploaded table occupies on the device.
@@ -31,3 +33,5 @@ void destroy_csd_torsion_device_table(void *handle);
 bool run_csd_torsion_device_batch(void *handle, smallfield::types::molecule_descriptor_t const *descriptors,
                                   std::uint32_t num_molecules, std::uint32_t torsion_stride,
                                   smallfield::types::etk_torsion_descriptor_t *torsions_out, std::uint32_t *counts_out);
+
+} // namespace smallfield::tests

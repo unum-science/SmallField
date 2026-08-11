@@ -1,6 +1,7 @@
 /**
- *  @file shard_inventory.cpp
- *  @brief Glob input Parquet shards and decide which outputs already exist.
+ *  @file cli/shard_inventory.cpp
+ *  @brief Walks the input directory, matches each shard to its deterministic output path, and checks
+ *  `.encoded` sentinels to find already-complete shards.
  */
 
 #include <cstdio> // `fprintf`, `stderr`
@@ -15,9 +16,9 @@
 
 #include "shard_inventory.hpp"
 
-namespace smallfield::cli {
-
 namespace fs = std::filesystem;
+
+namespace smallfield::cli {
 
 static std::uint64_t parquet_row_count(fs::path const &path) {
     try {
@@ -31,28 +32,28 @@ static std::uint64_t parquet_row_count(fs::path const &path) {
     }
 }
 
-/** A *.parquet whose name ends with ".3D.parquet" is one of our own outputs. */
+/** A `*.parquet` whose name ends with `.3D.parquet` is one of this tool's own outputs. */
 static bool is_output_shard(fs::path const &path) {
     std::string const filename = path.filename().string();
-    constexpr std::string_view suffix = ".3D.parquet";
-    return filename.size() >= suffix.size() &&
-           filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
+    constexpr std::string_view suffix_k = ".3D.parquet";
+    return filename.size() >= suffix_k.size() &&
+           filename.compare(filename.size() - suffix_k.size(), suffix_k.size(), suffix_k) == 0;
 }
 
 std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path const &output_dir, bool resume) {
     std::vector<shard_pair_t> shards;
 
-    std::error_code ec;
-    if (!fs::is_directory(input_dir, ec)) {
+    std::error_code error_code;
+    if (!fs::is_directory(input_dir, error_code)) {
         std::fprintf(stderr, "[smallfield_batch] input dir does not exist: %s\n", input_dir.string().c_str());
         return shards;
     }
-    fs::create_directories(output_dir, ec);
+    fs::create_directories(output_dir, error_code);
 
-    for (auto const &entry : fs::directory_iterator(input_dir, ec)) {
+    for (auto const &entry : fs::directory_iterator(input_dir, error_code)) {
         if (!entry.is_regular_file()) continue;
         if (entry.path().extension() != ".parquet") continue;
-        if (is_output_shard(entry.path())) continue; // skip our own outputs when --output == --input
+        if (is_output_shard(entry.path())) continue; // skip its own outputs when --output == --input
         shard_pair_t pair {};
         pair.input_path = entry.path();
         // Deterministic output name: "<name>.parquet" → "<name>.3D.parquet".
@@ -62,25 +63,25 @@ std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path c
         pair.already_complete = false;
         if (resume) {
             fs::path const sentinel = pair.output_path;
-            std::string sentinel_str = sentinel.string() + ".encoded";
-            pair.already_complete = fs::exists(fs::path(sentinel_str), ec);
+            std::string sentinel_string = sentinel.string() + ".encoded";
+            pair.already_complete = fs::exists(fs::path(sentinel_string), error_code);
         }
         shards.push_back(std::move(pair));
     }
 
     std::sort(shards.begin(), shards.end(),
-              [](shard_pair_t const &a, shard_pair_t const &b) { return a.input_path < b.input_path; });
+              [](shard_pair_t const &left, shard_pair_t const &right) { return left.input_path < right.input_path; });
     return shards;
 }
 
 std::vector<fs::path> list_input_shards(fs::path const &input_dir) {
     std::vector<fs::path> paths;
-    std::error_code ec;
-    if (!fs::is_directory(input_dir, ec)) {
+    std::error_code error_code;
+    if (!fs::is_directory(input_dir, error_code)) {
         std::fprintf(stderr, "[shard_inventory] input dir does not exist: %s\n", input_dir.string().c_str());
         return paths;
     }
-    for (auto const &entry : fs::directory_iterator(input_dir, ec)) {
+    for (auto const &entry : fs::directory_iterator(input_dir, error_code)) {
         if (!entry.is_regular_file()) continue;
         if (entry.path().extension() != ".parquet") continue;
         if (is_output_shard(entry.path())) continue;

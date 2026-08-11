@@ -1,5 +1,5 @@
 /**
- *  @file test_mmff_gpu_extract_kernels.hpp
+ *  @file test/mmff94/test_mmff_gpu_extract_kernels.hpp
  *  @brief Device harness for the MMFF94 GPU term-extraction pipeline, for use by its unit tests.
  */
 
@@ -13,6 +13,8 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+
+namespace smallfield::tests {
 
 /**
  *  @brief Host mirror of the packed, variable-length MMFF term arrays the compaction pass emits.
@@ -45,3 +47,5 @@ void launch_mmff94_gpu_extract_pipeline(smallfield::parameters::mmff94_tables_ho
                                         smallfield::types::mmff94_atom_interaction_t *out_interactions,
                                         smallfield::types::mmff94_atom_offsets_t *out_atom_offsets,
                                         mmff94_packed_host_result_t &packed_out);
+
+} // namespace smallfield::tests

@@ -1,5 +1,5 @@
 /**
- *  @file device_capacities.hpp
+ *  @file src/smallfield/preprocess/device_capacities.hpp
  *  @brief Per-molecule capacities for the regions the device preprocessing kernels fill.
  *
  *  The MMFF extractor, the CSD torsion matcher and the ETK CSR builder all write into batch-global

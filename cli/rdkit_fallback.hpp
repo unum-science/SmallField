@@ -1,11 +1,12 @@
 /**
- *  @file rdkit_fallback.hpp
- *  @brief RDKit-based conformer generation for molecules the GPU pipeline failed on.
+ *  @file cli/rdkit_fallback.hpp
+ *  @brief Declares `rdkit_fallback`, RDKit-based conformer generation for molecules the GPU pipeline
+ *  failed on.
  *
  *  OpenMP-parallel EmbedMultipleConfs + MMFFOptimizeConfs. Called by `smallfield_batch` after the GPU run;
  *  only rows where the GPU reported non-success are passed in. Each successful RDKit conformer overwrites
- *  the coordinate / energy slot and flips `solver` from 2 → 1. Remaining failures keep `solver = 2`,
- *  written as NULL.
+ *  the coordinate / energy slot and flips `solver` from 2 to 1. Remaining failures keep `solver = 2`,
+ *  written as null.
  */
 
 #pragma once

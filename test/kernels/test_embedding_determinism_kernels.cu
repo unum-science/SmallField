@@ -1,9 +1,8 @@
 /**
- *  @file test_embedding_determinism_kernels.cu
+ *  @file test/kernels/test_embedding_determinism_kernels.cu
  *  @brief CUDA driver for the metric-embedding reproducibility test.
  *
- *  Compiled by nvcc. The host test logic is in test_embedding_determinism.cpp,
- *  compiled by g++.
+ *  Compiled by nvcc. The host test logic is in test_embedding_determinism.cpp, compiled by g++.
  */
 
 #include <cstdint> // `std::uint32_t`
@@ -14,10 +13,12 @@
 
 #include "smallfield/cuda/metric_embedding_prepass.cuh"
 
+#include "test_embedding_determinism_kernels.hpp"
+
 namespace sfc = smallfield::cuda;
 using smallfield::types::etkdg_molecule_metadata_t;
 
-extern "C" {
+namespace smallfield::tests {
 
 /**
  *  @brief Runs `embed_4d_power_iter_kernel` over @p num_molecules copies of one bounds matrix.
@@ -83,4 +84,4 @@ int gpu_embed_replicated(float const *host_bounds, std::uint32_t num_atoms, std:
     return static_cast<int>(status);
 }
 
-} // extern "C"
+} // namespace smallfield::tests

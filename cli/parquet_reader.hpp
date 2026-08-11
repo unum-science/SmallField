@@ -1,9 +1,9 @@
 /**
- *  @file parquet_reader.hpp
- *  @brief Read a single Parquet shard into zero-copy SMILES views.
+ *  @file cli/parquet_reader.hpp
+ *  @brief Declares `read_shard`, which loads a Parquet shard into zero-copy SMILES views.
  *
- *  Keeps the Arrow table alive so SMILES can be accessed as string_view
- *  directly into Arrow's contiguous buffer — no per-string heap allocation.
+ *  Keeps the Arrow table alive so SMILES can be accessed as `string_view` directly into Arrow's contiguous
+ *  buffer, with no per-string heap allocation.
  */
 
 #pragma once

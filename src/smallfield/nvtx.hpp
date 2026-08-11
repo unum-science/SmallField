@@ -1,17 +1,16 @@
 /**
- *  @file nvtx.hpp
+ *  @file src/smallfield/nvtx.hpp
  *  @brief Scoped NVTX ranges for attributing host-side pipeline time in Nsight Systems.
  *
- *  The batch driver overlaps four roles — reader, gpu-runner, fallback, writer — on
- *  one thread each, so a flat `nsys` timeline shows CUDA activity but cannot say which
- *  role a host thread was in, nor which roles were genuinely concurrent. Wrapping each
- *  role's per-batch body in a named range makes the overlap (or lack of it) directly
- *  readable, which is what distinguishes "the GPU is idle because the pipeline stalled"
- *  from "the GPU is idle because the host is still doing RDKit work".
+ *  The batch driver overlaps four roles — reader, gpu-runner, fallback, writer — on one thread each, so a flat
+ *  `nsys` timeline shows CUDA activity but cannot say which role a host thread was in, nor which roles were
+ *  genuinely concurrent. Wrapping each role's per-batch body in a named range makes the overlap, or lack of it,
+ *  directly readable, which is what distinguishes "the GPU is idle because the pipeline stalled" from "the GPU
+ *  is idle because the host is still doing RDKit work".
  *
- *  Header-only and dependency-free: NVTX3 ships inside the CUDA toolkit and needs no
- *  link-time library. Compiles to nothing when `SMALLFIELD_ENABLE_NVTX` is undefined,
- *  so annotated builds and shipping builds stay byte-identical by default.
+ *  Header-only and dependency-free: NVTX3 ships inside the CUDA toolkit and needs no link-time library. Compiles
+ *  to nothing when `SMALLFIELD_ENABLE_NVTX` is undefined, so annotated builds and shipping builds stay
+ *  byte-identical by default.
  */
 #pragma once
 

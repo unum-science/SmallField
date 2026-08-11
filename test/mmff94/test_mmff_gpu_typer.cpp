@@ -1,5 +1,5 @@
 /**
- *  @file test_mmff_gpu_typer.cpp
+ *  @file test/mmff94/test_mmff_gpu_typer.cpp
  *  @brief Run the GPU MMFF typer kernel against the native CPU typer on a set of drug-like SMILES.
  *
  *  Gate: byte-identical atom types and per-atom partial charges.
@@ -9,12 +9,11 @@
 #include <cstdio> // `printf`
 
 #include <algorithm> // `std::max`, `std::unique`
-#include <fstream>   // `std::ifstream`
 #include <iostream>  // RDKit's `AtomTyper.h` needs it but does not include it
 #include <memory>    // `std::unique_ptr`
 #include <span>      // `std::span`
 #include <sstream>   // RDKit's `AtomTyper.h` needs it but does not include it
-#include <string>    // `std::string`, `std::getline`
+#include <string>    // `std::string`
 #include <vector>    // `std::vector`
 
 #include <boost/shared_ptr.hpp>
@@ -30,36 +29,16 @@
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
+#include "test_helpers.hpp"
 #include "test_mmff_gpu_typer_kernels.hpp"
 
-namespace sf = smallfield;
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sft = smallfield::types;
+namespace sftest = smallfield::tests;
 
-namespace {
-
-bool approximately_equal(float lhs, float rhs, float eps = 1e-3f) {
-    if (std::fabs(lhs - rhs) <= eps) return true;
-    float const scale = std::max(1.0f, std::max(std::fabs(lhs), std::fabs(rhs)));
-    return std::fabs(lhs - rhs) <= eps * scale;
-}
-
-std::vector<std::string> load_smiles(std::string const &path, std::size_t cap) {
-    std::vector<std::string> smiles;
-    std::ifstream input_stream(path);
-    if (!input_stream) return smiles;
-    std::string line;
-    while (std::getline(input_stream, line) && smiles.size() < cap) {
-        if (line.empty() || line[0] == '#') continue;
-        auto const separator = line.find_first_of(" \t");
-        if (separator != std::string::npos) line.resize(separator);
-        if (!line.empty()) smiles.push_back(line);
-    }
-    return smiles;
-}
-
-} // namespace
+using sftest::approximately_equal;
+using sftest::load_smiles;
 
 int main(int argc, char **argv) {
     std::printf("=== test_mmff_gpu_typer: GPU vs CPU MMFF typer byte-equality gate ===\n");
@@ -69,7 +48,7 @@ int main(int argc, char **argv) {
     sfparam::mmff94_tables_view_t host_view = tables_host.view();
 
     sfparam::mmff94_tables_view_t device_view {};
-    void *device_tables_handle = create_mmff94_device_tables_view(tables_host, device_view);
+    void *device_tables_handle = smallfield::tests::create_mmff94_device_tables_view(tables_host, device_view);
     if (!device_tables_handle) {
         std::printf("FAIL: device table upload failed\n");
         return 1;
@@ -133,9 +112,9 @@ int main(int argc, char **argv) {
     std::vector<float> gpu_atom_charges(total_atoms);
     std::vector<std::uint8_t> gpu_typing_status(descriptors.size());
 
-    launch_mmff94_gpu_typer_batch(device_view, descriptors.data(), static_cast<std::uint32_t>(descriptors.size()),
-                                  atom_offsets.data(), total_atoms, gpu_atom_types.data(), gpu_atom_charges.data(),
-                                  gpu_typing_status.data());
+    smallfield::tests::launch_mmff94_gpu_typer_batch(
+        device_view, descriptors.data(), static_cast<std::uint32_t>(descriptors.size()), atom_offsets.data(),
+        total_atoms, gpu_atom_types.data(), gpu_atom_charges.data(), gpu_typing_status.data());
 
     // Compare against CPU native.
     int matching_atom_count = 0;
@@ -207,7 +186,7 @@ int main(int argc, char **argv) {
     std::printf("charges: %d match / %d mismatch\n", matching_charge_count, mismatched_charge_count);
     std::printf("molecules: %d match / %d mismatch\n", matching_molecule_count, mismatched_molecule_count);
 
-    destroy_mmff94_device_tables_view(device_tables_handle);
+    smallfield::tests::destroy_mmff94_device_tables_view(device_tables_handle);
     if (mismatched_atom_count > 0 || mismatched_charge_count > 0) {
         std::printf("FAIL\n");
         return 1;

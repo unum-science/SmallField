@@ -1,7 +1,7 @@
 /**
- *  @file warp_primitives.cuh
- *  @brief Shared warp-level constants, reduction primitives, float3 vector helpers,
- *         and tiny tensor-view types with debug-mode bounds checking.
+ *  @file src/smallfield/cuda/warp_primitives.cuh
+ *  @brief Shared warp-level constants, reduction primitives, float3 vector helpers, and tiny tensor-view
+ *  types with debug-mode bounds checking.
  */
 
 #pragma once
@@ -12,11 +12,6 @@
 
 #include <cstdint> // `std::uint32_t`
 #include <cuda_runtime.h>
-
-namespace smallfield::cuda {
-
-constexpr std::uint32_t warp_size_k = 32;
-constexpr unsigned int full_mask_k = 0xFFFFFFFF;
 
 /**
  *  @brief Debug-only assertion that compiles to nothing in Release.
@@ -41,34 +36,39 @@ constexpr unsigned int full_mask_k = 0xFFFFFFFF;
     } while (0)
 #endif
 
+namespace smallfield::cuda {
+
+constexpr std::uint32_t warp_size_k = 32;
+constexpr unsigned int full_mask_k = 0xFFFFFFFF;
+
 /**
  *  @brief Type-safe view of a row-major N×N matrix.
  *
- *  12 bytes (pointer + uint32 stride). Trivially copyable so it passes
- *  through `__global__` kernel arguments without a dance. In Release
- *  the `operator`() compiles to the same SASS as raw `data[i*n+j]`.
- *  In Debug (`!NDEBUG`) it asserts `i < n && j < n` and traps on OOB —
- *  this is the guardrail that catches stride / offset bugs before they
+ *  12 bytes — a pointer plus a `std::uint32_t` stride. Trivially copyable, so it passes through
+ *  `__global__` kernel arguments without a dance. In Release `operator()` compiles to the same SASS as a
+ *  raw `data[row * side_length + column]`; in Debug it asserts `row < side_length && column < side_length`
+ *  and traps on an out-of-bounds access. That is the guardrail catching stride and offset bugs before they
  *  silently corrupt neighbouring memory.
  */
 template <typename value_type_>
 struct matrix_view_2d {
     value_type_ *data = nullptr;
-    std::uint32_t n = 0;
+    std::uint32_t side_length = 0;
 
     constexpr matrix_view_2d() noexcept = default;
-    __host__ __device__ constexpr matrix_view_2d(value_type_ *data_, std::uint32_t n_) noexcept : data(data_), n(n_) {}
+    __host__ __device__ constexpr matrix_view_2d(value_type_ *data_pointer, std::uint32_t side_length_) noexcept
+        : data(data_pointer), side_length(side_length_) {}
 
-    __host__ __device__ __forceinline__ value_type_ &operator()(std::uint32_t i, std::uint32_t j) const noexcept {
-        sf_assert_(i < n && j < n);
-        return data[i * n + j];
+    __host__ __device__ __forceinline__ value_type_ &operator()(std::uint32_t row,
+                                                                std::uint32_t column) const noexcept {
+        sf_assert_(row < side_length && column < side_length);
+        return data[row * side_length + column];
     }
 };
 
 /**
- *  @brief Type-safe view of a SoA `[x0..xN, y0..yN, z0..zN]` 3-component
- *  buffer. Mirrors `load_position_` / `store_gradient_` semantics
- *  with the same Debug-mode bounds check as `matrix_view_2d`.
+ *  @brief Type-safe view of a SoA `[x0..xN, y0..yN, z0..zN]` 3-component buffer. Mirrors the semantics of
+ *  `load_position_` and `store_gradient_`, with the same Debug-mode bounds check as `matrix_view_2d`.
  */
 template <typename value_type_>
 struct soa_view_3d {
@@ -76,8 +76,8 @@ struct soa_view_3d {
     std::uint32_t num_atoms = 0;
 
     constexpr soa_view_3d() noexcept = default;
-    __host__ __device__ constexpr soa_view_3d(value_type_ *data_, std::uint32_t num_atoms_) noexcept
-        : data(data_), num_atoms(num_atoms_) {}
+    __host__ __device__ constexpr soa_view_3d(value_type_ *data_pointer, std::uint32_t num_atoms_) noexcept
+        : data(data_pointer), num_atoms(num_atoms_) {}
 
     __host__ __device__ __forceinline__ value_type_ &component(std::uint32_t dim, std::uint32_t atom) const noexcept {
         sf_assert_(dim < 3u && atom < num_atoms);

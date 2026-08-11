@@ -1,15 +1,13 @@
 /**
- *  @file test_embedding_determinism.cpp
- *  @brief Asserts that the 4D metric embedding is bitwise reproducible.
+ *  @file test/kernels/test_embedding_determinism.cpp
+ *  @brief Assert that the 4D metric embedding is bitwise reproducible.
  *
- *  The metric prepass seeds every later ETKDG stage, so an order-dependent block
- *  reduction inside it — a shared-memory float `atomicAdd`, say, whose commit order
- *  the scheduler picks and whose addition does not associate — makes the coordinates
- *  of a shipped shard unregenerable. A dataset that cannot be reproduced byte for
- *  byte cannot be audited, so this test pins the property twice over: the same bounds
- *  matrix embedded in two separate launches must agree, and thousands of identical
- *  copies embedded inside one launch must agree with each other, since they differ
- *  only in which streaming multiprocessor and which neighbours they draw.
+ *  The metric prepass seeds every later ETKDG stage, so an order-dependent block reduction inside it — a
+ *  shared-memory float `atomicAdd`, say, whose commit order the scheduler picks and whose addition does not
+ *  associate — makes the coordinates of a shipped shard unregenerable. A dataset that cannot be reproduced byte
+ *  for byte cannot be audited, so this test pins the property twice over: the same bounds matrix embedded in two
+ *  separate launches must agree, and thousands of identical copies embedded inside one launch must agree with
+ *  each other, since they differ only in which streaming multiprocessor and which neighbours they draw.
  */
 
 #include <cmath>   // `std::sqrt`
@@ -19,11 +17,12 @@
 #include <random> // `std::mt19937`, `std::uniform_real_distribution`
 #include <vector> // `std::vector`
 
+#include "test_embedding_determinism_kernels.hpp"
 #include "test_helpers.hpp"
 
-/** Defined in `test_embedding_determinism_kernels.cu`, compiled by nvcc. */
-extern "C" int gpu_embed_replicated(float const *host_bounds, std::uint32_t num_atoms, std::uint32_t num_molecules,
-                                    float *host_coordinates);
+namespace sftest = smallfield::tests;
+
+using sftest::gpu_embed_replicated;
 
 /** Builds a satisfiable bounds matrix by bracketing the distances of a random point cloud. */
 static std::vector<float> synthetic_bounds(std::uint32_t num_atoms) {

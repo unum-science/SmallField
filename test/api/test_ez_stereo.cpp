@@ -1,11 +1,11 @@
 /**
- *  @file test_ez_stereo.cpp
- *  @brief Round-trip check that generated conformers honour defined E/Z double bonds.
+ *  @file test/api/test_ez_stereo.cpp
+ *  @brief Confirm, round-trip through RDKit, that generated conformers honour defined E/Z double bonds.
  *
- *  Generates conformers for a set of E/Z isomer pairs, hands the coordinates back to
- *  RDKit, re-perceives stereochemistry from 3D, and asserts the perceived bond stereo
- *  matches what the input SMILES declared. Without a stereo-aware 1-4 bounds envelope
- *  both isomers of a pair collapse to whichever geometry the minimizer happens to reach.
+ *  Generates conformers for a set of E/Z isomer pairs, hands the coordinates back to RDKit, re-perceives
+ *  stereochemistry from 3D, and asserts the perceived bond stereo matches what the input SMILES declared. Without
+ *  a stereo-aware 1-4 bounds envelope both isomers of a pair collapse to whichever geometry the minimizer happens
+ *  to reach.
  */
 
 #include <cstdio> // `printf`
@@ -32,10 +32,10 @@ struct ez_case_t {
 };
 
 /** Perceive bond stereo from 3D and report whether any double bond is cis. */
-static bool perceived_any_cis(RDKit::RWMol &mol, bool &found_stereo) {
-    RDKit::MolOps::assignStereochemistryFrom3D(mol);
+static bool perceived_any_cis(RDKit::RWMol &molecule, bool &found_stereo) {
+    RDKit::MolOps::assignStereochemistryFrom3D(molecule);
     found_stereo = false;
-    for (auto const *bond : mol.bonds()) {
+    for (auto const *bond : molecule.bonds()) {
         auto const stereo = bond->getStereo();
         if (stereo == RDKit::Bond::STEREOZ || stereo == RDKit::Bond::STEREOCIS) {
             found_stereo = true;
@@ -80,7 +80,7 @@ int main() {
     sfapi::config_t config;
     config.num_conformers = num_conformers;
     auto const batch_status = context.generate_conformers(smiles, config, max_atoms, coords, energies, status);
-    sf_verify_(batch_status == sfapi::conformer_status_t::success,
+    sf_verify_(batch_status == sfapi::conformer_status_t::success_k,
                "the batch must generate; otherwise every per-slot check below passes vacuously");
 
     std::uint32_t checked = 0, matched = 0, unperceived = 0;
@@ -88,7 +88,7 @@ int main() {
     for (std::uint32_t mol_index = 0; mol_index < num_molecules; ++mol_index) {
         for (std::uint32_t conformer = 0; conformer < num_conformers; ++conformer) {
             std::size_t const slot = static_cast<std::size_t>(mol_index) * num_conformers + conformer;
-            if (status[slot] != sfapi::conformer_status_t::success) continue;
+            if (status[slot] != sfapi::conformer_status_t::success_k) continue;
 
             auto molecule = sftest::mol_from_smiles(smiles_storage[mol_index]);
             if (!molecule) continue;
