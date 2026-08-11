@@ -186,6 +186,10 @@ static void run_device_lookup_cross_checks_(sf::parameters::mmff94_tables_host_t
         // Deliberately not the word `FAILED`: this line is narration, and a CI log filtered on the verdict
         // grammar must not answer a `FAIL` grep with a line that never decided anything.
         fmt::println("  NOTE mmff94_tables field=device_upload available=0 device_cross_checks=skipped");
+        // Returning here used to skip every `summarize` below, and the vacuous-section count only rises
+        // inside `summarize` -- so the whole device cross-validation vanished behind a passing verdict.
+        // Closing an empty section is what makes the skip visible to the gate in `main`.
+        device_reporter_.summarize("device_upload");
         return;
     }
 

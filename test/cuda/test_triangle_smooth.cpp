@@ -27,7 +27,8 @@ using sftest::gpu_triangle_smooth;
 
 static constexpr std::string_view test_name_k = "test_triangle_smooth";
 
-static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
+/** Returns whether this molecule's GPU bounds matched the reference; the caller decides the verdict. */
+static bool test_triangle_smoothing_single_molecule(std::string const &smiles) {
     fmt::println("  testing: {}", smiles);
 
     auto molecule = sftest::mol_from_smiles(smiles);
@@ -105,13 +106,20 @@ static void test_triangle_smoothing_single_molecule(std::string const &smiles) {
             }
         }
     }
+
+    return reporter.passed();
 }
 
 int main() {
     fmt::println("test_triangle_smooth: GPU warp smoothing vs the RDKit reference bounds matrix");
 
     auto molecules = sftest::standard_test_smiles();
-    for (auto const &smiles : molecules) { test_triangle_smoothing_single_molecule(smiles); }
+    // Every molecule runs before the verdict: one mismatch should not hide the rest.  The call sits
+    // left of `&&` so it is never short-circuited away.
+    bool all_matched = true;
+    for (auto const &smiles : molecules) all_matched = test_triangle_smoothing_single_molecule(smiles) && all_matched;
 
+    if (!all_matched)
+        return sftest::report_fail(test_name_k, "GPU smoothed bounds disagree with the RDKit reference");
     return sftest::report_pass(test_name_k);
 }
