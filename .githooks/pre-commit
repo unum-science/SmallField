@@ -145,7 +145,7 @@ check_markdown_doxygen() {
     local emphasis
     emphasis=$(printf '%s\n' "$added" |
         strip_literals |
-        grep -E '(//|/\*|^\+[[:space:]]*\*)[^*_]*(\*\*[^*]+\*\*|__[a-zA-Z][^_]*[[:space:]][^_]*__)' || true)
+        grep -E '(//|/\*|^\+[[:space:]]*\*)[^_]*(\*\*[^*]+\*\*|__[a-zA-Z][^_]*[[:space:]][^_]*__)' || true)
     [ -z "$emphasis" ] || fail "$emphasis" \
         "$file uses Markdown emphasis inside a Doxygen comment - use @b for one or two tokens:"
 }
@@ -162,9 +162,13 @@ check_doc_comment_forms() {
 # A member is documented above it, never beside it. A trailing ///< ties the declaration column to
 # the longest comment in the struct, so editing one comment re-pads every neighbour, and the prose
 # gets whatever width the declaration leaves over instead of the full line.
+#
+# All four trailing forms are matched, and /**< is the one that matters most: it is Doxygen's
+# canonical spelling and the only one consistent with this project's own "documentation is /** ... */"
+# rule, so it is what an author following the rest of the style guide reaches for first.
 check_trailing_member_docs() {
     local trailing
-    trailing=$(printf '%s\n' "$added" | grep -E '//[!/]<' || true)
+    trailing=$(printf '%s\n' "$added" | grep -E '(//[!/]|/\*[*!])<' || true)
     [ -z "$trailing" ] || fail "$trailing" \
         "$file documents a member beside it - move the text above the member as /** ... */:"
 }
@@ -236,23 +240,33 @@ check_region_dashes() {
 
 # The checked-in .clang-format and .cmake-format.py profiles are the law, so a file formats clean
 # as a whole rather than fencing off regions the formatter is told to skip.
+#
+# This one cannot read `code_only`: the directive is itself a comment, and `strip_comments` would
+# delete it before the grep ran. The whole-line anchor takes its place - a real fence occupies its
+# own line, while a rationale naming the construct sits inside a sentence.
 check_formatter_off() {
     local directives
     directives=$(printf '%s\n' "$added" |
-        code_only |
-        grep -E '(//[[:space:]]*clang-format[[:space:]]+(on|off)|#[[:space:]]*cmake-format:[[:space:]]*(on|off))' || true)
+        strip_literals |
+        grep -E '^\+[[:space:]]*(//[[:space:]]*clang-format[[:space:]]+(on|off)|#[[:space:]]*cmake-format:[[:space:]]*(on|off))[[:space:]]*$' || true)
     [ -z "$directives" ] || fail "$directives" \
         "$file disables a formatter in-band - the checked-in profiles are the law:"
 }
 
 # A container of pointers is a pointer chase plus an allocation per element for something whose
 # count is usually known and small. Store values, or store indices into a flat arena.
+#
+# Arrow is exempt, and only Arrow. `arrow::schema()` and `arrow::Table::Make()` take
+# `std::vector<std::shared_ptr<arrow::Field>>` and `...<arrow::Array>>` in their own signatures, so a
+# caller cannot pass anything else. That is the same boundary the naming rules already draw around
+# RDKit: a shape reached through a library object is that library's, not ours.
 check_pointer_containers() {
     local containers
     # Reads code only: a docstring naming RDKit's `std::vector<MMFF*>` parameter column describes
     # someone else's layout rather than declaring ours, and the rule is about what we declare.
     containers=$(printf '%s\n' "$added" |
         code_only |
+        grep -v 'std::shared_ptr<arrow::' |
         grep -E '(std::)?(vector|array)[[:space:]]*<[[:space:]]*(std::)?(unique_ptr|shared_ptr)|(std::)?(vector|array)[[:space:]]*<[[:space:]]*[A-Za-z_][A-Za-z_0-9:]*[[:space:]]*\*' || true)
     [ -z "$containers" ] || fail "$containers" \
         "$file holds pointers inside a container - store values, or indices into a flat arena:"
@@ -286,11 +300,18 @@ check_thread_local() {
 
 # Positional aggregate initialization silently survives a field insertion or rename: the literal
 # keeps compiling and means something else. Past three fields, name them.
+#
+# A designated initializer is excluded by requiring the first element not to open with a dot, rather
+# than by excluding dots everywhere - the earlier form did the latter and so could not see a float
+# literal or a member read. Both incidents the rule was written for are float-valued structs, so it
+# would have missed the two failures it exists to prevent. Direct initialization is matched too,
+# which is the shape the `distance_geometry_energy_functor_t` regression actually took.
 check_positional_aggregates() {
     local aggregates
     aggregates=$(printf '%s\n' "$added" |
         code_only |
-        grep -E '(push_back|emplace_back|emplace)[[:space:]]*\([[:space:]]*\{[^}.]*,[^}.]*,[^}.]*,[^}.]*\}' || true)
+        grep -vE '^\+[[:space:]]*(enum|struct|class|union|namespace)\b' |
+        grep -E '((push_back|emplace_back|emplace)[[:space:]]*\([[:space:]]*|[A-Za-z_][A-Za-z_0-9:]*[[:space:]]+[a-z_][A-Za-z_0-9]*[[:space:]]*)\{[[:space:]]*[^.},[:space:]][^},]*(,[^},]*){3,}\}' || true)
     [ -z "$aggregates" ] || fail "$aggregates" \
         "$file initializes an aggregate positionally past three fields - use designated" \
         "            initializers so a field insertion cannot silently shift the meaning:"
@@ -344,14 +365,31 @@ check_abbreviations() {
 # a rule stops catching the thing it was written for.
 check_short_identifiers() {
     local short
+    # The exempt words are tested against the bound name alone, never against the whole line. A
+    # line-wide filter exempts every other binding beside an exempt one.
+    #
+    # The name is split off with a tab and matched as `[[:space:]]`, because ERE has no `\t` escape
+    # and a pattern written that way silently matches a literal `t` instead, exempting nothing.
+    #
+    # One binding per line is inspected, so `float sum = 0.0f, ab = 1.0f;` is still judged on `sum`
+    # alone. Declaring two names on one line is rare here and the fix would cost the diagnostic its
+    # line number, which is worth more than the case.
+    #
+    # The type slot admits a capital, because RDKit, CUDA and Arrow types are the dominant type
+    # vocabulary here and a lowercase-only slot made every single-letter binding of one invisible.
+    #
+    # Statement keywords are dropped first: `return b;` puts `return` in the type slot and `b` in the
+    # name slot, which is a statement rather than a declaration.
+    #
     # Reads code only: the pattern takes ordinary English for a declaration, so a comment reading
     # "rewrites them from it, so ..." tripped a rule about identifiers. Blanking the comment text
     # rather than dropping the line also keeps `/* fast path */ int n = 0;` in scope.
     short=$(printf '%s\n' "$added" |
         code_only |
-        grep -vE '^\+[[:space:]]*namespace[[:space:]]+[a-z_]+[[:space:]]*=' |
-        grep -E '^\+.*\b((std::)?[a-z_0-9:]+|auto)[[:space:]]+(const[[:space:]]+)?\*?&?[a-z][a-z0-9_]{0,2}[[:space:]]*(=|;|\)|,)' |
-        grep -vwE 'out|end|key|row|dim|hit|ok|top|sum|max|min|raw|bin|tag|on|bit|log|got|now|arg|sha|oop|arc|cis|lhs|rhs|dx|dy|dz|atom_i|atom_j|atom_k|atom_l' || true)
+        grep -vE '^\+[[:space:]]*(namespace[[:space:]]+[a-z_]+[[:space:]]*=|(return|delete|throw|co_return|co_yield)\b)' |
+        sed -nE 's/^(\+.*\b((std::)?[A-Za-z_0-9:]+|auto)[[:space:]]+(const[[:space:]]+)?\*?&?)([a-z][a-z0-9_]{0,2})([[:space:]]*(=|;|\)|,).*)$/\5\t&/p' |
+        grep -vE '^(out|end|key|row|dim|hit|ok|top|sum|max|min|raw|bin|tag|on|bit|log|got|now|arg|sha|oop|arc|cis|lhs|rhs|dx|dy|dz|atom_i|atom_j|atom_k|atom_l)[[:space:]]' |
+        cut -f2- || true)
     [ -z "$short" ] || fail "$short" \
         "$file binds a name under four characters - name a loop counter for the axis it walks and" \
         "            spell a contraction out; see CONTRIBUTING.md for the exempt words:"
@@ -408,6 +446,29 @@ check_type_suffix() {
         "$file declares a type without the _t suffix:"
 }
 
+# A function's return type is its contract, so it is written rather than deduced. `auto` sends a
+# reader to the body and then to whatever the body calls, it is not what a grep for the type finds,
+# and it converts a compile error into silent propagation: change what a helper returns, and an
+# explicit signature fails at that one accessor while a deduced one carries the new type out through
+# every call site with nothing to say so.
+#
+# A trailing return type is the same promise written on the right, so `auto f() -> span<T>` passes.
+# A declaration under a template head is exempt, because there the return may genuinely depend on a
+# deduced parameter - `align_up_` returns the width of whatever it was handed, which is its point.
+check_deduced_return() {
+    local candidates line deduced=""
+    candidates=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*(\[\[nodiscard\]\][[:space:]]*)?(static[[:space:]]+|inline[[:space:]]+|constexpr[[:space:]]+)*auto[[:space:]]+[a-z_][a-z_0-9]*\(' |
+        grep -v -- '->' || true)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        declared_under_template_head "$line" && continue
+        deduced="${deduced}${line}"$'\n'
+    done <<<"$candidates"
+    [ -z "$deduced" ] || fail "$deduced" \
+        "$file deduces a function's return type - write it, or give it a trailing return type:"
+}
+
 # The other half of the same rule. A class or struct template wearing _t promises a type you can
 # declare a variable of, and delivers something you have to supply arguments to first. Name the
 # template for what it makes and let each specialization carry the suffix.
@@ -446,6 +507,26 @@ check_detail_namespace() {
         "            in the file's own namespace:"
 }
 
+# The `g_` prefix ban stays prose in CONTRIBUTING.md and gets no check here. A grep for it fires on
+# `g_factor`, the MMFF94 Slater-Kirkwood term, and on `g_trigger` in the torsion equations, and finds
+# no real violation anywhere in this tree - `g_` is domain vocabulary in a chemistry codebase, so the
+# check would only ever cost false positives.
+
+# Eleven pairs of files here differ only by extension and three of those pairs carry a byte-identical
+# @brief, so a bare basename cannot tell a reader which half of a pair they are in. The path is only
+# checked when the diff reaches the top of the file, which is where the block lives.
+check_file_docblock() {
+    case "$added" in
+    *"@file"*) ;;
+    *) return ;;
+    esac
+    local declared
+    declared=$(printf '%s\n' "$added" | grep -E '@file([[:space:]]|$)' || true)
+    [ -z "$declared" ] && return
+    printf '%s\n' "$declared" | grep -qF "$file" && return
+    fail "$declared" "$file names a different path in its @file - carry the project-relative path:"
+}
+
 #pragma endregion C, C++, and CUDA
 
 #pragma region CUDA only
@@ -461,6 +542,35 @@ check_host_threads() {
     [ -z "$threads" ] || fail "$threads" \
         "$file spawns host threads in a CUDA source - orchestrate devices with per-device" \
         "            non-blocking cudaStream_t and cudaEvent_t from one host thread:"
+}
+
+# cudaMalloc and cudaFree each synchronize the whole device, so under the per-device fan-out every
+# allocation on any device serializes against every other device's in-flight work. The stream-ordered
+# forms draw from a per-device pool, and the stream carries the device, so a free reaches the context
+# that made the allocation without anyone storing a device id.
+#
+# The open paren is part of the pattern so cudaMallocAsync, cudaFreeAsync and cudaMallocHost - which
+# are the replacements - do not match the rule that sends you to them.
+check_cuda_allocation() {
+    local synchronous
+    synchronous=$(printf '%s\n' "$added" |
+        code_only |
+        grep -E '\bcuda(Malloc|Free)[[:space:]]*\(' || true)
+    [ -z "$synchronous" ] || fail "$synchronous" \
+        "$file calls cudaMalloc or cudaFree, which synchronize the whole device - use" \
+        "            cudaMallocAsync and cudaFreeAsync on the allocator's stream:"
+}
+
+# {fmt} has no device-side form, and a header that pulls it in puts it in front of every kernel
+# body that includes the header. The rule is a list of function bodies enforced as a rule about
+# includes, because that is the part a grep can see.
+check_device_header_fmt() {
+    local formatting
+    formatting=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*#[[:space:]]*include[[:space:]]*<fmt/' || true)
+    [ -z "$formatting" ] || fail "$formatting" \
+        "$file is a device header and includes <fmt/...> - take a logger_t const * on the" \
+        "            host-side failure path instead, as cuda_error.hpp does:"
 }
 
 #pragma endregion CUDA only
@@ -510,6 +620,31 @@ check_split_literals() {
     [ -z "$shredded" ] || fail "$shredded" \
         "$file splits a string literal mid-word - break it yourself and pin each line with a trailing //:"
 }
+
+#pragma region Build files
+
+# Three settings that each cost this project real build time, measured rather than assumed.
+#
+# Interprocedural optimization on a CUDA target switches nvcc from emitting SASS to emitting NVVM
+# LTO IR, so every architecture's ptxas codegen moves to the device link - 101.9 s against 0.25 s
+# for a plain nvlink, about 84 % of the build, and invisible to ccache because no compiler cache
+# caches a device link. Separable compilation earns its keep only when a __device__ function defined
+# in one translation unit is referenced from another, which nothing here does.
+#
+# A CMAKE_<LANG>_FLAGS mutation reaches every target in every subdirectory, and a guard on
+# CMAKE_BUILD_TYPE around one is invisible to multi-config generators, where the variable is empty.
+# Build settings are interface targets, which are evaluated per configuration.
+check_cuda_build_settings() {
+    local settings
+    settings=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*#' |
+        grep -E 'INTERPROCEDURAL_OPTIMIZATION|CUDA_SEPARABLE_COMPILATION|set[[:space:]]*\([[:space:]]*CMAKE_(C|CXX|CUDA)_FLAGS' || true)
+    [ -z "$settings" ] || fail "$settings" \
+        "$file sets IPO, separable compilation, or a global flags variable - build settings are" \
+        "            interface targets, and both CUDA settings move ptxas to the device link:"
+}
+
+#pragma endregion Build files
 
 #pragma region Shipped tooling
 
@@ -626,6 +761,9 @@ while IFS= read -r -d '' file; do
         check_constant_suffix
         check_detail_namespace
         check_split_literals
+        check_file_docblock
+        check_cuda_allocation
+        check_deduced_return
         case "$file" in
         *.cu | *.cuh) check_host_threads ;;
         esac
@@ -635,6 +773,13 @@ while IFS= read -r -d '' file; do
             check_iostreams
             ;;
         esac
+        # The device-header set is a list of function bodies {fmt} may not enter, named by the files
+        # that carry them: everything under cuda/, every *_device.cuh, and the MMFF table header.
+        case "$file" in
+        src/smallfield/cuda/* | *_device.cuh | *mmff94_tables_device.cuh)
+            check_device_header_fmt
+            ;;
+        esac
         ;;
     *.md)
         check_markdown_asterisks
@@ -642,7 +787,17 @@ while IFS= read -r -d '' file; do
         ;;
     # An absolute path is wrong in a build file, a script or a config for the same reason it is wrong
     # in a source file, so this one rule reaches every text file the project ships.
-    *.py | *.sh | *.toml | *.json | *.yml | *.yaml | *.cmake | CMakeLists.txt)
+    #
+    # The glob carries `*/` as well as the bare name, because a `case` pattern matches the whole
+    # staged path: the bare word reaches the root `CMakeLists.txt` and nothing under `test/`, `cli/`
+    # or `bench/`, all three of which exist.
+    *.py | *.sh | *.toml | *.json | *.yml | *.yaml | *.cmake | CMakeLists.txt | */CMakeLists.txt)
+        check_absolute_paths
+        check_cuda_build_settings
+        ;;
+    # The hooks are extensionless, so no glob above reaches them and they went unchecked by
+    # themselves. A rule the enforcement breaks is a rule nobody believes.
+    .githooks/*)
         check_absolute_paths
         ;;
     esac
@@ -692,7 +847,7 @@ was_clean_at_head() { # was_clean_at_head <file> <checker-command...>
 if command -v cmake-format > /dev/null 2>&1 && [ -f .cmake-format.py ]; then
     while IFS= read -r -d '' file; do
         case "$file" in
-        CMakeLists.txt | *.cmake) ;;
+        CMakeLists.txt | */CMakeLists.txt | *.cmake) ;;
         *) continue ;;
         esac
         was_clean_at_head "$file" cmake-format --check || continue

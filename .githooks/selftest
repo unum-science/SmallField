@@ -174,6 +174,72 @@ assert_accepts "a relative path under data/" bench/note.py \
 assert_rejects "a violation behind a leading comment" src/smallfield/note.hpp \
     '/* fast path */ thread_local int counter = 0;' "declares thread_local state"
 
+# Every case below covers a check that had no fixture and was therefore broken in a way nobody saw.
+# The correlation was exact: each total failure sat in the no-fixture column.
+
+# `/**<` is Doxygen's canonical trailing form and the one this project's own /** */ rule leads an
+# author to, and it was the one form the pattern missed.
+assert_rejects "a trailing member doc in the canonical form" src/smallfield/note.hpp \
+    '    std::uint32_t atom_count; /**< atoms in this molecule */' "documents a member beside it"
+
+# The emphasis gap could not consume the third star of a /** opener, so it was blind to the opening
+# line of every doc block in the project.
+assert_rejects "Markdown emphasis in a single-line doc block" src/smallfield/note.hpp \
+    '/** __bits that must not be set__ are cleared here. */' "uses Markdown emphasis"
+
+# This one read `code_only`, whose first step deletes `//...`, so the clang-format arm could never
+# fire on the directive it exists to catch.
+assert_rejects "an in-band clang-format fence" src/smallfield/note.hpp \
+    '    // clang-format off' "disables a formatter in-band"
+assert_accepts "prose naming a clang-format fence" src/smallfield/note.hpp \
+    '/* A // clang-format off fence would hide the reflow, so the profile stays the law. */'
+
+# Excluding dots everywhere also excluded float literals, so the check would have missed both
+# incidents it was written for - each was a float-valued struct.
+assert_rejects "a positional aggregate of float literals" src/smallfield/note.hpp \
+    '    terms.push_back({1.0f, 2.0f, 3.0f, 4.0f});' "initializes an aggregate positionally"
+assert_accepts "a designated initializer past three fields" src/smallfield/note.hpp \
+    '    terms.push_back({.atom_i = 1, .atom_j = 2, .atom_k = 3, .angle = 4.0f});'
+assert_accepts "an enum class listing four enumerators" src/smallfield/note.hpp \
+    'enum class term_kind_t { bond_k, angle_k, torsion_k, nonbonded_k };'
+
+# `return` landed in the type slot and the bound value in the name slot, so a short return rejected
+# the commit; and the exempt words filtered the whole line rather than the bound name.
+assert_accepts "a short return value" src/smallfield/note.hpp \
+    '    return b;'
+assert_rejects "a single-letter binding of a capitalized type" src/smallfield/note.hpp \
+    '    RDKit::ROMol *m = molecule.get();' "binds a name under four characters"
+
+# Stream-ordered allocation, and the two forms that replace the banned ones.
+assert_rejects "a synchronous device allocation" src/smallfield/note.cu \
+    '    cudaMalloc(&device_pool, total_bytes);' "calls cudaMalloc or cudaFree"
+assert_accepts "a stream-ordered device allocation" src/smallfield/note.cu \
+    '    cudaMallocAsync(&device_pool, total_bytes, stream);'
+
+assert_rejects "fmt reaching a device header" src/smallfield/cuda/note.cuh \
+    '#include <fmt/format.h>' "is a device header and includes"
+
+# The glob was the bare word, so every CMakeLists.txt outside the root went unchecked.
+assert_rejects "interprocedural optimization in a subdirectory build file" test/CMakeLists.txt \
+    'set_target_properties(smallfield_test PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)' \
+    "sets IPO, separable compilation, or a global flags variable"
+
+assert_rejects "an @file naming another file" src/smallfield/note.hpp \
+    '/** @file src/smallfield/other.hpp */' "names a different path in its @file"
+
+# A deduced return type sends a reader to the body, hides from grep, and turns a change in one helper
+# into silent propagation through every accessor that forwards it.
+assert_rejects "a deduced return type on an accessor" src/smallfield/note.hpp \
+    '    auto etk_torsions() const noexcept { return region<etk_torsion_descriptor_t>(offset, count); }' \
+    "deduces a function's return type"
+assert_accepts "a trailing return type" src/smallfield/note.hpp \
+    'inline auto make_view() -> custd::span<float> { return {}; }'
+assert_accepts "a deduced return under a template head" src/smallfield/note.hpp \
+    'template <typename value_, typename alignment_>
+constexpr auto align_up_(value_ value, alignment_ alignment) noexcept {
+    return value + alignment;
+}'
+
 # Markdown emphasis, and the document that has to name the banned form to ban it.
 assert_rejects "asterisk emphasis in Markdown" NOTES.md \
     'This is **bold** text.' "uses asterisk emphasis"

@@ -23,6 +23,16 @@ There is deliberately no in-band escape comment.
 If a rule needs to bend for a legitimate one-off, edit the rule here and document the bend.
 `git commit --no-verify` exists and you should almost never reach for it.
 
+__That applies to the formatters too: no `// clang-format off` and no `# cmake-format: off`.__
+The checked-in `.clang-format` and `.cmake-format.py` profiles are the law, so a file formats clean as a whole rather than fencing off the parts it disagrees with.
+
+__In Markdown, bold is `__like this__` and italic is `_like this_`__, never the asterisk forms, so the rendered and the raw text agree across every renderer these documents pass through.
+Inside a Doxygen comment neither form is used at all — that is what `@b` is for.
+
+__Run `bash .githooks/selftest` after changing a check.__
+It builds a throwaway repository per fixture and asserts that a rejection fires for exactly one reason, which makes every rejection case a false-positive test for all the other checks.
+A check that arrives without a fixture is a check nobody has seen fail: of the six checks found broken in 2026-08, every one that failed completely rather than narrowly had no fixture.
+
 __The public release of 2026-08 was the one deliberate exception to the added-lines discipline.__
 A whole-tree sweep corrected documentation that contradicted the code, deleted dead code, and normalised includes.
 Reformatting whole files turns every legacy line into an added line, so the hook then reports violations the file has carried for months; that is the cost of a flag day and the reason the rule exists.
@@ -71,8 +81,13 @@ __A name reached through a library object keeps that library's spelling.__
 `sc->d_params[k].kbaIJK` is RDKit's field and renaming it does not compile, while the `kba_ijk` it is assigned into is ours.
 The adapter in `parameters/mmff94_tables_rdkit.hpp` is the boundary: library spelling on the right, ours on the left.
 
+__A name crossing into Python keeps Python's spelling, for the same reason.__
+`PascalCase` classes and `UPPER` enum members are what a Python caller expects, and the binding is a boundary exactly like the RDKit adapter — ours on one side, theirs on the other.
+So `ConformerStatus.SUCCESS` and `class ShardStats:` stay, while the C++ they bind to remains `conformer_status_t::success_k` and `shard_stats_t`.
+The carve-out reaches the binding and the Python package only; a C++ declaration is snake_case wherever it sits.
+
 Spell concepts out.
-`index` not `idx`, `config` not `cfg`, `source` and `destination` not `src` and `dst`, `scratch` not `tmp`, `count` not `cnt`.
+`index` not `idx`, `config` not `cfg`, `source` and `destination` not `src` and `dst`, `scratch` not `tmp`, `count` not `cnt`, `table` not `tbl`, `buffer` not `buf`, `pointer` not `ptr`, `neighbor` not `nbr`, `descriptor` not `desc`, `conformer` not `conf`, `compute` not `calc`.
 
 __A physics symbol is spelled out, and the symbol itself goes in the docstring.__
 `mmff94_bond_t::force_constant` documented as `kb` in mdyn per angstrom, never a bare `kb` in our own code.
@@ -103,7 +118,7 @@ __Namespaces mirror the directory structure, and `detail` namespaces do not exis
 An internal helper lives in the file's own namespace with a trailing underscore.
 A namespace alias spells its target out; `sfp` bound to two different namespaces in one test suite is what the short forms cost.
 
-`#pragma region <name>` and `#pragma endregion <name>` mark sections, with plain words in the name — a dash makes `clang-format` reflow around it and the markers drift out of pairing.
+`#pragma region <name>` and `#pragma endregion <name>` mark sections, with plain words in the name — a dash makes `clang-format` reflow around it and the markers drift out of pairing, and a bracket does the same.
 
 ## Includes
 
@@ -263,9 +278,35 @@ Both extents come from the spans, so a caller cannot restate one and get it wron
 The stream is required, never defaulted: the legacy default stream serializes against every other stream on the device.
 A pageable source silently degrades the copy to a blocking staged one inside the driver, which is why anything on the wave path stages through `pinned_bytes_t`.
 
+__Ownership is readable from a declaration, never reconstructed from call sites.__
+An owning buffer is `buffer<value_type_, allocator_type_>` and a borrowed one is a `custd::span` or a view.
+There is no third thing, and a raw pointer that outlives the expression using it is a defect.
+
+A pointer into a container, held across a phase boundary, is a lifetime bug waiting for a reallocation — `gpu_pipeline_handle_t` carried one until it was replaced by the span it actually read.
+Residence is a compile-time property for the same reason: host code holding a device pointer should not compile rather than fail at run time.
+
+__Two facts that must agree are one fact, or they are a defect.__
+An agreement maintained by hand at every write site is one the compiler will not help with, and the type system exists to carry most of them.
+
+A count beside a pointer is one span.
+A struct of `<name>_byte_offset` and `num_<name>` pairs is a layout of spans; `wave_slice_pool.hpp` spells 20 regions across 44 fields.
+Parallel arrays walked by a shared index are one struct, or a view that carries the relation.
+A field equal by construction to another is deleted rather than documented.
+And two identically-shaped things with different meanings get different types, which is what `coordinate_role_t` does and what generalizes beyond it.
+
+Where a relation genuinely cannot be typed, say so in a comment naming the invariant.
+Do not invent a wrapper whose only content is a cast.
+
+__A call that can outlast a millisecond releases the GIL.__
+Nothing inside the released scope may touch a Python object.
+A wave runs for minutes, and holding the lock across it blocks every other thread in the interpreter for no reason.
+
 __No pointers inside containers.__
 `std::vector<T *>` and `std::vector<std::unique_ptr<T>>` are a pointer chase plus an allocation per element for something whose count is usually known and small.
 Store values, or store indices into a flat arena.
+
+Arrow is the one exception, and it is the same boundary the naming rules draw around RDKit.
+`arrow::schema()` and `arrow::Table::Make()` take `std::vector<std::shared_ptr<arrow::Field>>` and `std::vector<std::shared_ptr<arrow::Array>>` in their own signatures, so a caller cannot hand them anything else — the shape is that library's rather than ours.
 
 __Lazy initialization is a function-local `static const`. There is no second mechanism.__
 
@@ -305,6 +346,50 @@ __A trailing underscore already marks internal linkage; `g_` adds nothing.__
 Carrying both is two conventions for one fact, and `g_` is a poor thing to grep for in a codebase where `g_factor` is the MMFF94 Slater-Kirkwood term.
 
 ## Control Flow
+
+__A function's return type is written, never deduced.__
+`auto` on a return sends a reader to the body and then to whatever the body calls, and it is not what a grep for the type finds.
+
+The real cost is that it converts a compile error into silent propagation.
+Change what a helper returns, and an explicit signature fails at the one accessor that forwards it; a deduced one carries the new type out through every call site with nothing to say so.
+
+```cpp
+// no — forty accessors whose contract is only discoverable by reading `region<T>`
+auto etk_torsions() const noexcept { return region<etk_torsion_descriptor_t>(…); }
+
+// yes
+custd::span<etk_torsion_descriptor_t> etk_torsions() const noexcept { return region<…>(…); }
+```
+
+A trailing return type is the same promise written on the right and is fine.
+A deduced return under a template head is fine too, because there it may genuinely depend on a deduced parameter — `align_up_` returns the width of whatever it was handed, which is the whole point of it.
+`auto` on a local whose type is obvious from its initializer is unaffected.
+
+__A wrapper whose body is a call with the same arguments is a name, not a function.__
+It adds one identifier to look up and one place for the two to drift, and it makes no wrong state harder to spell.
+Call the thing directly.
+
+```cpp
+// no — the name is the whole content
+static constexpr auto bits_identical_ = [](float host_value, float device_value) {
+    return bitwise_equal_(host_value, device_value);
+};
+```
+
+When such a wrapper is genuinely load-bearing, it is usually adapting arity, and the fix belongs at the callee.
+A predicate is a `constexpr` callable object rather than a function carrying a default argument: a function name decays to a pointer whose type does not include the default, so it cannot be passed where a two-argument callable is wanted, and every call site grows a lambda to bind what the declaration already said.
+`exactly_equal` in `test/test_helpers.hpp` is the shape to copy — it is used at a hundred call sites and needs an adapter at none of them.
+
+__Discard a return value by binding it `[[maybe_unused]]`, never with a `(void)` cast.__
+The cast is a C-era idiom that reads as hiding something, and it does not compose with `[[nodiscard]]` the way a bound variable does.
+`[[maybe_unused]] cudaError_t const status = allocator.deallocate(pointer);` names what was ignored, so the next reader can see whether ignoring it is still right.
+
+__Three or more `[&]` lambdas in one function means that function's locals are a struct.__
+The lambdas are its methods, and each should receive exactly the state it needs.
+
+`generate_conformers` holds seven across 108 of its 270 lines and `write_shard` holds eight in 321.
+Every one of them reaches an arbitrary subset of some twenty enclosing locals, so nothing declares which piece touches what, no piece can be reasoned about alone, and none can be tested.
+`[&]` is the smell rather than the lambda: where one genuinely wants two names, capture those two.
 
 __A `bool` that steers behavior is an enum.__
 Already stated under Naming for parameters; it applies equally to a `bool` return, which throws away the reason.
@@ -439,7 +524,7 @@ A trailing `//` on an `#include`, an `#endif`, or a closing brace is an idiom an
 
 Every `@param` declares its direction as `[in]`, `[out]`, or `[inout]` — the comma form is not a spelling of the last one.
 
-__Inline code and symbol names take backticks, and neither `@c` nor `@ref` is used.__
+__Inline code and symbol names take backticks, and none of `@c`, `@ref` or `@a` is used.__
 `@b` remains for emphasis of a word that is not code, because `**bold**` inside a comment prints literally.
 Emphasis is `@b`, never capitals: `bits that must @b not be set` rather than `bits that MUST NOT be set`.
 Backticks promise something a compiler would accept, so they never wrap prose, punctuation, a bare numeral, or math.
@@ -524,7 +609,8 @@ __Every section ends with its comparison count.__
 `PASS vdw compared=0` and a real pass must not read alike.
 A validator that silently compares nothing is the defect this convention was written after: one aliased its reference to our own entry and compared 5000 values against themselves, and another bound its result to an unused variable and checked nothing at all.
 
-__Three sinks, chosen by who reads the output.__
+__Three sinks, chosen by who reads the output, and an iostream is none of them.__
+`std::cout` and its siblings carry no level, no timestamp and no sink, so a library header reaching for one writes past whatever the caller configured.
 `src/` and `cli/` are operator-facing and long-running, so they use `logger_t` and want the wall clock.
 `bench/` is read as a report, so it uses bare `fmt::println`.
 `test/` uses the reporter and __not__ the logger, because a 34-character varying timestamp destroys column alignment and makes two runs undiffable, and ctest already timestamps.
