@@ -38,9 +38,9 @@ def _format_elapsed(seconds: float) -> str:
     return f"{total // 3600:02}:{(total // 60) % 60:02}:{total % 60:02}"
 
 
-def thousands(v: int) -> str:
+def thousands(count: int) -> str:
     """Format an integer with comma grouping: ``1_234_567 → '1,234,567'``."""
-    return f"{v:,}"
+    return f"{count:,}"
 
 
 @dataclass
@@ -62,14 +62,10 @@ class Logger:
 
     def _emit(self, console: Console, style: str, message: str, *args: Any) -> None:
         text = message.format(*args) if args else message
-        prefix = self.timestamp_prefix()
-        if style:
-            console.print(f"{prefix} [{style}]{text}[/]")
-        else:
-            console.print(f"{prefix} {text}")
+        console.print(f"{self.timestamp_prefix()} [{style}]{text}[/]")
 
     def info(self, message: str, *args: Any) -> None:
-        self._emit(self.console, "", message, *args)
+        self._emit(self.console, "info", message, *args)
 
     def warn(self, message: str, *args: Any) -> None:
         self._emit(self.err_console, "warn", message, *args)

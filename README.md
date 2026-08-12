@@ -146,13 +146,21 @@ The GPU pipeline context is also available directly:
 
 ```python
 context = sf.Context()
-coordinates_flat, energies, status = context.generate_conformers(
+batch = context.generate_conformers(
     ["CCO", "c1ccccc1"], num_conformers=3, max_atoms_per_molecule=192,
     max_stereo_attempts=10, random_seed=42,
 )
+batch.coordinates  # float16, flat, padded to max_atoms_per_molecule
+batch.energies     # float32, kcal/mol, one per conformer slot
+batch.status       # uint8 ConformerStatus codes
+batch.num_atoms    # one per molecule, with hydrogens, 0 if preprocess rejected it
 ```
 
-`max_atoms_per_molecule` is the output stride as well as the cap, so lowering it to the largest molecule you actually feed in saves proportional host memory; 192 is the compile-time ceiling the warp pipeline supports.
+Reuse one `Context` across calls: constructing it initialises every GPU and reserves every pinned pool, so building one per call pays that twice.
+
+Coordinates cross as `float16`, which is the precision the pipeline produces — widening them at the boundary would cost a second buffer three times the size for accuracy the slots never held. Call `.astype(numpy.float32)` if you want it, and the cost is then yours to see.
+
+`max_atoms_per_molecule` is the output stride as well as the cap, so lowering it to the largest molecule you actually feed in saves proportional host memory. Read the ceiling from `sf.MAX_ATOMS_PER_MOLECULE` rather than restating it; it is the stride two layers have to agree on.
 
 Requires RDKit for preprocessing — `pip install rdkit`.
 

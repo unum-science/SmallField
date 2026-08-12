@@ -45,22 +45,42 @@ def test_single_smiles_generation_returns_interleaved_coordinates():
 
 def test_batch_generation_returns_flat_buffers_and_status_codes():
     smiles_batch = ["CCO", "c1ccccc1"]
+    num_conformers = 2
+    atom_stride = 64
     gpu_context = sfa.Context([])
-    coordinates, energies, status_codes = gpu_context.generate_conformers(
+    batch = gpu_context.generate_conformers(
         smiles_batch,
-        2,
-        128,
-        10,
-        True,
-        42,
+        num_conformers=num_conformers,
+        max_atoms_per_molecule=atom_stride,
+        random_seed=42,
     )
 
-    expected_conformer_count = len(smiles_batch) * 2
-    assert np.asarray(coordinates).shape == (expected_conformer_count * 128 * 3,)
-    assert np.asarray(energies).shape == (expected_conformer_count,)
-    assert np.asarray(status_codes).shape == (expected_conformer_count,)
-    assert np.isfinite(np.asarray(energies)).all()
-    assert any(int(code) == int(sfa.ConformerStatus.SUCCESS) for code in status_codes)
+    expected_conformer_count = len(smiles_batch) * num_conformers
+    # Coordinates cross as float16, which is the storage the pipeline produces; widening them here
+    # would assert a precision the slots never held.
+    assert batch.coordinates.dtype == np.float16
+    assert batch.coordinates.shape == (expected_conformer_count * atom_stride * 3,)
+    assert batch.energies.shape == (expected_conformer_count,)
+    assert batch.status.shape == (expected_conformer_count,)
+    assert np.isfinite(batch.energies).all()
+    assert any(int(code) == int(sfa.ConformerStatus.SUCCESS) for code in batch.status)
+
+    # The per-molecule descriptors come from the molecule SmallField embedded, so they are one per
+    # input rather than one per conformer.
+    assert batch.num_atoms.shape == (len(smiles_batch),)
+    assert batch.num_heavy_atoms.shape == (len(smiles_batch),)
+    assert batch.num_bonds.shape == (len(smiles_batch),)
+    assert batch.molecular_weight.shape == (len(smiles_batch),)
+
+
+def test_atom_stride_is_published_rather_than_restated():
+    """The stride is the output layout, so a caller reads it rather than hard-coding 128 or 192.
+
+    It stays under ``smallfield.api`` rather than the package root, which holds only submodules —
+    the same reason ``Context`` is not re-exported there.
+    """
+    assert sfa.MAX_ATOMS_PER_MOLECULE > 0
+    assert not hasattr(smallfield, "MAX_ATOMS_PER_MOLECULE")
 
 
 def test_invalid_smiles_raises_value_error():
