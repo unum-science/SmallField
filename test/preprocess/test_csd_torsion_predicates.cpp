@@ -189,7 +189,7 @@ static void validate_recursive_for_molecule_(recursive_case_t const &compiled, R
                          compiled.body, smiles, atom, rdkit_hit ? 1 : 0, native_hit ? 1 : 0);
             fmt::println(
                 stderr, "NOTE csd_subquery atom={} element={} aromatic={} degree={} num_hydrogens={} hybridization={}",
-                atom, descriptor.element[atom], sft::atom_has_flag(descriptor, atom, sft::atom_flag_aromatic_k) ? 1 : 0,
+                atom, descriptor.element[atom], (descriptor.atom_flags[atom] & sft::atom_flag_aromatic_k) != 0 ? 1 : 0,
                 descriptor.degree[atom], descriptor.num_hydrogens[atom], descriptor.hybridization[atom]);
             sf_verify_(false, "sub-query mismatch vs RDKit");
         }

@@ -69,7 +69,14 @@ enum hybridization_t : std::uint8_t {
     hybridization_sp3d2_k = 6,
 };
 
-/** Per-atom boolean flags packed into a single byte. */
+/**
+ *  @brief Per-atom boolean flags packed into a single byte.
+ *
+ *  Read by masking `atom_flags` directly — `(descriptor.atom_flags[atom] & atom_flag_aromatic_k) != 0`.
+ *  There is no named per-flag accessor, because most sites want either several bits off one load or a
+ *  mask the caller assembled, and every one of them is reachable from a kernel where an extra load is
+ *  measured rather than assumed. `bond_flag_t` reads the same way.
+ */
 enum atom_flag_t : std::uint8_t {
     atom_flag_aromatic_k = 1u << 0,
     atom_flag_in_ring_k = 1u << 1,
@@ -408,17 +415,7 @@ inline api::conformer_status_t build_descriptor(RDKit::ROMol const &molecule, mo
 
 #pragma endregion Construction
 
-#pragma region Accessors
-
-/** True iff atom @p atom_index carries @p flag. */
-inline bool atom_has_flag(molecule_descriptor_t const &descriptor, std::uint32_t atom_index, atom_flag_t flag) {
-    return (descriptor.atom_flags[atom_index] & flag) != 0;
-}
-
-/** True iff bond @p bond_index carries @p flag. */
-inline bool bond_has_flag(molecule_descriptor_t const &descriptor, std::uint32_t bond_index, bond_flag_t flag) {
-    return (descriptor.bond_flags[bond_index] & flag) != 0;
-}
+#pragma region Derived Queries
 
 /**
  *  @brief Fill @p matrix with the all-pairs bond-hop counts of @p descriptor.
@@ -457,6 +454,6 @@ inline void fill_bond_distances(molecule_descriptor_t const &descriptor, hop_mat
     }
 }
 
-#pragma endregion Accessors
+#pragma endregion Derived Queries
 
 } // namespace smallfield::types

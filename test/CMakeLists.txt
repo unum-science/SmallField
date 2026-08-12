@@ -7,8 +7,18 @@
 #
 # EXTRA_SOURCES carries a table a test owns but does not want in its own translation unit: rows of plain data belong in
 # a host-only .cpp for the same reason `csd_torsion_table.cpp` is one.
+#
+# GPU marks a test that drives the device, and sets the `RESOURCE_LOCK` CTest holds while it runs, so `ctest -j` never
+# starts two of them at once.  Several of these size a device allocation against the whole card, so run together they
+# fail on allocation rather than on anything they assert -- red for contention costs whoever reproduces it more than
+# running them one at a time ever costs the suite.  A MIXED test compiles its own kernels to launch them, so it locks
+# without saying so; GPU is for a test whose device work arrives through `smallfield_lib`.  Everything unmarked is
+# host-only and still runs in parallel with the locked ones, which is what the flag buys over `ctest -j 1`.
+#
+# `RESOURCE_LOCK` rather than `RESOURCE_GROUPS`: the latter needs a resource spec file named on the command line, so a
+# plain `ctest -j 8` would silently get no serialization at all.
 function (define_smallfield_test subfolder base_name)
-    cmake_parse_arguments(ARG "MIXED" "" "LINK;EXTRA_SOURCES" ${ARGN})
+    cmake_parse_arguments(ARG "MIXED;GPU" "" "LINK;EXTRA_SOURCES" ${ARGN})
     set(sources "${subfolder}/test_${base_name}.cpp" ${ARG_EXTRA_SOURCES})
     if (ARG_MIXED)
         list(APPEND sources "${subfolder}/test_${base_name}_kernels.cu")
@@ -22,6 +32,9 @@ function (define_smallfield_test subfolder base_name)
         LINK ${ARG_LINK}
     )
     add_test(NAME test_${base_name} COMMAND test_${base_name})
+    if (ARG_MIXED OR ARG_GPU)
+        set_tests_properties(test_${base_name} PROPERTIES RESOURCE_LOCK smallfield_gpu)
+    endif ()
 endfunction ()
 
 define_smallfield_test(cuda triangle_smooth MIXED)
@@ -76,8 +89,9 @@ define_smallfield_target(
     LINK smallfield_lib
 )
 add_test(NAME test_mmff_term_parity COMMAND test_mmff_term_parity)
+set_tests_properties(test_mmff_term_parity PROPERTIES RESOURCE_LOCK smallfield_gpu)
 
 define_smallfield_test(api conformer_slot_layout)
-define_smallfield_test(api pipeline)
-define_smallfield_test(api seed_determinism)
-define_smallfield_test(api ez_stereo)
+define_smallfield_test(api pipeline GPU)
+define_smallfield_test(api seed_determinism GPU)
+define_smallfield_test(api ez_stereo GPU)

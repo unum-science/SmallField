@@ -112,10 +112,10 @@ static void compare_atoms_(RDKit::ROMol const &molecule, sft::molecule_descripto
             .field("num_hydrogens", atom->getTotalNumHs(true), descriptor.num_hydrogens[atom_index], exactly_equal)
             .field("formal_charge", atom->getFormalCharge(), descriptor.formal_charge[atom_index], exactly_equal)
             .field("aromatic", atom->getIsAromatic(),
-                   sft::atom_has_flag(descriptor, atom_index, sft::atom_flag_aromatic_k), exactly_equal);
+                   (descriptor.atom_flags[atom_index] & sft::atom_flag_aromatic_k) != 0, exactly_equal);
         if (!ring_labels_complete) continue; // the ring cap dropped labels this molecule legitimately lacks
         group.field("in_ring", ring_info->numAtomRings(atom_index) > 0,
-                    sft::atom_has_flag(descriptor, atom_index, sft::atom_flag_in_ring_k), exactly_equal);
+                    (descriptor.atom_flags[atom_index] & sft::atom_flag_in_ring_k) != 0, exactly_equal);
     }
 }
 
@@ -129,9 +129,9 @@ static void compare_bonds_(RDKit::ROMol const &molecule, sft::molecule_descripto
             .field("atom_i", bond->getBeginAtomIdx(), descriptor.bond_atom_i[bond_index], exactly_equal)
             .field("atom_j", bond->getEndAtomIdx(), descriptor.bond_atom_j[bond_index], exactly_equal)
             .field("aromatic", bond->getIsAromatic(),
-                   sft::bond_has_flag(descriptor, bond_index, sft::bond_flag_aromatic_k), exactly_equal)
+                   (descriptor.bond_flags[bond_index] & sft::bond_flag_aromatic_k) != 0, exactly_equal)
             .field("in_ring", ring_info->numBondRings(bond_index) > 0,
-                   sft::bond_has_flag(descriptor, bond_index, sft::bond_flag_in_ring_k), exactly_equal);
+                   (descriptor.bond_flags[bond_index] & sft::bond_flag_in_ring_k) != 0, exactly_equal);
     }
 }
 

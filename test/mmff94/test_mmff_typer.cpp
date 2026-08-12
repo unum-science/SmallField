@@ -6,6 +6,10 @@
  *  averaging six bad atoms over the ~889 000 in a 20 000-molecule sweep hides a whole structural class
  *  behind four nines.
  *
+ *  A third section pins `native_get_mmff_bond_type` against `MMFFMolProperties::getMMFFBondType` on molecules
+ *  kekulized with their aromatic flags left standing, which is the only state where the descriptor's two
+ *  aromatic bond flags disagree and so the only state that tells the right one from the wrong one.
+ *
  *  The two typers do @b not automatically read the same aromaticity. `MMFFMolProperties` guards only its
  *  Kekulize behind `_MMFFSanitized` and calls `MolOps::setMMFFAromaticity` unconditionally, so marking a
  *  molecule sanitized suppresses the Kekulize and nothing else. Whichever side snapshots the molecule
@@ -59,18 +63,21 @@ static constexpr std::size_t max_reported_mismatches_k = 64;
 struct typer_reporters_t {
     diagnostic_reporter_t atom_type {"rdkit", "native"};
     diagnostic_reporter_t partial_charge {"rdkit", "native"};
+    diagnostic_reporter_t bond_type {"rdkit", "native"};
 
     /** Cap what each section prints, so one pathological corpus cannot bury the log. */
     void limit_printed_lines(std::size_t maximum) noexcept {
         atom_type.limit_printed_lines(maximum);
         partial_charge.limit_printed_lines(maximum);
+        bond_type.limit_printed_lines(maximum);
     }
 
-    /** Close both sections; true when each compared something and every field agreed. */
+    /** Close every section; true when each compared something and every field agreed. */
     bool summarize_sections() {
         atom_type.summarize("atom_type");
         partial_charge.summarize("partial_charge");
-        return atom_type.passed() && partial_charge.passed();
+        bond_type.summarize("bond_type");
+        return atom_type.passed() && partial_charge.passed() && bond_type.passed();
     }
 };
 
@@ -157,6 +164,71 @@ static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t c
     if (mismatching_atoms != 0) ++tally.molecules_mismatched;
 }
 
+#pragma region Kekulized Aromatic Bonds
+
+/**
+ *  @brief Compare every MMFF bond type on a molecule whose aromatic bonds carry a Kekulé order.
+ *
+ *  `Kekulize` with `markAtomsBonds` false hands each aromatic bond an integer order and leaves
+ *  `getIsAromatic()` set, which is the one state where `bond_flag_aromatic_k` and
+ *  `bond_flag_order_aromatic_k` disagree — the plain flag is set, the order flag is not, and the order
+ *  is 1. RDKit's gate at `AtomTyper.cpp:2470` is `getBondType() == Bond::SINGLE`, so such a bond is a
+ *  single bond to RDKit and `native_get_mmff_bond_type` reproduces that only while it reads the order
+ *  flag. Reading the plain aromatic flag instead drops every one of them to type 0, and on this probe
+ *  set that is three to six wrong bonds per molecule.
+ *
+ *  Order of operations is what makes both sides read one molecule. `MMFFMolProperties` types the atoms
+ *  and then restores aromatic bond @b orders whatever `_MMFFSanitized` says, so the Kekulé structure is
+ *  laid down after it and the descriptor is built from the result. `getMMFFBondType` stores no bond
+ *  state and reads the `Bond` handed to it, so it sees the same kekulized bond the descriptor did.
+ *
+ *  RDKit's own atom types feed both sides, which leaves the bond gate as the only free variable. The
+ *  native typer would answer differently here, and legitimately: it reads the kekulized molecule while
+ *  `MMFFMolProperties` typed the aromatic one, and that divergence belongs to the `atom_type` section.
+ *
+ *  @param[in] smiles Aromatic SMILES to kekulize.
+ *  @param[in] tables MMFF94 parameter tables the native bond typer reads.
+ *  @param[inout] reporter Reporter for the `bond_type` section.
+ *  @param[inout] scratch Reusable storage for the atom types both sides read.
+ *  @return How many bonds reached the descriptor flagged aromatic without an aromatic order.
+ */
+static std::size_t test_kekulized_bond_types_(std::string const &smiles, sfparam::mmff94_tables_view_t const &tables,
+                                              diagnostic_reporter_t &reporter, native_typing_scratch_t &scratch) {
+    std::unique_ptr<RDKit::RWMol> molecule = mol_from_smiles(smiles);
+    sf_verify_(molecule != nullptr, ("kekule SMILES must parse: " + smiles).c_str());
+    if (!molecule->hasProp(RDKit::common_properties::_MMFFSanitized))
+        molecule->setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
+    RDKit::MMFF::MMFFMolProperties props(*molecule);
+    sf_verify_(props.isValid(), ("RDKit must type the kekule probe: " + smiles).c_str());
+
+    RDKit::MolOps::Kekulize(*molecule, false);
+    sft::molecule_descriptor_t descriptor;
+    sf_verify_(sft::build_descriptor(*molecule, descriptor) == sfapi::conformer_status_t::success_k,
+               ("kekule SMILES must fit the descriptor: " + smiles).c_str());
+    scratch.resize(descriptor.num_atoms);
+    for (std::uint32_t atom_index = 0; atom_index < descriptor.num_atoms; ++atom_index)
+        scratch.atom_types[atom_index] = props.getMMFFAtomType(atom_index);
+
+    std::size_t divergent_bonds = 0;
+    for (std::uint32_t bond_index = 0; bond_index < descriptor.num_bonds; ++bond_index) {
+        std::uint8_t const flags = descriptor.bond_flags[bond_index];
+        bool const aromatic = (flags & sft::bond_flag_aromatic_k) != 0;
+        bool const order_aromatic = (flags & sft::bond_flag_order_aromatic_k) != 0;
+        divergent_bonds += aromatic && !order_aromatic;
+        reporter
+            .mismatch("mmff_bond_type", "smiles={} bond={} order={} aromatic={} order_aromatic={} types={},{}", smiles,
+                      bond_index, descriptor.bond_order[bond_index], aromatic ? 1 : 0, order_aromatic ? 1 : 0,
+                      scratch.atom_types[descriptor.bond_atom_i[bond_index]],
+                      scratch.atom_types[descriptor.bond_atom_j[bond_index]])
+            .field("bond_type", props.getMMFFBondType(molecule->getBondWithIdx(bond_index)),
+                   sfmmff::native_get_mmff_bond_type(descriptor, tables, scratch.atom_types, bond_index),
+                   exactly_equal);
+    }
+    return divergent_bonds;
+}
+
+#pragma endregion Kekulized Aromatic Bonds
+
 } // namespace smallfield::tests
 
 int main(int argc, char **argv) {
@@ -202,6 +274,22 @@ int main(int argc, char **argv) {
     sftest::native_typing_scratch_t scratch;
     for (auto const &smiles : probe) sftest::test_one_(smiles, tables, reporters, scratch, tally);
     for (auto const &smiles : external) sftest::test_one_(smiles, tables, reporters, scratch, tally);
+
+    // Aromatic rings whose bonds are given a Kekulé order while keeping `getIsAromatic()`, the only state
+    // in which the descriptor's two aromatic bond flags disagree. Each carries a ring bond that reaches
+    // `native_get_mmff_bond_type` as `Bond::SINGLE`, and biphenyl adds the inter-ring single bond between
+    // two aromatic carbons, which is where MMFF's bond type 1 actually falls.
+    std::vector<std::string> const kekule_probe = {"c1ccccc1",   "Cc1ccccc1",           "c1ccc2ccccc2c1", "c1ccncc1",
+                                                   "c1cc[nH]c1", "c1ccc(-c2ccccc2)cc1", "c1ccc(cc1)C=O"};
+    std::size_t divergent_bonds = 0;
+    for (auto const &smiles : kekule_probe)
+        divergent_bonds += sftest::test_kekulized_bond_types_(smiles, tables, reporters.bond_type, scratch);
+    fmt::println("kekule probe: {} molecules, {} bonds aromatic without an aromatic order",
+                 fmt::group_digits(kekule_probe.size()), fmt::group_digits(divergent_bonds));
+    // Without one such bond the section compared only bonds the two flags agree on, and the parity it
+    // exists to pin is untested however green it prints.
+    if (divergent_bonds == 0)
+        return sftest::report_fail(test_name_k, "the kekule probe built no bond flagged aromatic at a Kekule order");
 
     fmt::println("molecules: {} tested, {} with at least one type or charge mismatch",
                  fmt::group_digits(tally.molecules), fmt::group_digits(tally.molecules_mismatched));

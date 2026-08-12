@@ -104,6 +104,7 @@ Everything in between is full overlap.
 - `logger_t` (`src/smallfield/log.hpp`) — owned per-`context_t` or per-tool; emits timestamp-prefixed log lines.
 - `cuda_error_sink_t` (`src/smallfield/cuda_error.hpp`) — routes CUDA / cuSOLVER errors through a `logger_t` and bumps an owner-supplied counter.
 - `batch_pool_t` (`src/smallfield/api/batch_pool.hpp`) — pinned host buffer packed with all per-molecule preprocess output for one `embedding-wave`.
+- `pool_region_t` (`src/smallfield/api/wave_slice_pool.hpp`) — one carved region of a `wave-slice` pool: a byte offset and an element count held as one fact, so an offset paired with a neighbouring region's count stops being spellable. `over` is the only place a region turns back into a pointer, and the count becomes the extent of the span it hands out. `wave_slice_layout_t` is the full set of them, declared in the order `compute_batch_layout` places them.
 - `molecule_complexity_score_` (`src/smallfield/preprocess/molecule_complexity.hpp`) — pure per-molecule work-estimate function used to balance the per-device stripe inside one `embedding-wave`.
 - `distribute_scratch_t` (`src/smallfield/preprocess/etkdg_prepare_batch.hpp`) — grow-only CSR scratch (sort permutation + per-device flat buffer + per-device offsets) reused across every `embedding-wave` so the stripe partition never allocates on the hot path.
 - `metric_scratch_t` (`src/smallfield/api/smallfield.hpp`) — per-GPU device scratch for the metric-embedding prepass within an `embedding-step`.
@@ -123,6 +124,30 @@ The Parquet writer persists the raw byte.
 |     4 | `too_many_atoms`     | Atom count exceeds the compile-time kernel bound.                                                           |
 |     5 | `preprocess_timeout` | Reserved. Nothing produces it; the value is kept so shipped shard bytes keep their meaning.                  |
 |     6 | `unsupported_element` | An atom has no MMFF94 type — boron, transition metals, lanthanides. Neither GPU nor `fallback-role` recovers it. |
+|     7 | `too_many_bonds`     | More bonds than the flat descriptor's `max_bonds_k`, which only a molecule under the atom cap carrying an unusual number of ring closures reaches. |
+|     8 | `too_many_rings`     | More SSSR rings than `atom_ring_bitmap` has bits, or more ring-membership entries than `ring_atoms` holds, so a genuinely in-ring atom would carry no ring label. |
+|     9 | `bounds_infeasible`  | Triangle smoothing drove some atom pair's lower bound above its upper, so no coordinates satisfy the molecule's bounds matrix. |
+
+## Fallback Disposition
+
+`fallback_disposition_t` in `cli/rdkit_fallback.hpp` is the `fallback-role`'s reading of a `conformer_status_t`, and the two states are the whole vocabulary for what a refused slot is worth dispatching.
+
+| Term            | What it means                                                                                                                                                                                    |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| __`retry_k`__   | RDKit embeds by a different route and may fill the slot, so the `fallback-role` spends an embedding on it. Every failure the GPU path can reach through its own numerics is one of these.        |
+| __`terminal_k`__ | `admit_molecule_` re-derives the same refusal from the same caps and the same parser, so dispatching buys one `SmilesToMol` and the verdict the slot already carries. `success` is terminal too. |
+
+The mapping is exhaustive over `conformer_status_t` and carries no `default:`, so a status appended to that append-only enum is a compiler warning rather than a policy inherited in silence.
+
+## Views
+
+A matrix crossing into a kernel is one of two views, and which one is a claim about the row stride rather than a preference.
+Both are `custd::mdspan` addressed `(row, column)`, so no call site decodes an index expression; the aliases are in `src/smallfield/types/views.hpp`.
+
+| Term                  | What it is                                                                                                                                                                                                    |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| __`packed_matrix`__   | Rows packed at the column extent, the host layout. `build_bounds_matrix` and `fill_bond_distances` both write it, and `hop_matrix_t` is its `std::uint8_t` specialization. 16 bytes per kernel argument.     |
+| __`strided_matrix`__  | Rows padded to a stride the caller states. Two layouts need exactly that: the device bounds matrix, whose rows `compute_bounds_row_stride` pads so all 32 lanes land on distinct shared-memory banks, and a conformer slot, whose component planes pad to `conformer_slot_layout_t::max_atoms`. 24 bytes per kernel argument. |
 
 ## Code Map
 
