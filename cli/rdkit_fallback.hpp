@@ -94,10 +94,8 @@ enum class fallback_disposition_t : std::uint8_t {
 
 #pragma region Reporting
 
-/** One past the highest `conformer_status_t`, so a counter array is indexed by the enumerator itself.
- *  The enum is append-only, so its newest value is always its widest. */
-constexpr std::size_t conformer_status_count_k =
-    static_cast<std::size_t>(api::conformer_status_t::bounds_infeasible_k) + 1u;
+/** Counter arrays here are indexed by the enumerator itself, so they take their extent from the enum. */
+using api::conformer_status_count_k;
 
 /**
  *  @brief Per-status account of what one `coprocessed-batch` of refusals cost and bought.

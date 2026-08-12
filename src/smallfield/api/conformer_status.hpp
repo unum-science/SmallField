@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`
 
 namespace smallfield::api {
@@ -54,5 +55,10 @@ enum class conformer_status_t : std::uint8_t {
      *  downstream under a name that describes the symptom rather than the cause. */
     bounds_infeasible_k = 9,
 };
+
+/** One past the highest `conformer_status_t`, so a per-status array is indexed by the enumerator
+ *  itself. The enum is append-only, so its newest value is always its widest. */
+inline constexpr std::size_t conformer_status_count_k =
+    static_cast<std::size_t>(conformer_status_t::bounds_infeasible_k) + 1u;
 
 } // namespace smallfield::api

@@ -164,6 +164,9 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
         },
         py::call_guard<py::gil_scoped_release>(), "Whether this process can see a CUDA device.");
 
+    // Every enumerator is named, so a caller reading `batch.status` never meets a bare integer. The
+    // assertion is what keeps that true: appending a status without naming it below stops the build here.
+    static_assert(api::conformer_status_count_k == 10u, "a conformer_status_t was added - name it below");
     py::enum_<api::conformer_status_t>(smallfield_module, "ConformerStatus")
         .value("SUCCESS", api::conformer_status_t::success_k)
         .value("STEREO_FAILURE", api::conformer_status_t::stereo_failure_k)
@@ -171,7 +174,10 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
         .value("INVALID_SMILES", api::conformer_status_t::invalid_smiles_k)
         .value("TOO_MANY_ATOMS", api::conformer_status_t::too_many_atoms_k)
         .value("PREPROCESS_TIMEOUT", api::conformer_status_t::preprocess_timeout_k)
-        .value("UNSUPPORTED_ELEMENT", api::conformer_status_t::unsupported_element_k);
+        .value("UNSUPPORTED_ELEMENT", api::conformer_status_t::unsupported_element_k)
+        .value("TOO_MANY_BONDS", api::conformer_status_t::too_many_bonds_k)
+        .value("TOO_MANY_RINGS", api::conformer_status_t::too_many_rings_k)
+        .value("BOUNDS_INFEASIBLE", api::conformer_status_t::bounds_infeasible_k);
 
     py::class_<conformer_batch_t>(smallfield_module, "ConformerBatch",
                                   "Named outputs of one `Context.generate_conformers` call.")
