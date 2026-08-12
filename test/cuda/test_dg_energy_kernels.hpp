@@ -1,51 +1,76 @@
 /**
  *  @file test/cuda/test_dg_energy_kernels.hpp
- *  @brief Device harness for distance-geometry energy and FIRE minimization, for use by its unit tests.
+ *  @brief Device harness for distance-geometry energy, chirality validation, and FIRE minimization.
  */
 
 #pragma once
 
 #include <cstdint> // `std::int32_t`, `std::uint32_t`
 
+#include "smallfield/types/etkdg_types.hpp"
+
 namespace smallfield::tests {
+
+/**
+ *  @brief Everything a device call needs about the molecule it is scoring, except the coordinates.
+ *
+ *  The three penalty weights and the two counts are all scalars of the same type, so the entry
+ *  points below take them as one named aggregate rather than as eleven positional arguments a call
+ *  site can silently transpose.
+ */
+struct dg_problem_t {
+    /** Flat `num_atoms` squared bounds matrix, upper bounds above the diagonal. */
+    float const *bounds = nullptr;
+    /** Chiral center descriptors, or `nullptr` when the molecule has none. */
+    types::chiral_center_descriptor_t const *chiral_centers = nullptr;
+    std::uint32_t num_atoms = 0;
+    std::uint32_t num_chiral_centers = 0;
+    /** Coordinate dimensionality — three or four. */
+    std::uint32_t spatial_dimension = 4;
+    float upper_weight = 1.0f;
+    float lower_weight = 1.0f;
+    float chiral_weight = 0.0f;
+    float fourth_dimension_weight = 0.0f;
+};
 
 /**
  *  @brief Evaluate distance-geometry energy and its gradient on the device for one molecule.
  *
+ *  @param[in] problem Bounds, chiral centers, extents, and penalty weights.
  *  @param[in] host_coords Coordinates as `(axis, atom)`, `spatial_dimension * num_atoms` entries, which is
  *      the layout the kernel indexes; an interleaved block passed here scores a different molecule.
  *  @param[out] host_gradient Receives the gradient, same layout as @p host_coords.
- *  @param[in] host_bounds Flat `num_atoms` squared bounds matrix.
- *  @param[in] num_atoms Atom count.
- *  @param[in] spatial_dimension Coordinate dimensionality.
- *  @param[in] upper_weight Penalty weight for upper-bound violations.
- *  @param[in] lower_weight Penalty weight for lower-bound violations.
- *  @param[in] fourth_dim_weight Penalty weight for the fourth-dimension term.
  *  @param[out] out_energy Receives the total energy.
  */
-void gpu_dg_energy(float const *host_coords, float *host_gradient, float const *host_bounds, std::uint32_t num_atoms,
-                   std::uint32_t spatial_dimension, float upper_weight, float lower_weight, float fourth_dim_weight,
-                   float *out_energy);
+void gpu_dg_energy(dg_problem_t const &problem, float const *host_coords, float *host_gradient, float *out_energy);
+
+/**
+ *  @brief Count the chiral centers whose realized geometry contradicts their descriptor.
+ *
+ *  @param[in] problem Bounds, chiral centers, extents, and penalty weights; only the centers are read.
+ *  @param[in] host_coords Coordinates as `(axis, atom)`.
+ *  @return How many centers failed; zero means the stereochemistry is intact.
+ */
+std::uint32_t gpu_count_invalid_chiral_centers(dg_problem_t const &problem, float const *host_coords);
+
+/** What FIRE reported when it stopped. */
+struct dg_minimize_report_t {
+    float energy = 0.0f;
+    float rms_gradient = 0.0f;
+    std::int32_t iterations = 0;
+    std::int32_t status = 0;
+};
 
 /**
  *  @brief Run FIRE minimization of the distance-geometry energy on the device for one molecule.
  *
+ *  @param[in] problem Bounds, chiral centers, extents, and penalty weights.
  *  @param[inout] host_coords Coordinates as `(axis, atom)`, overwritten with the minimized positions.
- *  @param[in] host_bounds Flat `num_atoms` squared bounds matrix.
- *  @param[in] num_atoms Atom count.
- *  @param[in] spatial_dimension Coordinate dimensionality.
- *  @param[in] upper_weight Penalty weight for upper-bound violations.
- *  @param[in] lower_weight Penalty weight for lower-bound violations.
- *  @param[in] fourth_dim_weight Penalty weight for the fourth-dimension term.
  *  @param[in] max_iterations Iteration cap for the FIRE loop.
  *  @param[in] gradient_threshold Convergence threshold on the gradient norm.
- *  @param[out] out_energy Receives the final energy.
- *  @param[out] out_iterations Receives the iteration count at convergence or the cap.
- *  @param[out] out_status Receives the FIRE termination status.
+ *  @param[out] out_report Receives the final energy, RMS gradient, iteration count, and status.
  */
-void gpu_dg_minimize(float *host_coords, float const *host_bounds, std::uint32_t num_atoms,
-                     std::uint32_t spatial_dimension, float upper_weight, float lower_weight, float fourth_dim_weight,
-                     std::int32_t max_iterations, float gradient_threshold, float *out_energy,
-                     std::int32_t *out_iterations, std::int32_t *out_status);
+void gpu_dg_minimize(dg_problem_t const &problem, float *host_coords, std::int32_t max_iterations,
+                     float gradient_threshold, dg_minimize_report_t *out_report);
 
 } // namespace smallfield::tests

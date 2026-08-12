@@ -398,26 +398,25 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                                                 num_atoms, conformer, attempt, lane, &rng_state);
 
             // Distance geometry minimization: Run DG minimization in 4D with up to 100 FIRE iterations.
-            distance_geometry_energy_functor_t dg_functor {shared_bounds,
-                                                           mol_chirals,
-                                                           mol_min,
-                                                           inv_scale,
-                                                           bounds_row_stride,
-                                                           num_atoms,
-                                                           meta.num_chiral_centers,
-                                                           4,
-                                                           1.0f,
-                                                           1.0f,
-                                                           100.0f,
-                                                           0.0f};
+            distance_geometry_energy_functor_t dg_functor {.bounds_matrix = shared_bounds,
+                                                           .chiral_centers = mol_chirals,
+                                                           .mol_min = mol_min,
+                                                           .inv_scale = inv_scale,
+                                                           .bounds_row_stride = bounds_row_stride,
+                                                           .num_atoms = num_atoms,
+                                                           .num_chiral_centers = meta.num_chiral_centers,
+                                                           .spatial_dimension = 4,
+                                                           .upper_violation_weight = 1.0f,
+                                                           .lower_violation_weight = 1.0f,
+                                                           .chiral_volume_weight = 100.0f,
+                                                           .fourth_dimension_penalty_weight = 0.0f};
 
             [[maybe_unused]] fire_result_t const dg_result = fire_minimize_(
                 positions, velocities, gradient, dimensions_4d, 100, 1e-4f, lane, dg_functor);
 
             // Stereochemistry validation: Check stereochemistry.
-            if (meta.num_chiral_centers > 0) {
-                if (!validate_chirality_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane)) continue;
-            }
+            if (count_invalid_chiral_centers_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane) != 0)
+                continue;
 
             // Fourth-dimension crush: Crush the fourth dimension with 50 FIRE iterations.
             dg_functor.fourth_dimension_penalty_weight = 10.0f;
@@ -438,12 +437,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
             else { final_energy = crush_result.energy; }
 
             // Final validation: Run final validation.
-            bool valid = true;
-            if (meta.num_chiral_centers > 0) {
-                valid = validate_chirality_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane);
-            }
-
-            if (valid) {
+            if (count_invalid_chiral_centers_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane) == 0) {
                 // ETK-refined 3D positions are the final output of this kernel.
                 // The sibling mmff_polish_warp_kernel picks them up from
                 // conformer_coordinates_out and runs MMFF94 polish in-place.

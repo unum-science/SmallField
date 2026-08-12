@@ -19,8 +19,8 @@ __global__ void chirality_check_kernel(float const *positions, std::uint32_t num
                                        bool *out_result) {
 
     std::uint32_t const lane = threadIdx.x;
-    bool const result = sfc::validate_chirality_(positions, num_atoms, chirals, num_chirals, lane);
-    if (lane == 0) { *out_result = result; }
+    std::uint32_t const invalid = sfc::count_invalid_chiral_centers_(positions, num_atoms, chirals, num_chirals, lane);
+    if (lane == 0) { *out_result = invalid == 0; }
 }
 
 namespace smallfield::tests {

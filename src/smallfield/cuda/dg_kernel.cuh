@@ -7,7 +7,7 @@
  *  @verbatim
  *  E_total    = E_distance + E_chiral + E_4th_dim
  *  E_distance = Σ_{i<j} [ w_upper * max(0, d_ij - u_ij)^2 + w_lower * max(0, l_ij - d_ij)^2 ]
- *  E_chiral   = Σ_c  w_chiral * V_c^2   (when sign(V_c) != target)
+ *  E_chiral   = Σ_c  w_chiral * (V_c - s_c*v_min_c)^2   (when V_c falls past the signed floor)
  *  E_4th_dim  = w_4 * Σ_i x_i4^2
  *  @endverbatim
  *
@@ -58,31 +58,46 @@ __device__ __forceinline__ float compute_signed_tetrahedral_volume_(float const 
 }
 
 /**
- *  @brief Validate all chiral centers.
+ *  Fraction of a center's `minimum_volume` it may fall to before validation calls it flat.
+ *  RDKit's `checkChiralCenters` in `Embedder.cpp` compares `vol / lb < .8` against the same window.
+ */
+constexpr float chiral_volume_slack_k = 0.8f;
+
+/**
+ *  @brief Count the chiral centers whose geometry contradicts their descriptor.
  *
- *  Returns true iff every signed volume matches its target sign.
- *  Uses `__ballot_sync` for warp-wide consensus.
+ *  A center fails on either of two grounds: the signed volume is handed the wrong way, or its
+ *  magnitude has collapsed to a fraction of the window's floor — a center flat enough to be read
+ *  either way has not proved anything. The handedness comparison is `signbit` against the stored
+ *  sign rather than a product against it, which is RDKit #7560: a product says nothing at a
+ *  negative zero and underflows to zero for the very magnitudes the test exists to catch.
+ *
+ *  Centers are spread across the warp, so the count is warp-reduced and every lane returns it.
  *
  *  @param[in] positions SoA coordinate array.
  *  @param[in] num_atoms Number of atoms.
  *  @param[in] chiral_centers Array of chiral center descriptors.
  *  @param[in] num_chiral_centers Number of chiral centers.
  *  @param[in] lane Warp lane index (0-31).
- *  @return True if all chiral centers have correct sign.
+ *  @return How many centers failed; zero means the stereochemistry is intact.
  */
-__device__ __forceinline__ bool validate_chirality_(float const *positions, std::uint32_t num_atoms,
-                                                    chiral_center_descriptor_t const *chiral_centers,
-                                                    std::uint32_t num_chiral_centers, std::uint32_t lane) {
-    bool lane_ok = true;
+__device__ __forceinline__ std::uint32_t count_invalid_chiral_centers_(float const *positions, std::uint32_t num_atoms,
+                                                                       chiral_center_descriptor_t const *chiral_centers,
+                                                                       std::uint32_t num_chiral_centers,
+                                                                       std::uint32_t lane) {
+    std::uint32_t lane_invalid = 0;
     for (std::uint32_t center_index = lane; center_index < num_chiral_centers; center_index += warp_size_k) {
         auto const &center = chiral_centers[center_index];
         float const volume = compute_signed_tetrahedral_volume_(positions, num_atoms, center.center_atom,
                                                                 center.neighbor_atoms[0], center.neighbor_atoms[1],
                                                                 center.neighbor_atoms[2]);
-        std::int8_t const actual_sign = (volume > 0.0f) ? 1 : -1;
-        if (actual_sign != center.target_sign) lane_ok = false;
+        bool const wrong_handed = (signbit(volume) != 0) != (center.target_sign < 0);
+        bool const too_flat = fabsf(volume) < chiral_volume_slack_k * center.minimum_volume;
+        lane_invalid += (wrong_handed || too_flat) ? 1u : 0u;
     }
-    return __ballot_sync(full_mask_k, lane_ok) == full_mask_k;
+    for (std::uint32_t offset = warp_size_k / 2; offset > 0; offset >>= 1)
+        lane_invalid += __shfl_xor_sync(full_mask_k, lane_invalid, offset);
+    return lane_invalid;
 }
 
 /** Row stride in bytes for the shared int8 bounds matrix.
@@ -235,17 +250,23 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
             float3 const cross_cd = cross_float3_(edge_c, edge_d);
             float const volume = dot_float3_(edge_b, cross_cd);
 
-            float const target_sign = static_cast<float>(center.target_sign);
-            if (volume * target_sign >= 0.0f) continue;
+            // Signing the floor puts both failure modes on one axis: a wrongly handed volume and a
+            // correctly handed but nearly flat one both land on the far side of it, and the
+            // distance to it is already the derivative the gradient wants. A sign test alone leaves
+            // the second case with no restoring force at all, which is the whole defect.
+            float const signed_minimum = center.target_sign < 0 ? -center.minimum_volume : center.minimum_volume;
+            float const shortfall = volume - signed_minimum;
+            float const excess_volume = (signbit(signed_minimum) != signbit(shortfall)) ? shortfall : 0.0f;
+            if (excess_volume == 0.0f) continue;
 
             // only one thread per chiral center counts the energy
-            if (atom == chiral_center_atom) total_energy += chiral_volume_weight * volume * volume;
+            if (atom == chiral_center_atom) total_energy += chiral_volume_weight * excess_volume * excess_volume;
 
             if constexpr (write_gradient) {
                 // V = edge_b · (edge_c × edge_d), so the chain rule gives each neighbour gradient as
                 // a cross product of the other two edges, and the centre takes the negated sum.
                 // cross(edge_c, edge_d) is already in hand as cross_cd.
-                float const scale = 2.0f * chiral_volume_weight * volume;
+                float const scale = 2.0f * chiral_volume_weight * excess_volume;
                 auto add_scaled_to_grad_a_ = [&](float3 const &delta) {
                     grad_a[0] += scale * delta.x;
                     grad_a[1] += scale * delta.y;

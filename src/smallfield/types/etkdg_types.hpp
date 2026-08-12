@@ -111,19 +111,66 @@ struct etkdg_molecule_metadata_t {
 };
 static_assert(sizeof(etkdg_molecule_metadata_t) == 108);
 
+/*
+ *  The volume window a chiral center must stay inside, in cubic angstrom, as magnitudes — the
+ *  handedness is `chiral_center_descriptor_t::target_sign` and lives in exactly one place.
+ *
+ *  Both floors are RDKit's, and each is taken from the place where it transfers into our convention.
+ *  Ours is the triple product over the center and its three lowest-indexed neighbors; RDKit's
+ *  `DistGeom::ChiralSet` bound is over the four @b neighbors taken from the fourth of them.
+ *
+ *  For a three-coordinate center the two are the same expression, because RDKit inserts the center
+ *  itself as its fourth point — so its lower bound of 2 transfers unchanged, and we are exactly as
+ *  strict as `checkChiralCenters` and no stricter.
+ *
+ *  For a four-coordinate center they do not. The two agree up to a factor of four only when the
+ *  center sits at the centroid of its neighbors:
+ *
+ *  @verbatim
+ *  n_0 + n_1 + n_2 + n_3 = 0  (center at the origin)
+ *  det[n_0 - n_3, n_1 - n_3, n_2 - n_3] = det[n_0, n_1, n_2] * det[[2,1,1],[1,2,1],[1,1,2]]
+ *                                       = det[n_0, n_1, n_2] * 4
+ *  @endverbatim
+ *
+ *  Real centers do not: over 2338 stereocenters of a PubChem sample the measured factor averages
+ *  5.4, and it varies with the center, so RDKit's 5 does not convert to a fixed number here. What
+ *  does transfer is its other floor, `MIN_TETRAHEDRAL_CHIRAL_VOL` in `Embedder.cpp`, which
+ *  `_volumeTest` applies to this very triple product over @b unit vectors. Read as a magnitude in
+ *  cubic angstrom it is strictly the weaker test, since every bond a stereocenter carries is longer
+ *  than one angstrom, which is what makes it safe as a dead band rather than a quality gate: across
+ *  3223 correctly embedded stereocenters the smallest realized volume was 0.49, against a rejection
+ *  threshold of 0.4.
+ *
+ *  RDKit's `volUpperBound` has no counterpart here. It sits at 100 cubic angstrom, which a center
+ *  would need bonds over three angstroms long to reach, so the upper branch of its penalty is a
+ *  branch nothing takes, and carrying it cost a register on `sm_100` for no force ever applied.
+ */
+
+/** Floor on |V| for a center with four bonded neighbors. */
+inline constexpr float min_four_coordinate_volume_k = 0.5f;
+/** Floor on |V| for a center whose fourth substituent is a lone pair. */
+inline constexpr float min_three_coordinate_volume_k = 2.0f;
+
 /**
  *  @brief Chiral center descriptor.
- *  Stores the central atom, its neighbors in ascending atom-index order, and the expected sign of
- *  the signed tetrahedral volume over that order.
+ *  Stores the central atom, its neighbors in ascending atom-index order, the expected sign of
+ *  the signed tetrahedral volume over that order, and the smallest magnitude that volume may take.
  *
  *  The ordering is index-based, not CIP-based: `target_sign` is derived from the tetrahedral tag
  *  and the parity of this permutation relative to the bond order the tag is defined against, so
  *  any deterministic order works as long as the same one is used at derivation and validation.
  *  A three-coordinate center stores its three bonded neighbors and leaves the fourth slot unused.
  *
+ *  The sign and the floor are two halves of one statement and neither is derivable from the other:
+ *  the sign says which way the center is handed, the floor says how far from flat it has to stay.
+ *  A sign on its own admits an arbitrarily small volume, and at zero it admits @b either answer, so
+ *  a coplanar center satisfies whichever target it was given and the penalty meant to restore it
+ *  reads no violation at all.
+ *
  *  @verbatim
  *  Validation: V = dot(r_b - r_a, cross(r_c - r_a, r_d - r_a))
- *  where a = center and b, c, d = neighbor_atoms[0..2]; sign(V) must equal target_sign.
+ *  where a = center and b, c, d = neighbor_atoms[0..2].
+ *  sign(V) must equal target_sign, and |V| must reach minimum_volume.
  *  @endverbatim
  */
 struct alignas(8) chiral_center_descriptor_t {
@@ -134,8 +181,11 @@ struct alignas(8) chiral_center_descriptor_t {
     /** Expected sign of the signed tetrahedral volume. */
     std::int8_t target_sign;
     std::uint8_t padding[2];
+    /** Smallest |V| the center may take before it counts as flat, in cubic angstrom. */
+    float minimum_volume;
+    float padding_float;
 };
-static_assert(sizeof(chiral_center_descriptor_t) == 8);
+static_assert(sizeof(chiral_center_descriptor_t) == 16);
 
 /**
  *  ETK torsion term from CSD preferences — the Cambridge Structural Database.

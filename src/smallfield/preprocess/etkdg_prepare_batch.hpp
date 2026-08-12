@@ -91,9 +91,7 @@ using smallfield::types::hop_matrix_t;
 using smallfield::types::hybridization_sp2_k;
 using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::max_bonds_k;
-using smallfield::types::max_four_coordinate_volume_k;
 using smallfield::types::max_mmff_interactions_per_mol_k;
-using smallfield::types::max_three_coordinate_volume_k;
 using smallfield::types::min_four_coordinate_volume_k;
 using smallfield::types::min_three_coordinate_volume_k;
 using smallfield::types::mmff94_angle_center_k;
@@ -981,11 +979,9 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
         int const order_parity = (swaps % 2 == 0) ? 1 : -1;
         chiral_center.target_sign = static_cast<std::int8_t>(-tag_sign * order_parity);
 
-        // A center with a lone pair in place of a fourth bond spans a smaller tetrahedron over the
-        // three neighbors it does have, so it carries the wider window.
-        bool const four_coordinate = count >= 4;
-        chiral_center.minimum_volume = four_coordinate ? min_four_coordinate_volume_k : min_three_coordinate_volume_k;
-        chiral_center.maximum_volume = four_coordinate ? max_four_coordinate_volume_k : max_three_coordinate_volume_k;
+        // Which floor applies is decided by whether RDKit's own bound transfers into our volume
+        // convention, and it does exactly when the center has no fourth bonded neighbor.
+        chiral_center.minimum_volume = count >= 4 ? min_four_coordinate_volume_k : min_three_coordinate_volume_k;
 
         chiral_centers.push_back(chiral_center);
     }
