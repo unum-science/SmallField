@@ -10,13 +10,20 @@
  *
  *      MISMATCH vdw atom_type=12 field=alpha rdkit=1.5 ours=1.5000001 delta=+1.19e-07
  *      MISMATCH bond bond_type=0 atom_i=3 atom_j=7 field=force_constant rdkit=4.928 ours=6.947 delta=+2.019
- *      PASS vdw compared=1245 mismatches=0 suppressed=0
+ *      DIVERGENCE bounds_1_4 smiles=C/C=C/C pair=0,3 upstream=BoundsMatrixBuilder.cpp:_getAtomStereo …
+ *      PASS vdw compared=1245 mismatches=0 divergences=0 suppressed=0
  *      PASS test_mmff94_tables
  *      FAIL test_mmff94_tables: 3 mismatches over 4838 comparisons
  *
  *  `^MISMATCH` filters, `awk -F'[ =]'` parses, and the failing field names itself instead of leaving
  *  the reader to spot which of five printed numbers moved.  Nothing carries a timestamp: ctest stamps
  *  its own, and a varying prefix would destroy the column alignment and make two runs undiffable.
+ *
+ *  `MISMATCH` and `DIVERGENCE` are counted apart because they mean different things. A mismatch is an
+ *  unexplained difference and fails its section; a divergence is one the suite asserts on purpose,
+ *  because upstream is wrong and we are right, and it carries the citation that says so. Folding the
+ *  second into the first would leave a suite only able to widen a tolerance until the disagreement
+ *  stopped failing, which is what destroys the tolerance's meaning.
  *
  *  Precision belongs to a value's role, never to the call site, so no call site writes a format
  *  specifier.  The roles and their specs:
@@ -62,6 +69,8 @@ enum class diagnostic_verb_t : std::uint8_t {
     fail_k,
     /** Narration: an operand pair worth printing whether or not it differs. */
     note_k,
+    /** A difference the suite asserts on purpose, because the reference is the one that is wrong. */
+    divergence_k,
 };
 
 /** The literal a verb prints as. */
@@ -70,6 +79,7 @@ inline std::string_view diagnostic_verb_name(diagnostic_verb_t verb) noexcept {
     case diagnostic_verb_t::mismatch_k: return "MISMATCH";
     case diagnostic_verb_t::pass_k: return "PASS";
     case diagnostic_verb_t::fail_k: return "FAIL";
+    case diagnostic_verb_t::divergence_k: return "DIVERGENCE";
     default: return "NOTE";
     }
 }
@@ -79,6 +89,8 @@ inline std::FILE *diagnostic_stream(diagnostic_verb_t verb) noexcept {
     switch (verb) {
     case diagnostic_verb_t::mismatch_k:
     case diagnostic_verb_t::fail_k: return stderr;
+    /*  `DIVERGENCE` joins `PASS` and `NOTE` on stdout. It is an asserted and cited difference rather
+     *  than a complaint, so a reader watching stderr sees only the differences nobody has explained. */
     default: return stdout;
     }
 }
@@ -132,6 +144,7 @@ class diagnostic_group_t {
 
     void count_comparison_() noexcept;
     void count_mismatch_() noexcept;
+    void count_divergence_() noexcept;
 
   private:
     diagnostic_reporter_t *owner_;
@@ -172,9 +185,10 @@ inline constexpr auto exactly_equal = [](auto const &reference, auto const &obse
 /**
  *  @brief A `NOTE` group whose fields print whether they agree or not.
  *
- *  For the comparisons a passing run still wants to see -- a reference energy beside ours -- where a
- *  divergence is expected and the number itself is the point.  Nothing here counts as a comparison,
- *  so narration can never make a validator look busier than it is.
+ *  For the operand pairs a passing run still wants to see -- a reference energy beside ours -- where the
+ *  number itself is the point and nothing is being asserted about it. Nothing here counts as a
+ *  comparison, so narration can never make a validator look busier than it is. A difference that @b is
+ *  asserted, and cited, is a `divergence_group_t` instead.
  */
 class narration_group_t final : public diagnostic_group_t {
   public:
@@ -190,9 +204,34 @@ class narration_group_t final : public diagnostic_group_t {
         : diagnostic_group_t(owner, diagnostic_verb_t::note_k, std::move(prefix)) {}
 };
 
+/**
+ *  @brief A `DIVERGENCE` group whose fields print unconditionally and are counted apart from mismatches.
+ *
+ *  Where a `NOTE` is narration nobody asserts, a divergence is an assertion the caller has already
+ *  made: it has established that the two operands differ, that the reference is the one that is wrong,
+ *  and that a citation says why. The caller therefore supplies no predicate, exactly as with a note,
+ *  but the line is counted -- as a comparison, so `compared=` stays the number of comparisons actually
+ *  performed, and as a divergence, so `mismatches=` keeps meaning "differences nobody has explained".
+ */
+class divergence_group_t final : public diagnostic_group_t {
+  public:
+    template <typename reference_type_, typename observed_type_>
+    divergence_group_t &field(std::string_view name, reference_type_ const &reference, observed_type_ const &observed) {
+        count_comparison_();
+        count_divergence_();
+        report_(name, reference, observed);
+        return *this;
+    }
+
+  private:
+    friend class diagnostic_reporter_t;
+    divergence_group_t(diagnostic_reporter_t &owner, std::string prefix) noexcept
+        : diagnostic_group_t(owner, diagnostic_verb_t::divergence_k, std::move(prefix)) {}
+};
+
 /** What one section closed with. Zero `compared` is a failure, so a caller can gate on it directly. */
 struct section_counts_t {
-    std::size_t compared = 0, mismatched = 0, suppressed = 0;
+    std::size_t compared = 0, mismatched = 0, diverged = 0, suppressed = 0;
 };
 
 /**
@@ -223,8 +262,15 @@ class diagnostic_reporter_t {
         return narration_group_t(*this, prefix_(subject, keys, std::forward<key_types_>(key_values)...));
     }
 
+    /** Open a group whose every field is a difference the caller has already established and cited. */
+    template <typename... key_types_>
+    divergence_group_t divergence(std::string_view subject, fmt::format_string<key_types_...> keys,
+                                  key_types_ &&...key_values) {
+        return divergence_group_t(*this, prefix_(subject, keys, std::forward<key_types_>(key_values)...));
+    }
+
     /**
-     *  @brief Close a section with `PASS <subject> compared=… mismatches=… suppressed=…`, or the FAIL form.
+     *  @brief Close a section with `PASS <subject> compared=… mismatches=… divergences=… suppressed=…`.
      *
      *  Counts run from the previous `summarize`, so one reporter can close several sections in order.
      *  A section that compared nothing fails: it is indistinguishable from a passing one otherwise.
@@ -234,18 +280,20 @@ class diagnostic_reporter_t {
     section_counts_t summarize(std::string_view subject) {
         std::size_t const compared = comparison_count_ - section_comparison_mark_;
         std::size_t const mismatched = mismatch_count_ - section_mismatch_mark_;
+        std::size_t const diverged = divergence_count_ - section_divergence_mark_;
         std::size_t const suppressed = suppressed_line_count_ - section_suppressed_mark_;
         if (compared == 0) ++vacuous_section_count_;
         diagnostic_verb_t const verb = (mismatched != 0 || compared == 0) ? diagnostic_verb_t::fail_k
                                                                           : diagnostic_verb_t::pass_k;
         std::FILE *const stream = diagnostic_stream(verb);
         if (stream == stderr) std::fflush(stdout);
-        fmt::println(stream, "{} {} compared={} mismatches={} suppressed={}", diagnostic_verb_name(verb), subject,
-                     compared, mismatched, suppressed);
+        fmt::println(stream, "{} {} compared={} mismatches={} divergences={} suppressed={}", diagnostic_verb_name(verb),
+                     subject, compared, mismatched, diverged, suppressed);
         section_comparison_mark_ = comparison_count_;
         section_mismatch_mark_ = mismatch_count_;
+        section_divergence_mark_ = divergence_count_;
         section_suppressed_mark_ = suppressed_line_count_;
-        return {compared, mismatched, suppressed};
+        return {.compared = compared, .mismatched = mismatched, .diverged = diverged, .suppressed = suppressed};
     }
 
     /** Cap printed lines so one pathological molecule cannot bury the log; the rest are still counted. */
@@ -253,6 +301,7 @@ class diagnostic_reporter_t {
 
     std::size_t comparison_count() const noexcept { return comparison_count_; }
     std::size_t mismatch_count() const noexcept { return mismatch_count_; }
+    std::size_t divergence_count() const noexcept { return divergence_count_; }
     std::size_t suppressed_line_count() const noexcept { return suppressed_line_count_; }
 
     /** True when nothing mismatched and every summarized section actually compared something. */
@@ -284,17 +333,20 @@ class diagnostic_reporter_t {
     std::string observed_label_;
     std::size_t comparison_count_ = 0;
     std::size_t mismatch_count_ = 0;
+    std::size_t divergence_count_ = 0;
     std::size_t printed_line_count_ = 0;
     std::size_t suppressed_line_count_ = 0;
     std::size_t vacuous_section_count_ = 0;
     std::size_t printed_line_budget_ = std::numeric_limits<std::size_t>::max();
     std::size_t section_comparison_mark_ = 0;
     std::size_t section_mismatch_mark_ = 0;
+    std::size_t section_divergence_mark_ = 0;
     std::size_t section_suppressed_mark_ = 0;
 };
 
 inline void diagnostic_group_t::count_comparison_() noexcept { ++owner_->comparison_count_; }
 inline void diagnostic_group_t::count_mismatch_() noexcept { ++owner_->mismatch_count_; }
+inline void diagnostic_group_t::count_divergence_() noexcept { ++owner_->divergence_count_; }
 
 template <typename reference_type_, typename observed_type_>
 void diagnostic_group_t::report_(std::string_view name, reference_type_ const &reference,
@@ -335,8 +387,8 @@ void diagnostic_group_t::report_(std::string_view name, reference_type_ const &r
  *  section, `PASS test_mmff94_tables` closes the process.
  */
 inline int report_pass(std::string_view test_name) {
-    fmt::println(diagnostic_stream(diagnostic_verb_t::pass_k), "{} {}",
-                 diagnostic_verb_name(diagnostic_verb_t::pass_k), test_name);
+    fmt::println(diagnostic_stream(diagnostic_verb_t::pass_k), "{} {}", diagnostic_verb_name(diagnostic_verb_t::pass_k),
+                 test_name);
     return 0;
 }
 

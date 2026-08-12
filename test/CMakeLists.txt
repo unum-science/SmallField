@@ -4,9 +4,12 @@
 # A mixed test pairs `<subfolder>/test_<name>.cpp` with `<subfolder>/test_<name>_kernels.cu`.  The .cpp calls a plain
 # host wrapper the .cu defines, which is ordinary host linkage -- no relocatable device code is involved, which is why
 # `define_smallfield_target` leaves it off.
+#
+# EXTRA_SOURCES carries a table a test owns but does not want in its own translation unit: rows of plain data belong in
+# a host-only .cpp for the same reason `csd_torsion_table.cpp` is one.
 function (define_smallfield_test subfolder base_name)
-    cmake_parse_arguments(ARG "MIXED" "" "LINK" ${ARGN})
-    set(sources "${subfolder}/test_${base_name}.cpp")
+    cmake_parse_arguments(ARG "MIXED" "" "LINK;EXTRA_SOURCES" ${ARGN})
+    set(sources "${subfolder}/test_${base_name}.cpp" ${ARG_EXTRA_SOURCES})
     if (ARG_MIXED)
         list(APPEND sources "${subfolder}/test_${base_name}_kernels.cu")
     endif ()
@@ -44,6 +47,7 @@ define_smallfield_test(preprocess csd_torsion_predicates)
 define_smallfield_test(preprocess element_gate)
 define_smallfield_test(preprocess chiral_parity)
 define_smallfield_test(preprocess batch_layout)
+define_smallfield_test(preprocess rdkit_divergences EXTRA_SOURCES preprocess/rdkit_divergence_table.cpp)
 
 define_smallfield_test(postprocess shape_descriptors)
 
