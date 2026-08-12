@@ -122,7 +122,6 @@ constexpr std::uint32_t compute_bounds_row_stride(std::uint32_t num_atoms) {
  *  every other atom in a warp-uniform inner loop, whose coordinates are read
  *  straight out of @p positions as a broadcast.
  *
- *  @tparam write_gradient When true, computes and writes gradient; when false, energy only.
  *  @param[in] bounds_matrix Int8-quantized bounds matrix in shared memory. Upper bound at
  *      [min_index × bounds_row_stride + max_index], lower at [max_index × bounds_row_stride + min_index].
  *      Dequantize with `q * inv_scale + mol_min`.
@@ -139,13 +138,12 @@ constexpr std::uint32_t compute_bounds_row_stride(std::uint32_t num_atoms) {
  *  @param[in] chiral_volume_weight Weight for chiral volume violations.
  *  @param[in] fourth_dimension_penalty_weight Weight for 4th dimension crush penalty.
  *  @param[in] positions SoA coordinate array.
- *  @param[out] gradient Output gradient array (same layout as positions), unused when !write_gradient.
+ *  @param[out] gradient Output gradient array (same layout as positions).
  *  @param[in] num_elements Total number of coordinate elements.
  *  @param[in] lane Warp lane index (0-31).
  *  @return Total energy (same value in all lanes after warp reduction).
  *  @see fire_minimize_
  */
-template <bool write_gradient>
 __device__ __forceinline__ float evaluate_distance_geometry_energy(
     std::uint8_t const *__restrict__ bounds_matrix, float mol_min, float inv_scale, std::uint32_t bounds_row_stride,
     chiral_center_descriptor_t const *__restrict__ chiral_centers, std::uint32_t num_atoms,
@@ -155,10 +153,8 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
 
     std::uint32_t const dim = spatial_dimension;
 
-    if constexpr (write_gradient) {
-        for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) gradient[element] = 0.0f;
-        __syncwarp(full_mask_k);
-    }
+    for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) gradient[element] = 0.0f;
+    __syncwarp(full_mask_k);
 
     float total_energy = 0.0f;
 
@@ -210,13 +206,11 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
                 float const violation = distance - upper_bound;
                 if (atom_first) total_energy += upper_violation_weight * violation * violation;
 
-                if constexpr (write_gradient) {
-                    float const scale = 2.0f * upper_violation_weight * violation * inverse_distance;
-                    grad_a[0] -= scale * delta_x;
-                    grad_a[1] -= scale * delta_y;
-                    grad_a[2] -= scale * delta_z;
-                    if (dim == 4) grad_a[3] -= scale * delta_w;
-                }
+                float const scale = 2.0f * upper_violation_weight * violation * inverse_distance;
+                grad_a[0] -= scale * delta_x;
+                grad_a[1] -= scale * delta_y;
+                grad_a[2] -= scale * delta_z;
+                if (dim == 4) grad_a[3] -= scale * delta_w;
             }
 
             // lower bound violation
@@ -224,13 +218,11 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
                 float const violation = lower_bound - distance;
                 if (atom_first) total_energy += lower_violation_weight * violation * violation;
 
-                if constexpr (write_gradient) {
-                    float const scale = -2.0f * lower_violation_weight * violation * inverse_distance;
-                    grad_a[0] -= scale * delta_x;
-                    grad_a[1] -= scale * delta_y;
-                    grad_a[2] -= scale * delta_z;
-                    if (dim == 4) grad_a[3] -= scale * delta_w;
-                }
+                float const scale = -2.0f * lower_violation_weight * violation * inverse_distance;
+                grad_a[0] -= scale * delta_x;
+                grad_a[1] -= scale * delta_y;
+                grad_a[2] -= scale * delta_z;
+                if (dim == 4) grad_a[3] -= scale * delta_w;
             }
         }
 
@@ -262,25 +254,23 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
             // only one thread per chiral center counts the energy
             if (atom == chiral_center_atom) total_energy += chiral_volume_weight * excess_volume * excess_volume;
 
-            if constexpr (write_gradient) {
-                // V = edge_b · (edge_c × edge_d), so the chain rule gives each neighbour gradient as
-                // a cross product of the other two edges, and the centre takes the negated sum.
-                // cross(edge_c, edge_d) is already in hand as cross_cd.
-                float const scale = 2.0f * chiral_volume_weight * excess_volume;
-                auto add_scaled_to_grad_a_ = [&](float3 const &delta) {
-                    grad_a[0] += scale * delta.x;
-                    grad_a[1] += scale * delta.y;
-                    grad_a[2] += scale * delta.z;
-                };
+            // V = edge_b · (edge_c × edge_d), so the chain rule gives each neighbour gradient as
+            // a cross product of the other two edges, and the centre takes the negated sum.
+            // cross(edge_c, edge_d) is already in hand as cross_cd.
+            float const scale = 2.0f * chiral_volume_weight * excess_volume;
+            auto add_scaled_to_grad_a_ = [&](float3 const &delta) {
+                grad_a[0] += scale * delta.x;
+                grad_a[1] += scale * delta.y;
+                grad_a[2] += scale * delta.z;
+            };
 
-                if (atom == chiral_neighbor_a) { add_scaled_to_grad_a_(cross_cd); }
-                else if (atom == chiral_neighbor_b) { add_scaled_to_grad_a_(cross_float3_(edge_d, edge_b)); }
-                else if (atom == chiral_neighbor_c) { add_scaled_to_grad_a_(cross_float3_(edge_b, edge_c)); }
-                else if (atom == chiral_center_atom) {
-                    float3 const dvdc = cross_float3_(edge_d, edge_b);
-                    float3 const dvdd = cross_float3_(edge_b, edge_c);
-                    add_scaled_to_grad_a_(scale_float3_(add_float3_(add_float3_(cross_cd, dvdc), dvdd), -1.0f));
-                }
+            if (atom == chiral_neighbor_a) { add_scaled_to_grad_a_(cross_cd); }
+            else if (atom == chiral_neighbor_b) { add_scaled_to_grad_a_(cross_float3_(edge_d, edge_b)); }
+            else if (atom == chiral_neighbor_c) { add_scaled_to_grad_a_(cross_float3_(edge_b, edge_c)); }
+            else if (atom == chiral_center_atom) {
+                float3 const dvdc = cross_float3_(edge_d, edge_b);
+                float3 const dvdd = cross_float3_(edge_b, edge_c);
+                add_scaled_to_grad_a_(scale_float3_(add_float3_(add_float3_(cross_cd, dvdc), dvdd), -1.0f));
             }
         }
 
@@ -288,14 +278,12 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
         if (fourth_dimension_penalty_weight > 0.0f && dim == 4) {
             float const w_coord = coord_a[3];
             total_energy += fourth_dimension_penalty_weight * w_coord * w_coord;
-            if constexpr (write_gradient) grad_a[3] += 2.0f * fourth_dimension_penalty_weight * w_coord;
+            grad_a[3] += 2.0f * fourth_dimension_penalty_weight * w_coord;
         }
 
         // write gradient for this atom (direct write, no atomicAdd)
-        if constexpr (write_gradient) {
-            for (std::uint32_t dimension = 0; dimension < dim; ++dimension)
-                gradient[dimension * num_atoms + atom] = grad_a[dimension];
-        }
+        for (std::uint32_t dimension = 0; dimension < dim; ++dimension)
+            gradient[dimension * num_atoms + atom] = grad_a[dimension];
     }
 
     return warp_reduce_sum_f32_(total_energy);
@@ -339,7 +327,7 @@ struct distance_geometry_energy_functor_t {
      */
     __device__ __forceinline__ float operator()(float const *positions, float *gradient, std::uint32_t num_elements,
                                                 std::uint32_t lane) const {
-        return evaluate_distance_geometry_energy<true>(
+        return evaluate_distance_geometry_energy(
             bounds_matrix, mol_min, inv_scale, bounds_row_stride, chiral_centers, num_atoms, num_chiral_centers,
             spatial_dimension, upper_violation_weight, lower_violation_weight, chiral_volume_weight,
             fourth_dimension_penalty_weight, positions, gradient, num_elements, lane);

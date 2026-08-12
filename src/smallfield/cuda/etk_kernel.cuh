@@ -40,7 +40,6 @@ using smallfield::types::etk_torsion_k;
  *  specified @p atom_role (first through fourth) into the provided @p grad_x / @p grad_y / @p grad_z
  *  accumulators.
  *
- *  @tparam write_gradient_ When true, computes and writes gradient; when false, energy only.
  *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
  *  @param[in] num_atoms Number of atoms in the molecule.
  *  @param[in] torsion Torsion descriptor with atom indices and Fourier coefficients.
@@ -48,7 +47,6 @@ using smallfield::types::etk_torsion_k;
  *  @param[inout] gradient Accumulated gradient for the atom.
  *  @return Torsion energy contribution (kcal/mol).
  */
-template <bool write_gradient_>
 __device__ __forceinline__ float compute_torsion_contribution_(float const *positions, std::uint32_t num_atoms,
                                                                etk_torsion_descriptor_t const &torsion,
                                                                std::uint32_t atom_role, float3 *gradient) {
@@ -81,25 +79,23 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
 
     // Direction of this atom's torsion force, which the Fourier coefficients only rescale.
     // The four roles' forces still sum to zero by Newton's 3rd law.
-    float3 force_direction {0.0f, 0.0f, 0.0f};
-    if constexpr (write_gradient_) {
-        float3 lever_0 {0.0f, 0.0f, 0.0f};
-        float3 lever_1 {0.0f, 0.0f, 0.0f};
-        switch (atom_role) {
-        case atom_role_first_k: lever_0 = scale_float3_(bond_vec_1, -inverse_normal_length_0); break;
-        case atom_role_second_k:
-            lever_0 = scale_float3_(sub_float3_(bond_vec_1, bond_vec_0), inverse_normal_length_0);
-            lever_1 = scale_float3_(bond_vec_3, -inverse_normal_length_1);
-            break;
-        case atom_role_third_k:
-            lever_0 = scale_float3_(bond_vec_0, inverse_normal_length_0);
-            lever_1 = scale_float3_(add_float3_(bond_vec_3, bond_vec_1), inverse_normal_length_1);
-            break;
-        case atom_role_fourth_k: lever_1 = scale_float3_(bond_vec_1, -inverse_normal_length_1); break;
-        }
-        force_direction = add_float3_(cross_float3_(normal_0, sub_float3_(lever_1, scale_float3_(lever_0, cos_phi))),
-                                      cross_float3_(normal_1, sub_float3_(lever_0, scale_float3_(lever_1, cos_phi))));
+    float3 lever_0 {0.0f, 0.0f, 0.0f};
+    float3 lever_1 {0.0f, 0.0f, 0.0f};
+    switch (atom_role) {
+    case atom_role_first_k: lever_0 = scale_float3_(bond_vec_1, -inverse_normal_length_0); break;
+    case atom_role_second_k:
+        lever_0 = scale_float3_(sub_float3_(bond_vec_1, bond_vec_0), inverse_normal_length_0);
+        lever_1 = scale_float3_(bond_vec_3, -inverse_normal_length_1);
+        break;
+    case atom_role_third_k:
+        lever_0 = scale_float3_(bond_vec_0, inverse_normal_length_0);
+        lever_1 = scale_float3_(add_float3_(bond_vec_3, bond_vec_1), inverse_normal_length_1);
+        break;
+    case atom_role_fourth_k: lever_1 = scale_float3_(bond_vec_1, -inverse_normal_length_1); break;
     }
+    float3 const force_direction = add_float3_(
+        cross_float3_(normal_0, sub_float3_(lever_1, scale_float3_(lever_0, cos_phi))),
+        cross_float3_(normal_1, sub_float3_(lever_0, scale_float3_(lever_1, cos_phi))));
 
     // Chebyshev recurrence for 6-term Fourier series
     float energy = 0.0f;
@@ -125,8 +121,6 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
         cos_curr = cos_next;
     }
 
-    if constexpr (!write_gradient_) return energy;
-
     // sin_term = -energy_gradient_dihedral / sin(φ), needed for the chain rule ∂E/∂r = sin_term * ∂cos(φ)/∂r
     // at φ = 0 or pi, sin(φ) -> 0 but energy_gradient_dihedral -> 0 too (sin(nφ) = 0 for integer n).
     // L'Hopital: lim[sin->0] energy_gradient_dihedral/sin(φ) = ∂^2E/∂φ^2 / cos(φ)
@@ -144,30 +138,26 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
  *  Each thread owns atoms, iterates all torsions checking participation.
  *  No atomicAdd.
  *
- *  @tparam write_gradient_ When true, computes and writes gradient; when false, energy only.
  *  @param[in] torsion_terms Array of torsion descriptors.
  *  @param[in] distance_constraints Array of distance constraint descriptors.
  *  @param[in] interactions Per-atom interaction list entries.
  *  @param[in] atom_offsets Per-atom offsets into the interaction list.
  *  @param[in] num_atoms Number of atoms in the molecule.
  *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
- *  @param[out] gradient Output gradient array (same layout as positions), unused when !write_gradient_.
+ *  @param[out] gradient Output gradient array (same layout as positions).
  *  @param[in] num_elements Total number of coordinate elements.
  *  @param[in] lane Warp lane index (0-31).
  *  @return Total energy (same value in all lanes after warp reduction).
  *  @see fire_minimize_
  */
-template <bool write_gradient_>
 __device__ __forceinline__ float evaluate_etk_torsion_energy(
     etk_torsion_descriptor_t const *__restrict__ torsion_terms,
     distance_constraint_t const *__restrict__ distance_constraints,
     etk_atom_interaction_t const *__restrict__ interactions, etk_atom_offsets_t const *__restrict__ atom_offsets,
     std::uint32_t num_atoms, float const *positions, float *gradient, std::uint32_t num_elements, std::uint32_t lane) {
 
-    if constexpr (write_gradient_) {
-        for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) gradient[element] = 0.0f;
-        __syncwarp(full_mask_k);
-    }
+    for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) gradient[element] = 0.0f;
+    __syncwarp(full_mask_k);
 
     float total_energy = 0.0f;
 
@@ -182,7 +172,7 @@ __device__ __forceinline__ float evaluate_etk_torsion_energy(
 
             if (entry.interaction_type == etk_torsion_k) {
                 // torsion term
-                float torsion_energy = compute_torsion_contribution_<write_gradient_>(
+                float torsion_energy = compute_torsion_contribution_(
                     positions, num_atoms, torsion_terms[entry.term_index], entry.role, &gradient_acc);
                 if (entry.role == atom_role_first_k) total_energy += torsion_energy;
             }
@@ -206,23 +196,19 @@ __device__ __forceinline__ float evaluate_etk_torsion_energy(
                 if (distance > upper_bound) {
                     if (entry.role == atom_role_first_k)
                         total_energy += weight * (distance - upper_bound) * (distance - upper_bound);
-                    if constexpr (write_gradient_) {
-                        float const scale = 2.0f * weight * (distance - upper_bound) * inverse_distance;
-                        accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
-                    }
+                    float const scale = 2.0f * weight * (distance - upper_bound) * inverse_distance;
+                    accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
                 }
                 else if (distance < lower_bound) {
                     if (entry.role == atom_role_first_k)
                         total_energy += weight * (lower_bound - distance) * (lower_bound - distance);
-                    if constexpr (write_gradient_) {
-                        float const scale = -2.0f * weight * (lower_bound - distance) * inverse_distance;
-                        accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
-                    }
+                    float const scale = -2.0f * weight * (lower_bound - distance) * inverse_distance;
+                    accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
                 }
             }
         }
 
-        if constexpr (write_gradient_) store_gradient_(gradient, num_atoms, atom, gradient_acc);
+        store_gradient_(gradient, num_atoms, atom, gradient_acc);
     }
 
     return warp_reduce_sum_f32_(total_energy);
@@ -243,8 +229,8 @@ struct etk_torsion_energy_functor_t {
 
     __device__ __forceinline__ float operator()(float const *positions, float *gradient, std::uint32_t num_elements,
                                                 std::uint32_t lane) const {
-        return evaluate_etk_torsion_energy<true>(torsion_terms, distance_constraints, interactions, atom_offsets,
-                                                 num_atoms, positions, gradient, num_elements, lane);
+        return evaluate_etk_torsion_energy(torsion_terms, distance_constraints, interactions, atom_offsets, num_atoms,
+                                           positions, gradient, num_elements, lane);
     }
 };
 

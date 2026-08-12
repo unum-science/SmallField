@@ -504,10 +504,8 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
  *  pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) — those terms
  *  are small and not worth packing out.
  *
- *  @tparam write_gradient_ When true, computes and writes gradient; when false, energy only.
  *  @see fire_minimize_
  */
-template <bool write_gradient_>
 __device__ __forceinline__ float evaluate_mmff94_energy(
     mmff94_atom_vdw_params_t const *__restrict__ atom_vdw_params, float const *__restrict__ atom_charge,
     std::uint8_t const *__restrict__ bond_distance, mmff94_bond_t const *__restrict__ bond_params,
@@ -516,10 +514,8 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
     mmff94_atom_interaction_t const *__restrict__ interactions, mmff94_atom_offsets_t const *__restrict__ atom_offsets,
     std::uint32_t num_atoms, float const *positions, float *gradient, std::uint32_t num_elements, std::uint32_t lane) {
 
-    if constexpr (write_gradient_) {
-        for (std::uint32_t i = lane; i < num_elements; i += warp_size_k) gradient[i] = 0.0f;
-        __syncwarp(full_mask_k);
-    }
+    for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) gradient[element] = 0.0f;
+    __syncwarp(full_mask_k);
 
     float total_energy = 0.0f;
 
@@ -568,7 +564,7 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
                                            stretchbend_params[interactions[index].term_index], interactions[index].role,
                                            &total_energy, &gradient_acc);
 
-        if constexpr (write_gradient_) store_gradient_(gradient, num_atoms, atom, gradient_acc);
+        store_gradient_(gradient, num_atoms, atom, gradient_acc);
     }
 
     return warp_reduce_sum_f32_(total_energy);
@@ -595,9 +591,9 @@ struct mmff94_energy_functor_t {
 
     __device__ __forceinline__ float operator()(float const *positions, float *gradient, std::uint32_t num_elements,
                                                 std::uint32_t lane) const {
-        return evaluate_mmff94_energy<true>(atom_vdw_params, atom_charge, bond_distance, bond_params, angle_params,
-                                            torsion_params, oop_params, stretchbend_params, interactions, atom_offsets,
-                                            num_atoms, positions, gradient, num_elements, lane);
+        return evaluate_mmff94_energy(atom_vdw_params, atom_charge, bond_distance, bond_params, angle_params,
+                                      torsion_params, oop_params, stretchbend_params, interactions, atom_offsets,
+                                      num_atoms, positions, gradient, num_elements, lane);
     }
 };
 
