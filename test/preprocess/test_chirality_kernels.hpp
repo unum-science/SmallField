@@ -28,9 +28,10 @@ enum class chirality_verdict_t : std::uint8_t {
     unavailable_k,
 };
 
-/** One molecule's conformer, read and never written by the device check. */
-using conformer_reader_t = smallfield::types::coordinates_soa<smallfield::types::coordinate_role_t::position_k,
-                                                              float const, smallfield::types::conformer_dimensions_k>;
+/** One molecule's axis-major conformer, read and never written by the device check. */
+using conformer_soa_reader_t =
+    smallfield::types::coordinates_soa<smallfield::types::coordinate_role_t::position_k, float const,
+                                       smallfield::types::conformer_dimensions_k>;
 
 /**
  *  @brief Validate every chiral center of one molecule on the device from its 3D coordinates.
@@ -41,6 +42,6 @@ using conformer_reader_t = smallfield::types::coordinates_soa<smallfield::types:
  *  @return Whether every center matches its expected parity, or that the device could not be asked.
  */
 chirality_verdict_t gpu_validate_chirality(
-    conformer_reader_t host_coords, custd::span<smallfield::types::chiral_center_descriptor_t const> host_chirals);
+    conformer_soa_reader_t host_coords, custd::span<smallfield::types::chiral_center_descriptor_t const> host_chirals);
 
 } // namespace smallfield::tests

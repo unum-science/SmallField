@@ -44,7 +44,7 @@
 
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfp = smallfield::postprocess;
+namespace sfpost = smallfield::postprocess;
 namespace sftest = smallfield::tests;
 
 static constexpr std::string_view test_name_k = "test_shape_descriptors";
@@ -178,7 +178,7 @@ struct shape_reporters_t {
 /** Buffers that outlive the molecule loop, so a corpus sweep grows each of them once. */
 struct shape_scratch_t {
     /** Typed once per molecule into the same object the production loops hoist, capacity included. */
-    sfp::molecule_shape_context_t context;
+    sfpost::molecule_shape_context_t context;
     std::vector<float> coordinates;
     std::array<double, 12> native_usr {};
     std::array<double, 60> native_usrcat {};
@@ -223,11 +223,11 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smil
         molecule, types::reset_coordinates_aos<types::coordinate_role_t::position_k>(scratch.coordinates, num_atoms));
     set_coords_interleaved(molecule, scratch.coordinates.data());
 
-    sfp::usr_descriptor(scratch.coordinates, num_atoms, scratch.native_usr);
+    sfpost::usr_descriptor(scratch.coordinates, num_atoms, scratch.native_usr);
     scratch.rdkit_usr.assign(scratch.native_usr.size(), 0.0);
     RDKit::Descriptors::USR(molecule, scratch.rdkit_usr);
 
-    sfp::usrcat_descriptor(scratch.coordinates, scratch.context, scratch.native_usrcat);
+    sfpost::usrcat_descriptor(scratch.coordinates, scratch.context, scratch.native_usrcat);
     scratch.rdkit_usrcat.assign(scratch.native_usrcat.size(), 0.0);
     // `USRCAT` reads the atom-id argument as an input whenever it arrives non-empty, so a reused buffer would
     // type this molecule with the previous one's CREDO subsets and compare two unrelated descriptors.
@@ -340,7 +340,7 @@ static double centroid_offaxis_(std::array<double, 3> const &centroid) {
  *      holding the separated ones.
  */
 static void check_separation_(std::string const &smiles, shape_reporters_t &reporters, shape_scratch_t &scratch) {
-    sfp::molecule_shape_context_t const &context = scratch.context;
+    sfpost::molecule_shape_context_t const &context = scratch.context;
     std::uint32_t const num_components = context.num_components;
     scratch.intra_sum_before.assign(num_components, 0.0);
     scratch.offaxis_before.assign(num_components, 0.0);
@@ -353,7 +353,7 @@ static void check_separation_(std::string const &smiles, shape_reporters_t &repo
         scratch.offaxis_before[component] = centroid_offaxis_(scratch.centroid_before[component]);
     }
 
-    sfp::separate_fragments(scratch.coordinates, context);
+    sfpost::separate_fragments(scratch.coordinates, context);
 
     auto const unchanged = [](double reference, double observed) {
         return std::fabs(reference - observed) <= rigid_relative_tolerance_k * std::max(1.0, std::fabs(reference));
@@ -418,11 +418,11 @@ static void check_builtin_(std::string const &smiles, shape_reporters_t &reporte
 
     // One verdict covers both claims a builtin has to meet: it types, and it types the molecule that was
     // just embedded, which is what makes the coordinates below address the atoms the context describes.
-    sfp::shape_typing_t const typing = sfp::build_shape_context_into(
+    sfpost::shape_typing_t const typing = sfpost::build_shape_context_into(
         smiles, molecule->getNumAtoms(), smallfield::keep_largest_fragment_k, scratch.context);
-    sf_verify_(typing == sfp::shape_typing_t::typed_k,
+    sf_verify_(typing == sfpost::shape_typing_t::typed_k,
                fmt::format("a builtin SMILES must type against its own embedded molecule, but {} {}", smiles,
-                           sfp::describe_shape_typing(typing)));
+                           sfpost::describe_shape_typing(typing)));
     compare_descriptors_(*molecule, smiles, reporters, scratch);
 }
 
@@ -437,10 +437,10 @@ static void check_builtin_salt_(shape_reporters_t &reporters, shape_scratch_t &s
     std::unique_ptr<RDKit::RWMol> molecule;
     sf_verify_(prepare_molecule_(salt, molecule) == prepare_outcome_t::prepared_k, "builtin salt must embed");
 
-    sfp::shape_typing_t const typing = sfp::build_shape_context_into(salt, molecule->getNumAtoms(),
-                                                                     smallfield::keep_all_fragments_k, scratch.context);
-    sf_verify_(typing == sfp::shape_typing_t::typed_k,
-               fmt::format("the builtin salt must type, but {} {}", salt, sfp::describe_shape_typing(typing)));
+    sfpost::shape_typing_t const typing = sfpost::build_shape_context_into(
+        salt, molecule->getNumAtoms(), smallfield::keep_all_fragments_k, scratch.context);
+    sf_verify_(typing == sfpost::shape_typing_t::typed_k,
+               fmt::format("the builtin salt must type, but {} {}", salt, sfpost::describe_shape_typing(typing)));
     sf_verify_(scratch.context.num_components == 2, "the builtin salt must have exactly two components");
 
     read_conformer_into(*molecule, types::reset_coordinates_aos<types::coordinate_role_t::position_k>(
@@ -467,12 +467,12 @@ static void check_corpus_line_(std::string const &smiles, shape_reporters_t &rep
 
     // Each refusal is a corpus line the comparison never reaches rather than a defect, so each is counted
     // under its own name and the section's `compared=` stays honest about what it saw.
-    switch (sfp::build_shape_context_into(smiles, molecule->getNumAtoms(), smallfield::keep_all_fragments_k,
-                                          scratch.context)) {
-    case sfp::shape_typing_t::unparsed_k: ++tally.untyped; return;
-    case sfp::shape_typing_t::too_many_fragments_k: ++tally.too_many_fragments; return;
-    case sfp::shape_typing_t::atom_count_divergence_k: ++tally.atom_count_divergence; return;
-    case sfp::shape_typing_t::typed_k: break;
+    switch (sfpost::build_shape_context_into(smiles, molecule->getNumAtoms(), smallfield::keep_all_fragments_k,
+                                             scratch.context)) {
+    case sfpost::shape_typing_t::unparsed_k: ++tally.untyped; return;
+    case sfpost::shape_typing_t::too_many_fragments_k: ++tally.too_many_fragments; return;
+    case sfpost::shape_typing_t::atom_count_divergence_k: ++tally.atom_count_divergence; return;
+    case sfpost::shape_typing_t::typed_k: break;
     }
 
     try {

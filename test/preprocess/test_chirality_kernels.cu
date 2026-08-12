@@ -50,7 +50,7 @@ struct chirality_arena_t {
     }
 };
 
-chirality_verdict_t gpu_validate_chirality(conformer_reader_t host_coords,
+chirality_verdict_t gpu_validate_chirality(conformer_soa_reader_t host_coords,
                                            custd::span<sft::chiral_center_descriptor_t const> host_chirals) {
 
     std::uint32_t const num_atoms = host_coords.extent(0);
