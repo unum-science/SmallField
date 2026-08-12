@@ -5,18 +5,21 @@
  *  Two regions a batch carries are quadratic in the atom count — the N × N distance bounds matrix and the
  *  N × N hop-count matrix — and every other region is linear. A `std::uint32_t` running total of a
  *  quadratic region wraps inside a single `embedding-wave` at drug-like sizes, and a wrapped total
- *  under-sizes the pinned allocation rather than failing, so the test drives `accumulate_sizes` and
- *  `compute_batch_layout` at molecule counts either side of the wrap and checks the totals against
- *  arithmetic done in 64 bits.
+ *  under-sizes the pinned allocation rather than failing, so the test drives `accumulate_sizes` and the
+ *  slice walk at molecule counts either side of the wrap and checks the totals against arithmetic done
+ *  in 64 bits.
  *
- *  Nothing here allocates the batch it describes: `compute_batch_layout` is pure arithmetic over element
- *  counts, so a 17 GB layout costs the test a few microseconds.
+ *  Nothing here allocates the batch it describes: the walk over an unallocated cursor hands out empty
+ *  spans and totals bytes, so a 17 GB slice costs the test a few microseconds. One walk over a
+ *  one-molecule allocation follows, which is what ties those byte totals to the spans they pay for.
  */
 
+#include <cstddef> // `std::byte`, `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
 #include <limits>      // `std::numeric_limits`
 #include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
@@ -95,32 +98,72 @@ static void check_accumulators_(uniform_batch_expectation_t const &expectation, 
 }
 
 /**
- *  @brief Check that the layout places every region the accumulators sized, past the 32-bit ceiling.
+ *  @brief Check that the walk sizes every region the accumulators counted, past the 32-bit ceiling.
  *
- *  The bounds region is the first one placed and the hop-count matrix the last, so a wrapped total
- *  shows up both as an element count and as a total byte size too small to cover the batch.
+ *  The walk is driven over an unallocated cursor, which is how it is driven to size the pool: every
+ *  carve hands back an empty span and only the byte total advances. The bounds matrix is the first
+ *  region placed and the hop-count matrix the last, so a total that wrapped shows up as an uploaded
+ *  prefix too small for the bounds matrix, or a device-only remainder too small for the hop counts.
+ *  A carve that also fits the pool is what `check_carve_` covers.
  *
  *  @param[in] expectation Counts the batch must total.
  *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
  */
 static void check_layout_(uniform_batch_expectation_t const &expectation, diagnostic_reporter_t &reporter) {
-    sfp::per_mol_sizes_t const totals = accumulate_uniform_batch_(expectation);
-    std::uint32_t const molecule_count = static_cast<std::uint32_t>(expectation.molecules);
     // One torsion slot per molecule keeps the device-only torsion region out of the comparison.
-    smallfield::api::wave_slice_layout_t const layout = sfp::compute_batch_layout(totals, molecule_count, 1u);
+    sfp::wave_slice_shape_t const shape {.totals = accumulate_uniform_batch_(expectation), .torsion_stride = 1u};
+    std::uint64_t const uploaded_bytes = sfp::uploaded_wave_slice_bytes(shape);
+    std::uint64_t const slice_bytes = sfp::wave_slice_bytes(shape);
 
     std::uint64_t const bounds_bytes = expectation.bounds * sizeof(float);
     std::uint64_t const bond_distance_bytes = expectation.bond_distance * sizeof(std::uint8_t);
     auto const at_least = [](std::uint64_t reference, std::uint64_t observed) { return observed >= reference; };
     reporter.mismatch("layout", "molecules={} atoms={}", expectation.molecules, expectation.atoms_per_molecule)
-        .field("num_bounds", expectation.bounds, static_cast<std::uint64_t>(layout.bounds.count), exactly_equal)
-        .field("num_bond_distance", expectation.bond_distance, static_cast<std::uint64_t>(layout.bond_distance.count),
+        .field("molecules", expectation.molecules, static_cast<std::uint64_t>(shape.totals.valid), exactly_equal)
+        .field("uploaded_bytes", bounds_bytes, uploaded_bytes, at_least)
+        .field("slice_bytes", bounds_bytes + bond_distance_bytes, slice_bytes, at_least)
+        .field("device_only_bytes", bond_distance_bytes, slice_bytes - uploaded_bytes, at_least);
+}
+
+/**
+ *  @brief Check that a walk over an allocation hands back the same regions the sizing walk paid for.
+ *
+ *  Run at one molecule, because the point is the relation between the two walks rather than the
+ *  arithmetic width: every span has to land inside the pool the sizing walk asked for, the uploaded
+ *  prefix has to stop before the first device-only region, and both extents have to be the element
+ *  counts the shape stated.
+ *
+ *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
+ */
+static void check_carve_(diagnostic_reporter_t &reporter) {
+    auto const single = expect_uniform_batch_(1u, drug_like_atom_count_k);
+    sfp::wave_slice_shape_t const shape {.totals = accumulate_uniform_batch_(single), .torsion_stride = 1u};
+    std::size_t const slice_bytes = sfp::wave_slice_bytes(shape);
+
+    std::vector<std::byte> pool(slice_bytes);
+    sfp::pool_cursor<std::byte> cursor {custd::span<std::byte> {pool}};
+    sfp::wave_slice_view_t const view = sfp::carve_wave_slice(shape, cursor);
+
+    auto const *const base = pool.data();
+    std::uint64_t const bounds_end = static_cast<std::uint64_t>(
+        reinterpret_cast<std::byte const *>(view.bounds_matrices.data() + view.bounds_matrices.size()) - base);
+    std::uint64_t const hops_end = static_cast<std::uint64_t>(
+        reinterpret_cast<std::byte const *>(view.bond_distance.data() + view.bond_distance.size()) - base);
+    std::uint64_t const hops_start = static_cast<std::uint64_t>(
+        reinterpret_cast<std::byte const *>(view.bond_distance.data()) - base);
+
+    auto const at_most = [](std::uint64_t ceiling, std::uint64_t observed) { return observed <= ceiling; };
+    auto const at_least = [](std::uint64_t reference, std::uint64_t observed) { return observed >= reference; };
+    reporter.mismatch("carve", "molecules=1 atoms={}", drug_like_atom_count_k)
+        .field("num_bounds", single.bounds, static_cast<std::uint64_t>(view.bounds_matrices.size()), exactly_equal)
+        .field("num_bond_distance", single.bond_distance, static_cast<std::uint64_t>(view.bond_distance.size()),
                exactly_equal)
-        .field("bytes_uploaded", bounds_bytes, static_cast<std::uint64_t>(layout.bytes_uploaded), at_least)
-        .field("bytes_total", bounds_bytes + bond_distance_bytes, static_cast<std::uint64_t>(layout.bytes_total),
-               at_least)
-        .field("bond_distance_byte_offset", static_cast<std::uint64_t>(layout.bytes_uploaded),
-               static_cast<std::uint64_t>(layout.bond_distance.byte_offset), at_least);
+        .field("bounds_inside_pool", slice_bytes, bounds_end, at_most)
+        .field("hops_inside_pool", slice_bytes, hops_end, at_most)
+        // The bounds matrix crosses PCIe and the hop counts do not, so the prefix the transfer rides
+        // has to cover the first and stop before the second.
+        .field("uploaded_covers_bounds", bounds_end, static_cast<std::uint64_t>(view.uploaded.size()), at_least)
+        .field("uploaded_stops_before_hops", static_cast<std::uint64_t>(view.uploaded.size()), hops_start, at_least);
 }
 
 /**
@@ -227,6 +270,9 @@ int main() {
 
     sftest::check_layout_(sweep, reporter);
     reporter.summarize("layout");
+
+    sftest::check_carve_(reporter);
+    reporter.summarize("carve");
 
     if (!reporter.passed())
         return sftest::report_fail(test_name_k, "{} of {} comparisons disagreed", reporter.mismatch_count(),

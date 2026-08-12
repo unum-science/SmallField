@@ -59,11 +59,10 @@ enum etk_interaction_type_t : std::uint8_t {
  *  Per-molecule metadata for the ETKDG pipeline.
  *  One per molecule in the batch; offsets point into concatenated arrays.
  *
- *  Every offset here counts @b elements, never bytes. The batch layout in
- *  `smallfield::api::wave_slice_layout_t` carves the same regions out of the pool and its offsets
- *  count bytes, so the two are named apart — `bounds_offset` here against `bounds.byte_offset`
- *  there — rather than differing only by word order, which would read and compile the same
- *  while addressing memory four times too far.
+ *  Every offset here counts @b elements, never bytes, and it indexes the region rather than the pool:
+ *  `smallfield::preprocess::carve_wave_slice` hands out each region as a typed subspan, so the byte
+ *  arithmetic that reaches one lives there and nothing in this struct is ever added to a pool base.
+ *  A kernel reads `region[metadata.bounds_offset]`, which is four times too far if the two are mixed up.
  */
 struct etkdg_molecule_metadata_t {
     std::uint32_t num_atoms;

@@ -26,10 +26,12 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/api/wave_slice_pool.hpp"
+#include "smallfield/preprocess/wave_slice_pool.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::api {
+
+using preprocess::wave_slice_view_t;
 
 /** The launch geometry and the scalar arguments one captured bin replays with. */
 struct wave_capture_scalars_t {
@@ -110,13 +112,14 @@ inline void report_captured_bin_timing(cudaStream_t stream) {
  *  the pointer arithmetic in the launch read the same locals. The stream is synchronized first, because
  *  the preprocess kernels that fill the batch pool are still in flight at that point.
  *
- *  @param[in] device_view Device mirror of the batch pool, whose `base` anchors every recorded offset.
- *  @param[in] batch_bytes Bytes the batch mirror spans.
+ *  @param[in] device_view Device mirror of the batch pool, carved out of @p batch_pool.
+ *  @param[in] batch_pool The batch mirror itself, whose base anchors every recorded offset.
  *  @param[in] metric_embedding The whole wave's four-dimensional embedding region.
  *  @param[in] scalars Launch geometry and scalar kernel arguments for this bin.
  *  @param[in] stream Stream the preprocessing rode, drained before the read-back.
  */
-inline capture_outcome_t capture_bin_launch(batch_pool_view_t device_view, std::size_t batch_bytes,
+inline capture_outcome_t capture_bin_launch(wave_slice_view_t const &device_view,
+                                            custd::span<std::byte const> batch_pool,
                                             custd::span<float const> metric_embedding,
                                             wave_capture_scalars_t const &scalars, cudaStream_t stream) {
     if (scalars.bin_max_atoms != capture_bin_atom_cap()) return capture_outcome_t::skipped_k;
@@ -130,14 +133,14 @@ inline capture_outcome_t capture_bin_launch(batch_pool_view_t device_view, std::
     std::string const directory = std::getenv("SMALLFIELD_CAPTURE_DIR");
     cudaStreamSynchronize(stream);
 
-    auto const *const batch_base = reinterpret_cast<char const *>(device_view.base);
+    auto const *const batch_base = reinterpret_cast<char const *>(batch_pool.data());
     auto offset_of_ = [batch_base](void const *pointer) -> std::size_t {
         return static_cast<std::size_t>(reinterpret_cast<char const *>(pointer) - batch_base);
     };
 
     // The nine bin-relative pointers the two launches build, spelled here exactly as they are spelled there.
-    auto const *const metadata = device_view.molecule_metadata().data() + scalars.bin_start;
-    auto const *const input_indices = device_view.input_indices().data() + scalars.bin_start;
+    auto const *const metadata = device_view.molecule_metadata.data() + scalars.bin_start;
+    auto const *const input_indices = device_view.input_indices.data() + scalars.bin_start;
     std::size_t const embedding_offset = static_cast<std::size_t>(scalars.bin_start) * scalars.gpu_max_atoms *
                                          types::embedding_dimensions_k;
 
@@ -158,34 +161,34 @@ inline capture_outcome_t capture_bin_launch(batch_pool_view_t device_view, std::
     line_("shared_bytes_etkdg", scalars.shared_bytes_etkdg);
     line_("shared_bytes_mmff", scalars.shared_bytes_mmff);
     line_("random_seed", static_cast<std::size_t>(scalars.random_seed));
-    line_("batch_bytes", batch_bytes);
+    line_("batch_bytes", batch_pool.size());
     line_("embedding_floats", metric_embedding.size());
     line_("embedding_offset_floats", embedding_offset);
-    line_("offset_bounds_matrices", offset_of_(device_view.bounds_matrices().data()));
-    line_("offset_chiral_centers", offset_of_(device_view.chiral_centers().data()));
-    line_("offset_etk_torsions", offset_of_(device_view.etk_torsions().data()));
-    line_("offset_distance_constraints", offset_of_(device_view.distance_constraints().data()));
-    line_("offset_etk_interactions", offset_of_(device_view.etk_interactions().data()));
-    line_("offset_etk_atom_offsets", offset_of_(device_view.etk_atom_offsets().data()));
+    line_("offset_bounds_matrices", offset_of_(device_view.bounds_matrices.data()));
+    line_("offset_chiral_centers", offset_of_(device_view.chiral_centers.data()));
+    line_("offset_etk_torsions", offset_of_(device_view.etk_torsions.data()));
+    line_("offset_distance_constraints", offset_of_(device_view.distance_constraints.data()));
+    line_("offset_etk_interactions", offset_of_(device_view.etk_interactions.data()));
+    line_("offset_etk_atom_offsets", offset_of_(device_view.etk_atom_offsets.data()));
     line_("offset_molecule_metadata", offset_of_(metadata));
     line_("offset_input_indices", offset_of_(input_indices));
-    line_("offset_mmff_atom_vdw", offset_of_(device_view.mmff_atom_vdw().data()));
-    line_("offset_mmff_atom_charge", offset_of_(device_view.mmff_atom_charge().data()));
-    line_("offset_bond_distance", offset_of_(device_view.bond_distance().data()));
-    line_("offset_mmff_bonds", offset_of_(device_view.mmff_bonds().data()));
-    line_("offset_mmff_angles", offset_of_(device_view.mmff_angles().data()));
-    line_("offset_mmff_torsions", offset_of_(device_view.mmff_torsions().data()));
-    line_("offset_mmff_oops", offset_of_(device_view.mmff_oops().data()));
-    line_("offset_mmff_stretchbends", offset_of_(device_view.mmff_stretchbends().data()));
-    line_("offset_mmff_interactions", offset_of_(device_view.mmff_interactions().data()));
-    line_("offset_mmff_atom_offsets", offset_of_(device_view.mmff_atom_offsets().data()));
+    line_("offset_mmff_atom_vdw", offset_of_(device_view.mmff_atom_vdw.data()));
+    line_("offset_mmff_atom_charge", offset_of_(device_view.mmff_atom_charge.data()));
+    line_("offset_bond_distance", offset_of_(device_view.bond_distance.data()));
+    line_("offset_mmff_bonds", offset_of_(device_view.mmff_bonds.data()));
+    line_("offset_mmff_angles", offset_of_(device_view.mmff_angles.data()));
+    line_("offset_mmff_torsions", offset_of_(device_view.mmff_torsions.data()));
+    line_("offset_mmff_oops", offset_of_(device_view.mmff_oops.data()));
+    line_("offset_mmff_stretchbends", offset_of_(device_view.mmff_stretchbends.data()));
+    line_("offset_mmff_interactions", offset_of_(device_view.mmff_interactions.data()));
+    line_("offset_mmff_atom_offsets", offset_of_(device_view.mmff_atom_offsets.data()));
     std::fclose(manifest);
 
-    bool const wrote_batch = write_device_region_(directory + "/batch.bin", device_view.base, batch_bytes);
+    bool const wrote_batch = write_device_region_(directory + "/batch.bin", batch_pool.data(), batch_pool.size());
     bool const wrote_embedding = write_device_region_(directory + "/embedding.bin", metric_embedding.data(),
                                                       metric_embedding.size() * sizeof(float));
     std::fprintf(stderr, "wave_capture: bin_max_atoms=%u bin_size=%u batch_bytes=%zu embedding_floats=%zu ok=%d\n",
-                 scalars.bin_max_atoms, scalars.bin_size, batch_bytes, metric_embedding.size(),
+                 scalars.bin_max_atoms, scalars.bin_size, batch_pool.size(), metric_embedding.size(),
                  static_cast<int>(wrote_batch && wrote_embedding));
 
     cudaEventRecord(capture_timing_events_().first, stream);

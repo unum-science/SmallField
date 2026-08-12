@@ -37,8 +37,9 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
-#include <concepts> // `std::convertible_to`
-#include <vector>   // `std::vector`
+#include <concepts>    // `std::convertible_to`
+#include <type_traits> // `std::conditional_t`, `std::is_const_v`
+#include <vector>      // `std::vector`
 
 #include <cuda/std/mdspan>
 #include <cuda/std/span>
@@ -352,5 +353,59 @@ inline void transpose_into(coordinates_soa<source_role_, source_type_, dimension
 }
 
 #pragma endregion Transposition
+
+#pragma region Pool Carving
+
+/** Alignment every carved subspan starts at, matching the CUDA convention the wave pool carves with. */
+inline constexpr std::size_t pool_alignment_k = 256;
+
+/**
+ *  @brief Cursor handing out typed subspans of one byte pool, each at `pool_alignment_k`.
+ *
+ *  One sequence of carves answers both questions a sub-allocated pool asks. Over a cursor holding no
+ *  pool every carve hands back an empty span while `bytes` still advances, so the walk ends holding the
+ *  size the allocation needs; over a cursor holding that allocation the same sequence hands back the
+ *  real subspans. There is no second sequence to keep in step, so a carve added to the walk sizes the
+ *  pool and fills the view in one edit.
+ *
+ *  Constness travels from the pool to the spans, so a cursor over `std::byte const` cannot hand out a
+ *  writable view of it.
+ *
+ *  Here rather than in `utilities.hpp` because a carve hands out a `custd::span`, and that header's
+ *  admission rule asks for nothing outside the standard ones — it includes no header at all today.
+ */
+template <typename byte_type_>
+struct pool_cursor {
+    /** The allocation being carved, empty while the walk is only sizing one. */
+    custd::span<byte_type_> pool {};
+    /** Bytes the walk has placed so far, and the offset the next aligned carve starts from. */
+    std::size_t bytes = 0;
+};
+
+/** An element viewed through bytes of the same constness, so `std::byte const` yields `element_ const`. */
+template <typename byte_type_, typename element_>
+using pool_element_t = std::conditional_t<std::is_const_v<byte_type_>, element_ const, element_>;
+
+/**
+ *  @brief Place @p count elements of @p element_ at @p cursor's next aligned offset and advance past them.
+ *
+ *  A free function rather than a member so a walk written against a dependent cursor type spells the
+ *  element once, without a `template` disambiguator at every carve.
+ */
+template <typename element_, typename byte_type_>
+[[nodiscard]] constexpr custd::span<pool_element_t<byte_type_, element_>> carve(pool_cursor<byte_type_> &cursor,
+                                                                                std::size_t count) noexcept {
+    cursor.bytes = align_up_(cursor.bytes, pool_alignment_k);
+    std::size_t const byte_offset = cursor.bytes;
+    cursor.bytes += count * sizeof(element_);
+    if (cursor.pool.empty()) return {};
+    // The sizing walk and the carving walk are one sequence, so a pool too small for the walk that
+    // measured it cannot happen by editing one and not the other. It can still happen by allocating
+    // against a different shape than the one carved here, and that reads as valid device memory.
+    sf_assert_(cursor.bytes <= cursor.pool.size());
+    return {reinterpret_cast<pool_element_t<byte_type_, element_> *>(cursor.pool.data() + byte_offset), count};
+}
+
+#pragma endregion Pool Carving
 
 } // namespace smallfield::types

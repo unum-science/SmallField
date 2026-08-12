@@ -85,22 +85,22 @@ static void test_device_matches_host_(std::vector<std::string> const &smiles_lis
 
     // Counterions are kept deliberately: a disconnected fragment is the only way to reach the
     // unreachable-hop sentinel, and the production path strips them.
-    sfp::etkdg_molecule_batch_t batch {};
+    sfp::wave_slice_pool_t batch {};
     sfp::prepare_molecule_batch_into(views, sft::max_atoms_per_molecule_k, batch, smallfield::keep_all_fragments_k);
-    sf_verify_(batch.num_molecules > 0, "no molecule survived preprocessing");
+    sf_verify_(batch.num_molecules() > 0, "no molecule survived preprocessing");
 
-    std::vector<std::uint8_t> device_matrix(batch.layout.bond_distance.count, std::uint8_t {0});
-    sftest::run_bond_distance_bfs_on_gpu(batch.host.view(), batch.layout, batch.num_molecules, device_matrix);
+    sfp::wave_slice_view_t const view = batch.host_view();
+    std::vector<std::uint8_t> device_matrix(batch.shape.totals.bond_distance, std::uint8_t {0});
+    sftest::run_bond_distance_bfs_on_gpu(view.uploaded, batch.shape, device_matrix);
 
-    sfapi::batch_pool_view_t const view = batch.host_view();
-    auto const metadata = view.molecule_metadata();
-    auto const input_indices = view.input_indices();
+    auto const metadata = view.molecule_metadata;
+    auto const input_indices = view.input_indices;
     std::vector<std::uint8_t> reference;
     std::size_t compared_bytes = 0;
     std::size_t unreachable_pairs = 0;
     std::size_t molecules_with_fragments = 0;
 
-    for (std::uint32_t molecule = 0; molecule < batch.num_molecules; ++molecule) {
+    for (std::uint32_t molecule = 0; molecule < batch.num_molecules(); ++molecule) {
         auto const &meta = metadata[molecule];
         std::string const &smiles = smiles_list[input_indices[molecule]];
         std::uint32_t const num_atoms = host_bond_hops_(smiles, reference);
@@ -129,7 +129,7 @@ static void test_device_matches_host_(std::vector<std::string> const &smiles_lis
 
     sf_verify_(molecules_with_fragments > 0, "corpus covered no disconnected fragment");
     fmt::println("  {} molecules, {} matrix bytes, {} unreachable pairs across {} multi-fragment molecules",
-                 fmt::group_digits(batch.num_molecules), fmt::group_digits(compared_bytes),
+                 fmt::group_digits(batch.num_molecules()), fmt::group_digits(compared_bytes),
                  fmt::group_digits(unreachable_pairs), fmt::group_digits(molecules_with_fragments));
 }
 

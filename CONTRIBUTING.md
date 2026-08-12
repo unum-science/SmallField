@@ -289,7 +289,8 @@ __Two facts that must agree are one fact, or they are a defect.__
 An agreement maintained by hand at every write site is one the compiler will not help with, and the type system exists to carry most of them.
 
 A count beside a pointer is one span.
-A struct of `<name>_byte_offset` and `num_<name>` pairs is a layout of spans; `wave_slice_pool.hpp` spells 20 regions across 44 fields.
+A struct of `<name>_byte_offset` and `num_<name>` pairs is a layout of spans, and a pool carved into such a struct is one walk handing out subspans — `pool_cursor` in `types/views.hpp` sizes an allocation and carves it with the same sequence, so `preprocess/wave_slice_pool.hpp` stores element counts and never an offset.
+A sizing pass and a carving pass written separately are the same defect one level up: two sequences of the same 27 steps, with nothing to notice when a step is added to one of them.
 Parallel arrays walked by a shared index are one struct, or a view that carries the relation.
 A field equal by construction to another is deleted rather than documented.
 And two identically-shaped things with different meanings get different types, which is what `coordinate_role_t` does and what generalizes beyond it.
@@ -354,11 +355,11 @@ The real cost is that it converts a compile error into silent propagation.
 Change what a helper returns, and an explicit signature fails at the one accessor that forwards it; a deduced one carries the new type out through every call site with nothing to say so.
 
 ```cpp
-// no — forty accessors whose contract is only discoverable by reading `region<T>`
-auto etk_torsions() const noexcept { return region<etk_torsion_descriptor_t>(…); }
+// no — the contract is only discoverable by reading whatever the body forwards to
+auto etk_torsions() const noexcept { return carve<etk_torsion_descriptor_t>(…); }
 
 // yes
-custd::span<etk_torsion_descriptor_t> etk_torsions() const noexcept { return region<…>(…); }
+custd::span<etk_torsion_descriptor_t> etk_torsions() const noexcept { return carve<…>(…); }
 ```
 
 A trailing return type is the same promise written on the right and is fine.

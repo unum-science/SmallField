@@ -44,7 +44,6 @@
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
-#include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/molecule_parse.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
@@ -54,15 +53,12 @@
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/preprocess/device_capacities.hpp"
 #include "smallfield/preprocess/molecule_complexity.hpp"
+#include "smallfield/preprocess/wave_slice_pool.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
 
 namespace smallfield::preprocess {
 using smallfield::api::conformer_status_t;
-using smallfield::api::place_pool_region_;
-using smallfield::api::reserve_outcome_t;
-using smallfield::api::wave_slice_layout_t;
-using smallfield::api::wave_slice_pool_t;
 using smallfield::types::atom_flag_aromatic_k;
 using smallfield::types::atom_flag_hbond_acceptor_k;
 using smallfield::types::atom_flag_hbond_donor_h_k;
@@ -111,6 +107,7 @@ using smallfield::types::mmff94_typing_patch_t;
 using smallfield::types::molecule_descriptor_t;
 using smallfield::types::no_stereo_atom_k;
 using smallfield::types::packed_matrix;
+using smallfield::types::reserve_outcome_t;
 using smallfield::types::reset_square_matrix;
 using smallfield::types::upper_distance_bound_at;
 
@@ -944,17 +941,7 @@ inline smallfield::api::conformer_status_t prepare_molecule_topology_into(std::s
     return conformer_status_t::success_k;
 }
 
-/**
- *  @brief Batch of molecules packed into a single pinned host buffer.
- *
- *  Type alias onto `wave_slice_pool_t`, which owns one contiguous pinned host allocation plus a
- *  byte-level `wave_slice_layout_t` describing every sub-region. The launch path issues @b one
- *  `cudaMemcpyAsync` of the uploaded prefix into a per-GPU device mirror; the regions past that
- *  prefix exist only on the device and the preprocessing kernels fill them there.
- */
 #pragma endregion Single Molecule
-
-using etkdg_molecule_batch_t = wave_slice_pool_t;
 
 #pragma region Batch Layout
 
@@ -995,119 +982,6 @@ inline std::uint32_t as_region_offset_(std::uint64_t element_count) noexcept {
     assert(element_count <= std::numeric_limits<std::uint32_t>::max() &&
            "region offset outgrew its 32-bit field; max_molecules_per_batch_k was not honoured");
     return static_cast<std::uint32_t>(element_count);
-}
-
-/**
- *  @brief Per-molecule element counts of every region a batch carries.
- *
- *  Packed into one cache-line-aligned struct so the prefix scan over per-molecule sizes is one
- *  pass over a single struct rather than a dozen parallel accumulator chains. The device-filled
- *  regions contribute their capacity rather than their eventual content, since that is what the
- *  host reserves for them. The `valid` field doubles as the dense-output compaction counter.
- *
- *  The two N × N regions lead because they are the only counts quadratic in the atom count, and
- *  a `std::uint32_t` running total of them wraps inside one wave: 104 atoms is 10816 elements per
- *  molecule, so the sum reaches 2^32 at 397094 molecules, under the 400000-molecule wave clamp.
- *  Every remaining region is linear and bounded by `max_mmff_interactions_per_mol_k` per molecule,
- *  which `max_molecules_per_batch_k` covers with room to spare.
- */
-struct alignas(64) per_mol_sizes_t {
-    /** N × N floats, one row-major bounds matrix per molecule. */
-    std::uint64_t bounds;
-    /** N × N bytes, one hop-count matrix per molecule. */
-    std::uint64_t bond_distance;
-    std::uint32_t chirals;
-    std::uint32_t distance_constraints;
-    /** Per-atom regions: types, charges, VdW params, and both CSR offset arrays. */
-    std::uint32_t atoms;
-    std::uint32_t etk_interactions;
-    std::uint32_t mmff_bonds;
-    std::uint32_t mmff_angles;
-    std::uint32_t mmff_torsions;
-    std::uint32_t mmff_oops;
-    std::uint32_t mmff_stretchbends;
-    std::uint32_t mmff_interactions;
-    std::uint32_t patch_atoms;
-    std::uint32_t patch_records;
-    /** 0 if the molecule failed preprocessing, 1 otherwise. */
-    std::uint32_t valid;
-};
-static_assert(sizeof(per_mol_sizes_t) == 128, "per_mol_sizes_t must be a whole number of cache lines");
-
-/** Accumulate one molecule's capacities into a running total. */
-inline void accumulate_sizes(per_mol_sizes_t &totals, etkdg_molecule_metadata_t const &metadata,
-                             device_capacities_t const &capacities) {
-    std::uint32_t const num_atoms = metadata.num_atoms;
-    // The bounds matrix and the hop-count matrix are the same N × N shape at different element
-    // widths, so one square serves both and the two can never disagree.
-    std::uint64_t const square_elements = static_cast<std::uint64_t>(num_atoms) * num_atoms;
-    totals.bounds += square_elements;
-    totals.chirals += metadata.num_chiral_centers;
-    totals.distance_constraints += metadata.num_distance_constraints;
-    totals.atoms += num_atoms;
-    totals.bond_distance += square_elements;
-    totals.etk_interactions += capacities.etk_interactions;
-    totals.mmff_bonds += capacities.mmff_bonds;
-    totals.mmff_angles += capacities.mmff_angles;
-    totals.mmff_torsions += capacities.mmff_torsions;
-    totals.mmff_oops += capacities.mmff_oops;
-    totals.mmff_stretchbends += capacities.mmff_stretchbends;
-    totals.mmff_interactions += capacities.mmff_interactions;
-    totals.valid += 1;
-}
-
-/**
- *  @brief Derive the `wave_slice_layout_t` from total per-region counts. Every region's byte offset is
- *  aligned to `pool_region_alignment_k` so the GPU pool slicing in `launch_gpu_pipeline` inherits
- *  correct alignment for free.
- *
- *  The uploaded prefix carries only what the host produces. Everything the preprocessing kernels
- *  write — both CSRs, the ETK torsions, every MMFF term array, the per-atom types and charges, the
- *  typer status and the hop-count matrix — is placed past `bytes_uploaded` and never crosses PCIe.
- *
- *  @param[in] totals Batch-wide element counts of every region.
- *  @param[in] n_valid Molecules that survived preprocessing.
- *  @param[in] torsion_stride Slots the CSD matcher reserves per molecule.
- */
-inline wave_slice_layout_t compute_batch_layout(per_mol_sizes_t const &totals, std::uint32_t n_valid,
-                                                std::uint32_t torsion_stride) {
-    wave_slice_layout_t layout {};
-    std::size_t running = 0;
-    layout.torsion_stride = torsion_stride;
-
-    layout.bounds = place_pool_region_<float>(running, totals.bounds);
-    layout.chirals = place_pool_region_<chiral_center_descriptor_t>(running, totals.chirals);
-    layout.distance_constraints = place_pool_region_<distance_constraint_t>(running, totals.distance_constraints);
-    layout.descriptors = place_pool_region_<molecule_descriptor_t>(running, n_valid);
-    layout.atom_bases = place_pool_region_<std::uint32_t>(running, n_valid);
-    layout.mmff_bases = place_pool_region_<mmff94_packed_offsets_t>(running, n_valid);
-    layout.typing_patches = place_pool_region_<mmff94_typing_patch_t>(running, totals.patch_records);
-    layout.patch_atom_types = place_pool_region_<std::uint8_t>(running, totals.patch_atoms);
-    layout.patch_atom_charges = place_pool_region_<float>(running, totals.patch_atoms);
-    layout.metadata = place_pool_region_<etkdg_molecule_metadata_t>(running, n_valid);
-    layout.input_indices = place_pool_region_<std::uint32_t>(running, n_valid);
-
-    layout.bytes_uploaded = running;
-
-    std::size_t const torsion_slots = static_cast<std::size_t>(n_valid) * torsion_stride;
-    layout.torsions = place_pool_region_<etk_torsion_descriptor_t>(running, torsion_slots);
-    layout.torsion_counts = place_pool_region_<std::uint32_t>(running, n_valid);
-    layout.etk_interactions = place_pool_region_<etk_atom_interaction_t>(running, totals.etk_interactions);
-    layout.etk_atom_offsets = place_pool_region_<etk_atom_offsets_t>(running, totals.atoms);
-    layout.atom_types = place_pool_region_<std::uint8_t>(running, totals.atoms);
-    layout.typing_status = place_pool_region_<std::uint8_t>(running, n_valid);
-    layout.mmff_atom_vdw = place_pool_region_<mmff94_atom_vdw_params_t>(running, totals.atoms);
-    layout.mmff_atom_charge = place_pool_region_<float>(running, totals.atoms);
-    layout.mmff_bonds = place_pool_region_<mmff94_bond_t>(running, totals.mmff_bonds);
-    layout.mmff_angles = place_pool_region_<mmff94_angle_t>(running, totals.mmff_angles);
-    layout.mmff_torsions = place_pool_region_<mmff94_torsion_t>(running, totals.mmff_torsions);
-    layout.mmff_oops = place_pool_region_<mmff94_oop_t>(running, totals.mmff_oops);
-    layout.mmff_stretchbends = place_pool_region_<mmff94_stretchbend_t>(running, totals.mmff_stretchbends);
-    layout.mmff_interactions = place_pool_region_<mmff94_atom_interaction_t>(running, totals.mmff_interactions);
-    layout.mmff_atom_offsets = place_pool_region_<mmff94_atom_offsets_t>(running, totals.atoms);
-    layout.bond_distance = place_pool_region_<std::uint8_t>(running, totals.bond_distance);
-    layout.bytes_total = running;
-    return layout;
 }
 
 /**
@@ -1159,7 +1033,7 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::vector<batch_prep_per_mol_record_t> mols;
     /** Slice-local input indices for every molecule this thread's slice rejected, each
      *  tagged with the reason. Aggregated upstream into `wave_slice_pool_t::rejected_input_indices`. */
-    std::vector<smallfield::api::rejected_mol_t> rejected_input_indices;
+    std::vector<rejected_mol_t> rejected_input_indices;
     std::uint32_t max_atoms_seen = 0;
     std::uint32_t max_bonds_seen = 0;
 };
@@ -1295,7 +1169,7 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
  */
 inline void collect_rejections_into_(std::vector<batch_prep_thread_contribution_t> const &contribs,
                                      std::size_t admitted_count, std::size_t input_count,
-                                     std::vector<smallfield::api::rejected_mol_t> &out) {
+                                     std::vector<rejected_mol_t> &out) {
     out.clear();
     for (auto const &contribution : contribs)
         out.insert(out.end(), contribution.rejected_input_indices.begin(), contribution.rejected_input_indices.end());
@@ -1434,14 +1308,12 @@ static inline std::uint32_t assign_molecules_to_devices_(std::vector<batch_prep_
  *  @param[inout] scratch Grow-only caller-owned scratch; see `distribute_scratch_t`.
  */
 inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contribution_t> const &contribs,
-                                             std::uint32_t device_count,
-                                             custd::span<etkdg_molecule_batch_t> per_device_out,
+                                             std::uint32_t device_count, custd::span<wave_slice_pool_t> per_device_out,
                                              distribute_scratch_t &scratch) {
 
     for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
-        per_device_out[device_index].num_molecules = 0;
         per_device_out[device_index].observed_max_atoms = 0;
-        per_device_out[device_index].layout = wave_slice_layout_t {};
+        per_device_out[device_index].shape = wave_slice_shape_t {};
     }
 
     std::uint32_t const assigned_mol_count = assign_molecules_to_devices_(contribs, device_count, scratch);
@@ -1453,7 +1325,7 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
             scratch.per_device_flat.data() + scratch.per_device_offsets[device_index],
             scratch.per_device_offsets[device_index + 1u] - scratch.per_device_offsets[device_index],
         };
-        etkdg_molecule_batch_t &out = per_device_out[device_index];
+        wave_slice_pool_t &out = per_device_out[device_index];
         std::uint32_t const device_mol_count = static_cast<std::uint32_t>(mol_list.size());
 
         auto &capacities_per_mol = scratch.capacities_per_mol[device_index];
@@ -1477,35 +1349,20 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
             }
         }
 
-        wave_slice_layout_t device_layout = compute_batch_layout(totals, device_mol_count,
-                                                                 std::max<std::uint32_t>(max_bonds_seen, 1u));
-        out.num_molecules = device_mol_count;
         out.observed_max_atoms = max_atoms_seen;
-        out.layout = device_layout;
+        out.shape = {.totals = totals, .torsion_stride = std::max<std::uint32_t>(max_bonds_seen, 1u)};
+        std::size_t const uploaded_bytes = uploaded_wave_slice_bytes(out.shape);
         // This runs inside the per-device fan-out, where the pre-allocation discipline wants
         // `unchanged_k`. The per-device pinned pools are the one exception the pipeline documents:
         // they carry no constructor reservation and size themselves from the first wave, which is
         // the largest, so `grown_k` fires once per pool and never again.
-        if (device_layout.bytes_uploaded > 0 &&
-            out.host.try_reserve(device_layout.bytes_uploaded) == reserve_outcome_t::failed_k) {
-            out.num_molecules = 0;
-            out.layout = wave_slice_layout_t {};
+        if (uploaded_bytes > 0 && out.host.try_reserve(uploaded_bytes) == reserve_outcome_t::failed_k) {
+            out.shape = wave_slice_shape_t {};
             continue;
         }
         if (device_mol_count == 0) continue;
 
-        auto const out_view = out.host_view();
-        auto bounds_destination = out_view.bounds_matrices();
-        auto chirals_destination = out_view.chiral_centers();
-        auto constraints_destination = out_view.distance_constraints();
-        auto descriptors_destination = out_view.descriptors();
-        auto atom_bases_destination = out_view.atom_bases();
-        auto mmff_bases_destination = out_view.mmff_bases();
-        auto patches_destination = out_view.typing_patches();
-        auto patch_types_destination = out_view.patch_atom_types();
-        auto patch_charges_destination = out_view.patch_atom_charges();
-        auto metadata_destination = out_view.molecule_metadata();
-        auto input_indices_destination = out_view.input_indices();
+        wave_slice_view_t const destination = out.host_view();
 
         per_mol_sizes_t running {};
         for (std::uint32_t position = 0; position < device_mol_count; ++position) {
@@ -1517,27 +1374,28 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
             std::uint32_t const atom_count = source_meta.num_atoms;
 
             std::copy_n(contribution.bounds.data() + source_meta.bounds_offset,
-                        static_cast<std::size_t>(atom_count) * atom_count, bounds_destination.data() + running.bounds);
+                        static_cast<std::size_t>(atom_count) * atom_count,
+                        destination.bounds_matrices.data() + running.bounds);
             std::copy_n(contribution.chirals.data() + source_meta.chiral_offset, source_meta.num_chiral_centers,
-                        chirals_destination.data() + running.chirals);
+                        destination.chiral_centers.data() + running.chirals);
             std::copy_n(contribution.distance_constraints.data() + source_meta.constraint_offset,
                         source_meta.num_distance_constraints,
-                        constraints_destination.data() + running.distance_constraints);
-            descriptors_destination[position] = contribution.descriptors[source.index_in_thread];
+                        destination.distance_constraints.data() + running.distance_constraints);
+            destination.descriptors[position] = contribution.descriptors[source.index_in_thread];
 
             std::uint32_t const patch_index = scratch.patch_of_molecule[flat_index];
             if (patch_index != distribute_scratch_t::no_typing_patch_k) {
                 auto const &source_patch = contribution.typing_patches[patch_index];
                 std::copy_n(contribution.patch_atom_types.data() + source_patch.patch_base, atom_count,
-                            patch_types_destination.data() + running.patch_atoms);
+                            destination.patch_atom_types.data() + running.patch_atoms);
                 std::copy_n(contribution.patch_atom_charges.data() + source_patch.patch_base, atom_count,
-                            patch_charges_destination.data() + running.patch_atoms);
+                            destination.patch_atom_charges.data() + running.patch_atoms);
                 mmff94_typing_patch_t patch {};
                 patch.molecule_index = position;
                 patch.atom_base = running.atoms;
                 patch.patch_base = running.patch_atoms;
                 patch.atom_count = atom_count;
-                patches_destination[running.patch_records] = patch;
+                destination.typing_patches[running.patch_records] = patch;
                 running.patch_records += 1;
                 running.patch_atoms += atom_count;
             }
@@ -1546,7 +1404,7 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
             destination_meta.bounds_offset = as_region_offset_(running.bounds);
             destination_meta.chiral_offset = running.chirals;
             destination_meta.constraint_offset = running.distance_constraints;
-            destination_meta.torsion_offset = position * device_layout.torsion_stride;
+            destination_meta.torsion_offset = position * out.shape.torsion_stride;
             destination_meta.mmff_atom_vdw_offset = running.atoms;
             destination_meta.mmff_atom_charge_offset = running.atoms;
             destination_meta.mmff_atom_csr_offset = running.atoms;
@@ -1558,10 +1416,10 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
             destination_meta.mmff_torsion_offset = running.mmff_torsions;
             destination_meta.mmff_oop_offset = running.mmff_oops;
             destination_meta.mmff_stretchbend_offset = running.mmff_stretchbends;
-            metadata_destination[position] = destination_meta;
-            input_indices_destination[position] = contribution.mols[source.index_in_thread].original_index;
-            atom_bases_destination[position] = running.atoms;
-            mmff_bases_destination[position] = {running.mmff_bonds,        running.mmff_angles,
+            destination.molecule_metadata[position] = destination_meta;
+            destination.input_indices[position] = contribution.mols[source.index_in_thread].original_index;
+            destination.atom_bases[position] = running.atoms;
+            destination.mmff_bases[position] = {running.mmff_bonds,        running.mmff_angles,
                                                 running.mmff_torsions,     running.mmff_oops,
                                                 running.mmff_stretchbends, running.mmff_interactions};
 
@@ -1593,8 +1451,7 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
  */
 inline void prepare_per_device_batches_into(
     custd::span<std::string_view const> smiles_list, std::uint32_t device_count, std::uint32_t output_atom_capacity,
-    custd::span<etkdg_molecule_batch_t> per_device_out,
-    std::vector<smallfield::api::rejected_mol_t> *rejected_input_indices_out = nullptr,
+    custd::span<wave_slice_pool_t> per_device_out, std::vector<rejected_mol_t> *rejected_input_indices_out = nullptr,
     smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
     static std::vector<batch_prep_thread_contribution_t> contribs;
     static distribute_scratch_t scratch;
@@ -1624,7 +1481,7 @@ inline void prepare_per_device_batches_into(
  *  @param[in] salt_policy Whether a multi-fragment input keeps its largest fragment.
  */
 inline void prepare_molecule_batch_into(custd::span<std::string_view const> smiles_list,
-                                        std::uint32_t output_atom_capacity, etkdg_molecule_batch_t &batch,
+                                        std::uint32_t output_atom_capacity, wave_slice_pool_t &batch,
                                         smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
     prepare_per_device_batches_into(smiles_list, 1u, output_atom_capacity, {&batch, 1}, &batch.rejected_input_indices,
                                     salt_policy);

@@ -13,7 +13,7 @@ A `parquet-shard` carries roughly a million molecules; a `coprocessed-batch` agg
 | __`parquet-shard`__     | One on-disk Parquet file. Inputs and outputs both use this unit.                                                                                                                                                             | ~1 M molecules                    |
 | __`coprocessed-batch`__ | One call to `context_t::generate_conformers`. Aggregates molecules from one or more `parquet-shards` into a batch large enough to saturate all visible GPUs.                                                                 | `num_gpus × 100 K` molecules      |
 | __`embedding-wave`__    | Subdivision of a `coprocessed-batch`. The unit of CPU/GPU pipelined work: wave N+1's CPU step overlaps wave N's GPU step.                                                                                                    | ~50 K molecules (VRAM-aware auto) |
-| __`wave-slice`__        | One `embedding-wave`'s share for a single GPU. The unit a `batch_pool_t` actually holds; the per-device stripe below produces one per device per wave.                                                       | wave ÷ `num_gpus`                 |
+| __`wave-slice`__        | One `embedding-wave`'s share for a single GPU. The unit a `wave_slice_pool_t` actually holds; the per-device stripe below produces one per device per wave.                                                       | wave ÷ `num_gpus`                 |
 | __`atom-limited-bin`__  | Inside one `wave-slice`, molecules are grouped into bins whose member atom counts fall under a fixed cap (16, 32, 48, 64, 80, 96, 112, 128). Each bin dispatches one kernel launch with shared memory sized for the cap. | 6–8 K molecules/bin               |
 | __`molecule`__          | One input SMILES → K output conformers.                                                                                                                                                                                      | —                                 |
 
@@ -103,8 +103,8 @@ Everything in between is full overlap.
 
 - `logger_t` (`src/smallfield/log.hpp`) — owned per-`context_t` or per-tool; emits timestamp-prefixed log lines.
 - `cuda_error_sink_t` (`src/smallfield/cuda_error.hpp`) — routes CUDA / cuSOLVER errors through a `logger_t` and bumps an owner-supplied counter.
-- `batch_pool_t` (`src/smallfield/api/batch_pool.hpp`) — pinned host buffer packed with all per-molecule preprocess output for one `embedding-wave`.
-- `pool_region_t` (`src/smallfield/api/wave_slice_pool.hpp`) — one carved region of a `wave-slice` pool: a byte offset and an element count held as one fact, so an offset paired with a neighbouring region's count stops being spellable. `over` is the only place a region turns back into a pointer, and the count becomes the extent of the span it hands out. `wave_slice_layout_t` is the full set of them, declared in the order `compute_batch_layout` places them.
+- `wave_slice_pool_t` (`src/smallfield/preprocess/wave_slice_pool.hpp`) — pinned host buffer packed with all per-molecule preprocess output for one `wave-slice`, plus the `wave_slice_shape_t` that carves it.
+- `pool_cursor` (`src/smallfield/types/views.hpp`) — a byte span and a running offset, from which `carve<element_>` hands out one aligned subspan at a time. A cursor holding no pool hands back empty spans and totals what the allocation must span, so `carve_wave_slice` in `src/smallfield/preprocess/wave_slice_pool.hpp` is one sequence that sizes a pool and fills a `wave_slice_view` over it; no byte offset is ever stored beside an extent.
 - `molecule_complexity_score_` (`src/smallfield/preprocess/molecule_complexity.hpp`) — pure per-molecule work-estimate function used to balance the per-device stripe inside one `embedding-wave`.
 - `distribute_scratch_t` (`src/smallfield/preprocess/etkdg_prepare_batch.hpp`) — grow-only CSR scratch (sort permutation + per-device flat buffer + per-device offsets) reused across every `embedding-wave` so the stripe partition never allocates on the hot path.
 - `metric_scratch_t` (`src/smallfield/api/smallfield.hpp`) — per-GPU device scratch for the metric-embedding prepass within an `embedding-step`.
@@ -157,7 +157,7 @@ Glossary terms are vocabulary; the table below points at where each one is groun
 | :------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------- |
 | `parquet-shard`     | `cli/smallfield_batch.cpp` — path-based iteration, no dedicated struct                                                                        |
 | `coprocessed-batch` | `coprocessed_batch_accumulator_t` in `cli/smallfield_batch.cpp` — one `generate_conformers` call        |
-| `wave-slice`        | `batch_pool_t` in `src/smallfield/api/batch_pool.hpp` (alias `etkdg_molecule_batch_t` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`) |
+| `wave-slice`        | `wave_slice_pool_t` in `src/smallfield/preprocess/wave_slice_pool.hpp` |
 | `embedding-wave`    | `wave_record_t` in `src/smallfield/api/smallfield.cu`                                                                                         |
 | `atom-limited-bin`  | `atom_limited_bin_caps_k[]` in `src/smallfield/api/smallfield.hpp`                                                                            |
 | pipeline roles      | `cli/smallfield_batch.cpp` — architectural comment blocks, no per-role struct                                                                 |

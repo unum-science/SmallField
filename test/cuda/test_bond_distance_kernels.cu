@@ -15,34 +15,38 @@
 
 #include "test/cuda/test_bond_distance_kernels.hpp"
 
-namespace sfa = smallfield::api;
 namespace sfc = smallfield::cuda;
+namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 
 namespace smallfield::tests {
 
-void run_bond_distance_bfs_on_gpu(custd::span<std::byte const> host_pool, sfa::wave_slice_layout_t const &layout,
-                                  std::uint32_t molecule_count, custd::span<std::uint8_t> bond_distance_out) {
-    if (layout.bytes_total == 0 || molecule_count == 0) return;
+void run_bond_distance_bfs_on_gpu(custd::span<std::byte const> host_uploaded, sfp::wave_slice_shape_t const &shape,
+                                  custd::span<std::uint8_t> bond_distance_out) {
+    std::size_t const slice_bytes = sfp::wave_slice_bytes(shape);
+    std::uint32_t const molecule_count = shape.totals.valid;
+    if (slice_bytes == 0 || molecule_count == 0) return;
 
     // The BFS launch and both transfers ride the legacy default stream, so this allocation is drawn from
     // the device memory pool and released against that same stream, and needs no synchronize of its own.
     sft::device_bytes_t device_pool;
-    if (device_pool.try_reserve(layout.bytes_total) == sft::reserve_outcome_t::failed_k) {
-        fmt::println(stderr, "NOTE bond_distance_kernels field=device_pool bytes={} succeeded=0", layout.bytes_total);
+    if (device_pool.try_reserve(slice_bytes) == sft::reserve_outcome_t::failed_k) {
+        fmt::println(stderr, "NOTE bond_distance_kernels field=device_pool bytes={} succeeded=0", slice_bytes);
         return;
     }
+    sfp::pool_cursor<std::byte> cursor {device_pool.view()};
+    sfp::wave_slice_view_t const device_view = sfp::carve_wave_slice(shape, cursor);
+
     // The uploaded prefix is exactly what production ships; the hop-count region past it is
     // poisoned first so a kernel that fails to write a byte cannot pass by accident.
-    if (!sft::upload_into(device_pool.view(), host_pool.first(layout.bytes_uploaded), nullptr)) {
-        fmt::println(stderr, "NOTE bond_distance_kernels field=upload bytes={} succeeded=0", layout.bytes_uploaded);
+    if (!sft::upload_into(device_view.uploaded, host_uploaded, nullptr)) {
+        fmt::println(stderr, "NOTE bond_distance_kernels field=upload bytes={} succeeded=0", host_uploaded.size());
         return;
     }
-    custd::span<std::uint8_t> const device_hops = layout.bond_distance.over<std::uint8_t>(device_pool.data());
+    custd::span<std::uint8_t> const device_hops = device_view.bond_distance;
     cudaMemset(device_hops.data(), 0xAB, device_hops.size_bytes());
 
-    sfa::batch_pool_view_t const device_view {device_pool.data(), &layout};
-    sfc::launch_bond_distance_bfs(device_view.descriptors().data(), device_view.molecule_metadata().data(),
+    sfc::launch_bond_distance_bfs(device_view.descriptors.data(), device_view.molecule_metadata.data(),
                                   device_hops.data(), molecule_count);
 
     if (!sft::download_from(bond_distance_out, custd::span<std::uint8_t const> {device_hops}, nullptr))

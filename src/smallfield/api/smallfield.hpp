@@ -39,15 +39,19 @@ using cudaStream_t = void *;
 
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/api/conformer_status.hpp"
-#include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/log.hpp"
+#include "smallfield/preprocess/wave_slice_pool.hpp"
 #include "smallfield/types/atom_limited_bins.hpp"
+#include "smallfield/types/storage.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::api {
 
 /*  `conformer_status_t` is defined in `smallfield/api/conformer_status.hpp`, transitively included
  *  above, so `wave_slice_pool.hpp` can name it without a cyclic dependency on this header. */
+
+using preprocess::wave_slice_pool_t;
+using types::device_indices_t;
 
 /**
  *  @brief Pipeline configuration.
