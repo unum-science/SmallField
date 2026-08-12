@@ -102,7 +102,7 @@ enum class prepare_outcome_t {
 };
 
 /**
- *  @brief Parse with the same contract `build_shape_context` uses, add Hs, embed one ETKDGv3 conformer at a
+ *  @brief Parse with the same contract `build_shape_context_into` uses, add Hs, embed one ETKDGv3 conformer at a
  *  fixed seed, and MMFF-optimize it.
  *
  *  @param[in] smiles SMILES to prepare.
@@ -137,7 +137,7 @@ static prepare_outcome_t prepare_molecule_(std::string const &smiles, std::uniqu
     // MMFF typing kekulizes the molecule and re-perceives aromaticity under the MMFF94 model, which marks
     // strictly fewer atoms than the model the parser used — 6 rather than 20 on a fused heteroaromatic.
     // RDKit's reference USRCAT matches its `[a]` subset against this same object, so leaving MMFF's
-    // perception in place types the reference on a different graph from the one `build_shape_context` saw.
+    // perception in place types the reference on a different graph from the one `build_shape_context_into` saw.
     try {
         RDKit::MolOps::sanitizeMol(*molecule);
     }
@@ -177,6 +177,8 @@ struct shape_reporters_t {
 
 /** Buffers that outlive the molecule loop, so a corpus sweep grows each of them once. */
 struct shape_scratch_t {
+    /** Typed once per molecule into the same object the production loops hoist, capacity included. */
+    sfp::molecule_shape_context_t context;
     std::vector<float> coordinates;
     std::array<double, 12> native_usr {};
     std::array<double, 60> native_usrcat {};
@@ -196,6 +198,7 @@ struct shape_tally_t {
     std::uint64_t unembedded = 0;
     std::uint64_t unsanitized = 0;
     std::uint64_t untyped = 0;
+    std::uint64_t too_many_fragments = 0;
     std::uint64_t atom_count_divergence = 0;
     std::uint64_t separated = 0;
     std::uint64_t reference_refused = 0;
@@ -210,12 +213,10 @@ struct shape_tally_t {
  *
  *  @param[inout] molecule Prepared molecule; its conformer is overwritten with the float-rounded coordinates.
  *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key.
- *  @param[in] context Typing context built for this same SMILES.
  *  @param[inout] reporters Reporters counting and printing the comparisons.
- *  @param[inout] scratch Buffers reused across molecules.
+ *  @param[inout] scratch Buffers reused across molecules, carrying this molecule's typing context.
  */
-static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smiles,
-                                 sfp::molecule_shape_context_t const &context, shape_reporters_t &reporters,
+static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smiles, shape_reporters_t &reporters,
                                  shape_scratch_t &scratch) {
     std::uint32_t const num_atoms = molecule.getNumAtoms();
     read_conformer_into(
@@ -226,7 +227,7 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smil
     scratch.rdkit_usr.assign(scratch.native_usr.size(), 0.0);
     RDKit::Descriptors::USR(molecule, scratch.rdkit_usr);
 
-    sfp::usrcat_descriptor(scratch.coordinates, context, scratch.native_usrcat);
+    sfp::usrcat_descriptor(scratch.coordinates, scratch.context, scratch.native_usrcat);
     scratch.rdkit_usrcat.assign(scratch.native_usrcat.size(), 0.0);
     // `USRCAT` reads the atom-id argument as an input whenever it arrives non-empty, so a reused buffer would
     // type this molecule with the previous one's CREDO subsets and compare two unrelated descriptors.
@@ -248,7 +249,7 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smil
         // atom ids it typed, so a typing divergence names itself here instead of surfacing as twelve moments.
         if (block > 0)
             usrcat_group.field("subset_size", scratch.rdkit_usrcat_atoms[block - 1].size(),
-                               context.credo_subsets[block - 1].size(), exactly_equal);
+                               scratch.context.credo_subsets[block - 1].size(), exactly_equal);
         std::size_t const base = block * usr_slot_names_k.size();
         for (std::size_t slot = 0; slot < usr_slot_names_k.size(); ++slot)
             usrcat_group.field(usr_slot_names_k[slot], scratch.rdkit_usrcat[base + slot],
@@ -333,13 +334,13 @@ static double centroid_offaxis_(std::array<double, 3> const &centroid) {
  *  Only consecutive centroid pairs are checked for clearance, because the components are laid along one axis in
  *  label order, so consecutive clearance implies every pair's.
  *
- *  @param[in] context Multi-component context for this molecule.
  *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key.
  *  @param[inout] reporters Reporters counting and printing the comparisons.
- *  @param[inout] scratch Carries the coordinates in, and is left holding the separated ones.
+ *  @param[inout] scratch Carries this molecule's multi-component context and the coordinates in, and is left
+ *      holding the separated ones.
  */
-static void check_separation_(sfp::molecule_shape_context_t const &context, std::string const &smiles,
-                              shape_reporters_t &reporters, shape_scratch_t &scratch) {
+static void check_separation_(std::string const &smiles, shape_reporters_t &reporters, shape_scratch_t &scratch) {
+    sfp::molecule_shape_context_t const &context = scratch.context;
     std::uint32_t const num_components = context.num_components;
     scratch.intra_sum_before.assign(num_components, 0.0);
     scratch.offaxis_before.assign(num_components, 0.0);
@@ -415,11 +416,14 @@ static void check_builtin_(std::string const &smiles, shape_reporters_t &reporte
     sf_verify_(prepare_molecule_(smiles, molecule) == prepare_outcome_t::prepared_k,
                ("builtin SMILES must parse and embed: " + smiles).c_str());
 
-    sfp::molecule_shape_context_t const context = sfp::build_shape_context(smiles);
-    sf_verify_(context.ok, ("build_shape_context failed for: " + smiles).c_str());
-    sf_verify_(context.num_atoms == molecule->getNumAtoms(),
-               ("context and RDKit disagree on the atom count for: " + smiles).c_str());
-    compare_descriptors_(*molecule, smiles, context, reporters, scratch);
+    // One verdict covers both claims a builtin has to meet: it types, and it types the molecule that was
+    // just embedded, which is what makes the coordinates below address the atoms the context describes.
+    sfp::shape_typing_t const typing = sfp::build_shape_context_into(
+        smiles, molecule->getNumAtoms(), smallfield::keep_largest_fragment_k, scratch.context);
+    sf_verify_(typing == sfp::shape_typing_t::typed_k,
+               fmt::format("a builtin SMILES must type against its own embedded molecule, but {} {}", smiles,
+                           sfp::describe_shape_typing(typing)));
+    compare_descriptors_(*molecule, smiles, reporters, scratch);
 }
 
 /**
@@ -433,13 +437,15 @@ static void check_builtin_salt_(shape_reporters_t &reporters, shape_scratch_t &s
     std::unique_ptr<RDKit::RWMol> molecule;
     sf_verify_(prepare_molecule_(salt, molecule) == prepare_outcome_t::prepared_k, "builtin salt must embed");
 
-    sfp::molecule_shape_context_t const context = sfp::build_shape_context(salt, smallfield::keep_all_fragments_k);
-    sf_verify_(context.ok, "build_shape_context failed for the builtin salt");
-    sf_verify_(context.num_components == 2, "the builtin salt must have exactly two components");
+    sfp::shape_typing_t const typing = sfp::build_shape_context_into(salt, molecule->getNumAtoms(),
+                                                                     smallfield::keep_all_fragments_k, scratch.context);
+    sf_verify_(typing == sfp::shape_typing_t::typed_k,
+               fmt::format("the builtin salt must type, but {} {}", salt, sfp::describe_shape_typing(typing)));
+    sf_verify_(scratch.context.num_components == 2, "the builtin salt must have exactly two components");
 
     read_conformer_into(*molecule, types::reset_coordinates_aos<types::coordinate_role_t::position_k>(
                                        scratch.coordinates, molecule->getNumAtoms()));
-    check_separation_(context, salt, reporters, scratch);
+    check_separation_(salt, reporters, scratch);
 }
 
 /**
@@ -459,23 +465,18 @@ static void check_corpus_line_(std::string const &smiles, shape_reporters_t &rep
     case prepare_outcome_t::prepared_k: break;
     }
 
-    sfp::molecule_shape_context_t const context = sfp::build_shape_context(smiles, smallfield::keep_all_fragments_k);
-    if (!context.ok) {
-        ++tally.untyped;
-        return;
-    }
-    if (context.num_atoms != molecule->getNumAtoms()) {
-        ++tally.atom_count_divergence;
-        return;
-    }
-    // `component_label` is a byte, so a molecule in more fragments than a byte counts cannot be labeled.
-    if (context.num_components > 255u) {
-        ++tally.untyped;
-        return;
+    // Each refusal is a corpus line the comparison never reaches rather than a defect, so each is counted
+    // under its own name and the section's `compared=` stays honest about what it saw.
+    switch (sfp::build_shape_context_into(smiles, molecule->getNumAtoms(), smallfield::keep_all_fragments_k,
+                                          scratch.context)) {
+    case sfp::shape_typing_t::unparsed_k: ++tally.untyped; return;
+    case sfp::shape_typing_t::too_many_fragments_k: ++tally.too_many_fragments; return;
+    case sfp::shape_typing_t::atom_count_divergence_k: ++tally.atom_count_divergence; return;
+    case sfp::shape_typing_t::typed_k: break;
     }
 
     try {
-        compare_descriptors_(*molecule, smiles, context, reporters, scratch);
+        compare_descriptors_(*molecule, smiles, reporters, scratch);
     }
     catch (...) {
         ++tally.reference_refused;
@@ -483,9 +484,9 @@ static void check_corpus_line_(std::string const &smiles, shape_reporters_t &rep
     }
     ++tally.compared;
 
-    if (context.num_components < 2) return; // nothing to pull apart
+    if (scratch.context.num_components < 2) return; // nothing to pull apart
     ++tally.separated;
-    check_separation_(context, smiles, reporters, scratch);
+    check_separation_(smiles, reporters, scratch);
 }
 
 #pragma endregion Corpora
@@ -520,10 +521,11 @@ int main(int argc, char **argv) {
 
         sftest::shape_tally_t tally;
         for (auto const &smiles : corpus) sftest::check_corpus_line_(smiles, reporters, scratch, tally);
-        fmt::println("  NOTE shape_corpus molecules={} separated={} unparsed={} unembedded={} " //
-                     "unsanitized={} untyped={} atom_count_divergence={} reference_refused={}", //
+        fmt::println("  NOTE shape_corpus molecules={} separated={} unparsed={} unembedded={} "  //
+                     "unsanitized={} untyped={} too_many_fragments={} atom_count_divergence={} " //
+                     "reference_refused={}",                                                     //
                      tally.compared, tally.separated, tally.unparsed, tally.unembedded, tally.unsanitized,
-                     tally.untyped, tally.atom_count_divergence, tally.reference_refused);
+                     tally.untyped, tally.too_many_fragments, tally.atom_count_divergence, tally.reference_refused);
         reporters.usr.summarize("usr_corpus");
         reporters.usrcat.summarize("usrcat_corpus");
     }

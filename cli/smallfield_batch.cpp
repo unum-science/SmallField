@@ -41,6 +41,7 @@
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/api/smallfield.hpp"
 #include "smallfield/log.hpp"
+#include "smallfield/molecule_parse.hpp"
 #include "smallfield/nvtx.hpp"
 #include "smallfield/postprocess/fragment_separation.hpp"
 #include "smallfield/postprocess/shape_descriptors.hpp"
@@ -590,15 +591,20 @@ static void compute_shape_descriptors_(cli_config_t const &config, thread_budget
     std::fill_n(buffer.usrcat.data(), total_conformers * sfcli::usrcat_components_k, 0.0);
     int const threads = budget.fallback > 0 ? budget.fallback : omp_get_max_threads();
 
-#pragma omp parallel for schedule(dynamic, 256) num_threads(threads) if (threads > 1)
+    // `private` hands each thread its own context, which keeps the capacity of its five vectors across the
+    // molecules that thread walks; declaring it inside the body would allocate and free once per molecule.
+    sfpost::molecule_shape_context_t context;
+
+#pragma omp parallel for schedule(dynamic, 256) num_threads(threads) private(context) if (threads > 1)
     for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
         std::uint8_t const stored_atoms = buffer.num_atoms_per_molecule[molecule_index];
         if (stored_atoms == 0) continue; // preprocess failed: no coordinates to describe
-        sfpost::molecule_shape_context_t const context = sfpost::build_shape_context(
-            accumulator.combined_smiles[molecule_index]);
-        // The reparse must reproduce the atom order the coordinates were written in, and a mismatched
-        // count is exactly where it did not.
-        if (!context.ok || context.num_atoms != stored_atoms) continue;
+        // Every refusal means the reparse could not reproduce the atom order the coordinates were written
+        // in, so the molecule's slots keep the zero-filled descriptor the writer emits as a null.
+        if (sfpost::build_shape_context_into(accumulator.combined_smiles[molecule_index], stored_atoms,
+                                             smallfield::keep_largest_fragment_k,
+                                             context) != sfpost::shape_typing_t::typed_k)
+            continue;
         std::uint32_t const num_atoms = stored_atoms;
 
         std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};

@@ -13,17 +13,20 @@
  *  third central moment, the skewness. The descriptor is reference-point major.
  *
  *  RDKit's `GetUSRCAT` re-types the four CREDO pharmacophore subsets on every call. A molecule with `k`
- *  conformers therefore pays for `k` substructure searches. Here `build_shape_context` types the subsets and
- *  labels connected components exactly once; `usrcat_descriptor` then consumes that context per conformer.
+ *  conformers therefore pays for `k` substructure searches. Here `build_shape_context_into` types the subsets
+ *  and labels connected components exactly once; `usrcat_descriptor` then consumes that context per conformer.
  *
  *  This header also owns `molecule_shape_context_t` and the coordinate primitives, because
- *  `build_shape_context` is the only producer of the connected-component labels that
+ *  `build_shape_context_into` is the only producer of the connected-component labels that
  *  `postprocess/fragment_separation.hpp` consumes.
  *
  *  @code{.cpp}
- *  auto context = smallfield::postprocess::build_shape_context("CC(=O)Oc1ccccc1C(=O)O");
- *  std::array<double, 60> fingerprint;
- *  smallfield::postprocess::usrcat_descriptor(coordinates, context, fingerprint);
+ *  namespace sfpost = smallfield::postprocess;
+ *  sfpost::molecule_shape_context_t context;  // hoisted above the molecule loop, one per worker
+ *  std::array<double, sfpost::usrcat_components_k> fingerprint;
+ *  if (sfpost::build_shape_context_into(smiles, num_atoms, smallfield::keep_largest_fragment_k, context) ==
+ *      sfpost::shape_typing_t::typed_k)
+ *      sfpost::usrcat_descriptor(coordinates, context, fingerprint);
  *  @endcode
  */
 
@@ -81,8 +84,8 @@ inline constexpr std::uint32_t max_components_k = 255;
  *  matching stored coordinate order. Duplicate matches are preserved exactly as RDKit collects them so subset
  *  distance distributions are identical.
  *
- *  `ok` is the only success signal: a refused molecule carries an otherwise default-constructed context. It is
- *  not derivable from `num_atoms`, because an empty SMILES parses into a real molecule of no atoms.
+ *  `build_shape_context_into` is the only producer and its `shape_typing_t` verdict the only success signal, so
+ *  the context carries no flag of its own. A refusal leaves every field empty, capacity aside.
  */
 struct molecule_shape_context_t {
     std::uint32_t num_atoms = 0;
@@ -91,8 +94,35 @@ struct molecule_shape_context_t {
     /** Per-atom connected-component id, so `num_components` never exceeds `max_components_k`. */
     std::vector<std::uint8_t> component_label;
     std::uint32_t num_components = 0;
-    bool ok = false;
 };
+
+/**
+ *  @brief Whether a molecule's shape context can describe the conformers already stored for it.
+ *
+ *  A refusal is not a repairable error; it names which way the typing failed to reproduce the atom order the
+ *  stored coordinates were written in, so a caller reports and skips rather than describing the wrong atoms.
+ */
+enum class shape_typing_t : std::uint8_t {
+    /** Typed, and the reparse reproduced the atom count the caller's coordinates were written for. */
+    typed_k,
+    /** The SMILES did not parse under the library's contract, or typing threw on it. */
+    unparsed_k,
+    /** More fragments than `max_components_k`, where a label would alias another component. */
+    too_many_fragments_k,
+    /** The reparse produced a different atom count, so the stored coordinate order cannot be trusted. */
+    atom_count_divergence_k,
+};
+
+/** Sentence fragment naming the verdict, meant to follow the molecule's SMILES in a diagnostic. */
+inline char const *describe_shape_typing(shape_typing_t typing) {
+    switch (typing) {
+    case shape_typing_t::typed_k: return "typed";
+    case shape_typing_t::unparsed_k: return "does not parse, or threw while being typed";
+    case shape_typing_t::too_many_fragments_k: return "falls into more fragments than a component label can name";
+    case shape_typing_t::atom_count_divergence_k: return "reparses to a different atom count";
+    }
+    return "was refused";
+}
 
 #pragma endregion Shape Context
 
@@ -303,36 +333,58 @@ inline std::array<RDKit::ROMol, credo_subset_count_k> const &credo_matchers_() {
     return compiled;
 }
 
+/**
+ *  @brief Puts @p out back into its empty state, keeping the capacity its five vectors already grew to.
+ *
+ *  `out = {}` would release them, which is the allocation a hoisted context exists to avoid: the refusal
+ *  paths are exactly where the next molecule's buffers would otherwise be freed.
+ */
+inline void clear_shape_context_(molecule_shape_context_t &out) {
+    out.num_atoms = 0;
+    for (std::vector<std::uint32_t> &subset : out.credo_subsets) subset.clear();
+    out.component_label.clear();
+    out.num_components = 0;
+}
+
 #pragma endregion Internal
 
 #pragma region Public API
 
 /**
- *  @brief Parses @p smiles and types it for USRCAT, once per molecule.
+ *  @brief Parses @p smiles and types it for USRCAT into @p out, once per molecule.
  *
  *  Uses the same parse contract as the rest of the library — sanitize on, keep explicit hydrogens, tolerant
  *  CXSMILES — then `MolOps::addHs` so the atom order matches the coordinates the conformer generator stores. The
  *  four CREDO subsets are matched with RDKit's own default USRCAT SMARTS, and connected components are labeled
  *  with `MolOps::getMolFrags`.
  *
- *  @return A populated context with `ok == true` on success; `ok == false`, with empty fields, if parsing or
- *          typing threw, or if the molecule falls into more fragments than `component_label` can name.
+ *  @param[in] smiles Molecule to type.
+ *  @param[in] expected_atoms Atoms the caller's stored coordinates were written for. This parse has to agree
+ *      with the one that produced them, so a divergence is refused here rather than described against the
+ *      wrong atom order. It is not derivable from the context, because an empty SMILES parses into a real
+ *      molecule of no atoms.
+ *  @param[in] salt_policy Counterion handling, matching the parse the stored coordinates came from.
+ *  @param[out] out Typed context on `typed_k`, emptied on every refusal. Its vectors keep the capacity they
+ *      grew to, so a context hoisted above a molecule loop stops allocating once the loop has warmed.
+ *  @return Which of the three refusals applies, or `typed_k`.
  */
-inline molecule_shape_context_t build_shape_context(
-    std::string_view smiles, smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
-    molecule_shape_context_t context;
+[[nodiscard]] inline shape_typing_t build_shape_context_into(std::string_view smiles, std::uint32_t expected_atoms,
+                                                             smallfield::salt_policy_t salt_policy,
+                                                             molecule_shape_context_t &out) {
+    clear_shape_context_(out);
     try {
-        // Same contract as the preprocess path, counterion removal included: this atom count is compared against
-        // the one the pipeline recorded, so the two parses have to agree. The cap is left off because every
+        // Same contract as the preprocess path, counterion removal included. The cap is left off because every
         // molecule reaching here already passed the pipeline's own gate.
         smallfield::parse_options_t parse_options;
         parse_options.max_atoms = 0;
         parse_options.salt_policy = salt_policy;
         smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
-        if (!parsed.molecule) return context;
+        if (!parsed.molecule) return shape_typing_t::unparsed_k;
+        // Checked before the four substructure searches, which a molecule nobody can describe need not pay for.
+        if (parsed.num_atoms != expected_atoms) return shape_typing_t::atom_count_divergence_k;
         std::unique_ptr<RDKit::RWMol> molecule = std::move(parsed.molecule);
 
-        context.num_atoms = parsed.num_atoms;
+        out.num_atoms = parsed.num_atoms;
 
         // Type the four CREDO subsets exactly as RDKit's `getAtomIdsForFeatures` does: collect every matched
         // atom index, preserving RDKit's collection order.
@@ -344,7 +396,7 @@ inline molecule_shape_context_t build_shape_context(
             RDKit::SubstructMatch(*molecule, matchers[subset_index], matches);
             for (auto const &match : matches)
                 for (auto const &pair : match)
-                    context.credo_subsets[subset_index].push_back(static_cast<std::uint32_t>(pair.second));
+                    out.credo_subsets[subset_index].push_back(static_cast<std::uint32_t>(pair.second));
         }
 
         // Label connected components — disconnected fragments and salt counterions. Past
@@ -352,18 +404,20 @@ inline molecule_shape_context_t build_shape_context(
         // molecule is refused rather than mislabelled.
         std::vector<int> mapping;
         std::uint32_t const num_components = RDKit::MolOps::getMolFrags(*molecule, mapping);
-        if (num_components > max_components_k) return molecule_shape_context_t {};
-        context.num_components = num_components;
-        context.component_label.resize(mapping.size());
+        if (num_components > max_components_k) {
+            clear_shape_context_(out);
+            return shape_typing_t::too_many_fragments_k;
+        }
+        out.num_components = num_components;
+        out.component_label.resize(mapping.size());
         for (std::size_t atom_index = 0; atom_index < mapping.size(); ++atom_index)
-            context.component_label[atom_index] = static_cast<std::uint8_t>(mapping[atom_index]);
-
-        context.ok = true;
+            out.component_label[atom_index] = static_cast<std::uint8_t>(mapping[atom_index]);
     }
     catch (...) {
-        context = molecule_shape_context_t {};
+        clear_shape_context_(out);
+        return shape_typing_t::unparsed_k;
     }
-    return context;
+    return shape_typing_t::typed_k;
 }
 
 /**
@@ -387,7 +441,7 @@ inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uin
  *  aromatic, acceptor, donor. Empty subsets contribute a block of zeros, matching RDKit.
  *
  *  @param[in] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
- *  @param[in] context Context from `build_shape_context` for this molecule.
+ *  @param[in] context Context from `build_shape_context_into` for this molecule.
  *  @param[out] out `usrcat_components_k` doubles, one `usr_components_k` block per subset.
  */
 inline void usrcat_descriptor(custd::span<float const> coords_interleaved, molecule_shape_context_t const &context,

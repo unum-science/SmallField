@@ -36,6 +36,7 @@
 
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/log.hpp"
+#include "smallfield/molecule_parse.hpp"
 #include "smallfield/postprocess/fragment_separation.hpp"
 #include "smallfield/postprocess/shape_descriptors.hpp"
 #include "smallfield/types/views.hpp"
@@ -423,8 +424,8 @@ shard_listing_t fill_reembed_store_(fs::path const &reembed_dir, std::uint32_t m
 
 /** Per-shard counters folded into the progress log. */
 struct shard_stats_t {
-    /** Molecules whose SMILES parse did not match stored n_atoms. */
-    std::atomic<std::uint64_t> context_mismatch {0};
+    /** Molecules refused by `build_shape_context_into`, on any of the ways a reparse can miss the stored one. */
+    std::atomic<std::uint64_t> context_unusable {0};
     std::atomic<std::uint64_t> fragments_separated {0};
 };
 
@@ -664,8 +665,9 @@ std::size_t read_row_coordinates_into_(input_shard_t const &shard, std::int64_t 
  *  preserved and only the descriptors stay zero-filled.
  */
 void augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t const> rows, std::uint64_t molecule_index,
-                       std::uint32_t num_atoms, sfpost::molecule_shape_context_t const &context, bool context_usable,
-                       sfapi::conformer_slot_layout_t const &layout, shard_buffers_t &buffers, shard_stats_t &stats) {
+                       std::uint32_t num_atoms, sfpost::molecule_shape_context_t const &context,
+                       sfpost::shape_typing_t typing, sfapi::conformer_slot_layout_t const &layout,
+                       shard_buffers_t &buffers, shard_stats_t &stats) {
     std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
     std::size_t const num_slots = std::min<std::size_t>(rows.size(), layout.num_conformers);
     for (std::size_t conformer_slot = 0; conformer_slot < num_slots; ++conformer_slot) {
@@ -684,8 +686,8 @@ void augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t cons
         custd::span<float> const coordinates {interleaved.data(), wanted};
 
         // Separating disconnected components needs the context's per-atom labels, so it is skipped along
-        // with the descriptors when the reparse could not be trusted.
-        if (context_usable && context.num_components > 1) {
+        // with the descriptors on every typing the reparse could not be trusted for.
+        if (typing == sfpost::shape_typing_t::typed_k && context.num_components > 1) {
             sfpost::separate_fragments(coordinates, context);
             stats.fragments_separated.fetch_add(1, std::memory_order_relaxed);
         }
@@ -694,7 +696,8 @@ void augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t cons
             buffers.coordinates.data() +
                 layout.slot_offset(molecule_index, static_cast<std::uint32_t>(conformer_slot)));
 
-        if (!context_usable) continue; // descriptors stay zero-filled, the coordinates above are preserved
+        // Descriptors stay zero-filled on a refusal, while the coordinates written above are preserved.
+        if (typing != sfpost::shape_typing_t::typed_k) continue;
         std::array<double, sfcli::usrcat_components_k> usrcat_row {};
         sfpost::usrcat_descriptor(coordinates, context, usrcat_row);
         std::copy(usrcat_row.begin(), usrcat_row.end(), buffers.usrcat.data() + flat * sfcli::usrcat_components_k);
@@ -769,11 +772,14 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
         config.max_atoms, std::max(grouping.widest_conformers, reembed.widest_molecule_conformers)};
     buffers.reset_for(span.num_molecules, layout);
 
-    // `private` hands each thread its own key buffer, which keeps its capacity across the molecules that
-    // thread walks; declaring it inside the body would allocate and free once per molecule.
+    // `private` hands each thread its own key buffer and its own typing context, both of which keep their
+    // capacity across the molecules that thread walks; declaring either inside the body would allocate and
+    // free once per molecule — six heap blocks between them.
     std::string reembed_key;
+    sfpost::molecule_shape_context_t context;
 
-#pragma omp parallel for schedule(dynamic, 256) num_threads(config.threads) private(reembed_key) if (config.threads > 1)
+#pragma omp parallel for schedule(dynamic, 256) \
+    num_threads(config.threads) private(reembed_key, context) if (config.threads > 1)
     for (std::uint64_t molecule_index = 0; molecule_index < span.num_molecules; ++molecule_index) {
         custd::span<std::int64_t const> const rows = buffers.rows_of(molecule_index);
         std::int64_t const first_row = rows.front();
@@ -788,12 +794,12 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
                                                                    buffers);
         if (num_atoms == 0) continue; // preprocess-failed molecule: single null row, no coordinates
 
-        // Typed once, under the same parse contract the producer uses. A reparsed atom count that misses
-        // the stored `n_atoms` means the coordinate order cannot be trusted for descriptors.
-        sfpost::molecule_shape_context_t const context = sfpost::build_shape_context(buffers.smiles[molecule_index]);
-        bool const context_usable = context.ok && context.num_atoms == num_atoms;
-        if (!context_usable) stats.context_mismatch.fetch_add(1, std::memory_order_relaxed);
-        augment_molecule_(shard, rows, molecule_index, num_atoms, context, context_usable, layout, buffers, stats);
+        // Typed once, under the same parse contract the producer uses. Every refusal names a way the reparse
+        // failed to reproduce the atom order the stored coordinates were written in.
+        sfpost::shape_typing_t const typing = sfpost::build_shape_context_into(
+            buffers.smiles[molecule_index], num_atoms, smallfield::keep_largest_fragment_k, context);
+        if (typing != sfpost::shape_typing_t::typed_k) stats.context_unusable.fetch_add(1, std::memory_order_relaxed);
+        augment_molecule_(shard, rows, molecule_index, num_atoms, context, typing, layout, buffers, stats);
     }
 
     // `write_shard` already logged its own refusal, so the outcome only has to survive the return.
@@ -811,7 +817,7 @@ struct run_tally_t {
     std::uint64_t completed = 0;
     std::uint64_t skipped = 0;
     std::uint64_t failed = 0;
-    std::uint64_t context_mismatch = 0;
+    std::uint64_t context_unusable = 0;
     std::uint64_t fragments_separated = 0;
 };
 
@@ -848,19 +854,19 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
 
     double const shard_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - shard_start).count();
     double const rows = static_cast<double>(shard.num_rows);
-    std::uint64_t const context_mismatch = stats.context_mismatch.load();
+    std::uint64_t const context_unusable = stats.context_unusable.load();
     std::uint64_t const separated = stats.fragments_separated.load();
-    tally.context_mismatch += context_mismatch;
+    tally.context_unusable += context_unusable;
     tally.fragments_separated += separated;
     ++tally.completed;
 
     double const rows_per_second = rows / std::max(shard_seconds, 1e-3);
-    logger.info("{:>4}/{:<4} {}  {:.1f}s  {} rows/s ({} rows/s/core)  ctx-mismatch {}  separated {}",
+    logger.info("{:>4}/{:<4} {}  {:.1f}s  {} rows/s ({} rows/s/core)  ctx-unusable {}  separated {}",
                 fmt::group_digits(tally.completed + tally.skipped), fmt::group_digits(total_shards),
                 input_path.filename().string(), shard_seconds,
                 fmt::group_digits(static_cast<std::uint64_t>(rows_per_second)),
                 fmt::group_digits(static_cast<std::uint64_t>(rows_per_second / std::max(config.threads, 1))),
-                fmt::group_digits(context_mismatch), fmt::group_digits(separated));
+                fmt::group_digits(context_unusable), fmt::group_digits(separated));
 }
 
 /**
@@ -926,8 +932,8 @@ int main(int argc, char **argv) {
     augment_shards_(inputs, config, reembed, logger, tally);
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    logger.info("complete  {} augmented, {} skipped, {} failed  in {:.0f}s  (ctx-mismatch {}, separated {})",
+    logger.info("complete  {} augmented, {} skipped, {} failed  in {:.0f}s  (ctx-unusable {}, separated {})",
                 fmt::group_digits(tally.completed), fmt::group_digits(tally.skipped), fmt::group_digits(tally.failed),
-                total, fmt::group_digits(tally.context_mismatch), fmt::group_digits(tally.fragments_separated));
+                total, fmt::group_digits(tally.context_unusable), fmt::group_digits(tally.fragments_separated));
     return tally.failed > 0 ? 1 : 0;
 }

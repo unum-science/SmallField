@@ -7,8 +7,8 @@
  *  its own region, so this lays them along the +x axis by rigid translation, leaving every intra-component
  *  distance untouched.
  *
- *  Reads the component labels off `molecule_shape_context_t`, whose only producer is `build_shape_context` in
- *  `postprocess/shape_descriptors.hpp`.
+ *  Reads the component labels off `molecule_shape_context_t`, whose only producer is `build_shape_context_into`
+ *  in `postprocess/shape_descriptors.hpp`.
  */
 
 #pragma once
@@ -46,7 +46,7 @@ struct component_placement_t {
  *  rather than rescanning every atom once per component.
  *
  *  @param[inout] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
- *  @param[in] context Context from `build_shape_context` supplying the per-atom component labels.
+ *  @param[in] context Context from `build_shape_context_into` supplying the per-atom component labels.
  */
 inline void separate_fragments(custd::span<float> coords_interleaved, molecule_shape_context_t const &context) {
     if (context.num_components <= 1) return;
