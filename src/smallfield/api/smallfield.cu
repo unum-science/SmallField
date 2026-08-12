@@ -810,8 +810,8 @@ static void enqueue_device_preprocess_(batch_pool_view_t device_view, wave_slice
     for (std::uint32_t window_start = 0; window_start < molecule_count; window_start += mmff_extract_window_k) {
         std::uint32_t const window_size = std::min(mmff_extract_window_k, molecule_count - window_start);
         mmff94_extract_terms_kernel<<<window_size, warp_size_k, 0, stream>>>(
-            descriptors + window_start, atom_types, atom_charges, atom_bases + window_start, window_size,
-            launch_buffers.mmff_tables.view, device_view.mmff_atom_vdw().data(), atom_charges, staging.bonds.data(),
+            descriptors + window_start, atom_types, atom_bases + window_start, window_size,
+            launch_buffers.mmff_tables.view, device_view.mmff_atom_vdw().data(), staging.bonds.data(),
             staging.angles.data(), staging.torsions.data(), staging.oops.data(), staging.stretchbends.data(),
             staging.counts.data(), typing_status + window_start);
         check_launch_(sink, "mmff94_extract_terms_kernel launch");

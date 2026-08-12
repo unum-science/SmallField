@@ -114,14 +114,12 @@ static_assert(sizeof(mmff94_angle_scratch_t) == 16, "angle scratch must stay at 
 static __launch_bounds__(warp_size_k, 4) __global__ void mmff94_extract_terms_kernel(
     // Inputs
     molecule_descriptor_t const *__restrict__ descriptors, std::uint8_t const *__restrict__ atom_types_all,
-    float const *__restrict__ atom_charges_all, std::uint32_t const *__restrict__ atom_offsets,
-    std::uint32_t num_molecules, mmff94_tables_view_t tables,
+    std::uint32_t const *__restrict__ atom_offsets, std::uint32_t num_molecules, mmff94_tables_view_t tables,
     // Outputs — fixed-stride per-molecule slices
-    mmff94_atom_vdw_params_t *__restrict__ out_atom_vdw, float *__restrict__ out_atom_charge,
-    mmff94_bond_t *__restrict__ out_bonds, mmff94_angle_t *__restrict__ out_angles,
-    mmff94_torsion_t *__restrict__ out_torsions, mmff94_oop_t *__restrict__ out_oops,
-    mmff94_stretchbend_t *__restrict__ out_stbns, mmff94_per_mol_counts_t *__restrict__ per_mol_counts,
-    std::uint8_t const *__restrict__ typing_status) {
+    mmff94_atom_vdw_params_t *__restrict__ out_atom_vdw, mmff94_bond_t *__restrict__ out_bonds,
+    mmff94_angle_t *__restrict__ out_angles, mmff94_torsion_t *__restrict__ out_torsions,
+    mmff94_oop_t *__restrict__ out_oops, mmff94_stretchbend_t *__restrict__ out_stbns,
+    mmff94_per_mol_counts_t *__restrict__ per_mol_counts, std::uint8_t const *__restrict__ typing_status) {
 
     std::uint32_t const molecule = blockIdx.x;
     if (molecule >= num_molecules) return;
@@ -137,20 +135,19 @@ static __launch_bounds__(warp_size_k, 4) __global__ void mmff94_extract_terms_ke
     molecule_descriptor_t const &descriptor = descriptors[molecule];
     std::uint32_t const atom_off = atom_offsets[molecule];
     std::uint8_t const *atom_types = atom_types_all + atom_off;
-    float const *charges = atom_charges_all + atom_off;
     std::uint32_t const num_atoms = descriptor.num_atoms;
     std::uint32_t const num_bonds = descriptor.num_bonds;
 
     // Per-molecule output bases.
     mmff94_atom_vdw_params_t *vdw_out = out_atom_vdw + atom_off;
-    float *charge_out = out_atom_charge + atom_off;
     mmff94_bond_t *bonds_out = out_bonds + (std::size_t)molecule * max_mmff_bonds_per_mol_k;
     mmff94_angle_t *angles_out = out_angles + (std::size_t)molecule * max_mmff_angles_per_mol_k;
     mmff94_torsion_t *torsions_out = out_torsions + (std::size_t)molecule * max_mmff_torsions_per_mol_k;
     mmff94_oop_t *oops_out = out_oops + (std::size_t)molecule * max_mmff_oops_per_mol_k;
     mmff94_stretchbend_t *stbns_out = out_stbns + (std::size_t)molecule * max_mmff_stretchbends_per_mol_k;
 
-    // Atom VdW and charge, lane-parallel over atoms.
+    // Atom VdW parameters, lane-parallel over atoms. The partial charges the polish kernel reads are
+    // already in place, written by `mmff94_type_and_charge_kernel` into the same per-atom slots.
     for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
         auto const *vdw_entry = lookup_vdw(tables, atom_types[atom]);
         mmff94_atom_vdw_params_t vdw_params {};
@@ -163,7 +160,6 @@ static __launch_bounds__(warp_size_k, 4) __global__ void mmff94_extract_terms_ke
             vdw_params.donor_acceptor = vdw_entry->donor_acceptor;
         }
         vdw_out[atom] = vdw_params;
-        charge_out[atom] = charges[atom];
     }
 
     // Per-bond type and stretch parameters, lane-parallel over bonds, staged in shared memory because

@@ -49,7 +49,6 @@ struct device_batch_t {
     device_array<float> partial_charges;
     device_array<std::uint8_t> status_codes;
     device_array<sft::mmff94_atom_vdw_params_t> vdw_params;
-    device_array<float> output_charges;
     device_array<sft::mmff94_bond_t> bond_terms;
     device_array<sft::mmff94_angle_t> angle_terms;
     device_array<sft::mmff94_torsion_t> torsion_terms;
@@ -76,7 +75,6 @@ struct device_batch_t {
         reserve_(partial_charges, total_atom_count);
         reserve_(status_codes, num_molecules);
         reserve_(vdw_params, total_atom_count);
-        reserve_(output_charges, total_atom_count);
         reserve_(bond_terms, static_cast<std::size_t>(num_molecules) * sft::max_mmff_bonds_per_mol_k);
         reserve_(angle_terms, static_cast<std::size_t>(num_molecules) * sft::max_mmff_angles_per_mol_k);
         reserve_(torsion_terms, static_cast<std::size_t>(num_molecules) * sft::max_mmff_torsions_per_mol_k);
@@ -166,10 +164,10 @@ trio_launch_t launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t 
     launch_type_and_charge_();
     cudaEventRecord(events.after_type_and_charge);
     sfmmff::mmff94_extract_terms_kernel<<<num_molecules, sfmmff::warp_size_k, 0, nullptr>>>(
-        batch.descriptors.data(), batch.atom_types.data(), batch.partial_charges.data(), batch.atom_offsets.data(),
-        num_molecules, tables_device.view, batch.vdw_params.data(), batch.output_charges.data(),
-        batch.bond_terms.data(), batch.angle_terms.data(), batch.torsion_terms.data(), batch.out_of_plane_terms.data(),
-        batch.stretch_bend_terms.data(), batch.counts_per_molecule.data(), batch.status_codes.data());
+        batch.descriptors.data(), batch.atom_types.data(), batch.atom_offsets.data(), num_molecules, tables_device.view,
+        batch.vdw_params.data(), batch.bond_terms.data(), batch.angle_terms.data(), batch.torsion_terms.data(),
+        batch.out_of_plane_terms.data(), batch.stretch_bend_terms.data(), batch.counts_per_molecule.data(),
+        batch.status_codes.data());
     cudaEventRecord(events.after_extract_terms);
     sfmmff::mmff94_build_csr_kernel<<<num_molecules, sfmmff::warp_size_k, 0, nullptr>>>(
         batch.descriptors.data(), batch.atom_offsets.data(), num_molecules, batch.counts_per_molecule.data(),

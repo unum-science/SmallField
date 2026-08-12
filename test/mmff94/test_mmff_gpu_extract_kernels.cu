@@ -40,7 +40,6 @@ struct extract_arena_t {
     device_array<float> atom_charges;
     device_array<std::uint8_t> typing_status;
     device_array<sft::mmff94_atom_vdw_params_t> vdw;
-    device_array<float> charges_out;
     device_array<sft::mmff94_bond_t> bonds;
     device_array<sft::mmff94_angle_t> angles;
     device_array<sft::mmff94_torsion_t> torsions;
@@ -76,7 +75,6 @@ struct extract_arena_t {
         reserve_(atom_charges, total_atoms);
         reserve_(typing_status, num_molecules);
         reserve_(vdw, total_atoms);
-        reserve_(charges_out, total_atoms);
         reserve_(bonds, std::size_t {num_molecules} * sft::max_mmff_bonds_per_mol_k);
         reserve_(angles, std::size_t {num_molecules} * sft::max_mmff_angles_per_mol_k);
         reserve_(torsions, std::size_t {num_molecules} * sft::max_mmff_torsions_per_mol_k);
@@ -149,10 +147,9 @@ void launch_mmff94_gpu_extract_pipeline(
     cudaDeviceSynchronize();
 
     sfmmff::mmff94_extract_terms_kernel<<<num_mols, sfmmff::warp_size_k, 0, nullptr>>>(
-        arena.descriptors.data(), arena.atom_types.data(), arena.atom_charges.data(), arena.atom_offsets.data(),
-        num_mols, device_tables.view, arena.vdw.data(), arena.charges_out.data(), arena.bonds.data(),
-        arena.angles.data(), arena.torsions.data(), arena.oops.data(), arena.stretch_bends.data(),
-        arena.counts_per_molecule.data(), arena.typing_status.data());
+        arena.descriptors.data(), arena.atom_types.data(), arena.atom_offsets.data(), num_mols, device_tables.view,
+        arena.vdw.data(), arena.bonds.data(), arena.angles.data(), arena.torsions.data(), arena.oops.data(),
+        arena.stretch_bends.data(), arena.counts_per_molecule.data(), arena.typing_status.data());
     cudaDeviceSynchronize();
 
     cudaError_t error = cudaGetLastError();
