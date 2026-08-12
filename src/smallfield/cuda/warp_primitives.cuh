@@ -24,6 +24,15 @@ constexpr std::uint32_t warp_size_k = 32;
 /** Every lane of a full warp, for the `__shfl_*_sync` and `__ballot_sync` mask argument. */
 constexpr unsigned int full_mask_k = 0xFFFFFFFF;
 
+/**
+ *  @brief `|sin φ|` below which a torsion's chain-rule factor takes its L'Hopital limit instead.
+ *
+ *  Both torsion terms divide their first derivative by `sin φ`, and both numerator and denominator go to
+ *  zero at φ = 0 and φ = pi. One threshold rather than two because the two kernels once carried 1e-6 and
+ *  1e-8 for the same quantity, and only the looser one had the limit written behind it.
+ */
+constexpr float torsion_planarity_threshold_k = 1e-6f;
+
 } // namespace smallfield::cuda
 
 #if defined(__CUDACC__)

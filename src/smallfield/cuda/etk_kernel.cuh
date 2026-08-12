@@ -130,9 +130,9 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
     // sin_term = -energy_gradient_dihedral / sin(φ), needed for the chain rule ∂E/∂r = sin_term * ∂cos(φ)/∂r
     // at φ = 0 or pi, sin(φ) -> 0 but energy_gradient_dihedral -> 0 too (sin(nφ) = 0 for integer n).
     // L'Hopital: lim[sin->0] energy_gradient_dihedral/sin(φ) = ∂^2E/∂φ^2 / cos(φ)
-    float const sin_term = (fabsf(sin_phi) > 1e-6f)
+    float const sin_term = (fabsf(sin_phi) > torsion_planarity_threshold_k)
                                ? (-energy_gradient_dihedral / sin_phi)
-                               : (-energy_second_gradient_dihedral / fmaxf(fabsf(cos_phi), 1e-10f));
+                               : (-energy_second_gradient_dihedral / copysignf(fmaxf(fabsf(cos_phi), 1e-10f), cos_phi));
 
     accumulate_gradient_(gradient, scale_float3_(force_direction, sin_term));
     return energy;

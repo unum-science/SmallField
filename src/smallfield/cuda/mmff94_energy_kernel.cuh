@@ -306,6 +306,11 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
                              (tor.torsion_v1 * (1.0f + cos_phi) + tor.torsion_v2 * (1.0f - cos_2phi) +
                               tor.torsion_v3 * (1.0f + cos_3phi));
 
+    // Both normals collapsing leaves the torsion undefined rather than planar, and an undefined torsion
+    // owes neither energy nor force. Accumulating the energy above this — which it did — meant a collapsed
+    // term still moved the total while contributing nothing to the gradient that would relax it.
+    if (fabsf(cos_phi) < 1e-8f && fabsf(sin_phi) < 1e-8f) return;
+
     if (role == atom_role_first_k) *energy += tor_energy;
 
     // ∂E/∂φ = 0.5 · (-V1·sin(φ) + 2V2·sin(2φ) - 3V3·sin(3φ)) using SIGNED sin
@@ -315,10 +320,21 @@ __device__ __forceinline__ void mmff_torsion_contribution_(float const *position
                                            (-tor.torsion_v1 * sin_phi + 2.0f * tor.torsion_v2 * sin_2phi -
                                             3.0f * tor.torsion_v3 * sin_3phi);
 
-    float const abs_sin = fabsf(sin_phi);
-    if (fabsf(cos_phi) < 1e-8f && abs_sin < 1e-8f) return;
-    float const sin_term = (abs_sin < 1e-8f) ? (-energy_gradient_dihedral / cos_phi)
-                                             : (-energy_gradient_dihedral / sin_phi);
+    // The chain rule wants -(∂E/∂φ)/sin(φ), and at φ = 0 or pi both go to zero together because every
+    // sin(nφ) does. L'Hopital gives the finite limit -(∂²E/∂φ²)/cos(φ), where
+    // ∂²E/∂φ² = 0.5 · (-V1·cos(φ) + 4V2·cos(2φ) - 9V3·cos(3φ)). Dividing the first derivative by cos(φ)
+    // there instead — which this did — evaluates to zero, so a planar torsion carried its energy with no
+    // force at all and could never restore a planarity it had lost. `copysignf` keeps the denominator's
+    // sign. Planarity leaves that limit in closed form rather than as a division: `sin φ` this small puts
+    // `cos φ` at ±1, so `cos 2φ` is 1 and `cos 3φ` shares `cos φ`'s sign, and the whole quotient collapses
+    // to one expression in the three barrier heights. Writing it out keeps the second derivative from
+    // ever existing — computed beside the first it costs eight registers on sm_120, where the polish
+    // kernel has none to give, and four even when confined to this branch.
+    float const planar_sign = copysignf(1.0f, cos_phi);
+    float const sin_term = (fabsf(sin_phi) > torsion_planarity_threshold_k)
+                               ? (-energy_gradient_dihedral / sin_phi)
+                               : (mmff_torsion_prefactor_k *
+                                  (tor.torsion_v1 + 9.0f * tor.torsion_v3 - 4.0f * tor.torsion_v2 * planar_sign));
 
     float3 const cos_grad_0 = scale_float3_(sub_float3_(normal_1, scale_float3_(normal_0, cos_phi)),
                                             inverse_normal_length_0);
