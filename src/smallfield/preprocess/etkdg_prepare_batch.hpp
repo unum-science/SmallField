@@ -17,10 +17,11 @@
 #include <cmath>   // `std::cos`, `std::sin`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
-#include <algorithm>   // `std::copy_n`, `std::max`, `std::min`, `std::sort`
+#include <algorithm>   // `std::copy_n`, `std::max`, `std::min`, `std::reverse`, `std::sort`
 #include <array>       // `std::array`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
+#include <numeric>     // `std::iota`
 #include <optional>    // `std::optional`
 #include <sstream>     // RDKit's `AtomTyper.h` needs it but does not include it
 #include <string_view> // `std::string_view`
@@ -492,7 +493,11 @@ static inline void build_mmff_atom_csr_(etkdg_prepared_molecule_t &result, std::
 /**
  *  @brief Extract MMFF94 force-field parameters and build per-atom interaction lists.
  *
+ *  Every MMFF94 array on @p result is emptied on entry, so the destination needs no preparation of
+ *  its own and a refusal below carries nothing of the previous molecule forward.
+ *
  *  @param[in] molecule RDKit molecule with explicit hydrogens.
+ *  @param[in] descriptor Flat descriptor supplying the bond list and the CSR adjacency.
  *  @param[inout] result Prepared molecule; MMFF94 arrays are filled in place.
  *  @return `conformer_status_t::success_k` on success;
  *          `conformer_status_t::unsupported_element_k` if any atom's
@@ -504,11 +509,18 @@ static inline void build_mmff_atom_csr_(etkdg_prepared_molecule_t &result, std::
 inline smallfield::api::conformer_status_t extract_mmff94_params_via_rdkit(RDKit::ROMol const &molecule,
                                                                            molecule_descriptor_t const &descriptor,
                                                                            etkdg_prepared_molecule_t &result) {
+    // `result` is caller-owned scratch reused across molecules, so every array this function writes is
+    // emptied here rather than at whichever call site happened to remember. That covers the two it
+    // resizes as well, because the element-gate and validity refusals below return ahead of the resize.
     result.mmff_atom_vdw.clear();
     result.mmff_atom_charge.clear();
     result.mmff_bonds.clear();
     result.mmff_angles.clear();
     result.mmff_torsions.clear();
+    result.mmff_oops.clear();
+    result.mmff_stretchbends.clear();
+    result.mmff_interactions.clear();
+    result.mmff_atom_offsets.clear();
 
     auto &mutable_molecule = const_cast<RDKit::ROMol &>(molecule);
     // Skip redundant Kekulize inside `MMFFMolProperties` — `SmilesToMol` already sanitized.
@@ -766,9 +778,8 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
     }
     if (mmff_status != conformer_status_t::success_k) {
         // MMFF could not parametrise this molecule — say, an atomic number outside the MMFF94 set.
-        // The mmff_* result vectors are empty after the early return inside
-        // `extract_mmff94_params_via_rdkit`, but ETK fields above are populated; clear num_atoms so
-        // downstream packing skips this mol.
+        // The mmff_* vectors hold whatever the extractor reached before it refused and the ETK fields
+        // above are fully populated, so zeroing `num_atoms` is what makes downstream packing skip it.
         result.num_atoms = 0;
         return mmff_status;
     }
@@ -1360,36 +1371,27 @@ struct distribute_scratch_t {
 };
 
 /**
- *  @brief Pack the workers' contributions straight into `device_count` per-device pinned pools,
- *  partitioned complexity-descending so per-device work distributions are near-identical.
+ *  @brief Decide which device every admitted molecule lands on, touching none of its bytes.
  *
- *  Each molecule's host-produced bytes are copied once, from the worker that produced them into the
- *  assigned device's pool, and its metadata, atom base, MMFF bases and typing patch are rebased to
- *  that device's layout. There is no shared staging pool: a molecule's device is decided from
- *  metadata the workers already carry, before anything is packed, so the wave costs one pass rather
- *  than a pack followed by a copy.
+ *  Flattens the workers' molecules into one addressable list, inverts each worker's typing-patch list
+ *  against it, ranks that list complexity-descending, and stripes the ranking across the devices so
+ *  each device draws evenly from every complexity band. Each device's CSR range is then reversed, so
+ *  the kernel bin-dispatch meets the smallest `atom-limited-bin` first.
  *
- *  Caller ensures `per_device_out[d].host` can be grown to hold this device's slice.
+ *  Pure index computation over the metadata the workers already carry: it reads no molecule payload,
+ *  writes no pool, and needs neither RDKit nor a device to run.
  *
  *  @param[in] contribs Per-worker contributions filled by `prepare_per_thread_contribs_`.
- *  @param[in] device_count Devices to partition across; 1 packs a single pool.
- *  @param[out] per_device_out One pinned pool per device, filled in place.
- *  @param[inout] scratch Grow-only caller-owned scratch; see `distribute_scratch_t`.
+ *  @param[in] device_count Devices to partition across; 1 assigns every molecule to one range.
+ *  @param[inout] scratch Grow-only caller-owned scratch; `molecule_sources`, `patch_of_molecule`,
+ *                `sort_permutation`, `per_device_flat` and `per_device_offsets` are filled here.
+ *  @return Molecules assigned, which is the sum of the `device_count` CSR range lengths.
  */
-inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contribution_t> const &contribs,
-                                             std::uint32_t device_count,
-                                             custd::span<etkdg_molecule_batch_t> per_device_out,
-                                             distribute_scratch_t &scratch) {
-
-    for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
-        per_device_out[device_index].num_molecules = 0;
-        per_device_out[device_index].observed_max_atoms = 0;
-        per_device_out[device_index].layout = wave_slice_layout_t {};
-    }
+static inline std::uint32_t assign_molecules_to_devices_(std::vector<batch_prep_thread_contribution_t> const &contribs,
+                                                         std::uint32_t device_count, distribute_scratch_t &scratch) {
 
     std::uint32_t total_mol_count = 0;
     for (auto const &contribution : contribs) total_mol_count += static_cast<std::uint32_t>(contribution.mols.size());
-    if (total_mol_count == 0) return;
 
     // Flatten every worker's molecules into one addressable list, and invert each worker's patch
     // list against it so a molecule finds its own patch in constant time.
@@ -1442,6 +1444,41 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
         auto *end = scratch.per_device_flat.data() + scratch.per_device_offsets[device_index + 1u];
         std::reverse(begin, end);
     }
+
+    return total_mol_count;
+}
+
+/**
+ *  @brief Pack the workers' contributions straight into `device_count` per-device pinned pools,
+ *  partitioned complexity-descending so per-device work distributions are near-identical.
+ *
+ *  Each molecule's host-produced bytes are copied once, from the worker that produced them into the
+ *  pool of the device `assign_molecules_to_devices_` gave it, and its metadata, atom base, MMFF bases
+ *  and typing patch are rebased to that device's layout. There is no shared staging pool: a
+ *  molecule's device is decided from
+ *  metadata the workers already carry, before anything is packed, so the wave costs one pass rather
+ *  than a pack followed by a copy.
+ *
+ *  Caller ensures `per_device_out[d].host` can be grown to hold this device's slice.
+ *
+ *  @param[in] contribs Per-worker contributions filled by `prepare_per_thread_contribs_`.
+ *  @param[in] device_count Devices to partition across; 1 packs a single pool.
+ *  @param[out] per_device_out One pinned pool per device, filled in place.
+ *  @param[inout] scratch Grow-only caller-owned scratch; see `distribute_scratch_t`.
+ */
+inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contribution_t> const &contribs,
+                                             std::uint32_t device_count,
+                                             custd::span<etkdg_molecule_batch_t> per_device_out,
+                                             distribute_scratch_t &scratch) {
+
+    for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
+        per_device_out[device_index].num_molecules = 0;
+        per_device_out[device_index].observed_max_atoms = 0;
+        per_device_out[device_index].layout = wave_slice_layout_t {};
+    }
+
+    std::uint32_t const assigned_mol_count = assign_molecules_to_devices_(contribs, device_count, scratch);
+    if (assigned_mol_count == 0) return;
 
 #pragma omp parallel for num_threads(static_cast<int>(device_count)) schedule(static, 1)
     for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
