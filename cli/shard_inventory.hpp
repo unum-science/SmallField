@@ -11,8 +11,13 @@
 
 #pragma once
 
-#include <filesystem> // `std::filesystem::path`
-#include <vector>     // `std::vector`
+#include <cstddef> // `std::size_t`
+#include <cstdio>  // `std::fopen`
+
+#include <filesystem>   // `std::filesystem::path`
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::error_code`
+#include <vector>       // `std::vector`
 
 #include "smallfield/log.hpp"
 
@@ -32,6 +37,35 @@ enum class restart_policy_t {
     /** Every shard is pending, so the run overwrites the outputs it finds. */
     restart_k,
 };
+
+/** Suffix marking an output shard complete; every producer appends it and `inventory_shards` looks for it. */
+inline constexpr std::string_view encoded_sentinel_suffix_k = ".encoded";
+
+/**
+ *  @brief Seal @p output_path by writing the sentinel a `--resume` run keys on, at `<output_path>.encoded`.
+ *
+ *  Removed again if the write was short, because a truncated sentinel would make the next run skip an
+ *  unfinished shard as though it were done. A null @p log falls back to a default one.
+ */
+inline void write_encoded_sentinel(std::filesystem::path const &output_path, logger_t const *log = nullptr) {
+    constexpr std::string_view body_k = "v1\n";
+    logger_t const fallback;
+    logger_t const &logger = log != nullptr ? *log : fallback;
+    std::filesystem::path sentinel = output_path;
+    sentinel += encoded_sentinel_suffix_k;
+
+    FILE *sentinel_file = std::fopen(sentinel.string().c_str(), "wb");
+    if (sentinel_file == nullptr) {
+        logger.error("sentinel write failed: {}", sentinel.string());
+        return;
+    }
+    std::size_t const written = std::fwrite(body_k.data(), 1, body_k.size(), sentinel_file);
+    std::fclose(sentinel_file);
+    if (written == body_k.size()) return;
+    std::error_code remove_error;
+    std::filesystem::remove(sentinel, remove_error);
+    logger.error("sentinel write truncated, removed: {}", sentinel.string());
+}
 
 /**
  *  @brief Pair every input shard in @p input_dir with its output in @p output_dir, sorted by input path.

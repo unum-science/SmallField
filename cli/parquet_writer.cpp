@@ -208,7 +208,7 @@ static std::uint32_t rows_of_molecule_(writer_inputs_t const &inputs, std::uint6
 /**
  *  @brief Describe every output row of the shard, energy-sorted inside each molecule.
  *
- *  @param[out] rows Caller-owned destination, cleared first; its capacity survives across shards.
+ *  @param[out] rows Caller-owned destination, cleared first.
  */
 static void fill_output_rows_into(writer_inputs_t const &inputs, std::vector<output_row_t> &rows) {
     conformer_slot_columns_t const &conformers = inputs.conformers;

@@ -197,13 +197,17 @@ static void print_usage_(char const *invocation) {
     fmt::println(stderr, "usage: {} --smi PATH [--max-molecules N]", invocation);
 }
 
-/** Fill @p arguments from `argv`, or explain on `stderr` why the command line was refused. */
+/** Fill @p arguments from `argv`, answer a help request, or explain on `stderr` why the line was refused. */
 static arguments_parse_t parse_arguments_(int argc, char **argv, kernel_bench_arguments_t &arguments) {
     for (sfbench::command_line_t line {executable_name_k, argc, argv}; line.advance();) {
         arguments_parse_t status = arguments_parse_t::accepted_k;
         if (line.flag() == "--smi") status = line.take_text(arguments.smiles_path);
         else if (line.flag() == "--max-molecules")
             status = line.take_number(max_molecules_per_run_k, arguments.max_molecules);
+        else if (line.flag() == "--help") {
+            print_usage_(argv[0]);
+            return arguments_parse_t::help_requested_k;
+        }
         else {
             print_usage_(argv[0]);
             status = line.refuse_unknown();
@@ -308,7 +312,11 @@ static double time_gpu_kernel_trio_(descriptor_batch_t const &batch, sfparam::mm
 
 int main(int argc, char **argv) {
     kernel_bench_arguments_t arguments;
-    if (parse_arguments_(argc, argv, arguments) != arguments_parse_t::accepted_k) return 2;
+    switch (parse_arguments_(argc, argv, arguments)) {
+    case arguments_parse_t::accepted_k: break;
+    case arguments_parse_t::help_requested_k: return 0;
+    case arguments_parse_t::refused_k: return 2;
+    }
 
     fmt::println("{}: GPU MMFF kernel trio against the CPU native path", executable_name_k);
     fmt::println("input: {} (cap {})", arguments.smiles_path, fmt::group_digits(arguments.max_molecules));

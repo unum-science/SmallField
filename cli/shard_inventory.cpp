@@ -39,8 +39,11 @@ std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path c
         shard_pair_t pair;
         pair.input_path = entry.path();
         pair.output_path = output_dir / (entry.path().stem().string() + ".3D.parquet");
-        if (restart_policy == restart_policy_t::resume_k)
-            pair.already_complete = fs::exists(fs::path {pair.output_path.string() + ".encoded"}, error_code);
+        if (restart_policy == restart_policy_t::resume_k) {
+            fs::path sentinel = pair.output_path;
+            sentinel += encoded_sentinel_suffix_k;
+            pair.already_complete = fs::exists(sentinel, error_code);
+        }
         shards.push_back(std::move(pair));
     }
 

@@ -11,7 +11,6 @@
 
 #include <csignal> // `std::signal`
 #include <cstdint> // `std::uint32_t`
-#include <cstdio>  // `std::fopen`
 #include <cstring> // `std::memcpy`
 
 #include <algorithm>     // `std::max`
@@ -499,6 +498,9 @@ struct molecule_grouping_t {
     std::uint32_t widest_conformers = 1;
     /** Molecules inside the `input_row` span owning no row, which is the gap a contiguous shard never has. */
     std::uint64_t unclaimed_molecules = 0;
+    /** `input_row` of the first such molecule, so a diagnostic points at the hole rather than counting it;
+     *  meaningless while `unclaimed_molecules` is zero. */
+    std::uint64_t first_unclaimed_row = 0;
 };
 
 /**
@@ -521,7 +523,10 @@ molecule_grouping_t group_rows_by_molecule_(input_shard_t const &shard, std::uin
     for (std::uint64_t molecule = 0; molecule < num_molecules; ++molecule) {
         std::uint64_t const owned = offsets[molecule + 1];
         grouping.widest_conformers = std::max(grouping.widest_conformers, static_cast<std::uint32_t>(owned));
-        if (owned == 0) ++grouping.unclaimed_molecules;
+        if (owned == 0) {
+            if (grouping.unclaimed_molecules == 0) grouping.first_unclaimed_row = base_row + molecule;
+            ++grouping.unclaimed_molecules;
+        }
         offsets[molecule + 1] += offsets[molecule];
     }
 
@@ -736,10 +741,10 @@ sfcli::writer_inputs_t shard_writer_inputs_(input_shard_t const &shard, cli_conf
  *  @param[inout] buffers Grown and reset in place; owned by the shard walk.
  */
 augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config, reembed_store_t const &reembed,
-                         shard_buffers_t &buffers, fs::path const &output_path, logger_t const &logger,
-                         shard_stats_t &stats) {
+                         shard_buffers_t &buffers, fs::path const &input_path, fs::path const &output_path,
+                         logger_t const &logger, shard_stats_t &stats) {
     if (shard.num_rows == 0) {
-        logger.warn("empty shard, skipping: {}", output_path.string());
+        logger.warn("empty shard, skipping: {}", input_path.string());
         return augment_t::empty_input_k;
     }
 
@@ -749,8 +754,12 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
     // A molecule with no rows would be written out as an all-null row carrying an `input_row` the input
     // shard never held, so a hole is refused rather than filled.
     if (grouping.unclaimed_molecules > 0) {
-        logger.error("input_row is not contiguous in {} — {} of {} molecules own no row, skipping",
-                     output_path.string(), grouping.unclaimed_molecules, span.num_molecules);
+        logger.error("shard {} is gapped over input_row {}..{}, skipping — {} of {} molecules own no row, " //
+                     "the first at input_row {}",                                                           //
+                     input_path.string(), fmt::group_digits(span.first_row),
+                     fmt::group_digits(span.first_row + span.num_molecules - 1),
+                     fmt::group_digits(grouping.unclaimed_molecules), fmt::group_digits(span.num_molecules),
+                     fmt::group_digits(grouping.first_unclaimed_row));
         return augment_t::gapped_input_k;
     }
 
@@ -806,29 +815,12 @@ struct run_tally_t {
     std::uint64_t fragments_separated = 0;
 };
 
-/** Write the 3-byte `<output>.encoded` sentinel a `--resume` run keys on. */
-void write_encoded_sentinel_(fs::path const &sentinel, logger_t const &logger) {
-    FILE *sentinel_file = std::fopen(sentinel.string().c_str(), "wb");
-    if (!sentinel_file) {
-        logger.error("sentinel write failed: {}", sentinel.string());
-        return;
-    }
-    // A short write would leave a sentinel that makes the next `--resume` skip an unprocessed shard.
-    std::size_t const written = std::fwrite("v1\n", 1, 3, sentinel_file);
-    std::fclose(sentinel_file);
-    if (written != 3) {
-        std::error_code remove_error;
-        fs::remove(sentinel, remove_error);
-        logger.error("sentinel write truncated, removed: {}", sentinel.string());
-    }
-}
-
 /** Read one input shard, augment it, seal it with its sentinel, and fold the outcome into @p tally. */
 void process_shard_(fs::path const &input_path, cli_config_t const &config, reembed_store_t const &reembed,
                     shard_buffers_t &buffers, std::uint64_t total_shards, logger_t const &logger, run_tally_t &tally) {
     fs::path const output_path = config.output_dir / input_path.filename();
     fs::path sentinel = output_path;
-    sentinel += ".encoded";
+    sentinel += sfcli::encoded_sentinel_suffix_k;
     if (config.restart_policy == sfcli::restart_policy_t::resume_k && fs::exists(sentinel)) {
         ++tally.skipped;
         return;
@@ -844,7 +836,7 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
     }
 
     shard_stats_t stats;
-    switch (augment_shard_(shard, config, reembed, buffers, output_path, logger, stats)) {
+    switch (augment_shard_(shard, config, reembed, buffers, input_path, output_path, logger, stats)) {
     case augment_t::written_k: break;
     // Every refusal already logged itself, in `augment_shard_` or in `write_shard`.
     case augment_t::empty_input_k:
@@ -852,7 +844,7 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
     case augment_t::write_failed_k: ++tally.failed; return;
     }
 
-    write_encoded_sentinel_(sentinel, logger);
+    sfcli::write_encoded_sentinel(output_path, &logger);
 
     double const shard_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - shard_start).count();
     double const rows = static_cast<double>(shard.num_rows);

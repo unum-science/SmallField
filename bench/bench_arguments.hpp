@@ -123,8 +123,8 @@ inline std::string_view corpus_path_from_environment() {
 
 #pragma region Command Line
 
-/** Whether the command line was accepted or refused. */
-enum class arguments_parse_t { accepted_k, refused_k };
+/** How a command line was answered: usable arguments, a help request, or a refusal. */
+enum class arguments_parse_t { accepted_k, help_requested_k, refused_k };
 
 /**
  *  @brief The command line as one cursor: the tokens, the position in them, and the name to blame.
