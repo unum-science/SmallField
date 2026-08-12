@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 
+#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/cuda/metric_embedding_prepass.cuh"
 #include "smallfield/types/storage.hpp"
 
@@ -33,8 +34,10 @@ struct embedding_arena_t {
     device_array<etkdg_molecule_metadata_t> metadata;
     device_array<std::uint32_t> indices;
     device_array<float> coordinates;
+    /** One verdict per copy, which the kernel writes only where a matrix turns out impossible. */
+    device_array<smallfield::api::conformer_status_t> verdicts;
 
-    /** Reserve one slot per replicated copy; false when the device refused any of the four arrays. */
+    /** Reserve one slot per replicated copy; false when the device refused any of the five arrays. */
     [[nodiscard]] bool resize_for(std::uint32_t num_molecules, std::size_t entries_per_molecule,
                                   std::size_t coordinates_per_molecule) noexcept {
         bool reserved = true;
@@ -45,6 +48,7 @@ struct embedding_arena_t {
         reserve_(metadata, num_molecules);
         reserve_(indices, num_molecules);
         reserve_(coordinates, coordinates_per_molecule * num_molecules);
+        reserve_(verdicts, num_molecules);
         return reserved;
     }
 };
@@ -81,8 +85,10 @@ int gpu_embed_replicated(sft::packed_matrix<float const> host_bounds, std::uint3
                          static_cast<int>(shared_bytes));
 
     cudaMemset(arena.coordinates.data(), 0, arena.coordinates.view().size_bytes());
+    cudaMemset(arena.verdicts.data(), 0, arena.verdicts.view().size_bytes());
     sfc::embed_4d_power_iter_kernel<<<num_molecules, sfc::embed_block_size_k, shared_bytes>>>(
-        arena.bounds.data(), arena.metadata.data(), arena.indices.data(), arena.coordinates.data(), num_atoms);
+        arena.bounds.data(), arena.metadata.data(), arena.indices.data(), arena.coordinates.data(), num_atoms,
+        arena.verdicts.data());
     cudaError_t status = cudaDeviceSynchronize();
     if (status == cudaSuccess) status = cudaGetLastError();
 

@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 
+#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/cuda/triangle_smooth.cuh"
 #include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/cuda_error.hpp"
@@ -30,6 +31,7 @@
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::cuda {
+using smallfield::api::conformer_status_t;
 using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::lower_distance_bound_at;
 using smallfield::types::packed_matrix;
@@ -138,19 +140,24 @@ __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *war
  *  and nothing compares them: a term added here without being added there overruns the request.
  *
  *  A molecule whose smoothed bounds cross — some pair's lower above its upper — has no embedding at all, so
- *  its block stops after persisting the bounds and leaves its coordinates zeroed.
+ *  its block stops after persisting the bounds, leaves its coordinates zeroed, and records
+ *  `bounds_infeasible_k` as that molecule's verdict. This kernel is the only stage that can tell an
+ *  impossible bounds matrix from a merely hard one, and the verdict it writes is what
+ *  `stamp_refused_molecules_kernel` later puts on the molecule's conformer slots.
  *
  *  @param[inout] bounds_matrices Flat per-molecule bounds matrices, smoothed in place.
  *  @param[in] molecule_metadata Per-molecule atom counts and bounds offsets.
  *  @param[in] molecule_indices Molecule index handled by each block.
  *  @param[out] initial_coordinates Destination for the 4D metric embedding.
  *  @param[in] max_atoms_per_molecule Stride between coordinate dimensions.
+ *  @param[out] molecule_verdicts One verdict per molecule, written only where the bounds are impossible.
  */
 __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
                                            etkdg_molecule_metadata_t const *__restrict__ molecule_metadata,
                                            std::uint32_t const *__restrict__ molecule_indices,
                                            float *__restrict__ initial_coordinates,
-                                           std::uint32_t max_atoms_per_molecule) {
+                                           std::uint32_t max_atoms_per_molecule,
+                                           conformer_status_t *__restrict__ molecule_verdicts) {
     std::uint32_t const group_index = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
     std::uint32_t const block_size = blockDim.x;
@@ -207,9 +214,13 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
     // place the atoms nowhere in particular. The block stops here, leaving this molecule's coordinates at the
     // zero `build_metric_initial_coordinates_on_gpu` memset — the same slot a molecule outside every bin
     // already gets — while the bounds just persisted carry the crossed pair itself. `__syncthreads_or`
-    // answers every thread alike, so the whole block leaves together.
+    // answers every thread alike, so the whole block leaves together, and the verdict is recorded on the way
+    // out rather than discarded here.
     smoothing_t const feasibility = bounds_consistency_(shared_bounds, lane, block_size);
-    if (__syncthreads_or(feasibility == smoothing_t::infeasible_k) != 0) return;
+    if (__syncthreads_or(feasibility == smoothing_t::infeasible_k) != 0) {
+        if (lane == 0) molecule_verdicts[molecule_index] = conformer_status_t::bounds_infeasible_k;
+        return;
+    }
 
     // Row means and grand mean for double-centering.
     for (std::uint32_t atom = lane; atom < num_atoms; atom += block_size) {
@@ -334,13 +345,16 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
  *  @p stream immediately afterward and the driver orders them correctly.
  *
  *  Every molecule's coordinates start zeroed, and a molecule that reaches no bin, or whose smoothed bounds
- *  turn out to be impossible, keeps that zero rather than an embedding.
+ *  turn out to be impossible, keeps that zero rather than an embedding. The impossible one is also the only
+ *  molecule this prepass names in @p device_molecule_verdicts, which the caller must have filled with
+ *  `success_k` before this runs — a molecule that reaches no bin gets no verdict here either.
  *
  *  @param[inout] device_bounds Flat per-molecule bounds matrices, smoothed in place.
  *  @param[in] device_metadata Per-molecule atom counts and bounds offsets, on the device.
  *  @param[in] host_metadata The same records on the host, which is where the binning reads them.
  *  @param[in] max_atoms_per_molecule Stride between coordinate dimensions.
  *  @param[out] device_initial_coordinates Destination for every molecule's 4D metric embedding.
+ *  @param[out] device_molecule_verdicts One verdict per molecule, written where the bounds are impossible.
  *  @param[inout] scratch Caller-owned bin groups and device staging for the group indices.
  *  @param[in] sink Where a refused CUDA call reports itself.
  *  @param[in] stream Stream every call in here rides.
@@ -351,7 +365,8 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
                                                     etkdg_molecule_metadata_t const *device_metadata,
                                                     custd::span<etkdg_molecule_metadata_t const> host_metadata,
                                                     std::uint32_t max_atoms_per_molecule,
-                                                    float *device_initial_coordinates, scratch_ &scratch,
+                                                    float *device_initial_coordinates,
+                                                    conformer_status_t *device_molecule_verdicts, scratch_ &scratch,
                                                     cuda_error_sink_t sink, cudaStream_t stream = nullptr) {
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(host_metadata.size());
     if (num_molecules == 0 || max_atoms_per_molecule == 0) return true;
@@ -410,7 +425,8 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         // One kernel launch performs the smooth-and-build-gram + eigendecomposition + project
         // chain entirely on-device: no host-side workspace, no global Gram/eigenvalue buffers.
         embed_4d_power_iter_kernel<<<static_cast<unsigned int>(group_size), embed_block_size_k, shared_bytes, stream>>>(
-            device_bounds, device_metadata, device_group_indices, device_initial_coordinates, max_atoms_per_molecule);
+            device_bounds, device_metadata, device_group_indices, device_initial_coordinates, max_atoms_per_molecule,
+            device_molecule_verdicts);
         if (!sink.check(cudaGetLastError(), "embed_4d_power_iter_kernel launch")) return false;
     }
 

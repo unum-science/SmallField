@@ -48,6 +48,7 @@ using smallfield::cuda::etkdg_pipeline_warp_kernel;
 using smallfield::cuda::launch_bond_distance_bfs;
 using smallfield::cuda::mmff94_apply_typing_patch_kernel;
 using smallfield::cuda::mmff_polish_warp_kernel;
+using smallfield::cuda::stamp_refused_molecules_kernel;
 using smallfield::cuda::upload_csd_torsion_table_to_device;
 using smallfield::cuda::warp_size_k;
 using smallfield::mmff94::mmff94_build_csr_kernel;
@@ -552,9 +553,12 @@ struct device_wave_regions_t {
     /** Post-conversion source of the coordinate download; halves the transfer. */
     custd::span<__half> coordinates_fp16 {};
     custd::span<float> energies {};
+    /** One `conformer_status_t` byte per slot, written by the pipeline kernel and then by the stamp. */
     custd::span<std::uint8_t> status {};
     /** Four-dimensional metric embedding the prepass writes and the pipeline kernel starts from. */
     custd::span<float> metric_embedding {};
+    /** What the prepass decided about each molecule's bounds, which only the stamp reads. */
+    custd::span<conformer_status_t> molecule_verdicts {};
 };
 
 /** Pinned host regions the wave's three device-to-host copies land in. */
@@ -572,7 +576,8 @@ struct host_wave_regions_t {
  *  cannot describe different layouts.
  */
 struct wave_pool_layout_t {
-    pool_region_t batch {}, coordinates_fp32 {}, coordinates_fp16 {}, energies {}, status {}, metric_embedding {};
+    pool_region_t batch {}, coordinates_fp32 {}, coordinates_fp16 {}, energies {}, status {}, metric_embedding {},
+        molecule_verdicts {};
     std::size_t device_bytes_total = 0;
     pool_region_t host_coordinates {}, host_energies {}, host_status {};
     std::size_t host_bytes_total = 0;
@@ -583,7 +588,8 @@ struct wave_pool_layout_t {
                 .coordinates_fp16 = coordinates_fp16.over<__half>(base),
                 .energies = energies.over<float>(base),
                 .status = status.over<std::uint8_t>(base),
-                .metric_embedding = metric_embedding.over<float>(base)};
+                .metric_embedding = metric_embedding.over<float>(base),
+                .molecule_verdicts = molecule_verdicts.over<conformer_status_t>(base)};
     }
 
     [[nodiscard]] host_wave_regions_t over_host(std::byte *base) const noexcept {
@@ -616,6 +622,7 @@ static wave_pool_layout_t compute_wave_pool_layout_(std::size_t batch_bytes, std
     layout.energies = place_pool_region_<float>(device_cursor, conformer_slots);
     layout.status = place_pool_region_<std::uint8_t>(device_cursor, conformer_slots);
     layout.metric_embedding = place_pool_region_<float>(device_cursor, embedding_count);
+    layout.molecule_verdicts = place_pool_region_<conformer_status_t>(device_cursor, molecule_count);
     layout.device_bytes_total = align_up_(device_cursor, pool_region_alignment_k);
 
     std::size_t host_cursor = 0;
@@ -719,15 +726,19 @@ struct molecule_readback_t {
 /**
  *  @brief Widen the byte a kernel wrote into the public per-conformer status.
  *
- *  `write_conformer_output_` writes `success_k` or `stereo_failure_k` and nothing else, using the
- *  enum's own numbering, so any other value is a slot the kernels never reached. It reports as
- *  unconverged rather than as a success the coordinates would not back.
+ *  Three values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`,
+ *  and `stamp_refused_molecules_kernel` overwrites both with `bounds_infeasible_k` wherever the metric
+ *  prepass found bounds no coordinates satisfy. Anything else is a slot no kernel reached, and it reports
+ *  as unconverged rather than as a success the coordinates would not back.
  */
 static conformer_status_t conformer_status_of_(std::uint8_t raw) noexcept {
     auto const status = static_cast<conformer_status_t>(raw);
-    return status == conformer_status_t::success_k || status == conformer_status_t::stereo_failure_k
-               ? status
-               : conformer_status_t::mmff_unconverged_k;
+    switch (status) {
+    case conformer_status_t::success_k:
+    case conformer_status_t::stereo_failure_k:
+    case conformer_status_t::bounds_infeasible_k: return status;
+    default: return conformer_status_t::mmff_unconverged_k;
+    }
 }
 
 /** Report the launch error the preceding `<<<>>>` left on the device, if any. */
@@ -888,7 +899,8 @@ struct gpu_pipeline_handle_t {
 };
 
 /**
- *  @brief Enqueue the per-bin pipeline and polish launches for one device's whole batch.
+ *  @brief Enqueue the per-bin pipeline and polish launches for one device's whole batch, and the stamp
+ *  that closes the status buffer behind them.
  *
  *  Molecules arrive atom-count ascending, so each atom-limited bin is a contiguous run and the bin's
  *  shared-memory footprint and occupancy come straight out of the construction-time launch cache.
@@ -959,6 +971,17 @@ static void enqueue_binned_kernels_(batch_pool_view_t device_view,
         check_launch_(sink, "mmff_polish_warp_kernel launch");
 
         bin_start = bin_end;
+    }
+
+    // Last on the status buffer, and after every bin: the two warp kernels above write a verdict for each
+    // slot they touch, and this replaces it wherever the metric prepass refused the molecule's bounds
+    // outright. A molecule refused there was still minimised from a zeroed embedding above, so what it holds
+    // is a conformer nothing asked for — the status is what stops it being read as one.
+    if (molecule_count != 0) {
+        constexpr std::uint32_t stamp_block_k = 256;
+        stamp_refused_molecules_kernel<<<divide_rounding_up(molecule_count, stamp_block_k), stamp_block_k, 0, stream>>>(
+            regions.molecule_verdicts.data(), regions.status.data(), molecule_count, conformer_count);
+        check_launch_(sink, "stamp_refused_molecules_kernel launch");
     }
 }
 
@@ -1054,6 +1077,16 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
             "memset device_coords_fp32 zero");
     }
 
+    // The prepass writes a verdict only for the molecules it refuses, so the rest have to arrive saying
+    // nothing. The pool is reused wave after wave, and without this a previous wave's refusal would be
+    // stamped onto whichever molecule now occupies that slot.
+    if (!regions.molecule_verdicts.empty()) {
+        [[maybe_unused]] bool const primed = sink.check(
+            cudaMemsetAsync(regions.molecule_verdicts.data(), static_cast<int>(conformer_status_t::success_k),
+                            regions.molecule_verdicts.size_bytes(), stream),
+            "memset device molecule verdicts");
+    }
+
     // Everything from here to the metric prepass reads the uploaded descriptors and writes the regions
     // past `bytes_uploaded`, so the host ships the molecular graph and the GPU derives the force field
     // from it. One stream, in order, so each pass sees the previous one's output with no event anywhere.
@@ -1062,7 +1095,8 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
     events.open(wave_phase_t::metric_k, stream);
     [[maybe_unused]] bool const embedded = build_metric_initial_coordinates_on_gpu(
         device_view.bounds_matrices().data(), device_view.molecule_metadata().data(), host_metadata, gpu_max_atoms,
-        regions.metric_embedding.data(), context.metric_scratch[device_index], sink, stream);
+        regions.metric_embedding.data(), regions.molecule_verdicts.data(), context.metric_scratch[device_index], sink,
+        stream);
 
     events.open(wave_phase_t::kernels_k, stream);
     enqueue_binned_kernels_(device_view, host_metadata, regions, context.launch_configs[device_index], config,

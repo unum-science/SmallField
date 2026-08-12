@@ -41,6 +41,16 @@ define_smallfield_test(
     LINK smallfield_rdkit fmt::fmt CUDA::cudart
 )
 
+# The infeasibility check compiles the metric prepass and the pipeline kernel itself, so it is bound by the same rule as
+# the reproducibility check above and must not also link `smallfield_lib`.  RDKit comes in for the headers the flat
+# molecule descriptor is declared against, and `CUDA::curand` for the Philox header the pipeline kernel seeds its jitter
+# from.
+define_smallfield_test(
+    cuda bounds_infeasible
+    MIXED
+    LINK smallfield_rdkit fmt::fmt CUDA::cudart CUDA::curand
+)
+
 define_smallfield_test(preprocess chirality MIXED)
 define_smallfield_test(preprocess descriptor)
 define_smallfield_test(preprocess csd_torsion_predicates)

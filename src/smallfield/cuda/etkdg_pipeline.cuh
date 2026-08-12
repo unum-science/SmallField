@@ -3,8 +3,7 @@
  *  @brief Persistent warp-loop CUDA kernels for the ETKDG conformer generation pipeline.
  *
  *  The pipeline lives in two sibling kernels that share the `warp_per_molecule` pattern, split to keep register
- *  pressure per kernel under the launch-bounds cap; each sub-kernel here lands at 72 regs/thread on Hopper,
- *  `sm_90`.
+ *  pressure per kernel under the launch-bounds cap; on Hopper, `sm_90`, they land at 69 and 72 regs/thread.
  *
  *  `etkdg_pipeline_warp_kernel` — bounds quantization through final validation: bounds quantize → DG FIRE →
  *  stereo retry → fourth-dim crush → ETK torsion → final validation. Writes ETK-refined 3D positions to
@@ -14,6 +13,10 @@
  *  positions from `conformer_coordinates_out` as written by the first kernel, overwrites them with the
  *  MMFF-polished coordinates, replaces the ETK energy with the MMFF energy in `conformer_energies_out`. Skips
  *  slots whose status is non-zero — a failed stereo check — or whose molecule has no MMFF terms.
+ *
+ *  `stamp_refused_molecules_kernel` — one thread per molecule, last of the three on the status buffer, and
+ *  the only one that speaks for the metric prepass: it replaces the status of every slot whose molecule has
+ *  a bounds matrix no coordinates satisfy.
  *
  *  Stages per molecule, across both kernels:
  *   - bounds quantization: load pre-smoothed bounds from global memory, int8-quantize to shared
@@ -40,6 +43,7 @@
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 
+#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/cuda/dg_kernel.cuh"
 #include "smallfield/cuda/etk_kernel.cuh"
 #include "smallfield/types/etkdg_types.hpp"
@@ -49,6 +53,7 @@
 #include "smallfield/utilities.hpp"
 
 namespace smallfield::cuda {
+using smallfield::api::conformer_status_t;
 using smallfield::preprocess::is_heavy_refinement_case;
 using smallfield::preprocess::total_mmff_terms;
 using smallfield::types::chiral_center_descriptor_t;
@@ -196,7 +201,7 @@ __device__ __forceinline__ void initialize_from_metric_coordinates_(float const 
  *
  *  @param[out] coordinates_out Global output coordinate buffer, SoA at @p output_stride.
  *  @param[out] energies_out Global output energy buffer, one float per conformer slot.
- *  @param[out] status_out Global output status buffer, 0 = success, 1 = failed.
+ *  @param[out] status_out Global output status buffer, one `conformer_status_t` byte per slot.
  *  @param[in] positions Shared-memory SoA positions — 3 × @p num_atoms floats.
  *  @param[in] molecule_index Molecule index within this wave's dispatch.
  *  @param[in] conformer_index Conformer index within this molecule.
@@ -204,7 +209,7 @@ __device__ __forceinline__ void initialize_from_metric_coordinates_(float const 
  *  @param[in] output_stride Atom stride in the global output arrays.
  *  @param[in] num_conformers Conformers per molecule — used to compute the flat slot.
  *  @param[in] energy Final energy to write for this conformer.
- *  @param[in] succeeded Whether this conformer passed stereo validation.
+ *  @param[in] verdict What this conformer ended as, which the host reads back unchanged.
  *  @param[in] lane Warp lane index, 0–31.
  *
  *  @see etkdg_pipeline_warp_kernel
@@ -214,8 +219,8 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
                                                         std::uint8_t *status_out, float const *positions,
                                                         std::uint32_t molecule_index, std::uint32_t conformer_index,
                                                         std::uint32_t num_atoms, std::uint32_t output_stride,
-                                                        std::uint32_t num_conformers, float energy, bool succeeded,
-                                                        std::uint32_t lane) {
+                                                        std::uint32_t num_conformers, float energy,
+                                                        conformer_status_t verdict, std::uint32_t lane) {
     std::uint32_t const slot = molecule_index * num_conformers + conformer_index;
     std::uint32_t const coord_offset = slot * output_stride * 3;
     // Positions use SoA layout with num_atoms stride, while output uses output_stride.
@@ -224,7 +229,7 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
             coordinates_out[coord_offset + dimension * output_stride + atom] = positions[dimension * num_atoms + atom];
     if (lane == 0) {
         energies_out[slot] = energy;
-        status_out[slot] = succeeded ? 0 : 1;
+        status_out[slot] = static_cast<std::uint8_t>(verdict);
     }
     __syncwarp(full_mask_k);
 }
@@ -246,19 +251,19 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
  *  allows, so it constrains nothing here. What actually bounds occupancy is the register count
  *  against the SM register file, and below the largest bins, the 32-blocks-per-SM slot limit.
  *
- *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`:
- *    sm_80=72, sm_89=80, sm_90=72, sm_100=118, sm_120=123 regs/thread. The Hopper-and-earlier
- *    targets spill nothing (STACK=0, LOCAL=0); both Blackwell targets carry a 120-byte frame.
- *    sm_89 costs eight registers more than its neighbours, which fits 25 blocks/SM rather than
- *    28 — still short of the 32-warp ceiling below, so the shape is unchanged, only tighter.
- *    On sm_90 that is 65536 / (72 × 32) = 28 blocks/SM = 28 warps, against a hard ceiling of
+ *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`, over the shipped
+ *    architecture set: sm_80=64, sm_89=69, sm_90=69, sm_100=112, sm_120=119 regs/thread. Hopper and
+ *    earlier spill nothing (STACK=0, LOCAL=0); both Blackwell targets carry a 64-byte frame.
+ *    On sm_90 that is 65536 / (69 × 32) = 29 blocks/SM = 29 warps, against a hard ceiling of
  *    32 warps — a 32-thread block can never fill more than 32 of the SM's 64 warp slots, so
- *    50 % is the most this shape can reach at any register count. Reaching 64 regs/thread
- *    would buy the last 1.14× of that; nothing below 32 regs/thread buys more.
- *    The remaining eight registers are not in the energy evaluators any more: stubbing the DG
- *    chiral loop out of the sm_90 build drops it to 71 and stubbing the ETK torsion term drops
- *    it not at all, while stubbing the whole ETK stage drops it to 64. What is left is the
- *    state the stereo-retry loop and the FIRE driver carry across every stage.
+ *    50 % is the most this shape can reach at any register count, and the last 1.10× of it is
+ *    all that a lower register count could buy.
+ *
+ *  Reading a verdict here rather than writing one is what that budget cannot afford. A molecule whose
+ *  bounds the metric prepass refused is minimised from its zeroed embedding like any other and lands here
+ *  as a stereo failure or a success, because a guard skipping it at the head of the pair loop measures four
+ *  registers on `sm_120`. `stamp_refused_molecules_kernel` replaces the verdict on those slots afterwards,
+ *  where the same fact costs nothing.
  *
  *  Writes ETK-refined 3D positions into `conformer_coordinates_out`;
  *  `mmff_polish_warp_kernel` runs next on the same buffer.
@@ -383,7 +388,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                                                    ? ((num_atoms - lane + warp_size_k - 1u) / warp_size_k)
                                                    : 0u;
 
-        bool succeeded = false;
+        conformer_status_t verdict = conformer_status_t::stereo_failure_k;
         float final_energy = 0.0f;
 
         for (std::uint32_t attempt = 0; attempt < max_stereo_attempts; ++attempt) {
@@ -435,7 +440,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                 // ETK-refined 3D positions are the final output of this kernel.
                 // The sibling mmff_polish_warp_kernel picks them up from
                 // conformer_coordinates_out and runs MMFF94 polish in-place.
-                succeeded = true;
+                verdict = conformer_status_t::success_k;
                 break;
             }
         }
@@ -443,7 +448,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         // Write the conformer output.
         write_conformer_output_(conformer_coordinates_out, conformer_energies_out, conformer_status_out, positions,
                                 molecule, conformer, num_atoms, output_atoms_stride, num_conformers_per_molecule,
-                                final_energy, succeeded, lane);
+                                final_energy, verdict, lane);
     }
 }
 
@@ -460,9 +465,9 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
  *  Registers bind before shared memory at every bin.
  *
  *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`:
- *    sm_80=64, sm_89=64, sm_90=72, sm_100=94, sm_120=103 regs/thread, no spills (STACK=0, LOCAL=0).
+ *    sm_80=64, sm_89=71, sm_90=72, sm_100=95, sm_120=101 regs/thread, no spills (STACK=0, LOCAL=0).
  *    On sm_90 that is 28 blocks/SM, against the same 32-warp ceiling a 32-thread block imposes,
- *    which is exactly where its sibling sits.
+ *    which is where its sibling sits too.
  *
  *    `bond_distance` is read from global memory on every FIRE iteration, N² per iteration. It
  *    is only ever tested as `< 3`, `== 3`, and `>= 4`, which is two bits per pair, so an N²/4
@@ -573,6 +578,32 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
         if (lane == 0) conformer_energies_out[slot] = mmff_energy;
         __syncwarp(full_mask_k);
     }
+}
+
+/**
+ *  @brief Replace the status of every conformer slot whose molecule the metric prepass refused.
+ *
+ *  One thread per molecule, launched after `mmff_polish_warp_kernel` so it is the last word on the status
+ *  buffer. `etkdg_pipeline_warp_kernel` cannot leave that word itself: it has no cheap way to know, and
+ *  buying one costs it registers it does not have.
+ *
+ *  @param[in] molecule_verdicts What the prepass decided per molecule, `success_k` where it has nothing to say.
+ *  @param[out] conformer_status_out Per-slot statuses the two warp kernels have finished writing.
+ *  @param[in] total_molecules Molecules the two arrays cover.
+ *  @param[in] num_conformers_per_molecule Slots each molecule owns in @p conformer_status_out.
+ *
+ *  @see etkdg_pipeline_warp_kernel
+ */
+__global__ void stamp_refused_molecules_kernel(conformer_status_t const *__restrict__ molecule_verdicts,
+                                               std::uint8_t *__restrict__ conformer_status_out,
+                                               std::uint32_t total_molecules,
+                                               std::uint32_t num_conformers_per_molecule) {
+    std::uint32_t const molecule = blockIdx.x * blockDim.x + threadIdx.x;
+    if (molecule >= total_molecules) return;
+    conformer_status_t const verdict = molecule_verdicts[molecule];
+    if (verdict == conformer_status_t::success_k) return;
+    for (std::uint32_t conformer = 0; conformer < num_conformers_per_molecule; ++conformer)
+        conformer_status_out[molecule * num_conformers_per_molecule + conformer] = static_cast<std::uint8_t>(verdict);
 }
 
 /**
