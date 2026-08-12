@@ -5,12 +5,19 @@
  *  Admission rule, applied to every candidate before it lands here. A helper belongs in this header only
  *  when all three hold:
  *   - it is generic over its operand type rather than tied to one struct or one table layout,
- *   - it depends on nothing outside the standard headers — no CUDA runtime, no RDKit, no project types,
- *   - it has two or more subsystems as consumers.
+ *   - it needs no `#include` at all — this file has none, and that is the property being maintained rather
+ *     than an accident of what has landed so far,
+ *   - it has two or more `src/` subsystems as consumers; `cli/` and `bench/` are tooling, not subsystems.
  *  A helper failing any of the three belongs to the subsystem that owns it, where its name sits next to
  *  the data it serves. `lower_bound_` in `parameters/mmff94_tables.hpp` is the worked example: generic and
  *  standalone, but read by that one header, so it stays there. Without the rule a file named "utilities"
  *  becomes the junk drawer every subsystem reaches into and nobody prunes.
+ *
+ *  @b Why the second clause is stricter than "standard headers only". `cuda/etkdg_pipeline.cuh`,
+ *  `cuda/warp_primitives.cuh` and `mmff94/mmff94_extract_device.cuh` all pull this header in, so every
+ *  include here reaches three translation units `nvcc` compiles. A host-only standard header such as
+ *  `<charconv>` costs all three of them to serve a helper no kernel can call — which is why the
+ *  command-line number parser lives in `number_parse.hpp` at the root instead of here.
  *
  *  Neither helper is marked `__host__ __device__`. `parameters/mmff94_tables.hpp` pulls this header in and
  *  is compiled as plain C++ by `test/parameters/test_mmff94_tables.cpp` and `test/mmff94/test_mmff_typer.cpp`,

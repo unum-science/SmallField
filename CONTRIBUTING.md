@@ -111,7 +111,9 @@ Getting this backwards is not cosmetic — `aj` in four files held the MMFF __k_
 
 __Directory trees stay flat.__
 The maximum depth is `src/smallfield/<subsystem>/<file>`.
-A shared helper that is generic over its operand type, depends on nothing outside the standard headers, and is used by two or more subsystems goes in `src/smallfield/utilities.hpp`; anything failing all three goes to the subsystem that owns it.
+A shared helper that is generic over its operand type, needs no `#include` at all, and is used by two or more `src/` subsystems goes in `src/smallfield/utilities.hpp`; anything failing any one of the three goes to the subsystem that owns it.
+The include clause is stricter than "standard headers only" on purpose — three headers `nvcc` compiles pull `utilities.hpp` in, so a host-only header like `<charconv>` would reach every device translation unit to serve a helper no kernel can call.
+`cli/` and `bench/` are tooling rather than subsystems, so a helper both of them share belongs in a root header such as `src/smallfield/number_parse.hpp`, not here.
 No catch-all directory families.
 
 __Namespaces mirror the directory structure, and `detail` namespaces do not exist.__
