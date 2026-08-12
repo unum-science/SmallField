@@ -37,7 +37,7 @@
 
 #include "smallfield/cuda/etkdg_pipeline.cuh"
 
-namespace sfcuda = smallfield::cuda;
+namespace sfc = smallfield::cuda;
 namespace sft = smallfield::types;
 
 /** Name printed on every line, so a concatenated log stays attributable. */
@@ -202,8 +202,8 @@ static void launch_etkdg_(capture_manifest_t const &manifest, replay_device_t co
     std::uint32_t const conformer_count = static_cast<std::uint32_t>(manifest.conformer_count);
     std::uint32_t const gpu_max_atoms = static_cast<std::uint32_t>(manifest.gpu_max_atoms);
 
-    sfcuda::etkdg_pipeline_warp_kernel<<<static_cast<std::uint32_t>(manifest.grid_etkdg), warp_size_k,
-                                         static_cast<std::uint32_t>(manifest.shared_bytes_etkdg)>>>(
+    sfc::etkdg_pipeline_warp_kernel<<<static_cast<std::uint32_t>(manifest.grid_etkdg), warp_size_k,
+                                      static_cast<std::uint32_t>(manifest.shared_bytes_etkdg)>>>(
         reinterpret_cast<float const *>(pool_at(manifest.offset_bounds_matrices)),
         device.embedding + manifest.embedding_offset_floats,
         reinterpret_cast<sft::chiral_center_descriptor_t const *>(pool_at(manifest.offset_chiral_centers)),
@@ -233,10 +233,10 @@ struct polish_launch_shape_t {
 
 static polish_launch_shape_t polish_launch_shape_(capture_manifest_t const &manifest) {
     std::uint32_t const bin_max_atoms = static_cast<std::uint32_t>(manifest.bin_max_atoms);
-    std::uint32_t const shared_bytes = sfcuda::compute_mmff_polish_shared_memory_bytes(bin_max_atoms);
+    std::uint32_t const shared_bytes = sfc::compute_mmff_polish_shared_memory_bytes(bin_max_atoms);
 
     int blocks_per_multiprocessor = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_multiprocessor, sfcuda::mmff_polish_warp_kernel,
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_multiprocessor, sfc::mmff_polish_warp_kernel,
                                                   static_cast<int>(warp_size_k), shared_bytes);
     int multiprocessor_count = 0;
     cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, 0);
@@ -255,7 +255,7 @@ static void launch_mmff_(capture_manifest_t const &manifest, replay_device_t con
     std::uint32_t const conformer_count = static_cast<std::uint32_t>(manifest.conformer_count);
     std::uint32_t const gpu_max_atoms = static_cast<std::uint32_t>(manifest.gpu_max_atoms);
 
-    sfcuda::mmff_polish_warp_kernel<<<shape.grid, warp_size_k, shape.shared_bytes>>>(
+    sfc::mmff_polish_warp_kernel<<<shape.grid, warp_size_k, shape.shared_bytes>>>(
         reinterpret_cast<sft::mmff94_atom_vdw_params_t const *>(pool_at(manifest.offset_mmff_atom_vdw)),
         reinterpret_cast<float const *>(pool_at(manifest.offset_mmff_atom_charge)),
         reinterpret_cast<std::uint8_t const *>(pool_at(manifest.offset_bond_distance)),

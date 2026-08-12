@@ -34,7 +34,9 @@
 #include "smallfield/types/views.hpp"
 
 namespace py = pybind11;
-namespace api = smallfield::api;
+/* `sfapi` rather than `api`, because `smallfield.api` is a Python module of this same package and the C++
+ * namespace it aliases is a different thing entirely. */
+namespace sfapi = smallfield::api;
 
 namespace {
 
@@ -84,8 +86,8 @@ struct conformer_batch_t {
 #pragma region Conformer Ordering
 
 /** Energy the ordering sees: a failed conformer carries infinity, so every success precedes it. */
-float ordering_energy_(float energy, api::conformer_status_t status) noexcept {
-    return status == api::conformer_status_t::success_k ? energy : std::numeric_limits<float>::infinity();
+float ordering_energy_(float energy, sfapi::conformer_status_t status) noexcept {
+    return status == sfapi::conformer_status_t::success_k ? energy : std::numeric_limits<float>::infinity();
 }
 
 /**
@@ -99,7 +101,7 @@ class conformer_energy_sorter_t {
     std::vector<std::uint32_t> permutation_;
     std::vector<__half> coordinates_scratch_;
     std::vector<float> energies_scratch_;
-    std::vector<api::conformer_status_t> status_scratch_;
+    std::vector<sfapi::conformer_status_t> status_scratch_;
 
   public:
     conformer_energy_sorter_t(std::uint32_t num_conformers, std::size_t coordinate_stride)
@@ -114,7 +116,7 @@ class conformer_energy_sorter_t {
      *  @param[inout] status This molecule's per-conformer status codes.
      */
     void sort_molecule(custd::span<__half> coordinates, custd::span<float> energies,
-                       custd::span<api::conformer_status_t> status) {
+                       custd::span<sfapi::conformer_status_t> status) {
         std::size_t const num_conformers = energies.size();
         std::size_t const coordinate_stride = coordinates.size() / num_conformers;
         sf_assert_(status.size() == num_conformers);
@@ -154,7 +156,7 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
     /*  The atom ceiling is a module constant so `smallfield.api` reads it rather than restating it. The same
      *  number is the stride every conformer slot is padded to, so two layers holding separate copies means
      *  one flat buffer addressed two ways, with nothing comparing them. */
-    smallfield_module.attr("MAX_ATOMS_PER_MOLECULE") = api::max_atoms_per_molecule_k;
+    smallfield_module.attr("MAX_ATOMS_PER_MOLECULE") = sfapi::max_atoms_per_molecule_k;
 
     smallfield_module.def(
         "supports_cuda",
@@ -166,18 +168,18 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
 
     // Every enumerator is named, so a caller reading `batch.status` never meets a bare integer. The
     // assertion is what keeps that true: appending a status without naming it below stops the build here.
-    static_assert(api::conformer_status_count_k == 10u, "a conformer_status_t was added - name it below");
-    py::enum_<api::conformer_status_t>(smallfield_module, "ConformerStatus")
-        .value("SUCCESS", api::conformer_status_t::success_k)
-        .value("STEREO_FAILURE", api::conformer_status_t::stereo_failure_k)
-        .value("MMFF_UNCONVERGED", api::conformer_status_t::mmff_unconverged_k)
-        .value("INVALID_SMILES", api::conformer_status_t::invalid_smiles_k)
-        .value("TOO_MANY_ATOMS", api::conformer_status_t::too_many_atoms_k)
-        .value("PREPROCESS_TIMEOUT", api::conformer_status_t::preprocess_timeout_k)
-        .value("UNSUPPORTED_ELEMENT", api::conformer_status_t::unsupported_element_k)
-        .value("TOO_MANY_BONDS", api::conformer_status_t::too_many_bonds_k)
-        .value("TOO_MANY_RINGS", api::conformer_status_t::too_many_rings_k)
-        .value("BOUNDS_INFEASIBLE", api::conformer_status_t::bounds_infeasible_k);
+    static_assert(sfapi::conformer_status_count_k == 10u, "a conformer_status_t was added - name it below");
+    py::enum_<sfapi::conformer_status_t>(smallfield_module, "ConformerStatus")
+        .value("SUCCESS", sfapi::conformer_status_t::success_k)
+        .value("STEREO_FAILURE", sfapi::conformer_status_t::stereo_failure_k)
+        .value("MMFF_UNCONVERGED", sfapi::conformer_status_t::mmff_unconverged_k)
+        .value("INVALID_SMILES", sfapi::conformer_status_t::invalid_smiles_k)
+        .value("TOO_MANY_ATOMS", sfapi::conformer_status_t::too_many_atoms_k)
+        .value("PREPROCESS_TIMEOUT", sfapi::conformer_status_t::preprocess_timeout_k)
+        .value("UNSUPPORTED_ELEMENT", sfapi::conformer_status_t::unsupported_element_k)
+        .value("TOO_MANY_BONDS", sfapi::conformer_status_t::too_many_bonds_k)
+        .value("TOO_MANY_RINGS", sfapi::conformer_status_t::too_many_rings_k)
+        .value("BOUNDS_INFEASIBLE", sfapi::conformer_status_t::bounds_infeasible_k);
 
     py::class_<conformer_batch_t>(smallfield_module, "ConformerBatch",
                                   "Named outputs of one `Context.generate_conformers` call.")
@@ -192,18 +194,18 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
         .def_readonly("num_bonds", &conformer_batch_t::num_bonds, "uint16 per molecule, hydrogen bonds included.")
         .def_readonly("molecular_weight", &conformer_batch_t::molecular_weight, "float32 per molecule, in daltons.");
 
-    py::class_<api::context_t>(smallfield_module, "Context",
-                               "GPU context owning CUDA streams and per-device scratch. Construction " // split
-                               "initializes every device, so reuse one across calls.")
+    py::class_<sfapi::context_t>(smallfield_module, "Context",
+                                 "GPU context owning CUDA streams and per-device scratch. Construction " // split
+                                 "initializes every device, so reuse one across calls.")
         .def(py::init([](std::vector<int> const &device_ids) {
-                 return std::make_unique<api::context_t>(custd::span<int const>(device_ids));
+                 return std::make_unique<sfapi::context_t>(custd::span<int const>(device_ids));
              }),
              py::arg("device_ids") = std::vector<int> {}, py::call_guard<py::gil_scoped_release>())
         .def(
             "generate_conformers",
-            [](api::context_t &gpu_context, std::vector<std::string> const &smiles_list, std::uint32_t num_conformers,
+            [](sfapi::context_t &gpu_context, std::vector<std::string> const &smiles_list, std::uint32_t num_conformers,
                std::uint32_t max_atoms_per_molecule, std::uint32_t max_stereo_attempts, std::uint64_t random_seed) {
-                api::config_t config;
+                sfapi::config_t config;
                 config.num_conformers = num_conformers;
                 config.max_stereo_attempts = max_stereo_attempts;
                 config.random_seed = random_seed;
@@ -214,7 +216,7 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
 
                 numpy_output<__half> coordinates {"float16", num_slots * coordinate_stride};
                 numpy_output<float> energies {"float32", num_slots};
-                numpy_output<api::conformer_status_t> status {"uint8", num_slots};
+                numpy_output<sfapi::conformer_status_t> status {"uint8", num_slots};
                 numpy_output<std::uint8_t> num_atoms {"uint8", num_molecules};
                 numpy_output<std::uint16_t> num_heavy_atoms {"uint16", num_molecules};
                 numpy_output<std::uint16_t> num_bonds {"uint16", num_molecules};
@@ -230,7 +232,7 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
 
                     // The batch status is `success_k` exactly when some slot of `status` is, so returning it
                     // as well would be one fact in two encodings. A caller reads the array.
-                    [[maybe_unused]] api::conformer_status_t const batch_status = gpu_context.generate_conformers(
+                    [[maybe_unused]] sfapi::conformer_status_t const batch_status = gpu_context.generate_conformers(
                         smiles_views, config, max_atoms_per_molecule, coordinates.view, energies.view, status.view,
                         num_atoms.view, num_heavy_atoms.view, num_bonds.view, molecular_weight.view);
 
@@ -267,10 +269,10 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
                     .molecular_weight = molecular_weight.array,
                 };
             },
-            py::arg("smiles"), py::arg("num_conformers") = api::config_t {}.num_conformers,
-            py::arg("max_atoms_per_molecule") = api::max_atoms_per_molecule_k,
-            py::arg("max_stereo_attempts") = api::config_t {}.max_stereo_attempts,
-            py::arg("random_seed") = api::config_t {}.random_seed,
+            py::arg("smiles"), py::arg("num_conformers") = sfapi::config_t {}.num_conformers,
+            py::arg("max_atoms_per_molecule") = sfapi::max_atoms_per_molecule_k,
+            py::arg("max_stereo_attempts") = sfapi::config_t {}.max_stereo_attempts,
+            py::arg("random_seed") = sfapi::config_t {}.random_seed,
             "Embed and minimize a batch, returning a `ConformerBatch`. Conformers within each " // pinned split
             "molecule come back sorted by ascending energy with failures last. Raises "         // pinned split
             "`RuntimeError` if the run hit a CUDA error, because the outputs are then "         // pinned split

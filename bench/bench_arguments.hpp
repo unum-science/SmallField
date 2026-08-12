@@ -2,9 +2,8 @@
  *  @file bench/bench_arguments.hpp
  *  @brief Command-line and corpus plumbing shared by the benchmark drivers.
  *
- *  `std::atoi` and `std::strtoull` both answer a malformed token with zero, so a run continues on a number
- *  nobody typed. Every benchmark flag goes through `parse_number` instead, whose ceiling is what stops a
- *  four-billion conformer count from reaching `std::vector::resize`.
+ *  Every benchmark flag goes through `parse_number` from `smallfield/number_parse.hpp`, whose ceiling is what
+ *  stops a four-billion conformer count from reaching `std::vector::resize`.
  */
 
 #pragma once
@@ -13,57 +12,17 @@
 #include <cstdio>  // `stderr`
 #include <cstdlib> // `std::getenv`
 
-#include <algorithm>    // `std::min`
-#include <charconv>     // `std::from_chars`
-#include <fstream>      // `std::ifstream`
-#include <string>       // `std::string`, `std::getline`
-#include <string_view>  // `std::string_view`
-#include <system_error> // `std::errc`
-#include <vector>       // `std::vector`
+#include <algorithm>   // `std::min`
+#include <fstream>     // `std::ifstream`
+#include <string>      // `std::string`, `std::getline`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include <fmt/format.h>
 
+#include "smallfield/number_parse.hpp"
+
 namespace smallfield::bench {
-
-/** Why a command-line token was accepted or refused as a number; `describe_number_parse` renders each. */
-enum class number_parse_t {
-    parsed_k,
-    /** Not a number at all, or carrying trailing characters. */
-    malformed_k,
-    out_of_range_k,
-    below_minimum_k,
-    above_maximum_k,
-};
-
-/**
- *  @brief Parse @p text whole as a number in `[minimum, maximum]`, leaving @p number untouched on refusal.
- *
- *  Partial parses are refusals: `12x` is malformed, not twelve. The destination keeps its prior value unless
- *  the token is accepted, so a caller may seed it with the default and read it back either way.
- */
-template <typename number_type_>
-number_parse_t parse_number(std::string_view text, number_type_ minimum, number_type_ maximum, number_type_ &number) {
-    number_type_ parsed {};
-    auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
-    if (error == std::errc::result_out_of_range) return number_parse_t::out_of_range_k;
-    if (error != std::errc {} || unparsed != text.data() + text.size()) return number_parse_t::malformed_k;
-    if (parsed < minimum) return number_parse_t::below_minimum_k;
-    if (parsed > maximum) return number_parse_t::above_maximum_k;
-    number = parsed;
-    return number_parse_t::parsed_k;
-}
-
-/** Sentence fragment naming the refusal, meant to follow the flag name in a diagnostic. */
-inline char const *describe_number_parse(number_parse_t status) {
-    switch (status) {
-    case number_parse_t::parsed_k: return "parsed";
-    case number_parse_t::malformed_k: return "is not a whole number";
-    case number_parse_t::out_of_range_k: return "does not fit the destination type";
-    case number_parse_t::below_minimum_k: return "is below the accepted minimum";
-    case number_parse_t::above_maximum_k: return "is above the accepted maximum";
-    }
-    return "was refused";
-}
 
 /** Environment variable naming a corpus when no `--smi` flag is given. */
 inline constexpr char const *corpus_environment_variable_k = "SMALLFIELD_TEST_CORPUS";
