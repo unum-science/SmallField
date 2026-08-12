@@ -8,8 +8,10 @@
  *  bound, and `compute_device_capacities` clamps each per-molecule capacity to the matching one
  *  here. Drug-like molecules at the 192-atom pipeline cap stay well under all six.
  *
- *  A molecule that did exceed one would have its extra terms dropped rather than refused: the
- *  device extractor stops emitting past the cap. Nothing downstream distinguishes that molecule.
+ *  A molecule that did exceed one has its extra terms dropped rather than being refused: both
+ *  extractors stop emitting past the cap and both say so — the device through
+ *  `mmff94_per_mol_counts_t::overflow`, the host through `mmff94_extract_outcome_t`. Nothing
+ *  downstream reads either, so a saturated molecule is otherwise indistinguishable.
  */
 
 #pragma once
