@@ -89,32 +89,31 @@ inline constexpr std::array<float, 55> vdw_radius_angstrom_k = []() {
     return radii;
 }();
 
-/** Bond-order shortening factor applied to the sum of covalent radii. */
-inline constexpr float bond_order_factor(std::uint8_t bond_order, bool aromatic) noexcept {
-    if (aromatic) return 0.92f;
-    switch (bond_order) {
-    case 1: return 1.00f;
-    case 2: return 0.87f;
-    case 3: return 0.78f;
-    default: return 1.00f;
-    }
-}
+/** The bond types the covalent-radius shortening is keyed by; an aromatic bond is its own case, not an order. */
+enum class covalent_bond_t : std::uint8_t { single_k, double_k, triple_k, aromatic_k };
 
 /**
  *  @brief Ideal bond length in Å for the bond between atoms i and j, whose atomic numbers are Z_i and Z_j.
  *
- *  Close enough to RDKit's `setTopolBounds` output for drug-like bonds that downstream triangle
- *  smoothing + FIRE refinement absorbs the residual.
+ *  The sum of the two covalent radii, shortened by the bond type. Close enough to RDKit's `setTopolBounds`
+ *  output for drug-like bonds that downstream triangle smoothing + FIRE refinement absorbs the residual.
  */
 inline float ideal_bond_length_angstrom(std::uint8_t atomic_number_i, std::uint8_t atomic_number_j,
-                                        std::uint8_t bond_order, bool aromatic) noexcept {
+                                        covalent_bond_t bond) noexcept {
     float const covalent_radius_i = atomic_number_i < covalent_radius_angstrom_k.size()
                                         ? covalent_radius_angstrom_k[atomic_number_i]
                                         : 0.76f;
     float const covalent_radius_j = atomic_number_j < covalent_radius_angstrom_k.size()
                                         ? covalent_radius_angstrom_k[atomic_number_j]
                                         : 0.76f;
-    return (covalent_radius_i + covalent_radius_j) * bond_order_factor(bond_order, aromatic);
+    float shortening = 1.00f;
+    switch (bond) {
+    case covalent_bond_t::single_k: break; // not shortened
+    case covalent_bond_t::double_k: shortening = 0.87f; break;
+    case covalent_bond_t::triple_k: shortening = 0.78f; break;
+    case covalent_bond_t::aromatic_k: shortening = 0.92f; break;
+    }
+    return (covalent_radius_i + covalent_radius_j) * shortening;
 }
 
 /** VdW contact lower bound for atoms i and j, keyed by atomic number. Used for pairs with bond_distance > 3. */
@@ -126,15 +125,33 @@ inline float vdw_lower_bound_angstrom(std::uint8_t atomic_number_i, std::uint8_t
     return 0.8f * (vdw_radius_i + vdw_radius_j);
 }
 
+/** Straight angle, 180°. The sp ideal, and the scale of a regular polygon's interior angle. */
+inline constexpr float straight_angle_radians_k = 3.14159265f;
+
+/** Trigonal angle, 120°. The sp2 ideal, and the fallback for a ring centre no other case answers for. */
+inline constexpr float trigonal_angle_radians_k = 2.09439510f;
+
+/** Tetrahedral angle, 109.47°. The sp3 ideal, and the fallback for an unrecognised hybridization. */
+inline constexpr float tetrahedral_angle_radians_k = 1.91063324f;
+
+/** Right angle, 90°. The sp3d axial and sp3d2 ideal. */
+inline constexpr float right_angle_radians_k = 1.57079633f;
+
+/** 104°, the angle an sp3 centre takes inside a five-membered ring. */
+inline constexpr float cyclopentane_angle_radians_k = 1.81514242f;
+
+/** 105°, the angle an sp3d centre takes inside a ring. */
+inline constexpr float ring_sp3d_angle_radians_k = 1.83259571f;
+
 /** Ideal 1-3 angle in radians by the center atom's hybridization. */
 inline float ideal_angle_radians(std::uint8_t hybridization) noexcept {
     switch (hybridization) {
-    case hybridization_sp_k: return 3.14159265f;    // 180°
-    case hybridization_sp2_k: return 2.09439510f;   // 120°
-    case hybridization_sp3_k: return 1.91063324f;   // 109.47°
-    case hybridization_sp3d_k: return 1.57079633f;  // 90° (axial)
-    case hybridization_sp3d2_k: return 1.57079633f; // 90°
-    default: return 1.91063324f;                    // default tetrahedral
+    case hybridization_sp_k: return straight_angle_radians_k;
+    case hybridization_sp2_k: return trigonal_angle_radians_k;
+    case hybridization_sp3_k: return tetrahedral_angle_radians_k;
+    case hybridization_sp3d_k: return right_angle_radians_k;
+    case hybridization_sp3d2_k: return right_angle_radians_k;
+    default: return tetrahedral_angle_radians_k;
     }
 }
 
@@ -156,11 +173,12 @@ inline float ring_interior_angle_radians(std::uint8_t hybridization, std::uint32
     // likewise pinned by the closure rather than by its preferred 120°.
     bool const closure_decides = ring_size == 3 || ring_size == 4 ||
                                  (hybridization == hybridization_sp2_k && ring_size <= 8);
-    if (closure_decides) return 3.14159265f * (1.0f - 2.0f / static_cast<float>(ring_size));
-    if (hybridization == hybridization_sp3_k) return ring_size == 5 ? 1.81514242f : 1.91063324f; // 104° or 109.47°
-    if (hybridization == hybridization_sp3d_k) return 1.83259571f;                               // 105°
-    if (hybridization == hybridization_sp3d2_k) return 1.57079633f;                              // 90°
-    return 2.09439510f;                                                                          // 120°
+    if (closure_decides) return straight_angle_radians_k * (1.0f - 2.0f / static_cast<float>(ring_size));
+    if (hybridization == hybridization_sp3_k)
+        return ring_size == 5 ? cyclopentane_angle_radians_k : tetrahedral_angle_radians_k;
+    if (hybridization == hybridization_sp3d_k) return ring_sp3d_angle_radians_k;
+    if (hybridization == hybridization_sp3d2_k) return right_angle_radians_k;
+    return trigonal_angle_radians_k;
 }
 
 } // namespace smallfield::preprocess

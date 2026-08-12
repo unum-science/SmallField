@@ -3,13 +3,15 @@
  *  @brief CUDA kernel wrapper for MMFF94 energy and gradient tests.
  */
 
+#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
 
-#include <algorithm> // `std::max`
+#include <fmt/format.h> // `fmt::println` -- host-side only; nothing below a `__global__` uses it
 
 #include <cuda_runtime.h>
 
 #include "smallfield/cuda/mmff94_energy_kernel.cuh"
+#include "smallfield/types/storage.hpp"
 
 #include "test/cuda/test_mmff_gradient_kernels.hpp"
 
@@ -38,106 +40,96 @@ __global__ void mmff_energy_eval_kernel(
 
 namespace smallfield::tests {
 
-void gpu_mmff_energy(float const *host_positions, std::uint32_t num_atoms,
-                     sft::mmff94_atom_vdw_params_t const *host_atom_vdw, float const *host_atom_charge,
-                     std::uint8_t const *host_bond_distance, sft::mmff94_bond_t const *host_bond_params,
-                     std::uint32_t num_bond_params, sft::mmff94_angle_t const *host_angle_params,
-                     std::uint32_t num_angle_params, sft::mmff94_torsion_t const *host_torsion_params,
-                     std::uint32_t num_torsion_params, sft::mmff94_oop_t const *host_oop_params,
-                     std::uint32_t num_oop_params, sft::mmff94_stretchbend_t const *host_stretchbend_params,
-                     std::uint32_t num_stretchbend_params, sft::mmff94_atom_interaction_t const *host_interactions,
-                     std::uint32_t num_interactions, sft::mmff94_atom_offsets_t const *host_atom_offsets,
-                     std::uint32_t num_atom_offsets, float *host_gradient, float *out_energy) {
+/** Grow-only device storage over the legacy default stream, which is the one this evaluation rides. */
+template <typename value_type_>
+using device_array = sft::buffer<value_type_, sft::device_allocator_t>;
 
-    std::uint32_t const num_elements = 3 * num_atoms;
+/** Every device array one energy evaluation stages, released in stream order however the call leaves. */
+struct gradient_arena_t {
+    device_array<float> positions;
+    device_array<float> gradient;
+    device_array<float> energy;
+    device_array<sft::mmff94_atom_vdw_params_t> atom_vdw;
+    device_array<float> atom_charge;
+    device_array<std::uint8_t> bond_distance;
+    device_array<sft::mmff94_bond_t> bonds;
+    device_array<sft::mmff94_angle_t> angles;
+    device_array<sft::mmff94_torsion_t> torsions;
+    device_array<sft::mmff94_oop_t> oops;
+    device_array<sft::mmff94_stretchbend_t> stretchbends;
+    device_array<sft::mmff94_atom_interaction_t> interactions;
+    device_array<sft::mmff94_atom_offsets_t> atom_offsets;
 
-    float *device_positions = nullptr;
-    float *device_gradient = nullptr;
-    float *device_energy = nullptr;
-    sft::mmff94_atom_vdw_params_t *device_atom_vdw = nullptr;
-    float *device_atom_charge = nullptr;
-    std::uint8_t *device_bond_distance = nullptr;
-    sft::mmff94_bond_t *device_bond_params = nullptr;
-    sft::mmff94_angle_t *device_angle_params = nullptr;
-    sft::mmff94_torsion_t *device_torsion_params = nullptr;
-    sft::mmff94_oop_t *device_oop_params = nullptr;
-    sft::mmff94_stretchbend_t *device_stretchbend_params = nullptr;
-    sft::mmff94_atom_interaction_t *device_interactions = nullptr;
-    sft::mmff94_atom_offsets_t *device_atom_offsets = nullptr;
+    /** Reserve every array one molecule of @p num_atoms needs, at the extents @p terms carries. */
+    [[nodiscard]] bool resize_for(std::uint32_t num_atoms, mmff_energy_terms_t const &terms) noexcept {
+        bool reserved = true;
+        auto reserve_ = [&](auto &array, std::size_t count) {
+            reserved &= array.try_reserve(count) != sft::reserve_outcome_t::failed_k;
+        };
+        // A term array may be empty beside a non-zero atom count -- the synthetic single-term fixtures build
+        // exactly that -- and the functor is handed every pointer regardless, so each term keeps one slot.
+        auto reserve_term_ = [&](auto &array, std::size_t count) { reserve_(array, count == 0 ? 1 : count); };
 
-    cudaMalloc(&device_positions, num_elements * sizeof(float));
-    cudaMalloc(&device_gradient, num_elements * sizeof(float));
-    cudaMalloc(&device_energy, sizeof(float));
-    cudaMalloc(&device_atom_vdw, std::max(num_atoms, 1u) * sizeof(sft::mmff94_atom_vdw_params_t));
-    cudaMalloc(&device_atom_charge, std::max(num_atoms, 1u) * sizeof(float));
-    cudaMalloc(&device_bond_distance, std::max(num_atoms * num_atoms, 1u) * sizeof(std::uint8_t));
-    cudaMalloc(&device_bond_params, std::max(num_bond_params, 1u) * sizeof(sft::mmff94_bond_t));
-    cudaMalloc(&device_angle_params, std::max(num_angle_params, 1u) * sizeof(sft::mmff94_angle_t));
-    cudaMalloc(&device_torsion_params, std::max(num_torsion_params, 1u) * sizeof(sft::mmff94_torsion_t));
-    cudaMalloc(&device_oop_params, std::max(num_oop_params, 1u) * sizeof(sft::mmff94_oop_t));
-    cudaMalloc(&device_stretchbend_params, std::max(num_stretchbend_params, 1u) * sizeof(sft::mmff94_stretchbend_t));
-    cudaMalloc(&device_interactions, std::max(num_interactions, 1u) * sizeof(sft::mmff94_atom_interaction_t));
-    cudaMalloc(&device_atom_offsets, std::max(num_atom_offsets, 1u) * sizeof(sft::mmff94_atom_offsets_t));
+        std::size_t const num_elements = std::size_t {3} * num_atoms;
+        reserve_(positions, num_elements);
+        reserve_(gradient, num_elements);
+        reserve_(energy, 1);
+        reserve_term_(atom_vdw, terms.atom_vdw.size());
+        reserve_term_(atom_charge, terms.atom_charge.size());
+        reserve_term_(bond_distance, std::size_t {num_atoms} * num_atoms);
+        reserve_term_(bonds, terms.bonds.size());
+        reserve_term_(angles, terms.angles.size());
+        reserve_term_(torsions, terms.torsions.size());
+        reserve_term_(oops, terms.oops.size());
+        reserve_term_(stretchbends, terms.stretchbends.size());
+        reserve_term_(interactions, terms.interactions.size());
+        reserve_term_(atom_offsets, terms.atom_offsets.size());
+        return reserved;
+    }
 
-    cudaMemcpy(device_positions, host_positions, num_elements * sizeof(float), cudaMemcpyHostToDevice);
-    // Guards check both num_atoms and the host pointer: build_single_oop_prepared
-    // and similar synthetic test fixtures construct a molecule with num_atoms > 0
-    // but empty mmff_atom_vdw / atom_charge / bond_distance vectors (the harness
-    // wrapper substitutes nullptr for empty().data()). Without the pointer
-    // check the cudaMemcpy hits cudaErrorInvalidValue per slot per FD probe and
-    // emits ~75 sanitizer-flagged API errors per test_single_oop run.
-    if (num_atoms > 0 && host_atom_vdw != nullptr)
-        cudaMemcpy(device_atom_vdw, host_atom_vdw, num_atoms * sizeof(sft::mmff94_atom_vdw_params_t),
-                   cudaMemcpyHostToDevice);
-    if (num_atoms > 0 && host_atom_charge != nullptr)
-        cudaMemcpy(device_atom_charge, host_atom_charge, num_atoms * sizeof(float), cudaMemcpyHostToDevice);
-    if (num_atoms > 0 && host_bond_distance != nullptr)
-        cudaMemcpy(device_bond_distance, host_bond_distance, num_atoms * num_atoms * sizeof(std::uint8_t),
-                   cudaMemcpyHostToDevice);
-    if (num_bond_params > 0)
-        cudaMemcpy(device_bond_params, host_bond_params, num_bond_params * sizeof(sft::mmff94_bond_t),
-                   cudaMemcpyHostToDevice);
-    if (num_angle_params > 0)
-        cudaMemcpy(device_angle_params, host_angle_params, num_angle_params * sizeof(sft::mmff94_angle_t),
-                   cudaMemcpyHostToDevice);
-    if (num_torsion_params > 0)
-        cudaMemcpy(device_torsion_params, host_torsion_params, num_torsion_params * sizeof(sft::mmff94_torsion_t),
-                   cudaMemcpyHostToDevice);
-    if (num_oop_params > 0)
-        cudaMemcpy(device_oop_params, host_oop_params, num_oop_params * sizeof(sft::mmff94_oop_t),
-                   cudaMemcpyHostToDevice);
-    if (num_stretchbend_params > 0)
-        cudaMemcpy(device_stretchbend_params, host_stretchbend_params,
-                   num_stretchbend_params * sizeof(sft::mmff94_stretchbend_t), cudaMemcpyHostToDevice);
-    if (num_interactions > 0)
-        cudaMemcpy(device_interactions, host_interactions, num_interactions * sizeof(sft::mmff94_atom_interaction_t),
-                   cudaMemcpyHostToDevice);
-    if (num_atom_offsets > 0)
-        cudaMemcpy(device_atom_offsets, host_atom_offsets, num_atom_offsets * sizeof(sft::mmff94_atom_offsets_t),
-                   cudaMemcpyHostToDevice);
+    /** Upload every host array onto its device counterpart; an empty one copies nothing. */
+    [[nodiscard]] bool upload(custd::span<float const> host_positions, mmff_energy_terms_t const &terms) noexcept {
+        custd::span<std::uint8_t const> const hops {terms.bond_distance.data_handle(), terms.bond_distance.size()};
+        return sft::upload_into(positions.view(), host_positions, nullptr) &&
+               sft::upload_into(atom_vdw.view(), terms.atom_vdw, nullptr) &&
+               sft::upload_into(atom_charge.view(), terms.atom_charge, nullptr) &&
+               sft::upload_into(bond_distance.view(), hops, nullptr) &&
+               sft::upload_into(bonds.view(), terms.bonds, nullptr) &&
+               sft::upload_into(angles.view(), terms.angles, nullptr) &&
+               sft::upload_into(torsions.view(), terms.torsions, nullptr) &&
+               sft::upload_into(oops.view(), terms.oops, nullptr) &&
+               sft::upload_into(stretchbends.view(), terms.stretchbends, nullptr) &&
+               sft::upload_into(interactions.view(), terms.interactions, nullptr) &&
+               sft::upload_into(atom_offsets.view(), terms.atom_offsets, nullptr);
+    }
+};
 
-    mmff_energy_eval_kernel<<<1, 32>>>(device_positions, device_gradient, device_atom_vdw, device_atom_charge,
-                                       device_bond_distance, device_bond_params, device_angle_params,
-                                       device_torsion_params, device_oop_params, device_stretchbend_params,
-                                       device_interactions, device_atom_offsets, num_atoms, device_energy);
+void gpu_mmff_energy(custd::span<float const> host_positions, std::uint32_t num_atoms, mmff_energy_terms_t const &terms,
+                     custd::span<float> host_gradient, float *out_energy) {
+
+    gradient_arena_t arena;
+    if (!arena.resize_for(num_atoms, terms)) {
+        fmt::println(stderr, "NOTE mmff_gradient_kernels field=device_arena atoms={} succeeded=0", num_atoms);
+        return;
+    }
+    if (!arena.upload(host_positions, terms)) {
+        fmt::println(stderr, "NOTE mmff_gradient_kernels field=upload atoms={} succeeded=0", num_atoms);
+        return;
+    }
+
+    mmff_energy_eval_kernel<<<1, sfc::warp_size_k>>>(
+        arena.positions.data(), arena.gradient.data(), arena.atom_vdw.data(), arena.atom_charge.data(),
+        arena.bond_distance.data(), arena.bonds.data(), arena.angles.data(), arena.torsions.data(), arena.oops.data(),
+        arena.stretchbends.data(), arena.interactions.data(), arena.atom_offsets.data(), num_atoms,
+        arena.energy.data());
     cudaDeviceSynchronize();
 
-    cudaMemcpy(host_gradient, device_gradient, num_elements * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(out_energy, device_energy, sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaFree(device_positions);
-    cudaFree(device_gradient);
-    cudaFree(device_energy);
-    cudaFree(device_atom_vdw);
-    cudaFree(device_atom_charge);
-    cudaFree(device_bond_distance);
-    cudaFree(device_bond_params);
-    cudaFree(device_angle_params);
-    cudaFree(device_torsion_params);
-    cudaFree(device_oop_params);
-    cudaFree(device_stretchbend_params);
-    cudaFree(device_interactions);
-    cudaFree(device_atom_offsets);
+    custd::span<float const> const device_gradient = arena.gradient.view();
+    custd::span<float const> const device_energy = arena.energy.view();
+    bool copied = sft::download_from(host_gradient, device_gradient, nullptr);
+    copied &= sft::download_from(custd::span<float> {out_energy, 1}, device_energy, nullptr);
+    if (!copied) fmt::println(stderr, "NOTE mmff_gradient_kernels field=download atoms={} succeeded=0", num_atoms);
+    cudaStreamSynchronize(nullptr);
 }
 
 } // namespace smallfield::tests

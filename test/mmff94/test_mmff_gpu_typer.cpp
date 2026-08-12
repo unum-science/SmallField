@@ -255,9 +255,8 @@ int main(int argc, char **argv) {
     std::vector<float> gpu_atom_charges(total_atoms);
     std::vector<std::uint8_t> gpu_typing_status(num_molecules);
 
-    sftest::launch_mmff94_gpu_typer_batch(device_view, descriptors.data(), num_molecules, atom_offsets.data(),
-                                          total_atoms, gpu_atom_types.data(), gpu_atom_charges.data(),
-                                          gpu_typing_status.data());
+    sftest::launch_mmff94_gpu_typer_batch(device_view, descriptors, atom_offsets, gpu_atom_types, gpu_atom_charges,
+                                          gpu_typing_status);
 
     sftest::typer_reporters_t reporters;
     reporters.limit_printed_lines(sftest::max_printed_lines_k);

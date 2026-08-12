@@ -20,9 +20,12 @@
 
 #include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
+#include "smallfield/types/views.hpp"
+
 #include "test/cuda/test_embedding_determinism_kernels.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
+namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
 using sftest::gpu_embed_replicated;
@@ -68,13 +71,14 @@ int main() {
     constexpr std::uint32_t num_molecules_k = 4096;
 
     std::vector<float> const bounds = synthetic_bounds(num_atoms_k);
-    std::size_t const coordinates_per_molecule = static_cast<std::size_t>(num_atoms_k) * 4;
+    sft::packed_matrix<float const> const bounds_matrix {bounds.data(), num_atoms_k, num_atoms_k};
+    std::size_t const coordinates_per_molecule = static_cast<std::size_t>(num_atoms_k) * sft::embedding_dimensions_k;
     std::vector<float> first_run(coordinates_per_molecule * num_molecules_k);
     std::vector<float> second_run(first_run.size());
 
-    int const first_status = gpu_embed_replicated(bounds.data(), num_atoms_k, num_molecules_k, first_run.data());
+    int const first_status = gpu_embed_replicated(bounds_matrix, num_molecules_k, first_run);
     sf_verify_(first_status == 0, "first embedding launch must succeed");
-    int const second_status = gpu_embed_replicated(bounds.data(), num_atoms_k, num_molecules_k, second_run.data());
+    int const second_status = gpu_embed_replicated(bounds_matrix, num_molecules_k, second_run);
     sf_verify_(second_status == 0, "second embedding launch must succeed");
 
     std::size_t const molecule_bytes = coordinates_per_molecule * sizeof(float);

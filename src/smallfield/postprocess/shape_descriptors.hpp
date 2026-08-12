@@ -246,6 +246,25 @@ inline void moments_for_subset_(custd::span<float const> coords_interleaved,
 }
 
 /**
+ *  @brief Writes the all-atom USR block and hands back the reference points every further block measures against.
+ *
+ *  @param[in] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
+ *  @param[in] num_atoms Atom count; the span carries three floats per atom.
+ *  @param[out] block Exactly `usr_components_k` numbers, reference-point major.
+ *  @return The four all-atom reference points, in RDKit order.
+ */
+inline std::array<point3_t, usr_reference_point_count_k> usr_block_into_(custd::span<float const> coords_interleaved,
+                                                                         std::uint32_t num_atoms,
+                                                                         custd::span<double> block) {
+    sf_assert_(coords_interleaved.size() >= static_cast<std::size_t>(num_atoms) * 3u);
+    std::array<point3_t, usr_reference_point_count_k> const points = reference_points_(coords_interleaved, num_atoms);
+    std::vector<std::uint32_t> all_atoms(num_atoms);
+    std::iota(all_atoms.begin(), all_atoms.end(), 0u);
+    moments_for_subset_(coords_interleaved, points, all_atoms, block);
+    return points;
+}
+
+/**
  *  @brief The four CREDO pharmacophore SMARTS matchers, compiled once.
  *
  *  Order matches RDKit's USRCAT default typing: hydrophobic, aromatic, acceptor, donor. Parsed on first use into
@@ -340,11 +359,8 @@ inline molecule_shape_context_t build_shape_context(
  */
 inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uint32_t num_atoms,
                            std::array<double, usr_components_k> &out) {
-    sf_assert_(coords_interleaved.size() >= static_cast<std::size_t>(num_atoms) * 3u);
-    std::array<point3_t, usr_reference_point_count_k> const points = reference_points_(coords_interleaved, num_atoms);
-    std::vector<std::uint32_t> all_atoms(num_atoms);
-    std::iota(all_atoms.begin(), all_atoms.end(), 0u);
-    moments_for_subset_(coords_interleaved, points, all_atoms, custd::span<double> {out.data(), out.size()});
+    [[maybe_unused]] std::array<point3_t, usr_reference_point_count_k> const points = usr_block_into_(
+        coords_interleaved, num_atoms, custd::span<double> {out.data(), out.size()});
 }
 
 /**
@@ -360,14 +376,9 @@ inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uin
  */
 inline void usrcat_descriptor(custd::span<float const> coords_interleaved, molecule_shape_context_t const &context,
                               std::array<double, usrcat_components_k> &out) {
-    std::uint32_t const num_atoms = context.num_atoms;
-    sf_assert_(coords_interleaved.size() >= static_cast<std::size_t>(num_atoms) * 3u);
-    std::array<point3_t, usr_reference_point_count_k> const points = reference_points_(coords_interleaved, num_atoms);
     custd::span<double> const row {out.data(), out.size()};
-
-    std::vector<std::uint32_t> all_atoms(num_atoms);
-    std::iota(all_atoms.begin(), all_atoms.end(), 0u);
-    moments_for_subset_(coords_interleaved, points, all_atoms, row.subspan(0, usr_components_k));
+    std::array<point3_t, usr_reference_point_count_k> const points = usr_block_into_(
+        coords_interleaved, context.num_atoms, row.subspan(0, usr_components_k));
 
     for (std::size_t subset_index = 0; subset_index < credo_subset_count_k; ++subset_index)
         moments_for_subset_(coords_interleaved, points, context.credo_subsets[subset_index],

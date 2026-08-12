@@ -61,7 +61,7 @@ enum etk_interaction_type_t : std::uint8_t {
  *
  *  Every offset here counts @b elements, never bytes. The batch layout in
  *  `smallfield::api::wave_slice_layout_t` carves the same regions out of the pool and its offsets
- *  count bytes, so the two are named apart — `bounds_offset` here against `bounds_byte_offset`
+ *  count bytes, so the two are named apart — `bounds_offset` here against `bounds.byte_offset`
  *  there — rather than differing only by word order, which would read and compile the same
  *  while addressing memory four times too far.
  */

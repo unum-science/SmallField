@@ -3,13 +3,19 @@
  *  @brief CUDA kernel wrappers for the distance-geometry energy, chirality, and FIRE tests.
  */
 
+#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
+
+#include <utility> // `std::exchange`, `std::swap`
+
+#include <fmt/format.h> // `fmt::println` -- host-side only; nothing below a `__global__` uses it
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "smallfield/cuda/dg_kernel.cuh"
 #include "smallfield/cuda/fire_warp.cuh"
+#include "smallfield/types/storage.hpp"
 
 #include "test/cuda/test_dg_energy_kernels.hpp"
 
@@ -145,24 +151,57 @@ __global__ void dg_minimize_kernel(sftest::device_problem_t problem, float const
 
 namespace smallfield::tests {
 
+/** Grow-only device storage over the stream a staged problem creates for itself. */
+template <typename value_type_>
+using device_array = sft::buffer<value_type_, sft::device_allocator_t>;
+
+/**
+ *  @brief A non-blocking stream that outlives every buffer allocated against it.
+ *
+ *  Declared before those buffers so it is destroyed after them: `cudaFreeAsync` against a destroyed stream
+ *  is undefined, which is the lifetime rule every stream-ordered resource in the pipeline already follows.
+ */
+struct owned_stream_t {
+    cudaStream_t handle = nullptr;
+
+    owned_stream_t() noexcept { cudaStreamCreateWithFlags(&handle, cudaStreamNonBlocking); }
+    ~owned_stream_t() noexcept {
+        if (handle == nullptr) return;
+        cudaStreamSynchronize(handle);
+        cudaStreamDestroy(handle);
+    }
+
+    owned_stream_t(owned_stream_t &&other) noexcept : handle(std::exchange(other.handle, nullptr)) {}
+    owned_stream_t &operator=(owned_stream_t &&other) noexcept {
+        std::swap(handle, other.handle);
+        return *this;
+    }
+};
+
 /**
  *  @brief Device-side copies of one molecule's inputs, released when the call returns.
  *
- *  Every entry point below stages the same four arrays, so the allocation and the release live
- *  here once rather than being spelled out and paired by hand at each of them. Allocation is
- *  stream-ordered: `cudaMalloc` and `cudaFree` synchronize the whole device, which the pipeline
- *  never does and a harness sharing the box with it should not either.
+ *  Every entry point below stages the same four arrays, so the reservation and the release live here once
+ *  rather than being spelled out and paired by hand at each of them. Allocation is stream-ordered:
+ *  `cudaMalloc` and `cudaFree` synchronize the whole device, which the pipeline never does and a harness
+ *  sharing the box with it should not either.
  */
 struct staged_problem_t {
     device_problem_t problem;
-    cudaStream_t stream = nullptr;
-    float *bounds = nullptr;
-    float *coordinates = nullptr;
-    float *gradient = nullptr;
-    sft::chiral_center_descriptor_t *chiral_centers = nullptr;
+    owned_stream_t stream;
+    device_array<float> bounds;
+    device_array<float> coordinates;
+    device_array<float> gradient;
+    device_array<sft::chiral_center_descriptor_t> chiral_centers;
     std::uint32_t num_elements = 0;
+    /** Whether every array reached the device; a launch on a half-staged problem would score garbage. */
+    bool ready = false;
 
-    staged_problem_t(dg_problem_t const &host_problem, float const *host_coords) {
+    staged_problem_t(dg_problem_t const &host_problem, float const *host_coords)
+        : bounds(sft::device_allocator_t {.stream = stream.handle}),
+          coordinates(sft::device_allocator_t {.stream = stream.handle}),
+          gradient(sft::device_allocator_t {.stream = stream.handle}),
+          chiral_centers(sft::device_allocator_t {.stream = stream.handle}) {
         problem.num_atoms = host_problem.num_atoms;
         problem.num_chiral_centers = host_problem.num_chiral_centers;
         problem.spatial_dimension = host_problem.spatial_dimension;
@@ -171,36 +210,28 @@ struct staged_problem_t {
         problem.chiral_weight = host_problem.chiral_weight;
         problem.fourth_dimension_weight = host_problem.fourth_dimension_weight;
         num_elements = host_problem.spatial_dimension * host_problem.num_atoms;
-        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 
-        std::size_t const bounds_bytes = std::size_t {host_problem.num_atoms} * host_problem.num_atoms * sizeof(float);
-        std::size_t const coordinate_bytes = std::size_t {num_elements} * sizeof(float);
-        cudaMallocAsync(&bounds, bounds_bytes, stream);
-        cudaMallocAsync(&coordinates, coordinate_bytes, stream);
-        cudaMallocAsync(&gradient, coordinate_bytes, stream);
-        cudaMemcpyAsync(bounds, host_problem.bounds, bounds_bytes, cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(coordinates, host_coords, coordinate_bytes, cudaMemcpyHostToDevice, stream);
+        std::size_t const bounds_entries = std::size_t {host_problem.num_atoms} * host_problem.num_atoms;
+        bool reserved = true;
+        auto reserve_ = [&](auto &array, std::size_t count) {
+            reserved &= array.try_reserve(count) != sft::reserve_outcome_t::failed_k;
+        };
+        reserve_(bounds, bounds_entries);
+        reserve_(coordinates, num_elements);
+        reserve_(gradient, num_elements);
+        reserve_(chiral_centers, host_problem.num_chiral_centers);
+        problem.chiral_centers = chiral_centers.data();
+        if (!reserved) return;
 
-        if (host_problem.num_chiral_centers != 0) {
-            std::size_t const chiral_bytes = std::size_t {host_problem.num_chiral_centers} *
-                                             sizeof(sft::chiral_center_descriptor_t);
-            cudaMallocAsync(&chiral_centers, chiral_bytes, stream);
-            cudaMemcpyAsync(chiral_centers, host_problem.chiral_centers, chiral_bytes, cudaMemcpyHostToDevice, stream);
-        }
-        problem.chiral_centers = chiral_centers;
+        ready = sft::upload_into(bounds.view(), custd::span<float const> {host_problem.bounds, bounds_entries},
+                                 stream.handle) &&
+                sft::upload_into(coordinates.view(), custd::span<float const> {host_coords, num_elements},
+                                 stream.handle) &&
+                sft::upload_into(chiral_centers.view(),
+                                 custd::span<sft::chiral_center_descriptor_t const> {host_problem.chiral_centers,
+                                                                                     host_problem.num_chiral_centers},
+                                 stream.handle);
     }
-
-    ~staged_problem_t() {
-        cudaFreeAsync(bounds, stream);
-        cudaFreeAsync(coordinates, stream);
-        cudaFreeAsync(gradient, stream);
-        cudaFreeAsync(chiral_centers, stream);
-        cudaStreamSynchronize(stream);
-        cudaStreamDestroy(stream);
-    }
-
-    staged_problem_t(staged_problem_t const &) = delete;
-    staged_problem_t &operator=(staged_problem_t const &) = delete;
 
     /** Bytes the bounds matrix alone occupies in shared memory, at the padded row stride. */
     std::uint32_t bounds_shared_bytes() const noexcept {
@@ -211,53 +242,68 @@ struct staged_problem_t {
 void gpu_dg_energy(dg_problem_t const &host_problem, float const *host_coords, float *host_gradient,
                    float *out_energy) {
     staged_problem_t staged(host_problem, host_coords);
-    float *device_energy = nullptr;
-    cudaMallocAsync(&device_energy, sizeof(float), staged.stream);
+    device_array<float> device_energy {sft::device_allocator_t {.stream = staged.stream.handle}};
+    if (!staged.ready || device_energy.try_reserve(1) == sft::reserve_outcome_t::failed_k) {
+        fmt::println(stderr, "NOTE dg_energy_kernels field=staging atoms={} succeeded=0", host_problem.num_atoms);
+        return;
+    }
 
-    dg_energy_eval_kernel<<<1, 32, staged.bounds_shared_bytes(), staged.stream>>>(
-        staged.problem, staged.bounds, staged.coordinates, staged.gradient, device_energy);
+    dg_energy_eval_kernel<<<1, sfc::warp_size_k, staged.bounds_shared_bytes(), staged.stream.handle>>>(
+        staged.problem, staged.bounds.data(), staged.coordinates.data(), staged.gradient.data(), device_energy.data());
 
-    cudaMemcpyAsync(out_energy, device_energy, sizeof(float), cudaMemcpyDeviceToHost, staged.stream);
-    cudaMemcpyAsync(host_gradient, staged.gradient, std::size_t {staged.num_elements} * sizeof(float),
-                    cudaMemcpyDeviceToHost, staged.stream);
-    cudaFreeAsync(device_energy, staged.stream);
-    cudaStreamSynchronize(staged.stream);
+    bool copied = sft::download_from(custd::span<float> {out_energy, 1},
+                                     custd::span<float const> {device_energy.view()}, staged.stream.handle);
+    copied &= sft::download_from(custd::span<float> {host_gradient, staged.num_elements},
+                                 custd::span<float const> {staged.gradient.view()}, staged.stream.handle);
+    if (!copied)
+        fmt::println(stderr, "NOTE dg_energy_kernels field=download atoms={} succeeded=0", host_problem.num_atoms);
+    cudaStreamSynchronize(staged.stream.handle);
 }
 
 std::uint32_t gpu_count_invalid_chiral_centers(dg_problem_t const &host_problem, float const *host_coords) {
     staged_problem_t staged(host_problem, host_coords);
-    std::uint32_t *device_invalid = nullptr;
-    cudaMallocAsync(&device_invalid, sizeof(std::uint32_t), staged.stream);
+    device_array<std::uint32_t> device_invalid {sft::device_allocator_t {.stream = staged.stream.handle}};
+    if (!staged.ready || device_invalid.try_reserve(1) == sft::reserve_outcome_t::failed_k) {
+        fmt::println(stderr, "NOTE dg_energy_kernels field=staging atoms={} succeeded=0", host_problem.num_atoms);
+        return 0;
+    }
 
-    dg_chirality_kernel<<<1, 32, 0, staged.stream>>>(staged.problem, staged.coordinates, device_invalid);
+    dg_chirality_kernel<<<1, sfc::warp_size_k, 0, staged.stream.handle>>>(staged.problem, staged.coordinates.data(),
+                                                                          device_invalid.data());
 
     std::uint32_t invalid = 0;
-    cudaMemcpyAsync(&invalid, device_invalid, sizeof(std::uint32_t), cudaMemcpyDeviceToHost, staged.stream);
-    cudaFreeAsync(device_invalid, staged.stream);
-    cudaStreamSynchronize(staged.stream);
+    if (!sft::download_from(custd::span<std::uint32_t> {&invalid, 1},
+                            custd::span<std::uint32_t const> {device_invalid.view()}, staged.stream.handle))
+        fmt::println(stderr, "NOTE dg_energy_kernels field=download atoms={} succeeded=0", host_problem.num_atoms);
+    cudaStreamSynchronize(staged.stream.handle);
     return invalid;
 }
 
 void gpu_dg_minimize(dg_problem_t const &host_problem, float *host_coords, std::int32_t max_iterations,
                      float gradient_threshold, dg_minimize_report_t *out_report) {
     staged_problem_t staged(host_problem, host_coords);
-    dg_minimize_report_t *device_report = nullptr;
-    cudaMallocAsync(&device_report, sizeof(dg_minimize_report_t), staged.stream);
+    device_array<dg_minimize_report_t> device_report {sft::device_allocator_t {.stream = staged.stream.handle}};
+    if (!staged.ready || device_report.try_reserve(1) == sft::reserve_outcome_t::failed_k) {
+        fmt::println(stderr, "NOTE dg_energy_kernels field=staging atoms={} succeeded=0", host_problem.num_atoms);
+        return;
+    }
 
     // FIRE needs velocities and a gradient beside the bounds; positions stay in global memory.
-    std::uint32_t const bounds_bytes_aligned = (staged.bounds_shared_bytes() + sizeof(float) - 1) &
-                                               ~(sizeof(float) - 1);
+    std::uint32_t const bounds_bytes_aligned = align_up_(staged.bounds_shared_bytes(), alignof(float));
     std::uint32_t const shared_bytes = bounds_bytes_aligned +
                                        2 * staged.num_elements * static_cast<std::uint32_t>(sizeof(float));
 
-    dg_minimize_kernel<<<1, 32, shared_bytes, staged.stream>>>(staged.problem, staged.bounds, staged.coordinates,
-                                                               max_iterations, gradient_threshold, device_report);
+    dg_minimize_kernel<<<1, sfc::warp_size_k, shared_bytes, staged.stream.handle>>>(
+        staged.problem, staged.bounds.data(), staged.coordinates.data(), max_iterations, gradient_threshold,
+        device_report.data());
 
-    cudaMemcpyAsync(host_coords, staged.coordinates, std::size_t {staged.num_elements} * sizeof(float),
-                    cudaMemcpyDeviceToHost, staged.stream);
-    cudaMemcpyAsync(out_report, device_report, sizeof(dg_minimize_report_t), cudaMemcpyDeviceToHost, staged.stream);
-    cudaFreeAsync(device_report, staged.stream);
-    cudaStreamSynchronize(staged.stream);
+    bool copied = sft::download_from(custd::span<float> {host_coords, staged.num_elements},
+                                     custd::span<float const> {staged.coordinates.view()}, staged.stream.handle);
+    copied &= sft::download_from(custd::span<dg_minimize_report_t> {out_report, 1},
+                                 custd::span<dg_minimize_report_t const> {device_report.view()}, staged.stream.handle);
+    if (!copied)
+        fmt::println(stderr, "NOTE dg_energy_kernels field=download atoms={} succeeded=0", host_problem.num_atoms);
+    cudaStreamSynchronize(staged.stream.handle);
 }
 
 } // namespace smallfield::tests

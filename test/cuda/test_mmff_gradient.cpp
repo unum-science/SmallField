@@ -127,27 +127,22 @@ static float mmff_energy_and_gradient_(sfp::etkdg_prepared_molecule_t const &pre
                                        custd::span<float const> positions, gradient_scratch_t &scratch,
                                        std::vector<float> &gradient) {
     gradient.assign(positions.size(), 0.0f);
-    fill_bond_hops_into(prepared.mmff_bonds,
-                        sft::reset_square_matrix(scratch.bond_hops, prepared.num_atoms, sft::unreachable_hops_k));
+    auto const bond_hops = sft::reset_square_matrix(scratch.bond_hops, prepared.num_atoms, sft::unreachable_hops_k);
+    fill_bond_hops_into(prepared.mmff_bonds, bond_hops);
+    mmff_energy_terms_t const terms {
+        .atom_vdw = prepared.mmff_atom_vdw,
+        .atom_charge = prepared.mmff_atom_charge,
+        .bond_distance = bond_hops,
+        .bonds = prepared.mmff_bonds,
+        .angles = prepared.mmff_angles,
+        .torsions = prepared.mmff_torsions,
+        .oops = prepared.mmff_oops,
+        .stretchbends = prepared.mmff_stretchbends,
+        .interactions = prepared.mmff_interactions,
+        .atom_offsets = prepared.mmff_atom_offsets,
+    };
     float energy = 0.0f;
-    gpu_mmff_energy(positions.data(), prepared.num_atoms,
-                    prepared.mmff_atom_vdw.empty() ? nullptr : prepared.mmff_atom_vdw.data(),
-                    prepared.mmff_atom_charge.empty() ? nullptr : prepared.mmff_atom_charge.data(),
-                    scratch.bond_hops.empty() ? nullptr : scratch.bond_hops.data(),
-                    prepared.mmff_bonds.empty() ? nullptr : prepared.mmff_bonds.data(),
-                    static_cast<std::uint32_t>(prepared.mmff_bonds.size()),
-                    prepared.mmff_angles.empty() ? nullptr : prepared.mmff_angles.data(),
-                    static_cast<std::uint32_t>(prepared.mmff_angles.size()),
-                    prepared.mmff_torsions.empty() ? nullptr : prepared.mmff_torsions.data(),
-                    static_cast<std::uint32_t>(prepared.mmff_torsions.size()),
-                    prepared.mmff_oops.empty() ? nullptr : prepared.mmff_oops.data(),
-                    static_cast<std::uint32_t>(prepared.mmff_oops.size()),
-                    prepared.mmff_stretchbends.empty() ? nullptr : prepared.mmff_stretchbends.data(),
-                    static_cast<std::uint32_t>(prepared.mmff_stretchbends.size()),
-                    prepared.mmff_interactions.empty() ? nullptr : prepared.mmff_interactions.data(),
-                    static_cast<std::uint32_t>(prepared.mmff_interactions.size()),
-                    prepared.mmff_atom_offsets.empty() ? nullptr : prepared.mmff_atom_offsets.data(),
-                    static_cast<std::uint32_t>(prepared.mmff_atom_offsets.size()), gradient.data(), &energy);
+    gpu_mmff_energy(positions, prepared.num_atoms, terms, gradient, &energy);
     return energy;
 }
 

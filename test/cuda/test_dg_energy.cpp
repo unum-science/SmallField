@@ -132,13 +132,11 @@ static void smooth_bounds_(sft::packed_matrix<float> bounds) {
  */
 static sft::packed_matrix<float const> reset_bounds_matrix_(sft::molecule_descriptor_t const &descriptor,
                                                             std::vector<float> &storage) {
-    sfp::build_bounds_matrix(descriptor, storage);
     std::uint32_t const num_atoms = descriptor.num_atoms;
-    sf_verify_(storage.size() == static_cast<std::size_t>(num_atoms) * num_atoms,
-               "the bounds builder sized its output against a different atom count");
-    sft::packed_matrix<float> const bounds {storage.data(), num_atoms, num_atoms};
+    sft::packed_matrix<float> const bounds = sft::reset_square_matrix(storage, num_atoms, 0.0f);
+    sfp::build_bounds_matrix(descriptor, bounds);
     smooth_bounds_(bounds);
-    return sft::packed_matrix<float const> {storage.data(), num_atoms, num_atoms};
+    return bounds;
 }
 
 #pragma endregion Coordinate Views

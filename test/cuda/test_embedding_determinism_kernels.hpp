@@ -7,6 +7,8 @@
 
 #include <cstdint> // `std::uint32_t`
 
+#include "smallfield/types/views.hpp"
+
 namespace smallfield::tests {
 
 /**
@@ -16,13 +18,12 @@ namespace smallfield::tests {
  *  streaming multiprocessor it lands on and whichever of its warps arrives at a reduction first.
  *  The kernel smooths its bounds in place, so a fresh copy is uploaded on each call.
  *
- *  @param[in] host_bounds One @p num_atoms times @p num_atoms bounds matrix, row-major.
- *  @param[in] num_atoms Atom count of that matrix.
+ *  @param[in] host_bounds One square bounds matrix, whose extent is the molecule's atom count.
  *  @param[in] num_molecules Number of identical copies to embed, one block each.
- *  @param[out] host_coordinates Receives @p num_molecules times @p num_atoms times 4 floats, dimension major.
+ *  @param[out] host_coordinates Receives @p num_molecules times atoms times four floats, dimension major.
  *  @return Zero on success, or the CUDA error code that stopped the run.
  */
-int gpu_embed_replicated(float const *host_bounds, std::uint32_t num_atoms, std::uint32_t num_molecules,
-                         float *host_coordinates);
+int gpu_embed_replicated(smallfield::types::packed_matrix<float const> host_bounds, std::uint32_t num_molecules,
+                         custd::span<float> host_coordinates);
 
 } // namespace smallfield::tests

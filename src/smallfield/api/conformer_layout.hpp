@@ -2,11 +2,12 @@
  *  @file src/smallfield/api/conformer_layout.hpp
  *  @brief Addressing contract for conformer coordinate slots, and the transposition against it.
  *
- *  Deliberately free of CUDA and of the rest of the public API: the three sites that must agree on this layout —
- *  the GPU producer, the RDKit `fallback-role` producer, and the Parquet writer — plus its regression test,
- *  should be able to include the contract without dragging in `context_t` or the CUDA runtime headers. The
- *  transposition below is templated on the slot's element type for the same reason: the pool holds `__half`,
- *  and naming that type here would put `<cuda_fp16.h>` in front of every one of those sites.
+ *  Deliberately free of the rest of the public API: the three sites that must agree on this layout — the GPU
+ *  producer, the RDKit `fallback-role` producer, and the Parquet writer — plus its regression test, should be
+ *  able to include the contract without dragging in `context_t` or the CUDA runtime. `types/views.hpp` is the
+ *  one dependency, and it names shapes rather than owning memory, so it costs none of that. The transposition
+ *  below is templated on the slot's element type for the same reason: the pool holds `__half`, and naming that
+ *  type here would put `<cuda_fp16.h>` in front of every one of those sites.
  */
 
 #pragma once
@@ -16,7 +17,10 @@
 
 #include <type_traits> // `std::is_integral_v`, `std::is_same_v`
 
+#include <cuda/std/array> // `custd::array`
+
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::api {
 
@@ -47,17 +51,41 @@ struct conformer_slot_layout_t {
 
     /** Halves spanned by one conformer slot, padding included. */
     [[nodiscard]] constexpr std::size_t slot_stride() const noexcept {
-        return static_cast<std::size_t>(max_atoms) * 3u;
+        return static_cast<std::size_t>(max_atoms) * types::conformer_dimensions_k;
+    }
+
+    /** Position of molecule @p molecule 's conformer @p conformer among all slots, which is what the
+     *  per-conformer status, energy and descriptor arrays are indexed by. */
+    [[nodiscard]] constexpr std::size_t flat_slot(std::uint64_t molecule, std::uint32_t conformer) const noexcept {
+        return static_cast<std::size_t>(molecule) * num_conformers + conformer;
     }
 
     /** Offset of molecule @p molecule 's conformer @p conformer from the buffer base. */
     [[nodiscard]] constexpr std::size_t slot_offset(std::uint64_t molecule, std::uint32_t conformer) const noexcept {
-        return (static_cast<std::size_t>(molecule) * num_conformers + conformer) * slot_stride();
+        return flat_slot(molecule, conformer) * slot_stride();
     }
 
     /** Offset of component @p axis (0 = x, 1 = y, 2 = z) of atom @p atom within a slot. */
     [[nodiscard]] constexpr std::size_t component_offset(std::uint32_t axis, std::uint32_t atom) const noexcept {
         return static_cast<std::size_t>(axis) * max_atoms + atom;
+    }
+
+    /**
+     *  @brief One slot's first @p num_atoms atoms as a `(axis, atom)` view, padded at this layout's stride.
+     *
+     *  The padding is what keeps this off `coordinates_soa`: that view's `custd::layout_left` packs its axis
+     *  planes at the atom count, while a slot pads every plane to `max_atoms` whatever the molecule holds.
+     *
+     *  @param[in] slot Base of the slot inside the coordinate pool, `pool.data() + slot_offset(...)`.
+     *  @param[in] num_atoms Atoms the molecule actually has; the slot's padding atoms fall outside the view.
+     */
+    template <typename value_type_>
+    [[nodiscard]] constexpr types::strided_matrix<value_type_> slot_view(value_type_ *slot,
+                                                                         std::uint32_t num_atoms) const noexcept {
+        return {
+            slot,
+            {custd::dextents<std::uint32_t, 2> {static_cast<std::uint32_t>(types::conformer_dimensions_k), num_atoms},
+             custd::array<std::size_t, 2> {max_atoms, 1u}}};
     }
 };
 
@@ -81,7 +109,7 @@ constexpr bool coordinates_assign_losslessly_k = std::is_same_v<slot_type_, inte
  *
  *  The transposition every reader of the pool performs, stated once beside the layout it addresses: the Parquet
  *  writer, the descriptor tool, and the tests and benchmarks that hand a conformer to RDKit all go through
- *  `component_offset`, so no two of them can disagree about where a component sits.
+ *  `slot_view`, so no two of them can disagree about where a component sits.
  *
  *  @param[in] slot Base of the slot inside the coordinate pool, `pool.data() + layout.slot_offset(...)`.
  *  @param[in] layout Addressing contract the producers and the consumers all agree on.
@@ -93,11 +121,10 @@ inline void gather_slot_into_interleaved(slot_type_ const *slot, conformer_slot_
                                          std::uint32_t num_atoms, interleaved_type_ *interleaved) noexcept {
     static_assert(coordinates_assign_losslessly_k<slot_type_, interleaved_type_>,
                   "an interleaved element is either the slot's own storage or a type it converts to numerically");
-    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-        std::size_t const triple = static_cast<std::size_t>(atom) * 3u;
-        for (std::uint32_t axis = 0; axis < 3u; ++axis)
-            interleaved[triple + axis] = slot[layout.component_offset(axis, atom)];
-    }
+    types::strided_matrix<slot_type_ const> const source = layout.slot_view(slot, num_atoms);
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
+        for (std::uint32_t axis = 0; axis < types::conformer_dimensions_k; ++axis)
+            interleaved[atom * types::conformer_dimensions_k + axis] = source(axis, atom);
 }
 
 /**
@@ -116,11 +143,10 @@ inline void scatter_interleaved_into_slot(interleaved_type_ const *interleaved, 
                                           std::uint32_t num_atoms, slot_type_ *slot) noexcept {
     static_assert(coordinates_assign_losslessly_k<slot_type_, interleaved_type_>,
                   "an interleaved element is either the slot's own storage or a type it converts to numerically");
-    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-        std::size_t const triple = static_cast<std::size_t>(atom) * 3u;
-        for (std::uint32_t axis = 0; axis < 3u; ++axis)
-            slot[layout.component_offset(axis, atom)] = interleaved[triple + axis];
-    }
+    types::strided_matrix<slot_type_> const destination = layout.slot_view(slot, num_atoms);
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
+        for (std::uint32_t axis = 0; axis < types::conformer_dimensions_k; ++axis)
+            destination(axis, atom) = interleaved[atom * types::conformer_dimensions_k + axis];
 }
 
 #pragma endregion Slot Transposition

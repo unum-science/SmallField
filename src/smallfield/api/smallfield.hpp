@@ -96,18 +96,16 @@ struct device_launch_config_t {
  *  the maximum supported atom count.
  */
 struct metric_scratch_t {
-    /** Owning grow-only device buffer, allocated and released along this device's stream. */
-    device_bytes_t pool;
-    /** Non-owning span into `pool`, sized `[max_group_size]` — rebound in
-     *  `ensure_metric_scratch` on growth. */
-    custd::span<std::uint32_t> group_indices {};
-    std::size_t max_group_size = 0;
+    /** Owning grow-only device list of which molecule goes into which bin, allocated and released along
+     *  this device's stream. Its `capacity()` is the largest group a wave may bin, so the extent cannot
+     *  drift from the allocation it describes. */
+    device_indices_t group_indices;
     std::uint32_t max_atoms = 0;
     /** Host-side per-bin molecule lists, refilled each wave; grows once. */
     std::array<std::vector<std::uint32_t>, atom_limited_bin_count_k> bin_groups {};
     /*  `embed_4d_power_iter_kernel` holds the Gram matrix, means, eigenvectors and reduction scratch
      *  in shared memory for its whole lifetime, so the only persistent device scratch is
-     *  `group_indices` — a per-bin uint32 list of which molecule goes into which bin. */
+     *  `group_indices`. */
 };
 
 /**
@@ -115,7 +113,8 @@ struct metric_scratch_t {
  *
  *  Defined in `smallfield.cu` because it holds this device's copy of the MMFF94 parameter tables and
  *  the compiled CSD torsion patterns, whose headers would otherwise reach every consumer of the
- *  public API. CUDA RAII wrappers are not the reason — `metric_scratch_t::pool` is one, right above.
+ *  public API. CUDA RAII wrappers are not the reason — `metric_scratch_t::group_indices` is one, right
+ *  above.
  */
 struct launch_scratch_t;
 

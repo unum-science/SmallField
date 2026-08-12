@@ -287,13 +287,14 @@ struct sampled_conformer_t {
  *  A shuffle rather than a prefix, because slot order follows corpus order and a corpus is ordered by
  *  deposition, so a prefix samples one neighbourhood of it.
  */
-static void fill_success_sample_into_(custd::span<sfapi::conformer_status_t const> status, std::uint32_t num_conformers,
-                                      std::uint32_t max_samples, std::vector<sampled_conformer_t> &sample) {
+static void fill_success_sample_into_(custd::span<sfapi::conformer_status_t const> status,
+                                      sfapi::conformer_slot_layout_t const &slot_layout, std::uint32_t max_samples,
+                                      std::vector<sampled_conformer_t> &sample) {
     sample.clear();
-    std::uint32_t const num_molecules = static_cast<std::uint32_t>(status.size() / num_conformers);
+    std::uint32_t const num_molecules = static_cast<std::uint32_t>(status.size() / slot_layout.num_conformers);
     for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index)
-        for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
-            if (status[molecule_index * num_conformers + conformer_index] == sfapi::conformer_status_t::success_k)
+        for (std::uint32_t conformer_index = 0; conformer_index < slot_layout.num_conformers; ++conformer_index)
+            if (status[slot_layout.flat_slot(molecule_index, conformer_index)] == sfapi::conformer_status_t::success_k)
                 sample.push_back({.molecule_index = molecule_index, .conformer_index = conformer_index});
 
     if (sample.size() <= max_samples) return;
@@ -327,7 +328,7 @@ static void score_sample_with_rdkit_(std::vector<std::string> const &smiles, std
             sftest::set_coords_interleaved(*rdkit_molecule, interleaved_coordinates.data());
             drawn.num_atoms = num_atoms;
             drawn.smallfield_energy = static_cast<double>(
-                energies[drawn.molecule_index * slot_layout.num_conformers + drawn.conformer_index]);
+                energies[slot_layout.flat_slot(drawn.molecule_index, drawn.conformer_index)]);
             // Written last: a finite value here is what marks the sample scored, so it must not be set
             // before the two fields a reader will pair it with.
             drawn.rdkit_energy = sftest::rdkit_mmff94_energy(*rdkit_molecule);
@@ -460,7 +461,7 @@ static gate_verdict_t cross_validate(std::vector<std::string> const &smiles, std
     fmt::println("\nQuality cross-validation");
 
     std::vector<sampled_conformer_t> sample;
-    fill_success_sample_into_(status, num_conformers, max_samples, sample);
+    fill_success_sample_into_(status, slot_layout, max_samples, sample);
     fmt::println("  Evaluating {} conformers via RDKit MMFF94...", fmt::group_digits(sample.size()));
     if (sample.empty()) {
         fmt::println("NOTE heavy_bin_gate atoms={}-{} compared=0 required={}", atom_count_bin_lower_bound_(gate_bin_k),

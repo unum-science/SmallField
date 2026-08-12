@@ -13,6 +13,7 @@
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
+#include "smallfield/types/views.hpp"
 
 namespace smallfield::tests {
 
@@ -33,19 +34,39 @@ struct mmff94_packed_host_result_t {
     std::vector<smallfield::types::etkdg_molecule_metadata_t> metadata;
 };
 
+/**
+ *  @brief Type, extract, build the CSR, and compact one batch on the device, then copy it all back.
+ *
+ *  Every staging array is fixed-stride, so each output span states the stride by its own extent and no
+ *  count travels beside it: `out_bonds` spans `max_mmff_bonds_per_mol_k` slots per descriptor, and
+ *  `out_atom_offsets` one slot per atom, which is what carries the batch's atom total.
+ *
+ *  @param[in] tables_host MMFF94 parameter tables, uploaded here.
+ *  @param[in] descriptors One descriptor per molecule.
+ *  @param[in] atom_offsets Each molecule's first atom in the batch-global atom array.
+ *  @param[out] out_counts Receives the per-molecule term counts.
+ *  @param[out] out_status Receives one typing status per molecule.
+ *  @param[out] out_bonds Receives the fixed-stride bond staging.
+ *  @param[out] out_angles Receives the fixed-stride angle staging.
+ *  @param[out] out_torsions Receives the fixed-stride torsion staging.
+ *  @param[out] out_oops Receives the fixed-stride out-of-plane staging.
+ *  @param[out] out_stbns Receives the fixed-stride stretch-bend staging.
+ *  @param[out] out_interactions Receives the fixed-stride nonbonded staging.
+ *  @param[out] out_atom_offsets Receives one CSR offset record per atom of the batch.
+ *  @param[out] packed_out Receives the compacted arrays, resized to the totals the scan reported.
+ */
 void launch_mmff94_gpu_extract_pipeline(smallfield::parameters::mmff94_tables_host_t const &tables_host,
-                                        smallfield::types::molecule_descriptor_t const *descriptors,
-                                        std::uint32_t num_mols, std::uint32_t const *atom_offsets,
-                                        std::uint32_t total_atoms,
-                                        smallfield::mmff94::mmff94_per_mol_counts_t *out_counts,
-                                        std::uint8_t *out_status, smallfield::types::mmff94_bond_t *out_bonds,
-                                        std::uint32_t bond_stride, smallfield::types::mmff94_angle_t *out_angles,
-                                        std::uint32_t angle_stride, smallfield::types::mmff94_torsion_t *out_torsions,
-                                        std::uint32_t torsion_stride, smallfield::types::mmff94_oop_t *out_oops,
-                                        std::uint32_t oop_stride, smallfield::types::mmff94_stretchbend_t *out_stbns,
-                                        std::uint32_t stbn_stride,
-                                        smallfield::types::mmff94_atom_interaction_t *out_interactions,
-                                        smallfield::types::mmff94_atom_offsets_t *out_atom_offsets,
+                                        custd::span<smallfield::types::molecule_descriptor_t const> descriptors,
+                                        custd::span<std::uint32_t const> atom_offsets,
+                                        custd::span<smallfield::mmff94::mmff94_per_mol_counts_t> out_counts,
+                                        custd::span<std::uint8_t> out_status,
+                                        custd::span<smallfield::types::mmff94_bond_t> out_bonds,
+                                        custd::span<smallfield::types::mmff94_angle_t> out_angles,
+                                        custd::span<smallfield::types::mmff94_torsion_t> out_torsions,
+                                        custd::span<smallfield::types::mmff94_oop_t> out_oops,
+                                        custd::span<smallfield::types::mmff94_stretchbend_t> out_stbns,
+                                        custd::span<smallfield::types::mmff94_atom_interaction_t> out_interactions,
+                                        custd::span<smallfield::types::mmff94_atom_offsets_t> out_atom_offsets,
                                         mmff94_packed_host_result_t &packed_out);
 
 } // namespace smallfield::tests

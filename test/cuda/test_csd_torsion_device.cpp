@@ -169,8 +169,8 @@ int main(int argc, char **argv) {
         if (descriptors.empty()) return;
         std::uint32_t const count = static_cast<std::uint32_t>(descriptors.size());
         auto const device_start = std::chrono::steady_clock::now();
-        bool const launched = sftest::run_csd_torsion_device_batch(
-            table_handle, descriptors.data(), count, torsion_stride_k, device_torsions.data(), device_counts.data());
+        bool const launched = sftest::run_csd_torsion_device_batch(table_handle, descriptors, torsion_stride_k,
+                                                                   device_torsions, device_counts);
         device_microseconds +=
             std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - device_start).count();
         sf_verify_(launched, "device torsion kernel failed");

@@ -585,7 +585,7 @@ void copy_reembed_molecule_into_(reembed_molecule_t const &molecule, std::uint64
     std::size_t const num_slots = std::min<std::size_t>(molecule.conformers.size(), layout.num_conformers);
     for (std::size_t conformer_slot = 0; conformer_slot < num_slots; ++conformer_slot) {
         reembed_conformer_t const &conformer = molecule.conformers[conformer_slot];
-        std::size_t const flat = static_cast<std::size_t>(molecule_index) * layout.num_conformers + conformer_slot;
+        std::size_t const flat = layout.flat_slot(molecule_index, static_cast<std::uint32_t>(conformer_slot));
         buffers.status[flat] = conformer.status;
         buffers.energies[flat] = conformer.energy;
         if (conformer.status != sfapi::conformer_status_t::success_k) continue; // a failure row stays null
@@ -666,7 +666,7 @@ void augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t cons
     for (std::size_t conformer_slot = 0; conformer_slot < num_slots; ++conformer_slot) {
         std::int64_t const row = rows[conformer_slot];
         auto const row_status = static_cast<sfapi::conformer_status_t>(shard.status->Value(row));
-        std::size_t const flat = static_cast<std::size_t>(molecule_index) * layout.num_conformers + conformer_slot;
+        std::size_t const flat = layout.flat_slot(molecule_index, static_cast<std::uint32_t>(conformer_slot));
         buffers.status[flat] = row_status;
         if (shard.conformer_energy->IsValid(row)) buffers.energies[flat] = shard.conformer_energy->Value(row);
         if (row_status != sfapi::conformer_status_t::success_k) continue; // a failure row stays null

@@ -478,25 +478,19 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
         auto const gpu_gradient = reset_coordinates_soa<coordinate_role_t::gradient_k, sft::conformer_dimensions_k>(
             scratch.gpu_gradient, num_atoms);
         float gpu_energy = 0.0f;
-        gpu_mmff_energy(positions.data_handle(), single.num_atoms,
-                        single.mmff_atom_vdw.empty() ? nullptr : single.mmff_atom_vdw.data(),
-                        single.mmff_atom_charge.empty() ? nullptr : single.mmff_atom_charge.data(),
-                        kind == term_kind_t::nonbonded_k ? bond_hops.data_handle() : unreachable_hops.data_handle(),
-                        single.mmff_bonds.empty() ? nullptr : single.mmff_bonds.data(),
-                        static_cast<std::uint32_t>(single.mmff_bonds.size()),
-                        single.mmff_angles.empty() ? nullptr : single.mmff_angles.data(),
-                        static_cast<std::uint32_t>(single.mmff_angles.size()),
-                        single.mmff_torsions.empty() ? nullptr : single.mmff_torsions.data(),
-                        static_cast<std::uint32_t>(single.mmff_torsions.size()),
-                        single.mmff_oops.empty() ? nullptr : single.mmff_oops.data(),
-                        static_cast<std::uint32_t>(single.mmff_oops.size()),
-                        single.mmff_stretchbends.empty() ? nullptr : single.mmff_stretchbends.data(),
-                        static_cast<std::uint32_t>(single.mmff_stretchbends.size()),
-                        single.mmff_interactions.empty() ? nullptr : single.mmff_interactions.data(),
-                        static_cast<std::uint32_t>(single.mmff_interactions.size()),
-                        single.mmff_atom_offsets.empty() ? nullptr : single.mmff_atom_offsets.data(),
-                        static_cast<std::uint32_t>(single.mmff_atom_offsets.size()), gpu_gradient.data_handle(),
-                        &gpu_energy);
+        mmff_energy_terms_t const terms {
+            .atom_vdw = single.mmff_atom_vdw,
+            .atom_charge = single.mmff_atom_charge,
+            .bond_distance = kind == term_kind_t::nonbonded_k ? bond_hops : unreachable_hops,
+            .bonds = single.mmff_bonds,
+            .angles = single.mmff_angles,
+            .torsions = single.mmff_torsions,
+            .oops = single.mmff_oops,
+            .stretchbends = single.mmff_stretchbends,
+            .interactions = single.mmff_interactions,
+            .atom_offsets = single.mmff_atom_offsets,
+        };
+        gpu_mmff_energy(scratch.positions, single.num_atoms, terms, scratch.gpu_gradient, &gpu_energy);
 
         auto const rdkit_gradient = reset_coordinates_aos<coordinate_role_t::gradient_k>(scratch.rdkit_gradient,
                                                                                          num_atoms);

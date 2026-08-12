@@ -3,11 +3,13 @@
  *  @brief CUDA kernel wrappers for chirality validation test.
  */
 
+#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
 
 #include <cuda_runtime.h>
 
 #include "smallfield/cuda/dg_kernel.cuh"
+#include "smallfield/types/storage.hpp"
 
 #include "test/preprocess/test_chirality_kernels.hpp"
 
@@ -25,33 +27,53 @@ __global__ void chirality_check_kernel(float const *positions, std::uint32_t num
 
 namespace smallfield::tests {
 
-bool gpu_validate_chirality(float const *host_coords, sft::chiral_center_descriptor_t const *host_chirals,
-                            std::uint32_t num_atoms, std::uint32_t num_chirals) {
+/** Grow-only device storage over the legacy default stream, which is the one this check launches on. */
+template <typename value_type_>
+using device_array = sft::buffer<value_type_, sft::device_allocator_t>;
 
-    std::uint32_t const coord_elements = 3 * num_atoms; // 3D only for chirality
-    float *device_coords;
-    sft::chiral_center_descriptor_t *device_chirals;
-    bool *device_result;
+/** Every device array one chirality check stages, released in stream order on every path out of the call. */
+struct chirality_arena_t {
+    device_array<float> coordinates;
+    device_array<sft::chiral_center_descriptor_t> centers;
+    device_array<bool> verdict;
 
-    cudaMalloc(&device_coords, coord_elements * sizeof(float));
-    cudaMalloc(&device_chirals, num_chirals * sizeof(sft::chiral_center_descriptor_t));
-    cudaMalloc(&device_result, sizeof(bool));
+    /** Reserve one molecule's coordinates and centers; false when the device refused any of them. */
+    [[nodiscard]] bool resize_for(std::size_t num_components, std::size_t num_centers) noexcept {
+        bool reserved = true;
+        auto reserve_ = [&](auto &array, std::size_t count) {
+            reserved &= array.try_reserve(count) != sft::reserve_outcome_t::failed_k;
+        };
+        reserve_(coordinates, num_components);
+        reserve_(centers, num_centers);
+        reserve_(verdict, 1);
+        return reserved;
+    }
+};
 
-    cudaMemcpy(device_coords, host_coords, coord_elements * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(device_chirals, host_chirals, num_chirals * sizeof(sft::chiral_center_descriptor_t),
-               cudaMemcpyHostToDevice);
+chirality_verdict_t gpu_validate_chirality(conformer_reader_t host_coords,
+                                           custd::span<sft::chiral_center_descriptor_t const> host_chirals) {
 
-    chirality_check_kernel<<<1, 32>>>(device_coords, num_atoms, device_chirals, num_chirals, device_result);
-    cudaDeviceSynchronize();
+    std::uint32_t const num_atoms = host_coords.extent(0);
+    std::size_t const num_components = sft::conformer_dimensions_k * std::size_t {num_atoms};
 
-    bool result = false;
-    cudaMemcpy(&result, device_result, sizeof(bool), cudaMemcpyDeviceToHost);
+    chirality_arena_t arena;
+    if (!arena.resize_for(num_components, host_chirals.size())) return chirality_verdict_t::unavailable_k;
 
-    cudaFree(device_coords);
-    cudaFree(device_chirals);
-    cudaFree(device_result);
+    custd::span<float const> const coordinates {host_coords.data_handle(), num_components};
+    if (!sft::upload_into(arena.coordinates.view(), coordinates, nullptr)) return chirality_verdict_t::unavailable_k;
+    if (!sft::upload_into(arena.centers.view(), host_chirals, nullptr)) return chirality_verdict_t::unavailable_k;
 
-    return result;
+    chirality_check_kernel<<<1, sfc::warp_size_k>>>(arena.coordinates.data(), num_atoms, arena.centers.data(),
+                                                    static_cast<std::uint32_t>(host_chirals.size()),
+                                                    arena.verdict.data());
+
+    bool satisfied = false;
+    custd::span<bool const> const device_verdict = arena.verdict.view();
+    if (!sft::download_from(custd::span<bool> {&satisfied, 1}, device_verdict, nullptr))
+        return chirality_verdict_t::unavailable_k;
+    cudaStreamSynchronize(nullptr);
+
+    return satisfied ? chirality_verdict_t::satisfied_k : chirality_verdict_t::violated_k;
 }
 
 } // namespace smallfield::tests

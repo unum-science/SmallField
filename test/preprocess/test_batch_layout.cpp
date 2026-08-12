@@ -113,14 +113,14 @@ static void check_layout_(uniform_batch_expectation_t const &expectation, diagno
     std::uint64_t const bond_distance_bytes = expectation.bond_distance * sizeof(std::uint8_t);
     auto const at_least = [](std::uint64_t reference, std::uint64_t observed) { return observed >= reference; };
     reporter.mismatch("layout", "molecules={} atoms={}", expectation.molecules, expectation.atoms_per_molecule)
-        .field("num_bounds", expectation.bounds, static_cast<std::uint64_t>(layout.num_bounds), exactly_equal)
-        .field("num_bond_distance", expectation.bond_distance, static_cast<std::uint64_t>(layout.num_bond_distance),
+        .field("num_bounds", expectation.bounds, static_cast<std::uint64_t>(layout.bounds.count), exactly_equal)
+        .field("num_bond_distance", expectation.bond_distance, static_cast<std::uint64_t>(layout.bond_distance.count),
                exactly_equal)
         .field("bytes_uploaded", bounds_bytes, static_cast<std::uint64_t>(layout.bytes_uploaded), at_least)
         .field("bytes_total", bounds_bytes + bond_distance_bytes, static_cast<std::uint64_t>(layout.bytes_total),
                at_least)
         .field("bond_distance_byte_offset", static_cast<std::uint64_t>(layout.bytes_uploaded),
-               static_cast<std::uint64_t>(layout.bond_distance_byte_offset), at_least);
+               static_cast<std::uint64_t>(layout.bond_distance.byte_offset), at_least);
 }
 
 /**

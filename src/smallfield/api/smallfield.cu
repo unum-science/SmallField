@@ -40,21 +40,21 @@ using smallfield::cuda::build_metric_initial_coordinates_on_gpu;
 using smallfield::cuda::compute_mmff_polish_shared_memory_bytes;
 using smallfield::cuda::compute_pipeline_shared_memory_bytes;
 using smallfield::cuda::convert_coords_fp32_to_fp16_kernel;
+using smallfield::cuda::csd_torsion_match_kernel;
 using smallfield::cuda::csd_torsion_table_device_t;
 using smallfield::cuda::csd_torsion_table_host_t;
+using smallfield::cuda::etk_build_csr_kernel;
 using smallfield::cuda::etkdg_pipeline_warp_kernel;
 using smallfield::cuda::launch_bond_distance_bfs;
-using smallfield::cuda::launch_csd_torsion_match;
-using smallfield::cuda::launch_etk_build_csr;
-using smallfield::cuda::launch_mmff94_apply_typing_patch;
+using smallfield::cuda::mmff94_apply_typing_patch_kernel;
 using smallfield::cuda::mmff_polish_warp_kernel;
 using smallfield::cuda::upload_csd_torsion_table_to_device;
 using smallfield::cuda::warp_size_k;
-using smallfield::mmff94::launch_mmff94_build_csr;
-using smallfield::mmff94::launch_mmff94_compact_terms;
-using smallfield::mmff94::launch_mmff94_extract_terms;
-using smallfield::mmff94::launch_mmff94_type_and_charge;
+using smallfield::mmff94::mmff94_build_csr_kernel;
+using smallfield::mmff94::mmff94_compact_terms_kernel;
+using smallfield::mmff94::mmff94_extract_terms_kernel;
 using smallfield::mmff94::mmff94_per_mol_counts_t;
+using smallfield::mmff94::mmff94_type_and_charge_kernel;
 using smallfield::parameters::extract_mmff94_tables_from_rdkit;
 using smallfield::parameters::mmff94_tables_device_t;
 using smallfield::parameters::mmff94_tables_host_t;
@@ -82,39 +82,6 @@ using smallfield::types::molecule_descriptor_t;
 using smallfield::types::upload_into;
 
 using smallfield::cuda_error_sink_t;
-
-#pragma region Pool Regions
-
-/** Alignment every carved region starts at; the same convention the batch pool's own layout uses. */
-inline constexpr std::size_t pool_region_alignment_k = wave_slice_layout_t::region_alignment_k;
-
-/**
- *  @brief Where one region of a carved pool starts, and how many elements it holds.
- *
- *  The offset and the count are one fact rather than two fields that have to be passed together and
- *  kept in step; `over` is the only place a region turns back into a pointer.
- */
-struct pool_region_t {
-    std::size_t byte_offset = 0;
-    std::size_t count = 0;
-
-    /** View this region over @p base, which must be the pool the region was placed in. */
-    template <typename element_>
-    [[nodiscard]] custd::span<element_> over(std::byte *base) const noexcept {
-        return {reinterpret_cast<element_ *>(base + byte_offset), count};
-    }
-};
-
-/** Place @p count elements of @p element_ at the next aligned offset and advance @p cursor past them. */
-template <typename element_>
-constexpr pool_region_t place_pool_region_(std::size_t &cursor, std::size_t count) noexcept {
-    cursor = align_up_(cursor, pool_region_alignment_k);
-    pool_region_t const region {.byte_offset = cursor, .count = count};
-    cursor += count * sizeof(element_);
-    return region;
-}
-
-#pragma endregion Pool Regions
 
 #pragma region Wave Sizing
 
@@ -344,9 +311,6 @@ enum class wave_phase_t : std::uint8_t {
 /** Phases a wave is timed in. One more boundary event than this is needed to bracket them all. */
 inline constexpr std::size_t wave_phase_count_k = 4;
 
-/** Position of @p phase in a per-phase array. */
-constexpr std::size_t phase_index_(wave_phase_t phase) noexcept { return static_cast<std::size_t>(phase); }
-
 /**
  *  @brief One wave's per-phase GPU and DMA wall on one device, in milliseconds.
  *
@@ -395,7 +359,9 @@ struct phase_events_t {
     }
 
     /** Stamp the boundary that opens @p phase into @p stream, before that phase's first call. */
-    void open(wave_phase_t phase, cudaStream_t stream) const noexcept { record_(phase_index_(phase), stream); }
+    void open(wave_phase_t phase, cudaStream_t stream) const noexcept {
+        record_(static_cast<std::size_t>(phase), stream);
+    }
 
     /** Stamp the closing boundary, after the last phase's work is enqueued. */
     void close(cudaStream_t stream) const noexcept { record_(wave_phase_count_k, stream); }
@@ -521,10 +487,11 @@ static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record
                      wave_record.wave_index, wave_width_k, wave_record.num_molecules, mols_width_k,
                      wave_record.prepare.duration_ms(), time_width_k, wave_record.launch.duration_ms(), time_width_k,
                      wave_record.finalize.duration_ms(), time_width_k, summary.average_ms, time_width_k, summary.max_ms,
-                     time_width_k, summary.average_phase_ms[phase_index_(wave_phase_t::upload_k)], time_width_k,
-                     summary.average_phase_ms[phase_index_(wave_phase_t::metric_k)], time_width_k,
-                     summary.average_phase_ms[phase_index_(wave_phase_t::kernels_k)], time_width_k,
-                     summary.average_phase_ms[phase_index_(wave_phase_t::download_k)], time_width_k);
+                     time_width_k, summary.average_phase_ms[static_cast<std::size_t>(wave_phase_t::upload_k)],
+                     time_width_k, summary.average_phase_ms[static_cast<std::size_t>(wave_phase_t::metric_k)],
+                     time_width_k, summary.average_phase_ms[static_cast<std::size_t>(wave_phase_t::kernels_k)],
+                     time_width_k, summary.average_phase_ms[static_cast<std::size_t>(wave_phase_t::download_k)],
+                     time_width_k);
     }
     logger.trace("wall {:.1f} ms", total_wall_ms);
     for (wave_record_t const &wave_record : wave_records) {
@@ -533,10 +500,11 @@ static void print_wave_timeline_(logger_t const &logger, std::vector<wave_record
             if (device_timing.total_ms <= 0.f) continue;
             logger.trace2(
                 "  wave={} dev={}  upload={:.1f}  metric={:.1f}  kernels={:.1f}  download={:.1f}  total={:.1f}",
-                wave_record.wave_index, device_index, device_timing.phase_ms[phase_index_(wave_phase_t::upload_k)],
-                device_timing.phase_ms[phase_index_(wave_phase_t::metric_k)],
-                device_timing.phase_ms[phase_index_(wave_phase_t::kernels_k)],
-                device_timing.phase_ms[phase_index_(wave_phase_t::download_k)], device_timing.total_ms);
+                wave_record.wave_index, device_index,
+                device_timing.phase_ms[static_cast<std::size_t>(wave_phase_t::upload_k)],
+                device_timing.phase_ms[static_cast<std::size_t>(wave_phase_t::metric_k)],
+                device_timing.phase_ms[static_cast<std::size_t>(wave_phase_t::kernels_k)],
+                device_timing.phase_ms[static_cast<std::size_t>(wave_phase_t::download_k)], device_timing.total_ms);
         }
     }
 }
@@ -659,18 +627,21 @@ static wave_pool_layout_t compute_wave_pool_layout_(std::size_t batch_bytes, std
 }
 
 /**
- *  @brief Grow the per-device metric scratch pool for the given group size and atom count; no-op on shrink.
+ *  @brief Grow the per-device metric scratch for the given group size and atom count; no-op on shrink.
  *
  *  The first wave of a workload pays the allocation and every later one reuses it. Declared here
- *  because `context_t`'s constructor pre-warms it, so the first user call does not allocate.
+ *  because `context_t`'s constructor pre-warms it, so the first user call does not allocate. A refused
+ *  grow leaves the previous allocation and its capacity in place, and the prepass re-tests that
+ *  capacity against the group it is about to bin, so the wave degrades rather than overruns.
  */
 void ensure_metric_scratch(context_t &context, std::size_t device_index, std::size_t max_group_size,
                            std::uint32_t max_atoms) {
     auto &scratch = context.metric_scratch[device_index];
-    if (max_group_size <= scratch.max_group_size && max_atoms <= scratch.max_atoms && scratch.pool.data() != nullptr)
+    if (max_group_size <= scratch.group_indices.capacity() && max_atoms <= scratch.max_atoms &&
+        scratch.group_indices.data() != nullptr)
         return;
 
-    std::size_t const new_group = std::max(scratch.max_group_size, max_group_size);
+    std::size_t const new_group = std::max(scratch.group_indices.capacity(), max_group_size);
     std::uint32_t const new_atoms = std::max<std::uint32_t>(scratch.max_atoms, max_atoms);
 
     cudaSetDevice(context.device_ids[device_index]);
@@ -679,13 +650,11 @@ void ensure_metric_scratch(context_t &context, std::size_t device_index, std::si
     // eigenvectors and reduction scratch all live there for the kernel's lifetime — so the only
     // persistent device scratch is the `group_indices` uint32 list of which molecule goes into
     // which bin, which is KB-scale.
-    std::size_t const group_bytes = align_up_(new_group * sizeof(std::uint32_t), pool_region_alignment_k);
-    if (scratch.pool.try_reserve(group_bytes) == reserve_outcome_t::failed_k) {
-        context.logger.error("ensure_metric_scratch: device allocation ({} bytes) failed", group_bytes);
+    if (scratch.group_indices.try_reserve(new_group) == reserve_outcome_t::failed_k) {
+        context.logger.error("ensure_metric_scratch: device allocation ({} bytes) failed",
+                             new_group * sizeof(std::uint32_t));
         return;
     }
-    scratch.group_indices = {reinterpret_cast<std::uint32_t *>(scratch.pool.data()), new_group};
-    scratch.max_group_size = new_group;
     scratch.max_atoms = new_atoms;
 }
 
@@ -807,57 +776,62 @@ static void enqueue_device_preprocess_(batch_pool_view_t device_view, wave_slice
     launch_bond_distance_bfs(descriptors, metadata, device_view.bond_distance().data(), molecule_count, stream);
     check_launch_(sink, "bond_distance_bfs_kernel launch");
 
-    launch_mmff94_type_and_charge(descriptors, atom_bases, molecule_count, launch_buffers.mmff_tables.view, atom_types,
-                                  atom_charges, typing_status, stream);
+    mmff94_type_and_charge_kernel<<<molecule_count, warp_size_k, 0, stream>>>(descriptors, atom_bases, molecule_count,
+                                                                              launch_buffers.mmff_tables.view,
+                                                                              atom_types, atom_charges, typing_status);
     check_launch_(sink, "mmff94_type_and_charge_kernel launch");
 
-    std::uint32_t const patch_count = static_cast<std::uint32_t>(batch_layout.num_typing_patches);
+    std::uint32_t const patch_count = static_cast<std::uint32_t>(batch_layout.typing_patches.count);
     if (sink.log != nullptr)
         sink.log->trace2("device preprocess: {} of {} molecules take the host typing path", patch_count,
                          molecule_count);
-    launch_mmff94_apply_typing_patch(device_view.typing_patches().data(), patch_count,
-                                     device_view.patch_atom_types().data(), device_view.patch_atom_charges().data(),
-                                     atom_types, atom_charges, typing_status, stream);
-    check_launch_(sink, "mmff94_apply_typing_patch_kernel launch");
+    // A batch every molecule typed natively leaves no patch records, and a zero-block launch is a
+    // configuration error rather than a no-op.
+    if (patch_count != 0) {
+        mmff94_apply_typing_patch_kernel<<<patch_count, warp_size_k, 0, stream>>>(
+            device_view.typing_patches().data(), patch_count, device_view.patch_atom_types().data(),
+            device_view.patch_atom_charges().data(), atom_types, atom_charges, typing_status);
+        check_launch_(sink, "mmff94_apply_typing_patch_kernel launch");
+    }
 
     mmff_staging_t const staging = mmff_staging_layout_k.over(launch_buffers.mmff_staging.data());
 
     for (std::uint32_t window_start = 0; window_start < molecule_count; window_start += mmff_extract_window_k) {
         std::uint32_t const window_size = std::min(mmff_extract_window_k, molecule_count - window_start);
-        launch_mmff94_extract_terms(descriptors + window_start, atom_types, atom_charges, atom_bases + window_start,
-                                    window_size, launch_buffers.mmff_tables.view, device_view.mmff_atom_vdw().data(),
-                                    atom_charges, staging.bonds.data(), staging.angles.data(), staging.torsions.data(),
-                                    staging.oops.data(), staging.stretchbends.data(), staging.counts.data(),
-                                    typing_status + window_start, stream);
+        mmff94_extract_terms_kernel<<<window_size, warp_size_k, 0, stream>>>(
+            descriptors + window_start, atom_types, atom_charges, atom_bases + window_start, window_size,
+            launch_buffers.mmff_tables.view, device_view.mmff_atom_vdw().data(), atom_charges, staging.bonds.data(),
+            staging.angles.data(), staging.torsions.data(), staging.oops.data(), staging.stretchbends.data(),
+            staging.counts.data(), typing_status + window_start);
         check_launch_(sink, "mmff94_extract_terms_kernel launch");
 
-        launch_mmff94_build_csr(descriptors + window_start, atom_bases + window_start, window_size,
-                                staging.counts.data(), staging.bonds.data(), staging.angles.data(),
-                                staging.torsions.data(), staging.oops.data(), staging.stretchbends.data(),
-                                staging.interactions.data(), atom_offsets, typing_status + window_start, stream);
+        mmff94_build_csr_kernel<<<window_size, warp_size_k, 0, stream>>>(
+            descriptors + window_start, atom_bases + window_start, window_size, staging.counts.data(),
+            staging.bonds.data(), staging.angles.data(), staging.torsions.data(), staging.oops.data(),
+            staging.stretchbends.data(), staging.interactions.data(), atom_offsets, typing_status + window_start);
         check_launch_(sink, "mmff94_build_csr_kernel launch");
 
-        launch_mmff94_compact_terms(descriptors + window_start, atom_bases + window_start, window_size,
-                                    staging.counts.data(), mmff_bases + window_start, staging.bonds.data(),
-                                    staging.angles.data(), staging.torsions.data(), staging.oops.data(),
-                                    staging.stretchbends.data(), staging.interactions.data(),
-                                    device_view.mmff_bonds().data(), device_view.mmff_angles().data(),
-                                    device_view.mmff_torsions().data(), device_view.mmff_oops().data(),
-                                    device_view.mmff_stretchbends().data(), device_view.mmff_interactions().data(),
-                                    atom_offsets, metadata + window_start, typing_status + window_start, stream);
+        mmff94_compact_terms_kernel<<<window_size, warp_size_k, 0, stream>>>(
+            descriptors + window_start, atom_bases + window_start, window_size, staging.counts.data(),
+            mmff_bases + window_start, staging.bonds.data(), staging.angles.data(), staging.torsions.data(),
+            staging.oops.data(), staging.stretchbends.data(), staging.interactions.data(),
+            device_view.mmff_bonds().data(), device_view.mmff_angles().data(), device_view.mmff_torsions().data(),
+            device_view.mmff_oops().data(), device_view.mmff_stretchbends().data(),
+            device_view.mmff_interactions().data(), atom_offsets, metadata + window_start,
+            typing_status + window_start);
         check_launch_(sink, "mmff94_compact_terms_kernel launch");
     }
 
     std::uint32_t const torsion_stride = batch_layout.torsion_stride;
-    launch_csd_torsion_match(descriptors, molecule_count, launch_buffers.csd_torsion_table.view,
-                             device_view.etk_torsions().data(), torsion_stride, device_view.torsion_counts().data(),
-                             stream);
+    csd_torsion_match_kernel<<<molecule_count, warp_size_k, 0, stream>>>(
+        descriptors, molecule_count, launch_buffers.csd_torsion_table.view, device_view.etk_torsions().data(),
+        torsion_stride, device_view.torsion_counts().data());
     check_launch_(sink, "csd_torsion_match_kernel launch");
 
-    launch_etk_build_csr(device_view.etk_torsions().data(), torsion_stride, device_view.torsion_counts().data(),
-                         device_view.distance_constraints().data(), molecule_count,
-                         device_view.etk_interactions().data(), device_view.etk_atom_offsets().data(), metadata,
-                         stream);
+    etk_build_csr_kernel<<<molecule_count, warp_size_k, 0, stream>>>(
+        device_view.etk_torsions().data(), torsion_stride, device_view.torsion_counts().data(),
+        device_view.distance_constraints().data(), molecule_count, device_view.etk_interactions().data(),
+        device_view.etk_atom_offsets().data(), metadata);
     check_launch_(sink, "etk_build_csr_kernel launch");
 }
 
@@ -1035,7 +1009,7 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
     // Preprocess already partitioned and atom-count sorted this device's molecules, so the kernels read
     // the uploaded metadata in place and no per-device sort happens here. The metadata region's extent
     // is this device's molecule count, which is the count every step below walks.
-    custd::span<etkdg_molecule_metadata_t const> const host_metadata = batch.molecule_metadata();
+    custd::span<etkdg_molecule_metadata_t const> const host_metadata = batch.host_view().molecule_metadata();
     sf_assert_(host_metadata.size() == batch.num_molecules);
 
     // The GPU coordinate buffer and the pinned staging are sized to this wave's actual largest atom
@@ -1100,7 +1074,7 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
 
     return {.device_id = device_id,
             .stream = stream,
-            .input_indices = batch.input_indices(),
+            .input_indices = batch.host_view().input_indices(),
             .conformer_count = config.num_conformers,
             .gpu_max_atoms = gpu_max_atoms,
             .host_max_atoms = host_max_atoms,
@@ -1243,8 +1217,8 @@ context_t::context_t(custd::span<int const> devices) {
 
         launch_scratch[device_index] = std::make_unique<launch_scratch_t>(stream);
         launch_scratch_t &scratch = *launch_scratch[device_index];
-        // The metric pool is reserved lazily by `ensure_metric_scratch`, so it only needs its stream now.
-        metric_scratch[device_index].pool = device_bytes_t {device_allocator_t {stream}};
+        // The metric scratch is reserved lazily by `ensure_metric_scratch`, so it only needs its stream now.
+        metric_scratch[device_index].group_indices = device_indices_t {device_allocator_t {stream}};
         upload_mmff94_tables_to_device(mmff_tables_host, scratch.mmff_tables, stream, sink);
         upload_csd_torsion_table_to_device(csd_torsion_host, scratch.csd_torsion_table, stream, sink);
         scratch.events.create(sink);
@@ -1433,7 +1407,7 @@ struct wave_dispatcher_t {
         // downstream reads one fact rather than two: the finalize scatter indexes the caller's buffers
         // directly, and the kernel seeds Philox from a row that does not move when the batch changes.
         for (wave_slice_pool_t &batch : slot) {
-            custd::span<std::uint32_t> const input_indices = batch.input_indices();
+            custd::span<std::uint32_t> const input_indices = batch.host_view().input_indices();
             for (std::uint32_t &index : input_indices) index = wave_outputs.caller_index_of(index);
         }
         for (rejected_mol_t const &entry : rejected) {
@@ -1445,8 +1419,9 @@ struct wave_dispatcher_t {
         if (!readback.wanted()) return;
         // Molecules preprocess refused keep the zero written before the first wave.
         for (wave_slice_pool_t const &batch : slot) {
-            custd::span<etkdg_molecule_metadata_t const> const metadata = batch.molecule_metadata();
-            custd::span<std::uint32_t const> const input_indices = batch.input_indices();
+            batch_pool_const_view_t const view = batch.host_view();
+            custd::span<etkdg_molecule_metadata_t const> const metadata = view.molecule_metadata();
+            custd::span<std::uint32_t const> const input_indices = view.input_indices();
             for (std::uint32_t molecule = 0; molecule < batch.num_molecules; ++molecule)
                 readback.write(input_indices[molecule], metadata[molecule]);
         }

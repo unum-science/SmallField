@@ -26,7 +26,6 @@
 
 #include <algorithm> // `std::max`, `std::min`, `std::sort`, `std::swap`
 #include <optional>  // `std::optional`
-#include <vector>    // `std::vector`
 
 #include "smallfield/preprocess/bounds_matrix_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
@@ -42,10 +41,13 @@ using smallfield::types::bond_flag_stereo_e_k;
 using smallfield::types::bond_flag_stereo_z_k;
 using smallfield::types::fill_bond_distances;
 using smallfield::types::hop_matrix_t;
+using smallfield::types::lower_distance_bound_at;
 using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::max_bonds_k;
 using smallfield::types::molecule_descriptor_t;
 using smallfield::types::no_stereo_atom_k;
+using smallfield::types::packed_matrix;
+using smallfield::types::upper_distance_bound_at;
 
 #pragma region Path Vocabulary
 
@@ -196,23 +198,24 @@ inline std::uint32_t smallest_ring_size_(molecule_descriptor_t const &descriptor
     return smallest;
 }
 
-/** Size of the largest SSSR ring named in @p ring_mask; 0 when the mask names none. */
-inline std::uint32_t largest_ring_size_(molecule_descriptor_t const &descriptor, std::uint32_t ring_mask) {
-    std::uint32_t largest = 0;
+/** Whether any SSSR ring named in @p ring_mask is a macrocycle. */
+inline bool ring_mask_holds_macrocycle_(molecule_descriptor_t const &descriptor, std::uint32_t ring_mask) {
     for (std::uint32_t ring = 0; ring < descriptor.num_rings; ++ring) {
         if ((ring_mask & (1u << ring)) == 0) continue;
-        std::uint32_t const ring_size = descriptor.ring_offset[ring + 1] - descriptor.ring_offset[ring];
-        if (ring_size > largest) largest = ring_size;
+        if (descriptor.ring_offset[ring + 1] - descriptor.ring_offset[ring] >= macrocycle_ring_size_k) return true;
     }
-    return largest;
+    return false;
 }
 
-/** Ideal length in Å of @p bond, read from the element pair and the bond order. */
+/** Ideal length in Å of @p bond, read from the element pair and the bond type. */
 inline float bond_length_angstrom_(molecule_descriptor_t const &descriptor, std::uint32_t bond) {
-    bool const aromatic = (descriptor.bond_flags[bond] & bond_flag_aromatic_k) != 0;
+    covalent_bond_t const covalent = (descriptor.bond_flags[bond] & bond_flag_aromatic_k) != 0
+                                         ? covalent_bond_t::aromatic_k
+                                     : descriptor.bond_order[bond] == 2 ? covalent_bond_t::double_k
+                                     : descriptor.bond_order[bond] == 3 ? covalent_bond_t::triple_k
+                                                                        : covalent_bond_t::single_k;
     return ideal_bond_length_angstrom(descriptor.element[descriptor.bond_atom_i[bond]],
-                                      descriptor.element[descriptor.bond_atom_j[bond]], descriptor.bond_order[bond],
-                                      aromatic);
+                                      descriptor.element[descriptor.bond_atom_j[bond]], covalent);
 }
 
 /**
@@ -418,6 +421,21 @@ inline bool ends_on_secondary_amide_hydrogen_(molecule_descriptor_t const &descr
     return hydrogen_on_nitrogen(path.first, path.second) || hydrogen_on_nitrogen(path.fourth, path.third);
 }
 
+/** A rule written for one direction along a 1-4 path. */
+using path_14_predicate_t = bool (*)(molecule_descriptor_t const &, path_14_t const &);
+
+/**
+ *  @brief Whether @p predicate holds on @p path walked from either end.
+ *
+ *  Every rule above reads the path's positions in order, so the arrangement it names is found only when
+ *  the path happens to be walked the way the rule is written. Which direction matched is not reported,
+ *  and the caller's own @p path keeps its orientation for whatever it reads next.
+ */
+inline bool holds_in_either_direction_(molecule_descriptor_t const &descriptor, path_14_t const &path,
+                                       path_14_predicate_t predicate) {
+    return predicate(descriptor, path) || predicate(descriptor, reversed_(path));
+}
+
 #pragma endregion Chemical Predicates
 
 #pragma region Torsion Targets
@@ -446,11 +464,11 @@ inline torsion_target_t chain_preference_(molecule_descriptor_t const &descripto
         if (central_pair_is_disulfide_(descriptor, path)) return {.preference = torsion_preference_t::right_angle_k};
         if (amide_geometry_k == amide_geometry_t::freely_rotating_k)
             return {.preference = torsion_preference_t::flexible_k};
-        if (is_amide_or_ester_14_(descriptor, path) || is_amide_or_ester_14_(descriptor, reversed_(path)))
+        if (holds_in_either_direction_(descriptor, path, is_amide_or_ester_14_))
             return {.preference = ends_on_secondary_amide_hydrogen_(descriptor, path) ? torsion_preference_t::trans_k
                                                                                       : torsion_preference_t::cis_k};
         // One atom further out the sense inverts: the amide's own N-H is now syn to the far end.
-        if (is_amide_or_ester_15_(descriptor, path) || is_amide_or_ester_15_(descriptor, reversed_(path)))
+        if (holds_in_either_direction_(descriptor, path, is_amide_or_ester_15_))
             return {.preference = ends_on_secondary_amide_hydrogen_(descriptor, path) ? torsion_preference_t::cis_k
                                                                                       : torsion_preference_t::trans_k};
         return {.preference = torsion_preference_t::flexible_k};
@@ -490,8 +508,7 @@ inline torsion_target_t two_in_same_ring_preference_(molecule_descriptor_t const
 /** `two_in_same_ring_preference_` for a macrocycle, where an amide across the ring reads cis. */
 inline torsion_target_t macrocycle_two_in_same_ring_preference_(molecule_descriptor_t const &descriptor,
                                                                 path_14_t const &path) {
-    if (is_macrocyclic_amide_or_ester_14_(descriptor, path) ||
-        is_macrocyclic_amide_or_ester_14_(descriptor, reversed_(path)))
+    if (holds_in_either_direction_(descriptor, path, is_macrocyclic_amide_or_ester_14_))
         return {.preference = torsion_preference_t::cis_k};
     return {.preference = stereo_preference_(descriptor, path)};
 }
@@ -507,10 +524,9 @@ inline torsion_target_t macrocycle_all_in_ring_preference_(molecule_descriptor_t
         return {.preference = stereo_preference_(descriptor, path)};
     case bond_kind_t::single_k:
         if (central_pair_is_disulfide_(descriptor, path)) return {.preference = torsion_preference_t::right_angle_k};
-        if (is_macrocyclic_ring_amide_or_ester_14_(descriptor, path) ||
-            is_macrocyclic_ring_amide_or_ester_14_(descriptor, reversed_(path)))
+        if (holds_in_either_direction_(descriptor, path, is_macrocyclic_ring_amide_or_ester_14_))
             return {.preference = torsion_preference_t::trans_k, .extra_reach = macrocycle_amide_reach_k};
-        if (is_amide_or_ester_15_(descriptor, path) || is_amide_or_ester_15_(descriptor, reversed_(path))) {
+        if (holds_in_either_direction_(descriptor, path, is_amide_or_ester_15_)) {
             // The secondary amide's own hydrogen is placed by the shorter path across the same amide,
             // so bounding it from here as well would fight that answer.
             bool const own_amide_hydrogen = descriptor.element[path.second] == 7 &&
@@ -551,7 +567,7 @@ inline path_14_case_t classify_path_14_(molecule_descriptor_t const &descriptor,
     if (ring_size_front != 0 || ring_size_back != 0) {
         // The middle bond belonging to a macrocycle is what makes the path a macrocycle case, whichever
         // of its two neighbours is the one sharing a ring with it.
-        if (largest_ring_size_(descriptor, rings_central) >= macrocycle_ring_size_k)
+        if (ring_mask_holds_macrocycle_(descriptor, rings_central))
             return {.kind = path_14_kind_t::macrocycle_two_in_same_ring_k};
         bool const flat_ring = (ring_size_front != 0 && ring_size_front <= largest_pinned_ring_size_k) ||
                                (ring_size_back != 0 && ring_size_back <= largest_pinned_ring_size_k);
@@ -662,45 +678,40 @@ inline bound_interval_t merge_intervals_(custd::span<bound_interval_t> intervals
  *  @brief Fill @p bounds with every pair's distance interval, in Å.
  *
  *  Four sweeps in increasing path length, each owning the pairs at its own hop distance so no later
- *  sweep can overwrite an earlier, tighter answer.
- *
- *  Output layout, N × N row-major:
- *  @verbatim
- *  bounds[row_atom * N + column_atom], row_atom < column_atom   upper bound distance in angstroms
- *  bounds[row_atom * N + column_atom], row_atom > column_atom   lower bound distance in angstroms
- *  @endverbatim
+ *  sweep can overwrite an earlier, tighter answer. Which triangle carries which end of a pair is
+ *  `types/views.hpp`'s convention, and `upper_distance_bound_at` and `lower_distance_bound_at` are how
+ *  every write below states it.
  *
  *  @param[in] descriptor Molecule graph with explicit hydrogens already added.
- *  @param[out] bounds Flat N × N float array filled in row-major order.
+ *  @param[out] bounds Square view over the molecule's atoms, zeroed by the caller — `reset_square_matrix`
+ *      does both — since the diagonal is the one part no sweep writes.
  */
-inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::vector<float> &bounds) {
+inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_matrix<float> bounds) {
     std::uint32_t const num_atoms = descriptor.num_atoms;
-    bounds.assign(static_cast<std::size_t>(num_atoms) * num_atoms, 0.0f);
+    sf_assert_(bounds.extent(0) == num_atoms && bounds.extent(1) == num_atoms);
 
     // The 1-4 and long-range sweeps below are the only host consumers of the hop matrix, so it
     // lives on this frame at the molecule's own row stride rather than inside the descriptor.
-    std::uint8_t bond_hops[max_atoms_per_molecule_k * max_atoms_per_molecule_k];
-    fill_bond_distances(descriptor, hop_matrix_t {bond_hops, num_atoms, num_atoms});
-
-    auto set_pair = [&](std::uint32_t first_atom, std::uint32_t second_atom, float lower, float upper) {
-        std::uint32_t const row = std::min(first_atom, second_atom);
-        std::uint32_t const column = std::max(first_atom, second_atom);
-        bounds[row * num_atoms + column] = upper;
-        bounds[column * num_atoms + row] = lower;
-    };
+    std::uint8_t bond_hop_storage[max_atoms_per_molecule_k * max_atoms_per_molecule_k];
+    hop_matrix_t const bond_hops {bond_hop_storage, num_atoms, num_atoms};
+    fill_bond_distances(descriptor, bond_hops);
 
     // Initial upper bound for every pair: large (effectively unconstrained).
     constexpr float upper_initial_k = 1000.0f;
     for (std::uint32_t row_atom = 0; row_atom < num_atoms; ++row_atom)
-        for (std::uint32_t column_atom = row_atom + 1; column_atom < num_atoms; ++column_atom)
-            set_pair(row_atom, column_atom, 0.0f, upper_initial_k);
+        for (std::uint32_t column_atom = row_atom + 1; column_atom < num_atoms; ++column_atom) {
+            upper_distance_bound_at(bounds, row_atom, column_atom) = upper_initial_k;
+            lower_distance_bound_at(bounds, row_atom, column_atom) = 0.0f;
+        }
 
     // set12 — exact ideal bond lengths ± 2% tolerance per bond from the descriptor.
     constexpr float bond_tolerance_k = 0.02f;
     for (std::uint32_t bond = 0; bond < descriptor.num_bonds; ++bond) {
+        std::uint32_t const atom_i = descriptor.bond_atom_i[bond];
+        std::uint32_t const atom_j = descriptor.bond_atom_j[bond];
         float const ideal = bond_length_angstrom_(descriptor, bond);
-        set_pair(descriptor.bond_atom_i[bond], descriptor.bond_atom_j[bond], ideal * (1.0f - bond_tolerance_k),
-                 ideal * (1.0f + bond_tolerance_k));
+        upper_distance_bound_at(bounds, atom_i, atom_j) = ideal * (1.0f + bond_tolerance_k);
+        lower_distance_bound_at(bounds, atom_i, atom_j) = ideal * (1.0f - bond_tolerance_k);
     }
 
     // set13 — one 1-3 bound per pair of neighbors around every center atom.
@@ -721,14 +732,15 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::ve
             for (std::uint32_t second_entry = first_entry + 1; second_entry < nend; ++second_entry) {
                 std::uint32_t const second_neighbor = descriptor.neighbor_atom[second_entry];
                 float const d_cj = bond_length_angstrom_(descriptor, descriptor.neighbor_bond[second_entry]);
-                if (bond_hops[first_neighbor * num_atoms + second_neighbor] != 2) continue;
+                if (bond_hops(first_neighbor, second_neighbor) != 2) continue;
 
                 float const theta = interior_angle_radians_(descriptor, first_neighbor, center, second_neighbor);
                 float const cos_theta = std::cos(theta);
                 float const d_ij = std::sqrt(
                     std::max(0.0f, d_ci * d_ci + d_cj * d_cj - 2.0f * d_ci * d_cj * cos_theta));
                 // ± 3% tolerance — 1-3 distances tend to have slightly more slack.
-                set_pair(first_neighbor, second_neighbor, d_ij * 0.97f, d_ij * 1.03f);
+                upper_distance_bound_at(bounds, first_neighbor, second_neighbor) = d_ij * 1.03f;
+                lower_distance_bound_at(bounds, first_neighbor, second_neighbor) = d_ij * 0.97f;
             }
         }
     }
@@ -757,7 +769,7 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::ve
     bound_interval_t claims[max_paths_per_pair_k];
     for (std::uint32_t row_atom = 0; row_atom < num_atoms; ++row_atom) {
         for (std::uint32_t column_atom = row_atom + 1; column_atom < num_atoms; ++column_atom) {
-            if (bond_hops[row_atom * num_atoms + column_atom] != 3) continue;
+            if (bond_hops(row_atom, column_atom) != 3) continue;
 
             std::uint32_t num_claims = 0;
             std::uint32_t const second_first = descriptor.neighbor_offset[row_atom];
@@ -789,12 +801,13 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::ve
 
             // Every path declining to bound the pair leaves it as loose as a non-bonded contact.
             if (num_claims == 0) {
-                bounds[column_atom * num_atoms + row_atom] = vdw_lower_bound_angstrom(descriptor.element[row_atom],
-                                                                                      descriptor.element[column_atom]);
+                lower_distance_bound_at(bounds, row_atom, column_atom) = vdw_lower_bound_angstrom(
+                    descriptor.element[row_atom], descriptor.element[column_atom]);
                 continue;
             }
             bound_interval_t const merged = merge_intervals_({claims, num_claims});
-            set_pair(row_atom, column_atom, merged.lower, merged.upper);
+            upper_distance_bound_at(bounds, row_atom, column_atom) = merged.upper;
+            lower_distance_bound_at(bounds, row_atom, column_atom) = merged.lower;
         }
     }
 
@@ -805,16 +818,16 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, std::ve
     // `f7a3f044ffd0` (#9188), with thanks — theirs never labels atom zero, since its sweep starts at one.
     for (std::uint32_t row_atom = 0; row_atom < num_atoms; ++row_atom) {
         for (std::uint32_t column_atom = row_atom + 1; column_atom < num_atoms; ++column_atom) {
-            if (bond_hops[row_atom * num_atoms + column_atom] <= 3) continue;
+            if (bond_hops(row_atom, column_atom) <= 3) continue;
             std::uint8_t const row_flags = descriptor.atom_flags[row_atom];
             std::uint8_t const column_flags = descriptor.atom_flags[column_atom];
             bool const hydrogen_bonded =
                 ((row_flags & atom_flag_hbond_donor_h_k) != 0 && (column_flags & atom_flag_hbond_acceptor_k) != 0) ||
                 ((column_flags & atom_flag_hbond_donor_h_k) != 0 && (row_flags & atom_flag_hbond_acceptor_k) != 0);
-            float const lower = hydrogen_bonded ? hydrogen_bond_length_k
-                                                : vdw_lower_bound_angstrom(descriptor.element[row_atom],
-                                                                           descriptor.element[column_atom]);
-            bounds[column_atom * num_atoms + row_atom] = lower; // lower triangle
+            lower_distance_bound_at(bounds, row_atom, column_atom) =
+                hydrogen_bonded
+                    ? hydrogen_bond_length_k
+                    : vdw_lower_bound_angstrom(descriptor.element[row_atom], descriptor.element[column_atom]);
         }
     }
 }

@@ -179,7 +179,7 @@ static divergence_reach_t fill_bounds_scratch_(RDKit::ROMol const &molecule, div
 
     std::uint32_t const num_atoms = molecule.getNumAtoms();
     fill_rdkit_bounds_into_(molecule, scratch.rdkit_bounds);
-    sfp::build_bounds_matrix(scratch.descriptor, scratch.our_bounds);
+    sfp::build_bounds_matrix(scratch.descriptor, sft::reset_square_matrix(scratch.our_bounds, num_atoms, 0.0f));
     scratch.hops.assign(static_cast<std::size_t>(num_atoms) * num_atoms, 0);
     sft::fill_bond_distances(scratch.descriptor, sft::hop_matrix_t {scratch.hops.data(), num_atoms, num_atoms});
     return divergence_reach_t::measured_k;

@@ -2,7 +2,7 @@
  *  @file cli/smallfield_batch.cpp
  *  @brief Restartable batch processor for bulk conformer generation.
  *
- *  Four `pipeline-roles` — see GLOSSARY.md — with depth-3 ring-buffer handoffs:
+ *  Four `pipeline-roles` — see GLOSSARY.md — with depth-5 ring-buffer handoffs:
  *  @verbatim
  *    reader-role     → reads parquet-shards, combines into coprocessed-batches
  *    gpu-runner-role → runs `generate_conformers` on each coprocessed-batch
@@ -588,7 +588,7 @@ static void compute_shape_descriptors_(cli_config_t const &config, thread_budget
 
         std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
         for (std::uint32_t conformer = 0; conformer < num_conformers; ++conformer) {
-            std::size_t const flat = static_cast<std::size_t>(molecule_index) * num_conformers + conformer;
+            std::size_t const flat = slot_layout.flat_slot(molecule_index, conformer);
             if (buffer.status[flat] != sfapi::conformer_status_t::success_k) continue;
             std::size_t const slot_base = slot_layout.slot_offset(molecule_index, conformer);
             sfapi::gather_slot_into_interleaved(buffer.coordinates.data() + slot_base, slot_layout, num_atoms,

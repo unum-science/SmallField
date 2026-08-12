@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include "smallfield/cuda/triangle_smooth.cuh"
+#include "smallfield/types/storage.hpp"
 #include "smallfield/types/views.hpp"
 
 #include "test/cuda/test_triangle_smooth_kernels.hpp"
@@ -21,7 +22,10 @@ namespace smallfield::tests {
 using smallfield::cuda::smoothing_t;
 using smallfield::cuda::triangle_smooth_warp_;
 using smallfield::cuda::warp_size_k;
+using smallfield::types::buffer;
+using smallfield::types::device_allocator_t;
 using smallfield::types::packed_matrix;
+using smallfield::types::reserve_outcome_t;
 
 /** Stage the matrix in shared memory, smooth it in one warp, and write the matrix and its verdict back. */
 __global__ void triangle_smooth_kernel(float *__restrict__ global_bounds, std::uint32_t num_atoms,
@@ -44,7 +48,7 @@ __global__ void triangle_smooth_kernel(float *__restrict__ global_bounds, std::u
 constexpr std::size_t max_shared_bytes_k = static_cast<std::size_t>(max_smoothed_atoms_k) * max_smoothed_atoms_k *
                                            sizeof(float);
 
-smoothing_t gpu_triangle_smooth(float *host_bounds, std::uint32_t num_atoms) {
+smoothing_t gpu_triangle_smooth(packed_matrix<float> bounds) {
     // Past 48 KB a kernel has to ask for its dynamic shared memory, and a 128-atom matrix is 64 KB. The
     // attribute is per-kernel driver state, so it is raised once for the process.
     [[maybe_unused]] static bool const shared_limit_raised = [] {
@@ -53,29 +57,45 @@ smoothing_t gpu_triangle_smooth(float *host_bounds, std::uint32_t num_atoms) {
         return true;
     }();
 
-    std::size_t const bounds_bytes = static_cast<std::size_t>(num_atoms) * num_atoms * sizeof(float);
-    float *device_bounds = nullptr;
-    smoothing_t *device_verdict = nullptr;
+    std::uint32_t const num_atoms = static_cast<std::uint32_t>(bounds.extent(0));
+    std::size_t const cell_count = static_cast<std::size_t>(num_atoms) * num_atoms;
 
     // The verdict starts at the mildest value, so a launch that never ran leaves the caller a matrix its own
     // comparisons reject rather than a verdict that looks decided.
     smoothing_t verdict = smoothing_t::consistent_k;
     cudaStream_t stream = nullptr;
-    cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-    cudaMallocAsync(&device_bounds, bounds_bytes, stream);
-    cudaMallocAsync(&device_verdict, sizeof(smoothing_t), stream);
-    cudaMemcpyAsync(device_bounds, host_bounds, bounds_bytes, cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(device_verdict, &verdict, sizeof(smoothing_t), cudaMemcpyHostToDevice, stream);
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) return verdict;
 
-    triangle_smooth_kernel<<<1, warp_size_k, bounds_bytes, stream>>>(device_bounds, num_atoms, device_verdict);
+    // The buffers live inside the stream's lifetime, so every stream-ordered free runs against a live stream.
+    {
+        device_allocator_t const allocator {.stream = stream};
+        buffer<float, device_allocator_t> device_bounds {allocator};
+        buffer<smoothing_t, device_allocator_t> device_verdict {allocator};
 
-    cudaMemcpyAsync(host_bounds, device_bounds, bounds_bytes, cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(&verdict, device_verdict, sizeof(smoothing_t), cudaMemcpyDeviceToHost, stream);
-    cudaFreeAsync(device_bounds, stream);
-    cudaFreeAsync(device_verdict, stream);
+        bool staged = device_bounds.try_reserve(cell_count) != reserve_outcome_t::failed_k &&
+                      device_verdict.try_reserve(1) != reserve_outcome_t::failed_k;
+        staged = staged && types::upload_into(device_bounds.view(),
+                                              custd::span<float const> {bounds.data_handle(), cell_count}, stream);
+        staged = staged &&
+                 types::upload_into(device_verdict.view(), custd::span<smoothing_t const> {&verdict, 1}, stream);
 
-    cudaError_t const smoothed = cudaStreamSynchronize(stream);
-    if (smoothed != cudaSuccess) std::fprintf(stderr, "triangle_smooth_kernel: %s\n", cudaGetErrorString(smoothed));
+        if (!staged) { std::fprintf(stderr, "gpu_triangle_smooth: device staging refused for %u atoms\n", num_atoms); }
+        else {
+            triangle_smooth_kernel<<<1, warp_size_k, cell_count * sizeof(float), stream>>>(
+                device_bounds.data(), num_atoms, device_verdict.data());
+
+            [[maybe_unused]] bool const read_back =
+                types::download_from(custd::span<float> {bounds.data_handle(), cell_count},
+                                     custd::span<float const> {device_bounds.data(), cell_count}, stream) &&
+                types::download_from(custd::span<smoothing_t> {&verdict, 1},
+                                     custd::span<smoothing_t const> {device_verdict.data(), 1}, stream);
+
+            cudaError_t const smoothed = cudaStreamSynchronize(stream);
+            if (smoothed != cudaSuccess)
+                std::fprintf(stderr, "triangle_smooth_kernel: %s\n", cudaGetErrorString(smoothed));
+        }
+    }
+
     cudaStreamDestroy(stream);
     return verdict;
 }

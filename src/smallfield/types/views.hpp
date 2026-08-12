@@ -66,6 +66,18 @@ namespace smallfield::types {
 template <typename value_type_>
 using packed_matrix = custd::mdspan<value_type_, custd::dextents<std::uint32_t, 2>>;
 
+/**
+ *  @brief Row-major matrix whose rows are padded to a stride the caller states.
+ *
+ *  The one thing `packed_matrix` cannot say is a row stride above the column extent, and two layouts here
+ *  need exactly that: the device bounds matrix, whose rows `compute_bounds_row_stride` pads to an odd
+ *  multiple of four so all 32 lanes of a warp land on distinct shared-memory banks, and a conformer slot,
+ *  whose component planes are padded to `conformer_slot_layout_t::max_atoms` rather than to the molecule's
+ *  own atom count. A strided view is 24 bytes against a packed view's 16, per kernel argument.
+ */
+template <typename value_type_>
+using strided_matrix = custd::mdspan<value_type_, custd::dextents<std::uint32_t, 2>, custd::layout_stride>;
+
 /** All-pairs bond-hop counts, one row per source atom, `unreachable_hops_k` where no path exists. */
 using hop_matrix_t = packed_matrix<std::uint8_t>;
 
@@ -152,14 +164,6 @@ using embedding_soa_t = coordinates_soa<coordinate_role_t::embedding_k, float, e
 /** A conformer in RDKit's order. */
 using conformer_aos_t = coordinates_aos<coordinate_role_t::position_k, float>;
 
-/*
- *  The device bounds matrix wants a third alias over `custd::layout_stride`, because
- *  `compute_bounds_row_stride` pads rows to an odd multiple of four so all 32 lanes of a warp land on
- *  distinct shared-memory banks. It arrives with its first consumer rather than ahead of it: the two view
- *  types this header replaced sat unused long enough for one of them to acquire a docblock that misstated
- *  its own size.
- */
-
 #pragma endregion Aliases
 
 #pragma region Distance Bounds
@@ -181,6 +185,11 @@ using conformer_aos_t = coordinates_aos<coordinate_role_t::position_k, float>;
  *  so a pair-returning form holds a value one branch never reads live across that branch, and `cuobjdump`
  *  charges `triangle_smooth_kernel` the extra registers for it. The packed view itself is free:
  *  `triangle_smooth_kernel` compiles to the same SASS through these as through raw index arithmetic.
+ *
+ *  Each name carries a second form over a mutable matrix, returning the cell rather than its value, so the
+ *  sweeps that build a square name the triangle they land in exactly as the sweeps that read it do. A
+ *  mutable matrix is an exact match for that form and a user-defined conversion away from the reading one,
+ *  so it is chosen without ambiguity and no reader of a `packed_matrix<float const>` is affected.
  */
 
 /**
@@ -199,6 +208,21 @@ constexpr float upper_distance_bound_at(packed_matrix<float const> matrix, std::
 }
 
 /**
+ *  @brief The upper triangle's cell for an atom pair, for a caller that writes it.
+ *
+ *  @param[inout] matrix Square bounds matrix over one molecule's atoms.
+ *  @param[in] first_atom One end of the pair; the two ends are interchangeable.
+ *  @param[in] second_atom The other end.
+ *  @return The cell holding how far apart the pair may go, in angstrom.
+ */
+constexpr float &upper_distance_bound_at(packed_matrix<float> matrix, std::uint32_t first_atom,
+                                         std::uint32_t second_atom) noexcept {
+    std::uint32_t const row = first_atom < second_atom ? first_atom : second_atom;
+    std::uint32_t const column = first_atom < second_atom ? second_atom : first_atom;
+    return matrix(row, column);
+}
+
+/**
  *  @brief Lower distance bound of an atom pair, from the packed square's lower triangle.
  *
  *  @param[in] matrix Square bounds matrix over one molecule's atoms.
@@ -208,6 +232,21 @@ constexpr float upper_distance_bound_at(packed_matrix<float const> matrix, std::
  */
 constexpr float lower_distance_bound_at(packed_matrix<float const> matrix, std::uint32_t first_atom,
                                         std::uint32_t second_atom) noexcept {
+    std::uint32_t const row = first_atom < second_atom ? second_atom : first_atom;
+    std::uint32_t const column = first_atom < second_atom ? first_atom : second_atom;
+    return matrix(row, column);
+}
+
+/**
+ *  @brief The lower triangle's cell for an atom pair, for a caller that writes it.
+ *
+ *  @param[inout] matrix Square bounds matrix over one molecule's atoms.
+ *  @param[in] first_atom One end of the pair; the two ends are interchangeable.
+ *  @param[in] second_atom The other end.
+ *  @return The cell holding how close the pair may come, in angstrom.
+ */
+constexpr float &lower_distance_bound_at(packed_matrix<float> matrix, std::uint32_t first_atom,
+                                         std::uint32_t second_atom) noexcept {
     std::uint32_t const row = first_atom < second_atom ? second_atom : first_atom;
     std::uint32_t const column = first_atom < second_atom ? first_atom : second_atom;
     return matrix(row, column);

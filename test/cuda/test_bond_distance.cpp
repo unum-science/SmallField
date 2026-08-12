@@ -85,14 +85,16 @@ static void test_device_matches_host_(std::vector<std::string> const &smiles_lis
 
     // Counterions are kept deliberately: a disconnected fragment is the only way to reach the
     // unreachable-hop sentinel, and the production path strips them.
-    auto batch = sfp::prepare_molecule_batch(views, smallfield::keep_all_fragments_k);
+    sfp::etkdg_molecule_batch_t batch {};
+    sfp::prepare_molecule_batch_into(views, sft::max_atoms_per_molecule_k, batch, smallfield::keep_all_fragments_k);
     sf_verify_(batch.num_molecules > 0, "no molecule survived preprocessing");
 
-    std::vector<std::uint8_t> device_matrix(batch.layout.num_bond_distance, std::uint8_t {0});
-    sftest::run_bond_distance_bfs_on_gpu(batch.host.data(), batch.layout, batch.num_molecules, device_matrix.data());
+    std::vector<std::uint8_t> device_matrix(batch.layout.bond_distance.count, std::uint8_t {0});
+    sftest::run_bond_distance_bfs_on_gpu(batch.host.view(), batch.layout, batch.num_molecules, device_matrix);
 
-    auto const metadata = batch.molecule_metadata();
-    auto const input_indices = batch.input_indices();
+    sfapi::batch_pool_view_t const view = batch.host_view();
+    auto const metadata = view.molecule_metadata();
+    auto const input_indices = view.input_indices();
     std::vector<std::uint8_t> reference;
     std::size_t compared_bytes = 0;
     std::size_t unreachable_pairs = 0;

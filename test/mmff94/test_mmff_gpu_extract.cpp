@@ -608,12 +608,8 @@ int main(int argc, char **argv) {
                  fmt::group_digits(batch.total_atoms));
 
     sftest::launch_mmff94_gpu_extract_pipeline(
-        tables_host, batch.descriptors.data(), batch.num_molecules(), batch.first_atoms.data(), batch.total_atoms,
-        batch.counts.data(), batch.typing_status.data(), batch.bonds.data(), sft::max_mmff_bonds_per_mol_k,
-        batch.angles.data(), sft::max_mmff_angles_per_mol_k, batch.torsions.data(), sft::max_mmff_torsions_per_mol_k,
-        batch.oops.data(), sft::max_mmff_oops_per_mol_k, batch.stretch_bends.data(),
-        sft::max_mmff_stretchbends_per_mol_k, batch.interactions.data(), batch.staged_atom_offsets.data(),
-        batch.packed);
+        tables_host, batch.descriptors, batch.first_atoms, batch.counts, batch.typing_status, batch.bonds, batch.angles,
+        batch.torsions, batch.oops, batch.stretch_bends, batch.interactions, batch.staged_atom_offsets, batch.packed);
 
     // The CPU reference comes from `extract_mmff94_params_fully_native`, one molecule at a time. The
     // sweep is deliberately non-short-circuiting: every molecule feeds the section counts below.

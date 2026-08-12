@@ -175,12 +175,6 @@ struct output_row_t {
     row_outcome_t outcome = row_outcome_t::molecule_failure_k;
 };
 
-/** Flat slot index of molecule @p molecule_index 's conformer @p conformer_slot. */
-static std::size_t flat_slot_(conformer_slot_columns_t const &conformers, std::uint64_t molecule_index,
-                              std::uint32_t conformer_slot) {
-    return static_cast<std::size_t>(molecule_index) * conformers.layout.num_conformers + conformer_slot;
-}
-
 /**
  *  @brief Sort key of one conformer slot: its energy, or infinity when the slot did not succeed.
  *
@@ -233,13 +227,13 @@ static void fill_output_rows_into(writer_inputs_t const &inputs, std::vector<out
         for (std::uint32_t conformer_slot = 0; conformer_slot < num_rows; ++conformer_slot)
             order[conformer_slot] = conformer_slot;
         std::stable_sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) {
-            return slot_ordering_energy_(conformers, flat_slot_(conformers, molecule_index, left)) <
-                   slot_ordering_energy_(conformers, flat_slot_(conformers, molecule_index, right));
+            return slot_ordering_energy_(conformers, conformers.layout.flat_slot(molecule_index, left)) <
+                   slot_ordering_energy_(conformers, conformers.layout.flat_slot(molecule_index, right));
         });
 
         for (std::uint32_t rank = 0; rank < num_rows; ++rank) {
             std::uint32_t const conformer_slot = order[rank];
-            bool const survived = conformers.status[flat_slot_(conformers, molecule_index, conformer_slot)] ==
+            bool const survived = conformers.status[conformers.layout.flat_slot(molecule_index, conformer_slot)] ==
                                   api::conformer_status_t::success_k;
             rows.push_back(
                 {.molecule_index = molecule_index,
@@ -357,7 +351,7 @@ static shard_write_report_t pack_usrcat_as_fp16_list(writer_inputs_t const &inpu
             if (!list_builder.AppendNull().ok()) return append_failed;
             continue;
         }
-        std::size_t const base = flat_slot_(inputs.conformers, row.molecule_index, row.conformer_slot) *
+        std::size_t const base = inputs.conformers.layout.flat_slot(row.molecule_index, row.conformer_slot) *
                                  usrcat_components_k;
         if (!list_builder.Append().ok()) return append_failed;
         for (std::uint32_t component = 0; component < usrcat_components_k; ++component) {
@@ -459,7 +453,7 @@ class row_columns_t {
     void append(writer_inputs_t const &inputs, output_row_t const &row) {
         molecule_columns_t const &molecules = inputs.molecules;
         std::uint64_t const molecule_index = row.molecule_index;
-        std::size_t const flat = flat_slot_(inputs.conformers, molecule_index, row.conformer_slot);
+        std::size_t const flat = inputs.conformers.layout.flat_slot(molecule_index, row.conformer_slot);
         std::string_view const smiles = molecules.smiles[molecule_index];
         auto record_append_ = [&](std::string_view column, arrow::Status status) {
             record_(shard_write_t::column_append_failed_k, column, status);

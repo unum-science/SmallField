@@ -257,7 +257,7 @@ static void resmooth_(packed_matrix<float> matrix, std::vector<float> &previous,
     for (std::uint32_t row = 0; row < num_atoms; ++row)
         for (std::uint32_t column = 0; column < num_atoms; ++column) before(row, column) = matrix(row, column);
 
-    smoothing_t const verdict = gpu_triangle_smooth(matrix.data_handle(), num_atoms);
+    smoothing_t const verdict = gpu_triangle_smooth(matrix);
     for (std::uint32_t row = 0; row < num_atoms; ++row)
         for (std::uint32_t column = 0; column < num_atoms; ++column) {
             if (row == column) continue;
@@ -283,7 +283,7 @@ static void compare_fixtures_(sftest::diagnostic_reporter_t &reporter, bounds_sc
 
         auto const reference = flatten_bounds_into_(host_bounds, fixture.num_atoms, scratch.fixture_reference);
         auto const device = flatten_bounds_into_(device_bounds, fixture.num_atoms, scratch.device);
-        smoothing_t const verdict = gpu_triangle_smooth(device.data_handle(), fixture.num_atoms);
+        smoothing_t const verdict = gpu_triangle_smooth(device);
 
         fmt::println("  fixture {} atoms={} verdict={}", fixture.name, fixture.num_atoms, smoothing_name(verdict));
         auto group = reporter.mismatch("fixture", "name={} verdict={}", fixture.name, smoothing_name(verdict));
@@ -336,7 +336,7 @@ static void compare_molecule_(std::string const &smiles, bounds_scratch_t &scrat
 
     auto const device = flatten_bounds_into_(*device_bounds, num_atoms, scratch.device);
     auto const reference = flatten_bounds_into_(*host_bounds, num_atoms, scratch.reference);
-    smoothing_t const verdict = gpu_triangle_smooth(device.data_handle(), num_atoms);
+    smoothing_t const verdict = gpu_triangle_smooth(device);
     ++counts.smoothed_molecules;
 
     reporter.mismatch("corpus_verdict", "smiles={} verdict={}", smiles, smoothing_name(verdict))

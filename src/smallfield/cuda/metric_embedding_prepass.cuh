@@ -42,25 +42,20 @@ constexpr std::uint32_t embed_block_size_k = 128;
 constexpr std::uint32_t embed_reduction_slots_k = embed_block_size_k / warp_size_k;
 
 /**
- *  @brief Dynamic shared floats `embed_4d_power_iter_kernel` needs for a molecule of @p num_atoms atoms.
+ *  @brief Dynamic shared bytes `embed_4d_power_iter_kernel` needs for a molecule of @p num_atoms atoms.
  *
- *  States the layout the kernel carves, term for term: the Gram matrix, the row means widened to hold the
+ *  Sums the layout the kernel carves, term for term: the Gram matrix, the row means widened to hold the
  *  block reduction's staging slots, the grand mean, four eigenvector estimates, the mat-vec scratch, and
  *  four eigenvalues. Every block derives its own layout from its own atom count, so a launch covering
  *  several molecules sizes its request from the largest.
  *
  *  @param[in] num_atoms Atoms the launch is sized against.
- *  @return Floats of dynamic shared memory to request.
+ *  @return Bytes of dynamic shared memory to request.
  */
-__host__ __device__ __forceinline__ std::size_t embed_shared_floats(std::uint32_t num_atoms) noexcept {
+__host__ __device__ __forceinline__ std::size_t embed_shared_bytes(std::uint32_t num_atoms) noexcept {
     std::size_t const atoms = num_atoms;
     std::size_t const row_means_extent = atoms > embed_reduction_slots_k ? atoms : embed_reduction_slots_k;
-    return atoms * atoms + row_means_extent + 1u + 4u * atoms + atoms + 4u;
-}
-
-/** Bytes of the same request. */
-__host__ __device__ __forceinline__ std::size_t embed_shared_bytes(std::uint32_t num_atoms) noexcept {
-    return embed_shared_floats(num_atoms) * sizeof(float);
+    return (atoms * atoms + row_means_extent + 1u + 4u * atoms + atoms + 4u) * sizeof(float);
 }
 
 /**
@@ -139,8 +134,8 @@ __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *war
  *    lambda[4]                  (eigenvalue estimates)
  *  @endverbatim
  *
- *  `embed_shared_floats` states this same layout as an expression, and every launch site sizes its request
- *  from it rather than restating the sum.
+ *  The carve below and `embed_shared_bytes` state that layout twice, once as pointers and once as a sum,
+ *  and nothing compares them: a term added here without being added there overruns the request.
  *
  *  A molecule whose smoothed bounds cross — some pair's lower above its upper — has no embedding at all, so
  *  its block stops after persisting the bounds and leaves its coordinates zeroed.
@@ -394,11 +389,11 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
 
         std::uint32_t const bin_n = bin_atom_counts_k[bin];
         std::size_t const group_size = group.size();
-        if (group_size > scratch.max_group_size || bin_n > scratch.max_atoms) {
+        if (group_size > scratch.group_indices.capacity() || bin_n > scratch.max_atoms) {
             if (sink.log != nullptr)
                 sink.log->error(
                     "metric_embedding_prepass: scratch too small (need group={} bin_n={}, have group={} atoms={})",
-                    group_size, bin_n, scratch.max_group_size, scratch.max_atoms);
+                    group_size, bin_n, scratch.group_indices.capacity(), scratch.max_atoms);
             return false;
         }
 

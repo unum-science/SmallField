@@ -75,11 +75,12 @@ struct chirality_tally_t {
     std::uint64_t unembedded = 0;
     std::uint64_t oversized = 0;
     std::uint64_t achiral = 0;
+    std::uint64_t device_refused = 0;
 };
 
 /** Molecules that never reached a comparison, however they got there. */
 static std::uint64_t declined_(chirality_tally_t const &tally) {
-    return tally.unparsed + tally.unembedded + tally.oversized + tally.achiral;
+    return tally.unparsed + tally.unembedded + tally.oversized + tally.achiral + tally.device_refused;
 }
 
 /** How far one molecule got, so the walk can bucket it without the check counting anything itself. */
@@ -94,6 +95,8 @@ enum class molecule_outcome_t {
     oversized_k,
     /** No tetrahedral center survived `assignStereochemistry`. */
     achiral_k,
+    /** The device refused the staging, so neither verdict was ever computed. */
+    device_refused_k,
 };
 
 /**
@@ -142,15 +145,17 @@ static molecule_outcome_t check_molecule_(std::string const &smiles, chirality_s
     scratch.inverted_targets.assign(scratch.targets.begin(), scratch.targets.end());
     for (auto &center : scratch.inverted_targets) center.target_sign = static_cast<std::int8_t>(-center.target_sign);
 
-    num_centers = static_cast<std::uint32_t>(scratch.targets.size());
-    bool const upright = sftest::gpu_validate_chirality(axis_major.data_handle(), scratch.targets.data(), num_atoms,
-                                                        num_centers);
-    bool const inverted = sftest::gpu_validate_chirality(axis_major.data_handle(), scratch.inverted_targets.data(),
-                                                         num_atoms, num_centers);
+    auto const upright = sftest::gpu_validate_chirality(axis_major, scratch.targets);
+    auto const inverted = sftest::gpu_validate_chirality(axis_major, scratch.inverted_targets);
+    // A refused staging is not an inverted stereocenter, so it never reaches the comparison below.
+    if (upright == sftest::chirality_verdict_t::unavailable_k || inverted == sftest::chirality_verdict_t::unavailable_k)
+        return molecule_outcome_t::device_refused_k;
 
+    num_centers = static_cast<std::uint32_t>(scratch.targets.size());
     reporter.mismatch("chirality", "smiles={} centers={}", smiles, num_centers)
-        .field("satisfied", true, upright, sftest::exactly_equal)
-        .field("satisfied_inverted", false, inverted, sftest::exactly_equal);
+        .field("satisfied", true, upright == sftest::chirality_verdict_t::satisfied_k, sftest::exactly_equal)
+        .field("satisfied_inverted", false, inverted == sftest::chirality_verdict_t::satisfied_k,
+               sftest::exactly_equal);
 
     return molecule_outcome_t::compared_k;
 }
@@ -165,6 +170,7 @@ static void walk_(custd::span<std::string const> corpus, chirality_scratch_t &sc
         case molecule_outcome_t::unembedded_k: ++tally.unembedded; break;
         case molecule_outcome_t::oversized_k: ++tally.oversized; break;
         case molecule_outcome_t::achiral_k: ++tally.achiral; break;
+        case molecule_outcome_t::device_refused_k: ++tally.device_refused; break;
         case molecule_outcome_t::compared_k:
             ++tally.molecules;
             tally.centers += num_centers;
@@ -175,11 +181,12 @@ static void walk_(custd::span<std::string const> corpus, chirality_scratch_t &sc
 
 /** Print one section's census beneath the section's own `PASS`/`FAIL` line. */
 static void report_(std::string_view heading, chirality_tally_t const &tally) {
-    fmt::println("  {}: molecules {}, centers {}, declined {} ({} unparsed, {} unembedded, {} oversized, {} achiral)",
+    fmt::println("  {}: molecules {}, centers {}, declined {} "                               //
+                 "({} unparsed, {} unembedded, {} oversized, {} achiral, {} device-refused)", //
                  heading, fmt::group_digits(tally.molecules), fmt::group_digits(tally.centers),
                  fmt::group_digits(declined_(tally)), fmt::group_digits(tally.unparsed),
                  fmt::group_digits(tally.unembedded), fmt::group_digits(tally.oversized),
-                 fmt::group_digits(tally.achiral));
+                 fmt::group_digits(tally.achiral), fmt::group_digits(tally.device_refused));
 }
 
 /**
