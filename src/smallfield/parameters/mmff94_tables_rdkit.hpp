@@ -4,12 +4,11 @@
  *
  *  Separated from `mmff94_tables.hpp` so that CUDA translation units can include the POD structs and
  *  lookup functions without pulling in RDKit, which triggers nvcc internal errors via `boost::tti`.
- *  Only host-side `.cpp` files that call `extract_mmff94_tables_from_rdkit` need this header.
  *
  *  This file is the declared library-spelling boundary: `crd`, `mltb`, `pilp`, `linh`, `sbmb`, `kbaIJK`
  *  and their siblings on the right of every assignment are RDKit's own field names, while the spelled-out
- *  names on the left are ours. One extractor per collection, and each one `assign`s its destination so a
- *  freshly value-initialized entry already carries the zeroes its padding needs.
+ *  names on the left are ours. Every extractor `assign`s its destination, so an entry's padding carries
+ *  the zeroes the device-side byte comparison needs.
  */
 
 #pragma once
@@ -33,12 +32,8 @@ namespace smallfield::parameters {
 
 #pragma region Sparse Tables
 
-/**
- *  @brief Extract the VdW entries and the five collection-wide scalars that arrive with them.
- *
- *  @param[out] out Container whose `vdw` table and `vdw_*` scalars are filled.
- *  @return Highest MMFF atom type the table mentions, which sizes the two dense tables below.
- */
+/** Extract the VdW entries and the five collection-wide scalars that arrive with them, returning the
+ *  highest MMFF atom type the table mentions — which sizes the two dense tables below. */
 inline std::uint8_t extract_vdw_table_(mmff94_tables_host_t &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFVdW();
     out.vdw_power = static_cast<float>(collection->power);
@@ -65,7 +60,6 @@ inline std::uint8_t extract_vdw_table_(mmff94_tables_host_t &out) {
     return max_atom_type;
 }
 
-/** Extract the bond-stretch table, sorted by (i, j, bond_type). */
 inline void extract_bond_table_(std::vector<mmff94_bond_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFBond();
     std::size_t const count = collection->d_iAtomType.size();
@@ -81,7 +75,6 @@ inline void extract_bond_table_(std::vector<mmff94_bond_entry_t> &out) {
     }
 }
 
-/** Extract the angle-bend table, sorted by (j, i, k, angle_type). */
 inline void extract_angle_table_(std::vector<mmff94_angle_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFAngle();
     std::size_t const count = collection->d_iAtomType.size();
@@ -98,7 +91,6 @@ inline void extract_angle_table_(std::vector<mmff94_angle_entry_t> &out) {
     }
 }
 
-/** Extract the torsion table, sorted by (j, k, i, l, tor_type). */
 inline void extract_torsion_table_(std::vector<mmff94_torsion_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFTor(false);
     std::size_t const count = collection->d_iAtomType.size();
@@ -117,7 +109,6 @@ inline void extract_torsion_table_(std::vector<mmff94_torsion_entry_t> &out) {
     }
 }
 
-/** Extract the out-of-plane table, sorted by (j, i, k, l). */
 inline void extract_oop_table_(std::vector<mmff94_oop_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFOop(false);
     std::size_t const count = collection->d_iAtomType.size();
@@ -132,7 +123,7 @@ inline void extract_oop_table_(std::vector<mmff94_oop_entry_t> &out) {
     }
 }
 
-/** Extract the stretch-bend table, sorted by (j, i, k, stretch_bend_type). */
+/** Extract the stretch-bend table. */
 inline void extract_stbn_table_(std::vector<mmff94_stbn_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFStbn();
     std::size_t const count = collection->d_iAtomType.size();
@@ -149,14 +140,9 @@ inline void extract_stbn_table_(std::vector<mmff94_stbn_entry_t> &out) {
     }
 }
 
-/**
- *  @brief Flatten the default stretch-bend fallback out of RDKit's three nested maps and sort it.
- *
- *  The lookup cascade binary-searches (row_i, row_j, row_k), so the map iteration order — already
- *  ascending for `std::map` but not guaranteed by the interface — is re-established explicitly.
- *
- *  @param[out] out Flat table, sorted by (row_i, row_j, row_k).
- */
+/** Flatten the default stretch-bend fallback out of RDKit's three nested maps into a table sorted by
+ *  (row_i, row_j, row_k). The sort is explicit because the nested-map interface does not promise the
+ *  ascending iteration order the lookup cascade binary-searches against. */
 inline void extract_dfsb_table_(std::vector<mmff94_dfsb_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFDfsb();
     out.clear();
@@ -178,7 +164,7 @@ inline void extract_dfsb_table_(std::vector<mmff94_dfsb_entry_t> &out) {
     });
 }
 
-/** Extract the partial bond-charge increments, sorted by atom type. */
+/** Extract the partial bond-charge increments. */
 inline void extract_pbci_table_(std::vector<mmff94_pbci_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFPBCI();
     std::size_t const count = collection->d_params.size();
@@ -191,7 +177,7 @@ inline void extract_pbci_table_(std::vector<mmff94_pbci_entry_t> &out) {
     }
 }
 
-/** Extract the bond-charge increments, sorted by (i, j, bond_type). */
+/** Extract the bond-charge increments. */
 inline void extract_chg_table_(std::vector<mmff94_chg_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFChg();
     std::size_t const count = collection->d_iAtomType.size();
@@ -205,7 +191,7 @@ inline void extract_chg_table_(std::vector<mmff94_chg_entry_t> &out) {
     }
 }
 
-/** Extract the default bond parameters, sorted by atomic-number pair. */
+/** Extract the default bond parameters. */
 inline void extract_bndk_table_(std::vector<mmff94_bndk_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFBndk();
     std::size_t const count = collection->d_iAtomicNum.size();
@@ -220,7 +206,7 @@ inline void extract_bndk_table_(std::vector<mmff94_bndk_entry_t> &out) {
     }
 }
 
-/** Extract the Herschbach-Laurie parameters, sorted by periodic-table-row pair. */
+/** Extract the Herschbach-Laurie parameters. */
 inline void extract_hl_table_(std::vector<mmff94_hl_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFHerschbachLaurie();
     std::size_t const count = collection->d_iRow.size();
@@ -236,7 +222,7 @@ inline void extract_hl_table_(std::vector<mmff94_hl_entry_t> &out) {
     }
 }
 
-/** Extract covalent radii and Pauling electronegativities, sorted by atomic number. */
+/** Extract covalent radii and Pauling electronegativities. */
 inline void extract_covrad_table_(std::vector<mmff94_covrad_entry_t> &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFCovRadPauEle();
     std::size_t const count = collection->d_atomicNum.size();
@@ -254,13 +240,9 @@ inline void extract_covrad_table_(std::vector<mmff94_covrad_entry_t> &out) {
 
 #pragma region Dense Tables
 
-/**
- *  @brief Extract the MMFFDef equivalence levels into a table indexed directly by atom type.
- *
- *  @param[out] out Dense table, one entry per atom type in [0, max_atom_type], zeroed where unused.
- *  @param[in] max_atom_type Highest type the VdW table mentions; the table must reach at least that far
- *             because the angle, torsion and out-of-plane cascades index it by an arbitrary type.
- */
+/** Extract the MMFFDef equivalence levels into a table indexed directly by atom type, zeroed where
+ *  unused. It reaches at least @p max_atom_type because the angle, torsion and out-of-plane cascades
+ *  index it by an arbitrary type. */
 inline void extract_def_table_(std::vector<mmff94_def_entry_t> &out, std::uint8_t max_atom_type) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFDef();
     std::size_t const count = collection->d_params.size();
@@ -273,13 +255,9 @@ inline void extract_def_table_(std::vector<mmff94_def_entry_t> &out, std::uint8_
     }
 }
 
-/**
- *  @brief Extract the MMFFProp per-atom-type properties into a table indexed directly by atom type.
- *
- *  @param[out] out Dense table, one entry per atom type in [0, max_atom_type], zeroed where unused.
- *  @param[in] max_atom_type Highest type the VdW table mentions; a property row past it is dropped
- *             rather than growing the table, since no lookup can reach it.
- */
+/** Extract the MMFFProp per-atom-type properties into a table indexed directly by atom type, zeroed
+ *  where unused. A property row past @p max_atom_type is dropped rather than growing the table, since
+ *  no lookup can reach it. */
 inline void extract_prop_table_(std::vector<mmff94_prop_entry_t> &out, std::uint8_t max_atom_type) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFProp();
     out.assign(static_cast<std::size_t>(max_atom_type) + 1, mmff94_prop_entry_t {});
@@ -303,13 +281,10 @@ inline void extract_prop_table_(std::vector<mmff94_prop_entry_t> &out, std::uint
 #pragma endregion Dense Tables
 
 /**
- *  @brief Extract every MMFF94 parameter table from RDKit's defaults collection into flat sorted
- *  `std::vector`s. Only called once per process.
+ *  @brief Extract every MMFF94 parameter table from RDKit's defaults into flat sorted `std::vector`s.
  *
  *  The VdW extraction runs first and hands its highest atom type to the two dense tables, so the one
  *  ordering constraint between the fourteen is a value the compiler carries rather than a comment.
- *
- *  @param[out] out Container filled from scratch; every table is assigned rather than appended.
  */
 inline void extract_mmff94_tables_from_rdkit(mmff94_tables_host_t &out) {
     out.max_atom_type = extract_vdw_table_(out);

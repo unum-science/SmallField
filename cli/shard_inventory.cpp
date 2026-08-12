@@ -38,7 +38,6 @@ std::vector<shard_pair_t> inventory_shards(fs::path const &input_dir, fs::path c
         if (is_output_shard(entry.path())) continue; // skip its own outputs when --output == --input
         shard_pair_t pair;
         pair.input_path = entry.path();
-        // Deterministic output name: "<name>.parquet" → "<name>.3D.parquet".
         pair.output_path = output_dir / (entry.path().stem().string() + ".3D.parquet");
         if (restart_policy == restart_policy_t::resume_k)
             pair.already_complete = fs::exists(fs::path {pair.output_path.string() + ".encoded"}, error_code);

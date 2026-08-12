@@ -46,12 +46,12 @@ static int smiles_column_index_(parquet::arrow::FileReader const &reader, std::s
  *  A null row becomes an empty view rather than being dropped, so a view's position stays the row it came
  *  from — the writer maps molecule index back onto `input_row` by that position alone.
  *
- *  @param[out] smiles Caller-owned destination, already cleared and reserved by the caller.
+ *  @param[out] smiles Caller-owned destination, cleared and reserved before the call.
  */
 static input_read_t fill_smiles_views_into_(arrow::ChunkedArray const &column, std::vector<std::string_view> &smiles) {
     for (int chunk_index = 0; chunk_index < column.num_chunks(); ++chunk_index) {
-        // A checked cast, because a `static_pointer_cast` of a non-null pointer is never null: the refusal
-        // below would be unreachable and a column of some other type would be reinterpreted as UTF-8.
+        // Checked, because a `static_pointer_cast` of a non-null pointer is never null: the refusal below
+        // would be unreachable and a column of some other type would be read as UTF-8.
         auto const *chunk = dynamic_cast<arrow::StringArray const *>(column.chunk(chunk_index).get());
         if (chunk == nullptr) return input_read_t::column_not_string_k;
         for (std::int64_t row = 0; row < chunk->length(); ++row) {
@@ -73,7 +73,7 @@ input_read_t read_shard(fs::path const &path, std::string const &smiles_column, 
     logger_t const &logger = log != nullptr ? *log : fallback;
 
     /* Every refusal below leaves through here, so the reason reaches the operator's log whatever the caller
-     * does with the status it gets back. @p detail carries whatever Arrow said for itself. */
+     * does with the status it gets back. */
     auto refuse_ = [&](input_read_t status, std::string_view detail = {}) {
         if (detail.empty()) logger.error("{} {}", path, describe_input_read(status));
         else logger.error("{} {}: {}", path, describe_input_read(status), detail);
@@ -83,8 +83,7 @@ input_read_t read_shard(fs::path const &path, std::string const &smiles_column, 
     auto open_result = arrow::io::ReadableFile::Open(path.string(), arrow::default_memory_pool());
     if (!open_result.ok()) return refuse_(input_read_t::cannot_open_k, open_result.status().message());
 
-    // Built through the Builder pattern so `ArrowReaderProperties` can be attached. `pre_buffer` keeps its
-    // default, leaving the async-IO read-ahead path out of this reader.
+    // `pre_buffer` keeps its default, leaving Arrow's async-IO read-ahead path out of this reader.
     parquet::arrow::FileReaderBuilder builder;
     if (arrow::Status const status = builder.Open(open_result.ValueOrDie()); !status.ok())
         return refuse_(input_read_t::not_parquet_k, status.message());

@@ -2,26 +2,15 @@
  *  @file src/smallfield/parameters/mmff94_tables.hpp
  *  @brief Flat MMFF94 parameter tables extracted once at context init.
  *
- *  RDKit's `DefaultParameters::getMMFF*()` collections are ultimately backed by parallel
- *  `std::vector<std::uint8_t>` lookup columns and a `std::vector<MMFF*>` parameter column — the
- *  `operator()` helpers do a cascade of `std::equal_range` calls against those vectors. A GPU port
- *  needs the same data in flat POD arrays that upload with one `cudaMemcpy` each and binary-search
- *  on the device.
+ *  RDKit's `DefaultParameters::getMMFF*()` collections are parallel lookup columns searched by a
+ *  cascade of `std::equal_range` calls. The POD entry structs and `lookup_*` cascades here hold the
+ *  same data in flat arrays that upload with one copy each and binary-search on the device, and every
+ *  cascade answers byte-identically to RDKit's `operator()` — including the four- and five-level
+ *  `MMFFDef` equivalence fallbacks of angle, torsion and out-of-plane.
+ *  `test/parameters/test_mmff94_tables.cpp` gates that against RDKit over 10K random key tuples.
  *
- *  This header exposes:
- *   - POD entry structs, `mmff94_*_entry_t`, one per collection.
- *   - `mmff94_tables_host_t` — aggregates all tables as sorted `std::vector`s in the same key order
- *     RDKit uses internally, so the device-side lookup can use `std::equal_range`-equivalent nested
- *     searches and produce bit-identical results.
- *   - `lookup_*` functions that match RDKit's `operator()` and `getMMFF*Params` behaviour exactly,
- *     including the 4/5-level equivalence cascades for angle, torsion and oop via `MMFFDef`.
- *
- *  Doubles are converted to floats at extraction time — the main ETKDG kernel already consumes
- *  float32, and the extra precision in RDKit's tables is not meaningful for the tolerances required.
- *
- *  Cross-validation gate: call both the `lookup_*` functions here and RDKit's `operator()` on 10K
- *  random key tuples, and assert byte-equality on the returned parameters. See
- *  `test/parameters/test_mmff94_tables.cpp`.
+ *  Doubles become floats at extraction time: the ETKDG kernel consumes float32 and the extra
+ *  precision sits below the tolerances required.
  */
 
 #pragma once
@@ -34,10 +23,9 @@
 #include "smallfield/types/views.hpp"
 #include "smallfield/utilities.hpp"
 
-/*  `SF_HOST_DEVICE_` resolves to `__host__ __device__` when compiled by nvcc, empty otherwise, so a
- *  function marked with it is callable from both host C++ and device kernels with the same source.
- *  The `lookup_*` helpers below reach device code as `constexpr` instead; the macro serves the MMFF94
- *  sources that include this header. */
+/*  `SF_HOST_DEVICE_` is `__host__ __device__` under nvcc and empty otherwise. The `lookup_*` helpers
+ *  below reach device code as `constexpr` instead; the macro serves the MMFF94 sources that include
+ *  this header. */
 #if defined(__CUDACC__)
 #define SF_HOST_DEVICE_ __host__ __device__
 #else
@@ -48,9 +36,8 @@ namespace smallfield::parameters {
 
 #pragma region Table Entry Structs
 
-/** Van-der-Waals parameters, one entry per MMFF atom type. Matches `mmff94_atom_vdw_params_t` in
- *  `types/etkdg_types.hpp` in most respects; the difference is that this struct keys by `atom_type`
- *  for lookup. */
+/** Van-der-Waals parameters, one entry per MMFF atom type. Same payload as
+ *  `mmff94_atom_vdw_params_t` in `types/etkdg_types.hpp`, carrying the `atom_type` it is keyed by. */
 struct alignas(8) mmff94_vdw_entry_t {
     std::uint8_t atom_type;
     /** 0 = '-', 1 = 'A' acceptor, 2 = 'D' donor. */
@@ -86,7 +73,6 @@ static_assert(sizeof(mmff94_bond_entry_t) == 16);
 /** Angle-bend parameter, MMFF `ka` and `theta0` in degrees, keyed by (j_type, i_type, k_type, angle_type)
  *  with i_type ≤ k_type canonical. */
 struct alignas(16) mmff94_angle_entry_t {
-    /** Center atom type. */
     std::uint8_t j_type;
     /** Canonical: i_type <= k_type. */
     std::uint8_t i_type;
@@ -118,12 +104,10 @@ struct alignas(16) mmff94_torsion_entry_t {
 };
 static_assert(sizeof(mmff94_torsion_entry_t) == 32);
 
-/** Out-of-plane bend parameter, MMFF `koop`, keyed by (j, canonical_i_type, canonical_k_type,
- *  canonical_l_type) where (canonical_i_type, canonical_k_type, canonical_l_type) is sorted ascending. */
+/** Out-of-plane bend parameter, MMFF `koop`, keyed by (j_type, i_type, k_type, l_type). */
 struct alignas(8) mmff94_oop_entry_t {
-    /** Center. */
     std::uint8_t j_type;
-    /** Sorted. */
+    /** Canonical: i_type <= k_type <= l_type. */
     std::uint8_t i_type;
     std::uint8_t k_type;
     std::uint8_t l_type;
@@ -132,9 +116,7 @@ struct alignas(8) mmff94_oop_entry_t {
 };
 static_assert(sizeof(mmff94_oop_entry_t) == 8);
 
-/** Stretch-bend parameter (kba_ijk, kba_kji), keyed by (j_type, i_type, k_type, stretch_bend_type)
- *  with the caller responsible for the swap flag returned alongside — whether i/k were swapped
- *  canonically. */
+/** Stretch-bend parameter, keyed by (j_type, i_type, k_type, stretch_bend_type). */
 struct alignas(16) mmff94_stbn_entry_t {
     std::uint8_t j_type;
     /** Canonical: i_type <= k_type. */
@@ -147,8 +129,8 @@ struct alignas(16) mmff94_stbn_entry_t {
 };
 static_assert(sizeof(mmff94_stbn_entry_t) == 16);
 
-/** Default-stretch-bend (DFSB) fallback parameter. Used by RDKit when primary Stbn lookup fails:
- *  keyed by (periodic-table row of i, j, k). */
+/** Default-stretch-bend fallback parameter, keyed by the periodic-table rows of i, j and k. RDKit reads
+ *  it when the primary Stbn lookup misses. */
 struct alignas(8) mmff94_dfsb_entry_t {
     /** Canonical: row_i <= row_k. */
     std::uint8_t row_i;
@@ -160,11 +142,8 @@ struct alignas(8) mmff94_dfsb_entry_t {
 };
 static_assert(sizeof(mmff94_dfsb_entry_t) == 16);
 
-/** MMFFProp — per-atom-type chemical properties. Used by `getMMFFBondType` through the
- *  `single_bond_multiple_bond` and `aromatic` fields, and by the empirical angle-bending rule
- *  through `coordination_number`, `valence`, `multiple_bond_designator` and `linear`. Dense array
- *  indexed directly by `atom_type`, one slot per possible type with zeros for unused slots,
- *  mirroring `mmff94_def_entry_t`. */
+/** MMFFProp per-atom-type chemical properties. Dense array indexed directly by `atom_type`, one slot
+ *  per possible type with zeros for unused slots. */
 struct alignas(8) mmff94_prop_entry_t {
     std::uint8_t atomic_num;
     std::uint8_t coordination_number;
@@ -182,8 +161,7 @@ static_assert(sizeof(mmff94_prop_entry_t) == 8);
  *  them: level 0 is the type itself and level 3 the wildcard. */
 inline constexpr unsigned mmff94_equivalence_levels_k = 4;
 
-/** MMFFDef equivalence levels — one byte per level per atom type. Indexed directly by `atom_type` — a
- *  dense array with one entry per possible type in [1, max_atom_type] and zeros for unused slots. */
+/** MMFFDef equivalence levels, one byte per level. Dense array indexed directly by `atom_type`. */
 struct mmff94_def_entry_t {
     std::uint8_t eq_level[mmff94_equivalence_levels_k];
 };
@@ -198,9 +176,8 @@ struct alignas(8) mmff94_pbci_entry_t {
 };
 static_assert(sizeof(mmff94_pbci_entry_t) == 16);
 
-/** Bond-charge-increment parameter. The *directional* increment applied from atom i to atom j; atom i's
- *  partial charge gains it, atom j loses it. Sorted by (i, j, bond_type); RDKit's Chg lookup checks (i,j,bt)
- *  and (j,i,bt), flipping sign accordingly. */
+/** Bond-charge-increment parameter, keyed by (i_type, j_type, bond_type). The increment is
+ *  @b directional: atom i's partial charge gains it and atom j loses it. */
 struct alignas(8) mmff94_chg_entry_t {
     std::uint8_t i_type;
     std::uint8_t j_type;
@@ -257,12 +234,8 @@ static_assert(sizeof(mmff94_covrad_entry_t) == 12);
 /**
  *  @brief POD view over every extracted MMFF table, passed by value into kernels.
  *
- *  Consumed by all `lookup_*` functions and by host and device alike — on host each span points into
- *  the `std::vector`s inside `mmff94_tables_host_t`; on device into the per-table device buffers that
- *  `upload_mmff94_tables_to_device` fills, see `parameters/mmff94_tables_device.cuh`.
- *
- *  The spans are `custd::span` rather than `std::span` because `std::span`'s members are not
- *  `__host__ __device__`, so the shared `lookup_*` cascades could not index one from a kernel.
+ *  On the host each span points into the `std::vector`s of `mmff94_tables_host_t`; on the device into
+ *  the per-table buffers `upload_mmff94_tables_to_device` fills.
  */
 struct mmff94_tables_view_t {
     custd::span<mmff94_vdw_entry_t const> vdw;
@@ -289,17 +262,15 @@ struct mmff94_tables_view_t {
     std::uint8_t max_atom_type = 0;
 };
 
-/*  Fourteen 16-byte spans, five floats and a byte, padded to the pointer alignment. The upload in
- *  `mmff94_tables_device.cuh` writes these fields and every MMFF kernel takes the struct by value, so a
- *  change in the layout silently redirects every parameter lookup on the device. */
+/*  The upload in `mmff94_tables_device.cuh` writes these fields and every MMFF kernel takes the struct
+ *  by value, so a change in the layout silently redirects every parameter lookup on the device. */
 static_assert(sizeof(mmff94_tables_view_t) == 248);
 
 #pragma endregion Table View
 
 #pragma region Table Container
 
-/** View one whole host table, so the extent comes from the storage rather than from a second argument
- *  a caller could take from the wrong vector. */
+/** View one whole host table, so the extent comes from the storage rather than a second argument. */
 template <typename element_>
 inline custd::span<element_ const> table_span_(std::vector<element_> const &table) noexcept {
     return {table.data(), table.size()};
@@ -348,8 +319,7 @@ struct mmff94_tables_host_t {
     /** Highest atom type seen, for `MMFFDef` indexing. */
     std::uint8_t max_atom_type = 0;
 
-    /** Build a read-only view that references this container's vector storage. Cheap — just copies
-     *  pointers + sizes + scalar constants. */
+    /** A read-only view over this container's own storage, which must outlive it. */
     mmff94_tables_view_t view() const noexcept {
         mmff94_tables_view_t result;
         result.vdw = table_span_(vdw);
@@ -383,17 +353,11 @@ struct mmff94_tables_host_t {
 /**
  *  @brief Hand-rolled `lower_bound` over one sorted table column, used by every lookup cascade below.
  *
- *  The project keeps its own binary search instead of `std::lower_bound`: libstdc++'s version reaches
- *  device code only through `--expt-relaxed-constexpr`, and along that route it has been seen to stop
- *  the search early, returning the first few elements only and declaring the key not found for
- *  anything past about 8 entries in a 95-element sorted array. A local definition keeps the code path
- *  identical between host and device.
+ *  Not `std::lower_bound`: libstdc++'s reaches device code only through `--expt-relaxed-constexpr`,
+ *  and along that route it stops the search early — past about 8 entries of a 95-element sorted array
+ *  it declares the key not found. A local definition keeps host and device on one code path.
  *
- *  @param[in] sorted Column sorted ascending by @p key_of.
- *  @param[in] key Value to place. Widened to `unsigned` so the `key + 1` the range search forms cannot
- *             wrap at atom type 255.
- *  @param[in] key_of Reads the key out of one entry.
- *  @return Index of the first entry whose key is not below @p key, or the extent when there is none.
+ *  @p key is `unsigned` so the `key + 1` the range search forms cannot wrap at atom type 255.
  */
 template <typename element_, typename key_accessor_>
 constexpr std::size_t lower_bound_(custd::span<element_ const> sorted, unsigned key, key_accessor_ &&key_of) noexcept {
@@ -406,18 +370,8 @@ constexpr std::size_t lower_bound_(custd::span<element_ const> sorted, unsigned 
     return lower;
 }
 
-/**
- *  @brief Narrow a sorted column to the run whose key equals @p key.
- *
- *  Every cascade below is a chain of these, so a sub-range travels as one span and no call site rebases
- *  an index onto its parent's start — the `parent_low +` that had to be written, correctly, in front of
- *  eleven of the fourteen inner searches this header used to spell by hand.
- *
- *  @param[in] sorted Column, or an already-narrowed run of it, sorted ascending by @p key_of.
- *  @param[in] key Value the run must carry.
- *  @param[in] key_of Reads the key out of one entry.
- *  @return The matching run, empty when the key is absent.
- */
+/** Narrow a sorted column, or an already-narrowed run of one, to the run whose key equals @p key.
+ *  Empty when the key is absent. */
 template <typename element_, typename key_accessor_>
 constexpr custd::span<element_ const> equal_range_(custd::span<element_ const> sorted, unsigned key,
                                                    key_accessor_ &&key_of) noexcept {
@@ -425,14 +379,8 @@ constexpr custd::span<element_ const> equal_range_(custd::span<element_ const> s
     return tail.first(lower_bound_(tail, key + 1, key_of));
 }
 
-/**
- *  @brief The one entry of a sorted column whose key equals @p key, which every cascade ends on.
- *
- *  @param[in] sorted Column, or an already-narrowed run of it, sorted ascending by @p key_of.
- *  @param[in] key Value to match exactly.
- *  @param[in] key_of Reads the key out of one entry.
- *  @return Pointer into @p sorted, or `nullptr` on a miss.
- */
+/** The one entry of a sorted column whose key equals @p key, which every cascade ends on, or
+ *  `nullptr` on a miss. */
 template <typename element_, typename key_accessor_>
 constexpr element_ const *find_sorted_(custd::span<element_ const> sorted, unsigned key,
                                        key_accessor_ &&key_of) noexcept {
@@ -444,16 +392,11 @@ constexpr element_ const *find_sorted_(custd::span<element_ const> sorted, unsig
 /**
  *  @brief One MMFFDef equivalence level of @p atom_type, or 0 where the dense table does not reach.
  *
- *  @p level is normally below `mmff94_equivalence_levels_k`. RDKit's torsion cascade has one stage that
- *  asks for level 4 and reads one past the entry, landing on the next atom type's level 0, and this port
- *  is required to answer identically — so the levels are walked as the flat dense run they physically
- *  are rather than by indexing past an array. The invariant the type cannot carry is that
+ *  @p level is 0 for the type itself and 3 for the wildcard, but RDKit's torsion cascade has one stage
+ *  that asks for level 4 and reads one past the entry, landing on the next atom type's level 0. This
+ *  port has to answer identically, so the levels are walked as the flat dense run they physically are
+ *  rather than by indexing past an array. The invariant no type carries is that
  *  `mmff94_tables_host_t::def` is dense and contiguous in atom type, which its extraction guarantees.
- *
- *  @param[in] tables Extracted tables, whose `def` column is dense in atom type.
- *  @param[in] atom_type MMFF atom type to equivalence.
- *  @param[in] level Equivalence level, 0 being the type itself and 3 the wildcard.
- *  @return The equivalent atom type, 0 when the table has no answer.
  */
 constexpr std::uint8_t equivalent_atom_type_(mmff94_tables_view_t const &tables, std::uint8_t atom_type,
                                              unsigned level) noexcept {
@@ -464,13 +407,7 @@ constexpr std::uint8_t equivalent_atom_type_(mmff94_tables_view_t const &tables,
 
 #pragma endregion Sorted Column Search
 
-/**
- *  @brief Binary-search cascade matching `MMFFVdWCollection::operator()`.
- *
- *  This and the lookups below match RDKit's `operator()` behaviour, byte-identical to RDKit, and
- *  serve two callers: the cross-validation test, which sanity-checks that the extraction produced
- *  sorted data correctly, and the native CPU port of `extract_mmff94_params_via_rdkit`.
- */
+/** Binary-search cascade matching `MMFFVdWCollection::operator()`. */
 constexpr mmff94_vdw_entry_t const *lookup_vdw(mmff94_tables_view_t const &tables, std::uint8_t atom_type) noexcept {
     return find_sorted_(tables.vdw, atom_type, [](mmff94_vdw_entry_t const &entry) { return entry.atom_type; });
 }
@@ -666,10 +603,9 @@ constexpr mmff94_torsion_entry_t const *find_torsion_entry_(
                         [](mmff94_torsion_entry_t const &entry) { return entry.tor_type; });
 }
 
-/** Torsion lookup with 5-stage equivalence cascade + fallback to the secondary torsion type. Mirrors
- *  `MMFFTorCollection::getMMFFTorParams` exactly. Returns the resolved (canonical torsion type,
- *  params pointer) — caller uses the canonical tor type for downstream debug/metrics, and nullptr
- *  params on miss. */
+/** Torsion lookup with the 5-stage equivalence cascade and the fallback to the secondary torsion
+ *  type, matching `MMFFTorCollection::getMMFFTorParams`. Returns the resolved canonical torsion type
+ *  beside the entry, which is null on a miss. */
 constexpr std::pair<unsigned, mmff94_torsion_entry_t const *> lookup_torsion(
     mmff94_tables_view_t const &tables, std::uint8_t tor_type_primary, std::uint8_t tor_type_secondary,
     std::uint8_t atom_i, std::uint8_t atom_j, std::uint8_t atom_k, std::uint8_t atom_l) noexcept {

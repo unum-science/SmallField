@@ -2,20 +2,8 @@
  *  @file src/smallfield/preprocess/csd_torsion_table.hpp
  *  @brief The CSD torsion-preference corpus, as a flat table of plain data.
  *
- *  RDKit ships this corpus as escaped C++ string literals that a consumer concatenates into one
- *  `std::string` and re-parses at load. Reproducing that here put roughly 41 KB of literals inside a
- *  header that every CUDA translation unit compiles once per architecture, for data no kernel reads,
- *  and then spent one `std::istringstream` and two heap allocations per row turning it back into
- *  numbers. The rows are a table with fixed arity, so they are stored as one.
- *
- *  The table itself lives in a host-only `.cpp`. Only this declaration is safe for a device
- *  translation unit to see, and there is nothing here for nvcc to tokenize.
- *
- *  Row order is semantic - `extract_etk_torsions_native` gives a bond to the first pattern that
- *  claims it, and the corpus is ordered most-specific first, so sorting or regrouping these rows
- *  changes the conformers the pipeline generates while everything still compiles. Anything that
- *  wants to group them has to preserve the sequence. `csd_torsion_table.cpp` carries the snippet
- *  that regenerates it from an RDKit checkout.
+ *  The rows themselves live in a host-only `.cpp`, so nothing here costs a device translation unit
+ *  41 KB of string literals it must tokenize once per architecture for data no kernel reads.
  */
 
 #pragma once

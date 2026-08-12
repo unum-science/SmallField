@@ -42,8 +42,8 @@ static void warm_up_rdkit_globals_for_fallback_() {
                 RDKit::MolOps::addHs(*warm);
                 RDKit::MolOps::assignStereochemistry(*warm, /*cleanIt=*/true, /*force=*/true,
                                                      /*flagPossibleStereoCenters=*/true);
-                // Constructing the properties is the warm-up: it forces RDKit's lazy MMFF
-                // parameter singletons to load before the parallel region opens on them.
+                // Constructing the properties is the warm-up: it loads RDKit's lazy MMFF parameter
+                // singletons before the parallel region opens on them.
                 RDKit::MMFF::MMFFMolProperties props(*warm);
             }
         }
@@ -76,9 +76,8 @@ static std::uint32_t unfilled_slots_of_(custd::span<sfapi::conformer_status_t co
 /**
  *  @brief Parse one SMILES the way the GPU path does and confirm MMFF can type the result.
  *
- *  Embedding is the dominant CPU cost here and it is wasted on a molecule the force field cannot type:
- *  `constructForceField` would throw below and every conformer would fail anyway, so asking first costs a
- *  typing check instead of K embeddings.
+ *  Typing is checked up front because `constructForceField` would throw below and every conformer would
+ *  fail anyway, so a molecule MMFF cannot type costs one typing check instead of K embeddings.
  *
  *  @param[out] molecule Receives the parsed molecule on `success_k`, untouched on every refusal.
  *  @return `success_k`, or the status every slot of this molecule takes.
@@ -136,9 +135,8 @@ static void write_conformer_into_slot_(RDKit::RWMol const &molecule, int conform
 /**
  *  @brief Embed fresh conformers for one molecule and lay them into the slots the GPU left unfilled.
  *
- *  Only as many conformers are embedded as there are unfilled slots: `EmbedMultipleConfs` is the dominant
- *  CPU cost in this path, and failures cluster in one of K, so halving the count halves the per-molecule
- *  wall in the common case. Slots the GPU did fill keep their coordinates, energy and status untouched.
+ *  Only as many conformers are embedded as there are unfilled slots, since `EmbedMultipleConfs` is the
+ *  dominant CPU cost here. Slots the GPU did fill keep their coordinates, energy and status untouched.
  *
  *  @return Slots this molecule recovered.
  */
@@ -198,8 +196,7 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         if (sfapi::conformer_status_t const admission = admit_molecule_(inputs.smiles[molecule_index], layout.max_atoms,
                                                                         molecule);
             admission != sfapi::conformer_status_t::success_k) {
-            // Only the unfilled slots take the refusal; a slot the GPU already filled keeps its geometry,
-            // which a whole-molecule overwrite used to discard along with the status that described it.
+            // Only the unfilled slots take the refusal, so a slot the GPU already filled keeps its geometry.
             for (sfapi::conformer_status_t &slot_status : status)
                 if (slot_status != sfapi::conformer_status_t::success_k) slot_status = admission;
             continue;
@@ -211,10 +208,8 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
                                         layout.num_conformers * layout.slot_stride()));
         if (recovered == 0) continue;
 
-        // Only a molecule that actually produced a conformer gets an atom count. Writing it before the
-        // embed left unrecovered molecules carrying a non-zero count over all-zero coordinates, which
-        // defeats the `num_atoms == 0` guard downstream and buys them a full shape-context parse plus four
-        // substructure searches for a row that has no geometry.
+        // Only a molecule that produced a conformer gets an atom count: a non-zero count over all-zero
+        // coordinates defeats the `num_atoms == 0` guard the descriptor pass downstream skips on.
         outputs.num_atoms_per_molecule[molecule_index] = static_cast<std::uint8_t>(molecule->getNumAtoms());
         num_recovered.fetch_add(1, std::memory_order_relaxed);
     }

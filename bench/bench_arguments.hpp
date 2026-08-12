@@ -2,21 +2,9 @@
  *  @file bench/bench_arguments.hpp
  *  @brief Command-line and corpus plumbing shared by the benchmark drivers.
  *
- *  `std::atoi` and `std::strtoull` both answer a malformed token with zero, so `--conformers abc` reads as
- *  `--conformers 0` and the run continues on a number nobody typed. Every benchmark flag goes through
- *  `parse_number` instead, which reports why a token was refused and enforces the caller's bounds in the
- *  same pass — the ceiling is what stops a four-billion conformer count from reaching `std::vector::resize`.
- *
- *  @code{.cpp}
- *  std::uint32_t num_conformers = 3;
- *  auto const status = smallfield::bench::parse_number(argv[index], 1u, 1024u, num_conformers);
- *  if (status != smallfield::bench::number_parse_t::parsed_k)
- *      fmt::println(stderr, "--conformers {}", smallfield::bench::describe_number_parse(status));
- *  @endcode
- *
- *  `load_corpus_into` is the single SMILES reader behind all three benchmarks. It separates a path that
- *  never opened from one that opened and held nothing, because a corpus read as zero molecules is a run that
- *  measures nothing and still exits clean.
+ *  `std::atoi` and `std::strtoull` both answer a malformed token with zero, so a run continues on a number
+ *  nobody typed. Every benchmark flag goes through `parse_number` instead, whose ceiling is what stops a
+ *  four-billion conformer count from reaching `std::vector::resize`.
  */
 
 #pragma once
@@ -37,17 +25,13 @@
 
 namespace smallfield::bench {
 
-/** Why a command-line token was accepted or refused as a number. */
+/** Why a command-line token was accepted or refused as a number; `describe_number_parse` renders each. */
 enum class number_parse_t {
-    /** The whole token is a number inside the accepted range. */
     parsed_k,
-    /** The token is not a number, or carries trailing characters. */
+    /** Not a number at all, or carrying trailing characters. */
     malformed_k,
-    /** The token is a number the destination type cannot hold. */
     out_of_range_k,
-    /** The token parses but falls under the caller's floor. */
     below_minimum_k,
-    /** The token parses but exceeds the caller's ceiling. */
     above_maximum_k,
 };
 
@@ -84,28 +68,25 @@ inline char const *describe_number_parse(number_parse_t status) {
 /** Environment variable naming a corpus when no `--smi` flag is given. */
 inline constexpr char const *corpus_environment_variable_k = "SMALLFIELD_TEST_CORPUS";
 
-/** Why a SMILES corpus was accepted or refused. */
+/**
+ *  @brief Why a SMILES corpus was accepted or refused.
+ *
+ *  A path that never opened is kept apart from one that opened and held nothing, because a corpus read as
+ *  zero molecules is a run that measures nothing and still exits clean.
+ */
 enum class corpus_load_t {
-    /** The file opened and yielded at least one SMILES. */
     loaded_k,
     /** Neither a flag nor the environment named a corpus. */
     unnamed_k,
-    /** The named path did not open. */
     cannot_open_k,
-    /** The file opened and held no SMILES. */
     empty_k,
 };
 
 /**
- *  @brief Read up to @p capacity SMILES from @p path into @p smiles, one per line, first whitespace field only.
+ *  @brief Read up to @p capacity SMILES from @p path into a cleared @p smiles, one per line.
  *
  *  Lines that are empty or start with `#` are skipped, and each kept line is truncated at its first run of
  *  whitespace, which drops a trailing name field along with any `\r`.
- *
- *  @param[in] path File to read, empty when nothing named a corpus.
- *  @param[in] capacity Upper bound on how many lines to keep.
- *  @param[out] smiles Caller-owned destination, cleared before the first line is appended.
- *  @return Whether the corpus loaded, and if not, which of the three refusals applies.
  */
 inline corpus_load_t load_corpus_into(std::string_view path, std::size_t capacity, std::vector<std::string> &smiles) {
     smiles.clear();
@@ -148,10 +129,8 @@ enum class arguments_parse_t { accepted_k, refused_k };
 /**
  *  @brief The command line as one cursor: the tokens, the position in them, and the name to blame.
  *
- *  `argc`, `argv` and the index into them are one thing, and passing them apart is what let each driver
- *  write its own "is there a token after this flag" check in its own spelling. Three things are refusals
- *  rather than silent defaults here: a token that is not a number, a token outside the caller's bounds, and
- *  a value-taking flag that appears last with nothing after it.
+ *  Three things are refusals rather than silent defaults: a token that is not a number, a token outside the
+ *  caller's bounds, and a value-taking flag that appears last with nothing after it.
  */
 class command_line_t {
     char const *executable_name_;

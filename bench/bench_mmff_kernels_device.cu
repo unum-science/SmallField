@@ -2,9 +2,8 @@
  *  @file bench/bench_mmff_kernels_device.cu
  *  @brief Device-side launcher for the MMFF GPU kernel trio.
  *
- *  Times each kernel with `cudaEvent`s and reports the totals back to the host benchmark driver. Nothing is
- *  copied back: the outputs are ≥ 10 GB on a large batch and the benchmark measures the kernels rather than
- *  the readback, so the correctness of the terms is the parity suite's job rather than this one's.
+ *  Nothing is copied back: the outputs run to 10 GB or more on a large batch, and the correctness of the
+ *  terms is the parity suite's job rather than this one's.
  */
 
 #include <cstddef> // `std::size_t`
@@ -42,13 +41,7 @@ char const *describe_trio_launch(trio_launch_t status) {
 template <typename value_type_>
 using device_array = types::buffer<value_type_, types::device_allocator_t>;
 
-/**
- *  @brief Every device array one batch needs, owned together so no refusal path has to free them by hand.
- *
- *  Fifteen arrays with fifteen hand-written releases is fifteen chances for one refusal path to miss one,
- *  and at roughly twelve gigabytes a batch that is the whole allocation. Owning them releases each in
- *  stream order from its own destructor, on every path out, including the ones nobody thought about.
- */
+/** Every device array one batch needs, each released in stream order on every path out of the launch. */
 struct device_batch_t {
     device_array<sft::molecule_descriptor_t> descriptors;
     device_array<std::uint32_t> atom_offsets;
@@ -69,8 +62,8 @@ struct device_batch_t {
     /**
      *  @brief Reserve every array for @p num_molecules molecules over @p total_atom_count atoms.
      *
-     *  Every term array is sized at the per-molecule maximum stride, which is what makes the batch's
-     *  footprint linear in the molecule count and about 50 kB a molecule.
+     *  Every term array is sized at the per-molecule maximum stride, so the batch costs about 50 kB a
+     *  molecule whatever the molecules are.
      */
     [[nodiscard]] bool reserve(std::uint32_t num_molecules, std::uint32_t total_atom_count) {
         bool reserved = true;
@@ -152,15 +145,13 @@ trio_launch_t launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t 
         return trio_launch_t::allocation_failed_k;
     }
 
-    // The allocations above are stream-ordered against the same stream the kernels and the events below
-    // ride, so the uploads see them without a synchronize of their own.
+    // The allocations above are stream-ordered against the stream the kernels and events below ride, so the
+    // uploads see them without a synchronize of their own.
     if (!types::upload_into(batch.descriptors.view(), descriptors, nullptr)) return trio_launch_t::allocation_failed_k;
     if (!types::upload_into(batch.atom_offsets.view(), atom_offsets, nullptr))
         return trio_launch_t::allocation_failed_k;
 
     trio_events_t events;
-    // The vocabulary stops at the launch: a `__global__` parameter is a raw `__restrict__` pointer, and the
-    // aliasing guarantee `nvcc` acts on is the one it derives from that formal parameter.
     auto launch_type_and_charge_ = [&] {
         sfmmff::launch_mmff94_type_and_charge(batch.descriptors.data(), batch.atom_offsets.data(), num_molecules,
                                               tables_device.view, batch.atom_types.data(), batch.partial_charges.data(),

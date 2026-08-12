@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """Draw a stratified SMILES sample across the shards of a molecule corpus.
 
-Taking the first N rows of one shard is not a sample of the corpus. Shards are ordered by
-deposition or by enumeration index, so neighbouring rows share a submission, a scaffold series,
-or a reagent set. This walks every shard, takes a random row group from each, and draws evenly,
-so the result reflects the corpus rather than one neighbourhood of it.
-
-    ./sample_corpora.py --corpus pubchem --count 20000 --out pubchem-20k.smi
+Taking the first N rows of one shard is not a sample of the corpus: shards are ordered by deposition
+or by enumeration index, so neighbouring rows share a submission, a scaffold series, or a reagent
+set. This walks every shard, takes a random row group from each, and draws evenly.
 
 Corpora are resolved under `data/`, whose entries are symlinks each machine makes for itself, so
 nothing here names a path outside the repository. `--root` overrides the lookup entirely.
@@ -21,9 +18,7 @@ import sys
 import numpy as np
 import pyarrow.parquet as pq
 
-# Relative to the repository root, which is this script's parent directory. An absolute path here
-# would be a claim about one filesystem, true on the machine that wrote it and silently wrong on
-# the next.
+# Relative to the repository root, which is this script's parent directory.
 CORPUS_ROOTS = {
     "pubchem": "data/usearch-molecules/pubchem/parquet",
     "gdb13": "data/usearch-molecules/gdb13/parquet",
@@ -71,8 +66,8 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     arguments = parser.parse_args()
 
-    # A `--root` is taken as the caller typed it; a named corpus resolves under the repository, so
-    # the script works from any working directory without naming one.
+    # A `--root` is taken as typed; a named corpus resolves under the repository, so the script works
+    # from any working directory.
     root = arguments.root or os.path.join(REPOSITORY_ROOT, CORPUS_ROOTS[arguments.corpus])
     paths = shard_paths(root)
     if not paths:

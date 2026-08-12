@@ -1,9 +1,9 @@
 /**
  *  @file src/smallfield/mmff94/mmff94_extract.hpp
- *  @brief Native CPU MMFF94 term extraction, host-only.
+ *  @brief Native CPU MMFF94 term extraction.
  *
- *  Separated from `mmff94_term_equations.hpp` so that CUDA translation units can include the helpers — periodic-table
- *  rows, ring queries, empirical rules — without pulling in `etkdg_prepare_batch.hpp`.
+ *  Host-only, because it reaches `etkdg_prepare_batch.hpp`. The classification and empirical rules it
+ *  shares with the device extractor live in `mmff94_term_equations.hpp`.
  */
 
 #pragma once

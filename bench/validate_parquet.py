@@ -1,21 +1,8 @@
 #!/usr/bin/env python3
-"""Validate SmallField output Parquet shards: schema, stats, and RDKit cross-check.
+"""Validate SmallField output Parquet shards: schema, aggregate stats, and an RDKit MMFF94 cross-check.
 
-Run as a script::
-
-    python validate_parquet.py --input data/usearch-molecules/pubchem/3d \\
-        --num-samples 500 --shard-limit 100
-
-Reports:
-  - Schema check on the first shard, against the canonical 13-column `*.3D.parquet`
-    schema declared in `cli/parquet_writer.hpp`.
-  - Aggregate stats across shards: rows, per-status counts, energy percentiles.
-  - Cross-validation against RDKit MMFF94: for a random sample of successful
-    conformers, overlay the stored SmallField coordinates onto a parsed molecule
-    and recompute the MMFF energy, then report the paired difference.
-
-Exit codes mean one thing each: 0 a clean run, 1 a check that failed, 2 a refused
-command line or an input directory holding nothing to validate.
+Exit code 1 is a check that failed and 2 is a refused command line or an input directory holding
+nothing to validate, so a broken shard and a mistyped path do not read alike.
 """
 
 from __future__ import annotations
@@ -35,9 +22,8 @@ from smallfield.log import Logger, log as _default_log, thousands
 
 log = Logger()
 
-# The canonical schema, in the order `cli/parquet_writer.hpp` documents it. A shard missing any of
-# these was written by something other than this project's writer, and every statistic below would
-# be measuring a format nobody ships.
+# The canonical schema, in the order `cli/parquet_writer.hpp` documents it, which is the authority for
+# what a shard carries. A shard missing any of these was written by something other than our writer.
 REQUIRED_COLUMNS: Sequence[str] = (
     "input_shard",
     "input_row",
@@ -155,11 +141,9 @@ def sample_successful_indices(first_shard: str, num_samples: int, seed: int = 42
 def cross_validate_with_rdkit(first_shard: str, sample_indices: np.ndarray) -> CrossValidation:
     """Recompute the RDKit MMFF94 energy on the stored SmallField coordinates and compare.
 
-    `conformer_coords` is a tight interleaved ``(n_atoms, 3)`` float16 list, the same block the C++
-    writer packs, so a row reshapes directly into atom-major coordinates. The conformer attached
-    below is empty rather than embedded: it only has to exist at the right size, and embedding one
-    per sample would spend an ETKDG run each time and silently drop the molecules ETKDG refuses,
-    which are disproportionately the large ones this comparison is about.
+    The conformer attached below is empty rather than embedded: it only has to exist at the right
+    size, and embedding one per sample would silently drop the molecules ETKDG refuses, which are
+    disproportionately the large ones this comparison is about.
     """
     result = CrossValidation(num_samples=len(sample_indices))
     try:
@@ -193,8 +177,8 @@ def cross_validate_with_rdkit(first_shard: str, sample_indices: np.ndarray) -> C
         num_atoms = molecule.GetNumAtoms()
 
         coordinates = np.asarray(stored_coordinates, dtype=np.float16).astype(np.float32)
-        # A row shorter than the molecule it names cannot be overlaid; the parse must reproduce the
-        # atom order the writer stored, and a length mismatch is exactly where it did not.
+        # The parse must reproduce the atom order the writer stored, and a length mismatch is exactly
+        # where it did not.
         if coordinates.size != num_atoms * 3:
             result.rdkit_failures += 1
             continue
@@ -217,8 +201,7 @@ def cross_validate_with_rdkit(first_shard: str, sample_indices: np.ndarray) -> C
             if force_field is None:
                 result.rdkit_failures += 1
                 continue
-            # Signed and paired: both numbers describe the same geometry, so the difference measures
-            # agreement. An absolute value hides which engine sits above the other.
+            # Signed and paired: an absolute value hides which engine sits above the other.
             deltas.append(stored_energy - force_field.CalcEnergy())
             result.compared += 1
         except Exception:
@@ -264,8 +247,7 @@ def render_cross_validation_table(result: CrossValidation) -> None:
     table = Table(title=f"RDKit cross-validation — {thousands(result.num_samples)} samples", show_header=False)
     table.add_column("metric", style="bold")
     table.add_column("value", justify="right")
-    # `compared` is printed whatever it is: a validator that silently compares nothing and exits
-    # clean is the defect this line exists to expose.
+    # `compared` is printed whatever it is, so a validator that compares nothing cannot look like a pass.
     table.add_row("compared", f"{result.compared} / {result.num_samples}")
     table.add_row("NaN coordinates", str(result.nan_coordinates))
     table.add_row("RDKit failures", str(result.rdkit_failures))

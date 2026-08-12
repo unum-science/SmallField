@@ -2,22 +2,13 @@
  *  @file src/smallfield/preprocess/csd_torsion_native.hpp
  *  @brief Compiler from CSD torsion SMARTS text into the stack-only pattern the matcher evaluates.
  *
- *  The whole 470-pattern CSD library compiles: four atoms bound by their `:1`-`:4` map labels, so a
- *  labelled atom inside a branch — `[a:1][c:2]!@;-[C:3](=[N:4])(-N)` — binds like any other; atom-level
- *  OR (`[cH,nX2H0]`), bond-level OR (`@;=,:`), ring-size ranges (`r{5-8}`), ring-bond connectivity
- *  (`x3`), a ring closure that walks the four labelled atoms back around a cycle, and recursive `$(...)`
- *  bodies compiled into the bounded sub-query pool of `csd_torsion_predicates.hpp`.
+ *  Host-only and reached once per process from `csd_torsion_dispatcher.hpp`; the shapes it fills live in
+ *  `csd_torsion_predicates.hpp`, which is the half the device kernel compiles.
  *
- *  Nothing here runs per molecule. This is the host-only half of the subsystem, reached once per process
- *  from `csd_torsion_dispatcher.hpp`; the shapes it fills and every predicate that reads them live in
- *  `csd_torsion_predicates.hpp`, which is what the device kernel compiles.
- *
- *  Why the matcher exists at all: 192-thread OpenMP preprocessing saturated at 32 threads because every
- *  `SubstructMatch` call allocates and destroys several `std::vector` objects plus VF2 state arrays.
- *  Removing those allocations restores linear thread scaling.
- *
- *  Correctness: identical matches to RDKit for every pattern, validated by a per-pattern per-atom
- *  byte-equivalence test against RDKit's `SubstructMatch` (see `test_csd_torsion_predicates.cpp`).
+ *  The whole 470-pattern CSD library fits the vocabulary: four atoms bound by their `:1`-`:4` map labels
+ *  wherever they sit in the text, atom-level OR (`[cH,nX2H0]`), bond-level OR (`@;=,:`), ring-size ranges
+ *  (`r{5-8}`), ring-bond connectivity (`x3`), one ring closure walking the labelled atoms back around a
+ *  cycle, and recursive `$(...)` bodies.
  */
 
 #pragma once
@@ -51,13 +42,8 @@ constexpr bool is_alpha_(char character) noexcept {
     return is_lower_(character) || (character >= 'A' && character <= 'Z');
 }
 
-/**
- *  @brief Read cursor over one piece of SMARTS text.
- *
- *  The text and the offset into it are one fact, so every primitive below takes the cursor rather than
- *  a `std::string_view` beside an index it has to step in the same direction by hand. Past the end
- *  `peek` answers `\0`, which is not a SMARTS character, so no caller tests `done` before looking.
- */
+/** Read cursor over one piece of SMARTS text. Past the end `peek` answers `\0`, which is not a SMARTS
+ *  character, so no caller tests `done` before looking. */
 struct smarts_cursor_t {
     std::string_view text;
     std::size_t position = 0;
@@ -74,16 +60,11 @@ struct smarts_cursor_t {
     }
     /** Text from @p start up to the cursor, which is how a run is captured once its end is known. */
     constexpr std::string_view since(std::size_t start) const noexcept { return text.substr(start, position - start); }
-    /** Step past a decimal run without reading it, which is all an atom map label needs here. */
     constexpr void skip_digits() noexcept {
         while (is_digit_(peek())) advance();
     }
-    /**
-     *  @brief Read the decimal run under the cursor into @p value.
-     *
-     *  @param[out] value Untouched unless the whole run is read, so a caller may pre-load a default.
-     *  @return False when no digit stands under the cursor, or the run does not fit 16 bits.
-     */
+    /** Read the decimal run under the cursor into @p value, which is left untouched — so a caller may
+     *  pre-load a default — unless the whole run is read and fits 16 bits. */
     constexpr bool take_unsigned(std::uint32_t &value) noexcept {
         if (!is_digit_(peek())) return false;
         std::uint32_t scanned = 0;
@@ -96,10 +77,8 @@ struct smarts_cursor_t {
     }
 };
 
-/**
- *  @brief Atomic number of a one- or two-letter element symbol, aliphatic or aromatic spelling alike.
- *  @return 0 when the symbol names no element the CSD corpus uses.
- */
+/** Atomic number of a one- or two-letter element symbol, aliphatic or aromatic spelling alike, or 0 when
+ *  the symbol names no element the CSD corpus uses. */
 inline std::uint8_t symbol_to_element(std::string_view symbol) {
     struct entry_t {
         char const *symbol;
@@ -116,12 +95,8 @@ inline std::uint8_t symbol_to_element(std::string_view symbol) {
     return 0;
 }
 
-/**
- *  @brief Read the element symbol standing under the cursor, preferring the two-letter reading.
- *
- *  @param[inout] cursor Positioned on the symbol; stepped past it only when one is read.
- *  @return Atomic number, or 0 when the letters name no element the corpus uses.
- */
+/** Read the element symbol standing under the cursor, preferring the two-letter reading. The cursor steps
+ *  past it only when one is read. */
 inline std::uint8_t take_element_symbol(smarts_cursor_t &cursor) {
     if (is_lower_(cursor.text.substr(cursor.position).size() > 1 ? cursor.text[cursor.position + 1] : '\0')) {
         std::uint8_t const two_letter = symbol_to_element(cursor.text.substr(cursor.position, 2));
@@ -136,14 +111,11 @@ inline std::uint8_t take_element_symbol(smarts_cursor_t &cursor) {
 }
 
 /**
- *  @brief Index of the delimiter closing the group opened at @p open_position.
+ *  @brief Index of the delimiter closing the `[` or `(` at @p open_position, or `std::string_view::npos`
+ *  when unbalanced.
  *
- *  Bracket and parenthesis depth are both tracked, so a recursive `$(...)` body cannot end its
- *  enclosing atom early and a branch cannot end inside one.
- *
- *  @param[in] text SMARTS text being scanned.
- *  @param[in] open_position Index of the opening `[` or `(`, which chooses the closer.
- *  @return Index of the matching delimiter, or `std::string_view::npos` when unbalanced.
+ *  Bracket and parenthesis depth are both tracked, so a recursive `$(...)` body cannot end its enclosing
+ *  atom early and a branch cannot end inside one.
  */
 inline std::size_t find_group_end(std::string_view text, std::size_t open_position) {
     char const closer = text[open_position] == '[' ? ']' : ')';
@@ -162,13 +134,10 @@ inline std::size_t find_group_end(std::string_view text, std::size_t open_positi
 }
 
 /**
- *  @brief Read the SMARTS atom-map label (`:n`) out of a bracket interior.
+ *  @brief The SMARTS atom-map label out of a bracket interior such as `CX3:2`, or 0 when it carries none.
  *
  *  A colon inside a recursive `$(...)` body is that sub-query's aromatic-bond operator, so only
  *  depth-zero colons followed by digits are labels.
- *
- *  @param[in] spec Bracket interior, e.g. `CX3:2` or `$(C=O):1`.
- *  @return The label, or 0 when the atom carries none.
  */
 inline std::uint8_t spec_map_number(std::string_view spec) {
     smarts_cursor_t cursor {spec};
@@ -190,12 +159,11 @@ inline std::uint8_t spec_map_number(std::string_view spec) {
 #pragma region Atom Primitives
 
 /**
- *  @brief Outcome of folding one SMARTS primitive run into an `atom_disjunct_t`. A
- *  contradiction between two primitives of the same conjunction — `r3` next to
- *  `r{5-6}`, two different `X<n>` — is not a parse failure: the disjunct simply
- *  matches nothing and is dropped, while the rest of the disjunction stands.
- *  Syntax the compiler cannot represent is a different answer entirely and sends
- *  the whole pattern to RDKit.
+ *  @brief Outcome of folding one SMARTS primitive run into an `atom_disjunct_t`.
+ *
+ *  A contradiction between two primitives of the same conjunction — `r3` next to `r{5-6}`, two different
+ *  `X<n>` — is not a parse failure: the disjunct matches nothing and is dropped while the rest of the
+ *  disjunction stands. Syntax the compiler cannot represent refuses the whole pattern instead.
  */
 enum term_parse_t : std::uint8_t {
     /** Primitives folded in, the disjunct is satisfiable. */
@@ -209,11 +177,8 @@ enum term_parse_t : std::uint8_t {
 /** Whether a `!` immediately preceded the primitive under the cursor. */
 enum class primitive_sense_t : std::uint8_t { positive_k, negated_k };
 
-/**
- *  @brief What a term's own symbols said about aromaticity: `c` and `n` are aromatic, `C` and `N`
- *  aliphatic, and a term naming both constrains neither — which is what lets `[!O]` still admit
- *  an aromatic oxygen.
- */
+/** What a term's own symbols said about aromaticity: `c` and `n` are aromatic, `C` and `N` aliphatic, and
+ *  a term naming both constrains neither. */
 enum class aromaticity_cue_t : std::uint8_t { unconstrained_k, aromatic_k, aliphatic_k, conflicting_k };
 
 /** SMARTS `^<n>` names a hybridization by its shell count, so the level indexes this table directly. */
@@ -227,12 +192,9 @@ inline bool compile_recursive_body(std::string_view body, std::uint8_t nesting, 
 /**
  *  @brief One conjunction of SMARTS atom primitives, in the middle of being folded into a disjunct.
  *
- *  Every `fold_` below steps past its own introducing character first, folds what follows, and answers
- *  whether the disjunct is still satisfiable — a primitive that contradicts one already folded drops
- *  the disjunct rather than refusing the pattern. Two readings cannot be settled until the term ends:
- *  a bare `H` is the hydrogen atom only if nothing else named an element, and an element symbol's case
- *  constrains aromaticity only if the term did not also name the other case. Those are what the cues
- *  carry, and `resolve` is where they land.
+ *  Two readings cannot be settled until the term ends: a bare `H` is the hydrogen atom only if nothing
+ *  else named an element, and an element symbol's case constrains aromaticity only if the term did not
+ *  also name the other case. Those are what the cues carry, and `resolve` is where they land.
  *
  *  The disjunct is shared with the term's siblings under `;`, so a mask already in it was written by an
  *  earlier conjunct of the same combination and every fold intersects rather than overwrites.
@@ -253,10 +215,10 @@ struct atom_term_t {
     /**
      *  @brief Intersect the disjunct's element set with one element primitive.
      *
-     *  The set is an include-list until a negated primitive turns it into an exclude-list, because
-     *  `!#1` has to keep admitting the elements past bit 63 that no include-list can name. An
-     *  include-list narrowed to nothing is unsatisfiable rather than unconstrained, which is the
-     *  difference between `[C;!#6]` matching no atom and it matching every atom.
+     *  The set is an include-list until a negated primitive turns it into an exclude-list, because `!#1`
+     *  has to keep admitting the elements past bit 63 that no include-list can name. An include-list
+     *  narrowed to nothing is unsatisfiable rather than unconstrained, which is the difference between
+     *  `[C;!#6]` matching no atom and it matching every atom.
      */
     term_parse_t fold_element(std::uint8_t element, primitive_sense_t sense) noexcept {
         if (element == 0 || element >= 64) return term_unsupported_k;
@@ -309,7 +271,7 @@ struct atom_term_t {
         return fold_element(element, sense);
     }
 
-    /** `*`, `A` and `a` — the wildcard and the two aromaticity classes, none of them negatable here. */
+    /** `*`, `A` and `a` — the wildcard and the two aromaticity classes, none of them negatable. */
     term_parse_t fold_wildcard(smarts_cursor_t &cursor, primitive_sense_t sense) noexcept {
         char const character = cursor.take();
         if (sense == primitive_sense_t::negated_k) return term_unsupported_k;
@@ -319,10 +281,8 @@ struct atom_term_t {
         return term_parsed_k;
     }
 
-    /**
-     *  @brief `X<n>` and `D<n>` — total degree. Running on an `addHs`-ed molecule RDKit's
-     *  `getDegree()` answers both, so the two primitives pin the same field.
-     */
+    /** `X<n>` and `D<n>` — total degree. On an `addHs`-ed molecule RDKit's `getDegree()` answers both,
+     *  so the two primitives pin the same field. */
     term_parse_t fold_degree(smarts_cursor_t &cursor, primitive_sense_t sense) noexcept {
         cursor.advance();
         if (sense == primitive_sense_t::negated_k) return term_unsupported_k;
@@ -333,10 +293,8 @@ struct atom_term_t {
         return term_parsed_k;
     }
 
-    /**
-     *  @brief `x<n>` — ring-bond connectivity, the number of the atom's bonds that lie in a ring.
-     *  `x0` is a real constraint, which is why the unconstrained sentinel is `no_count_k` rather than zero.
-     */
+    /** `x<n>` — the number of the atom's bonds that lie in a ring. `x0` is a real constraint, which is
+     *  why the unconstrained sentinel is `no_count_k` rather than zero. */
     term_parse_t fold_ring_bond_degree(smarts_cursor_t &cursor, primitive_sense_t sense) noexcept {
         cursor.advance();
         if (sense == primitive_sense_t::negated_k) return term_unsupported_k;
@@ -396,11 +354,8 @@ struct atom_term_t {
         return term_parsed_k;
     }
 
-    /**
-     *  @brief `r`, `r<n>`, `r{N-M}` and `!r` — the size of the atom's smallest ring, as a range.
-     *  Several ring-size primitives in one conjunction intersect: `r5` beside `r{5-8}` is `r5`,
-     *  and `r3` beside `r{5-6}` is nothing at all.
-     */
+    /** `r`, `r<n>`, `r{N-M}` and `!r` — the size of the atom's smallest ring, as a range. Several in one
+     *  conjunction intersect: `r5` beside `r{5-8}` is `r5`, and `r3` beside `r{5-6}` is nothing at all. */
     term_parse_t fold_ring_size(smarts_cursor_t &cursor, primitive_sense_t sense) noexcept {
         cursor.advance();
         if (sense == primitive_sense_t::negated_k) {
@@ -477,8 +432,8 @@ struct atom_term_t {
         if (cursor.peek() != '(') return term_unsupported_k;
         std::size_t const body_end = find_group_end(cursor.text, cursor.position);
         if (body_end == std::string_view::npos) return term_unsupported_k;
-        // Two sub-queries in one conjunction would need two guards on one disjunct; the corpus never
-        // writes that, so it stays outside the vocabulary.
+        // Two sub-queries in one conjunction would need two guards on one disjunct, which the corpus
+        // never writes.
         if (disjunct.recursive_root != no_recursive_node_k) return term_unsupported_k;
         std::uint8_t root = no_recursive_node_k;
         std::string_view const body = cursor.text.substr(cursor.position + 1, body_end - cursor.position - 1);
@@ -511,18 +466,11 @@ struct atom_term_t {
 
 /**
  *  @brief Parse one disjunct — the text between `,` separators inside a SMARTS bracket — into
- *  @p disjunct.
+ *  @p disjunct, which the term intersects into rather than overwrites.
  *
- *  A term is a conjunction of primitives separated by `&`/`;` or by nothing at all, and the whole of
- *  it shares one element identity, one aromaticity, one H-count. Which primitive is being read is
- *  decided by its leading character alone; what it then means to the disjunct is not, which is why
- *  the dispatch below is a table of one-line cases over folds that each own a reconciliation rule.
- *
- *  @param[in] token The disjunct body (no leading/trailing separators).
- *  @param[in] nesting How many `$(...)` levels enclose this term, zero at a pattern's own atoms.
- *  @param[inout] disjunct Accumulator; the term intersects into whatever earlier conjuncts wrote.
- *  @param[inout] pool Sub-query nodes a `$(...)` primitive appends to.
- *  @return `term_parsed_k`, `term_unsatisfiable_k`, or `term_unsupported_k`.
+ *  A term is a conjunction of primitives separated by `&`/`;` or by nothing at all, and the whole of it
+ *  shares one element identity, one aromaticity, one H-count. @p nesting counts the `$(...)` levels
+ *  enclosing the term, zero at a pattern's own atoms.
  */
 inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting, atom_disjunct_t &disjunct,
                                     recursive_pool_t &pool) {
@@ -533,8 +481,7 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
     while (!cursor.done()) {
         term_parse_t outcome = term_parsed_k;
         switch (cursor.peek()) {
-        // Both spellings of conjunction, and the negation that binds to whatever comes next. The
-        // term is already one alternative of one conjunct, so their precedences coincide here.
+        // The term is already one alternative of one conjunct, so `&` and `;` coincide here.
         case '&':
         case ';': cursor.advance(); continue;
         case '!':
@@ -576,16 +523,11 @@ inline term_parse_t parse_atom_term(std::string_view token, std::uint8_t nesting
 #pragma region Expressions
 
 /**
- *  @brief Split @p text on every @p separator sitting at parenthesis depth zero.
+ *  @brief Split @p text on every @p separator sitting at parenthesis depth zero, answering 0 when a piece
+ *  comes out empty or @p max_fields is exceeded.
  *
  *  Separators inside a recursive `$(...)` body belong to that sub-query, so `[$(C,N);X3]` has one
  *  top-level `;` and no top-level `,`.
- *
- *  @param[in] text Bracket interior or bond operator to split.
- *  @param[in] separator Top-level delimiter, `;` between conjuncts and `,` between alternatives.
- *  @param[out] fields Receives the pieces with the separators dropped.
- *  @param[in] max_fields Capacity of @p fields.
- *  @return Piece count, or 0 when a piece came out empty or the capacity was exceeded.
  */
 inline std::size_t split_top_level(std::string_view text, char separator, std::string_view *fields,
                                    std::size_t max_fields) {
@@ -609,18 +551,12 @@ inline std::size_t split_top_level(std::string_view text, char separator, std::s
 }
 
 /**
- *  @brief The disjunctive-normal-form skeleton of a bracket interior or a bond operator, plus the
- *  cursor that walks its combinations.
+ *  @brief The disjunctive-normal-form skeleton of a bracket interior or a bond operator, plus the cursor
+ *  that walks its combinations.
  *
  *  SMARTS logical-operator precedence is `!` then `&` then `,` then `;`, so an expression is a
- *  conjunction of alternations and its DNF is the cross product of one alternative per conjunct:
- *
- *  - `A,a;r{5-8}`   = `(A OR a) AND r{5-8}`  = two combinations.
- *  - `!#1;R2,R3;r5` = `!#1 AND (R2 OR R3) AND r5` = two combinations.
- *  - `cH1,n`        = one conjunct of two alternatives = two combinations.
- *
- *  The atom and bond parsers differ in what a combination means, not in how the combinations are
- *  enumerated, so both drive this and neither writes the mixed-radix counter itself.
+ *  conjunction of alternations and its DNF is the cross product of one alternative per conjunct. The atom
+ *  and bond parsers differ in what a combination means, not in how the combinations are enumerated.
  */
 struct dnf_skeleton_t {
     static constexpr std::size_t max_conjuncts_k = 6;
@@ -632,12 +568,8 @@ struct dnf_skeleton_t {
     std::size_t num_combinations = 0;
     std::size_t chosen[max_conjuncts_k] = {};
 
-    /**
-     *  @brief Split @p text into conjuncts and alternatives.
-     *  @param[in] max_combinations Combinations the caller's storage can hold.
-     *  @return False when @p text is empty, holds an empty piece, or would need more room than either
-     *          the skeleton or @p max_combinations has.
-     */
+    /** Split @p text into conjuncts and alternatives, refusing anything that would need more room than
+     *  the skeleton or the caller's @p max_combinations has. */
     bool split(std::string_view text, std::size_t max_combinations) {
         num_conjuncts = split_top_level(text, ';', conjunct_, max_conjuncts_k);
         if (num_conjuncts == 0) return false;
@@ -667,20 +599,11 @@ struct dnf_skeleton_t {
 };
 
 /**
- *  @brief Parse the content of a SMARTS atom bracket (`[...]`) into a fully populated
- *  `simple_atom_constraint_t`.
+ *  @brief Parse the interior of a SMARTS atom bracket into a `simple_atom_constraint_t`.
  *
- *  Each `atom_disjunct_t` stores one pure conjunction of primitives, and an atom matches the spec
- *  when any disjunct matches, so a mixed AND/OR spec becomes the cross product of its alternatives.
- *  A recursive `$(...)` rides along in whichever combination it was written in, so
- *  `[$([NX3H1]),$([NX3H2])]` yields two disjuncts each carrying its own guard. A combination whose
- *  primitives contradict each other matches nothing and simply drops out of the disjunction.
- *
- *  @param[in] spec Bracket interior, without the surrounding `[` and `]`.
- *  @param[in] nesting How many `$(...)` levels enclose this spec, zero at a pattern's own atoms.
- *  @param[out] constraint Populated disjunct list.
- *  @param[inout] pool Sub-query nodes the spec's recursive guards append to.
- *  @return True when the spec fits the compiler's vocabulary.
+ *  A mixed AND/OR spec becomes the cross product of its alternatives, and a recursive `$(...)` rides
+ *  along in whichever combination it was written in, so `[$([NX3H1]),$([NX3H2])]` yields two disjuncts
+ *  each carrying its own guard. A combination whose primitives contradict drops out of the disjunction.
  */
 inline bool parse_atom_spec(std::string_view spec, std::uint8_t nesting, simple_atom_constraint_t &constraint,
                             recursive_pool_t &pool) {
@@ -707,16 +630,10 @@ inline bool parse_atom_spec(std::string_view spec, std::uint8_t nesting, simple_
     return constraint.num_disjuncts != 0;
 }
 
-/**
- *  @brief Parse one bond-operator conjunction — the text between `,` separators — into a single
- *  `bond_disjunct_t`.
- *
- *  `/` and `\` would carry directional-bond stereo, which no loaded pattern uses, so they stay
- *  outside the vocabulary rather than widening the matcher.
- */
+/** Parse one bond-operator conjunction — the text between `,` separators — into a single
+ *  `bond_disjunct_t`. `/` and `\` carry directional-bond stereo, which no loaded pattern uses, so they
+ *  stay outside the vocabulary. */
 inline bool parse_bond_conjunct(std::string_view bond_operator, bond_disjunct_t &bond_disjunct) {
-    // An absent operator is the SMARTS "single or aromatic" default, which `parse_bond_op` spells as
-    // two disjuncts; here it simply constrains nothing.
     bond_disjunct = {};
     smarts_cursor_t cursor {bond_operator};
     bool negate = false;
@@ -727,8 +644,7 @@ inline bool parse_bond_conjunct(std::string_view bond_operator, bond_disjunct_t 
             negate = true;
             continue;
         }
-        // `@` is the only primitive a `!` may precede: the others name a bond order, and a negated
-        // order is a query this matcher does not represent.
+        // `@` is the only primitive a `!` may precede; a negated bond order is outside the vocabulary.
         if (character == '@') {
             if (negate) bond_disjunct.forbid_flags |= bond_flag_in_ring_k;
             else bond_disjunct.require_flags |= bond_flag_in_ring_k;
@@ -760,12 +676,11 @@ inline bool parse_bond_conjunct(std::string_view bond_operator, bond_disjunct_t 
 }
 
 /**
- *  @brief Parse a bond operator into `simple_bond_constraint_t`, flattened to disjunctive normal
- *  form the same way `parse_atom_spec` flattens an atom bracket.
+ *  @brief Parse a bond operator into `simple_bond_constraint_t`, flattened to disjunctive normal form the
+ *  same way `parse_atom_spec` flattens an atom bracket.
  *
- *  Empty @p bond_operator is the SMARTS default "single or aromatic", written as two disjuncts that
- *  both pin the order to 1 so a triple bond carrying an incidental aromatic flag cannot slip through.
- *  A comma as in `@;=,:` yields two disjuncts: `@ AND =` and `@ AND :`.
+ *  Empty @p bond_operator is the SMARTS default "single or aromatic", written as two disjuncts that both
+ *  pin the order to 1 so a triple bond carrying an incidental aromatic flag cannot slip through.
  */
 inline bool parse_bond_op(std::string_view bond_operator, simple_bond_constraint_t &bond_constraint) {
     bond_constraint = {};
@@ -803,11 +718,8 @@ inline bool parse_bond_op(std::string_view bond_operator, simple_bond_constraint
 
 #pragma region Chain Scanning
 
-/**
- *  @brief Maximum number of atoms — chain atoms plus map-labelled inline branches —
- *  that the SMARTS scanner records before declaring a pattern too wide for the
- *  4-atom matcher.
- */
+/** Chain atoms plus map-labelled inline branches the scanner records before declaring a pattern too wide
+ *  for the 4-atom matcher. */
 inline constexpr std::size_t max_pattern_atoms_k = 8;
 
 /** Maximum inline `(...)` branches the scanner records for a single atom. */
@@ -816,17 +728,16 @@ inline constexpr std::size_t max_atom_branches_k = 3;
 /** Atoms one recursive `$(...)` body or one inline branch body may spell out. */
 inline constexpr std::size_t max_recursive_body_atoms_k = 8;
 
-/**
- *  @brief Sentinel atom index: the parent of a pattern root, and an unbound torsion
- *  slot while the four labels are still being resolved.
- */
+/** Sentinel atom index: the parent of a pattern root, and an unbound torsion slot while the four labels
+ *  are still being resolved. */
 inline constexpr std::uint8_t no_atom_k = 0xFF;
 
 /**
- *  @brief One atom of a scanned SMARTS pattern together with the edge to the atom it
- *  hangs off. `parse_linear_torsion` scans a pattern into this shape first
- *  and binds the torsion atoms afterwards by their `:n` map label, so a labelled
- *  atom may sit anywhere in the text as long as the labels form a path.
+ *  @brief One atom of a scanned SMARTS pattern together with the edge to the atom it hangs off.
+ *
+ *  `parse_linear_torsion` scans a pattern into this shape first and binds the torsion atoms afterwards by
+ *  their `:n` map label, so a labelled atom may sit anywhere in the text as long as the labels form a
+ *  path.
  */
 struct scanned_atom_t {
     /** Atom text with its brackets, reused as branch text. */
@@ -856,16 +767,12 @@ inline bool stands_on_atom_(smarts_cursor_t const &cursor) {
 }
 
 /**
- *  @brief Read one chain atom — the bond-operator run before it and the atom itself — into @p atom.
+ *  @brief Read one chain atom — the bond-operator run before it and the atom itself — into @p atom,
+ *  stepping @p cursor past the whole of it.
  *
- *  A digit in the operator run would put an operator on a ring closure, a parenthesis would open a
- *  branch hanging off nothing, and a `$` outside a bracket is a sub-query with no atom to guard;
- *  none of the three reads back into a chain.
- *
- *  @param[inout] cursor Positioned at the operator run; stepped past the whole atom.
- *  @param[in] parent Scanned index the atom hangs off, `no_atom_k` at a chain root.
- *  @param[out] atom Overwritten with the scanned atom.
- *  @return False when no atom stands here, or the text before it cannot be a bond operator.
+ *  A digit in the operator run would put an operator on a ring closure, a parenthesis would open a branch
+ *  hanging off nothing, and a `$` outside a bracket is a sub-query with no atom to guard; none of the
+ *  three reads back into a chain.
  */
 inline bool scan_chain_atom_(smarts_cursor_t &cursor, std::uint8_t parent, scanned_atom_t &atom) {
     atom = {};
@@ -896,17 +803,11 @@ inline bool scan_chain_atom_(smarts_cursor_t &cursor, std::uint8_t parent, scann
 }
 
 /**
- *  @brief Scan a SMARTS chain into a flat parent-linked atom tree.
+ *  @brief Scan a SMARTS chain into a flat parent-linked atom tree, appended to @p atoms in scan order.
  *
- *  Unlike the pattern-level scan this one descends into `(...)` branches instead of keeping them as
- *  text, because a sub-query body is a tree of arbitrary shape rather than a path with leaves. Ring
- *  closures and anything else that would make the body cyclic are outside the vocabulary.
- *
- *  @param[in] text Chain to scan, e.g. `[C](=O)([NX3H1])[NX3H1]`.
- *  @param[in] parent Scanned index the first atom of the chain hangs off, `no_atom_k` at the root.
- *  @param[inout] atoms Flat tree filled in scan order.
- *  @param[inout] atom_count Entries already written to @p atoms.
- *  @return True when the whole chain scanned.
+ *  Unlike the pattern-level scan this one descends into `(...)` branches instead of keeping them as text,
+ *  because a sub-query body is a tree of arbitrary shape rather than a path with leaves. Ring closures
+ *  and anything else that would make the body cyclic are outside the vocabulary.
  */
 inline bool scan_recursive_chain(std::string_view text, std::uint8_t parent, scanned_atom_t *atoms,
                                  std::size_t &atom_count) {
@@ -934,17 +835,8 @@ inline bool scan_recursive_chain(std::string_view text, std::uint8_t parent, sca
 
 #pragma region Sub Query Compilation
 
-/**
- *  @brief Turn one scanned atom and everything hanging off it into pool nodes.
- *
- *  @param[in] atoms Flat tree produced by `scan_recursive_chain`.
- *  @param[in] scanned_index Atom to compile.
- *  @param[in] nesting How many `$(...)` levels enclose the body being compiled.
- *  @param[in] hops Distance in bonds from the body's root atom.
- *  @param[inout] pool Sub-query nodes; this subtree appends its own.
- *  @param[out] node Index of the node @p scanned_index compiled to.
- *  @return True when the whole subtree fits the compiler's vocabulary.
- */
+/** Turn one scanned atom and everything hanging off it into pool nodes, reporting the root of the
+ *  subtree in @p node. @p hops is its distance in bonds from the body's own root. */
 inline bool build_recursive_nodes(custd::span<scanned_atom_t const> atoms, std::uint8_t scanned_index,
                                   std::uint8_t nesting, std::uint8_t hops, recursive_pool_t &pool, std::uint8_t &node) {
     if (hops > max_recursive_hops_k) return false;
@@ -985,15 +877,8 @@ inline bool build_recursive_nodes(custd::span<scanned_atom_t const> atoms, std::
     return true;
 }
 
-/**
- *  @brief Compile a recursive `$(...)` body into @p pool and report the root node.
- *
- *  @param[in] body Text between `$(` and its matching `)`.
- *  @param[in] nesting How many `$(...)` levels enclose this one, the outermost being 1.
- *  @param[inout] pool Sub-query nodes; the body appends its own.
- *  @param[out] root Index of the node the body is rooted at.
- *  @return True when the body fits the compiler's vocabulary.
- */
+/** Compile the text between a `$(` and its matching `)` into @p pool and report the root node.
+ *  @p nesting counts the `$(...)` levels enclosing this one, the outermost being 1. */
 inline bool compile_recursive_body(std::string_view body, std::uint8_t nesting, recursive_pool_t &pool,
                                    std::uint8_t &root) {
     if (nesting > max_recursive_depth_k) return false;
@@ -1006,17 +891,12 @@ inline bool compile_recursive_body(std::string_view body, std::uint8_t nesting, 
 }
 
 /**
- *  @brief Parse the content of an inline `(...)` branch into a neighbour constraint.
+ *  @brief Parse the content of an inline `(...)` branch, parentheses already stripped, into a neighbour
+ *  constraint.
  *
- *  The branch content is what sits between the parentheses — `cH1` from `([cH1])`, `=O` from `(=O)`,
- *  `[cH0]Cl` from `([cH0]Cl)`. A leading bond operator applies to the edge leaving the torsion atom
- *  and stays on the constraint; everything after it compiles into the sub-query pool, so a branch may
- *  be a chain, may fan out, and may carry `$(...)` guards of its own.
- *
- *  @param[in] branch Branch content, parentheses already stripped.
- *  @param[inout] pool Sub-query nodes the branch body appends to.
- *  @param[out] constraint Populated neighbour constraint.
- *  @return True when the branch fits the compiler's vocabulary.
+ *  A leading bond operator applies to the edge leaving the torsion atom and stays on the constraint;
+ *  everything after it compiles into the sub-query pool, so a branch may be a chain, may fan out, and may
+ *  carry `$(...)` guards of its own.
  */
 inline bool parse_branch_spec(std::string_view branch, recursive_pool_t &pool,
                               simple_neighbor_constraint_t &constraint) {
@@ -1070,10 +950,8 @@ struct labelled_path_t {
     std::string_view bond_op[3];
 };
 
-/**
- *  @brief The route a ring-closing pattern takes from `:4` back to `:1`, as scanned indices with
- *  both labelled endpoints included. Length zero means the pattern closes no ring.
- */
+/** The route a ring-closing pattern takes from `:4` back to `:1`, as scanned indices with both labelled
+ *  endpoints included. Length zero means the pattern closes no ring. */
 struct scanned_arc_t {
     std::uint8_t atom[max_ring_closure_atoms_k + 2] = {};
     std::uint8_t length = 0;
@@ -1103,10 +981,6 @@ struct atom_branches_t {
  *
  *  A branch holding a map label becomes a scanned atom of its own so that label can join the torsion
  *  path; every other branch stays verbatim text for `parse_branch_spec`.
- *
- *  @param[in] smarts Whole pattern text.
- *  @param[out] scanned Atoms, their branches, and the closure ends.
- *  @return True when the text scanned inside every capacity the matcher has.
  */
 inline bool scan_torsion_pattern_(std::string_view smarts, scanned_pattern_t &scanned) {
     smarts_cursor_t cursor {smarts};
@@ -1183,12 +1057,8 @@ inline bool scan_torsion_pattern_(std::string_view smarts, scanned_pattern_t &sc
 /**
  *  @brief Bind the four torsion atoms by their map labels and demand the 1-2, 2-3 and 3-4 edges.
  *
- *  Where a labelled atom sits in the text does not matter, so `[a:1][c:2]!@;-[C:3](=[N:4])(-N)`
- *  binds even though `:4` lives inside a branch — only the labels have to form a connected path.
- *
- *  @param[in] scanned Scanned pattern.
- *  @param[out] path The four scanned indices and the three bond operators joining them.
- *  @return False when a label is missing, repeated, or the four do not form a path.
+ *  Where a labelled atom sits in the text does not matter, so `[a:1][c:2]!@;-[C:3](=[N:4])(-N)` binds
+ *  even though `:4` lives inside a branch — only the labels have to form a connected path.
  */
 inline bool bind_labelled_path_(scanned_pattern_t const &scanned, labelled_path_t &path) {
     for (std::size_t index = 0; index < scanned.num_atoms; ++index) {
@@ -1222,16 +1092,12 @@ inline std::size_t find_scanned_edge_(custd::span<scanned_edge_t const> edges, s
 }
 
 /**
- *  @brief Depth-first walk for the arc that closes a ring pattern.
+ *  @brief Depth-first walk for the arc that closes a ring pattern, from the `:4` the caller seeded
+ *  @p arc with to the `:1` in @p target.
  *
- *  The scanned pattern is a tree plus at most one closure edge, so exactly one cycle exists; with
- *  the three labelled-path edges struck out, the route from `:4` back to `:1` is the rest of that
+ *  The scanned pattern is a tree plus at most one closure edge, so exactly one cycle exists; with the
+ *  three labelled-path edges struck out of @p edges, the route from `:4` back to `:1` is the rest of that
  *  cycle and nothing else reaches it.
- *
- *  @param[in] edges Every edge of the scanned pattern, path edges already struck out.
- *  @param[in] target Scanned index of `:1`, where the walk stops.
- *  @param[inout] arc Route walked so far, seeded by the caller with `:4`.
- *  @return True when @p arc ends on @p target.
  */
 inline bool walk_closure_arc(custd::span<scanned_edge_t const> edges, std::uint8_t target, scanned_arc_t &arc) {
     std::uint8_t const current = arc.atom[arc.length - 1];
@@ -1252,17 +1118,11 @@ inline bool walk_closure_arc(custd::span<scanned_edge_t const> edges, std::uint8
 }
 
 /**
- *  @brief Compile the ring a closing pattern draws from `:4` back to `:1` into @p pattern.
+ *  @brief Compile the ring a closing pattern draws from `:4` back to `:1` into @p pattern, reporting the
+ *  scanned indices it runs through in @p arc, `:4` first and `:1` last.
  *
- *  The labelled path plus the closure edge draws exactly one cycle, so the arc is whatever of that
- *  cycle the labels do not already cover.
- *
- *  @param[in] scanned Scanned pattern.
- *  @param[in] path The four labelled atoms.
- *  @param[out] arc Scanned indices the arc runs through, `:4` first and `:1` last; empty when the
- *                  pattern closes no ring.
- *  @param[inout] pattern Receives the compiled closure and any sub-query nodes its atoms need.
- *  @return True when the pattern closes no ring, or the arc it closes fits the closure representation.
+ *  The labelled path plus the closure edge draws exactly one cycle, so the arc is whatever of that cycle
+ *  the labels do not already cover. A pattern that closes no ring succeeds with an empty @p arc.
  */
 inline bool compile_ring_closure_(scanned_pattern_t const &scanned, labelled_path_t const &path, scanned_arc_t &arc,
                                   simple_torsion_pattern_t &pattern) {
@@ -1325,17 +1185,11 @@ inline bool compile_ring_closure_(scanned_pattern_t const &scanned, labelled_pat
 }
 
 /**
- *  @brief Gather each labelled atom's inline neighbour branches: its own verbatim branches first,
- *  then every spare atom that leans on it.
+ *  @brief Gather each labelled atom's inline neighbour branches: its own verbatim branches first, then
+ *  every spare atom that leans on it.
  *
- *  Every atom of the pattern that is neither labelled nor on the ring arc has to be a leaf hanging
- *  off one of the four, and becomes a branch on it.
- *
- *  @param[in] scanned Scanned pattern.
- *  @param[in] path The four labelled atoms.
- *  @param[in] arc Ring arc, whose atoms are already accounted for.
- *  @param[out] branches One entry per labelled atom.
- *  @return False when a spare atom is not a leaf on a labelled atom, or one atom carries too many.
+ *  Every atom of the pattern that is neither labelled nor on the ring @p arc has to be a leaf hanging off
+ *  one of the four, and becomes a branch on it; anything else refuses the pattern.
  */
 inline bool collect_branch_texts_(scanned_pattern_t const &scanned, labelled_path_t const &path,
                                   scanned_arc_t const &arc, atom_branches_t (&branches)[4]) {
@@ -1370,10 +1224,9 @@ inline bool collect_branch_texts_(scanned_pattern_t const &scanned, labelled_pat
             }
         if (!attached) return false;
 
-        // A branch reads as its bond operator followed by its atom, and the two are contiguous in
-        // the source when the spare atom is the child. When it is instead the parent of a labelled
-        // atom the operator sits on the far side of the atom text, so only an implicit edge reads
-        // back.
+        // A branch reads as its bond operator followed by its atom, contiguous in the source when the
+        // spare atom is the child. When it is instead the parent of a labelled atom the operator sits on
+        // the far side of the atom text, so only an implicit edge reads back.
         std::string_view branch_form;
         if (scanned.atom[index].parent == neighbor)
             branch_form = std::string_view(scanned.atom[index].bond_op.data(),
@@ -1389,11 +1242,10 @@ inline bool collect_branch_texts_(scanned_pattern_t const &scanned, labelled_pat
 /**
  *  @brief Attempt to compile a 4-atom torsion SMARTS into `simple_torsion_pattern_t`.
  *
- *  Returns false on any feature the matcher cannot represent: a second ring closure, an unknown
- *  recursive body, a spare atom that is itself branched, or more than two inline neighbour
- *  constraints on one torsion atom. That is a yes-or-no question — the corpus is checked-in data
- *  and the load-time diagnostic names the pattern — so the refusals stay one answer rather than a
- *  reason code no caller could act on.
+ *  Refuses any feature the matcher cannot represent — a second ring closure, an unknown recursive body, a
+ *  spare atom that is itself branched, more than two inline neighbour constraints on one torsion atom —
+ *  without distinguishing them, because the corpus is checked-in data and the caller's load-time
+ *  diagnostic already names the offending pattern.
  */
 inline bool parse_linear_torsion(std::string_view smarts, simple_torsion_pattern_t &pattern) {
     pattern = {};

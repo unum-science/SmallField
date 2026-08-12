@@ -6,9 +6,8 @@
 find_package(Arrow CONFIG REQUIRED)
 find_package(Parquet CONFIG REQUIRED)
 
-# The producer git SHA is stamped into every shard's key-value metadata, so a shard stays self-describing in a
-# content-addressed store.  Reading it at configure time alone would go stale on the next commit and report a revision
-# that did not produce the file, so HEAD is registered as a configure dependency and moving it re-runs cmake.
+# The git SHA stamped into every shard's metadata is read at configure time, so HEAD is registered as a configure
+# dependency and moving it re-runs cmake; without that a shard would name a revision that did not produce it.
 set_property(
     DIRECTORY "${PROJECT_SOURCE_DIR}"
     APPEND
@@ -37,9 +36,7 @@ define_smallfield_target(
     DEFINES SMALLFIELD_GIT_SHA="${SMALLFIELD_GIT_SHA_VALUE}"
 )
 
-# Descriptor augmentation rewrites existing *.3D.parquet shards into the canonical 13-column schema by computing
-# USR/USRCAT from the stored fp16 coordinates and re-emitting through the same writer, so its output is byte-identical
-# to the batch producer's.  CPU-only.
+# Descriptor augmentation rewrites existing *.3D.parquet shards through the same writer.  CPU-only.
 define_smallfield_target(
     smallfield_descriptors
     SOURCES smallfield_descriptors.cpp

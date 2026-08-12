@@ -3,33 +3,21 @@
  *  @brief Native C++ port of RDKit's MMFF atom typer.
  *
  *  Reads `molecule_descriptor_t` and the MMFFProp table and produces the RDKit-equivalent MMFF atom type, 1
- *  through 99, for each atom. This eliminates the one remaining runtime RDKit dependency in the CPU prep path:
- *  `MMFFMolProperties::MMFFMolProperties()` and its per-atom `setMMFFHeavyAtomType` / `setMMFFHydrogenType`
- *  decision trees.
+ *  through 99, for each atom, in place of `MMFFMolProperties` and its `setMMFFHeavyAtomType` /
+ *  `setMMFFHydrogenType` decision trees.
  *
- *  Ports:
- *   - `setMMFFHeavyAtomType` — atom types 1-99 for heavy atoms
- *   - `setMMFFHydrogenType`  — hydrogen atom types (5, 21-33, 36, 50,
- *                              52, 71)
- *   - helpers: `is_atom_n_oxide`, `is_atom_in_aromatic_ring_of_size`,
- *              `atoms_in_same_ring_of_size`, ring-info queries
+ *  Mirrors `rdkit/.../AtomTyper.cpp` lines 504-2302, keeping its case branches and break semantics so a
+ *  future merge from RDKit's typer stays mechanical. Local names do not follow it — they spell out the
+ *  chemistry — so a merge needs the renames re-applied by hand.
  *
- *  Implementation faithfully mirrors `rdkit/.../AtomTyper.cpp` lines 504-2302. Structural decisions such as case
- *  branches and break sequences are preserved so future merges from RDKit's typer are mechanical; local variable
- *  names are not — they follow this project's snake_case convention and spell out the chemistry instead of
- *  RDKit's abbreviations, so a merge still needs the renames re-applied by hand.
- *
- *  Aromaticity input consumes the descriptor's aromatic flags, which are set by RDKit's default aromaticity
- *  perception during `SmilesToMol(...sanitize=true...)`. That is @b not always the perception RDKit's own
- *  typer sees. `MMFFMolProperties` guards only its Kekulize behind `_MMFFSanitized`; it calls
- *  `MolOps::setMMFFAromaticity` unconditionally, so presetting that property suppresses the Kekulize and
- *  nothing else. MMFF perceives aromaticity with its own pi-electron count, and it only ever adds.
- *
- *  So a caller that snapshots the descriptor before constructing `MMFFMolProperties` types from RDKit's
- *  default perception while RDKit types from MMFF's, and the two disagree on roughly 400 molecules per
- *  million — N-oxides and fused heterocycles, where the extra perception changes an atom type outright.
- *  Applying MMFF's perception before the snapshot removes the difference, since a second application is a
- *  no-op.
+ *  The descriptor's aromatic flags come from RDKit's default perception during
+ *  `SmilesToMol(...sanitize=true...)`, which is @b not always the perception RDKit's own typer sees.
+ *  `MMFFMolProperties` guards only its Kekulize behind `_MMFFSanitized` and calls
+ *  `MolOps::setMMFFAromaticity` unconditionally; MMFF perceives with its own pi-electron count and only ever
+ *  adds. So a caller that snapshots the descriptor before constructing `MMFFMolProperties` disagrees with
+ *  RDKit on roughly 400 molecules per million — N-oxides and fused heterocycles, where the extra perception
+ *  changes an atom type outright. Applying MMFF's perception before the snapshot removes the difference,
+ *  since a second application is a no-op.
  */
 
 #pragma once
@@ -50,13 +38,7 @@ using smallfield::types::bond_flag_order_aromatic_k;
 using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::molecule_descriptor_t;
 
-/**
- *  @defgroup ring_queries Ring-info queries on the descriptor
- *  Helpers that read `descriptor.atom_ring_bitmap` + `descriptor.ring_offset` /
- *  `descriptor.ring_atoms` to answer the "is atom X in a ring of size Y" /
- *  "do atoms X and Y share a ring" questions the MMFF typer needs.
- *  @{
- */
+#pragma region Descriptor Queries
 
 /** Number of SSSR rings that contain atom. */
 constexpr unsigned atom_num_rings(molecule_descriptor_t const &descriptor, std::uint32_t atom_index) noexcept {
@@ -79,27 +61,17 @@ constexpr bool atom_in_ring_of_size(molecule_descriptor_t const &descriptor, std
     return false;
 }
 
-/**
- *  @brief The bond between two atoms as RDKit's typer sees it.
- *
- *  Both facts come off one CSR walk because they describe one bond, and the typer's decision trees ask
- *  for them together at every site but one. `aromatic` is `Bond::getBondType() == Bond::AROMATIC`, the
- *  only bond-aromaticity test RDKit's typer ever makes — never `getIsAromatic()`, which an in-ring triple
- *  bond also carries.
- */
+/** The bond between two atoms as RDKit's typer sees it. */
 struct bond_typing_t {
     /** 1, 2 or 3, and 0 when the atoms are not adjacent. An aromatic bond has no Kekulé order to report,
      *  so it reports 1. */
     std::uint8_t order = 0;
+    /** `Bond::getBondType() == Bond::AROMATIC`, the only bond-aromaticity test RDKit's typer ever makes
+     *  — never `getIsAromatic()`, which an in-ring triple bond also carries. */
     bool aromatic = false;
 };
 
-/**
- *  @brief The typing of the bond one neighbour slot of the CSR reaches.
- *
- *  Every decision tree below that asks about a bond is already walking the slot that holds it, so this is
- *  the form nearly all of them want: the search is the exception, not the rule.
- */
+/** The typing of the bond one neighbour slot of the CSR reaches. */
 constexpr bond_typing_t bond_typing_at_slot(molecule_descriptor_t const &descriptor,
                                             std::uint16_t neighbor_slot) noexcept {
     std::uint16_t const bond_index = descriptor.neighbor_bond[neighbor_slot];
@@ -120,20 +92,18 @@ constexpr bond_typing_t bond_typing_between(molecule_descriptor_t const &descrip
 /**
  *  @brief `RDKit::Bond::BondType` as the integer the typer's decision trees compare against.
  *
- *  1, 2 or 3 for a Kekulé order, 4 for `Bond::AROMATIC`, and 0 for an absent bond. Only a bond RDKit
- *  types aromatic reports 4 — an in-ring triple bond keeps its 3 despite `getIsAromatic()`, which is what
- *  makes the isonitrile nitrogen of a dehydrobenzene ring type 61 rather than 53.
+ *  1, 2 or 3 for a Kekulé order, 4 for `Bond::AROMATIC`, 0 for an absent bond. An in-ring triple bond
+ *  keeps its 3 despite `getIsAromatic()`, which is what makes the isonitrile nitrogen of a dehydrobenzene
+ *  ring type 61 rather than 53.
  */
 constexpr unsigned rdkit_bond_type(bond_typing_t typing) noexcept { return typing.aromatic ? 4u : typing.order; }
 
 /**
  *  @brief True iff atom sits in a size-`size` SSSR ring whose bonds are all typed `Bond::AROMATIC`.
  *
- *  Matches `RDKit::MMFF::isRingAromatic`, which asks the bonds rather than the atoms: an in-ring triple
- *  bond and a quinoid single bond both carry aromatic *atoms* at both ends yet leave the ring non-aromatic
- *  for MMFF. Consecutive slots of `ring_atoms` are bonded because `RingInfo::atomRings()` stores each ring
- *  in cyclic walk order, and the ring-closure bond is deliberately left untested — RDKit's loop stops one
- *  short of the end, so a ring whose only non-aromatic bond is the closure still counts as aromatic.
+ *  Matches `RDKit::MMFF::isRingAromatic`, which asks the bonds rather than the atoms. The ring-closure
+ *  bond is deliberately left untested — RDKit's loop stops one short of the end, so a ring whose only
+ *  non-aromatic bond is the closure still counts as aromatic.
  */
 constexpr bool atom_in_aromatic_ring_of_size(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
                                              unsigned size) noexcept {
@@ -169,17 +139,12 @@ constexpr bool atoms_in_same_ring_of_size(molecule_descriptor_t const &descripto
     return false;
 }
 
-/*
- *  RDKit's typer asks two per-atom questions this port answers by reading the descriptor directly.
- *
- *  Its `getTotalDegree()` is `descriptor.degree`: the pipeline runs `MolOps::addHs` before
- *  `build_descriptor`, so every hydrogen is already an explicit neighbour and `descriptor.num_hydrogens`
- *  counts those same neighbours — adding it would count every hydrogen twice.
- *
- *  Its `getValence(ExplicitType) + getNumImplicitHs()` is `descriptor.total_valence`. Summing `bond_order`
- *  cannot reproduce that, since RDKit weighs an aromatic bond 1.5 and then clamps an aromatic atom's total
- *  down to the element's nearest permitted valence.
- */
+/*  RDKit's `getTotalDegree()` is `descriptor.degree`: the pipeline runs `MolOps::addHs` before
+ *  `build_descriptor`, so every hydrogen is already an explicit neighbour and adding
+ *  `descriptor.num_hydrogens` would count each one twice. Its
+ *  `getValence(ExplicitType) + getNumImplicitHs()` is `descriptor.total_valence`, which summing
+ *  `bond_order` cannot reproduce: RDKit weighs an aromatic bond 1.5 and then clamps an aromatic atom's
+ *  total down to the element's nearest permitted valence. */
 
 /** N-oxide detector. Matches `RDKit::MMFF::isAtomNOxide`: nitrogen with total degree ≥ 3 bonded to a
  *  singly-coordinated oxygen. */
@@ -208,23 +173,18 @@ constexpr unsigned count_terminal_o_neighbors(molecule_descriptor_t const &descr
     return oxygen_count;
 }
 
-/** @} */ // end of ring_queries
+#pragma endregion Descriptor Queries
 
 /**
  *  @brief What the aromatic five-ring branches of the heavy-atom typer ask about the heteroatoms around
  *  one atom.
  *
- *  Alpha heteroatoms are ring neighbours of the atom, beta heteroatoms ring neighbours of those. Every
- *  five-ring case of elements 6 and 7 keys on some combination of these five answers, and nothing
- *  downstream needs the atom indices themselves — which is why they stay inside the census rather than
- *  travelling as two 16-slot arrays through the eight hundred lines that follow.
+ *  Alpha heteroatoms are ring neighbours of the atom, beta heteroatoms ring neighbours of those.
  */
 struct aromatic_five_ring_census_t {
     unsigned alpha_count = 0;
     unsigned beta_count = 0;
-    /** An alpha heteroatom is oxygen or sulfur. */
     bool alpha_is_oxygen_or_sulfur = false;
-    /** A beta heteroatom is oxygen or sulfur. */
     bool beta_is_oxygen_or_sulfur = false;
     /** Some alpha and some beta heteroatom sit in one five-ring together. */
     bool alpha_and_beta_share_ring = false;
@@ -238,13 +198,8 @@ constexpr bool is_aromatic_five_ring_heteroatom_(molecule_descriptor_t const &de
             !is_atom_n_oxide(descriptor, atom_index));
 }
 
-/**
- *  @brief Census the alpha and beta heteroatoms of the aromatic five-ring around @p atom_index.
- *
- *  @param[in] descriptor Molecule being typed.
- *  @param[in] atom_index Ring atom whose neighbourhood is walked; only carbon and nitrogen reach here.
- *  @return The five answers the five-ring type cases key on, all zero when the walk finds nothing.
- */
+/** Census the alpha and beta heteroatoms of the aromatic five-ring around @p atom_index, which only
+ *  carbon and nitrogen ever reach. */
 constexpr aromatic_five_ring_census_t census_aromatic_five_ring_(molecule_descriptor_t const &descriptor,
                                                                  std::uint32_t atom_index) noexcept {
     std::array<std::uint8_t, 16> alpha_heteroatoms {};
@@ -288,11 +243,11 @@ constexpr aromatic_five_ring_census_t census_aromatic_five_ring_(molecule_descri
 }
 
 /**
- *  @brief Match of `RDKit::MMFF::setMMFFHeavyAtomType`. Returns an MMFF atom type in [1, 99], or 0 on failure.
+ *  @brief Port of `RDKit::MMFF::setMMFFHeavyAtomType` at `AtomTyper.cpp:504-2078`, keeping its branch
+ *  order and break semantics.
  *
- *  Faithful line-by-line port of `AtomTyper.cpp:504-2078` with element-keyed dispatch, the same branch
- *  order, and identical break semantics. Hydrogen atoms should not be passed here; use
- *  `native_set_mmff_hydrogen_type` for those.
+ *  Returns an MMFF atom type in [1, 99], or 0 on failure. Hydrogen goes to
+ *  `native_set_mmff_hydrogen_type` instead.
  */
 constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t const &descriptor,
                                                        std::uint32_t atom_index) noexcept {
@@ -1054,10 +1009,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
     return atom_type;
 }
 
-/**
- *  @brief Port of `setMMFFHydrogenType`. Takes the already-computed heavy-atom types so the H-typing nested
- *  switches can key on them.
- */
+/** Port of `setMMFFHydrogenType`, keyed on the already-computed heavy-atom types. */
 constexpr std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const &descriptor, std::uint32_t atom_index,
                                                      custd::span<std::uint8_t const> atom_types) noexcept {
     std::uint8_t atom_type = 0;
@@ -1148,12 +1100,7 @@ constexpr std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const
 
 #pragma region Formal Charge Rules
 
-/**
- *  @brief Fixed-capacity set of atom indices, backing the conjugated-nitrogen flood fill.
- *
- *  Constructed empty per fill rather than reset per fill, which is what removes the third of the three
- *  capture-everything lambdas this rule used to carry.
- */
+/** Fixed-capacity set of atom indices, backing the conjugated-nitrogen flood fill. */
 struct atom_bitset_t {
     std::array<std::uint32_t, (max_atoms_per_molecule_k + 31) / 32> words {};
 
@@ -1164,14 +1111,10 @@ struct atom_bitset_t {
 };
 
 /**
- *  @brief Charge on a terminal oxygen or sulfur, shared across the equivalent terminals of its centre.
+ *  @brief Charge on a terminal oxygen or sulfur of MMFF type 32 or 72, shared across the equivalent
+ *  terminals of its centre.
  *
  *  The first neighbour that matches a rule decides, which is why each arm returns rather than accumulating.
- *
- *  @param[in] descriptor Molecule being charged.
- *  @param[in] atom_types MMFF types of every atom, already computed.
- *  @param[in] atom_index The terminal oxygen or sulfur, of MMFF type 32 or 72.
- *  @return Its share of the centre's negative charge, or zero when no rule applies.
  */
 constexpr float shared_anion_formal_charge_(molecule_descriptor_t const &descriptor,
                                             custd::span<std::uint8_t const> atom_types,
@@ -1221,16 +1164,8 @@ constexpr float shared_anion_formal_charge_(molecule_descriptor_t const &descrip
     return 0.0f;
 }
 
-/**
- *  @brief Charge on an N5M nitrogen, sharing one unit across the N5M atoms of its five-ring.
- *
- *  Only the first five-ring the atom belongs to is consulted, matching RDKit.
- *
- *  @param[in] descriptor Molecule being charged.
- *  @param[in] atom_types MMFF types of every atom, already computed.
- *  @param[in] atom_index The nitrogen, of MMFF type 76.
- *  @return Its share of the ring's unit negative charge, or zero when the ring holds no N5M.
- */
+/** Charge on an N5M nitrogen of MMFF type 76, sharing one unit across the N5M atoms of its five-ring.
+ *  Only the first five-ring the atom belongs to is consulted, matching RDKit. */
 constexpr float five_ring_anion_formal_charge_(molecule_descriptor_t const &descriptor,
                                                custd::span<std::uint8_t const> atom_types,
                                                std::uint32_t atom_index) noexcept {
@@ -1249,16 +1184,11 @@ constexpr float five_ring_anion_formal_charge_(molecule_descriptor_t const &desc
 }
 
 /**
- *  @brief Charge on a conjugated nitrogen, split evenly across the conjugated system it belongs to.
+ *  @brief Charge on a nitrogen of MMFF type 55, 56 or 81, split evenly across its conjugated system.
  *
- *  Flood-fills from @p atom_index through carbon types 57 and 80 to every other 55, 56 or 81 nitrogen,
- *  sums their RDKit formal charges, and divides. The fill repeats until a sweep adds nothing, because a
- *  newly reached nitrogen can open a further carbon.
- *
- *  @param[in] descriptor Molecule being charged.
- *  @param[in] atom_types MMFF types of every atom, already computed.
- *  @param[in] atom_index The nitrogen, of MMFF type 55, 56 or 81.
- *  @return Its equal share of the system's total formal charge.
+ *  Flood-fills through carbon types 57 and 80 to every other 55, 56 or 81 nitrogen, sums their RDKit
+ *  formal charges, and divides. The fill repeats until a sweep adds nothing, because a newly reached
+ *  nitrogen can open a further carbon.
  */
 constexpr float conjugated_nitrogen_formal_charge_(molecule_descriptor_t const &descriptor,
                                                    custd::span<std::uint8_t const> atom_types,
@@ -1296,14 +1226,7 @@ constexpr float conjugated_nitrogen_formal_charge_(molecule_descriptor_t const &
     return charge_sum / static_cast<float>(num_conjugated);
 }
 
-/**
- *  @brief Charge on an isonitrile carbon, which is +1 when it carries the triply bonded nitrogen.
- *
- *  @param[in] descriptor Molecule being charged.
- *  @param[in] atom_types MMFF types of every atom, already computed.
- *  @param[in] atom_index The carbon, of MMFF type 61.
- *  @return 1 when a neighbour is MMFF type 42, else zero.
- */
+/** Charge on an isonitrile carbon of MMFF type 61: +1 when a neighbour is the MMFF type 42 nitrogen. */
 constexpr float isonitrile_carbon_formal_charge_(molecule_descriptor_t const &descriptor,
                                                  custd::span<std::uint8_t const> atom_types,
                                                  std::uint32_t atom_index) noexcept {
@@ -1316,17 +1239,8 @@ constexpr float isonitrile_carbon_formal_charge_(molecule_descriptor_t const &de
 
 #pragma endregion Formal Charge Rules
 
-/**
- *  @brief Compute MMFF formal charges per atom.
- *
- *  Port of the first half of `computeMMFFCharges` at `AtomTyper.cpp:3094-3421`. Four MMFF types allocate
- *  charge by a rule of their own — carboxylate sharing, N5M anion splitting, the conjugated-nitrogen flood
- *  fill and the isonitrile carbon — and the rest read straight off the type.
- *
- *  @param[in] descriptor Molecule being charged.
- *  @param[in] atom_types MMFF type of every atom, already computed.
- *  @param[out] formal_charges One per atom; every slot is written.
- */
+/** Port of the first half of `computeMMFFCharges` at `AtomTyper.cpp:3094-3421`. Four MMFF types allocate
+ *  charge by a rule of their own and the rest read straight off the type. */
 constexpr void native_compute_mmff_formal_charges(molecule_descriptor_t const &descriptor,
                                                   custd::span<std::uint8_t const> atom_types,
                                                   custd::span<float> formal_charges) noexcept {
@@ -1373,29 +1287,17 @@ constexpr void native_compute_mmff_formal_charges(molecule_descriptor_t const &d
  *  Returns 1 iff the bond is SINGLE and its two endpoints either both carry the MMFFProp
  *  single-bond-multiple-bond designator or are both aromatic atoms. Otherwise 0.
  *
- *  RDKit's one gate is `getBondType() == Bond::SINGLE`, so the test asks `bond_flag_order_aromatic_k`
- *  rather than `bond_flag_aromatic_k`: the latter is `getIsAromatic()`, which an in-ring triple bond and
- *  a Kekulé single bond both carry, and it is not the question RDKit asks.
- *
- *  @param[in] descriptor Molecule being typed.
- *  @param[in] tables Extracted MMFF94 tables, read for the two endpoints' MMFFProp rows.
- *  @param[in] atom_types MMFF type of every atom, already computed.
- *  @param[in] bond_index Bond to classify.
- *  @return MMFF bond type, 0 or 1.
+ *  RDKit's whole gate at `AtomTyper.cpp:2470` is `getBondType() == Bond::SINGLE`. `bond_order` reports 1
+ *  for a single bond and also 1 for an aromatic one, which carries no integer order, so the aromatic case
+ *  is excluded by `bond_flag_order_aromatic_k` — the flag that means exactly
+ *  `getBondType() == Bond::AROMATIC`. Not `bond_flag_aromatic_k`, which is `getIsAromatic()` and is set on
+ *  every bond in an aromatic ring including one that kept a Kekulé single order; asking that flag would
+ *  drop a bond RDKit types as SINGLE, so the two are not interchangeable and only this one is parity.
  */
 constexpr std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &descriptor,
                                                  mmff94_tables_view_t const &tables,
                                                  custd::span<std::uint8_t const> atom_types,
                                                  std::uint32_t bond_index) noexcept {
-    /*  The pair below is `getBondType() == Bond::SINGLE` and nothing else, which is RDKit's whole gate
-     *  at `AtomTyper.cpp:2470`. `bond_order` reports 1 for a single bond and also 1 for an aromatic
-     *  one, which carries no integer order, so the aromatic case is excluded by the flag that means
-     *  exactly `getBondType() == Bond::AROMATIC`.
-     *
-     *  Not `bond_flag_aromatic_k`, which is `getIsAromatic()` and is set on every bond in an aromatic
-     *  ring including one that kept a Kekulé single order. Asking that flag would drop a bond RDKit
-     *  types as SINGLE, so the two are not interchangeable and only this one is parity. Two of the
-     *  three copies this function replaces asked the wider flag, so the majority was the defect. */
     bool const single_bond = descriptor.bond_order[bond_index] == 1 &&
                              !(descriptor.bond_flags[bond_index] & bond_flag_order_aromatic_k);
     if (!single_bond) return 0;
@@ -1408,11 +1310,9 @@ constexpr std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &de
                : 0u;
 }
 
-/** Compute MMFF partial charges — second half of `computeMMFFCharges`
- *  (AtomTyper.cpp:3423-3487). Applies bond-charge increments (BCIs)
- *  from the extracted `chg` table, with the PBCI fallback when no BCI
- *  is tabulated. Formal-charge distribution follows equation 15 of
- *  MMFF.V. */
+/** Second half of `computeMMFFCharges` at `AtomTyper.cpp:3423-3487`: bond-charge increments from the
+ *  `chg` table with the PBCI fallback where none is tabulated, distributing formal charge by MMFF.V
+ *  equation 15. */
 SF_HOST_DEVICE_ inline void native_compute_mmff_partial_charges(molecule_descriptor_t const &descriptor,
                                                                 mmff94_tables_view_t const &tables,
                                                                 custd::span<std::uint8_t const> atom_types,
@@ -1481,11 +1381,7 @@ SF_HOST_DEVICE_ inline void native_compute_mmff_partial_charges(molecule_descrip
     }
 }
 
-/**
- *  @brief Top-level entry point that types every atom in the molecule.
- *
- *  Returns true iff every atom was typed successfully.
- */
+/** Type every atom in the molecule, returning true iff every one of them typed. */
 constexpr bool native_compute_mmff_atom_types(molecule_descriptor_t const &descriptor,
                                               custd::span<std::uint8_t> atom_types) noexcept {
     std::uint32_t const num_atoms = descriptor.num_atoms;

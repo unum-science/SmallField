@@ -2,13 +2,11 @@
  *  @file cli/shard_inventory.hpp
  *  @brief Glob input Parquet shards and decide which outputs already exist so a `--resume` run skips finished shards.
  *
- *  Restart policy: each input shard `<name>.parquet` deterministically maps to output `<name>.3D.parquet`, note the
- *  dot, matching the canonical `*.3D.parquet` naming shared with the Python reference reimplementation. An output
- *  is considered complete iff a sentinel file `<output>.encoded` exists. The sentinel is written by the writer @b
- *  only after the parquet has been atomically closed, so a kill mid-write never falsely flags completion.
- *
- *  Files whose name already ends with `.3D.parquet` are treated as outputs and excluded from the input set —
- *  important when `--output` defaults to the same directory as `--input`.
+ *  Each input shard `<name>.parquet` maps to the output `<name>.3D.parquet` — note the dot, which is the
+ *  canonical naming the Python reference reimplementation also keys on. An output counts as complete only
+ *  once its `<output>.encoded` sentinel exists, and the writer emits that sentinel after the parquet closes,
+ *  so a kill mid-write never flags completion. A file already ending in `.3D.parquet` is an output and never
+ *  an input, which is what lets `--output` default to `--input`.
  */
 
 #pragma once
@@ -36,12 +34,8 @@ enum class restart_policy_t {
 };
 
 /**
- *  @brief Inventory every `*.parquet` file in @p input_dir, excluding any `*.3D.parquet` siblings, compute
- *  the matching output path in @p output_dir, and mark shards whose `<output>.encoded` sentinel exists as
- *  `already_complete`.
+ *  @brief Pair every input shard in @p input_dir with its output in @p output_dir, sorted by input path.
  *
- *  @param[in] restart_policy Whether an existing sentinel marks a shard complete, or is ignored so the
- *         caller reproduces every output.
  *  @param[in] log Logger diagnostics are reported through; null falls back to a default one.
  */
 std::vector<shard_pair_t> inventory_shards(std::filesystem::path const &input_dir,

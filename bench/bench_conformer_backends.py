@@ -1,25 +1,8 @@
 #!/usr/bin/env python3
-"""Side-by-side conformer-generation benchmark across three systems.
+"""Side-by-side conformer-generation benchmark across pure RDKit, SmallField, and RDKit + nvMolKit.
 
-Runs each selected system on the same input SMILES and reports wall time,
-mol/s, conf/s, and success rate in a single rich.table.Table.
-
-Systems:
-  1. Pure RDKit Python — ``EmbedMultipleConfs`` + ``MMFFOptimizeMoleculeConfs``,
-     OpenMP across molecules via RDKit's built-in ``numThreads``.
-  2. SmallField Python API — ``smallfield.api.generate_conformers`` with
-     internal RDKit preprocessing + CUDA ETKDG/MMFF kernels.
-  3. RDKit + nvMolKit — ``nvmolkit.EmbedMolecules`` + ``MMFFOptimizeMoleculesConfs``,
-     processed in small chunks to survive nvMolKit's hard runtime crashes.
-
-Usage::
-
-    python bench_conformer_backends.py --input data/usearch-molecules/example/smiles/shard.smi \\
-        --max-mol 100000 --num-conformers 3 --gpus 0,1,2,3
-
-    python bench_conformer_backends.py --input ... --skip-nvmolkit --skip-rdkit
-
-Exit codes mean one thing each: 0 a clean run, 1 a system that failed outright.
+nvMolKit is driven in small chunks because it aborts the whole call on a molecule it does not support,
+so a chunk is the unit that can be lost rather than the run.
 """
 
 from __future__ import annotations
@@ -80,8 +63,8 @@ def load_smiles(path: str, max_molecules: int) -> List[str]:
 def parse_molecules(smiles: List[str]) -> List["object"]:
     """Parse and hydrogenate every SMILES that RDKit accepts, outside any timed region.
 
-    Shared by the two systems that hand RDKit molecules rather than strings, so neither one measures
-    the other's parse and both start from the same set of molecules.
+    Shared by the two systems that hand RDKit molecules rather than strings, so both start from the
+    same set of molecules.
     """
     from rdkit import Chem
 
@@ -146,8 +129,8 @@ def bench_smallfield(smiles: List[str], num_conformers: int, random_seed: int, g
     import smallfield.api as smallfield
 
     result = Result("SmallField (GPU)")
-    # The context is built once and reused, so the timed call pays neither the device initialisation
-    # nor the first-call kernel load that the warm-up below absorbs.
+    # One reused context, plus the warm-up call below, keeps device initialisation and the first-call
+    # kernel load out of the timed region.
     context = smallfield.Context(gpu_ids)
     smallfield.generate_conformers(
         smiles[: min(100, len(smiles))],
@@ -203,8 +186,7 @@ def bench_nvmolkit(
         try:
             EmbedMolecules(chunk, parameters, confsPerMolecule=num_conformers, hardwareOptions=hardware)
         except RuntimeError:
-            # nvMolKit aborts the whole chunk on an unsupported molecule, so the chunk is lost, not
-            # the run; the count is reported beside the throughput it depressed.
+            # The count is reported beside the throughput it depressed.
             failed_chunks += 1
             continue
         try:
@@ -289,8 +271,8 @@ def main() -> int:
         try:
             results.append(runner())
         except Exception as error:
-            # One system failing is a result about that system, so the remaining ones still run and
-            # the table still prints; the exit code carries that something did not.
+            # One system failing is a result about that system, so the rest still run and the table
+            # still prints; the exit code carries that something did not.
             log.error("{} failed: {}", label, error)
             failed = Result(label)
             failed.note = f"error: {error}"

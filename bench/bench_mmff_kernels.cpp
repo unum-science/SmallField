@@ -1,18 +1,10 @@
 /**
  *  @file bench/bench_mmff_kernels.cpp
- *  @brief GPU MMFF kernel-trio scaling benchmark.
+ *  @brief GPU MMFF kernel-trio scaling benchmark: type-and-charge, term extraction and CSR build, timed
+ *  against the CPU native path over the same batch.
  *
- *  Measures end-to-end wall time of the GPU MMFF kernel trio — type+charge, term extraction, CSR build — vs the CPU
- *  native path across large batches. Reports mol/s throughput + per-stage timing breakdown.
- *
- *  Usage:
- *  @code
- *    bench_mmff_kernels --smi /path/to/corpus.smi [--max-molecules N]
- *  @endcode
- *
- *  Default `--max-molecules` is 10K. ChEMBL-scale inputs, 240K, use ~12 GB of GPU memory for the per-molecule
- *  fixed-stride output arrays; chunk internally if you need more. The device launcher warms the driver with one
- *  untimed launch of the first kernel, so there is no warm-up count to pass.
+ *  The per-molecule fixed-stride output arrays are what bound the batch: ChEMBL scale, 240 K molecules,
+ *  already takes about 12 GB of device memory.
  */
 
 #include <cstddef> // `std::size_t`
@@ -77,9 +69,7 @@ enum class parse_outcome_t {
     hydrogenation_failed_k,
     /** Above `benchmark_atom_ceiling_k` once hydrogens are explicit. */
     above_atom_ceiling_k,
-    /** More bonds than a descriptor holds. */
     too_many_bonds_k,
-    /** More rings than a descriptor holds. */
     too_many_rings_k,
     /** `build_descriptor` refused the molecule for a reason this table does not tabulate. */
     no_descriptor_k,
@@ -99,12 +89,7 @@ static char const *describe_parse_outcome_(parse_outcome_t outcome) {
     return "other";
 }
 
-/**
- *  @brief Carry `build_descriptor`'s refusal into this table rather than collapsing it.
- *
- *  It names which extent a molecule exceeded, and folding three answers into one `no_descriptor` is how a
- *  corpus that outgrew the bond capacity would read the same as one that outgrew the ring capacity.
- */
+/** Carry `build_descriptor`'s refusal across, so the extent a corpus outgrew stays named in the histogram. */
 static parse_outcome_t outcome_of_descriptor_(smallfield::api::conformer_status_t status) {
     switch (status) {
     case smallfield::api::conformer_status_t::success_k: return parse_outcome_t::parsed_k;
@@ -194,28 +179,20 @@ using sfbench::print_parse_outcomes_;
 /** Name printed on every throughput line so a concatenated CI log stays attributable. */
 static constexpr char const *executable_name_k = "bench_mmff_kernels";
 
-/**
- *  @brief Ceiling on `--max-molecules`.
- *
- *  Every term array is allocated at the per-molecule maximum stride, so device memory grows at roughly 50 kB per
- *  molecule — 240 K already takes ~12 GB. The cap turns a mistyped count into a diagnostic instead of a
- *  `cudaMalloc` failure several seconds into the run.
- */
+/** Ceiling on `--max-molecules`, so a mistyped count is a diagnostic rather than a late `cudaMalloc` failure. */
 static constexpr std::size_t max_molecules_per_run_k = 1'000'000;
 
 #pragma region Command Line
 
 /** Everything this driver takes from the command line. */
 struct kernel_bench_arguments_t {
-    /** Corpus to time over, from `--smi` or from `SMALLFIELD_TEST_CORPUS`. There is no default. */
+    /** From `--smi` or from `SMALLFIELD_TEST_CORPUS`; there is no default. */
     std::string_view smiles_path;
-    /** Upper bound on molecules read from the corpus. */
     std::size_t max_molecules = 10'000;
 };
 
 using sfbench::arguments_parse_t;
 
-/** Print the one usage line, naming every flag this driver understands. */
 static void print_usage_(char const *invocation) {
     fmt::println(stderr, "usage: {} --smi PATH [--max-molecules N]", invocation);
 }
@@ -242,11 +219,11 @@ static arguments_parse_t parse_arguments_(int argc, char **argv, kernel_bench_ar
 #pragma region Timed Sections
 
 /**
- *  @brief The batch the kernels are timed over: one descriptor per molecule that parsed, packed together
- *  with the atom offsets that address the shared atom arena.
+ *  @brief The batch the kernels are timed over: one descriptor per molecule that parsed, with the atom
+ *  offsets addressing the shared atom arena.
  *
- *  The two arrays are walked by the same molecule index and the offset of a molecule is the running sum of
- *  its predecessors' atom counts, so the total is read off the struct rather than recomputed at the launch.
+ *  Both arrays are walked by the same molecule index, and an offset is the running sum of its
+ *  predecessors' atom counts.
  */
 struct descriptor_batch_t {
     std::vector<sft::molecule_descriptor_t> descriptors;
@@ -277,8 +254,8 @@ static void fill_descriptor_batch_into_(std::vector<parsed_molecule_t> const &pa
 /**
  *  @brief Time the CPU native extraction over the whole batch and report its throughput.
  *
- *  A cheap derived quantity is summed into a reduction so `-O3` cannot dead-code the call body when it sees
- *  the result go out of scope; the sum is printed for the same reason.
+ *  The term counts are summed into a reduction, and the sum is printed, so `-O3` cannot dead-code the call
+ *  body it sees go out of scope.
  *
  *  @return Molecules per second on the CPU path.
  */
@@ -307,7 +284,7 @@ static double time_cpu_native_path_(descriptor_batch_t const &batch, sfparam::mm
 /**
  *  @brief Time the GPU kernel trio over the same batch and report its per-stage breakdown.
  *
- *  @return Molecules per second on the GPU path, or zero when the launch named a refusal instead.
+ *  @return Molecules per second, or zero when the launch named a refusal instead.
  */
 static double time_gpu_kernel_trio_(descriptor_batch_t const &batch, sfparam::mmff94_tables_host_t const &tables) {
     sfbench::kernel_trio_timings_t timings;
@@ -336,8 +313,7 @@ int main(int argc, char **argv) {
     fmt::println("{}: GPU MMFF kernel trio against the CPU native path", executable_name_k);
     fmt::println("input: {} (cap {})", arguments.smiles_path, fmt::group_digits(arguments.max_molecules));
 
-    // A corpus that never opened must not read as an empty corpus. It is read before the parameter tables are
-    // extracted, so a refused path costs nothing.
+    // Read before the parameter tables are extracted, so a refused corpus path costs nothing.
     std::vector<std::string> smiles_batch;
     auto const load_start = clock_type_t::now();
     auto const load_status = sfbench::load_corpus_into(arguments.smiles_path, arguments.max_molecules, smiles_batch);

@@ -2,30 +2,10 @@
  *  @file src/smallfield/mmff94/mmff94_term_equations.hpp
  *  @brief MMFF94 term classification and empirical rules, shared by the host and device extractors.
  *
- *  Reads `molecule_descriptor_t` plus caller-supplied per-atom MMFF types and answers, term by term,
- *  the questions both extractors ask:
- *
- *   1. Topology queries — bond lookup through the descriptor's neighbour CSR, plus the 3-, 4-, and
- *      5-membered ring tests that angle and torsion typing key on.
- *   2. Term type classification — ports of `MMFFMolProperties::getMMFFBondType`, `getMMFFAngleType`
- *      and `getMMFFTorsionType`, and of the free `getMMFFStretchBendType`.
- *   3. Empirical fallback rules for bond stretch, angle bend, and torsion, reimplemented from MMFF.V
- *      equations 18 and 19 and torsion rules @b a through @b h, alongside `native_is_zero`, the
- *      `isDoubleZero` threshold that decides when a table entry is empty enough to fall back.
- *
- *  Nothing here touches `etkdg_prepared_molecule_t` or the preprocessing batch header, which is what
- *  lets a CUDA translation unit include it. Both extractors do:
- *  `mmff94/mmff94_extract.hpp` on the host, `mmff94/mmff94_extract_device.cuh` on the device.
- *  Sharing this layer is what keeps the two in step — `test/mmff94/test_mmff_gpu_extract.cpp`
- *  requires byte identity across them for every bonded term.
- *
- *  All parameter resolution goes through `parameters/mmff94_tables.hpp` — the extracted RDKit tables
- *  plus the `lookup_*` cascades that mirror RDKit's `operator()` behaviour, feeding off the `covrad`,
- *  `bndk`, `hl`, and `prop` tables.
- *
- *  Atom types and partial charges are caller-provided. The native atom typer and BCI charge
- *  perception live in the GPU kernel; where it leaves a molecule untyped, the host supplies RDKit's
- *  answer through `preprocess/etkdg_prepare_batch.hpp::extract_mmff94_typing_via_rdkit_`.
+ *  Nothing here may touch `etkdg_prepared_molecule_t` or `preprocess/etkdg_prepare_batch.hpp`, which is
+ *  what lets `mmff94_extract_device.cuh` include it beside `mmff94_extract.hpp`. Sharing this layer is
+ *  what keeps the two extractors in step: `test/mmff94/test_mmff_gpu_extract.cpp` requires byte identity
+ *  across them for every bonded term.
  */
 
 #pragma once
@@ -54,8 +34,7 @@ using smallfield::types::molecule_descriptor_t;
 
 #pragma region Periodic Table Rows
 
-/** Matches `RDKit::MMFF::getPeriodicTableRow`: row 0 holds H and He; row 1 Li through Ne; row 2 Na
- *  through Ar; row 3 K through Kr; row 4 Rb through Xe. */
+/** Matches `RDKit::MMFF::getPeriodicTableRow`, which numbers the first row 0. */
 constexpr std::uint8_t periodic_table_row(std::uint8_t atomic_num) noexcept {
     if (atomic_num >= 3 && atomic_num <= 10) return 1;
     if (atomic_num >= 11 && atomic_num <= 18) return 2;
@@ -64,8 +43,8 @@ constexpr std::uint8_t periodic_table_row(std::uint8_t atomic_num) noexcept {
     return 0;
 }
 
-/** Matches `RDKit::MMFF::getPeriodicTableRowHL` — 1-based, transition metals ×10. Used only by the
- *  Herschbach-Laurie fallback. */
+/** Matches `RDKit::MMFF::getPeriodicTableRowHL`, which numbers the first row 1 and multiplies a
+ *  transition metal's row by ten. Read only by the Herschbach-Laurie fallback. */
 constexpr std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num) noexcept {
     std::uint8_t row = 0;
     if (atomic_num == 2) row = 1;
@@ -83,8 +62,7 @@ constexpr std::uint8_t periodic_table_row_hl(std::uint8_t atomic_num) noexcept {
 
 #pragma region Neighbor CSR Helpers
 
-/** Find the bond index between `atom_i` and `atom_j` via the descriptor's neighbor CSR. Returns -1 on miss.
- *  Matches the `find_bond_index` lambda in `preprocess/etkdg_prepare_batch.hpp`. */
+/** Bond index between `atom_i` and `atom_j` from the descriptor's neighbor CSR, or -1 on a miss. */
 constexpr std::int32_t find_bond_index(molecule_descriptor_t const &descriptor, std::uint32_t atom_i,
                                        std::uint32_t atom_j) noexcept {
     std::uint16_t const start = descriptor.neighbor_offset[atom_i];
@@ -94,8 +72,7 @@ constexpr std::int32_t find_bond_index(molecule_descriptor_t const &descriptor, 
     return -1;
 }
 
-/** Are `atom_i` and `atom_k` both adjacent to `atom_j` and to each other? That is, does the i-j-k
- *  angle close back into a 3-ring. Purely uses the descriptor's CSR — no ring info required. */
+/** Whether the i-j-k angle closes back into a 3-ring, which needs no ring info to answer. */
 constexpr bool angle_in_ring_of_size_3(molecule_descriptor_t const &descriptor, std::uint32_t atom_i,
                                        std::uint32_t atom_k) noexcept {
     return find_bond_index(descriptor, atom_i, atom_k) >= 0;
@@ -119,7 +96,6 @@ constexpr bool angle_has_common_neighbor(molecule_descriptor_t const &descriptor
 /** Ring size containing the i-j-k angle, or 0 if not 3/4. Matches `isAngleInRingOfSize3or4` exactly. */
 constexpr unsigned native_is_angle_in_ring_3_or_4(molecule_descriptor_t const &descriptor, std::uint32_t atom_i,
                                                   std::uint32_t atom_j, std::uint32_t atom_k) noexcept {
-    // Caller should hold that i-j and j-k are real bonds; only the ring closure checks trigger here.
     if (find_bond_index(descriptor, atom_i, atom_j) < 0 || find_bond_index(descriptor, atom_j, atom_k) < 0) return 0;
     if (angle_in_ring_of_size_3(descriptor, atom_i, atom_k)) return 3;
     if (angle_has_common_neighbor(descriptor, atom_i, atom_j, atom_k)) return 4;
@@ -141,7 +117,6 @@ constexpr unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const 
          ++neighbor_offset_i) {
         std::uint32_t const candidate_from_i = descriptor.neighbor_atom[neighbor_offset_i];
         if (candidate_from_i == atom_j) continue;
-        // Is `candidate_from_i` also a neighbor of l, and not k?
         std::uint16_t const atom_l_neighbor_start = descriptor.neighbor_offset[atom_l];
         std::uint16_t const atom_l_neighbor_end = descriptor.neighbor_offset[atom_l + 1];
         for (std::uint16_t neighbor_offset_l = atom_l_neighbor_start; neighbor_offset_l < atom_l_neighbor_end;
@@ -175,8 +150,7 @@ constexpr std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &d
     return static_cast<std::uint8_t>(angle_type);
 }
 
-/** Native port of `MMFFMolProperties::getMMFFTorsionType`, returning (primary, secondary) matching
- *  RDKit's pair. */
+/** Native port of `MMFFMolProperties::getMMFFTorsionType`, returning RDKit's (primary, secondary) pair. */
 constexpr std::pair<std::uint8_t, std::uint8_t> native_get_mmff_torsion_type(molecule_descriptor_t const &descriptor,
                                                                              custd::span<std::uint8_t const> atom_types,
                                                                              custd::span<std::uint8_t const> bond_types,
@@ -239,9 +213,10 @@ constexpr std::uint8_t native_get_mmff_stretch_bend_type(unsigned angle_type, un
 
 #pragma region Empirical Fallback Rules
 
-/** Empirical bond-stretch rule from MMFF.V equations 18-19. Matches `getMMFFBondStretchEmpiricalRuleParams` and
- *  returns the force constant `kb` together with the equilibrium distance `r0` by value. Internally uses `double`
- *  to match RDKit's precision; inputs and outputs are float for parity with the extracted-table pipeline. */
+/** Empirical bond-stretch rule from MMFF.V equations 18-19, matching
+ *  `getMMFFBondStretchEmpiricalRuleParams`. Returns `kb` in mdyn per angstrom beside `r0` in angstroms.
+ *  The arithmetic is `double` to match RDKit's precision; the float boundary is what the extracted-table
+ *  path uses. */
 SF_HOST_DEVICE_ inline std::pair<float, float> native_bond_empirical(mmff94_tables_view_t const &tables,
                                                                      std::uint8_t atomic_i,
                                                                      std::uint8_t atomic_j) noexcept {
@@ -275,11 +250,13 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_bond_empirical(mmff94_tabl
     return {static_cast<float>(force_constant), static_cast<float>(equilibrium_distance)};
 }
 
-/** Empirical angle-bend rule from MMFF.V, Table VI and its equations. Takes already-computed bond params for the
- *  two flanking bonds and returns the force constant `ka` with θ₀ in degrees. Matches
- *  `getMMFFAngleBendEmpiricalRuleParams`. A `theta0_override_deg` of zero or more replaces the default θ₀ derived
- *  from `coordination_number`, `multiple_bond_designator` and `valence`; that matches RDKit's behaviour when a
- *  table entry exists with ka=0, where RDKit keeps the table's θ₀ and recomputes ka empirically. */
+/**
+ *  @brief Empirical angle-bend rule from MMFF.V Table VI, matching `getMMFFAngleBendEmpiricalRuleParams`.
+ *
+ *  Returns `ka` beside θ₀ in degrees, given the equilibrium lengths of the two flanking bonds. A
+ *  `theta0_override_deg` of zero or more replaces the derived θ₀, which is what RDKit does when a table
+ *  entry exists with ka of zero: it keeps the table's θ₀ and recomputes ka empirically.
+ */
 SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_descriptor_t const &descriptor,
                                                                       mmff94_tables_view_t const &tables,
                                                                       custd::span<std::uint8_t const> atom_types,
@@ -289,8 +266,6 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_d
     std::uint8_t const atomic_number_i = descriptor.element[atom_i], atomic_number_j = descriptor.element[atom_j],
                        atomic_number_k = descriptor.element[atom_k];
 
-    // θ₀ — depends on the central atom's `coordination_number`, `multiple_bond_designator`,
-    // `valence` and `linear`.
     auto const *prop_j = lookup_prop(tables, atom_types[atom_j]);
     float theta0_deg = 120.0f;
     if (prop_j) {
@@ -312,10 +287,9 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_d
     else if (ring_size == 4) theta0_deg = 90.0f;
     if (theta0_override_deg >= 0.0f) theta0_deg = theta0_override_deg;
 
-    // Force constant `ka` — atomic_constant_i * period_constant_j * atomic_constant_k * r0_ij * r0_kj ...
+    // Table VI of MMFF.V, page 628; RDKit `AtomTyper.cpp` lines 2787-2854. Returns the atomic constant
+    // `Z` beside the period constant `C`.
     auto lookup_angle_bend_constants = [](std::uint8_t atomic_num) -> std::pair<double, double> {
-        // Table VI — MMFF.V, page 628; RDKit `AtomTyper.cpp` lines 2787-2854.
-        // Returns (atomic_constant "Z", period_constant "C").
         switch (atomic_num) {
         case 1: return {1.395, 0.0};
         case 6: return {2.494, 1.016};
@@ -340,9 +314,7 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_d
     else if (ring_size == 3) beta *= 0.05;
     constexpr double mmff_degrees_to_radians_k = M_PI / 180.0;
     double const theta0_rad = static_cast<double>(theta0_deg) * mmff_degrees_to_radians_k;
-    // Widen before the arithmetic, not after: the difference and the sum below are formed in
-    // double so the squared asymmetry keeps its precision, which is what the float parameters
-    // were promoted for in the first place.
+    // Widened before the arithmetic, not after, so the squared asymmetry below keeps its precision.
     double const bond_length_ij = r0_ij;
     double const bond_length_kj = r0_kj;
     double const bond_length_sum = bond_length_ij + bond_length_kj;
@@ -353,8 +325,8 @@ SF_HOST_DEVICE_ inline std::pair<float, float> native_angle_empirical(molecule_d
     return {static_cast<float>(force_constant), theta0_deg};
 }
 
-/** Empirical torsion rule from MMFF.V, rules a-h. Matches `getMMFFTorsionEmpiricalRuleParams`.
- *  Returns (V1, V2, V3). The central bond's type is passed in so it is not looked up twice. */
+/** Empirical torsion rule from MMFF.V rules @b a through @b h, matching
+ *  `getMMFFTorsionEmpiricalRuleParams`. Returns V1, V2 and V3 in kcal/mol. */
 SF_HOST_DEVICE_ inline std::array<float, 3> native_torsion_empirical(molecule_descriptor_t const &descriptor,
                                                                      mmff94_tables_view_t const &tables,
                                                                      custd::span<std::uint8_t const> atom_types,
@@ -364,8 +336,8 @@ SF_HOST_DEVICE_ inline std::array<float, 3> native_torsion_empirical(molecule_de
     auto const *properties_k = lookup_prop(tables, atom_types[atom_k]);
     std::array<float, 3> out {0.0f, 0.0f, 0.0f};
     if (!properties_j || !properties_k) return out;
-    // Table VII — MMFF.V, page 631. Returns the twofold-pi constant "U", threefold constant "V",
-    // and O/S lone-pair twofold constant "W".
+    // Table VII of MMFF.V, page 631: the twofold-pi constant `U`, the threefold constant `V`, and the
+    // oxygen and sulfur lone-pair twofold constant `W`.
     auto lookup_torsion_constants = [](std::uint8_t atomic_number, float &twofold_pi_constant,
                                        float &threefold_constant, float &lone_pair_constant) {
         twofold_pi_constant = threefold_constant = lone_pair_constant = 0.0f;
@@ -413,10 +385,8 @@ SF_HOST_DEVICE_ inline std::array<float, 3> native_torsion_empirical(molecule_de
     // rule (a): linear heavy atom on either side — all zero.
     if (properties_j->linear || properties_k->linear) return out;
 
-    // rule (b): aromatic-aromatic in aromatic ring.
-    // RDKit uses the `MMFFArom` set of atom types, never nullptr for non-zero types. Replicated
-    // here with a small constant list — see `DefaultParameters::getMMFFArom`.
-    // `MMFFArom` types: {37, 38, 39, 44, 58, 59, 63, 64, 65, 66, 69, 76, 78, 79, 80, 81, 82}.
+    // rule (b): aromatic-aromatic in aromatic ring. The types below are RDKit's `MMFFArom` set, see
+    // `DefaultParameters::getMMFFArom`.
     auto is_mmff_arom = [](std::uint8_t atom_type) {
         switch (atom_type) {
         case 37:
@@ -523,8 +493,7 @@ SF_HOST_DEVICE_ inline std::array<float, 3> native_torsion_empirical(molecule_de
 
 #pragma region Numeric Predicates
 
-/** `isDoubleZero` predicate matching RDKit's 1e-10 threshold. Used by the angle-bend and torsion
- *  fallback logic. */
+/** RDKit's `isDoubleZero`, which decides when a table entry is empty enough to fall back. */
 SF_HOST_DEVICE_ inline bool native_is_zero(float value) noexcept { return std::fabs(value) < 1.0e-10f; }
 
 #pragma endregion Numeric Predicates

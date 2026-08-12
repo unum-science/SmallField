@@ -2,20 +2,13 @@
  *  @file src/smallfield/preprocess/csd_torsion_dispatcher.hpp
  *  @brief CSD torsion extraction with an element prefilter and a native matcher.
  *
- *  Replaces `ForceFields::CrystalFF::getExperimentalTorsions()` with an owned matching loop. The
- *  CSD SMARTS patterns are loaded once at static-init and compiled by `parse_linear_torsion`
- *  (see `csd_torsion_native.hpp`). For every molecule the loop applies an element, aromaticity and
- *  hybridization prefilter, then runs the stack-only `match_linear_pattern`. No heap allocation
- *  and no RDKit substructure search on the hot path.
+ *  Produces the same torsion set as `ForceFields::CrystalFF::getExperimentalTorsions()` with no heap
+ *  allocation and no RDKit substructure search on the hot path: the 470 patterns of the v2 and small-ring
+ *  corpora are compiled once at first use, and every molecule passes an element, aromaticity and
+ *  hybridization prefilter before the stack-only `match_linear_pattern` runs.
  *
- *  The whole loaded corpus — v2 plus smallrings, 470 patterns — compiles natively, so there is no
- *  fallback. A pattern the compiler cannot read is a load-time error rather than a silent runtime
- *  detour: the pattern library is checked-in data, so an unreadable entry is a build problem, and a
- *  fallback would hide it behind a path that never otherwise executes.
- *
- *  Correctness: identical torsion set to RDKit's `getExperimentalTorsions()`. The native matcher is
- *  byte-equivalence validated against RDKit across 19193 PubChem molecules in
- *  `test_csd_torsion_predicates.cpp` — 9020710 pattern checks, zero disagreements.
+ *  There is no runtime fallback to RDKit. The whole corpus compiles natively, and a pattern that stops
+ *  doing so is a build problem a fallback would hide behind a path nothing else executes.
  */
 
 #pragma once
@@ -55,11 +48,8 @@ using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::max_bonds_k;
 using smallfield::types::molecule_descriptor_t;
 
-/**
- *  @brief One CSD torsion pattern, compiled. Every pattern `csd_patterns` hands out has a usable
- *  `native_form`, so nothing here records whether it compiled — a row that did not is dropped at
- *  load with a diagnostic naming it.
- */
+/** One CSD torsion pattern, compiled. Every pattern `csd_patterns` hands out has a usable `native_form`,
+ *  so nothing here records whether it compiled — a row that did not is dropped at load. */
 struct csd_compiled_pattern_t {
     /** Borrowed from the static table, which outlives every caller. */
     std::string_view smarts;
@@ -67,11 +57,10 @@ struct csd_compiled_pattern_t {
     std::unique_ptr<RDKit::ROMol const> pattern;
     /** Atom indices in `pattern` for labels :1 through :4. */
     std::uint32_t index[4];
-    /** Bitset: bit N = pattern requires element N. */
+    /** Bit N set when the pattern requires element N. */
     std::uint64_t required_elements;
-    /** Bitset: bit H = pattern requires hybridization H (see `hybridization_t`). */
+    /** Bit H set when the pattern requires hybridization H, see `hybridization_t`. */
     std::uint8_t required_hybridizations;
-    /** True if any pattern atom is aromatic. */
     bool requires_aromatic;
     /** What the matcher reads. */
     simple_torsion_pattern_t native_form;
@@ -80,12 +69,11 @@ struct csd_compiled_pattern_t {
 };
 
 /**
- *  @brief Hybridizations that every match of the pattern must contain. Per-atom,
- *  a hybridization H is required iff @b every disjunct of that atom pins
- *  hybridization to H; if any disjunct is unconstrained or pins a different
- *  value, the atom can still match molecules without H. The pattern's
- *  overall required mask is the union of these per-atom required sets
- *  across the 4 labelled atoms (branches excluded — they're soft).
+ *  @brief Hybridizations every match of the pattern must contain.
+ *
+ *  An atom requires hybridization H only when @b every disjunct of it pins H; one unconstrained disjunct,
+ *  or one pinning something else, lets the atom match a molecule without H. The pattern's mask is the
+ *  union over the four labelled atoms, branches excluded because they are soft.
  */
 inline std::uint8_t compute_required_hybridizations(simple_torsion_pattern_t const &pattern) {
     std::uint8_t mask = 0;
@@ -106,18 +94,12 @@ inline std::uint8_t compute_required_hybridizations(simple_torsion_pattern_t con
 }
 
 /**
- *  @brief Compile every row of a corpus and append the ones the matcher can carry.
+ *  @brief Compile every row of a corpus, append the ones the matcher can carry to @p out in row order,
+ *  and return the number dropped.
  *
- *  A row the compiler cannot read is dropped rather than kept in a state nothing may match against,
- *  and it says so on the logger: the pattern library is checked-in data, so an unreadable entry is a
- *  build problem and the diagnostic names the SMARTS that has to change. Dropping it is what makes
- *  "every pattern in this vector matches" an invariant of the container rather than a flag each of
- *  its consumers has to remember to test — and the device table's flattener does not test one.
- *
- *  @param[in] rows One corpus, in its semantic order.
- *  @param[inout] out Compiled patterns, appended in row order.
- *  @param[in] logger Where a dropped row is announced.
- *  @return Rows dropped.
+ *  Dropping an unreadable row rather than keeping it inert is what makes "every pattern in this vector
+ *  matches" an invariant of the container rather than a flag each consumer must remember to test — and
+ *  the device table's flattener does not test one. Each drop names its SMARTS on @p logger.
  */
 inline std::size_t compile_patterns_into(custd::span<csd_torsion_row_t const> rows,
                                          std::vector<csd_compiled_pattern_t> &out, logger_t const &logger) {
@@ -134,7 +116,6 @@ inline std::size_t compile_patterns_into(custd::span<csd_torsion_row_t const> ro
             continue;
         }
 
-        // Find the atoms labeled :1 through :4 via their molAtomMapNumber property.
         compiled_pattern.index[0] = compiled_pattern.index[1] = compiled_pattern.index[2] = compiled_pattern.index[3] =
             0xFFFFFFFFu;
         compiled_pattern.required_elements = 0;
@@ -166,8 +147,8 @@ inline std::size_t compile_patterns_into(custd::span<csd_torsion_row_t const> ro
             continue;
         }
 
-        // The corpus spells a term as a sign beside a magnitude and nothing ever wants the two
-        // apart, so they are multiplied once here rather than at both places that emit a torsion.
+        // The corpus spells a term as a sign beside a magnitude, and nothing downstream wants the two
+        // apart.
         for (std::uint32_t term = 0; term < 6; ++term)
             compiled_pattern.fourier_coefficients[term] = static_cast<float>(row.signs[term]) * row.magnitudes[term];
         compiled_pattern.required_hybridizations = compute_required_hybridizations(compiled_pattern.native_form);
@@ -180,12 +161,11 @@ inline std::size_t compile_patterns_into(custd::span<csd_torsion_row_t const> ro
 /**
  *  @brief Lazy-load and compile all CSD patterns once per process.
  *
- *  The whole checked-in corpus compiles today, so the drop count is zero and a non-zero one is a
- *  build problem: a row was edited into syntax the matcher cannot represent, and the conformers the
- *  pipeline generates for the bonds that row used to claim will change. It is reported rather than
- *  fatal because there is no caller here to act on it — this runs at first use, inside a library,
- *  possibly under a host application that has its own idea of how to fail — and because losing one
- *  pattern out of 470 degrades the torsion set rather than invalidating it.
+ *  The checked-in corpus compiles whole, so a non-zero drop count means a row was edited into syntax the
+ *  matcher cannot represent, and the conformers generated for the bonds that row claims will change. It
+ *  is reported rather than fatal: this runs at first use inside a library, under a host application with
+ *  its own idea of how to fail, and losing one pattern out of 470 degrades the torsion set rather than
+ *  invalidating it.
  */
 inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
     static std::vector<csd_compiled_pattern_t> const patterns = [] {
@@ -204,15 +184,11 @@ inline std::vector<csd_compiled_pattern_t> const &csd_patterns() {
 }
 
 /**
- *  @brief Extract CSD torsions with element prefiltering, replacing
- *  ForceFields::CrystalFF::getExperimentalTorsions().
+ *  @brief Extract every CSD torsion of one molecule into @p torsions, whose prior contents are dropped.
  *
- *  Also handles the "basic knowledge" torsions (flat aromatic rings, sp2 centers with 3 neighbors)
- *  that getExperimentalTorsions produces. Everything reads the flat descriptor, so the same
- *  answer comes out of the device kernel in `smallfield/cuda/csd_torsion_kernel.cuh`.
- *
- *  @param[in] descriptor Molecule descriptor with topology, property and ring arrays.
- *  @param[out] torsions Extracted torsions; any prior contents are dropped.
+ *  The corpus pass is followed by the flat-ring torsions `getExperimentalTorsions` emits under
+ *  `useBasicKnowledge`. Everything reads the flat descriptor, so the device kernel in
+ *  `smallfield/cuda/csd_torsion_kernel.cuh` produces the same answer.
  */
 inline void extract_etk_torsions_native(molecule_descriptor_t const &descriptor,
                                         std::vector<etk_torsion_descriptor_t> &torsions) {
@@ -227,12 +203,10 @@ inline void extract_etk_torsions_native(molecule_descriptor_t const &descriptor,
 
     for (std::size_t pattern_index = 0; pattern_index < patterns.size(); ++pattern_index) {
         auto const &pattern = patterns[pattern_index];
-        // Element prefilter: skip patterns whose required elements are absent.
         if ((pattern.required_elements & ~gate.elements) != 0) continue;
         if (pattern.requires_aromatic && !gate.has_aromatic) continue;
         if ((pattern.required_hybridizations & ~gate.hybridizations) != 0) continue;
 
-        // Stack-only native matcher. Zero heap allocations in this branch.
         match_linear_pattern(
             descriptor, csd_pattern_view_t(pattern.native_form), done_bonds,
             [&](std::uint8_t atom_1, std::uint8_t atom_2, std::uint8_t atom_3, std::uint8_t atom_4,
@@ -253,7 +227,7 @@ inline void extract_etk_torsions_native(molecule_descriptor_t const &descriptor,
             });
     }
 
-    // Matches RDKit getExperimentalTorsions' useBasicKnowledge=true behavior.
+    // Flat-ring torsions, matching `getExperimentalTorsions` under `useBasicKnowledge`.
     for (std::uint32_t ring_index = 0; ring_index < descriptor.num_rings; ++ring_index) {
         std::uint32_t const size = ring_atom_count(descriptor, ring_index);
         if (size < 4 || size > 6) continue;
@@ -277,7 +251,7 @@ inline void extract_etk_torsions_native(molecule_descriptor_t const &descriptor,
             torsion.atom_indices[1] = atom_2;
             torsion.atom_indices[2] = atom_3;
             torsion.atom_indices[3] = atom_4;
-            // Flat-ring signature: signs[1]=-1, V[1]=100.0 (from RDKit's hardcoded values).
+            // The signature RDKit hardcodes for a flat ring: a sign of -1 on a V of 100.
             for (std::uint32_t term = 0; term < 6; ++term) torsion.fourier_coefficients[term] = 0.0f;
             torsion.fourier_coefficients[1] = -100.0f;
             torsions.push_back(torsion);

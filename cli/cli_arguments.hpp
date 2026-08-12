@@ -3,13 +3,9 @@
  *  @brief Command-line plumbing shared by the `cli/` binaries: bounded number parsing and the `argparse`
  *  bindings that write a parsed value straight into its destination.
  *
- *  `std::atoi` and `std::strtoull` both answer a malformed token with zero, so `--num-conformers abc` reads
- *  as zero and the run continues on a number nobody typed — which for that flag is a wave of nothing the
- *  library reports as a CUDA fault. Every value-taking flag goes through `parse_number` instead, which
- *  reports @b why a token was refused and enforces the caller's bounds in the same pass.
- *
- *  The conversion stays ours rather than `argparse`'s `scan`, whose diagnostic is `pattern 'abc' does not
- *  match to the end` — it never names the flag the operator actually typed, and it has no bounds to enforce.
+ *  `std::atoi` and `argparse`'s own `scan` both answer a malformed token without naming the flag that
+ *  carried it, so every value-taking flag goes through `parse_number`, which names the refusal and enforces
+ *  the caller's bounds in the same pass.
  */
 
 #pragma once
@@ -51,11 +47,6 @@ enum class number_parse_t {
  *
  *  Partial parses are refusals: `12x` is malformed, not twelve. The destination keeps its prior value unless
  *  the token is accepted, so a caller may seed it with the default and read it back either way.
- *
- *  @param[in] text Token as it appeared on the command line.
- *  @param[in] minimum Smallest value the flag accepts.
- *  @param[in] maximum Largest value the flag accepts.
- *  @param[out] number Value the token denotes; untouched unless the whole token parses inside the bounds.
  */
 template <typename number_type_>
 number_parse_t parse_number(std::string_view text, number_type_ minimum, number_type_ maximum, number_type_ &number) {
@@ -82,10 +73,10 @@ inline char const *describe_number_parse(number_parse_t status) {
 }
 
 /**
- *  @brief Bind a string flag straight to its destination, so the parsed value never sits anywhere but the config.
+ *  @brief Bind a string flag straight to its destination.
  *
- *  `append` marks the flag repeatable, which is what keeps the last occurrence winning: without it `argparse`
- *  rejects a second occurrence outright, and a wrapper that appends an override to a fixed prefix stops working.
+ *  `append` marks the flag repeatable, so the last occurrence wins; without it `argparse` refuses a second
+ *  occurrence outright.
  */
 template <typename string_type_>
 void add_string(argparse::ArgumentParser &parser, char const *flag, string_type_ &destination) {

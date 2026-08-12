@@ -70,8 +70,7 @@ std::string describe_shard_write(shard_write_report_t const &report) {
 /**
  *  @brief Log @p report against @p path and hand it back, so every refusal leaves a named reason behind.
  *
- *  @param[in] detail Whatever the failing layer said for itself — Arrow's own message, or the shape the
- *      size contract was checked against — omitted when it carries nothing.
+ *  @param[in] detail Whatever the failing layer said for itself, omitted when it carries nothing.
  */
 static shard_write_report_t refuse_(logger_t const &logger, fs::path const &path, shard_write_report_t const &report,
                                     std::string_view detail = {}) {
@@ -108,10 +107,9 @@ static std::size_t optional_required_(std::size_t held, std::size_t required) { 
 /**
  *  @brief Check every input span against the extent its axis requires, before anything indexes one.
  *
- *  Once this passes, no read below needs a bound of its own: a row names a molecule under
- *  `molecules.count()` and a slot under `layout.num_conformers` by construction, and the coordinate
- *  span covers the molecule count times the conformer count times the slot stride, so the widest offset
- *  any row reaches is inside it.
+ *  Once this passes no read below needs a bound of its own: every row names a molecule under
+ *  `molecules.count()` and a slot under `layout.num_conformers`, so the widest offset any row reaches is
+ *  inside the coordinate span checked here.
  */
 static shard_write_report_t check_input_extents_(writer_inputs_t const &inputs) {
     molecule_columns_t const &molecules = inputs.molecules;
@@ -150,9 +148,9 @@ static std::string describe_extents_(writer_inputs_t const &inputs) {
 /**
  *  @brief What one output row describes, which is what decides whether its per-conformer columns carry data.
  *
- *  The two failures null the same columns today and are still kept apart, because they are not the same fact:
- *  a molecule failure is the synthetic row a molecule with no surviving conformers is still given, so its
- *  slot and its `conformer_index` are zero rather than an energy rank.
+ *  The two failures null the same columns and stay distinct: a molecule failure is the synthetic row a
+ *  molecule with no surviving conformers is still given, so its slot and `conformer_index` are zero rather
+ *  than an energy rank.
  */
 enum class row_outcome_t : std::uint8_t {
     /** The conformer survived, so its coordinates, energy and descriptors are written. */
@@ -164,7 +162,7 @@ enum class row_outcome_t : std::uint8_t {
 };
 
 /**
- *  @brief One output row, holding together the three facts a shared row index used to walk in parallel.
+ *  @brief One output row of the shard.
  *
  *  Every field is inside its axis by construction: `molecule_index` below `molecules.count()` because the
  *  builder loops it, and `conformer_slot` below `layout.num_conformers` because the builder clamps it.
@@ -187,9 +185,8 @@ static std::size_t flat_slot_(conformer_slot_columns_t const &conformers, std::u
  *  @brief Sort key of one conformer slot: its energy, or infinity when the slot did not succeed.
  *
  *  Every failed slot compares equal, so a stable sort leaves the failures behind the successes @b in slot
- *  order — the key `python/smallfield/_binding.cpp` already sorts by, which is what makes a shard and the
- *  Python API rank one molecule's conformers identically. Ranking the failures among themselves by an
- *  energy no slot produced is what the two used to disagree about.
+ *  order — the key `python/smallfield/_binding.cpp` sorts by, which is what makes a shard and the Python
+ *  API rank one molecule's conformers identically.
  */
 static float slot_ordering_energy_(conformer_slot_columns_t const &conformers, std::size_t flat) {
     return conformers.status[flat] == api::conformer_status_t::success_k ? conformers.energies[flat]
@@ -199,9 +196,9 @@ static float slot_ordering_energy_(conformer_slot_columns_t const &conformers, s
 /**
  *  @brief Conformers of a molecule the shard can address, which is what the `n_conformers` column publishes.
  *
- *  An `n_conformers` above the slot stride is clamped rather than read: slot `num_conformers` of one
- *  molecule is slot zero of the next, so the unclamped read published a neighbour's geometry and energy.
- *  The column and the rows emitted are the same number by construction, because both come from here.
+ *  An `n_conformers` above the slot stride is clamped rather than read, because slot `num_conformers` of
+ *  one molecule is slot zero of the next. The column and the rows emitted are the same number by
+ *  construction, because both come from here.
  */
 static std::uint8_t addressable_conformers_(writer_inputs_t const &inputs, std::uint64_t molecule_index) {
     return static_cast<std::uint8_t>(std::min<std::uint32_t>(inputs.molecules.num_conformers[molecule_index],
@@ -224,7 +221,6 @@ static void fill_output_rows_into(writer_inputs_t const &inputs, std::vector<out
     std::uint64_t const num_molecules = inputs.molecules.count();
     rows.clear();
 
-    // Declared above the loop, so the energy sort of a million molecules grows one buffer once.
     std::vector<std::uint32_t> order;
     for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
         if (inputs.molecules.num_conformers[molecule_index] == 0) {
@@ -267,7 +263,7 @@ static void fill_output_rows_into(writer_inputs_t const &inputs, std::vector<out
  *  is null. Atom counts are clamped to the slot's own stride so the allocation pass and the emit pass agree
  *  even when a caller reports more atoms than fit.
  *
- *  @param[out] array A nullable `List<float16>` array with one element per output row, untouched on refusal.
+ *  @param[out] array Untouched on refusal.
  *  @return `written_k`, or the refusal that stopped the pack.
  */
 static shard_write_report_t pack_coordinates_as_list(writer_inputs_t const &inputs,
@@ -299,7 +295,7 @@ static shard_write_report_t pack_coordinates_as_list(writer_inputs_t const &inpu
     auto values_buffer = std::move(values_buffer_result).ValueOrDie();
     std::uint16_t *values = reinterpret_cast<std::uint16_t *>(values_buffer->mutable_data());
 
-    // Validity bitmap: bit `row` = 1 if the row has data, 0 if null.
+    // Arrow's validity bitmap: bit `row` is set when the row carries data and clear when it is null.
     std::size_t const bitmap_bytes = (num_rows + 7) / 8;
     auto validity_buffer_result = arrow::AllocateBuffer(static_cast<std::int64_t>(bitmap_bytes));
     if (!validity_buffer_result.ok()) return allocation_failed;
@@ -343,10 +339,9 @@ static shard_write_report_t pack_coordinates_as_list(writer_inputs_t const &inpu
  *  @brief Pack the per-slot USRCAT descriptor into a nullable `List<float16>`, one element per output row.
  *
  *  A row emits its `usrcat_components_k` values only when it is a success row and the column was supplied;
- *  otherwise it is null. fp16 is honest precision here: USRCAT's value range is small and it is derived from
- *  fp16 coordinates, so storing float64 would be illusory precision.
+ *  otherwise it is null.
  *
- *  @param[out] array A nullable `List<float16>` array with one element per output row, untouched on refusal.
+ *  @param[out] array Untouched on refusal.
  *  @return `written_k`, or the refusal that stopped the pack.
  */
 static shard_write_report_t pack_usrcat_as_fp16_list(writer_inputs_t const &inputs,
@@ -390,8 +385,7 @@ enum class column_nullability_t : bool { required_k, nullable_k };
 /**
  *  @brief The schema's fields and the arrays behind them, appended together so the two cannot drift.
  *
- *  A field's type comes from the array it names rather than from a second list beside it, which is what
- *  used to let a `list<float16>` column be declared next to a `float32` field with nothing to catch it.
+ *  A field's type comes from the array it names rather than from a second list beside it.
  */
 struct column_table_t {
     std::vector<std::shared_ptr<arrow::Field>> fields;
@@ -406,10 +400,8 @@ struct column_table_t {
 /**
  *  @brief The eleven scalar row columns, reserved once, appended per row, and finished together.
  *
- *  Each phase keeps the first column that refused and reports it afterwards rather than branching per row:
- *  a per-row check on eleven builders costs eleven branches a row for a condition that fires at most once,
- *  and collapsing the eleven call sites into one anonymous answer is what left callers printing
- *  `write failed` with no column name.
+ *  Each phase keeps the first column that refused and reports it once the phase ends, rather than costing
+ *  eleven branches a row for a condition that fires at most once.
  */
 class row_columns_t {
     arrow::StringBuilder input_shard_;
@@ -540,9 +532,9 @@ class row_columns_t {
 /**
  *  @brief Schema-level key-value metadata, so the bytes stay self-describing in a content-addressed store.
  *
- *  `SMALLFIELD_GIT_SHA` is injected by CMake. The coordinate frame reported is the one actually shipped:
- *  coordinates are centroid-centered but their orientation is not canonicalized, because the metric
- *  embedding aligns to principal axes and the FIRE/MMFF relaxation afterwards drifts the pose off that frame.
+ *  `SMALLFIELD_GIT_SHA` is injected by CMake. The frame is reported as `centered` rather than canonical:
+ *  the metric embedding aligns to principal axes, but the FIRE/MMFF relaxation after it drifts the pose off
+ *  that frame.
  */
 static std::shared_ptr<arrow::KeyValueMetadata> build_provenance_(writer_inputs_t const &inputs) {
     auto provenance = std::make_shared<arrow::KeyValueMetadata>();
