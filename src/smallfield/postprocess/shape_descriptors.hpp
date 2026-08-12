@@ -35,7 +35,7 @@
 
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
-#include <numeric>     // `std::iota`
+#include <ranges>      // `std::views::iota`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
 
@@ -105,12 +105,31 @@ struct point3_t {
     double z = 0.0;
 };
 
-/** Reads atom @p atom_index from a tight interleaved (num_atoms, 3) float buffer. */
-inline point3_t read_point_(custd::span<float const> coords_interleaved, std::uint32_t atom_index) {
-    std::size_t const base = static_cast<std::size_t>(atom_index) * 3u;
-    return point3_t {static_cast<double>(coords_interleaved[base + 0u]),
-                     static_cast<double>(coords_interleaved[base + 1u]),
-                     static_cast<double>(coords_interleaved[base + 2u])};
+/** One conformer's atom-major coordinates for a caller that only reads them. */
+using conformer_reader_t = types::coordinates_aos<types::coordinate_role_t::position_k, float const>;
+
+/*
+ *  A conformer reaches the public entry points as a flat buffer beside an atom count, two facts nothing
+ *  compares. These reconcile them at the boundary so everything below addresses `(atom, axis)`, and the second
+ *  form is an exact match for a mutable span, so a writer never spells index arithmetic of its own either.
+ */
+
+/** Views a tight interleaved (num_atoms, 3) float buffer as one conformer. */
+inline conformer_reader_t conformer_over_(custd::span<float const> coords_interleaved, std::uint32_t num_atoms) {
+    sf_assert_(coords_interleaved.size() >= static_cast<std::size_t>(num_atoms) * types::conformer_dimensions_k);
+    return conformer_reader_t {coords_interleaved.data(), num_atoms};
+}
+
+/** The same view for a caller that writes it. */
+inline types::conformer_aos_t conformer_over_(custd::span<float> coords_interleaved, std::uint32_t num_atoms) {
+    sf_assert_(coords_interleaved.size() >= static_cast<std::size_t>(num_atoms) * types::conformer_dimensions_k);
+    return types::conformer_aos_t {coords_interleaved.data(), num_atoms};
+}
+
+/** Reads atom @p atom_index out of a conformer. */
+inline point3_t read_point_(conformer_reader_t coords, std::uint32_t atom_index) {
+    return point3_t {static_cast<double>(coords(atom_index, 0)), static_cast<double>(coords(atom_index, 1)),
+                     static_cast<double>(coords(atom_index, 2))};
 }
 
 /** Euclidean distance between two points. */
@@ -125,11 +144,12 @@ inline double point_distance_(point3_t const &first, point3_t const &second) {
 
 #pragma region Internal
 
-/** Centroid of @p num_atoms atoms; the caller guarantees at least one. */
-inline point3_t centroid_of_(custd::span<float const> coords_interleaved, std::uint32_t num_atoms) {
+/** Centroid of a conformer's atoms; the caller guarantees at least one. */
+inline point3_t centroid_of_(conformer_reader_t coords) {
     point3_t centroid {};
+    std::uint32_t const num_atoms = coords.extent(0);
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
-        point3_t const point = read_point_(coords_interleaved, atom_index);
+        point3_t const point = read_point_(coords, atom_index);
         centroid.x += point.x;
         centroid.y += point.y;
         centroid.z += point.z;
@@ -141,12 +161,11 @@ inline point3_t centroid_of_(custd::span<float const> coords_interleaved, std::u
 }
 
 /** Atom nearest @p reference, first index winning a tie as RDKit's `smallestValId` does; at least one atom. */
-inline std::uint32_t nearest_atom_to_(custd::span<float const> coords_interleaved, std::uint32_t num_atoms,
-                                      point3_t const &reference) {
+inline std::uint32_t nearest_atom_to_(conformer_reader_t coords, point3_t const &reference) {
     std::uint32_t nearest = 0;
-    double nearest_distance = point_distance_(read_point_(coords_interleaved, 0), reference);
-    for (std::uint32_t atom_index = 1; atom_index < num_atoms; ++atom_index) {
-        double const distance = point_distance_(read_point_(coords_interleaved, atom_index), reference);
+    double nearest_distance = point_distance_(read_point_(coords, 0), reference);
+    for (std::uint32_t atom_index = 1; atom_index < coords.extent(0); ++atom_index) {
+        double const distance = point_distance_(read_point_(coords, atom_index), reference);
         if (distance >= nearest_distance) continue;
         nearest_distance = distance;
         nearest = atom_index;
@@ -155,12 +174,11 @@ inline std::uint32_t nearest_atom_to_(custd::span<float const> coords_interleave
 }
 
 /** Atom farthest from @p reference, first index winning a tie as RDKit's `largestValId` does; at least one atom. */
-inline std::uint32_t farthest_atom_from_(custd::span<float const> coords_interleaved, std::uint32_t num_atoms,
-                                         point3_t const &reference) {
+inline std::uint32_t farthest_atom_from_(conformer_reader_t coords, point3_t const &reference) {
     std::uint32_t farthest = 0;
-    double farthest_distance = point_distance_(read_point_(coords_interleaved, 0), reference);
-    for (std::uint32_t atom_index = 1; atom_index < num_atoms; ++atom_index) {
-        double const distance = point_distance_(read_point_(coords_interleaved, atom_index), reference);
+    double farthest_distance = point_distance_(read_point_(coords, 0), reference);
+    for (std::uint32_t atom_index = 1; atom_index < coords.extent(0); ++atom_index) {
+        double const distance = point_distance_(read_point_(coords, atom_index), reference);
         if (distance <= farthest_distance) continue;
         farthest_distance = distance;
         farthest = atom_index;
@@ -172,16 +190,15 @@ inline std::uint32_t farthest_atom_from_(custd::span<float const> coords_interle
  *  @brief The four USR reference points, in RDKit order: ctd, cst, fct, ftf.
  *
  *  A molecule of no atoms has no reference points and yields four origins, which the moment passes then turn into
- *  zeros; reading an atom out of an empty coordinate span is the alternative.
+ *  zeros; reading an atom out of an empty coordinate view is the alternative.
  */
-inline std::array<point3_t, usr_reference_point_count_k> reference_points_(custd::span<float const> coords_interleaved,
-                                                                           std::uint32_t num_atoms) {
+inline std::array<point3_t, usr_reference_point_count_k> reference_points_(conformer_reader_t coords) {
     std::array<point3_t, usr_reference_point_count_k> points {};
-    if (num_atoms == 0) return points;
-    points[0] = centroid_of_(coords_interleaved, num_atoms);
-    points[1] = read_point_(coords_interleaved, nearest_atom_to_(coords_interleaved, num_atoms, points[0]));
-    points[2] = read_point_(coords_interleaved, farthest_atom_from_(coords_interleaved, num_atoms, points[0]));
-    points[3] = read_point_(coords_interleaved, farthest_atom_from_(coords_interleaved, num_atoms, points[2]));
+    if (coords.extent(0) == 0) return points;
+    points[0] = centroid_of_(coords);
+    points[1] = read_point_(coords, nearest_atom_to_(coords, points[0]));
+    points[2] = read_point_(coords, farthest_atom_from_(coords, points[0]));
+    points[3] = read_point_(coords, farthest_atom_from_(coords, points[2]));
     return points;
 }
 
@@ -192,10 +209,12 @@ inline std::array<point3_t, usr_reference_point_count_k> reference_points_(custd
  *  signed cube root of the standardized third central moment. An empty subset yields three zeros; a degenerate
  *  one with zero standard deviation yields a zero third moment, RDKit's guard against dividing by zero.
  *
- *  The distances are walked twice rather than materialized, so a per-conformer descriptor allocates nothing.
+ *  The distances are walked twice rather than materialized and @p atom_indices is borrowed rather than built, so
+ *  a per-conformer descriptor allocates nothing.
  */
-inline std::array<double, usr_moment_count_k> moments_about_(custd::span<float const> coords_interleaved,
-                                                             custd::span<std::uint32_t const> atom_indices,
+template <typename atom_indices_type_>
+inline std::array<double, usr_moment_count_k> moments_about_(conformer_reader_t coords,
+                                                             atom_indices_type_ const &atom_indices,
                                                              point3_t const &reference) {
     std::array<double, usr_moment_count_k> moments {0.0, 0.0, 0.0};
     if (atom_indices.empty()) return moments;
@@ -203,14 +222,14 @@ inline std::array<double, usr_moment_count_k> moments_about_(custd::span<float c
 
     double sum = 0.0;
     for (std::uint32_t const atom_index : atom_indices)
-        sum += point_distance_(read_point_(coords_interleaved, atom_index), reference);
+        sum += point_distance_(read_point_(coords, atom_index), reference);
     double const mean = sum / num_points;
     moments[0] = mean;
 
     double sum_squared = 0.0;
     double sum_cubed = 0.0;
     for (std::uint32_t const atom_index : atom_indices) {
-        double const diff = point_distance_(read_point_(coords_interleaved, atom_index), reference) - mean;
+        double const diff = point_distance_(read_point_(coords, atom_index), reference) - mean;
         sum_squared += diff * diff;
         sum_cubed += diff * diff * diff;
     }
@@ -226,20 +245,20 @@ inline std::array<double, usr_moment_count_k> moments_about_(custd::span<float c
 /**
  *  @brief Writes one atom subset's block of moments, reference-point major.
  *
- *  @param[in] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
+ *  @param[in] coords One conformer's coordinates.
  *  @param[in] points The four all-atom reference points every block measures against.
  *  @param[in] atom_indices Atoms whose distances feed the distributions — every atom for the plain USR block, a
  *             CREDO subset for a USRCAT extension block. An empty subset writes zeros, as RDKit's empty
  *             `reducedCoords` path does.
  *  @param[out] block Exactly `usr_components_k` numbers of the caller's descriptor row.
  */
-inline void moments_for_subset_(custd::span<float const> coords_interleaved,
+template <typename atom_indices_type_>
+inline void moments_for_subset_(conformer_reader_t coords,
                                 std::array<point3_t, usr_reference_point_count_k> const &points,
-                                custd::span<std::uint32_t const> atom_indices, custd::span<double> block) {
+                                atom_indices_type_ const &atom_indices, custd::span<double> block) {
     sf_assert_(block.size() == usr_components_k);
     for (std::size_t reference = 0; reference < usr_reference_point_count_k; ++reference) {
-        std::array<double, usr_moment_count_k> const moments = moments_about_(coords_interleaved, atom_indices,
-                                                                              points[reference]);
+        std::array<double, usr_moment_count_k> const moments = moments_about_(coords, atom_indices, points[reference]);
         for (std::size_t moment = 0; moment < usr_moment_count_k; ++moment)
             block[reference * usr_moment_count_k + moment] = moments[moment];
     }
@@ -248,19 +267,14 @@ inline void moments_for_subset_(custd::span<float const> coords_interleaved,
 /**
  *  @brief Writes the all-atom USR block and hands back the reference points every further block measures against.
  *
- *  @param[in] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
- *  @param[in] num_atoms Atom count; the span carries three floats per atom.
+ *  @param[in] coords One conformer's coordinates.
  *  @param[out] block Exactly `usr_components_k` numbers, reference-point major.
  *  @return The four all-atom reference points, in RDKit order.
  */
-inline std::array<point3_t, usr_reference_point_count_k> usr_block_into_(custd::span<float const> coords_interleaved,
-                                                                         std::uint32_t num_atoms,
+inline std::array<point3_t, usr_reference_point_count_k> usr_block_into_(conformer_reader_t coords,
                                                                          custd::span<double> block) {
-    sf_assert_(coords_interleaved.size() >= static_cast<std::size_t>(num_atoms) * 3u);
-    std::array<point3_t, usr_reference_point_count_k> const points = reference_points_(coords_interleaved, num_atoms);
-    std::vector<std::uint32_t> all_atoms(num_atoms);
-    std::iota(all_atoms.begin(), all_atoms.end(), 0u);
-    moments_for_subset_(coords_interleaved, points, all_atoms, block);
+    std::array<point3_t, usr_reference_point_count_k> const points = reference_points_(coords);
+    moments_for_subset_(coords, points, std::views::iota(std::uint32_t {0}, coords.extent(0)), block);
     return points;
 }
 
@@ -323,8 +337,10 @@ inline molecule_shape_context_t build_shape_context(
         // Type the four CREDO subsets exactly as RDKit's `getAtomIdsForFeatures` does: collect every matched
         // atom index, preserving RDKit's collection order.
         std::array<RDKit::ROMol, credo_subset_count_k> const &matchers = credo_matchers_();
+        // `SubstructMatch` move-assigns a vector it built itself, so the buffer behind these four searches is
+        // RDKit's and the hoist keeps the object rather than its capacity.
+        std::vector<RDKit::MatchVectType> matches;
         for (std::size_t subset_index = 0; subset_index < credo_subset_count_k; ++subset_index) {
-            std::vector<RDKit::MatchVectType> matches;
             RDKit::SubstructMatch(*molecule, matchers[subset_index], matches);
             for (auto const &match : matches)
                 for (auto const &pair : match)
@@ -360,7 +376,7 @@ inline molecule_shape_context_t build_shape_context(
 inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uint32_t num_atoms,
                            std::array<double, usr_components_k> &out) {
     [[maybe_unused]] std::array<point3_t, usr_reference_point_count_k> const points = usr_block_into_(
-        coords_interleaved, num_atoms, custd::span<double> {out.data(), out.size()});
+        conformer_over_(coords_interleaved, num_atoms), custd::span<double> {out.data(), out.size()});
 }
 
 /**
@@ -376,12 +392,13 @@ inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uin
  */
 inline void usrcat_descriptor(custd::span<float const> coords_interleaved, molecule_shape_context_t const &context,
                               std::array<double, usrcat_components_k> &out) {
+    conformer_reader_t const coords = conformer_over_(coords_interleaved, context.num_atoms);
     custd::span<double> const row {out.data(), out.size()};
-    std::array<point3_t, usr_reference_point_count_k> const points = usr_block_into_(
-        coords_interleaved, context.num_atoms, row.subspan(0, usr_components_k));
+    std::array<point3_t, usr_reference_point_count_k> const points = usr_block_into_(coords,
+                                                                                     row.subspan(0, usr_components_k));
 
     for (std::size_t subset_index = 0; subset_index < credo_subset_count_k; ++subset_index)
-        moments_for_subset_(coords_interleaved, points, context.credo_subsets[subset_index],
+        moments_for_subset_(coords, points, context.credo_subsets[subset_index],
                             row.subspan((subset_index + 1) * usr_components_k, usr_components_k));
 }
 

@@ -13,7 +13,6 @@
 
 #pragma once
 
-#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
 
 #include <vector> // `std::vector`
@@ -52,17 +51,17 @@ struct component_placement_t {
 inline void separate_fragments(custd::span<float> coords_interleaved, molecule_shape_context_t const &context) {
     if (context.num_components <= 1) return;
     sf_assert_(context.component_label.size() >= context.num_atoms);
-    sf_assert_(coords_interleaved.size() >= static_cast<std::size_t>(context.num_atoms) * 3u);
+    types::conformer_aos_t const coords = conformer_over_(coords_interleaved, context.num_atoms);
 
     constexpr double margin_k = 2.0;
-    std::uint32_t const num_atoms = context.num_atoms;
+    std::uint32_t const num_atoms = coords.extent(0);
     std::vector<component_placement_t> placements(context.num_components);
 
     // Centroid of each component.
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
         sf_assert_(context.component_label[atom_index] < context.num_components);
         component_placement_t &placement = placements[context.component_label[atom_index]];
-        point3_t const point = read_point_(coords_interleaved, atom_index);
+        point3_t const point = read_point_(coords, atom_index);
         placement.centroid.x += point.x;
         placement.centroid.y += point.y;
         placement.centroid.z += point.z;
@@ -78,7 +77,7 @@ inline void separate_fragments(custd::span<float> coords_interleaved, molecule_s
     // Bounding-sphere radius of each component about its centroid.
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
         component_placement_t &placement = placements[context.component_label[atom_index]];
-        double const distance = point_distance_(read_point_(coords_interleaved, atom_index), placement.centroid);
+        double const distance = point_distance_(read_point_(coords, atom_index), placement.centroid);
         if (distance > placement.radius) placement.radius = distance;
     }
 
@@ -92,10 +91,9 @@ inline void separate_fragments(custd::span<float> coords_interleaved, molecule_s
 
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
         point3_t const &translation = placements[context.component_label[atom_index]].translation;
-        std::size_t const base = static_cast<std::size_t>(atom_index) * 3u;
-        coords_interleaved[base + 0u] += static_cast<float>(translation.x);
-        coords_interleaved[base + 1u] += static_cast<float>(translation.y);
-        coords_interleaved[base + 2u] += static_cast<float>(translation.z);
+        coords(atom_index, 0) += static_cast<float>(translation.x);
+        coords(atom_index, 1) += static_cast<float>(translation.y);
+        coords(atom_index, 2) += static_cast<float>(translation.z);
     }
 }
 
