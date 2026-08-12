@@ -1240,11 +1240,19 @@ context_t::context_t(custd::span<int const> devices) {
         device_ids.resize(max_devices_k);
     }
 
-    std::size_t const device_count = device_ids.size();
-    streams.resize(device_count);
-    metric_scratch.resize(device_count);
-    launch_scratch.resize(device_count);
-    launch_configs.assign(device_count, device_launch_config_t {});
+    // Every container below is filled only on the success path of the bring-up loop, so a device that
+    // refuses is absent rather than present-and-null. `device_ids` is rewritten from the survivors at the
+    // end, which is what stops preprocess partitioning molecules across a device the launch cannot reach.
+    // Reserved rather than resized: the loop appends, and reserving up front means no regrow moves a
+    // half-built entry.
+    std::vector<int> const requested_device_ids = device_ids;
+    std::size_t const requested_count = requested_device_ids.size();
+    device_ids.clear();
+    device_ids.reserve(requested_count);
+    streams.reserve(requested_count);
+    metric_scratch.reserve(requested_count);
+    launch_scratch.reserve(requested_count);
+    launch_configs.reserve(requested_count);
 
     // The MMFF94 parameter tables and the compiled CSD torsion patterns are process-wide constants
     // extracted once from RDKit; each device gets its own arena so no kernel reaches across a
@@ -1260,20 +1268,16 @@ context_t::context_t(custd::span<int const> devices) {
     // 148.5 KB of shared memory, above the 48 KB default.
     std::size_t const max_embed_shared_bytes = smallfield::cuda::embed_shared_bytes(max_atoms_per_molecule_k);
 
-    for (std::size_t device_index = 0; device_index < device_count; ++device_index) {
-        int const device_id = device_ids[device_index];
+    for (int const device_id : requested_device_ids) {
         if (!sink.check(cudaSetDevice(device_id), "cudaSetDevice(context_t)")) continue;
-        if (!sink.check(cudaStreamCreate(&streams[device_index]), "cudaStreamCreate")) continue;
-        cudaStream_t const stream = streams[device_index];
+        cudaStream_t stream = nullptr;
+        if (!sink.check(cudaStreamCreate(&stream), "cudaStreamCreate")) continue;
 
-        launch_scratch[device_index] = std::make_unique<launch_scratch_t>(stream);
-        launch_scratch_t &scratch = *launch_scratch[device_index];
-        // The metric scratch is reserved lazily by `ensure_metric_scratch`, so it only needs its stream now.
-        metric_scratch[device_index].group_indices = device_indices_t {device_allocator_t {stream}};
+        auto scratch_owner = std::make_unique<launch_scratch_t>(stream);
+        launch_scratch_t &scratch = *scratch_owner;
         upload_mmff94_tables_to_device(mmff_tables_host, scratch.mmff_tables, stream, sink);
         upload_csd_torsion_table_to_device(csd_torsion_host, scratch.csd_torsion_table, stream, sink);
         scratch.events.create(sink);
-        populate_device_launch_config_(device_id, launch_configs[device_index], sink);
         [[maybe_unused]] bool const shared_raised = sink.check(
             cudaFuncSetAttribute(smallfield::cuda::embed_4d_power_iter_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(max_embed_shared_bytes)),
@@ -1281,7 +1285,24 @@ context_t::context_t(custd::span<int const> devices) {
         if (scratch.mmff_staging.try_reserve(mmff_staging_layout_k.bytes_total) == reserve_outcome_t::failed_k)
             this->logger.error("context_t: MMFF staging allocation ({} bytes) failed on device {}",
                                mmff_staging_layout_k.bytes_total, device_id);
+
+        device_launch_config_t launch_config {};
+        populate_device_launch_config_(device_id, launch_config, sink);
+        // The metric scratch is reserved lazily by `ensure_metric_scratch`, so it only needs its stream now.
+        metric_scratch_t scratch_for_metric;
+        scratch_for_metric.group_indices = device_indices_t {device_allocator_t {stream}};
+
+        device_ids.push_back(device_id);
+        streams.push_back(stream);
+        launch_scratch.push_back(std::move(scratch_owner));
+        launch_configs.push_back(launch_config);
+        metric_scratch.push_back(std::move(scratch_for_metric));
     }
+
+    if (device_ids.size() != requested_count)
+        this->logger.error("context_t: {} of {} devices came up; the rest are not used", device_ids.size(),
+                           requested_count);
+    std::size_t const device_count = device_ids.size();
 
     // Pre-allocate every per-device wave pool so the hot path never grows: a grow discards the
     // buffer's contents whatever it costs, so `launch_gpu_pipeline` asserts it finds `unchanged_k`.
@@ -1296,7 +1317,6 @@ context_t::context_t(custd::span<int const> devices) {
         per_device_reserved_molecules, max_conformer_count_k, max_atoms_per_molecule_k);
 
     for (std::size_t device_index = 0; device_index < device_count; ++device_index) {
-        if (!launch_scratch[device_index]) continue;
         int const device_id = device_ids[device_index];
         if (!sink.check(cudaSetDevice(device_id), "cudaSetDevice(context_t reserve)")) continue;
         // Probes at `per_device_reserved_molecules` molecules of `max_atoms_per_molecule_k` atoms each.
@@ -1318,11 +1338,14 @@ context_t::context_t(custd::span<int const> devices) {
 }
 
 context_t::~context_t() {
+    // Every entry is whole: the constructor appends a device only once its stream and scratch exist, so
+    // there is no half-built slot to test for here. The scratch is released before its stream, because
+    // `cudaFreeAsync` against a destroyed stream is undefined.
     for (std::size_t device_index = 0; device_index < device_ids.size(); ++device_index) {
         cudaSetDevice(device_ids[device_index]);
-        if (launch_scratch[device_index]) launch_scratch[device_index]->events.destroy();
+        launch_scratch[device_index]->events.destroy();
         launch_scratch[device_index].reset();
-        if (streams[device_index] != nullptr) cudaStreamDestroy(streams[device_index]);
+        cudaStreamDestroy(streams[device_index]);
     }
 }
 
