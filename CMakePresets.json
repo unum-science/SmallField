@@ -38,11 +38,12 @@
     {
       "name": "profile",
       "displayName": "Profiling",
-      "description": "Release plus CUDA line info, so `ncu` can attribute stalls to source lines.",
+      "description": "Release plus CUDA line info for `ncu` and NVTX ranges for `nsys` role timelines.",
       "inherits": "release",
       "binaryDir": "${sourceDir}/build-profile",
       "cacheVariables": {
-        "SMALLFIELD_CUDA_LINEINFO": "ON"
+        "SMALLFIELD_CUDA_LINEINFO": "ON",
+        "SMALLFIELD_USE_NVTX": "ON"
       }
     }
   ],

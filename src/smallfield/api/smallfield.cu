@@ -19,6 +19,7 @@
 #include <vector>        // `std::vector`
 
 #include "smallfield/api/smallfield.hpp"
+#include "smallfield/api/wave_capture.hpp"
 #include "smallfield/api/wave_slice_pool.hpp"
 #include "smallfield/cuda/bond_distance_kernel.cuh"
 #include "smallfield/cuda/csd_torsion_kernel.cuh"
@@ -949,6 +950,21 @@ static void enqueue_binned_kernels_(batch_pool_view_t device_view,
                                             types::conformer_dimensions_k;
         std::size_t const slot_base = static_cast<std::size_t>(bin_start) * conformer_count;
 
+        capture_outcome_t const capture = capture_bin_launch(device_view, regions.batch.size(),
+                                                             regions.metric_embedding,
+                                                             {.bin_start = bin_start,
+                                                              .bin_size = bin_size,
+                                                              .conformer_count = conformer_count,
+                                                              .max_stereo_attempts = config.max_stereo_attempts,
+                                                              .bin_max_atoms = bin_max_atoms,
+                                                              .gpu_max_atoms = gpu_max_atoms,
+                                                              .grid_etkdg = grid_size_etkdg,
+                                                              .grid_mmff = grid_size_mmff,
+                                                              .shared_bytes_etkdg = shared_bytes_etkdg,
+                                                              .shared_bytes_mmff = shared_bytes_mmff,
+                                                              .random_seed = config.random_seed},
+                                                             stream);
+
         etkdg_pipeline_warp_kernel<<<grid_size_etkdg, warp_size_k, shared_bytes_etkdg, stream>>>(
             device_view.bounds_matrices().data(),
             regions.metric_embedding.data() +
@@ -969,6 +985,7 @@ static void enqueue_binned_kernels_(batch_pool_view_t device_view,
             regions.coordinates_fp32.data() + coordinate_base, regions.energies.data() + slot_base,
             regions.status.data() + slot_base, bin_size, conformer_count, gpu_max_atoms, bin_max_atoms);
         check_launch_(sink, "mmff_polish_warp_kernel launch");
+        if (capture == capture_outcome_t::captured_k) report_captured_bin_timing(stream);
 
         bin_start = bin_end;
     }

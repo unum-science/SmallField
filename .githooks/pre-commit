@@ -551,7 +551,15 @@ check_host_threads() {
 #
 # The open paren is part of the pattern so cudaMallocAsync, cudaFreeAsync and cudaMallocHost - which
 # are the replacements - do not match the rule that sends you to them.
+#
+# `bench/bench_kernel_replay.cu` is exempt. It links the CUDA runtime and nothing else, because every
+# profiler dies inside a binary carrying the conda-forge stack, and it allocates once before the region
+# it measures and ends that setup on an explicit `cudaDeviceSynchronize`. The device-wide stall the rule
+# exists to prevent is one this file asks for by hand, so the stream-ordered forms would buy it nothing.
 check_cuda_allocation() {
+    case "$file" in
+    bench/bench_kernel_replay.cu) return 0 ;;
+    esac
     local synchronous
     synchronous=$(printf '%s\n' "$added" |
         code_only |
