@@ -288,7 +288,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     float *__restrict__ conformer_energies_out, std::uint8_t *__restrict__ conformer_status_out,
     std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t max_stereo_attempts,
     std::uint32_t max_atoms_per_molecule, std::uint32_t initial_coordinate_stride, std::uint32_t output_atoms_stride,
-    std::uint32_t wave_input_base, std::uint64_t random_seed) {
+    std::uint64_t random_seed) {
 
     std::uint32_t const warp_id = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
@@ -369,16 +369,14 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
         etk_torsion_descriptor_t const *mol_torsions = torsion_terms + meta.torsion_offset;
         distance_constraint_t const *mol_constraints = distance_constraints + meta.constraint_offset;
 
-        // Seed Philox from the molecule's position in the caller's input, not from its offset
-        // inside the device batch. Preprocess distributes molecules across host threads with a
-        // dynamic schedule and then atom-count-sorts them, so the batch offset of a given
-        // molecule varies between runs while its input position does not; keying off the input
-        // position is what makes a fixed `random_seed` reproduce the same conformers. The
-        // conformer index enters the stream too, so the conformers of one molecule stay
-        // independent of each other.
-        std::uint64_t const global_input_index = wave_input_base + molecule_input_indices[molecule];
-        std::uint64_t const sequence = (global_input_index * num_conformers_per_molecule + conformer) * warp_size_k +
-                                       lane;
+        // Seed Philox from the caller's own row, which `molecule_input_indices` already holds. Everything
+        // between the caller and here reorders molecules — preprocess distributes across host threads on a
+        // dynamic schedule and atom-count-sorts, the dispatcher length-sorts the whole input and splits it
+        // into waves — and a fixed `random_seed` reproduces the same conformers only if the stream is keyed
+        // to something none of that moves. The conformer index enters the stream too, so the conformers of
+        // one molecule stay independent of each other.
+        std::uint64_t const caller_row = molecule_input_indices[molecule];
+        std::uint64_t const sequence = (caller_row * num_conformers_per_molecule + conformer) * warp_size_k + lane;
 
         // Rebuilding it at the head of every attempt from an explicit absolute offset keeps it
         // out of the DG, crush, and ETK stages entirely. The offset is the exact position the

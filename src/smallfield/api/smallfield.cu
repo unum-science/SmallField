@@ -928,15 +928,14 @@ struct gpu_pipeline_handle_t {
  *  @param[in] launch_config Per-bin occupancy, probed once at construction.
  *  @param[in] config Conformer count, stereo retry limit and seed.
  *  @param[in] gpu_max_atoms Coordinate stride these launches write at.
- *  @param[in] wave_base First sorted input position this wave covers; seeds the per-conformer RNG.
  *  @param[in] stream Stream to enqueue on.
  *  @param[in] sink Error sink routing failures through the caller's logger.
  */
 static void enqueue_binned_kernels_(batch_pool_view_t device_view,
                                     custd::span<etkdg_molecule_metadata_t const> host_metadata,
                                     device_wave_regions_t const &regions, device_launch_config_t const &launch_config,
-                                    config_t const &config, std::uint32_t gpu_max_atoms, std::uint32_t wave_base,
-                                    cudaStream_t stream, cuda_error_sink_t const &sink) {
+                                    config_t const &config, std::uint32_t gpu_max_atoms, cudaStream_t stream,
+                                    cuda_error_sink_t const &sink) {
     std::uint32_t const molecule_count = static_cast<std::uint32_t>(host_metadata.size());
     std::uint32_t const conformer_count = config.num_conformers;
     auto *const device_metadata = device_view.molecule_metadata().data();
@@ -973,7 +972,7 @@ static void enqueue_binned_kernels_(batch_pool_view_t device_view,
             device_view.etk_atom_offsets().data(), device_metadata + bin_start,
             device_view.input_indices().data() + bin_start, regions.coordinates_fp32.data() + coordinate_base,
             regions.energies.data() + slot_base, regions.status.data() + slot_base, bin_size, conformer_count,
-            config.max_stereo_attempts, bin_max_atoms, gpu_max_atoms, gpu_max_atoms, wave_base, config.random_seed);
+            config.max_stereo_attempts, bin_max_atoms, gpu_max_atoms, gpu_max_atoms, config.random_seed);
         check_launch_(sink, "etkdg_pipeline_warp_kernel launch");
 
         mmff_polish_warp_kernel<<<grid_size_mmff, warp_size_k, shared_bytes_mmff, stream>>>(
@@ -1093,7 +1092,7 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
 
     events.open(wave_phase_t::kernels_k, stream);
     enqueue_binned_kernels_(device_view, host_metadata, regions, context.launch_configs[device_index], config,
-                            gpu_max_atoms, outputs.wave_base, stream, sink);
+                            gpu_max_atoms, stream, sink);
 
     events.open(wave_phase_t::download_k, stream);
     enqueue_download_(regions, staged, stream, sink);
@@ -1129,9 +1128,9 @@ static void finalize_gpu_pipeline(gpu_pipeline_handle_t &handle) {
                                                             "cudaStreamSynchronize(finalize)");
     handle.events.elapsed_into(handle.timings);
 
-    // Preprocess wrote this device's batch in atom-count ascending order, so `input_indices[sorted]`
-    // maps a staged slot back to its position within the wave, and `wave_outputs_t::caller_index_of`
-    // then converts that position into the caller's own row.
+    // Preprocess wrote this device's batch in atom-count ascending order, and `prepare` has already
+    // translated `input_indices` into the caller's own rows, so a staged slot maps to its destination
+    // with no further indirection.
     std::uint32_t const molecule_count = static_cast<std::uint32_t>(handle.input_indices.size());
     std::uint32_t const conformer_count = handle.conformer_count;
     conformer_slot_layout_t const destination_layout {handle.host_max_atoms, conformer_count};
@@ -1146,7 +1145,7 @@ static void finalize_gpu_pipeline(gpu_pipeline_handle_t &handle) {
     // are still finalized one at a time, so the fan-out here gives each device's permutation every core.
 #pragma omp parallel for schedule(static)
     for (std::uint32_t sorted_index = 0; sorted_index < molecule_count; ++sorted_index) {
-        std::uint32_t const caller_index = handle.outputs.caller_index_of(handle.input_indices[sorted_index]);
+        std::uint32_t const caller_index = handle.input_indices[sorted_index];
         for (std::uint32_t conformer = 0; conformer < conformer_count; ++conformer) {
             std::size_t const source_slot = static_cast<std::size_t>(sorted_index) * conformer_count + conformer;
             std::size_t const destination_slot = static_cast<std::size_t>(caller_index) * conformer_count + conformer;
@@ -1428,6 +1427,15 @@ struct wave_dispatcher_t {
                                         host_max_atoms, slot, &rejected);
 
         wave_outputs_t const wave_outputs = outputs_for(range);
+
+        // Preprocess numbers its molecules by their position in the slice it was handed, and that slice is a
+        // wave of the length-sorted order. Translate to the caller's own rows here, once, so everything
+        // downstream reads one fact rather than two: the finalize scatter indexes the caller's buffers
+        // directly, and the kernel seeds Philox from a row that does not move when the batch changes.
+        for (wave_slice_pool_t &batch : slot) {
+            custd::span<std::uint32_t> const input_indices = batch.input_indices();
+            for (std::uint32_t &index : input_indices) index = wave_outputs.caller_index_of(index);
+        }
         for (rejected_mol_t const &entry : rejected) {
             std::uint32_t const caller_index = wave_outputs.caller_index_of(entry.slice_local_index);
             for (std::uint32_t conformer = 0; conformer < config.num_conformers; ++conformer)
@@ -1440,7 +1448,7 @@ struct wave_dispatcher_t {
             custd::span<etkdg_molecule_metadata_t const> const metadata = batch.molecule_metadata();
             custd::span<std::uint32_t const> const input_indices = batch.input_indices();
             for (std::uint32_t molecule = 0; molecule < batch.num_molecules; ++molecule)
-                readback.write(wave_outputs.caller_index_of(input_indices[molecule]), metadata[molecule]);
+                readback.write(input_indices[molecule], metadata[molecule]);
         }
     }
 
