@@ -27,7 +27,7 @@ __global__ void chirality_check_kernel(float const *positions, std::uint32_t num
 
 namespace smallfield::tests {
 
-/** Grow-only device storage over the legacy default stream, which is the one this check launches on. */
+/** Grow-only device storage over the stream this check creates for itself. */
 template <typename value_type_>
 using device_array = sft::buffer<value_type_, sft::device_allocator_t>;
 
@@ -36,6 +36,10 @@ struct chirality_arena_t {
     device_array<float> coordinates;
     device_array<sft::chiral_center_descriptor_t> centers;
     device_array<bool> verdict;
+
+    /** Bind every array to the stream the check's transfers and launch ride, so each free reaches it. */
+    explicit chirality_arena_t(sft::device_allocator_t allocator) noexcept
+        : coordinates(allocator), centers(allocator), verdict(allocator) {}
 
     /** Reserve one molecule's coordinates and centers; false when the device refused any of them. */
     [[nodiscard]] bool resize_for(std::size_t num_components, std::size_t num_centers) noexcept {
@@ -56,24 +60,39 @@ chirality_verdict_t gpu_validate_chirality(conformer_soa_reader_t host_coords,
     std::uint32_t const num_atoms = host_coords.extent(0);
     std::size_t const num_components = sft::conformer_dimensions_k * std::size_t {num_atoms};
 
-    chirality_arena_t arena;
-    if (!arena.resize_for(num_components, host_chirals.size())) return chirality_verdict_t::unavailable_k;
-
-    custd::span<float const> const coordinates {host_coords.data_handle(), num_components};
-    if (!sft::upload_into(arena.coordinates.view(), coordinates, nullptr)) return chirality_verdict_t::unavailable_k;
-    if (!sft::upload_into(arena.centers.view(), host_chirals, nullptr)) return chirality_verdict_t::unavailable_k;
-
-    chirality_check_kernel<<<1, sfc::warp_size_k>>>(arena.coordinates.data(), num_atoms, arena.centers.data(),
-                                                    static_cast<std::uint32_t>(host_chirals.size()),
-                                                    arena.verdict.data());
-
-    bool satisfied = false;
-    custd::span<bool const> const device_verdict = arena.verdict.view();
-    if (!sft::download_from(custd::span<bool> {&satisfied, 1}, device_verdict, nullptr))
+    cudaStream_t stream = nullptr;
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
         return chirality_verdict_t::unavailable_k;
-    cudaStreamSynchronize(nullptr);
 
-    return satisfied ? chirality_verdict_t::satisfied_k : chirality_verdict_t::violated_k;
+    // Only a kernel answer that came back off the stream decides this, so a staging or launch failure leaves
+    // the caller a refusal rather than a violation the device never reported.
+    chirality_verdict_t verdict = chirality_verdict_t::unavailable_k;
+
+    // The arrays live inside the stream's lifetime, so every stream-ordered free runs against a live stream.
+    {
+        chirality_arena_t arena {sft::device_allocator_t {.stream = stream}};
+        custd::span<float const> const coordinates {host_coords.data_handle(), num_components};
+
+        bool staged = arena.resize_for(num_components, host_chirals.size());
+        staged = staged && sft::upload_into(arena.coordinates.view(), coordinates, stream);
+        staged = staged && sft::upload_into(arena.centers.view(), host_chirals, stream);
+
+        if (staged) {
+            chirality_check_kernel<<<1, sfc::warp_size_k, 0, stream>>>(
+                arena.coordinates.data(), num_atoms, arena.centers.data(),
+                static_cast<std::uint32_t>(host_chirals.size()), arena.verdict.data());
+
+            bool satisfied = false;
+            custd::span<bool const> const device_verdict = arena.verdict.view();
+            bool const read_back = sft::download_from(custd::span<bool> {&satisfied, 1}, device_verdict, stream);
+            cudaError_t const drained = cudaStreamSynchronize(stream);
+            if (read_back && drained == cudaSuccess)
+                verdict = satisfied ? chirality_verdict_t::satisfied_k : chirality_verdict_t::violated_k;
+        }
+    }
+
+    cudaStreamDestroy(stream);
+    return verdict;
 }
 
 } // namespace smallfield::tests
