@@ -1,5 +1,6 @@
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from setuptools import setup
@@ -12,9 +13,15 @@ import numpy as np
 
 is_macos = platform.system() == "Darwin"
 is_linux = platform.system() == "Linux"
-is_nvcc_available = os.system("which nvcc > /dev/null 2>&1") == 0
+nvcc_path = shutil.which("nvcc")
 enable_openmp = not is_macos
-enable_cuda = is_linux and is_nvcc_available
+enable_cuda = is_linux and nvcc_path is not None
+
+# The CMake tree this links against, and where every intermediate object lands. `build` is what the
+# presets configure and stays the default; SMALLFIELD_BUILD_DIR points a parallel session at a
+# private tree instead, so validating the binding does not write into a build directory something
+# else is using.
+smallfield_build_dir = os.environ.get("SMALLFIELD_BUILD_DIR") or "build"
 
 # RDKit ships no pkg-config, so probe the usual prefixes most-explicit first.
 # RDKIT_PREFIX mirrors the CMake flag, CONDA_PREFIX covers an activated conda or
@@ -47,14 +54,22 @@ rdkit_include_root = os.path.join(rdkit_prefix, "include")
 rdkit_include_dir = os.path.join(rdkit_include_root, "rdkit")
 rdkit_lib_dir = os.path.join(rdkit_prefix, "lib")
 
-cuda_root_candidates = [
-    os.environ.get("CUDA_HOME"),
-    os.environ.get("CUDA_PATH"),
-    "/usr/local/cuda-13.0",
-    "/usr/local/cuda",
-    "/usr",
-]
-cuda_root = next((candidate for candidate in cuda_root_candidates if candidate and os.path.exists(candidate)), "")
+# The toolkit is the one holding the `nvcc` on PATH, resolved through its symlinks, rather than a
+# guess at where a toolkit is installed. `/usr/local/cuda` is an alternatives symlink that routinely
+# names a different release than the `nvcc` that will run, and picking headers from one release while
+# compiling under another is not a latent inconsistency: it is how `fatal error: cuda/std/array`
+# arrives from a host compile that never saw the toolkit it was meant to build against. CUDA_HOME and
+# CUDA_PATH still win, since naming a toolkit that is not first on PATH is what they are for.
+cuda_root = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or ""
+if not cuda_root and nvcc_path:
+    cuda_root = os.path.dirname(os.path.dirname(os.path.realpath(nvcc_path)))
+if not cuda_root:
+    raise SystemExit(
+        "SmallField needs a CUDA toolkit to build the Python binding: it includes libcu++\n"
+        "through `smallfield/api/conformer_layout.hpp` whatever it ends up linking.\n"
+        "Put `nvcc` on PATH, or pass CUDA_HOME=/path/to/toolkit."
+    )
+
 cuda_include_dirs = [
     os.path.join(cuda_root, "targets", "x86_64-linux", "include"),
     os.path.join(cuda_root, "include"),
@@ -66,6 +81,18 @@ cuda_library_dirs = [
     "/usr/lib/x86_64-linux-gnu",
     "/usr/lib/wsl/lib",
 ]
+
+# CUDA 12 is what the binding builds against, and this is where that claim is stated: 13 relocated
+# libcu++ from `include/cuda/std` to `include/cccl/cuda/std`, so the include paths above find nothing
+# under it and the host compile of `_binding.cpp` has nowhere else to look. Probing exactly the
+# directories that reach the compiler is what lets the refusal name the toolkit, rather than leaving
+# a missing header to surface a minute into a compile.
+if not any(os.path.exists(os.path.join(path, "cuda", "std", "array")) for path in cuda_include_dirs):
+    raise SystemExit(
+        f"The CUDA toolkit at {cuda_root} carries no libcu++ under include/cuda/std.\n"
+        "CUDA 13 moved it to include/cccl, which this binding does not build against.\n"
+        "Pass CUDA_HOME=/path/to/cuda-12.x, or put that toolkit's `nvcc` first on PATH."
+    )
 
 rdkit_libraries = [
     "RDKitSmilesParse",
@@ -89,170 +116,32 @@ boost_libraries = ["boost_serialization", "boost_iostreams"]
 
 
 class BuildExt(build_ext):
-    def build_extensions(self):
-        self.ensure_smallfield_libraries()
-        self.compiler.src_extensions.append(".cu")
+    def finalize_options(self):
+        super().finalize_options()
+        # Objects land beside the CMake tree they link against rather than under setuptools' own
+        # `build/`, so a private build directory is private for the whole build and not only for
+        # the library it resolves.
+        self.build_temp = os.path.join(smallfield_build_dir, os.path.basename(self.build_temp))
 
-        for ext in self.extensions:
-            if any(source.endswith(".cu") for source in ext.sources):
-                if is_nvcc_available:
-                    self.build_cuda_extension(ext)
-                else:
-                    self.build_gcc_extension(ext)
-            else:
-                super().build_extension(ext)
+    def build_extensions(self):
+        # The extension is one `.cpp` against a library CMake has already built, so the only thing
+        # this adds to the base class is making sure that library exists.
+        self.ensure_smallfield_libraries()
+        super().build_extensions()
 
     def ensure_smallfield_libraries(self):
-        static_library = os.path.join("build", "libsmallfield_lib.a")
-        shared_library = os.path.join("build", "libsmallfield_python_lib.so")
+        static_library = os.path.join(smallfield_build_dir, "libsmallfield_lib.a")
+        shared_library = os.path.join(smallfield_build_dir, "libsmallfield_python_lib.so")
         if os.path.exists(static_library) and os.path.exists(shared_library):
             return
 
-        configure_cmd = ["cmake", "-S", ".", "-B", "build"]
+        configure_cmd = ["cmake", "-S", ".", "-B", smallfield_build_dir]
         configure_cmd.append(f"-DRDKIT_PREFIX={rdkit_prefix}")
         subprocess.run(configure_cmd, check=True)
         subprocess.run(
-            ["cmake", "--build", "build", "--target", "smallfield_lib", "smallfield_python_lib", "-j"], check=True
+            ["cmake", "--build", smallfield_build_dir, "--target", "smallfield_lib", "smallfield_python_lib", "-j"],
+            check=True,
         )
-
-    def build_cuda_extension(self, ext):
-        # Compile CUDA source files
-        for source in ext.sources:
-            if source.endswith(".cu"):
-                self.compile_cuda(source)
-
-        # Compile non-CUDA source files
-        objects = []
-        for source in ext.sources:
-            if not source.endswith(".cu"):
-                obj = self.compiler.compile(
-                    [source],
-                    output_dir=self.build_temp,
-                    extra_postargs=[
-                        "-fPIC",
-                        "-std=c++20",
-                        "-fdiagnostics-color=always",
-                        "-DSMALLFIELD_BUILD_PYTHON=1",
-                    ]
-                    + ext.extra_compile_args,
-                    include_dirs=ext.include_dirs,
-                )
-                objects.extend(obj)
-
-        # Link all object files
-        self.compiler.link_shared_object(
-            objects + [os.path.join(self.build_temp, "smallfield.o")],
-            self.get_ext_fullpath(ext.name),
-            libraries=ext.libraries,
-            library_dirs=ext.library_dirs,
-            runtime_library_dirs=ext.runtime_library_dirs,
-            extra_postargs=ext.extra_link_args,
-            target_lang=ext.language,
-        )
-
-    def build_gcc_extension(self, ext):
-        # Fallback for compiling on macOS or without CUDA
-        objects = []
-        for source in ext.sources:
-            if source.endswith(".cu"):
-                obj = self.compiler.compile(
-                    [source],
-                    output_dir=self.build_temp,
-                    extra_preargs=["-x", "c++"],
-                    extra_postargs=[
-                        "-fPIC",
-                        "-std=c++20",
-                        "-fdiagnostics-color=always",
-                        "-DSMALLFIELD_BUILD_PYTHON=1",
-                    ]
-                    + ext.extra_compile_args
-                    + (["-fopenmp"] if enable_openmp else []),
-                    include_dirs=ext.include_dirs,
-                )
-            else:
-                obj = self.compiler.compile(
-                    [source],
-                    output_dir=self.build_temp,
-                    extra_postargs=[
-                        "-fPIC",
-                        "-std=c++20",
-                        "-fdiagnostics-color=always",
-                        "-DSMALLFIELD_BUILD_PYTHON=1",
-                    ]
-                    + ext.extra_compile_args
-                    + (["-fopenmp"] if enable_openmp else []),
-                    include_dirs=ext.include_dirs,
-                )
-            objects.extend(obj)
-
-        # Link all object files
-        self.compiler.link_shared_object(
-            objects,
-            self.get_ext_fullpath(ext.name),
-            libraries=[lib for lib in ext.libraries if not lib.startswith("cu")],
-            library_dirs=ext.library_dirs,
-            runtime_library_dirs=ext.runtime_library_dirs,
-            extra_postargs=ext.extra_link_args,
-            target_lang=ext.language,
-        )
-
-    def compile_cuda(self, source):
-        # Compile CUDA source file using NVCC
-        ext = self.extensions[0]
-        output_dir = self.build_temp
-        os.makedirs(output_dir, exist_ok=True)
-        include_dirs = self.compiler.include_dirs + ext.include_dirs
-        include_dirs = " ".join(f"-I{dir}" for dir in include_dirs)
-        output_file = os.path.join(output_dir, "smallfield.o")
-
-        # Detected per build, unlike CMakeLists.txt which ships a multi-arch fatbin.
-        default_arch_code = "90"
-        arch_code = None
-        try:
-            import pycuda.driver as cuda
-            import pycuda.autoinit
-
-            device = cuda.Device(0)  # Get the default device
-            major, minor = device.compute_capability()
-            arch_code = f"{major}{minor}"
-        except ImportError:
-            # Fallback: try nvidia-smi to detect compute capability
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-                    capture_output=True, text=True
-                )
-                if result.returncode == 0:
-                    cap = result.stdout.strip().split("\n")[0].strip()
-                    arch_code = cap.replace(".", "")
-            except Exception:
-                pass
-
-        if arch_code is None:
-            # No GPU reachable, so the guess is probably wrong. Say so rather than
-            # silently emitting a binding for the wrong device.
-            arch_code = default_arch_code
-            print(
-                f"warning: no GPU detected, building the Python binding for sm_{arch_code}. "
-                f"Set CUDA_ARCH_CODE to override.",
-                file=sys.stderr,
-            )
-        arch_code = os.environ.get("CUDA_ARCH_CODE", arch_code)
-
-        # Pass AVX-512 flags to host compiler via -Xcompiler
-        host_flags = (
-            "-fPIC,-mavx512f,-mavx512bw,-mavx512dq,-mavx512vl,-mavx512bf16,-mavx512fp16"
-        )
-        if enable_openmp:
-            host_flags += ",-fopenmp"
-        cmd = (
-            f"nvcc -c {source} -o {output_file} -std=c++20 "
-            f"-gencode=arch=compute_{arch_code},code=sm_{arch_code} "
-            f"-Xcompiler {host_flags} {include_dirs} -DSMALLFIELD_BUILD_PYTHON=1 -O3 -g"
-        )
-        if os.system(cmd) != 0:
-            raise RuntimeError(f"nvcc compilation of {source} failed")
 
 
 # Get Python library path dynamically
@@ -272,9 +161,9 @@ ext_modules = [
             rdkit_include_dir,
         ]
         + [path for path in cuda_include_dirs if path and os.path.exists(path)],
-        library_dirs=[python_lib_dir, rdkit_lib_dir, "build"]
+        library_dirs=[python_lib_dir, rdkit_lib_dir, smallfield_build_dir]
         + [path for path in cuda_library_dirs if path and os.path.exists(path)],
-        extra_objects=[os.path.abspath(os.path.join("build", "libsmallfield_python_lib.so"))],
+        extra_objects=[os.path.abspath(os.path.join(smallfield_build_dir, "libsmallfield_python_lib.so"))],
         libraries=[python_lib_name.replace(".a", "")]
         + rdkit_libraries
         + boost_libraries
@@ -287,7 +176,7 @@ ext_modules = [
         extra_compile_args=["-std=c++20", "-fPIC", "-march=native"]
         + (["-fopenmp"] if enable_openmp else []),
         extra_link_args=[f"-Wl,-rpath,{python_lib_dir}"]
-        + [f"-Wl,-rpath,{os.path.abspath('build')}"]
+        + [f"-Wl,-rpath,{os.path.abspath(smallfield_build_dir)}"]
         + [f"-Wl,-rpath,{rdkit_lib_dir}"]
         + (["-fopenmp"] if enable_openmp else []),
         language="c++",

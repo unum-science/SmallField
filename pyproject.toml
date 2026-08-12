@@ -44,9 +44,6 @@ classifiers = [
 [project.optional-dependencies]
 test = ["pytest", "pytest-benchmark", "rdkit"]
 dev = ["pytest", "pytest-benchmark", "rdkit", "pybind11", "black", "ruff"]
-# `setup.py` reads the GPU's compute capability to pick one architecture for the
-# binding. It falls back to `nvidia-smi`, so this is a convenience, not a requirement.
-gpu-autodetect = ["pycuda"]
 
 # The VERSION file is the single source of truth. The release workflow rewrites every other copy
 # from it, so nothing needs to assert that they agree.
