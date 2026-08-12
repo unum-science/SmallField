@@ -359,6 +359,19 @@ static constexpr float near_flat_retention_k = 0.02f;
 /** Fraction kept for the finite-difference sweep: well inside the penalty's active branch, and smooth. */
 static constexpr float penalized_retention_k = 0.3f;
 
+/** Relative agreement demanded between the minimiser's own report and a fresh evaluation of it. */
+static constexpr double reported_state_relative_tolerance_k = 1e-3;
+
+static bool rms_gradients_agree_(double recomputed, double reported) {
+    return std::fabs(reported - recomputed) <=
+           reported_state_relative_tolerance_k * std::max(1e-6, std::fabs(recomputed));
+}
+
+/** The word a `fire_status_t` prints as, so the diagnostic key is readable and greppable. */
+static std::string_view fire_status_name_(smallfield::cuda::fire_status_t status) noexcept {
+    return status == smallfield::cuda::fire_status_t::converged_k ? "converged" : "exhausted";
+}
+
 static bool increased_(double before, double after) { return after > before; }
 static bool decreased_(double before, double after) { return after < before; }
 static bool both_finite_(double reference, double observed) {
@@ -724,16 +737,25 @@ static void check_minimization_(sftest::diagnostic_reporter_t &reporter, molecul
     float const final_violation = max_bound_violation_(coordinates, bounds);
     float const final_fourth = mean_fourth_dimension_magnitude_(coordinates);
 
+    // The report has to describe the positions it handed back rather than a state one step earlier,
+    // so both of its numbers are checked against a fresh evaluation exactly where it stopped.
+    float recomputed_energy = 0.0f;
+    gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &recomputed_energy);
+    double const element_count = static_cast<double>(coordinates.extent(0)) * coordinates.extent(1);
+    double const recomputed_rms = gradient_norm_(gradient) / std::sqrt(element_count);
+
     sft::transpose_into(coordinates, interleaved);
     sftest::set_coords_interleaved(molecule, interleaved.data_handle());
     double const mmff_at_dg_coords = sftest::rdkit_mmff94_energy(molecule);
 
     reporter
-        .mismatch("dg_minimize", "smiles={} atoms={} status={} iterations={}", smiles, num_atoms, report.status,
-                  report.iterations)
+        .mismatch("dg_minimize", "smiles={} atoms={} status={} iterations={}", smiles, num_atoms,
+                  fire_status_name_(report.status), report.iterations)
         .field("energy", start_energy, final_energy, decreased_)
         .field("max_violation", start_violation, final_violation, decreased_)
         .field("fourth_dimension_magnitude", start_fourth, final_fourth, decreased_)
+        .field("reported_energy", recomputed_energy, final_energy, energies_agree_)
+        .field("reported_rms_gradient", recomputed_rms, report.rms_gradient, rms_gradients_agree_)
         .field("mmff94_energy", mmff_at_embedding, mmff_at_dg_coords, both_finite_);
 }
 

@@ -128,12 +128,13 @@ __global__ void dg_minimize_kernel(sftest::device_problem_t problem, float const
     std::uint32_t const bounds_bytes_aligned =
         (problem.num_atoms * bounds_row_stride * sizeof(std::uint8_t) + sizeof(float) - 1) & ~(sizeof(float) - 1);
     float *shared_float = reinterpret_cast<float *>(shared_raw + bounds_bytes_aligned);
-    float *velocities = shared_float;
-    float *gradient = velocities + num_elements;
+    sfc::fire_scratch<sft::embedding_dimensions_k> const scratch {
+        .positions = sfc::fire_positions<sft::embedding_dimensions_k> {positions, problem.num_atoms},
+        .velocities = sfc::fire_velocities<sft::embedding_dimensions_k> {shared_float, problem.num_atoms},
+        .gradient = sfc::fire_gradient<sft::embedding_dimensions_k> {shared_float + num_elements, problem.num_atoms}};
 
     auto const functor = make_functor_(problem);
-    sfc::fire_result_t const result = sfc::fire_minimize_(positions, velocities, gradient, num_elements, max_iterations,
-                                                          gradient_threshold, lane, functor);
+    sfc::fire_result_t const result = sfc::fire_minimize_(scratch, max_iterations, gradient_threshold, lane, functor);
     if (lane == 0) {
         out_report->energy = result.energy;
         out_report->rms_gradient = result.rms_gradient;
@@ -246,7 +247,8 @@ void gpu_dg_minimize(dg_problem_t const &host_problem, float *host_coords, std::
     // FIRE needs velocities and a gradient beside the bounds; positions stay in global memory.
     std::uint32_t const bounds_bytes_aligned = (staged.bounds_shared_bytes() + sizeof(float) - 1) &
                                                ~(sizeof(float) - 1);
-    std::uint32_t const shared_bytes = bounds_bytes_aligned + 2 * staged.num_elements * sizeof(float);
+    std::uint32_t const shared_bytes = bounds_bytes_aligned +
+                                       2 * staged.num_elements * static_cast<std::uint32_t>(sizeof(float));
 
     dg_minimize_kernel<<<1, 32, shared_bytes, staged.stream>>>(staged.problem, staged.bounds, staged.coordinates,
                                                                max_iterations, gradient_threshold, device_report);

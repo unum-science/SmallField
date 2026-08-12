@@ -7,6 +7,7 @@
 
 #include <cstdint> // `std::int32_t`, `std::uint32_t`
 
+#include "smallfield/cuda/fire_warp.cuh" // `smallfield::cuda::fire_status_t`, outside its CUDA guard
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::tests {
@@ -53,12 +54,12 @@ void gpu_dg_energy(dg_problem_t const &problem, float const *host_coords, float 
  */
 std::uint32_t gpu_count_invalid_chiral_centers(dg_problem_t const &problem, float const *host_coords);
 
-/** What FIRE reported when it stopped. */
+/** What FIRE reported when it stopped; every field describes the positions it handed back. */
 struct dg_minimize_report_t {
     float energy = 0.0f;
     float rms_gradient = 0.0f;
     std::int32_t iterations = 0;
-    std::int32_t status = 0;
+    cuda::fire_status_t status = cuda::fire_status_t::converged_k;
 };
 
 /**

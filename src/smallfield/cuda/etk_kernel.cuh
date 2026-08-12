@@ -231,8 +231,8 @@ __device__ __forceinline__ float evaluate_etk_torsion_energy(
 /**
  *  @brief Atom-centric ETK torsion energy and gradient functor.
  *
- *  Thin wrapper around `evaluate_etk_torsion_energy` that provides the
- *  `operator()` / `energy_only()` interface expected by `fire_minimize_`.
+ *  Thin wrapper around `evaluate_etk_torsion_energy` that provides the `operator()` interface
+ *  expected by `fire_minimize_`.
  */
 struct etk_torsion_energy_functor_t {
     etk_torsion_descriptor_t const *__restrict__ torsion_terms;
@@ -245,12 +245,6 @@ struct etk_torsion_energy_functor_t {
                                                 std::uint32_t lane) const {
         return evaluate_etk_torsion_energy<true>(torsion_terms, distance_constraints, interactions, atom_offsets,
                                                  num_atoms, positions, gradient, num_elements, lane);
-    }
-
-    __device__ __forceinline__ float energy_only(float const *positions, std::uint32_t num_elements,
-                                                 std::uint32_t lane) const {
-        return evaluate_etk_torsion_energy<false>(torsion_terms, distance_constraints, interactions, atom_offsets,
-                                                  num_atoms, positions, nullptr, num_elements, lane);
     }
 };
 

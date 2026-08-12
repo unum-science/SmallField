@@ -8,54 +8,131 @@
  *  Functor interface:
  *  @code
  *    float functor(positions, gradient, num_elements, lane)
- *    float functor.energy_only(positions, num_elements, lane)
  *  @endcode
  */
 
 #pragma once
 
-#if defined(__CUDACC__)
-
-#include "smallfield/cuda/warp_primitives.cuh"
+#include <cstdint> // `std::int32_t`
 
 namespace smallfield::cuda {
 
 /**
- *  @brief Outcome of a FIRE minimization stage.
+ *  @brief Why a FIRE stage stopped.
  *
- *  All fields are warp-uniform: every lane returns the same struct value
- *  because energy / rms_gradient are warp-reduced inside the loop and
- *  iterations / status are derived from the (uniform) loop counter.
+ *  Outside the CUDA guard below because a host caller staging or reporting a stage's outcome needs
+ *  to name the two states, and the enumerator is the name.
+ */
+enum class fire_status_t : std::int32_t {
+    /** The RMS gradient fell below the stage's threshold. */
+    converged_k = 0,
+    /** The iteration budget ran out first. */
+    exhausted_k = 1,
+};
+
+} // namespace smallfield::cuda
+
+#if defined(__CUDACC__)
+
+#include "smallfield/cuda/warp_primitives.cuh"
+#include "smallfield/types/views.hpp"
+
+namespace smallfield::cuda {
+using smallfield::types::coordinate_role_t;
+using smallfield::types::coordinates_soa;
+
+/** The positions a FIRE stage moves, at @p dimensions_ rows per atom. */
+template <std::size_t dimensions_>
+using fire_positions = coordinates_soa<coordinate_role_t::position_k, float, dimensions_>;
+
+/** The momentum FIRE carries between steps, in the same shape and layout as the positions. */
+template <std::size_t dimensions_>
+using fire_velocities = coordinates_soa<coordinate_role_t::velocity_k, float, dimensions_>;
+
+/** Where the energy functor writes what it computed, in the same shape and layout again. */
+template <std::size_t dimensions_>
+using fire_gradient = coordinates_soa<coordinate_role_t::gradient_k, float, dimensions_>;
+
+/**
+ *  @brief The three same-shaped arrays a FIRE stage walks together.
+ *
+ *  Positions, velocities and a gradient have identical shape, layout and element type, so as three
+ *  bare pointers under one count nothing but their order tells them apart — and the order is
+ *  restated at every call. Swapping the last two compiles and minimizes something else: the driver
+ *  zeroes what it thinks are velocities and the functor overwrites what it thinks is the gradient.
+ *  `coordinate_role_t` is an accessor rather than a wrapper, so naming them costs no bytes.
+ *
+ *  @tparam dimensions_ Rows per atom: four while the fourth dimension is live, three afterwards.
+ */
+template <std::size_t dimensions_>
+struct fire_scratch {
+    fire_positions<dimensions_> positions;
+    fire_velocities<dimensions_> velocities;
+    fire_gradient<dimensions_> gradient;
+};
+
+/**
+ *  @brief Outcome of a FIRE minimization stage, taken at the positions it hands back.
+ *
+ *  All fields are warp-uniform: every lane returns the same struct value because energy and
+ *  `rms_gradient` are warp-reduced inside the loop and the other two are derived from the uniform
+ *  loop counter.
+ *
+ *  The energy and the gradient norm describe the @b same geometry, which is the geometry in
+ *  `positions` on return. That is not free: it is why the loop stops one step short rather than
+ *  taking a move it has not measured.
  */
 struct fire_result_t {
     float energy;
+    /**
+     *  Root-mean-square gradient over @b elements, so the same threshold is a different absolute
+     *  norm per stage: distance geometry and the fourth-dimension crush run at four elements per
+     *  atom and the ETK and MMFF stages at three, which is a factor of sqrt(4/3) between them for
+     *  one molecule. `select_refinement_policy_` sets the ETK and MMFF thresholds separately and the
+     *  distance-geometry stages carry their own, so the four are calibrated apart rather than shared.
+     */
     float rms_gradient;
     std::int32_t iterations;
-    /** 0 = converged below @p gradient_threshold, 1 = hit max_iterations. */
-    std::int32_t status;
+    fire_status_t status;
 };
+
+/**
+ *  Largest root-mean-square displacement one step may apply, in angstrom.
+ *
+ *  It bounds the step's length and leaves its direction alone. Bounding each component instead
+ *  bounds a box rather than a ball, so a step whose components differ in magnitude comes out
+ *  rotated: the components that clipped shrank and the ones that did not kept their length, and the
+ *  minimizer then walks somewhere the energy never pointed.
+ */
+constexpr float max_root_mean_square_step_k = 0.5f;
 
 /**
  *  @brief FIRE minimization driver.
  *
+ *  @tparam dimensions_ Rows per atom the stage works in.
  *  @tparam energy_gradient_functor_ Callable: float(positions, gradient, num_elements, lane)
  *
- *  @param[inout] positions Coordinate array (modified in place). Length = @p num_elements.
- *  @param[inout] velocities Shared memory for FIRE velocities. Length = @p num_elements.
- *  @param[out] gradient Shared memory for gradient. Length = @p num_elements.
- *  @param[in] num_elements Total coordinate dimensions (e.g., 3*N or 4*N).
- *  @param[in] max_iterations Maximum FIRE iterations.
+ *  @param[inout] scratch The stage's positions, velocities and gradient, each named by its role.
+ *  @param[in] max_iterations Maximum energy evaluations; one fewer step is taken, so the state
+ *      reported is one the driver measured rather than one it moved to and never looked at.
  *  @param[in] gradient_threshold Convergence when rms(gradient) < threshold.
  *  @param[in] lane Warp lane index (threadIdx.x % 32).
  *  @param[in] compute_energy_gradient The energy/gradient functor.
  *  @return Warp-uniform `fire_result_t` with energy, RMS gradient, iteration count, and status.
  *  @see distance_geometry_energy_functor_t, etk_torsion_energy_functor_t, mmff94_energy_functor_t
  */
-template <typename energy_gradient_functor_>
-__device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float *velocities, float *gradient,
-                                                        std::uint32_t num_elements, std::int32_t max_iterations,
+template <std::size_t dimensions_, typename energy_gradient_functor_>
+__device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_> scratch, std::int32_t max_iterations,
                                                         float gradient_threshold, std::uint32_t lane,
                                                         energy_gradient_functor_ &&compute_energy_gradient) {
+    // The evaluators take the flat arrays a kernel formal parameter can carry `__restrict__` on, so
+    // the roles stop here: they exist to keep the three apart at every call site, which is where a
+    // transposition would otherwise compile.
+    float *const positions = scratch.positions.data_handle();
+    float *const velocities = scratch.velocities.data_handle();
+    float *const gradient = scratch.gradient.data_handle();
+    std::uint32_t const num_elements = scratch.positions.extent(0) * static_cast<std::uint32_t>(dimensions_);
+
     // FIRE parameters (Bitzek et al., PRL 2006)
     constexpr float initial_timestep_k = 0.05f;
     constexpr float max_timestep_k = 0.5f;
@@ -68,7 +145,10 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
     float timestep = initial_timestep_k;
     float alpha = initial_alpha_k;
     int steps_since_reset = 0;
-    float last_rms_gradient = 0.0f;
+
+    // The state the driver last measured, and the state it returns.
+    float energy = 0.0f;
+    float rms_gradient = 0.0f;
 
     // zero velocities
     for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) velocities[element] = 0.0f;
@@ -76,7 +156,7 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
 
     for (std::int32_t iteration = 0; iteration < max_iterations; ++iteration) {
         // compute energy and gradient (gradient = -force, so force = -gradient)
-        float const energy = compute_energy_gradient(positions, gradient, num_elements, lane);
+        energy = compute_energy_gradient(positions, gradient, num_elements, lane);
         __syncwarp(full_mask_k);
 
         // fused computation: rms_gradient, power, velocity_norm, force_norm in a single pass
@@ -97,11 +177,17 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
             velocity_dot_velocity += __shfl_xor_sync(full_mask_k, velocity_dot_velocity, offset);
         }
 
-        float const rms_gradient = sqrtf(gradient_dot_gradient / static_cast<float>(num_elements));
-        last_rms_gradient = rms_gradient;
-        if (rms_gradient < gradient_threshold) {
-            return {energy, rms_gradient, iteration, 0};
-        }
+        rms_gradient = sqrtf(gradient_dot_gradient / static_cast<float>(num_elements));
+        if (rms_gradient < gradient_threshold)
+            return {.energy = energy,
+                    .rms_gradient = rms_gradient,
+                    .iterations = iteration,
+                    .status = fire_status_t::converged_k};
+
+        // The last budgeted evaluation has happened, so a step now would move the structure past the
+        // only state this call has measured, and the caller would read an energy and a gradient norm
+        // belonging to two different geometries.
+        if (iteration + 1 == max_iterations) break;
 
         float const power = -gradient_dot_velocity; // P = F·v = -∇E·v
         if (power > 0.0f) {
@@ -131,20 +217,38 @@ __device__ __forceinline__ fire_result_t fire_minimize_(float *positions, float 
         }
         __syncwarp(full_mask_k);
 
-        // velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt
+        // velocity Verlet: x += v·dt − ½·g·dt², then v -= g·dt, with the whole step held to a
+        // trust region on its length. Its length is not known until the step is built, so the sweep
+        // runs twice: once to measure, once to apply. The second pass rebuilds the step rather than
+        // parking it, because a fourth shared array of `num_elements` floats would cost more than
+        // the arithmetic does.
         float const half_timestep_squared = 0.5f * timestep * timestep;
+        float step_dot_step = 0.0f;
         for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
-            float displacement = fmaf(velocities[element], timestep, -gradient[element] * half_timestep_squared);
-            displacement = fmaxf(-0.5f, fminf(0.5f, displacement));
-            positions[element] += displacement;
-            velocities[element] = fmaf(gradient[element], -timestep, velocities[element]);
+            float const step = fmaf(velocities[element], timestep, -gradient[element] * half_timestep_squared);
+            step_dot_step = fmaf(step, step, step_dot_step);
+        }
+        step_dot_step = warp_reduce_sum_f32_(step_dot_step);
+
+        float const root_mean_square_step = sqrtf(step_dot_step / static_cast<float>(num_elements));
+        float const step_scale = root_mean_square_step > max_root_mean_square_step_k
+                                     ? max_root_mean_square_step_k / root_mean_square_step
+                                     : 1.0f;
+
+        // The scale rides the velocity increment too: a bounded step is a shorter step, and the
+        // momentum it feeds into the next iteration has to agree with how far it actually went.
+        for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
+            float const step = fmaf(velocities[element], timestep, -gradient[element] * half_timestep_squared);
+            positions[element] += step * step_scale;
+            velocities[element] = fmaf(gradient[element], -timestep * step_scale, velocities[element]);
         }
         __syncwarp(full_mask_k);
     }
 
-    // max iterations reached — report the last computed energy
-    float const final_energy = compute_energy_gradient.energy_only(positions, num_elements, lane);
-    return {final_energy, last_rms_gradient, max_iterations, 1};
+    return {.energy = energy,
+            .rms_gradient = rms_gradient,
+            .iterations = max_iterations,
+            .status = fire_status_t::exhausted_k};
 }
 
 } // namespace smallfield::cuda

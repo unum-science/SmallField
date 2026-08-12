@@ -561,8 +561,8 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
 /**
  *  @brief MMFF94 energy and gradient functor using per-atom interaction lists.
  *
- *  Thin wrapper around `evaluate_mmff94_energy` that provides the
- *  `operator()` / `energy_only()` interface expected by `fire_minimize_`.
+ *  Thin wrapper around `evaluate_mmff94_energy` that provides the `operator()` interface expected
+ *  by `fire_minimize_`.
  */
 struct mmff94_energy_functor_t {
     mmff94_atom_vdw_params_t const *__restrict__ atom_vdw_params;
@@ -582,13 +582,6 @@ struct mmff94_energy_functor_t {
         return evaluate_mmff94_energy<true>(atom_vdw_params, atom_charge, bond_distance, bond_params, angle_params,
                                             torsion_params, oop_params, stretchbend_params, interactions, atom_offsets,
                                             num_atoms, positions, gradient, num_elements, lane);
-    }
-
-    __device__ __forceinline__ float energy_only(float const *positions, std::uint32_t num_elements,
-                                                 std::uint32_t lane) const {
-        return evaluate_mmff94_energy<false>(atom_vdw_params, atom_charge, bond_distance, bond_params, angle_params,
-                                             torsion_params, oop_params, stretchbend_params, interactions, atom_offsets,
-                                             num_atoms, positions, nullptr, num_elements, lane);
     }
 };
 

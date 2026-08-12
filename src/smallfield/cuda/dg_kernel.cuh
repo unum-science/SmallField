@@ -304,8 +304,8 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
 /**
  *  @brief Atom-centric distance geometry energy and gradient functor.
  *
- *  Thin wrapper around `evaluate_distance_geometry_energy` that provides the
- *  `operator()` / `energy_only()` interface expected by `fire_minimize_`.
+ *  Thin wrapper around `evaluate_distance_geometry_energy` that provides the `operator()`
+ *  interface expected by `fire_minimize_`.
  *
  *  Bounds matrix stored as uint8_t in shared memory, with the per-molecule
  *  dequantization pair (mol_min, inv_scale) held in registers.
@@ -343,24 +343,6 @@ struct distance_geometry_energy_functor_t {
             bounds_matrix, mol_min, inv_scale, bounds_row_stride, chiral_centers, num_atoms, num_chiral_centers,
             spatial_dimension, upper_violation_weight, lower_violation_weight, chiral_volume_weight,
             fourth_dimension_penalty_weight, positions, gradient, num_elements, lane);
-    }
-
-    /**
-     *  @brief Energy-only evaluation (skips gradient writes).
-     *
-     *  Used by line search.
-     *
-     *  @param[in] positions SoA coordinate array.
-     *  @param[in] num_elements Total number of coordinate elements.
-     *  @param[in] lane Warp lane index (0-31).
-     *  @return Total energy (same value in all lanes after warp reduction).
-     */
-    __device__ __forceinline__ float energy_only(float const *positions, std::uint32_t num_elements,
-                                                 std::uint32_t lane) const {
-        return evaluate_distance_geometry_energy<false>(
-            bounds_matrix, mol_min, inv_scale, bounds_row_stride, chiral_centers, num_atoms, num_chiral_centers,
-            spatial_dimension, upper_violation_weight, lower_violation_weight, chiral_volume_weight,
-            fourth_dimension_penalty_weight, positions, nullptr, num_elements, lane);
     }
 };
 
