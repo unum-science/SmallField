@@ -96,17 +96,6 @@ struct etkdg_molecule_metadata_t {
     /** Offset into batched ETK atom offsets. */
     std::uint32_t etk_atom_csr_offset;
     /**
-     *  @brief Reserved for a future host-side bounds quantisation step.
-     *
-     *  The pipeline computes per-molecule (mol_min, inv_scale) inside `etkdg_pipeline_warp_kernel`
-     *  because the metric prepass smooths bounds in global memory and the quantise step must scan
-     *  the @b post-smoothed values. If smoothing ever moves host-side these slots can carry the
-     *  pre-quantised range — until then they are unused, `prepare_molecule_into` sets them to
-     *  {0, 1}, and the kernel ignores them.
-     */
-    float bounds_min;
-    float bounds_inv_scale;
-    /**
      *  @brief Heavy, non-hydrogen, atom count.
      *
      *  This and the two fields below are optional readbacks, populated by preprocess and bubbled
@@ -120,6 +109,7 @@ struct etkdg_molecule_metadata_t {
     /** Exact molecular weight in Daltons. */
     float molecular_weight;
 };
+static_assert(sizeof(etkdg_molecule_metadata_t) == 108);
 
 /**
  *  @brief Chiral center descriptor.
@@ -145,6 +135,7 @@ struct alignas(8) chiral_center_descriptor_t {
     std::int8_t target_sign;
     std::uint8_t padding[2];
 };
+static_assert(sizeof(chiral_center_descriptor_t) == 8);
 
 /**
  *  ETK torsion term from CSD preferences — the Cambridge Structural Database.
@@ -161,6 +152,7 @@ struct alignas(32) etk_torsion_descriptor_t {
     /** V₁ through V₆ in kcal/mol. */
     float fourier_coefficients[6];
 };
+static_assert(sizeof(etk_torsion_descriptor_t) == 32);
 
 /**
  *  Distance constraint for distance geometry and ETK refinement stages.
@@ -175,9 +167,7 @@ struct alignas(16) distance_constraint_t {
     std::uint8_t atom_index_i;
     /** Second atom index within molecule. */
     std::uint8_t atom_index_j;
-    /** 0 = 1-2 bond, 1 = 1-3 angle-derived, 2 = custom. */
-    std::uint8_t constraint_type;
-    std::uint8_t padding;
+    std::uint8_t padding[2];
     /** Minimum allowed interatomic distance. */
     float lower_bound_angstrom;
     /** Maximum allowed interatomic distance. */
@@ -185,6 +175,7 @@ struct alignas(16) distance_constraint_t {
     /** Force constant for bound violation penalty. */
     float penalty_weight;
 };
+static_assert(sizeof(distance_constraint_t) == 16);
 
 /**
  *  @brief Per-atom MMFF94 VdW parameters.
@@ -342,6 +333,7 @@ struct mmff94_atom_interaction_t {
     mmff94_interaction_type_t interaction_type;
     atom_role_t role;
 };
+static_assert(sizeof(mmff94_atom_interaction_t) == 8);
 
 /**
  *  @brief Per-atom per-type offsets into the MMFF94 interaction list.
@@ -367,6 +359,7 @@ struct mmff94_atom_offsets_t {
     std::uint32_t oop_count;
     std::uint32_t stretchbend_count;
 };
+static_assert(sizeof(mmff94_atom_offsets_t) == 40);
 
 /**
  *  @brief Per-atom ETK interaction descriptor.
@@ -377,6 +370,7 @@ struct etk_atom_interaction_t {
     etk_interaction_type_t interaction_type;
     atom_role_t role;
 };
+static_assert(sizeof(etk_atom_interaction_t) == 8);
 
 /**
  *  @brief Per-atom offset into the ETK interaction list.
@@ -385,6 +379,7 @@ struct etk_atom_offsets_t {
     std::uint32_t interaction_offset;
     std::uint32_t interaction_count;
 };
+static_assert(sizeof(etk_atom_offsets_t) == 8);
 
 /**
  *  @brief One molecule the device MMFF typer cannot type, with the host's answer for it.
@@ -408,5 +403,6 @@ struct mmff94_typing_patch_t {
     std::uint32_t patch_base;
     std::uint32_t atom_count;
 };
+static_assert(sizeof(mmff94_typing_patch_t) == 16);
 
 } // namespace smallfield::types

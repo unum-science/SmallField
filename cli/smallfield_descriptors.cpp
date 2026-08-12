@@ -38,10 +38,9 @@
 #include <chrono>        // `std::chrono::steady_clock`
 #include <filesystem>    // `std::filesystem::path`
 #include <memory>        // `std::shared_ptr`
-#include <stdexcept>     // `std::runtime_error`
 #include <string>        // `std::string`
 #include <string_view>   // `std::string_view`
-#include <system_error>  // `std::errc`
+#include <system_error>  // `std::error_code`
 #include <unordered_map> // `std::unordered_map`
 #include <vector>        // `std::vector`
 
@@ -59,7 +58,9 @@
 #include "smallfield/postprocess/shape_descriptors.hpp"
 #include "smallfield/types/views.hpp"
 
+#include "cli/cli_arguments.hpp"
 #include "cli/parquet_writer.hpp"
+#include "cli/shard_inventory.hpp"
 
 namespace fs = std::filesystem;
 namespace sfapi = smallfield::api;
@@ -100,8 +101,8 @@ struct cli_config_t {
     std::string dataset;
     /** OpenMP threads across molecules within a shard; resolved to the core count when the flag says 0. */
     int threads = 0;
-    /** Skip shards whose `<output>.encoded` sentinel exists. */
-    bool resume = true;
+    /** Whether a shard whose `<output>.encoded` sentinel exists is skipped or augmented again. */
+    sfcli::restart_policy_t restart_policy = sfcli::restart_policy_t::resume_k;
     /** Coord stride / provenance `max_atoms`. */
     std::uint32_t max_atoms = sfapi::max_atoms_per_molecule_k;
 };
@@ -119,88 +120,7 @@ void print_usage_() {
 )");
 }
 
-/** Outcome of a command line: a usable configuration, a help request, or a rejected command line. */
-enum class cli_parse_t {
-    parsed_k,
-    help_requested_k,
-    invalid_k,
-};
-
-/** Why a command-line token was accepted or refused as a number. */
-enum class number_parse_t {
-    /** The whole token is a number inside the accepted range. */
-    parsed_k,
-    /** The token is not a number, or carries trailing characters. */
-    malformed_k,
-    /** The token is a number the destination type cannot hold. */
-    out_of_range_k,
-    /** The token parses but falls under the caller's floor. */
-    below_minimum_k,
-    /** The token parses but exceeds the caller's ceiling. */
-    above_maximum_k,
-};
-
-/**
- *  @brief Parse @p text whole as a number in `[minimum, maximum]`, leaving @p number untouched on refusal.
- *
- *  Partial parses are refusals: `12x` is malformed, not twelve. The destination keeps its prior value unless
- *  the token is accepted, so a caller may seed it with the default and read it back either way.
- *
- *  @param[in] text Token as it appeared on the command line.
- *  @param[in] minimum Smallest value the flag accepts.
- *  @param[in] maximum Largest value the flag accepts.
- *  @param[out] number Value the token denotes; untouched unless the whole token parses inside the bounds.
- */
-template <typename number_type_>
-number_parse_t parse_number_(std::string_view text, number_type_ minimum, number_type_ maximum, number_type_ &number) {
-    number_type_ parsed {};
-    auto const [unparsed, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
-    if (error == std::errc::result_out_of_range) return number_parse_t::out_of_range_k;
-    if (error != std::errc {} || unparsed != text.data() + text.size()) return number_parse_t::malformed_k;
-    if (parsed < minimum) return number_parse_t::below_minimum_k;
-    if (parsed > maximum) return number_parse_t::above_maximum_k;
-    number = parsed;
-    return number_parse_t::parsed_k;
-}
-
-/** Sentence fragment naming the refusal, meant to follow the flag name in a diagnostic. */
-char const *describe_number_parse_(number_parse_t status) {
-    switch (status) {
-    case number_parse_t::parsed_k: return "parsed";
-    case number_parse_t::malformed_k: return "is not a whole number";
-    case number_parse_t::out_of_range_k: return "does not fit the destination type";
-    case number_parse_t::below_minimum_k: return "is below the accepted minimum";
-    case number_parse_t::above_maximum_k: return "is above the accepted maximum";
-    }
-    return "was refused";
-}
-
-/**
- *  @brief Bind a string flag straight to its destination, so the parsed value never sits anywhere but the config.
- *
- *  `append` marks the flag repeatable, which is what keeps the last occurrence winning: without it `argparse` rejects
- *  a second occurrence outright, and a wrapper that appends an override to a fixed prefix stops working.
- */
-template <typename string_type_>
-void add_string_(argparse::ArgumentParser &parser, char const *flag, string_type_ &destination) {
-    parser.add_argument(flag).append().action([&destination](std::string const &text) { destination = text; });
-}
-
-/**
- *  @brief Bind a numeric flag bounded by `[minimum, maximum]`, naming both the flag and the reason on refusal.
- *
- *  The conversion stays ours rather than `argparse`'s `scan`, whose diagnostic is `pattern 'abc' does not match to
- *  the end` — it never names the flag the operator actually typed, and it has no bounds to enforce.
- */
-template <typename number_type_>
-void add_number_(argparse::ArgumentParser &parser, char const *flag, number_type_ minimum, number_type_ maximum,
-                 number_type_ &number) {
-    parser.add_argument(flag).append().action([flag, minimum, maximum, &number](std::string const &text) {
-        number_parse_t const status = parse_number_(text, minimum, maximum, number);
-        if (status != number_parse_t::parsed_k)
-            throw std::runtime_error(fmt::format("{} {}, got: {}", flag, describe_number_parse_(status), text));
-    });
-}
+using sfcli::cli_parse_t;
 
 cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
     // `default_arguments::none` suppresses the `-h` and `--version` that `argparse` would otherwise supply, so
@@ -208,15 +128,17 @@ cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
     argparse::ArgumentParser parser {executable_name_k, "", argparse::default_arguments::none};
     bool help_requested = false;
 
-    add_string_(parser, "--input", config.input_dir);
-    add_string_(parser, "--output", config.output_dir);
-    add_string_(parser, "--reembed", config.reembed_dir);
-    add_string_(parser, "--dataset", config.dataset);
+    sfcli::add_string(parser, "--input", config.input_dir);
+    sfcli::add_string(parser, "--output", config.output_dir);
+    sfcli::add_string(parser, "--reembed", config.reembed_dir);
+    sfcli::add_string(parser, "--dataset", config.dataset);
     // Zero threads is the documented "all cores", resolved below; the atom cap cannot exceed what the
     // kernels and the interleaved scratch here are dimensioned for.
-    add_number_(parser, "--threads", 0, max_threads_k, config.threads);
-    add_number_(parser, "--max-atoms", 1u, sfapi::max_atoms_per_molecule_k, config.max_atoms);
-    parser.add_argument("--restart").flag().append().action([&config](std::string const &) { config.resume = false; });
+    sfcli::add_number(parser, "--threads", 0, max_threads_k, config.threads);
+    sfcli::add_number(parser, "--max-atoms", 1u, sfapi::max_atoms_per_molecule_k, config.max_atoms);
+    parser.add_argument("--restart").flag().append().action([&config](std::string const &) {
+        config.restart_policy = sfcli::restart_policy_t::restart_k;
+    });
     parser.add_argument("-h", "--help").flag().append().action([&](std::string const &) {
         print_usage_();
         help_requested = true;
@@ -409,22 +331,26 @@ char const *describe_shard_listing_(shard_listing_t status) {
 
 /** One conformer row copied verbatim from a `--reembed` shard. */
 struct reembed_conformer_t {
-    std::uint8_t status = 0;
+    sfapi::conformer_status_t status = sfapi::conformer_status_t::success_k;
     float energy = 0.0f;
-    bool has_coords = false;
-    /** Tight interleaved (n_atoms, 3) fp16 bit patterns. */
-    std::vector<std::uint16_t> coord_bits;
+    /**
+     *  @brief Tight interleaved `(num_atoms, 3)` fp16 bit patterns, empty when the row carried no geometry.
+     *
+     *  Emptiness @b is the "no coordinates" answer, so no separate flag can disagree with the storage.
+     */
+    std::vector<std::uint16_t> coordinate_bits;
     /** USR is the first 12 of USRCAT, not stored separately. */
-    std::array<double, 60> usrcat {};
+    std::array<double, sfcli::usrcat_components_k> usrcat {};
 };
 
 /** One molecule copied verbatim from a `--reembed` shard (its already-corrected geometry). */
 struct reembed_molecule_t {
     std::uint8_t num_atoms = 0;
-    std::uint16_t n_heavy_atoms = 0;
-    std::uint16_t n_bonds = 0;
+    std::uint16_t num_heavy_atoms = 0;
+    std::uint16_t num_bonds = 0;
     float molecular_weight = 0.0f;
-    std::uint8_t n_conformers = 0;
+    /** K as the source shard recorded it, which is not the same fact as the rows actually carried. */
+    std::uint8_t num_conformers = 0;
     std::string smiles;
     std::vector<reembed_conformer_t> conformers;
 };
@@ -490,32 +416,31 @@ void load_reembed_shard_(input_shard_t const &shard, std::uint32_t max_atoms, re
             molecule.smiles = shard.smiles->GetString(row);
             std::uint16_t const stored_atoms = shard.n_atoms->IsValid(row) ? shard.n_atoms->Value(row) : 0;
             molecule.num_atoms = stored_atoms <= max_atoms ? static_cast<std::uint8_t>(stored_atoms) : 0;
-            molecule.n_heavy_atoms = shard.n_heavy_atoms && shard.n_heavy_atoms->IsValid(row)
-                                         ? shard.n_heavy_atoms->Value(row)
-                                         : 0;
-            molecule.n_bonds = shard.n_bonds && shard.n_bonds->IsValid(row) ? shard.n_bonds->Value(row) : 0;
+            molecule.num_heavy_atoms = shard.n_heavy_atoms && shard.n_heavy_atoms->IsValid(row)
+                                           ? shard.n_heavy_atoms->Value(row)
+                                           : 0;
+            molecule.num_bonds = shard.n_bonds && shard.n_bonds->IsValid(row) ? shard.n_bonds->Value(row) : 0;
             molecule.molecular_weight = shard.molecular_weight && shard.molecular_weight->IsValid(row)
                                             ? shard.molecular_weight->Value(row)
                                             : 0.0f;
-            molecule.n_conformers = shard.n_conformers->IsValid(row) ? shard.n_conformers->Value(row) : 0;
+            molecule.num_conformers = shard.n_conformers->IsValid(row) ? shard.n_conformers->Value(row) : 0;
         }
 
         reembed_conformer_t conformer;
-        conformer.status = shard.status->Value(row);
-        conformer.has_coords = coords_list.IsValid(row);
-        if (conformer.has_coords) {
+        conformer.status = static_cast<sfapi::conformer_status_t>(shard.status->Value(row));
+        if (coords_list.IsValid(row)) {
             std::int64_t const begin = coords_list.value_offset(row);
             std::int64_t const end = coords_list.value_offset(row + 1);
-            conformer.coord_bits.reserve(static_cast<std::size_t>(end - begin));
+            conformer.coordinate_bits.reserve(static_cast<std::size_t>(end - begin));
             for (std::int64_t value_index = begin; value_index < end; ++value_index)
-                conformer.coord_bits.push_back(coords_values.Value(value_index));
+                conformer.coordinate_bits.push_back(coords_values.Value(value_index));
         }
         if (shard.conformer_energy->IsValid(row)) conformer.energy = shard.conformer_energy->Value(row);
 
         if (usrcat_values && usrcat_column->IsValid(row)) {
             std::int64_t const begin = usrcat_column->value_offset(row);
-            if (usrcat_column->value_offset(row + 1) - begin >= 60)
-                for (std::size_t component = 0; component < 60; ++component)
+            if (usrcat_column->value_offset(row + 1) - begin >= sfcli::usrcat_components_k)
+                for (std::size_t component = 0; component < sfcli::usrcat_components_k; ++component)
                     conformer.usrcat[component] = half_bits_to_float_(
                         usrcat_values->Value(begin + static_cast<std::int64_t>(component)));
         }
@@ -580,7 +505,7 @@ void grow_if_needed_(std::vector<element_type_> &buffer, std::size_t count) {
 struct shard_buffers_t {
     std::vector<__half> coordinates;
     std::vector<float> energies;
-    std::vector<std::uint8_t> status_codes;
+    std::vector<sfapi::conformer_status_t> status;
     std::vector<double> usrcat;
 
     std::vector<std::string_view> smiles;
@@ -588,12 +513,10 @@ struct shard_buffers_t {
     std::vector<std::uint16_t> num_heavy_atoms_per_molecule;
     std::vector<std::uint16_t> num_bonds_per_molecule;
     std::vector<float> molecular_weight_per_molecule;
-    std::vector<std::uint8_t> n_conformers_per_molecule;
+    std::vector<std::uint8_t> num_conformers_per_molecule;
 
     /** `num_molecules + 1` bucket bounds into `molecule_rows`. */
     std::vector<std::uint64_t> molecule_row_offsets;
-    /** Write cursors used while bucketing, one per molecule. */
-    std::vector<std::uint64_t> molecule_row_cursors;
     /** Every row of the shard, grouped by molecule and in file order within a molecule. */
     std::vector<std::int64_t> molecule_rows;
 
@@ -604,31 +527,31 @@ struct shard_buffers_t {
      *  element the writer can read is written here, because a stale `smiles` view would otherwise point
      *  into the previous shard's released Arrow table.
      */
-    void reset_for(std::uint64_t num_molecules, std::uint32_t max_conformers, std::uint32_t max_atoms) {
-        std::size_t const total_slots = static_cast<std::size_t>(num_molecules) * max_conformers;
-        std::size_t const coordinate_total = total_slots * static_cast<std::size_t>(max_atoms) * 3u;
-        grow_if_needed_(coordinates, coordinate_total);
-        grow_if_needed_(energies, total_slots);
-        grow_if_needed_(status_codes, total_slots);
-        grow_if_needed_(usrcat, total_slots * 60u);
-        grow_if_needed_(smiles, num_molecules);
-        grow_if_needed_(num_atoms_per_molecule, num_molecules);
-        grow_if_needed_(num_heavy_atoms_per_molecule, num_molecules);
-        grow_if_needed_(num_bonds_per_molecule, num_molecules);
-        grow_if_needed_(molecular_weight_per_molecule, num_molecules);
-        grow_if_needed_(n_conformers_per_molecule, num_molecules);
-
-        std::fill_n(coordinates.begin(), coordinate_total, __float2half(0.0f));
-        std::fill_n(energies.begin(), total_slots, 0.0f);
+    void reset_for(std::uint64_t num_molecules, sfapi::conformer_slot_layout_t const &layout) {
+        std::size_t const total_slots = static_cast<std::size_t>(num_molecules) * layout.num_conformers;
+        std::size_t const coordinate_total = total_slots * layout.slot_stride();
+        auto reset_ = [](auto &buffer, std::size_t count, auto value) {
+            if (buffer.size() < count) buffer.resize(count);
+            std::fill_n(buffer.begin(), count, value);
+        };
+        reset_(coordinates, coordinate_total, __float2half(0.0f));
+        reset_(energies, total_slots, 0.0f);
         // A slot no molecule claims must not read as a success, so the unused tail defaults non-success.
-        std::fill_n(status_codes.begin(), total_slots, static_cast<std::uint8_t>(1));
-        std::fill_n(usrcat.begin(), total_slots * 60u, 0.0);
-        std::fill_n(smiles.begin(), num_molecules, std::string_view {});
-        std::fill_n(num_atoms_per_molecule.begin(), num_molecules, static_cast<std::uint8_t>(0));
-        std::fill_n(num_heavy_atoms_per_molecule.begin(), num_molecules, static_cast<std::uint16_t>(0));
-        std::fill_n(num_bonds_per_molecule.begin(), num_molecules, static_cast<std::uint16_t>(0));
-        std::fill_n(molecular_weight_per_molecule.begin(), num_molecules, 0.0f);
-        std::fill_n(n_conformers_per_molecule.begin(), num_molecules, static_cast<std::uint8_t>(0));
+        reset_(status, total_slots, sfapi::conformer_status_t::mmff_unconverged_k);
+        reset_(usrcat, total_slots * sfcli::usrcat_components_k, 0.0);
+        reset_(smiles, num_molecules, std::string_view {});
+        reset_(num_atoms_per_molecule, num_molecules, std::uint8_t {0});
+        reset_(num_heavy_atoms_per_molecule, num_molecules, std::uint16_t {0});
+        reset_(num_bonds_per_molecule, num_molecules, std::uint16_t {0});
+        reset_(molecular_weight_per_molecule, num_molecules, 0.0f);
+        reset_(num_conformers_per_molecule, num_molecules, std::uint8_t {0});
+    }
+
+    /** The rows molecule @p molecule_index owns, in the file order the bucketing preserved. */
+    [[nodiscard]] custd::span<std::int64_t const> rows_of(std::uint64_t molecule_index) const {
+        std::uint64_t const begin = molecule_row_offsets[molecule_index];
+        std::uint64_t const end = molecule_row_offsets[molecule_index + 1];
+        return {molecule_rows.data() + begin, static_cast<std::size_t>(end - begin)};
     }
 };
 
@@ -636,29 +559,32 @@ struct shard_buffers_t {
  *  @brief Bucket the shard's rows by molecule into @p buffers, keeping file order inside each bucket.
  *
  *  File order is conformer_index order within a molecule, which is what makes slot `conformer_slot` of the
- *  output the same conformer the input row described.
+ *  output the same conformer the input row described. The counting sort scatters through the offset array
+ *  itself and shifts it back afterwards, so no second cursor array can disagree with the bounds it copied.
  *
  *  @return Row count of the widest molecule, never below one.
  */
 std::uint32_t group_rows_by_molecule_(input_shard_t const &shard, std::uint64_t base_row, std::uint64_t num_molecules,
                                       shard_buffers_t &buffers) {
-    grow_if_needed_(buffers.molecule_row_offsets, num_molecules + 1);
-    grow_if_needed_(buffers.molecule_row_cursors, num_molecules);
+    std::vector<std::uint64_t> &offsets = buffers.molecule_row_offsets;
+    grow_if_needed_(offsets, num_molecules + 1);
     grow_if_needed_(buffers.molecule_rows, static_cast<std::size_t>(shard.num_rows));
-    std::fill_n(buffers.molecule_row_offsets.begin(), num_molecules + 1, 0ull);
+    std::fill_n(offsets.begin(), num_molecules + 1, 0ull);
 
-    for (std::int64_t row = 0; row < shard.num_rows; ++row)
-        ++buffers.molecule_row_offsets[shard.input_row->Value(row) - base_row + 1];
+    for (std::int64_t row = 0; row < shard.num_rows; ++row) ++offsets[shard.input_row->Value(row) - base_row + 1];
 
     std::uint32_t widest = 1;
     for (std::uint64_t molecule = 0; molecule < num_molecules; ++molecule) {
-        widest = std::max(widest, static_cast<std::uint32_t>(buffers.molecule_row_offsets[molecule + 1]));
-        buffers.molecule_row_offsets[molecule + 1] += buffers.molecule_row_offsets[molecule];
+        widest = std::max(widest, static_cast<std::uint32_t>(offsets[molecule + 1]));
+        offsets[molecule + 1] += offsets[molecule];
     }
 
-    std::copy_n(buffers.molecule_row_offsets.begin(), num_molecules, buffers.molecule_row_cursors.begin());
+    // Scatter with `offsets[molecule]` as the cursor, which leaves every entry holding the end of its own
+    // bucket; shifting the array right by one restores the bounds `rows_of` reads.
     for (std::int64_t row = 0; row < shard.num_rows; ++row)
-        buffers.molecule_rows[buffers.molecule_row_cursors[shard.input_row->Value(row) - base_row]++] = row;
+        buffers.molecule_rows[offsets[shard.input_row->Value(row) - base_row]++] = row;
+    for (std::uint64_t molecule = num_molecules; molecule > 0; --molecule) offsets[molecule] = offsets[molecule - 1];
+    offsets[0] = 0;
     return widest;
 }
 
@@ -681,6 +607,187 @@ enum class augment_t {
  *
  *  @param[inout] buffers Slot arrays for this shard, grown and reset in place; owned by the shard walk.
  */
+/** The contiguous `input_row` span a shard covers, from which `input_row = first_row + molecule_index`. */
+struct molecule_span_t {
+    std::uint64_t first_row = 0;
+    std::uint64_t num_molecules = 0;
+};
+
+/**
+ *  @brief The `input_row` range the shard's rows cover.
+ *
+ *  The 3D schema groups a molecule's rows and keeps `input_row` contiguous, so every molecule in the range
+ *  owns at least one row; the scan is what keeps that a measured fact rather than an assumed one.
+ */
+molecule_span_t molecule_span_of_(input_shard_t const &shard) {
+    std::uint64_t first_row = shard.input_row->Value(0);
+    std::uint64_t last_row = first_row;
+    for (std::int64_t row = 1; row < shard.num_rows; ++row) {
+        std::uint64_t const value = shard.input_row->Value(row);
+        first_row = std::min(first_row, value);
+        last_row = std::max(last_row, value);
+    }
+    return {.first_row = first_row, .num_molecules = last_row - first_row + 1};
+}
+
+/**
+ *  @brief Copy one already-corrected `--reembed` molecule into its slots, verbatim.
+ *
+ *  Nothing here is recomputed: the geometry, the energies and the descriptors are what the reembed run
+ *  produced, so a corrected molecule survives the augmentation unchanged.
+ */
+void copy_reembed_molecule_into_(reembed_molecule_t const &molecule, std::uint64_t molecule_index,
+                                 sfapi::conformer_slot_layout_t const &layout, shard_buffers_t &buffers) {
+    // string_view into the reembed store's persistent storage, which outlives every shard
+    buffers.smiles[molecule_index] = molecule.smiles;
+    buffers.num_atoms_per_molecule[molecule_index] = molecule.num_atoms;
+    buffers.num_heavy_atoms_per_molecule[molecule_index] = molecule.num_heavy_atoms;
+    buffers.num_bonds_per_molecule[molecule_index] = molecule.num_bonds;
+    buffers.molecular_weight_per_molecule[molecule_index] = molecule.molecular_weight;
+    buffers.num_conformers_per_molecule[molecule_index] = molecule.num_conformers;
+
+    std::uint32_t const num_atoms = molecule.num_atoms;
+    std::size_t const num_slots = std::min<std::size_t>(molecule.conformers.size(), layout.num_conformers);
+    for (std::size_t conformer_slot = 0; conformer_slot < num_slots; ++conformer_slot) {
+        reembed_conformer_t const &conformer = molecule.conformers[conformer_slot];
+        std::size_t const flat = static_cast<std::size_t>(molecule_index) * layout.num_conformers + conformer_slot;
+        buffers.status[flat] = conformer.status;
+        buffers.energies[flat] = conformer.energy;
+        if (conformer.status != sfapi::conformer_status_t::success_k) continue; // a failure row stays null
+        if (num_atoms == 0) continue;                                           // preprocess failed: no geometry
+        // The row's own geometry is shorter than the atom count it claims, so it cannot fill the slot.
+        if (conformer.coordinate_bits.size() < static_cast<std::size_t>(num_atoms) * 3u) continue;
+
+        // `coordinate_bits` holds the row's float16 patterns exactly as Arrow stored them, which is the
+        // pool's own storage; naming them `__half` keeps the transposition a verbatim copy instead of a
+        // numeric conversion of the bit pattern.
+        auto const *coordinate_halves = reinterpret_cast<__half const *>(conformer.coordinate_bits.data());
+        sfapi::scatter_interleaved_into_slot(
+            coordinate_halves, layout, num_atoms,
+            buffers.coordinates.data() +
+                layout.slot_offset(molecule_index, static_cast<std::uint32_t>(conformer_slot)));
+        std::copy(conformer.usrcat.begin(), conformer.usrcat.end(),
+                  buffers.usrcat.data() + flat * sfcli::usrcat_components_k);
+    }
+}
+
+/**
+ *  @brief Copy one molecule's per-molecule scalars out of the original shard.
+ *
+ *  @return Atoms the molecule carries, zero when it has no usable geometry — a molecule wider than the
+ *      coordinate stride cannot be laid into a slot, and narrowing its count to the stride would describe
+ *      another molecule's atoms, so it is treated exactly like a preprocess failure.
+ */
+std::uint8_t copy_molecule_scalars_into_(input_shard_t const &shard, std::int64_t first_row,
+                                         std::uint64_t molecule_index, std::uint32_t max_atoms,
+                                         shard_buffers_t &buffers) {
+    buffers.smiles[molecule_index] = shard.smiles->GetView(first_row);
+    std::uint16_t const stored_atoms = shard.n_atoms->IsValid(first_row) ? shard.n_atoms->Value(first_row) : 0;
+    std::uint8_t const num_atoms = stored_atoms <= max_atoms ? static_cast<std::uint8_t>(stored_atoms) : 0;
+    buffers.num_atoms_per_molecule[molecule_index] = num_atoms;
+    buffers.num_heavy_atoms_per_molecule[molecule_index] =
+        shard.n_heavy_atoms && shard.n_heavy_atoms->IsValid(first_row) ? shard.n_heavy_atoms->Value(first_row) : 0;
+    buffers.num_bonds_per_molecule[molecule_index] = shard.n_bonds && shard.n_bonds->IsValid(first_row)
+                                                         ? shard.n_bonds->Value(first_row)
+                                                         : 0;
+    buffers.molecular_weight_per_molecule[molecule_index] = shard.molecular_weight &&
+                                                                    shard.molecular_weight->IsValid(first_row)
+                                                                ? shard.molecular_weight->Value(first_row)
+                                                                : 0.0f;
+    buffers.num_conformers_per_molecule[molecule_index] = shard.n_conformers->IsValid(first_row)
+                                                              ? shard.n_conformers->Value(first_row)
+                                                              : 0;
+    return num_atoms;
+}
+
+/**
+ *  @brief Read one stored conformer row into @p interleaved, in the atom-major order the descriptors want.
+ *
+ *  @return The components the row actually held, which is short of `3 * num_atoms` on a truncated row.
+ */
+std::size_t read_row_coordinates_into_(input_shard_t const &shard, std::int64_t row, std::uint32_t num_atoms,
+                                       custd::span<float> interleaved) {
+    std::size_t const begin = static_cast<std::size_t>(shard.conformer_coords->value_offset(row));
+    std::size_t const stored = static_cast<std::size_t>(shard.conformer_coords->value_offset(row + 1)) - begin;
+    std::size_t const wanted = static_cast<std::size_t>(num_atoms) * 3u;
+    std::size_t const copied = std::min(stored, wanted);
+    for (std::size_t value_index = 0; value_index < copied; ++value_index)
+        interleaved[value_index] = half_bits_to_float_(
+            shard.coords_values->Value(static_cast<std::int64_t>(begin + value_index)));
+    return copied;
+}
+
+/**
+ *  @brief Lay one molecule's stored conformers into its slots and compute their descriptors.
+ *
+ *  Every conformer slot is written here, so the loop runs to completion even when an early row is a
+ *  failure: a `break` would leave the later slots holding the reset value. When the reparsed atom order
+ *  cannot be trusted the coordinates are still preserved and only the descriptors stay zero-filled.
+ */
+void augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t const> rows, std::uint64_t molecule_index,
+                       std::uint32_t num_atoms, sfpost::molecule_shape_context_t const &context, bool context_usable,
+                       sfapi::conformer_slot_layout_t const &layout, shard_buffers_t &buffers, shard_stats_t &stats) {
+    std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
+    std::size_t const num_slots = std::min<std::size_t>(rows.size(), layout.num_conformers);
+    for (std::size_t conformer_slot = 0; conformer_slot < num_slots; ++conformer_slot) {
+        std::int64_t const row = rows[conformer_slot];
+        auto const row_status = static_cast<sfapi::conformer_status_t>(shard.status->Value(row));
+        std::size_t const flat = static_cast<std::size_t>(molecule_index) * layout.num_conformers + conformer_slot;
+        buffers.status[flat] = row_status;
+        if (shard.conformer_energy->IsValid(row)) buffers.energies[flat] = shard.conformer_energy->Value(row);
+        if (row_status != sfapi::conformer_status_t::success_k) continue; // a failure row stays null
+        if (!shard.conformer_coords->IsValid(row)) continue;              // the row carried no geometry
+
+        // A row holding fewer components than its atom count claims cannot fill the slot, and copying the
+        // prefix would leave the previous conformer's coordinates in the tail of the shared scratch.
+        std::size_t const wanted = static_cast<std::size_t>(num_atoms) * 3u;
+        if (read_row_coordinates_into_(shard, row, num_atoms, interleaved) < wanted) continue;
+        custd::span<float> const coordinates {interleaved.data(), wanted};
+
+        // Multi-fragment safety net: separate disconnected components and write the corrected geometry
+        // back, mirroring the producer. Only when the context is usable, since it needs the labels.
+        if (context_usable && context.num_components > 1) {
+            sfpost::separate_fragments(coordinates, context);
+            stats.fragments_separated.fetch_add(1, std::memory_order_relaxed);
+        }
+        sfapi::scatter_interleaved_into_slot(
+            interleaved.data(), layout, num_atoms,
+            buffers.coordinates.data() +
+                layout.slot_offset(molecule_index, static_cast<std::uint32_t>(conformer_slot)));
+
+        if (!context_usable) continue; // descriptors stay zero-filled, the coordinates above are preserved
+        std::array<double, sfcli::usrcat_components_k> usrcat_row {};
+        sfpost::usrcat_descriptor(coordinates, context, usrcat_row);
+        std::copy(usrcat_row.begin(), usrcat_row.end(), buffers.usrcat.data() + flat * sfcli::usrcat_components_k);
+    }
+}
+
+/** Hand the reconstructed slot layout to the producer's own writer, for byte-identical output. */
+sfcli::writer_inputs_t shard_writer_inputs_(input_shard_t const &shard, cli_config_t const &config,
+                                            molecule_span_t const &span, sfapi::conformer_slot_layout_t const &layout,
+                                            shard_buffers_t const &buffers) {
+    // Each span carries the extent this shard actually filled, which is below the buffers' own size
+    // whenever an earlier shard was the wider one.
+    std::uint64_t const num_molecules = span.num_molecules;
+    std::size_t const num_slots = static_cast<std::size_t>(num_molecules) * layout.num_conformers;
+    return {
+        .provenance = {.input_shard_stem = std::string {shard.input_shard->GetView(0)},
+                       .dataset = config.dataset,
+                       .base_row_index = span.first_row},
+        .molecules = {.smiles = {buffers.smiles.data(), num_molecules},
+                      .num_atoms = {buffers.num_atoms_per_molecule.data(), num_molecules},
+                      .num_conformers = {buffers.num_conformers_per_molecule.data(), num_molecules},
+                      .num_heavy_atoms = {buffers.num_heavy_atoms_per_molecule.data(), num_molecules},
+                      .num_bonds = {buffers.num_bonds_per_molecule.data(), num_molecules},
+                      .molecular_weight = {buffers.molecular_weight_per_molecule.data(), num_molecules}},
+        .conformers = {.layout = layout,
+                       .status = {buffers.status.data(), num_slots},
+                       .energies = {buffers.energies.data(), num_slots},
+                       .coordinates = {buffers.coordinates.data(), num_slots * layout.slot_stride()},
+                       .usrcat = {buffers.usrcat.data(), num_slots * sfcli::usrcat_components_k}},
+    };
+}
+
 augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config, reembed_store_t const &reembed,
                          shard_buffers_t &buffers, fs::path const &output_path, logger_t const &logger,
                          shard_stats_t &stats) {
@@ -689,29 +796,14 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
         return augment_t::empty_input_k;
     }
 
-    // Contiguous molecule span: input_row = base_row + molecule_index. The 3D schema guarantees rows are
-    // grouped and input_row is contiguous, so every molecule owns at least one row.
-    std::uint64_t base_row = shard.input_row->Value(0);
-    std::uint64_t max_row = base_row;
-    for (std::int64_t row = 0; row < shard.num_rows; ++row) {
-        std::uint64_t const value = shard.input_row->Value(row);
-        base_row = std::min(base_row, value);
-        max_row = std::max(max_row, value);
-    }
-    std::uint64_t const num_molecules = max_row - base_row + 1;
-
-    // The slot stride K must cover the widest molecule (original or reembed) and match the
-    // producer's `num_conformers` provenance value. Reembed molecules can only add rows.
-    std::uint32_t const observed_conformers = group_rows_by_molecule_(shard, base_row, num_molecules, buffers);
-    std::uint32_t const max_conformers = std::max(observed_conformers, reembed.widest_molecule_conformers);
-
-    std::uint32_t const max_atoms = config.max_atoms;
-    sfapi::conformer_slot_layout_t const slot_layout {max_atoms, max_conformers};
-    std::size_t const total_slots = static_cast<std::size_t>(num_molecules) * max_conformers;
-    buffers.reset_for(num_molecules, max_conformers, max_atoms);
-
-    arrow::HalfFloatArray const &coords_values = *shard.coords_values;
-    arrow::ListArray const &coords_list = *shard.conformer_coords;
+    molecule_span_t const span = molecule_span_of_(shard);
+    // The slot stride K must cover the widest molecule, original or reembed, and match the producer's
+    // `num_conformers` provenance value. Reembed molecules can only add rows.
+    std::uint32_t const observed_conformers = group_rows_by_molecule_(shard, span.first_row, span.num_molecules,
+                                                                      buffers);
+    sfapi::conformer_slot_layout_t const layout {config.max_atoms,
+                                                 std::max(observed_conformers, reembed.widest_molecule_conformers)};
+    buffers.reset_for(span.num_molecules, layout);
 
     // Per-worker scratch for the reembed lookup key: `private` hands each thread its own string, which then
     // keeps its capacity across every molecule that thread walks. Declaring it inside the body instead would
@@ -719,152 +811,34 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
     std::string reembed_key;
 
 #pragma omp parallel for schedule(dynamic, 256) num_threads(config.threads) private(reembed_key) if (config.threads > 1)
-    for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
-        std::uint64_t const rows_begin = buffers.molecule_row_offsets[molecule_index];
-        std::uint64_t const rows_end = buffers.molecule_row_offsets[molecule_index + 1];
-        if (rows_begin == rows_end) continue; // contiguous input guarantees this never fires; defensive only
-        custd::span<std::int64_t const> const rows {buffers.molecule_rows.data() + rows_begin,
-                                                    static_cast<std::size_t>(rows_end - rows_begin)};
+    for (std::uint64_t molecule_index = 0; molecule_index < span.num_molecules; ++molecule_index) {
+        custd::span<std::int64_t const> const rows = buffers.rows_of(molecule_index);
+        if (rows.empty()) continue; // contiguous input guarantees this never fires; defensive only
         std::int64_t const first_row = rows.front();
-        std::string_view const stem = shard.input_shard->GetView(first_row);
-        std::uint64_t const input_row = shard.input_row->Value(first_row);
 
         // Reembed override: copy the corrected molecule verbatim into this molecule's slots.
-        fill_reembed_key_into_(stem, input_row, reembed_key);
+        fill_reembed_key_into_(shard.input_shard->GetView(first_row), shard.input_row->Value(first_row), reembed_key);
         if (auto found = reembed.molecules.find(reembed_key); found != reembed.molecules.end()) {
-            reembed_molecule_t const &molecule = found->second;
-            // string_view into the reembed store's persistent storage, which outlives every shard
-            buffers.smiles[molecule_index] = molecule.smiles;
-            buffers.num_atoms_per_molecule[molecule_index] = molecule.num_atoms;
-            buffers.num_heavy_atoms_per_molecule[molecule_index] = molecule.n_heavy_atoms;
-            buffers.num_bonds_per_molecule[molecule_index] = molecule.n_bonds;
-            buffers.molecular_weight_per_molecule[molecule_index] = molecule.molecular_weight;
-            buffers.n_conformers_per_molecule[molecule_index] = molecule.n_conformers;
-            std::uint32_t const num_atoms = molecule.num_atoms;
-            for (std::size_t conformer_slot = 0;
-                 conformer_slot < molecule.conformers.size() && conformer_slot < max_conformers; ++conformer_slot) {
-                reembed_conformer_t const &conformer = molecule.conformers[conformer_slot];
-                std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
-                buffers.status_codes[flat] = conformer.status;
-                buffers.energies[flat] = conformer.energy;
-                if (!conformer.has_coords) continue; // the reembed row carried no geometry
-                if (conformer.status != 0) continue; // a failure row stays null in the output
-                if (num_atoms == 0) continue;        // preprocess failed: no coordinates to lay out
-                // the row's own geometry is shorter than the atom count it claims
-                if (conformer.coord_bits.size() < static_cast<std::size_t>(num_atoms) * 3u) continue;
-                std::size_t const slot_base = slot_layout.slot_offset(molecule_index,
-                                                                      static_cast<std::uint32_t>(conformer_slot));
-                // `coord_bits` holds the row's float16 patterns exactly as Arrow stored them, which is the
-                // pool's own storage; naming them `__half` keeps the transposition a verbatim copy instead
-                // of a numeric conversion of the bit pattern.
-                auto const *coordinate_halves = reinterpret_cast<__half const *>(conformer.coord_bits.data());
-                sfapi::scatter_interleaved_into_slot(coordinate_halves, slot_layout, num_atoms,
-                                                     buffers.coordinates.data() + slot_base);
-                std::copy(conformer.usrcat.begin(), conformer.usrcat.end(), buffers.usrcat.data() + flat * 60u);
-            }
+            copy_reembed_molecule_into_(found->second, molecule_index, layout, buffers);
             continue;
         }
 
-        // Augment path: per-molecule scalars come straight from the original shard.
-        buffers.smiles[molecule_index] = shard.smiles->GetView(first_row);
-        std::uint16_t const stored_atoms = shard.n_atoms->IsValid(first_row) ? shard.n_atoms->Value(first_row) : 0;
-        // A molecule wider than the coordinate stride cannot be laid into a slot, and narrowing its count
-        // to the stride would describe another molecule's atoms; treat it exactly like a preprocess failure.
-        std::uint8_t const num_atoms_u8 = stored_atoms <= max_atoms ? static_cast<std::uint8_t>(stored_atoms) : 0;
-        buffers.num_atoms_per_molecule[molecule_index] = num_atoms_u8;
-        buffers.num_heavy_atoms_per_molecule[molecule_index] =
-            shard.n_heavy_atoms && shard.n_heavy_atoms->IsValid(first_row) ? shard.n_heavy_atoms->Value(first_row) : 0;
-        buffers.num_bonds_per_molecule[molecule_index] = shard.n_bonds && shard.n_bonds->IsValid(first_row)
-                                                             ? shard.n_bonds->Value(first_row)
-                                                             : 0;
-        buffers.molecular_weight_per_molecule[molecule_index] = shard.molecular_weight &&
-                                                                        shard.molecular_weight->IsValid(first_row)
-                                                                    ? shard.molecular_weight->Value(first_row)
-                                                                    : 0.0f;
-        buffers.n_conformers_per_molecule[molecule_index] = shard.n_conformers->IsValid(first_row)
-                                                                ? shard.n_conformers->Value(first_row)
-                                                                : 0;
+        std::uint8_t const num_atoms = copy_molecule_scalars_into_(shard, first_row, molecule_index, config.max_atoms,
+                                                                   buffers);
+        if (num_atoms == 0) continue; // preprocess-failed molecule: single null row, no coordinates
 
-        if (num_atoms_u8 == 0) continue; // preprocess-failed molecule: single null row, no coords
-
-        // Type the molecule once (same parse contract the producer uses). A mismatch between
-        // the reparsed atom count and the stored n_atoms means the coordinate order can't be
-        // trusted for descriptors — keep the coordinates, emit zero-filled descriptors, and count.
+        // Type the molecule once, under the same parse contract the producer uses. A mismatch between the
+        // reparsed atom count and the stored `n_atoms` means the coordinate order cannot be trusted for
+        // descriptors, so the coordinates are kept, the descriptors are left zero, and the case is counted.
         sfpost::molecule_shape_context_t const context = sfpost::build_shape_context(buffers.smiles[molecule_index]);
-        bool const context_usable = context.ok && context.num_atoms == num_atoms_u8;
+        bool const context_usable = context.ok && context.num_atoms == num_atoms;
         if (!context_usable) stats.context_mismatch.fetch_add(1, std::memory_order_relaxed);
-        std::uint32_t const num_atoms = num_atoms_u8;
-
-        // Every conformer slot of this molecule is written below, so the loop runs to completion even
-        // when an early row is a failure: a `break` would leave the later slots holding the reset value.
-        std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
-        for (std::size_t conformer_slot = 0; conformer_slot < rows.size() && conformer_slot < max_conformers;
-             ++conformer_slot) {
-            std::int64_t const row = rows[conformer_slot];
-            std::uint8_t const row_status = shard.status->Value(row);
-            std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
-            buffers.status_codes[flat] = row_status;
-            if (shard.conformer_energy->IsValid(row)) buffers.energies[flat] = shard.conformer_energy->Value(row);
-            if (row_status != 0 || !coords_list.IsValid(row)) continue; // failure row stays null
-
-            std::size_t const begin = static_cast<std::size_t>(coords_list.value_offset(row));
-            std::size_t const stored = static_cast<std::size_t>(coords_list.value_offset(row + 1)) - begin;
-            std::size_t const wanted = static_cast<std::size_t>(num_atoms) * 3u;
-            std::size_t const copy = std::min(stored, wanted);
-            for (std::size_t value_index = 0; value_index < copy; ++value_index)
-                interleaved[value_index] = half_bits_to_float_(
-                    coords_values.Value(static_cast<std::int64_t>(begin + value_index)));
-
-            std::size_t const slot_base = slot_layout.slot_offset(molecule_index,
-                                                                  static_cast<std::uint32_t>(conformer_slot));
-            custd::span<float> coords_view {interleaved.data(), wanted};
-
-            // Multi-fragment safety net: separate disconnected components and write the corrected
-            // geometry back, mirroring the producer. Only when the context is usable (needs labels).
-            if (context_usable && context.num_components > 1) {
-                sfpost::separate_fragments(coords_view, context);
-                stats.fragments_separated.fetch_add(1, std::memory_order_relaxed);
-            }
-
-            sfapi::scatter_interleaved_into_slot(interleaved.data(), slot_layout, num_atoms,
-                                                 buffers.coordinates.data() + slot_base);
-
-            if (context_usable) {
-                std::array<double, 60> usrcat_row {};
-                sfpost::usrcat_descriptor(coords_view, context, usrcat_row);
-                std::copy(usrcat_row.begin(), usrcat_row.end(), buffers.usrcat.data() + flat * 60u);
-            }
-            // else: descriptors stay zero-filled (not null), coordinates preserved.
-        }
+        augment_molecule_(shard, rows, molecule_index, num_atoms, context, context_usable, layout, buffers, stats);
     }
 
-    // Hand the reconstructed slot layout to the producer's writer for byte-identical output. Each span
-    // carries the extent this shard actually filled, which is below the buffers' own size whenever an
-    // earlier shard was the wider one.
-    sfcli::writer_inputs_t const writer_inputs {
-        .input_shard_stem = std::string(shard.input_shard->GetView(0)),
-        .dataset = config.dataset,
-        .base_row_index = base_row,
-        .num_molecules = num_molecules,
-        .max_conformers = max_conformers,
-        .max_atoms = max_atoms,
-        .smiles = custd::span<std::string_view const>(buffers.smiles.data(), num_molecules),
-        .num_atoms_per_molecule = custd::span<std::uint8_t const>(buffers.num_atoms_per_molecule.data(), num_molecules),
-        .num_heavy_atoms_per_molecule = custd::span<std::uint16_t const>(buffers.num_heavy_atoms_per_molecule.data(),
-                                                                         num_molecules),
-        .num_bonds_per_molecule = custd::span<std::uint16_t const>(buffers.num_bonds_per_molecule.data(),
-                                                                   num_molecules),
-        .molecular_weight_per_molecule = custd::span<float const>(buffers.molecular_weight_per_molecule.data(),
-                                                                  num_molecules),
-        .n_conformers_per_molecule = custd::span<std::uint8_t const>(buffers.n_conformers_per_molecule.data(),
-                                                                     num_molecules),
-        .status = custd::span<std::uint8_t const>(buffers.status_codes.data(), total_slots),
-        .coordinates = custd::span<__half const>(buffers.coordinates.data(), total_slots * slot_layout.slot_stride()),
-        .energies = custd::span<float const>(buffers.energies.data(), total_slots),
-        .usrcat = custd::span<double const>(buffers.usrcat.data(), total_slots * 60u),
-    };
     // `write_shard` names its own refusal in the log, so the outcome only has to survive the return.
-    sfcli::shard_write_report_t const report = sfcli::write_shard(output_path, writer_inputs, &logger);
+    sfcli::shard_write_report_t const report = sfcli::write_shard(
+        output_path, shard_writer_inputs_(shard, config, span, layout, buffers), &logger);
     return report.status == sfcli::shard_write_t::written_k ? augment_t::written_k : augment_t::write_failed_k;
 }
 
@@ -905,7 +879,7 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
     fs::path const output_path = config.output_dir / input_path.filename();
     fs::path sentinel = output_path;
     sentinel += ".encoded";
-    if (config.resume && fs::exists(sentinel)) {
+    if (config.restart_policy == sfcli::restart_policy_t::resume_k && fs::exists(sentinel)) {
         ++tally.skipped;
         return;
     }

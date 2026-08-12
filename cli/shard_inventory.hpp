@@ -13,8 +13,6 @@
 
 #pragma once
 
-#include <cstdint> // `std::uint64_t`
-
 #include <filesystem> // `std::filesystem::path`
 #include <vector>     // `std::vector`
 
@@ -22,12 +20,11 @@
 
 namespace smallfield::cli {
 
-/** One input/output Parquet shard with its row count and completion flag. */
+/** One input Parquet shard, the output it maps to, and whether that output is already sealed. */
 struct shard_pair_t {
     std::filesystem::path input_path;
     std::filesystem::path output_path;
-    std::uint64_t input_num_rows;
-    bool already_complete;
+    bool already_complete = false;
 };
 
 /** Whether an output shard that already carries its `.encoded` sentinel is kept or produced again. */
@@ -50,13 +47,5 @@ enum class restart_policy_t {
 std::vector<shard_pair_t> inventory_shards(std::filesystem::path const &input_dir,
                                            std::filesystem::path const &output_dir, restart_policy_t restart_policy,
                                            logger_t const *log = nullptr);
-
-/**
- *  @brief List every `*.parquet` file in @p input_dir, excluding `*.3D.parquet`, sorted lexicographically.
- *
- *  @param[in] log Logger diagnostics are reported through; null falls back to a default one.
- */
-std::vector<std::filesystem::path> list_input_shards(std::filesystem::path const &input_dir,
-                                                     logger_t const *log = nullptr);
 
 } // namespace smallfield::cli

@@ -22,6 +22,7 @@
 #include "smallfield/api/smallfield.hpp"
 
 #include "bench/bench_arguments.hpp"
+#include "bench/bench_reporting.hpp"
 
 namespace sfapi = smallfield::api;
 namespace sfbench = smallfield::bench;
@@ -50,8 +51,7 @@ struct profile_arguments_t {
     std::uint32_t conformers_per_molecule = 1;
 };
 
-/** Whether the command line was accepted or refused. */
-enum class arguments_parse_t { accepted_k, refused_k };
+using sfbench::arguments_parse_t;
 
 /** Print the one usage line, naming every flag this driver understands. */
 static void print_usage_(char const *invocation) {
@@ -65,68 +65,22 @@ static void print_usage_(char const *invocation) {
  *  silently used the defaults would report a corpus nobody asked for.
  */
 static arguments_parse_t parse_arguments_(int argc, char **argv, profile_arguments_t &arguments) {
-    for (int argument_index = 1; argument_index < argc; ++argument_index) {
-        std::string_view const flag = argv[argument_index];
-        if (flag == "--smi") {
-            if (argument_index + 1 >= argc) {
-                fmt::println(stderr, "{}: --smi takes a value, and none followed it", executable_name_k);
-                return arguments_parse_t::refused_k;
-            }
-            arguments.smiles_path = argv[++argument_index];
-        }
-        else if (flag == "--conformers") {
-            if (argument_index + 1 >= argc) {
-                fmt::println(stderr, "{}: --conformers takes a value, and none followed it", executable_name_k);
-                return arguments_parse_t::refused_k;
-            }
-            std::string_view const text = argv[++argument_index];
-            auto const status = sfbench::parse_number(text, std::uint32_t {1}, max_conformers_per_molecule_k,
-                                                      arguments.conformers_per_molecule);
-            if (status != sfbench::number_parse_t::parsed_k) {
-                fmt::println(stderr, "{}: --conformers value '{}' {} (accepted range 1..{})", executable_name_k, text,
-                             sfbench::describe_number_parse(status), max_conformers_per_molecule_k);
-                return arguments_parse_t::refused_k;
-            }
-        }
+    for (sfbench::command_line_t line {executable_name_k, argc, argv}; line.advance();) {
+        arguments_parse_t status = arguments_parse_t::accepted_k;
+        if (line.flag() == "--smi") status = line.take_text(arguments.smiles_path);
+        else if (line.flag() == "--conformers")
+            status = line.take_number(max_conformers_per_molecule_k, arguments.conformers_per_molecule);
         else {
-            fmt::println(stderr, "{}: unknown argument '{}'", executable_name_k, flag);
             print_usage_(argv[0]);
-            return arguments_parse_t::refused_k;
+            status = line.refuse_unknown();
         }
+        if (status != arguments_parse_t::accepted_k) return arguments_parse_t::refused_k;
     }
     if (arguments.smiles_path.empty()) arguments.smiles_path = sfbench::corpus_path_from_environment();
     return arguments_parse_t::accepted_k;
 }
 
 #pragma endregion Command Line
-
-#pragma region Reporting
-
-/** Conformers per status code, indexed by the enumerator's own value. */
-using status_histogram_t = std::array<std::uint64_t, 8>;
-
-/** Tally @p status by code, so a rejection class cannot grow unnoticed behind an attempted-throughput number. */
-static status_histogram_t status_histogram_of_(std::vector<sfapi::conformer_status_t> const &status) {
-    status_histogram_t histogram {};
-    for (auto status_code : status) {
-        auto const code = static_cast<std::size_t>(status_code);
-        if (code < histogram.size()) ++histogram[code];
-    }
-    return histogram;
-}
-
-/** Print every non-empty failure class in @p histogram as a count and a share of @p total_conformers. */
-static void print_status_histogram_(status_histogram_t const &histogram, std::size_t total_conformers) {
-    constexpr std::array<char const *, 8> status_names {
-        "success",        "stereo_failure",     "mmff_unconverged",    "invalid_smiles",
-        "too_many_atoms", "preprocess_timeout", "unsupported_element", "other"};
-    for (std::size_t code = 1; code < histogram.size(); ++code)
-        if (histogram[code] > 0)
-            fmt::println("  {:<20} {:>12}  {:.3f} %", status_names[code], fmt::group_digits(histogram[code]),
-                         100.0 * static_cast<double>(histogram[code]) / static_cast<double>(total_conformers));
-}
-
-#pragma endregion Reporting
 
 int main(int argc, char **argv) {
     profile_arguments_t arguments;
@@ -182,13 +136,13 @@ int main(int argc, char **argv) {
     // Attempted throughput counts molecules that never reached the GPU, so a corpus that rejects
     // more looks faster than it is. Report produced conformers alongside it, and break the
     // failures down by reason so a rejection class cannot grow unnoticed.
-    auto const histogram = status_histogram_of_(status);
-    std::uint64_t const ok = histogram[static_cast<std::size_t>(sfapi::conformer_status_t::success_k)];
+    auto const histogram = sfbench::status_histogram_of(status);
+    std::uint64_t const succeeded = sfbench::successful_conformers_of(histogram);
     fmt::println("{}: wall {:.1f} ms, mol/s {:.1f}, conf/s {:.1f}, succeeded {} / {}", executable_name_k, milliseconds,
                  static_cast<double>(storage.size()) * 1000.0 / milliseconds,
-                 static_cast<double>(ok) * 1000.0 / milliseconds, fmt::group_digits(ok),
+                 static_cast<double>(succeeded) * 1000.0 / milliseconds, fmt::group_digits(succeeded),
                  fmt::group_digits(status.size()));
-    print_status_histogram_(histogram, status.size());
+    sfbench::print_status_histogram(histogram, status.size());
 
     return 0;
 }

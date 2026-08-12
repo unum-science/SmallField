@@ -40,15 +40,16 @@ def shard_paths(root: str) -> list:
 
 
 def draw(paths: list, total: int, seed: int) -> list:
-    rng = random.Random(seed)
+    """Draw evenly from a random row group of every shard, up to ``total`` SMILES."""
+    random_generator = random.Random(seed)
     per_shard = max(1, total // max(1, len(paths)))
-    out = []
+    drawn = []
     for path in paths:
-        if len(out) >= total:
+        if len(drawn) >= total:
             break
         try:
             handle = pq.ParquetFile(path)
-            group = rng.randrange(handle.metadata.num_row_groups)
+            group = random_generator.randrange(handle.metadata.num_row_groups)
             column = handle.read_row_group(group, columns=["smiles"])["smiles"].to_pylist()
         except Exception as error:  # noqa: BLE001 - a damaged shard should not abort the draw
             print(f"  skipping {os.path.basename(path)}: {error}", file=sys.stderr)
@@ -56,9 +57,9 @@ def draw(paths: list, total: int, seed: int) -> list:
         column = [entry for entry in column if entry]
         if not column:
             continue
-        take = min(per_shard, len(column), total - len(out))
-        out.extend(rng.sample(column, take))
-    return out
+        take = min(per_shard, len(column), total - len(drawn))
+        drawn.extend(random_generator.sample(column, take))
+    return drawn
 
 
 def main() -> int:

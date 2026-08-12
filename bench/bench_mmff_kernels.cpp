@@ -76,8 +76,12 @@ enum class parse_outcome_t {
     /** `MolOps::addHs` threw. */
     hydrogenation_failed_k,
     /** Above `benchmark_atom_ceiling_k` once hydrogens are explicit. */
-    too_many_atoms_k,
-    /** `build_descriptor` refused the molecule. */
+    above_atom_ceiling_k,
+    /** More bonds than a descriptor holds. */
+    too_many_bonds_k,
+    /** More rings than a descriptor holds. */
+    too_many_rings_k,
+    /** `build_descriptor` refused the molecule for a reason this table does not tabulate. */
     no_descriptor_k,
 };
 
@@ -87,16 +91,34 @@ static char const *describe_parse_outcome_(parse_outcome_t outcome) {
     case parse_outcome_t::parsed_k: return "parsed";
     case parse_outcome_t::unparseable_k: return "unparseable";
     case parse_outcome_t::hydrogenation_failed_k: return "hydrogenation_failed";
-    case parse_outcome_t::too_many_atoms_k: return "too_many_atoms";
+    case parse_outcome_t::above_atom_ceiling_k: return "above_atom_ceiling";
+    case parse_outcome_t::too_many_bonds_k: return "too_many_bonds";
+    case parse_outcome_t::too_many_rings_k: return "too_many_rings";
     case parse_outcome_t::no_descriptor_k: return "no_descriptor";
     }
     return "other";
 }
 
+/**
+ *  @brief Carry `build_descriptor`'s refusal into this table rather than collapsing it.
+ *
+ *  It names which extent a molecule exceeded, and folding three answers into one `no_descriptor` is how a
+ *  corpus that outgrew the bond capacity would read the same as one that outgrew the ring capacity.
+ */
+static parse_outcome_t outcome_of_descriptor_(smallfield::api::conformer_status_t status) {
+    switch (status) {
+    case smallfield::api::conformer_status_t::success_k: return parse_outcome_t::parsed_k;
+    case smallfield::api::conformer_status_t::too_many_atoms_k: return parse_outcome_t::above_atom_ceiling_k;
+    case smallfield::api::conformer_status_t::too_many_bonds_k: return parse_outcome_t::too_many_bonds_k;
+    case smallfield::api::conformer_status_t::too_many_rings_k: return parse_outcome_t::too_many_rings_k;
+    default: return parse_outcome_t::no_descriptor_k;
+    }
+}
+
 struct parsed_molecule_t {
     std::unique_ptr<RDKit::RWMol> rdkit_molecule;
     sft::molecule_descriptor_t descriptor;
-    /** Only `parsed_k` carries a usable `descriptor`; the other four name the reason it is absent. */
+    /** Only `parsed_k` carries a usable `descriptor`; every other outcome names why it is absent. */
     parse_outcome_t outcome = parse_outcome_t::unparseable_k;
 };
 
@@ -127,21 +149,20 @@ static std::vector<parsed_molecule_t> parse_smiles_batch_(std::vector<std::strin
         }
         if (parsed.rdkit_molecule->getNumAtoms() > benchmark_atom_ceiling_k) {
             parsed.rdkit_molecule.reset();
-            parsed.outcome = parse_outcome_t::too_many_atoms_k;
+            parsed.outcome = parse_outcome_t::above_atom_ceiling_k;
             continue;
         }
-        if (!sft::build_descriptor(*parsed.rdkit_molecule, parsed.descriptor)) {
-            parsed.rdkit_molecule.reset();
-            parsed.outcome = parse_outcome_t::no_descriptor_k;
-            continue;
-        }
-        parsed.outcome = parse_outcome_t::parsed_k;
+        parsed.outcome = outcome_of_descriptor_(sft::build_descriptor(*parsed.rdkit_molecule, parsed.descriptor));
+        if (parsed.outcome != parse_outcome_t::parsed_k) parsed.rdkit_molecule.reset();
     }
     return parsed_molecules;
 }
 
 /** Molecules per parse outcome, indexed by the enumerator's own value. */
-using parse_outcome_histogram_t = std::array<std::size_t, 5>;
+using parse_outcome_histogram_t = std::array<std::size_t, 7>;
+static_assert(static_cast<std::size_t>(parse_outcome_t::no_descriptor_k) + 1 ==
+                  std::tuple_size_v<parse_outcome_histogram_t>,
+              "one bucket per outcome");
 
 /** Tally @p parsed_molecules by outcome in one pass. */
 static parse_outcome_histogram_t parse_outcome_histogram_of_(std::vector<parsed_molecule_t> const &parsed_molecules) {
@@ -192,8 +213,7 @@ struct kernel_bench_arguments_t {
     std::size_t max_molecules = 10'000;
 };
 
-/** Whether the command line was accepted or refused. */
-enum class arguments_parse_t { accepted_k, refused_k };
+using sfbench::arguments_parse_t;
 
 /** Print the one usage line, naming every flag this driver understands. */
 static void print_usage_(char const *invocation) {
@@ -202,40 +222,112 @@ static void print_usage_(char const *invocation) {
 
 /** Fill @p arguments from `argv`, or explain on `stderr` why the command line was refused. */
 static arguments_parse_t parse_arguments_(int argc, char **argv, kernel_bench_arguments_t &arguments) {
-    for (int argument_index = 1; argument_index < argc; ++argument_index) {
-        std::string_view const flag = argv[argument_index];
-        if (flag == "--smi") {
-            if (argument_index + 1 >= argc) {
-                fmt::println(stderr, "{}: --smi takes a value, and none followed it", executable_name_k);
-                return arguments_parse_t::refused_k;
-            }
-            arguments.smiles_path = argv[++argument_index];
-        }
-        else if (flag == "--max-molecules") {
-            if (argument_index + 1 >= argc) {
-                fmt::println(stderr, "{}: --max-molecules takes a value, and none followed it", executable_name_k);
-                return arguments_parse_t::refused_k;
-            }
-            std::string_view const text = argv[++argument_index];
-            auto const status = sfbench::parse_number(text, std::size_t {1}, max_molecules_per_run_k,
-                                                      arguments.max_molecules);
-            if (status != sfbench::number_parse_t::parsed_k) {
-                fmt::println(stderr, "{}: --max-molecules value '{}' {} (accepted range 1..{})", executable_name_k,
-                             text, sfbench::describe_number_parse(status), fmt::group_digits(max_molecules_per_run_k));
-                return arguments_parse_t::refused_k;
-            }
-        }
+    for (sfbench::command_line_t line {executable_name_k, argc, argv}; line.advance();) {
+        arguments_parse_t status = arguments_parse_t::accepted_k;
+        if (line.flag() == "--smi") status = line.take_text(arguments.smiles_path);
+        else if (line.flag() == "--max-molecules")
+            status = line.take_number(max_molecules_per_run_k, arguments.max_molecules);
         else {
-            fmt::println(stderr, "{}: unknown argument '{}'", executable_name_k, flag);
             print_usage_(argv[0]);
-            return arguments_parse_t::refused_k;
+            status = line.refuse_unknown();
         }
+        if (status != arguments_parse_t::accepted_k) return arguments_parse_t::refused_k;
     }
     if (arguments.smiles_path.empty()) arguments.smiles_path = sfbench::corpus_path_from_environment();
     return arguments_parse_t::accepted_k;
 }
 
 #pragma endregion Command Line
+
+#pragma region Timed Sections
+
+/**
+ *  @brief The batch the kernels are timed over: one descriptor per molecule that parsed, packed together
+ *  with the atom offsets that address the shared atom arena.
+ *
+ *  The two arrays are walked by the same molecule index and the offset of a molecule is the running sum of
+ *  its predecessors' atom counts, so the total is read off the struct rather than recomputed at the launch.
+ */
+struct descriptor_batch_t {
+    std::vector<sft::molecule_descriptor_t> descriptors;
+    std::vector<std::uint32_t> atom_offsets;
+    std::uint32_t total_atom_count = 0;
+
+    [[nodiscard]] std::uint32_t num_molecules() const noexcept {
+        return static_cast<std::uint32_t>(descriptors.size());
+    }
+};
+
+/** Pack every molecule that parsed into @p batch, which is cleared first. */
+static void fill_descriptor_batch_into_(std::vector<parsed_molecule_t> const &parsed_molecules,
+                                        descriptor_batch_t &batch) {
+    batch.descriptors.clear();
+    batch.atom_offsets.clear();
+    batch.total_atom_count = 0;
+    batch.descriptors.reserve(parsed_molecules.size());
+    batch.atom_offsets.reserve(parsed_molecules.size());
+    for (auto const &parsed_molecule : parsed_molecules) {
+        if (parsed_molecule.outcome != parse_outcome_t::parsed_k) continue; // no descriptor was built
+        batch.atom_offsets.push_back(batch.total_atom_count);
+        batch.total_atom_count += parsed_molecule.descriptor.num_atoms;
+        batch.descriptors.push_back(parsed_molecule.descriptor);
+    }
+}
+
+/**
+ *  @brief Time the CPU native extraction over the whole batch and report its throughput.
+ *
+ *  A cheap derived quantity is summed into a reduction so `-O3` cannot dead-code the call body when it sees
+ *  the result go out of scope; the sum is printed for the same reason.
+ *
+ *  @return Molecules per second on the CPU path.
+ */
+static double time_cpu_native_path_(descriptor_batch_t const &batch, sfparam::mmff94_tables_view_t const &tables) {
+    std::size_t checksum = 0;
+    std::uint32_t const num_molecules = batch.num_molecules();
+    auto const start = clock_type_t::now();
+#pragma omp parallel for schedule(dynamic, 64) reduction(+ : checksum)
+    for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
+        sfp::etkdg_prepared_molecule_t extracted_molecule;
+        extracted_molecule.num_atoms = batch.descriptors[molecule_index].num_atoms;
+        sfmmff::extract_mmff94_params_fully_native(batch.descriptors[molecule_index], tables, extracted_molecule);
+        checksum += extracted_molecule.mmff_bonds.size() + extracted_molecule.mmff_angles.size() +
+                    extracted_molecule.mmff_torsions.size() + extracted_molecule.mmff_oops.size() +
+                    extracted_molecule.mmff_stretchbends.size() + extracted_molecule.mmff_interactions.size();
+    }
+    double const wall_ms = elapsed_ms_(start, clock_type_t::now());
+    double const throughput = static_cast<double>(num_molecules) * 1000.0 / wall_ms;
+    fmt::println("CPU sink (checksum): {}", fmt::group_digits(checksum));
+    fmt::println("\nCPU native path:");
+    fmt::println("  wall = {:.1f} ms  ({} OMP threads)", wall_ms, omp_get_max_threads());
+    fmt::println("  {} cpu mol/s: {:.1f}", executable_name_k, throughput);
+    return throughput;
+}
+
+/**
+ *  @brief Time the GPU kernel trio over the same batch and report its per-stage breakdown.
+ *
+ *  @return Molecules per second on the GPU path, or zero when the launch named a refusal instead.
+ */
+static double time_gpu_kernel_trio_(descriptor_batch_t const &batch, sfparam::mmff94_tables_host_t const &tables) {
+    sfbench::kernel_trio_timings_t timings;
+    if (sfbench::trio_launch_t const status = sfbench::launch_mmff94_kernel_trio_benchmark(
+            tables, batch.descriptors, batch.atom_offsets, batch.total_atom_count, timings);
+        status != sfbench::trio_launch_t::timed_k) {
+        fmt::println(stderr, "{}: the GPU kernel trio {}", executable_name_k, sfbench::describe_trio_launch(status));
+        return 0.0;
+    }
+    double const throughput = static_cast<double>(batch.num_molecules()) * 1000.0 / timings.total_ms;
+    fmt::println("\nGPU kernel trio:");
+    fmt::println("  type+charge   = {:.1f} ms", timings.type_and_charge_ms);
+    fmt::println("  extract_terms = {:.1f} ms", timings.extract_terms_ms);
+    fmt::println("  build_csr     = {:.1f} ms", timings.build_csr_ms);
+    fmt::println("  total         = {:.1f} ms", timings.total_ms);
+    fmt::println("  {} gpu mol/s: {:.1f}", executable_name_k, throughput);
+    return throughput;
+}
+
+#pragma endregion Timed Sections
 
 int main(int argc, char **argv) {
     kernel_bench_arguments_t arguments;
@@ -249,7 +341,6 @@ int main(int argc, char **argv) {
     std::vector<std::string> smiles_batch;
     auto const load_start = clock_type_t::now();
     auto const load_status = sfbench::load_corpus_into(arguments.smiles_path, arguments.max_molecules, smiles_batch);
-    auto const load_end = clock_type_t::now();
     if (load_status != sfbench::corpus_load_t::loaded_k) {
         fmt::println(stderr, "{}: corpus '{}' {}", executable_name_k, arguments.smiles_path,
                      sfbench::describe_corpus_load(load_status));
@@ -257,78 +348,29 @@ int main(int argc, char **argv) {
         return 2;
     }
     fmt::println("SMILES loaded: {} lines in {:.1f} ms", fmt::group_digits(smiles_batch.size()),
-                 elapsed_ms_(load_start, load_end));
+                 elapsed_ms_(load_start, clock_type_t::now()));
 
-    // Table extraction once.
     sfparam::mmff94_tables_host_t tables_host;
     sfparam::extract_mmff94_tables_from_rdkit(tables_host);
-    auto const tables_view = tables_host.view();
     fmt::println("tables extracted: vdw={} bond={} angle={} tor={}", tables_host.vdw.size(), tables_host.bond.size(),
                  tables_host.angle.size(), tables_host.torsion.size());
 
     auto const parse_start = clock_type_t::now();
     auto const parsed_molecules = parse_smiles_batch_(smiles_batch);
-    auto const parse_end = clock_type_t::now();
+    double const parse_ms = elapsed_ms_(parse_start, clock_type_t::now());
 
-    std::vector<sft::molecule_descriptor_t> descriptors;
-    std::vector<std::uint32_t> atom_offsets;
-    descriptors.reserve(parsed_molecules.size());
-    atom_offsets.reserve(parsed_molecules.size());
-    std::uint32_t total_atom_count = 0;
-    for (auto const &parsed_molecule : parsed_molecules) {
-        if (parsed_molecule.outcome != parse_outcome_t::parsed_k) continue; // no descriptor was built
-        atom_offsets.push_back(total_atom_count);
-        total_atom_count += parsed_molecule.descriptor.num_atoms;
-        descriptors.push_back(parsed_molecule.descriptor);
-    }
-    std::uint32_t const num_molecules = static_cast<std::uint32_t>(descriptors.size());
-    fmt::println("parsed: {} valid molecules / {} total atoms in {:.1f} ms", fmt::group_digits(num_molecules),
-                 fmt::group_digits(total_atom_count), elapsed_ms_(parse_start, parse_end));
+    descriptor_batch_t batch;
+    fill_descriptor_batch_into_(parsed_molecules, batch);
+    fmt::println("parsed: {} valid molecules / {} total atoms in {:.1f} ms", fmt::group_digits(batch.num_molecules()),
+                 fmt::group_digits(batch.total_atom_count), parse_ms);
     print_parse_outcomes_(sfbench::parse_outcome_histogram_of_(parsed_molecules), parsed_molecules.size());
-
-    if (num_molecules == 0) {
+    if (batch.num_molecules() == 0) {
         fmt::println(stderr, "{}: no molecules — aborting", executable_name_k);
         return 1;
     }
 
-    // CPU timing. Run extract_mmff94_params_fully_native on every molecule with OpenMP parallelism,
-    // matching the prep path's production settings. Sink a cheap derived quantity into a shared atomic
-    // so `-O3` does not DCE the call body when it sees the result go out of scope.
-    std::size_t checksum = 0;
-    auto const cpu_start = clock_type_t::now();
-#pragma omp parallel for schedule(dynamic, 64) reduction(+ : checksum)
-    for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
-        sfp::etkdg_prepared_molecule_t extracted_molecule;
-        extracted_molecule.num_atoms = descriptors[molecule_index].num_atoms;
-        sfmmff::extract_mmff94_params_fully_native(descriptors[molecule_index], tables_view, extracted_molecule);
-        checksum += extracted_molecule.mmff_bonds.size() + extracted_molecule.mmff_angles.size() +
-                    extracted_molecule.mmff_torsions.size() + extracted_molecule.mmff_oops.size() +
-                    extracted_molecule.mmff_stretchbends.size() + extracted_molecule.mmff_interactions.size();
-    }
-    auto const cpu_end = clock_type_t::now();
-    double const cpu_ms = elapsed_ms_(cpu_start, cpu_end);
-    fmt::println("CPU sink (checksum): {}", fmt::group_digits(checksum));
-    double const cpu_throughput = static_cast<double>(num_molecules) * 1000.0 / cpu_ms;
-    fmt::println("\nCPU native path:");
-    fmt::println("  wall = {:.1f} ms  ({} OMP threads)", cpu_ms, omp_get_max_threads());
-    fmt::println("  {} cpu mol/s: {:.1f}", executable_name_k, cpu_throughput);
-
-    // GPU timing.
-    float type_and_charge_ms = 0.0f;
-    float extract_terms_ms = 0.0f;
-    float build_csr_ms = 0.0f;
-    float total_gpu_ms = 0.0f;
-    sfbench::launch_mmff94_kernel_trio_benchmark(tables_host, descriptors.data(), num_molecules, atom_offsets.data(),
-                                                 total_atom_count, &type_and_charge_ms, &extract_terms_ms,
-                                                 &build_csr_ms, &total_gpu_ms);
-    double const gpu_throughput = static_cast<double>(num_molecules) * 1000.0 / total_gpu_ms;
-    fmt::println("\nGPU kernel trio:");
-    fmt::println("  type+charge   = {:.1f} ms", type_and_charge_ms);
-    fmt::println("  extract_terms = {:.1f} ms", extract_terms_ms);
-    fmt::println("  build_csr     = {:.1f} ms", build_csr_ms);
-    fmt::println("  total         = {:.1f} ms", total_gpu_ms);
-    fmt::println("  {} gpu mol/s: {:.1f}", executable_name_k, gpu_throughput);
+    double const cpu_throughput = time_cpu_native_path_(batch, tables_host.view());
+    double const gpu_throughput = time_gpu_kernel_trio_(batch, tables_host);
     fmt::println("\nspeedup (CPU→GPU): {:.2f} ×", cpu_throughput > 0.0 ? gpu_throughput / cpu_throughput : 0.0);
-
     return 0;
 }

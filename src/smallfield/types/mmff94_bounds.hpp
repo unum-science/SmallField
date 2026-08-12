@@ -2,12 +2,14 @@
  *  @file src/smallfield/types/mmff94_bounds.hpp
  *  @brief Per-molecule MMFF94 term-count upper bounds shared between the CPU extractor
  *  (`src/smallfield/mmff94/mmff94_extract.hpp`) and the GPU extractor
- * (`src/smallfield/mmff94/mmff94_extract_device.cuh`).
+ *  (`src/smallfield/mmff94/mmff94_extract_device.cuh`).
  *
- *  Drug-like molecules with 128 heavy+H atoms never approach these limits;
- *  they exist so every stack-sized scratch array has a compile-time
- *  constant bound. A molecule that exceeds any of them is flagged in
- *  per-molecule status and routed to the CPU RDKit fallback path.
+ *  They exist so every stack-sized and shared-memory scratch array has a compile-time constant
+ *  bound, and `compute_device_capacities` clamps each per-molecule capacity to the matching one
+ *  here. Drug-like molecules at the 192-atom pipeline cap stay well under all six.
+ *
+ *  A molecule that did exceed one would have its extra terms dropped rather than refused: the
+ *  device extractor stops emitting past the cap. Nothing downstream distinguishes that molecule.
  */
 
 #pragma once
@@ -41,5 +43,6 @@ struct mmff94_packed_offsets_t {
     std::uint32_t stretchbends;
     std::uint32_t interactions;
 };
+static_assert(sizeof(mmff94_packed_offsets_t) == 24);
 
 } // namespace smallfield::types

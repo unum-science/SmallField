@@ -8,11 +8,11 @@
 #include <cstring> // `std::memset`, `std::memcpy`
 
 #include <algorithm>   // `std::min`, `std::stable_sort`
-#include <array>       // `std::array`
+#include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::shared_ptr`, `std::make_shared`
 #include <string>      // `std::string`, `std::to_string`
 #include <string_view> // `std::string_view`
-#include <utility>     // `std::move`, `std::pair`
+#include <utility>     // `std::move`
 #include <vector>      // `std::vector`
 
 #include <arrow/array/array_nested.h>
@@ -31,6 +31,7 @@
 #include <parquet/arrow/writer.h>
 
 #include "smallfield/api/conformer_layout.hpp"
+#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
 #include "cli/parquet_writer.hpp"
@@ -44,11 +45,8 @@ namespace smallfield::cli {
 char const *describe_shard_write(shard_write_t status) {
     switch (status) {
     case shard_write_t::written_k: return "written";
-    case shard_write_t::missing_per_molecule_arrays_k: return "was handed no per-molecule arrays";
+    case shard_write_t::missing_per_molecule_arrays_k: return "was handed nothing a row could describe";
     case shard_write_t::input_span_too_short_k: return "was handed a short input span";
-    case shard_write_t::row_sidecar_too_short_k: return "derived more rows than its per-row sidecars describe";
-    case shard_write_t::molecule_index_out_of_range_k: return "reached past the end of the per-molecule arrays";
-    case shard_write_t::coordinate_slot_out_of_range_k: return "reached a conformer slot past the coordinate span";
     case shard_write_t::buffer_allocation_failed_k: return "could not allocate a column buffer";
     case shard_write_t::column_reserve_failed_k: return "could not reserve a column for every row";
     case shard_write_t::column_append_failed_k: return "could not append to a column";
@@ -69,10 +67,85 @@ std::string describe_shard_write(shard_write_report_t const &report) {
     return std::string {reason};
 }
 
-/** The refusal naming an input span whose length broke the writer's size contract. */
-static shard_write_report_t short_input_span_(std::string_view column, std::size_t held, std::size_t required) {
-    return {.status = shard_write_t::input_span_too_short_k, .column = column, .held = held, .required = required};
+/**
+ *  @brief Log @p report against @p path and hand it back, so every refusal leaves a named reason behind.
+ *
+ *  @param[in] detail Whatever the failing layer said for itself — Arrow's own message, or the shape the
+ *      size contract was checked against — omitted when it carries nothing.
+ */
+static shard_write_report_t refuse_(logger_t const &logger, fs::path const &path, shard_write_report_t const &report,
+                                    std::string_view detail = {}) {
+    if (detail.empty()) logger.error("{}: {}", path, describe_shard_write(report));
+    else logger.error("{}: {}: {}", path, describe_shard_write(report), detail);
+    return report;
 }
+
+#pragma endregion Refusals
+
+#pragma region Input Extents
+
+/** One input span measured against the extent its axis requires; `required` of zero opts a column out. */
+struct column_extent_t {
+    std::string_view column;
+    std::size_t held;
+    std::size_t required;
+};
+
+/** The first entry of @p extents that is short, or a `written_k` report when every one covers its axis. */
+static shard_write_report_t first_short_column_(std::initializer_list<column_extent_t> extents) {
+    for (column_extent_t const &extent : extents)
+        if (extent.held < extent.required)
+            return {.status = shard_write_t::input_span_too_short_k,
+                    .column = extent.column,
+                    .held = extent.held,
+                    .required = extent.required};
+    return {.status = shard_write_t::written_k};
+}
+
+/** An optional column is either opted out with an empty span, or long enough to cover @p required. */
+static std::size_t optional_required_(std::size_t held, std::size_t required) { return held == 0 ? 0 : required; }
+
+/**
+ *  @brief Check every input span against the extent its axis requires, before anything indexes one.
+ *
+ *  Once this passes, no read below needs a bound of its own: a row names a molecule under
+ *  `molecules.count()` and a slot under `layout.num_conformers` by construction, and the coordinate
+ *  span covers the molecule count times the conformer count times the slot stride, so the widest offset
+ *  any row reaches is inside it.
+ */
+static shard_write_report_t check_input_extents_(writer_inputs_t const &inputs) {
+    molecule_columns_t const &molecules = inputs.molecules;
+    conformer_slot_columns_t const &conformers = inputs.conformers;
+    if (molecules.num_atoms.empty() || molecules.num_conformers.empty() || conformers.layout.num_conformers == 0)
+        return {.status = shard_write_t::missing_per_molecule_arrays_k};
+
+    std::uint64_t const num_molecules = molecules.count();
+    std::size_t const num_slots = conformers.slot_count(num_molecules);
+    return first_short_column_({
+        {"num_conformers", molecules.num_conformers.size(), num_molecules},
+        {"smiles", molecules.smiles.size(), num_molecules},
+        {"num_heavy_atoms", molecules.num_heavy_atoms.size(),
+         optional_required_(molecules.num_heavy_atoms.size(), num_molecules)},
+        {"num_bonds", molecules.num_bonds.size(), optional_required_(molecules.num_bonds.size(), num_molecules)},
+        {"molecular_weight", molecules.molecular_weight.size(),
+         optional_required_(molecules.molecular_weight.size(), num_molecules)},
+        {"status", conformers.status.size(), num_slots},
+        {"energies", conformers.energies.size(), num_slots},
+        {"coordinates", conformers.coordinates.size(), num_slots * conformers.layout.slot_stride()},
+        {"usrcat", conformers.usrcat.size(),
+         optional_required_(conformers.usrcat.size(), num_slots * usrcat_components_k)},
+    });
+}
+
+/** The shape the size contract was checked against, quoted beside a short-span refusal. */
+static std::string describe_extents_(writer_inputs_t const &inputs) {
+    return fmt::format("num_molecules={}, max_conformers={}, max_atoms={}", fmt::group_digits(inputs.molecules.count()),
+                       inputs.conformers.layout.num_conformers, inputs.conformers.layout.max_atoms);
+}
+
+#pragma endregion Input Extents
+
+#pragma region Output Rows
 
 /**
  *  @brief What one output row describes, which is what decides whether its per-conformer columns carry data.
@@ -90,77 +163,145 @@ enum class row_outcome_t : std::uint8_t {
     molecule_failure_k,
 };
 
-#pragma endregion Refusals
+/**
+ *  @brief One output row, holding together the three facts a shared row index used to walk in parallel.
+ *
+ *  Every field is inside its axis by construction: `molecule_index` below `molecules.count()` because the
+ *  builder loops it, and `conformer_slot` below `layout.num_conformers` because the builder clamps it.
+ */
+struct output_row_t {
+    std::uint64_t molecule_index = 0;
+    std::uint32_t conformer_slot = 0;
+    /** Rank by ascending energy inside the molecule, which is what the `conformer_index` column publishes. */
+    std::uint8_t energy_rank = 0;
+    row_outcome_t outcome = row_outcome_t::molecule_failure_k;
+};
+
+/** Flat slot index of molecule @p molecule_index 's conformer @p conformer_slot. */
+static std::size_t flat_slot_(conformer_slot_columns_t const &conformers, std::uint64_t molecule_index,
+                              std::uint32_t conformer_slot) {
+    return static_cast<std::size_t>(molecule_index) * conformers.layout.num_conformers + conformer_slot;
+}
 
 /**
- *  @brief Pack fp16 coordinates from a strided GPU output buffer into a tight Arrow `List<float16>` array,
- *  one element per output row.
+ *  @brief Sort key of one conformer slot: its energy, or infinity when the slot did not succeed.
  *
- *  Input layout: `coordinates` is a strided fp16 buffer of `num_molecules * max_conformers * stride_halves`
- *  halves, where `stride_halves = max_atoms * 3`. For a `molecule_index` and a `conformer_slot`, the coordinate
- *  block starts at offset `(molecule_index * max_conformers + conformer_slot) * stride_halves`.
+ *  Every failed slot compares equal, so a stable sort leaves the failures behind the successes @b in slot
+ *  order — the key `python/smallfield/_binding.cpp` already sorts by, which is what makes a shard and the
+ *  Python API rank one molecule's conformers identically. Ranking the failures among themselves by an
+ *  energy no slot produced is what the two used to disagree about.
+ */
+static float slot_ordering_energy_(conformer_slot_columns_t const &conformers, std::size_t flat) {
+    return conformers.status[flat] == api::conformer_status_t::success_k ? conformers.energies[flat]
+                                                                         : std::numeric_limits<float>::infinity();
+}
+
+/**
+ *  @brief Conformers of a molecule the shard can address, which is what the `n_conformers` column publishes.
  *
- *  Output layout: one row per surviving conformer, walked in molecule-major then conformer-index order,
- *  copying only the first `num_atoms_per_molecule[molecule_index] * 3` halves per row. Post-Kabsch,
- *  `n_conformers_per_molecule[molecule_index]` gives the number of slots [0..surviving_conformers) to emit
- *  for that molecule. Failed molecules (surviving_conformers = 0) emit one null row; conformers whose
- *  status is non-success emit null lists.
+ *  An `n_conformers` above the slot stride is clamped rather than read: slot `num_conformers` of one
+ *  molecule is slot zero of the next, so the unclamped read published a neighbour's geometry and energy.
+ *  The column and the rows emitted are the same number by construction, because both come from here.
+ */
+static std::uint8_t addressable_conformers_(writer_inputs_t const &inputs, std::uint64_t molecule_index) {
+    return static_cast<std::uint8_t>(std::min<std::uint32_t>(inputs.molecules.num_conformers[molecule_index],
+                                                             inputs.conformers.layout.num_conformers));
+}
+
+/** Rows molecule @p molecule_index contributes; a molecule with no surviving conformer still gets one. */
+static std::uint32_t rows_of_molecule_(writer_inputs_t const &inputs, std::uint64_t molecule_index) {
+    std::uint8_t const addressable = addressable_conformers_(inputs, molecule_index);
+    return addressable == 0 ? 1u : addressable;
+}
+
+/**
+ *  @brief Describe every output row of the shard, energy-sorted inside each molecule.
  *
- *  @param[in] row_outcomes Per-output-row outcome; only a success row carries three halves per atom, and
- *      every other row is null. Length = num_output_rows.
- *  @param[in] molecule_index_per_row Maps output row index back to its source molecule.
- *  @param[in] conformer_slot_per_row Maps output row index to which K-slot it came from.
+ *  @param[out] rows Caller-owned destination, cleared first; its capacity survives across shards.
+ */
+static void fill_output_rows_into(writer_inputs_t const &inputs, std::vector<output_row_t> &rows) {
+    conformer_slot_columns_t const &conformers = inputs.conformers;
+    std::uint64_t const num_molecules = inputs.molecules.count();
+    rows.clear();
+
+    // Declared above the loop, so the energy sort of a million molecules grows one buffer once.
+    std::vector<std::uint32_t> order;
+    for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
+        if (inputs.molecules.num_conformers[molecule_index] == 0) {
+            rows.push_back({.molecule_index = molecule_index, .outcome = row_outcome_t::molecule_failure_k});
+            continue;
+        }
+
+        std::uint32_t const num_rows = rows_of_molecule_(inputs, molecule_index);
+        order.resize(num_rows);
+        for (std::uint32_t conformer_slot = 0; conformer_slot < num_rows; ++conformer_slot)
+            order[conformer_slot] = conformer_slot;
+        std::stable_sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) {
+            return slot_ordering_energy_(conformers, flat_slot_(conformers, molecule_index, left)) <
+                   slot_ordering_energy_(conformers, flat_slot_(conformers, molecule_index, right));
+        });
+
+        for (std::uint32_t rank = 0; rank < num_rows; ++rank) {
+            std::uint32_t const conformer_slot = order[rank];
+            bool const survived = conformers.status[flat_slot_(conformers, molecule_index, conformer_slot)] ==
+                                  api::conformer_status_t::success_k;
+            rows.push_back(
+                {.molecule_index = molecule_index,
+                 .conformer_slot = conformer_slot,
+                 .energy_rank = static_cast<std::uint8_t>(rank),
+                 .outcome = survived ? row_outcome_t::conformer_success_k : row_outcome_t::conformer_failure_k});
+        }
+    }
+}
+
+#pragma endregion Output Rows
+
+#pragma region List Columns
+
+/**
+ *  @brief Pack fp16 coordinates from the strided slot pool into a tight Arrow `List<float16>`, one element
+ *  per output row.
+ *
+ *  A success row carries the first `num_atoms[molecule] * 3` halves of its slot, transposed out of the
+ *  structure-of-arrays layout into the interleaved `(atom, 3)` block a Parquet row exposes; every other row
+ *  is null. Atom counts are clamped to the slot's own stride so the allocation pass and the emit pass agree
+ *  even when a caller reports more atoms than fit.
+ *
  *  @param[out] array A nullable `List<float16>` array with one element per output row, untouched on refusal.
  *  @return `written_k`, or the refusal that stopped the pack.
  */
-static shard_write_report_t pack_coordinates_as_list(custd::span<__half const> coordinates,
-                                                     custd::span<std::uint8_t const> num_atoms_per_molecule,
-                                                     custd::span<row_outcome_t const> row_outcomes,
-                                                     custd::span<std::uint64_t const> molecule_index_per_row,
-                                                     custd::span<std::uint32_t const> conformer_slot_per_row,
-                                                     std::uint32_t max_conformers, std::uint32_t stride_halves,
+static shard_write_report_t pack_coordinates_as_list(writer_inputs_t const &inputs,
+                                                     custd::span<output_row_t const> rows,
                                                      std::shared_ptr<arrow::Array> &array) {
+    api::conformer_slot_layout_t const &layout = inputs.conformers.layout;
+    custd::span<std::uint8_t const> const num_atoms_per_molecule = inputs.molecules.num_atoms;
+    std::size_t const num_rows = rows.size();
 
-    std::int64_t const num_rows = static_cast<std::int64_t>(row_outcomes.size());
-    smallfield::api::conformer_slot_layout_t const slot_layout {stride_halves / 3u, max_conformers};
+    auto atoms_of_ = [&](output_row_t const &row) {
+        return std::min<std::uint32_t>(num_atoms_per_molecule[row.molecule_index], layout.max_atoms);
+    };
 
-    // Caller (write_shard) is responsible for the size invariants on
-    // num_atoms_per_molecule and coordinates; the parallel index sidecars
-    // (molecule_index_per_row, conformer_slot_per_row) are populated locally
-    // so their lengths match num_rows by construction. The two range checks
-    // below catch the case where the caller passed mismatched per-row sidecars
-    // (e.g. a future refactor) and bail before OOB.
-    if (molecule_index_per_row.size() < static_cast<std::size_t>(num_rows) ||
-        conformer_slot_per_row.size() < static_cast<std::size_t>(num_rows))
-        return {.status = shard_write_t::row_sidecar_too_short_k, .column = "conformer_coords"};
-    std::int64_t total_halves = 0;
-    for (std::int64_t row = 0; row < num_rows; ++row) {
-        if (row_outcomes[row] != row_outcome_t::conformer_success_k) continue;
-        std::uint64_t const molecule_index = molecule_index_per_row[row];
-        if (molecule_index >= num_atoms_per_molecule.size()) // caller-contract violation
-            return {.status = shard_write_t::molecule_index_out_of_range_k, .column = "conformer_coords"};
-        // Clamp exactly as the emit loop below does, so the allocation and the
-        // offsets stay in agreement when a caller reports more atoms than fit.
-        std::uint32_t atom_count = static_cast<std::uint32_t>(num_atoms_per_molecule[molecule_index]);
-        if (atom_count > slot_layout.max_atoms) atom_count = slot_layout.max_atoms;
-        total_halves += static_cast<std::int64_t>(atom_count) * 3;
-    }
+    std::size_t total_halves = 0;
+    for (output_row_t const &row : rows)
+        if (row.outcome == row_outcome_t::conformer_success_k)
+            total_halves += static_cast<std::size_t>(atoms_of_(row)) * 3u;
 
     shard_write_report_t const allocation_failed {.status = shard_write_t::buffer_allocation_failed_k,
                                                   .column = "conformer_coords"};
-    auto offsets_buffer_result = arrow::AllocateBuffer((num_rows + 1) * sizeof(std::int32_t));
+    auto offsets_buffer_result = arrow::AllocateBuffer(
+        static_cast<std::int64_t>((num_rows + 1) * sizeof(std::int32_t)));
     if (!offsets_buffer_result.ok()) return allocation_failed;
     auto offsets_buffer = std::move(offsets_buffer_result).ValueOrDie();
     std::int32_t *offsets = reinterpret_cast<std::int32_t *>(offsets_buffer->mutable_data());
 
-    auto values_buffer_result = arrow::AllocateBuffer(total_halves * sizeof(std::uint16_t));
+    auto values_buffer_result = arrow::AllocateBuffer(static_cast<std::int64_t>(total_halves * sizeof(std::uint16_t)));
     if (!values_buffer_result.ok()) return allocation_failed;
     auto values_buffer = std::move(values_buffer_result).ValueOrDie();
     std::uint16_t *values = reinterpret_cast<std::uint16_t *>(values_buffer->mutable_data());
 
     // Validity bitmap: bit `row` = 1 if the row has data, 0 if null.
-    std::int64_t const bitmap_bytes = (num_rows + 7) / 8;
-    auto validity_buffer_result = arrow::AllocateBuffer(bitmap_bytes);
+    std::size_t const bitmap_bytes = (num_rows + 7) / 8;
+    auto validity_buffer_result = arrow::AllocateBuffer(static_cast<std::int64_t>(bitmap_bytes));
     if (!validity_buffer_result.ok()) return allocation_failed;
     auto validity_buffer = std::move(validity_buffer_result).ValueOrDie();
     std::memset(validity_buffer->mutable_data(), 0, bitmap_bytes);
@@ -168,40 +309,30 @@ static shard_write_report_t pack_coordinates_as_list(custd::span<__half const> c
 
     std::int32_t running = 0;
     std::int64_t null_count = 0;
-    for (std::int64_t row = 0; row < num_rows; ++row) {
-        offsets[row] = running;
-        if (row_outcomes[row] == row_outcome_t::conformer_success_k) {
-            std::uint64_t const molecule_index = molecule_index_per_row[row];
-            std::uint32_t const conformer_slot = conformer_slot_per_row[row];
-            std::uint32_t const max_atoms = slot_layout.max_atoms;
-            // Defence against a contract-violating caller: per-mol num_atoms must
-            // fit in the stride. Clamp rather than OOB; the slot's coords beyond
-            // stride_halves don't exist in `coordinates` regardless.
-            std::uint32_t atom_count = static_cast<std::uint32_t>(num_atoms_per_molecule[molecule_index]);
-            if (atom_count > max_atoms) atom_count = max_atoms;
-            if (atom_count > 0) {
-                std::size_t const source_offset = slot_layout.slot_offset(molecule_index, conformer_slot);
-                if (source_offset + stride_halves > coordinates.size())
-                    return {.status = shard_write_t::coordinate_slot_out_of_range_k, .column = "conformer_coords"};
-                std::uint16_t const *source = reinterpret_cast<std::uint16_t const *>(coordinates.data()) +
-                                              source_offset;
-                // Transpose the structure-of-arrays slot into the tight interleaved
-                // `(atom_count, 3)` block a Parquet row exposes. See
-                // `conformer_slot_layout_t` for why a contiguous copy is not valid here.
-                api::gather_slot_into_interleaved(source, slot_layout, atom_count, values + running);
-                running += static_cast<std::int32_t>(atom_count * 3u);
-            }
-            validity[row >> 3] |= static_cast<std::uint8_t>(1u << (row & 7));
+    for (std::size_t row_index = 0; row_index < num_rows; ++row_index) {
+        output_row_t const &row = rows[row_index];
+        offsets[row_index] = running;
+        if (row.outcome != row_outcome_t::conformer_success_k) {
+            ++null_count;
+            continue;
         }
-        else { ++null_count; }
+        std::uint32_t const atom_count = atoms_of_(row);
+        if (atom_count > 0) {
+            std::uint16_t const *source = reinterpret_cast<std::uint16_t const *>(
+                                              inputs.conformers.coordinates.data()) +
+                                          layout.slot_offset(row.molecule_index, row.conformer_slot);
+            api::gather_slot_into_interleaved(source, layout, atom_count, values + running);
+            running += static_cast<std::int32_t>(atom_count * 3u);
+        }
+        validity[row_index >> 3] |= static_cast<std::uint8_t>(1u << (row_index & 7u));
     }
     offsets[num_rows] = running;
 
-    auto leaf_data = arrow::ArrayData::Make(arrow::float16(), total_halves, {nullptr, std::move(values_buffer)},
-                                            /*null_count=*/0);
+    auto leaf_data = arrow::ArrayData::Make(arrow::float16(), static_cast<std::int64_t>(total_halves),
+                                            {nullptr, std::move(values_buffer)}, /*null_count=*/0);
     auto leaf_array = arrow::MakeArray(std::move(leaf_data));
 
-    auto list_data = arrow::ArrayData::Make(arrow::list(arrow::float16()), num_rows,
+    auto list_data = arrow::ArrayData::Make(arrow::list(arrow::float16()), static_cast<std::int64_t>(num_rows),
                                             {std::move(validity_buffer), std::move(offsets_buffer)},
                                             {leaf_array->data()}, null_count);
     array = arrow::MakeArray(std::move(list_data));
@@ -209,49 +340,36 @@ static shard_write_report_t pack_coordinates_as_list(custd::span<__half const> c
 }
 
 /**
- *  @brief Pack a per-slot USRCAT descriptor (60 doubles per slot) into a nullable `List<float16>`, one
- *  element per output row, downcasting each value to half precision on write. A row emits its `stride`
- *  values only when it is a success row and `values` is non-empty; otherwise it is null. Slot addressing
- *  matches the coord packer: `flat = molecule_index * max_conformers + conformer_slot`, values live at
- *  `[flat*stride, flat*stride+stride)`. fp16 is honest precision here: USRCAT's value range is small and
- *  it is derived from fp16 coordinates, so storing float64 would be illusory precision.
+ *  @brief Pack the per-slot USRCAT descriptor into a nullable `List<float16>`, one element per output row.
+ *
+ *  A row emits its `usrcat_components_k` values only when it is a success row and the column was supplied;
+ *  otherwise it is null. fp16 is honest precision here: USRCAT's value range is small and it is derived from
+ *  fp16 coordinates, so storing float64 would be illusory precision.
  *
  *  @param[out] array A nullable `List<float16>` array with one element per output row, untouched on refusal.
  *  @return `written_k`, or the refusal that stopped the pack.
  */
-static shard_write_report_t pack_usrcat_as_fp16_list(custd::span<double const> values, std::uint32_t stride,
-                                                     custd::span<row_outcome_t const> row_outcomes,
-                                                     custd::span<std::uint64_t const> molecule_index_per_row,
-                                                     custd::span<std::uint32_t const> conformer_slot_per_row,
-                                                     std::uint32_t max_conformers,
+static shard_write_report_t pack_usrcat_as_fp16_list(writer_inputs_t const &inputs,
+                                                     custd::span<output_row_t const> rows,
                                                      std::shared_ptr<arrow::Array> &array) {
-
     auto value_builder = std::make_shared<arrow::HalfFloatBuilder>();
     arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-    std::int64_t const num_rows = static_cast<std::int64_t>(row_outcomes.size());
-    bool const have_values = !values.empty();
+    custd::span<double const> const values = inputs.conformers.usrcat;
     shard_write_report_t const append_failed {.status = shard_write_t::column_append_failed_k, .column = "usrcat"};
 
-    for (std::int64_t row = 0; row < num_rows; ++row) {
-        if (have_values && row_outcomes[row] == row_outcome_t::conformer_success_k) {
-            std::uint64_t const molecule_index = molecule_index_per_row[row];
-            std::uint32_t const conformer_slot = conformer_slot_per_row[row];
-            std::size_t const base = (static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot) *
-                                     stride;
-            if (base + stride > values.size()) {
-                if (!list_builder.AppendNull().ok()) return append_failed;
-                continue;
-            }
-            if (!list_builder.Append().ok()) return append_failed;
-            for (std::uint32_t component = 0; component < stride; ++component) {
-                __half const half_value = __float2half(static_cast<float>(values[base + component]));
-                std::uint16_t bits;
-                std::memcpy(&bits, &half_value, sizeof(bits));
-                if (!value_builder->Append(bits).ok()) return append_failed;
-            }
-        }
-        else {
+    for (output_row_t const &row : rows) {
+        if (values.empty() || row.outcome != row_outcome_t::conformer_success_k) {
             if (!list_builder.AppendNull().ok()) return append_failed;
+            continue;
+        }
+        std::size_t const base = flat_slot_(inputs.conformers, row.molecule_index, row.conformer_slot) *
+                                 usrcat_components_k;
+        if (!list_builder.Append().ok()) return append_failed;
+        for (std::uint32_t component = 0; component < usrcat_components_k; ++component) {
+            __half const half_value = __float2half(static_cast<float>(values[base + component]));
+            std::uint16_t bits;
+            std::memcpy(&bits, &half_value, sizeof(bits));
+            if (!value_builder->Append(bits).ok()) return append_failed;
         }
     }
 
@@ -262,326 +380,249 @@ static shard_write_report_t pack_usrcat_as_fp16_list(custd::span<double const> v
     return {.status = shard_write_t::written_k};
 }
 
-shard_write_report_t write_shard(fs::path const &path, writer_inputs_t const &inputs, logger_t const *log) {
-    std::uint64_t const num_molecules = inputs.num_molecules;
-    std::uint32_t const max_conformers = inputs.max_conformers;
-    std::uint32_t const coord_stride_halves = inputs.max_atoms * 3u;
-    logger_t const fallback;
-    logger_t const &logger = log != nullptr ? *log : fallback;
+#pragma endregion List Columns
 
-    /* Every refusal below leaves through here, so the reason reaches the operator's log whatever the caller
-     * does with the report it gets back. @p detail carries whatever the failing layer said for itself —
-     * Arrow's own message, or the shape the size contract was checked against. */
-    auto refuse_ = [&](shard_write_report_t const &report, std::string_view detail = {}) {
-        if (detail.empty()) logger.error("{}: {}", path, describe_shard_write(report));
-        else logger.error("{}: {}: {}", path, describe_shard_write(report), detail);
-        return report;
-    };
+#pragma region Assembled Table
 
-    if (inputs.num_atoms_per_molecule.empty() || inputs.n_conformers_per_molecule.empty())
-        return refuse_({.status = shard_write_t::missing_per_molecule_arrays_k});
+/** Whether a schema column admits nulls, which the writer decides and the array cannot say for itself. */
+enum class column_nullability_t : bool { required_k, nullable_k };
 
-    // Every code path below indexes these spans
-    // unguarded; if a caller violates the contract, a single early failure
-    // here is preferable to OOB memory reads inside Arrow builders or the
-    // coordinate packer.
-    std::size_t const total_slots = static_cast<std::size_t>(num_molecules) * max_conformers;
-    auto fail_size_ = [&](std::string_view column, std::size_t held, std::size_t required) {
-        return refuse_(short_input_span_(column, held, required),
-                       fmt::format("num_molecules={}, max_conformers={}, max_atoms={}",
-                                   fmt::group_digits(num_molecules), max_conformers, inputs.max_atoms));
-    };
-    if (inputs.num_atoms_per_molecule.size() < num_molecules)
-        return fail_size_("num_atoms_per_molecule", inputs.num_atoms_per_molecule.size(), num_molecules);
-    if (inputs.n_conformers_per_molecule.size() < num_molecules)
-        return fail_size_("n_conformers_per_molecule", inputs.n_conformers_per_molecule.size(), num_molecules);
-    if (inputs.smiles.size() < num_molecules) return fail_size_("smiles", inputs.smiles.size(), num_molecules);
-    if (inputs.status.size() < total_slots) return fail_size_("status", inputs.status.size(), total_slots);
-    if (inputs.energies.size() < total_slots) return fail_size_("energies", inputs.energies.size(), total_slots);
-    if (inputs.coordinates.size() < total_slots * coord_stride_halves)
-        return fail_size_("coordinates", inputs.coordinates.size(), total_slots * coord_stride_halves);
-    // Optional per-molecule columns: callers may pass an empty span to opt out;
-    // otherwise the size must cover every molecule.
-    if (!inputs.num_heavy_atoms_per_molecule.empty() && inputs.num_heavy_atoms_per_molecule.size() < num_molecules)
-        return fail_size_("num_heavy_atoms_per_molecule", inputs.num_heavy_atoms_per_molecule.size(), num_molecules);
-    if (!inputs.num_bonds_per_molecule.empty() && inputs.num_bonds_per_molecule.size() < num_molecules)
-        return fail_size_("num_bonds_per_molecule", inputs.num_bonds_per_molecule.size(), num_molecules);
-    if (!inputs.molecular_weight_per_molecule.empty() && inputs.molecular_weight_per_molecule.size() < num_molecules)
-        return fail_size_("molecular_weight_per_molecule", inputs.molecular_weight_per_molecule.size(), num_molecules);
+/**
+ *  @brief The schema's fields and the arrays behind them, appended together so the two cannot drift.
+ *
+ *  A field's type comes from the array it names rather than from a second list beside it, which is what
+ *  used to let a `list<float16>` column be declared next to a `float32` field with nothing to catch it.
+ */
+struct column_table_t {
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    std::vector<std::shared_ptr<arrow::Array>> arrays;
 
-    // Determine total output rows. For each molecule, surviving_conformers =
-    // n_conformers_per_molecule[molecule_index] surviving conformers (post-Kabsch). surviving_conformers = 0
-    // indicates the molecule failed preprocess entirely; the writer still emits one row with all-null per-mol
-    // fields so every input row has at least one output row.
-    std::uint64_t total_rows = 0;
-    for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
-        std::uint8_t const surviving_conformers = inputs.n_conformers_per_molecule[molecule_index];
-        total_rows += (surviving_conformers == 0) ? 1u : static_cast<std::uint64_t>(surviving_conformers);
+    void append(std::string name, column_nullability_t nullability, std::shared_ptr<arrow::Array> array) {
+        fields.push_back(arrow::field(std::move(name), array->type(), nullability == column_nullability_t::nullable_k));
+        arrays.push_back(std::move(array));
+    }
+};
+
+/**
+ *  @brief The eleven scalar row columns, reserved once, appended per row, and finished together.
+ *
+ *  Each phase keeps the first column that refused and reports it afterwards rather than branching per row:
+ *  a per-row check on eleven builders costs eleven branches a row for a condition that fires at most once,
+ *  and collapsing the eleven call sites into one anonymous answer is what left callers printing
+ *  `write failed` with no column name.
+ */
+class row_columns_t {
+    arrow::StringBuilder input_shard_;
+    arrow::UInt64Builder input_row_;
+    arrow::StringBuilder smiles_;
+    arrow::UInt8Builder conformer_index_;
+    arrow::UInt8Builder status_;
+    arrow::UInt16Builder num_heavy_atoms_;
+    arrow::UInt16Builder num_atoms_;
+    arrow::UInt16Builder num_bonds_;
+    arrow::FloatBuilder molecular_weight_;
+    arrow::UInt8Builder num_conformers_;
+    arrow::FloatBuilder conformer_energy_;
+
+    shard_write_report_t report_ {};
+    std::string detail_;
+
+    /** Keep the first refusal of the current phase, with the column that produced it. */
+    void record_(shard_write_t status, std::string_view column, arrow::Status const &arrow_status) {
+        if (arrow_status.ok() || report_.status != shard_write_t::written_k) return;
+        report_ = {.status = status, .column = column};
+        detail_ = arrow_status.message();
     }
 
-    // Build per-output-row index sidecars used by the coord packer + the row-loop.
-    std::vector<row_outcome_t> row_outcomes;
-    row_outcomes.reserve(total_rows);
-    std::vector<std::uint64_t> molecule_index_per_row;
-    molecule_index_per_row.reserve(total_rows);
-    std::vector<std::uint32_t> conformer_slot_per_row;
-    conformer_slot_per_row.reserve(total_rows);
-    // conformer_index emitted per row is the energy rank within the molecule (0 = lowest energy),
-    // not the original K-slot; rows within a molecule are energy-sorted below.
-    std::vector<std::uint8_t> conformer_index_per_row;
-    conformer_index_per_row.reserve(total_rows);
+  public:
+    /** Whatever Arrow said about the refusal, empty when nothing refused. */
+    [[nodiscard]] std::string const &detail() const noexcept { return detail_; }
 
-    // K is tiny (3 in production); a fixed stack buffer avoids a per-molecule heap allocation on
-    // the hot path. Molecules with more slots than this fall back to unsorted emission.
-    constexpr std::uint32_t max_sortable_conformers_k = 64;
-
-    for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
-        std::uint8_t const surviving_conformers = inputs.n_conformers_per_molecule[molecule_index];
-        if (surviving_conformers == 0) {
-            row_outcomes.push_back(row_outcome_t::molecule_failure_k);
-            molecule_index_per_row.push_back(molecule_index);
-            conformer_slot_per_row.push_back(0);
-            conformer_index_per_row.push_back(0);
-            continue;
-        }
-
-        // Energy-sort this molecule's slots: successful conformers first (ascending energy), failed
-        // slots (null energy) trail in slot order. conformer_index then reads as an energy rank.
-        auto slot_key = [&](std::uint32_t conformer_slot) -> std::pair<int, float> {
-            std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
-            std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 1;
-            float const energy = (flat < inputs.energies.size()) ? inputs.energies[flat] : 0.0f;
-            return {status_code == 0 ? 0 : 1, energy};
+    /** Size every column for @p num_rows, so the fixed-width appends below cannot fail on capacity. */
+    [[nodiscard]] shard_write_report_t reserve(std::size_t num_rows) {
+        std::int64_t const rows = static_cast<std::int64_t>(num_rows);
+        auto reserve_ = [&](std::string_view column, auto &builder) {
+            record_(shard_write_t::column_reserve_failed_k, column, builder.Reserve(rows));
         };
-        std::array<std::uint32_t, max_sortable_conformers_k> order {};
-        std::uint32_t const sortable = std::min<std::uint32_t>(surviving_conformers, max_sortable_conformers_k);
-        for (std::uint32_t conformer_slot = 0; conformer_slot < sortable; ++conformer_slot)
-            order[conformer_slot] = conformer_slot;
-        std::stable_sort(order.begin(), order.begin() + sortable,
-                         [&](std::uint32_t left, std::uint32_t right) { return slot_key(left) < slot_key(right); });
-
-        for (std::uint32_t rank = 0; rank < surviving_conformers; ++rank) {
-            std::uint32_t const conformer_slot = rank < sortable ? order[rank] : rank; // overflow: unsorted tail
-            std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
-            std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 0;
-            row_outcomes.push_back(status_code == 0 ? row_outcome_t::conformer_success_k
-                                                    : row_outcome_t::conformer_failure_k);
-            molecule_index_per_row.push_back(molecule_index);
-            conformer_slot_per_row.push_back(conformer_slot);
-            conformer_index_per_row.push_back(static_cast<std::uint8_t>(rank));
-        }
+        reserve_("input_shard", input_shard_);
+        reserve_("input_row", input_row_);
+        reserve_("smiles", smiles_);
+        reserve_("conformer_index", conformer_index_);
+        reserve_("status", status_);
+        reserve_("n_heavy_atoms", num_heavy_atoms_);
+        reserve_("n_atoms", num_atoms_);
+        reserve_("n_bonds", num_bonds_);
+        reserve_("molecular_weight", molecular_weight_);
+        reserve_("n_conformers", num_conformers_);
+        reserve_("conformer_energy", conformer_energy_);
+        return report_;
     }
 
-    // Allocate Arrow builders.
-    arrow::StringBuilder input_shard_builder;
-    arrow::UInt64Builder input_row_builder;
-    arrow::StringBuilder smiles_builder;
-    arrow::UInt8Builder conformer_index_builder;
-    arrow::UInt8Builder status_builder;
-    arrow::UInt16Builder n_heavy_atoms_builder;
-    arrow::UInt16Builder n_atoms_builder;
-    arrow::UInt16Builder n_bonds_builder;
-    arrow::FloatBuilder molecular_weight_builder;
-    arrow::UInt8Builder n_conformers_builder;
-    arrow::FloatBuilder conformer_energy_builder;
+    /**
+     *  @brief Append one row to every column.
+     *
+     *  `Reserve` sizes `smiles_`'s offset array rather than its character data, so that one append can still
+     *  hit an allocation failure; the refusal is kept and read once after the pass.
+     */
+    void append(writer_inputs_t const &inputs, output_row_t const &row) {
+        molecule_columns_t const &molecules = inputs.molecules;
+        std::uint64_t const molecule_index = row.molecule_index;
+        std::size_t const flat = flat_slot_(inputs.conformers, molecule_index, row.conformer_slot);
+        std::string_view const smiles = molecules.smiles[molecule_index];
+        auto record_append_ = [&](std::string_view column, arrow::Status status) {
+            record_(shard_write_t::column_append_failed_k, column, status);
+        };
 
-    // Keep the first column that cannot reserve and check once after the pass, so the refusal names the
-    // column rather than the eleven call sites collapsing into one anonymous answer.
-    shard_write_report_t reserve_report;
-    auto reserve_column_ = [&](std::string_view column, auto &builder) {
-        arrow::Status const status = builder.Reserve(static_cast<std::int64_t>(total_rows));
-        if (status.ok() || reserve_report.status != shard_write_t::written_k) return;
-        reserve_report = refuse_({.status = shard_write_t::column_reserve_failed_k, .column = column},
-                                 status.message());
-    };
-    reserve_column_("input_shard", input_shard_builder);
-    reserve_column_("input_row", input_row_builder);
-    reserve_column_("smiles", smiles_builder);
-    reserve_column_("conformer_index", conformer_index_builder);
-    reserve_column_("status", status_builder);
-    reserve_column_("n_heavy_atoms", n_heavy_atoms_builder);
-    reserve_column_("n_atoms", n_atoms_builder);
-    reserve_column_("n_bonds", n_bonds_builder);
-    reserve_column_("molecular_weight", molecular_weight_builder);
-    reserve_column_("n_conformers", n_conformers_builder);
-    reserve_column_("conformer_energy", conformer_energy_builder);
-    if (reserve_report.status != shard_write_t::written_k) return reserve_report;
+        record_append_("input_shard", input_shard_.Append(inputs.provenance.input_shard_stem));
+        record_append_("input_row", input_row_.Append(inputs.provenance.base_row_index + molecule_index));
+        record_append_("smiles", smiles_.Append(smiles.data(), static_cast<std::int32_t>(smiles.size())));
+        record_append_("conformer_index", conformer_index_.Append(row.energy_rank));
+        record_append_("status", status_.Append(static_cast<std::uint8_t>(inputs.conformers.status[flat])));
 
-    // Helper: bool indicating whether a molecule's preprocess succeeded (n_atoms > 0).
-    auto molecule_ok = [&](std::uint64_t molecule_index) -> bool {
-        return inputs.num_atoms_per_molecule[molecule_index] != 0;
-    };
-
-    // Every builder above is reserved for `total_rows`, so the fixed-width appends below cannot
-    // fail on capacity. `smiles_builder` is the exception: `Reserve` sizes the offset array, not
-    // the character data, so its append can still hit an allocation failure and truncate the shard
-    // silently. Keep the first failure and check once after the loop rather than branching per row.
-    arrow::Status append_status;
-    std::string_view append_column;
-    auto record_append_ = [&](std::string_view column, arrow::Status status) {
-        if (!append_status.ok() || status.ok()) return;
-        append_status = std::move(status);
-        append_column = column;
-    };
-
-    for (std::uint64_t row = 0; row < total_rows; ++row) {
-        std::uint64_t const molecule_index = molecule_index_per_row[row];
-        std::uint32_t const conformer_slot = conformer_slot_per_row[row];
-        row_outcome_t const outcome = row_outcomes[row];
-
-        std::uint64_t const input_row = inputs.base_row_index + molecule_index;
-        std::string_view const smiles = molecule_index < inputs.smiles.size() ? inputs.smiles[molecule_index] : "";
-        std::size_t const flat = static_cast<std::size_t>(molecule_index) * max_conformers + conformer_slot;
-        std::uint8_t const status_code = (flat < inputs.status.size()) ? inputs.status[flat] : 0;
-
-        record_append_("input_shard", input_shard_builder.Append(inputs.input_shard_stem));
-        record_append_("input_row", input_row_builder.Append(input_row));
-        record_append_("smiles", smiles_builder.Append(smiles.data(), static_cast<std::int32_t>(smiles.size())));
-        record_append_("conformer_index", conformer_index_builder.Append(conformer_index_per_row[row]));
-        record_append_("status", status_builder.Append(status_code));
-
-        if (molecule_ok(molecule_index)) {
-            record_append_("n_heavy_atoms",
-                           n_heavy_atoms_builder.Append(inputs.num_heavy_atoms_per_molecule.empty()
-                                                            ? 0u
-                                                            : inputs.num_heavy_atoms_per_molecule[molecule_index]));
-            record_append_("n_atoms", n_atoms_builder.Append(
-                                          static_cast<std::uint16_t>(inputs.num_atoms_per_molecule[molecule_index])));
-            record_append_("n_bonds", n_bonds_builder.Append(inputs.num_bonds_per_molecule.empty()
-                                                                 ? 0u
-                                                                 : inputs.num_bonds_per_molecule[molecule_index]));
-            record_append_("molecular_weight",
-                           molecular_weight_builder.Append(inputs.molecular_weight_per_molecule.empty()
-                                                               ? 0.0f
-                                                               : inputs.molecular_weight_per_molecule[molecule_index]));
-            record_append_("n_conformers",
-                           n_conformers_builder.Append(inputs.n_conformers_per_molecule[molecule_index]));
+        if (molecules.num_atoms[molecule_index] == 0) { // preprocess failed, so every per-molecule column is null
+            record_append_("n_heavy_atoms", num_heavy_atoms_.AppendNull());
+            record_append_("n_atoms", num_atoms_.AppendNull());
+            record_append_("n_bonds", num_bonds_.AppendNull());
+            record_append_("molecular_weight", molecular_weight_.AppendNull());
+            record_append_("n_conformers", num_conformers_.AppendNull());
         }
         else {
-            record_append_("n_heavy_atoms", n_heavy_atoms_builder.AppendNull());
-            record_append_("n_atoms", n_atoms_builder.AppendNull());
-            record_append_("n_bonds", n_bonds_builder.AppendNull());
-            record_append_("molecular_weight", molecular_weight_builder.AppendNull());
-            record_append_("n_conformers", n_conformers_builder.AppendNull());
+            record_append_("n_heavy_atoms", num_heavy_atoms_.Append(molecules.num_heavy_atoms.empty()
+                                                                        ? std::uint16_t {0}
+                                                                        : molecules.num_heavy_atoms[molecule_index]));
+            record_append_("n_atoms", num_atoms_.Append(molecules.num_atoms[molecule_index]));
+            record_append_("n_bonds",
+                           num_bonds_.Append(molecules.num_bonds.empty() ? std::uint16_t {0}
+                                                                         : molecules.num_bonds[molecule_index]));
+            record_append_("molecular_weight",
+                           molecular_weight_.Append(
+                               molecules.molecular_weight.empty() ? 0.0f : molecules.molecular_weight[molecule_index]));
+            record_append_("n_conformers", num_conformers_.Append(addressable_conformers_(inputs, molecule_index)));
         }
 
-        if (outcome == row_outcome_t::conformer_success_k) {
-            record_append_("conformer_energy", conformer_energy_builder.Append(inputs.energies[flat]));
-        }
-        else { record_append_("conformer_energy", conformer_energy_builder.AppendNull()); }
+        if (row.outcome == row_outcome_t::conformer_success_k)
+            record_append_("conformer_energy", conformer_energy_.Append(inputs.conformers.energies[flat]));
+        else record_append_("conformer_energy", conformer_energy_.AppendNull());
     }
 
-    // A failed append leaves the column arrays inconsistent in length, which Parquet would happily
-    // write as a truncated shard. Refuse instead.
-    if (!append_status.ok())
-        return refuse_({.status = shard_write_t::column_append_failed_k, .column = append_column},
-                       append_status.message());
+    /** The first append that refused; a short column would otherwise be written as a truncated shard. */
+    [[nodiscard]] shard_write_report_t append_report() const noexcept { return report_; }
 
-    std::shared_ptr<arrow::Array> input_shard_array, input_row_array, smiles_array, conformer_index_array;
-    std::shared_ptr<arrow::Array> status_array, n_heavy_atoms_array, n_atoms_array, n_bonds_array;
-    std::shared_ptr<arrow::Array> molecular_weight_array, n_conformers_array, conformer_energy_array;
-    // Same shape as the reserve pass: the first column that cannot finish names itself, and one check
-    // after the pass carries it out.
-    shard_write_report_t finish_report;
-    auto finish_column_ = [&](std::string_view column, auto &builder, std::shared_ptr<arrow::Array> &array) {
-        arrow::Status const status = builder.Finish(&array);
-        if (status.ok() || finish_report.status != shard_write_t::written_k) return;
-        finish_report = refuse_({.status = shard_write_t::column_finish_failed_k, .column = column}, status.message());
-    };
-    finish_column_("input_shard", input_shard_builder, input_shard_array);
-    finish_column_("input_row", input_row_builder, input_row_array);
-    finish_column_("smiles", smiles_builder, smiles_array);
-    finish_column_("conformer_index", conformer_index_builder, conformer_index_array);
-    finish_column_("status", status_builder, status_array);
-    finish_column_("n_heavy_atoms", n_heavy_atoms_builder, n_heavy_atoms_array);
-    finish_column_("n_atoms", n_atoms_builder, n_atoms_array);
-    finish_column_("n_bonds", n_bonds_builder, n_bonds_array);
-    finish_column_("molecular_weight", molecular_weight_builder, molecular_weight_array);
-    finish_column_("n_conformers", n_conformers_builder, n_conformers_array);
-    finish_column_("conformer_energy", conformer_energy_builder, conformer_energy_array);
-    if (finish_report.status != shard_write_t::written_k) return finish_report;
+    /** Hand every finished column to @p table in schema order. */
+    [[nodiscard]] shard_write_report_t finish_into(column_table_t &table) {
+        auto finish_ = [&](std::string_view column, column_nullability_t nullability, auto &builder) {
+            std::shared_ptr<arrow::Array> array;
+            record_(shard_write_t::column_finish_failed_k, column, builder.Finish(&array));
+            if (array) table.append(std::string {column}, nullability, std::move(array));
+        };
+        finish_("input_shard", column_nullability_t::required_k, input_shard_);
+        finish_("input_row", column_nullability_t::required_k, input_row_);
+        finish_("smiles", column_nullability_t::required_k, smiles_);
+        finish_("conformer_index", column_nullability_t::required_k, conformer_index_);
+        finish_("status", column_nullability_t::required_k, status_);
+        finish_("n_heavy_atoms", column_nullability_t::nullable_k, num_heavy_atoms_);
+        finish_("n_atoms", column_nullability_t::nullable_k, num_atoms_);
+        finish_("n_bonds", column_nullability_t::nullable_k, num_bonds_);
+        finish_("molecular_weight", column_nullability_t::nullable_k, molecular_weight_);
+        finish_("n_conformers", column_nullability_t::nullable_k, num_conformers_);
+        return report_;
+    }
 
-    std::shared_ptr<arrow::Array> coord_array;
-    if (shard_write_report_t const report = pack_coordinates_as_list(
-            inputs.coordinates, inputs.num_atoms_per_molecule, row_outcomes, molecule_index_per_row,
-            conformer_slot_per_row, max_conformers, coord_stride_halves, coord_array);
-        report.status != shard_write_t::written_k)
-        return refuse_(report);
+    /** The energy column trails the two list columns in the schema, so it is finished after them. */
+    [[nodiscard]] shard_write_report_t finish_energy_into(column_table_t &table) {
+        std::shared_ptr<arrow::Array> array;
+        record_(shard_write_t::column_finish_failed_k, "conformer_energy", conformer_energy_.Finish(&array));
+        if (array) table.append("conformer_energy", column_nullability_t::nullable_k, std::move(array));
+        return report_;
+    }
+};
 
-    std::shared_ptr<arrow::Array> usrcat_array;
-    if (shard_write_report_t const report = pack_usrcat_as_fp16_list(inputs.usrcat, 60u, row_outcomes,
-                                                                     molecule_index_per_row, conformer_slot_per_row,
-                                                                     max_conformers, usrcat_array);
-        report.status != shard_write_t::written_k)
-        return refuse_(report);
-
-    // Provenance: schema-level key-value metadata so the bytes are self-describing (a
-    // content-addressed store keeps no path context). SMALLFIELD_GIT_SHA is injected by CMake.
+/**
+ *  @brief Schema-level key-value metadata, so the bytes stay self-describing in a content-addressed store.
+ *
+ *  `SMALLFIELD_GIT_SHA` is injected by CMake. The coordinate frame reported is the one actually shipped:
+ *  coordinates are centroid-centered but their orientation is not canonicalized, because the metric
+ *  embedding aligns to principal axes and the FIRE/MMFF relaxation afterwards drifts the pose off that frame.
+ */
+static std::shared_ptr<arrow::KeyValueMetadata> build_provenance_(writer_inputs_t const &inputs) {
     auto provenance = std::make_shared<arrow::KeyValueMetadata>();
     provenance->Append("producer", "smallfield_batch");
 #ifdef SMALLFIELD_GIT_SHA
     provenance->Append("producer_git_sha", SMALLFIELD_GIT_SHA);
 #endif
-    provenance->Append("num_conformers", std::to_string(max_conformers));
-    provenance->Append("max_atoms", std::to_string(inputs.max_atoms));
-    if (!inputs.dataset.empty()) provenance->Append("dataset", inputs.dataset);
-    // Coordinates are centroid-centered but orientation is not canonicalized: the metric embedding aligns to
-    // principal axes, but the subsequent FIRE/MMFF relaxation drifts the pose off that frame. Report the
-    // frame actually shipped. A true canonical principal-axis pose, a final reframe with a fixed sign
-    // convention, is a possible future enhancement.
+    provenance->Append("num_conformers", std::to_string(inputs.conformers.layout.num_conformers));
+    provenance->Append("max_atoms", std::to_string(inputs.conformers.layout.max_atoms));
+    if (!inputs.provenance.dataset.empty()) provenance->Append("dataset", inputs.provenance.dataset);
     provenance->Append("coordinate_frame", "centered");
     provenance->Append("schema_version", "2");
     provenance->Append("dedup", "none");
+    return provenance;
+}
 
-    auto schema = arrow::schema(
-        {
-            arrow::field("input_shard", arrow::utf8(), false),
-            arrow::field("input_row", arrow::uint64(), false),
-            arrow::field("smiles", arrow::utf8(), false),
-            arrow::field("conformer_index", arrow::uint8(), false),
-            arrow::field("status", arrow::uint8(), false),
-            arrow::field("n_heavy_atoms", arrow::uint16(), true),
-            arrow::field("n_atoms", arrow::uint16(), true),
-            arrow::field("n_bonds", arrow::uint16(), true),
-            arrow::field("molecular_weight", arrow::float32(), true),
-            arrow::field("n_conformers", arrow::uint8(), true),
-            arrow::field("conformer_coords", arrow::list(arrow::float16()), true),
-            arrow::field("conformer_energy", arrow::float32(), true),
-            arrow::field("usrcat", arrow::list(arrow::float16()), true),
-        },
-        provenance);
-
-    auto table = arrow::Table::Make(schema, {
-                                                input_shard_array,
-                                                input_row_array,
-                                                smiles_array,
-                                                conformer_index_array,
-                                                status_array,
-                                                n_heavy_atoms_array,
-                                                n_atoms_array,
-                                                n_bonds_array,
-                                                molecular_weight_array,
-                                                n_conformers_array,
-                                                coord_array,
-                                                conformer_energy_array,
-                                                usrcat_array,
-                                            });
-
+/** Write @p table to @p path as one ZSTD-compressed Parquet file, closed before this returns. */
+static shard_write_report_t write_parquet_(fs::path const &path, arrow::Table const &table, logger_t const &logger) {
     auto outfile_result = arrow::io::FileOutputStream::Open(path.string());
     if (!outfile_result.ok())
-        return refuse_({.status = shard_write_t::output_open_failed_k}, outfile_result.status().message());
+        return refuse_(logger, path, {.status = shard_write_t::output_open_failed_k},
+                       outfile_result.status().message());
     auto outfile = outfile_result.ValueOrDie();
 
     auto writer_props =
         parquet::WriterProperties::Builder().compression(parquet::Compression::ZSTD)->compression_level(3)->build();
     auto arrow_props = parquet::ArrowWriterProperties::Builder().store_schema()->build();
-    auto write_status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile, 65536, writer_props,
+    auto write_status = parquet::arrow::WriteTable(table, arrow::default_memory_pool(), outfile, 65536, writer_props,
                                                    arrow_props);
-    if (!write_status.ok()) return refuse_({.status = shard_write_t::parquet_write_failed_k}, write_status.message());
+    if (!write_status.ok())
+        return refuse_(logger, path, {.status = shard_write_t::parquet_write_failed_k}, write_status.message());
 
     auto close_status = outfile->Close();
-    if (!close_status.ok()) return refuse_({.status = shard_write_t::output_close_failed_k}, close_status.message());
+    if (!close_status.ok())
+        return refuse_(logger, path, {.status = shard_write_t::output_close_failed_k}, close_status.message());
     return {.status = shard_write_t::written_k};
+}
+
+#pragma endregion Assembled Table
+
+shard_write_report_t write_shard(fs::path const &path, writer_inputs_t const &inputs, logger_t const *log) {
+    logger_t const fallback;
+    logger_t const &logger = log != nullptr ? *log : fallback;
+
+    if (shard_write_report_t const report = check_input_extents_(inputs); report.status != shard_write_t::written_k)
+        return refuse_(logger, path, report, describe_extents_(inputs));
+
+    std::vector<output_row_t> rows;
+    fill_output_rows_into(inputs, rows);
+
+    row_columns_t columns;
+    if (shard_write_report_t const report = columns.reserve(rows.size()); report.status != shard_write_t::written_k)
+        return refuse_(logger, path, report, columns.detail());
+
+    for (output_row_t const &row : rows) columns.append(inputs, row);
+    if (shard_write_report_t const report = columns.append_report(); report.status != shard_write_t::written_k)
+        return refuse_(logger, path, report, columns.detail());
+
+    column_table_t table;
+    if (shard_write_report_t const report = columns.finish_into(table); report.status != shard_write_t::written_k)
+        return refuse_(logger, path, report, columns.detail());
+
+    std::shared_ptr<arrow::Array> coordinates_array;
+    if (shard_write_report_t const report = pack_coordinates_as_list(inputs, rows, coordinates_array);
+        report.status != shard_write_t::written_k)
+        return refuse_(logger, path, report);
+    table.append("conformer_coords", column_nullability_t::nullable_k, std::move(coordinates_array));
+
+    if (shard_write_report_t const report = columns.finish_energy_into(table);
+        report.status != shard_write_t::written_k)
+        return refuse_(logger, path, report, columns.detail());
+
+    std::shared_ptr<arrow::Array> usrcat_array;
+    if (shard_write_report_t const report = pack_usrcat_as_fp16_list(inputs, rows, usrcat_array);
+        report.status != shard_write_t::written_k)
+        return refuse_(logger, path, report);
+    table.append("usrcat", column_nullability_t::nullable_k, std::move(usrcat_array));
+
+    auto schema = arrow::schema(table.fields, build_provenance_(inputs));
+    return write_parquet_(path, *arrow::Table::Make(schema, table.arrays), logger);
 }
 
 } // namespace smallfield::cli

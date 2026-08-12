@@ -54,138 +54,169 @@ static void warm_up_rdkit_globals_for_fallback_() {
     }();
 }
 
-std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallback_outputs_t &outputs) {
-    std::uint32_t const num_conformers = inputs.num_conformers;
-    std::uint32_t const max_atoms = inputs.max_atoms;
-    sfapi::conformer_slot_layout_t const slot_layout {max_atoms, num_conformers};
-    std::uint32_t const coordinate_stride = static_cast<std::uint32_t>(slot_layout.slot_stride());
-    std::uint64_t const num_retries = inputs.retry_indices.size();
+#pragma region One Molecule
 
+/** This molecule's conformer slots, as one view into the batch-wide arrays. */
+template <typename element_type_>
+static custd::span<element_type_> slots_of_(custd::span<element_type_> batch,
+                                            sfapi::conformer_slot_layout_t const &layout,
+                                            std::uint32_t molecule_index) {
+    std::size_t const first = static_cast<std::size_t>(molecule_index) * layout.num_conformers;
+    return batch.subspan(first, layout.num_conformers);
+}
+
+/** Conformer slots of one molecule the GPU did not fill, which is how many fresh ones to embed. */
+static std::uint32_t unfilled_slots_of_(custd::span<sfapi::conformer_status_t const> status) {
+    std::uint32_t unfilled = 0;
+    for (sfapi::conformer_status_t const slot_status : status)
+        if (slot_status != sfapi::conformer_status_t::success_k) ++unfilled;
+    return unfilled;
+}
+
+/**
+ *  @brief Parse one SMILES the way the GPU path does and confirm MMFF can type the result.
+ *
+ *  Embedding is the dominant CPU cost here and it is wasted on a molecule the force field cannot type:
+ *  `constructForceField` would throw below and every conformer would fail anyway, so asking first costs a
+ *  typing check instead of K embeddings.
+ *
+ *  @param[out] molecule Receives the parsed molecule on `success_k`, untouched on every refusal.
+ *  @return `success_k`, or the status every slot of this molecule takes.
+ */
+static sfapi::conformer_status_t admit_molecule_(std::string_view smiles, std::uint32_t max_atoms,
+                                                 std::unique_ptr<RDKit::RWMol> &molecule) {
+    if (smiles.empty()) return sfapi::conformer_status_t::invalid_smiles_k;
+
+    // Same parse contract as the GPU path, counterion removal included, so a molecule recovered here
+    // carries the atom count and geometry the rest of the pipeline expects.
+    smallfield::parse_options_t parse_options;
+    parse_options.max_atoms = max_atoms;
+    smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
+    if (parsed.status != sfapi::conformer_status_t::success_k) return parsed.status;
+    if (!RDKit::MMFF::MMFFMolProperties(*parsed.molecule).isValid())
+        return sfapi::conformer_status_t::unsupported_element_k;
+
+    molecule = std::move(parsed.molecule);
+    return sfapi::conformer_status_t::success_k;
+}
+
+/**
+ *  @brief MMFF-minimize one embedded conformer in place and read back its energy.
+ *
+ *  @param[out] energy_kcal_per_mol Minimized MMFF94 energy, untouched unless the field converged.
+ */
+static bool minimize_conformer_(RDKit::RWMol &molecule, int conformer_id, float &energy_kcal_per_mol) {
+    try {
+        auto force_field = std::unique_ptr<ForceFields::ForceField>(
+            RDKit::MMFF::constructForceField(molecule, /*nonBondedThresh=*/100.0, conformer_id));
+        if (!force_field) return false;
+        force_field->initialize();
+        force_field->minimize(200, 1e-4, 1e-6);
+        energy_kcal_per_mol = static_cast<float>(force_field->calcEnergy());
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
+/** Write one RDKit conformer into its structure-of-arrays slot, zeroing the padding atoms first. */
+static void write_conformer_into_slot_(RDKit::RWMol const &molecule, int conformer_id,
+                                       sfapi::conformer_slot_layout_t const &layout, __half *slot) {
+    std::memset(reinterpret_cast<void *>(slot), 0, sizeof(__half) * layout.slot_stride());
+    auto const &conformer = molecule.getConformer(conformer_id);
+    for (unsigned int atom = 0; atom < molecule.getNumAtoms(); ++atom) {
+        auto const &position = conformer.getAtomPos(atom);
+        slot[layout.component_offset(0u, atom)] = __float2half(static_cast<float>(position.x));
+        slot[layout.component_offset(1u, atom)] = __float2half(static_cast<float>(position.y));
+        slot[layout.component_offset(2u, atom)] = __float2half(static_cast<float>(position.z));
+    }
+}
+
+/**
+ *  @brief Embed fresh conformers for one molecule and lay them into the slots the GPU left unfilled.
+ *
+ *  Only as many conformers are embedded as there are unfilled slots: `EmbedMultipleConfs` is the dominant
+ *  CPU cost in this path, and failures cluster in one of K, so halving the count halves the per-molecule
+ *  wall in the common case. Slots the GPU did fill keep their coordinates, energy and status untouched.
+ *
+ *  @return Slots this molecule recovered.
+ */
+static std::uint32_t recover_molecule_(RDKit::RWMol &molecule, std::uint64_t random_seed,
+                                       sfapi::conformer_slot_layout_t const &layout,
+                                       custd::span<sfapi::conformer_status_t> status, custd::span<float> energies,
+                                       custd::span<__half> coordinates) {
+    RDKit::DGeomHelpers::EmbedParameters embed_params = RDKit::DGeomHelpers::ETKDGv3;
+    embed_params.randomSeed = static_cast<int>(random_seed);
+    embed_params.maxIterations = 200;
+
+    std::vector<int> conformer_ids;
+    try {
+        conformer_ids = RDKit::DGeomHelpers::EmbedMultipleConfs(
+            molecule, static_cast<unsigned int>(unfilled_slots_of_(status)), embed_params);
+    }
+    catch (...) { /* an embedding RDKit refused leaves every slot as the GPU left it */
+    }
+
+    std::uint32_t recovered = 0;
+    std::size_t fresh_index = 0;
+    for (std::uint32_t conformer_slot = 0; conformer_slot < layout.num_conformers; ++conformer_slot) {
+        if (status[conformer_slot] == sfapi::conformer_status_t::success_k) continue; // the GPU filled this one
+        if (fresh_index >= conformer_ids.size()) break;                               // nothing left to lay in
+        int const conformer_id = conformer_ids[fresh_index++];
+
+        float energy_kcal_per_mol = 0.0f;
+        if (!minimize_conformer_(molecule, conformer_id, energy_kcal_per_mol)) continue;
+
+        write_conformer_into_slot_(molecule, conformer_id, layout,
+                                   coordinates.data() + conformer_slot * layout.slot_stride());
+        energies[conformer_slot] = energy_kcal_per_mol;
+        status[conformer_slot] = sfapi::conformer_status_t::success_k;
+        ++recovered;
+    }
+    return recovered;
+}
+
+#pragma endregion One Molecule
+
+std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallback_outputs_t &outputs) {
+    sfapi::conformer_slot_layout_t const &layout = inputs.layout;
+    std::uint64_t const num_retries = inputs.retry_indices.size();
     if (num_retries == 0) return 0;
 
     std::atomic<std::uint64_t> num_recovered {0};
-
     int const num_threads = inputs.num_threads > 0 ? inputs.num_threads : omp_get_max_threads();
-
     warm_up_rdkit_globals_for_fallback_();
 
 #pragma omp parallel for schedule(dynamic, 16) num_threads(num_threads) if (num_threads > 1)
     for (std::uint64_t retry_entry = 0; retry_entry < num_retries; ++retry_entry) {
         std::uint32_t const molecule_index = inputs.retry_indices[retry_entry];
-        std::string_view const smiles = inputs.smiles[molecule_index];
+        custd::span<sfapi::conformer_status_t> const status = slots_of_(outputs.status, layout, molecule_index);
+        if (unfilled_slots_of_(status) == 0) continue; // the GPU filled every slot after all
 
-        // Successful GPU conformers (solver==0, status==success) are preserved untouched — they keep
-        // their GPU coordinates, energy, and status. Anything not flipped to success by this loop keeps
-        // its existing failed status; the solver code below is only updated when a slot is successfully
-        // recovered.
-        std::uint32_t needed_slots = 0;
-        for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index) {
-            std::uint8_t const slot_status = outputs.status[molecule_index * num_conformers + conformer_index];
-            if (slot_status != static_cast<std::uint8_t>(sfapi::conformer_status_t::success_k)) ++needed_slots;
-        }
-        if (needed_slots == 0) continue;
-
-        if (smiles.empty()) {
-            for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
-                outputs.status[molecule_index * num_conformers + conformer_index] = static_cast<std::uint8_t>(
-                    sfapi::conformer_status_t::invalid_smiles_k);
+        std::unique_ptr<RDKit::RWMol> molecule;
+        if (sfapi::conformer_status_t const admission = admit_molecule_(inputs.smiles[molecule_index], layout.max_atoms,
+                                                                        molecule);
+            admission != sfapi::conformer_status_t::success_k) {
+            // Only the unfilled slots take the refusal; a slot the GPU already filled keeps its geometry,
+            // which a whole-molecule overwrite used to discard along with the status that described it.
+            for (sfapi::conformer_status_t &slot_status : status)
+                if (slot_status != sfapi::conformer_status_t::success_k) slot_status = admission;
             continue;
         }
 
-        // Same parse contract as the GPU path, counterion removal included, so a molecule recovered
-        // here carries the atom count and geometry the rest of the pipeline expects.
-        smallfield::parse_options_t parse_options;
-        parse_options.max_atoms = max_atoms;
-        smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
-        if (parsed.status != sfapi::conformer_status_t::success_k) {
-            for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
-                outputs.status[molecule_index * num_conformers + conformer_index] = static_cast<std::uint8_t>(
-                    parsed.status);
-            continue;
-        }
-        std::unique_ptr<RDKit::RWMol> molecule = std::move(parsed.molecule);
+        std::uint32_t const recovered = recover_molecule_(
+            *molecule, inputs.random_seed, layout, status, slots_of_(outputs.energies, layout, molecule_index),
+            outputs.coordinates.subspan(layout.slot_offset(molecule_index, 0),
+                                        layout.num_conformers * layout.slot_stride()));
+        if (recovered == 0) continue;
 
-        // Embedding is the dominant CPU cost here, and it is wasted on a molecule the force field
-        // cannot type: `constructForceField` throws below and every conformer fails anyway. Ask
-        // first, so an untypeable molecule costs a typing check instead of K embeddings.
-        if (!RDKit::MMFF::MMFFMolProperties(*molecule).isValid()) {
-            for (std::uint32_t conformer_index = 0; conformer_index < num_conformers; ++conformer_index)
-                outputs.status[molecule_index * num_conformers + conformer_index] = static_cast<std::uint8_t>(
-                    sfapi::conformer_status_t::unsupported_element_k);
-            continue;
-        }
-
-        RDKit::DGeomHelpers::EmbedParameters embed_params = RDKit::DGeomHelpers::ETKDGv3;
-        embed_params.randomSeed = static_cast<int>(inputs.random_seed);
-        embed_params.maxIterations = 200;
-
-        // Only embed as many fresh conformers as are still needed. EmbedMultipleConfs is the dominant CPU
-        // cost in this path; halving the count halves the per-molecule fallback wall when failures cluster
-        // in one of K, the common case.
-        std::vector<int> conformer_ids;
-        try {
-            conformer_ids = RDKit::DGeomHelpers::EmbedMultipleConfs(*molecule, static_cast<unsigned int>(needed_slots),
-                                                                    embed_params);
-        }
-        catch (...) { /* ignore */
-        }
-
-        if (conformer_ids.empty()) continue;
-
-        bool recovered_any = false;
-        std::uint32_t fresh_index = 0;
-        for (std::uint32_t conformer_slot = 0; conformer_slot < num_conformers; ++conformer_slot) {
-            std::uint8_t const slot_status = outputs.status[molecule_index * num_conformers + conformer_slot];
-            if (slot_status == static_cast<std::uint8_t>(sfapi::conformer_status_t::success_k)) continue;
-            if (fresh_index >= conformer_ids.size()) break;
-            int const rdkit_conformer_id = conformer_ids[fresh_index++];
-
-            // MMFF optimise this conformer in place.
-            float energy_kcal_per_mol = 0.0f;
-            try {
-                auto force_field = std::unique_ptr<ForceFields::ForceField>(
-                    RDKit::MMFF::constructForceField(*molecule, /*nonBondedThresh=*/100.0, rdkit_conformer_id));
-                if (!force_field) continue;
-                force_field->initialize();
-                force_field->minimize(200, 1e-4, 1e-6);
-                energy_kcal_per_mol = static_cast<float>(force_field->calcEnergy());
-            }
-            catch (...) {
-                continue;
-            }
-
-            auto const &conformer = molecule->getConformer(rdkit_conformer_id);
-            std::size_t const coord_base =
-                (static_cast<std::size_t>(molecule_index) * num_conformers + conformer_slot) * coordinate_stride;
-            // Zero the trailing atoms (pad region).
-            std::memset(reinterpret_cast<void *>(outputs.coordinates.data() + coord_base), 0,
-                        sizeof(__half) * coordinate_stride);
-
-            // Slot layout is shared with the GPU producer — see `conformer_slot_layout_t`.
-            for (unsigned int atom_index = 0; atom_index < molecule->getNumAtoms(); ++atom_index) {
-                auto const &position = conformer.getAtomPos(atom_index);
-                outputs.coordinates[coord_base + slot_layout.component_offset(0u, atom_index)] = __float2half(
-                    static_cast<float>(position.x));
-                outputs.coordinates[coord_base + slot_layout.component_offset(1u, atom_index)] = __float2half(
-                    static_cast<float>(position.y));
-                outputs.coordinates[coord_base + slot_layout.component_offset(2u, atom_index)] = __float2half(
-                    static_cast<float>(position.z));
-            }
-
-            outputs.energies[molecule_index * num_conformers + conformer_slot] = energy_kcal_per_mol;
-            outputs.status[molecule_index * num_conformers + conformer_slot] = static_cast<std::uint8_t>(
-                sfapi::conformer_status_t::success_k);
-            outputs.solver[molecule_index * num_conformers + conformer_slot] = 1;
-            recovered_any = true;
-        }
-        // Only a molecule that actually produced a conformer gets an atom count. Writing it before
-        // the embed left unrecovered molecules carrying a non-zero count over all-zero coordinates,
-        // which defeats the `num_atoms == 0` guard downstream and buys them a full shape-context
-        // parse plus four substructure searches for a row that has no geometry.
-        if (recovered_any) {
-            outputs.num_atoms_per_molecule[molecule_index] = static_cast<std::uint8_t>(molecule->getNumAtoms());
-            num_recovered.fetch_add(1, std::memory_order_relaxed);
-        }
+        // Only a molecule that actually produced a conformer gets an atom count. Writing it before the
+        // embed left unrecovered molecules carrying a non-zero count over all-zero coordinates, which
+        // defeats the `num_atoms == 0` guard downstream and buys them a full shape-context parse plus four
+        // substructure searches for a row that has no geometry.
+        outputs.num_atoms_per_molecule[molecule_index] = static_cast<std::uint8_t>(molecule->getNumAtoms());
+        num_recovered.fetch_add(1, std::memory_order_relaxed);
     }
 
     return num_recovered.load();

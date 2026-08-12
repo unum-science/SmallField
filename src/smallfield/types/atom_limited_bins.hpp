@@ -24,10 +24,10 @@
 namespace smallfield::types {
 
 /** Atom-count caps for `atom-limited-bin` dispatch, ascending. */
-inline constexpr std::size_t atom_limited_bin_count_k = 9;
-inline constexpr std::array<std::uint32_t, atom_limited_bin_count_k> atom_limited_bin_caps_k = {
-    16, 32, 48, 64, 80, 96, 112, 128, 192,
-};
+inline constexpr auto atom_limited_bin_caps_k = std::to_array<std::uint32_t>({16, 32, 48, 64, 80, 96, 112, 128, 192});
+
+/** Bins the ladder defines, counted from the ladder rather than restated beside it. */
+inline constexpr std::size_t atom_limited_bin_count_k = atom_limited_bin_caps_k.size();
 
 static_assert(atom_limited_bin_caps_k.back() == max_atoms_per_molecule_k,
               "the last bin has to be the atom cap, or molecules the pipeline accepts fall in no bin");

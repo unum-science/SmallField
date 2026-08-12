@@ -18,6 +18,8 @@ Usage::
         --max-mol 100000 --num-conformers 3 --gpus 0,1,2,3
 
     python bench_conformer_backends.py --input ... --skip-nvmolkit --skip-rdkit
+
+Exit codes mean one thing each: 0 a clean run, 1 a system that failed outright.
 """
 
 from __future__ import annotations
@@ -61,17 +63,35 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_smiles(path: str, max_mol: int) -> List[str]:
+def load_smiles(path: str, max_molecules: int) -> List[str]:
+    """Read one SMILES per line, first whitespace field only, up to ``max_molecules``."""
     smiles: List[str] = []
     with open(path) as handle:
         for line in handle:
-            parts = line.strip().split()
-            if not parts:
+            fields = line.strip().split()
+            if not fields:
                 continue
-            smiles.append(parts[0])
-            if max_mol and len(smiles) >= max_mol:
+            smiles.append(fields[0])
+            if max_molecules and len(smiles) >= max_molecules:
                 break
     return smiles
+
+
+def parse_molecules(smiles: List[str]) -> List["object"]:
+    """Parse and hydrogenate every SMILES that RDKit accepts, outside any timed region.
+
+    Shared by the two systems that hand RDKit molecules rather than strings, so neither one measures
+    the other's parse and both start from the same set of molecules.
+    """
+    from rdkit import Chem
+
+    molecules = []
+    for entry in smiles:
+        molecule = Chem.MolFromSmiles(entry)
+        if molecule is None:
+            continue
+        molecules.append(Chem.AddHs(molecule))
+    return molecules
 
 
 class Result:
@@ -79,77 +99,74 @@ class Result:
 
     def __init__(self, name: str):
         self.name = name
-        self.wall_s: Optional[float] = None
-        self.mol_per_s: Optional[float] = None
-        self.conf_per_s: Optional[float] = None
+        self.wall_seconds: Optional[float] = None
+        self.molecules_per_second: Optional[float] = None
+        self.conformers_per_second: Optional[float] = None
         self.num_success: Optional[int] = None
         self.num_target: Optional[int] = None
         self.note: str = ""
 
-    def record(self, wall_s: float, num_success: int, num_target: int, num_mol: int, note: str = "") -> None:
-        self.wall_s = wall_s
-        self.mol_per_s = num_mol / wall_s if wall_s > 0 else 0.0
-        self.conf_per_s = num_success / wall_s if wall_s > 0 else 0.0
+    def record(
+        self, wall_seconds: float, num_success: int, num_target: int, num_molecules: int, note: str = ""
+    ) -> None:
+        self.wall_seconds = wall_seconds
+        self.molecules_per_second = num_molecules / wall_seconds if wall_seconds > 0 else 0.0
+        self.conformers_per_second = num_success / wall_seconds if wall_seconds > 0 else 0.0
         self.num_success = num_success
         self.num_target = num_target
         self.note = note
 
 
 def bench_rdkit(smiles: List[str], num_conformers: int, random_seed: int) -> Result:
-    from rdkit import Chem
     from rdkit.Chem import AllChem, rdDistGeom
 
     result = Result("RDKit (CPU, OpenMP)")
-    params = rdDistGeom.ETKDGv3()
-    params.randomSeed = random_seed
-    params.numThreads = 0  # auto, use all cores
+    parameters = rdDistGeom.ETKDGv3()
+    parameters.randomSeed = random_seed
+    parameters.numThreads = 0  # auto, use all cores
 
-    molecules = []
-    for smi in smiles:
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            continue
-        molecules.append(Chem.AddHs(mol))
+    molecules = parse_molecules(smiles)
 
-    t0 = time.perf_counter()
+    started = time.perf_counter()
     num_success = 0
-    for mol in molecules:
+    for molecule in molecules:
         try:
-            conf_ids = AllChem.EmbedMultipleConfs(mol, numConfs=num_conformers, params=params)
-            if conf_ids:
-                AllChem.MMFFOptimizeMoleculeConfs(mol)
-                num_success += len(conf_ids)
+            conformer_ids = AllChem.EmbedMultipleConfs(molecule, numConfs=num_conformers, params=parameters)
+            if conformer_ids:
+                AllChem.MMFFOptimizeMoleculeConfs(molecule)
+                num_success += len(conformer_ids)
         except Exception:
             continue
-    wall = time.perf_counter() - t0
+    wall = time.perf_counter() - started
     result.record(wall, num_success, len(smiles) * num_conformers, len(smiles))
     return result
 
 
 def bench_smallfield(smiles: List[str], num_conformers: int, random_seed: int, gpu_ids: List[int]) -> Result:
-    import smallfield.api as sf
+    import smallfield.api as smallfield
 
     result = Result("SmallField (GPU)")
-    # Warm up: build context + short generate_conformers to pay first-call costs.
-    sf.Context(gpu_ids)
-    sf.generate_conformers(
+    # The context is built once and reused, so the timed call pays neither the device initialisation
+    # nor the first-call kernel load that the warm-up below absorbs.
+    context = smallfield.Context(gpu_ids)
+    smallfield.generate_conformers(
         smiles[: min(100, len(smiles))],
         num_conformers=num_conformers,
         random_seed=random_seed,
-        device_ids=gpu_ids,
+        context=context,
     )
 
-    t0 = time.perf_counter()
-    _coords, _energies, status = sf.generate_conformers(
+    started = time.perf_counter()
+    batch = smallfield.generate_conformers(
         smiles,
         num_conformers=num_conformers,
         random_seed=random_seed,
-        device_ids=gpu_ids,
+        context=context,
     )
-    wall = time.perf_counter() - t0
+    wall = time.perf_counter() - started
 
-    status_arr = np.array(status, dtype=np.uint8)
-    num_success = int(np.sum(status_arr == 0))
+    status = np.asarray(batch.status, dtype=np.uint8)
+    num_success = int(np.sum(status == int(smallfield.ConformerStatus.SUCCESS)))
     result.record(wall, num_success, len(smiles) * num_conformers, len(smiles))
     return result
 
@@ -168,41 +185,38 @@ def bench_nvmolkit(
     from nvmolkit.types import HardwareOptions
 
     result = Result("RDKit + nvMolKit (GPU)")
-    params = rdDistGeom.ETKDGv3()
-    params.randomSeed = random_seed
-    params.useRandomCoords = True
+    parameters = rdDistGeom.ETKDGv3()
+    parameters.randomSeed = random_seed
+    parameters.useRandomCoords = True
 
-    molecules = []
-    for smi in smiles:
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            continue
-        molecules.append(Chem.AddHs(mol))
+    molecules = parse_molecules(smiles)
 
-    hw = HardwareOptions()
-    hw.gpuIds = gpu_ids
+    hardware = HardwareOptions()
+    hardware.gpuIds = gpu_ids
 
-    num_mol = len(molecules)
-    total_confs = 0
+    num_molecules = len(molecules)
+    total_conformers = 0
     failed_chunks = 0
-    t0 = time.perf_counter()
-    for start in range(0, num_mol, chunk_size):
-        mols = [Chem.RWMol(m) for m in molecules[start : start + chunk_size]]
+    started = time.perf_counter()
+    for chunk_start in range(0, num_molecules, chunk_size):
+        chunk = [Chem.RWMol(molecule) for molecule in molecules[chunk_start : chunk_start + chunk_size]]
         try:
-            EmbedMolecules(mols, params, confsPerMolecule=num_conformers, hardwareOptions=hw)
+            EmbedMolecules(chunk, parameters, confsPerMolecule=num_conformers, hardwareOptions=hardware)
         except RuntimeError:
+            # nvMolKit aborts the whole chunk on an unsupported molecule, so the chunk is lost, not
+            # the run; the count is reported beside the throughput it depressed.
             failed_chunks += 1
             continue
         try:
-            MMFFOptimizeMoleculesConfs(mols, hardwareOptions=hw)
+            MMFFOptimizeMoleculesConfs(chunk, hardwareOptions=hardware)
         except RuntimeError:
             pass
-        total_confs += sum(m.GetNumConformers() for m in mols)
-    wall = time.perf_counter() - t0
+        total_conformers += sum(molecule.GetNumConformers() for molecule in chunk)
+    wall = time.perf_counter() - started
 
-    num_chunks = (num_mol + chunk_size - 1) // chunk_size
+    num_chunks = (num_molecules + chunk_size - 1) // chunk_size
     note = f"{failed_chunks}/{num_chunks} chunks crashed" if failed_chunks else ""
-    result.record(wall, total_confs, num_mol * num_conformers, num_mol, note=note)
+    result.record(wall, total_conformers, num_molecules * num_conformers, num_molecules, note=note)
     return result
 
 
@@ -214,43 +228,31 @@ def render_results_table(results: Iterable[Result]) -> None:
     table.add_column("conf/s", justify="right", style="green")
     table.add_column("Success", justify="right")
     table.add_column("Notes")
-    for r in results:
-        if r.wall_s is None:
-            table.add_row(r.name, "—", "—", "—", "—", "skipped")
+    for result in results:
+        if result.wall_seconds is None:
+            table.add_row(result.name, "—", "—", "—", "—", result.note or "skipped")
             continue
-        success_pct = (100.0 * r.num_success / r.num_target) if r.num_target else 0.0
+        success_share = (100.0 * result.num_success / result.num_target) if result.num_target else 0.0
         table.add_row(
-            r.name,
-            f"{r.wall_s:.2f}",
-            thousands(int(r.mol_per_s)),
-            thousands(int(r.conf_per_s)),
-            f"{thousands(r.num_success)} / {thousands(r.num_target)} ({success_pct:.1f} %)",
-            r.note or "",
+            result.name,
+            f"{result.wall_seconds:.2f}",
+            thousands(int(result.molecules_per_second)),
+            thousands(int(result.conformers_per_second)),
+            f"{thousands(result.num_success)} / {thousands(result.num_target)} ({success_share:.3f} %)",
+            result.note or "",
         )
     _default_log.console.print(table)
 
 
-def main() -> int:
-    args = parse_args()
-    gpu_ids: List[int] = [int(x) for x in args.gpus.split(",") if x.strip()]
-
-    smiles = load_smiles(args.input, args.max_mol)
-    log.info(
-        "loaded {} SMILES from {}, generating {} conformers each",
-        thousands(len(smiles)),
-        args.input,
-        args.num_conformers,
-    )
-
-    tasks: List[tuple[str, Callable[[], Result]]] = []
+def selected_systems(args: argparse.Namespace, smiles: List[str], gpu_ids: List[int]) -> List[tuple]:
+    """Pair each system the flags left enabled with the call that runs it."""
+    systems: List[tuple[str, Callable[[], Result]]] = []
     if not args.skip_rdkit:
-        tasks.append(("RDKit", lambda: bench_rdkit(smiles, args.num_conformers, args.random_seed)))
+        systems.append(("RDKit", lambda: bench_rdkit(smiles, args.num_conformers, args.random_seed)))
     if not args.skip_smallfield:
-        tasks.append(
-            ("SmallField", lambda: bench_smallfield(smiles, args.num_conformers, args.random_seed, gpu_ids))
-        )
+        systems.append(("SmallField", lambda: bench_smallfield(smiles, args.num_conformers, args.random_seed, gpu_ids)))
     if not args.skip_nvmolkit:
-        tasks.append(
+        systems.append(
             (
                 "nvMolKit",
                 lambda: bench_nvmolkit(
@@ -262,20 +264,41 @@ def main() -> int:
                 ),
             )
         )
+    return systems
+
+
+def main() -> int:
+    args = parse_args()
+    gpu_ids: List[int] = [int(entry) for entry in args.gpus.split(",") if entry.strip()]
+
+    smiles = load_smiles(args.input, args.max_mol)
+    if not smiles:
+        log.error("no SMILES read from {}", args.input)
+        return 1
+    log.info(
+        "loaded {} SMILES from {}, generating {} conformers each",
+        thousands(len(smiles)),
+        args.input,
+        args.num_conformers,
+    )
 
     results: List[Result] = []
-    for label, runner in tasks:
+    failures = 0
+    for label, runner in selected_systems(args, smiles, gpu_ids):
         log.info("running {}", label)
         try:
             results.append(runner())
-        except Exception as exc:
-            log.error("{} failed: {}", label, exc)
-            r = Result(label)
-            r.note = f"error: {exc}"
-            results.append(r)
+        except Exception as error:
+            # One system failing is a result about that system, so the remaining ones still run and
+            # the table still prints; the exit code carries that something did not.
+            log.error("{} failed: {}", label, error)
+            failed = Result(label)
+            failed.note = f"error: {error}"
+            results.append(failed)
+            failures += 1
 
     render_results_table(results)
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

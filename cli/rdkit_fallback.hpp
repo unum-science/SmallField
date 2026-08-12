@@ -5,8 +5,8 @@
  *
  *  OpenMP-parallel EmbedMultipleConfs + MMFFOptimizeConfs. Called by `smallfield_batch` after the GPU run;
  *  only rows where the GPU reported non-success are passed in. Each successful RDKit conformer overwrites
- *  the coordinate / energy slot and flips `solver` from 2 to 1. Remaining failures keep `solver = 2`,
- *  written as null.
+ *  the coordinate / energy slot and flips its status to `success_k`; remaining failures keep the status the
+ *  GPU left, which the writer emits as a null row.
  */
 
 #pragma once
@@ -17,6 +17,8 @@
 
 #include <cuda_fp16.h>
 
+#include "smallfield/api/conformer_layout.hpp"
+#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::cli {
@@ -26,17 +28,15 @@ struct rdkit_fallback_inputs_t {
     custd::span<std::string_view const> smiles;
     /** Subset of [0, N) to re-attempt. */
     custd::span<std::uint32_t const> retry_indices;
-    std::uint32_t num_conformers;
-    std::uint32_t max_atoms;
+    /** Slot stride and conformer count, shared with the GPU producer and the Parquet writer. */
+    api::conformer_slot_layout_t layout;
     int num_threads;
     std::uint64_t random_seed;
 };
 
 struct rdkit_fallback_outputs_t {
     /** Length N × K (updated in place). */
-    custd::span<std::uint8_t> status;
-    /** Length N × K (2 → 1 on success). */
-    custd::span<std::uint8_t> solver;
+    custd::span<api::conformer_status_t> status;
     /** Length N (written when discovered). */
     custd::span<std::uint8_t> num_atoms_per_molecule;
     /** Length N × K × max_atoms × 3. */
