@@ -49,6 +49,7 @@ namespace fs = std::filesystem;
 namespace sfapi = smallfield::api;
 namespace sfcli = smallfield::cli;
 namespace sfpost = smallfield::postprocess;
+namespace sft = smallfield::types;
 using smallfield::logger_t;
 
 namespace {
@@ -291,7 +292,7 @@ char const *describe_shard_listing_(shard_listing_t status) {
 
 /** One conformer row copied verbatim from a `--reembed` shard. */
 struct reembed_conformer_t {
-    sfapi::conformer_status_t status = sfapi::conformer_status_t::success_k;
+    sft::conformer_status_t status = sft::conformer_status_t::success_k;
     float energy = 0.0f;
     /** Tight interleaved `(num_atoms, 3)` fp16 bit patterns, empty when the row carried no geometry. */
     std::vector<std::uint16_t> coordinate_bits;
@@ -370,7 +371,7 @@ void load_reembed_shard_(input_shard_t const &shard, std::uint32_t max_atoms, re
         }
 
         reembed_conformer_t conformer;
-        conformer.status = static_cast<sfapi::conformer_status_t>(shard.status->Value(row));
+        conformer.status = static_cast<sft::conformer_status_t>(shard.status->Value(row));
         if (coords_list.IsValid(row)) {
             std::int64_t const begin = coords_list.value_offset(row);
             std::int64_t const end = coords_list.value_offset(row + 1);
@@ -444,7 +445,7 @@ void grow_if_needed_(std::vector<element_type_> &buffer, std::size_t count) {
 struct shard_buffers_t {
     std::vector<__half> coordinates;
     std::vector<float> energies;
-    std::vector<sfapi::conformer_status_t> status;
+    std::vector<sft::conformer_status_t> status;
     std::vector<double> usrcat;
 
     std::vector<std::string_view> smiles;
@@ -475,7 +476,7 @@ struct shard_buffers_t {
         reset_(coordinates, coordinate_total, __float2half(0.0f));
         reset_(energies, total_slots, 0.0f);
         // A slot no molecule claims must not read as a success, so the unused tail defaults non-success.
-        reset_(status, total_slots, sfapi::conformer_status_t::mmff_unconverged_k);
+        reset_(status, total_slots, sft::conformer_status_t::mmff_unconverged_k);
         reset_(usrcat, total_slots * sfcli::usrcat_components_k, 0.0);
         reset_(smiles, num_molecules, std::string_view {});
         reset_(num_atoms_per_molecule, num_molecules, std::uint8_t {0});
@@ -594,8 +595,8 @@ void copy_reembed_molecule_into_(reembed_molecule_t const &molecule, std::uint64
         std::size_t const flat = layout.flat_slot(molecule_index, static_cast<std::uint32_t>(conformer_slot));
         buffers.status[flat] = conformer.status;
         buffers.energies[flat] = conformer.energy;
-        if (conformer.status != sfapi::conformer_status_t::success_k) continue; // a failure row stays null
-        if (num_atoms == 0) continue;                                           // preprocess failed: no geometry
+        if (conformer.status != sft::conformer_status_t::success_k) continue; // a failure row stays null
+        if (num_atoms == 0) continue;                                         // preprocess failed: no geometry
         // The row's own geometry is shorter than the atom count it claims, so it cannot fill the slot.
         if (conformer.coordinate_bits.size() < static_cast<std::size_t>(num_atoms) * 3u) continue;
 
@@ -611,16 +612,25 @@ void copy_reembed_molecule_into_(reembed_molecule_t const &molecule, std::uint64
     }
 }
 
+/** What this run can do with a molecule's stored atom count, which is what its slots' status has to say. */
+enum class molecule_geometry_t {
+    /** The atom count fits the coordinate stride, so the stored conformers can be laid into slots. */
+    describable_k,
+    /** The source shard recorded no atoms, so the molecule was refused before any geometry existed. */
+    preprocess_failed_k,
+    /** More atoms than `--max-atoms` addresses; narrowing the count would describe another molecule's atoms. */
+    wider_than_stride_k,
+};
+
 /**
  *  @brief Copy one molecule's per-molecule scalars out of the original shard.
  *
- *  @return Atoms the molecule carries, zero when it has none usable — a molecule wider than the coordinate
- *      stride is treated exactly like a preprocess failure, since narrowing its count to the stride would
- *      describe another molecule's atoms.
+ *  @return What the stored atom count leaves this run able to do, which the atom count alone cannot say: a
+ *      molecule wider than the stride and a molecule that never preprocessed both land at zero atoms.
  */
-std::uint8_t copy_molecule_scalars_into_(input_shard_t const &shard, std::int64_t first_row,
-                                         std::uint64_t molecule_index, std::uint32_t max_atoms,
-                                         shard_buffers_t &buffers) {
+molecule_geometry_t copy_molecule_scalars_into_(input_shard_t const &shard, std::int64_t first_row,
+                                                std::uint64_t molecule_index, std::uint32_t max_atoms,
+                                                shard_buffers_t &buffers) {
     buffers.smiles[molecule_index] = shard.smiles->GetView(first_row);
     std::uint16_t const stored_atoms = shard.n_atoms->IsValid(first_row) ? shard.n_atoms->Value(first_row) : 0;
     std::uint8_t const num_atoms = stored_atoms <= max_atoms ? static_cast<std::uint8_t>(stored_atoms) : 0;
@@ -637,7 +647,34 @@ std::uint8_t copy_molecule_scalars_into_(input_shard_t const &shard, std::int64_
     buffers.num_conformers_per_molecule[molecule_index] = shard.n_conformers->IsValid(first_row)
                                                               ? shard.n_conformers->Value(first_row)
                                                               : 0;
-    return num_atoms;
+    if (num_atoms > 0) return molecule_geometry_t::describable_k;
+    return stored_atoms == 0 ? molecule_geometry_t::preprocess_failed_k : molecule_geometry_t::wider_than_stride_k;
+}
+
+/**
+ *  @brief Copy every stored row's status and energy into its conformer slot.
+ *
+ *  This runs for every molecule, geometry or not, because the stored status is the only record of why a
+ *  molecule was refused and a slot left at `reset_for`'s fill would publish the fill instead — a molecule
+ *  turned away at the SMILES parser reported as one whose force field did not converge.
+ */
+void copy_row_outcomes_into_(input_shard_t const &shard, custd::span<std::int64_t const> rows,
+                             std::uint64_t molecule_index, molecule_geometry_t geometry,
+                             sfapi::conformer_slot_layout_t const &layout, shard_buffers_t &buffers) {
+    std::size_t const num_slots = std::min<std::size_t>(rows.size(), layout.num_conformers);
+    for (std::size_t conformer_slot = 0; conformer_slot < num_slots; ++conformer_slot) {
+        std::int64_t const row = rows[conformer_slot];
+        std::size_t const flat = layout.flat_slot(molecule_index, static_cast<std::uint32_t>(conformer_slot));
+        auto const stored = static_cast<sft::conformer_status_t>(shard.status->Value(row));
+        // A success this run has no slot wide enough to carry is restated as the refusal it is, so it is not
+        // published as a success with an empty coordinate list. Every other stored value already is the
+        // truest thing known about the row.
+        buffers.status[flat] = geometry == molecule_geometry_t::wider_than_stride_k &&
+                                       stored == sft::conformer_status_t::success_k
+                                   ? sft::conformer_status_t::too_many_atoms_k
+                                   : stored;
+        if (shard.conformer_energy->IsValid(row)) buffers.energies[flat] = shard.conformer_energy->Value(row);
+    }
 }
 
 /**
@@ -660,9 +697,10 @@ std::size_t read_row_coordinates_into_(input_shard_t const &shard, std::int64_t 
 /**
  *  @brief Lay one molecule's stored conformers into its slots and compute their descriptors.
  *
- *  The loop runs to completion deliberately, even past a failed row: a `break` would leave the later slots
- *  holding the reset value. Where the reparsed atom order cannot be trusted the coordinates are still
- *  preserved and only the descriptors stay zero-filled.
+ *  The status each slot carries is already there, from `copy_row_outcomes_into_`, and is what decides which
+ *  slots get geometry. The loop runs to completion deliberately, even past a failed row: a `break` would
+ *  leave the later slots holding no coordinates. Where the reparsed atom order cannot be trusted the
+ *  coordinates are still preserved and only the descriptors stay zero-filled.
  */
 void augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t const> rows, std::uint64_t molecule_index,
                        std::uint32_t num_atoms, sfpost::molecule_shape_context_t const &context,
@@ -672,12 +710,9 @@ void augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t cons
     std::size_t const num_slots = std::min<std::size_t>(rows.size(), layout.num_conformers);
     for (std::size_t conformer_slot = 0; conformer_slot < num_slots; ++conformer_slot) {
         std::int64_t const row = rows[conformer_slot];
-        auto const row_status = static_cast<sfapi::conformer_status_t>(shard.status->Value(row));
         std::size_t const flat = layout.flat_slot(molecule_index, static_cast<std::uint32_t>(conformer_slot));
-        buffers.status[flat] = row_status;
-        if (shard.conformer_energy->IsValid(row)) buffers.energies[flat] = shard.conformer_energy->Value(row);
-        if (row_status != sfapi::conformer_status_t::success_k) continue; // a failure row stays null
-        if (!shard.conformer_coords->IsValid(row)) continue;              // the row carried no geometry
+        if (buffers.status[flat] != sft::conformer_status_t::success_k) continue; // a failure row stays null
+        if (!shard.conformer_coords->IsValid(row)) continue;                      // the row carried no geometry
 
         // A row holding fewer components than its atom count claims cannot fill the slot, and copying the
         // prefix would leave the previous conformer's coordinates in the tail of the shared scratch.
@@ -790,12 +825,16 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
             continue;
         }
 
-        std::uint8_t const num_atoms = copy_molecule_scalars_into_(shard, first_row, molecule_index, config.max_atoms,
-                                                                   buffers);
-        if (num_atoms == 0) continue; // preprocess-failed molecule: single null row, no coordinates
+        molecule_geometry_t const geometry = copy_molecule_scalars_into_(shard, first_row, molecule_index,
+                                                                         config.max_atoms, buffers);
+        copy_row_outcomes_into_(shard, rows, molecule_index, geometry, layout, buffers);
+        // A molecule this run cannot describe carries the refusal just written and nothing else: there are no
+        // coordinates to lay out, and no atom order for a reparse to agree with.
+        if (geometry != molecule_geometry_t::describable_k) continue;
 
         // Typed once, under the same parse contract the producer uses. Every refusal names a way the reparse
         // failed to reproduce the atom order the stored coordinates were written in.
+        std::uint8_t const num_atoms = buffers.num_atoms_per_molecule[molecule_index];
         sfpost::shape_typing_t const typing = sfpost::build_shape_context_into(
             buffers.smiles[molecule_index], num_atoms, smallfield::keep_largest_fragment_k, context);
         if (typing != sfpost::shape_typing_t::typed_k) stats.context_unusable.fetch_add(1, std::memory_order_relaxed);
