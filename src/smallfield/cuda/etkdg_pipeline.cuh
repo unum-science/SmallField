@@ -45,9 +45,12 @@
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/cuda/fire_warp.cuh"
 #include "smallfield/cuda/mmff94_energy_kernel.cuh"
+#include "smallfield/preprocess/molecule_complexity.hpp"
 #include "smallfield/utilities.hpp"
 
 namespace smallfield::cuda {
+using smallfield::preprocess::is_heavy_refinement_case;
+using smallfield::preprocess::total_mmff_terms;
 using smallfield::types::chiral_center_descriptor_t;
 using smallfield::types::distance_constraint_t;
 using smallfield::types::etk_atom_interaction_t;
@@ -73,32 +76,17 @@ struct refinement_policy_t {
     float mmff_gradient_threshold;
 };
 
-constexpr std::uint32_t total_mmff_terms_(etkdg_molecule_metadata_t const &meta) {
-    // Nonbonded pairs are enumerated on the fly — approximate their contribution as
-    // N²/2 to keep the "is this a heavy case" heuristic calibrated similarly.
-    std::uint32_t const approx_nonbonded = meta.num_atoms * (meta.num_atoms - 1u) / 2u;
-    return approx_nonbonded + meta.num_mmff_bonds + meta.num_mmff_angles + meta.num_mmff_torsions + meta.num_mmff_oops +
-           meta.num_mmff_stretchbends;
-}
-
-constexpr bool is_heavy_refinement_case_(etkdg_molecule_metadata_t const &meta) {
-    std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
-    std::uint32_t const torsion_complexity = meta.num_etk_torsions + meta.num_mmff_torsions;
-    return meta.num_atoms >= 96 || total_mmff_terms >= 900 || torsion_complexity >= 64;
-}
-
 constexpr float heavy_mmff_rescue_threshold_(etkdg_molecule_metadata_t const &meta) {
     return fmaxf(220.0f, 2.0f * static_cast<float>(meta.num_atoms));
 }
 
 constexpr refinement_policy_t select_refinement_policy_(etkdg_molecule_metadata_t const &meta) {
-    std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
+    std::uint32_t const mmff_terms = total_mmff_terms(meta);
     std::uint32_t const torsion_complexity = meta.num_etk_torsions + meta.num_mmff_torsions;
 
-    if (meta.num_atoms <= 20 && total_mmff_terms <= 96 && torsion_complexity <= 12)
-        return {60, 0, 1.5e-4f, 120, 0, 1.5e-4f};
+    if (meta.num_atoms <= 20 && mmff_terms <= 96 && torsion_complexity <= 12) return {60, 0, 1.5e-4f, 120, 0, 1.5e-4f};
 
-    if (is_heavy_refinement_case_(meta)) return {160, 80, 7.5e-5f, 320, 160, 5.0e-5f};
+    if (is_heavy_refinement_case(meta)) return {160, 80, 7.5e-5f, 320, 160, 5.0e-5f};
 
     return {100, 40, 1.0e-4f, 200, 80, 1.0e-4f};
 }
@@ -519,8 +507,8 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
         std::uint32_t const num_atoms = meta.num_atoms;
         std::uint32_t const dimensions_3d = 3 * num_atoms;
 
-        std::uint32_t const total_mmff_terms = total_mmff_terms_(meta);
-        if (total_mmff_terms == 0 || mmff_interactions == nullptr) continue;
+        std::uint32_t const mmff_terms = total_mmff_terms(meta);
+        if (mmff_terms == 0 || mmff_interactions == nullptr) continue;
 
         auto const refinement_policy = select_refinement_policy_(meta);
 
@@ -570,7 +558,7 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
                                                     refinement_policy.mmff_continuation_iterations,
                                                     refinement_policy.mmff_gradient_threshold, lane, mmff_functor);
 
-        bool const run_heavy_rescue = is_heavy_refinement_case_(meta) &&
+        bool const run_heavy_rescue = is_heavy_refinement_case(meta) &&
                                       (mmff_result.status == fire_status_t::exhausted_k ||
                                        mmff_result.energy > heavy_mmff_rescue_threshold_(meta));
         if (run_heavy_rescue) { mmff_result = run_fire_stage_(scratch, 160, 160, 2.5e-5f, lane, mmff_functor); }
