@@ -12,12 +12,10 @@
  *  budget of `max_molecule_value_mismatch_ppm_k`.
  */
 
-#include <cmath>   // `std::fabs`
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
 #include <cstdio>  // `std::fflush`, `stderr`
-#include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::binary_search`, `std::max`, `std::sort`
+#include <algorithm>   // `std::binary_search`, `std::sort`
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
 #include <sstream>     // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
@@ -134,20 +132,6 @@ struct port_tally_t {
     std::uint64_t total_molecules() const { return molecules[0] + molecules[1] + molecules[2]; }
 };
 
-/** Bitwise-identical float comparison (allowing NaN != NaN). */
-static bool bit_eq_(float left, float right) {
-    std::uint32_t left_bits, right_bits;
-    std::memcpy(&left_bits, &left, 4);
-    std::memcpy(&right_bits, &right, 4);
-    return left_bits == right_bits;
-}
-
-/** Near-equal with absolute tolerance — used for empirical-rule terms. */
-static bool near_(float left, float right, float tolerance = 1e-3f) {
-    if (bit_eq_(left, right)) return true;
-    return std::fabs(left - right) <= tolerance * std::max(1.0f, std::max(std::fabs(left), std::fabs(right)));
-}
-
 /** Which native extractor produced the terms under test. */
 enum class native_extractor_t : std::uint8_t {
     /** `extract_mmff94_params_native` — atom types and partial charges handed in from RDKit. */
@@ -259,10 +243,11 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
     for (std::size_t atom = 0; atom < rdkit_result.mmff_atom_vdw.size(); ++atom) {
         auto const &rdkit_term = rdkit_result.mmff_atom_vdw[atom];
         auto const &native_term = native_result.mmff_atom_vdw[atom];
-        if (!(bit_eq_(rdkit_term.alpha, native_term.alpha) &&
-              bit_eq_(rdkit_term.n_effective, native_term.n_effective) &&
-              bit_eq_(rdkit_term.a_scale, native_term.a_scale) && bit_eq_(rdkit_term.g_factor, native_term.g_factor) &&
-              bit_eq_(rdkit_term.r_star, native_term.r_star) &&
+        if (!(bitwise_equal(rdkit_term.alpha, native_term.alpha) &&
+              bitwise_equal(rdkit_term.n_effective, native_term.n_effective) &&
+              bitwise_equal(rdkit_term.a_scale, native_term.a_scale) &&
+              bitwise_equal(rdkit_term.g_factor, native_term.g_factor) &&
+              bitwise_equal(rdkit_term.r_star, native_term.r_star) &&
               rdkit_term.donor_acceptor == native_term.donor_acceptor)) {
             if (verbose) {
                 value_header();
@@ -273,11 +258,12 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
         }
         // The hybrid path is handed RDKit's own `double` charges, so it must reproduce them bit for bit.
         // The fully-native path sums bond-charge increments in `float` where RDKit sums in `double`, so it
-        // earns the same 1e-3 tolerance every other natively-computed term in this file already gets.
+        // earns the shared charge tolerance the two typer suites hold the same quantity to.
         bool const charge_matches =
             extractor == native_extractor_t::hybrid_k
-                ? bit_eq_(rdkit_result.mmff_atom_charge[atom], native_result.mmff_atom_charge[atom])
-                : near_(rdkit_result.mmff_atom_charge[atom], native_result.mmff_atom_charge[atom]);
+                ? bitwise_equal(rdkit_result.mmff_atom_charge[atom], native_result.mmff_atom_charge[atom])
+                : equal_within(mmff94_partial_charge_tolerance_k)(rdkit_result.mmff_atom_charge[atom],
+                                                                  native_result.mmff_atom_charge[atom]);
         if (!charge_matches) {
             if (verbose) {
                 value_header();
@@ -303,8 +289,8 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
             ++tally.term_failures;
             continue;
         }
-        if (!near_(rdkit_term.force_constant, native_term.force_constant) ||
-            !near_(rdkit_term.equilibrium_distance, native_term.equilibrium_distance)) {
+        if (!approximately_equal(rdkit_term.force_constant, native_term.force_constant) ||
+            !approximately_equal(rdkit_term.equilibrium_distance, native_term.equilibrium_distance)) {
             if (verbose) {
                 value_header();
                 fmt::println("    bond[{}] kb rdk={:.4f} nat={:.4f}  r0 rdk={:.4f} nat={:.4f}", term,
@@ -331,8 +317,8 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
             ++tally.term_failures;
             continue;
         }
-        if (!near_(rdkit_term.force_constant, native_term.force_constant) ||
-            !near_(rdkit_term.equilibrium_angle, native_term.equilibrium_angle)) {
+        if (!approximately_equal(rdkit_term.force_constant, native_term.force_constant) ||
+            !approximately_equal(rdkit_term.equilibrium_angle, native_term.equilibrium_angle)) {
             if (verbose) {
                 value_header();
                 fmt::println("    angle[{}] ka rdk={:.4f} nat={:.4f} θ₀ rdk={:.4f} nat={:.4f}", term,
@@ -359,9 +345,9 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
             ++tally.term_failures;
             continue;
         }
-        if (!near_(rdkit_term.torsion_v1, native_term.torsion_v1) ||
-            !near_(rdkit_term.torsion_v2, native_term.torsion_v2) ||
-            !near_(rdkit_term.torsion_v3, native_term.torsion_v3)) {
+        if (!approximately_equal(rdkit_term.torsion_v1, native_term.torsion_v1) ||
+            !approximately_equal(rdkit_term.torsion_v2, native_term.torsion_v2) ||
+            !approximately_equal(rdkit_term.torsion_v3, native_term.torsion_v3)) {
             if (verbose) {
                 value_header();
                 fmt::println("    tor[{}] ijkl={}-{}-{}-{} V rdk=({:.4f}, {:.4f}, {:.4f}) nat=({:.4f}, {:.4f}, {:.4f})",
@@ -389,7 +375,7 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
             ++tally.term_failures;
             continue;
         }
-        if (!near_(rdkit_term.force_constant, native_term.force_constant)) {
+        if (!approximately_equal(rdkit_term.force_constant, native_term.force_constant)) {
             if (verbose) {
                 value_header();
                 fmt::println("    oop[{}] ijkl={}-{}-{}-{} koop rdk={:.4f} nat={:.4f}", term, rdkit_term.atom_i,
@@ -415,10 +401,11 @@ static term_structure_t compare_mol_(std::string_view smiles, native_extractor_t
             ++tally.term_failures;
             continue;
         }
-        if (!near_(rdkit_term.kba_ijk, native_term.kba_ijk) || !near_(rdkit_term.kba_kji, native_term.kba_kji) ||
-            !near_(rdkit_term.equilibrium_angle, native_term.equilibrium_angle) ||
-            !near_(rdkit_term.equilibrium_distance_ij, native_term.equilibrium_distance_ij) ||
-            !near_(rdkit_term.equilibrium_distance_kj, native_term.equilibrium_distance_kj)) {
+        if (!approximately_equal(rdkit_term.kba_ijk, native_term.kba_ijk) ||
+            !approximately_equal(rdkit_term.kba_kji, native_term.kba_kji) ||
+            !approximately_equal(rdkit_term.equilibrium_angle, native_term.equilibrium_angle) ||
+            !approximately_equal(rdkit_term.equilibrium_distance_ij, native_term.equilibrium_distance_ij) ||
+            !approximately_equal(rdkit_term.equilibrium_distance_kj, native_term.equilibrium_distance_kj)) {
             if (verbose) {
                 value_header();
                 fmt::println("    sb[{}] ijk={}-{}-{} rdk k=({:.4f}, {:.4f}) θ₀={:.4f} r0=({:.4f}, {:.4f}) " //

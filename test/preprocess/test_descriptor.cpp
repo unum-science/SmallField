@@ -20,7 +20,6 @@
 #include <memory>      // `std::unique_ptr`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::common_type_t`, `std::decay_t`
 #include <vector>      // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
@@ -52,12 +51,6 @@ static constexpr double rdkit_unreachable_distance_k = 1e7;
 namespace smallfield::tests {
 
 #pragma region Comparison
-
-/** Exact equality, promoted so a signed operand and an unsigned one still compare as numbers. */
-static constexpr auto exactly_equal_ = [](auto const &reference, auto const &observed) {
-    using promoted_type_ = std::common_type_t<std::decay_t<decltype(reference)>, std::decay_t<decltype(observed)>>;
-    return static_cast<promoted_type_>(reference) == static_cast<promoted_type_>(observed);
-};
 
 /** Buffers that outlive the molecule loop, so a corpus sweep grows each of them once. */
 struct descriptor_scratch_t {
@@ -112,17 +105,17 @@ static void compare_atoms_(RDKit::ROMol const &molecule, sft::molecule_descripto
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
         auto const *atom = molecule.getAtomWithIdx(atom_index);
         auto group = reporter.mismatch("atom", "smiles={} atom={}", smiles, atom_index);
-        group.field("element", atom->getAtomicNum(), descriptor.element[atom_index], exactly_equal_)
+        group.field("element", atom->getAtomicNum(), descriptor.element[atom_index], exactly_equal)
             .field("hybridization", static_cast<std::uint8_t>(atom->getHybridization()),
-                   descriptor.hybridization[atom_index], exactly_equal_)
-            .field("degree", atom->getDegree(), descriptor.degree[atom_index], exactly_equal_)
-            .field("num_hydrogens", atom->getTotalNumHs(true), descriptor.num_hydrogens[atom_index], exactly_equal_)
-            .field("formal_charge", atom->getFormalCharge(), descriptor.formal_charge[atom_index], exactly_equal_)
+                   descriptor.hybridization[atom_index], exactly_equal)
+            .field("degree", atom->getDegree(), descriptor.degree[atom_index], exactly_equal)
+            .field("num_hydrogens", atom->getTotalNumHs(true), descriptor.num_hydrogens[atom_index], exactly_equal)
+            .field("formal_charge", atom->getFormalCharge(), descriptor.formal_charge[atom_index], exactly_equal)
             .field("aromatic", atom->getIsAromatic(),
-                   sft::atom_has_flag(descriptor, atom_index, sft::atom_flag_aromatic_k), exactly_equal_);
+                   sft::atom_has_flag(descriptor, atom_index, sft::atom_flag_aromatic_k), exactly_equal);
         if (!ring_labels_complete) continue; // the ring cap dropped labels this molecule legitimately lacks
         group.field("in_ring", ring_info->numAtomRings(atom_index) > 0,
-                    sft::atom_has_flag(descriptor, atom_index, sft::atom_flag_in_ring_k), exactly_equal_);
+                    sft::atom_has_flag(descriptor, atom_index, sft::atom_flag_in_ring_k), exactly_equal);
     }
 }
 
@@ -133,12 +126,12 @@ static void compare_bonds_(RDKit::ROMol const &molecule, sft::molecule_descripto
     for (std::uint32_t bond_index = 0; bond_index < num_bonds; ++bond_index) {
         auto const *bond = molecule.getBondWithIdx(bond_index);
         reporter.mismatch("bond", "smiles={} bond={}", smiles, bond_index)
-            .field("atom_i", bond->getBeginAtomIdx(), descriptor.bond_atom_i[bond_index], exactly_equal_)
-            .field("atom_j", bond->getEndAtomIdx(), descriptor.bond_atom_j[bond_index], exactly_equal_)
+            .field("atom_i", bond->getBeginAtomIdx(), descriptor.bond_atom_i[bond_index], exactly_equal)
+            .field("atom_j", bond->getEndAtomIdx(), descriptor.bond_atom_j[bond_index], exactly_equal)
             .field("aromatic", bond->getIsAromatic(),
-                   sft::bond_has_flag(descriptor, bond_index, sft::bond_flag_aromatic_k), exactly_equal_)
+                   sft::bond_has_flag(descriptor, bond_index, sft::bond_flag_aromatic_k), exactly_equal)
             .field("in_ring", ring_info->numBondRings(bond_index) > 0,
-                   sft::bond_has_flag(descriptor, bond_index, sft::bond_flag_in_ring_k), exactly_equal_);
+                   sft::bond_has_flag(descriptor, bond_index, sft::bond_flag_in_ring_k), exactly_equal);
     }
 }
 
@@ -160,13 +153,13 @@ static void compare_neighbors_(RDKit::ROMol const &molecule, descriptor_scratch_
         std::sort(scratch.descriptor_neighbors.begin(), scratch.descriptor_neighbors.end());
 
         reporter.mismatch("neighbors", "smiles={} atom={}", smiles, atom_index)
-            .field("count", scratch.rdkit_neighbors.size(), scratch.descriptor_neighbors.size(), exactly_equal_);
+            .field("count", scratch.rdkit_neighbors.size(), scratch.descriptor_neighbors.size(), exactly_equal);
         if (scratch.rdkit_neighbors.size() != scratch.descriptor_neighbors.size())
             continue; // lists of different lengths cannot be paired slot by slot
         for (std::size_t slot = 0; slot < scratch.rdkit_neighbors.size(); ++slot)
             reporter.mismatch("neighbors", "smiles={} atom={} slot={}", smiles, atom_index, slot)
                 .field("neighbor_atom", scratch.rdkit_neighbors[slot], scratch.descriptor_neighbors[slot],
-                       exactly_equal_);
+                       exactly_equal);
     }
 }
 
@@ -184,9 +177,9 @@ static void compare_bond_hops_(RDKit::ROMol const &molecule, descriptor_scratch_
             std::uint8_t const hops = scratch.bond_hops[row * num_atoms + column];
             bool const reference_reachable = reference < rdkit_unreachable_distance_k;
             auto group = reporter.mismatch("bond_hops", "smiles={} row={} column={}", smiles, row, column);
-            group.field("reachable", reference_reachable, hops != sft::unreachable_hops_k, exactly_equal_);
+            group.field("reachable", reference_reachable, hops != sft::unreachable_hops_k, exactly_equal);
             if (!reference_reachable) continue; // the two encodings of "no bonded path" are not comparable
-            group.field("hops", reference, hops, exactly_equal_);
+            group.field("hops", reference, hops, exactly_equal);
         }
     }
 }
@@ -207,10 +200,10 @@ static void check_molecule_(RDKit::ROMol const &molecule, std::string const &smi
 
     auto const *ring_info = molecule.getRingInfo();
     reporter.mismatch("counts", "smiles={}", smiles)
-        .field("num_atoms", molecule.getNumAtoms(), scratch.descriptor.num_atoms, exactly_equal_)
-        .field("num_bonds", molecule.getNumBonds(), scratch.descriptor.num_bonds, exactly_equal_)
+        .field("num_atoms", molecule.getNumAtoms(), scratch.descriptor.num_atoms, exactly_equal)
+        .field("num_bonds", molecule.getNumBonds(), scratch.descriptor.num_bonds, exactly_equal)
         .field("num_rings", std::min<std::uint32_t>(ring_info->numRings(), sft::max_rings_k),
-               scratch.descriptor.num_rings, exactly_equal_);
+               scratch.descriptor.num_rings, exactly_equal);
 
     compare_atoms_(molecule, scratch.descriptor, smiles, reporter);
     compare_bonds_(molecule, scratch.descriptor, smiles, reporter);

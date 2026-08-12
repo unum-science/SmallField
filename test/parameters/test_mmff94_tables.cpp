@@ -18,11 +18,9 @@
  *  no parameters at all, and its `compared=` count alone cannot say so.
  */
 
-#include <cmath>   // `std::abs`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
 #include <cstdio>  // `std::fflush`
-#include <cstring> // `std::memcpy`
 
 #include <initializer_list> // `std::initializer_list`
 #include <iostream>         // RDKit's `AtomTyper.h` defaults a parameter to `std::cout` without including it
@@ -61,29 +59,10 @@ namespace smallfield::tests {
 
 #pragma region Predicates and Budgets
 
-static bool approximately_equal_(float lhs, double rhs, float tolerance = 1e-5f) {
-    float const rhs_as_float = static_cast<float>(rhs);
-    return std::abs(lhs - rhs_as_float) < tolerance;
-}
-
-static bool bitwise_equal_(float lhs, float rhs) {
-    std::uint32_t lhs_bits;
-    std::uint32_t rhs_bits;
-    std::memcpy(&lhs_bits, &lhs, sizeof(lhs_bits));
-    std::memcpy(&rhs_bits, &rhs, sizeof(rhs_bits));
-    return lhs_bits == rhs_bits;
-}
-
-/*  `comparison_group_t::field` invokes its predicate as `equals(reference, observed)`, so each suite's
- *  comparison is wrapped rather than reimplemented. RDKit tabulates in `double` and we narrow to `float`, so
- *  the host suite carries a tolerance; the device reads the very bytes the host uploaded, so any difference
- *  there is a lookup bug and the test is bitwise. */
-static constexpr auto rdkit_within_tolerance_ = [](double rdkit_value, float our_value) {
-    return approximately_equal_(our_value, rdkit_value);
-};
-static constexpr auto bits_identical_ = [](float host_value, float device_value) {
-    return bitwise_equal_(host_value, device_value);
-};
+/** What our `float` may differ from RDKit's `double` by, which is the narrowing and nothing else. The device
+ *  suite carries no such constant: it reads the very bytes the host uploaded, so any difference there is a
+ *  lookup bug and its comparison is `bitwise_equal`. */
+static constexpr float rdkit_narrowing_tolerance_k = 1e-5f;
 
 /** How many mismatching fields a reporter prints before the rest are only counted. A systematic divergence
  *  would otherwise print one line per probe and bury every other section in the log. */
@@ -390,11 +369,11 @@ static void compare_vdw_against_rdkit_(sf::parameters::mmff94_tables_view_t cons
         std::uint8_t const reference_donor_acceptor = static_cast<std::uint8_t>((reference->DA == 'D')   ? 2
                                                                                 : (reference->DA == 'A') ? 1
                                                                                                          : 0);
-        entry.field("alpha", reference->alpha_i, ours->alpha_i, rdkit_within_tolerance_)
-            .field("n_effective", reference->N_i, ours->n_effective, rdkit_within_tolerance_)
-            .field("a_scale", reference->A_i, ours->a_scale, rdkit_within_tolerance_)
-            .field("g_factor", reference->G_i, ours->g_factor, rdkit_within_tolerance_)
-            .field("r_star", reference->R_star, ours->r_star, rdkit_within_tolerance_)
+        entry.field("alpha", reference->alpha_i, ours->alpha_i, equal_within(rdkit_narrowing_tolerance_k))
+            .field("n_effective", reference->N_i, ours->n_effective, equal_within(rdkit_narrowing_tolerance_k))
+            .field("a_scale", reference->A_i, ours->a_scale, equal_within(rdkit_narrowing_tolerance_k))
+            .field("g_factor", reference->G_i, ours->g_factor, equal_within(rdkit_narrowing_tolerance_k))
+            .field("r_star", reference->R_star, ours->r_star, equal_within(rdkit_narrowing_tolerance_k))
             .field("donor_acceptor", reference_donor_acceptor, ours->donor_acceptor, exactly_equal);
     }
     report_coverage_("vdw", coverage);
@@ -414,8 +393,9 @@ static void compare_bond_against_rdkit_(sf::parameters::mmff94_tables_view_t con
         entry.field("present", reference != nullptr, ours != nullptr, exactly_equal);
         if (reference == nullptr || ours == nullptr) continue; // one side carries no parameters to compare
         ++coverage.table_hits;
-        entry.field("force_constant", reference->kb, ours->force_constant, rdkit_within_tolerance_)
-            .field("equilibrium_distance", reference->r0, ours->equilibrium_distance, rdkit_within_tolerance_);
+        entry.field("force_constant", reference->kb, ours->force_constant, equal_within(rdkit_narrowing_tolerance_k))
+            .field("equilibrium_distance", reference->r0, ours->equilibrium_distance,
+                   equal_within(rdkit_narrowing_tolerance_k));
     }
     report_coverage_("bond", coverage);
     reporter.summarize("bond");
@@ -437,8 +417,8 @@ static void compare_angle_against_rdkit_(sf::parameters::mmff94_tables_view_t co
         entry.field("present", reference != nullptr, ours != nullptr, exactly_equal);
         if (reference == nullptr || ours == nullptr) continue; // one side carries no parameters to compare
         ++coverage.table_hits;
-        entry.field("force_constant", reference->ka, ours->force_constant, rdkit_within_tolerance_)
-            .field("theta0_deg", reference->theta0, ours->theta0_deg, rdkit_within_tolerance_);
+        entry.field("force_constant", reference->ka, ours->force_constant, equal_within(rdkit_narrowing_tolerance_k))
+            .field("theta0_deg", reference->theta0, ours->theta0_deg, equal_within(rdkit_narrowing_tolerance_k));
     }
     report_coverage_("angle", coverage);
     reporter.summarize("angle");
@@ -466,9 +446,12 @@ static void compare_torsion_against_rdkit_(sf::parameters::mmff94_tables_view_t 
         if (reference.second == nullptr || ours.second == nullptr) continue; // nothing to compare on one side
         ++coverage.table_hits;
         entry.field("canonical_torsion_type", reference.first, ours.first, exactly_equal)
-            .field("torsion_v1", reference.second->V1, ours.second->torsion_v1, rdkit_within_tolerance_)
-            .field("torsion_v2", reference.second->V2, ours.second->torsion_v2, rdkit_within_tolerance_)
-            .field("torsion_v3", reference.second->V3, ours.second->torsion_v3, rdkit_within_tolerance_);
+            .field("torsion_v1", reference.second->V1, ours.second->torsion_v1,
+                   equal_within(rdkit_narrowing_tolerance_k))
+            .field("torsion_v2", reference.second->V2, ours.second->torsion_v2,
+                   equal_within(rdkit_narrowing_tolerance_k))
+            .field("torsion_v3", reference.second->V3, ours.second->torsion_v3,
+                   equal_within(rdkit_narrowing_tolerance_k));
     }
     report_coverage_("torsion", coverage);
     reporter.summarize("torsion");
@@ -586,11 +569,11 @@ static void compare_vdw_on_device_(sf::parameters::mmff94_tables_view_t const &h
         entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal);
         if (!host_hit || results[probe].hit == 0) continue; // one side resolved nothing to compare
         ++coverage.table_hits;
-        entry.field("alpha", ours->alpha_i, results[probe].alpha, bits_identical_)
-            .field("n_effective", ours->n_effective, results[probe].effective_electron_count, bits_identical_)
-            .field("a_scale", ours->a_scale, results[probe].polarizability_scale, bits_identical_)
-            .field("g_factor", ours->g_factor, results[probe].slater_kirkwood_factor, bits_identical_)
-            .field("r_star", ours->r_star, results[probe].r_star, bits_identical_)
+        entry.field("alpha", ours->alpha_i, results[probe].alpha, bitwise_equal)
+            .field("n_effective", ours->n_effective, results[probe].effective_electron_count, bitwise_equal)
+            .field("a_scale", ours->a_scale, results[probe].polarizability_scale, bitwise_equal)
+            .field("g_factor", ours->g_factor, results[probe].slater_kirkwood_factor, bitwise_equal)
+            .field("r_star", ours->r_star, results[probe].r_star, bitwise_equal)
             .field("donor_acceptor", ours->donor_acceptor, results[probe].donor_acceptor, exactly_equal);
     }
     report_coverage_("vdw", coverage);
@@ -619,9 +602,9 @@ static void compare_bond_on_device_(sf::parameters::mmff94_tables_view_t const &
         entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal);
         if (!host_hit || results[probe].hit == 0) continue; // one side resolved nothing to compare
         ++coverage.table_hits;
-        entry.field("force_constant", ours->force_constant, results[probe].force_constant, bits_identical_)
+        entry.field("force_constant", ours->force_constant, results[probe].force_constant, bitwise_equal)
             .field("equilibrium_distance", ours->equilibrium_distance, results[probe].equilibrium_distance,
-                   bits_identical_);
+                   bitwise_equal);
     }
     report_coverage_("bond", coverage);
     reporter.summarize("bond");
@@ -652,8 +635,8 @@ static void compare_angle_on_device_(sf::parameters::mmff94_tables_view_t const 
         entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal);
         if (!host_hit || results[probe].hit == 0) continue; // one side resolved nothing to compare
         ++coverage.table_hits;
-        entry.field("force_constant", ours->force_constant, results[probe].force_constant, bits_identical_)
-            .field("theta0_deg", ours->theta0_deg, results[probe].equilibrium_angle_degrees, bits_identical_);
+        entry.field("force_constant", ours->force_constant, results[probe].force_constant, bitwise_equal)
+            .field("theta0_deg", ours->theta0_deg, results[probe].equilibrium_angle_degrees, bitwise_equal);
     }
     report_coverage_("angle", coverage);
     reporter.summarize("angle");
@@ -689,9 +672,9 @@ static void compare_torsion_on_device_(sf::parameters::mmff94_tables_view_t cons
         entry
             .field("canonical_torsion_type", static_cast<std::uint8_t>(ours.first),
                    results[probe].canonical_torsion_type, exactly_equal)
-            .field("torsion_v1", ours.second->torsion_v1, results[probe].torsion_v1, bits_identical_)
-            .field("torsion_v2", ours.second->torsion_v2, results[probe].torsion_v2, bits_identical_)
-            .field("torsion_v3", ours.second->torsion_v3, results[probe].torsion_v3, bits_identical_);
+            .field("torsion_v1", ours.second->torsion_v1, results[probe].torsion_v1, bitwise_equal)
+            .field("torsion_v2", ours.second->torsion_v2, results[probe].torsion_v2, bitwise_equal)
+            .field("torsion_v3", ours.second->torsion_v3, results[probe].torsion_v3, bitwise_equal);
     }
     report_coverage_("torsion", coverage);
     reporter.summarize("torsion");

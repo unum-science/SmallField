@@ -63,22 +63,16 @@ static constexpr std::string_view test_name_k = "test_dg_energy";
 #pragma region Coordinate Views
 
 /**
- *  @brief The four-axis buffer the energy, gradient, and minimization kernels all operate on.
+ *  @brief A gradient over an embedding's four axes; nothing but the role separates it from the embedding.
  *
- *  Addressed `(atom, axis)`: axes zero through two are x, y, and z, and axis three is the w the crush penalty
- *  flattens before the structure is projected back to three dimensions. Every buffer this file hands a kernel
- *  carries all four.
+ *  Both are addressed `(atom, axis)`: axes zero through two are x, y, and z, and axis three is the w the crush
+ *  penalty flattens before the structure is projected back to three dimensions. Every buffer this file hands a
+ *  kernel carries all four.
  */
-using embedding_t = sft::embedding_soa_t;
-
-/** A gradient over the same four axes; nothing but the role separates it from an embedding. */
 using gradient_t = sft::coordinates_soa<coordinate_role_t::gradient_k, float, sft::embedding_dimensions_k>;
 
-/** Coordinates as `(atom, axis)` over three axes, the layout RDKit's conformer API speaks. */
-using interleaved_t = sft::conformer_aos_t;
-
 /** Grow @p storage to a four-axis embedding over @p num_atoms atoms, zero it, and view it. */
-static embedding_t reset_embedding_(std::vector<float> &storage, std::uint32_t num_atoms) {
+static sft::embedding_soa_t reset_embedding_(std::vector<float> &storage, std::uint32_t num_atoms) {
     return sft::reset_coordinates_soa<coordinate_role_t::embedding_k, sft::embedding_dimensions_k>(storage, num_atoms);
 }
 
@@ -88,7 +82,7 @@ static gradient_t reset_gradient_(std::vector<float> &storage, std::uint32_t num
 }
 
 /** Grow @p storage to @p num_atoms atom-major triples, zero it, and view it. */
-static interleaved_t reset_interleaved_(std::vector<float> &storage, std::uint32_t num_atoms) {
+static sft::conformer_aos_t reset_interleaved_(std::vector<float> &storage, std::uint32_t num_atoms) {
     return sft::reset_coordinates_aos<coordinate_role_t::position_k>(storage, num_atoms);
 }
 
@@ -227,7 +221,7 @@ static quantized_bounds_t quantize_bounds_(sft::packed_matrix<float const> bound
  *  @return Total energy.
  */
 template <typename bound_reader_>
-static double reference_dg_energy_(embedding_t coordinates, bound_reader_ read_bound, dg_weights_t weights) {
+static double reference_dg_energy_(sft::embedding_soa_t coordinates, bound_reader_ read_bound, dg_weights_t weights) {
     std::uint32_t const num_atoms = coordinates.extent(0);
     double energy = 0.0;
     for (std::uint32_t first_atom = 0; first_atom < num_atoms; ++first_atom) {
@@ -256,7 +250,7 @@ static double reference_dg_energy_(embedding_t coordinates, bound_reader_ read_b
 }
 
 /** The largest amount, in angstroms, by which any pair sits outside its bounds. */
-static float max_bound_violation_(embedding_t coordinates, sft::packed_matrix<float const> bounds) {
+static float max_bound_violation_(sft::embedding_soa_t coordinates, sft::packed_matrix<float const> bounds) {
     std::uint32_t const num_atoms = coordinates.extent(0);
     float worst = 0.0f;
     for (std::uint32_t first_atom = 0; first_atom < num_atoms; ++first_atom)
@@ -283,7 +277,7 @@ static float largest_bound_(sft::packed_matrix<float const> bounds) {
 }
 
 /** Widest extent of the structure along any one axis. */
-static float coordinate_span_(embedding_t coordinates) {
+static float coordinate_span_(sft::embedding_soa_t coordinates) {
     float span = 0.0f;
     for (std::uint32_t axis = 0; axis < coordinates.extent(1); ++axis) {
         float lowest = coordinates(0, axis), highest = coordinates(0, axis);
@@ -297,7 +291,7 @@ static float coordinate_span_(embedding_t coordinates) {
 }
 
 /** Mean magnitude of the embedding's fourth axis — the quantity the crush penalty exists to shrink. */
-static float mean_fourth_dimension_magnitude_(embedding_t coordinates) {
+static float mean_fourth_dimension_magnitude_(sft::embedding_soa_t coordinates) {
     std::uint32_t const num_atoms = coordinates.extent(0);
     double total = 0.0;
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) total += std::fabs(coordinates(atom, 3));
@@ -311,7 +305,7 @@ static float mean_fourth_dimension_magnitude_(embedding_t coordinates) {
  *  every third atom, which is how this file once fed the kernel coordinates near 4e8 and compared two
  *  reference implementations of the same nonsense.
  */
-static void fill_fourth_dimension_(embedding_t coordinates) {
+static void fill_fourth_dimension_(sft::embedding_soa_t coordinates) {
     for (std::uint32_t atom = 0; atom < coordinates.extent(0); ++atom)
         coordinates(atom, 3) = 0.1f * (static_cast<float>(atom % 3u) - 1.0f);
 }
@@ -583,8 +577,8 @@ static void check_gradient_(sftest::diagnostic_reporter_t &reporter, molecule_ca
  *  @param[in] centers Chiral centers whose center atoms are moved.
  *  @param[in] retained Fraction of the out-of-plane height each center keeps.
  */
-static void flatten_chiral_centers_(embedding_t coordinates, custd::span<sft::chiral_center_descriptor_t const> centers,
-                                    float retained) {
+static void flatten_chiral_centers_(sft::embedding_soa_t coordinates,
+                                    custd::span<sft::chiral_center_descriptor_t const> centers, float retained) {
     for (auto const &center : centers) {
         std::uint32_t const origin = center.neighbor_atoms[0];
         float first_edge[3] = {}, second_edge[3] = {}, normal[3] = {};

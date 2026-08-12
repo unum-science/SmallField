@@ -45,11 +45,6 @@ static constexpr std::string_view test_name_k = "test_mmff_gpu_typer";
 
 namespace smallfield::tests {
 
-/** A partial charge carries the file's magnitude-scaled tolerance. */
-static constexpr auto within_tolerance_ = [](float cpu_value, float gpu_value) {
-    return approximately_equal(cpu_value, gpu_value);
-};
-
 /** How many mismatching fields either section prints before the rest are only counted. */
 static constexpr std::size_t max_printed_lines_k = 32;
 
@@ -202,7 +197,7 @@ static std::size_t compare_molecule_(typer_reporters_t &reporters, cpu_typing_sc
         auto charge = reporters.partial_charge.mismatch("mmff_typer", "molecule={} atom={}", molecule_index,
                                                         atom_index);
         charge.field("partial_charge", scratch.partial_charges[atom_index], gpu_atom_charges[atom_offset + atom_index],
-                     within_tolerance_);
+                     equal_within(mmff94_partial_charge_tolerance_k));
         mismatching_atoms += charge.reported_field_count() != 0;
     }
     return mismatching_atoms;

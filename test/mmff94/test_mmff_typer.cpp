@@ -13,7 +13,6 @@
  *  seventeen probes is a molecule whose perception moves.
  */
 
-#include <cmath>   // `std::fabs`
 #include <cstddef> // `std::size_t`
 #include <cstdio>  // `std::fflush`
 
@@ -50,11 +49,6 @@ namespace sftest = smallfield::tests;
 static constexpr std::string_view test_name_k = "test_mmff_typer";
 
 namespace smallfield::tests {
-
-/** A partial charge is summed in `float` here against RDKit's `double`, so it carries an absolute tolerance. */
-static constexpr auto charge_within_tolerance_ = [](float rdkit_value, float native_value) {
-    return std::fabs(rdkit_value - native_value) <= 1e-3f;
-};
 
 /** How many mismatching fields either section prints before the rest are only counted. A cap of three
  *  or ten turned a thirteen-molecule structural class into what read as a single stray molecule, so
@@ -157,7 +151,7 @@ static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t c
         auto charge = reporters.partial_charge.mismatch("mmff_typer", "smiles={} atom={} element={}", smiles,
                                                         atom_index, descriptor.element[atom_index]);
         charge.field("partial_charge", static_cast<float>(props.getMMFFPartialCharge(atom_index)),
-                     scratch.partial_charges[atom_index], charge_within_tolerance_);
+                     scratch.partial_charges[atom_index], equal_within(mmff94_partial_charge_tolerance_k));
         mismatching_atoms += charge.reported_field_count() != 0;
     }
     if (mismatching_atoms != 0) ++tally.molecules_mismatched;

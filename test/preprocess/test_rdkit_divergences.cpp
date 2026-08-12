@@ -356,7 +356,10 @@ struct divergence_reporters_t {
     }
 
     /** Divergences asserted across every section, for the verdict line. */
-    std::size_t divergence_count() const noexcept { return disagreement.divergence_count(); }
+    std::size_t divergence_count() const noexcept {
+        return shape.divergence_count() + drift.divergence_count() + disagreement.divergence_count() +
+               completeness.divergence_count();
+    }
 
     /** Mismatches across every section, for the verdict line. */
     std::size_t mismatch_count() const noexcept {

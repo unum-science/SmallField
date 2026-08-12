@@ -8,11 +8,9 @@
 
 #pragma once
 
-#include <cmath>   // `std::fabs`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 #include <cstdlib> // `std::getenv`
 
-#include <algorithm>    // `std::max`
 #include <charconv>     // `std::from_chars`
 #include <fstream>      // `std::ifstream`
 #include <limits>       // `std::numeric_limits`
@@ -252,18 +250,19 @@ inline corpus_selection_t select_corpus(int argc, char const *const *argv, std::
 }
 
 /**
- *  @brief Compare two floats within a tolerance that scales with the larger operand's magnitude.
+ *  @brief The absolute agreement an MMFF94 partial charge is held to, wherever one is compared.
  *
- *  @param[in] lhs First value.
- *  @param[in] rhs Second value.
- *  @param[in] tolerance Absolute tolerance below unit magnitude; scales with magnitude above it.
- *  @return True when the values agree within tolerance.
+ *  Three suites compare this one quantity -- against RDKit, across the host and the device, and across the two
+ *  native extractors -- and a threshold each picks for itself is a threshold whose loosest instance decides
+ *  what the project actually enforces.
+ *
+ *  It is absolute rather than magnitude-scaled because the error being tolerated is `float` rounding
+ *  accumulated over a sum of bond-charge increments, and that does not grow with the sum it lands on. Scaling
+ *  by magnitude would invert the relationship: MMFF94's metal-ion types carry a partial charge equal to their
+ *  formal charge, up to `+3`, so an atom whose charge is barely computed at all would collect three times the
+ *  slack of the covalent atoms whose charges are summed.
  */
-inline bool approximately_equal(float lhs, float rhs, float tolerance = 1e-3f) {
-    if (std::fabs(lhs - rhs) <= tolerance) return true;
-    float const scale = std::max(1.0f, std::max(std::fabs(lhs), std::fabs(rhs)));
-    return std::fabs(lhs - rhs) <= tolerance * scale;
-}
+inline constexpr float mmff94_partial_charge_tolerance_k = 1e-3f;
 
 /**
  *  @brief Standard set of drug-like test molecules covering a range of sizes.

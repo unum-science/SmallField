@@ -51,11 +51,6 @@ namespace smallfield::tests {
 
 #pragma region Batch
 
-/** Every compared float carries the file's magnitude-scaled tolerance. */
-static constexpr auto within_tolerance_ = [](float cpu_value, float gpu_value) {
-    return approximately_equal(cpu_value, gpu_value);
-};
-
 /** How many mismatching fields any one section prints before the rest are only counted. */
 static constexpr std::size_t max_printed_lines_k = 32;
 
@@ -320,9 +315,9 @@ static std::size_t compare_bonds_(diagnostic_reporter_t &reporter, std::uint32_t
         auto term = reporter.mismatch("bond", "molecule={} term={}", molecule_index, term_index);
         term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal)
             .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
-            .field("force_constant", cpu_term.force_constant, gpu_term.force_constant, within_tolerance_)
+            .field("force_constant", cpu_term.force_constant, gpu_term.force_constant, approximately_equal)
             .field("equilibrium_distance", cpu_term.equilibrium_distance, gpu_term.equilibrium_distance,
-                   within_tolerance_);
+                   approximately_equal);
         mismatching_terms += term.reported_field_count() != 0;
     }
     return mismatching_terms;
@@ -339,8 +334,8 @@ static std::size_t compare_angles_(diagnostic_reporter_t &reporter, std::uint32_
         term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal)
             .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
             .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal)
-            .field("force_constant", cpu_term.force_constant, gpu_term.force_constant, within_tolerance_)
-            .field("equilibrium_angle", cpu_term.equilibrium_angle, gpu_term.equilibrium_angle, within_tolerance_);
+            .field("force_constant", cpu_term.force_constant, gpu_term.force_constant, approximately_equal)
+            .field("equilibrium_angle", cpu_term.equilibrium_angle, gpu_term.equilibrium_angle, approximately_equal);
         mismatching_terms += term.reported_field_count() != 0;
     }
     return mismatching_terms;
@@ -358,9 +353,9 @@ static std::size_t compare_torsions_(diagnostic_reporter_t &reporter, std::uint3
             .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
             .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal)
             .field("atom_l", cpu_term.atom_l, gpu_term.atom_l, exactly_equal)
-            .field("torsion_v1", cpu_term.torsion_v1, gpu_term.torsion_v1, within_tolerance_)
-            .field("torsion_v2", cpu_term.torsion_v2, gpu_term.torsion_v2, within_tolerance_)
-            .field("torsion_v3", cpu_term.torsion_v3, gpu_term.torsion_v3, within_tolerance_);
+            .field("torsion_v1", cpu_term.torsion_v1, gpu_term.torsion_v1, approximately_equal)
+            .field("torsion_v2", cpu_term.torsion_v2, gpu_term.torsion_v2, approximately_equal)
+            .field("torsion_v3", cpu_term.torsion_v3, gpu_term.torsion_v3, approximately_equal);
         mismatching_terms += term.reported_field_count() != 0;
     }
     return mismatching_terms;
@@ -377,7 +372,7 @@ static std::size_t compare_oops_(diagnostic_reporter_t &reporter, std::uint32_t 
             .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
             .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal)
             .field("atom_l", cpu_term.atom_l, gpu_term.atom_l, exactly_equal)
-            .field("force_constant", cpu_term.force_constant, gpu_term.force_constant, within_tolerance_);
+            .field("force_constant", cpu_term.force_constant, gpu_term.force_constant, approximately_equal);
         mismatching_terms += term.reported_field_count() != 0;
     }
     return mismatching_terms;
@@ -394,13 +389,13 @@ static std::size_t compare_stretch_bends_(diagnostic_reporter_t &reporter, std::
         term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal)
             .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
             .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal)
-            .field("kba_ijk", cpu_term.kba_ijk, gpu_term.kba_ijk, within_tolerance_)
-            .field("kba_kji", cpu_term.kba_kji, gpu_term.kba_kji, within_tolerance_)
-            .field("equilibrium_angle", cpu_term.equilibrium_angle, gpu_term.equilibrium_angle, within_tolerance_)
+            .field("kba_ijk", cpu_term.kba_ijk, gpu_term.kba_ijk, approximately_equal)
+            .field("kba_kji", cpu_term.kba_kji, gpu_term.kba_kji, approximately_equal)
+            .field("equilibrium_angle", cpu_term.equilibrium_angle, gpu_term.equilibrium_angle, approximately_equal)
             .field("equilibrium_distance_ij", cpu_term.equilibrium_distance_ij, gpu_term.equilibrium_distance_ij,
-                   within_tolerance_)
+                   approximately_equal)
             .field("equilibrium_distance_kj", cpu_term.equilibrium_distance_kj, gpu_term.equilibrium_distance_kj,
-                   within_tolerance_);
+                   approximately_equal);
         mismatching_terms += term.reported_field_count() != 0;
     }
     return mismatching_terms;

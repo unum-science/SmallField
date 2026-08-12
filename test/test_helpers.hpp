@@ -46,6 +46,8 @@
 #include <cstdio>  // `std::FILE`, `std::fwrite`, `stdout`, `stderr`
 #include <cstdlib> // `std::exit`
 
+#include <algorithm>   // `std::max`
+#include <bit>         // `std::bit_cast`
 #include <iterator>    // `std::back_inserter`
 #include <limits>      // `std::numeric_limits`
 #include <string>      // `std::string`
@@ -118,6 +120,54 @@ inline void append_delta(fmt::memory_buffer &out, reference_type_ const &referen
 
 #pragma endregion Grammar
 
+#pragma region Predicates
+
+/*  The predicates `comparison_group_t::field` is handed, which is why each is a `constexpr` callable rather
+ *  than a function carrying a default argument: a function name decays to a pointer whose type does not
+ *  include the default, so it cannot be passed where a two-argument callable is wanted and every call site
+ *  grows a lambda to bind what the declaration already said.
+ *
+ *  The two tolerance predicates narrow to `float` before subtracting. A reference tabulated in `double` is
+ *  being asked whether our `float` reproduces it at our own precision, and subtracting in `double` would
+ *  charge us for the narrowing itself -- at `1e-5` over the MMFF94 angle table, half an ULP of `theta0` is
+ *  most of that budget. */
+
+/** Exact equality, promoted so a signed operand and an unsigned one still compare as numbers. */
+inline constexpr auto exactly_equal = [](auto const &reference, auto const &observed) {
+    using promoted_type_ = std::common_type_t<std::decay_t<decltype(reference)>, std::decay_t<decltype(observed)>>;
+    return static_cast<promoted_type_>(reference) == static_cast<promoted_type_>(observed);
+};
+
+/** Bit-pattern identity, for a comparison written to catch the one-ULP divergence any tolerance would hide. */
+inline constexpr auto bitwise_equal = [](auto const &reference, auto const &observed) {
+    static_assert(std::is_same_v<std::decay_t<decltype(reference)>, float> &&
+                      std::is_same_v<std::decay_t<decltype(observed)>, float>,
+                  "bitwise equality is written for `float`, and a wider operand would narrow into it silently");
+    return std::bit_cast<std::uint32_t>(reference) == std::bit_cast<std::uint32_t>(observed);
+};
+
+/**
+ *  @brief Agreement at `1e-3`, scaled by the larger operand once that passes unit magnitude.
+ *
+ *  For a quantity whose error grows with itself, and which spans orders of magnitude -- a force constant, an
+ *  equilibrium distance, a torsion amplitude. A quantity whose error is instead a fixed accumulation of
+ *  rounding, such as an MMFF94 partial charge, takes `equal_within` and names its threshold, so that a large
+ *  operand cannot quietly buy slack the arithmetic behind it never spent.
+ */
+inline constexpr auto approximately_equal = [](auto const &reference, auto const &observed) {
+    float const expected = static_cast<float>(reference), measured = static_cast<float>(observed);
+    return std::fabs(expected - measured) <= 1e-3f * std::max(1.0f, std::max(std::fabs(expected), std::fabs(measured)));
+};
+
+/** Agreement at an absolute @p tolerance, which the call site therefore names rather than inherits. */
+inline constexpr auto equal_within = [](float tolerance) {
+    return [tolerance](auto const &reference, auto const &observed) {
+        return std::fabs(static_cast<float>(reference) - static_cast<float>(observed)) <= tolerance;
+    };
+};
+
+#pragma endregion Predicates
+
 #pragma region Reporter
 
 class diagnostic_reporter_t;
@@ -178,9 +228,6 @@ class comparison_group_t final : public diagnostic_group_t {
     comparison_group_t(diagnostic_reporter_t &owner, std::string prefix) noexcept
         : diagnostic_group_t(owner, diagnostic_verb_t::mismatch_k, std::move(prefix)) {}
 };
-
-/** The `field` predicate for operands that carry no tolerance at all: a count, a type, a flag, a sign. */
-inline constexpr auto exactly_equal = [](auto const &reference, auto const &observed) { return reference == observed; };
 
 /**
  *  @brief A `NOTE` group whose fields print whether they agree or not.
@@ -442,11 +489,5 @@ inline int report_fail(std::string_view test_name, fmt::format_string<reason_typ
             std::exit(1);                                                                                         \
         }                                                                                                         \
     } while (0)
-
-/** `sf_verify_` for a floating comparison, with the absolute error taken against @p tolerance. */
-#define sf_verify_near_(actual, expected, tolerance, message)                                                    \
-    sf_verify_(                                                                                                  \
-        std::fabs(static_cast<double>(actual) - static_cast<double>(expected)) < static_cast<double>(tolerance), \
-        (message))
 
 #pragma endregion Assertions
