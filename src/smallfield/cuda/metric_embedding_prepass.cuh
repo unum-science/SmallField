@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 
+#include "smallfield/cuda/triangle_smooth.cuh"
 #include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/cuda_error.hpp"
 #include "smallfield/types/atom_limited_bins.hpp"
@@ -141,6 +142,9 @@ __device__ __forceinline__ float embed_block_reduce_sum_(float value, float *war
  *  `embed_shared_floats` states this same layout as an expression, and every launch site sizes its request
  *  from it rather than restating the sum.
  *
+ *  A molecule whose smoothed bounds cross — some pair's lower above its upper — has no embedding at all, so
+ *  its block stops after persisting the bounds and leaves its coordinates zeroed.
+ *
  *  @param[inout] bounds_matrices Flat per-molecule bounds matrices, smoothed in place.
  *  @param[in] molecule_metadata Per-molecule atom counts and bounds offsets.
  *  @param[in] molecule_indices Molecule index handled by each block.
@@ -185,41 +189,32 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
         shared_gram[linear_index] = global_bounds[linear_index];
     __syncthreads();
 
-    // A read view over the shared block while it still holds bounds. The element type is `const` because
-    // every access through it is a read; it carries no aliasing promise, so the in-place updates below and
-    // the Gram build further down stay visible through it.
-    packed_matrix<float const> const shared_bounds {shared_gram, num_atoms, num_atoms};
+    // A view over the shared block while it still holds bounds. It carries no aliasing promise, so the
+    // in-place smoothing below and the Gram build further down stay visible through it.
+    packed_matrix<float> const shared_bounds {shared_gram, num_atoms, num_atoms};
 
-    // Floyd-Warshall triangle smoothing on the N × N block.
+    // Floyd-Warshall triangle smoothing on the N × N block. Each round says whether it moved a bound, which
+    // this kernel has no use for: feasibility is the only verdict it acts on, and the scan below settles that
+    // in one pass over the finished matrix. The barrier belongs after the round rather than inside it —
+    // `triangle_smooth_pivot_` documents why its own reads and writes cannot collide.
     for (std::uint32_t pivot = 0; pivot < num_atoms; ++pivot) {
-        for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += block_size) {
-            std::uint32_t const row = linear_index / num_atoms;
-            std::uint32_t const column = linear_index % num_atoms;
-            if (row == column || row == pivot || column == pivot) continue;
-            float const upper_row_pivot = upper_distance_bound_at(shared_bounds, row, pivot);
-            float const upper_pivot_column = upper_distance_bound_at(shared_bounds, pivot, column);
-            // Above the diagonal the cell is the pair's upper bound, below it the lower one, so the branch
-            // picks which of the two inequalities applies rather than which cell to touch. The lower bounds
-            // stay inside the branch that consults them, where they cost no register on the other path.
-            if (row < column) {
-                float const candidate = upper_row_pivot + upper_pivot_column;
-                float &current = shared_gram[row * num_atoms + column];
-                if (candidate < current) current = candidate;
-            }
-            else {
-                float const lower_row_pivot = lower_distance_bound_at(shared_bounds, row, pivot);
-                float const lower_pivot_column = lower_distance_bound_at(shared_bounds, pivot, column);
-                float &current = shared_gram[row * num_atoms + column];
-                current = fmaxf(current,
-                                fmaxf(lower_row_pivot - upper_pivot_column, lower_pivot_column - upper_row_pivot));
-            }
-        }
+        [[maybe_unused]] smoothing_t const round_verdict = triangle_smooth_pivot_(shared_bounds, pivot, lane,
+                                                                                  block_size);
         __syncthreads();
     }
 
     // Persist smoothed bounds back to global memory.
     for (std::uint32_t linear_index = lane; linear_index < total_entries; linear_index += block_size)
         global_bounds[linear_index] = shared_gram[linear_index];
+
+    // An impossible matrix has no metric embedding: `midpoint_distance_squared_` averages a lower bound that
+    // sits above its upper, so the Gram matrix built from it is not a distance matrix and its eigenvectors
+    // place the atoms nowhere in particular. The block stops here, leaving this molecule's coordinates at the
+    // zero `build_metric_initial_coordinates_on_gpu` memset — the same slot a molecule outside every bin
+    // already gets — while the bounds just persisted carry the crossed pair itself. `__syncthreads_or`
+    // answers every thread alike, so the whole block leaves together.
+    smoothing_t const feasibility = bounds_consistency_(shared_bounds, lane, block_size);
+    if (__syncthreads_or(feasibility == smoothing_t::infeasible_k) != 0) return;
 
     // Row means and grand mean for double-centering.
     for (std::uint32_t atom = lane; atom < num_atoms; atom += block_size) {
@@ -336,14 +331,25 @@ __global__ void embed_4d_power_iter_kernel(float *__restrict__ bounds_matrices,
 }
 
 /**
- *  @brief Async-only metric prepass driver that takes a caller-owned solver handle +
- *  scratch pool.
+ *  @brief Async-only metric prepass driver that takes a caller-owned scratch pool.
  *
- *  @p scratch must be pre-sized for @p num_molecules × @p max_atoms_per_molecule by
- *  the caller (see `ensure_metric_scratch` in smallfield.cu). This function performs
- *  no device allocations and no CPU-side synchronization; all CUDA calls go on
- *  @p stream, so the caller can issue kernel launches against @p stream
- *  immediately afterward and the driver orders them correctly.
+ *  @p scratch must be pre-sized for the wave's molecule count and @p max_atoms_per_molecule by the caller,
+ *  see `ensure_metric_scratch`. This function performs no device allocations and no CPU-side
+ *  synchronization; all CUDA calls go on @p stream, so the caller can issue kernel launches against
+ *  @p stream immediately afterward and the driver orders them correctly.
+ *
+ *  Every molecule's coordinates start zeroed, and a molecule that reaches no bin, or whose smoothed bounds
+ *  turn out to be impossible, keeps that zero rather than an embedding.
+ *
+ *  @param[inout] device_bounds Flat per-molecule bounds matrices, smoothed in place.
+ *  @param[in] device_metadata Per-molecule atom counts and bounds offsets, on the device.
+ *  @param[in] host_metadata The same records on the host, which is where the binning reads them.
+ *  @param[in] max_atoms_per_molecule Stride between coordinate dimensions.
+ *  @param[out] device_initial_coordinates Destination for every molecule's 4D metric embedding.
+ *  @param[inout] scratch Caller-owned bin groups and device staging for the group indices.
+ *  @param[in] sink Where a refused CUDA call reports itself.
+ *  @param[in] stream Stream every call in here rides.
+ *  @return Whether every launch was issued; the sink carries which call refused when it was not.
  */
 template <typename scratch_>
 inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
@@ -361,28 +367,20 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
                     "cudaMemsetAsync(metric coordinates)"))
         return false;
 
-    // Bin molecules into 8 fixed wave-dispatch buckets {16,32,48,64,80,96,112,128}.
-    // Everything in a bin pads up to the bin's N for the eigendecomposition, so the
-    // kernel launches ONCE per bin instead of once per exact atom count.
+    // Bin molecules onto the shared atom-count ladder. Everything in a bin pads up to the bin's cap for the
+    // eigendecomposition, so the kernel launches once per bin instead of once per exact atom count.
     auto const &bin_atom_counts_k = smallfield::types::atom_limited_bin_caps_k;
-    constexpr std::uint32_t num_bins_k = static_cast<std::uint32_t>(smallfield::types::atom_limited_bin_count_k);
-
-    auto bin_for = [&](std::uint32_t num_atoms) -> int {
-        std::size_t const bin_index = smallfield::types::atom_limited_bin_for(num_atoms);
-        return bin_index < smallfield::types::atom_limited_bin_count_k ? static_cast<int>(bin_index) : -1;
-    };
 
     auto &bin_groups = scratch.bin_groups;
     for (auto &bin_group : bin_groups) bin_group.clear();
     for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
         std::uint32_t const num_atoms = host_metadata[molecule_index].num_atoms;
-        if (num_atoms == 0 || num_atoms > max_atoms_per_molecule) continue;
-        int const bin = bin_for(num_atoms);
-        if (bin < 0) continue;
+        if (num_atoms == 0) continue;                     // preprocess refused the molecule
+        if (num_atoms > max_atoms_per_molecule) continue; // wider than the coordinate stride this launch has
+        std::size_t const bin = smallfield::types::atom_limited_bin_for(num_atoms);
+        if (bin == smallfield::types::atom_limited_bin_count_k) continue; // past the last cap on the ladder
         bin_groups[bin].push_back(molecule_index);
     }
-
-    bool success = true;
 
     // The `cudaFuncAttributeMaxDynamicSharedMemorySize` attribute for
     // `embed_4d_power_iter_kernel` is set once per device in
@@ -390,7 +388,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
     // this function runs concurrently from OMP per-device worker threads, and
     // the attribute mutates driver-global per-kernel state on the same symbol.
 
-    for (std::uint32_t bin = 0; bin < num_bins_k && success; ++bin) {
+    for (std::size_t bin = 0; bin < smallfield::types::atom_limited_bin_count_k; ++bin) {
         auto const &group = bin_groups[bin];
         if (group.empty()) continue;
 
@@ -409,22 +407,22 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         // Shared memory for embed_4d_power_iter_kernel:
         std::size_t const shared_bytes = embed_shared_bytes(bin_n);
 
-        success &= sink.check(cudaMemcpyAsync(device_group_indices, group.data(), group_size * sizeof(std::uint32_t),
-                                              cudaMemcpyHostToDevice, stream),
-                              "cudaMemcpyAsync(bin group indices)");
-        if (!success) continue;
+        if (!sink.check(cudaMemcpyAsync(device_group_indices, group.data(), group_size * sizeof(std::uint32_t),
+                                        cudaMemcpyHostToDevice, stream),
+                        "cudaMemcpyAsync(bin group indices)"))
+            return false;
 
         // One kernel launch performs the smooth-and-build-gram + eigendecomposition + project
         // chain entirely on-device: no host-side workspace, no global Gram/eigenvalue buffers.
         embed_4d_power_iter_kernel<<<static_cast<unsigned int>(group_size), embed_block_size_k, shared_bytes, stream>>>(
             device_bounds, device_metadata, device_group_indices, device_initial_coordinates, max_atoms_per_molecule);
-        success &= sink.check(cudaGetLastError(), "embed_4d_power_iter_kernel launch");
+        if (!sink.check(cudaGetLastError(), "embed_4d_power_iter_kernel launch")) return false;
     }
 
     // No final stream sync: the prepass is stream-ordered with whatever work the
     // caller launches next on the same stream. Caller's `finalize_gpu_pipeline`
     // syncs the stream once per wave, which is enough.
-    return success;
+    return true;
 }
 
 } // namespace smallfield::cuda

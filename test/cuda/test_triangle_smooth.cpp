@@ -1,13 +1,19 @@
 /**
  *  @file test/cuda/test_triangle_smooth.cpp
- *  @brief Test GPU triangle smoothing against the RDKit reference.
+ *  @brief Test GPU triangle smoothing, and the verdict it returns, against the RDKit reference.
  *
- *  Compiled with g++ (not nvcc) to avoid RDKit C++20 header conflicts. CUDA kernel calls are in
+ *  Compiled with g++, not nvcc, to avoid RDKit C++20 header conflicts. The CUDA kernel calls are in
  *  test_triangle_smooth_kernels.cu.
  *
- *  Corpus: the built-in standards by default, so a bare `ctest` run stays self-contained; name a `.smi`
- *  file in `argv[1]` or in `SMALLFIELD_TEST_CORPUS` for a wider sweep. Molecules the warp kernel cannot
- *  hold are counted and skipped rather than failing the run, and a sweep that smoothed none of them fails.
+ *  Two sections, in the order a reader wants them. `fixture` smooths hand-built matrices whose verdict is
+ *  known by construction and confirms each one against `DistGeom::triangleSmoothBounds`, which is the only
+ *  independent answer to "is this matrix impossible" the project has. `corpus` sweeps real molecules,
+ *  compares every cell of the smoothed matrix against RDKit's so a verdict that agrees for the wrong reason
+ *  still fails, and re-smooths each one to pin what a second sweep may and may not move.
+ *
+ *  Corpus: the built-in standards by default, so a bare `ctest` run stays self-contained; name a `.smi` file
+ *  in `argv[1]` or in `SMALLFIELD_TEST_CORPUS` for a wider sweep. Molecules the warp kernel cannot hold are
+ *  counted and skipped rather than failing the run, and a sweep that smoothed none of them fails.
  */
 
 #include <cmath>   // `std::fabs`
@@ -25,36 +31,94 @@
 #include <DistGeom/TriangleSmooth.h>
 #include <GraphMol/DistGeomHelpers/BoundsMatrixBuilder.h>
 
+#include "smallfield/types/views.hpp"
+
 #include "test/cuda/test_triangle_smooth_kernels.hpp"
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
 namespace sftest = smallfield::tests;
 
+using sftest::exactly_equal;
 using sftest::gpu_triangle_smooth;
+using smallfield::cuda::smoothing_name;
+using smallfield::cuda::smoothing_t;
+using smallfield::types::packed_matrix;
 
 static constexpr std::string_view test_name_k = "test_triangle_smooth";
 
 /** Molecules taken from a named corpus when no cap is given; the built-in standards are always walked. */
 static constexpr std::size_t default_max_molecules_k = 50;
 
-/** Atom ceiling of the warp-level kernel: the whole matrix has to fit one shared-memory tile. */
-static constexpr std::uint32_t max_smoothed_atoms_k = 128;
+/** Float32 against RDKit's float64, over a sweep whose every intermediate sum is in single precision. */
+static constexpr float bound_tolerance_k = 1e-2f;
 
-/** Which smoothing a flattened bounds matrix has already had when it reaches the caller. */
-enum class bounds_smoothing_t {
-    /** Topological bounds only — the matrix the device kernel is handed. */
-    unsmoothed_k,
-    /** RDKit's own `triangleSmoothBounds` applied on the host — the reference. */
-    host_smoothed_k,
+/** Both operands land in float before the comparison, because single precision is what is under test. */
+static constexpr auto within_bound_tolerance = [](auto reference, auto observed) {
+    return !(std::fabs(static_cast<float>(observed) - static_cast<float>(reference)) > bound_tolerance_k);
 };
 
-/** Buffers the per-molecule pass writes into, so the sweep over the corpus allocates once rather than per molecule. */
+#pragma region Fixtures
+
+/** One atom pair's window, in angstrom, as a fixture states it. */
+struct pair_bound_t {
+    std::uint32_t first_atom;
+    std::uint32_t second_atom;
+    double lower;
+    double upper;
+};
+
+/** A hand-built bounds matrix and the verdict smoothing it has to reach. */
+struct bounds_fixture_t {
+    std::string_view name;
+    std::uint32_t num_atoms;
+    smoothing_t expected_verdict;
+    custd::span<pair_bound_t const> pairs;
+};
+
+/* Two rigid 1 A bonds from atom 0 hold atoms 1 and 2 within 2 A of one another, and their own window asks
+ * for at least 4. Nothing can satisfy both. */
+static constexpr pair_bound_t three_atom_contradiction_k[] = {{0, 1, 1.0, 1.0}, {0, 2, 1.0, 1.0}, {1, 2, 4.0, 5.0}};
+
+/* The same two bonds with a window the triangle can meet: the upper falls from 5 to 2 and the lower holds. */
+static constexpr pair_bound_t three_atom_tightened_k[] = {{0, 1, 1.0, 1.0}, {0, 2, 1.0, 1.0}, {1, 2, 0.5, 5.0}};
+
+/* The same geometry stated at its closure already, so every inequality holds on arrival and nothing moves. */
+static constexpr pair_bound_t three_atom_already_tight_k[] = {{0, 1, 1.0, 1.0}, {0, 2, 1.0, 1.0}, {1, 2, 0.0, 2.0}};
+
+/* A rigid four-bond chain of 1.5 A steps. Every non-bonded window arrives wide open and smoothing closes
+ * each one onto the chain length that reaches it. */
+static constexpr pair_bound_t five_atom_chain_k[] = {
+    {0, 1, 1.5, 1.5},   {1, 2, 1.5, 1.5},   {2, 3, 1.5, 1.5},   {3, 4, 1.5, 1.5},   {0, 2, 1.0, 100.0},
+    {0, 3, 1.0, 100.0}, {0, 4, 1.0, 100.0}, {1, 3, 1.0, 100.0}, {1, 4, 1.0, 100.0}, {2, 4, 1.0, 100.0}};
+
+/* The same chain with its two ends held at least 9 A apart, which four 1.5 A steps cannot reach. */
+static constexpr pair_bound_t five_atom_chain_overstretched_k[] = {
+    {0, 1, 1.5, 1.5},   {1, 2, 1.5, 1.5},  {2, 3, 1.5, 1.5},   {3, 4, 1.5, 1.5},   {0, 2, 1.0, 100.0},
+    {0, 3, 1.0, 100.0}, {0, 4, 9.0, 12.0}, {1, 3, 1.0, 100.0}, {1, 4, 1.0, 100.0}, {2, 4, 1.0, 100.0}};
+
+static constexpr bounds_fixture_t fixtures_k[] = {
+    {"three_atom_contradiction", 3, smoothing_t::infeasible_k, three_atom_contradiction_k},
+    {"three_atom_tightened", 3, smoothing_t::tightened_k, three_atom_tightened_k},
+    {"three_atom_already_tight", 3, smoothing_t::consistent_k, three_atom_already_tight_k},
+    {"five_atom_chain", 5, smoothing_t::tightened_k, five_atom_chain_k},
+    {"five_atom_chain_overstretched", 5, smoothing_t::infeasible_k, five_atom_chain_overstretched_k},
+};
+
+#pragma endregion Fixtures
+
+#pragma region Scratch
+
+/** Buffers each pass writes into, so a sweep over the corpus allocates once rather than per molecule. */
 struct bounds_scratch_t {
-    /** Host-smoothed reference bounds, N × N row-major. */
+    /** Host-smoothed reference bounds over a corpus molecule, N × N row-major. */
     std::vector<double> reference;
+    /** The same for a fixture, whose windows are authored in float precision anyway. */
+    std::vector<float> fixture_reference;
     /** Unsmoothed bounds on the way in, device-smoothed in place on the way out. */
     std::vector<float> device;
+    /** The device matrix as it stood before the second sweep `resmooth_` runs over it. */
+    std::vector<float> previous;
 };
 
 /** What the sweep did with each molecule, so a run that smoothed nothing cannot read like a pass. */
@@ -62,115 +126,245 @@ struct run_counts_t {
     std::size_t smoothed_molecules = 0;
     std::size_t oversized_molecules = 0;
     std::size_t unparsed_molecules = 0;
+    std::size_t infeasible_molecules = 0;
+    /** Widest `lower - upper` any satisfiable molecule ended on, against `bounds_crossing_tolerance_k`. */
+    float widest_crossing = 0.0f;
 };
 
+#pragma endregion Scratch
+
+#pragma region Reference
+
 /**
- *  @brief Flatten RDKit's bounds for @p molecule into @p flat as a row-major N × N matrix.
+ *  @brief Copy an RDKit bounds matrix into the packed square the kernel reads.
  *
  *  Upper triangle holds upper bounds and lower triangle lower bounds, matching what the kernel expects.
- *  Reference and device inputs come from this one builder, so @p smoothing is the only way they differ.
+ *  Reference and device inputs both come through here, so the host smoothing is the only way they differ.
  *
- *  @param[inout] molecule Molecule to derive topological bounds for.
- *  @param[in] smoothing Whether the host smooths the matrix before it is flattened.
- *  @param[out] flat Caller-owned storage, resized to N × N and fully overwritten.
+ *  @param[in] bounds RDKit's own matrix, smoothed or not.
+ *  @param[in] num_atoms Row and column count of @p bounds.
+ *  @param[inout] storage Caller-owned buffer, resized to N × N and fully overwritten.
+ *  @return View over @p storage.
  */
 template <typename scalar_type_>
-static void fill_bounds_into_(RDKit::RWMol &molecule, bounds_smoothing_t smoothing, std::vector<scalar_type_> &flat) {
-    std::uint32_t const num_atoms = molecule.getNumAtoms();
-    auto *bounds_raw = new DistGeom::BoundsMatrix(num_atoms);
-    DistGeom::BoundsMatPtr bounds_matrix(bounds_raw);
-    RDKit::DGeomHelpers::initBoundsMat(bounds_raw);
-    RDKit::DGeomHelpers::setTopolBounds(molecule, bounds_matrix);
-    if (smoothing == bounds_smoothing_t::host_smoothed_k) DistGeom::triangleSmoothBounds(bounds_raw);
-
-    flat.assign(static_cast<std::size_t>(num_atoms) * num_atoms, static_cast<scalar_type_>(0));
-    for (std::uint32_t row = 0; row < num_atoms; ++row) {
+static packed_matrix<scalar_type_> flatten_bounds_into_(DistGeom::BoundsMatrix const &bounds, std::uint32_t num_atoms,
+                                                        std::vector<scalar_type_> &storage) {
+    auto const matrix = smallfield::types::reset_square_matrix(storage, num_atoms, static_cast<scalar_type_>(0));
+    for (std::uint32_t row = 0; row < num_atoms; ++row)
         for (std::uint32_t column = row + 1; column < num_atoms; ++column) {
-            flat[row * num_atoms + column] = static_cast<scalar_type_>(bounds_matrix->getUpperBound(row, column));
-            flat[column * num_atoms + row] = static_cast<scalar_type_>(bounds_matrix->getLowerBound(row, column));
+            matrix(row, column) = static_cast<scalar_type_>(bounds.getUpperBound(row, column));
+            matrix(column, row) = static_cast<scalar_type_>(bounds.getLowerBound(row, column));
         }
+    return matrix;
+}
+
+/**
+ *  @brief Lay a fixture's pair windows into an RDKit bounds matrix.
+ *
+ *  @param[in] fixture Pair windows; every unordered pair of its atoms appears exactly once.
+ *  @param[out] bounds Matrix of the fixture's atom count, fully written.
+ */
+static void apply_fixture_(bounds_fixture_t const &fixture, DistGeom::BoundsMatrix &bounds) {
+    for (auto const &pair : fixture.pairs) {
+        bounds.setLowerBound(pair.first_atom, pair.second_atom, pair.lower);
+        bounds.setUpperBound(pair.first_atom, pair.second_atom, pair.upper);
     }
 }
 
 /**
- *  @brief Smooth one molecule on the device and compare it against the host reference.
+ *  @brief RDKit's topological bounds for @p molecule, before any smoothing.
  *
- *  A molecule the kernel cannot hold, or one that does not parse, is counted in @p counts and answers
- *  "nothing disagreed" — it is the tally in `main`, not this answer, that keeps a silent sweep from passing.
+ *  Returns RDKit's own owning handle because `setTopolBounds` takes nothing else, the same boundary the
+ *  naming rules draw around that library.
+ *
+ *  @param[inout] molecule Molecule to derive topological bounds for.
+ *  @return A freshly built bounds matrix over the molecule's atoms.
+ */
+static DistGeom::BoundsMatPtr topological_bounds_(RDKit::RWMol &molecule) {
+    auto *bounds_raw = new DistGeom::BoundsMatrix(molecule.getNumAtoms());
+    DistGeom::BoundsMatPtr bounds(bounds_raw);
+    RDKit::DGeomHelpers::initBoundsMat(bounds_raw);
+    RDKit::DGeomHelpers::setTopolBounds(molecule, bounds);
+    return bounds;
+}
+
+#pragma endregion Reference
+
+#pragma region Sections
+
+/**
+ *  @brief Widest amount by which a pair's lower bound overshoots its upper, zero when none does.
+ *
+ *  @param[in] matrix Smoothed bounds matrix.
+ *  @return `max(lower - upper)` over every unordered pair, floored at zero.
+ */
+static float widest_crossing_(packed_matrix<float const> matrix) {
+    float widest = 0.0f;
+    for (std::uint32_t row = 0; row < matrix.extent(0); ++row)
+        for (std::uint32_t column = row + 1; column < matrix.extent(0); ++column) {
+            float const crossing = matrix(column, row) - matrix(row, column);
+            if (crossing > widest) widest = crossing;
+        }
+    return widest;
+}
+
+/**
+ *  @brief Assert every smoothed upper bound satisfies the triangle inequalities it was smoothed against.
+ *
+ *  A post-condition rather than a comparison, so it aborts on the first violation instead of counting: one
+ *  violated triangle means the sweep did not reach closure and the rest of the matrix then says nothing.
+ *
+ *  @param[in] matrix Smoothed bounds matrix.
+ */
+static void verify_triangle_closure_(packed_matrix<float const> matrix) {
+    using smallfield::types::upper_distance_bound_at;
+    for (std::uint32_t row = 0; row < matrix.extent(0); ++row)
+        for (std::uint32_t column = row + 1; column < matrix.extent(0); ++column)
+            for (std::uint32_t via_atom = 0; via_atom < matrix.extent(0); ++via_atom) {
+                if (via_atom == row || via_atom == column) continue;
+                float const routed = upper_distance_bound_at(matrix, row, via_atom) +
+                                     upper_distance_bound_at(matrix, via_atom, column);
+                sf_verify_(matrix(row, column) <= routed + bound_tolerance_k,
+                           "a smoothed upper bound still exceeds the two legs it routes through");
+            }
+}
+
+/**
+ *  @brief Smooth an already-smoothed matrix again and check which way each bound is allowed to move.
+ *
+ *  Smoothing is monotone, and that is the property the crossing scan rests on: an upper bound is only ever
+ *  assigned a strictly smaller value and a lower bound a strictly larger one, so a pair that crosses at any
+ *  point in a sweep is still crossed when the sweep ends, and no later sweep can un-cross it.
+ *
+ *  A second sweep is not a no-op, and neither is RDKit's. The lower-bound update reads upper bounds the same
+ *  sweep is still lowering, so a pivot visited early leaves a lower bound a further sweep raises again; and
+ *  in float even the upper bounds shed a last ULP, because `u_ik + u_kj` recomputed from the already-rounded
+ *  legs can land just under the sum that set `u_ij`. Monotonicity is what survives both, so it is what is
+ *  asserted.
+ *
+ *  @param[inout] matrix Smoothed matrix, smoothed once more in place.
+ *  @param[inout] previous Caller-owned buffer holding the matrix as it stood before this sweep.
+ *  @param[inout] reporter Where a bound that moved the wrong way prints.
+ *  @param[in] smiles Molecule the matrix belongs to, for the diagnostic's key column.
+ */
+static void resmooth_(packed_matrix<float> matrix, std::vector<float> &previous,
+                      sftest::diagnostic_reporter_t &reporter, std::string const &smiles) {
+    static constexpr auto never_rises = [](float earlier, float later) { return later <= earlier; };
+    static constexpr auto never_falls = [](float earlier, float later) { return later >= earlier; };
+
+    std::uint32_t const num_atoms = matrix.extent(0);
+    auto const before = smallfield::types::reset_square_matrix(previous, num_atoms, 0.0f);
+    for (std::uint32_t row = 0; row < num_atoms; ++row)
+        for (std::uint32_t column = 0; column < num_atoms; ++column) before(row, column) = matrix(row, column);
+
+    smoothing_t const verdict = gpu_triangle_smooth(matrix.data_handle(), num_atoms);
+    for (std::uint32_t row = 0; row < num_atoms; ++row)
+        for (std::uint32_t column = 0; column < num_atoms; ++column) {
+            if (row == column) continue;
+            auto group = reporter.mismatch("resmooth", "smiles={} row={} column={} verdict={}", smiles, row, column,
+                                           smoothing_name(verdict));
+            if (row < column) group.field("upper_bound", before(row, column), matrix(row, column), never_rises);
+            else group.field("lower_bound", before(row, column), matrix(row, column), never_falls);
+        }
+}
+
+/**
+ *  @brief Smooth every hand-built fixture and check its verdict against construction and against RDKit.
+ *
+ *  @param[inout] reporter Where a disagreeing verdict or cell prints.
+ *  @param[inout] scratch Bounds buffers reused across the fixtures.
+ */
+static void compare_fixtures_(sftest::diagnostic_reporter_t &reporter, bounds_scratch_t &scratch) {
+    for (auto const &fixture : fixtures_k) {
+        DistGeom::BoundsMatrix host_bounds(fixture.num_atoms), device_bounds(fixture.num_atoms);
+        apply_fixture_(fixture, host_bounds);
+        apply_fixture_(fixture, device_bounds);
+        bool const rdkit_satisfiable = DistGeom::triangleSmoothBounds(&host_bounds);
+
+        auto const reference = flatten_bounds_into_(host_bounds, fixture.num_atoms, scratch.fixture_reference);
+        auto const device = flatten_bounds_into_(device_bounds, fixture.num_atoms, scratch.device);
+        smoothing_t const verdict = gpu_triangle_smooth(device.data_handle(), fixture.num_atoms);
+
+        fmt::println("  fixture {} atoms={} verdict={}", fixture.name, fixture.num_atoms, smoothing_name(verdict));
+        auto group = reporter.mismatch("fixture", "name={} verdict={}", fixture.name, smoothing_name(verdict));
+        group.field("verdict", static_cast<std::uint8_t>(fixture.expected_verdict), static_cast<std::uint8_t>(verdict),
+                    exactly_equal);
+        group.field("satisfiable", rdkit_satisfiable, verdict != smoothing_t::infeasible_k, exactly_equal);
+
+        // RDKit returns the moment it finds a crossed pair, so an unsatisfiable fixture's reference matrix is
+        // only partly smoothed and there is nothing to compare it against. A satisfiable one reached closure.
+        if (!rdkit_satisfiable) continue;
+        for (std::uint32_t row = 0; row < fixture.num_atoms; ++row)
+            for (std::uint32_t column = 0; column < fixture.num_atoms; ++column) {
+                if (row == column) continue;
+                reporter.mismatch("fixture_cell", "name={} row={} column={}", fixture.name, row, column)
+                    .field(row < column ? "upper_bound" : "lower_bound", reference(row, column), device(row, column),
+                           within_bound_tolerance);
+            }
+    }
+}
+
+/**
+ *  @brief Smooth one molecule on the device and compare every cell against the host reference.
+ *
+ *  A molecule the kernel cannot hold, or one that does not parse, is counted in @p counts and compared
+ *  against nothing — it is the tally in `main`, not this function, that keeps a silent sweep from passing.
  *
  *  @param[in] smiles Molecule under test.
  *  @param[inout] scratch Bounds buffers reused across the corpus.
  *  @param[inout] counts Running tally of smoothed and skipped molecules.
- *  @return Whether this molecule's GPU bounds matched the reference; the caller decides the verdict.
+ *  @param[inout] reporter Where a disagreeing verdict or cell prints.
+ *  @param[inout] resweep Where a second sweep that moved a bound the wrong way prints.
  */
-static bool test_triangle_smoothing_single_molecule(std::string const &smiles, bounds_scratch_t &scratch,
-                                                    run_counts_t &counts) {
+static void compare_molecule_(std::string const &smiles, bounds_scratch_t &scratch, run_counts_t &counts,
+                              sftest::diagnostic_reporter_t &reporter, sftest::diagnostic_reporter_t &resweep) {
     auto molecule = sftest::mol_from_smiles(smiles);
     if (molecule == nullptr) {
         ++counts.unparsed_molecules;
-        return true;
+        return;
     }
 
     std::uint32_t const num_atoms = molecule->getNumAtoms();
-    if (num_atoms > max_smoothed_atoms_k) {
+    if (num_atoms > sftest::max_smoothed_atoms_k) {
         ++counts.oversized_molecules;
-        return true;
+        return;
     }
 
-    fmt::println("  testing: {}", smiles);
-    fill_bounds_into_(*molecule, bounds_smoothing_t::host_smoothed_k, scratch.reference);
-    fill_bounds_into_(*molecule, bounds_smoothing_t::unsmoothed_k, scratch.device);
-    gpu_triangle_smooth(scratch.device.data(), num_atoms);
+    auto const device_bounds = topological_bounds_(*molecule);
+    auto const host_bounds = topological_bounds_(*molecule);
+    bool const rdkit_satisfiable = DistGeom::triangleSmoothBounds(host_bounds);
+
+    auto const device = flatten_bounds_into_(*device_bounds, num_atoms, scratch.device);
+    auto const reference = flatten_bounds_into_(*host_bounds, num_atoms, scratch.reference);
+    smoothing_t const verdict = gpu_triangle_smooth(device.data_handle(), num_atoms);
     ++counts.smoothed_molecules;
 
-    float max_error = 0.0f;
-    float const tolerance = 1e-2f; // float32 vs float64 tolerance
-
-    sftest::diagnostic_reporter_t reporter {"rdkit", "gpu"};
-    reporter.limit_printed_lines(5); // a 128-atom molecule would otherwise emit sixteen thousand lines
-    auto const within_tolerance = [tolerance](double rdkit_value, float gpu_value) {
-        return !(std::fabs(gpu_value - static_cast<float>(rdkit_value)) > tolerance);
-    };
-
-    for (std::uint32_t row = 0; row < num_atoms; ++row) {
-        for (std::uint32_t column = 0; column < num_atoms; ++column) {
-            if (row == column) continue;
-
-            float const gpu_value = scratch.device[row * num_atoms + column];
-            double const rdkit_value = scratch.reference[row * num_atoms + column];
-            float const error = std::fabs(gpu_value - static_cast<float>(rdkit_value));
-
-            if (error > max_error) max_error = error;
-            // The upper triangle holds upper bounds and the lower triangle lower bounds, so the field
-            // name says which of the two disagreed rather than leaving it to be inferred from row < column.
-            reporter.mismatch("triangle_smooth", "row={} column={}", row, column)
-                .field(row < column ? "upper_bound" : "lower_bound", rdkit_value, gpu_value, within_tolerance);
-        }
+    reporter.mismatch("corpus_verdict", "smiles={} verdict={}", smiles, smoothing_name(verdict))
+        .field("satisfiable", rdkit_satisfiable, verdict != smoothing_t::infeasible_k, exactly_equal);
+    if (verdict == smoothing_t::infeasible_k) {
+        ++counts.infeasible_molecules;
+        return;
     }
 
-    fmt::println("    atoms={} max_error={:.6f}", num_atoms, max_error);
-    reporter.summarize("triangle_smooth");
+    float const crossing = widest_crossing_(device);
+    if (crossing > counts.widest_crossing) counts.widest_crossing = crossing;
+    verify_triangle_closure_(device);
 
-    // verify triangle inequality holds after smoothing
-    for (std::uint32_t row = 0; row < num_atoms; ++row) {
-        for (std::uint32_t column = row + 1; column < num_atoms; ++column) {
-            float const upper_row_column = scratch.device[row * num_atoms + column];
-            for (std::uint32_t via_atom = 0; via_atom < num_atoms; ++via_atom) {
-                if (via_atom == row || via_atom == column) continue;
-
-                float const upper_row_via = (row < via_atom) ? scratch.device[row * num_atoms + via_atom]
-                                                             : scratch.device[via_atom * num_atoms + row];
-                float const upper_via_column = (via_atom < column) ? scratch.device[via_atom * num_atoms + column]
-                                                                   : scratch.device[column * num_atoms + via_atom];
-
-                sf_verify_(upper_row_column <= upper_row_via + upper_via_column + 0.01f,
-                           "triangle inequality violation for upper bounds");
+    if (rdkit_satisfiable) // a partly smoothed reference has no cell worth comparing
+        for (std::uint32_t row = 0; row < num_atoms; ++row)
+            for (std::uint32_t column = 0; column < num_atoms; ++column) {
+                if (row == column) continue;
+                // The upper triangle holds upper bounds and the lower triangle lower bounds, so the field
+                // name says which of the two disagreed rather than leaving it inferred from row < column.
+                reporter.mismatch("corpus_cell", "smiles={} row={} column={}", smiles, row, column)
+                    .field(row < column ? "upper_bound" : "lower_bound", reference(row, column), device(row, column),
+                           within_bound_tolerance);
             }
-        }
-    }
 
-    return reporter.passed();
+    resmooth_(device, scratch.previous, resweep, smiles);
 }
+
+#pragma endregion Sections
 
 int main(int argc, char **argv) {
     fmt::println("{}: GPU warp smoothing vs the RDKit reference bounds matrix", test_name_k);
@@ -192,20 +386,33 @@ int main(int argc, char **argv) {
     }
     else fmt::println("Corpus: built-ins only; name one on the command line or in SMALLFIELD_TEST_CORPUS");
 
-    // Declared above the loop so the two bounds matrices grow once for the whole corpus.
+    // Declared above the loops so the bounds matrices grow once for the whole run.
     bounds_scratch_t scratch;
     run_counts_t counts;
+    sftest::diagnostic_reporter_t reporter {"rdkit", "gpu"};
+    sftest::diagnostic_reporter_t resweep {"first_sweep", "second_sweep"};
+    // A 128-atom molecule would otherwise emit sixteen thousand lines from one section.
+    reporter.limit_printed_lines(20);
+    resweep.limit_printed_lines(20);
 
-    // Every molecule runs before the verdict: one mismatch should not hide the rest.  The call sits
-    // left of `&&` so it is never short-circuited away.
-    bool all_matched = true;
-    for (auto const &smiles : molecules)
-        all_matched = test_triangle_smoothing_single_molecule(smiles, scratch, counts) && all_matched;
+    compare_fixtures_(reporter, scratch);
+    reporter.summarize("fixture");
 
-    fmt::println("  smoothed={} skipped_oversized={} skipped_unparsed={}", fmt::group_digits(counts.smoothed_molecules),
-                 fmt::group_digits(counts.oversized_molecules), fmt::group_digits(counts.unparsed_molecules));
+    // Every molecule runs before any verdict: one mismatch should not hide the rest.
+    for (auto const &smiles : molecules) compare_molecule_(smiles, scratch, counts, reporter, resweep);
+    reporter.summarize("corpus");
+    resweep.summarize("resmooth");
+
+    fmt::println("  smoothed={} infeasible={} skipped_oversized={} skipped_unparsed={} widest_crossing={}",
+                 fmt::group_digits(counts.smoothed_molecules), fmt::group_digits(counts.infeasible_molecules),
+                 fmt::group_digits(counts.oversized_molecules), fmt::group_digits(counts.unparsed_molecules),
+                 counts.widest_crossing);
     sf_verify_(counts.smoothed_molecules > 0, "no molecule was small enough for warp-level smoothing");
+    sf_verify_(counts.widest_crossing <= smallfield::cuda::bounds_crossing_tolerance_k,
+               "a molecule RDKit calls satisfiable ends wider than the crossing tolerance allows");
 
-    if (!all_matched) return sftest::report_fail(test_name_k, "GPU smoothed bounds disagree with the RDKit reference");
+    if (!reporter.passed() || !resweep.passed())
+        return sftest::report_fail(test_name_k, "GPU smoothing disagrees over {} fields, and re-smoothing over {}",
+                                   reporter.mismatch_count(), resweep.mismatch_count());
     return sftest::report_pass(test_name_k);
 }

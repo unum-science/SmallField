@@ -47,6 +47,12 @@ enum class conformer_status_t : std::uint8_t {
      *  MMFF typing and the CSD torsion match then read the molecule as acyclic where it is not,
      *  so the molecule is refused rather than parametrised from partial ring perception. */
     too_many_rings_k = 8,
+    /** Triangle smoothing drove some atom pair's lower bound above its upper, so no set of
+     *  coordinates satisfies the molecule's bounds matrix. `smoothing_t::infeasible_k` is the
+     *  device-side verdict that names it, and the smoothed matrix the prepass persists carries the
+     *  crossed pair. Distinct from `stereo_failure_k`: an impossible matrix embedded anyway fails
+     *  downstream under a name that describes the symptom rather than the cause. */
+    bounds_infeasible_k = 9,
 };
 
 } // namespace smallfield::api
