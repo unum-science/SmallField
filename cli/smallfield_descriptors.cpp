@@ -493,16 +493,23 @@ struct shard_buffers_t {
     }
 };
 
+/** What the bucketing measured about the shard, beyond the buckets themselves. */
+struct molecule_grouping_t {
+    /** Row count of the widest molecule, never below one. */
+    std::uint32_t widest_conformers = 1;
+    /** Molecules inside the `input_row` span owning no row, which is the gap a contiguous shard never has. */
+    std::uint64_t unclaimed_molecules = 0;
+};
+
 /**
  *  @brief Bucket the shard's rows by molecule into @p buffers, keeping file order inside each bucket.
  *
  *  File order is `conformer_index` order within a molecule, which is what makes slot `conformer_slot` of
- *  the output the same conformer the input row described.
- *
- *  @return Row count of the widest molecule, never below one.
+ *  the output the same conformer the input row described. The histogram this walks is also the only place
+ *  a gap in `input_row` is visible, so the unclaimed molecules are counted in the same pass.
  */
-std::uint32_t group_rows_by_molecule_(input_shard_t const &shard, std::uint64_t base_row, std::uint64_t num_molecules,
-                                      shard_buffers_t &buffers) {
+molecule_grouping_t group_rows_by_molecule_(input_shard_t const &shard, std::uint64_t base_row,
+                                            std::uint64_t num_molecules, shard_buffers_t &buffers) {
     std::vector<std::uint64_t> &offsets = buffers.molecule_row_offsets;
     grow_if_needed_(offsets, num_molecules + 1);
     grow_if_needed_(buffers.molecule_rows, static_cast<std::size_t>(shard.num_rows));
@@ -510,9 +517,11 @@ std::uint32_t group_rows_by_molecule_(input_shard_t const &shard, std::uint64_t 
 
     for (std::int64_t row = 0; row < shard.num_rows; ++row) ++offsets[shard.input_row->Value(row) - base_row + 1];
 
-    std::uint32_t widest = 1;
+    molecule_grouping_t grouping;
     for (std::uint64_t molecule = 0; molecule < num_molecules; ++molecule) {
-        widest = std::max(widest, static_cast<std::uint32_t>(offsets[molecule + 1]));
+        std::uint64_t const owned = offsets[molecule + 1];
+        grouping.widest_conformers = std::max(grouping.widest_conformers, static_cast<std::uint32_t>(owned));
+        if (owned == 0) ++grouping.unclaimed_molecules;
         offsets[molecule + 1] += offsets[molecule];
     }
 
@@ -522,13 +531,15 @@ std::uint32_t group_rows_by_molecule_(input_shard_t const &shard, std::uint64_t 
         buffers.molecule_rows[offsets[shard.input_row->Value(row) - base_row]++] = row;
     for (std::uint64_t molecule = num_molecules; molecule > 0; --molecule) offsets[molecule] = offsets[molecule - 1];
     offsets[0] = 0;
-    return widest;
+    return grouping;
 }
 
-/** How one shard's augmentation ended, so an empty input and a refused write stay distinguishable. */
+/** How one shard's augmentation ended, so each refusal stays distinguishable from the others. */
 enum class augment_t {
     written_k,
     empty_input_k,
+    /** A molecule inside the shard's `input_row` span owns no row, so the shard is not what the schema promises. */
+    gapped_input_k,
     write_failed_k,
 };
 
@@ -541,8 +552,8 @@ struct molecule_span_t {
 /**
  *  @brief The `input_row` range the shard's rows cover.
  *
- *  The 3D schema keeps `input_row` contiguous, so every molecule in the range owns at least one row; the
- *  scan is what keeps that measured rather than assumed.
+ *  Only the ends are read here. Whether the range is genuinely contiguous is what
+ *  `molecule_grouping_t::unclaimed_molecules` answers, because only the bucket histogram can see a hole.
  */
 molecule_span_t molecule_span_of_(input_shard_t const &shard) {
     std::uint64_t first_row = shard.input_row->Value(0);
@@ -733,12 +744,20 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
     }
 
     molecule_span_t const span = molecule_span_of_(shard);
+    molecule_grouping_t const grouping = group_rows_by_molecule_(shard, span.first_row, span.num_molecules, buffers);
+
+    // A molecule with no rows would be written out as an all-null row carrying an `input_row` the input
+    // shard never held, so a hole is refused rather than filled.
+    if (grouping.unclaimed_molecules > 0) {
+        logger.error("input_row is not contiguous in {} — {} of {} molecules own no row, skipping",
+                     output_path.string(), grouping.unclaimed_molecules, span.num_molecules);
+        return augment_t::gapped_input_k;
+    }
+
     // The slot stride K must cover the widest molecule, original or reembed, and match the producer's
     // `num_conformers` provenance value. Reembed molecules can only add rows.
-    std::uint32_t const observed_conformers = group_rows_by_molecule_(shard, span.first_row, span.num_molecules,
-                                                                      buffers);
-    sfapi::conformer_slot_layout_t const layout {config.max_atoms,
-                                                 std::max(observed_conformers, reembed.widest_molecule_conformers)};
+    sfapi::conformer_slot_layout_t const layout {
+        config.max_atoms, std::max(grouping.widest_conformers, reembed.widest_molecule_conformers)};
     buffers.reset_for(span.num_molecules, layout);
 
     // `private` hands each thread its own key buffer, which keeps its capacity across the molecules that
@@ -748,7 +767,6 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
 #pragma omp parallel for schedule(dynamic, 256) num_threads(config.threads) private(reembed_key) if (config.threads > 1)
     for (std::uint64_t molecule_index = 0; molecule_index < span.num_molecules; ++molecule_index) {
         custd::span<std::int64_t const> const rows = buffers.rows_of(molecule_index);
-        if (rows.empty()) continue; // contiguous input guarantees this never fires; defensive only
         std::int64_t const first_row = rows.front();
 
         fill_reembed_key_into_(shard.input_shard->GetView(first_row), shard.input_row->Value(first_row), reembed_key);
@@ -828,8 +846,9 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
     shard_stats_t stats;
     switch (augment_shard_(shard, config, reembed, buffers, output_path, logger, stats)) {
     case augment_t::written_k: break;
-    // Both refusals already logged themselves, in `augment_shard_` and in `write_shard`.
+    // Every refusal already logged itself, in `augment_shard_` or in `write_shard`.
     case augment_t::empty_input_k:
+    case augment_t::gapped_input_k:
     case augment_t::write_failed_k: ++tally.failed; return;
     }
 
