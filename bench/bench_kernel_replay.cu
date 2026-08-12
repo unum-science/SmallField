@@ -16,13 +16,9 @@
  *  writes the snapshot this reads; `src/smallfield/api/wave_capture.hpp` is the writer and defines the
  *  manifest keys.
  *
- *  Build, with no include or library path reaching the pixi environment:
- *
- *  @verbatim
- *  nvcc -O2 -DNDEBUG -std=c++20 -arch=native --expt-relaxed-constexpr --extended-lambda \
- *       --use_fast_math -Xptxas=-O3 -lineinfo -Isrc bench/bench_kernel_replay.cu \
- *       -o build-replay/bench_kernel_replay
- *  @endverbatim
+ *  That is also why `bench/CMakeLists.txt` builds it as its own target rather than through
+ *  `define_smallfield_target`: it links `smallfield_settings` for the flags the shipped kernels compile under
+ *  and `CUDA::cudart` for the runtime, and nothing else.
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
