@@ -6,10 +6,11 @@
  *  `build_bounds_matrix`, not MMFF94 parameters. The MMFF94 tables are a separate
  *  thing entirely and live in `parameters/mmff94_tables.hpp`.
  *
- *  Covers the drug-like subset of the periodic table — H, C, N, O, F, P, S, Cl, Br, I and a few
- *  others. Elements outside the table fall back to generic carbon-like values; in practice
- *  `preprocess/etkdg_prepare_batch.hpp` rejects any molecule with an element outside MMFF94's
- *  coverage before it reaches these tables, so the fallback values are not exercised in production.
+ *  Covers every element MMFF94 parametrises, plus B, As and Se. Anything outside the table falls back
+ *  to carbon-like values, and that fallback is reached: `preprocess/etkdg_prepare_batch.hpp` builds the
+ *  bounds matrix before it types the molecule, so an exotic element is measured here and only then
+ *  refused. The bounds it produced are discarded with the rest of the molecule, so a carbon-like
+ *  covalent radius costs a few multiplications rather than a wrong geometry.
  *
  *  All values in Å and radians. Rendered as static constexpr arrays indexed by atomic number;
  *  lookup is O(1) with a bounds check.
@@ -35,15 +36,23 @@ inline constexpr std::array<float, 55> covalent_radius_angstrom_k = []() {
     std::array<float, 55> radii {};
     for (auto &radius : radii) radius = 0.76f; // carbon fallback
     radii[1] = 0.31f;                          // H
+    radii[3] = 1.28f;                          // Li
     radii[5] = 0.85f;                          // B
     radii[6] = 0.76f;                          // C
     radii[7] = 0.71f;                          // N
     radii[8] = 0.66f;                          // O
     radii[9] = 0.57f;                          // F
+    radii[11] = 1.66f;                         // Na
+    radii[12] = 1.41f;                         // Mg
     radii[14] = 1.11f;                         // Si
     radii[15] = 1.07f;                         // P
     radii[16] = 1.05f;                         // S
     radii[17] = 1.02f;                         // Cl
+    radii[19] = 2.03f;                         // K
+    radii[20] = 1.76f;                         // Ca
+    radii[26] = 1.32f;                         // Fe, low spin
+    radii[29] = 1.32f;                         // Cu
+    radii[30] = 1.22f;                         // Zn
     radii[33] = 1.21f;                         // As
     radii[34] = 1.20f;                         // Se
     radii[35] = 1.20f;                         // Br
@@ -55,20 +64,28 @@ inline constexpr std::array<float, 55> covalent_radius_angstrom_k = []() {
 inline constexpr std::array<float, 55> vdw_radius_angstrom_k = []() {
     std::array<float, 55> radii {};
     for (auto &radius : radii) radius = 1.70f; // carbon fallback
-    radii[1] = 1.20f;
-    radii[5] = 1.92f;
-    radii[6] = 1.70f;
-    radii[7] = 1.55f;
-    radii[8] = 1.52f;
-    radii[9] = 1.47f;
-    radii[14] = 2.10f;
-    radii[15] = 1.80f;
-    radii[16] = 1.80f;
-    radii[17] = 1.75f;
-    radii[33] = 1.85f;
-    radii[34] = 1.90f;
-    radii[35] = 1.85f;
-    radii[53] = 1.98f;
+    radii[1] = 1.20f;                          // H
+    radii[3] = 2.20f;                          // Li
+    radii[5] = 1.92f;                          // B
+    radii[6] = 1.70f;                          // C
+    radii[7] = 1.55f;                          // N
+    radii[8] = 1.52f;                          // O
+    radii[9] = 1.47f;                          // F
+    radii[11] = 2.40f;                         // Na
+    radii[12] = 2.20f;                         // Mg
+    radii[14] = 2.10f;                         // Si
+    radii[15] = 1.80f;                         // P
+    radii[16] = 1.80f;                         // S
+    radii[17] = 1.75f;                         // Cl
+    radii[19] = 2.80f;                         // K
+    radii[20] = 2.40f;                         // Ca
+    radii[26] = 2.05f;                         // Fe
+    radii[29] = 2.00f;                         // Cu
+    radii[30] = 2.10f;                         // Zn
+    radii[33] = 1.85f;                         // As
+    radii[34] = 1.90f;                         // Se
+    radii[35] = 1.85f;                         // Br
+    radii[53] = 1.98f;                         // I
     return radii;
 }();
 
