@@ -9,6 +9,7 @@
  */
 
 #include <cmath>   // `std::abs`
+#include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`
 
 #include <array>       // `std::array`
@@ -29,15 +30,23 @@ static constexpr std::string_view test_name_k = "test_conformer_slot_layout";
 
 namespace smallfield::tests {
 
-/** Emulates the writer's slot-to-row transpose without the Arrow machinery. */
-static std::vector<float> pack_row_(std::vector<float> const &slot, conformer_slot_layout_t const &layout,
-                                    std::uint32_t atom_count) {
-    std::vector<float> row(static_cast<std::size_t>(atom_count) * 3u);
-    for (std::uint32_t atom = 0; atom < atom_count; ++atom)
-        for (std::uint32_t axis = 0; axis < 3u; ++axis)
-            row[atom * 3u + axis] = slot[layout.component_offset(axis, atom)];
-    return row;
+/**
+ *  @brief Whether `slot_view` addresses every component of a full slot where the contract says it does.
+ *
+ *  The tetrahedron below exercises four atoms; this walks all `3 * max_atoms` of them, and it is the only
+ *  thing pinning the view's strides to `axis * max_atoms + atom` now that no call site spells that twice.
+ */
+static constexpr bool slot_view_matches_contract_() {
+    conformer_slot_layout_t const layout {128u, 3u};
+    custd::layout_stride::mapping<custd::dextents<std::uint32_t, 2>> const mapping =
+        layout.slot_view<float>(nullptr, layout.max_atoms).mapping();
+    for (std::uint32_t axis = 0; axis < 3u; ++axis)
+        for (std::uint32_t atom = 0; atom < layout.max_atoms; ++atom)
+            if (mapping(axis, atom) != static_cast<std::size_t>(axis) * layout.max_atoms + atom) return false;
+    return true;
 }
+
+static_assert(slot_view_matches_contract_(), "a slot view must land every component where the contract puts it");
 
 /** Rank of the centered coordinate cloud; a real conformer spans 3 dimensions. */
 static std::uint32_t coordinate_rank_(std::vector<float> const &row, std::uint32_t atom_count) {
@@ -70,7 +79,6 @@ static std::uint32_t coordinate_rank_(std::vector<float> const &row, std::uint32
 } // namespace smallfield::tests
 
 using smallfield::tests::coordinate_rank_;
-using smallfield::tests::pack_row_;
 
 int main() {
     fmt::println("{}: structure-of-arrays slot transpose and slot offset arithmetic", test_name_k);
@@ -85,12 +93,19 @@ int main() {
     // `max_atoms` far exceeds `atom_count`, which is exactly the regime the bug hit:
     // 3 * 4 = 12 halves never reach the y component at offset 128.
     conformer_slot_layout_t const layout {128u, 3u};
+
+    // The slot is filled through the contract spelled out rather than through the type that implements it:
+    // three planes of `max_atoms`, so component `axis` of `atom` sits at `axis * max_atoms + atom`. That is
+    // what a shipped shard's `conformer_coords` column is packed against, and asking the layout where to
+    // write would make the round trip below agree with itself whatever the layout said.
     std::vector<float> buffer(layout.slot_offset(1u, 0u), 0.0f);
     for (std::uint32_t atom = 0; atom < atom_count; ++atom)
         for (std::uint32_t axis = 0; axis < 3u; ++axis)
-            buffer[layout.component_offset(axis, atom)] = reference[atom][axis];
+            buffer[static_cast<std::size_t>(axis) * layout.max_atoms + atom] = reference[atom][axis];
 
-    std::vector<float> const row = pack_row_(buffer, layout, atom_count);
+    // The gather the Parquet writer, the descriptor tool and the benchmarks all reach the pool through.
+    std::vector<float> row(static_cast<std::size_t>(atom_count) * 3u, 0.0f);
+    smallfield::api::gather_slot_into_interleaved(buffer.data(), layout, atom_count, row.data());
 
     // Round-trip fidelity.
     for (std::uint32_t atom = 0; atom < atom_count; ++atom)

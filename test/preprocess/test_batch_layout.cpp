@@ -151,6 +151,34 @@ static void check_offset_cap_(diagnostic_reporter_t &reporter) {
 }
 
 /**
+ *  @brief Check the bound across atom capacities, which is where a wave and a slice have to agree.
+ *
+ *  Two independent sites read this function at the caller's own atom capacity — the wave sizing that
+ *  decides how many molecules a wave carries, and the preprocess refusal that drops whatever a slice
+ *  hands it past the bound. They agree only while it answers identically for every spelling of "no
+ *  capacity of my own" and never rises as the capacity widens, so both are asserted here rather than
+ *  left to the one call site each happens to take.
+ *
+ *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
+ */
+static void check_capacity_bound_(diagnostic_reporter_t &reporter) {
+    constexpr std::uint64_t cap_k = sfp::max_molecules_per_batch_k;
+
+    auto const at_least = [](std::uint64_t reference, std::uint64_t observed) { return observed >= reference; };
+    // Zero is how a caller says it imposes no capacity of its own, and a capacity wider than the
+    // pipeline's own cap cannot buy room the pipeline does not have; both fold onto the cap.
+    reporter.mismatch("capacity", "atoms={} cap={}", sweep_atom_count_k, cap_k)
+        .field("unbounded_equals_cap", cap_k, static_cast<std::uint64_t>(sfp::max_molecules_for_atom_capacity(0u)),
+               exactly_equal)
+        .field("above_cap_equals_cap", cap_k,
+               static_cast<std::uint64_t>(sfp::max_molecules_for_atom_capacity(sweep_atom_count_k + 1u)), exactly_equal)
+        // The bound is quadratic in the capacity, so halving the capacity admits at least four times
+        // the molecules — which is what makes the cap at the pipeline's own atom cap the tightest one.
+        .field("half_capacity_admits_four_times", 4u * cap_k,
+               static_cast<std::uint64_t>(sfp::max_molecules_for_atom_capacity(sweep_atom_count_k / 2u)), at_least);
+}
+
+/**
  *  @brief Check the molecule count at which a 32-bit total first wraps for drug-like molecules.
  *
  *  The figure is what makes the defect concrete rather than theoretical: it sits below the wave clamp,
@@ -182,6 +210,9 @@ int main() {
 
     sftest::check_offset_cap_(reporter);
     reporter.summarize("cap");
+
+    sftest::check_capacity_bound_(reporter);
+    reporter.summarize("capacity");
 
     sftest::check_drug_like_wrap_(reporter);
     reporter.summarize("drug_like");

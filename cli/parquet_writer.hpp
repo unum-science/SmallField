@@ -95,8 +95,8 @@ struct conformer_slot_columns_t {
     /**
      *  @brief Structure-of-arrays coordinates, filled by either the GPU or the RDKit fallback.
      *
-     *  `layout.slot_offset(molecule, slot)` names a slot's base and `layout.component_offset` a component
-     *  inside it; a contiguous `3 * num_atoms` read from the slot base is not a valid gather.
+     *  `layout.slot_offset(molecule, slot)` names a slot's base and `gather_slot_into_interleaved` reads it
+     *  into an atom-major row; a contiguous `3 * num_atoms` read from the slot base is not a valid gather.
      */
     custd::span<__half const> coordinates;
     /**

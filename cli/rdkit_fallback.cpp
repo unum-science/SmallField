@@ -119,16 +119,25 @@ static bool minimize_conformer_(RDKit::RWMol &molecule, int conformer_id, float 
     }
 }
 
-/** Write one RDKit conformer into its structure-of-arrays slot, zeroing the padding atoms first. */
+/**
+ *  @brief Write one RDKit conformer into its structure-of-arrays slot, zeroing the padding atoms first.
+ *
+ *  The three components are written out rather than gathered through `scatter_interleaved_into_slot`,
+ *  because RDKit's `RDGeom::Point3D` derives from a polymorphic base and indexes by axis through a virtual
+ *  `operator[]`, so reaching that entry point costs a staged interleaved copy per conformer inside the
+ *  fallback's parallel region.
+ */
 static void write_conformer_into_slot_(RDKit::RWMol const &molecule, int conformer_id,
                                        sfapi::conformer_slot_layout_t const &layout, __half *slot) {
     std::memset(reinterpret_cast<void *>(slot), 0, sizeof(__half) * layout.slot_stride());
+    std::uint32_t const num_atoms = molecule.getNumAtoms();
     auto const &conformer = molecule.getConformer(conformer_id);
-    for (unsigned int atom = 0; atom < molecule.getNumAtoms(); ++atom) {
+    types::strided_matrix<__half> const destination = layout.slot_view(slot, num_atoms);
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
         auto const &position = conformer.getAtomPos(atom);
-        slot[layout.component_offset(0u, atom)] = __float2half(static_cast<float>(position.x));
-        slot[layout.component_offset(1u, atom)] = __float2half(static_cast<float>(position.y));
-        slot[layout.component_offset(2u, atom)] = __float2half(static_cast<float>(position.z));
+        destination(0u, atom) = __float2half(static_cast<float>(position.x));
+        destination(1u, atom) = __float2half(static_cast<float>(position.y));
+        destination(2u, atom) = __float2half(static_cast<float>(position.z));
     }
 }
 

@@ -1112,16 +1112,28 @@ inline wave_slice_layout_t compute_batch_layout(per_mol_sizes_t const &totals, s
 
 /**
  *  @brief One per-OpenMP-thread record accumulated during `prepare_per_thread_contribs_`.
- *  Every offset field on the metadata holds a @b thread-local index; the pack pass rebases them by
- *  adding the thread's pool-wide base.
+ *
+ *  `bounds_offset`, `chiral_offset` and `constraint_offset` index the producing thread's own staged
+ *  arrays, which is how the pack pass finds this molecule's bytes. Every other offset the metadata
+ *  carries names a region no thread stages, so the pack pass stamps it from the per-device prefix it
+ *  already runs and nothing is written here for it to overwrite.
  */
 struct batch_prep_per_mol_record_t {
     std::uint32_t original_index;
-    /** Thread-local base of this molecule inside the MMFF interaction array. The metadata
-     *  has no field for it because only the per-atom CSR entries reference it, and those are
-     *  device-built; the launch path passes it through `mmff_bases` instead. */
-    std::uint32_t mmff_interaction_base;
     etkdg_molecule_metadata_t metadata;
+};
+
+/**
+ *  @brief Where one molecule's RDKit-supplied atom types and charges sit in its producer's staging.
+ *
+ *  The shipped `mmff94_typing_patch_t` also carries the pool-wide atom base and the atom count, and
+ *  the pack pass derives both from the prefix and the metadata it already holds. So a worker records
+ *  only what nothing downstream can re-derive: which of its molecules was patched, and where in its
+ *  own two staged arrays that molecule's run begins.
+ */
+struct staged_typing_patch_t {
+    std::uint32_t molecule_index;
+    std::uint32_t patch_base;
 };
 
 /**
@@ -1130,8 +1142,9 @@ struct batch_prep_per_mol_record_t {
  *
  *  One instance per thread. Each region accumulator holds the concatenation of the host-produced
  *  region for every molecule that thread processed, in append order, at the element type that region
- *  carries; the `*_count` accumulators hold the reservations for the device-filled regions, which
- *  carry no host elements at all.
+ *  carries, so each accumulator's own `size()` is the next molecule's offset into it. The
+ *  device-filled regions stage nothing here — the kernels write them in place after the upload —
+ *  and their room is reserved by the per-device prefix the pack pass runs.
  *  Persisted across calls via a file-scope `static` vector so the `std::vector` capacities survive.
  */
 struct alignas(64) batch_prep_thread_contribution_t {
@@ -1142,19 +1155,7 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::vector<molecule_descriptor_t> descriptors;
     std::vector<std::uint8_t> patch_atom_types;
     std::vector<float> patch_atom_charges;
-    std::vector<mmff94_typing_patch_t> typing_patches;
-    /** Running element counts of this thread's share of every device-filled region. The
-     *  bytes are never staged: the kernels write them in place after the upload, so the thread
-     *  accumulates only the room its molecules claim. */
-    std::size_t atom_count = 0;
-    std::size_t bond_distance_count = 0;
-    std::size_t etk_interaction_count = 0;
-    std::size_t mmff_bond_count = 0;
-    std::size_t mmff_angle_count = 0;
-    std::size_t mmff_torsion_count = 0;
-    std::size_t mmff_oop_count = 0;
-    std::size_t mmff_stretchbend_count = 0;
-    std::size_t mmff_interaction_count = 0;
+    std::vector<staged_typing_patch_t> typing_patches;
     std::vector<batch_prep_per_mol_record_t> mols;
     /** Slice-local input indices for every molecule this thread's slice rejected, each
      *  tagged with the reason. Aggregated upstream into `wave_slice_pool_t::rejected_input_indices`. */
@@ -1196,8 +1197,8 @@ inline void warm_up_rdkit_globals_once_() {
  *  @brief First stage of the preprocess-step: parallel per-molecule RDKit parse and byte-append into
  *  each OpenMP thread's contribution buffer.
  *
- *  After return, each thread's contribution carries its share of the input molecules with
- *  thread-local metadata offsets.
+ *  After return, each thread's contribution carries its share of the input molecules, each one's
+ *  staged regions addressed by a metadata offset into that thread's own arrays.
  *
  *  @param[in] smiles_list Slice of input SMILES to prepare.
  *  @param[in] salt_policy Whether a multi-fragment input keeps its largest fragment.
@@ -1224,15 +1225,6 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
         contribution.rejected_input_indices.clear();
         contribution.max_atoms_seen = 0;
         contribution.max_bonds_seen = 0;
-        contribution.atom_count = 0;
-        contribution.bond_distance_count = 0;
-        contribution.etk_interaction_count = 0;
-        contribution.mmff_bond_count = 0;
-        contribution.mmff_angle_count = 0;
-        contribution.mmff_torsion_count = 0;
-        contribution.mmff_oop_count = 0;
-        contribution.mmff_stretchbend_count = 0;
-        contribution.mmff_interaction_count = 0;
     }
 
     std::size_t const molecule_count = smiles_list.size();
@@ -1273,45 +1265,17 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
                                                      prepared.distance_constraints.end());
             contribution.descriptors.push_back(prepared.descriptor);
 
-            // Every per-atom region shares one base: the molecule's first atom in the batch.
-            std::uint32_t const atom_base = static_cast<std::uint32_t>(contribution.atom_count);
-            record.metadata.mmff_atom_vdw_offset = atom_base;
-            record.metadata.mmff_atom_charge_offset = atom_base;
-            record.metadata.mmff_atom_csr_offset = atom_base;
-            record.metadata.etk_atom_csr_offset = atom_base;
-            contribution.atom_count += num_atoms;
-
-            record.metadata.bond_distance_offset = static_cast<std::uint32_t>(contribution.bond_distance_count);
-            contribution.bond_distance_count += static_cast<std::size_t>(num_atoms) * num_atoms;
-            record.metadata.etk_interaction_offset = static_cast<std::uint32_t>(contribution.etk_interaction_count);
-            contribution.etk_interaction_count += prepared.capacities.etk_interactions;
-            record.metadata.mmff_bond_offset = static_cast<std::uint32_t>(contribution.mmff_bond_count);
-            contribution.mmff_bond_count += prepared.capacities.mmff_bonds;
-            record.metadata.mmff_angle_offset = static_cast<std::uint32_t>(contribution.mmff_angle_count);
-            contribution.mmff_angle_count += prepared.capacities.mmff_angles;
-            record.metadata.mmff_torsion_offset = static_cast<std::uint32_t>(contribution.mmff_torsion_count);
-            contribution.mmff_torsion_count += prepared.capacities.mmff_torsions;
-            record.metadata.mmff_oop_offset = static_cast<std::uint32_t>(contribution.mmff_oop_count);
-            contribution.mmff_oop_count += prepared.capacities.mmff_oops;
-            record.metadata.mmff_stretchbend_offset = static_cast<std::uint32_t>(contribution.mmff_stretchbend_count);
-            contribution.mmff_stretchbend_count += prepared.capacities.mmff_stretchbends;
-            record.mmff_interaction_base = static_cast<std::uint32_t>(contribution.mmff_interaction_count);
-            contribution.mmff_interaction_count += prepared.capacities.mmff_interactions;
-
             if (!prepared.patch_atom_types.empty()) {
-                mmff94_typing_patch_t patch {};
-                patch.molecule_index = static_cast<std::uint32_t>(contribution.mols.size());
-                patch.atom_base = atom_base;
                 // One base addresses both arrays, so both take the same count from the same molecule.
-                patch.patch_base = static_cast<std::uint32_t>(contribution.patch_atom_types.size());
+                contribution.typing_patches.push_back(
+                    {.molecule_index = static_cast<std::uint32_t>(contribution.mols.size()),
+                     .patch_base = static_cast<std::uint32_t>(contribution.patch_atom_types.size())});
                 contribution.patch_atom_types.insert(contribution.patch_atom_types.end(),
                                                      prepared.patch_atom_types.data(),
                                                      prepared.patch_atom_types.data() + num_atoms);
                 contribution.patch_atom_charges.insert(contribution.patch_atom_charges.end(),
                                                        prepared.patch_atom_charges.data(),
                                                        prepared.patch_atom_charges.data() + num_atoms);
-                patch.atom_count = num_atoms;
-                contribution.typing_patches.push_back(patch);
             }
 
             contribution.mols.push_back(record);
@@ -1322,9 +1286,12 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
 /**
  *  @brief Merge every worker's refusals, plus the tail the batch could not address, into @p out.
  *
- *  Each entry carries the slice-local input index and the `conformer_status_t` reason. The tail
- *  past @p admitted_count is refused for the same reason a single oversized molecule is: the batch
- *  cannot address that many atoms, so the caller's `fallback-role` sees it on the path it has.
+ *  Each entry carries the slice-local input index and the `conformer_status_t` reason. The tail past
+ *  @p admitted_count is refused with `too_many_atoms_k`, which the `fallback-role` treats as terminal
+ *  because it re-derives that same refusal from the same atom cap — so a molecule in the tail is
+ *  dropped rather than retried. Nothing in the tail is oversized, so that is only the right verdict
+ *  while the tail stays empty: a caller sizes its slice to `max_molecules_for_atom_capacity` and a
+ *  non-empty tail is that caller's sizing bug rather than a property of the molecules in it.
  */
 inline void collect_rejections_into_(std::vector<batch_prep_thread_contribution_t> const &contribs,
                                      std::size_t admitted_count, std::size_t input_count,
@@ -1613,8 +1580,9 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
  *  and the partition buffers so neither allocation fires on the hot path; that is also what makes
  *  this entry non-reentrant, and the reason a caller must not drive it from two threads.
  *
- *  @param[in] smiles_list Slice of input SMILES to prepare, at most `max_molecules_per_batch_k` of
- *             which are admitted; the tail past that is refused with `too_many_atoms_k`.
+ *  @param[in] smiles_list Slice of input SMILES to prepare, at most
+ *             `max_molecules_for_atom_capacity(output_atom_capacity)` of which are admitted; the tail
+ *             past that is refused with `too_many_atoms_k`, which no `fallback-role` retries.
  *  @param[in] device_count Devices to partition across; 1 fills a single pool.
  *  @param[in] output_atom_capacity Atoms the caller's per-molecule coordinate slot holds. Every
  *             admitted molecule fits it, so a slice's `observed_max_atoms` — the stride the launch
