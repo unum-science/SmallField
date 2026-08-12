@@ -12,9 +12,13 @@ Read those before proposing work here, so a closed question is not reopened.
 The pipeline is GPU-bound on a single Hopper card as of 2026-08-03, after preprocessing moved to the device.
 Sampling `utilization.gpu` at 100 ms across a 20 000-molecule stratified PubChem run at K=3 on one H100 gives 7.71 s of GPU-busy time against an 8.05 s `generate_conformers` window, about 96 %.
 
-`BENCH.md` still reports host-bound at 10M USearch, K=1, 8× Blackwell, refreshed 2026-07-31, which predates that move.
-Both readings are in this document's terms: different corpus, different conformer count, different hardware, and one of them older than the change that matters.
-Neither generalises to the other, and neither is the answer for a multi-node tier nobody has measured.
+That reading is confirmed at production scale.
+At `8M REAL, K=3, 1× H100` on 2026-08-12 the batch pipeline spends 92.3 % of wall in GPU work, and at `100K REAL, K=3, 1× H100` the GPU stage is 89 % of a library-harness run.
+A kernel 2× would therefore be worth roughly 1.8× end to end on that corpus.
+
+__The bound is corpus-dependent, and on PubChem it is not the GPU.__
+There the RDKit fallback-role is roughly 85 % of wall, because 2.60 % of molecules enter it and only 26 % of those are recoverable.
+Neither reading generalises to the other, and neither is the answer for a multi-GPU or multi-node tier nobody has measured at K=3.
 Re-measure per tier before treating either as current.
 
 ## How to Read This Document
@@ -43,6 +47,80 @@ Every item below carries the same six fields, so two items can be compared witho
 __Evidence__ names its scale tag and its date, and says so outright when the measurement predates a change that invalidates it.
 
 ## Software
+
+### Where the Wall Time Actually Is
+
+Measured 2026-08-12 — `100K REAL, K=3, 1× H100`, kernel durations from `nsys` without replay, within-kernel attribution from `ncu` PC sampling with source correlation, bin-weighted across the two largest waves and cross-checked by ablation to within 4 points.
+
+Composing the measured layers — 92.3 % of wall in GPU, about 98 % of that in kernels, 94.2 % of kernels in MMFF94 polish:
+
+| Component                                        | Share of Wall |
+| :----------------------------------------------- | ------------: |
+| MMFF nonbonded, van der Waals plus electrostatic |    __37.6 %__ |
+| MMFF torsion                                     |    __20.6 %__ |
+| MMFF angle                                       |         9.1 % |
+| MMFF stretch-bend                                |         8.2 % |
+| Exposed host — fallback tail, writer, reader     |         7.7 % |
+| MMFF out-of-plane                                |         6.3 % |
+| ETKDG kernel, all seven stages                   |         3.8 % |
+| Upload, metric prepass, download                 |         1.8 % |
+| MMFF bond                                        |         1.7 % |
+| Other kernels                                    |         1.4 % |
+
+__Two MMFF terms are 58 % of production wall time__, and the entire ETKDG kernel is 3.8 %.
+Deleting ETKDG outright would buy 1.044×.
+On PubChem the ranking inverts: the fallback tail is roughly 85 % of wall there, so dispatch work outweighs kernel work on that corpus.
+
+Four hypotheses died here, each as a separate build on `20K REAL, K=3, 1× H100`.
+Occupancy is not the lever — halving the persistent grid costs only 29 %, so doubling occupancy buys under 20 %.
+FIRE budgets are not over-provisioned — disabling the convergence test moves runtime 0.3 %, so the budget is the runtime.
+Coalescing the `bond_distance` read by transposing it is 1.4 % __slower__, because the row walk already strength-reduces to a pointer bump.
+Integer arithmetic does not dominate the ETKDG kernel — `alu/fma` is 0.557 — and that kernel is 4.2 % of GPU time regardless.
+
+### Half-Shell Nonbonded With a Cyclic Offset
+
+__Mechanism:__ Replace the `j = 0..N` nonbonded sweep in `mmff94_energy_kernel.cuh:82-146` with `j = (atom + offset) mod N` for `offset = 1..N/2`, so each pair is visited once with all 32 lanes active, and deliver the reaction force to the partner atom.
+__Evidence:__ `100K REAL, K=3, 1× H100`, 2026-08-12 — nonbonded is 41.6 % of kernel time and 37.6 % of wall, stalling on arithmetic dependency chains rather than memory.
+A naive triangular prune, `if (j <= atom) continue`, measured only −6.5 % because `j` is warp-uniform, so idle lanes still cost the warp its issue slot; the cyclic form exists to fix exactly that.
+__Gain:__ Up to half of 37.6 % of wall, less the cost of force delivery.
+__Effort:__ High.
+__Risk:__ High — the reaction force has to reach an atom owned by another lane, and the one delivery mechanism measured so far made things worse; see the entry below.
+__Gate:__ Prototype the delivery mechanism before planning around the arithmetic saving, and gate on paired energies against RDKit rather than on wall time.
+
+### De-Duplicate MMFF Bonded Term Evaluation
+
+__Mechanism:__ Bonded terms are evaluated once per participating atom, so each is computed 2 to 4 times, and roughly 85 % of each term body is role-independent.
+Evaluate term-centric in chunks of 32 — lane `L` takes term `chunk*32+L`, writes its role-independent intermediates to shared memory, seven floats for a torsion — then let the atom-centric pass read those and build only its own role's force.
+__Evidence:__ `20K REAL, K=3, 1× H100`, 2026-08-12 — an ablation computing each bonded term exactly once measures __−42.5 %__ on the MMFF kernel, which is the only lever large enough for 2×.
+Torsion alone is 20.6 % of wall.
+__Gain:__ Up to 42.5 % of the MMFF kernel, so about 36 % of wall at the ceiling.
+__Effort:__ High.
+__Risk:__ High — realizing the same saving by scattering role forces through shared-memory `atomicAdd` measured __10 % slower__ than baseline, because on a 32-lane warp sharing one small gradient array those atomics serialize on conflicts, costing 2.9× the math they saved.
+Registers rose 72 → 77 in that attempt.
+Shared memory for 32 terms in flight is 896 B, which leaves registers binding on `sm_90` at 28 blocks, but `sm_120` sits at 101 registers and 20 blocks and needs its own measurement before this lands.
+__Gate:__ Prototype the no-atomics staging first and confirm it beats baseline before designing around the ceiling.
+
+### Conflict-Free Atomic Gradient Store
+
+__Mechanism:__ Replace the final `store_gradient_` in `mmff_polish_warp_kernel` with three shared-memory `atomicAdd` calls into a zeroed array.
+__Evidence:__ `20K REAL, K=3, 1× H100`, 2026-08-12 — __−5.2 %__ on the MMFF kernel, which is 4.9 % of wall, at unchanged register count and bitwise-identical output, since each atom is written by exactly one lane and no atomic ever contends.
+__Gain:__ 4.9 % of wall.
+__Effort:__ Low.
+__Risk:__ Low.
+__Gate:__ Bitwise-identical output over a shard, and `cuobjdump --dump-resource-usage` showing 72 registers unchanged.
+Do not generalise the result — a conflict-free atomic is faster than a plain store here, while a conflicting one is not.
+
+### Skip Provably Terminal Statuses Before the Fallback
+
+__Mechanism:__ `fill_retry_indices_into_` selects molecules on "not `success_k`" alone, so it hands the fallback-role refusals that `admit_molecule_` re-derives identically from the same parser and the same atom cap.
+Classify each `conformer_status_t` as retryable or terminal and dispatch only the former.
+__Evidence:__ `1M PubChem, K=3, 1× H100`, 2026-08-12 — of 25,999 molecules dispatched, 10,236 are `unsupported_element_k` and 6,918 are `too_many_atoms_k`, so __66 % pay a `SmilesToMol` plus `addHs` plus `MMFFMolProperties` to reach a known verdict__.
+The fallback tail is roughly 85 % of wall on that corpus.
+`too_many_rings_k` and `too_many_bonds_k` are __not__ terminal — they are set during descriptor build, which the fallback never performs.
+__Gain:__ A large share of PubChem's 85 % tail; nothing on REAL, where the tail is small and 98.5 % recoverable.
+__Effort:__ Low.
+__Risk:__ Low — behaviour-preserving by construction, since the skipped molecules already end at the same status.
+__Gate:__ Per-status counts in the output shard unchanged, with only wall time moving.
 
 ### Depth-3 Ring Buffer and Async Finalize
 
@@ -118,6 +196,11 @@ __Risk:__ Medium — smoothing is a transitive closure over sums of bounds, so q
 A geometry regression surfaces as chirality failures downstream, not as a smoothing bug.
 __Gate:__ Measure the bin population first and drop this if the corpus does not reach it.
 Then measure `__half` before int8, and gate on `stereo_failure` rate and paired energies rather than on wall time — the size-aware distance-geometry budget rejected on 2026-08-03 looked free on wall time and cost 3 102 conformers.
+
+__Closed 2026-08-12.__
+That gate is now answered and the answer is no.
+At `100K REAL, K=3, 1× H100` the whole of `embed_4d_power_iter_kernel` is 0.12 % of GPU time, and the entire bounds-matrix representation question — int8 quantization plus every dequantizing read in the distance-geometry inner loop — is under 1.6 %.
+Narrowing the smoothing type cannot pay however well it benchmarks in isolation, and the same arithmetic retires the runtime divisor in `triangle_smooth_pivot_`.
 
 ## Datasets
 

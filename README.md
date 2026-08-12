@@ -27,7 +27,12 @@ Having SmallField silently substitute a different tautomer than the one you prov
 __Why is point (tetrahedral) chirality not enumerated?__
 Same reason: distinct stereoisomers are distinct SMILES.
 If an input SMILES has all stereocentres assigned, we use that assignment; if a centre is unspecified, ETKDG picks one handedness deterministically from the random seed.
-For bulk corpora that ship every centre specified (ChEMBL, USearch, PubChem canonical), this is zero information loss — a 100 K sample of USearch and ChEMBL both measured 0.00 % of molecules with undefined stereocentres.
+For bulk corpora that ship every centre specified — ChEMBL, USearch, PubChem canonical — this is zero information loss, and a 100 K sample of USearch and ChEMBL both measured 0.00 % of molecules with undefined stereocentres.
+
+One caveat that measurement does not cover: __CXSMILES enhanced-stereo groups are read as absolute configurations__.
+A block such as `|&1:2,4|` declares those centres racemic, but `extract_chiral_centers` accepts any atom whose chiral tag survives `assignStereochemistry` and never consults `getStereoGroups`, so the written enantiomer is embedded and enforced as though it were asserted.
+This affects 19.6 % of Enamine REAL rows.
+Since chiral-volume validation is the only check that fails a conformer on the GPU, those centres are also enforced during embedding, which costs retries the input never asked for.
 
 __What about axial and helical chirality?__
 These are geometric chirality modes (atropisomerism of ortho-substituted biaryls, helicenes) that are not captured by a SMILES string at all — two molecules with opposite helicity have the same SMILES.
@@ -125,11 +130,25 @@ Wave N+1's preprocess overlaps wave N's embedding via a depth-2 batch-pool ring.
 
 ## Performance
 
-On an 8× RTX PRO 6000 Blackwell / 2× Xeon 6776P host, SmallField generates ETKDG + MMFF94 conformers up to __9.7× faster than RDKit__ across 192 CPU threads, at 16,826 mol/s on ChEMBL 241,596 with one conformer per molecule.
-Every number, with its corpus, its hardware and its methodology, lives in [`BENCH.md`](BENCH.md) — including single-H100 figures and the nvMolKit comparison.
+Conformers per second, at three conformers per molecule, normalised per compute unit.
 
-NVIDIA's [nvMolKit](https://docs.nvidia.com/bionemo/) also targets GPU conformer generation, but it requires the BioNeMo proprietary stack.
-SmallField is open-source and runs on any CUDA 12+ GPU.
+| System         | Throughput Per Core | Core Type   | Per Device | Per DGX Node |
+| :------------- | ------------------: | :---------- | ---------: | -----------: |
+| __SmallField__ |      76 molecules/s | GPU SM core |       ~10⁴ |     ~10⁴–10⁵ |
+| nvMolKit       |     3.9 molecules/s | GPU SM core |   ~10²–10³ |         ~10³ |
+| RDKit          |     4.8 molecules/s | CPU core    |       ~10² |         ~10³ |
+
+A single DGX-H100 node is eight GPUs or roughly two hundred CPU cores.
+An H100 has 132 GPU _"streaming multiprocessor"_ SM cores.
+On one H100 the GPU stage runs at 10,070 conf/s and the full batch pipeline delivers 9,291 conf/s end to end, which is 10 million Enamine REAL molecules in under an hour.
+
+Python and C++ share the GPU path.
+`sf.generate_conformers` and `smallfield::api::context_t` enter the same CUDA pipeline, so neither is the faster interface.
+The `smallfield_batch` binary adds the Parquet reader, writer and CPU fallback roles around it for corpus-scale runs.
+
+Sustained throughput depends on how often the GPU refuses a molecule, since every refusal falls back to CPU RDKit.
+Clean, lead-like corpora stay near the ceiling; heterogeneous archives with large molecules and unsupported elements pay more.
+Every number, with its corpus, its hardware and its methodology, including that corpus spread, lives in [`BENCH.md`](BENCH.md).
 
 ## Python
 
@@ -158,9 +177,11 @@ batch.num_atoms    # one per molecule, with hydrogens, 0 if preprocess rejected 
 
 Reuse one `Context` across calls: constructing it initialises every GPU and reserves every pinned pool, so building one per call pays that twice.
 
-Coordinates cross as `float16`, which is the precision the pipeline produces — widening them at the boundary would cost a second buffer three times the size for accuracy the slots never held. Call `.astype(numpy.float32)` if you want it, and the cost is then yours to see.
+Coordinates cross as `float16`, which is the precision the pipeline produces — widening them at the boundary would cost a second buffer three times the size for accuracy the slots never held.
+Call `.astype(numpy.float32)` if you want it, and the cost is then yours to see.
 
-`max_atoms_per_molecule` is the output stride as well as the cap, so lowering it to the largest molecule you actually feed in saves proportional host memory. Read the ceiling from `sf.MAX_ATOMS_PER_MOLECULE` rather than restating it; it is the stride two layers have to agree on.
+`max_atoms_per_molecule` is the output stride as well as the cap, so lowering it to the largest molecule you actually feed in saves proportional host memory.
+Read the ceiling from `sf.MAX_ATOMS_PER_MOLECULE` rather than restating it; it is the stride two layers have to agree on.
 
 Requires RDKit for preprocessing — `pip install rdkit`.
 
