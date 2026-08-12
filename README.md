@@ -261,6 +261,18 @@ python/smallfield/          Python package: api.py (generate), tools/ (shard pre
 There are no dependencies beyond CUDA 12+ and RDKit for preprocessing.
 Apache Arrow + Parquet are optional and only needed for the batch CLI binary.
 
+## Acknowledgements
+
+[RDKit](https://github.com/rdkit/rdkit) did the bulk of this work, over two decades, before any of it was fast.
+The chemistry SmallField runs is theirs — the distance geometry, the torsion preferences, the force field and the parameter sets behind them — and every correctness claim here is a claim about agreeing with them.
+A reimplementation is only ever as good as what it reimplements, and the fixes that landed in their 2026.03 series are cited in the commits that borrowed them.
+
+[Nebius](https://nebius.com) provided the compute this was built and measured on.
+Nothing in the benchmarks would exist without hardware to run them against.
+
+[NVIDIA](https://github.com/NVIDIA/nvMolKit) deserves acknowledgement well beyond the GPUs.
+Their sustained work on accelerating science is what makes a project like this reasonable to attempt at all, and nvMolKit is pushing the same problem forward from a different direction.
+
 ## License
 
 Apache 2.0
