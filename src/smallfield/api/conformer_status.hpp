@@ -11,6 +11,8 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`
 
+#include <string_view> // `std::string_view`
+
 namespace smallfield::api {
 
 /**
@@ -60,5 +62,35 @@ enum class conformer_status_t : std::uint8_t {
  *  itself. The enum is append-only, so its newest value is always its widest. */
 inline constexpr std::size_t conformer_status_count_k =
     static_cast<std::size_t>(conformer_status_t::bounds_infeasible_k) + 1u;
+
+/** What a status byte no enumerator claims prints as, which a shard from a newer producer can carry. */
+inline constexpr std::string_view unnamed_status_k = "unnamed_status";
+
+/**
+ *  @brief The name a per-status report prints, which is the enumerator without its suffix.
+ *
+ *  Exhaustive and carrying no `default:`, so appending to the enum is a `-Wswitch` warning here rather
+ *  than a row printed under a neighbour's name.
+ */
+inline constexpr std::string_view conformer_status_name(conformer_status_t status) noexcept {
+    switch (status) {
+    case conformer_status_t::success_k: return "success";
+    case conformer_status_t::stereo_failure_k: return "stereo_failure";
+    case conformer_status_t::mmff_unconverged_k: return "mmff_unconverged";
+    case conformer_status_t::invalid_smiles_k: return "invalid_smiles";
+    case conformer_status_t::too_many_atoms_k: return "too_many_atoms";
+    case conformer_status_t::preprocess_timeout_k: return "preprocess_timeout";
+    case conformer_status_t::unsupported_element_k: return "unsupported_element";
+    case conformer_status_t::too_many_bonds_k: return "too_many_bonds";
+    case conformer_status_t::too_many_rings_k: return "too_many_rings";
+    case conformer_status_t::bounds_infeasible_k: return "bounds_infeasible";
+    }
+    return unnamed_status_k;
+}
+
+static_assert(conformer_status_name(static_cast<conformer_status_t>(conformer_status_count_k - 1)) !=
+                      unnamed_status_k &&
+                  conformer_status_name(static_cast<conformer_status_t>(conformer_status_count_k)) == unnamed_status_k,
+              "every enumerator carries a name, and nothing past the last one does");
 
 } // namespace smallfield::api

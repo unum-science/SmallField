@@ -668,28 +668,6 @@ static void fallback_loop_(cli_config_t const &config, thread_budget_t const &bu
     }
 }
 
-/**
- *  @brief Touch the 3-byte `<output>.encoded` sentinel a `--resume` run keys on.
- *
- *  Removed again if the write was short, because a truncated sentinel would make the next run skip an
- *  unencoded shard as though it were finished.
- */
-static void write_encoded_sentinel_(fs::path const &output_path, logger_t const &logger) {
-    fs::path sentinel = output_path;
-    sentinel += ".encoded";
-    FILE *sentinel_file = std::fopen(sentinel.string().c_str(), "wb");
-    if (!sentinel_file) {
-        logger.error("sentinel write failed: {}", sentinel.string());
-        return;
-    }
-    std::size_t const written = std::fwrite("v1\n", 1, 3, sentinel_file);
-    std::fclose(sentinel_file);
-    if (written == 3) return;
-    std::error_code remove_error;
-    fs::remove(sentinel, remove_error);
-    logger.error("sentinel write truncated, removed: {}", sentinel.string());
-}
-
 /** The slice of a batch's buffers one input file owns, ready for `write_shard`. */
 static sfcli::writer_inputs_t shard_writer_inputs_(cli_config_t const &config,
                                                    coprocessed_batch_accumulator_t const &accumulator,
@@ -737,7 +715,7 @@ static void write_batch_shards_(cli_config_t const &config, coprocessed_batch_ac
         // `write_shard` already logged the column or the file that stopped it, so nothing is said here.
         sfcli::shard_write_report_t const report = sfcli::write_shard(
             output_path, shard_writer_inputs_(config, accumulator, buffer, file_index), &logger);
-        if (report.status == sfcli::shard_write_t::written_k) write_encoded_sentinel_(output_path, logger);
+        if (report.status == sfcli::shard_write_t::written_k) sfcli::write_encoded_sentinel(output_path, &logger);
 
         counters.molecules_completed.fetch_add(accumulator.molecules_of(file_index));
         counters.input_files_completed.fetch_add(1);
@@ -749,22 +727,7 @@ static double percent_of_(std::uint64_t part, std::uint64_t whole) noexcept {
     return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole);
 }
 
-/** The name a per-status report prints, which is the enumerator without its suffix. */
-static std::string_view conformer_status_name_(sfapi::conformer_status_t status) noexcept {
-    switch (status) {
-    case sfapi::conformer_status_t::success_k: return "success";
-    case sfapi::conformer_status_t::stereo_failure_k: return "stereo_failure";
-    case sfapi::conformer_status_t::mmff_unconverged_k: return "mmff_unconverged";
-    case sfapi::conformer_status_t::invalid_smiles_k: return "invalid_smiles";
-    case sfapi::conformer_status_t::too_many_atoms_k: return "too_many_atoms";
-    case sfapi::conformer_status_t::preprocess_timeout_k: return "preprocess_timeout";
-    case sfapi::conformer_status_t::unsupported_element_k: return "unsupported_element";
-    case sfapi::conformer_status_t::too_many_bonds_k: return "too_many_bonds";
-    case sfapi::conformer_status_t::too_many_rings_k: return "too_many_rings";
-    case sfapi::conformer_status_t::bounds_infeasible_k: return "bounds_infeasible";
-    }
-    return "unknown";
-}
+using sfapi::conformer_status_name;
 
 /**
  *  @brief One line per status that sent molecules to the `fallback-role`, or held them back from it.
@@ -779,11 +742,11 @@ static void log_fallback_breakdown_(coprocessed_batch_result_t const &result, lo
         std::uint64_t const attempted = result.fallback_report.attempted[index];
         std::uint64_t const skipped = result.fallback_report.skipped[index];
         if (attempted > 0)
-            logger.info("  fallback cause={} attempted={} recovered={} {:.3f}%", conformer_status_name_(status),
+            logger.info("  fallback cause={} attempted={} recovered={} {:.3f}%", conformer_status_name(status),
                         fmt::group_digits(attempted), fmt::group_digits(result.fallback_report.recovered[index]),
                         percent_of_(result.fallback_report.recovered[index], attempted));
         if (skipped > 0)
-            logger.info("  fallback cause={} terminal={}", conformer_status_name_(status), fmt::group_digits(skipped));
+            logger.info("  fallback cause={} terminal={}", conformer_status_name(status), fmt::group_digits(skipped));
     }
 }
 
