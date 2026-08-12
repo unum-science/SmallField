@@ -306,9 +306,8 @@ struct coprocessed_batch_result_t {
     pipeline_item_t item = pipeline_item_t::batch_k;
     /** When the `gpu-runner-role` picked the batch up, so the progress line spans GPU, fallback and write. */
     std::chrono::steady_clock::time_point batch_start {};
-    std::uint64_t fallback_attempted = 0;
-    /** Molecules for which RDKit filled at least one slot. */
-    std::uint64_t fallback_recovered = 0;
+    /** What the batch's refusals cost and bought, by the status that decided each molecule. */
+    sfcli::fallback_report_t fallback_report {};
 };
 
 /** Bounded ring-buffer producer/consumer channel; see `run_pipeline_` for what its depth buys. */
@@ -469,16 +468,29 @@ static void park_batch_shards_(coprocessed_batch_accumulator_t const &accumulato
     }
 }
 
-/** List the molecules with at least one unfilled conformer slot into @p retry_indices, which is cleared first. */
+/**
+ *  @brief List the molecules the `fallback-role` could still fill a slot for into @p retry_indices,
+ *  which is cleared first, and tally the ones it is spared into @p report.
+ *
+ *  A molecule whose every unfilled slot carries a status `admit_molecule_` re-derives is not
+ *  dispatched: it would pay a `SmilesToMol`, an `addHs` and an `MMFFMolProperties` to arrive at the
+ *  verdict its slots already hold. Those molecules ship at exactly the status they already carry.
+ */
 static void fill_retry_indices_into_(custd::span<sfapi::conformer_status_t const> status, std::uint32_t num_conformers,
-                                     std::vector<std::uint32_t> &retry_indices) {
+                                     std::vector<std::uint32_t> &retry_indices, sfcli::fallback_report_t &report) {
     retry_indices.clear();
+    report.skipped = {};
     std::uint64_t const num_molecules = status.size() / num_conformers;
     for (std::uint64_t molecule = 0; molecule < num_molecules; ++molecule) {
         auto const slots = status.subspan(molecule * num_conformers, num_conformers);
+        if (sfcli::fallback_dispatch_cause(slots) != sfapi::conformer_status_t::success_k) {
+            retry_indices.push_back(static_cast<std::uint32_t>(molecule));
+            continue;
+        }
+        // Nothing here the fallback can fill; name the refusal that ships, where there is one.
         for (sfapi::conformer_status_t const slot_status : slots)
             if (slot_status != sfapi::conformer_status_t::success_k) {
-                retry_indices.push_back(static_cast<std::uint32_t>(molecule));
+                ++report.skipped[static_cast<std::size_t>(slot_status)];
                 break;
             }
     }
@@ -546,12 +558,15 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
 
         std::size_t const total_conformers = static_cast<std::size_t>(accumulator.num_molecules()) *
                                              config.num_conformers;
-        fill_retry_indices_into_({buffer.status.data(), total_conformers}, config.num_conformers, buffer.retry_indices);
+        sfcli::fallback_report_t report;
+        fill_retry_indices_into_({buffer.status.data(), total_conformers}, config.num_conformers, buffer.retry_indices,
+                                 report);
 
         output_queue.send({.accumulator = std::move(accumulator),
                            .buffer_slot = buffer_slot,
                            .item = pipeline_item_t::batch_k,
-                           .batch_start = batch_start});
+                           .batch_start = batch_start,
+                           .fallback_report = report});
     }
 
     coprocessed_batch_result_t sentinel;
@@ -641,8 +656,7 @@ static void fallback_loop_(cli_config_t const &config, thread_budget_t const &bu
                 .coordinates = {buffer.coordinates.data(), total_conformers * layout.slot_stride()},
                 .energies = {buffer.energies.data(), total_conformers},
             };
-            result.fallback_attempted = buffer.retry_indices.size();
-            result.fallback_recovered = sfcli::rdkit_fallback(fallback_inputs, fallback_outputs);
+            sfcli::rdkit_fallback(fallback_inputs, fallback_outputs, result.fallback_report);
         }
 
         {
@@ -730,6 +744,49 @@ static void write_batch_shards_(cli_config_t const &config, coprocessed_batch_ac
     }
 }
 
+/** Share of @p whole that @p part is, as a percentage; zero when nothing was counted. */
+static double percent_of_(std::uint64_t part, std::uint64_t whole) noexcept {
+    return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole);
+}
+
+/** The name a per-status report prints, which is the enumerator without its suffix. */
+static std::string_view conformer_status_name_(sfapi::conformer_status_t status) noexcept {
+    switch (status) {
+    case sfapi::conformer_status_t::success_k: return "success";
+    case sfapi::conformer_status_t::stereo_failure_k: return "stereo_failure";
+    case sfapi::conformer_status_t::mmff_unconverged_k: return "mmff_unconverged";
+    case sfapi::conformer_status_t::invalid_smiles_k: return "invalid_smiles";
+    case sfapi::conformer_status_t::too_many_atoms_k: return "too_many_atoms";
+    case sfapi::conformer_status_t::preprocess_timeout_k: return "preprocess_timeout";
+    case sfapi::conformer_status_t::unsupported_element_k: return "unsupported_element";
+    case sfapi::conformer_status_t::too_many_bonds_k: return "too_many_bonds";
+    case sfapi::conformer_status_t::too_many_rings_k: return "too_many_rings";
+    case sfapi::conformer_status_t::bounds_infeasible_k: return "bounds_infeasible";
+    }
+    return "unknown";
+}
+
+/**
+ *  @brief One line per status that sent molecules to the `fallback-role`, or held them back from it.
+ *
+ *  Recovery read against the dispatching status is what decides whether that status should stay
+ *  `fallback_disposition_t::retry_k`: one whose molecules RDKit never fills is one the dispatch pays
+ *  a full parse for and gets nothing from. Statuses nothing counted are left unprinted.
+ */
+static void log_fallback_breakdown_(coprocessed_batch_result_t const &result, logger_t const &logger) {
+    for (std::size_t index = 0; index < sfcli::conformer_status_count_k; ++index) {
+        auto const status = static_cast<sfapi::conformer_status_t>(index);
+        std::uint64_t const attempted = result.fallback_report.attempted[index];
+        std::uint64_t const skipped = result.fallback_report.skipped[index];
+        if (attempted > 0)
+            logger.info("  fallback cause={} attempted={} recovered={} {:.3f}%", conformer_status_name_(status),
+                        fmt::group_digits(attempted), fmt::group_digits(result.fallback_report.recovered[index]),
+                        percent_of_(result.fallback_report.recovered[index], attempted));
+        if (skipped > 0)
+            logger.info("  fallback cause={} terminal={}", conformer_status_name_(status), fmt::group_digits(skipped));
+    }
+}
+
 /** One progress line per batch: its own throughput, the cumulative rate, and the projected finish. */
 static void log_batch_progress_(coprocessed_batch_result_t const &result, logger_t const &logger,
                                 progress_counters_t const &counters) {
@@ -745,10 +802,14 @@ static void log_batch_progress_(coprocessed_batch_result_t const &result, logger
     auto const finish_wall = std::chrono::system_clock::now() +
                              std::chrono::milliseconds(static_cast<std::int64_t>(remaining_seconds * 1000.0));
 
+    std::uint64_t const attempted = sfcli::total_of(result.fallback_report.attempted);
+    std::uint64_t const recovered = sfcli::total_of(result.fallback_report.recovered);
+    std::uint64_t const skipped = sfcli::total_of(result.fallback_report.skipped);
     std::string fallback_fragment;
-    if (result.fallback_attempted > 0)
-        fallback_fragment = fmt::format("  fallback {}→{} rec", fmt::group_digits(result.fallback_attempted),
-                                        fmt::group_digits(result.fallback_recovered));
+    if (attempted > 0 || skipped > 0)
+        fallback_fragment = fmt::format("  fallback attempted={} recovered={} {:.3f}% terminal={}",
+                                        fmt::group_digits(attempted), fmt::group_digits(recovered),
+                                        percent_of_(recovered, attempted), fmt::group_digits(skipped));
 
     double const batch_rate = static_cast<double>(result.accumulator.num_molecules()) / std::max(batch_seconds, 0.001);
     double const cumulative_rate = static_cast<double>(molecules_done) / std::max(wall, 0.001);
@@ -772,6 +833,7 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
         write_batch_shards_(config, result.accumulator, pool.at(result.buffer_slot), logger, counters);
         pool.release(result.buffer_slot);
         log_batch_progress_(result, logger, counters);
+        log_fallback_breakdown_(result, logger);
     }
 }
 

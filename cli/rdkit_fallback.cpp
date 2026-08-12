@@ -4,9 +4,9 @@
  *  conformer slots the GPU pipeline could not fill.
  */
 
+#include <cstddef> // `std::size_t`
 #include <cstring> // `std::memset`
 
-#include <atomic>  // `std::atomic`
 #include <memory>  // `std::unique_ptr`
 #include <sstream> // RDKit's `AtomTyper.h` uses `std::stringstream` without including it
 #include <vector>  // `std::vector`
@@ -177,12 +177,14 @@ static std::uint32_t recover_molecule_(RDKit::RWMol &molecule, std::uint64_t ran
 
 #pragma endregion One Molecule
 
-std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallback_outputs_t &outputs) {
+void rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallback_outputs_t &outputs,
+                    fallback_report_t &report) {
+    report.attempted = {};
+    report.recovered = {};
     sfapi::conformer_slot_layout_t const &layout = inputs.layout;
     std::uint64_t const num_retries = inputs.retry_indices.size();
-    if (num_retries == 0) return 0;
+    if (num_retries == 0) return;
 
-    std::atomic<std::uint64_t> num_recovered {0};
     int const num_threads = inputs.num_threads > 0 ? inputs.num_threads : omp_get_max_threads();
     warm_up_rdkit_globals_for_fallback_();
 
@@ -190,7 +192,12 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
     for (std::uint64_t retry_entry = 0; retry_entry < num_retries; ++retry_entry) {
         std::uint32_t const molecule_index = inputs.retry_indices[retry_entry];
         custd::span<sfapi::conformer_status_t> const status = slots_of_(outputs.status, layout, molecule_index);
-        if (unfilled_slots_of_(status) == 0) continue; // the GPU filled every slot after all
+        // Read before anything below overwrites it: this is the status the recovery is attributed to.
+        sfapi::conformer_status_t const cause = fallback_dispatch_cause(status);
+        if (cause == sfapi::conformer_status_t::success_k) continue; // no slot this role can fill
+        std::size_t const cause_index = static_cast<std::size_t>(cause);
+#pragma omp atomic
+        ++report.attempted[cause_index];
 
         std::unique_ptr<RDKit::RWMol> molecule;
         if (sfapi::conformer_status_t const admission = admit_molecule_(inputs.smiles[molecule_index], layout.max_atoms,
@@ -211,10 +218,9 @@ std::uint64_t rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallba
         // Only a molecule that produced a conformer gets an atom count: a non-zero count over all-zero
         // coordinates defeats the `num_atoms == 0` guard the descriptor pass downstream skips on.
         outputs.num_atoms_per_molecule[molecule_index] = static_cast<std::uint8_t>(molecule->getNumAtoms());
-        num_recovered.fetch_add(1, std::memory_order_relaxed);
+#pragma omp atomic
+        ++report.recovered[cause_index];
     }
-
-    return num_recovered.load();
 }
 
 } // namespace smallfield::cli
