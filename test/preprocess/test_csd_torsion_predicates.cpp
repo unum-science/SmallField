@@ -52,7 +52,6 @@
 
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -349,7 +348,7 @@ static molecule_admission_t admit_molecule_(std::string const &smiles, std::uniq
     if (ring_info != nullptr && ring_info->isInitialized() && ring_info->atomRings().size() > sft::max_rings_k)
         return molecule_admission_t::exceeds_ring_capacity_k;
 
-    if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k)
+    if (sft::build_descriptor(*molecule, descriptor) != sft::conformer_status_t::success_k)
         return molecule_admission_t::no_descriptor_k;
     return molecule_admission_t::admitted_k;
 }

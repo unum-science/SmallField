@@ -43,9 +43,9 @@
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 
-#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/cuda/dg_kernel.cuh"
 #include "smallfield/cuda/etk_kernel.cuh"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/cuda/fire_warp.cuh"
 #include "smallfield/cuda/mmff94_energy_kernel.cuh"
@@ -53,10 +53,10 @@
 #include "smallfield/utilities.hpp"
 
 namespace smallfield::cuda {
-using smallfield::api::conformer_status_t;
 using smallfield::preprocess::is_heavy_refinement_case;
 using smallfield::preprocess::total_mmff_terms;
 using smallfield::types::chiral_center_descriptor_t;
+using smallfield::types::conformer_status_t;
 using smallfield::types::distance_constraint_t;
 using smallfield::types::etk_atom_interaction_t;
 using smallfield::types::etk_atom_offsets_t;

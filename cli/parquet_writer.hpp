@@ -44,8 +44,8 @@
 #include <cuda_fp16.h>
 
 #include "smallfield/api/conformer_layout.hpp"
-#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/log.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::cli {
@@ -90,7 +90,7 @@ inline constexpr std::uint32_t usrcat_components_k = 60;
  */
 struct conformer_slot_columns_t {
     api::conformer_slot_layout_t layout {};
-    custd::span<api::conformer_status_t const> status;
+    custd::span<types::conformer_status_t const> status;
     custd::span<float const> energies;
     /**
      *  @brief Structure-of-arrays coordinates, filled by either the GPU or the RDKit fallback.

@@ -25,8 +25,8 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/preprocess/device_capacities.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/mmff94_bounds.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
@@ -36,7 +36,7 @@
 
 namespace smallfield::preprocess {
 
-using smallfield::api::conformer_status_t;
+using smallfield::types::conformer_status_t;
 
 /**
  *  @brief Tagged rejection record: which slice-local input was dropped, and why.

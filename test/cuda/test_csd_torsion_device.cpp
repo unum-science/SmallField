@@ -37,7 +37,6 @@
 #include "test/cuda/test_csd_torsion_device_kernels.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -109,7 +108,7 @@ static bool build_descriptor_from_smiles_(std::string const &smiles, sft::molecu
     }
     if (molecule->getNumAtoms() > sft::max_atoms_per_molecule_k || molecule->getNumBonds() > sft::max_bonds_k)
         return false;
-    return sft::build_descriptor(*molecule, descriptor) == sfapi::conformer_status_t::success_k;
+    return sft::build_descriptor(*molecule, descriptor) == sft::conformer_status_t::success_k;
 }
 
 } // namespace smallfield::tests

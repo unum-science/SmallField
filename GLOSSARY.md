@@ -112,7 +112,7 @@ Everything in between is full overlap.
 
 ## Conformer Status Codes
 
-`conformer_status_t` (`src/smallfield/api/smallfield.hpp`) is written per conformer slot into the caller's `status_out` span.
+`conformer_status_t` (`src/smallfield/types/conformer_status.hpp`, re-exported by `src/smallfield/api/smallfield.hpp`) is written per conformer slot into the caller's `status_out` span.
 The Parquet writer persists the raw byte.
 
 | Value | Name                 | Meaning                                                                                                     |

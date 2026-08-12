@@ -46,7 +46,6 @@
 #include "test/cuda/test_mmff_gradient_kernels.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -416,7 +415,7 @@ static constexpr std::string_view gradient_field_names_k[3] = {"gradient_x", "gr
 static void compare_case_(term_parity_case_t const &probe, narration_t narration, molecule_scratch_t &scratch,
                           term_reporters_t &reporters, intake_tally_t &tally) {
     ++tally.cases;
-    if (sfp::prepare_molecule_into(probe.smiles, scratch.prepared) != sfapi::conformer_status_t::success_k) {
+    if (sfp::prepare_molecule_into(probe.smiles, scratch.prepared) != sft::conformer_status_t::success_k) {
         ++tally.preprocess_rejected;
         return;
     }

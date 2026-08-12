@@ -90,12 +90,12 @@ static char const *describe_parse_outcome_(parse_outcome_t outcome) {
 }
 
 /** Carry `build_descriptor`'s refusal across, so the extent a corpus outgrew stays named in the histogram. */
-static parse_outcome_t outcome_of_descriptor_(smallfield::api::conformer_status_t status) {
+static parse_outcome_t outcome_of_descriptor_(sft::conformer_status_t status) {
     switch (status) {
-    case smallfield::api::conformer_status_t::success_k: return parse_outcome_t::parsed_k;
-    case smallfield::api::conformer_status_t::too_many_atoms_k: return parse_outcome_t::above_atom_ceiling_k;
-    case smallfield::api::conformer_status_t::too_many_bonds_k: return parse_outcome_t::too_many_bonds_k;
-    case smallfield::api::conformer_status_t::too_many_rings_k: return parse_outcome_t::too_many_rings_k;
+    case sft::conformer_status_t::success_k: return parse_outcome_t::parsed_k;
+    case sft::conformer_status_t::too_many_atoms_k: return parse_outcome_t::above_atom_ceiling_k;
+    case sft::conformer_status_t::too_many_bonds_k: return parse_outcome_t::too_many_bonds_k;
+    case sft::conformer_status_t::too_many_rings_k: return parse_outcome_t::too_many_rings_k;
     default: return parse_outcome_t::no_descriptor_k;
     }
 }

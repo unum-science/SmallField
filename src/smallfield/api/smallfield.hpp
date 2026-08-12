@@ -38,17 +38,21 @@ using cudaStream_t = void *;
 #include <vector>      // `std::vector`
 
 #include "smallfield/api/conformer_layout.hpp"
-#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/log.hpp"
 #include "smallfield/preprocess/wave_slice_pool.hpp"
 #include "smallfield/types/atom_limited_bins.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/storage.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::api {
 
-/*  `conformer_status_t` is defined in `smallfield/api/conformer_status.hpp`, transitively included
- *  above, so `wave_slice_pool.hpp` can name it without a cyclic dependency on this header. */
+/** The vocabulary every rejection speaks. Defined in `types/` because `build_descriptor` answers with
+ *  one and the warp kernels write one; re-exported here because it is also the status a caller of
+ *  `generate_conformers` reads, and the name that caller reaches for is `smallfield::api::`. */
+using types::conformer_status_count_k;
+using types::conformer_status_name;
+using types::conformer_status_t;
 
 using preprocess::wave_slice_pool_t;
 using types::device_indices_t;

@@ -44,7 +44,6 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfparam = smallfield::parameters;
 namespace sfmmff = smallfield::mmff94;
 namespace sft = smallfield::types;
@@ -137,7 +136,7 @@ static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t c
 
     sft::molecule_descriptor_t descriptor;
     // an element or a bond order we do not carry
-    if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k) return;
+    if (sft::build_descriptor(*molecule, descriptor) != sft::conformer_status_t::success_k) return;
     scratch.resize(descriptor.num_atoms);
     sfmmff::native_compute_mmff_atom_types(descriptor, scratch.atom_types);
     sfmmff::native_compute_mmff_formal_charges(descriptor, scratch.atom_types, scratch.formal_charges);
@@ -203,7 +202,7 @@ static std::size_t test_kekulized_bond_types_(std::string const &smiles, sfparam
 
     RDKit::MolOps::Kekulize(*molecule, false);
     sft::molecule_descriptor_t descriptor;
-    sf_verify_(sft::build_descriptor(*molecule, descriptor) == sfapi::conformer_status_t::success_k,
+    sf_verify_(sft::build_descriptor(*molecule, descriptor) == sft::conformer_status_t::success_k,
                ("kekule SMILES must fit the descriptor: " + smiles).c_str());
     scratch.resize(descriptor.num_atoms);
     for (std::uint32_t atom_index = 0; atom_index < descriptor.num_atoms; ++atom_index)

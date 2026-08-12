@@ -19,7 +19,7 @@
 #include <cuda_fp16.h>
 
 #include "smallfield/api/conformer_layout.hpp"
-#include "smallfield/api/conformer_status.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::cli {
@@ -45,49 +45,49 @@ enum class fallback_disposition_t : std::uint8_t {
  *  the salt policy the GPU path used, then `MMFF::MMFFMolProperties::isValid`. It builds no
  *  `molecule_descriptor_t`, so no extent of that descriptor is re-derivable.
  */
-[[nodiscard]] constexpr fallback_disposition_t fallback_disposition(api::conformer_status_t status) noexcept {
+[[nodiscard]] constexpr fallback_disposition_t fallback_disposition(types::conformer_status_t status) noexcept {
     switch (status) {
 
     /* Terminal: the fallback reaches the same answer by the same route. */
     // The slot already holds a conformer, and the fallback leaves a filled slot alone.
-    case api::conformer_status_t::success_k: return fallback_disposition_t::terminal_k;
+    case types::conformer_status_t::success_k: return fallback_disposition_t::terminal_k;
     // `parse_smiles` gates the atom count against the cap the `gpu-runner-role` passed.
-    case api::conformer_status_t::too_many_atoms_k: return fallback_disposition_t::terminal_k;
+    case types::conformer_status_t::too_many_atoms_k: return fallback_disposition_t::terminal_k;
     // `MMFFMolProperties::isValid` is the same typing check on the same molecule.
-    case api::conformer_status_t::unsupported_element_k: return fallback_disposition_t::terminal_k;
+    case types::conformer_status_t::unsupported_element_k: return fallback_disposition_t::terminal_k;
 
     /* Retry: nothing in `admit_molecule_` reproduces these. */
     // ETKDG perceives and enforces chirality by its own route, so a chiral volume the device driver
     // could not satisfy is not a verdict RDKit shares.
-    case api::conformer_status_t::stereo_failure_k: return fallback_disposition_t::retry_k;
+    case types::conformer_status_t::stereo_failure_k: return fallback_disposition_t::retry_k;
     // A different MMFF minimizer from the device FIRE driver, and the status the kernels also leave
     // on a slot they never reached.
-    case api::conformer_status_t::mmff_unconverged_k: return fallback_disposition_t::retry_k;
+    case types::conformer_status_t::mmff_unconverged_k: return fallback_disposition_t::retry_k;
     // Two producers and only one is re-derived: `parse_smiles` refusing the string, which the
     // fallback repeats, and `prepare_molecule_topology_into` catching an exception out of descriptor,
     // bounds, chirality or MMFF typing construction — none of which the fallback performs, and whose
     // molecules parse and type cleanly.
-    case api::conformer_status_t::invalid_smiles_k: return fallback_disposition_t::retry_k;
+    case types::conformer_status_t::invalid_smiles_k: return fallback_disposition_t::retry_k;
     // Nothing produces it, and the fallback carries no deadline that could re-derive it.
-    case api::conformer_status_t::preprocess_timeout_k: return fallback_disposition_t::retry_k;
+    case types::conformer_status_t::preprocess_timeout_k: return fallback_disposition_t::retry_k;
     // Both are extents of `molecule_descriptor_t`, which the fallback never builds; RDKit embeds a
     // molecule wider than the flat descriptor without difficulty.
-    case api::conformer_status_t::too_many_bonds_k: return fallback_disposition_t::retry_k;
-    case api::conformer_status_t::too_many_rings_k: return fallback_disposition_t::retry_k;
+    case types::conformer_status_t::too_many_bonds_k: return fallback_disposition_t::retry_k;
+    case types::conformer_status_t::too_many_rings_k: return fallback_disposition_t::retry_k;
     // `EmbedMultipleConfs` smooths its own bounds by a different route and may not agree the matrix
     // is infeasible. Whether it ever does is what the per-status recovery tally measures.
-    case api::conformer_status_t::bounds_infeasible_k: return fallback_disposition_t::retry_k;
+    case types::conformer_status_t::bounds_infeasible_k: return fallback_disposition_t::retry_k;
     }
     // A status byte outside the enum keeps its second chance rather than being dropped.
     return fallback_disposition_t::retry_k;
 }
 
 /** The status that sends one molecule's slots to the `fallback-role`, or `success_k` when none does. */
-[[nodiscard]] inline api::conformer_status_t fallback_dispatch_cause(
-    custd::span<api::conformer_status_t const> slots) noexcept {
-    for (api::conformer_status_t const slot_status : slots)
+[[nodiscard]] inline types::conformer_status_t fallback_dispatch_cause(
+    custd::span<types::conformer_status_t const> slots) noexcept {
+    for (types::conformer_status_t const slot_status : slots)
         if (fallback_disposition(slot_status) == fallback_disposition_t::retry_k) return slot_status;
-    return api::conformer_status_t::success_k;
+    return types::conformer_status_t::success_k;
 }
 
 #pragma endregion Dispatch Policy
@@ -95,7 +95,7 @@ enum class fallback_disposition_t : std::uint8_t {
 #pragma region Reporting
 
 /** Counter arrays here are indexed by the enumerator itself, so they take their extent from the enum. */
-using api::conformer_status_count_k;
+using types::conformer_status_count_k;
 
 /**
  *  @brief Per-status account of what one `coprocessed-batch` of refusals cost and bought.
@@ -136,7 +136,7 @@ struct rdkit_fallback_inputs_t {
 
 struct rdkit_fallback_outputs_t {
     /** Length N × K (updated in place). */
-    custd::span<api::conformer_status_t> status;
+    custd::span<types::conformer_status_t> status;
     /** Length N (written when discovered). */
     custd::span<std::uint8_t> num_atoms_per_molecule;
     /** Length N × K × max_atoms × 3. */

@@ -174,7 +174,7 @@ static std::uint8_t bounds_kind_separation_(divergence_kind_t kind) noexcept {
  *  @return Whether our own descriptor could be built, which is the only way this fails.
  */
 static divergence_reach_t fill_bounds_scratch_(RDKit::ROMol const &molecule, divergence_scratch_t &scratch) {
-    if (sft::build_descriptor(molecule, scratch.descriptor) != api::conformer_status_t::success_k)
+    if (sft::build_descriptor(molecule, scratch.descriptor) != types::conformer_status_t::success_k)
         return divergence_reach_t::descriptor_refused_k;
 
     std::uint32_t const num_atoms = molecule.getNumAtoms();

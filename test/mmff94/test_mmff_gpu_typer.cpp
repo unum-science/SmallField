@@ -35,7 +35,6 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sft = smallfield::types;
@@ -153,7 +152,7 @@ static std::uint32_t build_descriptor_batch_(std::vector<std::string> const &smi
 
         sft::molecule_descriptor_t descriptor;
         // an element or a bond order we do not carry
-        if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k) continue;
+        if (sft::build_descriptor(*molecule, descriptor) != sft::conformer_status_t::success_k) continue;
         atom_offsets.push_back(total_atoms);
         total_atoms += descriptor.num_atoms;
         descriptors.push_back(descriptor);

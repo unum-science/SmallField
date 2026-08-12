@@ -33,7 +33,6 @@
 
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
@@ -194,8 +193,8 @@ static void compare_bond_hops_(RDKit::ROMol const &molecule, descriptor_scratch_
  */
 static void check_molecule_(RDKit::ROMol const &molecule, std::string const &smiles, diagnostic_reporter_t &reporter,
                             descriptor_scratch_t &scratch) {
-    sfapi::conformer_status_t const built = sft::build_descriptor(molecule, scratch.descriptor);
-    sf_verify_(built == sfapi::conformer_status_t::success_k,
+    sft::conformer_status_t const built = sft::build_descriptor(molecule, scratch.descriptor);
+    sf_verify_(built == sft::conformer_status_t::success_k,
                ("build_descriptor refused a molecule inside both extents: " + smiles).c_str());
 
     auto const *ring_info = molecule.getRingInfo();

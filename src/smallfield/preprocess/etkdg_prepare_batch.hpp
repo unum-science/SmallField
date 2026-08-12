@@ -58,7 +58,6 @@
 #include "smallfield/types/mmff94_bounds.hpp"
 
 namespace smallfield::preprocess {
-using smallfield::api::conformer_status_t;
 using smallfield::types::atom_flag_aromatic_k;
 using smallfield::types::atom_flag_hbond_acceptor_k;
 using smallfield::types::atom_flag_hbond_donor_h_k;
@@ -72,6 +71,7 @@ using smallfield::types::bond_flag_stereo_e_k;
 using smallfield::types::bond_flag_stereo_z_k;
 using smallfield::types::build_descriptor;
 using smallfield::types::chiral_center_descriptor_t;
+using smallfield::types::conformer_status_t;
 using smallfield::types::distance_constraint_t;
 using smallfield::types::etk_atom_interaction_t;
 using smallfield::types::etk_atom_offsets_t;
@@ -503,9 +503,9 @@ static inline void build_mmff_atom_csr_(etkdg_prepared_molecule_t &result, std::
  *          `MMFFMolProperties` constructor otherwise reports the
  *          molecule as not parametrizable.
  */
-inline smallfield::api::conformer_status_t extract_mmff94_params_via_rdkit(RDKit::ROMol const &molecule,
-                                                                           molecule_descriptor_t const &descriptor,
-                                                                           etkdg_prepared_molecule_t &result) {
+inline smallfield::types::conformer_status_t extract_mmff94_params_via_rdkit(RDKit::ROMol const &molecule,
+                                                                             molecule_descriptor_t const &descriptor,
+                                                                             etkdg_prepared_molecule_t &result) {
     // `result` is caller-owned scratch reused across molecules, so every array this function writes is
     // emptied here rather than at whichever call site happened to remember. That covers the two it
     // resizes as well, because the element-gate and validity refusals below return ahead of the resize.
@@ -536,13 +536,13 @@ inline smallfield::api::conformer_status_t extract_mmff94_params_via_rdkit(RDKit
     std::uint8_t atom_type[max_atoms_per_molecule_k];
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
         atom_type[atom] = static_cast<std::uint8_t>(mmff_props.getMMFFAtomType(atom));
-        if (atom_type[atom] == 0) return smallfield::api::conformer_status_t::unsupported_element_k;
+        if (atom_type[atom] == 0) return smallfield::types::conformer_status_t::unsupported_element_k;
     }
 
     // Defence in depth: catch the rare case of all-typed atoms but unparametrized interactions,
     // such as missing torsion params. Same routing as the per-atom case — the molecule can't be
     // MMFF-optimised on-device and must fall back to CPU ETKDGv3.
-    if (!mmff_props.isValid()) return smallfield::api::conformer_status_t::unsupported_element_k;
+    if (!mmff_props.isValid()) return smallfield::types::conformer_status_t::unsupported_element_k;
 
     // Per-atom data: VdW params + partial charge. The kernel's nonbonded loop enumerates
     // pairs on the fly from the bond_distance matrix and applies Halgren's R* combining
@@ -577,7 +577,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params_via_rdkit(RDKit
         // 1-2 / 1-3 / 1-4 nonbonded exclusions. Reject the molecule instead and let the fallback
         // role handle it.
         if (!mmff_props.getMMFFBondStretchParams(mutable_molecule, atom_i, atom_j, bond_type, bond_params))
-            return smallfield::api::conformer_status_t::unsupported_element_k;
+            return smallfield::types::conformer_status_t::unsupported_element_k;
         result.mmff_bonds.push_back({.atom_i = static_cast<std::uint8_t>(atom_i),
                                      .atom_j = static_cast<std::uint8_t>(atom_j),
                                      .padding = {0, 0},
@@ -702,7 +702,7 @@ inline smallfield::api::conformer_status_t extract_mmff94_params_via_rdkit(RDKit
     }
 
     build_mmff_atom_csr_(result, num_atoms);
-    return smallfield::api::conformer_status_t::success_k;
+    return smallfield::types::conformer_status_t::success_k;
 }
 
 #pragma endregion MMFF94 Extraction
@@ -719,8 +719,8 @@ inline smallfield::api::conformer_status_t extract_mmff94_params_via_rdkit(RDKit
  *  rejection reason; on success returns `conformer_status_t::success_k`. Callers that don't need the
  *  per-molecule reason code can still test `result.num_atoms == 0` as the in-band drop signal.
  */
-inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_view smiles,
-                                                                 etkdg_prepared_molecule_t &result) {
+inline smallfield::types::conformer_status_t prepare_molecule_into(std::string_view smiles,
+                                                                   etkdg_prepared_molecule_t &result) {
     result.num_atoms = 0;
     result.bounds_matrix.clear();
     result.chiral_centers.clear();
@@ -825,26 +825,26 @@ inline smallfield::api::conformer_status_t prepare_molecule_into(std::string_vie
  *  @return `conformer_status_t::success_k`, or `unsupported_element_k` when RDKit cannot type the
  *          molecule either — an atomic number outside the MMFF94 parameter set.
  */
-inline smallfield::api::conformer_status_t extract_mmff94_typing_via_rdkit_(RDKit::ROMol const &molecule,
-                                                                            std::uint32_t num_atoms,
-                                                                            std::vector<std::uint8_t> &atom_types,
-                                                                            std::vector<float> &atom_charges) {
+inline smallfield::types::conformer_status_t extract_mmff94_typing_via_rdkit_(RDKit::ROMol const &molecule,
+                                                                              std::uint32_t num_atoms,
+                                                                              std::vector<std::uint8_t> &atom_types,
+                                                                              std::vector<float> &atom_charges) {
     auto &mutable_molecule = const_cast<RDKit::ROMol &>(molecule);
     // `SmilesToMol` already sanitized, so tell `MMFFMolProperties` to skip its own Kekulize pass.
     if (!mutable_molecule.hasProp(RDKit::common_properties::_MMFFSanitized))
         mutable_molecule.setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
     RDKit::MMFF::MMFFMolProperties properties(mutable_molecule);
-    if (!properties.isValid()) return smallfield::api::conformer_status_t::unsupported_element_k;
+    if (!properties.isValid()) return smallfield::types::conformer_status_t::unsupported_element_k;
 
     atom_types.resize(num_atoms);
     atom_charges.resize(num_atoms);
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
         std::uint32_t const type = properties.getMMFFAtomType(atom);
-        if (type == 0) return smallfield::api::conformer_status_t::unsupported_element_k;
+        if (type == 0) return smallfield::types::conformer_status_t::unsupported_element_k;
         atom_types[atom] = static_cast<std::uint8_t>(type);
         atom_charges[atom] = static_cast<float>(properties.getMMFFPartialCharge(atom));
     }
-    return smallfield::api::conformer_status_t::success_k;
+    return smallfield::types::conformer_status_t::success_k;
 }
 
 /**
@@ -865,10 +865,10 @@ inline smallfield::api::conformer_status_t extract_mmff94_typing_via_rdkit_(RDKi
  *             means the caller imposes no limit of its own and only the pipeline cap applies.
  *  @param[out] result Caller-owned buffer, cleared on entry and refilled.
  */
-inline smallfield::api::conformer_status_t prepare_molecule_topology_into(std::string_view smiles,
-                                                                          smallfield::salt_policy_t salt_policy,
-                                                                          std::uint32_t output_atom_capacity,
-                                                                          etkdg_prepared_molecule_t &result) {
+inline smallfield::types::conformer_status_t prepare_molecule_topology_into(std::string_view smiles,
+                                                                            smallfield::salt_policy_t salt_policy,
+                                                                            std::uint32_t output_atom_capacity,
+                                                                            etkdg_prepared_molecule_t &result) {
     using smallfield::mmff94::native_compute_mmff_atom_types;
 
     result.num_atoms = 0;

@@ -20,14 +20,14 @@
 
 #include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
 
-#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
+#include "smallfield/types/conformer_status.hpp"
 
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
-namespace sfprep = smallfield::preprocess;
+namespace sfp = smallfield::preprocess;
+namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
 static constexpr std::string_view test_name_k = "test_element_gate";
@@ -43,7 +43,7 @@ namespace smallfield::tests {
 struct element_gate_case_t {
     std::string_view label;
     std::string_view smiles;
-    sfapi::conformer_status_t expected;
+    sft::conformer_status_t expected;
 };
 
 /**
@@ -52,33 +52,33 @@ struct element_gate_case_t {
  *  `parse_smiles` applies it after `addHs`, so the alkanes below straddle the cap by chain length:
  *  C63H128 is 191 atoms and fits, C64H130 is 194 and does not.
  */
-static constexpr std::size_t atom_cap_k = sfprep::max_atoms_per_molecule_k;
+static constexpr std::size_t atom_cap_k = sfp::max_atoms_per_molecule_k;
 
 /** The whole curated corpus: one entry per path the gate can take. */
 static element_gate_case_t const element_gate_cases_k[] = {
     // Happy path — drug-like organic, all MMFF94-supported elements.
-    {"ethanol", "CCO", sfapi::conformer_status_t::success_k},
-    {"benzene", "c1ccccc1", sfapi::conformer_status_t::success_k},
-    {"aspirin", "CC(=O)Oc1ccccc1C(=O)O", sfapi::conformer_status_t::success_k},
+    {"ethanol", "CCO", sft::conformer_status_t::success_k},
+    {"benzene", "c1ccccc1", sft::conformer_status_t::success_k},
+    {"aspirin", "CC(=O)Oc1ccccc1C(=O)O", sft::conformer_status_t::success_k},
 
     // Bug-report repro — yttrium (Z=39) is not in the MMFF94 atom-type table.
-    {"yttrium-bracketed", "CC[Y]CC", sfapi::conformer_status_t::unsupported_element_k},
+    {"yttrium-bracketed", "CC[Y]CC", sft::conformer_status_t::unsupported_element_k},
 
     // Other transition metals and lanthanides — no MMFF94 type.
-    {"lone-iron", "[Fe]", sfapi::conformer_status_t::unsupported_element_k},
-    {"lanthanum", "[La]", sfapi::conformer_status_t::unsupported_element_k},
+    {"lone-iron", "[Fe]", sft::conformer_status_t::unsupported_element_k},
+    {"lanthanum", "[La]", sft::conformer_status_t::unsupported_element_k},
 
     // SMILES parse failure — clearly malformed input.
-    {"garbage", "not-a-smiles-string-((", sfapi::conformer_status_t::invalid_smiles_k},
+    {"garbage", "not-a-smiles-string-((", sft::conformer_status_t::invalid_smiles_k},
 };
 
 /** The four statuses `prepare_molecule_into` can answer with; anything else means a path went unhandled. */
-static bool gate_can_answer_(sfapi::conformer_status_t status) noexcept {
+static bool gate_can_answer_(sft::conformer_status_t status) noexcept {
     switch (status) {
-    case sfapi::conformer_status_t::success_k:
-    case sfapi::conformer_status_t::invalid_smiles_k:
-    case sfapi::conformer_status_t::too_many_atoms_k:
-    case sfapi::conformer_status_t::unsupported_element_k: return true;
+    case sft::conformer_status_t::success_k:
+    case sft::conformer_status_t::invalid_smiles_k:
+    case sft::conformer_status_t::too_many_atoms_k:
+    case sft::conformer_status_t::unsupported_element_k: return true;
     default: return false;
     }
 }
@@ -94,14 +94,14 @@ static bool gate_can_answer_(sfapi::conformer_status_t status) noexcept {
  *  @param[in] scratch Reusable preparation buffer, cleared by `prepare_molecule_into` on entry.
  *  @param[inout] reporter Sink that counts and prints both comparisons.
  */
-static void check_curated_case_(element_gate_case_t const &probe, sfprep::etkdg_prepared_molecule_t &scratch,
+static void check_curated_case_(element_gate_case_t const &probe, sfp::etkdg_prepared_molecule_t &scratch,
                                 diagnostic_reporter_t &reporter) {
     std::string const smiles {probe.smiles};
-    auto const status = sfprep::prepare_molecule_into(smiles, scratch);
+    auto const status = sfp::prepare_molecule_into(smiles, scratch);
 
     // A rejected molecule must leave nothing behind, so the caller cannot mistake a refusal for an
     // empty-but-accepted preparation and hand it to the device.
-    bool const expected_atoms_present = probe.expected == sfapi::conformer_status_t::success_k;
+    bool const expected_atoms_present = probe.expected == sft::conformer_status_t::success_k;
     reporter.mismatch("element_gate", "molecule={} smiles={}", probe.label, probe.smiles)
         .field("status_code", static_cast<unsigned>(probe.expected), static_cast<unsigned>(status), exactly_equal)
         .field("atoms_present", expected_atoms_present, scratch.num_atoms != 0, exactly_equal);
@@ -115,11 +115,11 @@ static void check_curated_case_(element_gate_case_t const &probe, sfprep::etkdg_
  *  @param[inout] reporter Sink that counts and prints both comparisons.
  *  @return The status the gate answered with, for the census.
  */
-static sfapi::conformer_status_t check_corpus_molecule_(std::string const &smiles,
-                                                        sfprep::etkdg_prepared_molecule_t &scratch,
-                                                        diagnostic_reporter_t &reporter) {
-    auto const status = sfprep::prepare_molecule_into(smiles, scratch);
-    bool const expected_atoms_present = status == sfapi::conformer_status_t::success_k;
+static sft::conformer_status_t check_corpus_molecule_(std::string const &smiles,
+                                                      sfp::etkdg_prepared_molecule_t &scratch,
+                                                      diagnostic_reporter_t &reporter) {
+    auto const status = sfp::prepare_molecule_into(smiles, scratch);
+    bool const expected_atoms_present = status == sft::conformer_status_t::success_k;
     reporter.mismatch("element_gate", "molecule=corpus smiles={}", smiles)
         .field("status_answerable", true, gate_can_answer_(status), exactly_equal)
         .field("atoms_present", expected_atoms_present, scratch.num_atoms != 0, exactly_equal);
@@ -133,11 +133,11 @@ struct status_census_t {
     std::size_t too_many_atoms = 0;
     std::size_t invalid_smiles = 0;
 
-    void count(sfapi::conformer_status_t status) noexcept {
+    void count(sft::conformer_status_t status) noexcept {
         switch (status) {
-        case sfapi::conformer_status_t::success_k: ++accepted; break;
-        case sfapi::conformer_status_t::unsupported_element_k: ++unsupported_element; break;
-        case sfapi::conformer_status_t::too_many_atoms_k: ++too_many_atoms; break;
+        case sft::conformer_status_t::success_k: ++accepted; break;
+        case sft::conformer_status_t::unsupported_element_k: ++unsupported_element; break;
+        case sft::conformer_status_t::too_many_atoms_k: ++too_many_atoms; break;
         default: ++invalid_smiles; break;
         }
     }
@@ -159,7 +159,7 @@ int main(int argc, char **argv) {
 
     sftest::diagnostic_reporter_t reporter {"expected", "observed"};
     reporter.limit_printed_lines(max_printed_lines_k);
-    sfprep::etkdg_prepared_molecule_t scratch {};
+    sfp::etkdg_prepared_molecule_t scratch {};
 
     for (auto const &probe : sftest::element_gate_cases_k) sftest::check_curated_case_(probe, scratch, reporter);
 
@@ -169,8 +169,8 @@ int main(int argc, char **argv) {
     std::string const alkane_at_cap(carbons_that_fit, 'C');
     std::string const alkane_over_cap(carbons_that_fit + 1, 'C');
     sftest::element_gate_case_t const cap_cases[] = {
-        {"alkane-at-cap", alkane_at_cap, sfapi::conformer_status_t::success_k},
-        {"alkane-over-cap", alkane_over_cap, sfapi::conformer_status_t::too_many_atoms_k},
+        {"alkane-at-cap", alkane_at_cap, sft::conformer_status_t::success_k},
+        {"alkane-over-cap", alkane_over_cap, sft::conformer_status_t::too_many_atoms_k},
     };
     for (auto const &probe : cap_cases) sftest::check_curated_case_(probe, scratch, reporter);
     reporter.summarize("curated");

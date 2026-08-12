@@ -1,9 +1,10 @@
 /**
- *  @file src/smallfield/api/conformer_status.hpp
- *  @brief Public per-conformer status enum.
+ *  @file src/smallfield/types/conformer_status.hpp
+ *  @brief Per-conformer status enum, and the vocabulary every rejection in the pipeline speaks.
  *
- *  Lives in its own header so `wave_slice_pool.hpp`, which the public `smallfield.hpp` includes, can
- *  reference it without creating a cyclic include with `smallfield.hpp`.
+ *  A leaf header with no project dependency, because the refusals start at the leaves: `build_descriptor`
+ *  answers with one before a molecule is anything more than a flat descriptor, and the warp kernels write
+ *  one per slot. `api/smallfield.hpp` re-exports it as the spelling a caller of `generate_conformers` reads.
  */
 
 #pragma once
@@ -13,7 +14,7 @@
 
 #include <string_view> // `std::string_view`
 
-namespace smallfield::api {
+namespace smallfield::types {
 
 /**
  *  @brief Per-conformer status code, and the vocabulary every rejection in the pipeline speaks.
@@ -93,4 +94,4 @@ static_assert(conformer_status_name(static_cast<conformer_status_t>(conformer_st
                   conformer_status_name(static_cast<conformer_status_t>(conformer_status_count_k)) == unnamed_status_k,
               "every enumerator carries a name, and nothing past the last one does");
 
-} // namespace smallfield::api
+} // namespace smallfield::types

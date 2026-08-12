@@ -29,7 +29,7 @@
 #include <GraphMol/MolStandardize/Fragment.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
-#include "smallfield/api/conformer_status.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
 namespace smallfield {
@@ -66,7 +66,7 @@ struct parse_options_t {
 struct parse_result_t {
     /** Null unless `status` is `success_k`. */
     std::unique_ptr<RDKit::RWMol> molecule;
-    api::conformer_status_t status = api::conformer_status_t::invalid_smiles_k;
+    types::conformer_status_t status = types::conformer_status_t::invalid_smiles_k;
     std::uint32_t num_atoms = 0;
     /** Zero unless `parse_options_t::metadata_policy` asked for them. */
     std::uint32_t num_heavy_atoms = 0;
@@ -153,7 +153,7 @@ inline parse_result_t parse_smiles(std::string_view smiles, parse_options_t cons
     result.num_atoms = static_cast<std::uint32_t>(result.molecule->getNumAtoms());
     if (options.max_atoms != 0 && result.num_atoms > options.max_atoms) {
         result.molecule.reset();
-        result.status = api::conformer_status_t::too_many_atoms_k;
+        result.status = types::conformer_status_t::too_many_atoms_k;
         return result;
     }
 
@@ -168,7 +168,7 @@ inline parse_result_t parse_smiles(std::string_view smiles, parse_options_t cons
         }
     }
 
-    result.status = api::conformer_status_t::success_k;
+    result.status = types::conformer_status_t::success_k;
     return result;
 }
 

@@ -29,7 +29,6 @@
 #include "test/cuda/test_bond_distance_kernels.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -71,7 +70,7 @@ static std::uint32_t host_bond_hops_(std::string const &smiles, std::vector<std:
     RDKit::MolOps::addHs(*molecule);
 
     sft::molecule_descriptor_t descriptor;
-    if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k) return 0;
+    if (sft::build_descriptor(*molecule, descriptor) != sft::conformer_status_t::success_k) return 0;
     std::uint32_t const num_atoms = descriptor.num_atoms;
     reference.assign(static_cast<std::size_t>(num_atoms) * num_atoms, std::uint8_t {255});
     sft::fill_bond_distances(descriptor, sft::hop_matrix_t {reference.data(), num_atoms, num_atoms});

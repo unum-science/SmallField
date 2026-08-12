@@ -38,7 +38,6 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sfp = smallfield::preprocess;
@@ -192,7 +191,7 @@ static void fill_descriptors_into_(std::vector<std::string> const &smiles_list, 
         // capacity: this gates the extractor on drug-like input rather than on the atom limit.
         if (molecule->getNumAtoms() > 128) continue;
         auto &descriptor = batch.descriptors.emplace_back();
-        if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k) {
+        if (sft::build_descriptor(*molecule, descriptor) != sft::conformer_status_t::success_k) {
             batch.descriptors.pop_back(); // above the descriptor's atom or bond capacity
             continue;
         }

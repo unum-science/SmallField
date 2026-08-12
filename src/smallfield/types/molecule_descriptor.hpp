@@ -28,7 +28,7 @@
 #include <GraphMol/RingInfo.h>
 #include <GraphMol/MolOps.h>
 
-#include "smallfield/api/conformer_status.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::types {
@@ -186,18 +186,18 @@ struct alignas(8) molecule_descriptor_t {
  *  @param[in] molecule Sanitized, hydrogen-explicit molecule.
  *  @return `success_k`, or the extent the molecule exceeds.
  */
-inline api::conformer_status_t descriptor_capacity_status_(RDKit::ROMol const &molecule) {
-    if (molecule.getNumAtoms() > max_atoms_per_molecule_k) return api::conformer_status_t::too_many_atoms_k;
-    if (molecule.getNumBonds() > max_bonds_k) return api::conformer_status_t::too_many_bonds_k;
+inline conformer_status_t descriptor_capacity_status_(RDKit::ROMol const &molecule) {
+    if (molecule.getNumAtoms() > max_atoms_per_molecule_k) return conformer_status_t::too_many_atoms_k;
+    if (molecule.getNumBonds() > max_bonds_k) return conformer_status_t::too_many_bonds_k;
 
     RDKit::RingInfo const *const ring_info = molecule.getRingInfo();
-    if (ring_info == nullptr || !ring_info->isInitialized()) return api::conformer_status_t::success_k;
+    if (ring_info == nullptr || !ring_info->isInitialized()) return conformer_status_t::success_k;
     auto const &atom_rings = ring_info->atomRings();
-    if (atom_rings.size() > max_rings_k) return api::conformer_status_t::too_many_rings_k;
+    if (atom_rings.size() > max_rings_k) return conformer_status_t::too_many_rings_k;
     std::size_t ring_atom_entries = 0;
     for (auto const &ring : atom_rings) ring_atom_entries += ring.size();
-    if (ring_atom_entries > max_ring_atom_entries_k) return api::conformer_status_t::too_many_rings_k;
-    return api::conformer_status_t::success_k;
+    if (ring_atom_entries > max_ring_atom_entries_k) return conformer_status_t::too_many_rings_k;
+    return conformer_status_t::success_k;
 }
 
 /**
@@ -400,9 +400,9 @@ inline void fill_rings_(RDKit::ROMol const &molecule, molecule_descriptor_t &des
  *          extent the molecule exceeds. The reason is the same vocabulary the pipeline reports
  *          per conformer, so a caller forwards it rather than translating it.
  */
-inline api::conformer_status_t build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t &descriptor) {
-    api::conformer_status_t const capacity = descriptor_capacity_status_(molecule);
-    if (capacity != api::conformer_status_t::success_k) return capacity;
+inline conformer_status_t build_descriptor(RDKit::ROMol const &molecule, molecule_descriptor_t &descriptor) {
+    conformer_status_t const capacity = descriptor_capacity_status_(molecule);
+    if (capacity != conformer_status_t::success_k) return capacity;
 
     descriptor.num_atoms = static_cast<std::uint8_t>(molecule.getNumAtoms());
     descriptor.num_bonds = static_cast<std::uint16_t>(molecule.getNumBonds());
@@ -410,7 +410,7 @@ inline api::conformer_status_t build_descriptor(RDKit::ROMol const &molecule, mo
     fill_bonds_(molecule, descriptor);
     fill_adjacency_(descriptor);
     fill_rings_(molecule, descriptor);
-    return api::conformer_status_t::success_k;
+    return conformer_status_t::success_k;
 }
 
 #pragma endregion Construction

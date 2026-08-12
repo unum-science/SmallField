@@ -49,7 +49,6 @@
 #include "test/cuda/test_dg_energy_kernels.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -452,7 +451,7 @@ static molecule_setup_t setup_molecule_(std::string const &smiles, std::unique_p
     molecule = sftest::mol_from_smiles(smiles);
     if (molecule == nullptr) return molecule_setup_t::unparsed_k;
     if (!sftest::embed_molecule(*molecule)) return molecule_setup_t::unembeddable_k;
-    if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k)
+    if (sft::build_descriptor(*molecule, descriptor) != sft::conformer_status_t::success_k)
         return molecule_setup_t::undescribable_k;
     return molecule_setup_t::ready_k;
 }

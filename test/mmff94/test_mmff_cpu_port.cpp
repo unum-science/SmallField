@@ -43,7 +43,6 @@
 
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sfparam = smallfield::parameters;
 namespace sfmmff = smallfield::mmff94;
@@ -646,7 +645,7 @@ static molecule_intake_t prepare_one_(std::string_view smiles, molecule_under_te
 
     std::uint32_t const num_atoms = subject.molecule->getNumAtoms();
     if (num_atoms > max_atoms_compared_k) return molecule_intake_t::above_atom_ceiling_k;
-    if (sft::build_descriptor(*subject.molecule, subject.descriptor) != sfapi::conformer_status_t::success_k)
+    if (sft::build_descriptor(*subject.molecule, subject.descriptor) != sft::conformer_status_t::success_k)
         return molecule_intake_t::undescribable_k;
 
     // Both the oracle and the hybrid path read their atom types and charges here, so a molecule MMFF94

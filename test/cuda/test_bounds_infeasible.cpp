@@ -26,8 +26,8 @@
 
 #include <fmt/format.h> // `fmt::println`
 
-#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/cuda/triangle_smooth.cuh"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
 #include "test/cuda/test_bounds_infeasible_kernels.hpp"
@@ -37,7 +37,7 @@ namespace sftest = smallfield::tests;
 
 using sftest::exactly_equal;
 using sftest::gpu_pipeline_status_of_bounds;
-using smallfield::api::conformer_status_t;
+using smallfield::types::conformer_status_t;
 using smallfield::types::packed_matrix;
 
 static constexpr std::string_view test_name_k = "test_bounds_infeasible";

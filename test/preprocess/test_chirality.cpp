@@ -35,7 +35,6 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
-namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -126,7 +125,7 @@ static molecule_outcome_t check_molecule_(std::string const &smiles, chirality_s
     if (!sftest::embed_molecule(*molecule)) return molecule_outcome_t::unembedded_k;
     // `build_descriptor` refuses a molecule past its fixed atom and bond extents, and leaves its output
     // stale rather than empty when it does, so the refusal is read before the extraction trusts it.
-    if (sft::build_descriptor(*molecule, scratch.descriptor) != sfapi::conformer_status_t::success_k)
+    if (sft::build_descriptor(*molecule, scratch.descriptor) != sft::conformer_status_t::success_k)
         return molecule_outcome_t::oversized_k;
 
     sfp::extract_chiral_centers(*molecule, scratch.descriptor, scratch.targets);

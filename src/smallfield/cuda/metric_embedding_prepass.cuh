@@ -22,16 +22,16 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/cuda/triangle_smooth.cuh"
 #include "smallfield/cuda/warp_primitives.cuh"
 #include "smallfield/cuda_error.hpp"
 #include "smallfield/types/atom_limited_bins.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::cuda {
-using smallfield::api::conformer_status_t;
+using smallfield::types::conformer_status_t;
 using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::lower_distance_bound_at;
 using smallfield::types::packed_matrix;

@@ -12,8 +12,8 @@
 
 #include <cuda_runtime.h>
 
-#include "smallfield/api/conformer_status.hpp"
 #include "smallfield/cuda/metric_embedding_prepass.cuh"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/storage.hpp"
 
 #include "test/cuda/test_embedding_determinism_kernels.hpp"
@@ -35,7 +35,7 @@ struct embedding_arena_t {
     device_array<std::uint32_t> indices;
     device_array<float> coordinates;
     /** One verdict per copy, which the kernel writes only where a matrix turns out impossible. */
-    device_array<smallfield::api::conformer_status_t> verdicts;
+    device_array<smallfield::types::conformer_status_t> verdicts;
 
     /** Reserve one slot per replicated copy; false when the device refused any of the five arrays. */
     [[nodiscard]] bool resize_for(std::uint32_t num_molecules, std::size_t entries_per_molecule,

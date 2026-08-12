@@ -25,7 +25,7 @@ namespace sft = smallfield::types;
 
 namespace smallfield::tests {
 
-using smallfield::api::conformer_status_t;
+using smallfield::types::conformer_status_t;
 using smallfield::types::etkdg_molecule_metadata_t;
 
 /** Stream-ordered device storage, matching how the pipeline itself allocates. */

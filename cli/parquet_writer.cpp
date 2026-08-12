@@ -31,7 +31,7 @@
 #include <parquet/arrow/writer.h>
 
 #include "smallfield/api/conformer_layout.hpp"
-#include "smallfield/api/conformer_status.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
 #include "cli/parquet_writer.hpp"
@@ -183,8 +183,8 @@ struct output_row_t {
  *  API rank one molecule's conformers identically.
  */
 static float slot_ordering_energy_(conformer_slot_columns_t const &conformers, std::size_t flat) {
-    return conformers.status[flat] == api::conformer_status_t::success_k ? conformers.energies[flat]
-                                                                         : std::numeric_limits<float>::infinity();
+    return conformers.status[flat] == types::conformer_status_t::success_k ? conformers.energies[flat]
+                                                                           : std::numeric_limits<float>::infinity();
 }
 
 /**
@@ -234,7 +234,7 @@ static void fill_output_rows_into(writer_inputs_t const &inputs, std::vector<out
         for (std::uint32_t rank = 0; rank < num_rows; ++rank) {
             std::uint32_t const conformer_slot = order[rank];
             bool const survived = conformers.status[conformers.layout.flat_slot(molecule_index, conformer_slot)] ==
-                                  api::conformer_status_t::success_k;
+                                  types::conformer_status_t::success_k;
             rows.push_back(
                 {.molecule_index = molecule_index,
                  .conformer_slot = conformer_slot,

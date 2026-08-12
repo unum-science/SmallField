@@ -17,22 +17,22 @@
 
 #include <fmt/format.h>
 
-#include "smallfield/api/conformer_status.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::bench {
 
-using api::conformer_status_name;
-using api::unnamed_status_k;
+using types::conformer_status_name;
+using types::unnamed_status_k;
 
 /** Conformers per status code, indexed by the enumerator's own value; the trailing bucket collects the
  *  codes no enumerator claims. */
-using status_histogram_t = std::array<std::uint64_t, api::conformer_status_count_k + 1>;
+using status_histogram_t = std::array<std::uint64_t, types::conformer_status_count_k + 1>;
 
 /** Tally @p status by code in one pass; a code no enumerator claims lands in the last bucket. */
-inline status_histogram_t status_histogram_of(custd::span<api::conformer_status_t const> status) {
+inline status_histogram_t status_histogram_of(custd::span<types::conformer_status_t const> status) {
     status_histogram_t histogram {};
-    for (api::conformer_status_t const status_code : status) {
+    for (types::conformer_status_t const status_code : status) {
         std::size_t const code = static_cast<std::size_t>(status_code);
         ++histogram[code < histogram.size() ? code : histogram.size() - 1];
     }
@@ -41,7 +41,7 @@ inline status_histogram_t status_histogram_of(custd::span<api::conformer_status_
 
 /** Conformers that survived. */
 inline std::uint64_t successful_conformers_of(status_histogram_t const &histogram) {
-    return histogram[static_cast<std::size_t>(api::conformer_status_t::success_k)];
+    return histogram[static_cast<std::size_t>(types::conformer_status_t::success_k)];
 }
 
 /** Print every non-empty failure class in @p histogram as a count and a share of @p total_conformers. */
@@ -49,7 +49,8 @@ inline void print_status_histogram(status_histogram_t const &histogram, std::siz
     if (total_conformers == 0) return;
     for (std::size_t code = 1; code < histogram.size(); ++code)
         if (histogram[code] > 0)
-            fmt::println("  {:<20} {:>12}  {:.3f} %", conformer_status_name(static_cast<api::conformer_status_t>(code)),
+            fmt::println("  {:<20} {:>12}  {:.3f} %",
+                         conformer_status_name(static_cast<types::conformer_status_t>(code)),
                          fmt::group_digits(histogram[code]),
                          100.0 * static_cast<double>(histogram[code]) / static_cast<double>(total_conformers));
 }

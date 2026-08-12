@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "smallfield/api/conformer_status.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::tests {
@@ -22,6 +22,6 @@ namespace smallfield::tests {
  *  @param[inout] bounds Square bounds matrix over the molecule's atoms, smoothed in place by the prepass.
  *  @return The conformer slot's status, in the same numbering the device wrote.
  */
-smallfield::api::conformer_status_t gpu_pipeline_status_of_bounds(smallfield::types::packed_matrix<float> bounds);
+smallfield::types::conformer_status_t gpu_pipeline_status_of_bounds(smallfield::types::packed_matrix<float> bounds);
 
 } // namespace smallfield::tests
