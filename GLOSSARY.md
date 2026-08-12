@@ -18,7 +18,7 @@ A `parquet-shard` carries roughly a million molecules; a `coprocessed-batch` agg
 | __`molecule`__          | One input SMILES → K output conformers.                                                                                                                                                                                      | —                                 |
 
 Within one `embedding-wave` the per-device stripe sorts molecules by `molecule_complexity_score_` (a pure function of `etkdg_molecule_metadata_t`; see `src/smallfield/preprocess/molecule_complexity.hpp`) descending and assigns sorted rank `k` to device `k % device_count`.
-The score combines atom-count² (bounds-matrix + nonbonded-pair scan), MMFF+ETK torsion count (FIRE iteration cost), and the `is_heavy_refinement_case_` multiplier, so the stripe balances estimated GPU wall time rather than atom count alone.
+The score combines atom-count² (bounds-matrix + nonbonded-pair scan), MMFF+ETK torsion count (FIRE iteration cost), and the `is_heavy_refinement_case` multiplier — the same predicate `src/smallfield/cuda/etkdg_pipeline.cuh` dispatches its heavy-rescue branch on — so the stripe balances estimated GPU wall time rather than atom count alone.
 
 Old names that have been retired: `gpus-batch` → `coprocessed-batch`, `chunk` → `embedding-wave`, `wave bin` → `atom-limited-bin`.
 The CLI flag `--gpus-batch-size` stays as an alias for `--batch-size`.

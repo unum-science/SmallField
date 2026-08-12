@@ -153,9 +153,9 @@ trio_launch_t launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t 
 
     trio_events_t events;
     auto launch_type_and_charge_ = [&] {
-        sfmmff::launch_mmff94_type_and_charge(batch.descriptors.data(), batch.atom_offsets.data(), num_molecules,
-                                              tables_device.view, batch.atom_types.data(), batch.partial_charges.data(),
-                                              batch.status_codes.data());
+        sfmmff::mmff94_type_and_charge_kernel<<<num_molecules, sfmmff::warp_size_k, 0, nullptr>>>(
+            batch.descriptors.data(), batch.atom_offsets.data(), num_molecules, tables_device.view,
+            batch.atom_types.data(), batch.partial_charges.data(), batch.status_codes.data());
     };
 
     // Warm the driver, so the one-shot setup of a first launch is not charged to the steady-state cost.
@@ -165,17 +165,17 @@ trio_launch_t launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t 
     cudaEventRecord(events.start);
     launch_type_and_charge_();
     cudaEventRecord(events.after_type_and_charge);
-    sfmmff::launch_mmff94_extract_terms(
+    sfmmff::mmff94_extract_terms_kernel<<<num_molecules, sfmmff::warp_size_k, 0, nullptr>>>(
         batch.descriptors.data(), batch.atom_types.data(), batch.partial_charges.data(), batch.atom_offsets.data(),
         num_molecules, tables_device.view, batch.vdw_params.data(), batch.output_charges.data(),
         batch.bond_terms.data(), batch.angle_terms.data(), batch.torsion_terms.data(), batch.out_of_plane_terms.data(),
         batch.stretch_bend_terms.data(), batch.counts_per_molecule.data(), batch.status_codes.data());
     cudaEventRecord(events.after_extract_terms);
-    sfmmff::launch_mmff94_build_csr(batch.descriptors.data(), batch.atom_offsets.data(), num_molecules,
-                                    batch.counts_per_molecule.data(), batch.bond_terms.data(), batch.angle_terms.data(),
-                                    batch.torsion_terms.data(), batch.out_of_plane_terms.data(),
-                                    batch.stretch_bend_terms.data(), batch.interactions.data(),
-                                    batch.atom_offsets_lookup.data(), batch.status_codes.data());
+    sfmmff::mmff94_build_csr_kernel<<<num_molecules, sfmmff::warp_size_k, 0, nullptr>>>(
+        batch.descriptors.data(), batch.atom_offsets.data(), num_molecules, batch.counts_per_molecule.data(),
+        batch.bond_terms.data(), batch.angle_terms.data(), batch.torsion_terms.data(), batch.out_of_plane_terms.data(),
+        batch.stretch_bend_terms.data(), batch.interactions.data(), batch.atom_offsets_lookup.data(),
+        batch.status_codes.data());
     cudaEventRecord(events.after_build_csr);
     cudaEventSynchronize(events.after_build_csr);
 

@@ -27,11 +27,8 @@
 namespace smallfield::mmff94 {
 using smallfield::cuda::warp_size_k;
 using smallfield::parameters::lookup_angle;
-using smallfield::parameters::lookup_bndk;
 using smallfield::parameters::lookup_bond;
-using smallfield::parameters::lookup_covrad;
 using smallfield::parameters::lookup_dfsb;
-using smallfield::parameters::lookup_hl;
 using smallfield::parameters::lookup_oop;
 using smallfield::parameters::lookup_prop;
 using smallfield::parameters::lookup_stbn;
@@ -714,62 +711,6 @@ static __launch_bounds__(warp_size_k, 8) __global__ void mmff94_compact_terms_ke
     entry.mmff_atom_csr_offset = atom_base;
     entry.mmff_atom_vdw_offset = atom_base;
     entry.mmff_atom_charge_offset = atom_base;
-}
-#endif // __CUDACC__
-
-#if defined(__CUDACC__)
-inline void launch_mmff94_build_csr(molecule_descriptor_t const *descriptors, std::uint32_t const *atom_offsets,
-                                    std::uint32_t num_molecules, mmff94_per_mol_counts_t *per_mol_counts,
-                                    mmff94_bond_t const *bonds, mmff94_angle_t const *angles,
-                                    mmff94_torsion_t const *torsions, mmff94_oop_t const *oops,
-                                    mmff94_stretchbend_t const *stbns, mmff94_atom_interaction_t *interactions,
-                                    mmff94_atom_offsets_t *atom_offsets_out, std::uint8_t const *typing_status,
-                                    cudaStream_t stream = nullptr) {
-    if (num_molecules == 0) return;
-    mmff94_build_csr_kernel<<<num_molecules, warp_size_k, 0, stream>>>(
-        descriptors, atom_offsets, num_molecules, per_mol_counts, bonds, angles, torsions, oops, stbns, interactions,
-        atom_offsets_out, typing_status);
-}
-
-/** The caller reads @p totals back to size the packed arrays. */
-inline void launch_mmff94_scan_counts(mmff94_per_mol_counts_t const *per_mol_counts, std::uint32_t num_molecules,
-                                      mmff94_packed_offsets_t *per_mol_offsets, mmff94_packed_offsets_t *totals,
-                                      cudaStream_t stream = nullptr) {
-    if (num_molecules == 0) return;
-    mmff94_scan_counts_kernel<<<1, mmff94_scan_block_k, 0, stream>>>(per_mol_counts, num_molecules, per_mol_offsets,
-                                                                     totals);
-}
-
-inline void launch_mmff94_compact_terms(
-    molecule_descriptor_t const *descriptors, std::uint32_t const *atom_offsets, std::uint32_t num_molecules,
-    mmff94_per_mol_counts_t const *per_mol_counts, mmff94_packed_offsets_t const *per_mol_offsets,
-    mmff94_bond_t const *staged_bonds, mmff94_angle_t const *staged_angles, mmff94_torsion_t const *staged_torsions,
-    mmff94_oop_t const *staged_oops, mmff94_stretchbend_t const *staged_stbns,
-    mmff94_atom_interaction_t const *staged_interactions, mmff94_bond_t *packed_bonds, mmff94_angle_t *packed_angles,
-    mmff94_torsion_t *packed_torsions, mmff94_oop_t *packed_oops, mmff94_stretchbend_t *packed_stbns,
-    mmff94_atom_interaction_t *packed_interactions, mmff94_atom_offsets_t *atom_interaction_offsets,
-    etkdg_molecule_metadata_t *metadata, std::uint8_t const *typing_status, cudaStream_t stream = nullptr) {
-    if (num_molecules == 0) return;
-    mmff94_compact_terms_kernel<<<num_molecules, warp_size_k, 0, stream>>>(
-        descriptors, atom_offsets, num_molecules, per_mol_counts, per_mol_offsets, staged_bonds, staged_angles,
-        staged_torsions, staged_oops, staged_stbns, staged_interactions, packed_bonds, packed_angles, packed_torsions,
-        packed_oops, packed_stbns, packed_interactions, atom_interaction_offsets, metadata, typing_status);
-}
-#endif
-
-#if defined(__CUDACC__)
-inline void launch_mmff94_extract_terms(molecule_descriptor_t const *descriptors, std::uint8_t const *atom_types_all,
-                                        float const *atom_charges_all, std::uint32_t const *atom_offsets,
-                                        std::uint32_t num_molecules, mmff94_tables_view_t tables,
-                                        mmff94_atom_vdw_params_t *out_atom_vdw, float *out_atom_charge,
-                                        mmff94_bond_t *out_bonds, mmff94_angle_t *out_angles,
-                                        mmff94_torsion_t *out_torsions, mmff94_oop_t *out_oops,
-                                        mmff94_stretchbend_t *out_stbns, mmff94_per_mol_counts_t *per_mol_counts,
-                                        std::uint8_t const *typing_status, cudaStream_t stream = nullptr) {
-    if (num_molecules == 0) return;
-    mmff94_extract_terms_kernel<<<num_molecules, warp_size_k, 0, stream>>>(
-        descriptors, atom_types_all, atom_charges_all, atom_offsets, num_molecules, tables, out_atom_vdw,
-        out_atom_charge, out_bonds, out_angles, out_torsions, out_oops, out_stbns, per_mol_counts, typing_status);
 }
 #endif // __CUDACC__
 

@@ -391,26 +391,6 @@ static __global__ __launch_bounds__(32, 8) void csd_torsion_match_kernel(
     }
 }
 
-/**
- *  @brief Launch `csd_torsion_match_kernel`, one warp per molecule.
- *
- *  @param[in] descriptors Device-resident descriptors.
- *  @param[in] num_molecules Molecules to process.
- *  @param[in] table Uploaded pattern table.
- *  @param[out] torsions Device output slots, @p torsion_stride per molecule.
- *  @param[in] torsion_stride Slots reserved per molecule.
- *  @param[out] torsion_counts Device array of per-molecule torsion counts.
- *  @param[in] stream Stream to launch on.
- */
-inline void launch_csd_torsion_match(molecule_descriptor_t const *descriptors, std::uint32_t num_molecules,
-                                     csd_torsion_table_view_t table, etk_torsion_descriptor_t *torsions,
-                                     std::uint32_t torsion_stride, std::uint32_t *torsion_counts,
-                                     cudaStream_t stream = nullptr) {
-    if (num_molecules == 0) return;
-    csd_torsion_match_kernel<<<num_molecules, warp_size_k, 0, stream>>>(descriptors, num_molecules, table, torsions,
-                                                                        torsion_stride, torsion_counts);
-}
-
 } // namespace smallfield::cuda
 
 #endif // __CUDACC__

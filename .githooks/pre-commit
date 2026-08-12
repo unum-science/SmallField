@@ -267,7 +267,7 @@ check_pointer_containers() {
     containers=$(printf '%s\n' "$added" |
         code_only |
         grep -v 'std::shared_ptr<arrow::' |
-        grep -E '(std::)?(vector|array)[[:space:]]*<[[:space:]]*(std::)?(unique_ptr|shared_ptr)|(std::)?(vector|array)[[:space:]]*<[[:space:]]*[A-Za-z_][A-Za-z_0-9:]*[[:space:]]*\*' || true)
+        grep -E '(std::)?(vector|array)[[:space:]]*<[[:space:]]*(std::)?(unique_ptr|shared_ptr)|(std::)?(vector|array)[[:space:]]*<[[:space:]]*(const[[:space:]]+)?[A-Za-z_][A-Za-z_0-9:]*[[:space:]]*(const[[:space:]]*)?\*' || true)
     [ -z "$containers" ] || fail "$containers" \
         "$file holds pointers inside a container - store values, or indices into a flat arena:"
 }

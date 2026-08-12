@@ -40,7 +40,6 @@
 
 namespace smallfield::preprocess {
 using smallfield::types::atom_flag_aromatic_k;
-using smallfield::types::atom_has_flag;
 using smallfield::types::bond_flag_aromatic_k;
 using smallfield::types::etk_torsion_descriptor_t;
 using smallfield::types::hybridization_sp2_k;

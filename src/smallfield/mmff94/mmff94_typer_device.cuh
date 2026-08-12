@@ -92,15 +92,4 @@ static __launch_bounds__(32, 8) __global__
     }
 }
 
-inline void launch_mmff94_type_and_charge(molecule_descriptor_t const *descriptors_dev,
-                                          std::uint32_t const *atom_offsets_dev, std::uint32_t num_molecules,
-                                          mmff94_tables_view_t tables_view, std::uint8_t *atom_types_out_dev,
-                                          float *atom_charges_out_dev, std::uint8_t *typing_status_dev,
-                                          cudaStream_t stream = nullptr) {
-    if (num_molecules == 0) return;
-    mmff94_type_and_charge_kernel<<<num_molecules, 32, 0, stream>>>(descriptors_dev, atom_offsets_dev, num_molecules,
-                                                                    tables_view, atom_types_out_dev,
-                                                                    atom_charges_out_dev, typing_status_dev);
-}
-
 } // namespace smallfield::mmff94

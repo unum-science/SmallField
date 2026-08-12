@@ -49,14 +49,11 @@ struct nvtx_range_t {
  */
 #define SF_NVTX_PASTE_(prefix, suffix) prefix##suffix
 #define SF_NVTX_NAME_(line) SF_NVTX_PASTE_(nvtx_scope_, line)
-#define SF_NVTX_RANGE(name) \
-    ::smallfield::nvtx_range_t SF_NVTX_NAME_(__LINE__) { name }
 #define SF_NVTX_RANGE_COLORED(name, color) \
     ::smallfield::nvtx_range_t SF_NVTX_NAME_(__LINE__) { name, color }
 
 #else
 
-#define SF_NVTX_RANGE(name) ((void)0)
 #define SF_NVTX_RANGE_COLORED(name, color) ((void)0)
 
 #endif

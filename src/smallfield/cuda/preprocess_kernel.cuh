@@ -144,27 +144,6 @@ static __global__ __launch_bounds__(32, 8) void etk_build_csr_kernel(
     }
 }
 
-/** Launch `mmff94_apply_typing_patch_kernel`, one warp per flagged molecule. */
-inline void launch_mmff94_apply_typing_patch(mmff94_typing_patch_t const *patches, std::uint32_t num_patches,
-                                             std::uint8_t const *staged_atom_types, float const *staged_atom_charges,
-                                             std::uint8_t *atom_types, float *atom_charges, std::uint8_t *typing_status,
-                                             cudaStream_t stream = nullptr) {
-    if (num_patches == 0) return;
-    mmff94_apply_typing_patch_kernel<<<num_patches, 32, 0, stream>>>(
-        patches, num_patches, staged_atom_types, staged_atom_charges, atom_types, atom_charges, typing_status);
-}
-
-/** Launch `etk_build_csr_kernel`, one block per molecule. */
-inline void launch_etk_build_csr(etk_torsion_descriptor_t const *torsions, std::uint32_t torsion_stride,
-                                 std::uint32_t const *torsion_counts, distance_constraint_t const *constraints,
-                                 std::uint32_t num_molecules, etk_atom_interaction_t *interactions,
-                                 etk_atom_offsets_t *atom_offsets, etkdg_molecule_metadata_t *metadata,
-                                 cudaStream_t stream = nullptr) {
-    if (num_molecules == 0) return;
-    etk_build_csr_kernel<<<num_molecules, 32, 0, stream>>>(torsions, torsion_stride, torsion_counts, constraints,
-                                                           num_molecules, interactions, atom_offsets, metadata);
-}
-
 } // namespace smallfield::cuda
 
 #endif // __CUDACC__

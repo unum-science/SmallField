@@ -420,11 +420,6 @@ inline bool bond_has_flag(molecule_descriptor_t const &descriptor, std::uint32_t
     return (descriptor.bond_flags[bond_index] & flag) != 0;
 }
 
-/** True iff atom @p atom_i and atom @p atom_j are in the same SSSR ring. */
-inline bool share_ring(molecule_descriptor_t const &descriptor, std::uint32_t atom_i, std::uint32_t atom_j) {
-    return (descriptor.atom_ring_bitmap[atom_i] & descriptor.atom_ring_bitmap[atom_j]) != 0;
-}
-
 /**
  *  @brief Fill @p matrix with the all-pairs bond-hop counts of @p descriptor.
  *

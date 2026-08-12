@@ -270,12 +270,6 @@ static_assert(sizeof(mmff94_tables_view_t) == 248);
 
 #pragma region Table Container
 
-/** View one whole host table, so the extent comes from the storage rather than a second argument. */
-template <typename element_>
-inline custd::span<element_ const> table_span_(std::vector<element_> const &table) noexcept {
-    return {table.data(), table.size()};
-}
-
 /** All MMFF94 parameter tables in a single container, extracted once at context init. Each vector is
  *  sorted in the exact lookup order RDKit uses internally — see the per-collection `d_*` column
  *  orderings in `rdkit/ForceField/MMFF/Params.h`. */
@@ -319,23 +313,24 @@ struct mmff94_tables_host_t {
     /** Highest atom type seen, for `MMFFDef` indexing. */
     std::uint8_t max_atom_type = 0;
 
-    /** A read-only view over this container's own storage, which must outlive it. */
+    /** A read-only view over this container's own storage, which must outlive it. Each assignment is
+     *  `custd::span`'s range constructor, so the extent comes from the vector rather than restated. */
     mmff94_tables_view_t view() const noexcept {
         mmff94_tables_view_t result;
-        result.vdw = table_span_(vdw);
-        result.bond = table_span_(bond);
-        result.angle = table_span_(angle);
-        result.torsion = table_span_(torsion);
-        result.oop = table_span_(oop);
-        result.stbn = table_span_(stbn);
-        result.dfsb = table_span_(dfsb);
-        result.def = table_span_(def);
-        result.prop = table_span_(prop);
-        result.pbci = table_span_(pbci);
-        result.chg = table_span_(chg);
-        result.bndk = table_span_(bndk);
-        result.hl = table_span_(hl);
-        result.covrad = table_span_(covrad);
+        result.vdw = vdw;
+        result.bond = bond;
+        result.angle = angle;
+        result.torsion = torsion;
+        result.oop = oop;
+        result.stbn = stbn;
+        result.dfsb = dfsb;
+        result.def = def;
+        result.prop = prop;
+        result.pbci = pbci;
+        result.chg = chg;
+        result.bndk = bndk;
+        result.hl = hl;
+        result.covrad = covrad;
         result.vdw_power = vdw_power;
         result.vdw_b = vdw_b;
         result.vdw_beta = vdw_beta;
