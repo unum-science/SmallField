@@ -130,7 +130,7 @@ struct alignas(8) mmff94_oop_entry_t {
     /** MMFF `koop`, in mdyn·angstrom per rad², against the Wilson out-of-plane angle. */
     float force_constant;
 };
-static_assert(sizeof(mmff94_oop_entry_t) == 8 || sizeof(mmff94_oop_entry_t) == 16);
+static_assert(sizeof(mmff94_oop_entry_t) == 8);
 
 /** Stretch-bend parameter (kba_ijk, kba_kji), keyed by (j_type, i_type, k_type, stretch_bend_type)
  *  with the caller responsible for the swap flag returned alongside — whether i/k were swapped
@@ -178,12 +178,16 @@ struct alignas(8) mmff94_prop_entry_t {
 };
 static_assert(sizeof(mmff94_prop_entry_t) == 8);
 
-/** MMFFDef equivalence levels — 4 bytes per atom type. Indexed directly by `atom_type` — a dense
- *  array with one entry per possible type in [1, max_atom_type] and zeros for unused slots. */
+/** Equivalence levels MMFFDef tabulates per atom type, and the stage count of every cascade keyed on
+ *  them: level 0 is the type itself and level 3 the wildcard. */
+inline constexpr unsigned mmff94_equivalence_levels_k = 4;
+
+/** MMFFDef equivalence levels — one byte per level per atom type. Indexed directly by `atom_type` — a
+ *  dense array with one entry per possible type in [1, max_atom_type] and zeros for unused slots. */
 struct mmff94_def_entry_t {
-    std::uint8_t eq_level[4];
+    std::uint8_t eq_level[mmff94_equivalence_levels_k];
 };
-static_assert(sizeof(mmff94_def_entry_t) == 4);
+static_assert(sizeof(mmff94_def_entry_t) == mmff94_equivalence_levels_k);
 
 /** Partial-bond-charge-increment per atom type. */
 struct alignas(8) mmff94_pbci_entry_t {
@@ -294,6 +298,13 @@ static_assert(sizeof(mmff94_tables_view_t) == 248);
 
 #pragma region Table Container
 
+/** View one whole host table, so the extent comes from the storage rather than from a second argument
+ *  a caller could take from the wrong vector. */
+template <typename element_>
+inline custd::span<element_ const> table_span_(std::vector<element_> const &table) noexcept {
+    return {table.data(), table.size()};
+}
+
 /** All MMFF94 parameter tables in a single container, extracted once at context init. Each vector is
  *  sorted in the exact lookup order RDKit uses internally — see the per-collection `d_*` column
  *  orderings in `rdkit/ForceField/MMFF/Params.h`. */
@@ -341,20 +352,20 @@ struct mmff94_tables_host_t {
      *  pointers + sizes + scalar constants. */
     mmff94_tables_view_t view() const noexcept {
         mmff94_tables_view_t result;
-        result.vdw = {vdw.data(), vdw.size()};
-        result.bond = {bond.data(), bond.size()};
-        result.angle = {angle.data(), angle.size()};
-        result.torsion = {torsion.data(), torsion.size()};
-        result.oop = {oop.data(), oop.size()};
-        result.stbn = {stbn.data(), stbn.size()};
-        result.dfsb = {dfsb.data(), dfsb.size()};
-        result.def = {def.data(), def.size()};
-        result.prop = {prop.data(), prop.size()};
-        result.pbci = {pbci.data(), pbci.size()};
-        result.chg = {chg.data(), chg.size()};
-        result.bndk = {bndk.data(), bndk.size()};
-        result.hl = {hl.data(), hl.size()};
-        result.covrad = {covrad.data(), covrad.size()};
+        result.vdw = table_span_(vdw);
+        result.bond = table_span_(bond);
+        result.angle = table_span_(angle);
+        result.torsion = table_span_(torsion);
+        result.oop = table_span_(oop);
+        result.stbn = table_span_(stbn);
+        result.dfsb = table_span_(dfsb);
+        result.def = table_span_(def);
+        result.prop = table_span_(prop);
+        result.pbci = table_span_(pbci);
+        result.chg = table_span_(chg);
+        result.bndk = table_span_(bndk);
+        result.hl = table_span_(hl);
+        result.covrad = table_span_(covrad);
         result.vdw_power = vdw_power;
         result.vdw_b = vdw_b;
         result.vdw_beta = vdw_beta;
@@ -367,6 +378,8 @@ struct mmff94_tables_host_t {
 
 #pragma endregion Table Container
 
+#pragma region Sorted Column Search
+
 /**
  *  @brief Hand-rolled `lower_bound` over one sorted table column, used by every lookup cascade below.
  *
@@ -375,17 +388,81 @@ struct mmff94_tables_host_t {
  *  the search early, returning the first few elements only and declaring the key not found for
  *  anything past about 8 entries in a 95-element sorted array. A local definition keeps the code path
  *  identical between host and device.
+ *
+ *  @param[in] sorted Column sorted ascending by @p key_of.
+ *  @param[in] key Value to place. Widened to `unsigned` so the `key + 1` the range search forms cannot
+ *             wrap at atom type 255.
+ *  @param[in] key_of Reads the key out of one entry.
+ *  @return Index of the first entry whose key is not below @p key, or the extent when there is none.
  */
-template <typename element_, typename key_, typename key_accessor_>
-constexpr std::size_t lower_bound_(element_ const *base, std::size_t count, key_ key, key_accessor_ &&key_of) noexcept {
-    std::size_t lower = 0, upper = count;
+template <typename element_, typename key_accessor_>
+constexpr std::size_t lower_bound_(custd::span<element_ const> sorted, unsigned key, key_accessor_ &&key_of) noexcept {
+    std::size_t lower = 0, upper = sorted.size();
     while (lower < upper) {
         std::size_t const middle = lower + (upper - lower) / 2;
-        if (key_of(base[middle]) < key) lower = middle + 1;
+        if (static_cast<unsigned>(key_of(sorted[middle])) < key) lower = middle + 1;
         else upper = middle;
     }
     return lower;
 }
+
+/**
+ *  @brief Narrow a sorted column to the run whose key equals @p key.
+ *
+ *  Every cascade below is a chain of these, so a sub-range travels as one span and no call site rebases
+ *  an index onto its parent's start — the `parent_low +` that had to be written, correctly, in front of
+ *  eleven of the fourteen inner searches this header used to spell by hand.
+ *
+ *  @param[in] sorted Column, or an already-narrowed run of it, sorted ascending by @p key_of.
+ *  @param[in] key Value the run must carry.
+ *  @param[in] key_of Reads the key out of one entry.
+ *  @return The matching run, empty when the key is absent.
+ */
+template <typename element_, typename key_accessor_>
+constexpr custd::span<element_ const> equal_range_(custd::span<element_ const> sorted, unsigned key,
+                                                   key_accessor_ &&key_of) noexcept {
+    custd::span<element_ const> const tail = sorted.subspan(lower_bound_(sorted, key, key_of));
+    return tail.first(lower_bound_(tail, key + 1, key_of));
+}
+
+/**
+ *  @brief The one entry of a sorted column whose key equals @p key, which every cascade ends on.
+ *
+ *  @param[in] sorted Column, or an already-narrowed run of it, sorted ascending by @p key_of.
+ *  @param[in] key Value to match exactly.
+ *  @param[in] key_of Reads the key out of one entry.
+ *  @return Pointer into @p sorted, or `nullptr` on a miss.
+ */
+template <typename element_, typename key_accessor_>
+constexpr element_ const *find_sorted_(custd::span<element_ const> sorted, unsigned key,
+                                       key_accessor_ &&key_of) noexcept {
+    std::size_t const index = lower_bound_(sorted, key, key_of);
+    if (index == sorted.size() || static_cast<unsigned>(key_of(sorted[index])) != key) return nullptr;
+    return &sorted[index];
+}
+
+/**
+ *  @brief One MMFFDef equivalence level of @p atom_type, or 0 where the dense table does not reach.
+ *
+ *  @p level is normally below `mmff94_equivalence_levels_k`. RDKit's torsion cascade has one stage that
+ *  asks for level 4 and reads one past the entry, landing on the next atom type's level 0, and this port
+ *  is required to answer identically — so the levels are walked as the flat dense run they physically
+ *  are rather than by indexing past an array. The invariant the type cannot carry is that
+ *  `mmff94_tables_host_t::def` is dense and contiguous in atom type, which its extraction guarantees.
+ *
+ *  @param[in] tables Extracted tables, whose `def` column is dense in atom type.
+ *  @param[in] atom_type MMFF atom type to equivalence.
+ *  @param[in] level Equivalence level, 0 being the type itself and 3 the wildcard.
+ *  @return The equivalent atom type, 0 when the table has no answer.
+ */
+constexpr std::uint8_t equivalent_atom_type_(mmff94_tables_view_t const &tables, std::uint8_t atom_type,
+                                             unsigned level) noexcept {
+    std::size_t const entry = atom_type + level / mmff94_equivalence_levels_k;
+    if (entry >= tables.def.size()) return 0;
+    return tables.def[entry].eq_level[level % mmff94_equivalence_levels_k];
+}
+
+#pragma endregion Sorted Column Search
 
 /**
  *  @brief Binary-search cascade matching `MMFFVdWCollection::operator()`.
@@ -395,10 +472,7 @@ constexpr std::size_t lower_bound_(element_ const *base, std::size_t count, key_
  *  sorted data correctly, and the native CPU port of `extract_mmff94_params_via_rdkit`.
  */
 constexpr mmff94_vdw_entry_t const *lookup_vdw(mmff94_tables_view_t const &tables, std::uint8_t atom_type) noexcept {
-    std::size_t const index = lower_bound_(tables.vdw.data(), tables.vdw.size(), atom_type,
-                                           [](mmff94_vdw_entry_t const &entry) { return entry.atom_type; });
-    if (index < tables.vdw.size() && tables.vdw[index].atom_type == atom_type) return &tables.vdw[index];
-    return nullptr;
+    return find_sorted_(tables.vdw, atom_type, [](mmff94_vdw_entry_t const &entry) { return entry.atom_type; });
 }
 
 /** Binary-search cascade matching `MMFFBondCollection::operator()`. Canonicalises (atom_i, atom_j) to
@@ -408,23 +482,10 @@ constexpr mmff94_bond_entry_t const *lookup_bond(mmff94_tables_view_t const &tab
     std::uint8_t lower_type = atom_i, upper_type = atom_j;
     if (lower_type > upper_type) swap_(lower_type, upper_type);
 
-    // Cascade on i_type → j_type → bond_type.
-    mmff94_bond_entry_t const *bond_base = tables.bond.data();
-    std::size_t const count = tables.bond.size();
-    auto i_key = [](mmff94_bond_entry_t const &entry) { return entry.i_type; };
-    auto j_key = [](mmff94_bond_entry_t const &entry) { return entry.j_type; };
-    auto bond_type_key = [](mmff94_bond_entry_t const &entry) { return entry.bond_type; };
-    std::size_t const i_lo = lower_bound_(bond_base, count, lower_type, i_key);
-    std::size_t const i_hi = lower_bound_(bond_base, count, lower_type + 1, i_key);
-    if (i_lo == i_hi) return nullptr;
-    std::size_t const j_span = i_hi - i_lo;
-    std::size_t const j_lo = i_lo + lower_bound_(bond_base + i_lo, j_span, upper_type, j_key);
-    std::size_t const j_hi = i_lo + lower_bound_(bond_base + i_lo, j_span, upper_type + 1, j_key);
-    if (j_lo == j_hi) return nullptr;
-    std::size_t const bond_type_span = j_hi - j_lo;
-    std::size_t const bond_type_low = j_lo + lower_bound_(bond_base + j_lo, bond_type_span, bond_type, bond_type_key);
-    if (bond_type_low != j_hi && bond_base[bond_type_low].bond_type == bond_type) return bond_base + bond_type_low;
-    return nullptr;
+    auto const by_i = equal_range_(tables.bond, lower_type,
+                                   [](mmff94_bond_entry_t const &entry) { return entry.i_type; });
+    auto const by_j = equal_range_(by_i, upper_type, [](mmff94_bond_entry_t const &entry) { return entry.j_type; });
+    return find_sorted_(by_j, bond_type, [](mmff94_bond_entry_t const &entry) { return entry.bond_type; });
 }
 
 /** Binary-search cascade matching `MMFFAngleCollection::operator()` — including the 4-level
@@ -432,30 +493,19 @@ constexpr mmff94_bond_entry_t const *lookup_bond(mmff94_tables_view_t const &tab
 constexpr mmff94_angle_entry_t const *lookup_angle(mmff94_tables_view_t const &tables, std::uint8_t angle_type,
                                                    std::uint8_t atom_i, std::uint8_t atom_j_center,
                                                    std::uint8_t atom_k) noexcept {
-    mmff94_angle_entry_t const *angle_base = tables.angle.data();
-    std::size_t const count = tables.angle.size();
-    auto j_key = [](mmff94_angle_entry_t const &entry) { return entry.j_type; };
-    auto i_key = [](mmff94_angle_entry_t const &entry) { return entry.i_type; };
-    auto k_key = [](mmff94_angle_entry_t const &entry) { return entry.k_type; };
-    auto at_key = [](mmff94_angle_entry_t const &entry) { return entry.angle_type; };
-    for (int iter = 0; iter < 4; ++iter) {
-        std::uint8_t canonical_i_type = (atom_i < tables.def.size()) ? tables.def[atom_i].eq_level[iter]
-                                                                     : std::uint8_t {0};
-        std::uint8_t canonical_k_type = (atom_k < tables.def.size()) ? tables.def[atom_k].eq_level[iter]
-                                                                     : std::uint8_t {0};
+    auto const j_key = [](mmff94_angle_entry_t const &entry) { return entry.j_type; };
+    auto const i_key = [](mmff94_angle_entry_t const &entry) { return entry.i_type; };
+    auto const k_key = [](mmff94_angle_entry_t const &entry) { return entry.k_type; };
+    auto const angle_type_key = [](mmff94_angle_entry_t const &entry) { return entry.angle_type; };
+    for (unsigned level = 0; level < mmff94_equivalence_levels_k; ++level) {
+        std::uint8_t canonical_i_type = equivalent_atom_type_(tables, atom_i, level);
+        std::uint8_t canonical_k_type = equivalent_atom_type_(tables, atom_k, level);
         if (canonical_i_type > canonical_k_type) swap_(canonical_i_type, canonical_k_type);
 
-        std::size_t const j_lo = lower_bound_(angle_base, count, atom_j_center, j_key);
-        std::size_t const j_hi = lower_bound_(angle_base, count, atom_j_center + 1, j_key);
-        if (j_lo == j_hi) continue;
-        std::size_t const i_lo = j_lo + lower_bound_(angle_base + j_lo, j_hi - j_lo, canonical_i_type, i_key);
-        std::size_t const i_hi = j_lo + lower_bound_(angle_base + j_lo, j_hi - j_lo, canonical_i_type + 1, i_key);
-        if (i_lo == i_hi) continue;
-        std::size_t const k_lo = i_lo + lower_bound_(angle_base + i_lo, i_hi - i_lo, canonical_k_type, k_key);
-        std::size_t const k_hi = i_lo + lower_bound_(angle_base + i_lo, i_hi - i_lo, canonical_k_type + 1, k_key);
-        if (k_lo == k_hi) continue;
-        std::size_t const at_lo = k_lo + lower_bound_(angle_base + k_lo, k_hi - k_lo, angle_type, at_key);
-        if (at_lo != k_hi && angle_base[at_lo].angle_type == angle_type) return angle_base + at_lo;
+        auto const by_j = equal_range_(tables.angle, atom_j_center, j_key);
+        auto const by_i = equal_range_(by_j, canonical_i_type, i_key);
+        auto const by_k = equal_range_(by_i, canonical_k_type, k_key);
+        if (auto const *entry = find_sorted_(by_k, angle_type, angle_type_key); entry) return entry;
     }
     return nullptr;
 }
@@ -468,10 +518,7 @@ constexpr mmff94_prop_entry_t const *lookup_prop(mmff94_tables_view_t const &tab
 
 /** Partial-bond-charge-increment lookup by atom type. */
 constexpr mmff94_pbci_entry_t const *lookup_pbci(mmff94_tables_view_t const &tables, std::uint8_t atom_type) noexcept {
-    std::size_t const index = lower_bound_(tables.pbci.data(), tables.pbci.size(), atom_type,
-                                           [](mmff94_pbci_entry_t const &entry) { return entry.atom_type; });
-    if (index < tables.pbci.size() && tables.pbci[index].atom_type == atom_type) return &tables.pbci[index];
-    return nullptr;
+    return find_sorted_(tables.pbci, atom_type, [](mmff94_pbci_entry_t const &entry) { return entry.atom_type; });
 }
 
 /** Signed bond-charge-increment lookup. Mirrors `MMFFChgCollection::getMMFFChgParams`: returns (sign, entry)
@@ -487,21 +534,10 @@ constexpr std::pair<int, mmff94_chg_entry_t const *> lookup_chg(mmff94_tables_vi
         upper_type = atom_i;
         sign = 1;
     }
-    mmff94_chg_entry_t const *chg_base = tables.chg.data();
-    std::size_t const count = tables.chg.size();
-    auto i_key = [](mmff94_chg_entry_t const &entry) { return entry.i_type; };
-    auto j_key = [](mmff94_chg_entry_t const &entry) { return entry.j_type; };
-    auto bond_type_key = [](mmff94_chg_entry_t const &entry) { return entry.bond_type; };
-    std::size_t const i_lo = lower_bound_(chg_base, count, lower_type, i_key);
-    std::size_t const i_hi = lower_bound_(chg_base, count, lower_type + 1, i_key);
-    if (i_lo == i_hi) return {sign, nullptr};
-    std::size_t const j_lo = i_lo + lower_bound_(chg_base + i_lo, i_hi - i_lo, upper_type, j_key);
-    std::size_t const j_hi = i_lo + lower_bound_(chg_base + i_lo, i_hi - i_lo, upper_type + 1, j_key);
-    if (j_lo == j_hi) return {sign, nullptr};
-    std::size_t const bond_type_low = j_lo + lower_bound_(chg_base + j_lo, j_hi - j_lo, bond_type, bond_type_key);
-    if (bond_type_low != j_hi && chg_base[bond_type_low].bond_type == bond_type)
-        return {sign, chg_base + bond_type_low};
-    return {sign, nullptr};
+    auto const by_i = equal_range_(tables.chg, lower_type,
+                                   [](mmff94_chg_entry_t const &entry) { return entry.i_type; });
+    auto const by_j = equal_range_(by_i, upper_type, [](mmff94_chg_entry_t const &entry) { return entry.j_type; });
+    return {sign, find_sorted_(by_j, bond_type, [](mmff94_chg_entry_t const &entry) { return entry.bond_type; })};
 }
 
 /** Bndk lookup — the default bond keyed by atomic-number pair. */
@@ -509,25 +545,15 @@ constexpr mmff94_bndk_entry_t const *lookup_bndk(mmff94_tables_view_t const &tab
                                                  std::uint8_t atomic_j) noexcept {
     std::uint8_t lower_atomic_num = atomic_i, upper_atomic_num = atomic_j;
     if (lower_atomic_num > upper_atomic_num) swap_(lower_atomic_num, upper_atomic_num);
-    mmff94_bndk_entry_t const *bndk_base = tables.bndk.data();
-    std::size_t const count = tables.bndk.size();
-    auto i_key = [](mmff94_bndk_entry_t const &entry) { return entry.atomic_num_i; };
-    auto j_key = [](mmff94_bndk_entry_t const &entry) { return entry.atomic_num_j; };
-    std::size_t const i_lo = lower_bound_(bndk_base, count, lower_atomic_num, i_key);
-    std::size_t const i_hi = lower_bound_(bndk_base, count, lower_atomic_num + 1, i_key);
-    if (i_lo == i_hi) return nullptr;
-    std::size_t const j_lo = i_lo + lower_bound_(bndk_base + i_lo, i_hi - i_lo, upper_atomic_num, j_key);
-    if (j_lo != i_hi && bndk_base[j_lo].atomic_num_j == upper_atomic_num) return bndk_base + j_lo;
-    return nullptr;
+    auto const by_i = equal_range_(tables.bndk, lower_atomic_num,
+                                   [](mmff94_bndk_entry_t const &entry) { return entry.atomic_num_i; });
+    return find_sorted_(by_i, upper_atomic_num, [](mmff94_bndk_entry_t const &entry) { return entry.atomic_num_j; });
 }
 
 /** Covalent radius + Pauling electronegativity lookup by atomic number. */
 constexpr mmff94_covrad_entry_t const *lookup_covrad(mmff94_tables_view_t const &tables,
                                                      std::uint8_t atomic_num) noexcept {
-    std::size_t const index = lower_bound_(tables.covrad.data(), tables.covrad.size(), atomic_num,
-                                           [](mmff94_covrad_entry_t const &entry) { return entry.atomic_num; });
-    if (index < tables.covrad.size() && tables.covrad[index].atomic_num == atomic_num) return &tables.covrad[index];
-    return nullptr;
+    return find_sorted_(tables.covrad, atomic_num, [](mmff94_covrad_entry_t const &entry) { return entry.atomic_num; });
 }
 
 /** Herschbach-Laurie lookup by periodic-table-row pair. */
@@ -535,48 +561,31 @@ constexpr mmff94_hl_entry_t const *lookup_hl(mmff94_tables_view_t const &tables,
                                              std::uint8_t row_j) noexcept {
     std::uint8_t lower_row = row_i, upper_row = row_j;
     if (lower_row > upper_row) swap_(lower_row, upper_row);
-    mmff94_hl_entry_t const *hl_base = tables.hl.data();
-    std::size_t const count = tables.hl.size();
-    auto i_key = [](mmff94_hl_entry_t const &entry) { return entry.row_i; };
-    auto j_key = [](mmff94_hl_entry_t const &entry) { return entry.row_j; };
-    std::size_t const i_lo = lower_bound_(hl_base, count, lower_row, i_key);
-    std::size_t const i_hi = lower_bound_(hl_base, count, lower_row + 1, i_key);
-    if (i_lo == i_hi) return nullptr;
-    std::size_t const j_lo = i_lo + lower_bound_(hl_base + i_lo, i_hi - i_lo, upper_row, j_key);
-    if (j_lo != i_hi && hl_base[j_lo].row_j == upper_row) return hl_base + j_lo;
-    return nullptr;
+    auto const by_i = equal_range_(tables.hl, lower_row, [](mmff94_hl_entry_t const &entry) { return entry.row_i; });
+    return find_sorted_(by_i, upper_row, [](mmff94_hl_entry_t const &entry) { return entry.row_j; });
 }
 
 /** OOP bend lookup with 4-stage equivalence cascade. Matches `MMFFOopCollection::operator()` exactly. */
 constexpr mmff94_oop_entry_t const *lookup_oop(mmff94_tables_view_t const &tables, std::uint8_t atom_i,
                                                std::uint8_t atom_j, std::uint8_t atom_k, std::uint8_t atom_l) noexcept {
-    mmff94_oop_entry_t const *oop_base = tables.oop.data();
-    std::size_t const count = tables.oop.size();
-    auto j_key = [](mmff94_oop_entry_t const &entry) { return entry.j_type; };
-    auto i_key = [](mmff94_oop_entry_t const &entry) { return entry.i_type; };
-    auto k_key = [](mmff94_oop_entry_t const &entry) { return entry.k_type; };
-    auto l_key = [](mmff94_oop_entry_t const &entry) { return entry.l_type; };
-    for (int iter = 0; iter < 4; ++iter) {
+    auto const j_key = [](mmff94_oop_entry_t const &entry) { return entry.j_type; };
+    auto const i_key = [](mmff94_oop_entry_t const &entry) { return entry.i_type; };
+    auto const k_key = [](mmff94_oop_entry_t const &entry) { return entry.k_type; };
+    auto const l_key = [](mmff94_oop_entry_t const &entry) { return entry.l_type; };
+    for (unsigned level = 0; level < mmff94_equivalence_levels_k; ++level) {
         // The MMFF out-of-plane spec letters i, k, l after the sorting network below.
         std::uint8_t canonical_ikl_types[3] = {
-            (atom_i < tables.def.size()) ? tables.def[atom_i].eq_level[iter] : std::uint8_t {0},
-            (atom_k < tables.def.size()) ? tables.def[atom_k].eq_level[iter] : std::uint8_t {0},
-            (atom_l < tables.def.size()) ? tables.def[atom_l].eq_level[iter] : std::uint8_t {0},
+            equivalent_atom_type_(tables, atom_i, level),
+            equivalent_atom_type_(tables, atom_k, level),
+            equivalent_atom_type_(tables, atom_l, level),
         };
         if (canonical_ikl_types[0] > canonical_ikl_types[1]) swap_(canonical_ikl_types[0], canonical_ikl_types[1]);
         if (canonical_ikl_types[1] > canonical_ikl_types[2]) swap_(canonical_ikl_types[1], canonical_ikl_types[2]);
         if (canonical_ikl_types[0] > canonical_ikl_types[1]) swap_(canonical_ikl_types[0], canonical_ikl_types[1]);
-        std::size_t const j_lo = lower_bound_(oop_base, count, atom_j, j_key);
-        std::size_t const j_hi = lower_bound_(oop_base, count, atom_j + 1, j_key);
-        if (j_lo == j_hi) continue;
-        std::size_t const i_lo = j_lo + lower_bound_(oop_base + j_lo, j_hi - j_lo, canonical_ikl_types[0], i_key);
-        std::size_t const i_hi = j_lo + lower_bound_(oop_base + j_lo, j_hi - j_lo, canonical_ikl_types[0] + 1, i_key);
-        if (i_lo == i_hi) continue;
-        std::size_t const k_lo = i_lo + lower_bound_(oop_base + i_lo, i_hi - i_lo, canonical_ikl_types[1], k_key);
-        std::size_t const k_hi = i_lo + lower_bound_(oop_base + i_lo, i_hi - i_lo, canonical_ikl_types[1] + 1, k_key);
-        if (k_lo == k_hi) continue;
-        std::size_t const l_lo = k_lo + lower_bound_(oop_base + k_lo, k_hi - k_lo, canonical_ikl_types[2], l_key);
-        if (l_lo != k_hi && oop_base[l_lo].l_type == canonical_ikl_types[2]) return oop_base + l_lo;
+        auto const by_j = equal_range_(tables.oop, atom_j, j_key);
+        auto const by_i = equal_range_(by_j, canonical_ikl_types[0], i_key);
+        auto const by_k = equal_range_(by_i, canonical_ikl_types[1], k_key);
+        if (auto const *entry = find_sorted_(by_k, canonical_ikl_types[2], l_key); entry) return entry;
     }
     return nullptr;
 }
@@ -598,25 +607,12 @@ constexpr std::pair<bool, mmff94_stbn_entry_t const *> lookup_stbn(mmff94_tables
     }
     else if (atom_i == atom_k) swap = bond_type_1 < bond_type_2;
 
-    mmff94_stbn_entry_t const *stbn_base = tables.stbn.data();
-    std::size_t const count = tables.stbn.size();
-    auto j_key = [](mmff94_stbn_entry_t const &entry) { return entry.j_type; };
-    auto i_key = [](mmff94_stbn_entry_t const &entry) { return entry.i_type; };
-    auto k_key = [](mmff94_stbn_entry_t const &entry) { return entry.k_type; };
-    auto sb_key = [](mmff94_stbn_entry_t const &entry) { return entry.stretch_bend_type; };
-    std::size_t const j_lo = lower_bound_(stbn_base, count, atom_j_center, j_key);
-    std::size_t const j_hi = lower_bound_(stbn_base, count, atom_j_center + 1, j_key);
-    if (j_lo == j_hi) return {swap, nullptr};
-    std::size_t const i_lo = j_lo + lower_bound_(stbn_base + j_lo, j_hi - j_lo, lower_type, i_key);
-    std::size_t const i_hi = j_lo + lower_bound_(stbn_base + j_lo, j_hi - j_lo, lower_type + 1, i_key);
-    if (i_lo == i_hi) return {swap, nullptr};
-    std::size_t const k_lo = i_lo + lower_bound_(stbn_base + i_lo, i_hi - i_lo, upper_type, k_key);
-    std::size_t const k_hi = i_lo + lower_bound_(stbn_base + i_lo, i_hi - i_lo, upper_type + 1, k_key);
-    if (k_lo == k_hi) return {swap, nullptr};
-    std::size_t const stretch_bend_low = k_lo + lower_bound_(stbn_base + k_lo, k_hi - k_lo, stretch_bend_type, sb_key);
-    if (stretch_bend_low != k_hi && stbn_base[stretch_bend_low].stretch_bend_type == stretch_bend_type)
-        return {swap, stbn_base + stretch_bend_low};
-    return {swap, nullptr};
+    auto const by_j = equal_range_(tables.stbn, atom_j_center,
+                                   [](mmff94_stbn_entry_t const &entry) { return entry.j_type; });
+    auto const by_i = equal_range_(by_j, lower_type, [](mmff94_stbn_entry_t const &entry) { return entry.i_type; });
+    auto const by_k = equal_range_(by_i, upper_type, [](mmff94_stbn_entry_t const &entry) { return entry.k_type; });
+    return {swap, find_sorted_(by_k, stretch_bend_type,
+                               [](mmff94_stbn_entry_t const &entry) { return entry.stretch_bend_type; })};
 }
 
 /** DFSB fallback lookup by periodic-table-row triple, with swap. */
@@ -629,20 +625,45 @@ constexpr std::pair<bool, mmff94_dfsb_entry_t const *> lookup_dfsb(mmff94_tables
         swap_(lower_row, upper_row);
         swap = true;
     }
-    mmff94_dfsb_entry_t const *dfsb_base = tables.dfsb.data();
-    std::size_t const count = tables.dfsb.size();
-    auto ri_key = [](mmff94_dfsb_entry_t const &entry) { return entry.row_i; };
-    auto rj_key = [](mmff94_dfsb_entry_t const &entry) { return entry.row_j; };
-    auto rk_key = [](mmff94_dfsb_entry_t const &entry) { return entry.row_k; };
-    std::size_t const ri_lo = lower_bound_(dfsb_base, count, lower_row, ri_key);
-    std::size_t const ri_hi = lower_bound_(dfsb_base, count, lower_row + 1, ri_key);
-    if (ri_lo == ri_hi) return {swap, nullptr};
-    std::size_t const rj_lo = ri_lo + lower_bound_(dfsb_base + ri_lo, ri_hi - ri_lo, row_j, rj_key);
-    std::size_t const rj_hi = ri_lo + lower_bound_(dfsb_base + ri_lo, ri_hi - ri_lo, row_j + 1, rj_key);
-    if (rj_lo == rj_hi) return {swap, nullptr};
-    std::size_t const rk_lo = rj_lo + lower_bound_(dfsb_base + rj_lo, rj_hi - rj_lo, upper_row, rk_key);
-    if (rk_lo != rj_hi && dfsb_base[rk_lo].row_k == upper_row) return {swap, dfsb_base + rk_lo};
-    return {swap, nullptr};
+    auto const by_row_i = equal_range_(tables.dfsb, lower_row,
+                                       [](mmff94_dfsb_entry_t const &entry) { return entry.row_i; });
+    auto const by_row_j = equal_range_(by_row_i, row_j, [](mmff94_dfsb_entry_t const &entry) { return entry.row_j; });
+    return {swap, find_sorted_(by_row_j, upper_row, [](mmff94_dfsb_entry_t const &entry) { return entry.row_k; })};
+}
+
+/**
+ *  @brief MMFFDef levels the torsion cascade reads for the i and l ends at one stage.
+ *
+ *  The five stages combine levels 1-1-1-1, 2-2-2-2, 3-2-2-5, 5-2-2-3 and 5-2-2-5 in MMFF.IV's numbering,
+ *  so stages 1 and 2 wildcard one end while holding the other and the two levels are not simply the
+ *  stage number.
+ */
+struct torsion_wildcard_levels_t {
+    unsigned i_level;
+    unsigned l_level;
+};
+
+/** The i and l equivalence levels of one torsion cascade stage. */
+constexpr torsion_wildcard_levels_t torsion_wildcard_levels_(unsigned stage) noexcept {
+    if (stage == 1) return {.i_level = 1, .l_level = 3};
+    if (stage == 2) return {.i_level = 3, .l_level = 1};
+    return {.i_level = stage, .l_level = stage};
+}
+
+/** One stage of the torsion cascade: five binary searches on j → k → i → l → tor_type. */
+constexpr mmff94_torsion_entry_t const *find_torsion_entry_(
+    mmff94_tables_view_t const &tables, std::uint8_t canonical_i_type, std::uint8_t canonical_j_type,
+    std::uint8_t canonical_k_type, std::uint8_t canonical_l_type, unsigned canonical_torsion_type) noexcept {
+    auto const by_j = equal_range_(tables.torsion, canonical_j_type,
+                                   [](mmff94_torsion_entry_t const &entry) { return entry.j_type; });
+    auto const by_k = equal_range_(by_j, canonical_k_type,
+                                   [](mmff94_torsion_entry_t const &entry) { return entry.k_type; });
+    auto const by_i = equal_range_(by_k, canonical_i_type,
+                                   [](mmff94_torsion_entry_t const &entry) { return entry.i_type; });
+    auto const by_l = equal_range_(by_i, canonical_l_type,
+                                   [](mmff94_torsion_entry_t const &entry) { return entry.l_type; });
+    return find_sorted_(by_l, canonical_torsion_type,
+                        [](mmff94_torsion_entry_t const &entry) { return entry.tor_type; });
 }
 
 /** Torsion lookup with 5-stage equivalence cascade + fallback to the secondary torsion type. Mirrors
@@ -654,33 +675,22 @@ constexpr std::pair<unsigned, mmff94_torsion_entry_t const *> lookup_torsion(
     std::uint8_t atom_i, std::uint8_t atom_j, std::uint8_t atom_k, std::uint8_t atom_l) noexcept {
     mmff94_torsion_entry_t const *hit = nullptr;
     unsigned canonical_torsion_type = tor_type_primary;
-    unsigned iter = 0;
-    unsigned max_iterations = 5;
-    while (((iter < max_iterations) && ((!hit) || (max_iterations == 4))) ||
-           ((iter == 4) && (tor_type_primary == 5) && tor_type_secondary)) {
+    unsigned stage = 0;
+    unsigned max_stages = 5;
+    while (((stage < max_stages) && ((!hit) || (max_stages == 4))) ||
+           ((stage == 4) && (tor_type_primary == 5) && tor_type_secondary)) {
         // Secondary fallback: after the 5-stage attempt with the primary tor type, retry the first
         // 4 stages with the secondary tor type.
-        if ((max_iterations == 5) && (iter == 4)) {
-            max_iterations = 4;
-            iter = 0;
+        if ((max_stages == 5) && (stage == 4)) {
+            max_stages = 4;
+            stage = 0;
             canonical_torsion_type = tor_type_secondary;
         }
-        unsigned i_wildcard_level = iter, l_wildcard_level = iter;
-        if (iter == 1) {
-            i_wildcard_level = 1;
-            l_wildcard_level = 3;
-        }
-        else if (iter == 2) {
-            i_wildcard_level = 3;
-            l_wildcard_level = 1;
-        }
-
-        std::uint8_t canonical_i_type = (atom_i < tables.def.size()) ? tables.def[atom_i].eq_level[i_wildcard_level]
-                                                                     : 0;
+        auto const [i_level, l_level] = torsion_wildcard_levels_(stage);
+        std::uint8_t canonical_i_type = equivalent_atom_type_(tables, atom_i, i_level);
         std::uint8_t canonical_j_type = atom_j;
         std::uint8_t canonical_k_type = atom_k;
-        std::uint8_t canonical_l_type = (atom_l < tables.def.size()) ? tables.def[atom_l].eq_level[l_wildcard_level]
-                                                                     : 0;
+        std::uint8_t canonical_l_type = equivalent_atom_type_(tables, atom_l, l_level);
         if (canonical_j_type > canonical_k_type) {
             swap_(canonical_j_type, canonical_k_type);
             swap_(canonical_i_type, canonical_l_type);
@@ -689,44 +699,13 @@ constexpr std::pair<unsigned, mmff94_torsion_entry_t const *> lookup_torsion(
             swap_(canonical_i_type, canonical_l_type);
         }
 
-        // Cascade of 5 binary searches: j → k → i → l → tor_type.
-        mmff94_torsion_entry_t const *torsion_base = tables.torsion.data();
-        std::size_t const count = tables.torsion.size();
-        auto j_key = [](mmff94_torsion_entry_t const &entry) { return entry.j_type; };
-        auto k_key = [](mmff94_torsion_entry_t const &entry) { return entry.k_type; };
-        auto i_key = [](mmff94_torsion_entry_t const &entry) { return entry.i_type; };
-        auto l_key = [](mmff94_torsion_entry_t const &entry) { return entry.l_type; };
-        auto tt_key = [](mmff94_torsion_entry_t const &entry) { return entry.tor_type; };
-        std::size_t const j_lo = lower_bound_(torsion_base, count, canonical_j_type, j_key);
-        std::size_t const j_hi = lower_bound_(torsion_base, count, canonical_j_type + 1, j_key);
-        if (j_lo != j_hi) {
-            int const canonical_k_type_next = canonical_k_type + 1;
-            std::size_t const k_lo = j_lo + lower_bound_(torsion_base + j_lo, j_hi - j_lo, canonical_k_type, k_key);
-            std::size_t const k_hi = j_lo +
-                                     lower_bound_(torsion_base + j_lo, j_hi - j_lo, canonical_k_type_next, k_key);
-            if (k_lo != k_hi) {
-                int const canonical_i_type_next = canonical_i_type + 1;
-                std::size_t const i_lo = k_lo + lower_bound_(torsion_base + k_lo, k_hi - k_lo, canonical_i_type, i_key);
-                std::size_t const i_hi = k_lo +
-                                         lower_bound_(torsion_base + k_lo, k_hi - k_lo, canonical_i_type_next, i_key);
-                if (i_lo != i_hi) {
-                    int const canonical_l_type_next = canonical_l_type + 1;
-                    std::size_t const l_lo = i_lo +
-                                             lower_bound_(torsion_base + i_lo, i_hi - i_lo, canonical_l_type, l_key);
-                    std::size_t const l_hi = i_lo + lower_bound_(torsion_base + i_lo, i_hi - i_lo,
-                                                                 canonical_l_type_next, l_key);
-                    if (l_lo != l_hi) {
-                        std::size_t const tt_lo = l_lo + lower_bound_(torsion_base + l_lo, l_hi - l_lo,
-                                                                      (std::uint8_t)canonical_torsion_type, tt_key);
-                        if (tt_lo != l_hi && torsion_base[tt_lo].tor_type == canonical_torsion_type) {
-                            hit = torsion_base + tt_lo;
-                            if (max_iterations == 4) break;
-                        }
-                    }
-                }
-            }
+        if (auto const *entry = find_torsion_entry_(tables, canonical_i_type, canonical_j_type, canonical_k_type,
+                                                    canonical_l_type, canonical_torsion_type);
+            entry) {
+            hit = entry;
+            if (max_stages == 4) break;
         }
-        ++iter;
+        ++stage;
     }
     return {canonical_torsion_type, hit};
 }

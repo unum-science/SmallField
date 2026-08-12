@@ -38,6 +38,7 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
+namespace sfapi = smallfield::api;
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sfp = smallfield::preprocess;
@@ -50,10 +51,7 @@ namespace smallfield::tests {
 
 #pragma region Batch
 
-/*  `comparison_group_t::field` invokes its predicate as `equals(reference, observed)`. Term indices
- *  and counts must agree exactly; the floats carry the file's magnitude-scaled tolerance, which is
- *  the same predicate the hand-rolled `if` chains applied. */
-static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
+/** Every compared float carries the file's magnitude-scaled tolerance. */
 static constexpr auto within_tolerance_ = [](float cpu_value, float gpu_value) {
     return approximately_equal(cpu_value, gpu_value);
 };
@@ -199,7 +197,7 @@ static void fill_descriptors_into_(std::vector<std::string> const &smiles_list, 
         // capacity: this gates the extractor on drug-like input rather than on the atom limit.
         if (molecule->getNumAtoms() > 128) continue;
         auto &descriptor = batch.descriptors.emplace_back();
-        if (!sft::build_descriptor(*molecule, descriptor)) {
+        if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k) {
             batch.descriptors.pop_back(); // above the descriptor's atom or bond capacity
             continue;
         }
@@ -298,12 +296,12 @@ static std::size_t compare_term_counts_(diagnostic_reporter_t &reporter, std::ui
                                         sfp::etkdg_prepared_molecule_t const &cpu_reference,
                                         sfmmff::mmff94_per_mol_counts_t const &gpu_counts) {
     auto molecule = reporter.mismatch("mmff_extract", "molecule={}", molecule_index);
-    molecule.field("bonds", cpu_reference.mmff_bonds.size(), std::size_t {gpu_counts.bonds}, exactly_equal_)
-        .field("angles", cpu_reference.mmff_angles.size(), std::size_t {gpu_counts.angles}, exactly_equal_)
-        .field("torsions", cpu_reference.mmff_torsions.size(), std::size_t {gpu_counts.torsions}, exactly_equal_)
-        .field("oops", cpu_reference.mmff_oops.size(), std::size_t {gpu_counts.oops}, exactly_equal_)
+    molecule.field("bonds", cpu_reference.mmff_bonds.size(), std::size_t {gpu_counts.bonds}, exactly_equal)
+        .field("angles", cpu_reference.mmff_angles.size(), std::size_t {gpu_counts.angles}, exactly_equal)
+        .field("torsions", cpu_reference.mmff_torsions.size(), std::size_t {gpu_counts.torsions}, exactly_equal)
+        .field("oops", cpu_reference.mmff_oops.size(), std::size_t {gpu_counts.oops}, exactly_equal)
         .field("stretchbends", cpu_reference.mmff_stretchbends.size(), std::size_t {gpu_counts.stretchbends},
-               exactly_equal_);
+               exactly_equal);
     return molecule.reported_field_count();
 }
 
@@ -320,8 +318,8 @@ static std::size_t compare_bonds_(diagnostic_reporter_t &reporter, std::uint32_t
         auto const &cpu_term = cpu_terms[term_index];
         auto const &gpu_term = gpu_terms[term_index];
         auto term = reporter.mismatch("bond", "molecule={} term={}", molecule_index, term_index);
-        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal_)
-            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal_)
+        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal)
+            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
             .field("force_constant", cpu_term.force_constant, gpu_term.force_constant, within_tolerance_)
             .field("equilibrium_distance", cpu_term.equilibrium_distance, gpu_term.equilibrium_distance,
                    within_tolerance_);
@@ -338,9 +336,9 @@ static std::size_t compare_angles_(diagnostic_reporter_t &reporter, std::uint32_
         auto const &cpu_term = cpu_terms[term_index];
         auto const &gpu_term = gpu_terms[term_index];
         auto term = reporter.mismatch("angle", "molecule={} term={}", molecule_index, term_index);
-        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal_)
-            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal_)
-            .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal_)
+        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal)
+            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
+            .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal)
             .field("force_constant", cpu_term.force_constant, gpu_term.force_constant, within_tolerance_)
             .field("equilibrium_angle", cpu_term.equilibrium_angle, gpu_term.equilibrium_angle, within_tolerance_);
         mismatching_terms += term.reported_field_count() != 0;
@@ -356,10 +354,10 @@ static std::size_t compare_torsions_(diagnostic_reporter_t &reporter, std::uint3
         auto const &cpu_term = cpu_terms[term_index];
         auto const &gpu_term = gpu_terms[term_index];
         auto term = reporter.mismatch("torsion", "molecule={} term={}", molecule_index, term_index);
-        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal_)
-            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal_)
-            .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal_)
-            .field("atom_l", cpu_term.atom_l, gpu_term.atom_l, exactly_equal_)
+        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal)
+            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
+            .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal)
+            .field("atom_l", cpu_term.atom_l, gpu_term.atom_l, exactly_equal)
             .field("torsion_v1", cpu_term.torsion_v1, gpu_term.torsion_v1, within_tolerance_)
             .field("torsion_v2", cpu_term.torsion_v2, gpu_term.torsion_v2, within_tolerance_)
             .field("torsion_v3", cpu_term.torsion_v3, gpu_term.torsion_v3, within_tolerance_);
@@ -375,10 +373,10 @@ static std::size_t compare_oops_(diagnostic_reporter_t &reporter, std::uint32_t 
         auto const &cpu_term = cpu_terms[term_index];
         auto const &gpu_term = gpu_terms[term_index];
         auto term = reporter.mismatch("oop", "molecule={} term={}", molecule_index, term_index);
-        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal_)
-            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal_)
-            .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal_)
-            .field("atom_l", cpu_term.atom_l, gpu_term.atom_l, exactly_equal_)
+        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal)
+            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
+            .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal)
+            .field("atom_l", cpu_term.atom_l, gpu_term.atom_l, exactly_equal)
             .field("force_constant", cpu_term.force_constant, gpu_term.force_constant, within_tolerance_);
         mismatching_terms += term.reported_field_count() != 0;
     }
@@ -393,9 +391,9 @@ static std::size_t compare_stretch_bends_(diagnostic_reporter_t &reporter, std::
         auto const &cpu_term = cpu_terms[term_index];
         auto const &gpu_term = gpu_terms[term_index];
         auto term = reporter.mismatch("stretchbend", "molecule={} term={}", molecule_index, term_index);
-        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal_)
-            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal_)
-            .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal_)
+        term.field("atom_i", cpu_term.atom_i, gpu_term.atom_i, exactly_equal)
+            .field("atom_j", cpu_term.atom_j, gpu_term.atom_j, exactly_equal)
+            .field("atom_k", cpu_term.atom_k, gpu_term.atom_k, exactly_equal)
             .field("kba_ijk", cpu_term.kba_ijk, gpu_term.kba_ijk, within_tolerance_)
             .field("kba_kji", cpu_term.kba_kji, gpu_term.kba_kji, within_tolerance_)
             .field("equilibrium_angle", cpu_term.equilibrium_angle, gpu_term.equilibrium_angle, within_tolerance_)
@@ -424,11 +422,11 @@ static std::size_t compare_csr_counts_(diagnostic_reporter_t &reporter, std::uin
         auto const &cpu_offset = cpu_offsets[atom_index];
         auto const &gpu_offset = gpu_offsets[atom_index];
         auto atom = reporter.mismatch("csr", "molecule={} atom={}", molecule_index, atom_index);
-        atom.field("bond_count", cpu_offset.bond_count, gpu_offset.bond_count, exactly_equal_)
-            .field("angle_count", cpu_offset.angle_count, gpu_offset.angle_count, exactly_equal_)
-            .field("torsion_count", cpu_offset.torsion_count, gpu_offset.torsion_count, exactly_equal_)
-            .field("oop_count", cpu_offset.oop_count, gpu_offset.oop_count, exactly_equal_)
-            .field("stretchbend_count", cpu_offset.stretchbend_count, gpu_offset.stretchbend_count, exactly_equal_);
+        atom.field("bond_count", cpu_offset.bond_count, gpu_offset.bond_count, exactly_equal)
+            .field("angle_count", cpu_offset.angle_count, gpu_offset.angle_count, exactly_equal)
+            .field("torsion_count", cpu_offset.torsion_count, gpu_offset.torsion_count, exactly_equal)
+            .field("oop_count", cpu_offset.oop_count, gpu_offset.oop_count, exactly_equal)
+            .field("stretchbend_count", cpu_offset.stretchbend_count, gpu_offset.stretchbend_count, exactly_equal);
         mismatching_atoms += atom.reported_field_count() != 0;
     }
     return mismatching_atoms;
@@ -454,13 +452,13 @@ static std::size_t compare_packed_layout_(diagnostic_reporter_t &reporter, extra
     std::uint32_t const atom_offset_base = batch.first_atoms[molecule_index];
 
     auto layout = reporter.mismatch("packed", "molecule={}", molecule_index);
-    layout.field("num_mmff_bonds", std::uint32_t {gpu_counts.bonds}, meta.num_mmff_bonds, exactly_equal_)
-        .field("num_mmff_angles", std::uint32_t {gpu_counts.angles}, meta.num_mmff_angles, exactly_equal_)
-        .field("num_mmff_torsions", std::uint32_t {gpu_counts.torsions}, meta.num_mmff_torsions, exactly_equal_)
-        .field("num_mmff_oops", std::uint32_t {gpu_counts.oops}, meta.num_mmff_oops, exactly_equal_)
+    layout.field("num_mmff_bonds", std::uint32_t {gpu_counts.bonds}, meta.num_mmff_bonds, exactly_equal)
+        .field("num_mmff_angles", std::uint32_t {gpu_counts.angles}, meta.num_mmff_angles, exactly_equal)
+        .field("num_mmff_torsions", std::uint32_t {gpu_counts.torsions}, meta.num_mmff_torsions, exactly_equal)
+        .field("num_mmff_oops", std::uint32_t {gpu_counts.oops}, meta.num_mmff_oops, exactly_equal)
         .field("num_mmff_stretchbends", std::uint32_t {gpu_counts.stretchbends}, meta.num_mmff_stretchbends,
-               exactly_equal_)
-        .field("mmff_atom_csr_offset", atom_offset_base, meta.mmff_atom_csr_offset, exactly_equal_);
+               exactly_equal)
+        .field("mmff_atom_csr_offset", atom_offset_base, meta.mmff_atom_csr_offset, exactly_equal);
     // The offsets below index the packed arrays, so reading them is only safe once they agree.
     if (layout.reported_field_count() != 0) return layout.reported_field_count();
 
@@ -468,24 +466,24 @@ static std::size_t compare_packed_layout_(diagnostic_reporter_t &reporter, extra
         .field("bond_slice", true,
                slices_equal_(batch.bonds_of(molecule_index), batch.packed.bonds.data() + meta.mmff_bond_offset,
                              gpu_counts.bonds * sizeof(sft::mmff94_bond_t)),
-               exactly_equal_)
+               exactly_equal)
         .field("angle_slice", true,
                slices_equal_(batch.angles_of(molecule_index), batch.packed.angles.data() + meta.mmff_angle_offset,
                              gpu_counts.angles * sizeof(sft::mmff94_angle_t)),
-               exactly_equal_)
+               exactly_equal)
         .field("torsion_slice", true,
                slices_equal_(batch.torsions_of(molecule_index), batch.packed.torsions.data() + meta.mmff_torsion_offset,
                              gpu_counts.torsions * sizeof(sft::mmff94_torsion_t)),
-               exactly_equal_)
+               exactly_equal)
         .field("oop_slice", true,
                slices_equal_(batch.oops_of(molecule_index), batch.packed.oops.data() + meta.mmff_oop_offset,
                              gpu_counts.oops * sizeof(sft::mmff94_oop_t)),
-               exactly_equal_)
+               exactly_equal)
         .field("stretchbend_slice", true,
                slices_equal_(batch.stretch_bends_of(molecule_index),
                              batch.packed.stretchbends.data() + meta.mmff_stretchbend_offset,
                              gpu_counts.stretchbends * sizeof(sft::mmff94_stretchbend_t)),
-               exactly_equal_);
+               exactly_equal);
     // An atomless molecule has no CSR run, so the interaction base below would not exist.
     if (num_atoms == 0) return layout.reported_field_count();
 
@@ -495,20 +493,20 @@ static std::size_t compare_packed_layout_(diagnostic_reporter_t &reporter, extra
         "interaction_slice", true,
         slices_equal_(batch.interactions_of(molecule_index), batch.packed.interactions.data() + interaction_base,
                       gpu_counts.interactions * sizeof(sft::mmff94_atom_interaction_t)),
-        exactly_equal_);
+        exactly_equal);
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
         auto const &staged_offset = staged_offsets[atom_index];
         auto const &packed_offset = batch.packed.atom_offsets[atom_offset_base + atom_index];
         layout
             .field("bond_offset", staged_offset.bond_offset + interaction_base, packed_offset.bond_offset,
-                   exactly_equal_)
+                   exactly_equal)
             .field("angle_offset", staged_offset.angle_offset + interaction_base, packed_offset.angle_offset,
-                   exactly_equal_)
+                   exactly_equal)
             .field("torsion_offset", staged_offset.torsion_offset + interaction_base, packed_offset.torsion_offset,
-                   exactly_equal_)
-            .field("oop_offset", staged_offset.oop_offset + interaction_base, packed_offset.oop_offset, exactly_equal_)
+                   exactly_equal)
+            .field("oop_offset", staged_offset.oop_offset + interaction_base, packed_offset.oop_offset, exactly_equal)
             .field("stretchbend_offset", staged_offset.stretchbend_offset + interaction_base,
-                   packed_offset.stretchbend_offset, exactly_equal_);
+                   packed_offset.stretchbend_offset, exactly_equal);
     }
     return layout.reported_field_count();
 }

@@ -46,6 +46,7 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
+namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -90,9 +91,6 @@ struct oracle_reporters_t {
         geometry.limit_printed_lines(maximum);
     }
 };
-
-/** Both oracles answer with a signed-volume sign, and a sign agrees only exactly. */
-static bool signs_agree_(int reference, int observed) noexcept { return reference == observed; }
 
 /**
  *  @brief Parity of the permutation carrying @p from onto @p to.
@@ -197,7 +195,7 @@ static void check_against_cip_(RDKit::ROMol const &molecule, sft::molecule_descr
         int const expected_sign = reference_sign * parity;
 
         reporters.cip.mismatch("chiral_parity", "oracle=cip molecule={} atom={} cip_code={}", label, atom, cip_code)
-            .field("target_sign", expected_sign, static_cast<int>(center.target_sign), signs_agree_);
+            .field("target_sign", expected_sign, static_cast<int>(center.target_sign), exactly_equal);
     }
 }
 
@@ -243,7 +241,7 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
         reporters.geometry
             .mismatch("chiral_parity", "oracle=geometry molecule={} atom={} signed_volume={}", label,
                       static_cast<unsigned>(center.center_atom), volume)
-            .field("target_sign", realized_sign, static_cast<int>(center.target_sign), signs_agree_);
+            .field("target_sign", realized_sign, static_cast<int>(center.target_sign), exactly_equal);
     }
 }
 
@@ -269,7 +267,7 @@ static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, ch
     if (molecule.getNumAtoms() > sft::max_atoms_per_molecule_k || molecule.getNumBonds() > sft::max_bonds_k) return;
 
     sft::molecule_descriptor_t descriptor;
-    if (!sft::build_descriptor(molecule, descriptor)) return;
+    if (sft::build_descriptor(molecule, descriptor) != sfapi::conformer_status_t::success_k) return;
 
     std::vector<sft::chiral_center_descriptor_t> centers;
     sfp::extract_chiral_centers(molecule, descriptor, centers);
@@ -407,7 +405,6 @@ int main(int argc, char **argv) {
         fmt::println("{}: corpus {}, {} SMILES", test_name_k, selection.path, fmt::group_digits(corpus.size()));
 
         sftest::oracle_tally_t corpus_tally;
-        std::size_t const cip_before_corpus = reporters.cip.comparison_count();
         for (auto const &smiles : corpus) {
             // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs
             // inside the guard alongside `addHs`.
@@ -423,10 +420,9 @@ int main(int argc, char **argv) {
             }
         }
         sftest::report_("corpus", corpus_tally);
-        reporters.cip.summarize("corpus_cip");
         // The same reasoning one level down: every molecule may have been skipped, and a section of zero
         // comparisons is indistinguishable from a section of zero mismatches.
-        if (reporters.cip.comparison_count() == cip_before_corpus)
+        if (reporters.cip.summarize("corpus_cip").compared == 0)
             return sftest::report_fail(test_name_k, "corpus {} produced no CIP comparisons over {} SMILES",
                                        selection.path, corpus.size());
         sf_verify_(reporters.cip.passed(), "every corpus stereocenter must match the CIP oracle");

@@ -166,6 +166,9 @@ class comparison_group_t final : public diagnostic_group_t {
         : diagnostic_group_t(owner, diagnostic_verb_t::mismatch_k, std::move(prefix)) {}
 };
 
+/** The `field` predicate for operands that carry no tolerance at all: a count, a type, a flag, a sign. */
+inline constexpr auto exactly_equal = [](auto const &reference, auto const &observed) { return reference == observed; };
+
 /**
  *  @brief A `NOTE` group whose fields print whether they agree or not.
  *
@@ -185,6 +188,11 @@ class narration_group_t final : public diagnostic_group_t {
     friend class diagnostic_reporter_t;
     narration_group_t(diagnostic_reporter_t &owner, std::string prefix) noexcept
         : diagnostic_group_t(owner, diagnostic_verb_t::note_k, std::move(prefix)) {}
+};
+
+/** What one section closed with. Zero `compared` is a failure, so a caller can gate on it directly. */
+struct section_counts_t {
+    std::size_t compared = 0, mismatched = 0, suppressed = 0;
 };
 
 /**
@@ -220,8 +228,10 @@ class diagnostic_reporter_t {
      *
      *  Counts run from the previous `summarize`, so one reporter can close several sections in order.
      *  A section that compared nothing fails: it is indistinguishable from a passing one otherwise.
+     *  They are returned as well as printed, so a caller gating on its own section does not recompute them;
+     *  most callers ignore the result, so this is deliberately not `[[nodiscard]]`.
      */
-    void summarize(std::string_view subject) {
+    section_counts_t summarize(std::string_view subject) {
         std::size_t const compared = comparison_count_ - section_comparison_mark_;
         std::size_t const mismatched = mismatch_count_ - section_mismatch_mark_;
         std::size_t const suppressed = suppressed_line_count_ - section_suppressed_mark_;
@@ -235,6 +245,7 @@ class diagnostic_reporter_t {
         section_comparison_mark_ = comparison_count_;
         section_mismatch_mark_ = mismatch_count_;
         section_suppressed_mark_ = suppressed_line_count_;
+        return {compared, mismatched, suppressed};
     }
 
     /** Cap printed lines so one pathological molecule cannot bury the log; the rest are still counted. */

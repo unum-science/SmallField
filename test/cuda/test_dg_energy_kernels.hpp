@@ -12,7 +12,8 @@ namespace smallfield::tests {
 /**
  *  @brief Evaluate distance-geometry energy and its gradient on the device for one molecule.
  *
- *  @param[in] host_coords Flat interleaved coordinates, `spatial_dimension * num_atoms` entries.
+ *  @param[in] host_coords Coordinates as `(axis, atom)`, `spatial_dimension * num_atoms` entries, which is
+ *      the layout the kernel indexes; an interleaved block passed here scores a different molecule.
  *  @param[out] host_gradient Receives the gradient, same layout as @p host_coords.
  *  @param[in] host_bounds Flat `num_atoms` squared bounds matrix.
  *  @param[in] num_atoms Atom count.
@@ -29,7 +30,7 @@ void gpu_dg_energy(float const *host_coords, float *host_gradient, float const *
 /**
  *  @brief Run FIRE minimization of the distance-geometry energy on the device for one molecule.
  *
- *  @param[inout] host_coords Flat interleaved coordinates, overwritten with the minimized positions.
+ *  @param[inout] host_coords Coordinates as `(axis, atom)`, overwritten with the minimized positions.
  *  @param[in] host_bounds Flat `num_atoms` squared bounds matrix.
  *  @param[in] num_atoms Atom count.
  *  @param[in] spatial_dimension Coordinate dimensionality.

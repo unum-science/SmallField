@@ -103,6 +103,8 @@ struct metric_scratch_t {
     custd::span<std::uint32_t> group_indices {};
     std::size_t max_group_size = 0;
     std::uint32_t max_atoms = 0;
+    /** Host-side per-bin molecule lists, refilled each wave; grows once. */
+    std::array<std::vector<std::uint32_t>, atom_limited_bin_count_k> bin_groups {};
     /*  `embed_4d_power_iter_kernel` holds the Gram matrix, means, eigenvectors and reduction scratch
      *  in shared memory for its whole lifetime, so the only persistent device scratch is
      *  `group_indices` — a per-bin uint32 list of which molecule goes into which bin. */
@@ -111,12 +113,32 @@ struct metric_scratch_t {
 /**
  *  @brief Forward-declares persistent per-device launch scratch.
  *
- *  Defined in `smallfield.cu` so the public header does not need CUDA RAII wrappers.
+ *  Defined in `smallfield.cu` because it holds this device's copy of the MMFF94 parameter tables and
+ *  the compiled CSD torsion patterns, whose headers would otherwise reach every consumer of the
+ *  public API. CUDA RAII wrappers are not the reason — `metric_scratch_t::pool` is one, right above.
  */
 struct launch_scratch_t;
 
 /**
- *  @brief GPU context managing CUDA streams and cuSOLVER handles.
+ *  @brief Waves in flight at once, and with it the slot count of every per-wave ring.
+ *
+ *  Two, and that is a property of the code rather than a tuning knob. There is one
+ *  `launch_scratch_t::device_pool` per device, so two waves resident on one device would carve their
+ *  outputs from the same bytes, and `prepare_per_device_batches_into` holds per-call state a second
+ *  concurrent preparation would share.
+ *
+ *  Named for the pinned prep ring rather than for "the pipeline", because `cli/smallfield_batch.cpp`
+ *  carries a depth of its own for the four-role handoff and the two are unrelated numbers.
+ */
+inline constexpr std::uint32_t pinned_prep_depth_k = 2;
+
+/** The ring slot wave @p wave_index owns. The one place the ring modulus is written. */
+[[nodiscard]] constexpr std::uint32_t pinned_prep_slot_of(std::uint32_t wave_index) noexcept {
+    return wave_index % pinned_prep_depth_k;
+}
+
+/**
+ *  @brief GPU context owning the per-device CUDA streams, scratch and pinned pools a wave runs on.
  *
  *  Reuse across multiple `generate_conformers` calls to avoid re-initialization.
  */
@@ -132,15 +154,14 @@ struct context_t {
     /** One per device. */
     std::vector<device_launch_config_t> launch_configs;
     /**
-     *  @brief Persistent per-device 2-slot pinned batch pool ring.
+     *  @brief Persistent ring of per-device pinned batch pools, one slot per wave in flight.
      *
-     *  Each GPU owns its own pinned source buffer per slot; preprocess writes
-     *  every molecule's bytes into the pool assigned to that molecule's target
-     *  device, and the per-device `cudaMemcpyAsync H2D` reads only from its
-     *  own pool. Eliminates the concurrent-pinned-source-DMA pattern that
-     *  arose when all devices read the same shared pinned buffer.
+     *  Slot-major because that is the shape `prepare_per_device_batches_into` fills: it takes one
+     *  contiguous run of pools and writes every molecule's bytes into the pool of its target device.
+     *  Each GPU's host-to-device copy then reads only from its own pool, so no two devices pull from
+     *  one pinned source. Reach a slot through `wave_slot`, never a hand-written modulus.
      */
-    std::array<std::array<wave_slice_pool_t, max_devices_k>, 2> batch_slots_per_device {};
+    std::array<std::array<wave_slice_pool_t, max_devices_k>, pinned_prep_depth_k> batch_slots_per_device {};
     /** Per-device molecule count every pool above was pre-sized for. The wave
      *  sizer clamps to this so a runtime wave can never exceed the construction-time
      *  reservation and trigger a grow from inside the per-device launch fan-out. */
@@ -154,8 +175,8 @@ struct context_t {
     smallfield::logger_t logger;
 
     /**
-     *  @brief Per-context CUDA error accumulator, incremented by `check_cuda_status_` every time a CUDA /
-     *  cuSOLVER API call returns a non-success status. Production callers read this after each
+     *  @brief Per-context CUDA error accumulator, incremented by `cuda_error_sink_t::check` every time a
+     *  CUDA API call returns a non-success status. Production callers read this after each
      *  `generate_conformers` call and exit non-zero if it is positive, catching silent failures that would
      *  otherwise hide behind per-wave zero-filled outputs. Reset via `context.cuda_error_count.store(0)`.
      */
@@ -171,6 +192,16 @@ struct context_t {
 
     context_t(context_t const &) = delete;
     context_t &operator=(context_t const &) = delete;
+
+    /**
+     *  @brief The per-device pinned pools wave @p wave_index prepares into, one per device in order.
+     *
+     *  Extent is the live device count rather than `max_devices_k`, so preprocess cannot write past
+     *  the devices this context actually manages.
+     */
+    [[nodiscard]] custd::span<wave_slice_pool_t> wave_slot(std::uint32_t wave_index) noexcept {
+        return {batch_slots_per_device[pinned_prep_slot_of(wave_index)].data(), device_ids.size()};
+    }
 
     /**
      *  @brief Generate 3D conformers for a batch of molecules.

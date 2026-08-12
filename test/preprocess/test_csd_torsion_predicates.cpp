@@ -52,6 +52,7 @@
 
 #include "test/test_rdkit_reference_helpers.hpp"
 
+namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -235,8 +236,6 @@ static std::size_t validate_patterns_for_molecule_(RDKit::ROMol const &molecule,
     std::uint8_t done_bonds_u8[sft::max_bonds_k] = {};
     std::size_t ok = 0;
     for (auto const &compiled_pattern : patterns) {
-        if (!compiled_pattern.native) continue;
-
         // Collect native matches. We cannot use the dispatcher's `done_bonds`
         // shortcut here because we want @b every emission, not just the first
         // per bond; use a fresh stub that never marks the bond done.
@@ -294,15 +293,16 @@ static void compile_recursive_cases_into_(std::vector<recursive_case_t> &cases) 
     }
 }
 
-/** Announce the pattern corpus, and report how many of its patterns the native matcher parses. */
+/**
+ *  @brief Announce the pattern corpus.
+ *
+ *  Every pattern `csd_patterns` hands out compiled natively — one that did not is dropped at load
+ *  with a diagnostic — so this count is the corpus size, and a drop shows up here as a shortfall
+ *  against the 470 rows the table carries.
+ */
 static std::size_t announce_pattern_corpus_(std::vector<sfp::csd_compiled_pattern_t> const &patterns) {
-    std::size_t native_patterns = 0;
-    for (auto const &pattern : patterns)
-        if (pattern.native) ++native_patterns;
-    double const native_percent = 100.0 * static_cast<double>(native_patterns) / static_cast<double>(patterns.size());
-    fmt::println("CSD patterns: {} total, {} native ({:.3f}%)", fmt::group_digits(patterns.size()),
-                 fmt::group_digits(native_patterns), native_percent);
-    return native_patterns;
+    fmt::println("CSD patterns: {} native", fmt::group_digits(patterns.size()));
+    return patterns.size();
 }
 
 /** Why a corpus molecule was left out of the sweep, or that it was not. */
@@ -349,7 +349,8 @@ static molecule_admission_t admit_molecule_(std::string const &smiles, std::uniq
     if (ring_info != nullptr && ring_info->isInitialized() && ring_info->atomRings().size() > sft::max_rings_k)
         return molecule_admission_t::exceeds_ring_capacity_k;
 
-    if (!sft::build_descriptor(*molecule, descriptor)) return molecule_admission_t::no_descriptor_k;
+    if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k)
+        return molecule_admission_t::no_descriptor_k;
     return molecule_admission_t::admitted_k;
 }
 

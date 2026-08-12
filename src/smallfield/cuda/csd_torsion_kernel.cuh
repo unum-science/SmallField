@@ -82,9 +82,7 @@ inline constexpr std::uint32_t no_closure_offset_k = 0xFFFFFFFFu;
 /**
  *  @brief POD mirror of one compiled torsion pattern. Everything the matcher reads is either inline here
  *  or reachable through an offset into the table's node and closure arenas, so the whole struct is
- *  memcpy-able to the device. The six Fourier coefficients are the host's `fourier_signs[i] *
- *  fourier_magnitudes[i]` products, folded at upload time because the kernel never needs the two
- *  factors apart.
+ *  memcpy-able to the device.
  */
 struct alignas(8) csd_device_pattern_t {
     /** The labelled atoms `:1` through `:4`. */
@@ -154,8 +152,7 @@ inline void build_csd_torsion_table(csd_torsion_table_host_t &out) {
         pattern.required_hybridizations = source.required_hybridizations;
         pattern.requires_aromatic = source.requires_aromatic ? 1u : 0u;
         for (std::uint32_t term = 0; term < 6; ++term)
-            pattern.fourier_coefficients[term] = static_cast<float>(native.fourier_signs[term]) *
-                                                 native.fourier_magnitudes[term];
+            pattern.fourier_coefficients[term] = source.fourier_coefficients[term];
 
         pattern.pool_offset = static_cast<std::uint32_t>(out.nodes.size());
         for (std::uint32_t node_index = 0; node_index < native.pool.num_nodes; ++node_index)

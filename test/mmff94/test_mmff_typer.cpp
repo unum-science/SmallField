@@ -41,6 +41,7 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
+namespace sfapi = smallfield::api;
 namespace sfparam = smallfield::parameters;
 namespace sfmmff = smallfield::mmff94;
 namespace sft = smallfield::types;
@@ -50,10 +51,7 @@ static constexpr std::string_view test_name_k = "test_mmff_typer";
 
 namespace smallfield::tests {
 
-/*  `comparison_group_t::field` invokes its predicate as `equals(reference, observed)`. An atom type is
- *  an index and must agree exactly; a partial charge is summed in `float` here against RDKit's
- *  `double`, so it carries the absolute 1e-3 tolerance this suite has always applied. */
-static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
+/** A partial charge is summed in `float` here against RDKit's `double`, so it carries an absolute tolerance. */
 static constexpr auto charge_within_tolerance_ = [](float rdkit_value, float native_value) {
     return std::fabs(rdkit_value - native_value) <= 1e-3f;
 };
@@ -137,7 +135,8 @@ static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t c
     if (!props.isValid()) return; // RDKit cannot type it either, so there is nothing to compare
 
     sft::molecule_descriptor_t descriptor;
-    if (!sft::build_descriptor(*molecule, descriptor)) return; // an element or a bond order we do not carry
+    // an element or a bond order we do not carry
+    if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k) return;
     scratch.resize(descriptor.num_atoms);
     sfmmff::native_compute_mmff_atom_types(descriptor, scratch.atom_types);
     sfmmff::native_compute_mmff_formal_charges(descriptor, scratch.atom_types, scratch.formal_charges);
@@ -150,7 +149,7 @@ static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t c
         std::uint8_t const rdkit_atom_type = props.getMMFFAtomType(atom_index);
         auto atom = reporters.atom_type.mismatch("mmff_typer", "smiles={} atom={} element={}", smiles, atom_index,
                                                  descriptor.element[atom_index]);
-        atom.field("atom_type", rdkit_atom_type, scratch.atom_types[atom_index], exactly_equal_);
+        atom.field("atom_type", rdkit_atom_type, scratch.atom_types[atom_index], exactly_equal);
         bool const types_agree = atom.reported_field_count() == 0;
         mismatching_atoms += !types_agree;
         if (!types_agree) continue; // a wrong type gives a wrong charge, so the charge says nothing

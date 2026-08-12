@@ -84,7 +84,6 @@ static constexpr auto rdkit_within_tolerance_ = [](double rdkit_value, float our
 static constexpr auto bits_identical_ = [](float host_value, float device_value) {
     return bitwise_equal_(host_value, device_value);
 };
-static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
 
 /** How many mismatching fields a reporter prints before the rest are only counted. A systematic divergence
  *  would otherwise print one line per probe and bury every other section in the log. */
@@ -383,7 +382,7 @@ static void compare_vdw_against_rdkit_(sf::parameters::mmff94_tables_view_t cons
         auto const *reference = (*collection)(query.atom_type);
         ++coverage.probes;
         auto entry = reporter.mismatch("vdw", "atom_type={}", query.atom_type);
-        entry.field("present", reference != nullptr, ours != nullptr, exactly_equal_);
+        entry.field("present", reference != nullptr, ours != nullptr, exactly_equal);
         if (reference == nullptr || ours == nullptr) continue; // one side carries no parameters to compare
         ++coverage.table_hits;
         // RDKit stores the donor/acceptor flag as the tabulated character; the extraction maps it onto a
@@ -396,7 +395,7 @@ static void compare_vdw_against_rdkit_(sf::parameters::mmff94_tables_view_t cons
             .field("a_scale", reference->A_i, ours->a_scale, rdkit_within_tolerance_)
             .field("g_factor", reference->G_i, ours->g_factor, rdkit_within_tolerance_)
             .field("r_star", reference->R_star, ours->r_star, rdkit_within_tolerance_)
-            .field("donor_acceptor", reference_donor_acceptor, ours->donor_acceptor, exactly_equal_);
+            .field("donor_acceptor", reference_donor_acceptor, ours->donor_acceptor, exactly_equal);
     }
     report_coverage_("vdw", coverage);
     reporter.summarize("vdw");
@@ -412,7 +411,7 @@ static void compare_bond_against_rdkit_(sf::parameters::mmff94_tables_view_t con
         ++coverage.probes;
         auto entry = reporter.mismatch("bond", "bond_type={} atom_i={} atom_j={}", query.bond_type, query.atom_type_i,
                                        query.atom_type_j);
-        entry.field("present", reference != nullptr, ours != nullptr, exactly_equal_);
+        entry.field("present", reference != nullptr, ours != nullptr, exactly_equal);
         if (reference == nullptr || ours == nullptr) continue; // one side carries no parameters to compare
         ++coverage.table_hits;
         entry.field("force_constant", reference->kb, ours->force_constant, rdkit_within_tolerance_)
@@ -435,7 +434,7 @@ static void compare_angle_against_rdkit_(sf::parameters::mmff94_tables_view_t co
         ++coverage.probes;
         auto entry = reporter.mismatch("angle", "angle_type={} atom_i={} atom_j={} atom_k={}", query.angle_type,
                                        query.atom_type_i, query.atom_type_j_center, query.atom_type_k);
-        entry.field("present", reference != nullptr, ours != nullptr, exactly_equal_);
+        entry.field("present", reference != nullptr, ours != nullptr, exactly_equal);
         if (reference == nullptr || ours == nullptr) continue; // one side carries no parameters to compare
         ++coverage.table_hits;
         entry.field("force_constant", reference->ka, ours->force_constant, rdkit_within_tolerance_)
@@ -463,10 +462,10 @@ static void compare_torsion_against_rdkit_(sf::parameters::mmff94_tables_view_t 
             "torsion", "primary_torsion_type={} secondary_torsion_type={} atom_i={} atom_j={} atom_k={} atom_l={}",
             query.primary_torsion_type, query.secondary_torsion_type, query.atom_type_i, query.atom_type_j,
             query.atom_type_k, query.atom_type_l);
-        entry.field("present", reference.second != nullptr, ours.second != nullptr, exactly_equal_);
+        entry.field("present", reference.second != nullptr, ours.second != nullptr, exactly_equal);
         if (reference.second == nullptr || ours.second == nullptr) continue; // nothing to compare on one side
         ++coverage.table_hits;
-        entry.field("canonical_torsion_type", reference.first, ours.first, exactly_equal_)
+        entry.field("canonical_torsion_type", reference.first, ours.first, exactly_equal)
             .field("torsion_v1", reference.second->V1, ours.second->torsion_v1, rdkit_within_tolerance_)
             .field("torsion_v2", reference.second->V2, ours.second->torsion_v2, rdkit_within_tolerance_)
             .field("torsion_v3", reference.second->V3, ours.second->torsion_v3, rdkit_within_tolerance_);
@@ -584,7 +583,7 @@ static void compare_vdw_on_device_(sf::parameters::mmff94_tables_view_t const &h
         bool const host_hit = ours != nullptr;
         ++coverage.probes;
         auto entry = reporter.mismatch("vdw", "atom_type={}", queries[probe].atom_type);
-        entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal_);
+        entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal);
         if (!host_hit || results[probe].hit == 0) continue; // one side resolved nothing to compare
         ++coverage.table_hits;
         entry.field("alpha", ours->alpha_i, results[probe].alpha, bits_identical_)
@@ -592,7 +591,7 @@ static void compare_vdw_on_device_(sf::parameters::mmff94_tables_view_t const &h
             .field("a_scale", ours->a_scale, results[probe].polarizability_scale, bits_identical_)
             .field("g_factor", ours->g_factor, results[probe].slater_kirkwood_factor, bits_identical_)
             .field("r_star", ours->r_star, results[probe].r_star, bits_identical_)
-            .field("donor_acceptor", ours->donor_acceptor, results[probe].donor_acceptor, exactly_equal_);
+            .field("donor_acceptor", ours->donor_acceptor, results[probe].donor_acceptor, exactly_equal);
     }
     report_coverage_("vdw", coverage);
     reporter.summarize("vdw");
@@ -617,7 +616,7 @@ static void compare_bond_on_device_(sf::parameters::mmff94_tables_view_t const &
         ++coverage.probes;
         auto entry = reporter.mismatch("bond", "bond_type={} atom_i={} atom_j={}", queries[probe].bond_type,
                                        queries[probe].atom_type_i, queries[probe].atom_type_j);
-        entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal_);
+        entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal);
         if (!host_hit || results[probe].hit == 0) continue; // one side resolved nothing to compare
         ++coverage.table_hits;
         entry.field("force_constant", ours->force_constant, results[probe].force_constant, bits_identical_)
@@ -650,7 +649,7 @@ static void compare_angle_on_device_(sf::parameters::mmff94_tables_view_t const 
         auto entry = reporter.mismatch("angle", "angle_type={} atom_i={} atom_j={} atom_k={}",
                                        queries[probe].angle_type, queries[probe].atom_type_i,
                                        queries[probe].atom_type_j_center, queries[probe].atom_type_k);
-        entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal_);
+        entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal);
         if (!host_hit || results[probe].hit == 0) continue; // one side resolved nothing to compare
         ++coverage.table_hits;
         entry.field("force_constant", ours->force_constant, results[probe].force_constant, bits_identical_)
@@ -684,12 +683,12 @@ static void compare_torsion_on_device_(sf::parameters::mmff94_tables_view_t cons
             "torsion", "primary_torsion_type={} secondary_torsion_type={} atom_i={} atom_j={} atom_k={} atom_l={}",
             queries[probe].primary_torsion_type, queries[probe].secondary_torsion_type, queries[probe].atom_type_i,
             queries[probe].atom_type_j, queries[probe].atom_type_k, queries[probe].atom_type_l);
-        entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal_);
+        entry.field("hit", host_hit, results[probe].hit != 0, exactly_equal);
         if (!host_hit || results[probe].hit == 0) continue; // one side resolved nothing to compare
         ++coverage.table_hits;
         entry
             .field("canonical_torsion_type", static_cast<std::uint8_t>(ours.first),
-                   results[probe].canonical_torsion_type, exactly_equal_)
+                   results[probe].canonical_torsion_type, exactly_equal)
             .field("torsion_v1", ours.second->torsion_v1, results[probe].torsion_v1, bits_identical_)
             .field("torsion_v2", ours.second->torsion_v2, results[probe].torsion_v2, bits_identical_)
             .field("torsion_v3", ours.second->torsion_v3, results[probe].torsion_v3, bits_identical_);

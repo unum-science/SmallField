@@ -110,23 +110,6 @@ using gradient_soa_t = coordinates_soa<coordinate_role_t::gradient_k, float, sft
 /** RDKit's gradient, atom-major and double-precision, which is what `calcGrad` accumulates into. */
 using gradient_aos_t = coordinates_aos<coordinate_role_t::gradient_k, double>;
 
-/**
- *  @brief Read @p molecule's conformer into @p atom_major without allocating.
- *
- *  @param[in] molecule Molecule carrying at least one conformer.
- *  @param[out] atom_major Destination, whose extent decides how many atoms are read.
- */
-static void read_coordinates_into_(RDKit::ROMol const &molecule, conformer_aos_t atom_major) {
-    sf_verify_(atom_major.extent(0) == molecule.getNumAtoms(), "coordinate view must span the molecule's atoms");
-    auto const &conformer = molecule.getConformer();
-    for (std::uint32_t atom = 0; atom < atom_major.extent(0); ++atom) {
-        auto const &position = conformer.getAtomPos(atom);
-        atom_major(atom, 0) = static_cast<float>(position.x);
-        atom_major(atom, 1) = static_cast<float>(position.y);
-        atom_major(atom, 2) = static_cast<float>(position.z);
-    }
-}
-
 #pragma endregion Coordinate Layouts
 
 #pragma region Term Isolation
@@ -473,7 +456,7 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
     auto const interleaved = reset_coordinates_aos<coordinate_role_t::position_k>(scratch.interleaved, num_atoms);
     auto const positions = reset_coordinates_soa<coordinate_role_t::position_k, sft::conformer_dimensions_k>(
         scratch.positions, num_atoms);
-    read_coordinates_into_(molecule, interleaved);
+    read_conformer_into(molecule, interleaved);
     transpose_into(interleaved, positions);
     if (probe.perturbation > 0.0f) {
         perturb_(positions, probe.perturbation);

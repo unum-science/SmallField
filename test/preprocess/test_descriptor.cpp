@@ -34,6 +34,7 @@
 
 #include "test/test_rdkit_reference_helpers.hpp"
 
+namespace sfapi = smallfield::api;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
 
@@ -174,7 +175,7 @@ static void compare_bond_hops_(RDKit::ROMol const &molecule, descriptor_scratch_
     std::uint32_t const num_atoms = molecule.getNumAtoms();
     std::size_t const cell_count = static_cast<std::size_t>(num_atoms) * num_atoms;
     if (scratch.bond_hops.size() < cell_count) scratch.bond_hops.resize(cell_count);
-    sft::fill_bond_distances(scratch.descriptor, scratch.bond_hops.data(), num_atoms);
+    sft::fill_bond_distances(scratch.descriptor, sft::hop_matrix_t {scratch.bond_hops.data(), num_atoms, num_atoms});
 
     double const *rdkit_distances = RDKit::MolOps::getDistanceMat(molecule);
     for (std::uint32_t row = 0; row < num_atoms; ++row) {
@@ -200,8 +201,9 @@ static void compare_bond_hops_(RDKit::ROMol const &molecule, descriptor_scratch_
  */
 static void check_molecule_(RDKit::ROMol const &molecule, std::string const &smiles, diagnostic_reporter_t &reporter,
                             descriptor_scratch_t &scratch) {
-    bool const built = sft::build_descriptor(molecule, scratch.descriptor);
-    sf_verify_(built, ("build_descriptor refused a molecule inside both extents: " + smiles).c_str());
+    sfapi::conformer_status_t const built = sft::build_descriptor(molecule, scratch.descriptor);
+    sf_verify_(built == sfapi::conformer_status_t::success_k,
+               ("build_descriptor refused a molecule inside both extents: " + smiles).c_str());
 
     auto const *ring_info = molecule.getRingInfo();
     reporter.mismatch("counts", "smiles={}", smiles)

@@ -83,10 +83,6 @@ static bool gate_can_answer_(sfapi::conformer_status_t status) noexcept {
     }
 }
 
-/** A status code and an atoms-survived flag agree only exactly. */
-static bool agree_exactly_(unsigned reference, unsigned observed) noexcept { return reference == observed; }
-static bool flags_agree_(bool reference, bool observed) noexcept { return reference == observed; }
-
 #pragma endregion Curated Cases
 
 #pragma region Checks
@@ -107,8 +103,8 @@ static void check_curated_case_(element_gate_case_t const &probe, sfprep::etkdg_
     // empty-but-accepted preparation and hand it to the device.
     bool const expected_atoms_present = probe.expected == sfapi::conformer_status_t::success_k;
     reporter.mismatch("element_gate", "molecule={} smiles={}", probe.label, probe.smiles)
-        .field("status_code", static_cast<unsigned>(probe.expected), static_cast<unsigned>(status), agree_exactly_)
-        .field("atoms_present", expected_atoms_present, scratch.num_atoms != 0, flags_agree_);
+        .field("status_code", static_cast<unsigned>(probe.expected), static_cast<unsigned>(status), exactly_equal)
+        .field("atoms_present", expected_atoms_present, scratch.num_atoms != 0, exactly_equal);
 }
 
 /**
@@ -125,8 +121,8 @@ static sfapi::conformer_status_t check_corpus_molecule_(std::string const &smile
     auto const status = sfprep::prepare_molecule_into(smiles, scratch);
     bool const expected_atoms_present = status == sfapi::conformer_status_t::success_k;
     reporter.mismatch("element_gate", "molecule=corpus smiles={}", smiles)
-        .field("status_answerable", true, gate_can_answer_(status), flags_agree_)
-        .field("atoms_present", expected_atoms_present, scratch.num_atoms != 0, flags_agree_);
+        .field("status_answerable", true, gate_can_answer_(status), exactly_equal)
+        .field("atoms_present", expected_atoms_present, scratch.num_atoms != 0, exactly_equal);
     return status;
 }
 

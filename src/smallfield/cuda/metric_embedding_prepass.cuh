@@ -372,8 +372,7 @@ inline bool build_metric_initial_coordinates_on_gpu(float *device_bounds,
         return bin_index < smallfield::types::atom_limited_bin_count_k ? static_cast<int>(bin_index) : -1;
     };
 
-    // Bins are reused across calls via a thread_local store; no per-call allocation.
-    thread_local std::array<std::vector<std::uint32_t>, num_bins_k> bin_groups;
+    auto &bin_groups = scratch.bin_groups;
     for (auto &bin_group : bin_groups) bin_group.clear();
     for (std::uint32_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
         std::uint32_t const num_atoms = host_metadata[molecule_index].num_atoms;

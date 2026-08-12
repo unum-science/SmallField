@@ -5,6 +5,11 @@
  *  Separated from `mmff94_tables.hpp` so that CUDA translation units can include the POD structs and
  *  lookup functions without pulling in RDKit, which triggers nvcc internal errors via `boost::tti`.
  *  Only host-side `.cpp` files that call `extract_mmff94_tables_from_rdkit` need this header.
+ *
+ *  This file is the declared library-spelling boundary: `crd`, `mltb`, `pilp`, `linh`, `sbmb`, `kbaIJK`
+ *  and their siblings on the right of every assignment are RDKit's own field names, while the spelled-out
+ *  names on the left are ours. One extractor per collection, and each one `assign`s its destination so a
+ *  freshly value-initialized entry already carries the zeroes its padding needs.
  */
 
 #pragma once
@@ -26,259 +31,301 @@ ForceFields::MMFF::MMFFCovRadPauEleCollection const *getMMFFCovRadPauEle();
 
 namespace smallfield::parameters {
 
+#pragma region Sparse Tables
+
+/**
+ *  @brief Extract the VdW entries and the five collection-wide scalars that arrive with them.
+ *
+ *  @param[out] out Container whose `vdw` table and `vdw_*` scalars are filled.
+ *  @return Highest MMFF atom type the table mentions, which sizes the two dense tables below.
+ */
+inline std::uint8_t extract_vdw_table_(mmff94_tables_host_t &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFVdW();
+    out.vdw_power = static_cast<float>(collection->power);
+    out.vdw_b = static_cast<float>(collection->B);
+    out.vdw_beta = static_cast<float>(collection->Beta);
+    out.vdw_darad = static_cast<float>(collection->DARAD);
+    out.vdw_daeps = static_cast<float>(collection->DAEPS);
+
+    std::size_t const count = collection->d_atomType.size();
+    out.vdw.assign(count, mmff94_vdw_entry_t {});
+    std::uint8_t max_atom_type = 0;
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out.vdw[entry_index];
+        auto const &params = collection->d_params[entry_index];
+        entry.atom_type = collection->d_atomType[entry_index];
+        entry.alpha_i = static_cast<float>(params.alpha_i);
+        entry.n_effective = static_cast<float>(params.N_i);
+        entry.a_scale = static_cast<float>(params.A_i);
+        entry.g_factor = static_cast<float>(params.G_i);
+        entry.r_star = static_cast<float>(params.R_star);
+        entry.donor_acceptor = (params.DA == 'D') ? 2u : (params.DA == 'A') ? 1u : 0u;
+        if (entry.atom_type > max_atom_type) max_atom_type = entry.atom_type;
+    }
+    return max_atom_type;
+}
+
+/** Extract the bond-stretch table, sorted by (i, j, bond_type). */
+inline void extract_bond_table_(std::vector<mmff94_bond_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFBond();
+    std::size_t const count = collection->d_iAtomType.size();
+    out.assign(count, mmff94_bond_entry_t {});
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out[entry_index];
+        auto const &params = collection->d_params[entry_index];
+        entry.i_type = collection->d_iAtomType[entry_index];
+        entry.j_type = collection->d_jAtomType[entry_index];
+        entry.bond_type = collection->d_bondType[entry_index];
+        entry.force_constant = static_cast<float>(params.kb);
+        entry.equilibrium_distance = static_cast<float>(params.r0);
+    }
+}
+
+/** Extract the angle-bend table, sorted by (j, i, k, angle_type). */
+inline void extract_angle_table_(std::vector<mmff94_angle_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFAngle();
+    std::size_t const count = collection->d_iAtomType.size();
+    out.assign(count, mmff94_angle_entry_t {});
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out[entry_index];
+        auto const &params = collection->d_params[entry_index];
+        entry.j_type = collection->d_jAtomType[entry_index];
+        entry.i_type = collection->d_iAtomType[entry_index];
+        entry.k_type = collection->d_kAtomType[entry_index];
+        entry.angle_type = collection->d_angleType[entry_index];
+        entry.force_constant = static_cast<float>(params.ka);
+        entry.theta0_deg = static_cast<float>(params.theta0);
+    }
+}
+
+/** Extract the torsion table, sorted by (j, k, i, l, tor_type). */
+inline void extract_torsion_table_(std::vector<mmff94_torsion_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFTor(false);
+    std::size_t const count = collection->d_iAtomType.size();
+    out.assign(count, mmff94_torsion_entry_t {});
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out[entry_index];
+        auto const &params = collection->d_params[entry_index];
+        entry.j_type = collection->d_jAtomType[entry_index];
+        entry.k_type = collection->d_kAtomType[entry_index];
+        entry.i_type = collection->d_iAtomType[entry_index];
+        entry.l_type = collection->d_lAtomType[entry_index];
+        entry.tor_type = collection->d_torType[entry_index];
+        entry.torsion_v1 = static_cast<float>(params.V1);
+        entry.torsion_v2 = static_cast<float>(params.V2);
+        entry.torsion_v3 = static_cast<float>(params.V3);
+    }
+}
+
+/** Extract the out-of-plane table, sorted by (j, i, k, l). */
+inline void extract_oop_table_(std::vector<mmff94_oop_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFOop(false);
+    std::size_t const count = collection->d_iAtomType.size();
+    out.assign(count, mmff94_oop_entry_t {});
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out[entry_index];
+        entry.j_type = collection->d_jAtomType[entry_index];
+        entry.i_type = collection->d_iAtomType[entry_index];
+        entry.k_type = collection->d_kAtomType[entry_index];
+        entry.l_type = collection->d_lAtomType[entry_index];
+        entry.force_constant = static_cast<float>(collection->d_params[entry_index].koop);
+    }
+}
+
+/** Extract the stretch-bend table, sorted by (j, i, k, stretch_bend_type). */
+inline void extract_stbn_table_(std::vector<mmff94_stbn_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFStbn();
+    std::size_t const count = collection->d_iAtomType.size();
+    out.assign(count, mmff94_stbn_entry_t {});
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out[entry_index];
+        auto const &params = collection->d_params[entry_index];
+        entry.j_type = collection->d_jAtomType[entry_index];
+        entry.i_type = collection->d_iAtomType[entry_index];
+        entry.k_type = collection->d_kAtomType[entry_index];
+        entry.stretch_bend_type = collection->d_stretchBendType[entry_index];
+        entry.kba_ijk = static_cast<float>(params.kbaIJK);
+        entry.kba_kji = static_cast<float>(params.kbaKJI);
+    }
+}
+
+/**
+ *  @brief Flatten the default stretch-bend fallback out of RDKit's three nested maps and sort it.
+ *
+ *  The lookup cascade binary-searches (row_i, row_j, row_k), so the map iteration order — already
+ *  ascending for `std::map` but not guaranteed by the interface — is re-established explicitly.
+ *
+ *  @param[out] out Flat table, sorted by (row_i, row_j, row_k).
+ */
+inline void extract_dfsb_table_(std::vector<mmff94_dfsb_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFDfsb();
+    out.clear();
+    for (auto const &[row_i, by_row_j] : collection->d_params)
+        for (auto const &[row_j, by_row_k] : by_row_j)
+            for (auto const &[row_k, params] : by_row_k) {
+                mmff94_dfsb_entry_t entry {};
+                entry.row_i = static_cast<std::uint8_t>(row_i);
+                entry.row_j = static_cast<std::uint8_t>(row_j);
+                entry.row_k = static_cast<std::uint8_t>(row_k);
+                entry.kba_ijk = static_cast<float>(params.kbaIJK);
+                entry.kba_kji = static_cast<float>(params.kbaKJI);
+                out.push_back(entry);
+            }
+    std::sort(out.begin(), out.end(), [](mmff94_dfsb_entry_t const &left, mmff94_dfsb_entry_t const &right) {
+        if (left.row_i != right.row_i) return left.row_i < right.row_i;
+        if (left.row_j != right.row_j) return left.row_j < right.row_j;
+        return left.row_k < right.row_k;
+    });
+}
+
+/** Extract the partial bond-charge increments, sorted by atom type. */
+inline void extract_pbci_table_(std::vector<mmff94_pbci_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFPBCI();
+    std::size_t const count = collection->d_params.size();
+    out.assign(count, mmff94_pbci_entry_t {});
+    for (std::size_t type_index = 0; type_index < count; ++type_index) {
+        auto &entry = out[type_index];
+        entry.atom_type = static_cast<std::uint8_t>(type_index + 1);
+        entry.pbci = static_cast<float>(collection->d_params[type_index].pbci);
+        entry.fcadj = static_cast<float>(collection->d_params[type_index].fcadj);
+    }
+}
+
+/** Extract the bond-charge increments, sorted by (i, j, bond_type). */
+inline void extract_chg_table_(std::vector<mmff94_chg_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFChg();
+    std::size_t const count = collection->d_iAtomType.size();
+    out.assign(count, mmff94_chg_entry_t {});
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out[entry_index];
+        entry.i_type = collection->d_iAtomType[entry_index];
+        entry.j_type = collection->d_jAtomType[entry_index];
+        entry.bond_type = collection->d_bondType[entry_index];
+        entry.bond_charge_increment = static_cast<float>(collection->d_params[entry_index].bci);
+    }
+}
+
+/** Extract the default bond parameters, sorted by atomic-number pair. */
+inline void extract_bndk_table_(std::vector<mmff94_bndk_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFBndk();
+    std::size_t const count = collection->d_iAtomicNum.size();
+    out.assign(count, mmff94_bndk_entry_t {});
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out[entry_index];
+        auto const &params = collection->d_params[entry_index];
+        entry.atomic_num_i = collection->d_iAtomicNum[entry_index];
+        entry.atomic_num_j = collection->d_jAtomicNum[entry_index];
+        entry.force_constant = static_cast<float>(params.kb);
+        entry.equilibrium_distance = static_cast<float>(params.r0);
+    }
+}
+
+/** Extract the Herschbach-Laurie parameters, sorted by periodic-table-row pair. */
+inline void extract_hl_table_(std::vector<mmff94_hl_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFHerschbachLaurie();
+    std::size_t const count = collection->d_iRow.size();
+    out.assign(count, mmff94_hl_entry_t {});
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out[entry_index];
+        auto const &params = collection->d_params[entry_index];
+        entry.row_i = collection->d_iRow[entry_index];
+        entry.row_j = collection->d_jRow[entry_index];
+        entry.a_ij = static_cast<float>(params.a_ij);
+        entry.d_ij = static_cast<float>(params.d_ij);
+        entry.dp_ij = static_cast<float>(params.dp_ij);
+    }
+}
+
+/** Extract covalent radii and Pauling electronegativities, sorted by atomic number. */
+inline void extract_covrad_table_(std::vector<mmff94_covrad_entry_t> &out) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFCovRadPauEle();
+    std::size_t const count = collection->d_atomicNum.size();
+    out.assign(count, mmff94_covrad_entry_t {});
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        auto &entry = out[entry_index];
+        auto const &params = collection->d_params[entry_index];
+        entry.atomic_num = collection->d_atomicNum[entry_index];
+        entry.covalent_radius = static_cast<float>(params.r0);
+        entry.pauling_electronegativity = static_cast<float>(params.chi);
+    }
+}
+
+#pragma endregion Sparse Tables
+
+#pragma region Dense Tables
+
+/**
+ *  @brief Extract the MMFFDef equivalence levels into a table indexed directly by atom type.
+ *
+ *  @param[out] out Dense table, one entry per atom type in [0, max_atom_type], zeroed where unused.
+ *  @param[in] max_atom_type Highest type the VdW table mentions; the table must reach at least that far
+ *             because the angle, torsion and out-of-plane cascades index it by an arbitrary type.
+ */
+inline void extract_def_table_(std::vector<mmff94_def_entry_t> &out, std::uint8_t max_atom_type) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFDef();
+    std::size_t const count = collection->d_params.size();
+    out.assign(std::max<std::size_t>(max_atom_type, count) + 1, mmff94_def_entry_t {});
+    for (std::size_t type_index = 0; type_index < count; ++type_index) {
+        auto const &params = collection->d_params[type_index];
+        auto &entry = out[type_index + 1];
+        for (unsigned level = 0; level < mmff94_equivalence_levels_k; ++level)
+            entry.eq_level[level] = params.eqLevel[level];
+    }
+}
+
+/**
+ *  @brief Extract the MMFFProp per-atom-type properties into a table indexed directly by atom type.
+ *
+ *  @param[out] out Dense table, one entry per atom type in [0, max_atom_type], zeroed where unused.
+ *  @param[in] max_atom_type Highest type the VdW table mentions; a property row past it is dropped
+ *             rather than growing the table, since no lookup can reach it.
+ */
+inline void extract_prop_table_(std::vector<mmff94_prop_entry_t> &out, std::uint8_t max_atom_type) {
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFProp();
+    out.assign(static_cast<std::size_t>(max_atom_type) + 1, mmff94_prop_entry_t {});
+    std::size_t const count = collection->d_iAtomType.size();
+    for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
+        std::uint8_t const atom_type = collection->d_iAtomType[entry_index];
+        if (atom_type >= out.size()) continue;
+        auto const &params = collection->d_params[entry_index];
+        auto &entry = out[atom_type];
+        entry.atomic_num = params.atno;
+        entry.coordination_number = params.crd;
+        entry.valence = params.val;
+        entry.pi_lone_pair = params.pilp;
+        entry.multiple_bond_designator = params.mltb;
+        entry.aromatic = params.arom;
+        entry.linear = params.linh;
+        entry.single_bond_multiple_bond = params.sbmb;
+    }
+}
+
+#pragma endregion Dense Tables
+
 /**
  *  @brief Extract every MMFF94 parameter table from RDKit's defaults collection into flat sorted
  *  `std::vector`s. Only called once per process.
+ *
+ *  The VdW extraction runs first and hands its highest atom type to the two dense tables, so the one
+ *  ordering constraint between the fourteen is a value the compiler carries rather than a comment.
+ *
+ *  @param[out] out Container filled from scratch; every table is assigned rather than appended.
  */
 inline void extract_mmff94_tables_from_rdkit(mmff94_tables_host_t &out) {
-    // VdW.
-    {
-        auto const *vdw_collection = RDKit::MMFF::DefaultParameters::getMMFFVdW();
-        out.vdw_power = static_cast<float>(vdw_collection->power);
-        out.vdw_b = static_cast<float>(vdw_collection->B);
-        out.vdw_beta = static_cast<float>(vdw_collection->Beta);
-        out.vdw_darad = static_cast<float>(vdw_collection->DARAD);
-        out.vdw_daeps = static_cast<float>(vdw_collection->DAEPS);
-        std::size_t const count = vdw_collection->d_atomType.size();
-        out.vdw.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.vdw[entry_index];
-            entry.atom_type = vdw_collection->d_atomType[entry_index];
-            auto const &params = vdw_collection->d_params[entry_index];
-            entry.alpha_i = static_cast<float>(params.alpha_i);
-            entry.n_effective = static_cast<float>(params.N_i);
-            entry.a_scale = static_cast<float>(params.A_i);
-            entry.g_factor = static_cast<float>(params.G_i);
-            entry.r_star = static_cast<float>(params.R_star);
-            entry.donor_acceptor = (params.DA == 'D') ? 2u : (params.DA == 'A') ? 1u : 0u;
-            entry.padding[0] = entry.padding[1] = 0;
-            entry.padding_float = 0.0f;
-            if (entry.atom_type > out.max_atom_type) out.max_atom_type = entry.atom_type;
-        }
-    }
-
-    // Bond.
-    {
-        auto const *bond_collection = RDKit::MMFF::DefaultParameters::getMMFFBond();
-        std::size_t const count = bond_collection->d_iAtomType.size();
-        out.bond.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.bond[entry_index];
-            entry.i_type = bond_collection->d_iAtomType[entry_index];
-            entry.j_type = bond_collection->d_jAtomType[entry_index];
-            entry.bond_type = bond_collection->d_bondType[entry_index];
-            entry.padding = 0;
-            entry.force_constant = static_cast<float>(bond_collection->d_params[entry_index].kb);
-            entry.equilibrium_distance = static_cast<float>(bond_collection->d_params[entry_index].r0);
-            entry.padding_float = 0.0f;
-        }
-    }
-
-    // Angle.
-    {
-        auto const *angle_collection = RDKit::MMFF::DefaultParameters::getMMFFAngle();
-        std::size_t const count = angle_collection->d_iAtomType.size();
-        out.angle.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.angle[entry_index];
-            entry.j_type = angle_collection->d_jAtomType[entry_index];
-            entry.i_type = angle_collection->d_iAtomType[entry_index];
-            entry.k_type = angle_collection->d_kAtomType[entry_index];
-            entry.angle_type = angle_collection->d_angleType[entry_index];
-            auto const &params = angle_collection->d_params[entry_index];
-            entry.force_constant = static_cast<float>(params.ka);
-            entry.theta0_deg = static_cast<float>(params.theta0);
-            entry.padding_float = 0.0f;
-        }
-    }
-
-    // Torsion.
-    {
-        auto const *torsion_collection = RDKit::MMFF::DefaultParameters::getMMFFTor(false);
-        std::size_t const count = torsion_collection->d_iAtomType.size();
-        out.torsion.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.torsion[entry_index];
-            entry.j_type = torsion_collection->d_jAtomType[entry_index];
-            entry.k_type = torsion_collection->d_kAtomType[entry_index];
-            entry.i_type = torsion_collection->d_iAtomType[entry_index];
-            entry.l_type = torsion_collection->d_lAtomType[entry_index];
-            entry.tor_type = torsion_collection->d_torType[entry_index];
-            entry.padding[0] = entry.padding[1] = entry.padding[2] = 0;
-            auto const &params = torsion_collection->d_params[entry_index];
-            entry.torsion_v1 = static_cast<float>(params.V1);
-            entry.torsion_v2 = static_cast<float>(params.V2);
-            entry.torsion_v3 = static_cast<float>(params.V3);
-        }
-    }
-
-    // Out-of-plane.
-    {
-        auto const *oop_collection = RDKit::MMFF::DefaultParameters::getMMFFOop(false);
-        std::size_t const count = oop_collection->d_iAtomType.size();
-        out.oop.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.oop[entry_index];
-            entry.j_type = oop_collection->d_jAtomType[entry_index];
-            entry.i_type = oop_collection->d_iAtomType[entry_index];
-            entry.k_type = oop_collection->d_kAtomType[entry_index];
-            entry.l_type = oop_collection->d_lAtomType[entry_index];
-            entry.force_constant = static_cast<float>(oop_collection->d_params[entry_index].koop);
-        }
-    }
-
-    // Stretch-bend.
-    {
-        auto const *stbn_collection = RDKit::MMFF::DefaultParameters::getMMFFStbn();
-        std::size_t const count = stbn_collection->d_iAtomType.size();
-        out.stbn.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.stbn[entry_index];
-            entry.j_type = stbn_collection->d_jAtomType[entry_index];
-            entry.i_type = stbn_collection->d_iAtomType[entry_index];
-            entry.k_type = stbn_collection->d_kAtomType[entry_index];
-            entry.stretch_bend_type = stbn_collection->d_stretchBendType[entry_index];
-            entry.kba_ijk = static_cast<float>(stbn_collection->d_params[entry_index].kbaIJK);
-            entry.kba_kji = static_cast<float>(stbn_collection->d_params[entry_index].kbaKJI);
-            entry.padding_float = 0.0f;
-        }
-    }
-
-    // DFSB.
-    {
-        auto const *dfsb_collection = RDKit::MMFF::DefaultParameters::getMMFFDfsb();
-        for (auto const &[row_i, by_row_j] : dfsb_collection->d_params) {
-            for (auto const &[row_j, by_row_k] : by_row_j) {
-                for (auto const &[row_k, params] : by_row_k) {
-                    mmff94_dfsb_entry_t entry;
-                    entry.row_i = static_cast<std::uint8_t>(row_i);
-                    entry.row_j = static_cast<std::uint8_t>(row_j);
-                    entry.row_k = static_cast<std::uint8_t>(row_k);
-                    entry.padding = 0;
-                    entry.kba_ijk = static_cast<float>(params.kbaIJK);
-                    entry.kba_kji = static_cast<float>(params.kbaKJI);
-                    out.dfsb.push_back(entry);
-                }
-            }
-        }
-        std::sort(out.dfsb.begin(), out.dfsb.end(), [](auto const &left, auto const &right) {
-            if (left.row_i != right.row_i) return left.row_i < right.row_i;
-            if (left.row_j != right.row_j) return left.row_j < right.row_j;
-            return left.row_k < right.row_k;
-        });
-    }
-
-    // MMFFDef.
-    {
-        auto const *def_collection = RDKit::MMFF::DefaultParameters::getMMFFDef();
-        std::size_t const count = def_collection->d_params.size();
-        std::size_t const dense_count = std::max<std::size_t>(out.max_atom_type, static_cast<std::uint8_t>(count)) + 1;
-        out.def.assign(dense_count, mmff94_def_entry_t {});
-        for (std::size_t type_index = 0; type_index < count; ++type_index) {
-            auto const &def_params = def_collection->d_params[type_index];
-            std::size_t const atom_type = type_index + 1;
-            out.def[atom_type].eq_level[0] = def_params.eqLevel[0];
-            out.def[atom_type].eq_level[1] = def_params.eqLevel[1];
-            out.def[atom_type].eq_level[2] = def_params.eqLevel[2];
-            out.def[atom_type].eq_level[3] = def_params.eqLevel[3];
-        }
-    }
-
-    // PBCI.
-    {
-        auto const *pbci_collection = RDKit::MMFF::DefaultParameters::getMMFFPBCI();
-        std::size_t const count = pbci_collection->d_params.size();
-        out.pbci.reserve(count);
-        for (std::size_t type_index = 0; type_index < count; ++type_index) {
-            mmff94_pbci_entry_t entry {};
-            entry.atom_type = static_cast<std::uint8_t>(type_index + 1);
-            entry.pbci = static_cast<float>(pbci_collection->d_params[type_index].pbci);
-            entry.fcadj = static_cast<float>(pbci_collection->d_params[type_index].fcadj);
-            out.pbci.push_back(entry);
-        }
-    }
-
-    // Chg.
-    {
-        auto const *chg_collection = RDKit::MMFF::DefaultParameters::getMMFFChg();
-        std::size_t const count = chg_collection->d_iAtomType.size();
-        out.chg.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.chg[entry_index];
-            entry.i_type = chg_collection->d_iAtomType[entry_index];
-            entry.j_type = chg_collection->d_jAtomType[entry_index];
-            entry.bond_type = chg_collection->d_bondType[entry_index];
-            entry.padding = 0;
-            entry.bond_charge_increment = static_cast<float>(chg_collection->d_params[entry_index].bci);
-        }
-    }
-
-    // Bndk.
-    {
-        auto const *bndk_collection = RDKit::MMFF::DefaultParameters::getMMFFBndk();
-        std::size_t const count = bndk_collection->d_iAtomicNum.size();
-        out.bndk.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.bndk[entry_index];
-            entry.atomic_num_i = bndk_collection->d_iAtomicNum[entry_index];
-            entry.atomic_num_j = bndk_collection->d_jAtomicNum[entry_index];
-            entry.padding[0] = entry.padding[1] = 0;
-            entry.force_constant = static_cast<float>(bndk_collection->d_params[entry_index].kb);
-            entry.equilibrium_distance = static_cast<float>(bndk_collection->d_params[entry_index].r0);
-        }
-    }
-
-    // Herschbach-Laurie.
-    {
-        auto const *herschbach_laurie_collection = RDKit::MMFF::DefaultParameters::getMMFFHerschbachLaurie();
-        std::size_t const count = herschbach_laurie_collection->d_iRow.size();
-        out.hl.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.hl[entry_index];
-            entry.row_i = herschbach_laurie_collection->d_iRow[entry_index];
-            entry.row_j = herschbach_laurie_collection->d_jRow[entry_index];
-            entry.padding[0] = entry.padding[1] = 0;
-            entry.a_ij = static_cast<float>(herschbach_laurie_collection->d_params[entry_index].a_ij);
-            entry.d_ij = static_cast<float>(herschbach_laurie_collection->d_params[entry_index].d_ij);
-            entry.dp_ij = static_cast<float>(herschbach_laurie_collection->d_params[entry_index].dp_ij);
-        }
-    }
-
-    // CovRadPauEle.
-    {
-        auto const *covrad_collection = RDKit::MMFF::DefaultParameters::getMMFFCovRadPauEle();
-        std::size_t const count = covrad_collection->d_atomicNum.size();
-        out.covrad.resize(count);
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            auto &entry = out.covrad[entry_index];
-            entry.atomic_num = covrad_collection->d_atomicNum[entry_index];
-            entry.padding[0] = entry.padding[1] = entry.padding[2] = 0;
-            entry.covalent_radius = static_cast<float>(covrad_collection->d_params[entry_index].r0);
-            entry.pauling_electronegativity = static_cast<float>(covrad_collection->d_params[entry_index].chi);
-        }
-    }
-
-    // MMFFProp.
-    {
-        auto const *prop_collection = RDKit::MMFF::DefaultParameters::getMMFFProp();
-        std::size_t const dense_count = static_cast<std::size_t>(out.max_atom_type) + 1;
-        out.prop.assign(dense_count, mmff94_prop_entry_t {});
-        std::size_t const count = prop_collection->d_iAtomType.size();
-        for (std::size_t entry_index = 0; entry_index < count; ++entry_index) {
-            std::uint8_t const atom_type = prop_collection->d_iAtomType[entry_index];
-            if (atom_type >= dense_count) continue;
-            auto const &params = prop_collection->d_params[entry_index];
-            auto &entry = out.prop[atom_type];
-            entry.atomic_num = params.atno;
-            entry.coordination_number = params.crd;
-            entry.valence = params.val;
-            entry.pi_lone_pair = params.pilp;
-            entry.multiple_bond_designator = params.mltb;
-            entry.aromatic = params.arom;
-            entry.linear = params.linh;
-            entry.single_bond_multiple_bond = params.sbmb;
-        }
-    }
+    out.max_atom_type = extract_vdw_table_(out);
+    extract_bond_table_(out.bond);
+    extract_angle_table_(out.angle);
+    extract_torsion_table_(out.torsion);
+    extract_oop_table_(out.oop);
+    extract_stbn_table_(out.stbn);
+    extract_dfsb_table_(out.dfsb);
+    extract_pbci_table_(out.pbci);
+    extract_chg_table_(out.chg);
+    extract_bndk_table_(out.bndk);
+    extract_hl_table_(out.hl);
+    extract_covrad_table_(out.covrad);
+    extract_def_table_(out.def, out.max_atom_type);
+    extract_prop_table_(out.prop, out.max_atom_type);
 }
 
 } // namespace smallfield::parameters

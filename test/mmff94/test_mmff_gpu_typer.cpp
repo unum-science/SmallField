@@ -35,6 +35,7 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
+namespace sfapi = smallfield::api;
 namespace sfmmff = smallfield::mmff94;
 namespace sfparam = smallfield::parameters;
 namespace sft = smallfield::types;
@@ -44,10 +45,7 @@ static constexpr std::string_view test_name_k = "test_mmff_gpu_typer";
 
 namespace smallfield::tests {
 
-/*  `comparison_group_t::field` invokes its predicate as `equals(reference, observed)`. An atom type
- *  is an index and must agree exactly; a partial charge carries the file's magnitude-scaled
- *  tolerance, which is the predicate the hand-rolled `if` chain applied. */
-static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
+/** A partial charge carries the file's magnitude-scaled tolerance. */
 static constexpr auto within_tolerance_ = [](float cpu_value, float gpu_value) {
     return approximately_equal(cpu_value, gpu_value);
 };
@@ -159,7 +157,8 @@ static std::uint32_t build_descriptor_batch_(std::vector<std::string> const &smi
         if (molecule->getNumAtoms() > sampled_atom_ceiling_k) continue; // wider than this sweep samples
 
         sft::molecule_descriptor_t descriptor;
-        if (!sft::build_descriptor(*molecule, descriptor)) continue; // an element or a bond order we do not carry
+        // an element or a bond order we do not carry
+        if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k) continue;
         atom_offsets.push_back(total_atoms);
         total_atoms += descriptor.num_atoms;
         descriptors.push_back(descriptor);
@@ -193,7 +192,7 @@ static std::size_t compare_molecule_(typer_reporters_t &reporters, cpu_typing_sc
         auto atom = reporters.atom_type.mismatch("mmff_typer", "molecule={} atom={} element={}", molecule_index,
                                                  atom_index, descriptor.element[atom_index]);
         atom.field("atom_type", scratch.atom_types[atom_index], gpu_atom_types[atom_offset + atom_index],
-                   exactly_equal_);
+                   exactly_equal);
         bool const types_agree = atom.reported_field_count() == 0;
         mismatching_atoms += !types_agree;
 

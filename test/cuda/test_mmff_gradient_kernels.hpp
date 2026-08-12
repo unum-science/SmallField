@@ -14,7 +14,8 @@ namespace smallfield::tests {
 /**
  *  @brief Evaluate MMFF94 energy and its gradient on the device for one molecule.
  *
- *  @param[in] host_positions Flat interleaved xyz coordinates, `3 * num_atoms` entries.
+ *  @param[in] host_positions Coordinates as `(axis, atom)`, `3 * num_atoms` entries, which is the layout
+ *      the kernel indexes; an interleaved block passed here scores a different molecule.
  *  @param[in] num_atoms Atom count.
  *  @param[in] host_atom_vdw Per-atom Van der Waals parameters.
  *  @param[in] host_atom_charge Per-atom partial charges.

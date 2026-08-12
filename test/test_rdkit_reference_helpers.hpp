@@ -24,11 +24,8 @@
 
 #include <fmt/format.h> // `fmt::println`
 
-#include <DistGeom/BoundsMatrix.h>
-#include <DistGeom/TriangleSmooth.h>
 #include <ForceField/ForceField.h>
 #include <Geometry/point.h>
-#include <GraphMol/DistGeomHelpers/BoundsMatrixBuilder.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
 #include <GraphMol/ForceFieldHelpers/MMFF/MMFF.h>
 #include <GraphMol/GraphMol.h>
@@ -43,6 +40,7 @@
 
 namespace smallfield::tests {
 
+using smallfield::types::conformer_aos_t;
 using smallfield::types::hop_matrix_t;
 using smallfield::types::mmff94_bond_t;
 using smallfield::types::unreachable_hops_k;
@@ -96,23 +94,23 @@ inline unsigned int attach_empty_conformer(RDKit::RWMol &molecule) {
 }
 
 /**
- *  @brief Extract 3D coordinates as a flat interleaved array [x0,y0,z0, x1,y1,z1, ...].
+ *  @brief Read a molecule's conformer straight into caller-owned atom-major storage.
  *
- *  @param[in] molecule Molecule with at least one conformer.
+ *  The atom count is not a parameter: @p atom_major carries its own extent, so it cannot disagree with the
+ *  storage behind it.
+ *
+ *  @param[in] molecule Molecule carrying the conformer to read.
  *  @param[in] conformer_id Conformer index (-1 for the default conformer).
- *  @return Flat float vector of interleaved xyz coordinates.
+ *  @param[out] atom_major View spanning exactly the molecule's atoms.
  */
-inline std::vector<float> extract_coords_interleaved(RDKit::ROMol const &molecule, int conformer_id = -1) {
+inline void read_conformer_into(RDKit::ROMol const &molecule, conformer_aos_t atom_major, int conformer_id = -1) {
     auto const &conformer = molecule.getConformer(conformer_id);
-    std::uint32_t const num_atoms = molecule.getNumAtoms();
-    std::vector<float> coords(num_atoms * 3);
-    for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
-        auto const &position = conformer.getAtomPos(atom_index);
-        coords[atom_index * 3 + 0] = static_cast<float>(position.x);
-        coords[atom_index * 3 + 1] = static_cast<float>(position.y);
-        coords[atom_index * 3 + 2] = static_cast<float>(position.z);
+    for (std::uint32_t atom = 0; atom < atom_major.extent(0); ++atom) {
+        auto const &position = conformer.getAtomPos(atom);
+        atom_major(atom, 0) = static_cast<float>(position.x);
+        atom_major(atom, 1) = static_cast<float>(position.y);
+        atom_major(atom, 2) = static_cast<float>(position.z);
     }
-    return coords;
 }
 
 /**
@@ -149,31 +147,6 @@ inline double rdkit_mmff94_energy(RDKit::RWMol &molecule, int conformer_id = -1)
     if (!force_field) { return std::numeric_limits<double>::quiet_NaN(); }
     force_field->initialize();
     return force_field->calcEnergy();
-}
-
-/**
- *  @brief Get the smoothed bounds matrix from RDKit as a flat N × N double array.
- *
- *  @param[inout] molecule Molecule to compute bounds for.
- *  @return Row-major N × N flat double vector (upper triangle = upper bounds, lower = lower bounds).
- */
-inline std::vector<double> rdkit_bounds_matrix(RDKit::RWMol &molecule) {
-    std::uint32_t const num_atoms = molecule.getNumAtoms();
-    auto *bounds_raw = new DistGeom::BoundsMatrix(num_atoms);
-    DistGeom::BoundsMatPtr bounds_matrix(bounds_raw);
-    RDKit::DGeomHelpers::initBoundsMat(bounds_raw);
-    RDKit::DGeomHelpers::setTopolBounds(molecule, bounds_matrix);
-    DistGeom::triangleSmoothBounds(bounds_raw);
-
-    // flatten to row-major N × N
-    std::vector<double> flat(num_atoms * num_atoms, 0.0);
-    for (std::uint32_t row = 0; row < num_atoms; ++row) {
-        for (std::uint32_t column = row + 1; column < num_atoms; ++column) {
-            flat[row * num_atoms + column] = bounds_matrix->getUpperBound(row, column); // upper
-            flat[column * num_atoms + row] = bounds_matrix->getLowerBound(row, column); // lower
-        }
-    }
-    return flat;
 }
 
 /** How a `load_smiles_into` call ended; a named path that does not open is never an empty run. */
@@ -222,18 +195,6 @@ inline smiles_load_t load_smiles_into(std::string const &path, std::size_t max_c
         if (!line.empty()) out.push_back(std::move(line));
     }
     return out.empty() ? smiles_load_t::empty_file_k : smiles_load_t::loaded_k;
-}
-
-/**
- *  @brief `load_smiles_into` for a caller that treats an unreadable @p path as an empty corpus.
- *
- *  Prefer `load_smiles_into` wherever the path was named by a flag or an environment variable: a
- *  corpus nobody can open then fails loudly instead of passing a validator that compared nothing.
- */
-inline std::vector<std::string> load_smiles(std::string const &path, std::size_t max_count) {
-    std::vector<std::string> smiles_list;
-    [[maybe_unused]] smiles_load_t const outcome = load_smiles_into(path, max_count, smiles_list);
-    return smiles_list;
 }
 
 /** Whether a test was pointed at a corpus, and whether its command line made sense. */

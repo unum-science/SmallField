@@ -35,6 +35,7 @@
 
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
+#include <numeric>     // `std::iota`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
 
@@ -48,6 +49,28 @@
 
 namespace smallfield::postprocess {
 
+#pragma region Extents
+
+/** Reference points a USR block measures against: centroid, nearest to it, farthest from it, farthest from that. */
+inline constexpr std::size_t usr_reference_point_count_k = 4;
+
+/** Moments taken of each reference point's distance distribution: mean, standard deviation, skewness. */
+inline constexpr std::size_t usr_moment_count_k = 3;
+
+/** Numbers one USR block carries, reference-point major. */
+inline constexpr std::size_t usr_components_k = usr_reference_point_count_k * usr_moment_count_k;
+
+/** CREDO pharmacophore subsets USRCAT adds, in RDKit's order: hydrophobic, aromatic, acceptor, donor. */
+inline constexpr std::size_t credo_subset_count_k = 4;
+
+/** Numbers USRCAT carries: the all-atom block, then one block per CREDO subset. */
+inline constexpr std::size_t usrcat_components_k = usr_components_k * (credo_subset_count_k + 1);
+
+/** Connected components a context can label, set by the width of `component_label`. */
+inline constexpr std::uint32_t max_components_k = 255;
+
+#pragma endregion Extents
+
 #pragma region Shape Context
 
 /**
@@ -57,12 +80,15 @@ namespace smallfield::postprocess {
  *  atom indices that the corresponding SMARTS pattern matched, indexing into the hydrogen-augmented molecule and
  *  matching stored coordinate order. Duplicate matches are preserved exactly as RDKit collects them so subset
  *  distance distributions are identical.
+ *
+ *  `ok` is the only success signal: a refused molecule carries an otherwise default-constructed context. It is
+ *  not derivable from `num_atoms`, because an empty SMILES parses into a real molecule of no atoms.
  */
 struct molecule_shape_context_t {
     std::uint32_t num_atoms = 0;
     /** Hydrophobic, aromatic, acceptor, donor. */
-    std::array<std::vector<std::uint32_t>, 4> credo_subsets;
-    /** Per-atom connected-component id. */
+    std::array<std::vector<std::uint32_t>, credo_subset_count_k> credo_subsets;
+    /** Per-atom connected-component id, so `num_components` never exceeds `max_components_k`. */
     std::vector<std::uint8_t> component_label;
     std::uint32_t num_components = 0;
     bool ok = false;
@@ -99,17 +125,8 @@ inline double point_distance_(point3_t const &first, point3_t const &second) {
 
 #pragma region Internal
 
-/**
- *  @brief The four USR reference points, in RDKit order.
- *
- *  Index 0 = centroid (ctd); 1 = atom closest to the centroid (cst);
- *  2 = atom farthest from the centroid (fct); 3 = atom farthest from fct (ftf).
- *  Tie-breaking matches RDKit's `smallestValId` / `largestValId`: strict comparison, first winning index kept.
- */
-inline std::array<point3_t, 4> reference_points_(custd::span<float const> coords_interleaved, std::uint32_t num_atoms) {
-    std::array<point3_t, 4> points {};
-
-    // ctd: centroid of all atoms.
+/** Centroid of @p num_atoms atoms; the caller guarantees at least one. */
+inline point3_t centroid_of_(custd::span<float const> coords_interleaved, std::uint32_t num_atoms) {
     point3_t centroid {};
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
         point3_t const point = read_point_(coords_interleaved, atom_index);
@@ -117,107 +134,114 @@ inline std::array<point3_t, 4> reference_points_(custd::span<float const> coords
         centroid.y += point.y;
         centroid.z += point.z;
     }
-    if (num_atoms > 0) {
-        centroid.x /= num_atoms;
-        centroid.y /= num_atoms;
-        centroid.z /= num_atoms;
-    }
-    points[0] = centroid;
+    centroid.x /= num_atoms;
+    centroid.y /= num_atoms;
+    centroid.z /= num_atoms;
+    return centroid;
+}
 
-    // Distances to the centroid, then closest (cst) and farthest (fct).
-    std::uint32_t closest_index = 0;
-    std::uint32_t farthest_index = 0;
-    double closest_distance = 0.0;
-    double farthest_distance = 0.0;
-    for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
-        double const distance = point_distance_(read_point_(coords_interleaved, atom_index), centroid);
-        if (atom_index == 0) {
-            closest_distance = distance;
-            farthest_distance = distance;
-        }
-        else {
-            if (distance < closest_distance) {
-                closest_distance = distance;
-                closest_index = atom_index;
-            }
-            if (distance > farthest_distance) {
-                farthest_distance = distance;
-                farthest_index = atom_index;
-            }
-        }
+/** Atom nearest @p reference, first index winning a tie as RDKit's `smallestValId` does; at least one atom. */
+inline std::uint32_t nearest_atom_to_(custd::span<float const> coords_interleaved, std::uint32_t num_atoms,
+                                      point3_t const &reference) {
+    std::uint32_t nearest = 0;
+    double nearest_distance = point_distance_(read_point_(coords_interleaved, 0), reference);
+    for (std::uint32_t atom_index = 1; atom_index < num_atoms; ++atom_index) {
+        double const distance = point_distance_(read_point_(coords_interleaved, atom_index), reference);
+        if (distance >= nearest_distance) continue;
+        nearest_distance = distance;
+        nearest = atom_index;
     }
-    points[1] = read_point_(coords_interleaved, closest_index);
-    points[2] = read_point_(coords_interleaved, farthest_index);
+    return nearest;
+}
 
-    // ftf: atom farthest from fct.
-    std::uint32_t farthest_from_fct_index = 0;
-    double farthest_from_fct_distance = 0.0;
-    for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
-        double const distance = point_distance_(read_point_(coords_interleaved, atom_index), points[2]);
-        if (atom_index == 0) { farthest_from_fct_distance = distance; }
-        else if (distance > farthest_from_fct_distance) {
-            farthest_from_fct_distance = distance;
-            farthest_from_fct_index = atom_index;
-        }
+/** Atom farthest from @p reference, first index winning a tie as RDKit's `largestValId` does; at least one atom. */
+inline std::uint32_t farthest_atom_from_(custd::span<float const> coords_interleaved, std::uint32_t num_atoms,
+                                         point3_t const &reference) {
+    std::uint32_t farthest = 0;
+    double farthest_distance = point_distance_(read_point_(coords_interleaved, 0), reference);
+    for (std::uint32_t atom_index = 1; atom_index < num_atoms; ++atom_index) {
+        double const distance = point_distance_(read_point_(coords_interleaved, atom_index), reference);
+        if (distance <= farthest_distance) continue;
+        farthest_distance = distance;
+        farthest = atom_index;
     }
-    points[3] = read_point_(coords_interleaved, farthest_from_fct_index);
+    return farthest;
+}
 
+/**
+ *  @brief The four USR reference points, in RDKit order: ctd, cst, fct, ftf.
+ *
+ *  A molecule of no atoms has no reference points and yields four origins, which the moment passes then turn into
+ *  zeros; reading an atom out of an empty coordinate span is the alternative.
+ */
+inline std::array<point3_t, usr_reference_point_count_k> reference_points_(custd::span<float const> coords_interleaved,
+                                                                           std::uint32_t num_atoms) {
+    std::array<point3_t, usr_reference_point_count_k> points {};
+    if (num_atoms == 0) return points;
+    points[0] = centroid_of_(coords_interleaved, num_atoms);
+    points[1] = read_point_(coords_interleaved, nearest_atom_to_(coords_interleaved, num_atoms, points[0]));
+    points[2] = read_point_(coords_interleaved, farthest_atom_from_(coords_interleaved, num_atoms, points[0]));
+    points[3] = read_point_(coords_interleaved, farthest_atom_from_(coords_interleaved, num_atoms, points[2]));
     return points;
 }
 
 /**
- *  @brief Three USR moments of a distance list, matching RDKit's `calcMoments`.
+ *  @brief Three USR moments of the distances from @p atom_indices to @p reference, matching RDKit's `calcMoments`.
  *
  *  Order: [0] mean, [1] standard deviation — the square root of the mean squared deviation from the mean, [2]
- *  signed cube root of the standardized third central moment — the cube root of the mean cubed deviation from the
- *  mean, divided by the cubed standard deviation. An empty list yields three zeros; a degenerate list with zero
- *  standard deviation yields a zero third moment (RDKit's guard against dividing by zero).
+ *  signed cube root of the standardized third central moment. An empty subset yields three zeros; a degenerate
+ *  one with zero standard deviation yields a zero third moment, RDKit's guard against dividing by zero.
+ *
+ *  The distances are walked twice rather than materialized, so a per-conformer descriptor allocates nothing.
  */
-inline std::array<double, 3> calculate_moments_(std::vector<double> const &distances) {
-    std::array<double, 3> moments {0.0, 0.0, 0.0};
-    std::size_t const num_points = distances.size();
-    if (num_points == 0) return moments;
+inline std::array<double, usr_moment_count_k> moments_about_(custd::span<float const> coords_interleaved,
+                                                             custd::span<std::uint32_t const> atom_indices,
+                                                             point3_t const &reference) {
+    std::array<double, usr_moment_count_k> moments {0.0, 0.0, 0.0};
+    if (atom_indices.empty()) return moments;
+    double const num_points = static_cast<double>(atom_indices.size());
 
-    double mean = 0.0;
-    for (double const distance : distances) mean += distance;
-    mean /= static_cast<double>(num_points);
+    double sum = 0.0;
+    for (std::uint32_t const atom_index : atom_indices)
+        sum += point_distance_(read_point_(coords_interleaved, atom_index), reference);
+    double const mean = sum / num_points;
     moments[0] = mean;
 
     double sum_squared = 0.0;
     double sum_cubed = 0.0;
-    for (double const distance : distances) {
-        double const diff = distance - mean;
+    for (std::uint32_t const atom_index : atom_indices) {
+        double const diff = point_distance_(read_point_(coords_interleaved, atom_index), reference) - mean;
         sum_squared += diff * diff;
         sum_cubed += diff * diff * diff;
     }
-    double const standard_deviation = std::sqrt(sum_squared / static_cast<double>(num_points));
+    double const standard_deviation = std::sqrt(sum_squared / num_points);
     moments[1] = standard_deviation;
+    if (standard_deviation == 0.0) return moments;
 
-    double const third_central = sum_cubed / static_cast<double>(num_points);
-    if (standard_deviation == 0.0) moments[2] = 0.0;
-    else moments[2] = std::cbrt(third_central / (standard_deviation * standard_deviation * standard_deviation));
+    double const third_central = sum_cubed / num_points;
+    moments[2] = std::cbrt(third_central / (standard_deviation * standard_deviation * standard_deviation));
     return moments;
 }
 
 /**
- *  @brief Writes the 12 moments for one atom subset relative to four reference points.
+ *  @brief Writes one atom subset's block of moments, reference-point major.
  *
- *  @p atom_indices lists the atoms whose distances feed the distributions — all atoms for the plain USR block, a
- *  CREDO subset for USRCAT extension blocks. Output is written reference-point major starting at @p out_offset.
- *  An empty subset writes twelve zeros, exactly as RDKit's empty `reducedCoords` path does.
+ *  @param[in] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
+ *  @param[in] points The four all-atom reference points every block measures against.
+ *  @param[in] atom_indices Atoms whose distances feed the distributions — every atom for the plain USR block, a
+ *             CREDO subset for a USRCAT extension block. An empty subset writes zeros, as RDKit's empty
+ *             `reducedCoords` path does.
+ *  @param[out] block Exactly `usr_components_k` numbers of the caller's descriptor row.
  */
-inline void moments_for_subset_(custd::span<float const> coords_interleaved, std::array<point3_t, 4> const &points,
-                                custd::span<std::uint32_t const> atom_indices, double *out, std::size_t out_offset) {
-    std::vector<double> distances;
-    distances.reserve(atom_indices.size());
-    for (std::size_t reference = 0; reference < 4; ++reference) {
-        distances.clear();
-        for (std::uint32_t const atom_index : atom_indices)
-            distances.push_back(point_distance_(read_point_(coords_interleaved, atom_index), points[reference]));
-        std::array<double, 3> const moments = calculate_moments_(distances);
-        out[out_offset + reference * 3u + 0u] = moments[0];
-        out[out_offset + reference * 3u + 1u] = moments[1];
-        out[out_offset + reference * 3u + 2u] = moments[2];
+inline void moments_for_subset_(custd::span<float const> coords_interleaved,
+                                std::array<point3_t, usr_reference_point_count_k> const &points,
+                                custd::span<std::uint32_t const> atom_indices, custd::span<double> block) {
+    sf_assert_(block.size() == usr_components_k);
+    for (std::size_t reference = 0; reference < usr_reference_point_count_k; ++reference) {
+        std::array<double, usr_moment_count_k> const moments = moments_about_(coords_interleaved, atom_indices,
+                                                                              points[reference]);
+        for (std::size_t moment = 0; moment < usr_moment_count_k; ++moment)
+            block[reference * usr_moment_count_k + moment] = moments[moment];
     }
 }
 
@@ -227,8 +251,8 @@ inline void moments_for_subset_(custd::span<float const> coords_interleaved, std
  *  Order matches RDKit's USRCAT default typing: hydrophobic, aromatic, acceptor, donor. Parsed on first use into
  *  a function-local static so the SMARTS are never re-parsed per molecule.
  */
-inline std::array<RDKit::ROMol, 4> const &credo_matchers_() {
-    static char const *const patterns[4] = {
+inline std::array<RDKit::ROMol, credo_subset_count_k> const &credo_matchers_() {
+    static char const *const patterns[credo_subset_count_k] = {
         "[#6+0!$(*~[#7,#8,F]),SH0+0v2,s+0,S^3,Cl+0,Br+0,I+0]",             //  hydrophobic
         "[a]",                                                             //  aromatic
         "[$([O,S;H1;v2]-[!$(*=[O,N,P,S])]),$([O,S;H0;v2]),$([O,S;-]),"     //  acceptor
@@ -241,8 +265,8 @@ inline std::array<RDKit::ROMol, 4> const &credo_matchers_() {
         std::unique_ptr<RDKit::ROMol const> const parsed {RDKit::SmartsToMol(smarts)};
         return RDKit::ROMol(*parsed);
     };
-    static std::array<RDKit::ROMol, 4> const compiled {parse_one(patterns[0]), parse_one(patterns[1]),
-                                                       parse_one(patterns[2]), parse_one(patterns[3])};
+    static std::array<RDKit::ROMol, credo_subset_count_k> const compiled {
+        parse_one(patterns[0]), parse_one(patterns[1]), parse_one(patterns[2]), parse_one(patterns[3])};
     return compiled;
 }
 
@@ -259,7 +283,7 @@ inline std::array<RDKit::ROMol, 4> const &credo_matchers_() {
  *  with `MolOps::getMolFrags`.
  *
  *  @return A populated context with `ok == true` on success; `ok == false`, with empty fields, if parsing or
- *          typing threw.
+ *          typing threw, or if the molecule falls into more fragments than `component_label` can name.
  */
 inline molecule_shape_context_t build_shape_context(
     std::string_view smiles, smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
@@ -279,8 +303,8 @@ inline molecule_shape_context_t build_shape_context(
 
         // Type the four CREDO subsets exactly as RDKit's `getAtomIdsForFeatures` does: collect every matched
         // atom index, preserving RDKit's collection order.
-        std::array<RDKit::ROMol, 4> const &matchers = credo_matchers_();
-        for (std::size_t subset_index = 0; subset_index < 4; ++subset_index) {
+        std::array<RDKit::ROMol, credo_subset_count_k> const &matchers = credo_matchers_();
+        for (std::size_t subset_index = 0; subset_index < credo_subset_count_k; ++subset_index) {
             std::vector<RDKit::MatchVectType> matches;
             RDKit::SubstructMatch(*molecule, matchers[subset_index], matches);
             for (auto const &match : matches)
@@ -288,9 +312,13 @@ inline molecule_shape_context_t build_shape_context(
                     context.credo_subsets[subset_index].push_back(static_cast<std::uint32_t>(pair.second));
         }
 
-        // Label connected components — disconnected fragments and salt counterions.
+        // Label connected components — disconnected fragments and salt counterions. Past
+        // `max_components_k` a label does not fit its byte and would alias another component, so the
+        // molecule is refused rather than mislabelled.
         std::vector<int> mapping;
-        context.num_components = RDKit::MolOps::getMolFrags(*molecule, mapping);
+        std::uint32_t const num_components = RDKit::MolOps::getMolFrags(*molecule, mapping);
+        if (num_components > max_components_k) return molecule_shape_context_t {};
+        context.num_components = num_components;
         context.component_label.resize(mapping.size());
         for (std::size_t atom_index = 0; atom_index < mapping.size(); ++atom_index)
             context.component_label[atom_index] = static_cast<std::uint8_t>(mapping[atom_index]);
@@ -306,43 +334,44 @@ inline molecule_shape_context_t build_shape_context(
 /**
  *  @brief The 12-number USR shape descriptor for one conformer.
  *
- *  @param[in] coords_interleaved tight (num_atoms, 3) row-major xyz for one conformer.
- *  @param[in] num_atoms          atom count (must equal `coords_interleaved.size() / 3`).
- *  @param[out] out               12 doubles, reference-point major (ctd, cst, fct, ftf).
+ *  @param[in] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
+ *  @param[in] num_atoms Atom count; the span carries three floats per atom.
+ *  @param[out] out `usr_components_k` doubles, reference-point major (ctd, cst, fct, ftf).
  */
 inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uint32_t num_atoms,
-                           std::array<double, 12> &out) {
-    std::array<point3_t, 4> const points = reference_points_(coords_interleaved, num_atoms);
+                           std::array<double, usr_components_k> &out) {
+    sf_assert_(coords_interleaved.size() >= static_cast<std::size_t>(num_atoms) * 3u);
+    std::array<point3_t, usr_reference_point_count_k> const points = reference_points_(coords_interleaved, num_atoms);
     std::vector<std::uint32_t> all_atoms(num_atoms);
-    for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) all_atoms[atom_index] = atom_index;
-    moments_for_subset_(coords_interleaved, points, all_atoms, out.data(), 0);
+    std::iota(all_atoms.begin(), all_atoms.end(), 0u);
+    moments_for_subset_(coords_interleaved, points, all_atoms, custd::span<double> {out.data(), out.size()});
 }
 
 /**
  *  @brief The 60-number USRCAT shape descriptor for one conformer.
  *
- *  Block 0, indices 0 through 11, is the plain USR over all atoms. Blocks 1 through 4 repeat the 12 moments
- *  using the same four all-atom reference points, but restricting the distance distributions to each CREDO
- *  subset in order hydrophobic, aromatic, acceptor, donor. Empty subsets contribute twelve zeros, matching
- *  RDKit.
+ *  Block 0 is the plain USR over all atoms. Blocks 1 through 4 repeat the same moments against the same four
+ *  all-atom reference points, restricting the distance distributions to each CREDO subset in order hydrophobic,
+ *  aromatic, acceptor, donor. Empty subsets contribute a block of zeros, matching RDKit.
  *
- *  @param[in] coords_interleaved tight (num_atoms, 3) row-major xyz for one conformer.
- *  @param[in] context            context from `build_shape_context` for this molecule.
- *  @param[out] out               60 doubles.
+ *  @param[in] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
+ *  @param[in] context Context from `build_shape_context` for this molecule.
+ *  @param[out] out `usrcat_components_k` doubles, one `usr_components_k` block per subset.
  */
 inline void usrcat_descriptor(custd::span<float const> coords_interleaved, molecule_shape_context_t const &context,
-                              std::array<double, 60> &out) {
-    std::array<point3_t, 4> const points = reference_points_(coords_interleaved, context.num_atoms);
+                              std::array<double, usrcat_components_k> &out) {
+    std::uint32_t const num_atoms = context.num_atoms;
+    sf_assert_(coords_interleaved.size() >= static_cast<std::size_t>(num_atoms) * 3u);
+    std::array<point3_t, usr_reference_point_count_k> const points = reference_points_(coords_interleaved, num_atoms);
+    custd::span<double> const row {out.data(), out.size()};
 
-    std::vector<std::uint32_t> all_atoms(context.num_atoms);
-    for (std::uint32_t atom_index = 0; atom_index < context.num_atoms; ++atom_index) all_atoms[atom_index] = atom_index;
-    moments_for_subset_(coords_interleaved, points, all_atoms, out.data(), 0);
+    std::vector<std::uint32_t> all_atoms(num_atoms);
+    std::iota(all_atoms.begin(), all_atoms.end(), 0u);
+    moments_for_subset_(coords_interleaved, points, all_atoms, row.subspan(0, usr_components_k));
 
-    std::size_t out_offset = 12;
-    for (std::size_t subset_index = 0; subset_index < 4; ++subset_index) {
-        moments_for_subset_(coords_interleaved, points, context.credo_subsets[subset_index], out.data(), out_offset);
-        out_offset += 12;
-    }
+    for (std::size_t subset_index = 0; subset_index < credo_subset_count_k; ++subset_index)
+        moments_for_subset_(coords_interleaved, points, context.credo_subsets[subset_index],
+                            row.subspan((subset_index + 1) * usr_components_k, usr_components_k));
 }
 
 #pragma endregion Public API

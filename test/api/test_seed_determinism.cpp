@@ -80,9 +80,6 @@ namespace smallfield::tests {
 using api::conformer_slot_layout_t;
 using api::conformer_status_t;
 
-/** Every field compared here is reproduced exactly or not at all, so one predicate serves the file. */
-static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
-
 #pragma region Corpus
 
 /**
@@ -270,9 +267,9 @@ static void compare_runs_into(diagnostic_reporter_t &reporter, std::string_view 
                 .mismatch(subject, "molecule={} conformer={} atom={} axis={} num_atoms={}", molecule, conformer, atom,
                           axis, static_cast<std::uint32_t>(first.num_atoms[molecule]))
                 .field("status", static_cast<std::uint32_t>(first.statuses[slot]),
-                       static_cast<std::uint32_t>(second.statuses[slot]), exactly_equal_)
+                       static_cast<std::uint32_t>(second.statuses[slot]), exactly_equal)
                 .field("num_atoms", static_cast<std::uint32_t>(first.num_atoms[molecule]),
-                       static_cast<std::uint32_t>(second.num_atoms[molecule]), exactly_equal_)
+                       static_cast<std::uint32_t>(second.num_atoms[molecule]), exactly_equal)
                 .field("energy_kcal_per_mol", first.energies[slot], second.energies[slot],
                        [](float reference, float observed) {
                            return std::memcmp(&reference, &observed, sizeof(float)) == 0;

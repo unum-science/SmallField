@@ -158,29 +158,6 @@ constexpr unsigned native_is_torsion_in_ring_4_or_5(molecule_descriptor_t const 
 
 #pragma region Native Type Classification
 
-/** Native port of `MMFFMolProperties::getMMFFBondType`. Returns 1 iff the bond is SINGLE and its two
- *  endpoints either both carry the MMFFProp single-bond-multiple-bond designator or are both
- *  aromatic atoms. Otherwise returns 0. */
-constexpr std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &descriptor,
-                                                 mmff94_tables_view_t const &tables,
-                                                 custd::span<std::uint8_t const> atom_types,
-                                                 std::uint32_t bond_index) noexcept {
-    std::uint8_t const bond_order = descriptor.bond_order[bond_index];
-    bool const aromatic_bond = (descriptor.bond_flags[bond_index] & bond_flag_aromatic_k) != 0;
-    // RDKit's rule triggers only when the bond is SINGLE. Aromatic bonds in the descriptor report order=1
-    // with the aromatic flag set, so the test keys on `bond_order == 1 && !aromatic_bond` to exclude aromatic.
-    if (!(bond_order == 1 && !aromatic_bond)) return 0;
-    std::uint8_t const atom_i = descriptor.bond_atom_i[bond_index];
-    std::uint8_t const atom_j = descriptor.bond_atom_j[bond_index];
-    auto const *prop_i = lookup_prop(tables, atom_types[atom_i]);
-    auto const *prop_j = lookup_prop(tables, atom_types[atom_j]);
-    if (!prop_i || !prop_j) return 0;
-    if ((prop_i->single_bond_multiple_bond && prop_j->single_bond_multiple_bond) ||
-        (prop_i->aromatic && prop_j->aromatic))
-        return 1;
-    return 0;
-}
-
 /** Native port of `MMFFMolProperties::getMMFFAngleType`. */
 constexpr std::uint8_t native_get_mmff_angle_type(molecule_descriptor_t const &descriptor,
                                                   custd::span<std::uint8_t const> bond_types, std::uint32_t atom_i,

@@ -236,13 +236,10 @@ struct known_divergence_t {
  *
  *  Caffeine's native MMFF94 partial charges differ from RDKit's on ten of its twenty-four atoms, worst
  *  0.59 e on a ring carbonyl carbon, against 6e-9 across every other built-in; its atom types agree, so
- *  what reaches the kernel is already wrong and the total comes back 13.9 kcal per mol low. Testosterone's
- *  charges match to 7e-9 and its total is still 0.276 kcal per mol high, which puts that one in the
- *  bonded terms; which term it is has not been established.
+ *  what reaches the kernel is already wrong and the total comes back 13.9 kcal per mol low.
  */
 static constexpr known_divergence_t known_energy_divergences_k[] = {
     {"Cn1c(=O)c2c(ncn2C)n(C)c1=O", "native MMFF94 partial charges differ from RDKit by up to 0.59 e"},
-    {"CC12CCC3C(C1CCC2O)CCC4=CC(=O)CCC34C", "bonded terms differ by 0.276 kcal per mol at matching charges"},
 };
 
 /** The reason @p smiles is a known divergence, or an empty view when it is gated like any other. */
@@ -511,10 +508,9 @@ static molecule_outcome_t compare_molecule_(std::string const &smiles, gradient_
         return molecule_outcome_t::unaligned_k;
     }
 
-    // `extract_coords_interleaved` returns its buffer, so this one copy allocates per molecule while every
-    // other buffer the sweep touches lives in the scratch.
-    scratch.atom_major = extract_coords_interleaved(*molecule);
-    sft::conformer_aos_t const atom_major {scratch.atom_major.data(), rdkit_atoms};
+    auto const atom_major = sft::reset_coordinates_aos<sft::coordinate_role_t::position_k>(scratch.atom_major,
+                                                                                           rdkit_atoms);
+    read_conformer_into(*molecule, atom_major);
     sft::conformer_soa_t const axis_major =
         sft::reset_coordinates_soa<sft::coordinate_role_t::position_k, sft::conformer_dimensions_k>(scratch.axis_major,
                                                                                                     rdkit_atoms);

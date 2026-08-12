@@ -8,18 +8,31 @@
 
 #pragma once
 
-#if defined(__CUDACC__)
-
 #include <cstdint> // `std::uint32_t`
+
+namespace smallfield::cuda {
+
+/*  These two sit outside the `__CUDACC__` guard below, unlike everything else here, because they are
+ *  hardware facts rather than device code. A host translation unit that sizes a launch or a stride
+ *  against the warp width has to be able to name the same constant the kernel does — and this header
+ *  is where it is named once, so putting it behind a guard `g++` never takes would push every host
+ *  caller back to a bare `32`. */
+
+/** Threads a warp carries on every architecture this project targets. */
+constexpr std::uint32_t warp_size_k = 32;
+
+/** Every lane of a full warp, for the `__shfl_*_sync` and `__ballot_sync` mask argument. */
+constexpr unsigned int full_mask_k = 0xFFFFFFFF;
+
+} // namespace smallfield::cuda
+
+#if defined(__CUDACC__)
 
 #include <cuda_runtime.h>
 
 #include "smallfield/utilities.hpp"
 
 namespace smallfield::cuda {
-
-constexpr std::uint32_t warp_size_k = 32;
-constexpr unsigned int full_mask_k = 0xFFFFFFFF;
 
 __device__ __forceinline__ float dot_float3_(float3 const &lhs, float3 const &rhs) {
     return fmaf(lhs.x, rhs.x, fmaf(lhs.y, rhs.y, lhs.z * rhs.z));

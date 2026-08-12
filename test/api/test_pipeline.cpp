@@ -55,9 +55,6 @@ namespace smallfield::tests {
 
 using api::conformer_status_t;
 
-/** Every field compared here is an exact quantity, so one predicate serves the whole file. */
-static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
-
 #pragma region Wave Sizing Arithmetic
 
 /**
@@ -109,7 +106,7 @@ static void check_wave_budget_arithmetic(diagnostic_reporter_t &reporter) {
             .field("budget_bytes", budget_case.expected_budget_bytes,
                    api::wave_budget_bytes(budget_case.free_probe_count, budget_case.free_per_slot_bytes,
                                           budget_case.total_per_slot_bytes),
-                   exactly_equal_);
+                   exactly_equal);
     reporter.summarize("wave_budget");
 }
 
@@ -146,10 +143,10 @@ static void check_per_device_reservation(diagnostic_reporter_t &reporter) {
             .mismatch("wave_sizing", "wave_size={} device_count={}", division_case.wave_size,
                       division_case.device_count)
             .field("quotient", division_case.expected_quotient,
-                   api::divide_rounding_up(division_case.wave_size, division_case.device_count), exactly_equal_)
+                   api::divide_rounding_up(division_case.wave_size, division_case.device_count), exactly_equal)
             .field("reservation", division_case.expected_reservation,
                    api::reserve_molecules_per_device(division_case.wave_size, division_case.device_count),
-                   exactly_equal_);
+                   exactly_equal);
     reporter.summarize("wave_sizing");
 }
 
@@ -308,9 +305,9 @@ static void check_empty_wave_timings(diagnostic_reporter_t &reporter) {
 
     // The rejected molecules never reach a GPU pool, so the last wave is empty by construction.
     reporter.mismatch("empty_wave", "wave={}", rows[2].wave_index)
-        .field("molecule_count", 2u, rows[2].molecule_count, exactly_equal_)
-        .field("gpu_max_ms", 0.f, rows[2].gpu_max_ms, exactly_equal_)
-        .field("gpu_average_ms", 0.f, rows[2].gpu_average_ms, exactly_equal_);
+        .field("molecule_count", 2u, rows[2].molecule_count, exactly_equal)
+        .field("gpu_max_ms", 0.f, rows[2].gpu_max_ms, exactly_equal)
+        .field("gpu_average_ms", 0.f, rows[2].gpu_average_ms, exactly_equal);
     reporter.summarize("empty_wave");
 
     for (std::uint32_t molecule = first_rejected_molecule_k; molecule < past_last_rejected_molecule_k; ++molecule)
@@ -318,7 +315,7 @@ static void check_empty_wave_timings(diagnostic_reporter_t &reporter) {
             reporter
                 .mismatch("element_gate", "molecule={} conformer={} smiles={}", molecule, conformer, smiles[molecule])
                 .field("status", static_cast<unsigned>(conformer_status_t::unsupported_element_k),
-                       static_cast<unsigned>(outputs.status[molecule * num_conformers_k + conformer]), exactly_equal_);
+                       static_cast<unsigned>(outputs.status[molecule * num_conformers_k + conformer]), exactly_equal);
     reporter.summarize("element_gate");
 
     fmt::println("  empty-wave timings: {} rows parsed, wave0 gpu_max={:.1f} ms, wave2 gpu_max={:.1f} ms (must be 0)",
@@ -446,7 +443,7 @@ static void check_generation_against_rdkit(custd::span<std::string_view const> c
 
         std::uint32_t const num_atoms = rdkit_molecule->getNumAtoms();
         checks.mismatch("atom_count", "molecule={} smiles={}", molecule, corpus[molecule])
-            .field("num_atoms", num_atoms, static_cast<std::uint32_t>(outputs.num_atoms[molecule]), exactly_equal_);
+            .field("num_atoms", num_atoms, static_cast<std::uint32_t>(outputs.num_atoms[molecule]), exactly_equal);
         if (outputs.num_atoms[molecule] != num_atoms) continue; // gathering past our own count reads padding
         ++tally.molecules_compared;
 

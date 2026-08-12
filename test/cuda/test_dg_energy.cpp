@@ -44,6 +44,7 @@
 #include "test/cuda/test_dg_energy_kernels.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
+namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -84,18 +85,6 @@ static gradient_t reset_gradient_(std::vector<float> &storage, std::uint32_t num
 /** Grow @p storage to @p num_atoms atom-major triples, zero it, and view it. */
 static interleaved_t reset_interleaved_(std::vector<float> &storage, std::uint32_t num_atoms) {
     return sft::reset_coordinates_aos<coordinate_role_t::position_k>(storage, num_atoms);
-}
-
-/** Read a molecule's conformer straight into caller-owned interleaved storage. */
-static void read_conformer_into_(RDKit::ROMol const &molecule, interleaved_t interleaved) {
-    sf_verify_(interleaved.extent(0) == molecule.getNumAtoms(), "the interleaved view does not fit the molecule");
-    auto const &conformer = molecule.getConformer();
-    for (std::uint32_t atom = 0; atom < interleaved.extent(0); ++atom) {
-        auto const &position = conformer.getAtomPos(atom);
-        interleaved(atom, 0) = static_cast<float>(position.x);
-        interleaved(atom, 1) = static_cast<float>(position.y);
-        interleaved(atom, 2) = static_cast<float>(position.z);
-    }
 }
 
 /**
@@ -349,7 +338,8 @@ static molecule_setup_t setup_molecule_(std::string const &smiles, std::unique_p
     molecule = sftest::mol_from_smiles(smiles);
     if (molecule == nullptr) return molecule_setup_t::unparsed_k;
     if (!sftest::embed_molecule(*molecule)) return molecule_setup_t::unembeddable_k;
-    if (!sft::build_descriptor(*molecule, descriptor)) return molecule_setup_t::undescribable_k;
+    if (sft::build_descriptor(*molecule, descriptor) != sfapi::conformer_status_t::success_k)
+        return molecule_setup_t::undescribable_k;
     return molecule_setup_t::ready_k;
 }
 
@@ -368,7 +358,7 @@ static void check_energy_(sftest::diagnostic_reporter_t &reporter, sftest::diagn
     auto const gradient = reset_gradient_(scratch.gradient, num_atoms);
     auto const interleaved = reset_interleaved_(scratch.interleaved, num_atoms);
 
-    read_conformer_into_(molecule, interleaved);
+    sftest::read_conformer_into(molecule, interleaved);
     sft::transpose_into(interleaved, coordinates);
     fill_fourth_dimension_(coordinates);
 
@@ -417,7 +407,7 @@ static void check_gradient_(sftest::diagnostic_reporter_t &reporter, std::string
     auto const spare = reset_gradient_(scratch.spare_gradient, num_atoms);
     auto const interleaved = reset_interleaved_(scratch.interleaved, num_atoms);
 
-    read_conformer_into_(molecule, interleaved);
+    sftest::read_conformer_into(molecule, interleaved);
     sft::transpose_into(interleaved, coordinates);
 
     // A conformer sits close to its bounds, and a gradient of exact zeros compares equal to anything.

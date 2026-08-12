@@ -86,7 +86,6 @@ static sfp::per_mol_sizes_t accumulate_uniform_batch_(uniform_batch_expectation_
  */
 static void check_accumulators_(uniform_batch_expectation_t const &expectation, diagnostic_reporter_t &reporter) {
     sfp::per_mol_sizes_t const totals = accumulate_uniform_batch_(expectation);
-    auto const exactly_equal = [](std::uint64_t reference, std::uint64_t observed) { return reference == observed; };
     reporter.mismatch("accumulate", "molecules={} atoms={}", expectation.molecules, expectation.atoms_per_molecule)
         .field("bounds", expectation.bounds, static_cast<std::uint64_t>(totals.bounds), exactly_equal)
         .field("bond_distance", expectation.bond_distance, static_cast<std::uint64_t>(totals.bond_distance),
@@ -112,7 +111,6 @@ static void check_layout_(uniform_batch_expectation_t const &expectation, diagno
 
     std::uint64_t const bounds_bytes = expectation.bounds * sizeof(float);
     std::uint64_t const bond_distance_bytes = expectation.bond_distance * sizeof(std::uint8_t);
-    auto const exactly_equal = [](std::uint64_t reference, std::uint64_t observed) { return reference == observed; };
     auto const at_least = [](std::uint64_t reference, std::uint64_t observed) { return observed >= reference; };
     reporter.mismatch("layout", "molecules={} atoms={}", expectation.molecules, expectation.atoms_per_molecule)
         .field("num_bounds", expectation.bounds, static_cast<std::uint64_t>(layout.num_bounds), exactly_equal)

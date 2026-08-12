@@ -35,6 +35,7 @@
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
 
+namespace sfapi = smallfield::api;
 namespace sfp = smallfield::preprocess;
 namespace sft = smallfield::types;
 namespace sftest = smallfield::tests;
@@ -43,30 +44,6 @@ static constexpr std::string_view test_name_k = "test_chirality";
 
 /** A stereo-rich corpus can disagree at hundreds of molecules, and ten lines already name the pattern. */
 static constexpr std::size_t max_printed_lines_k = 10;
-
-/** A verdict is a flag: it agrees with what was expected of it or it does not. */
-static constexpr auto exactly_equal_ = [](auto reference, auto observed) { return reference == observed; };
-
-#pragma region Conformer Access
-
-/**
- *  @brief Read a molecule's default conformer straight into caller-owned atom-major storage.
- *
- *  @param[in] molecule Molecule carrying the conformer to read.
- *  @param[out] atom_major View spanning exactly the molecule's atoms.
- */
-static void read_conformer_into_(RDKit::ROMol const &molecule, sft::conformer_aos_t atom_major) {
-    sf_verify_(atom_major.extent(0) == molecule.getNumAtoms(), "the atom-major view does not fit the molecule");
-    auto const &conformer = molecule.getConformer();
-    for (std::uint32_t atom = 0; atom < atom_major.extent(0); ++atom) {
-        auto const &position = conformer.getAtomPos(atom);
-        atom_major(atom, 0) = static_cast<float>(position.x);
-        atom_major(atom, 1) = static_cast<float>(position.y);
-        atom_major(atom, 2) = static_cast<float>(position.z);
-    }
-}
-
-#pragma endregion Conformer Access
 
 #pragma region Molecule Walk
 
@@ -146,7 +123,8 @@ static molecule_outcome_t check_molecule_(std::string const &smiles, chirality_s
     if (!sftest::embed_molecule(*molecule)) return molecule_outcome_t::unembedded_k;
     // `build_descriptor` refuses a molecule past its fixed atom and bond extents, and leaves its output
     // stale rather than empty when it does, so the refusal is read before the extraction trusts it.
-    if (!sft::build_descriptor(*molecule, scratch.descriptor)) return molecule_outcome_t::oversized_k;
+    if (sft::build_descriptor(*molecule, scratch.descriptor) != sfapi::conformer_status_t::success_k)
+        return molecule_outcome_t::oversized_k;
 
     sfp::extract_chiral_centers(*molecule, scratch.descriptor, scratch.targets);
     // An achiral molecule satisfies the upright and the inverted targets alike — the warp ballot over zero
@@ -158,7 +136,7 @@ static molecule_outcome_t check_molecule_(std::string const &smiles, chirality_s
                                                                                            num_atoms);
     auto const axis_major = sft::reset_coordinates_soa<sft::coordinate_role_t::position_k, sft::conformer_dimensions_k>(
         scratch.axis_major, num_atoms);
-    read_conformer_into_(*molecule, atom_major);
+    sftest::read_conformer_into(*molecule, atom_major);
     sft::transpose_into(atom_major, axis_major);
 
     scratch.inverted_targets.assign(scratch.targets.begin(), scratch.targets.end());
@@ -171,8 +149,8 @@ static molecule_outcome_t check_molecule_(std::string const &smiles, chirality_s
                                                          num_atoms, num_centers);
 
     reporter.mismatch("chirality", "smiles={} centers={}", smiles, num_centers)
-        .field("satisfied", true, upright, exactly_equal_)
-        .field("satisfied_inverted", false, inverted, exactly_equal_);
+        .field("satisfied", true, upright, sftest::exactly_equal)
+        .field("satisfied_inverted", false, inverted, sftest::exactly_equal);
 
     return molecule_outcome_t::compared_k;
 }

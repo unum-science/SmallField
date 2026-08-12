@@ -218,7 +218,8 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smil
                                  sfp::molecule_shape_context_t const &context, shape_reporters_t &reporters,
                                  shape_scratch_t &scratch) {
     std::uint32_t const num_atoms = molecule.getNumAtoms();
-    scratch.coordinates = extract_coords_interleaved(molecule);
+    read_conformer_into(
+        molecule, types::reset_coordinates_aos<types::coordinate_role_t::position_k>(scratch.coordinates, num_atoms));
     set_coords_interleaved(molecule, scratch.coordinates.data());
 
     sfp::usr_descriptor(scratch.coordinates, num_atoms, scratch.native_usr);
@@ -240,8 +241,6 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smil
     for (std::size_t slot = 0; slot < usr_slot_names_k.size(); ++slot)
         usr_group.field(usr_slot_names_k[slot], scratch.rdkit_usr[slot], scratch.native_usr[slot], within_tolerance);
 
-    auto const same_count = [](std::size_t reference, std::size_t observed) { return reference == observed; };
-
     for (std::size_t block = 0; block < usrcat_block_names_k.size(); ++block) {
         auto usrcat_group = reporters.usrcat.mismatch("usrcat", "smiles={} subset={}", smiles,
                                                       usrcat_block_names_k[block]);
@@ -249,7 +248,7 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smil
         // atom ids it typed, so a typing divergence names itself here instead of surfacing as twelve moments.
         if (block > 0)
             usrcat_group.field("subset_size", scratch.rdkit_usrcat_atoms[block - 1].size(),
-                               context.credo_subsets[block - 1].size(), same_count);
+                               context.credo_subsets[block - 1].size(), exactly_equal);
         std::size_t const base = block * usr_slot_names_k.size();
         for (std::size_t slot = 0; slot < usr_slot_names_k.size(); ++slot)
             usrcat_group.field(usr_slot_names_k[slot], scratch.rdkit_usrcat[base + slot],
@@ -438,7 +437,8 @@ static void check_builtin_salt_(shape_reporters_t &reporters, shape_scratch_t &s
     sf_verify_(context.ok, "build_shape_context failed for the builtin salt");
     sf_verify_(context.num_components == 2, "the builtin salt must have exactly two components");
 
-    scratch.coordinates = extract_coords_interleaved(*molecule);
+    read_conformer_into(*molecule, types::reset_coordinates_aos<types::coordinate_role_t::position_k>(
+                                       scratch.coordinates, molecule->getNumAtoms()));
     check_separation_(context, salt, reporters, scratch);
 }
 
