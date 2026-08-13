@@ -12,8 +12,8 @@
  *  no algebra with the rest of the stage, so a sign error in it hides inside a full-stage total but
  *  cannot hide once every other term's force constant is gone.
  *
- *  The built-in molecules are what `ctest` gates on, and the two of them whose totals do not reproduce
- *  RDKit's are named in `known_energy_divergences_k` with what is known about each. A corpus named on
+ *  The built-in molecules are what `ctest` gates on, and every one of them reproduces RDKit's total
+ *  inside `energies_agree_`'s band, so the sweep exempts none of them. A corpus named on
  *  the command line turns the same sweep into a survey: over a 40-molecule PubChem sample the gradient
  *  sections stay clean and the energy section reports real divergences, 18 molecules beyond its band and
  *  four of them past 20 kcal per mol, which is the state of the two implementations rather than a
@@ -220,40 +220,12 @@ static constexpr gradient_tolerance_t full_stage_tolerance_k {.absolute = 2.5e-2
  *  @brief Whether the device total and RDKit's are the same number, at the resolution `float` allows.
  *
  *  The band is what the two implementations measurably achieve rather than what they can be made to
- *  pass at: eight of the ten built-in molecules agree to 2e-4 kcal per mol or better, so a band of a
- *  whole kcal would leave four orders of magnitude of regression unreported. The two that do not agree
- *  are named in `known_energy_divergences_k`.
+ *  pass at: every one of the ten built-in molecules agrees to 3e-4 kcal per mol or better, so a band of
+ *  a whole kcal would leave three orders of magnitude of regression unreported.
  */
 static bool energies_agree_(double rdkit_energy, double device_energy) noexcept {
     double const band = std::max(1.0e-2, 1.0e-4 * std::fabs(rdkit_energy));
     return std::fabs(device_energy - rdkit_energy) < band;
-}
-
-/** A molecule whose two MMFF94 implementations disagree today, and what the disagreement is. */
-struct known_divergence_t {
-    std::string_view smiles;
-    std::string_view reason;
-};
-
-/**
- *  @brief Built-in molecules whose device total is known not to reproduce RDKit's, and why.
- *
- *  Their energies are narrated rather than gated, so the divergence is printed by every run instead of
- *  living only in this table, and a listed molecule that starts agreeing fails the run as a stale entry.
- *
- *  Caffeine's native MMFF94 partial charges differ from RDKit's on ten of its twenty-four atoms, worst
- *  0.59 e on a ring carbonyl carbon, against 6e-9 across every other built-in; its atom types agree, so
- *  what reaches the kernel is already wrong and the total comes back 13.9 kcal per mol low.
- */
-static constexpr known_divergence_t known_energy_divergences_k[] = {
-    {"Cn1c(=O)c2c(ncn2C)n(C)c1=O", "native MMFF94 partial charges differ from RDKit by up to 0.59 e"},
-};
-
-/** The reason @p smiles is a known divergence, or an empty view when it is gated like any other. */
-static std::string_view known_energy_divergence_(std::string_view smiles) noexcept {
-    for (known_divergence_t const &divergence : known_energy_divergences_k)
-        if (divergence.smiles == smiles) return divergence.reason;
-    return {};
 }
 
 /**
@@ -305,10 +277,6 @@ struct gradient_tally_t {
     mmff_energy_probe_t first_refusal = mmff_energy_probe_t::completed_k;
     /** Compared molecules carrying no out-of-plane term, which that section has nothing to probe on. */
     std::uint32_t without_oop = 0;
-    /** Compared molecules on `known_energy_divergences_k`, whose energies are narrated rather than gated. */
-    std::uint32_t known_divergence = 0;
-    /** Listed molecules that agree with RDKit, so their roster entry states something untrue. */
-    std::uint32_t stale_divergence = 0;
     float worst_oop_error = 0.0f;
     float worst_stage_error = 0.0f;
 };
@@ -560,18 +528,8 @@ static molecule_outcome_t compare_molecule_(std::string const &smiles, gradient_
                                                                     scratch.stage_gradient, device_energy);
         probe != mmff_energy_probe_t::completed_k)
         return refuse_(probe);
-    std::string_view const divergence_reason = known_energy_divergence_(smiles);
-    if (divergence_reason.empty())
-        reporters.stage_energy.mismatch("stage_energy", "smiles={} atoms={}", smiles, scratch.prepared.num_atoms)
-            .field("total_energy", rdkit_energy, static_cast<double>(device_energy), energies_agree_);
-    else {
-        // Narrated, not compared: the number is the point, and printing it every run is what keeps the
-        // roster entry from becoming a claim nobody rechecks.
-        reporters.stage_energy.note("known_divergence", "smiles={} reason={}", smiles, divergence_reason)
-            .field("total_energy", rdkit_energy, static_cast<double>(device_energy));
-        ++tally.known_divergence;
-        if (energies_agree_(rdkit_energy, static_cast<double>(device_energy))) ++tally.stale_divergence;
-    }
+    reporters.stage_energy.mismatch("stage_energy", "smiles={} atoms={}", smiles, scratch.prepared.num_atoms)
+        .field("total_energy", rdkit_energy, static_cast<double>(device_energy), energies_agree_);
 
     compare_translation_invariance_(smiles, gradient_soa_t {scratch.stage_gradient.data(), rdkit_atoms},
                                     reporters.translation_invariance);
@@ -644,9 +602,9 @@ int main(int argc, char **argv) {
     sftest::sweep_corpus_(corpus, reporters, tally);
 
     fmt::println("molecules compared={} unprepared={} unembedded={} unaligned={} " // what the sweep saw
-                 "unreferenced={} refused={} without_oop={} known_divergence={}",  // and what it stepped past
+                 "unreferenced={} refused={} without_oop={}",                      // and what it stepped past
                  tally.compared, tally.unprepared, tally.unembedded, tally.unaligned, tally.unreferenced, tally.refused,
-                 tally.without_oop, tally.known_divergence);
+                 tally.without_oop);
     fmt::println("worst gradient error oop={} stage={} against absolute floors {:.3g} and {:.3g}, " // the margin
                  "above which the relative band decides",                                           // and the band
                  tally.worst_oop_error, tally.worst_stage_error, sftest::single_term_tolerance_k.absolute,
@@ -656,9 +614,6 @@ int main(int argc, char **argv) {
         return sftest::report_fail(test_name_k, "the device refused {} molecules, first as {}", tally.refused,
                                    sftest::mmff_energy_probe_reason(tally.first_refusal));
     if (tally.compared == 0) return sftest::report_fail(test_name_k, "corpus yielded no comparable molecule");
-    if (tally.stale_divergence != 0)
-        return sftest::report_fail(test_name_k, "{} known divergences now agree with RDKit and must leave the roster",
-                                   tally.stale_divergence);
     if (!sections_passed)
         return sftest::report_fail(test_name_k, "{} mismatches over {} comparisons", reporters.mismatch_count(),
                                    reporters.comparison_count());
