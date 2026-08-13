@@ -52,6 +52,10 @@ __Evidence__ names its scale tag and its date, and says so outright when the mea
 
 Measured 2026-08-12 — `100K REAL, K=3, 1× H100`, kernel durations from `nsys` without replay, within-kernel attribution from `ncu` PC sampling with source correlation, bin-weighted across the two largest waves and cross-checked by ablation to within 4 points.
 
+_Stale in one row._
+The half-shell traversal landed on 2026-08-13 and halves the nonbonded pair evaluations, so that 37.6 % is roughly 20 % now and every other row is a correspondingly larger share of a smaller total.
+The commits that landed those changes carry the measurements, and the two proposals that closed against them.
+
 Composing the measured layers — 92.3 % of wall in GPU, about 98 % of that in kernels, 94.2 % of kernels in MMFF94 polish:
 
 | Component                                        | Share of Wall |
@@ -77,16 +81,6 @@ FIRE budgets are not over-provisioned — disabling the convergence test moves r
 Coalescing the `bond_distance` read by transposing it is 1.4 % __slower__, because the row walk already strength-reduces to a pointer bump.
 Integer arithmetic does not dominate the ETKDG kernel — `alu/fma` is 0.557 — and that kernel is 4.2 % of GPU time regardless.
 
-### Half-Shell Nonbonded With a Cyclic Offset
-
-__Mechanism:__ Replace the `j = 0..N` nonbonded sweep in `mmff94_energy_kernel.cuh:82-146` with `j = (atom + offset) mod N` for `offset = 1..N/2`, so each pair is visited once with all 32 lanes active, and deliver the reaction force to the partner atom.
-__Evidence:__ `100K REAL, K=3, 1× H100`, 2026-08-12 — nonbonded is 41.6 % of kernel time and 37.6 % of wall, stalling on arithmetic dependency chains rather than memory.
-A naive triangular prune, `if (j <= atom) continue`, measured only −6.5 % because `j` is warp-uniform, so idle lanes still cost the warp its issue slot; the cyclic form exists to fix exactly that.
-__Gain:__ Up to half of 37.6 % of wall, less the cost of force delivery.
-__Effort:__ High.
-__Risk:__ High — the reaction force has to reach an atom owned by another lane, and the one delivery mechanism measured so far made things worse; see the entry below.
-__Gate:__ Prototype the delivery mechanism before planning around the arithmetic saving, and gate on paired energies against RDKit rather than on wall time.
-
 ### De-Duplicate MMFF Bonded Term Evaluation
 
 __Mechanism:__ Bonded terms are evaluated once per participating atom, so each is computed 2 to 4 times, and roughly 85 % of each term body is role-independent.
@@ -97,18 +91,10 @@ __Gain:__ Up to 42.5 % of the MMFF kernel, so about 36 % of wall at the ceiling.
 __Effort:__ High.
 __Risk:__ High — realizing the same saving by scattering role forces through shared-memory `atomicAdd` measured __10 % slower__ than baseline, because on a 32-lane warp sharing one small gradient array those atomics serialize on conflicts, costing 2.9× the math they saved.
 Registers rose 72 → 77 in that attempt.
-Shared memory for 32 terms in flight is 896 B, which leaves registers binding on `sm_90` at 28 blocks, but `sm_120` sits at 101 registers and 20 blocks and needs its own measurement before this lands.
-__Gate:__ Prototype the no-atomics staging first and confirm it beats baseline before designing around the ceiling.
-
-### Conflict-Free Atomic Gradient Store
-
-__Mechanism:__ Replace the final `store_gradient_` in `mmff_polish_warp_kernel` with three shared-memory `atomicAdd` calls into a zeroed array.
-__Evidence:__ `20K REAL, K=3, 1× H100`, 2026-08-12 — __−5.2 %__ on the MMFF kernel, which is 4.9 % of wall, at unchanged register count and bitwise-identical output, since each atom is written by exactly one lane and no atomic ever contends.
-__Gain:__ 4.9 % of wall.
-__Effort:__ Low.
-__Risk:__ Low.
-__Gate:__ Bitwise-identical output over a shard, and `cuobjdump --dump-resource-usage` showing 72 registers unchanged.
-Do not generalise the result — a conflict-free atomic is faster than a plain store here, while a conflicting one is not.
+Shared memory is what refuses this now rather than registers.
+`sm_90` sits at the 32-block slot limit, so any per-molecule scratch spends occupancy from the first byte: an ablation adding the 72 bytes per atom a 3N torsion scratch needs takes bin 64 from 32 blocks to 25 and the kernel 17.9 % slower, against a mechanism whose matched-occupancy ceiling is −14.5 %.
+896 B for 32 terms in flight is the footprint that has to hold.
+__Gate:__ Prototype the no-atomics staging first, size it under about 2 KB per molecule at bin 64, and confirm it beats baseline before designing around the ceiling.
 
 ### Skip Provably Terminal Statuses Before the Fallback
 

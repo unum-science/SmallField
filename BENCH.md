@@ -119,11 +119,12 @@ __Kernel resources__, from `cuobjdump --dump-resource-usage` on the `sm_90` buil
 | Kernel                       | Registers | Stack | Note       |
 | :--------------------------- | --------: | ----: | :--------- |
 | `etkdg_pipeline_warp_kernel` |        69 |     0 | no spills  |
-| `mmff_polish_warp_kernel`    |        72 |     0 | no spills  |
+| `mmff_polish_warp_kernel`    |        64 |     0 | no spills  |
 | `csd_torsion_match_kernel`   |       255 |   192 | __spills__ |
 
 A 32-thread block occupies at most 32 of a multiprocessor's 64 warp slots, so 50 % is the ceiling this shape reaches at any register count.
-Registers bind first, at 28 blocks per multiprocessor, which is 43.75 % theoretical.
+The polish kernel reaches it: at 64 registers nothing but the slot limit binds, and its shared memory is 3584 B at bin 64 against 228 KB per multiprocessor.
+Its sibling is still register-bound, at 29 blocks per multiprocessor.
 
 __Quality__, PubChem 20,000 molecules with 10,000 conformers sampled.
 

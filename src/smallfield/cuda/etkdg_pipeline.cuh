@@ -462,22 +462,37 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
  *  and energy in place. Skips slots that failed stereo (status != 0) and
  *  molecules with zero MMFF terms.
  *
- *  Shared memory at bin 128 is ~4.5 KB, FIRE scratch only, since no bounds matrix is needed here.
- *  Registers bind before shared memory at every bin.
+ *  Shared memory at bin 128 is 7 KB, FIRE scratch plus the two per-atom caches, since no bounds
+ *  matrix is needed here. On `sm_90` neither that nor the register count binds any more: at 64
+ *  registers and 228 KB of shared memory per multiprocessor the 32-block slot limit a 32-thread
+ *  block imposes is what is left, at every bin. On `sm_120`'s 100 KB the shared memory binds
+ *  first at bin 128, at 14 blocks against the 23 the registers would allow.
+ *
+ *  Which is why 4.5 KB of per-molecule scratch cannot be added here without paying for it. An
+ *  ablation raising the allocation by the 72 bytes per atom a 3N torsion scratch would need,
+ *  arithmetic unchanged, takes bin 64 from 32 blocks per multiprocessor to 25 and the kernel
+ *  17.9 % slower.
+ *
+ *  Unlike its sibling's, this kernel's second launch bound is a cap that binds. Twenty blocks per
+ *  multiprocessor at 32 threads asks `ptxas` for at most 102 registers against a 65536-register
+ *  file, which is above what any architecture but `sm_120` reaches on its own, so it is the one
+ *  place the Blackwell budget is stated rather than discovered. It costs `sm_90` nothing, where the
+ *  count is already 64. A bound of 24 takes `sm_100` to 70 and `sm_120` to 72, still without
+ *  spilling, and that is a claim about codegen on hardware this box does not have.
  *
  *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`:
- *    sm_80=64, sm_89=71, sm_90=72, sm_100=95, sm_120=101 regs/thread, no spills (STACK=0, LOCAL=0).
- *    On sm_90 that is 28 blocks/SM, against the same 32-warp ceiling a 32-thread block imposes,
- *    which is where its sibling sits too.
+ *    sm_80=63, sm_89=64, sm_90=64, sm_100=79, sm_120=87 regs/thread, no spills (STACK=0, LOCAL=0).
+ *    On sm_90 that is the 32-block slot limit a 32-thread block imposes, so nothing but the slot
+ *    cap is left to bind there.
  *
- *    `bond_distance` is read from global memory on every FIRE iteration, N² per iteration. It
- *    is only ever tested as `< 3`, `== 3`, and `>= 4`, which is two bits per pair, so an N²/4
- *    packed copy staged into shared memory alongside the FIRE arrays would remove that traffic
- *    without displacing anything.
+ *    `bond_distance` is read from global memory on every FIRE iteration, N²/2 per iteration since
+ *    the pair sweep visits each pair once. It is only ever tested as `< 3`, `== 3`, and `>= 4`,
+ *    which is two bits per pair, so an N²/4 packed copy staged into shared memory alongside the
+ *    FIRE arrays would remove that traffic for a footprint the smaller bins can afford.
  *
  *  @see etkdg_pipeline_warp_kernel
  */
-__global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
+__global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
     mmff94_atom_vdw_params_t const *__restrict__ mmff_atom_vdw, float const *__restrict__ mmff_atom_charge,
     std::uint8_t const *__restrict__ bond_distance, mmff94_bond_t const *__restrict__ mmff_bond_terms,
     mmff94_angle_t const *__restrict__ mmff_angle_terms, mmff94_torsion_t const *__restrict__ mmff_torsion_terms,
