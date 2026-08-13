@@ -7,10 +7,28 @@
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
+#include <string_view> // `std::string_view`
+
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::tests {
+
+/**
+ *  @brief Which step of the device round trip refused, so a caller can say why it compared nothing.
+ *
+ *  A launch the driver declines never writes the gradient or the energy, and neither buffer is zeroed
+ *  first, so a caller that reads them anyway differentiates whatever the allocation found.
+ */
+enum class mmff_energy_probe_t {
+    completed_k,
+    allocation_failed_k,
+    transfer_failed_k,
+    launch_failed_k,
+};
+
+/** The sentence an `mmff_energy_probe_t` reads as, for the `NOTE` line above a skipped comparison. */
+std::string_view mmff_energy_probe_reason(mmff_energy_probe_t outcome) noexcept;
 
 /**
  *  @brief One molecule's MMFF94 terms, as the device stages them.
@@ -45,8 +63,8 @@ struct mmff_energy_terms_t {
 /**
  *  @brief Evaluate MMFF94 energy and its gradient on the device for one molecule.
  *
- *  A device array it cannot reserve leaves @p host_gradient and @p out_energy untouched and says so on
- *  `stderr`, rather than launching the functor on a null pointer.
+ *  A device array it cannot reserve leaves @p host_gradient and @p out_energy untouched and answers with
+ *  the refusal, rather than launching the functor on a null pointer.
  *
  *  @param[in] host_positions Coordinates as `(axis, atom)`, `3 * num_atoms` entries, which is the layout
  *      the kernel indexes; an interleaved block passed here scores a different molecule.
@@ -54,8 +72,10 @@ struct mmff_energy_terms_t {
  *  @param[in] terms Every parameter array the energy functor reads.
  *  @param[out] host_gradient Receives the gradient, same extent and layout as @p host_positions.
  *  @param[out] out_energy Receives the total energy.
+ *  @return Whether the round trip completed, and which step refused it.
  */
-void gpu_mmff_energy(custd::span<float const> host_positions, std::uint32_t num_atoms, mmff_energy_terms_t const &terms,
-                     custd::span<float> host_gradient, float *out_energy);
+[[nodiscard]] mmff_energy_probe_t gpu_mmff_energy(custd::span<float const> host_positions, std::uint32_t num_atoms,
+                                                  mmff_energy_terms_t const &terms, custd::span<float> host_gradient,
+                                                  float *out_energy);
 
 } // namespace smallfield::tests

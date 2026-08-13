@@ -121,11 +121,13 @@ struct gradient_scratch_t {
  *  @param[in] positions Axis-major coordinates, `3 * prepared.num_atoms` components.
  *  @param[inout] scratch Supplies the hop-matrix storage this call refills.
  *  @param[out] gradient Grown to match @p positions, then filled axis-major.
- *  @return Total energy in kcal per mol.
+ *  @param[out] energy Receives the total in kcal per mol; zero until the device answers.
+ *  @return Whether the device round trip completed, and which step refused it.
  */
-static float mmff_energy_and_gradient_(sfp::etkdg_prepared_molecule_t const &prepared,
-                                       custd::span<float const> positions, gradient_scratch_t &scratch,
-                                       std::vector<float> &gradient) {
+[[nodiscard]] static mmff_energy_probe_t mmff_energy_and_gradient_(sfp::etkdg_prepared_molecule_t const &prepared,
+                                                                   custd::span<float const> positions,
+                                                                   gradient_scratch_t &scratch,
+                                                                   std::vector<float> &gradient, float &energy) {
     gradient.assign(positions.size(), 0.0f);
     auto const bond_hops = sft::reset_square_matrix(scratch.bond_hops, prepared.num_atoms, sft::unreachable_hops_k);
     fill_bond_hops_into(prepared.mmff_bonds, bond_hops);
@@ -141,9 +143,8 @@ static float mmff_energy_and_gradient_(sfp::etkdg_prepared_molecule_t const &pre
         .interactions = prepared.mmff_interactions,
         .atom_offsets = prepared.mmff_atom_offsets,
     };
-    float energy = 0.0f;
-    gpu_mmff_energy(positions, prepared.num_atoms, terms, gradient, &energy);
-    return energy;
+    energy = 0.0f;
+    return gpu_mmff_energy(positions, prepared.num_atoms, terms, gradient, &energy);
 }
 
 /**
@@ -156,18 +157,29 @@ static float mmff_energy_and_gradient_(sfp::etkdg_prepared_molecule_t const &pre
  *  @param[in] axis Spatial dimension of the perturbed component, `0` for x through `2` for z.
  *  @param[in] atom Atom whose coordinate is perturbed.
  *  @param[inout] scratch Holds the coordinates, and the buffers the two energy calls fill.
- *  @return The derivative in kcal per mol per angstrom.
+ *  @param[out] derivative Receives the derivative in kcal per mol per angstrom; untouched on a refusal.
+ *  @return Whether both device round trips completed, and which step refused one.
  */
-static float finite_difference_component_(sfp::etkdg_prepared_molecule_t const &prepared, std::uint32_t axis,
-                                          std::uint32_t atom, gradient_scratch_t &scratch) {
+[[nodiscard]] static mmff_energy_probe_t finite_difference_component_(sfp::etkdg_prepared_molecule_t const &prepared,
+                                                                      std::uint32_t axis, std::uint32_t atom,
+                                                                      gradient_scratch_t &scratch, float &derivative) {
     sft::conformer_soa_t const coordinates {scratch.axis_major.data(), prepared.num_atoms};
     float const original = coordinates(atom, axis);
+    float energy_plus = 0.0f, energy_minus = 0.0f;
+
     coordinates(atom, axis) = original + finite_difference_step_k;
-    float const energy_plus = mmff_energy_and_gradient_(prepared, scratch.axis_major, scratch, scratch.probe_gradient);
+    mmff_energy_probe_t probe = mmff_energy_and_gradient_(prepared, scratch.axis_major, scratch, scratch.probe_gradient,
+                                                          energy_plus);
     coordinates(atom, axis) = original - finite_difference_step_k;
-    float const energy_minus = mmff_energy_and_gradient_(prepared, scratch.axis_major, scratch, scratch.probe_gradient);
+    if (probe == mmff_energy_probe_t::completed_k)
+        probe = mmff_energy_and_gradient_(prepared, scratch.axis_major, scratch, scratch.probe_gradient, energy_minus);
+
+    // Restored before the refusal is answered, so a probe leaves the coordinates it borrowed as it found
+    // them whatever the device said.
     coordinates(atom, axis) = original;
-    return (energy_plus - energy_minus) / (2.0f * finite_difference_step_k);
+    if (probe != mmff_energy_probe_t::completed_k) return probe;
+    derivative = (energy_plus - energy_minus) / (2.0f * finite_difference_step_k);
+    return mmff_energy_probe_t::completed_k;
 }
 
 #pragma endregion Device Evaluation
@@ -270,6 +282,8 @@ enum class molecule_outcome_t : std::uint8_t {
     unaligned_k,
     /** RDKit cannot build MMFF94 properties for it, so there is no reference energy. */
     unreferenced_k,
+    /** The device refused a launch, so the gradient it would have been compared against was never written. */
+    refused_k,
 };
 
 /**
@@ -285,6 +299,10 @@ struct gradient_tally_t {
     std::uint32_t unembedded = 0;
     std::uint32_t unaligned = 0;
     std::uint32_t unreferenced = 0;
+    /** Molecules the device refused a launch for, which is a failure of the run rather than of a molecule. */
+    std::uint32_t refused = 0;
+    /** Which step the first refusal came from, which is the one thing the count cannot carry. */
+    mmff_energy_probe_t first_refusal = mmff_energy_probe_t::completed_k;
     /** Compared molecules carrying no out-of-plane term, which that section has nothing to probe on. */
     std::uint32_t without_oop = 0;
     /** Compared molecules on `known_energy_divergences_k`, whose energies are narrated rather than gated. */
@@ -382,12 +400,17 @@ static void fill_single_oop_term_into_(sfp::etkdg_prepared_molecule_t const &pre
  *  @param[inout] scratch Holds the coordinates the probes perturb and the buffers they fill.
  *  @param[inout] reporter Section that receives one comparison per position and axis.
  *  @param[inout] tally Keeps the worst error this section saw.
+ *  @return Whether every device round trip completed, and which step refused one.
  */
-static void compare_oop_gradient_(std::string const &smiles, gradient_scratch_t &scratch,
-                                  diagnostic_reporter_t &reporter, gradient_tally_t &tally) {
+[[nodiscard]] static mmff_energy_probe_t compare_oop_gradient_(std::string const &smiles, gradient_scratch_t &scratch,
+                                                               diagnostic_reporter_t &reporter,
+                                                               gradient_tally_t &tally) {
     fill_single_oop_term_into_(scratch.prepared, scratch.single_oop);
-    [[maybe_unused]] float const term_energy = mmff_energy_and_gradient_(scratch.single_oop, scratch.axis_major,
-                                                                         scratch, scratch.term_gradient);
+    [[maybe_unused]] float term_energy = 0.0f;
+    if (mmff_energy_probe_t const staged = mmff_energy_and_gradient_(scratch.single_oop, scratch.axis_major, scratch,
+                                                                     scratch.term_gradient, term_energy);
+        staged != mmff_energy_probe_t::completed_k)
+        return staged;
     gradient_soa_t const term_gradient {scratch.term_gradient.data(), scratch.single_oop.num_atoms};
 
     sft::mmff94_oop_t const &oop = scratch.single_oop.mmff_oops.front();
@@ -399,13 +422,18 @@ static void compare_oop_gradient_(std::string const &smiles, gradient_scratch_t 
     for (std::uint32_t role = 0; role < 4; ++role) {     // the term's i, j, k and l positions
         for (std::uint32_t axis = 0; axis < 3; ++axis) { // the three spatial dimensions
             std::uint32_t const atom = oop_atoms[role];
-            float const finite_difference = finite_difference_component_(scratch.single_oop, axis, atom, scratch);
+            float finite_difference = 0.0f;
+            if (mmff_energy_probe_t const probed = finite_difference_component_(scratch.single_oop, axis, atom, scratch,
+                                                                                finite_difference);
+                probed != mmff_energy_probe_t::completed_k)
+                return probed;
             float const analytical = term_gradient(atom, axis);
             tally.worst_oop_error = std::max(tally.worst_oop_error, std::fabs(analytical - finite_difference));
             reporter.mismatch("oop_gradient", "smiles={} atom={} role={}", smiles, atom, role)
                 .field(gradient_field_name_(axis), finite_difference, analytical, agree);
         }
     }
+    return mmff_energy_probe_t::completed_k;
 }
 
 /**
@@ -448,9 +476,11 @@ static void compare_translation_invariance_(std::string const &smiles, gradient_
  *  @param[inout] scratch Holds the coordinates the probes perturb and the gradient they are compared to.
  *  @param[inout] reporter Section that receives one comparison per sampled component.
  *  @param[inout] tally Keeps the worst error this section saw.
+ *  @return Whether every device round trip completed, and which step refused one.
  */
-static void compare_stage_gradient_(std::string const &smiles, gradient_scratch_t &scratch,
-                                    diagnostic_reporter_t &reporter, gradient_tally_t &tally) {
+[[nodiscard]] static mmff_energy_probe_t compare_stage_gradient_(std::string const &smiles, gradient_scratch_t &scratch,
+                                                                 diagnostic_reporter_t &reporter,
+                                                                 gradient_tally_t &tally) {
     std::uint32_t const num_atoms = scratch.prepared.num_atoms;
     gradient_soa_t const stage_gradient {scratch.stage_gradient.data(), num_atoms};
     std::size_t const total_components = stage_gradient.size();
@@ -464,12 +494,17 @@ static void compare_stage_gradient_(std::string const &smiles, gradient_scratch_
     for (std::size_t component = 0; component < total_components; component += stride) {
         std::uint32_t const axis = static_cast<std::uint32_t>(component / num_atoms);
         std::uint32_t const atom = static_cast<std::uint32_t>(component % num_atoms);
-        float const finite_difference = finite_difference_component_(scratch.prepared, axis, atom, scratch);
+        float finite_difference = 0.0f;
+        if (mmff_energy_probe_t const probed = finite_difference_component_(scratch.prepared, axis, atom, scratch,
+                                                                            finite_difference);
+            probed != mmff_energy_probe_t::completed_k)
+            return probed;
         float const analytical = stage_gradient(atom, axis);
         tally.worst_stage_error = std::max(tally.worst_stage_error, std::fabs(analytical - finite_difference));
         reporter.mismatch("stage_gradient", "smiles={} atom={}", smiles, atom)
             .field(gradient_field_name_(axis), finite_difference, analytical, agree);
     }
+    return mmff_energy_probe_t::completed_k;
 }
 
 #pragma endregion Sections
@@ -514,8 +549,17 @@ static molecule_outcome_t compare_molecule_(std::string const &smiles, gradient_
     double const rdkit_energy = rdkit_mmff94_energy(*molecule);
     if (!std::isfinite(rdkit_energy)) return molecule_outcome_t::unreferenced_k;
 
-    float const device_energy = mmff_energy_and_gradient_(scratch.prepared, scratch.axis_major, scratch,
-                                                          scratch.stage_gradient);
+    /** Keep the first refusal the molecule met, so the run's failure can name the step that refused. */
+    auto const refuse_ = [&tally](mmff_energy_probe_t probe) {
+        if (tally.first_refusal == mmff_energy_probe_t::completed_k) tally.first_refusal = probe;
+        return molecule_outcome_t::refused_k;
+    };
+
+    float device_energy = 0.0f;
+    if (mmff_energy_probe_t const probe = mmff_energy_and_gradient_(scratch.prepared, scratch.axis_major, scratch,
+                                                                    scratch.stage_gradient, device_energy);
+        probe != mmff_energy_probe_t::completed_k)
+        return refuse_(probe);
     std::string_view const divergence_reason = known_energy_divergence_(smiles);
     if (divergence_reason.empty())
         reporters.stage_energy.mismatch("stage_energy", "smiles={} atoms={}", smiles, scratch.prepared.num_atoms)
@@ -531,10 +575,14 @@ static molecule_outcome_t compare_molecule_(std::string const &smiles, gradient_
 
     compare_translation_invariance_(smiles, gradient_soa_t {scratch.stage_gradient.data(), rdkit_atoms},
                                     reporters.translation_invariance);
-    compare_stage_gradient_(smiles, scratch, reporters.stage_gradient, tally);
+    if (mmff_energy_probe_t const probe = compare_stage_gradient_(smiles, scratch, reporters.stage_gradient, tally);
+        probe != mmff_energy_probe_t::completed_k)
+        return refuse_(probe);
 
     if (scratch.prepared.mmff_oops.empty()) ++tally.without_oop;
-    else compare_oop_gradient_(smiles, scratch, reporters.oop_gradient, tally);
+    else if (mmff_energy_probe_t const probe = compare_oop_gradient_(smiles, scratch, reporters.oop_gradient, tally);
+             probe != mmff_energy_probe_t::completed_k)
+        return refuse_(probe);
     return molecule_outcome_t::compared_k;
 }
 
@@ -558,6 +606,7 @@ static void sweep_corpus_(std::vector<std::string> const &corpus, gradient_repor
         case molecule_outcome_t::unembedded_k: ++tally.unembedded; break;
         case molecule_outcome_t::unaligned_k: ++tally.unaligned; break;
         case molecule_outcome_t::unreferenced_k: ++tally.unreferenced; break;
+        case molecule_outcome_t::refused_k: ++tally.refused; break;
         }
     }
 }
@@ -595,14 +644,17 @@ int main(int argc, char **argv) {
     sftest::sweep_corpus_(corpus, reporters, tally);
 
     fmt::println("molecules compared={} unprepared={} unembedded={} unaligned={} " // what the sweep saw
-                 "unreferenced={} without_oop={} known_divergence={}",             // and what it stepped past
-                 tally.compared, tally.unprepared, tally.unembedded, tally.unaligned, tally.unreferenced,
+                 "unreferenced={} refused={} without_oop={} known_divergence={}",  // and what it stepped past
+                 tally.compared, tally.unprepared, tally.unembedded, tally.unaligned, tally.unreferenced, tally.refused,
                  tally.without_oop, tally.known_divergence);
     fmt::println("worst gradient error oop={} stage={} against absolute floors {:.3g} and {:.3g}, " // the margin
                  "above which the relative band decides",                                           // and the band
                  tally.worst_oop_error, tally.worst_stage_error, sftest::single_term_tolerance_k.absolute,
                  sftest::full_stage_tolerance_k.absolute);
     bool const sections_passed = reporters.summarize_sections();
+    if (tally.refused != 0)
+        return sftest::report_fail(test_name_k, "the device refused {} molecules, first as {}", tally.refused,
+                                   sftest::mmff_energy_probe_reason(tally.first_refusal));
     if (tally.compared == 0) return sftest::report_fail(test_name_k, "corpus yielded no comparable molecule");
     if (tally.stale_divergence != 0)
         return sftest::report_fail(test_name_k, "{} known divergences now agree with RDKit and must leave the roster",

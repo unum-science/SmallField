@@ -254,8 +254,15 @@ int main(int argc, char **argv) {
     std::vector<float> gpu_atom_charges(total_atoms);
     std::vector<std::uint8_t> gpu_typing_status(num_molecules);
 
-    sftest::launch_mmff94_gpu_typer_batch(device_view, descriptors, atom_offsets, gpu_atom_types, gpu_atom_charges,
-                                          gpu_typing_status);
+    // Zero is the typer's verdict for a molecule it accepted, so a refused launch would leave the status
+    // array claiming the whole batch was typed and the sweep below would compare uninitialised types.
+    auto const probe = sftest::launch_mmff94_gpu_typer_batch(device_view, descriptors, atom_offsets, gpu_atom_types,
+                                                             gpu_atom_charges, gpu_typing_status);
+    if (probe != sftest::typer_probe_t::completed_k) {
+        sftest::destroy_mmff94_device_tables_view(device_tables_handle);
+        return sftest::report_fail(test_name_k, "the device refused the typer batch: {}",
+                                   sftest::typer_probe_reason(probe));
+    }
 
     sftest::typer_reporters_t reporters;
     reporters.limit_printed_lines(sftest::max_printed_lines_k);

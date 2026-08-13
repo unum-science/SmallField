@@ -7,7 +7,8 @@
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
-#include <vector> // `std::vector`
+#include <string_view> // `std::string_view`
+#include <vector>      // `std::vector`
 
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"
@@ -16,6 +17,24 @@
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::tests {
+
+/**
+ *  @brief Which step of the extraction round trip refused, so a caller can say why it compared nothing.
+ *
+ *  Zero is the typer's own verdict for a molecule it accepted, and no path here writes the status array
+ *  before the kernels do, so a caller that reads it after a refusal is told every molecule was typed and
+ *  then scores every one of them against the CPU extractor's real answer.
+ */
+enum class extract_probe_t {
+    completed_k,
+    table_upload_failed_k,
+    allocation_failed_k,
+    transfer_failed_k,
+    launch_failed_k,
+};
+
+/** The sentence an `extract_probe_t` reads as, for the `NOTE` line above a skipped comparison. */
+std::string_view extract_probe_reason(extract_probe_t outcome) noexcept;
 
 /**
  *  @brief Host mirror of the packed, variable-length MMFF term arrays the compaction pass emits.
@@ -54,19 +73,18 @@ struct mmff94_packed_host_result_t {
  *  @param[out] out_interactions Receives the fixed-stride nonbonded staging.
  *  @param[out] out_atom_offsets Receives one CSR offset record per atom of the batch.
  *  @param[out] packed_out Receives the compacted arrays, resized to the totals the scan reported.
+ *  @return Whether the round trip completed, and which step refused it.
  */
-void launch_mmff94_gpu_extract_pipeline(smallfield::parameters::mmff94_tables_host_t const &tables_host,
-                                        custd::span<smallfield::types::molecule_descriptor_t const> descriptors,
-                                        custd::span<std::uint32_t const> atom_offsets,
-                                        custd::span<smallfield::mmff94::mmff94_per_mol_counts_t> out_counts,
-                                        custd::span<std::uint8_t> out_status,
-                                        custd::span<smallfield::types::mmff94_bond_t> out_bonds,
-                                        custd::span<smallfield::types::mmff94_angle_t> out_angles,
-                                        custd::span<smallfield::types::mmff94_torsion_t> out_torsions,
-                                        custd::span<smallfield::types::mmff94_oop_t> out_oops,
-                                        custd::span<smallfield::types::mmff94_stretchbend_t> out_stbns,
-                                        custd::span<smallfield::types::mmff94_atom_interaction_t> out_interactions,
-                                        custd::span<smallfield::types::mmff94_atom_offsets_t> out_atom_offsets,
-                                        mmff94_packed_host_result_t &packed_out);
+[[nodiscard]] extract_probe_t launch_mmff94_gpu_extract_pipeline(
+    smallfield::parameters::mmff94_tables_host_t const &tables_host,
+    custd::span<smallfield::types::molecule_descriptor_t const> descriptors,
+    custd::span<std::uint32_t const> atom_offsets, custd::span<smallfield::mmff94::mmff94_per_mol_counts_t> out_counts,
+    custd::span<std::uint8_t> out_status, custd::span<smallfield::types::mmff94_bond_t> out_bonds,
+    custd::span<smallfield::types::mmff94_angle_t> out_angles,
+    custd::span<smallfield::types::mmff94_torsion_t> out_torsions,
+    custd::span<smallfield::types::mmff94_oop_t> out_oops,
+    custd::span<smallfield::types::mmff94_stretchbend_t> out_stbns,
+    custd::span<smallfield::types::mmff94_atom_interaction_t> out_interactions,
+    custd::span<smallfield::types::mmff94_atom_offsets_t> out_atom_offsets, mmff94_packed_host_result_t &packed_out);
 
 } // namespace smallfield::tests

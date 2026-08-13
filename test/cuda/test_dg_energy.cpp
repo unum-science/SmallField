@@ -462,10 +462,13 @@ static molecule_setup_t setup_molecule_(std::string const &smiles, std::unique_p
  *  Two comparisons per call: the kernel's arithmetic against a reference reading the same quantized bounds,
  *  and the energy before a known 1.5 angstrom shift against the energy after it. The first would pass on a
  *  kernel that always returned zero; the second is what rules that out.
+ *
+ *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
  */
-static void check_energy_(sftest::diagnostic_reporter_t &reporter, sftest::diagnostic_reporter_t &quantization,
-                          molecule_case_t const &subject, RDKit::ROMol const &molecule, dg_weights_t weights,
-                          molecule_scratch_t &scratch) {
+static sftest::dg_probe_t check_energy_(sftest::diagnostic_reporter_t &reporter,
+                                        sftest::diagnostic_reporter_t &quantization, molecule_case_t const &subject,
+                                        RDKit::ROMol const &molecule, dg_weights_t weights,
+                                        molecule_scratch_t &scratch) {
     auto const bounds = subject.bounds;
     auto const &smiles = subject.smiles;
     std::uint32_t const num_atoms = bounds.extent(0);
@@ -480,7 +483,9 @@ static void check_energy_(sftest::diagnostic_reporter_t &reporter, sftest::diagn
     auto const problem = problem_for_(bounds, {}, weights);
 
     float relaxed_energy = 0.0f;
-    gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &relaxed_energy);
+    sftest::dg_probe_t probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(),
+                                             &relaxed_energy);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
 
     // Push atom zero along x past every bound it has, so each of its pairs is strictly on the
     // upper-bound branch and strictly further out than before, and no other pair moves at all —
@@ -489,7 +494,8 @@ static void check_energy_(sftest::diagnostic_reporter_t &reporter, sftest::diagn
     coordinates(0, 0) += largest_bound_(bounds) + coordinate_span_(coordinates) + bound_clearance_angstrom_k;
 
     float gpu_energy = 0.0f;
-    gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &gpu_energy);
+    probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &gpu_energy);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
 
     auto const quantized = quantize_bounds_(bounds, scratch.bound_levels);
     double const quantized_reference = reference_dg_energy_(
@@ -508,6 +514,7 @@ static void check_energy_(sftest::diagnostic_reporter_t &reporter, sftest::diagn
     quantization
         .note("dg_bounds", "smiles={} atoms={} fourth_dimension_weight={}", smiles, num_atoms, weights.fourth_dimension)
         .field("energy", exact_reference, quantized_reference);
+    return sftest::dg_probe_t::completed_k;
 }
 
 /**
@@ -515,9 +522,12 @@ static void check_energy_(sftest::diagnostic_reporter_t &reporter, sftest::diagn
  *
  *  Every one of the four axes is swept, and the fourth-dimension weight is non-zero so the crush term's
  *  contribution to the w axis is covered rather than multiplied away.
+ *
+ *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
  */
-static void check_gradient_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
-                            RDKit::ROMol const &molecule, dg_weights_t weights, molecule_scratch_t &scratch) {
+static sftest::dg_probe_t check_gradient_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
+                                          RDKit::ROMol const &molecule, dg_weights_t weights,
+                                          molecule_scratch_t &scratch) {
     auto const bounds = subject.bounds;
     auto const &smiles = subject.smiles;
     std::uint32_t const num_atoms = bounds.extent(0);
@@ -540,7 +550,9 @@ static void check_gradient_(sftest::diagnostic_reporter_t &reporter, molecule_ca
     auto const problem = problem_for_(bounds, subject.chiral_centers, weights);
 
     float energy_at_center = 0.0f;
-    gpu_dg_energy(problem, coordinates.data_handle(), analytical.data_handle(), &energy_at_center);
+    sftest::dg_probe_t probe = gpu_dg_energy(problem, coordinates.data_handle(), analytical.data_handle(),
+                                             &energy_at_center);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
 
     for (std::uint32_t dimension = 0; dimension < coordinates.extent(1); ++dimension) {
         for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
@@ -548,19 +560,24 @@ static void check_gradient_(sftest::diagnostic_reporter_t &reporter, molecule_ca
 
             coordinates(atom, dimension) = original + finite_difference_step_k;
             float energy_plus = 0.0f;
-            gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_plus);
+            probe = gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_plus);
 
             coordinates(atom, dimension) = original - finite_difference_step_k;
             float energy_minus = 0.0f;
-            gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_minus);
+            if (probe == sftest::dg_probe_t::completed_k)
+                probe = gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_minus);
 
             coordinates(atom, dimension) = original;
+            // Restored first, so the sweep leaves the coordinates it borrowed as it found them whatever
+            // the device answered, and only then does the refusal end the sweep.
+            if (probe != sftest::dg_probe_t::completed_k) return probe;
 
             float const finite_difference = (energy_plus - energy_minus) / (2.0f * finite_difference_step_k);
             reporter.mismatch("dg_gradient", "smiles={} atom={} dimension={}", smiles, atom, dimension)
                 .field("gradient", finite_difference, analytical(atom, dimension), gradients_agree_);
         }
     }
+    return sftest::dg_probe_t::completed_k;
 }
 
 /**
@@ -619,11 +636,13 @@ static double gradient_norm_(gradient_t gradient) {
  *  The gradient of the chiral term is then swept against a central difference of the same kernel's
  *  energy, on a geometry well inside the penalty's active branch so the sweep never crosses the
  *  window's kink.
+ *
+ *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
  */
-static void check_chirality_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
-                             RDKit::ROMol const &molecule, molecule_scratch_t &scratch) {
+static sftest::dg_probe_t check_chirality_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
+                                           RDKit::ROMol const &molecule, molecule_scratch_t &scratch) {
     auto const centers = subject.chiral_centers;
-    if (centers.empty()) return;
+    if (centers.empty()) return sftest::dg_probe_t::completed_k;
 
     std::uint32_t const num_atoms = subject.bounds.extent(0);
     auto const coordinates = reset_embedding_(scratch.embedding, num_atoms);
@@ -646,19 +665,26 @@ static void check_chirality_(sftest::diagnostic_reporter_t &reporter, molecule_c
     sft::transpose_into(interleaved, coordinates);
 
     float upright_energy = 0.0f;
-    gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &upright_energy);
+    sftest::dg_probe_t probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(),
+                                             &upright_energy);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
+    std::uint32_t upright_invalid = 0;
+    probe = gpu_count_invalid_chiral_centers(problem, coordinates.data_handle(), upright_invalid);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
     reporter.mismatch("dg_chirality", "smiles={} centers={} geometry=upright", subject.smiles, expected)
-        .field("invalid_centers", 0u, gpu_count_invalid_chiral_centers(problem, coordinates.data_handle()),
-               sftest::exactly_equal)
+        .field("invalid_centers", 0u, upright_invalid, sftest::exactly_equal)
         .field("energy", 0.0f, upright_energy, sftest::exactly_equal);
 
     for (float const retained : {0.0f, near_flat_retention_k}) {
         reload_(retained);
         float energy = 0.0f;
-        gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &energy);
+        probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &energy);
+        if (probe != sftest::dg_probe_t::completed_k) return probe;
+        std::uint32_t invalid = 0;
+        probe = gpu_count_invalid_chiral_centers(problem, coordinates.data_handle(), invalid);
+        if (probe != sftest::dg_probe_t::completed_k) return probe;
         reporter.mismatch("dg_chirality", "smiles={} centers={} retained={}", subject.smiles, expected, retained)
-            .field("invalid_centers", expected, gpu_count_invalid_chiral_centers(problem, coordinates.data_handle()),
-                   sftest::exactly_equal)
+            .field("invalid_centers", expected, invalid, sftest::exactly_equal)
             .field("energy", 0.0f, energy, increased_)
             .field("restoring_force", 0.0, gradient_norm_(gradient), increased_);
     }
@@ -666,7 +692,8 @@ static void check_chirality_(sftest::diagnostic_reporter_t &reporter, molecule_c
     // Finite differences of the chiral term, over the atoms it actually touches.
     reload_(penalized_retention_k);
     float energy_at_center = 0.0f;
-    gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &energy_at_center);
+    probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &energy_at_center);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
     for (auto const &center : centers)
         for (std::uint8_t const atom :
              {center.center_atom, center.neighbor_atoms[0], center.neighbor_atoms[1], center.neighbor_atoms[2]})
@@ -675,18 +702,23 @@ static void check_chirality_(sftest::diagnostic_reporter_t &reporter, molecule_c
 
                 coordinates(atom, axis) = original + finite_difference_step_k;
                 float energy_plus = 0.0f;
-                gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_plus);
+                probe = gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_plus);
 
                 coordinates(atom, axis) = original - finite_difference_step_k;
                 float energy_minus = 0.0f;
-                gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_minus);
+                if (probe == sftest::dg_probe_t::completed_k)
+                    probe = gpu_dg_energy(problem, coordinates.data_handle(), spare.data_handle(), &energy_minus);
 
                 coordinates(atom, axis) = original;
+                // Restored first, so the sweep leaves the coordinates it borrowed as it found them whatever
+                // the device answered, and only then does the refusal end the sweep.
+                if (probe != sftest::dg_probe_t::completed_k) return probe;
 
                 float const finite_difference = (energy_plus - energy_minus) / (2.0f * finite_difference_step_k);
                 reporter.mismatch("dg_chirality", "smiles={} atom={} axis={}", subject.smiles, atom, axis)
                     .field("chiral_gradient", finite_difference, gradient(atom, axis), gradients_agree_);
             }
+    return sftest::dg_probe_t::completed_k;
 }
 
 /**
@@ -697,9 +729,12 @@ static void check_chirality_(sftest::diagnostic_reporter_t &reporter, molecule_c
  *  magnitude the crush penalty exists to flatten. The MMFF94 energy of the projected structure is then
  *  compared for finiteness against RDKit's own embedding, which is what makes the number a reference
  *  rather than a lone `isfinite` that any garbage satisfies.
+ *
+ *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
  */
-static void check_minimization_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
-                                RDKit::RWMol &molecule, dg_weights_t weights, molecule_scratch_t &scratch) {
+static sftest::dg_probe_t check_minimization_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
+                                              RDKit::RWMol &molecule, dg_weights_t weights,
+                                              molecule_scratch_t &scratch) {
     auto const bounds = subject.bounds;
     auto const &smiles = subject.smiles;
     std::uint32_t const num_atoms = bounds.extent(0);
@@ -717,12 +752,14 @@ static void check_minimization_(sftest::diagnostic_reporter_t &reporter, molecul
     auto const problem = problem_for_(bounds, subject.chiral_centers, weights);
 
     float start_energy = 0.0f;
-    gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &start_energy);
+    sftest::dg_probe_t probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &start_energy);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
     float const start_violation = max_bound_violation_(coordinates, bounds);
     float const start_fourth = mean_fourth_dimension_magnitude_(coordinates);
 
     sftest::dg_minimize_report_t report;
-    gpu_dg_minimize(problem, coordinates.data_handle(), max_iterations_k, gradient_threshold_k, &report);
+    probe = gpu_dg_minimize(problem, coordinates.data_handle(), max_iterations_k, gradient_threshold_k, &report);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
     float const final_energy = report.energy;
 
     float const final_violation = max_bound_violation_(coordinates, bounds);
@@ -731,7 +768,8 @@ static void check_minimization_(sftest::diagnostic_reporter_t &reporter, molecul
     // The report has to describe the positions it handed back rather than a state one step earlier,
     // so both of its numbers are checked against a fresh evaluation exactly where it stopped.
     float recomputed_energy = 0.0f;
-    gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &recomputed_energy);
+    probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &recomputed_energy);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
     double const element_count = static_cast<double>(coordinates.extent(0)) * coordinates.extent(1);
     double const recomputed_rms = gradient_norm_(gradient) / std::sqrt(element_count);
 
@@ -748,6 +786,7 @@ static void check_minimization_(sftest::diagnostic_reporter_t &reporter, molecul
         .field("reported_energy", recomputed_energy, final_energy, energies_agree_)
         .field("reported_rms_gradient", recomputed_rms, report.rms_gradient, rms_gradients_agree_)
         .field("mmff94_energy", mmff_at_embedding, mmff_at_dg_coords, both_finite_);
+    return sftest::dg_probe_t::completed_k;
 }
 
 #pragma endregion Molecule Checks
@@ -797,6 +836,16 @@ int main(int argc, char **argv) {
     sft::molecule_descriptor_t descriptor;
     std::unique_ptr<RDKit::RWMol> molecule;
     std::size_t ready_molecules = 0, skipped_molecules = 0, gradient_molecules = 0, chiral_molecules = 0;
+    std::size_t refused_sections = 0;
+
+    // A launch the driver declines leaves the kernel's outputs as the allocation found them, so a section
+    // that met one names the refusal here rather than closing as though it had compared something.
+    auto const record_ = [&refused_sections](std::string_view section, std::string const &smiles,
+                                             sftest::dg_probe_t probe) {
+        if (probe == sftest::dg_probe_t::completed_k) return;
+        fmt::println("  NOTE {} device_probe={} smiles={}", section, sftest::dg_probe_reason(probe), smiles);
+        ++refused_sections;
+    };
 
     // Without the crush penalty the fourth axis only enters through the pair distances; with it, the term
     // that collapses the embedding is live. Both are gated, because the kernel branches on the weight.
@@ -829,21 +878,25 @@ int main(int argc, char **argv) {
         sfp::extract_chiral_centers(*molecule, descriptor, scratch.chiral_centers);
         molecule_case_t const subject {.smiles = smiles, .bounds = bounds, .chiral_centers = {scratch.chiral_centers}};
 
-        check_energy_(reporters.energy, reporters.quantization, subject, *molecule, flat_weights, scratch);
-        check_energy_(reporters.energy, reporters.quantization, subject, *molecule, crushed_weights, scratch);
+        record_("dg_energy", smiles,
+                check_energy_(reporters.energy, reporters.quantization, subject, *molecule, flat_weights, scratch));
+        record_("dg_energy", smiles,
+                check_energy_(reporters.energy, reporters.quantization, subject, *molecule, crushed_weights, scratch));
 
         if (gradient_molecules < max_gradient_molecules_k) {
-            check_gradient_(reporters.gradient, subject, *molecule, crushed_weights, scratch);
+            record_("dg_gradient", smiles,
+                    check_gradient_(reporters.gradient, subject, *molecule, crushed_weights, scratch));
             ++gradient_molecules;
         }
 
         if (!subject.chiral_centers.empty() && chiral_molecules < max_chiral_molecules_k) {
-            check_chirality_(reporters.chirality, subject, *molecule, scratch);
+            record_("dg_chirality", smiles, check_chirality_(reporters.chirality, subject, *molecule, scratch));
             ++chiral_molecules;
         }
 
         // Last per molecule: it overwrites the conformer the other sections read.
-        check_minimization_(reporters.minimize, subject, *molecule, minimize_weights, scratch);
+        record_("dg_minimize", smiles,
+                check_minimization_(reporters.minimize, subject, *molecule, minimize_weights, scratch));
     }
 
     fmt::println("  {} molecules walked, {} skipped, {} swept for finite differences, {} flattened at their centers",
@@ -857,6 +910,9 @@ int main(int argc, char **argv) {
     reporters.chirality.summarize("dg_chirality");
     reporters.minimize.summarize("dg_minimize");
 
+    if (refused_sections != 0)
+        return sftest::report_fail(test_name_k, "the device refused {} sections before either operand existed",
+                                   refused_sections);
     if (!reporters.passed())
         return sftest::report_fail(test_name_k, "{} energy, {} gradient, {} chirality, and {} minimization mismatches",
                                    reporters.energy.mismatch_count(), reporters.gradient.mismatch_count(),

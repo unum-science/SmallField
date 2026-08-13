@@ -7,10 +7,29 @@
 
 #include <cstdint> // `std::int32_t`, `std::uint32_t`
 
+#include <string_view> // `std::string_view`
+
 #include "smallfield/cuda/fire_warp.cuh" // `smallfield::cuda::fire_status_t`, outside its CUDA guard
 #include "smallfield/types/etkdg_types.hpp"
 
 namespace smallfield::tests {
+
+/**
+ *  @brief Which step of a device round trip refused, so a caller can say why it compared nothing.
+ *
+ *  A launch the driver declines never writes an output buffer, and none of the entry points below zeroes
+ *  one first, so a caller that reads the buffer anyway scores whatever the allocation found and reports it
+ *  as an energy, a gradient, or a chiral-center count.
+ */
+enum class dg_probe_t {
+    completed_k,
+    staging_failed_k,
+    transfer_failed_k,
+    launch_failed_k,
+};
+
+/** The sentence a `dg_probe_t` reads as, for the `NOTE` line above a skipped comparison. */
+std::string_view dg_probe_reason(dg_probe_t outcome) noexcept;
 
 /**
  *  @brief Everything a device call needs about the molecule it is scoring, except the coordinates.
@@ -40,19 +59,26 @@ struct dg_problem_t {
  *  @param[in] problem Bounds, chiral centers, extents, and penalty weights.
  *  @param[in] host_coords Coordinates as `(axis, atom)`, `spatial_dimension * num_atoms` entries, which is
  *      the layout the kernel indexes; an interleaved block passed here scores a different molecule.
- *  @param[out] host_gradient Receives the gradient, same layout as @p host_coords.
- *  @param[out] out_energy Receives the total energy.
+ *  @param[out] host_gradient Receives the gradient, same layout as @p host_coords; untouched on a refusal.
+ *  @param[out] out_energy Receives the total energy; untouched on a refusal.
+ *  @return Whether the round trip completed, and which step refused it.
  */
-void gpu_dg_energy(dg_problem_t const &problem, float const *host_coords, float *host_gradient, float *out_energy);
+[[nodiscard]] dg_probe_t gpu_dg_energy(dg_problem_t const &problem, float const *host_coords, float *host_gradient,
+                                       float *out_energy);
 
 /**
  *  @brief Count the chiral centers whose realized geometry contradicts their descriptor.
  *
+ *  The count is an output rather than the return, because zero is the answer "the stereochemistry is
+ *  intact" and a refused launch must not be able to spell it.
+ *
  *  @param[in] problem Bounds, chiral centers, extents, and penalty weights; only the centers are read.
  *  @param[in] host_coords Coordinates as `(axis, atom)`.
- *  @return How many centers failed; zero means the stereochemistry is intact.
+ *  @param[out] out_invalid Receives how many centers failed; untouched on a refusal.
+ *  @return Whether the round trip completed, and which step refused it.
  */
-std::uint32_t gpu_count_invalid_chiral_centers(dg_problem_t const &problem, float const *host_coords);
+[[nodiscard]] dg_probe_t gpu_count_invalid_chiral_centers(dg_problem_t const &problem, float const *host_coords,
+                                                          std::uint32_t &out_invalid);
 
 /** What FIRE reported when it stopped; every field describes the positions it handed back. */
 struct dg_minimize_report_t {
@@ -69,9 +95,11 @@ struct dg_minimize_report_t {
  *  @param[inout] host_coords Coordinates as `(axis, atom)`, overwritten with the minimized positions.
  *  @param[in] max_iterations Iteration cap for the FIRE loop.
  *  @param[in] gradient_threshold Convergence threshold on the gradient norm.
- *  @param[out] out_report Receives the final energy, RMS gradient, iteration count, and status.
+ *  @param[out] out_report Receives the final energy, RMS gradient, iteration count, and status; untouched
+ *      on a refusal, as are @p host_coords.
+ *  @return Whether the round trip completed, and which step refused it.
  */
-void gpu_dg_minimize(dg_problem_t const &problem, float *host_coords, std::int32_t max_iterations,
-                     float gradient_threshold, dg_minimize_report_t *out_report);
+[[nodiscard]] dg_probe_t gpu_dg_minimize(dg_problem_t const &problem, float *host_coords, std::int32_t max_iterations,
+                                         float gradient_threshold, dg_minimize_report_t *out_report);
 
 } // namespace smallfield::tests

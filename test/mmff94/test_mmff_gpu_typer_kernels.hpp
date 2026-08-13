@@ -7,11 +7,30 @@
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
+#include <string_view> // `std::string_view`
+
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/views.hpp"
 
 namespace smallfield::tests {
+
+/**
+ *  @brief Which step of the typing round trip refused, so a caller can say why it compared nothing.
+ *
+ *  Zero is the typer's own verdict for a molecule it accepted, and nothing writes the status array before
+ *  the kernel does, so a caller reading it after a refusal is told the whole batch was typed.
+ */
+enum class typer_probe_t {
+    completed_k,
+    empty_batch_k,
+    allocation_failed_k,
+    transfer_failed_k,
+    launch_failed_k,
+};
+
+/** The sentence a `typer_probe_t` reads as, for the `NOTE` line above a skipped comparison. */
+std::string_view typer_probe_reason(typer_probe_t outcome) noexcept;
 
 void *create_mmff94_device_tables_view(smallfield::parameters::mmff94_tables_host_t const &host,
                                        smallfield::parameters::mmff94_tables_view_t &out_view);
@@ -30,11 +49,12 @@ void destroy_mmff94_device_tables_view(void *handle);
  *  @param[out] atom_types_out Receives one MMFF atom type per atom of the batch.
  *  @param[out] atom_charges_out Receives one partial charge per atom, same extent as @p atom_types_out.
  *  @param[out] typing_status_out Receives one status per molecule, zero where the typer accepted it.
+ *  @return Whether the round trip completed, and which step refused it.
  */
-void launch_mmff94_gpu_typer_batch(smallfield::parameters::mmff94_tables_view_t tables_view,
-                                   custd::span<smallfield::types::molecule_descriptor_t const> descriptors,
-                                   custd::span<std::uint32_t const> atom_offsets,
-                                   custd::span<std::uint8_t> atom_types_out, custd::span<float> atom_charges_out,
-                                   custd::span<std::uint8_t> typing_status_out);
+[[nodiscard]] typer_probe_t launch_mmff94_gpu_typer_batch(
+    smallfield::parameters::mmff94_tables_view_t tables_view,
+    custd::span<smallfield::types::molecule_descriptor_t const> descriptors,
+    custd::span<std::uint32_t const> atom_offsets, custd::span<std::uint8_t> atom_types_out,
+    custd::span<float> atom_charges_out, custd::span<std::uint8_t> typing_status_out);
 
 } // namespace smallfield::tests

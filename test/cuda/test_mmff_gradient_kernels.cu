@@ -6,7 +6,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
 
-#include <fmt/format.h> // `fmt::println` -- host-side only; nothing below a `__global__` uses it
+#include <string_view> // `std::string_view`
 
 #include <cuda_runtime.h>
 
@@ -112,18 +112,22 @@ struct gradient_arena_t {
     }
 };
 
-void gpu_mmff_energy(custd::span<float const> host_positions, std::uint32_t num_atoms, mmff_energy_terms_t const &terms,
-                     custd::span<float> host_gradient, float *out_energy) {
+std::string_view mmff_energy_probe_reason(mmff_energy_probe_t outcome) noexcept {
+    switch (outcome) {
+    case mmff_energy_probe_t::allocation_failed_k: return "device_allocation_failed";
+    case mmff_energy_probe_t::transfer_failed_k: return "device_transfer_failed";
+    case mmff_energy_probe_t::launch_failed_k: return "kernel_launch_failed";
+    default: return "completed";
+    }
+}
+
+mmff_energy_probe_t gpu_mmff_energy(custd::span<float const> host_positions, std::uint32_t num_atoms,
+                                    mmff_energy_terms_t const &terms, custd::span<float> host_gradient,
+                                    float *out_energy) {
 
     gradient_arena_t arena;
-    if (!arena.resize_for(num_atoms, terms)) {
-        fmt::println(stderr, "NOTE mmff_gradient_kernels field=device_arena atoms={} succeeded=0", num_atoms);
-        return;
-    }
-    if (!arena.upload(host_positions, terms)) {
-        fmt::println(stderr, "NOTE mmff_gradient_kernels field=upload atoms={} succeeded=0", num_atoms);
-        return;
-    }
+    if (!arena.resize_for(num_atoms, terms)) return mmff_energy_probe_t::allocation_failed_k;
+    if (!arena.upload(host_positions, terms)) return mmff_energy_probe_t::transfer_failed_k;
 
     std::uint32_t const shared_bytes = num_atoms * static_cast<std::uint32_t>(sizeof(sft::mmff94_atom_vdw_folded_t));
     mmff_energy_eval_kernel<<<1, sfc::warp_size_k, shared_bytes>>>(
@@ -131,14 +135,19 @@ void gpu_mmff_energy(custd::span<float const> host_positions, std::uint32_t num_
         arena.bond_distance.data(), arena.bonds.data(), arena.angles.data(), arena.torsions.data(), arena.oops.data(),
         arena.stretchbends.data(), arena.interactions.data(), arena.atom_offsets.data(), num_atoms,
         arena.energy.data());
-    cudaDeviceSynchronize();
+    // A launch the driver refuses to enqueue reports here and nowhere else. The kernel never runs, so the
+    // drain below has nothing to fail on, and the gradient still holds whatever the allocation found --
+    // which a caller differencing it against its own energies would read as a wrong analytic gradient.
+    if (cudaGetLastError() != cudaSuccess) return mmff_energy_probe_t::launch_failed_k;
 
     custd::span<float const> const device_gradient = arena.gradient.view();
     custd::span<float const> const device_energy = arena.energy.view();
-    bool copied = sft::download_from(host_gradient, device_gradient, nullptr);
-    copied &= sft::download_from(custd::span<float> {out_energy, 1}, device_energy, nullptr);
-    if (!copied) fmt::println(stderr, "NOTE mmff_gradient_kernels field=download atoms={} succeeded=0", num_atoms);
-    cudaStreamSynchronize(nullptr);
+    bool const copied = sft::download_from(host_gradient, device_gradient, nullptr) &&
+                        sft::download_from(custd::span<float> {out_energy, 1}, device_energy, nullptr);
+    cudaError_t const drained = cudaStreamSynchronize(nullptr);
+    if (!copied) return mmff_energy_probe_t::transfer_failed_k;
+    if (drained != cudaSuccess) return mmff_energy_probe_t::launch_failed_k;
+    return mmff_energy_probe_t::completed_k;
 }
 
 } // namespace smallfield::tests

@@ -8,9 +8,8 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
+#include <string_view> // `std::string_view`
 #include <type_traits> // `std::remove_cvref_t`
-
-#include <fmt/format.h> // `fmt::println` -- host-side only; nothing below a `__global__` uses it
 
 #include <cuda_runtime.h>
 
@@ -31,6 +30,26 @@ namespace smallfield::tests {
 /** Grow-only device storage over the legacy default stream, which is the one every kernel below rides. */
 template <typename value_type_>
 using device_array = sft::buffer<value_type_, sft::device_allocator_t>;
+
+std::string_view extract_probe_reason(extract_probe_t outcome) noexcept {
+    switch (outcome) {
+    case extract_probe_t::table_upload_failed_k: return "table_upload_failed";
+    case extract_probe_t::allocation_failed_k: return "device_allocation_failed";
+    case extract_probe_t::transfer_failed_k: return "device_transfer_failed";
+    case extract_probe_t::launch_failed_k: return "kernel_launch_failed";
+    default: return "completed";
+    }
+}
+
+/**
+ *  @brief Whether the launch just enqueued was accepted and then ran to completion.
+ *
+ *  A refusal to enqueue reports through `cudaGetLastError` and nowhere else, and a fault inside the kernel
+ *  reports at the drain; both leave the outputs as the allocation found them, so neither may be discarded.
+ */
+[[nodiscard]] static bool launch_completed_() noexcept {
+    return cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
+}
 
 /** Every device array the extraction pipeline stages, released in stream order however the launch leaves. */
 struct extract_arena_t {
@@ -111,7 +130,7 @@ struct extract_arena_t {
     }
 };
 
-void launch_mmff94_gpu_extract_pipeline(
+extract_probe_t launch_mmff94_gpu_extract_pipeline(
     sfparam::mmff94_tables_host_t const &tables_host, custd::span<sft::molecule_descriptor_t const> descriptors,
     custd::span<std::uint32_t const> atom_offsets, custd::span<sfmmff::mmff94_per_mol_counts_t> out_counts,
     custd::span<std::uint8_t> out_status, custd::span<sft::mmff94_bond_t> out_bonds,
@@ -121,50 +140,34 @@ void launch_mmff94_gpu_extract_pipeline(
     custd::span<sft::mmff94_atom_offsets_t> out_atom_offsets, mmff94_packed_host_result_t &packed_out) {
     sfparam::mmff94_tables_device_t device_tables;
     sfparam::upload_mmff94_tables_to_device(tables_host, device_tables, nullptr);
-    if (device_tables.view.vdw.empty()) {
-        fmt::println(stderr, "NOTE mmff_extract_kernels field=table_upload succeeded=0");
-        return;
-    }
+    if (device_tables.view.vdw.empty()) return extract_probe_t::table_upload_failed_k;
 
     // The CSR offset array carries one record per atom, so it is what states the batch's atom total.
     std::uint32_t const num_mols = static_cast<std::uint32_t>(descriptors.size());
     std::size_t const total_atoms = out_atom_offsets.size();
 
     extract_arena_t arena;
-    if (!arena.resize_for(num_mols, total_atoms)) {
-        fmt::println(stderr, "NOTE mmff_extract_kernels field=device_arena molecules={} succeeded=0", num_mols);
-        return;
-    }
+    if (!arena.resize_for(num_mols, total_atoms)) return extract_probe_t::allocation_failed_k;
     if (!sft::upload_into(arena.descriptors.view(), descriptors, nullptr) ||
-        !sft::upload_into(arena.atom_offsets.view(), atom_offsets, nullptr)) {
-        fmt::println(stderr, "NOTE mmff_extract_kernels field=upload molecules={} succeeded=0", num_mols);
-        return;
-    }
+        !sft::upload_into(arena.atom_offsets.view(), atom_offsets, nullptr))
+        return extract_probe_t::transfer_failed_k;
 
     sfmmff::mmff94_type_and_charge_kernel<<<num_mols, sfmmff::warp_size_k, 0, nullptr>>>(
         arena.descriptors.data(), arena.atom_offsets.data(), num_mols, device_tables.view, arena.atom_types.data(),
         arena.atom_charges.data(), arena.typing_status.data());
-    cudaDeviceSynchronize();
+    if (!launch_completed_()) return extract_probe_t::launch_failed_k;
 
     sfmmff::mmff94_extract_terms_kernel<<<num_mols, sfmmff::warp_size_k, 0, nullptr>>>(
         arena.descriptors.data(), arena.atom_types.data(), arena.atom_offsets.data(), num_mols, device_tables.view,
         arena.vdw.data(), arena.bonds.data(), arena.angles.data(), arena.torsions.data(), arena.oops.data(),
         arena.stretch_bends.data(), arena.counts_per_molecule.data(), arena.typing_status.data());
-    cudaDeviceSynchronize();
-
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess)
-        fmt::println(stderr, "NOTE mmff_extract_kernels field=extract_launch cuda_error={}", cudaGetErrorString(error));
+    if (!launch_completed_()) return extract_probe_t::launch_failed_k;
 
     sfmmff::mmff94_build_csr_kernel<<<num_mols, sfmmff::warp_size_k, 0, nullptr>>>(
         arena.descriptors.data(), arena.atom_offsets.data(), num_mols, arena.counts_per_molecule.data(),
         arena.bonds.data(), arena.angles.data(), arena.torsions.data(), arena.oops.data(), arena.stretch_bends.data(),
         arena.interactions.data(), arena.atom_offsets_lookup.data(), arena.typing_status.data());
-    cudaDeviceSynchronize();
-    error = cudaGetLastError();
-    if (error != cudaSuccess)
-        fmt::println(stderr, "NOTE mmff_extract_kernels field=csr_build_launch cuda_error={}",
-                     cudaGetErrorString(error));
+    if (!launch_completed_()) return extract_probe_t::launch_failed_k;
 
     custd::span<sft::mmff94_atom_interaction_t const> const device_interactions = arena.interactions.view();
     custd::span<sft::mmff94_atom_offsets_t const> const device_atom_offsets = arena.atom_offsets_lookup.view();
@@ -176,14 +179,15 @@ void launch_mmff94_gpu_extract_pipeline(
     // A single block scans the whole batch, so the grid is one whatever the molecule count is.
     sfmmff::mmff94_scan_counts_kernel<<<1, sfmmff::mmff94_scan_block_k, 0, nullptr>>>(
         arena.counts_per_molecule.data(), num_mols, arena.packed_offsets.data(), arena.packed_totals.data());
-    cudaDeviceSynchronize();
+    if (!launch_completed_()) return extract_probe_t::launch_failed_k;
 
     sfmmff::mmff94_packed_offsets_t packed_totals {};
     custd::span<sfmmff::mmff94_packed_offsets_t const> const device_totals = arena.packed_totals.view();
     copied &= sft::download_from(custd::span<sfmmff::mmff94_packed_offsets_t> {&packed_totals, 1}, device_totals,
                                  nullptr);
     // The totals size every allocation below, so the host waits for them rather than reading a copy in flight.
-    cudaStreamSynchronize(nullptr);
+    if (cudaStreamSynchronize(nullptr) != cudaSuccess) return extract_probe_t::launch_failed_k;
+    if (!copied) return extract_probe_t::transfer_failed_k;
 
     packed_out.bonds.resize(packed_totals.bonds);
     packed_out.angles.resize(packed_totals.angles);
@@ -194,11 +198,9 @@ void launch_mmff94_gpu_extract_pipeline(
     packed_out.atom_offsets.resize(total_atoms);
     packed_out.metadata.resize(num_mols);
 
-    if (!arena.resize_packed_for(packed_totals)) {
-        fmt::println(stderr, "NOTE mmff_extract_kernels field=packed_arena molecules={} succeeded=0", num_mols);
-        return;
-    }
-    cudaMemset(arena.metadata.data(), 0, arena.metadata.view().size_bytes());
+    if (!arena.resize_packed_for(packed_totals)) return extract_probe_t::allocation_failed_k;
+    if (cudaMemset(arena.metadata.data(), 0, arena.metadata.view().size_bytes()) != cudaSuccess)
+        return extract_probe_t::transfer_failed_k;
 
     sfmmff::mmff94_compact_terms_kernel<<<num_mols, sfmmff::warp_size_k, 0, nullptr>>>(
         arena.descriptors.data(), arena.atom_offsets.data(), num_mols, arena.counts_per_molecule.data(),
@@ -207,11 +209,7 @@ void launch_mmff94_gpu_extract_pipeline(
         arena.packed_torsions.data(), arena.packed_oops.data(), arena.packed_stretch_bends.data(),
         arena.packed_interactions.data(), arena.atom_offsets_lookup.data(), arena.metadata.data(),
         arena.typing_status.data());
-    cudaDeviceSynchronize();
-    error = cudaGetLastError();
-    if (error != cudaSuccess)
-        fmt::println(stderr, "NOTE mmff_extract_kernels field=compaction_launch cuda_error={}",
-                     cudaGetErrorString(error));
+    if (!launch_completed_()) return extract_probe_t::launch_failed_k;
 
     // Each packed array holds one slot past its total, so the host extent is what decides the copy.
     auto download_packed_ = [&](auto &host_array, auto const &device_source) {
@@ -245,8 +243,10 @@ void launch_mmff94_gpu_extract_pipeline(
     copied &= sft::download_from(out_stbns, custd::span<sft::mmff94_stretchbend_t const> {arena.stretch_bends.view()},
                                  nullptr);
 
-    if (!copied) fmt::println(stderr, "NOTE mmff_extract_kernels field=download molecules={} succeeded=0", num_mols);
-    cudaStreamSynchronize(nullptr);
+    cudaError_t const drained = cudaStreamSynchronize(nullptr);
+    if (!copied) return extract_probe_t::transfer_failed_k;
+    if (drained != cudaSuccess) return extract_probe_t::launch_failed_k;
+    return extract_probe_t::completed_k;
 }
 
 } // namespace smallfield::tests

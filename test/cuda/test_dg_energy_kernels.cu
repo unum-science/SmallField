@@ -6,9 +6,8 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
 
-#include <utility> // `std::exchange`, `std::swap`
-
-#include <fmt/format.h> // `fmt::println` -- host-side only; nothing below a `__global__` uses it
+#include <string_view> // `std::string_view`
+#include <utility>     // `std::exchange`, `std::swap`
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -239,54 +238,67 @@ struct staged_problem_t {
     }
 };
 
-void gpu_dg_energy(dg_problem_t const &host_problem, float const *host_coords, float *host_gradient,
-                   float *out_energy) {
+std::string_view dg_probe_reason(dg_probe_t outcome) noexcept {
+    switch (outcome) {
+    case dg_probe_t::staging_failed_k: return "device_staging_failed";
+    case dg_probe_t::transfer_failed_k: return "device_transfer_failed";
+    case dg_probe_t::launch_failed_k: return "kernel_launch_failed";
+    default: return "completed";
+    }
+}
+
+dg_probe_t gpu_dg_energy(dg_problem_t const &host_problem, float const *host_coords, float *host_gradient,
+                         float *out_energy) {
     staged_problem_t staged(host_problem, host_coords);
     device_array<float> device_energy {sft::device_allocator_t {.stream = staged.stream.handle}};
-    if (!staged.ready || device_energy.try_reserve(1) == sft::reserve_outcome_t::failed_k) {
-        fmt::println(stderr, "NOTE dg_energy_kernels field=staging atoms={} succeeded=0", host_problem.num_atoms);
-        return;
-    }
+    if (!staged.ready || device_energy.try_reserve(1) == sft::reserve_outcome_t::failed_k)
+        return dg_probe_t::staging_failed_k;
 
     dg_energy_eval_kernel<<<1, sfc::warp_size_k, staged.bounds_shared_bytes(), staged.stream.handle>>>(
         staged.problem, staged.bounds.data(), staged.coordinates.data(), staged.gradient.data(), device_energy.data());
+    // A launch the driver refuses to enqueue reports here and nowhere else. The kernel never runs, so the
+    // drain below has nothing to fail on, and the energy and the gradient still hold whatever the
+    // allocation found -- which the caller would otherwise compare and read as a numerical defect.
+    if (cudaGetLastError() != cudaSuccess) return dg_probe_t::launch_failed_k;
 
-    bool copied = sft::download_from(custd::span<float> {out_energy, 1},
-                                     custd::span<float const> {device_energy.view()}, staged.stream.handle);
-    copied &= sft::download_from(custd::span<float> {host_gradient, staged.num_elements},
-                                 custd::span<float const> {staged.gradient.view()}, staged.stream.handle);
-    if (!copied)
-        fmt::println(stderr, "NOTE dg_energy_kernels field=download atoms={} succeeded=0", host_problem.num_atoms);
-    cudaStreamSynchronize(staged.stream.handle);
+    bool const copied = sft::download_from(custd::span<float> {out_energy, 1},
+                                           custd::span<float const> {device_energy.view()}, staged.stream.handle) &&
+                        sft::download_from(custd::span<float> {host_gradient, staged.num_elements},
+                                           custd::span<float const> {staged.gradient.view()}, staged.stream.handle);
+    cudaError_t const drained = cudaStreamSynchronize(staged.stream.handle);
+    if (!copied) return dg_probe_t::transfer_failed_k;
+    if (drained != cudaSuccess) return dg_probe_t::launch_failed_k;
+    return dg_probe_t::completed_k;
 }
 
-std::uint32_t gpu_count_invalid_chiral_centers(dg_problem_t const &host_problem, float const *host_coords) {
+dg_probe_t gpu_count_invalid_chiral_centers(dg_problem_t const &host_problem, float const *host_coords,
+                                            std::uint32_t &out_invalid) {
     staged_problem_t staged(host_problem, host_coords);
     device_array<std::uint32_t> device_invalid {sft::device_allocator_t {.stream = staged.stream.handle}};
-    if (!staged.ready || device_invalid.try_reserve(1) == sft::reserve_outcome_t::failed_k) {
-        fmt::println(stderr, "NOTE dg_energy_kernels field=staging atoms={} succeeded=0", host_problem.num_atoms);
-        return 0;
-    }
+    if (!staged.ready || device_invalid.try_reserve(1) == sft::reserve_outcome_t::failed_k)
+        return dg_probe_t::staging_failed_k;
 
     dg_chirality_kernel<<<1, sfc::warp_size_k, 0, staged.stream.handle>>>(staged.problem, staged.coordinates.data(),
                                                                           device_invalid.data());
+    if (cudaGetLastError() != cudaSuccess) return dg_probe_t::launch_failed_k;
 
     std::uint32_t invalid = 0;
-    if (!sft::download_from(custd::span<std::uint32_t> {&invalid, 1},
-                            custd::span<std::uint32_t const> {device_invalid.view()}, staged.stream.handle))
-        fmt::println(stderr, "NOTE dg_energy_kernels field=download atoms={} succeeded=0", host_problem.num_atoms);
-    cudaStreamSynchronize(staged.stream.handle);
-    return invalid;
+    bool const copied = sft::download_from(custd::span<std::uint32_t> {&invalid, 1},
+                                           custd::span<std::uint32_t const> {device_invalid.view()},
+                                           staged.stream.handle);
+    cudaError_t const drained = cudaStreamSynchronize(staged.stream.handle);
+    if (!copied) return dg_probe_t::transfer_failed_k;
+    if (drained != cudaSuccess) return dg_probe_t::launch_failed_k;
+    out_invalid = invalid;
+    return dg_probe_t::completed_k;
 }
 
-void gpu_dg_minimize(dg_problem_t const &host_problem, float *host_coords, std::int32_t max_iterations,
-                     float gradient_threshold, dg_minimize_report_t *out_report) {
+dg_probe_t gpu_dg_minimize(dg_problem_t const &host_problem, float *host_coords, std::int32_t max_iterations,
+                           float gradient_threshold, dg_minimize_report_t *out_report) {
     staged_problem_t staged(host_problem, host_coords);
     device_array<dg_minimize_report_t> device_report {sft::device_allocator_t {.stream = staged.stream.handle}};
-    if (!staged.ready || device_report.try_reserve(1) == sft::reserve_outcome_t::failed_k) {
-        fmt::println(stderr, "NOTE dg_energy_kernels field=staging atoms={} succeeded=0", host_problem.num_atoms);
-        return;
-    }
+    if (!staged.ready || device_report.try_reserve(1) == sft::reserve_outcome_t::failed_k)
+        return dg_probe_t::staging_failed_k;
 
     // FIRE needs velocities and a gradient beside the bounds; positions stay in global memory.
     std::uint32_t const bounds_bytes_aligned = align_up_(staged.bounds_shared_bytes(), alignof(float));
@@ -296,14 +308,18 @@ void gpu_dg_minimize(dg_problem_t const &host_problem, float *host_coords, std::
     dg_minimize_kernel<<<1, sfc::warp_size_k, shared_bytes, staged.stream.handle>>>(
         staged.problem, staged.bounds.data(), staged.coordinates.data(), max_iterations, gradient_threshold,
         device_report.data());
+    if (cudaGetLastError() != cudaSuccess) return dg_probe_t::launch_failed_k;
 
-    bool copied = sft::download_from(custd::span<float> {host_coords, staged.num_elements},
-                                     custd::span<float const> {staged.coordinates.view()}, staged.stream.handle);
-    copied &= sft::download_from(custd::span<dg_minimize_report_t> {out_report, 1},
-                                 custd::span<dg_minimize_report_t const> {device_report.view()}, staged.stream.handle);
-    if (!copied)
-        fmt::println(stderr, "NOTE dg_energy_kernels field=download atoms={} succeeded=0", host_problem.num_atoms);
-    cudaStreamSynchronize(staged.stream.handle);
+    bool const copied = sft::download_from(custd::span<float> {host_coords, staged.num_elements},
+                                           custd::span<float const> {staged.coordinates.view()},
+                                           staged.stream.handle) &&
+                        sft::download_from(custd::span<dg_minimize_report_t> {out_report, 1},
+                                           custd::span<dg_minimize_report_t const> {device_report.view()},
+                                           staged.stream.handle);
+    cudaError_t const drained = cudaStreamSynchronize(staged.stream.handle);
+    if (!copied) return dg_probe_t::transfer_failed_k;
+    if (drained != cudaSuccess) return dg_probe_t::launch_failed_k;
+    return dg_probe_t::completed_k;
 }
 
 } // namespace smallfield::tests

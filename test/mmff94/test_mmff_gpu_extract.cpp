@@ -606,9 +606,14 @@ int main(int argc, char **argv) {
     fmt::println("batch: {} molecules, {} total atoms", fmt::group_digits(batch.num_molecules()),
                  fmt::group_digits(batch.total_atoms));
 
-    sftest::launch_mmff94_gpu_extract_pipeline(
+    // Zero is the typer's verdict for a molecule it accepted, so a refused launch would leave the status
+    // array claiming the whole batch was typed and every comparison below would run on stale staging.
+    auto const probe = sftest::launch_mmff94_gpu_extract_pipeline(
         tables_host, batch.descriptors, batch.first_atoms, batch.counts, batch.typing_status, batch.bonds, batch.angles,
         batch.torsions, batch.oops, batch.stretch_bends, batch.interactions, batch.staged_atom_offsets, batch.packed);
+    if (probe != sftest::extract_probe_t::completed_k)
+        return sftest::report_fail(test_name_k, "the device refused the extraction pipeline: {}",
+                                   sftest::extract_probe_reason(probe));
 
     // The CPU reference comes from `extract_mmff94_params_fully_native`, one molecule at a time. The
     // sweep is deliberately non-short-circuiting: every molecule feeds the section counts below.

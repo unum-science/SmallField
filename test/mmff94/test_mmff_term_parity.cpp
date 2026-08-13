@@ -266,6 +266,10 @@ struct intake_tally_t {
     std::uint64_t untypable = 0;
     /** Case-and-term pairs RDKit declined to reference. */
     std::uint64_t reference_unavailable = 0;
+    /** Case-and-term pairs the device refused a launch for, so no energy or gradient was ever written. */
+    std::uint64_t device_refused = 0;
+    /** Which step the first refusal came from, which is the one thing the count cannot carry. */
+    mmff_energy_probe_t first_refusal = mmff_energy_probe_t::completed_k;
     /** Cases carrying at least one disagreement, so a rate reads per molecule as well as per component. */
     std::uint64_t cases_differing = 0;
 };
@@ -489,7 +493,15 @@ static void compare_case_(term_parity_case_t const &probe, narration_t narration
             .interactions = single.mmff_interactions,
             .atom_offsets = single.mmff_atom_offsets,
         };
-        gpu_mmff_energy(scratch.positions, single.num_atoms, terms, scratch.gpu_gradient, &gpu_energy);
+        // A refused launch never writes the gradient, and the buffer is not zeroed first, so a term whose
+        // launch the driver declined would otherwise be scored against RDKit on whatever it held.
+        if (mmff_energy_probe_t const probe = gpu_mmff_energy(scratch.positions, single.num_atoms, terms,
+                                                              scratch.gpu_gradient, &gpu_energy);
+            probe != mmff_energy_probe_t::completed_k) {
+            if (tally.first_refusal == mmff_energy_probe_t::completed_k) tally.first_refusal = probe;
+            ++tally.device_refused;
+            continue;
+        }
 
         auto const rdkit_gradient = reset_coordinates_aos<coordinate_role_t::gradient_k>(scratch.rdkit_gradient,
                                                                                          num_atoms);
@@ -549,13 +561,13 @@ static void sweep_(custd::span<term_parity_case_t const> probes, narration_t nar
  *  @param[in] tally Counters to report.
  */
 static void report_intake_(std::string_view heading, intake_tally_t const &tally) {
-    fmt::println("NOTE intake sweep={} cases={} compared={}"               //
-                 " preprocess_rejected={} unparsable={} embed_failures={}" //
-                 " fragment_differs={} parses_differ={} untypable={}"      //
-                 " reference_unavailable={}",                              //
+    fmt::println("NOTE intake sweep={} cases={} compared={}"                     //
+                 " preprocess_rejected={} unparsable={} embed_failures={}"       //
+                 " fragment_differs={} parses_differ={} untypable={}"            //
+                 " reference_unavailable={} device_refused={} first_refusal={}", //
                  heading, tally.cases, tally.compared, tally.preprocess_rejected, tally.unparsable,
                  tally.embed_failures, tally.fragment_differs, tally.parses_differ, tally.untypable,
-                 tally.reference_unavailable);
+                 tally.reference_unavailable, tally.device_refused, mmff_energy_probe_reason(tally.first_refusal));
 }
 
 #pragma endregion Comparison
@@ -627,6 +639,9 @@ static int report_curated_(term_reporters_t &reporters, intake_tally_t const &ta
                            tally.cases - tally.compared, tally.cases);
     if (tally.reference_unavailable != 0)
         return report_fail(test_name_k, "RDKit declined to reference {} curated terms", tally.reference_unavailable);
+    if (tally.device_refused != 0)
+        return report_fail(test_name_k, "the device refused {} curated terms, first as {}", tally.device_refused,
+                           mmff_energy_probe_reason(tally.first_refusal));
     if (!reporters.passed())
         return report_fail(test_name_k, "{} of {} curated comparisons disagree with RDKit", reporters.mismatch_count(),
                            reporters.comparison_count());
@@ -645,6 +660,9 @@ static int report_corpus_(term_reporters_t &reporters, intake_tally_t const &tal
     report_intake_("corpus", tally);
     if (tally.compared == 0)
         return report_fail(test_name_k, "corpus {} produced no comparison over {} scorings", path, tally.cases);
+    if (tally.device_refused != 0)
+        return report_fail(test_name_k, "the device refused {} corpus terms, first as {}", tally.device_refused,
+                           mmff_energy_probe_reason(tally.first_refusal));
 
     // The sections close here rather than through `summarize`, because on a corpus a disagreement inside
     // budget is not a failure and the verb at column zero has to agree with the exit code. Every term is
