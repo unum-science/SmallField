@@ -850,6 +850,35 @@ static void log_fallback_breakdown_(coprocessed_batch_result_t const &result, lo
     }
 }
 
+/**
+ *  @brief What the dispatched molecules cost, by stage and by how long the whole attempt took.
+ *
+ *  Stage time is summed over the whole OpenMP team, so it exceeds the role's wall time by roughly the width
+ *  of that team. The duration bins are what a per-molecule mean cannot show: a single molecule in the top
+ *  bin outweighs a thousand in the bottom one, and which of the two a batch is made of decides whether the
+ *  fallback is worth making faster or worth making smaller.
+ */
+static void log_fallback_cost_(coprocessed_batch_result_t const &result, logger_t const &logger) {
+    auto const &report = result.fallback_report;
+    std::uint64_t summed_nanoseconds = 0;
+    for (std::uint64_t const nanoseconds : report.nanoseconds) summed_nanoseconds += nanoseconds;
+    if (summed_nanoseconds == 0) return;
+
+    for (std::size_t stage = 0; stage < sfcli::fallback_stage_count_k; ++stage)
+        logger.info("  fallback stage={} seconds={:.1f} {:.3f}%", sfcli::fallback_stage_names_k[stage],
+                    static_cast<double>(report.nanoseconds[stage]) * 1e-9,
+                    percent_of_(report.nanoseconds[stage], summed_nanoseconds));
+
+    for (std::size_t bin = 0; bin < sfcli::fallback_duration_bin_count_k; ++bin)
+        if (report.molecules_by_duration[bin] > 0)
+            logger.info("  fallback duration_ms>={} molecules={}",
+                        fmt::group_digits(sfcli::fallback_duration_bin_floor_milliseconds(bin)),
+                        fmt::group_digits(report.molecules_by_duration[bin]));
+
+    logger.info("  fallback slowest seconds={:.1f} smiles={}", static_cast<double>(report.slowest_nanoseconds) * 1e-9,
+                result.accumulator.combined_smiles[report.slowest_molecule_index]);
+}
+
 /** One progress line per batch: its own throughput, the cumulative rate, and the projected finish. */
 static void log_batch_progress_(coprocessed_batch_result_t const &result, logger_t const &logger,
                                 progress_counters_t const &counters) {
@@ -908,6 +937,7 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
         counters.molecules_undescribed.fetch_add(result.molecules_undescribed);
         log_batch_progress_(result, logger, counters);
         log_fallback_breakdown_(result, logger);
+        log_fallback_cost_(result, logger);
     }
 }
 

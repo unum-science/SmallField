@@ -14,6 +14,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
 #include <array>       // `std::array`
+#include <bit>         // `std::bit_width`
 #include <string_view> // `std::string_view`
 
 #include <cuda_fp16.h>
@@ -63,10 +64,11 @@ enum class fallback_disposition_t : std::uint8_t {
     // A different MMFF minimizer from the device FIRE driver, and the status the kernels also leave
     // on a slot they never reached.
     case types::conformer_status_t::mmff_unconverged_k: return fallback_disposition_t::retry_k;
-    // Two producers and only one is re-derived: `parse_smiles` refusing the string, which the
+    // Two producers and only one is fully re-derived: `parse_smiles` refusing the string, which the
     // fallback repeats, and `prepare_molecule_topology_into` catching an exception out of descriptor,
-    // bounds, chirality or MMFF typing construction — none of which the fallback performs, and whose
-    // molecules parse and type cleanly.
+    // bounds, chirality or MMFF typing construction. Only the last of those four does the fallback
+    // also run, and where it throws the same way `admit_molecule_` answers `unsupported_element_k`
+    // rather than embedding, so the dispatch costs a parse and a typing pass.
     case types::conformer_status_t::invalid_smiles_k: return fallback_disposition_t::retry_k;
     // Nothing produces it, and the fallback carries no deadline that could re-derive it.
     case types::conformer_status_t::preprocess_timeout_k: return fallback_disposition_t::retry_k;
@@ -92,6 +94,56 @@ enum class fallback_disposition_t : std::uint8_t {
 
 #pragma endregion Dispatch Policy
 
+#pragma region Cost Accounting
+
+/** One stage of what the `fallback-role` spends on a molecule, in the order the stages run. */
+enum class fallback_stage_t : std::uint8_t {
+    /** `parse_smiles`: `SmilesToMol`, sanitization, counterion removal and `addHs`. */
+    parse_k,
+    /** `MMFFMolProperties`: aromaticity re-perception, ring build, atom typing and partial charges. */
+    type_k,
+    /** `EmbedMultipleConfs`: bounds smoothing plus one distance-geometry embedding per unfilled slot. */
+    embed_k,
+    /** `constructForceField`: MMFF term construction over one conformer. */
+    build_k,
+    /** `ForceField::minimize` and the energy read-back. */
+    minimize_k,
+    /** `write_conformer_into_slot_`: the fp16 scatter into the batch's coordinate arrays. */
+    store_k,
+};
+
+constexpr std::size_t fallback_stage_count_k = 6;
+
+/** Report names in enumerator order, so a printed line and the enum cannot drift. */
+constexpr std::array<std::string_view, fallback_stage_count_k> fallback_stage_names_k {"parse", "type",     "embed",
+                                                                                       "build", "minimize", "store"};
+
+/** Host nanoseconds spent per stage, indexed by `fallback_stage_t`. */
+using fallback_stage_nanoseconds_t = std::array<std::uint64_t, fallback_stage_count_k>;
+
+[[nodiscard]] inline std::uint64_t &nanoseconds_of(fallback_stage_nanoseconds_t &tally,
+                                                   fallback_stage_t stage) noexcept {
+    return tally[static_cast<std::size_t>(stage)];
+}
+
+/** Power-of-two millisecond bins one molecule's whole attempt lands in; the last one is open-ended. */
+constexpr std::size_t fallback_duration_bin_count_k = 16;
+
+/** Bin of @p nanoseconds: bin `b` above zero holds `[2^(b-1), 2^b)` milliseconds, bin 0 everything under one. */
+[[nodiscard]] inline std::size_t fallback_duration_bin(std::uint64_t nanoseconds) noexcept {
+    std::uint64_t const milliseconds = nanoseconds / 1'000'000u;
+    if (milliseconds == 0) return 0;
+    std::size_t const bin = static_cast<std::size_t>(std::bit_width(milliseconds));
+    return bin < fallback_duration_bin_count_k ? bin : fallback_duration_bin_count_k - 1;
+}
+
+/** Lower edge in milliseconds of the bin `fallback_duration_bin` returns, so a report labels its own bins. */
+[[nodiscard]] inline std::uint64_t fallback_duration_bin_floor_milliseconds(std::size_t bin) noexcept {
+    return bin == 0 ? 0 : std::uint64_t {1} << (bin - 1);
+}
+
+#pragma endregion Cost Accounting
+
 #pragma region Reporting
 
 /** Counter arrays here are indexed by the enumerator itself, so they take their extent from the enum. */
@@ -111,6 +163,14 @@ struct fallback_report_t {
     std::array<std::uint64_t, conformer_status_count_k> attempted {};
     /** Of `attempted`, those RDKit filled at least one slot for. */
     std::array<std::uint64_t, conformer_status_count_k> recovered {};
+    /** Host nanoseconds the dispatched molecules cost, by stage, summed over every worker thread. */
+    fallback_stage_nanoseconds_t nanoseconds {};
+    /** Dispatched molecules by the millisecond bin their whole attempt fell in, which is the shape a
+     *  mean over a heavy tail cannot show. */
+    std::array<std::uint64_t, fallback_duration_bin_count_k> molecules_by_duration {};
+    /** The single slowest attempt of the batch, and the molecule that ran it. */
+    std::uint64_t slowest_nanoseconds = 0;
+    std::uint32_t slowest_molecule_index = 0;
 };
 
 /** Molecules across every status of one of a report's arrays. */
