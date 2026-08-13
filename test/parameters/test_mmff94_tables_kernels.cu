@@ -2,9 +2,10 @@
  *  @file test/parameters/test_mmff94_tables_kernels.cu
  *  @brief Device-side validation kernels for test_mmff94_tables.
  *
- *  Launches one device lookup per probe key (vdw / bond / angle / torsion / oop / stbn) and writes the resolved
- *  parameters into a device output buffer. The host then bit-equals the device result against the host-side lookup
- *  over the same inputs.
+ *  Launches one device lookup per probe key (vdw / bond / angle / torsion) and writes the resolved parameters into
+ *  a device output buffer. The host then bit-equals the device result against the host-side lookup over the same
+ *  inputs. `lookup_oop` and `lookup_stbn` are reached on the device through the extracted terms `test_mmff_gpu_extract`
+ *  compares, so they need no probe of their own here.
  */
 
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
@@ -89,90 +90,39 @@ __global__ void torsion_lookup_kernel(sf::parameters::mmff94_tables_view_t view,
     results[probe_index] = result;
 }
 
-__global__ void oop_lookup_kernel(sf::parameters::mmff94_tables_view_t view, oop_query_t const *queries,
-                                  oop_result_t *results, std::uint32_t query_count) {
-    std::uint32_t const probe_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (probe_index >= query_count) return;
-
-    auto const *lookup_entry = sf::parameters::lookup_oop(
-        view, queries[probe_index].atom_type_i, queries[probe_index].atom_type_j_center,
-        queries[probe_index].atom_type_k, queries[probe_index].atom_type_l);
-    oop_result_t result {};
-    if (lookup_entry) {
-        result.hit = 1;
-        result.force_constant = lookup_entry->force_constant;
-    }
-    results[probe_index] = result;
-}
-
-__global__ void stbn_lookup_kernel(sf::parameters::mmff94_tables_view_t view, stbn_query_t const *queries,
-                                   stbn_result_t *results, std::uint32_t query_count) {
-    std::uint32_t const probe_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (probe_index >= query_count) return;
-
-    auto const lookup_result = sf::parameters::lookup_stbn(
-        view, queries[probe_index].stretch_bend_type, queries[probe_index].bond_type_ij,
-        queries[probe_index].bond_type_kj, queries[probe_index].atom_type_i, queries[probe_index].atom_type_j_center,
-        queries[probe_index].atom_type_k);
-    stbn_result_t result {};
-    if (lookup_result.second) {
-        result.hit = 1;
-        result.canonical_order_swapped = lookup_result.first ? 1 : 0;
-        result.kba_ijk = lookup_result.second->kba_ijk;
-        result.kba_kji = lookup_result.second->kba_kji;
-    }
-    results[probe_index] = result;
-}
-
 #pragma region Host Callable Launchers
 
+/** Threads per block for every probe launch, and with it the grid each launcher rounds up to. */
+static constexpr std::uint32_t probe_block_threads_k = 128;
+
+static std::uint32_t probe_blocks_(std::uint32_t query_count) noexcept {
+    return (query_count + probe_block_threads_k - 1) / probe_block_threads_k;
+}
+
 void launch_device_vdw_lookup(sf::parameters::mmff94_tables_view_t view, vdw_query_t const *queries,
-                              vdw_result_t *results, std::uint32_t query_count) {
-    vdw_lookup_kernel<<<(query_count + 127) / 128, 128>>>(view, queries, results, query_count);
+                              vdw_result_t *results, std::uint32_t query_count, cudaStream_t stream) {
+    vdw_lookup_kernel<<<probe_blocks_(query_count), probe_block_threads_k, 0, stream>>>(view, queries, results,
+                                                                                        query_count);
 }
 
 void launch_device_bond_lookup(sf::parameters::mmff94_tables_view_t view, bond_query_t const *queries,
-                               bond_result_t *results, std::uint32_t query_count) {
-    bond_lookup_kernel<<<(query_count + 127) / 128, 128>>>(view, queries, results, query_count);
+                               bond_result_t *results, std::uint32_t query_count, cudaStream_t stream) {
+    bond_lookup_kernel<<<probe_blocks_(query_count), probe_block_threads_k, 0, stream>>>(view, queries, results,
+                                                                                         query_count);
 }
 
 void launch_device_angle_lookup(sf::parameters::mmff94_tables_view_t view, angle_query_t const *queries,
-                                angle_result_t *results, std::uint32_t query_count) {
-    angle_lookup_kernel<<<(query_count + 127) / 128, 128>>>(view, queries, results, query_count);
+                                angle_result_t *results, std::uint32_t query_count, cudaStream_t stream) {
+    angle_lookup_kernel<<<probe_blocks_(query_count), probe_block_threads_k, 0, stream>>>(view, queries, results,
+                                                                                          query_count);
 }
 
 void launch_device_torsion_lookup(sf::parameters::mmff94_tables_view_t view, torsion_query_t const *queries,
-                                  torsion_result_t *results, std::uint32_t query_count) {
-    torsion_lookup_kernel<<<(query_count + 127) / 128, 128>>>(view, queries, results, query_count);
-}
-
-void launch_device_oop_lookup(sf::parameters::mmff94_tables_view_t view, oop_query_t const *queries,
-                              oop_result_t *results, std::uint32_t query_count) {
-    oop_lookup_kernel<<<(query_count + 127) / 128, 128>>>(view, queries, results, query_count);
-}
-
-void launch_device_stbn_lookup(sf::parameters::mmff94_tables_view_t view, stbn_query_t const *queries,
-                               stbn_result_t *results, std::uint32_t query_count) {
-    stbn_lookup_kernel<<<(query_count + 127) / 128, 128>>>(view, queries, results, query_count);
+                                  torsion_result_t *results, std::uint32_t query_count, cudaStream_t stream) {
+    torsion_lookup_kernel<<<probe_blocks_(query_count), probe_block_threads_k, 0, stream>>>(view, queries, results,
+                                                                                            query_count);
 }
 
 #pragma endregion Host Callable Launchers
-
-void *device_tables_create(sf::parameters::mmff94_tables_host_t const &host_tables,
-                           sf::parameters::mmff94_tables_view_t &out_view) {
-    auto *device_tables = new sf::parameters::mmff94_tables_device_t;
-    // The legacy default stream is the one stream guaranteed to outlive the buffers it frees against, which
-    // is what a suite that owns no pipeline needs; the synchronization is what makes the tables readable.
-    cudaStream_t const stream = nullptr;
-    sf::parameters::upload_mmff94_tables_to_device(host_tables, *device_tables, stream);
-    if (cudaStreamSynchronize(stream) != cudaSuccess || device_tables->view.vdw.empty()) {
-        delete device_tables;
-        return nullptr;
-    }
-    out_view = device_tables->view;
-    return device_tables;
-}
-
-void device_tables_destroy(void *handle) { delete static_cast<sf::parameters::mmff94_tables_device_t *>(handle); }
 
 } // namespace smallfield::tests

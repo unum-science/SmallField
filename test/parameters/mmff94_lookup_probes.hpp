@@ -1,6 +1,6 @@
 /**
  *  @file test/parameters/mmff94_lookup_probes.hpp
- *  @brief Query/result structs for probing each MMFF94 parameter table lookup in isolation.
+ *  @brief Query/result structs for probing the vdW, bond, angle and torsion table lookups in isolation.
  */
 
 #pragma once
@@ -63,34 +63,6 @@ struct torsion_result_t {
     float torsion_v2;
     float torsion_v3;
     std::uint8_t canonical_torsion_type;
-};
-
-struct oop_query_t {
-    std::uint8_t atom_type_i;
-    std::uint8_t atom_type_j_center;
-    std::uint8_t atom_type_k;
-    std::uint8_t atom_type_l;
-};
-
-struct oop_result_t {
-    std::uint8_t hit;
-    float force_constant;
-};
-
-struct stbn_query_t {
-    std::uint8_t stretch_bend_type;
-    std::uint8_t bond_type_ij;
-    std::uint8_t bond_type_kj;
-    std::uint8_t atom_type_i;
-    std::uint8_t atom_type_j_center;
-    std::uint8_t atom_type_k;
-};
-
-struct stbn_result_t {
-    std::uint8_t hit;
-    std::uint8_t canonical_order_swapped;
-    float kba_ijk;
-    float kba_kji;
 };
 
 } // namespace smallfield::tests

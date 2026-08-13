@@ -44,6 +44,7 @@
 #include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 
 #include "smallfield/parameters/mmff94_tables.hpp"
+#include "smallfield/parameters/mmff94_tables_device.cuh"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 
 #include "test/parameters/test_mmff94_tables_kernels.hpp"
@@ -501,39 +502,50 @@ static std::string_view device_probe_reason_(device_probe_t outcome) noexcept {
 /**
  *  @brief Ship @p queries to the device, run @p launch over them, and bring the results back.
  *
- *  Every section's round trip is this one function, so the allocate, copy, launch, copy, free sequence is
- *  written once and each section holds only its comparison.
+ *  Every section's round trip is this one function, so the reserve, copy, launch, copy sequence is written
+ *  once and each section holds only its comparison. Both buffers are released in @p stream's order when
+ *  they go out of scope, so @p stream must outlive this call.
  *
+ *  @param[in] device_tables Uploaded tables the kernel reads, passed straight through to @p launch.
  *  @param[in] queries Probe keys for one table.
  *  @param[out] results Resized to match @p queries and overwritten with what the kernel wrote.
- *  @param[in] launch Kernel launcher, taking the device query and result pointers and the query count.
+ *  @param[in] stream Carries the allocations, the transfers and the launch, and with them the device.
+ *  @param[in] launch One of the table launchers, which this calls with the device pointers it just staged.
  *  @return Whether the round trip completed, and which step refused it.
  */
-template <typename query_type_, typename result_type_, typename launch_type_>
-static device_probe_t run_device_probes_(std::vector<query_type_> const &queries, std::vector<result_type_> &results,
-                                         launch_type_ launch) {
+template <typename query_type_, typename result_type_>
+static device_probe_t run_device_probes_(sf::parameters::mmff94_tables_view_t const &device_tables,
+                                         std::vector<query_type_> const &queries, std::vector<result_type_> &results,
+                                         cudaStream_t stream,
+                                         void (*launch)(sf::parameters::mmff94_tables_view_t, query_type_ const *,
+                                                        result_type_ *, std::uint32_t, cudaStream_t)) {
     results.assign(queries.size(), result_type_ {});
     if (queries.empty()) return device_probe_t::completed_k;
 
-    std::size_t const query_bytes = queries.size() * sizeof(query_type_);
-    std::size_t const result_bytes = results.size() * sizeof(result_type_);
-    query_type_ *query_device = nullptr;
-    result_type_ *result_device = nullptr;
-    device_probe_t outcome = device_probe_t::completed_k;
-    if (cudaMalloc(&query_device, query_bytes) != cudaSuccess ||
-        cudaMalloc(&result_device, result_bytes) != cudaSuccess)
-        outcome = device_probe_t::allocation_failed_k;
-    else if (cudaMemcpy(query_device, queries.data(), query_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
-        outcome = device_probe_t::transfer_failed_k;
-    else {
-        launch(query_device, result_device, static_cast<std::uint32_t>(queries.size()));
-        if (cudaDeviceSynchronize() != cudaSuccess) outcome = device_probe_t::launch_failed_k;
-        else if (cudaMemcpy(results.data(), result_device, result_bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
-            outcome = device_probe_t::transfer_failed_k;
-    }
-    cudaFree(query_device);
-    cudaFree(result_device);
-    return outcome;
+    sf::types::device_allocator_t const allocator {.stream = stream};
+    sf::types::buffer<query_type_, sf::types::device_allocator_t> query_device {allocator};
+    sf::types::buffer<result_type_, sf::types::device_allocator_t> result_device {allocator};
+    if (query_device.try_reserve(queries.size()) == sf::types::reserve_outcome_t::failed_k ||
+        result_device.try_reserve(results.size()) == sf::types::reserve_outcome_t::failed_k)
+        return device_probe_t::allocation_failed_k;
+
+    custd::span<query_type_ const> const host_queries {queries.data(), queries.size()};
+    if (!sf::types::upload_into(query_device.view(), host_queries, stream)) return device_probe_t::transfer_failed_k;
+
+    launch(device_tables, query_device.data(), result_device.data(), static_cast<std::uint32_t>(queries.size()),
+           stream);
+    // A launch the driver refuses to enqueue reports here and nowhere else. The kernel never runs, so the
+    // drain below has nothing to fail on and the result buffer still holds whatever the allocation found,
+    // which the section would then compare against the host lookups and read as a device defect.
+    if (cudaGetLastError() != cudaSuccess) return device_probe_t::launch_failed_k;
+
+    custd::span<result_type_> const host_results {results.data(), results.size()};
+    custd::span<result_type_ const> const device_results = result_device.view();
+    bool const read_back = sf::types::download_from(host_results, device_results, stream);
+    cudaError_t const drained = cudaStreamSynchronize(stream);
+    if (!read_back) return device_probe_t::transfer_failed_k;
+    if (drained != cudaSuccess) return device_probe_t::launch_failed_k;
+    return device_probe_t::completed_k;
 }
 
 /**
@@ -550,14 +562,11 @@ static void close_skipped_section_(std::string_view subject, std::string_view re
 }
 
 static void compare_vdw_on_device_(sf::parameters::mmff94_tables_view_t const &host_tables,
-                                   sf::parameters::mmff94_tables_view_t const &device_tables,
+                                   sf::parameters::mmff94_tables_view_t const &device_tables, cudaStream_t stream,
                                    std::vector<vdw_query_t> const &queries, diagnostic_reporter_t &reporter,
                                    lookup_coverage_t &coverage) {
     std::vector<vdw_result_t> results;
-    auto const outcome = run_device_probes_(
-        queries, results, [&](vdw_query_t const *device_queries, vdw_result_t *device_results, std::uint32_t count) {
-            launch_device_vdw_lookup(device_tables, device_queries, device_results, count);
-        });
+    auto const outcome = run_device_probes_(device_tables, queries, results, stream, launch_device_vdw_lookup);
     if (outcome != device_probe_t::completed_k)
         return close_skipped_section_("vdw", device_probe_reason_(outcome), reporter);
 
@@ -581,14 +590,11 @@ static void compare_vdw_on_device_(sf::parameters::mmff94_tables_view_t const &h
 }
 
 static void compare_bond_on_device_(sf::parameters::mmff94_tables_view_t const &host_tables,
-                                    sf::parameters::mmff94_tables_view_t const &device_tables,
+                                    sf::parameters::mmff94_tables_view_t const &device_tables, cudaStream_t stream,
                                     std::vector<bond_query_t> const &queries, diagnostic_reporter_t &reporter,
                                     lookup_coverage_t &coverage) {
     std::vector<bond_result_t> results;
-    auto const outcome = run_device_probes_(
-        queries, results, [&](bond_query_t const *device_queries, bond_result_t *device_results, std::uint32_t count) {
-            launch_device_bond_lookup(device_tables, device_queries, device_results, count);
-        });
+    auto const outcome = run_device_probes_(device_tables, queries, results, stream, launch_device_bond_lookup);
     if (outcome != device_probe_t::completed_k)
         return close_skipped_section_("bond", device_probe_reason_(outcome), reporter);
 
@@ -611,15 +617,11 @@ static void compare_bond_on_device_(sf::parameters::mmff94_tables_view_t const &
 }
 
 static void compare_angle_on_device_(sf::parameters::mmff94_tables_view_t const &host_tables,
-                                     sf::parameters::mmff94_tables_view_t const &device_tables,
+                                     sf::parameters::mmff94_tables_view_t const &device_tables, cudaStream_t stream,
                                      std::vector<angle_query_t> const &queries, diagnostic_reporter_t &reporter,
                                      lookup_coverage_t &coverage) {
     std::vector<angle_result_t> results;
-    auto const outcome = run_device_probes_(
-        queries, results,
-        [&](angle_query_t const *device_queries, angle_result_t *device_results, std::uint32_t count) {
-            launch_device_angle_lookup(device_tables, device_queries, device_results, count);
-        });
+    auto const outcome = run_device_probes_(device_tables, queries, results, stream, launch_device_angle_lookup);
     if (outcome != device_probe_t::completed_k)
         return close_skipped_section_("angle", device_probe_reason_(outcome), reporter);
 
@@ -643,15 +645,11 @@ static void compare_angle_on_device_(sf::parameters::mmff94_tables_view_t const 
 }
 
 static void compare_torsion_on_device_(sf::parameters::mmff94_tables_view_t const &host_tables,
-                                       sf::parameters::mmff94_tables_view_t const &device_tables,
+                                       sf::parameters::mmff94_tables_view_t const &device_tables, cudaStream_t stream,
                                        std::vector<torsion_query_t> const &queries, diagnostic_reporter_t &reporter,
                                        lookup_coverage_t &coverage) {
     std::vector<torsion_result_t> results;
-    auto const outcome = run_device_probes_(
-        queries, results,
-        [&](torsion_query_t const *device_queries, torsion_result_t *device_results, std::uint32_t count) {
-            launch_device_torsion_lookup(device_tables, device_queries, device_results, count);
-        });
+    auto const outcome = run_device_probes_(device_tables, queries, results, stream, launch_device_torsion_lookup);
     if (outcome != device_probe_t::completed_k)
         return close_skipped_section_("torsion", device_probe_reason_(outcome), reporter);
 
@@ -691,21 +689,31 @@ static void compare_torsion_on_device_(sf::parameters::mmff94_tables_view_t cons
 static void compare_against_device_(sf::parameters::mmff94_tables_host_t const &host_tables, probe_keys_t const &keys,
                                     diagnostic_reporter_t &reporter, suite_coverage_t &coverage) {
     fmt::println("NOTE suite=device reference=host observed=device");
-    sf::parameters::mmff94_tables_view_t device_tables {};
-    void *device_handle = device_tables_create(host_tables, device_tables);
-    if (device_handle == nullptr) {
-        // One skipped section rather than four: no upload means no device suite at all, and closing it
-        // empty is what carries the skip to the gate in `main`.
-        close_skipped_section_("device_upload", "device_upload_failed", reporter);
-        return;
-    }
+    cudaStream_t stream = nullptr;
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
+        return close_skipped_section_("device_upload", "device_stream_unavailable", reporter);
 
-    auto const tables = host_tables.view();
-    compare_vdw_on_device_(tables, device_tables, keys.vdw_keys, reporter, coverage.van_der_waals);
-    compare_bond_on_device_(tables, device_tables, keys.bond_keys, reporter, coverage.bond);
-    compare_angle_on_device_(tables, device_tables, keys.angle_keys, reporter, coverage.angle);
-    compare_torsion_on_device_(tables, device_tables, keys.torsion_keys, reporter, coverage.torsion);
-    device_tables_destroy(device_handle);
+    // Every allocation this suite makes is ordered against `stream`, so all of them are released inside this
+    // scope and the stream is destroyed only once nothing is left to free against it.
+    {
+        sf::parameters::mmff94_tables_device_t device_storage;
+        sf::parameters::upload_mmff94_tables_to_device(host_tables, device_storage, stream);
+        if (cudaStreamSynchronize(stream) != cudaSuccess || device_storage.view.vdw.empty()) {
+            // One skipped section rather than four: no upload means no device suite at all, and closing it
+            // empty is what carries the skip to the gate in `main`.
+            close_skipped_section_("device_upload", "device_upload_failed", reporter);
+        }
+        else {
+            auto const tables = host_tables.view();
+            compare_vdw_on_device_(tables, device_storage.view, stream, keys.vdw_keys, reporter,
+                                   coverage.van_der_waals);
+            compare_bond_on_device_(tables, device_storage.view, stream, keys.bond_keys, reporter, coverage.bond);
+            compare_angle_on_device_(tables, device_storage.view, stream, keys.angle_keys, reporter, coverage.angle);
+            compare_torsion_on_device_(tables, device_storage.view, stream, keys.torsion_keys, reporter,
+                                       coverage.torsion);
+        }
+    }
+    cudaStreamDestroy(stream);
 }
 
 #pragma endregion Device Against Host
