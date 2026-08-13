@@ -127,6 +127,8 @@ static shard_write_report_t check_input_extents_(writer_inputs_t const &inputs) 
         {"num_bonds", molecules.num_bonds.size(), optional_required_(molecules.num_bonds.size(), num_molecules)},
         {"molecular_weight", molecules.molecular_weight.size(),
          optional_required_(molecules.molecular_weight.size(), num_molecules)},
+        {"shape_described", molecules.shape_described.size(),
+         optional_required_(molecules.shape_described.size(), num_molecules)},
         {"status", conformers.status.size(), num_slots},
         {"energies", conformers.energies.size(), num_slots},
         {"coordinates", conformers.coordinates.size(), num_slots * conformers.layout.slot_stride()},
@@ -329,11 +331,19 @@ static shard_write_report_t pack_coordinates_as_list(writer_inputs_t const &inpu
     return {.status = shard_write_t::written_k};
 }
 
+/** Whether a row's slot holds a descriptor: the column is supplied, the row succeeded, and it was described. */
+static shape_described_t row_shape_described_(writer_inputs_t const &inputs, output_row_t const &row) {
+    if (inputs.conformers.usrcat.empty() || row.outcome != row_outcome_t::conformer_success_k)
+        return shape_described_t::undescribed_k;
+    custd::span<shape_described_t const> const described = inputs.molecules.shape_described;
+    return described.empty() ? shape_described_t::described_k : described[row.molecule_index];
+}
+
 /**
  *  @brief Pack the per-slot USRCAT descriptor into a nullable `List<float16>`, one element per output row.
  *
- *  A row emits its `usrcat_components_k` values only when it is a success row and the column was supplied;
- *  otherwise it is null.
+ *  A row emits its `usrcat_components_k` values only when its molecule was described; otherwise it is null,
+ *  because the zero-filled block an undescribed slot holds is a shape fingerprint no molecule with a body has.
  *
  *  @param[out] array Untouched on refusal.
  *  @return `written_k`, or the refusal that stopped the pack.
@@ -347,7 +357,7 @@ static shard_write_report_t pack_usrcat_as_fp16_list(writer_inputs_t const &inpu
     shard_write_report_t const append_failed {.status = shard_write_t::column_append_failed_k, .column = "usrcat"};
 
     for (output_row_t const &row : rows) {
-        if (values.empty() || row.outcome != row_outcome_t::conformer_success_k) {
+        if (row_shape_described_(inputs, row) == shape_described_t::undescribed_k) {
             if (!list_builder.AppendNull().ok()) return append_failed;
             continue;
         }

@@ -234,6 +234,8 @@ struct output_buffers_t {
     std::vector<std::uint8_t> num_conformers_per_molecule;
     /** `usrcat_components_k` per conformer slot. */
     std::vector<double> usrcat;
+    /** Whether a molecule's shape context was rebuilt, so the writer can tell an absent descriptor from one. */
+    std::vector<sfcli::shape_described_t> shape_described;
     std::vector<std::uint32_t> retry_indices;
 
     void resize_for(std::uint64_t num_molecules, sfapi::conformer_slot_layout_t const &layout) {
@@ -250,6 +252,7 @@ struct output_buffers_t {
         grow_(num_bonds_per_molecule, num_molecules);
         grow_(molecular_weight_per_molecule, num_molecules);
         grow_(num_conformers_per_molecule, num_molecules);
+        grow_(shape_described, num_molecules);
     }
 };
 
@@ -309,6 +312,8 @@ struct coprocessed_batch_result_t {
     std::chrono::steady_clock::time_point batch_start {};
     /** What the batch's refusals cost and bought, by the status that decided each molecule. */
     sfcli::fallback_report_t fallback_report {};
+    /** Molecules with coordinates whose shape context could not be rebuilt, so they ship no USRCAT. */
+    std::uint64_t molecules_undescribed = 0;
 };
 
 /** Bounded ring-buffer producer/consumer channel; see `run_pipeline_` for what its depth buys. */
@@ -409,6 +414,8 @@ struct progress_counters_t {
     std::atomic<std::uint64_t> input_files_completed {0};
     /** Pending input-files that reached no output shard, on either end of the pipeline; drives the exit code. */
     std::atomic<std::uint64_t> input_files_failed {0};
+    /** Molecules that shipped coordinates but no USRCAT, because their shape context could not be rebuilt. */
+    std::atomic<std::uint64_t> molecules_undescribed {0};
     std::uint64_t total_input_files = 0;
     std::chrono::steady_clock::time_point start_time;
 };
@@ -583,32 +590,42 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
 /**
  *  @brief Compute USRCAT descriptors and separate disconnected fragments over a batch's coordinates.
  *
- *  Runs after the RDKit fallback, so every slot is final. A non-success or preprocess-failed slot keeps
- *  the zero-filled descriptor, which the writer emits as a null.
+ *  Runs after the RDKit fallback, so every slot is final. A molecule whose shape context cannot be rebuilt is
+ *  marked `undescribed_k`, which is what makes the writer null its `usrcat` rows instead of publishing the
+ *  zero-filled block they hold.
+ *
+ *  @return Molecules that had coordinates to describe and were left undescribed anyway.
  */
-static void compute_shape_descriptors_(cli_config_t const &config, thread_budget_t const &budget,
-                                       coprocessed_batch_accumulator_t const &accumulator, output_buffers_t &buffer) {
+static std::uint64_t compute_shape_descriptors_(cli_config_t const &config, thread_budget_t const &budget,
+                                                coprocessed_batch_accumulator_t const &accumulator,
+                                                output_buffers_t &buffer) {
     std::uint64_t const num_molecules = accumulator.num_molecules();
     std::uint32_t const num_conformers = config.num_conformers;
     sfapi::conformer_slot_layout_t const slot_layout {config.max_atoms, num_conformers};
     std::size_t const total_conformers = static_cast<std::size_t>(num_molecules) * num_conformers;
     std::fill_n(buffer.usrcat.data(), total_conformers * sfcli::usrcat_components_k, 0.0);
+    std::fill_n(buffer.shape_described.data(), num_molecules, sfcli::shape_described_t::undescribed_k);
     int const threads = budget.fallback > 0 ? budget.fallback : omp_get_max_threads();
+    std::uint64_t undescribed = 0;
 
     // `private` hands each thread its own context, which keeps the capacity of its five vectors across the
     // molecules that thread walks; declaring it inside the body would allocate and free once per molecule.
     sfpost::molecule_shape_context_t context;
 
-#pragma omp parallel for schedule(dynamic, 256) num_threads(threads) private(context) if (threads > 1)
+#pragma omp parallel for schedule(dynamic, 256) num_threads(threads) private(context) \
+    reduction(+ : undescribed) if (threads > 1)
     for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
         std::uint8_t const stored_atoms = buffer.num_atoms_per_molecule[molecule_index];
         if (stored_atoms == 0) continue; // preprocess failed: no coordinates to describe
         // Every refusal means the reparse could not reproduce the atom order the coordinates were written
-        // in, so the molecule's slots keep the zero-filled descriptor the writer emits as a null.
+        // in, so the molecule stays undescribed and ships no shape fingerprint at all.
         if (sfpost::build_shape_context_into(accumulator.combined_smiles[molecule_index], stored_atoms,
                                              smallfield::keep_largest_fragment_k,
-                                             context) != sfpost::shape_typing_t::typed_k)
+                                             context) != sfpost::shape_typing_t::typed_k) {
+            ++undescribed;
             continue;
+        }
+        buffer.shape_described[molecule_index] = sfcli::shape_described_t::described_k;
         std::uint32_t const num_atoms = stored_atoms;
 
         std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
@@ -631,6 +648,7 @@ static void compute_shape_descriptors_(cli_config_t const &config, thread_budget
             std::copy(usrcat.begin(), usrcat.end(), buffer.usrcat.data() + flat * sfcli::usrcat_components_k);
         }
     }
+    return undescribed;
 }
 
 static void fallback_loop_(cli_config_t const &config, thread_budget_t const &budget, buffer_pool_t &pool,
@@ -671,7 +689,7 @@ static void fallback_loop_(cli_config_t const &config, thread_budget_t const &bu
 
         {
             SF_NVTX_RANGE_COLORED("postprocess: descriptors+fragments", 0x8E44AD);
-            compute_shape_descriptors_(config, budget, accumulator, buffer);
+            result.molecules_undescribed = compute_shape_descriptors_(config, budget, accumulator, buffer);
         }
 
         output_queue.send(std::move(result));
@@ -698,8 +716,8 @@ static sfcli::writer_inputs_t shard_writer_inputs_(cli_config_t const &config,
                       .num_conformers = {buffer.num_conformers_per_molecule.data() + first_molecule, num_molecules},
                       .num_heavy_atoms = {buffer.num_heavy_atoms_per_molecule.data() + first_molecule, num_molecules},
                       .num_bonds = {buffer.num_bonds_per_molecule.data() + first_molecule, num_molecules},
-                      .molecular_weight = {buffer.molecular_weight_per_molecule.data() + first_molecule,
-                                           num_molecules}},
+                      .molecular_weight = {buffer.molecular_weight_per_molecule.data() + first_molecule, num_molecules},
+                      .shape_described = {buffer.shape_described.data() + first_molecule, num_molecules}},
         .conformers = {.layout = layout,
                        .status = {buffer.status.data() + first_slot, num_slots},
                        .energies = {buffer.energies.data() + first_slot, num_slots},
@@ -789,12 +807,19 @@ static void log_batch_progress_(coprocessed_batch_result_t const &result, logger
         fallback_fragment = fmt::format("  fallback attempted={} recovered={} {:.3f}% terminal={}",
                                         fmt::group_digits(attempted), fmt::group_digits(recovered),
                                         percent_of_(recovered, attempted), fmt::group_digits(skipped));
+    // Molecules whose coordinates ship without a shape fingerprint, which is a hole in a similarity index
+    // rather than a missing row, so it is named on the same line as the batch that produced it.
+    std::string undescribed_fragment;
+    if (result.molecules_undescribed > 0)
+        undescribed_fragment = fmt::format(
+            "  undescribed={} {:.3f}%", fmt::group_digits(result.molecules_undescribed),
+            percent_of_(result.molecules_undescribed, result.accumulator.num_molecules()));
 
     double const batch_rate = static_cast<double>(result.accumulator.num_molecules()) / std::max(batch_seconds, 0.001);
     double const cumulative_rate = static_cast<double>(molecules_done) / std::max(wall, 0.001);
-    logger.info("{:>4}/{:<4} done {:.0f}s  {} mol/s{}  cumulative {}  avg {} mol/s  ETA {}",
+    logger.info("{:>4}/{:<4} done {:.0f}s  {} mol/s{}{}  cumulative {}  avg {} mol/s  ETA {}",
                 fmt::group_digits(files_done), fmt::group_digits(counters.total_input_files), batch_seconds,
-                fmt::group_digits(static_cast<std::uint64_t>(batch_rate)), fallback_fragment,
+                fmt::group_digits(static_cast<std::uint64_t>(batch_rate)), fallback_fragment, undescribed_fragment,
                 fmt::group_digits(molecules_done), fmt::group_digits(static_cast<std::uint64_t>(cumulative_rate)),
                 smallfield::format_wall_time(finish_wall));
 }
@@ -811,6 +836,7 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
 
         write_batch_shards_(config, result.accumulator, pool.at(result.buffer_slot), logger, counters);
         pool.release(result.buffer_slot);
+        counters.molecules_undescribed.fetch_add(result.molecules_undescribed);
         log_batch_progress_(result, logger, counters);
         log_fallback_breakdown_(result, logger);
     }
@@ -911,8 +937,10 @@ int main(int argc, char **argv) {
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - counters.start_time).count();
     std::uint64_t const done = counters.molecules_completed.load();
-    logger.info("complete  {} mols  {} mol/s", fmt::group_digits(done),
-                fmt::group_digits(static_cast<std::uint64_t>(static_cast<double>(done) / std::max(total, 0.001))));
+    std::uint64_t const undescribed = counters.molecules_undescribed.load();
+    logger.info("complete  {} mols  {} mol/s  undescribed {} {:.3f}%", fmt::group_digits(done),
+                fmt::group_digits(static_cast<std::uint64_t>(static_cast<double>(done) / std::max(total, 0.001))),
+                fmt::group_digits(undescribed), sfcli::percent_of_(undescribed, done));
     std::uint64_t const files_failed = counters.input_files_failed.load();
     if (files_failed > 0)
         logger.error("{} of {} input-files produced no output shard — none of them was sealed, so a rerun retries them",

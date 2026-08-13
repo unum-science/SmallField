@@ -19,7 +19,7 @@
  *  | n_conformers         | uint8            | yes      | mol   | K (no dedup); null on preprocess failure    |
  *  | conformer_coords     | List<float16>    | yes      | row   | 3*n_atoms halves; null if status != success |
  *  | conformer_energy     | float32          | yes      | row   | this row's MMFF94 energy; null on failure   |
- *  | usrcat               | List<float16>    | yes      | row   | 60-dim USRCAT shape; null if !success       |
+ *  | usrcat               | List<float16>    | yes      | row   | 60-dim USRCAT shape; null if undescribed    |
  *
  *  The on-disk names keep the `n_` spelling already in every shard this project has produced; the C++
  *  members feeding them are spelled out like everything else here. Beside the columns, the schema's
@@ -60,10 +60,22 @@ struct shard_provenance_t {
 };
 
 /**
+ *  @brief Whether a molecule carries a shape descriptor at all, which no value of one can say for itself.
+ *
+ *  A producer that cannot rebuild a molecule's shape context leaves its slots' `usrcat` blocks unwritten,
+ *  and an unwritten block is zero-filled — which is a descriptor a single-atom molecule genuinely has. So
+ *  the absence travels beside the numbers rather than inside them.
+ */
+enum class shape_described_t : std::uint8_t {
+    described_k,
+    undescribed_k,
+};
+
+/**
  *  @brief The molecule axis: one element per molecule, in one order, across every non-empty column.
  *
- *  `num_heavy_atoms`, `num_bonds` and `molecular_weight` are optional: an empty span opts the column out and
- *  writes it all-null, and any other length must cover every molecule.
+ *  `num_heavy_atoms`, `num_bonds`, `molecular_weight` and `shape_described` are optional: an empty span opts
+ *  the column out, and any other length must cover every molecule.
  */
 struct molecule_columns_t {
     custd::span<std::string_view const> smiles;
@@ -74,6 +86,8 @@ struct molecule_columns_t {
     custd::span<std::uint16_t const> num_heavy_atoms;
     custd::span<std::uint16_t const> num_bonds;
     custd::span<float const> molecular_weight;
+    /** `undescribed_k` writes `usrcat` null on every row the molecule owns; an empty span describes all. */
+    custd::span<shape_described_t const> shape_described;
 
     /** The extent every column above shares; `write_shard` refuses a sibling shorter than it. */
     [[nodiscard]] std::uint64_t count() const noexcept { return num_atoms.size(); }
@@ -103,8 +117,8 @@ struct conformer_slot_columns_t {
      *  @brief `usrcat_components_k` doubles per slot, downcast to float16 on write.
      *
      *  Float16 because the descriptor is derived from float16 coordinates, so a wider column would be
-     *  illusory precision. An empty span opts the column out, marking it all-null; a non-success slot is
-     *  written null either way.
+     *  illusory precision. An empty span opts the column out, marking it all-null; a non-success slot and an
+     *  undescribed molecule are written null either way.
      */
     custd::span<double const> usrcat;
 
