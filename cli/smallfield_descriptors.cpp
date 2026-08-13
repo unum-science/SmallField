@@ -307,6 +307,8 @@ struct reembed_molecule_t {
     float molecular_weight = 0.0f;
     /** K as the source shard recorded it, which is not the same fact as the rows actually carried. */
     std::uint8_t num_conformers = 0;
+    /** Downgraded by the first success row whose source carried no descriptor, so its zeros stay unpublished. */
+    sfcli::shape_described_t shape_described = sfcli::shape_described_t::described_k;
     std::string smiles;
     std::vector<reembed_conformer_t> conformers;
 };
@@ -381,13 +383,21 @@ void load_reembed_shard_(input_shard_t const &shard, std::uint32_t max_atoms, re
         }
         if (shard.conformer_energy->IsValid(row)) conformer.energy = shard.conformer_energy->Value(row);
 
+        sfcli::shape_described_t row_described = sfcli::shape_described_t::undescribed_k;
         if (usrcat_values && usrcat_column->IsValid(row)) {
             std::int64_t const begin = usrcat_column->value_offset(row);
-            if (usrcat_column->value_offset(row + 1) - begin >= sfcli::usrcat_components_k)
+            if (usrcat_column->value_offset(row + 1) - begin >= sfcli::usrcat_components_k) {
                 for (std::size_t component = 0; component < sfcli::usrcat_components_k; ++component)
                     conformer.usrcat[component] = half_bits_to_float_(
                         usrcat_values->Value(begin + static_cast<std::int64_t>(component)));
+                row_described = sfcli::shape_described_t::described_k;
+            }
         }
+        // The writer nulls `usrcat` on the molecule axis, so one success row copied from a source that held
+        // no descriptor for it leaves the whole molecule undescribed rather than publishing its zeros.
+        if (conformer.status == sft::conformer_status_t::success_k &&
+            row_described == sfcli::shape_described_t::undescribed_k)
+            molecule.shape_described = sfcli::shape_described_t::undescribed_k;
 
         molecule.conformers.push_back(std::move(conformer));
         store.widest_molecule_conformers = std::max(store.widest_molecule_conformers,
@@ -425,8 +435,8 @@ shard_listing_t fill_reembed_store_(fs::path const &reembed_dir, std::uint32_t m
 
 /** Per-shard counters folded into the progress log. */
 struct shard_stats_t {
-    /** Molecules refused by `build_shape_context_into`, on any of the ways a reparse can miss the stored one. */
-    std::atomic<std::uint64_t> context_unusable {0};
+    /** Molecules that ship coordinates and no shape fingerprint, which is a hole in a similarity index. */
+    std::atomic<std::uint64_t> molecules_undescribed {0};
     std::atomic<std::uint64_t> fragments_separated {0};
 };
 
@@ -454,6 +464,7 @@ struct shard_buffers_t {
     std::vector<std::uint16_t> num_bonds_per_molecule;
     std::vector<float> molecular_weight_per_molecule;
     std::vector<std::uint8_t> num_conformers_per_molecule;
+    std::vector<sfcli::shape_described_t> shape_described;
 
     /** `num_molecules + 1` bucket bounds into `molecule_rows`. */
     std::vector<std::uint64_t> molecule_row_offsets;
@@ -484,6 +495,9 @@ struct shard_buffers_t {
         reset_(num_bonds_per_molecule, num_molecules, std::uint16_t {0});
         reset_(molecular_weight_per_molecule, num_molecules, 0.0f);
         reset_(num_conformers_per_molecule, num_molecules, std::uint8_t {0});
+        // Same reason as the status fill above: a molecule no branch of the walk claims must not publish the
+        // zero-filled `usrcat` block its slots hold.
+        reset_(shape_described, num_molecules, sfcli::shape_described_t::undescribed_k);
     }
 
     /** The rows molecule @p molecule_index owns, in the file order the bucketing preserved. */
@@ -587,6 +601,7 @@ void copy_reembed_molecule_into_(reembed_molecule_t const &molecule, std::uint64
     buffers.num_bonds_per_molecule[molecule_index] = molecule.num_bonds;
     buffers.molecular_weight_per_molecule[molecule_index] = molecule.molecular_weight;
     buffers.num_conformers_per_molecule[molecule_index] = molecule.num_conformers;
+    buffers.shape_described[molecule_index] = molecule.shape_described;
 
     std::uint32_t const num_atoms = molecule.num_atoms;
     std::size_t const num_slots = std::min<std::size_t>(molecule.conformers.size(), layout.num_conformers);
@@ -700,24 +715,37 @@ std::size_t read_row_coordinates_into_(input_shard_t const &shard, std::int64_t 
  *  The status each slot carries is already there, from `copy_row_outcomes_into_`, and is what decides which
  *  slots get geometry. The loop runs to completion deliberately, even past a failed row: a `break` would
  *  leave the later slots holding no coordinates. Where the reparsed atom order cannot be trusted the
- *  coordinates are still preserved and only the descriptors stay zero-filled.
+ *  coordinates are still preserved and only the descriptors stay unwritten.
+ *
+ *  @return `undescribed_k` where any success slot was left without a computed descriptor, because the writer
+ *      nulls `usrcat` on the molecule axis and a published zero block reads as a measurement. A molecule
+ *      whose every row failed keeps `described_k`: no row of it publishes a descriptor either way.
  */
-void augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t const> rows, std::uint64_t molecule_index,
-                       std::uint32_t num_atoms, sfpost::molecule_shape_context_t const &context,
-                       sfpost::shape_typing_t typing, sfapi::conformer_slot_layout_t const &layout,
-                       shard_buffers_t &buffers, shard_stats_t &stats) {
+sfcli::shape_described_t augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t const> rows,
+                                           std::uint64_t molecule_index, std::uint32_t num_atoms,
+                                           sfpost::molecule_shape_context_t const &context,
+                                           sfpost::shape_typing_t typing, sfapi::conformer_slot_layout_t const &layout,
+                                           shard_buffers_t &buffers, shard_stats_t &stats) {
     std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
+    sfcli::shape_described_t described = sfcli::shape_described_t::described_k;
     std::size_t const num_slots = std::min<std::size_t>(rows.size(), layout.num_conformers);
     for (std::size_t conformer_slot = 0; conformer_slot < num_slots; ++conformer_slot) {
         std::int64_t const row = rows[conformer_slot];
         std::size_t const flat = layout.flat_slot(molecule_index, static_cast<std::uint32_t>(conformer_slot));
         if (buffers.status[flat] != sft::conformer_status_t::success_k) continue; // a failure row stays null
-        if (!shard.conformer_coords->IsValid(row)) continue;                      // the row carried no geometry
+        // The row claims success and carries no geometry, so there is nothing here to describe it from.
+        if (!shard.conformer_coords->IsValid(row)) {
+            described = sfcli::shape_described_t::undescribed_k;
+            continue;
+        }
 
         // A row holding fewer components than its atom count claims cannot fill the slot, and copying the
         // prefix would leave the previous conformer's coordinates in the tail of the shared scratch.
         std::size_t const wanted = static_cast<std::size_t>(num_atoms) * 3u;
-        if (read_row_coordinates_into_(shard, row, num_atoms, interleaved) < wanted) continue;
+        if (read_row_coordinates_into_(shard, row, num_atoms, interleaved) < wanted) {
+            described = sfcli::shape_described_t::undescribed_k;
+            continue;
+        }
         custd::span<float> const coordinates {interleaved.data(), wanted};
 
         // Separating disconnected components needs the context's per-atom labels, so it is skipped along
@@ -731,12 +759,16 @@ void augment_molecule_(input_shard_t const &shard, custd::span<std::int64_t cons
             buffers.coordinates.data() +
                 layout.slot_offset(molecule_index, static_cast<std::uint32_t>(conformer_slot)));
 
-        // Descriptors stay zero-filled on a refusal, while the coordinates written above are preserved.
-        if (typing != sfpost::shape_typing_t::typed_k) continue;
+        // The descriptor stays unwritten on a refusal, while the coordinates written above are preserved.
+        if (typing != sfpost::shape_typing_t::typed_k) {
+            described = sfcli::shape_described_t::undescribed_k;
+            continue;
+        }
         std::array<double, sfcli::usrcat_components_k> usrcat_row {};
         sfpost::usrcat_descriptor(coordinates, context, usrcat_row);
         std::copy(usrcat_row.begin(), usrcat_row.end(), buffers.usrcat.data() + flat * sfcli::usrcat_components_k);
     }
+    return described;
 }
 
 /**
@@ -759,7 +791,8 @@ sfcli::writer_inputs_t shard_writer_inputs_(input_shard_t const &shard, cli_conf
                       .num_conformers = {buffers.num_conformers_per_molecule.data(), num_molecules},
                       .num_heavy_atoms = {buffers.num_heavy_atoms_per_molecule.data(), num_molecules},
                       .num_bonds = {buffers.num_bonds_per_molecule.data(), num_molecules},
-                      .molecular_weight = {buffers.molecular_weight_per_molecule.data(), num_molecules}},
+                      .molecular_weight = {buffers.molecular_weight_per_molecule.data(), num_molecules},
+                      .shape_described = {buffers.shape_described.data(), num_molecules}},
         .conformers = {.layout = layout,
                        .status = {buffers.status.data(), num_slots},
                        .energies = {buffers.energies.data(), num_slots},
@@ -822,6 +855,8 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
         fill_reembed_key_into_(shard.input_shard->GetView(first_row), shard.input_row->Value(first_row), reembed_key);
         if (auto found = reembed.molecules.find(reembed_key); found != reembed.molecules.end()) {
             copy_reembed_molecule_into_(found->second, molecule_index, layout, buffers);
+            if (found->second.num_atoms > 0 && found->second.shape_described == sfcli::shape_described_t::undescribed_k)
+                stats.molecules_undescribed.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
 
@@ -837,8 +872,10 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
         std::uint8_t const num_atoms = buffers.num_atoms_per_molecule[molecule_index];
         sfpost::shape_typing_t const typing = sfpost::build_shape_context_into(
             buffers.smiles[molecule_index], num_atoms, smallfield::keep_largest_fragment_k, context);
-        if (typing != sfpost::shape_typing_t::typed_k) stats.context_unusable.fetch_add(1, std::memory_order_relaxed);
-        augment_molecule_(shard, rows, molecule_index, num_atoms, context, typing, layout, buffers, stats);
+        buffers.shape_described[molecule_index] = augment_molecule_(shard, rows, molecule_index, num_atoms, context,
+                                                                    typing, layout, buffers, stats);
+        if (buffers.shape_described[molecule_index] == sfcli::shape_described_t::undescribed_k)
+            stats.molecules_undescribed.fetch_add(1, std::memory_order_relaxed);
     }
 
     // `write_shard` already logged its own refusal, so the outcome only has to survive the return.
@@ -856,7 +893,7 @@ struct run_tally_t {
     std::uint64_t completed = 0;
     std::uint64_t skipped = 0;
     std::uint64_t failed = 0;
-    std::uint64_t context_unusable = 0;
+    std::uint64_t molecules_undescribed = 0;
     std::uint64_t fragments_separated = 0;
 };
 
@@ -893,19 +930,19 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
 
     double const shard_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - shard_start).count();
     double const rows = static_cast<double>(shard.num_rows);
-    std::uint64_t const context_unusable = stats.context_unusable.load();
+    std::uint64_t const undescribed = stats.molecules_undescribed.load();
     std::uint64_t const separated = stats.fragments_separated.load();
-    tally.context_unusable += context_unusable;
+    tally.molecules_undescribed += undescribed;
     tally.fragments_separated += separated;
     ++tally.completed;
 
     double const rows_per_second = rows / std::max(shard_seconds, 1e-3);
-    logger.info("{:>4}/{:<4} {}  {:.1f}s  {} rows/s ({} rows/s/core)  ctx-unusable {}  separated {}",
+    logger.info("{:>4}/{:<4} {}  {:.1f}s  {} rows/s ({} rows/s/core)  undescribed {}  separated {}",
                 fmt::group_digits(tally.completed + tally.skipped), fmt::group_digits(total_shards),
                 input_path.filename().string(), shard_seconds,
                 fmt::group_digits(static_cast<std::uint64_t>(rows_per_second)),
                 fmt::group_digits(static_cast<std::uint64_t>(rows_per_second / std::max(config.threads, 1))),
-                fmt::group_digits(context_unusable), fmt::group_digits(separated));
+                fmt::group_digits(undescribed), fmt::group_digits(separated));
 }
 
 /**
@@ -971,8 +1008,8 @@ int main(int argc, char **argv) {
     augment_shards_(inputs, config, reembed, logger, tally);
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    logger.info("complete  {} augmented, {} skipped, {} failed  in {:.0f}s  (ctx-unusable {}, separated {})",
+    logger.info("complete  {} augmented, {} skipped, {} failed  in {:.0f}s  (undescribed {}, separated {})",
                 fmt::group_digits(tally.completed), fmt::group_digits(tally.skipped), fmt::group_digits(tally.failed),
-                total, fmt::group_digits(tally.context_unusable), fmt::group_digits(tally.fragments_separated));
+                total, fmt::group_digits(tally.molecules_undescribed), fmt::group_digits(tally.fragments_separated));
     return tally.failed > 0 ? 1 : 0;
 }
