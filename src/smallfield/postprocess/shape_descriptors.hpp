@@ -88,12 +88,17 @@ inline constexpr std::uint32_t max_components_k = 255;
  *  the context carries no flag of its own. A refusal leaves every field empty, capacity aside.
  */
 struct molecule_shape_context_t {
-    std::uint32_t num_atoms = 0;
     /** Hydrophobic, aromatic, acceptor, donor. */
     std::array<std::vector<std::uint32_t>, credo_subset_count_k> credo_subsets;
     /** Per-atom connected-component id, so `num_components` never exceeds `max_components_k`. */
     std::vector<std::uint8_t> component_label;
     std::uint32_t num_components = 0;
+
+    /** Atoms the context describes. Read off the per-atom labeling rather than stored beside it, so an
+     *  atom count that disagrees with the labels it indexes is not representable. */
+    [[nodiscard]] std::uint32_t num_atoms() const noexcept {
+        return static_cast<std::uint32_t>(component_label.size());
+    }
 };
 
 /**
@@ -340,7 +345,6 @@ inline std::array<RDKit::ROMol, credo_subset_count_k> const &credo_matchers_() {
  *  paths are exactly where the next molecule's buffers would otherwise be freed.
  */
 inline void clear_shape_context_(molecule_shape_context_t &out) {
-    out.num_atoms = 0;
     for (std::vector<std::uint32_t> &subset : out.credo_subsets) subset.clear();
     out.component_label.clear();
     out.num_components = 0;
@@ -383,8 +387,6 @@ inline void clear_shape_context_(molecule_shape_context_t &out) {
         // Checked before the four substructure searches, which a molecule nobody can describe need not pay for.
         if (parsed.num_atoms != expected_atoms) return shape_typing_t::atom_count_divergence_k;
         std::unique_ptr<RDKit::RWMol> molecule = std::move(parsed.molecule);
-
-        out.num_atoms = parsed.num_atoms;
 
         // Type the four CREDO subsets exactly as RDKit's `getAtomIdsForFeatures` does: collect every matched
         // atom index, preserving RDKit's collection order.
@@ -446,7 +448,7 @@ inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uin
  */
 inline void usrcat_descriptor(custd::span<float const> coords_interleaved, molecule_shape_context_t const &context,
                               std::array<double, usrcat_components_k> &out) {
-    conformer_reader_t const coords = conformer_over_(coords_interleaved, context.num_atoms);
+    conformer_reader_t const coords = conformer_over_(coords_interleaved, context.num_atoms());
     custd::span<double> const row {out.data(), out.size()};
     std::array<point3_t, usr_reference_point_count_k> const points = usr_block_into_(coords,
                                                                                      row.subspan(0, usr_components_k));

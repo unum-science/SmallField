@@ -50,8 +50,7 @@ struct component_placement_t {
  */
 inline void separate_fragments(custd::span<float> coords_interleaved, molecule_shape_context_t const &context) {
     if (context.num_components <= 1) return;
-    sf_assert_(context.component_label.size() >= context.num_atoms);
-    types::conformer_aos_t const coords = conformer_over_(coords_interleaved, context.num_atoms);
+    types::conformer_aos_t const coords = conformer_over_(coords_interleaved, context.num_atoms());
 
     constexpr double margin_k = 2.0;
     std::uint32_t const num_atoms = coords.extent(0);
