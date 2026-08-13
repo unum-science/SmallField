@@ -407,13 +407,15 @@ static thread_budget_t compute_thread_budget_(int user_fallback_override, int us
 struct progress_counters_t {
     std::atomic<std::uint64_t> molecules_completed {0};
     std::atomic<std::uint64_t> input_files_completed {0};
+    /** Pending input-files that reached no output shard, on either end of the pipeline; drives the exit code. */
+    std::atomic<std::uint64_t> input_files_failed {0};
     std::uint64_t total_input_files = 0;
     std::chrono::steady_clock::time_point start_time;
 };
 
 static void reader_loop_(custd::span<shard_pair_t const *const> pending, cli_config_t const &config,
                          std::uint32_t batch_target, thread_budget_t const &budget, logger_t const &logger,
-                         handoff<coprocessed_batch_accumulator_t> &output_queue) {
+                         handoff<coprocessed_batch_accumulator_t> &output_queue, progress_counters_t &counters) {
     omp_set_num_threads(budget.reader);
     coprocessed_batch_accumulator_t accumulator;
 
@@ -424,8 +426,10 @@ static void reader_loop_(custd::span<shard_pair_t const *const> pending, cli_con
         }
         sfcli::shard_data_t data;
         // `read_shard` already named the refusal in the log, so this only says the shard was left behind.
+        // It leaves no sentinel either, so `--resume` picks it up again on the next invocation.
         if (sfcli::read_shard(pair->input_path, config.smiles_column, data, &logger) != sfcli::input_read_t::read_k) {
             logger.error("skipping {}", pair->input_path.string());
+            counters.input_files_failed.fetch_add(1);
             continue;
         }
         accumulator.add_input_file(std::move(data), pair);
@@ -721,7 +725,13 @@ static void write_batch_shards_(cli_config_t const &config, coprocessed_batch_ac
         // `write_shard` already logged the column or the file that stopped it, so nothing is said here.
         sfcli::shard_write_report_t const report = sfcli::write_shard(
             output_path, shard_writer_inputs_(config, accumulator, buffer, file_index), &logger);
-        if (report.status == sfcli::shard_write_t::written_k) sfcli::write_encoded_sentinel(output_path, &logger);
+        // A refused shard publishes nothing, so it counts as neither molecules nor a completed input-file, and
+        // its sentinel is left unwritten so `--resume` retries it on the next invocation.
+        if (report.status != sfcli::shard_write_t::written_k) {
+            counters.input_files_failed.fetch_add(1);
+            continue;
+        }
+        sfcli::write_encoded_sentinel(output_path, &logger);
 
         counters.molecules_completed.fetch_add(accumulator.molecules_of(file_index));
         counters.input_files_completed.fetch_add(1);
@@ -842,7 +852,7 @@ static gpu_runner_outcome_t run_pipeline_(sfapi::context_t &gpu_context, cli_con
 #pragma omp parallel sections num_threads(4)
     {
 #pragma omp section
-        { reader_loop_(pending, config, batch_target, budget, logger, reader_to_gpu); }
+        { reader_loop_(pending, config, batch_target, budget, logger, reader_to_gpu, counters); }
 #pragma omp section
         { outcome = gpu_runner_loop_(gpu_context, config, budget, logger, reader_to_gpu, gpu_to_fallback, pool); }
 #pragma omp section
@@ -903,11 +913,16 @@ int main(int argc, char **argv) {
     std::uint64_t const done = counters.molecules_completed.load();
     logger.info("complete  {} mols  {} mol/s", fmt::group_digits(done),
                 fmt::group_digits(static_cast<std::uint64_t>(static_cast<double>(done) / std::max(total, 0.001))));
+    std::uint64_t const files_failed = counters.input_files_failed.load();
+    if (files_failed > 0)
+        logger.error("{} of {} input-files produced no output shard — none of them was sealed, so a rerun retries them",
+                     fmt::group_digits(files_failed), fmt::group_digits(counters.total_input_files));
+
     if (outcome == sfcli::gpu_runner_outcome_t::cuda_fault_k) return 1;
     std::uint64_t const cuda_errors = gpu_context.cuda_error_count.load();
     if (cuda_errors > 0) {
         logger.error("{} CUDA errors reported by the library — output is unreliable", fmt::group_digits(cuda_errors));
         return 1;
     }
-    return 0;
+    return files_failed > 0 ? 1 : 0;
 }
