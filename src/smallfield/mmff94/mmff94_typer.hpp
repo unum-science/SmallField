@@ -10,19 +10,14 @@
  *  future merge from RDKit's typer stays mechanical. Local names do not follow it — they spell out the
  *  chemistry — so a merge needs the renames re-applied by hand.
  *
- *  The descriptor's aromatic flags come from RDKit's default perception during
- *  `SmilesToMol(...sanitize=true...)`, which is @b not the perception RDKit's own typer sees.
- *  `MMFFMolProperties` kekulizes, which strips every aromatic flag, and then calls
- *  `MolOps::setMMFFAromaticity`, which re-marks only the rings its own pi-electron count accepts — so the
- *  pass is subtractive, and presetting `_MMFFSanitized` to suppress the Kekulize leaves the rings MMFF
- *  refuses standing. A caller that snapshots the descriptor before that pass disagrees with RDKit on 9.4 %
- *  of 45787 typed PubChem molecules, 13.1 % of 47847 typed ChEMBL-37 molecules and 2.9 % of 50000 GDB-13
- *  molecules. The class is every ring whose aromaticity rests on an exocyclic carbonyl — pyridinones,
- *  uracil and thymine, quinolones, coumarins, xanthines such as caffeine — where the ring nitrogen types
- *  58 rather than 10, draws a whole formal charge in `native_compute_mmff_formal_charges`, and moves every
- *  partial charge on the molecule with it. Applying MMFF's perception before the snapshot removes the
- *  difference outright, with no type disagreement left on any of the three corpora, since a second
- *  application is a no-op.
+ *  Every aromaticity question here is asked of the descriptor's MMFF fields — `mmff_bond_type` and
+ *  `atom_flag_mmff_aromatic_k` — and never of `bond_order`, `bond_flags` or `atom_flag_aromatic_k`, which
+ *  carry RDKit's default perception and belong to ETKDG. The two models genuinely disagree: RDKit's own
+ *  typer sees what `fill_mmff_perception` produces, and typing the parser's perception instead misplaces
+ *  a type on 9.5 % of PubChem, 15.9 % of ChEMBL-37 and 2.9 % of GDB-13, every one of them a ring whose
+ *  aromaticity rests on an exocyclic carbonyl — a pyridinone's ring nitrogen types 58 rather than 10,
+ *  draws a whole formal charge in `native_compute_mmff_formal_charges`, and moves every partial charge on
+ *  the molecule with it.
  */
 
 #pragma once
@@ -38,9 +33,13 @@
 namespace smallfield::mmff94 {
 using smallfield::parameters::lookup_prop;
 using smallfield::parameters::mmff94_tables_view_t;
-using smallfield::types::atom_flag_aromatic_k;
-using smallfield::types::bond_flag_order_aromatic_k;
+using smallfield::types::atom_flag_mmff_aromatic_k;
 using smallfield::types::max_atoms_per_molecule_k;
+using smallfield::types::mmff_bond_absent_k;
+using smallfield::types::mmff_bond_aromatic_k;
+using smallfield::types::mmff_bond_double_k;
+using smallfield::types::mmff_bond_single_k;
+using smallfield::types::mmff_bond_triple_k;
 using smallfield::types::molecule_descriptor_t;
 
 #pragma region Descriptor Queries
@@ -66,42 +65,21 @@ constexpr bool atom_in_ring_of_size(molecule_descriptor_t const &descriptor, std
     return false;
 }
 
-/** The bond between two atoms as RDKit's typer sees it. */
-struct bond_typing_t {
-    /** 1, 2 or 3, and 0 when the atoms are not adjacent. An aromatic bond has no Kekulé order to report,
-     *  so it reports 1. */
-    std::uint8_t order = 0;
-    /** `Bond::getBondType() == Bond::AROMATIC`, the only bond-aromaticity test RDKit's typer ever makes
-     *  — never `getIsAromatic()`, which an in-ring triple bond also carries. */
-    bool aromatic = false;
-};
-
-/** The typing of the bond one neighbour slot of the CSR reaches. */
-constexpr bond_typing_t bond_typing_at_slot(molecule_descriptor_t const &descriptor,
-                                            std::uint16_t neighbor_slot) noexcept {
-    std::uint16_t const bond_index = descriptor.neighbor_bond[neighbor_slot];
-    return {.order = descriptor.bond_order[bond_index],
-            .aromatic = (descriptor.bond_flags[bond_index] & bond_flag_order_aromatic_k) != 0};
+/** The MMFF type of the bond one neighbour slot of the CSR reaches. */
+constexpr std::uint8_t mmff_bond_type_at_slot(molecule_descriptor_t const &descriptor,
+                                              std::uint16_t neighbor_slot) noexcept {
+    return descriptor.mmff_bond_type[descriptor.neighbor_bond[neighbor_slot]];
 }
 
-/** The typing of the bond between two atoms; `order` is 0 when they are not adjacent. */
-constexpr bond_typing_t bond_typing_between(molecule_descriptor_t const &descriptor, std::uint32_t atom_i,
-                                            std::uint32_t atom_j) noexcept {
+/** The MMFF type of the bond between two atoms; `mmff_bond_absent_k` when they are not adjacent. */
+constexpr std::uint8_t mmff_bond_type_between(molecule_descriptor_t const &descriptor, std::uint32_t atom_i,
+                                              std::uint32_t atom_j) noexcept {
     std::uint16_t const neighbor_start = descriptor.neighbor_offset[atom_i];
     std::uint16_t const neighbor_end = descriptor.neighbor_offset[atom_i + 1];
     for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot)
-        if (descriptor.neighbor_atom[neighbor_slot] == atom_j) return bond_typing_at_slot(descriptor, neighbor_slot);
-    return {};
+        if (descriptor.neighbor_atom[neighbor_slot] == atom_j) return mmff_bond_type_at_slot(descriptor, neighbor_slot);
+    return mmff_bond_absent_k;
 }
-
-/**
- *  @brief `RDKit::Bond::BondType` as the integer the typer's decision trees compare against.
- *
- *  1, 2 or 3 for a Kekulé order, 4 for `Bond::AROMATIC`, 0 for an absent bond. An in-ring triple bond
- *  keeps its 3 despite `getIsAromatic()`, which is what makes the isonitrile nitrogen of a dehydrobenzene
- *  ring type 61 rather than 53.
- */
-constexpr unsigned rdkit_bond_type(bond_typing_t typing) noexcept { return typing.aromatic ? 4u : typing.order; }
 
 /**
  *  @brief True iff atom sits in a size-`size` SSSR ring whose bonds are all typed `Bond::AROMATIC`.
@@ -122,7 +100,7 @@ constexpr bool atom_in_aromatic_ring_of_size(molecule_descriptor_t const &descri
         for (unsigned ring_atom_slot = first_slot; ring_atom_slot + 1 < last_slot; ++ring_atom_slot) {
             std::uint8_t const ring_atom = descriptor.ring_atoms[ring_atom_slot];
             std::uint8_t const next_ring_atom = descriptor.ring_atoms[ring_atom_slot + 1];
-            if (!bond_typing_between(descriptor, ring_atom, next_ring_atom).aromatic) {
+            if (mmff_bond_type_between(descriptor, ring_atom, next_ring_atom) != mmff_bond_aromatic_k) {
                 all_aromatic = false;
                 break;
             }
@@ -258,7 +236,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                                                        std::uint32_t atom_index) noexcept {
     std::uint8_t atom_type = 0;
     unsigned const element = descriptor.element[atom_index];
-    bool const aromatic = (descriptor.atom_flags[atom_index] & atom_flag_aromatic_k) != 0;
+    bool const aromatic = (descriptor.atom_flags[atom_index] & atom_flag_mmff_aromatic_k) != 0;
 
     // Aromatic typing handles 5-ring and 6-ring cases.
     if (aromatic) {
@@ -314,7 +292,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                             !atom_in_ring_of_size(descriptor, neighbor_atom, 6))
                             surrounded_by_benzene_c = false;
                         if (atoms_in_same_ring_of_size(descriptor, atom_index, neighbor_atom, 5) &&
-                            !(descriptor.atom_flags[neighbor_atom] & atom_flag_aromatic_k))
+                            !(descriptor.atom_flags[neighbor_atom] & atom_flag_mmff_aromatic_k))
                             surrounded_by_aromatic = false;
                     }
                     if ((alpha_count == 0 && beta_count == 0 && !surrounded_by_benzene_c && surrounded_by_aromatic) ||
@@ -420,15 +398,16 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                 unsigned double_bonded_elem = 0;
                 for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
                     std::uint8_t const neighbor_atom = descriptor.neighbor_atom[neighbor_slot];
-                    unsigned const bond_type = rdkit_bond_type(bond_typing_at_slot(descriptor, neighbor_slot));
-                    if (bond_type == 2) double_bonded_elem = descriptor.element[neighbor_atom];
+                    std::uint8_t const bond_type = mmff_bond_type_at_slot(descriptor, neighbor_slot);
+                    if (bond_type == mmff_bond_double_k) double_bonded_elem = descriptor.element[neighbor_atom];
                     if (descriptor.degree[neighbor_atom] == 1) {
                         if (descriptor.element[neighbor_atom] == 8) ++num_terminal_oxygens;
                         else if (descriptor.element[neighbor_atom] == 16) ++num_terminal_sulfurs;
                     }
                     else if (descriptor.element[neighbor_atom] == 7) {
                         if (descriptor.degree[neighbor_atom] == 3) ++num_n3_nitrogens;
-                        else if (descriptor.degree[neighbor_atom] == 2 && bond_type == 2) ++num_n2_nitrogens;
+                        else if (descriptor.degree[neighbor_atom] == 2 && bond_type == mmff_bond_double_k)
+                            ++num_n2_nitrogens;
                     }
                 }
                 if (num_n3_nitrogens >= 2 && !num_n2_nitrogens && double_bonded_elem == 7) {
@@ -494,7 +473,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                     bool double_bonded_cn = false;
                     for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
                         std::uint8_t const neighbor_atom = descriptor.neighbor_atom[neighbor_slot];
-                        if (rdkit_bond_type(bond_typing_at_slot(descriptor, neighbor_slot)) == 2) {
+                        if (mmff_bond_type_at_slot(descriptor, neighbor_slot) == mmff_bond_double_k) {
                             double_bonded_cn = (descriptor.element[neighbor_atom] == 7 ||
                                                 descriptor.element[neighbor_atom] == 6);
                             if (descriptor.element[neighbor_atom] == 6) {
@@ -534,7 +513,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                         std::uint8_t const neighbor_atom = descriptor.neighbor_atom[neighbor_slot];
                         if (descriptor.element[neighbor_atom] == 6) {
                             is_neighbor_carbon = true;
-                            if ((descriptor.atom_flags[neighbor_atom] & atom_flag_aromatic_k) &&
+                            if ((descriptor.atom_flags[neighbor_atom] & atom_flag_mmff_aromatic_k) &&
                                 atom_in_ring_of_size(descriptor, neighbor_atom, 6))
                                 is_neighbor_benzene_carbon = true;
                             num_n2_nitrogens_bonded_to_carbon = num_n3_nitrogens_bonded_to_carbon =
@@ -545,17 +524,17 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                             for (std::uint16_t second_neighbor_slot = second_neighbor_start;
                                  second_neighbor_slot < second_neighbor_end; ++second_neighbor_slot) {
                                 std::uint8_t const second_neighbor = descriptor.neighbor_atom[second_neighbor_slot];
-                                auto const [bond_order, is_aromatic_bond] = bond_typing_at_slot(descriptor,
-                                                                                                second_neighbor_slot);
-                                if (bond_order == 2 && (descriptor.element[second_neighbor] == 8 ||
-                                                        descriptor.element[second_neighbor] == 16))
+                                std::uint8_t const bond_type = mmff_bond_type_at_slot(descriptor, second_neighbor_slot);
+                                if (bond_type == mmff_bond_double_k && (descriptor.element[second_neighbor] == 8 ||
+                                                                        descriptor.element[second_neighbor] == 16))
                                     is_n_c_o_or_n_c_s = true;
-                                if (bond_order == 2 ||
-                                    (is_aromatic_bond && (descriptor.element[second_neighbor] == 6 ||
-                                                          (descriptor.element[second_neighbor] == 7 &&
-                                                           atom_num_rings(descriptor, second_neighbor) == 1))))
+                                if (bond_type == mmff_bond_double_k ||
+                                    (bond_type == mmff_bond_aromatic_k &&
+                                     (descriptor.element[second_neighbor] == 6 ||
+                                      (descriptor.element[second_neighbor] == 7 &&
+                                       atom_num_rings(descriptor, second_neighbor) == 1))))
                                     element_double_bonded_to_carbon = descriptor.element[second_neighbor];
-                                if (bond_order == 3)
+                                if (bond_type == mmff_bond_triple_k)
                                     element_triple_bonded_to_carbon = descriptor.element[second_neighbor];
                                 if (descriptor.element[second_neighbor] == 7 &&
                                     descriptor.degree[second_neighbor] == 3) {
@@ -576,9 +555,10 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                                         ++num_n3_nitrogens_bonded_to_carbon;
                                 }
                                 if (descriptor.element[second_neighbor] == 7 &&
-                                    descriptor.degree[second_neighbor] == 2 && (bond_order == 2 || is_aromatic_bond))
+                                    descriptor.degree[second_neighbor] == 2 &&
+                                    (bond_type == mmff_bond_double_k || bond_type == mmff_bond_aromatic_k))
                                     ++num_n2_nitrogens_bonded_to_carbon;
-                                if (descriptor.atom_flags[second_neighbor] & atom_flag_aromatic_k) {
+                                if (descriptor.atom_flags[second_neighbor] & atom_flag_mmff_aromatic_k) {
                                     if (descriptor.element[second_neighbor] == 8) ++num_oxygens_bonded_to_carbon;
                                     if (descriptor.element[second_neighbor] == 16) ++num_sulfurs_bonded_to_carbon;
                                 }
@@ -600,7 +580,8 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                             for (std::uint16_t second_neighbor_slot = second_neighbor_start;
                                  second_neighbor_slot < second_neighbor_end; ++second_neighbor_slot) {
                                 std::uint8_t const second_neighbor = descriptor.neighbor_atom[second_neighbor_slot];
-                                if (bond_typing_at_slot(descriptor, second_neighbor_slot).order != 2) continue;
+                                if (mmff_bond_type_at_slot(descriptor, second_neighbor_slot) != mmff_bond_double_k)
+                                    continue;
                                 if (descriptor.element[second_neighbor] == 6) {
                                     std::uint16_t const third_neighbor_start =
                                         descriptor.neighbor_offset[second_neighbor];
@@ -657,7 +638,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                     bool is_isonitrile = false;
                     for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end && !is_isonitrile;
                          ++neighbor_slot)
-                        is_isonitrile = rdkit_bond_type(bond_typing_at_slot(descriptor, neighbor_slot)) == 3;
+                        is_isonitrile = mmff_bond_type_at_slot(descriptor, neighbor_slot) == mmff_bond_triple_k;
                     if (is_isonitrile) {
                         atom_type = 61;
                         break;
@@ -669,7 +650,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                     bool is_nitroso = false, is_imine_or_azo = false;
                     for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
                         std::uint8_t const neighbor_atom = descriptor.neighbor_atom[neighbor_slot];
-                        if (rdkit_bond_type(bond_typing_at_slot(descriptor, neighbor_slot)) == 2) {
+                        if (mmff_bond_type_at_slot(descriptor, neighbor_slot) == mmff_bond_double_k) {
                             is_nitroso = (descriptor.element[neighbor_atom] == 8 && terminal_oxygen_count == 1);
                             is_imine_or_azo = (descriptor.element[neighbor_atom] == 6 ||
                                                descriptor.element[neighbor_atom] == 7);
@@ -721,7 +702,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                 for (std::uint16_t neighbor_slot = neighbor_start;
                      neighbor_slot < neighbor_end && !is_triple_bonded_nitrogen && !is_nazt; ++neighbor_slot) {
                     std::uint8_t const neighbor_atom = descriptor.neighbor_atom[neighbor_slot];
-                    is_triple_bonded_nitrogen = rdkit_bond_type(bond_typing_at_slot(descriptor, neighbor_slot)) == 3;
+                    is_triple_bonded_nitrogen = mmff_bond_type_at_slot(descriptor, neighbor_slot) == mmff_bond_triple_k;
                     if (descriptor.element[neighbor_atom] == 7 && descriptor.degree[neighbor_atom] == 2) {
                         std::uint16_t const second_neighbor_start = descriptor.neighbor_offset[neighbor_atom];
                         std::uint16_t const second_neighbor_end = descriptor.neighbor_offset[neighbor_atom + 1];
@@ -792,16 +773,16 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                         }
                     }
                     if (descriptor.element[neighbor_atom] == 1) is_oxide_oxygen_bonded_to_hydrogen = true;
-                    unsigned const bond_type = rdkit_bond_type(bond_typing_at_slot(descriptor, neighbor_slot));
+                    std::uint8_t const bond_type = mmff_bond_type_at_slot(descriptor, neighbor_slot);
                     if (descriptor.element[neighbor_atom] == 6) {
                         is_carboxylate_oxygen = (num_oxygens_bonded_to_carbon_nitrogen_or_sulfur == 2);
-                        is_carbonyl_oxygen = (bond_type == 2);
-                        is_oxide_oxygen_bonded_to_carbon = (bond_type == 1 &&
+                        is_carbonyl_oxygen = (bond_type == mmff_bond_double_k);
+                        is_oxide_oxygen_bonded_to_carbon = (bond_type == mmff_bond_single_k &&
                                                             num_oxygens_bonded_to_carbon_nitrogen_or_sulfur == 1);
                     }
                     if (descriptor.element[neighbor_atom] == 7) {
-                        is_nitroso_oxygen = (bond_type == 2);
-                        if (bond_type == 1 && num_oxygens_bonded_to_carbon_nitrogen_or_sulfur == 1) {
+                        is_nitroso_oxygen = (bond_type == mmff_bond_double_k);
+                        if (bond_type == mmff_bond_single_k && num_oxygens_bonded_to_carbon_nitrogen_or_sulfur == 1) {
                             // RDKit adds `getNumImplicitHs()` to the valence here, which `MolOps::addHs` has
                             // already driven to zero; `num_hydrogens` counts neighbor Hs the valence sum
                             // covers, so adding it would count every hydrogen twice.
@@ -813,11 +794,11 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                     }
                     if (descriptor.element[neighbor_atom] == 16) {
                         is_thiosulfinate_oxygen = (num_sulfurs_bonded_to_carbon_nitrogen_or_sulfur == 1);
-                        is_sulfate_oxygen = (bond_type == 1 ||
-                                             (bond_type == 2 &&
+                        is_sulfate_oxygen = (bond_type == mmff_bond_single_k ||
+                                             (bond_type == mmff_bond_double_k &&
                                               (num_oxygens_bonded_to_carbon_nitrogen_or_sulfur +
                                                num_nitrogens_bonded_to_carbon_nitrogen_or_sulfur) > 1));
-                        is_sulfoxide_oxygen = (bond_type == 2 &&
+                        is_sulfoxide_oxygen = (bond_type == mmff_bond_double_k &&
                                                (num_oxygens_bonded_to_carbon_nitrogen_or_sulfur +
                                                 num_nitrogens_bonded_to_carbon_nitrogen_or_sulfur) == 1);
                     }
@@ -887,7 +868,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                 for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
                     std::uint8_t const neighbor_atom = descriptor.neighbor_atom[neighbor_slot];
                     if (descriptor.element[neighbor_atom] == 6 &&
-                        rdkit_bond_type(bond_typing_at_slot(descriptor, neighbor_slot)) == 2)
+                        mmff_bond_type_at_slot(descriptor, neighbor_slot) == mmff_bond_double_k)
                         is_carbon_double_bonded_to_sulfur = true;
                     if ((descriptor.degree[neighbor_atom] == 1 && descriptor.element[neighbor_atom] == 8) ||
                         (descriptor.degree[neighbor_atom] == 2 && descriptor.element[neighbor_atom] == 7))
@@ -914,7 +895,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                 for (std::uint16_t neighbor_slot = neighbor_start; neighbor_slot < neighbor_end; ++neighbor_slot) {
                     std::uint8_t const neighbor_atom = descriptor.neighbor_atom[neighbor_slot];
                     if (descriptor.element[neighbor_atom] == 8 &&
-                        rdkit_bond_type(bond_typing_at_slot(descriptor, neighbor_slot)) == 2)
+                        mmff_bond_type_at_slot(descriptor, neighbor_slot) == mmff_bond_double_k)
                         is_oxygen_double_bonded_to_sulfur = true;
                 }
                 if (is_oxygen_double_bonded_to_sulfur) {
@@ -938,7 +919,7 @@ constexpr std::uint8_t native_set_mmff_heavy_atom_type(molecule_descriptor_t con
                             ++num_terminal_sulfurs_bonded_to_neighbor;
                     }
                     if (descriptor.element[neighbor_atom] == 6 &&
-                        rdkit_bond_type(bond_typing_at_slot(descriptor, neighbor_slot)) == 2)
+                        mmff_bond_type_at_slot(descriptor, neighbor_slot) == mmff_bond_double_k)
                         is_carbon_double_bonded_to_sulfur = true;
                 }
                 if (is_carbon_double_bonded_to_sulfur && num_terminal_sulfurs_bonded_to_neighbor != 2) {
@@ -1065,12 +1046,12 @@ constexpr std::uint8_t native_set_mmff_hydrogen_type(molecule_descriptor_t const
                              third_neighbor_slot < third_neighbor_end; ++third_neighbor_slot) {
                             std::uint8_t const third_neighbor = descriptor.neighbor_atom[third_neighbor_slot];
                             if (third_neighbor == neighbor_atom) continue;
-                            auto const [bond_order, is_aromatic_bond] = bond_typing_at_slot(descriptor,
-                                                                                            third_neighbor_slot);
+                            std::uint8_t const bond_type = mmff_bond_type_at_slot(descriptor, third_neighbor_slot);
                             if ((descriptor.element[third_neighbor] == 6 || descriptor.element[third_neighbor] == 7) &&
-                                (bond_order == 2 || is_aromatic_bond))
+                                (bond_type == mmff_bond_double_k || bond_type == mmff_bond_aromatic_k))
                                 is_h_o_c_c_or_h_o_c_n = true;
-                            if (descriptor.element[third_neighbor] == 8 && bond_order == 2) is_h_o_c_o = true;
+                            if (descriptor.element[third_neighbor] == 8 && bond_type == mmff_bond_double_k)
+                                is_h_o_c_o = true;
                         }
                     }
                     if (descriptor.element[second_neighbor] == 15) is_h_o_p = true;
@@ -1137,7 +1118,7 @@ constexpr float shared_anion_formal_charge_(molecule_descriptor_t const &descrip
              ++second_shell_slot) {
             std::uint8_t const second_shell_index = descriptor.neighbor_atom[second_shell_slot];
             if (descriptor.element[second_shell_index] == 7 && descriptor.degree[second_shell_index] == 2 &&
-                !(descriptor.atom_flags[second_shell_index] & atom_flag_aromatic_k))
+                !(descriptor.atom_flags[second_shell_index] & atom_flag_mmff_aromatic_k))
                 ++num_secondary_nitrogens;
             if ((descriptor.element[second_shell_index] == 8 || descriptor.element[second_shell_index] == 16) &&
                 descriptor.degree[second_shell_index] == 1)
@@ -1293,20 +1274,15 @@ constexpr void native_compute_mmff_formal_charges(molecule_descriptor_t const &d
  *  Returns 1 iff the bond is SINGLE and its two endpoints either both carry the MMFFProp
  *  single-bond-multiple-bond designator or are both aromatic atoms. Otherwise 0.
  *
- *  RDKit's whole gate at `AtomTyper.cpp:2470` is `getBondType() == Bond::SINGLE`. `bond_order` reports 1
- *  for a single bond and also 1 for an aromatic one, which carries no integer order, so the aromatic case
- *  is excluded by `bond_flag_order_aromatic_k` — the flag that means exactly
- *  `getBondType() == Bond::AROMATIC`. Not `bond_flag_aromatic_k`, which is `getIsAromatic()` and is set on
- *  every bond in an aromatic ring including one that kept a Kekulé single order; asking that flag would
- *  drop a bond RDKit types as SINGLE, so the two are not interchangeable and only this one is parity.
+ *  RDKit's whole gate at `AtomTyper.cpp:2470` is `getBondType() == Bond::SINGLE`, which `mmff_bond_type`
+ *  answers directly: an aromatic bond is `mmff_bond_aromatic_k` and a bond kekulized to a single order is
+ *  `mmff_bond_single_k`, so the two states RDKit distinguishes stay distinguished.
  */
 constexpr std::uint8_t native_get_mmff_bond_type(molecule_descriptor_t const &descriptor,
                                                  mmff94_tables_view_t const &tables,
                                                  custd::span<std::uint8_t const> atom_types,
                                                  std::uint32_t bond_index) noexcept {
-    bool const single_bond = descriptor.bond_order[bond_index] == 1 &&
-                             !(descriptor.bond_flags[bond_index] & bond_flag_order_aromatic_k);
-    if (!single_bond) return 0;
+    if (descriptor.mmff_bond_type[bond_index] != mmff_bond_single_k) return 0;
     auto const *prop_i = lookup_prop(tables, atom_types[descriptor.bond_atom_i[bond_index]]);
     auto const *prop_j = lookup_prop(tables, atom_types[descriptor.bond_atom_j[bond_index]]);
     if (!prop_i || !prop_j) return 0;

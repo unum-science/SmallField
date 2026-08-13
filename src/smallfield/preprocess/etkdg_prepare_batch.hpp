@@ -80,6 +80,7 @@ using smallfield::types::etk_torsion_descriptor_t;
 using smallfield::types::etk_torsion_k;
 using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::fill_bond_distances;
+using smallfield::types::fill_mmff_perception;
 using smallfield::types::hop_matrix_t;
 using smallfield::types::hybridization_sp2_k;
 using smallfield::types::lower_distance_bound_at;
@@ -819,8 +820,8 @@ inline smallfield::types::conformer_status_t prepare_molecule_into(std::string_v
  *  every other one; where RDKit cannot, the caller rejects it. On both samples above RDKit
  *  rejects every one of them, so this returns `unsupported_element_k` throughout.
  *
- *  @param[inout] molecule RDKit molecule with explicit hydrogens, already sanitized; the typing
- *                rewrites its aromatic perception in place.
+ *  @param[inout] molecule RDKit molecule with explicit hydrogens, already carrying MMFF's aromatic
+ *                perception from `fill_mmff_perception`.
  *  @param[in] num_atoms Atoms in @p molecule.
  *  @param[out] atom_types Filled with one MMFF94 numeric atom type per atom.
  *  @param[out] atom_charges Filled with one MMFF94 partial charge per atom.
@@ -831,8 +832,8 @@ inline smallfield::types::conformer_status_t extract_mmff94_typing_via_rdkit_(RD
                                                                               std::uint32_t num_atoms,
                                                                               std::vector<std::uint8_t> &atom_types,
                                                                               std::vector<float> &atom_charges) {
-    // The constructor rewrites @p molecule into MMFF's own aromatic perception before it types, so
-    // the answer read back below is the one RDKit's force field would use.
+    // `fill_mmff_perception` has already put the molecule in the state RDKit's own force field types,
+    // and marked it so this constructor does not kekulize a second time.
     RDKit::MMFF::MMFFMolProperties properties(const_cast<RDKit::ROMol &>(molecule));
     if (!properties.isValid()) return smallfield::types::conformer_status_t::unsupported_element_k;
 
@@ -908,6 +909,12 @@ inline smallfield::types::conformer_status_t prepare_molecule_topology_into(std:
         build_bounds_matrix(result.descriptor, bounds);
         extract_chiral_centers(*molecule, result.descriptor, result.chiral_centers);
         extract_distance_constraints(result.descriptor, bounds, result.distance_constraints);
+
+        // Everything above reads RDKit's aromatic perception, which is the one ETKDG is defined on and
+        // the last thing this function asks of the molecule. MMFF94's perception is a different model
+        // and reaches the device on its own descriptor fields, so it is laid down here, after the
+        // geometry is already built and before anything types an atom.
+        fill_mmff_perception(*molecule, result.descriptor);
 
         // The device typer runs the same code on the same descriptor, so deciding here which
         // molecules it will reject needs no readback: the answer is already computable.

@@ -39,7 +39,6 @@ using smallfield::types::atom_role_first_k;
 using smallfield::types::atom_role_fourth_k;
 using smallfield::types::atom_role_second_k;
 using smallfield::types::atom_role_third_k;
-using smallfield::types::bond_flag_aromatic_k;
 using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::max_atoms_per_molecule_k;
 using smallfield::types::max_bonds_k;

@@ -29,7 +29,9 @@ using smallfield::parameters::lookup_covrad;
 using smallfield::parameters::lookup_hl;
 using smallfield::parameters::lookup_prop;
 using smallfield::parameters::mmff94_tables_view_t;
-using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::mmff_bond_aromatic_k;
+using smallfield::types::mmff_bond_double_k;
+using smallfield::types::mmff_bond_single_k;
 using smallfield::types::molecule_descriptor_t;
 
 #pragma region Periodic Table Rows
@@ -165,8 +167,7 @@ constexpr std::pair<std::uint8_t, std::uint8_t> native_get_mmff_torsion_type(mol
     std::uint8_t const bond_type_ij = bond_types[bond_index_ij];
     std::uint8_t const bond_type_jk = bond_types[bond_index_jk];
     std::uint8_t const bond_type_kl = bond_types[bond_index_kl];
-    bool const jk_single = (descriptor.bond_order[bond_index_jk] == 1) &&
-                           !(descriptor.bond_flags[bond_index_jk] & bond_flag_aromatic_k);
+    bool const jk_single = descriptor.mmff_bond_type[bond_index_jk] == mmff_bond_single_k;
 
     unsigned torsion_type = bond_type_jk;
     unsigned secondary = 0;
@@ -378,9 +379,10 @@ SF_HOST_DEVICE_ inline std::array<float, 3> native_torsion_empirical(molecule_de
                              lone_pair_constant_k);
     float const torsions_about_jk = static_cast<float>((properties_j->coordination_number - 1) *
                                                        (properties_k->coordination_number - 1));
-    bool const jk_double = descriptor.bond_order[bond_jk_index] == 2;
-    bool const jk_aromatic = (descriptor.bond_flags[bond_jk_index] & bond_flag_aromatic_k) != 0;
-    bool const jk_single = descriptor.bond_order[bond_jk_index] == 1 && !jk_aromatic;
+    std::uint8_t const jk_bond_type = descriptor.mmff_bond_type[bond_jk_index];
+    bool const jk_double = jk_bond_type == mmff_bond_double_k;
+    bool const jk_aromatic = jk_bond_type == mmff_bond_aromatic_k;
+    bool const jk_single = jk_bond_type == mmff_bond_single_k;
 
     // rule (a): linear heavy atom on either side — all zero.
     if (properties_j->linear || properties_k->linear) return out;

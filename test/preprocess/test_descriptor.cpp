@@ -7,6 +7,11 @@
  *  The builtin drug-like set runs unconditionally; naming a `.smi` file on the command line, or in
  *  `SMALLFIELD_TEST_CORPUS`, adds a second section over that corpus.
  *
+ *  A third pair of sections covers `fill_mmff_perception`, which is the one writer that puts two aromatic
+ *  models in one descriptor: that it moves nothing outside `mmff_bond_type` and `atom_flag_mmff_aromatic_k`,
+ *  which is what keeps ETKDG reading the perception it is defined on, and that those two fields land where
+ *  RDKit's own MMFF force field would have read them.
+ *
  *  `build_descriptor` answers a `conformer_status_t`, so this suite forwards that answer rather than re-deriving
  *  it: a corpus line it refuses is counted under the status it was refused with, and a builtin it refuses is a
  *  defect, since the builtin set is curated to fit. The return is never discarded, because a refusal writes
@@ -15,6 +20,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstring> // `std::memcmp`, `std::memset`
 
 #include <algorithm>   // `std::sort`
 #include <memory>      // `std::unique_ptr`
@@ -28,6 +34,7 @@
 #include <GraphMol/RingInfo.h>
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
+#include <GraphMol/ForceFieldHelpers/MMFF/AtomTyper.h>
 
 #include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
@@ -63,6 +70,8 @@ struct descriptor_scratch_t {
 /** Where every corpus line went, so a section that compared little says why. */
 struct descriptor_tally_t {
     std::size_t compared = 0;
+    /** Compared lines whose MMFF perception also reached RDKit's own answer; the rest RDKit will not type. */
+    std::size_t perceived = 0;
     /** Lines left out of the comparison, indexed by the status that refused them. */
     std::size_t refused[sft::conformer_status_count_k] = {};
 };
@@ -184,6 +193,82 @@ static sft::conformer_status_t check_molecule_(RDKit::ROMol const &molecule, std
 
 #pragma endregion Comparison
 
+#pragma region MMFF Perception
+
+/** The two descriptors one molecule produces, and the third RDKit's own MMFF pass leaves behind. */
+struct perception_scratch_t {
+    sft::molecule_descriptor_t before {};
+    sft::molecule_descriptor_t after {};
+    sft::molecule_descriptor_t rdkit {};
+};
+
+/** The fields `fill_mmff_perception` owns, blanked, so what remains is what ETKDG reads. */
+static void blank_mmff_fields_(sft::molecule_descriptor_t &descriptor) {
+    std::memset(descriptor.mmff_bond_type, 0, sizeof(descriptor.mmff_bond_type));
+    for (std::uint32_t atom_index = 0; atom_index < sft::max_atoms_per_molecule_k; ++atom_index)
+        descriptor.atom_flags[atom_index] &= static_cast<std::uint8_t>(~sft::atom_flag_mmff_aromatic_k);
+}
+
+/**
+ *  @brief Perceive MMFF's aromaticity onto a copy of one molecule's descriptor and check what moved.
+ *
+ *  Two claims. The first is what keeps the geometry out of it: outside the two MMFF fields, every byte is
+ *  the byte `build_descriptor` wrote, so the bounds matrix, the CSD torsion match and the chirality pass
+ *  read the perception ETKDG is defined on. The second is that those two fields carry what RDKit's own
+ *  force field reads, which is the molecule `MMFFMolProperties` leaves behind — taken from a second parse,
+ *  because that constructor perceives once and `MolOps::setMMFFAromaticity` is not idempotent on every
+ *  molecule.
+ *
+ *  @param[inout] molecule Molecule already compared against RDKit; its aromaticity is rewritten here.
+ *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key and reparsed for the oracle.
+ *  @param[inout] etkdg_reporter Reporter for the fields that must not move.
+ *  @param[inout] mmff_reporter Reporter for the two fields against RDKit's own perception.
+ *  @param[inout] scratch Descriptors reused across molecules.
+ *  @return Whether the molecule reached the comparison against RDKit at all.
+ */
+static bool check_mmff_perception_(RDKit::RWMol &molecule, std::string const &smiles,
+                                   diagnostic_reporter_t &etkdg_reporter, diagnostic_reporter_t &mmff_reporter,
+                                   perception_scratch_t &scratch) {
+    if (sft::build_descriptor(molecule, scratch.before) != sft::conformer_status_t::success_k) return false;
+    scratch.after = scratch.before;
+    sft::fill_mmff_perception(molecule, scratch.after);
+
+    sft::molecule_descriptor_t masked_before = scratch.before, masked_after = scratch.after;
+    blank_mmff_fields_(masked_before);
+    blank_mmff_fields_(masked_after);
+    etkdg_reporter.mismatch("mmff_perception", "smiles={}", smiles)
+        .field("etkdg_field_bytes", std::memcmp(&masked_before, &masked_after, sizeof(masked_before)), 0,
+               exactly_equal);
+
+    // A second parse rather than a copy, and guarded, because a corpus line reaches this too.
+    std::unique_ptr<RDKit::RWMol> reference;
+    try {
+        reference.reset(RDKit::SmilesToMol(smiles));
+        if (!reference) return false;
+        RDKit::MolOps::addHs(*reference);
+        RDKit::MMFF::MMFFMolProperties properties(*reference);
+        if (!properties.isValid()) return false; // RDKit will not type it, so it perceived for nothing
+    }
+    catch (...) {
+        return false;
+    }
+    if (sft::build_descriptor(*reference, scratch.rdkit) != sft::conformer_status_t::success_k) return false;
+
+    std::uint32_t const num_atoms = scratch.after.num_atoms;
+    for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index)
+        mmff_reporter.mismatch("mmff_perception", "smiles={} atom={}", smiles, atom_index)
+            .field("mmff_aromatic", (scratch.rdkit.atom_flags[atom_index] & sft::atom_flag_mmff_aromatic_k) != 0,
+                   (scratch.after.atom_flags[atom_index] & sft::atom_flag_mmff_aromatic_k) != 0, exactly_equal);
+    std::uint32_t const num_bonds = scratch.after.num_bonds;
+    for (std::uint32_t bond_index = 0; bond_index < num_bonds; ++bond_index)
+        mmff_reporter.mismatch("mmff_perception", "smiles={} bond={}", smiles, bond_index)
+            .field("mmff_bond_type", scratch.rdkit.mmff_bond_type[bond_index], scratch.after.mmff_bond_type[bond_index],
+                   exactly_equal);
+    return true;
+}
+
+#pragma endregion MMFF Perception
+
 #pragma region Corpora
 
 /** Molecules whose graphs stress a feature the drug-like standards do not reach. */
@@ -198,18 +283,22 @@ static std::vector<std::string> stress_test_smiles_() {
 }
 
 /** The builtin molecules are curated, so anything that stops one short of the comparison is a defect. */
-static void check_builtin_(std::string const &smiles, diagnostic_reporter_t &reporter, descriptor_scratch_t &scratch) {
+static void check_builtin_(std::string const &smiles, diagnostic_reporter_t &reporter, descriptor_scratch_t &scratch,
+                           diagnostic_reporter_t &perception_reporter, perception_scratch_t &perception) {
     std::unique_ptr<RDKit::RWMol> molecule = mol_from_smiles(smiles);
     sf_verify_(molecule != nullptr, ("builtin SMILES must parse: " + smiles).c_str());
     sft::conformer_status_t const built = check_molecule_(*molecule, smiles, reporter, scratch);
     sf_verify_(
         built == sft::conformer_status_t::success_k,
         fmt::format("build_descriptor refused the builtin SMILES {} as {}", smiles, sft::conformer_status_name(built)));
+    // Last, because it rewrites the molecule the comparisons above read.
+    check_mmff_perception_(*molecule, smiles, perception_reporter, reporter, perception);
 }
 
 /** A corpus line is untrusted input, so each way it can miss the comparison is counted and named. */
 static void check_corpus_line_(std::string const &smiles, diagnostic_reporter_t &reporter,
-                               descriptor_scratch_t &scratch, descriptor_tally_t &tally) {
+                               descriptor_scratch_t &scratch, descriptor_tally_t &tally,
+                               diagnostic_reporter_t &perception_reporter, perception_scratch_t &perception) {
     // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs inside the
     // guard alongside `addHs`.
     std::unique_ptr<RDKit::RWMol> molecule;
@@ -227,11 +316,13 @@ static void check_corpus_line_(std::string const &smiles, diagnostic_reporter_t 
         return;
     }
     ++tally.compared;
+    // Last, because it rewrites the molecule the comparisons above read.
+    tally.perceived += check_mmff_perception_(*molecule, smiles, perception_reporter, reporter, perception);
 }
 
 /** Narrate where the corpus lines went, naming each refusal with the status that refused it. */
 static void announce_corpus_tally_(descriptor_tally_t const &tally) {
-    fmt::print("NOTE descriptor_corpus molecules={}", tally.compared);
+    fmt::print("NOTE descriptor_corpus molecules={} mmff_perceived={}", tally.compared, tally.perceived);
     for (std::size_t status = 0; status < sft::conformer_status_count_k; ++status) {
         if (tally.refused[status] == 0) continue; // a refusal nothing in this corpus reached
         fmt::print(" {}={}", sft::conformer_status_name(static_cast<sft::conformer_status_t>(status)),
@@ -255,11 +346,19 @@ int main(int argc, char **argv) {
 
     sftest::diagnostic_reporter_t reporter {"rdkit", "ours"};
     reporter.limit_printed_lines(max_printed_lines_k);
+    // Its own reporter, because the two operands here are one descriptor before and after a pass of ours,
+    // and calling either of them "rdkit" would misname the thing that is being asserted.
+    sftest::diagnostic_reporter_t perception_reporter {"before", "after"};
+    perception_reporter.limit_printed_lines(max_printed_lines_k);
     sftest::descriptor_scratch_t scratch;
+    sftest::perception_scratch_t perception;
 
-    for (auto const &smiles : sftest::standard_test_smiles()) sftest::check_builtin_(smiles, reporter, scratch);
-    for (auto const &smiles : sftest::stress_test_smiles_()) sftest::check_builtin_(smiles, reporter, scratch);
+    for (auto const &smiles : sftest::standard_test_smiles())
+        sftest::check_builtin_(smiles, reporter, scratch, perception_reporter, perception);
+    for (auto const &smiles : sftest::stress_test_smiles_())
+        sftest::check_builtin_(smiles, reporter, scratch, perception_reporter, perception);
     reporter.summarize("descriptor_builtin");
+    perception_reporter.summarize("mmff_perception_builtin");
 
     if (selection.knob == sftest::corpus_knob_t::named_k) {
         // Naming a corpus is a request to validate against it, so a path that does not open is a failure
@@ -271,13 +370,18 @@ int main(int argc, char **argv) {
         fmt::println("{}: corpus {}, {} SMILES", test_name_k, selection.path, fmt::group_digits(corpus.size()));
 
         sftest::descriptor_tally_t tally;
-        for (auto const &smiles : corpus) sftest::check_corpus_line_(smiles, reporter, scratch, tally);
+        for (auto const &smiles : corpus)
+            sftest::check_corpus_line_(smiles, reporter, scratch, tally, perception_reporter, perception);
         sftest::announce_corpus_tally_(tally);
         reporter.summarize("descriptor_corpus");
+        perception_reporter.summarize("mmff_perception_corpus");
     }
 
     if (!reporter.passed())
         return sftest::report_fail(test_name_k, "{} mismatches over {} comparisons", reporter.mismatch_count(),
                                    reporter.comparison_count());
+    if (!perception_reporter.passed())
+        return sftest::report_fail(test_name_k, "{} of {} MMFF perception comparisons moved a field ETKDG reads",
+                                   perception_reporter.mismatch_count(), perception_reporter.comparison_count());
     return sftest::report_pass(test_name_k);
 }

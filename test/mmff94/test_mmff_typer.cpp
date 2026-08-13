@@ -10,12 +10,13 @@
  *  kekulized with their aromatic flags left standing, which is the only state where the descriptor's two
  *  aromatic bond flags disagree and so the only state that tells the right one from the wrong one.
  *
- *  The two typers do @b not automatically read the same aromaticity, and the order of two lines is what
- *  makes them. Constructing `MMFFMolProperties` kekulizes the molecule and re-marks only the rings MMFF's
- *  own pi-electron count accepts, in place; every section here therefore constructs it @b before it
- *  snapshots the descriptor, so both sides read one molecule. Presetting `_MMFFSanitized` instead
- *  suppresses that pass on the baseline as well, which pins the oracle to whatever the native typer
- *  already answers and is how a divergence over 9 % of PubChem read as an exact match.
+ *  The two typers do @b not automatically read the same aromaticity, and this suite runs the sequence the
+ *  preprocess-step runs rather than one arranged to agree: the descriptor is built from the parser's
+ *  perception, `fill_mmff_perception` then lays MMFF's onto its own fields, and the native typer reads
+ *  those. The oracle comes from a second parse of the same SMILES, so `MMFFMolProperties` perceives it
+ *  exactly once as it perceives each side once — `MolOps::setMMFFAromaticity` is not idempotent on every
+ *  molecule, and perceiving the subject twice would compare two different molecules. Skipping the
+ *  perception on the subject entirely is what left a divergence over 9 % of PubChem in the shipped path.
  */
 
 #include <cstddef> // `std::size_t`
@@ -100,6 +101,25 @@ struct native_typing_scratch_t {
     }
 };
 
+/** Parse one corpus line the way the pipeline does, or nothing if it refuses or outgrows the sweep. */
+static std::unique_ptr<RDKit::RWMol> parse_for_typing_(std::string const &smiles) {
+    std::unique_ptr<RDKit::RWMol> molecule;
+    try {
+        RDKit::SmilesParserParams parser_params;
+        parser_params.sanitize = true;
+        parser_params.removeHs = false;
+        parser_params.strictCXSMILES = false;
+        molecule.reset(RDKit::SmilesToMol(smiles, parser_params));
+        if (!molecule) return nullptr;
+        RDKit::MolOps::addHs(*molecule);
+    }
+    catch (...) {
+        return nullptr;
+    }
+    if (molecule->getNumAtoms() > 128) return nullptr; // beyond what this sweep samples
+    return molecule;
+}
+
 /**
  *  @brief Type one SMILES both ways and fold the outcome into @p tally.
  *
@@ -109,34 +129,20 @@ struct native_typing_scratch_t {
  */
 static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t const &tables,
                       typer_reporters_t &reporters, native_typing_scratch_t &scratch, typer_tally_t &tally) {
-    std::unique_ptr<RDKit::RWMol> molecule;
-    try {
-        RDKit::SmilesParserParams parser_params;
-        parser_params.sanitize = true;
-        parser_params.removeHs = false;
-        parser_params.strictCXSMILES = false;
-        molecule.reset(RDKit::SmilesToMol(smiles, parser_params));
-    }
-    catch (...) {
-        return;
-    }
-    if (!molecule) return; // the parser refused it
-    try {
-        RDKit::MolOps::addHs(*molecule);
-    }
-    catch (...) {
-        return;
-    }
-    if (molecule->getNumAtoms() > 128) return; // beyond the descriptor's fixed capacity
-
-    // RDKit baseline, constructed before the descriptor is snapshotted because the constructor
-    // rewrites the molecule into MMFF's own aromatic perception. Both sides then read one molecule.
-    RDKit::MMFF::MMFFMolProperties props(*molecule);
-    if (!props.isValid()) return; // RDKit cannot type it either, so there is nothing to compare
+    std::unique_ptr<RDKit::RWMol> molecule = parse_for_typing_(smiles);
+    if (!molecule) return; // the parser refused it, or it is beyond the descriptor's fixed capacity
 
     sft::molecule_descriptor_t descriptor;
     // an element or a bond order we do not carry
     if (sft::build_descriptor(*molecule, descriptor) != sft::conformer_status_t::success_k) return;
+    sft::fill_mmff_perception(*molecule, descriptor);
+
+    // The oracle, on its own parse so that each side is perceived exactly once.
+    std::unique_ptr<RDKit::RWMol> reference = parse_for_typing_(smiles);
+    if (!reference) return;
+    RDKit::MMFF::MMFFMolProperties props(*reference);
+    if (!props.isValid()) return; // RDKit cannot type it either, so there is nothing to compare
+
     scratch.resize(descriptor.num_atoms);
     sfmmff::native_compute_mmff_atom_types(descriptor, scratch.atom_types);
     sfmmff::native_compute_mmff_formal_charges(descriptor, scratch.atom_types, scratch.formal_charges);
@@ -169,12 +175,12 @@ static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t c
  *  @brief Compare every MMFF bond type on a molecule whose aromatic bonds carry a Kekulé order.
  *
  *  `Kekulize` with `markAtomsBonds` false hands each aromatic bond an integer order and leaves
- *  `getIsAromatic()` set, which is the one state where `bond_flag_aromatic_k` and
- *  `bond_flag_order_aromatic_k` disagree — the plain flag is set, the order flag is not, and the order
- *  is 1. RDKit's gate at `AtomTyper.cpp:2470` is `getBondType() == Bond::SINGLE`, so such a bond is a
- *  single bond to RDKit and `native_get_mmff_bond_type` reproduces that only while it reads the order
- *  flag. Reading the plain aromatic flag instead drops every one of them to type 0, and on this probe
- *  set that is three to six wrong bonds per molecule.
+ *  `getIsAromatic()` set, which is the one state where `bond_flag_aromatic_k` and `mmff_bond_type`
+ *  disagree — the flag is set and the type is `mmff_bond_single_k`. RDKit's gate at `AtomTyper.cpp:2470`
+ *  is `getBondType() == Bond::SINGLE`, so such a bond is a single bond to RDKit and
+ *  `native_get_mmff_bond_type` reproduces that only while it reads the bond type. Reading the plain
+ *  aromatic flag instead drops every one of them to type 0, and on this probe set that is three to six
+ *  wrong bonds per molecule.
  *
  *  Order of operations is what makes both sides read one molecule. `MMFFMolProperties` types the atoms
  *  and restores aromatic bond @b orders on the rings MMFF accepts, so the Kekulé structure is laid down
@@ -208,13 +214,12 @@ static std::size_t test_kekulized_bond_types_(std::string const &smiles, sfparam
 
     std::size_t divergent_bonds = 0;
     for (std::uint32_t bond_index = 0; bond_index < descriptor.num_bonds; ++bond_index) {
-        std::uint8_t const flags = descriptor.bond_flags[bond_index];
-        bool const aromatic = (flags & sft::bond_flag_aromatic_k) != 0;
-        bool const order_aromatic = (flags & sft::bond_flag_order_aromatic_k) != 0;
-        divergent_bonds += aromatic && !order_aromatic;
+        bool const aromatic = (descriptor.bond_flags[bond_index] & sft::bond_flag_aromatic_k) != 0;
+        std::uint8_t const mmff_bond_type = descriptor.mmff_bond_type[bond_index];
+        divergent_bonds += aromatic && mmff_bond_type != sft::mmff_bond_aromatic_k;
         reporter
-            .mismatch("mmff_bond_type", "smiles={} bond={} order={} aromatic={} order_aromatic={} types={},{}", smiles,
-                      bond_index, descriptor.bond_order[bond_index], aromatic ? 1 : 0, order_aromatic ? 1 : 0,
+            .mismatch("mmff_bond_type", "smiles={} bond={} order={} aromatic={} mmff_bond_type={} types={},{}", smiles,
+                      bond_index, descriptor.bond_order[bond_index], aromatic ? 1 : 0, mmff_bond_type,
                       scratch.atom_types[descriptor.bond_atom_i[bond_index]],
                       scratch.atom_types[descriptor.bond_atom_j[bond_index]])
             .field("bond_type", props.getMMFFBondType(molecule->getBondWithIdx(bond_index)),
