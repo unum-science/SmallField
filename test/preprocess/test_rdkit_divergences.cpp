@@ -38,6 +38,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
 
+#include <iterator>    // `std::size`
 #include <memory>      // `std::unique_ptr`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
@@ -101,8 +102,9 @@ static std::string_view divergence_reach_reason(divergence_reach_t reach) noexce
     case divergence_reach_t::topology_does_not_match_kind_k: return "bond separation is not the kind's";
     case divergence_reach_t::no_such_torsion_k: return "no experimental torsion spans those atoms";
     case divergence_reach_t::descriptor_refused_k: return "build_descriptor refused the molecule";
-    default: return "no measurement for that kind";
+    case divergence_reach_t::no_measurement_for_kind_k: return "no measurement for that kind";
     }
+    return "unrecorded reach outcome";
 }
 
 /** Both sides of one row, as measured now. */
@@ -157,14 +159,22 @@ static void read_bounds_pair_(std::vector<scalar_type_> const &flat, std::uint32
     out[1] = static_cast<float>(flat[row * num_atoms + column]);
 }
 
-/** How many bonds apart a pair must be for each bounds kind; anything else is a mislabelled row. */
-static std::uint8_t bounds_kind_separation_(divergence_kind_t kind) noexcept {
-    switch (kind) {
-    case divergence_kind_t::bounds_1_2_k: return 1;
-    case divergence_kind_t::bounds_1_3_k: return 2;
-    default: return 3;
-    }
-}
+/**
+ *  @brief The pairwise bounds kind each bond separation sorts a pair into, indexed by `hops - 1`.
+ *
+ *  One table read in one direction is the whole relation: the rescan reads it to label a pair it found,
+ *  and a registry row is checked by reading it and comparing against the kind the row declares. An
+ *  inverse table would be a second copy of the same three facts with nothing to notice them disagreeing.
+ */
+static constexpr divergence_kind_t bounds_kinds_by_separation_k[] = {
+    divergence_kind_t::bounds_1_2_k,
+    divergence_kind_t::bounds_1_3_k,
+    divergence_kind_t::bounds_1_4_k,
+};
+
+/** Widest separation the table above labels, taken from it so a guard and the table cannot disagree. */
+static constexpr std::uint8_t widest_labelled_separation_k = static_cast<std::uint8_t>(
+    std::size(bounds_kinds_by_separation_k));
 
 /**
  *  @brief Fill both bounds matrices and the hop matrix for @p molecule.
@@ -195,7 +205,8 @@ static divergence_reach_t measure_bounds_row_(rdkit_divergence_row_t const &row,
 
     divergence_reach_t const filled = fill_bounds_scratch_(molecule, scratch);
     if (filled != divergence_reach_t::measured_k) return filled;
-    if (scratch.hops[first_atom * num_atoms + second_atom] != bounds_kind_separation_(row.kind))
+    std::uint8_t const hops = scratch.hops[first_atom * num_atoms + second_atom];
+    if (hops == 0 || hops > widest_labelled_separation_k || bounds_kinds_by_separation_k[hops - 1] != row.kind)
         return divergence_reach_t::topology_does_not_match_kind_k;
 
     read_bounds_pair_(scratch.rdkit_bounds, num_atoms, first_atom, second_atom, measurement.rdkit_values);
@@ -324,8 +335,12 @@ static divergence_reach_t measure_row_(rdkit_divergence_row_t const &row, diverg
     case divergence_kind_t::bounds_1_3_k:
     case divergence_kind_t::bounds_1_4_k: return measure_bounds_row_(row, *molecule, scratch, measurement);
     case divergence_kind_t::torsion_preference_k: return measure_torsion_row_(row, *molecule, measurement);
-    default: return divergence_reach_t::no_measurement_for_kind_k;
+    // Neither kind has a measurement written above, so a row carrying one is reported unreachable
+    // rather than silently satisfied.
+    case divergence_kind_t::chiral_volume_k:
+    case divergence_kind_t::smoothing_consistency_k: return divergence_reach_t::no_measurement_for_kind_k;
     }
+    return divergence_reach_t::no_measurement_for_kind_k;
 }
 
 #pragma endregion Measurement
@@ -376,7 +391,7 @@ struct divergence_reporters_t {
 
 /** The two atom-index columns a row's diagnostic lines carry, as one `key=value` fragment. */
 static std::string row_atom_keys_(rdkit_divergence_row_t const &row) {
-    if (divergence_atom_arity(row.kind) == 4)
+    if (divergence_kind_traits(row.kind).atom_arity == 4)
         return fmt::format("atoms={},{},{},{}", row.atoms[0], row.atoms[1], row.atoms[2], row.atoms[3]);
     return fmt::format("pair={},{}", row.atoms[0], row.atoms[1]);
 }
@@ -407,7 +422,7 @@ static std::size_t refuse_flapping_rows_(custd::span<rdkit_divergence_row_t cons
     for (auto const &row : rows) {
         float const noise_band = row.rdkit_tolerance + row.our_tolerance;
         std::size_t const before = reporter.mismatch_count();
-        reporter.mismatch(divergence_kind_name(row.kind), "smiles={} {}", row.smiles, row_atom_keys_(row))
+        reporter.mismatch(divergence_kind_traits(row.kind).name, "smiles={} {}", row.smiles, row_atom_keys_(row))
             .field("rdkit_tolerance", 0.0f, row.rdkit_tolerance, strictly_positive)
             .field("our_tolerance", 0.0f, row.our_tolerance, strictly_positive)
             .field("divergence_threshold", noise_band, row.divergence_threshold, strictly_greater);
@@ -428,14 +443,15 @@ static std::size_t refuse_flapping_rows_(custd::span<rdkit_divergence_row_t cons
 static void check_row_(rdkit_divergence_row_t const &row, std::uint32_t installed_release_code,
                        divergence_scratch_t &scratch, divergence_reporters_t &reporters, registry_tally_t &tally) {
     ++tally.rows;
+    divergence_kind_traits_t const traits = divergence_kind_traits(row.kind);
     std::string const keys = row_atom_keys_(row);
-    std::string_view const subject = divergence_kind_name(row.kind);
+    std::string_view const subject = traits.name;
 
     divergence_expectation_t const expectation = divergence_expectation(row, installed_release_code);
     if (expectation == divergence_expectation_t::predates_installed_release_k) {
         ++tally.predating;
         reporters.drift.note(subject, "smiles={} {} upstream={}", row.smiles, keys, row.upstream)
-            .field("release", rdkit_release_code(row.since), installed_release_code);
+            .field("release", static_cast<std::uint32_t>(row.since), installed_release_code);
         return;
     }
 
@@ -451,9 +467,6 @@ static void check_row_(rdkit_divergence_row_t const &row, std::uint32_t installe
     }
     ++tally.measured;
 
-    divergence_value_names_t const names = divergence_value_names(row.kind);
-    char const *const slot_names[2] = {names.first, names.second};
-
     auto const within = [](float tolerance) {
         return [tolerance](float recorded, float measured) { return !(std::fabs(measured - recorded) > tolerance); };
     };
@@ -461,9 +474,9 @@ static void check_row_(rdkit_divergence_row_t const &row, std::uint32_t installe
                                                 row.upstream);
     auto our_drift = reporters.drift.mismatch(subject, "smiles={} {} side=ours", row.smiles, keys);
     for (std::size_t slot = 0; slot < 2; ++slot) {
-        rdkit_drift.field(slot_names[slot], row.rdkit_values[slot], measurement.rdkit_values[slot],
+        rdkit_drift.field(traits.value_names[slot], row.rdkit_values[slot], measurement.rdkit_values[slot],
                           within(row.rdkit_tolerance));
-        our_drift.field(slot_names[slot], row.our_values[slot], measurement.our_values[slot],
+        our_drift.field(traits.value_names[slot], row.our_values[slot], measurement.our_values[slot],
                         within(row.our_tolerance));
     }
 
@@ -471,9 +484,9 @@ static void check_row_(rdkit_divergence_row_t const &row, std::uint32_t installe
         // The row is retired: upstream now agrees, and the assertion that used to demand a difference
         // demands its absence instead, so the fix cannot silently regress.
         auto agreement = reporters.disagreement.mismatch(subject, "smiles={} {} fixed_in={}", row.smiles, keys,
-                                                         rdkit_release_code(row.fixed_in));
+                                                         static_cast<std::uint32_t>(row.fixed_in));
         for (std::size_t slot = 0; slot < 2; ++slot)
-            agreement.field(slot_names[slot], measurement.rdkit_values[slot], measurement.our_values[slot],
+            agreement.field(traits.value_names[slot], measurement.rdkit_values[slot], measurement.our_values[slot],
                             within(row.rdkit_tolerance + row.our_tolerance));
         return;
     }
@@ -488,9 +501,9 @@ static void check_row_(rdkit_divergence_row_t const &row, std::uint32_t installe
         float const deviation = std::fabs(measurement.our_values[slot] - measurement.rdkit_values[slot]);
         if (deviation > row.divergence_threshold) {
             ++apart;
-            divergent.field(slot_names[slot], measurement.rdkit_values[slot], measurement.our_values[slot]);
+            divergent.field(traits.value_names[slot], measurement.rdkit_values[slot], measurement.our_values[slot]);
         }
-        else agreeing.field(slot_names[slot], measurement.rdkit_values[slot], measurement.our_values[slot]);
+        else agreeing.field(traits.value_names[slot], measurement.rdkit_values[slot], measurement.our_values[slot]);
     }
     auto const at_least = [](std::size_t minimum, std::size_t actual) { return actual >= minimum; };
     reporters.drift.mismatch(subject, "smiles={} {} threshold={:.3g}", row.smiles, keys, row.divergence_threshold)
@@ -523,15 +536,6 @@ static constexpr float determined_spread_k = 0.6f;
  */
 static constexpr float scan_threshold_k = 0.5f;
 
-/** The kind a bond separation sorts a pair into. */
-static divergence_kind_t bounds_kind_for_separation_(std::uint8_t hops) noexcept {
-    switch (hops) {
-    case 1: return divergence_kind_t::bounds_1_2_k;
-    case 2: return divergence_kind_t::bounds_1_3_k;
-    default: return divergence_kind_t::bounds_1_4_k;
-    }
-}
-
 /** Whether some registry row already explains this molecule's pair at this kind. */
 static bool covered_by_registry_(custd::span<rdkit_divergence_row_t const> rows, std::string const &smiles,
                                  divergence_kind_t kind, std::uint32_t first_atom, std::uint32_t second_atom) {
@@ -549,7 +553,7 @@ static void print_candidate_row_(std::string const &smiles, divergence_kind_t ki
                                  std::uint32_t second_atom, divergence_measurement_t const &measurement,
                                  std::uint32_t installed_release_code) {
     fmt::println("    {{.smiles = \"{}\",", smiles);
-    fmt::println("     .kind = divergence_kind_t::{}_k,", divergence_kind_name(kind));
+    fmt::println("     .kind = divergence_kind_t::{}_k,", divergence_kind_traits(kind).name);
     fmt::println("     .atoms = {{{}, {}, 0, 0}},", first_atom, second_atom);
     fmt::println("     .rdkit_values = {{{}f, {}f}},", measurement.rdkit_values[0], measurement.rdkit_values[1]);
     fmt::println("     .our_values = {{{}f, {}f}},", measurement.our_values[0], measurement.our_values[1]);
@@ -601,7 +605,8 @@ static void rescan_molecule_(std::string const &smiles, custd::span<rdkit_diverg
     for (std::uint32_t first_atom = 0; first_atom < num_atoms; ++first_atom) {
         for (std::uint32_t second_atom = first_atom + 1; second_atom < num_atoms; ++second_atom) {
             std::uint8_t const hops = scratch.hops[first_atom * num_atoms + second_atom];
-            if (hops == 0 || hops > 3) continue; // beyond 1-4 both sides only bracket, so nothing to compare
+            // Beyond 1-4 both sides only bracket the pair, so there is nothing to compare.
+            if (hops == 0 || hops > widest_labelled_separation_k) continue;
 
             divergence_measurement_t measurement;
             read_bounds_pair_(scratch.rdkit_bounds, num_atoms, first_atom, second_atom, measurement.rdkit_values);
@@ -615,15 +620,14 @@ static void rescan_molecule_(std::string const &smiles, custd::span<rdkit_diverg
                 float const deviation = std::fabs(measurement.our_values[slot] - measurement.rdkit_values[slot]);
                 if (deviation > widest) widest = deviation;
             }
-            divergence_kind_t const kind = bounds_kind_for_separation_(hops);
+            divergence_kind_t const kind = bounds_kinds_by_separation_k[hops - 1];
+            std::string_view const subject = divergence_kind_traits(kind).name;
 
             // Every determined pair is a comparison, whether or not it disagrees: a rescan that
             // silently looked at nothing and a rescan that found nothing must not read alike.
             bool const explained = widest <= scan_threshold_k ||
                                    covered_by_registry_(rows, smiles, kind, first_atom, second_atom);
-            reporter
-                .mismatch(divergence_kind_name(kind), "smiles={} pair={},{} widest={:.3g}", smiles, first_atom,
-                          second_atom, widest)
+            reporter.mismatch(subject, "smiles={} pair={},{} widest={:.3g}", smiles, first_atom, second_atom, widest)
                 .field("explained", true, explained, exactly_equal);
             if (explained) {
                 if (widest <= scan_threshold_k && widest > tally.widest_within_floor)
@@ -632,8 +636,8 @@ static void rescan_molecule_(std::string const &smiles, custd::span<rdkit_diverg
             }
 
             ++tally.unlisted;
-            fmt::println("Unlisted {} disagreement on {} between atoms {} and {}; the row it would take:",
-                         divergence_kind_name(kind), smiles, first_atom, second_atom);
+            fmt::println("Unlisted {} disagreement on {} between atoms {} and {}; the row it would take:", subject,
+                         smiles, first_atom, second_atom);
             print_candidate_row_(smiles, kind, first_atom, second_atom, measurement, installed_release_code);
         }
     }

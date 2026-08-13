@@ -89,34 +89,20 @@ static constexpr rdkit_divergence_row_t divergence_rows_k[] = {
 
 #pragma endregion Divergence rows
 
-std::uint8_t divergence_atom_arity(divergence_kind_t kind) noexcept {
+divergence_kind_traits_t divergence_kind_traits(divergence_kind_t kind) noexcept {
     switch (kind) {
-    case divergence_kind_t::chiral_volume_k:
-    case divergence_kind_t::torsion_preference_k: return 4;
-    default: return 2;
+    case divergence_kind_t::bounds_1_2_k: return {"bounds_1_2", {"lower_bound", "upper_bound"}, 2};
+    case divergence_kind_t::bounds_1_3_k: return {"bounds_1_3", {"lower_bound", "upper_bound"}, 2};
+    case divergence_kind_t::bounds_1_4_k: return {"bounds_1_4", {"lower_bound", "upper_bound"}, 2};
+    case divergence_kind_t::chiral_volume_k: return {"chiral_volume", {"target_volume", "enforced_volume"}, 4};
+    case divergence_kind_t::torsion_preference_k:
+        return {"torsion_preference", {"energy_delta", "torsion_gradient"}, 4};
+    case divergence_kind_t::smoothing_consistency_k:
+        return {"smoothing_consistency", {"lower_bound", "upper_bound"}, 2};
     }
+    // A kind byte outside the enum names itself, so a diagnostic can never borrow a real kind's labels.
+    return {"unknown_kind", {"first_value", "second_value"}, 2};
 }
-
-std::string_view divergence_kind_name(divergence_kind_t kind) noexcept {
-    switch (kind) {
-    case divergence_kind_t::bounds_1_2_k: return "bounds_1_2";
-    case divergence_kind_t::bounds_1_3_k: return "bounds_1_3";
-    case divergence_kind_t::bounds_1_4_k: return "bounds_1_4";
-    case divergence_kind_t::chiral_volume_k: return "chiral_volume";
-    case divergence_kind_t::torsion_preference_k: return "torsion_preference";
-    default: return "smoothing_consistency";
-    }
-}
-
-divergence_value_names_t divergence_value_names(divergence_kind_t kind) noexcept {
-    switch (kind) {
-    case divergence_kind_t::chiral_volume_k: return {"target_volume", "enforced_volume"};
-    case divergence_kind_t::torsion_preference_k: return {"energy_delta", "torsion_gradient"};
-    default: return {"lower_bound", "upper_bound"};
-    }
-}
-
-std::uint32_t rdkit_release_code(rdkit_release_t release) noexcept { return static_cast<std::uint32_t>(release); }
 
 std::uint32_t rdkit_release_code_from_version(std::string_view version_text) noexcept {
     // `2026.03.5`: four digits, a dot, two digits. Anything else is a shape this table cannot place.
@@ -135,11 +121,12 @@ custd::span<rdkit_divergence_row_t const> rdkit_divergence_rows() { return diver
 
 divergence_expectation_t divergence_expectation(rdkit_divergence_row_t const &row,
                                                 std::uint32_t installed_release_code) noexcept {
-    if (installed_release_code < rdkit_release_code(row.since))
+    if (installed_release_code < static_cast<std::uint32_t>(row.since))
         return divergence_expectation_t::predates_installed_release_k;
     if (row.fixed_in == rdkit_release_t::not_yet_fixed_k) return divergence_expectation_t::still_diverges_k;
-    return installed_release_code >= rdkit_release_code(row.fixed_in) ? divergence_expectation_t::fixed_upstream_k
-                                                                      : divergence_expectation_t::still_diverges_k;
+    return installed_release_code >= static_cast<std::uint32_t>(row.fixed_in)
+               ? divergence_expectation_t::fixed_upstream_k
+               : divergence_expectation_t::still_diverges_k;
 }
 
 } // namespace smallfield::tests

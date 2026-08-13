@@ -60,20 +60,24 @@ enum class divergence_kind_t : std::uint8_t {
     smoothing_consistency_k,
 };
 
-/** How many entries of a row's `atoms` array the kind gives meaning to. */
-std::uint8_t divergence_atom_arity(divergence_kind_t kind) noexcept;
-
-/** The literal a kind prints as, which is also the subject its diagnostic lines open with. */
-std::string_view divergence_kind_name(divergence_kind_t kind) noexcept;
-
-/** What a kind calls its two value slots, which is what a diagnostic line's `field=` carries. */
-struct divergence_value_names_t {
-    char const *first;
-    char const *second;
+/** Everything a kind fixes about the row carrying it, which is the whole of that row's shape. */
+struct divergence_kind_traits_t {
+    /** The literal the kind prints as, which is also the subject its diagnostic lines open with. */
+    std::string_view name;
+    /** What the kind calls its two value slots, in the order a row stores them; a line's `field=`. */
+    char const *value_names[2];
+    /** How many entries of a row's `atoms` array the kind gives meaning to. */
+    std::uint8_t atom_arity;
 };
 
-/** The two slot names belonging to @p kind, in the order the row stores them. */
-divergence_value_names_t divergence_value_names(divergence_kind_t kind) noexcept;
+/**
+ *  @brief The name, the two slot names and the atom arity belonging to @p kind.
+ *
+ *  Exhaustive over `divergence_kind_t` and carrying no `default:`, so a kind appended to that enum is a
+ *  `-Wswitch` warning here rather than three wrong labels inherited in silence. All three travel
+ *  together because a kind fixes all three at once, and a row mislabelled in one is mislabelled in all.
+ */
+divergence_kind_traits_t divergence_kind_traits(divergence_kind_t kind) noexcept;
 
 /**
  *  @brief An RDKit release, as the `YYYYMM` its version string opens with.
@@ -87,9 +91,6 @@ enum class rdkit_release_t : std::uint32_t {
     release_2025_09_k = 202509,
     release_2026_03_k = 202603,
 };
-
-/** The `YYYYMM` a release compares as; asking this of `not_yet_fixed_k` is a caller error. */
-std::uint32_t rdkit_release_code(rdkit_release_t release) noexcept;
 
 /** The `YYYYMM` in an RDKit version string such as `2026.03.5`, or zero when it cannot be read. */
 std::uint32_t rdkit_release_code_from_version(std::string_view version_text) noexcept;
@@ -122,7 +123,7 @@ struct rdkit_divergence_row_t {
     char const *smiles;
     /** Fixes the arity of `atoms` and the meaning of both value slots. */
     divergence_kind_t kind;
-    /** Atom indices into @p smiles after `addHs`; only the first `divergence_atom_arity(kind)` count. */
+    /** Atom indices into @p smiles after `addHs`; only the kind's own `atom_arity` of them count. */
     std::uint8_t atoms[4];
     /** What RDKit produced when the row was last measured. */
     float rdkit_values[2];
