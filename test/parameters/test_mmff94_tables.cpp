@@ -255,10 +255,8 @@ enum class molecule_typing_t {
  */
 static molecule_typing_t append_molecule_keys_into_(RDKit::RWMol &molecule, neighbor_scratch_t &scratch,
                                                     probe_keys_t &keys) {
-    // `MMFFMolProperties` guards only its Kekulize behind `_MMFFSanitized`, and `SmilesToMol` has already
-    // sanitized, so marking the molecule suppresses the redundant pass and nothing else.
-    if (!molecule.hasProp(RDKit::common_properties::_MMFFSanitized))
-        molecule.setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
+    // The constructor kekulizes @p molecule and re-marks only the rings MMFF's own pi-electron count
+    // accepts, so the keys below are the ones a production force field asks the tables for.
     RDKit::MMFF::MMFFMolProperties properties(molecule);
     if (!properties.isValid()) return molecule_typing_t::refused_k;
 

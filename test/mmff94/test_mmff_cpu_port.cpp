@@ -444,9 +444,8 @@ static void rdkit_direct_extract_(RDKit::ROMol &molecule, sft::molecule_descript
     out.mmff_oops.clear();
     out.mmff_stretchbends.clear();
 
-    if (!molecule.hasProp(RDKit::common_properties::_MMFFSanitized)) {
-        molecule.setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
-    }
+    // `prepare_one_` already put the molecule through this constructor, so MMFF's own aromatic
+    // perception is what @p descriptor was snapshotted from and a second construction changes nothing.
     RDKit::MMFF::MMFFMolProperties props(molecule);
     if (!props.isValid()) return;
     std::uint32_t const num_atoms = descriptor.num_atoms;
@@ -645,15 +644,15 @@ static molecule_intake_t prepare_one_(std::string_view smiles, molecule_under_te
 
     std::uint32_t const num_atoms = subject.molecule->getNumAtoms();
     if (num_atoms > max_atoms_compared_k) return molecule_intake_t::above_atom_ceiling_k;
-    if (sft::build_descriptor(*subject.molecule, subject.descriptor) != sft::conformer_status_t::success_k)
-        return molecule_intake_t::undescribable_k;
 
     // Both the oracle and the hybrid path read their atom types and charges here, so a molecule MMFF94
-    // cannot type has no reference to compare the native tables against.
-    if (!subject.molecule->hasProp(RDKit::common_properties::_MMFFSanitized))
-        subject.molecule->setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
+    // cannot type has no reference to compare the native tables against. Constructing the properties
+    // rewrites the molecule into MMFF's own aromatic perception, so it precedes the descriptor: the
+    // native extractors would otherwise read the parser's rings while the types describe MMFF's.
     RDKit::MMFF::MMFFMolProperties props(*subject.molecule);
     if (!props.isValid()) return molecule_intake_t::untypable_k;
+    if (sft::build_descriptor(*subject.molecule, subject.descriptor) != sft::conformer_status_t::success_k)
+        return molecule_intake_t::undescribable_k;
 
     subject.atom_types.assign(num_atoms, std::uint8_t {0});
     subject.charges.assign(num_atoms, 0.0f);

@@ -92,8 +92,12 @@ static sfapi::conformer_status_t admit_molecule_(std::string_view smiles, std::u
     parse_options.max_atoms = max_atoms;
     smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
     if (parsed.status != sfapi::conformer_status_t::success_k) return parsed.status;
-    if (!RDKit::MMFF::MMFFMolProperties(*parsed.molecule).isValid())
-        return sfapi::conformer_status_t::unsupported_element_k;
+
+    // Named rather than a temporary because constructing it rewrites the molecule that is moved out
+    // below: it kekulizes and re-marks aromaticity by MMFF's own pi-electron count, so the molecule
+    // the caller receives is the one MMFF typed rather than the one the parser produced.
+    RDKit::MMFF::MMFFMolProperties mmff_properties(*parsed.molecule);
+    if (!mmff_properties.isValid()) return sfapi::conformer_status_t::unsupported_element_k;
 
     molecule = std::move(parsed.molecule);
     return sfapi::conformer_status_t::success_k;

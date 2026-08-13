@@ -10,11 +10,12 @@
  *  kekulized with their aromatic flags left standing, which is the only state where the descriptor's two
  *  aromatic bond flags disagree and so the only state that tells the right one from the wrong one.
  *
- *  The two typers do @b not automatically read the same aromaticity. `MMFFMolProperties` guards only its
- *  Kekulize behind `_MMFFSanitized` and calls `MolOps::setMMFFAromaticity` unconditionally, so marking a
- *  molecule sanitized suppresses the Kekulize and nothing else. Whichever side snapshots the molecule
- *  before that call sees a different one, and the curated set comes out exact only because none of its
- *  seventeen probes is a molecule whose perception moves.
+ *  The two typers do @b not automatically read the same aromaticity, and the order of two lines is what
+ *  makes them. Constructing `MMFFMolProperties` kekulizes the molecule and re-marks only the rings MMFF's
+ *  own pi-electron count accepts, in place; every section here therefore constructs it @b before it
+ *  snapshots the descriptor, so both sides read one molecule. Presetting `_MMFFSanitized` instead
+ *  suppresses that pass on the baseline as well, which pins the oracle to whatever the native typer
+ *  already answers and is how a divergence over 9 % of PubChem read as an exact match.
  */
 
 #include <cstddef> // `std::size_t`
@@ -128,9 +129,8 @@ static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t c
     }
     if (molecule->getNumAtoms() > 128) return; // beyond the descriptor's fixed capacity
 
-    // RDKit baseline, which uses MMFF-specific aromaticity internally.
-    if (!molecule->hasProp(RDKit::common_properties::_MMFFSanitized))
-        molecule->setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
+    // RDKit baseline, constructed before the descriptor is snapshotted because the constructor
+    // rewrites the molecule into MMFF's own aromatic perception. Both sides then read one molecule.
     RDKit::MMFF::MMFFMolProperties props(*molecule);
     if (!props.isValid()) return; // RDKit cannot type it either, so there is nothing to compare
 
@@ -177,9 +177,9 @@ static void test_one_(std::string const &smiles, sfparam::mmff94_tables_view_t c
  *  set that is three to six wrong bonds per molecule.
  *
  *  Order of operations is what makes both sides read one molecule. `MMFFMolProperties` types the atoms
- *  and then restores aromatic bond @b orders whatever `_MMFFSanitized` says, so the Kekulé structure is
- *  laid down after it and the descriptor is built from the result. `getMMFFBondType` stores no bond
- *  state and reads the `Bond` handed to it, so it sees the same kekulized bond the descriptor did.
+ *  and restores aromatic bond @b orders on the rings MMFF accepts, so the Kekulé structure is laid down
+ *  after it and the descriptor is built from the result. `getMMFFBondType` stores no bond state and reads
+ *  the `Bond` handed to it, so it sees the same kekulized bond the descriptor did.
  *
  *  RDKit's own atom types feed both sides, which leaves the bond gate as the only free variable. The
  *  native typer would answer differently here, and legitimately: it reads the kekulized molecule while
@@ -195,8 +195,6 @@ static std::size_t test_kekulized_bond_types_(std::string const &smiles, sfparam
                                               diagnostic_reporter_t &reporter, native_typing_scratch_t &scratch) {
     std::unique_ptr<RDKit::RWMol> molecule = mol_from_smiles(smiles);
     sf_verify_(molecule != nullptr, ("kekule SMILES must parse: " + smiles).c_str());
-    if (!molecule->hasProp(RDKit::common_properties::_MMFFSanitized))
-        molecule->setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
     RDKit::MMFF::MMFFMolProperties props(*molecule);
     sf_verify_(props.isValid(), ("RDKit must type the kekule probe: " + smiles).c_str());
 

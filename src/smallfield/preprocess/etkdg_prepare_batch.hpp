@@ -493,7 +493,8 @@ static inline void build_mmff_atom_csr_(etkdg_prepared_molecule_t &result, std::
  *  Every MMFF94 array on @p result is emptied on entry, so the destination needs no preparation of
  *  its own and a refusal below carries nothing of the previous molecule forward.
  *
- *  @param[in] molecule RDKit molecule with explicit hydrogens.
+ *  @param[inout] molecule RDKit molecule with explicit hydrogens; the MMFF typing rewrites its
+ *                aromatic perception in place.
  *  @param[in] descriptor Flat descriptor supplying the bond list and the CSR adjacency.
  *  @param[inout] result Prepared molecule; MMFF94 arrays are filled in place.
  *  @return `conformer_status_t::success_k` on success;
@@ -519,11 +520,11 @@ inline smallfield::types::conformer_status_t extract_mmff94_params_via_rdkit(RDK
     result.mmff_interactions.clear();
     result.mmff_atom_offsets.clear();
 
+    // Constructing the properties rewrites @p molecule: it kekulizes, which strips every aromatic
+    // flag `SmilesToMol` set, and then re-marks only the rings MMFF's own pi-electron count accepts.
+    // That pass is what separates a 2-pyridone's amide nitrogen from a pyridinium's, so suppressing
+    // it moves the type and every partial charge on the molecule with it.
     auto &mutable_molecule = const_cast<RDKit::ROMol &>(molecule);
-    // Skip redundant Kekulize inside `MMFFMolProperties` — `SmilesToMol` already sanitized.
-    if (!mutable_molecule.hasProp(RDKit::common_properties::_MMFFSanitized)) {
-        mutable_molecule.setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
-    }
     RDKit::MMFF::MMFFMolProperties mmff_props(mutable_molecule);
 
     std::uint32_t const num_atoms = descriptor.num_atoms;
@@ -818,7 +819,8 @@ inline smallfield::types::conformer_status_t prepare_molecule_into(std::string_v
  *  every other one; where RDKit cannot, the caller rejects it. On both samples above RDKit
  *  rejects every one of them, so this returns `unsupported_element_k` throughout.
  *
- *  @param[in] molecule RDKit molecule with explicit hydrogens, already sanitized.
+ *  @param[inout] molecule RDKit molecule with explicit hydrogens, already sanitized; the typing
+ *                rewrites its aromatic perception in place.
  *  @param[in] num_atoms Atoms in @p molecule.
  *  @param[out] atom_types Filled with one MMFF94 numeric atom type per atom.
  *  @param[out] atom_charges Filled with one MMFF94 partial charge per atom.
@@ -829,11 +831,9 @@ inline smallfield::types::conformer_status_t extract_mmff94_typing_via_rdkit_(RD
                                                                               std::uint32_t num_atoms,
                                                                               std::vector<std::uint8_t> &atom_types,
                                                                               std::vector<float> &atom_charges) {
-    auto &mutable_molecule = const_cast<RDKit::ROMol &>(molecule);
-    // `SmilesToMol` already sanitized, so tell `MMFFMolProperties` to skip its own Kekulize pass.
-    if (!mutable_molecule.hasProp(RDKit::common_properties::_MMFFSanitized))
-        mutable_molecule.setProp(RDKit::common_properties::_MMFFSanitized, 1, true);
-    RDKit::MMFF::MMFFMolProperties properties(mutable_molecule);
+    // The constructor rewrites @p molecule into MMFF's own aromatic perception before it types, so
+    // the answer read back below is the one RDKit's force field would use.
+    RDKit::MMFF::MMFFMolProperties properties(const_cast<RDKit::ROMol &>(molecule));
     if (!properties.isValid()) return smallfield::types::conformer_status_t::unsupported_element_k;
 
     atom_types.resize(num_atoms);
