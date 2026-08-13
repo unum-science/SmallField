@@ -22,6 +22,7 @@
 
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/types/conformer_status.hpp"
+#include "smallfield/types/molecule_descriptor.hpp"
 
 #include "test/test_helpers.hpp"
 #include "test/test_rdkit_reference_helpers.hpp"
@@ -54,6 +55,26 @@ struct element_gate_case_t {
  */
 static constexpr std::size_t atom_cap_k = sfp::max_atoms_per_molecule_k;
 
+/** The ladder below opens one ring-bond label per rung beside the macrocycle's own, and SMILES has
+ *  ninety-nine of them. */
+static_assert(sft::max_rings_k + 11 < 99, "the ring cap outgrew the two-digit ring-bond labels");
+
+/**
+ *  @brief A carbon ladder RDKit perceives exactly @p rings rings in, for probing the ring cap.
+ *
+ *  Two parallel carbon chains walked as one macrocycle — down one side and back up the other — with
+ *  every rung but the last closed by its own ring-bond label. A rung adds two carbons and three
+ *  bonds, so a ladder straddling the ring cap sits under three quarters of the atom cap and the ring
+ *  extent is the only one it can cross.
+ */
+static std::string carbon_ladder_(std::size_t rings) {
+    std::string ladder = "C%99";
+    for (std::size_t rung = 1; rung < rings; ++rung) ladder += fmt::format("C%{}", rung + 10);
+    ladder += "CC"; // The far end, whose two carbons close the last ring against the chain itself.
+    for (std::size_t rung = rings - 1; rung > 0; --rung) ladder += fmt::format("C%{}", rung + 10);
+    return ladder + "C%99";
+}
+
 /** The whole curated corpus: one entry per path the gate can take. */
 static element_gate_case_t const element_gate_cases_k[] = {
     // Happy path — drug-like organic, all MMFF94-supported elements.
@@ -72,15 +93,32 @@ static element_gate_case_t const element_gate_cases_k[] = {
     {"garbage", "not-a-smiles-string-((", sft::conformer_status_t::invalid_smiles_k},
 };
 
-/** The four statuses `prepare_molecule_into` can answer with; anything else means a path went unhandled. */
+/**
+ *  @brief Whether `prepare_molecule_into` is entitled to answer with @p status.
+ *
+ *  Exhaustive over `conformer_status_t` and carrying no `default:`, so a status appended to that
+ *  append-only enum is a `-Wswitch` warning here rather than a refusal this suite blames on the
+ *  molecule that carried it.
+ */
 static bool gate_can_answer_(sft::conformer_status_t status) noexcept {
     switch (status) {
+    // The three refusal points the gate walks: `parse_smiles`, then `build_descriptor` for each of
+    // the flat descriptor's extents, then MMFF typing.
     case sft::conformer_status_t::success_k:
     case sft::conformer_status_t::invalid_smiles_k:
     case sft::conformer_status_t::too_many_atoms_k:
+    case sft::conformer_status_t::too_many_bonds_k:
+    case sft::conformer_status_t::too_many_rings_k:
     case sft::conformer_status_t::unsupported_element_k: return true;
-    default: return false;
+    // Verdicts of stages downstream of the gate — the metric prepass, the warp pipeline and the MMFF
+    // polish — plus the reserved value nothing produces.
+    case sft::conformer_status_t::stereo_failure_k:
+    case sft::conformer_status_t::mmff_unconverged_k:
+    case sft::conformer_status_t::preprocess_timeout_k:
+    case sft::conformer_status_t::bounds_infeasible_k: return false;
     }
+    // A status byte no enumerator claims is nothing the gate answers with, so it borrows no verdict.
+    return false;
 }
 
 #pragma endregion Curated Cases
@@ -126,22 +164,35 @@ static sft::conformer_status_t check_corpus_molecule_(std::string const &smiles,
     return status;
 }
 
+/** One census slot per `conformer_status_t`, plus the trailing slot a byte no enumerator claims falls
+ *  into — which `conformer_status_name` already names `unnamed_status`. */
+static constexpr std::size_t census_slots_k = sft::conformer_status_count_k + 1;
+
 /** Per-status census of a corpus run; the comparison counts belong to the reporter's own section. */
 struct status_census_t {
-    std::size_t accepted = 0;
-    std::size_t unsupported_element = 0;
-    std::size_t too_many_atoms = 0;
-    std::size_t invalid_smiles = 0;
+    /** Indexed by the status itself, so a status appended to the enum counts under its own name
+     *  rather than inflating a neighbour's column. */
+    std::size_t counts[census_slots_k] = {};
 
     void count(sft::conformer_status_t status) noexcept {
-        switch (status) {
-        case sft::conformer_status_t::success_k: ++accepted; break;
-        case sft::conformer_status_t::unsupported_element_k: ++unsupported_element; break;
-        case sft::conformer_status_t::too_many_atoms_k: ++too_many_atoms; break;
-        default: ++invalid_smiles; break;
-        }
+        std::size_t const slot = static_cast<std::size_t>(status);
+        ++counts[slot < sft::conformer_status_count_k ? slot : sft::conformer_status_count_k];
     }
 };
+
+/** One line of `status=count` for every verdict the corpus produced, ending with the molecule count so
+ *  a run that classified nothing cannot read like one that classified everything. */
+static void report_census_(status_census_t const &census) {
+    std::size_t molecules = 0;
+    fmt::print("NOTE element_gate verdicts");
+    for (std::size_t slot = 0; slot < census_slots_k; ++slot) {
+        molecules += census.counts[slot];
+        if (census.counts[slot] == 0) continue;
+        fmt::print(" {}={}", sft::conformer_status_name(static_cast<sft::conformer_status_t>(slot)),
+                   census.counts[slot]);
+    }
+    fmt::println(" molecules={}", molecules);
+}
 
 #pragma endregion Checks
 
@@ -163,14 +214,24 @@ int main(int argc, char **argv) {
 
     for (auto const &probe : sftest::element_gate_cases_k) sftest::check_curated_case_(probe, scratch, reporter);
 
-    // The atom-count cap is a boundary, so it is checked as one: the longest alkane that fits and the
-    // shortest that does not, both named from the library constant rather than from a magic number.
+    // Each descriptor extent the gate refuses on is a boundary, so both are checked as one: the
+    // longest alkane that fits and the shortest that does not, then the widest ladder whose SSSR
+    // rings fit and the narrowest whose rings do not. Every bound is named from its library constant
+    // rather than from a magic number.
+    //
+    // `too_many_bonds_k` gets no case: at four bonds per carbon a molecule under the atom cap tops
+    // out at exactly `max_bonds_k`, so no real molecule crosses it and only a descriptor array bound
+    // is being guarded.
     std::size_t const carbons_that_fit = (sftest::atom_cap_k - 2) / 3;
     std::string const alkane_at_cap(carbons_that_fit, 'C');
     std::string const alkane_over_cap(carbons_that_fit + 1, 'C');
+    std::string const ladder_at_cap = sftest::carbon_ladder_(sft::max_rings_k);
+    std::string const ladder_over_cap = sftest::carbon_ladder_(sft::max_rings_k + 1);
     sftest::element_gate_case_t const cap_cases[] = {
         {"alkane-at-cap", alkane_at_cap, sft::conformer_status_t::success_k},
         {"alkane-over-cap", alkane_over_cap, sft::conformer_status_t::too_many_atoms_k},
+        {"ladder-at-ring-cap", ladder_at_cap, sft::conformer_status_t::success_k},
+        {"ladder-over-ring-cap", ladder_over_cap, sft::conformer_status_t::too_many_rings_k},
     };
     for (auto const &probe : cap_cases) sftest::check_curated_case_(probe, scratch, reporter);
     reporter.summarize("curated");
@@ -191,9 +252,7 @@ int main(int argc, char **argv) {
         sftest::status_census_t census;
         for (auto const &smiles : corpus) census.count(sftest::check_corpus_molecule_(smiles, scratch, reporter));
         reporter.summarize("corpus");
-        fmt::println("  corpus verdicts: {} accepted, {} unsupported element, {} over the atom cap, {} unparsable",
-                     fmt::group_digits(census.accepted), fmt::group_digits(census.unsupported_element),
-                     fmt::group_digits(census.too_many_atoms), fmt::group_digits(census.invalid_smiles));
+        sftest::report_census_(census);
 
         if (!reporter.passed())
             return sftest::report_fail(test_name_k, "corpus violated the gate's invariants over {} comparisons",
