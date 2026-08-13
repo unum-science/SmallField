@@ -28,9 +28,17 @@ __global__ void mmff_energy_eval_kernel(
     sft::mmff94_atom_offsets_t const *atom_offsets, std::uint32_t num_atoms, float *out_energy) {
 
     std::uint32_t const lane = threadIdx.x;
-    sfc::mmff94_energy_functor_t functor {atom_vdw,     atom_charge,    bond_distance, bond_params,
-                                          angle_params, torsion_params, oop_params,    stretchbend_params,
-                                          interactions, atom_offsets,   num_atoms};
+
+    // The pair loop reads the folded table, and the polish kernel folds while it stages, so the
+    // harness stages the same way rather than folding on the host under different rounding.
+    extern __shared__ sft::mmff94_atom_vdw_folded_t shared_atom_vdw[];
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += sfc::warp_size_k)
+        shared_atom_vdw[atom] = sfc::fold_atom_vdw_params_(atom_vdw[atom]);
+    __syncwarp(sfc::full_mask_k);
+
+    sfc::mmff94_energy_functor_t functor {shared_atom_vdw, atom_charge,    bond_distance, bond_params,
+                                          angle_params,    torsion_params, oop_params,    stretchbend_params,
+                                          interactions,    atom_offsets,   num_atoms};
 
     float const energy = functor(positions, gradient, 3 * num_atoms, lane);
     if (lane == 0) *out_energy = energy;
@@ -117,7 +125,8 @@ void gpu_mmff_energy(custd::span<float const> host_positions, std::uint32_t num_
         return;
     }
 
-    mmff_energy_eval_kernel<<<1, sfc::warp_size_k>>>(
+    std::uint32_t const shared_bytes = num_atoms * static_cast<std::uint32_t>(sizeof(sft::mmff94_atom_vdw_folded_t));
+    mmff_energy_eval_kernel<<<1, sfc::warp_size_k, shared_bytes>>>(
         arena.positions.data(), arena.gradient.data(), arena.atom_vdw.data(), arena.atom_charge.data(),
         arena.bond_distance.data(), arena.bonds.data(), arena.angles.data(), arena.torsions.data(), arena.oops.data(),
         arena.stretchbends.data(), arena.interactions.data(), arena.atom_offsets.data(), num_atoms,

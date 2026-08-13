@@ -25,6 +25,7 @@ using smallfield::types::atom_role_third_k;
 using smallfield::types::mmff94_angle_t;
 using smallfield::types::mmff94_atom_interaction_t;
 using smallfield::types::mmff94_atom_offsets_t;
+using smallfield::types::mmff94_atom_vdw_folded_t;
 using smallfield::types::mmff94_atom_vdw_params_t;
 using smallfield::types::mmff94_bond_t;
 using smallfield::types::mmff94_oop_t;
@@ -57,6 +58,15 @@ enum class pair_separation_t : bool { beyond_one_four_k = false, one_four_k = tr
  */
 enum class pair_endpoint_t : bool { mirror_k = false, owning_k = true };
 
+/** Reduce @p params to the pair-invariant factors the nonbonded sweep reads. */
+__device__ __forceinline__ mmff94_atom_vdw_folded_t fold_atom_vdw_params_(mmff94_atom_vdw_params_t const &params) {
+    return {.r_star = params.r_star,
+            .polarizability_numerator = params.g_factor * params.alpha,
+            .polarizability_root = sqrtf(params.alpha * (1.0f / (params.n_effective))),
+            .donor_acceptor = params.donor_acceptor,
+            .padding = {0, 0, 0}};
+}
+
 /**
  *  @brief Compute nonbonded (VdW + electrostatic) energy and gradient contribution for one atom.
  *
@@ -69,19 +79,17 @@ enum class pair_endpoint_t : bool { mirror_k = false, owning_k = true };
  *  @param[in] num_atoms Number of atoms in the molecule.
  *  @param[in] atom Index of the atom this thread is accumulating for.
  *  @param[in] other Other atom participating in the pair.
- *  @param[in] p_atom Per-atom VdW params for @p atom.
- *  @param[in] p_other Per-atom VdW params for @p other.
+ *  @param[in] p_atom Folded per-atom VdW factors for @p atom.
+ *  @param[in] p_other Folded per-atom VdW factors for @p other.
  *  @param[in] charge_product Pre-multiplied q_atom * q_other.
  *  @param[in] separation Whether the pair is 1-4, which scales electrostatics.
  *  @param[in] endpoint Which endpoint speaks for the pair; only the owning one adds energy.
  *  @param[inout] energy Accumulated energy, incremented only for the owning endpoint.
- *  @param[inout] gradient_x Accumulated x-gradient for @p atom.
- *  @param[inout] gradient_y Accumulated y-gradient for @p atom.
- *  @param[inout] gradient_z Accumulated z-gradient for @p atom.
+ *  @param[inout] gradient Accumulated gradient for @p atom.
  */
 __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const *positions, std::uint32_t num_atoms, std::uint32_t atom, std::uint32_t other,
-    mmff94_atom_vdw_params_t const &p_atom, mmff94_atom_vdw_params_t const &p_other, float charge_product,
+    mmff94_atom_vdw_folded_t const &p_atom, mmff94_atom_vdw_folded_t const &p_other, float charge_product,
     pair_separation_t separation, pair_endpoint_t endpoint, float *energy, float3 *gradient) {
 
     // Halgren R* combining rule with donor-suppression clause, plus Slater-Kirkwood epsilon.
@@ -94,10 +102,8 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
 
     float const vdw_radius_squared = vdw_radius_combined * vdw_radius_combined;
     float const vdw_radius_pow6 = vdw_radius_squared * vdw_radius_squared * vdw_radius_squared;
-    float vdw_epsilon = 181.16f * p_atom.g_factor * p_other.g_factor * p_atom.alpha * p_other.alpha *
-                        (1.0f / ((sqrtf(p_atom.alpha * (1.0f / (p_atom.n_effective))) +
-                                  sqrtf(p_other.alpha * (1.0f / (p_other.n_effective)))) *
-                                 vdw_radius_pow6));
+    float vdw_epsilon = 181.16f * p_atom.polarizability_numerator * p_other.polarizability_numerator *
+                        (1.0f / ((p_atom.polarizability_root + p_other.polarizability_root) * vdw_radius_pow6));
 
     // Donor-acceptor scaling (RDKit's scaleVdWParams when DA pairing is detected).
     bool const is_donor_acceptor_pair = (p_atom.donor_acceptor == 2 && p_other.donor_acceptor == 1) ||
@@ -507,7 +513,7 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
  *  @see fire_minimize_
  */
 __device__ __forceinline__ float evaluate_mmff94_energy(
-    mmff94_atom_vdw_params_t const *__restrict__ atom_vdw_params, float const *__restrict__ atom_charge,
+    mmff94_atom_vdw_folded_t const *__restrict__ atom_vdw_params, float const *__restrict__ atom_charge,
     std::uint8_t const *__restrict__ bond_distance, mmff94_bond_t const *__restrict__ bond_params,
     mmff94_angle_t const *__restrict__ angle_params, mmff94_torsion_t const *__restrict__ torsion_params,
     mmff94_oop_t const *__restrict__ oop_params, mmff94_stretchbend_t const *__restrict__ stretchbend_params,
@@ -522,7 +528,7 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
     for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
         float3 gradient_acc {0.0f, 0.0f, 0.0f};
         auto const &offsets = atom_offsets[atom];
-        mmff94_atom_vdw_params_t const p_atom = atom_vdw_params[atom];
+        mmff94_atom_vdw_folded_t const p_atom = atom_vdw_params[atom];
         float const q_atom = atom_charge[atom];
 
         // Nonbonded pairs, enumerated from bond_distance, which a warp BFS over the
@@ -577,7 +583,7 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
  *  by `fire_minimize_`.
  */
 struct mmff94_energy_functor_t {
-    mmff94_atom_vdw_params_t const *__restrict__ atom_vdw_params;
+    mmff94_atom_vdw_folded_t const *__restrict__ atom_vdw_params;
     float const *__restrict__ atom_charge;
     std::uint8_t const *__restrict__ bond_distance;
     mmff94_bond_t const *__restrict__ bond_params;

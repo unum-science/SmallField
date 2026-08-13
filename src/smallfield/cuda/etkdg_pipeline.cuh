@@ -65,6 +65,7 @@ using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::mmff94_angle_t;
 using smallfield::types::mmff94_atom_interaction_t;
 using smallfield::types::mmff94_atom_offsets_t;
+using smallfield::types::mmff94_atom_vdw_folded_t;
 using smallfield::types::mmff94_atom_vdw_params_t;
 using smallfield::types::mmff94_bond_t;
 using smallfield::types::mmff94_oop_t;
@@ -136,11 +137,11 @@ constexpr std::uint32_t compute_pipeline_shared_memory_bytes(std::uint32_t max_a
 /** Compute shared memory bytes for the MMFF polish kernel.
  *
  *  Layout: [positions, velocities, gradient: 3 × 3N × float]
- *          [atom_vdw cache: N × mmff94_atom_vdw_params_t]
+ *          [atom_vdw cache: N × mmff94_atom_vdw_folded_t]
  *          [atom_charge cache: N × float].
  *  No bounds matrix — MMFF94 uses explicit bonded + nonbonded term lists rather
  *  than a pair-distance matrix.
- *  At N=128: 4.5 KB FIRE + 3.5 KB caches = ~8 KB; still leaves comfortable
+ *  At N=128: 4.5 KB FIRE + 2.5 KB caches = 7 KB; still leaves comfortable
  *  occupancy headroom on Hopper / Blackwell (typically reg-cap-bound rather
  *  than shmem-bound). The caches eliminate ~2N² duplicate global reads of
  *  atom_vdw_params[j] / atom_charge[j] per FIRE step.
@@ -151,7 +152,7 @@ constexpr std::uint32_t compute_mmff_polish_shared_memory_bytes(std::uint32_t ma
     std::uint32_t const dimensions_3d = 3 * max_atoms;
     std::uint32_t const fire_bytes = 3 * dimensions_3d * sizeof(float);
     std::uint32_t const atom_vdw_bytes = max_atoms * static_cast<std::uint32_t>(
-                                                         sizeof(smallfield::types::mmff94_atom_vdw_params_t));
+                                                         sizeof(smallfield::types::mmff94_atom_vdw_folded_t));
     std::uint32_t const atom_charge_bytes = max_atoms * static_cast<std::uint32_t>(sizeof(float));
     return fire_bytes + atom_vdw_bytes + atom_charge_bytes;
 }
@@ -495,7 +496,7 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
     // `compute_mmff_polish_shared_memory_bytes` sizes this block at launch from `bin_max_atoms`, and
     // the three pointers below carve it in the order that function assumes.
     extern __shared__ float shared_float[];
-    auto *shared_atom_vdw = reinterpret_cast<mmff94_atom_vdw_params_t *>(shared_float + 9u * bin_max_atoms);
+    auto *shared_atom_vdw = reinterpret_cast<mmff94_atom_vdw_folded_t *>(shared_float + 9u * bin_max_atoms);
     float *shared_atom_charge = reinterpret_cast<float *>(shared_atom_vdw + bin_max_atoms);
 
     // One warp per (molecule, conformer) pair, matching the sibling kernel's index space so
@@ -517,16 +518,12 @@ __global__ __launch_bounds__(32, 4) void mmff_polish_warp_kernel(
 
         auto const refinement_policy = select_refinement_policy_(meta);
 
-        // Stage per-atom params into shmem for this pair.  6 float-words
-        // per atom_vdw entry (24 bytes, aligned 8) + 1 word per atom_charge.
-        // Iterate as a flat float-words sweep so all lanes participate.
+        // Stage per-atom params into shmem for this pair, folding the pair-invariant half of the
+        // combining rules on the way in so the FIRE loop never re-derives it.
         {
             mmff94_atom_vdw_params_t const *global_vdw = mmff_atom_vdw + meta.mmff_atom_vdw_offset;
-            float const *global_vdw_words = reinterpret_cast<float const *>(global_vdw);
-            float *shared_vdw_words = reinterpret_cast<float *>(shared_atom_vdw);
-            std::uint32_t const vdw_words = num_atoms * (sizeof(mmff94_atom_vdw_params_t) / sizeof(float));
-            for (std::uint32_t word = lane; word < vdw_words; word += warp_size_k)
-                shared_vdw_words[word] = global_vdw_words[word];
+            for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k)
+                shared_atom_vdw[atom] = fold_atom_vdw_params_(global_vdw[atom]);
             float const *global_charge = mmff_atom_charge + meta.mmff_atom_charge_offset;
             for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k)
                 shared_atom_charge[atom] = global_charge[atom];

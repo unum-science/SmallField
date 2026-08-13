@@ -254,6 +254,27 @@ struct alignas(8) mmff94_atom_vdw_params_t {
 static_assert(sizeof(mmff94_atom_vdw_params_t) == 24);
 
 /**
+ *  @brief Per-atom MMFF94 VdW parameters reduced to what a nonbonded pair evaluation reads.
+ *
+ *  Every factor in the Halgren and Slater-Kirkwood combining rules that names one atom rather than a
+ *  pair is folded once, when the polish kernel stages the table into shared memory, so the FIRE loop
+ *  stops re-deriving it for every pair on every iteration. `a_scale` is absent because nothing reads
+ *  it, which is where the other eight bytes go.
+ */
+struct alignas(8) mmff94_atom_vdw_folded_t {
+    /** This atom's VdW radius R*. */
+    float r_star;
+    /** `G_i * alpha_i`, this atom's share of the well-depth numerator. */
+    float polarizability_numerator;
+    /** `sqrt(alpha_i / N_i)`, this atom's addend in the well-depth denominator. */
+    float polarizability_root;
+    /** 0 = '-', 1 = 'A' acceptor, 2 = 'D' donor. */
+    std::uint8_t donor_acceptor;
+    std::uint8_t padding[3];
+};
+static_assert(sizeof(mmff94_atom_vdw_folded_t) == 16);
+
+/**
  *  @brief MMFF94 bond stretching term.
  *
  *  @verbatim
