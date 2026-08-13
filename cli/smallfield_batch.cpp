@@ -408,10 +408,61 @@ static thread_budget_t compute_thread_budget_(int user_fallback_override, int us
     return {reader, writer, gpu_runner, fallback};
 }
 
+/** Host time one timed span of the pipeline cost, and the molecules that span walked. */
+struct role_timing_t {
+    std::atomic<std::uint64_t> nanoseconds {0};
+    std::atomic<std::uint64_t> molecules {0};
+};
+
+/**
+ *  @brief Where a run's host time went, one entry per timed span of the outer pipeline.
+ *
+ *  `fallback` and `descriptors` both sit inside the `fallback-role` and are timed apart because they walk
+ *  different populations: `rdkit_fallback` runs on the molecules the GPU refused a slot to, while
+ *  `compute_shape_descriptors_` reparses every molecule of the `coprocessed-batch`. Summed, they are what
+ *  that role costs; apart, they say which of the two is paying for it.
+ */
+struct pipeline_timings_t {
+    role_timing_t reader;
+    role_timing_t gpu_runner;
+    role_timing_t fallback;
+    role_timing_t descriptors;
+    role_timing_t writer;
+};
+
+/**
+ *  @brief Folds one span of work into @p timing when it leaves scope.
+ *
+ *  @p molecules is read at scope exit rather than at entry, so a body that only learns its count on the way
+ *  out — the reader-role, which has to open the shard first — reports the same way as one that knows it up
+ *  front, and must therefore outlive the span.
+ */
+class scoped_role_span_t {
+    role_timing_t &timing_;
+    std::uint64_t const &molecules_;
+    std::chrono::steady_clock::time_point const start_;
+
+  public:
+    scoped_role_span_t(role_timing_t &timing, std::uint64_t const &molecules) noexcept
+        : timing_(timing), molecules_(molecules), start_(std::chrono::steady_clock::now()) {}
+    ~scoped_role_span_t() noexcept {
+        auto const elapsed = std::chrono::steady_clock::now() - start_;
+        timing_.nanoseconds.fetch_add(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+            std::memory_order_relaxed);
+        timing_.molecules.fetch_add(molecules_, std::memory_order_relaxed);
+    }
+
+    scoped_role_span_t(scoped_role_span_t const &) = delete;
+    scoped_role_span_t &operator=(scoped_role_span_t const &) = delete;
+};
+
 /** Cumulative counters shared across pipeline stages. */
 struct progress_counters_t {
     std::atomic<std::uint64_t> molecules_completed {0};
     std::atomic<std::uint64_t> input_files_completed {0};
+    /** Batches the writer-role has finished, which is what says whether any two roles ever overlapped. */
+    std::atomic<std::uint64_t> batches_completed {0};
     /** Pending input-files that reached no output shard, on either end of the pipeline; drives the exit code. */
     std::atomic<std::uint64_t> input_files_failed {0};
     /** Molecules that shipped coordinates but no USRCAT, because their shape context could not be rebuilt. */
@@ -422,7 +473,8 @@ struct progress_counters_t {
 
 static void reader_loop_(custd::span<shard_pair_t const *const> pending, cli_config_t const &config,
                          std::uint32_t batch_target, thread_budget_t const &budget, logger_t const &logger,
-                         handoff<coprocessed_batch_accumulator_t> &output_queue, progress_counters_t &counters) {
+                         handoff<coprocessed_batch_accumulator_t> &output_queue, progress_counters_t &counters,
+                         pipeline_timings_t &timings) {
     omp_set_num_threads(budget.reader);
     coprocessed_batch_accumulator_t accumulator;
 
@@ -432,12 +484,19 @@ static void reader_loop_(custd::span<shard_pair_t const *const> pending, cli_con
             break;
         }
         sfcli::shard_data_t data;
-        // `read_shard` already named the refusal in the log, so this only says the shard was left behind.
-        // It leaves no sentinel either, so `--resume` picks it up again on the next invocation.
-        if (sfcli::read_shard(pair->input_path, config.smiles_column, data, &logger) != sfcli::input_read_t::read_k) {
-            logger.error("skipping {}", pair->input_path.string());
-            counters.input_files_failed.fetch_add(1);
-            continue;
+        std::uint64_t molecules_read = 0;
+        {
+            SF_NVTX_RANGE_COLORED("reader: parquet", 0xC0392B);
+            scoped_role_span_t const timed {timings.reader, molecules_read};
+            // `read_shard` already named the refusal in the log, so this only says the shard was left behind.
+            // It leaves no sentinel either, so `--resume` picks it up again on the next invocation.
+            if (sfcli::read_shard(pair->input_path, config.smiles_column, data, &logger) !=
+                sfcli::input_read_t::read_k) {
+                logger.error("skipping {}", pair->input_path.string());
+                counters.input_files_failed.fetch_add(1);
+                continue;
+            }
+            molecules_read = data.smiles.size();
         }
         accumulator.add_input_file(std::move(data), pair);
 
@@ -539,7 +598,8 @@ static void generate_batch_(sfapi::context_t &gpu_context, cli_config_t const &c
 static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_config_t const &config,
                                              thread_budget_t const &budget, logger_t const &logger,
                                              handoff<coprocessed_batch_accumulator_t> &input_queue,
-                                             handoff<coprocessed_batch_result_t> &output_queue, buffer_pool_t &pool) {
+                                             handoff<coprocessed_batch_result_t> &output_queue, buffer_pool_t &pool,
+                                             pipeline_timings_t &timings) {
     omp_set_num_threads(budget.gpu_runner);
     gpu_runner_outcome_t outcome = gpu_runner_outcome_t::completed_k;
 
@@ -550,6 +610,8 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
         // the reader-role never blocks on a full ring and the whole pipeline can shut down in order.
         if (outcome == gpu_runner_outcome_t::cuda_fault_k) continue;
         SF_NVTX_RANGE_COLORED("gpu_runner: preprocess+launch", 0x2E86C1);
+        std::uint64_t const batch_molecules = accumulator.num_molecules();
+        scoped_role_span_t const timed {timings.gpu_runner, batch_molecules};
 
         auto const batch_start = std::chrono::steady_clock::now();
         std::size_t const buffer_slot = pool.acquire();
@@ -568,8 +630,7 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
             continue;
         }
 
-        std::size_t const total_conformers = static_cast<std::size_t>(accumulator.num_molecules()) *
-                                             config.num_conformers;
+        std::size_t const total_conformers = static_cast<std::size_t>(batch_molecules) * config.num_conformers;
         sfcli::fallback_report_t report;
         fill_retry_indices_into_({buffer.status.data(), total_conformers}, config.num_conformers, buffer.retry_indices,
                                  report);
@@ -653,7 +714,7 @@ static std::uint64_t compute_shape_descriptors_(cli_config_t const &config, thre
 
 static void fallback_loop_(cli_config_t const &config, thread_budget_t const &budget, buffer_pool_t &pool,
                            handoff<coprocessed_batch_result_t> &input_queue,
-                           handoff<coprocessed_batch_result_t> &output_queue) {
+                           handoff<coprocessed_batch_result_t> &output_queue, pipeline_timings_t &timings) {
     omp_set_num_threads(budget.fallback);
     sfapi::conformer_slot_layout_t const layout {config.max_atoms, config.num_conformers};
 
@@ -668,9 +729,13 @@ static void fallback_loop_(cli_config_t const &config, thread_budget_t const &bu
         auto const &accumulator = result.accumulator;
         std::uint64_t const num_molecules = accumulator.num_molecules();
         std::size_t const total_conformers = static_cast<std::size_t>(num_molecules) * config.num_conformers;
-        SF_NVTX_RANGE_COLORED("fallback: rdkit recovery", 0xE67E22);
 
         if (!buffer.retry_indices.empty()) {
+            // Both the range and the span name the recovery alone. The descriptor pass below is the other
+            // half of this role and walks a population two orders of magnitude wider.
+            SF_NVTX_RANGE_COLORED("fallback: rdkit recovery", 0xE67E22);
+            std::uint64_t const retry_molecules = buffer.retry_indices.size();
+            scoped_role_span_t const timed {timings.fallback, retry_molecules};
             sfcli::rdkit_fallback_inputs_t const fallback_inputs {
                 .smiles = accumulator.combined_smiles,
                 .retry_indices = buffer.retry_indices,
@@ -689,6 +754,7 @@ static void fallback_loop_(cli_config_t const &config, thread_budget_t const &bu
 
         {
             SF_NVTX_RANGE_COLORED("postprocess: descriptors+fragments", 0x8E44AD);
+            scoped_role_span_t const timed {timings.descriptors, num_molecules};
             result.molecules_undescribed = compute_shape_descriptors_(config, budget, accumulator, buffer);
         }
 
@@ -826,16 +892,19 @@ static void log_batch_progress_(coprocessed_batch_result_t const &result, logger
 
 static void writer_loop_(cli_config_t const &config, thread_budget_t const &budget, logger_t const &logger,
                          handoff<coprocessed_batch_result_t> &input_queue, buffer_pool_t &pool,
-                         progress_counters_t &counters) {
+                         progress_counters_t &counters, pipeline_timings_t &timings) {
     omp_set_num_threads(budget.writer);
 
     for (;;) {
         auto result = input_queue.receive();
         if (result.item == pipeline_item_t::end_of_stream_k) break;
         SF_NVTX_RANGE_COLORED("writer: parquet", 0x27AE60);
+        std::uint64_t const batch_molecules = result.accumulator.num_molecules();
+        scoped_role_span_t const timed {timings.writer, batch_molecules};
 
         write_batch_shards_(config, result.accumulator, pool.at(result.buffer_slot), logger, counters);
         pool.release(result.buffer_slot);
+        counters.batches_completed.fetch_add(1);
         counters.molecules_undescribed.fetch_add(result.molecules_undescribed);
         log_batch_progress_(result, logger, counters);
         log_fallback_breakdown_(result, logger);
@@ -866,7 +935,7 @@ static void fill_pending_shards_into_(std::vector<shard_pair_t> const &shard_pai
 static gpu_runner_outcome_t run_pipeline_(sfapi::context_t &gpu_context, cli_config_t const &config,
                                           custd::span<shard_pair_t const *const> pending, std::uint32_t batch_target,
                                           thread_budget_t const &budget, logger_t const &logger,
-                                          progress_counters_t &counters) {
+                                          progress_counters_t &counters, pipeline_timings_t &timings) {
     constexpr std::size_t pipeline_depth_k = 5;
     buffer_pool_t pool {pipeline_depth_k + 1};
     handoff<coprocessed_batch_accumulator_t> reader_to_gpu {pipeline_depth_k};
@@ -878,15 +947,72 @@ static gpu_runner_outcome_t run_pipeline_(sfapi::context_t &gpu_context, cli_con
 #pragma omp parallel sections num_threads(4)
     {
 #pragma omp section
-        { reader_loop_(pending, config, batch_target, budget, logger, reader_to_gpu, counters); }
+        { reader_loop_(pending, config, batch_target, budget, logger, reader_to_gpu, counters, timings); }
 #pragma omp section
-        { outcome = gpu_runner_loop_(gpu_context, config, budget, logger, reader_to_gpu, gpu_to_fallback, pool); }
+        {
+            outcome = gpu_runner_loop_(gpu_context, config, budget, logger, reader_to_gpu, gpu_to_fallback, pool,
+                                       timings);
+        }
 #pragma omp section
-        { fallback_loop_(config, budget, pool, gpu_to_fallback, fallback_to_writer); }
+        { fallback_loop_(config, budget, pool, gpu_to_fallback, fallback_to_writer, timings); }
 #pragma omp section
-        { writer_loop_(config, budget, logger, fallback_to_writer, pool, counters); }
+        { writer_loop_(config, budget, logger, fallback_to_writer, pool, counters, timings); }
     }
     return outcome;
+}
+
+/** Host seconds a span accumulated over the run. */
+static double seconds_of_(role_timing_t const &timing) noexcept {
+    return static_cast<double>(timing.nanoseconds.load()) * 1e-9;
+}
+
+/** One timed span of the pipeline, paired with the name the report prints it under. */
+struct named_span_t {
+    std::string_view name;
+    role_timing_t const &timing;
+};
+
+/**
+ *  @brief Where the run's host time went, one line per timed span, printed once at the end.
+ *
+ *  A span opens when its role already holds work, so blocking on an empty queue belongs to no span and the
+ *  summed span time is what the run spent doing something. Shares are of that sum rather than of the wall
+ *  clock, because the spans overlap — their ratio is the overlap factor on the last line.
+ *
+ *  One `coprocessed-batch` has nothing to overlap with, so a single-batch run decomposes four roles that ran
+ *  strictly serially. That is a cold decomposition and not a steady-state share, which is why the batch count
+ *  leads the report.
+ */
+static void log_pipeline_timings_(pipeline_timings_t const &timings, progress_counters_t const &counters,
+                                  double wall_seconds, logger_t const &logger) {
+    std::array<named_span_t, 5> const spans {{
+        {"reader-role", timings.reader},
+        {"gpu-runner-role", timings.gpu_runner},
+        {"rdkit-fallback", timings.fallback},
+        {"shape-descriptors", timings.descriptors},
+        {"writer-role", timings.writer},
+    }};
+
+    double summed_seconds = 0.0;
+    for (named_span_t const &span : spans) summed_seconds += seconds_of_(span.timing);
+
+    std::uint64_t const batches = counters.batches_completed.load();
+    logger.info("role decomposition  coprocessed-batches={} input-files={}  {}", fmt::group_digits(batches),
+                fmt::group_digits(counters.input_files_completed.load()),
+                batches < 2 ? "cold: the roles ran strictly serially" : "steady state: the roles overlap");
+    for (named_span_t const &span : spans) {
+        double const seconds = seconds_of_(span.timing);
+        std::uint64_t const molecules = span.timing.molecules.load();
+        double const share = summed_seconds > 0.0 ? 100.0 * seconds / summed_seconds : 0.0;
+        double const per_molecule_us = molecules > 0 ? 1e6 * seconds / static_cast<double>(molecules) : 0.0;
+        logger.info("  span={:<18} wall={:>8.1f}s share={:>7.3f}% per_molecule={:>7.1f}us molecules={}", span.name,
+                    seconds, share, per_molecule_us, fmt::group_digits(molecules));
+    }
+    // Naming the two middle spans as one role on the closing line, so their sum is read as the fallback-role's
+    // cost and neither is read as all of it.
+    logger.info("  spans summed {:.1f}s over {:.1f}s wall, overlap {:.2f}x; " //
+                "rdkit-fallback and shape-descriptors are both the fallback-role",
+                summed_seconds, wall_seconds, wall_seconds > 0.0 ? summed_seconds / wall_seconds : 0.0);
 }
 
 } // namespace smallfield::cli
@@ -932,8 +1058,9 @@ int main(int argc, char **argv) {
     sfcli::progress_counters_t counters;
     counters.total_input_files = pending.size();
     counters.start_time = logger.start_time;
+    sfcli::pipeline_timings_t timings;
     sfcli::gpu_runner_outcome_t const outcome = sfcli::run_pipeline_(gpu_context, config, pending, batch_target, budget,
-                                                                     logger, counters);
+                                                                     logger, counters, timings);
 
     double const total = std::chrono::duration<double>(std::chrono::steady_clock::now() - counters.start_time).count();
     std::uint64_t const done = counters.molecules_completed.load();
@@ -941,6 +1068,7 @@ int main(int argc, char **argv) {
     logger.info("complete  {} mols  {} mol/s  undescribed {} {:.3f}%", fmt::group_digits(done),
                 fmt::group_digits(static_cast<std::uint64_t>(static_cast<double>(done) / std::max(total, 0.001))),
                 fmt::group_digits(undescribed), sfcli::percent_of_(undescribed, done));
+    sfcli::log_pipeline_timings_(timings, counters, total, logger);
     std::uint64_t const files_failed = counters.input_files_failed.load();
     if (files_failed > 0)
         logger.error("{} of {} input-files produced no output shard — none of them was sealed, so a rerun retries them",

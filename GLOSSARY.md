@@ -32,7 +32,7 @@ A _role_ is a persistent thread actor; never substitute "section" or "phase".
 | --------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------- |
 | __`reader-role`__     | `smallfield_batch`      | Reads a `parquet-shard` off disk, extracts SMILES into a `coprocessed-batch`.                        |
 | __`gpu-runner-role`__ | `smallfield_batch`      | Calls `context_t::generate_conformers` on each `coprocessed-batch` (inner pipeline runs here).       |
-| __`fallback-role`__   | `smallfield_batch`      | Runs RDKit CPU for the conformer slots the GPU could not fill (≤5 % on drug-like inputs).            |
+| __`fallback-role`__   | `smallfield_batch`      | Runs RDKit CPU for the conformer slots the GPU could not fill — ≤5 % on drug-like inputs — then computes the USRCAT descriptor for every molecule of the batch. |
 | __`writer-role`__     | `smallfield_batch`      | Writes one output `parquet-shard` per consumed input `parquet-shard`.                                |
 
 ## Wave Steps, Library Inner
