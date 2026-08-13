@@ -1169,17 +1169,18 @@ constexpr float shared_anion_formal_charge_(molecule_descriptor_t const &descrip
     return 0.0f;
 }
 
-/** Charge on an N5M nitrogen of MMFF type 76, sharing one unit across the N5M atoms of its five-ring.
- *  Only the first five-ring the atom belongs to is consulted, matching RDKit. */
-constexpr float five_ring_anion_formal_charge_(molecule_descriptor_t const &descriptor,
-                                               custd::span<std::uint8_t const> atom_types,
-                                               std::uint32_t atom_index) noexcept {
+/** Charge on an N5M nitrogen of MMFF type 76, sharing one unit across the N5M atoms of one ring.
+ *  Only the first ring the atom belongs to is consulted, whatever its size, matching RDKit: a
+ *  macrocyclic tetrapyrrole lists its 16-ring ahead of the pyrrole, and skipping to the five-ring
+ *  spreads the unit over one nitrogen where RDKit spreads it over two. */
+constexpr float n5m_anion_formal_charge_(molecule_descriptor_t const &descriptor,
+                                         custd::span<std::uint8_t const> atom_types,
+                                         std::uint32_t atom_index) noexcept {
     std::uint32_t const ring_bitmap = descriptor.atom_ring_bitmap[atom_index];
     for (unsigned ring_index = 0; ring_index < descriptor.num_rings; ++ring_index) {
         if (!(ring_bitmap & (1u << ring_index))) continue;
         unsigned const first_slot = descriptor.ring_offset[ring_index];
         unsigned const last_slot = descriptor.ring_offset[ring_index + 1];
-        if (last_slot - first_slot != 5) continue;
         unsigned num_n5m_in_ring = 0;
         for (unsigned ring_atom_slot = first_slot; ring_atom_slot < last_slot; ++ring_atom_slot)
             if (atom_types[descriptor.ring_atoms[ring_atom_slot]] == 76) ++num_n5m_in_ring;
@@ -1255,7 +1256,7 @@ constexpr void native_compute_mmff_formal_charges(molecule_descriptor_t const &d
         // O2CM carboxylate / phosphate / sulfonate oxygen, and SM anionic terminal sulfur.
         case 32:
         case 72: formal_charge = shared_anion_formal_charge_(descriptor, atom_types, atom_index); break;
-        case 76: formal_charge = five_ring_anion_formal_charge_(descriptor, atom_types, atom_index); break;
+        case 76: formal_charge = n5m_anion_formal_charge_(descriptor, atom_types, atom_index); break;
         // Amidinium, guanidinium and imidazolium nitrogen.
         case 55:
         case 56:
