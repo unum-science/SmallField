@@ -15,8 +15,10 @@
  *  `bool forceTransAmides` are named enumerations, and their `merge` of a heap vector is a sweep over
  *  caller-owned scratch.
  *
- *  A pair reachable by several paths collects one interval per path, and `merge_intervals_` collapses
- *  them, so nothing depends on which path is found first.
+ *  A pair reachable by several paths collects one interval per path, so nothing depends on which path is
+ *  found first. The 1-4 sweep collapses its claims through `merge_intervals_`; the 1-3 sweep widens the
+ *  pair to the union of what its shared centers ask, which is the rule `_checkAndSetBounds` applies
+ *  upstream and not the same rule as `merge_intervals_` — that one intersects claims that overlap.
  */
 
 #pragma once
@@ -739,8 +741,19 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_
                 float const d_ij = std::sqrt(
                     std::max(0.0f, d_ci * d_ci + d_cj * d_cj - 2.0f * d_ci * d_cj * cos_theta));
                 // ± 3% tolerance — 1-3 distances tend to have slightly more slack.
-                upper_distance_bound_at(bounds, first_neighbor, second_neighbor) = d_ij * 1.03f;
-                lower_distance_bound_at(bounds, first_neighbor, second_neighbor) = d_ij * 0.97f;
+                float const lower = d_ij * 0.97f, upper = d_ij * 1.03f;
+                float &current_lower = lower_distance_bound_at(bounds, first_neighbor, second_neighbor);
+                float &current_upper = upper_distance_bound_at(bounds, first_neighbor, second_neighbor);
+                // A pair sharing two centers is claimed once per center, and the two claims differ when
+                // the centers differ in hybridization or in bond length — a beta-lactam ring reaches it.
+                // Widening rather than replacing keeps both, so the pair does not depend on which center
+                // the walk found first; that is what RDKit's `_checkAndSetBounds` does at
+                // `setIfBetter=false`, and it is not what `merge_intervals_` does to the 1-4 claims,
+                // which is to intersect them. The unset test reads the upper because no 1-3 distance
+                // reaches a thousand angstroms, where a degenerate one could reach the lower's zero.
+                bool const unbounded = current_upper == upper_initial_k;
+                current_lower = unbounded ? lower : std::min(current_lower, lower);
+                current_upper = unbounded ? upper : std::max(current_upper, upper);
             }
         }
     }
