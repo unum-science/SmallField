@@ -76,6 +76,14 @@ __device__ __forceinline__ void store_gradient_(float *gradient, std::uint32_t n
     gradient[2u * num_atoms + atom] = value.z;
 }
 
+/** Add @p value into a SoA gradient array [x0..xN, y0..yN, z0..zN] at @p atom (mirrors store_gradient_). */
+__device__ __forceinline__ void accumulate_gradient_into_(float *gradient, std::uint32_t num_atoms, std::uint32_t atom,
+                                                          float3 const &value) {
+    gradient[atom] += value.x;
+    gradient[num_atoms + atom] += value.y;
+    gradient[2u * num_atoms + atom] += value.z;
+}
+
 /** Add @p delta into a per-atom float3 accumulator held in registers. */
 __device__ __forceinline__ void accumulate_gradient_(float3 *gradient, float3 const &delta) {
     *gradient = add_float3_(*gradient, delta);

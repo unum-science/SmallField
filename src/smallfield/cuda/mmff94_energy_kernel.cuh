@@ -50,14 +50,6 @@ constexpr float mmff_radians_to_degrees_k = 180.0f / 3.14159265f;
 /** Whether a nonbonded pair is exactly three bonds apart, which scales electrostatics. */
 enum class pair_separation_t : bool { beyond_one_four_k = false, one_four_k = true };
 
-/**
- *  @brief Which endpoint of a nonbonded pair this call speaks for.
- *
- *  Both endpoints accumulate their own gradient, but only the owning one adds the
- *  pair's energy, so the shared term is not counted twice.
- */
-enum class pair_endpoint_t : bool { mirror_k = false, owning_k = true };
-
 /** Reduce @p params to the pair-invariant factors the nonbonded sweep reads. */
 __device__ __forceinline__ mmff94_atom_vdw_folded_t fold_atom_vdw_params_(mmff94_atom_vdw_params_t const &params) {
     return {.r_star = params.r_star,
@@ -68,7 +60,7 @@ __device__ __forceinline__ mmff94_atom_vdw_folded_t fold_atom_vdw_params_(mmff94
 }
 
 /**
- *  @brief Compute nonbonded (VdW + electrostatic) energy and gradient contribution for one atom.
+ *  @brief Compute one nonbonded pair's (VdW + electrostatic) energy and the force it exerts.
  *
  *  Inlines Halgren's R* combining rule (with the donor-suppression clause) and
  *  Slater-Kirkwood's epsilon combining rule, then applies donor-acceptor
@@ -83,14 +75,16 @@ __device__ __forceinline__ mmff94_atom_vdw_folded_t fold_atom_vdw_params_(mmff94
  *  @param[in] p_other Folded per-atom VdW factors for @p other.
  *  @param[in] charge_product Pre-multiplied q_atom * q_other.
  *  @param[in] separation Whether the pair is 1-4, which scales electrostatics.
- *  @param[in] endpoint Which endpoint speaks for the pair; only the owning one adds energy.
- *  @param[inout] energy Accumulated energy, incremented only for the owning endpoint.
- *  @param[inout] gradient Accumulated gradient for @p atom.
+ *  @param[inout] energy Accumulated energy; the pair is visited once, so it always adds.
+ *  @param[out] force What this pair exerts on @p atom. Its exact negation is the force on @p other,
+ *    so one evaluation serves both ends of the pair.
  */
-__device__ __forceinline__ void mmff_nonbonded_contribution_(
-    float const *positions, std::uint32_t num_atoms, std::uint32_t atom, std::uint32_t other,
-    mmff94_atom_vdw_folded_t const &p_atom, mmff94_atom_vdw_folded_t const &p_other, float charge_product,
-    pair_separation_t separation, pair_endpoint_t endpoint, float *energy, float3 *gradient) {
+__device__ __forceinline__ void mmff_nonbonded_contribution_(float const *positions, std::uint32_t num_atoms,
+                                                             std::uint32_t atom, std::uint32_t other,
+                                                             mmff94_atom_vdw_folded_t const &p_atom,
+                                                             mmff94_atom_vdw_folded_t const &p_other,
+                                                             float charge_product, pair_separation_t separation,
+                                                             float *energy, float3 *force) {
 
     // Halgren R* combining rule with donor-suppression clause, plus Slater-Kirkwood epsilon.
     float const vdw_radius_i = p_atom.r_star;
@@ -144,11 +138,10 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(
     float const energy_gradient_electrostatic = -mmff_coulomb_k * charge_product *
                                                 (1.0f / (buffered_distance * buffered_distance)) * scale;
 
-    // Only the lower-index endpoint adds to total energy.
-    if (endpoint == pair_endpoint_t::owning_k) *energy += energy_vdw + energy_electrostatic;
+    *energy += energy_vdw + energy_electrostatic;
 
     float const energy_gradient_distance = energy_gradient_vdw + energy_gradient_electrostatic;
-    accumulate_gradient_(gradient, scale_float3_(delta, -energy_gradient_distance * inverse_distance));
+    *force = scale_float3_(delta, -energy_gradient_distance * inverse_distance);
 }
 
 /**
@@ -505,10 +498,9 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
 /**
  *  @brief MMFF94 energy and gradient evaluation.
  *
- *  Nonbonded pairs are enumerated on the fly from the `bond_distance` matrix and
- *  their parameters are combined in registers; bonded terms still iterate the
- *  pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) — those terms
- *  are small and not worth packing out.
+ *  Bonded terms iterate the pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) first, then
+ *  nonbonded pairs are enumerated on the fly from the `bond_distance` matrix, once per pair, with
+ *  their parameters combined in registers. The order is what keeps the bonded write a plain store.
  *
  *  @see fire_minimize_
  */
@@ -525,27 +517,12 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
 
     float total_energy = 0.0f;
 
+    // Bonded terms walk the per-atom CSR, one lane per atom, so each writes only the three words its
+    // own atom owns and reads none another lane owns. Running them before the pair sweep is what
+    // keeps that write a plain store: the pair sweep below is the only pass that reaches a partner.
     for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
         float3 gradient_acc {0.0f, 0.0f, 0.0f};
         auto const &offsets = atom_offsets[atom];
-        mmff94_atom_vdw_folded_t const p_atom = atom_vdw_params[atom];
-        float const q_atom = atom_charge[atom];
-
-        // Nonbonded pairs, enumerated from bond_distance, which a warp BFS over the
-        // undirected bond graph fills (cuda/bond_distance_kernel.cuh) — so it is
-        // symmetric: bond_distance[atom*N+j] == bond_distance[j*N+atom].
-        // The sweep reads j in a single contiguous row; whichever endpoint has the
-        // lower index owns the pair's energy, the other endpoint contributes its
-        // gradient as the mirror endpoint.
-        for (std::uint32_t j = 0; j < num_atoms; ++j) {
-            if (j == atom) continue;
-            std::uint8_t const bd = bond_distance[atom * num_atoms + j];
-            if (bd < 3 || bd == 255) continue;
-            mmff_nonbonded_contribution_(
-                positions, num_atoms, atom, j, p_atom, atom_vdw_params[j], q_atom * atom_charge[j],
-                bd == 3 ? pair_separation_t::one_four_k : pair_separation_t::beyond_one_four_k,
-                atom < j ? pair_endpoint_t::owning_k : pair_endpoint_t::mirror_k, &total_energy, &gradient_acc);
-        }
 
         for (std::uint32_t index = offsets.bond_offset; index < offsets.bond_offset + offsets.bond_count; ++index)
             mmff_bond_contribution_(positions, num_atoms, atom, bond_params[interactions[index].term_index],
@@ -571,6 +548,43 @@ __device__ __forceinline__ float evaluate_mmff94_energy(
                                            &total_energy, &gradient_acc);
 
         store_gradient_(gradient, num_atoms, atom, gradient_acc);
+    }
+    __syncwarp(full_mask_k);
+
+    // Nonbonded pairs, enumerated from bond_distance, which a warp BFS over the undirected bond
+    // graph fills (cuda/bond_distance_kernel.cuh) — so it is symmetric and one endpoint's read
+    // answers for both. Walking `other = (atom + offset) mod num_atoms` over the first half of the
+    // ring visits every pair exactly once with all 32 lanes productive, where an `other > atom`
+    // test would leave half the warp's issue slots idle on a warp-uniform predicate.
+    //
+    // The partner's share of the force is the exact negation of this atom's, so one evaluation
+    // delivers both. At a fixed offset the 32 lanes address 32 distinct atoms, whatever the atom
+    // count, so writing the partner's share into the shared gradient needs no atomic.
+    std::uint32_t const half_shell = num_atoms / 2;
+    // An even atom count makes the last offset its own mirror, since atom and atom + N/2 reach each
+    // other from both ends, so only the lower half of the ring speaks for that offset.
+    bool const middle_offset_is_mirrored = (num_atoms % 2u) == 0u;
+
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
+        mmff94_atom_vdw_folded_t const p_atom = atom_vdw_params[atom];
+        float const q_atom = atom_charge[atom];
+        float3 own_force {0.0f, 0.0f, 0.0f};
+
+        for (std::uint32_t offset = 1; offset <= half_shell; ++offset) {
+            if (middle_offset_is_mirrored && offset == half_shell && atom >= half_shell) continue;
+            std::uint32_t const wrapped = atom + offset;
+            std::uint32_t const other = wrapped < num_atoms ? wrapped : wrapped - num_atoms;
+            std::uint8_t const bond_hops = bond_distance[atom * num_atoms + other];
+            if (bond_hops < 3 || bond_hops == 255) continue; // bonded, geminal, or unreachable
+            float3 pair_force {0.0f, 0.0f, 0.0f};
+            mmff_nonbonded_contribution_(
+                positions, num_atoms, atom, other, p_atom, atom_vdw_params[other], q_atom * atom_charge[other],
+                bond_hops == 3 ? pair_separation_t::one_four_k : pair_separation_t::beyond_one_four_k, &total_energy,
+                &pair_force);
+            own_force = add_float3_(own_force, pair_force);
+            accumulate_gradient_into_(gradient, num_atoms, other, scale_float3_(pair_force, -1.0f));
+        }
+        accumulate_gradient_into_(gradient, num_atoms, atom, own_force);
     }
 
     return warp_reduce_sum_f32_(total_energy);
