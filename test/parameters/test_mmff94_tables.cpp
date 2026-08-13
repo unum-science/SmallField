@@ -727,7 +727,7 @@ static void report_table_sizes_(sf::parameters::mmff94_tables_host_t const &host
                  host_tables.vdw.size(), host_tables.bond.size(), host_tables.angle.size(), host_tables.torsion.size(),
                  host_tables.oop.size(), host_tables.stbn.size(), host_tables.dfsb.size(), host_tables.def.size(),
                  host_tables.pbci.size(), host_tables.chg.size(), host_tables.hl.size(), host_tables.max_atom_type,
-                 host_tables.vdw_power);
+                 host_tables.vdw_constants.vdw_power);
 }
 
 /** One line naming how many keys each table will be probed with, before either suite runs. */

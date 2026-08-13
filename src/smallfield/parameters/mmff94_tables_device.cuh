@@ -118,11 +118,7 @@ inline void upload_mmff94_tables_to_device(mmff94_tables_host_t const &host, mmf
     device.view.hl = upload_table_(host.hl, device.hl, stream, sink);
     device.view.covrad = upload_table_(host.covrad, device.covrad, stream, sink);
 
-    device.view.vdw_power = host.vdw_power;
-    device.view.vdw_b = host.vdw_b;
-    device.view.vdw_beta = host.vdw_beta;
-    device.view.vdw_darad = host.vdw_darad;
-    device.view.vdw_daeps = host.vdw_daeps;
+    device.view.vdw_constants = host.vdw_constants;
     device.view.max_atom_type = host.max_atom_type;
 }
 

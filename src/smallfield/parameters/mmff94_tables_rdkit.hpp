@@ -32,15 +32,17 @@ namespace smallfield::parameters {
 
 #pragma region Sparse Tables
 
-/** Extract the VdW entries and the five collection-wide scalars that arrive with them, returning the
+/** Extract the VdW entries and the collection-wide scalars that arrive with them, returning the
  *  highest MMFF atom type the table mentions — which sizes the two dense tables below. */
 inline std::uint8_t extract_vdw_table_(mmff94_tables_host_t &out) {
     auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFVdW();
-    out.vdw_power = static_cast<float>(collection->power);
-    out.vdw_b = static_cast<float>(collection->B);
-    out.vdw_beta = static_cast<float>(collection->Beta);
-    out.vdw_darad = static_cast<float>(collection->DARAD);
-    out.vdw_daeps = static_cast<float>(collection->DAEPS);
+    out.vdw_constants = {
+        .vdw_power = static_cast<float>(collection->power),
+        .vdw_b = static_cast<float>(collection->B),
+        .vdw_beta = static_cast<float>(collection->Beta),
+        .vdw_darad = static_cast<float>(collection->DARAD),
+        .vdw_daeps = static_cast<float>(collection->DAEPS),
+    };
 
     std::size_t const count = collection->d_atomType.size();
     out.vdw.assign(count, mmff94_vdw_entry_t {});

@@ -227,6 +227,26 @@ struct mmff94_covrad_entry_t {
 };
 static_assert(sizeof(mmff94_covrad_entry_t) == 12);
 
+/**
+ *  @brief The `MMFFVdWCollection` scalars that belong to the collection rather than to one atom type.
+ *
+ *  Both the host container and the device view hold one of these, so the extraction, the view and the
+ *  upload each move all five in a single assignment and a sixth scalar arrives in one place.
+ */
+struct mmff94_vdw_constants_t {
+    /** MMFF `power`, the exponent `alpha_i` is raised to in the R* combination rule. */
+    float vdw_power = 0.25f;
+    /** MMFF `B`, the amplitude of that rule's asymmetry correction. */
+    float vdw_b = 0.2f;
+    /** MMFF `Beta`, how fast the correction decays with the asymmetry. */
+    float vdw_beta = 12.0f;
+    /** MMFF `DARAD`, the R* scale a donor-acceptor pair takes. */
+    float vdw_darad = 0.8f;
+    /** MMFF `DAEPS`, the well-depth scale a donor-acceptor pair takes. */
+    float vdw_daeps = 0.5f;
+};
+static_assert(sizeof(mmff94_vdw_constants_t) == 20);
+
 #pragma endregion Table Entry Structs
 
 #pragma region Table View
@@ -253,11 +273,7 @@ struct mmff94_tables_view_t {
     custd::span<mmff94_hl_entry_t const> hl;
     custd::span<mmff94_covrad_entry_t const> covrad;
 
-    float vdw_power = 0.25f;
-    float vdw_b = 0.2f;
-    float vdw_beta = 12.0f;
-    float vdw_darad = 0.8f;
-    float vdw_daeps = 0.5f;
+    mmff94_vdw_constants_t vdw_constants;
 
     std::uint8_t max_atom_type = 0;
 };
@@ -304,11 +320,7 @@ struct mmff94_tables_host_t {
     std::vector<mmff94_covrad_entry_t> covrad;
 
     /** VdW collection scalar constants, from `MMFFVdWCollection` members. */
-    float vdw_power = 0.25f;
-    float vdw_b = 0.2f;
-    float vdw_beta = 12.0f;
-    float vdw_darad = 0.8f;
-    float vdw_daeps = 0.5f;
+    mmff94_vdw_constants_t vdw_constants;
 
     /** Highest atom type seen, for `MMFFDef` indexing. */
     std::uint8_t max_atom_type = 0;
@@ -331,11 +343,7 @@ struct mmff94_tables_host_t {
         result.bndk = bndk;
         result.hl = hl;
         result.covrad = covrad;
-        result.vdw_power = vdw_power;
-        result.vdw_b = vdw_b;
-        result.vdw_beta = vdw_beta;
-        result.vdw_darad = vdw_darad;
-        result.vdw_daeps = vdw_daeps;
+        result.vdw_constants = vdw_constants;
         result.max_atom_type = max_atom_type;
         return result;
     }
