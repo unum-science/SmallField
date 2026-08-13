@@ -23,7 +23,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
-#include <cstdio>  // `std::fflush`, `stdout`
+#include <cstdio>  // `stderr`
 #include <cstring> // `std::memset`
 
 #include <algorithm>     // `std::min`
@@ -38,7 +38,6 @@
 #include <vector>        // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
-#include <fmt/ranges.h> // `fmt::join`
 
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
@@ -48,6 +47,7 @@
 #include "smallfield/preprocess/csd_torsion_dispatcher.hpp"
 #include "smallfield/preprocess/csd_torsion_native.hpp"
 #include "smallfield/preprocess/csd_torsion_predicates.hpp"
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
 #include "test/test_rdkit_reference_helpers.hpp"
@@ -171,27 +171,19 @@ static void fill_rdkit_root_matches_into_(RDKit::ROMol const &molecule, RDKit::R
     }
 }
 
-/** Cross-validate one compiled sub-query against RDKit on one molecule. */
+/** Cross-validate one compiled sub-query against RDKit on one molecule, aborting on the first disagreement. */
 static void validate_recursive_for_molecule_(recursive_case_t const &compiled, RDKit::ROMol const &molecule,
                                              sft::molecule_descriptor_t const &descriptor, std::string const &smiles,
-                                             match_scratch_t &scratch) {
+                                             match_scratch_t &scratch, diagnostic_reporter_t &reporter) {
     fill_rdkit_root_matches_into_(molecule, *compiled.query, scratch.matches, scratch.rdkit_roots);
 
     std::uint32_t const num_atoms = descriptor.num_atoms;
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) {
-        bool const native_hit = sfp::recursive_query_match(descriptor, atom, compiled.pool, compiled.root);
-        bool const rdkit_hit = (scratch.rdkit_roots.count(atom) != 0);
-        if (native_hit != rdkit_hit) {
-            std::fflush(stdout);
-            fmt::println(stderr,
-                         "MISMATCH csd_subquery body=$({}) smiles={} atom={} field=root_match rdkit={} native={}",
-                         compiled.body, smiles, atom, rdkit_hit ? 1 : 0, native_hit ? 1 : 0);
-            fmt::println(
-                stderr, "NOTE csd_subquery atom={} element={} aromatic={} degree={} num_hydrogens={} hybridization={}",
-                atom, descriptor.element[atom], (descriptor.atom_flags[atom] & sft::atom_flag_aromatic_k) != 0 ? 1 : 0,
-                descriptor.degree[atom], descriptor.num_hydrogens[atom], descriptor.hybridization[atom]);
-            sf_verify_(false, "sub-query mismatch vs RDKit");
-        }
+        auto group = reporter.mismatch("csd_subquery", "body=$({}) smiles={} atom={}", compiled.body, smiles, atom);
+        group.field("root_match", scratch.rdkit_roots.count(atom) != 0,
+                    sfp::recursive_query_match(descriptor, atom, compiled.pool, compiled.root), exactly_equal);
+        sf_verify_(group.reported_field_count() == 0,
+                   fmt::format("the native sub-query $({}) disagrees with RDKit on {}", compiled.body, smiles));
     }
 }
 
@@ -223,17 +215,25 @@ static void fill_rdkit_torsion_tuples_into_(RDKit::ROMol const &molecule,
     }
 }
 
+/** Compare one torsion tuple's presence on each side, so a tuple only one matcher emitted names itself. */
+static void compare_torsion_tuple_(diagnostic_reporter_t &reporter, std::string_view smarts, std::string const &smiles,
+                                   torsion_tuple_t const &tuple, std::set<torsion_tuple_t> const &rdkit_tuples,
+                                   std::set<torsion_tuple_t> const &native_tuples) {
+    reporter
+        .mismatch("csd_pattern", "smarts={} smiles={} torsion={},{},{},{}", smarts, smiles, std::get<0>(tuple),
+                  std::get<1>(tuple), std::get<2>(tuple), std::get<3>(tuple))
+        .field("emitted", rdkit_tuples.count(tuple) != 0, native_tuples.count(tuple) != 0, exactly_equal);
+}
+
 /**
- *  @brief Run every native-parsed pattern against @p molecule and compare the emitted 4-tuple set to
- *  RDKit's SubstructMatch. Returns the number of patterns fully agreed; aborts on any disagreement.
+ *  @brief Run every native-parsed pattern against @p molecule and compare the emitted 4-tuples to RDKit's
+ *  `SubstructMatch`, one tuple at a time, aborting on the first pattern that disagrees.
  */
-static std::size_t validate_patterns_for_molecule_(RDKit::ROMol const &molecule,
-                                                   sft::molecule_descriptor_t const &descriptor,
-                                                   std::string const &smiles,
-                                                   std::vector<sfp::csd_compiled_pattern_t> const &patterns,
-                                                   match_scratch_t &scratch) {
+static void validate_patterns_for_molecule_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
+                                            std::string const &smiles,
+                                            std::vector<sfp::csd_compiled_pattern_t> const &patterns,
+                                            match_scratch_t &scratch, diagnostic_reporter_t &reporter) {
     std::uint8_t done_bonds_u8[sft::max_bonds_k] = {};
-    std::size_t ok = 0;
     for (auto const &compiled_pattern : patterns) {
         // Collect native matches. We cannot use the dispatcher's `done_bonds`
         // shortcut here because we want @b every emission, not just the first
@@ -254,20 +254,17 @@ static std::size_t validate_patterns_for_molecule_(RDKit::ROMol const &molecule,
                 return false; // keep scanning — we want every emission
             });
 
-        std::set<torsion_tuple_t> const &rdkit_tuples = scratch.rdkit_tuples;
         fill_rdkit_torsion_tuples_into_(molecule, compiled_pattern, scratch.matches, scratch.rdkit_tuples);
-        if (native_tuples != rdkit_tuples) {
-            std::fflush(stdout);
-            fmt::println(stderr,
-                         "MISMATCH csd_pattern smarts={} smiles={} field=torsion_tuple_count rdkit={} native={}",
-                         compiled_pattern.smarts, smiles, rdkit_tuples.size(), native_tuples.size());
-            fmt::println(stderr, "NOTE csd_pattern smarts={} rdkit_tuples=[{}] native_tuples=[{}]",
-                         compiled_pattern.smarts, fmt::join(rdkit_tuples, " "), fmt::join(native_tuples, " "));
-            sf_verify_(false, "pattern mismatch vs RDKit");
+        std::set<torsion_tuple_t> const &rdkit_tuples = scratch.rdkit_tuples;
+        for (auto const &tuple : rdkit_tuples)
+            compare_torsion_tuple_(reporter, compiled_pattern.smarts, smiles, tuple, rdkit_tuples, native_tuples);
+        for (auto const &tuple : native_tuples) {
+            if (rdkit_tuples.count(tuple) != 0) continue; // already compared from RDKit's side of the union
+            compare_torsion_tuple_(reporter, compiled_pattern.smarts, smiles, tuple, rdkit_tuples, native_tuples);
         }
-        ++ok;
+        sf_verify_(native_tuples == rdkit_tuples, fmt::format("the native CSD pattern {} disagrees with RDKit on {}",
+                                                              compiled_pattern.smarts, smiles));
     }
-    return ok;
 }
 
 /**
@@ -293,73 +290,45 @@ static void compile_recursive_cases_into_(std::vector<recursive_case_t> &cases) 
 }
 
 /**
- *  @brief Announce the pattern corpus.
- *
- *  Every pattern `csd_patterns` hands out compiled natively — one that did not is dropped at load
- *  with a diagnostic — so this count is the corpus size, and a drop shows up here as a shortfall
- *  against the 470 rows the table carries.
- */
-static std::size_t announce_pattern_corpus_(std::vector<sfp::csd_compiled_pattern_t> const &patterns) {
-    fmt::println("CSD patterns: {} native", fmt::group_digits(patterns.size()));
-    return patterns.size();
-}
-
-/** Why a corpus molecule was left out of the sweep, or that it was not. */
-enum class molecule_admission_t {
-    /** Parsed, hydrogenated, and inside every descriptor capacity. */
-    admitted_k,
-    /** `SmilesToMol` refused it, or `addHs` threw on it. */
-    unparsable_k,
-    /** Beyond `max_atoms_per_molecule_k` or `max_bonds_k`. */
-    exceeds_atom_or_bond_capacity_k,
-    /** More SSSR rings than `max_rings_k`. */
-    exceeds_ring_capacity_k,
-    /** `build_descriptor` refused it. */
-    no_descriptor_k,
-};
-
-/**
  *  @brief Parse @p smiles, add hydrogens, and build the flat descriptor both matchers read.
  *
  *  @param[in] smiles Molecule to rebuild, as it appears in the corpus.
  *  @param[out] molecule Reset to the parsed, hydrogenated molecule when it is admitted.
  *  @param[out] descriptor Filled when the molecule is admitted, untouched otherwise.
- *  @return Whether the molecule joins the sweep, and why it does not when it does not.
+ *  @return `success_k` when the molecule joins the sweep, otherwise the status that refused it.
  */
-static molecule_admission_t admit_molecule_(std::string const &smiles, std::unique_ptr<RDKit::RWMol> &molecule,
-                                            sft::molecule_descriptor_t &descriptor) {
-    molecule.reset(RDKit::SmilesToMol(smiles));
-    if (!molecule) return molecule_admission_t::unparsable_k;
+static sft::conformer_status_t admit_molecule_(std::string const &smiles, std::unique_ptr<RDKit::RWMol> &molecule,
+                                               sft::molecule_descriptor_t &descriptor) {
+    // `SmilesToMol` throws on some malformed input rather than returning null, so it belongs inside the
+    // guard alongside `addHs`.
     try {
-        RDKit::MolOps::addHs(*molecule);
+        molecule.reset(RDKit::SmilesToMol(smiles));
+        if (molecule) RDKit::MolOps::addHs(*molecule);
     }
     catch (...) {
-        return molecule_admission_t::unparsable_k;
+        molecule.reset();
     }
-    if (molecule->getNumAtoms() > sft::max_atoms_per_molecule_k || molecule->getNumBonds() > sft::max_bonds_k)
-        return molecule_admission_t::exceeds_atom_or_bond_capacity_k;
-
-    // Ring-based pattern constraints silently under-match past the descriptor's ring capacity,
-    // because `atom_ring_bitmap` and `smallest_ring` are only populated for rings [0, max_rings_k).
-    // Pathological polycyclic cages -- the fused-cyclopropane P+ scaffold in USearch, say -- are the
-    // only inputs that reach it, and the production preprocess rejects them upstream via the
-    // 128-atom cap for everything except spiro cages.
-    auto const *ring_info = molecule->getRingInfo();
-    if (ring_info != nullptr && ring_info->isInitialized() && ring_info->atomRings().size() > sft::max_rings_k)
-        return molecule_admission_t::exceeds_ring_capacity_k;
-
-    if (sft::build_descriptor(*molecule, descriptor) != sft::conformer_status_t::success_k)
-        return molecule_admission_t::no_descriptor_k;
-    return molecule_admission_t::admitted_k;
+    if (!molecule) return sft::conformer_status_t::invalid_smiles_k;
+    return sft::build_descriptor(*molecule, descriptor);
 }
 
-/** What one sweep over a SMILES corpus compared. */
+/** What one sweep over a SMILES corpus compared, and where the lines it did not compare went. */
 struct predicate_tally_t {
     std::size_t validated = 0;
-    std::size_t skipped = 0;
-    std::size_t sub_query_checks = 0;
-    std::size_t pattern_checks = 0;
+    /** Corpus lines left out of the sweep, indexed by the status that refused them. */
+    std::size_t refused[sft::conformer_status_count_k] = {};
 };
+
+/** Narrate what the sweep covered, naming each refusal with the status that refused it. */
+static void announce_corpus_tally_(predicate_tally_t const &tally) {
+    fmt::print("NOTE csd_predicates molecules={}", tally.validated);
+    for (std::size_t status = 0; status < sft::conformer_status_count_k; ++status) {
+        if (tally.refused[status] == 0) continue; // a refusal nothing in this corpus reached
+        fmt::print(" {}={}", sft::conformer_status_name(static_cast<sft::conformer_status_t>(status)),
+                   tally.refused[status]);
+    }
+    fmt::println("");
+}
 
 /**
  *  @brief Sweep a corpus: every sub-query at every atom, then every native pattern, molecule by molecule.
@@ -369,26 +338,26 @@ struct predicate_tally_t {
  *  @param[in] patterns Compiled CSD torsion patterns; only the natively parsed ones are compared.
  *  @param[in] max_molecules Stop once this many molecules have been validated.
  *  @param[inout] tally Counters advanced by every molecule.
+ *  @param[inout] reporter Reporter counting and printing the comparisons.
  */
 static void validate_corpus_(std::vector<std::string> const &smiles_list, std::vector<recursive_case_t> const &cases,
                              std::vector<sfp::csd_compiled_pattern_t> const &patterns, std::size_t max_molecules,
-                             predicate_tally_t &tally) {
+                             predicate_tally_t &tally, diagnostic_reporter_t &reporter) {
     std::unique_ptr<RDKit::RWMol> molecule;
     sft::molecule_descriptor_t descriptor;
     match_scratch_t scratch;
     for (auto const &smiles : smiles_list) {
-        if (admit_molecule_(smiles, molecule, descriptor) != molecule_admission_t::admitted_k) {
-            ++tally.skipped;
+        sft::conformer_status_t const admitted = admit_molecule_(smiles, molecule, descriptor);
+        if (admitted != sft::conformer_status_t::success_k) {
+            ++tally.refused[static_cast<std::size_t>(admitted)];
             continue;
         }
 
-        for (auto const &compiled : cases) {
-            validate_recursive_for_molecule_(compiled, *molecule, descriptor, smiles, scratch);
-            ++tally.sub_query_checks;
-        }
+        for (auto const &compiled : cases)
+            validate_recursive_for_molecule_(compiled, *molecule, descriptor, smiles, scratch, reporter);
 
         // Full-pattern byte-equivalence pass across every native pattern.
-        tally.pattern_checks += validate_patterns_for_molecule_(*molecule, descriptor, smiles, patterns, scratch);
+        validate_patterns_for_molecule_(*molecule, descriptor, smiles, patterns, scratch, reporter);
 
         ++tally.validated;
         if (tally.validated >= max_molecules) break;
@@ -426,17 +395,22 @@ int main(int argc, char **argv) {
                      "or in SMALLFIELD_TEST_CORPUS for a wider sweep");
     }
 
+    // Every pattern `csd_patterns` hands out compiled natively — one that did not is dropped at load with a
+    // diagnostic — so this count is the corpus size, and a drop shows up as a shortfall against the table's rows.
     auto const &patterns = sfp::csd_patterns();
-    std::size_t const native_patterns = sftest::announce_pattern_corpus_(patterns);
+    fmt::println("{}: {} sub-queries and {} native CSD patterns per molecule", test_name_k,
+                 fmt::group_digits(cases.size()), fmt::group_digits(patterns.size()));
 
+    sftest::diagnostic_reporter_t reporter {"rdkit", "native"};
     sftest::predicate_tally_t tally;
-    sftest::validate_corpus_(smiles_list, cases, patterns, selection.max_molecules, tally);
+    sftest::validate_corpus_(smiles_list, cases, patterns, selection.max_molecules, tally, reporter);
+    sftest::announce_corpus_tally_(tally);
+    reporter.summarize("csd_predicates");
 
-    fmt::println("Validated {} molecules (skipped {}), {} sub-query checks", fmt::group_digits(tally.validated),
-                 fmt::group_digits(tally.skipped), fmt::group_digits(tally.sub_query_checks));
-    fmt::println("Pattern checks: {} (= {} molecules x {} native patterns)", fmt::group_digits(tally.pattern_checks),
-                 fmt::group_digits(tally.validated), fmt::group_digits(native_patterns));
     std::size_t const expected_min = std::min<std::size_t>(selection.max_molecules, 8);
     sf_verify_(tally.validated >= expected_min, "fewer molecules validated than the corpus floor — bad test data?");
+    if (!reporter.passed())
+        return sftest::report_fail(test_name_k, "{} mismatches over {} comparisons", reporter.mismatch_count(),
+                                   reporter.comparison_count());
     return sftest::report_pass(test_name_k);
 }

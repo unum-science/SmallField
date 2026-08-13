@@ -7,16 +7,16 @@
  *  The builtin drug-like set runs unconditionally; naming a `.smi` file on the command line, or in
  *  `SMALLFIELD_TEST_CORPUS`, adds a second section over that corpus.
  *
- *  `build_descriptor` answers one `bool` for two different refusals, so a molecule's extents are classified
- *  before the call: an oversized corpus line is counted and skipped, and a refusal with both extents in range is
- *  a defect. The return is never discarded, because a discarded one leaves the previous molecule's descriptor in
- *  place and compares it against this molecule's RDKit answers.
+ *  `build_descriptor` answers a `conformer_status_t`, so this suite forwards that answer rather than re-deriving
+ *  it: a corpus line it refuses is counted under the status it was refused with, and a builtin it refuses is a
+ *  defect, since the builtin set is curated to fit. The return is never discarded, because a refusal writes
+ *  nothing and the descriptor still holds the previous molecule's fields.
  */
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 
-#include <algorithm>   // `std::min`, `std::sort`
+#include <algorithm>   // `std::sort`
 #include <memory>      // `std::unique_ptr`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
@@ -29,6 +29,7 @@
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
 
+#include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 
 #include "test/test_rdkit_reference_helpers.hpp"
@@ -61,60 +62,28 @@ struct descriptor_scratch_t {
 
 /** Where every corpus line went, so a section that compared little says why. */
 struct descriptor_tally_t {
-    std::uint64_t compared = 0;
-    std::uint64_t unparsed = 0;
-    std::uint64_t too_many_atoms = 0;
-    std::uint64_t too_many_bonds = 0;
+    std::size_t compared = 0;
+    /** Lines left out of the comparison, indexed by the status that refused them. */
+    std::size_t refused[sft::conformer_status_count_k] = {};
 };
-
-/** Which of the two extents `build_descriptor` folds into its single `false` a molecule would trip. */
-enum class descriptor_capacity_t {
-    fits_k,
-    too_many_atoms_k,
-    too_many_bonds_k,
-};
-
-/** Recover the refusal reason the bare `bool` return discards, before making the call. */
-static descriptor_capacity_t classify_capacity_(RDKit::ROMol const &molecule) {
-    if (molecule.getNumAtoms() > sft::max_atoms_per_molecule_k) return descriptor_capacity_t::too_many_atoms_k;
-    if (molecule.getNumBonds() > sft::max_bonds_k) return descriptor_capacity_t::too_many_bonds_k;
-    return descriptor_capacity_t::fits_k;
-}
-
-/**
- *  @brief Whether every ring label the descriptor carries per atom is complete for this molecule.
- *
- *  `build_descriptor` keeps the first `max_rings_k` SSSR rings and stops writing ring atoms at the capacity of
- *  `ring_atoms`, so beyond either bound a genuinely in-ring atom carries no `atom_flag_in_ring_k` and the
- *  comparison would report a clamp as a defect. Bond ring flags come from `numBondRings` directly and are never
- *  clamped, so they stay compared either way.
- */
-static bool ring_labels_are_complete_(RDKit::RingInfo const &ring_info) {
-    if (ring_info.numRings() > sft::max_rings_k) return false;
-    std::size_t ring_atom_count = 0;
-    for (auto const &ring : ring_info.atomRings()) ring_atom_count += ring.size();
-    return ring_atom_count <= sft::max_atoms_per_molecule_k * 2u;
-}
 
 static void compare_atoms_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
                            std::string const &smiles, diagnostic_reporter_t &reporter) {
     auto const *ring_info = molecule.getRingInfo();
-    bool const ring_labels_complete = ring_labels_are_complete_(*ring_info);
     std::uint32_t const num_atoms = molecule.getNumAtoms();
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
         auto const *atom = molecule.getAtomWithIdx(atom_index);
-        auto group = reporter.mismatch("atom", "smiles={} atom={}", smiles, atom_index);
-        group.field("element", atom->getAtomicNum(), descriptor.element[atom_index], exactly_equal)
+        reporter.mismatch("atom", "smiles={} atom={}", smiles, atom_index)
+            .field("element", atom->getAtomicNum(), descriptor.element[atom_index], exactly_equal)
             .field("hybridization", static_cast<std::uint8_t>(atom->getHybridization()),
                    descriptor.hybridization[atom_index], exactly_equal)
             .field("degree", atom->getDegree(), descriptor.degree[atom_index], exactly_equal)
             .field("num_hydrogens", atom->getTotalNumHs(true), descriptor.num_hydrogens[atom_index], exactly_equal)
             .field("formal_charge", atom->getFormalCharge(), descriptor.formal_charge[atom_index], exactly_equal)
             .field("aromatic", atom->getIsAromatic(),
-                   (descriptor.atom_flags[atom_index] & sft::atom_flag_aromatic_k) != 0, exactly_equal);
-        if (!ring_labels_complete) continue; // the ring cap dropped labels this molecule legitimately lacks
-        group.field("in_ring", ring_info->numAtomRings(atom_index) > 0,
-                    (descriptor.atom_flags[atom_index] & sft::atom_flag_in_ring_k) != 0, exactly_equal);
+                   (descriptor.atom_flags[atom_index] & sft::atom_flag_aromatic_k) != 0, exactly_equal)
+            .field("in_ring", ring_info->numAtomRings(atom_index) > 0,
+                   (descriptor.atom_flags[atom_index] & sft::atom_flag_in_ring_k) != 0, exactly_equal);
     }
 }
 
@@ -184,30 +153,33 @@ static void compare_bond_hops_(RDKit::ROMol const &molecule, descriptor_scratch_
 }
 
 /**
- *  @brief Build the descriptor for one molecule already known to fit, then compare every field it carries.
+ *  @brief Build the descriptor for one molecule, then compare every field it carries.
+ *
+ *  A refusal writes nothing, so it returns before the comparisons rather than reading the previous
+ *  molecule's descriptor against this molecule's RDKit answers.
  *
  *  @param[in] molecule Sanitized molecule with hydrogens added.
  *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key.
  *  @param[inout] reporter Reporter counting and printing the comparisons.
  *  @param[inout] scratch Buffers reused across molecules.
+ *  @return What `build_descriptor` answered, so the caller decides whether a refusal is a defect.
  */
-static void check_molecule_(RDKit::ROMol const &molecule, std::string const &smiles, diagnostic_reporter_t &reporter,
-                            descriptor_scratch_t &scratch) {
+static sft::conformer_status_t check_molecule_(RDKit::ROMol const &molecule, std::string const &smiles,
+                                               diagnostic_reporter_t &reporter, descriptor_scratch_t &scratch) {
     sft::conformer_status_t const built = sft::build_descriptor(molecule, scratch.descriptor);
-    sf_verify_(built == sft::conformer_status_t::success_k,
-               ("build_descriptor refused a molecule inside both extents: " + smiles).c_str());
+    if (built != sft::conformer_status_t::success_k) return built;
 
     auto const *ring_info = molecule.getRingInfo();
     reporter.mismatch("counts", "smiles={}", smiles)
         .field("num_atoms", molecule.getNumAtoms(), scratch.descriptor.num_atoms, exactly_equal)
         .field("num_bonds", molecule.getNumBonds(), scratch.descriptor.num_bonds, exactly_equal)
-        .field("num_rings", std::min<std::uint32_t>(ring_info->numRings(), sft::max_rings_k),
-               scratch.descriptor.num_rings, exactly_equal);
+        .field("num_rings", ring_info->numRings(), scratch.descriptor.num_rings, exactly_equal);
 
     compare_atoms_(molecule, scratch.descriptor, smiles, reporter);
     compare_bonds_(molecule, scratch.descriptor, smiles, reporter);
     compare_neighbors_(molecule, scratch, smiles, reporter);
     compare_bond_hops_(molecule, scratch, smiles, reporter);
+    return built;
 }
 
 #pragma endregion Comparison
@@ -229,9 +201,10 @@ static std::vector<std::string> stress_test_smiles_() {
 static void check_builtin_(std::string const &smiles, diagnostic_reporter_t &reporter, descriptor_scratch_t &scratch) {
     std::unique_ptr<RDKit::RWMol> molecule = mol_from_smiles(smiles);
     sf_verify_(molecule != nullptr, ("builtin SMILES must parse: " + smiles).c_str());
-    sf_verify_(classify_capacity_(*molecule) == descriptor_capacity_t::fits_k,
-               ("builtin SMILES must fit the descriptor extents: " + smiles).c_str());
-    check_molecule_(*molecule, smiles, reporter, scratch);
+    sft::conformer_status_t const built = check_molecule_(*molecule, smiles, reporter, scratch);
+    sf_verify_(
+        built == sft::conformer_status_t::success_k,
+        fmt::format("build_descriptor refused the builtin SMILES {} as {}", smiles, sft::conformer_status_name(built)));
 }
 
 /** A corpus line is untrusted input, so each way it can miss the comparison is counted and named. */
@@ -247,17 +220,24 @@ static void check_corpus_line_(std::string const &smiles, diagnostic_reporter_t 
     catch (...) {
         molecule.reset();
     }
-    if (!molecule) {
-        ++tally.unparsed;
+    sft::conformer_status_t const built = molecule ? check_molecule_(*molecule, smiles, reporter, scratch)
+                                                   : sft::conformer_status_t::invalid_smiles_k;
+    if (built != sft::conformer_status_t::success_k) {
+        ++tally.refused[static_cast<std::size_t>(built)];
         return;
     }
-    switch (classify_capacity_(*molecule)) {
-    case descriptor_capacity_t::too_many_atoms_k: ++tally.too_many_atoms; return;
-    case descriptor_capacity_t::too_many_bonds_k: ++tally.too_many_bonds; return;
-    case descriptor_capacity_t::fits_k: break;
-    }
     ++tally.compared;
-    check_molecule_(*molecule, smiles, reporter, scratch);
+}
+
+/** Narrate where the corpus lines went, naming each refusal with the status that refused it. */
+static void announce_corpus_tally_(descriptor_tally_t const &tally) {
+    fmt::print("NOTE descriptor_corpus molecules={}", tally.compared);
+    for (std::size_t status = 0; status < sft::conformer_status_count_k; ++status) {
+        if (tally.refused[status] == 0) continue; // a refusal nothing in this corpus reached
+        fmt::print(" {}={}", sft::conformer_status_name(static_cast<sft::conformer_status_t>(status)),
+                   tally.refused[status]);
+    }
+    fmt::println("");
 }
 
 #pragma endregion Corpora
@@ -292,8 +272,7 @@ int main(int argc, char **argv) {
 
         sftest::descriptor_tally_t tally;
         for (auto const &smiles : corpus) sftest::check_corpus_line_(smiles, reporter, scratch, tally);
-        fmt::println("  NOTE descriptor_corpus molecules={} unparsed={} too_many_atoms={} too_many_bonds={}",
-                     tally.compared, tally.unparsed, tally.too_many_atoms, tally.too_many_bonds);
+        sftest::announce_corpus_tally_(tally);
         reporter.summarize("descriptor_corpus");
     }
 
