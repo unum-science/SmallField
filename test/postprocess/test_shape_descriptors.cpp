@@ -77,16 +77,16 @@ namespace smallfield::tests {
 
 #pragma region Preparation
 
-/** The 12 USR slots, in the reference-point-major order `usr_descriptor` writes them. */
-static constexpr std::array<std::string_view, 12> usr_slot_names_k {
+/** The USR slots, in the reference-point-major order `usr_descriptor` writes them. */
+static constexpr std::array<std::string_view, sfpost::usr_components_k> usr_slot_names_k {
     "ctd_mean", "ctd_standard_deviation", "ctd_skewness", //
     "cst_mean", "cst_standard_deviation", "cst_skewness", //
     "fct_mean", "fct_standard_deviation", "fct_skewness", //
     "ftf_mean", "ftf_standard_deviation", "ftf_skewness",
 };
 
-/** USRCAT's five 12-slot blocks, in the order `usrcat_descriptor` writes them. */
-static constexpr std::array<std::string_view, 5> usrcat_block_names_k {
+/** USRCAT's blocks, the plain USR one and then the CREDO subsets, in the order `usrcat_descriptor` writes them. */
+static constexpr std::array<std::string_view, sfpost::credo_subset_count_k + 1> usrcat_block_names_k {
     "all", "hydrophobic", "aromatic", "acceptor", "donor",
 };
 
@@ -109,14 +109,14 @@ enum class prepare_outcome_t {
  *  @param[out] molecule Owns the prepared molecule on `prepared_k`, and is left null otherwise.
  *  @return Which of the two ways preparation can end short, or `prepared_k`.
  */
-static prepare_outcome_t prepare_molecule_(std::string const &smiles, std::unique_ptr<RDKit::RWMol> &molecule) {
+static prepare_outcome_t prepare_molecule_(std::string_view smiles, std::unique_ptr<RDKit::RWMol> &molecule) {
     molecule.reset();
     try {
         RDKit::SmilesParserParams params;
         params.sanitize = true;
         params.removeHs = false;
         params.strictCXSMILES = false;
-        molecule.reset(RDKit::SmilesToMol(smiles, params));
+        molecule.reset(RDKit::SmilesToMol(std::string {smiles}, params));
         if (!molecule) return prepare_outcome_t::unparsed_k;
         RDKit::MolOps::addHs(*molecule);
     }
@@ -175,20 +175,24 @@ struct shape_reporters_t {
     }
 };
 
+/** What one component measured before `separate_fragments` moved it, against which the after side is checked. */
+struct component_before_t {
+    double intra_distance_sum = 0.0;
+    std::array<double, 3> centroid {0.0, 0.0, 0.0};
+};
+
 /** Buffers that outlive the molecule loop, so a corpus sweep grows each of them once. */
 struct shape_scratch_t {
     /** Typed once per molecule into the same object the production loops hoist, capacity included. */
     sfpost::molecule_shape_context_t context;
     std::vector<float> coordinates;
-    std::array<double, 12> native_usr {};
-    std::array<double, 60> native_usrcat {};
+    std::array<double, sfpost::usr_components_k> native_usr {};
+    std::array<double, sfpost::usrcat_components_k> native_usrcat {};
     std::vector<double> rdkit_usr;
     std::vector<double> rdkit_usrcat;
     std::vector<std::vector<unsigned int>> rdkit_usrcat_atoms;
     std::vector<std::uint32_t> component_atoms;
-    std::vector<double> intra_sum_before;
-    std::vector<double> offaxis_before;
-    std::vector<std::array<double, 3>> centroid_before;
+    std::vector<component_before_t> components_before;
 };
 
 /** Where every corpus line went, so a section that compared little says why. */
@@ -216,7 +220,7 @@ struct shape_tally_t {
  *  @param[inout] reporters Reporters counting and printing the comparisons.
  *  @param[inout] scratch Buffers reused across molecules, carrying this molecule's typing context.
  */
-static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smiles, shape_reporters_t &reporters,
+static void compare_descriptors_(RDKit::RWMol &molecule, std::string_view smiles, shape_reporters_t &reporters,
                                  shape_scratch_t &scratch) {
     std::uint32_t const num_atoms = molecule.getNumAtoms();
     read_conformer_into(
@@ -260,6 +264,11 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string const &smil
 #pragma endregion Descriptors
 
 #pragma region Fragment Separation
+
+/*  The helpers below re-derive the centroid, the radius and the pairwise distances rather than calling
+ *  `centroid_of_` and `point_distance_` from `shape_descriptors.hpp`, which the code under test uses. Sharing
+ *  those would let a defect in either appear on both sides of the comparison and cancel itself out.
+ */
 
 /** Sum of pairwise distances within one component — invariant under a rigid translation. */
 static double intra_component_distance_sum_(std::vector<float> const &coords, std::vector<std::uint8_t> const &label,
@@ -339,18 +348,16 @@ static double centroid_offaxis_(std::array<double, 3> const &centroid) {
  *  @param[inout] scratch Carries this molecule's multi-component context and the coordinates in, and is left
  *      holding the separated ones.
  */
-static void check_separation_(std::string const &smiles, shape_reporters_t &reporters, shape_scratch_t &scratch) {
+static void check_separation_(std::string_view smiles, shape_reporters_t &reporters, shape_scratch_t &scratch) {
     sfpost::molecule_shape_context_t const &context = scratch.context;
     std::uint32_t const num_components = context.num_components;
-    scratch.intra_sum_before.assign(num_components, 0.0);
-    scratch.offaxis_before.assign(num_components, 0.0);
-    scratch.centroid_before.assign(num_components, std::array<double, 3> {0.0, 0.0, 0.0});
+    scratch.components_before.assign(num_components, component_before_t {});
     for (std::uint32_t component = 0; component < num_components; ++component) {
         std::uint8_t const label = static_cast<std::uint8_t>(component);
-        scratch.intra_sum_before[component] = intra_component_distance_sum_(
-            scratch.coordinates, context.component_label, label, scratch.component_atoms);
-        scratch.centroid_before[component] = component_centroid_(scratch.coordinates, context.component_label, label);
-        scratch.offaxis_before[component] = centroid_offaxis_(scratch.centroid_before[component]);
+        component_before_t &before = scratch.components_before[component];
+        before.intra_distance_sum = intra_component_distance_sum_(scratch.coordinates, context.component_label, label,
+                                                                  scratch.component_atoms);
+        before.centroid = component_centroid_(scratch.coordinates, context.component_label, label);
     }
 
     sfpost::separate_fragments(scratch.coordinates, context);
@@ -358,6 +365,8 @@ static void check_separation_(std::string const &smiles, shape_reporters_t &repo
     auto const unchanged = [](double reference, double observed) {
         return std::fabs(reference - observed) <= rigid_relative_tolerance_k * std::max(1.0, std::fabs(reference));
     };
+    // The claim is where the centroid ended up, not how far it moved, so the before value is reported as context
+    // and deliberately not consulted.
     auto const on_axis = [](double, double observed) { return observed < on_axis_tolerance_k; };
 
     std::array<double, 3> previous_centroid {0.0, 0.0, 0.0};
@@ -371,9 +380,10 @@ static void check_separation_(std::string const &smiles, shape_reporters_t &repo
         double const radius_after = component_radius_(scratch.coordinates, context.component_label, label,
                                                       centroid_after);
 
+        component_before_t const &before = scratch.components_before[component];
         reporters.separation.mismatch("fragment_separation", "smiles={} component={}", smiles, component)
-            .field("intra_distance_sum", scratch.intra_sum_before[component], intra_sum_after, unchanged)
-            .field("centroid_offaxis", scratch.offaxis_before[component], centroid_offaxis_(centroid_after), on_axis);
+            .field("intra_distance_sum", before.intra_distance_sum, intra_sum_after, unchanged)
+            .field("centroid_offaxis", centroid_offaxis_(before.centroid), centroid_offaxis_(centroid_after), on_axis);
 
         if (component > 0) {
             // The two bounding spheres must clear each other, which a gap that merely grew does not promise.
@@ -383,7 +393,7 @@ static void check_separation_(std::string const &smiles, shape_reporters_t &repo
                 .mismatch("fragment_separation", "smiles={} components={}-{} clearance={:.3g}", smiles, component - 1,
                           component, clearance)
                 .field("centroid_gap",
-                       centroid_distance_(scratch.centroid_before[component - 1], scratch.centroid_before[component]),
+                       centroid_distance_(scratch.components_before[component - 1].centroid, before.centroid),
                        centroid_distance_(previous_centroid, centroid_after), clears);
         }
         previous_centroid = centroid_after;
@@ -396,25 +406,23 @@ static void check_separation_(std::string const &smiles, shape_reporters_t &repo
 #pragma region Corpora
 
 /** Molecules whose CREDO subsets between them reach every USRCAT block. */
-static std::vector<std::string> shape_test_smiles_() {
-    return {
-        "CCO",                    //
-        "c1ccccc1",               //
-        "CC(=O)Oc1ccccc1C(=O)O",  // aspirin
-        "Nc1ccc(cc1)S(=O)(=O)N",  // sulfanilamide: donors + acceptors
-        "OC(=O)CCc1cc(O)c(O)cc1", // multiple donors/acceptors/aromatic
-        "CC(=O)Nc1ccc(O)cc1",     // paracetamol
-    };
-}
+static constexpr std::array<std::string_view, 6> builtin_smiles_k {
+    "CCO",                    //
+    "c1ccccc1",               //
+    "CC(=O)Oc1ccccc1C(=O)O",  // aspirin
+    "Nc1ccc(cc1)S(=O)(=O)N",  // sulfanilamide: donors + acceptors
+    "OC(=O)CCc1cc(O)c(O)cc1", // multiple donors/acceptors/aromatic
+    "CC(=O)Nc1ccc(O)cc1",     // paracetamol
+};
 
 /** The salt whose two components exercise `separate_fragments` when no corpus supplies one. */
 static constexpr std::string_view builtin_salt_k = "CC(=O)[O-].[Na+]";
 
 /** The builtin molecules are curated, so anything that stops one short of the comparison is a defect. */
-static void check_builtin_(std::string const &smiles, shape_reporters_t &reporters, shape_scratch_t &scratch) {
+static void check_builtin_(std::string_view smiles, shape_reporters_t &reporters, shape_scratch_t &scratch) {
     std::unique_ptr<RDKit::RWMol> molecule;
     sf_verify_(prepare_molecule_(smiles, molecule) == prepare_outcome_t::prepared_k,
-               ("builtin SMILES must parse and embed: " + smiles).c_str());
+               fmt::format("a builtin SMILES must parse and embed, but {} did not", smiles));
 
     // One verdict covers both claims a builtin has to meet: it types, and it types the molecule that was
     // just embedded, which is what makes the coordinates below address the atoms the context describes.
@@ -433,19 +441,19 @@ static void check_builtin_(std::string const &smiles, shape_reporters_t &reporte
  *  counterions before it can ever see one, so the context is built with every fragment kept.
  */
 static void check_builtin_salt_(shape_reporters_t &reporters, shape_scratch_t &scratch) {
-    std::string const salt {builtin_salt_k};
     std::unique_ptr<RDKit::RWMol> molecule;
-    sf_verify_(prepare_molecule_(salt, molecule) == prepare_outcome_t::prepared_k, "builtin salt must embed");
+    sf_verify_(prepare_molecule_(builtin_salt_k, molecule) == prepare_outcome_t::prepared_k, "builtin salt must embed");
 
     sfpost::shape_typing_t const typing = sfpost::build_shape_context_into(
-        salt, molecule->getNumAtoms(), smallfield::keep_all_fragments_k, scratch.context);
-    sf_verify_(typing == sfpost::shape_typing_t::typed_k,
-               fmt::format("the builtin salt must type, but {} {}", salt, sfpost::describe_shape_typing(typing)));
+        builtin_salt_k, molecule->getNumAtoms(), smallfield::keep_all_fragments_k, scratch.context);
+    sf_verify_(
+        typing == sfpost::shape_typing_t::typed_k,
+        fmt::format("the builtin salt must type, but {} {}", builtin_salt_k, sfpost::describe_shape_typing(typing)));
     sf_verify_(scratch.context.num_components == 2, "the builtin salt must have exactly two components");
 
     read_conformer_into(*molecule, types::reset_coordinates_aos<types::coordinate_role_t::position_k>(
                                        scratch.coordinates, molecule->getNumAtoms()));
-    check_separation_(salt, reporters, scratch);
+    check_separation_(builtin_salt_k, reporters, scratch);
 }
 
 /**
@@ -455,7 +463,7 @@ static void check_builtin_salt_(shape_reporters_t &reporters, shape_scratch_t &s
  *  straight out of the same SMILES: a context that stripped a counterion would be typing a different molecule
  *  from the one RDKit measures.
  */
-static void check_corpus_line_(std::string const &smiles, shape_reporters_t &reporters, shape_scratch_t &scratch,
+static void check_corpus_line_(std::string_view smiles, shape_reporters_t &reporters, shape_scratch_t &scratch,
                                shape_tally_t &tally) {
     std::unique_ptr<RDKit::RWMol> molecule;
     switch (prepare_molecule_(smiles, molecule)) {
@@ -506,7 +514,7 @@ int main(int argc, char **argv) {
     reporters.limit_printed_lines(max_printed_lines_k);
     sftest::shape_scratch_t scratch;
 
-    for (auto const &smiles : sftest::shape_test_smiles_()) sftest::check_builtin_(smiles, reporters, scratch);
+    for (std::string_view const smiles : sftest::builtin_smiles_k) sftest::check_builtin_(smiles, reporters, scratch);
     reporters.usr.summarize("usr_builtin");
     reporters.usrcat.summarize("usrcat_builtin");
 
