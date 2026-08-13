@@ -42,6 +42,15 @@ static constexpr char const *executable_name_k = "bench_kernel_replay";
 /** Warp size, spelled once, matching the block size both kernels are launched at. */
 static constexpr std::uint32_t warp_size_k = 32;
 
+/**
+ *  @brief The byte a status slot carries before either kernel has written it.
+ *
+ *  Zero is `conformer_status_t::success_k`, so a slot memset to zero and never reached counts as a
+ *  conformer the replay produced -- which is the one measurement separating a representative capture
+ *  from one whose every slot the polish kernel skipped.
+ */
+static constexpr std::uint8_t unwritten_status_k = 0xFF;
+
 #pragma region Capture Manifest
 
 /**
@@ -291,7 +300,7 @@ static bool upload_(capture_manifest_t const &manifest, std::vector<char> const 
     cudaMemcpy(device.embedding, embedding.data(), embedding.size(), cudaMemcpyHostToDevice);
     cudaMemset(device.coordinates, 0, coordinate_count * sizeof(float));
     cudaMemset(device.energies, 0, slot_count * sizeof(float));
-    cudaMemset(device.status, 0, slot_count);
+    cudaMemset(device.status, unwritten_status_k, slot_count);
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
@@ -387,7 +396,7 @@ int main(int argc, char **argv) {
     }
 
     for (std::uint32_t repeat = 0; repeat < arguments.repeats; ++repeat) {
-        cudaMemset(device.status, 0, slot_count);
+        cudaMemset(device.status, unwritten_status_k, slot_count);
         cudaEventRecord(before);
         launch_etkdg_(manifest, device);
         cudaEventRecord(between);
@@ -412,14 +421,14 @@ int main(int argc, char **argv) {
     // A snapshot of unrepresentative inputs replays at the right speed for the wrong reason: the ETKDG
     // kernel would burn every stereo attempt and the polish kernel would skip every slot. Counting the
     // slots that ended `success_k` and the energies the polish wrote is what separates the two.
-    std::vector<std::uint8_t> status(slot_count);
+    std::vector<std::uint8_t> status(slot_count, unwritten_status_k);
     std::vector<float> energies(slot_count);
     cudaMemcpy(status.data(), device.status, slot_count, cudaMemcpyDeviceToHost);
     cudaMemcpy(energies.data(), device.energies, slot_count * sizeof(float), cudaMemcpyDeviceToHost);
     std::uint64_t succeeded = 0;
     double energy_sum = 0.0;
     for (std::uint64_t slot = 0; slot < slot_count; ++slot)
-        if (status[slot] == 0) {
+        if (status[slot] == static_cast<std::uint8_t>(sft::conformer_status_t::success_k)) {
             ++succeeded;
             energy_sum += static_cast<double>(energies[slot]);
         }

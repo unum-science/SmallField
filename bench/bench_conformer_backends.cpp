@@ -63,6 +63,15 @@ static constexpr std::size_t min_heavy_bin_samples_k = 30;
  */
 static constexpr std::uint32_t coordinate_stride_atoms_k = smallfield::types::max_atoms_per_molecule_k;
 
+/**
+ *  @brief What a conformer slot carries before `generate_conformers` has written it.
+ *
+ *  A value-initialized `conformer_status_t` is `success_k`, so a slot the pipeline never reached would be
+ *  counted as a conformer it produced and drawn into the RDKit cross-validation sample, which then scores
+ *  uninitialized coordinates and decides this binary's exit code on them.
+ */
+static constexpr sfapi::conformer_status_t unwritten_status_k = sfapi::conformer_status_t::invalid_smiles_k;
+
 #pragma region Statistics
 
 /** Linear-interpolated percentile of an @b already sorted sample; zero for an empty one. */
@@ -197,7 +206,7 @@ static void bench_smallfield_gpu(std::vector<std::string> const &smiles, std::ui
     std::size_t const total_conformers = static_cast<std::size_t>(num_smiles) * num_conformers;
     coords_out.resize(total_conformers * coordinate_stride_atoms_k * 3);
     energies_out.resize(total_conformers);
-    status_out.resize(total_conformers);
+    status_out.assign(total_conformers, unwritten_status_k);
 
     int const device_id = 0;
     sfapi::context_t gpu_context(custd::span<int const>(&device_id, 1));
@@ -230,7 +239,7 @@ static void bench_smallfield_multi_gpu(std::vector<std::string> const &smiles, s
     std::size_t const total_conformers = static_cast<std::size_t>(num_smiles) * num_conformers;
     std::vector<__half> coords(total_conformers * coordinate_stride_atoms_k * 3);
     std::vector<float> energies(total_conformers);
-    std::vector<sfapi::conformer_status_t> status(total_conformers);
+    std::vector<sfapi::conformer_status_t> status(total_conformers, unwritten_status_k);
 
     // An empty device span is every visible GPU, so a scaling sweep controlling the count through
     // `CUDA_VISIBLE_DEVICES` reaches this path with one device and still runs.

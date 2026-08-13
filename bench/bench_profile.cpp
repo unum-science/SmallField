@@ -40,6 +40,15 @@ static constexpr std::uint32_t max_conformers_per_molecule_k = 1024;
 /** Ceiling on the host coordinate buffer, refused before allocation rather than during it. */
 static constexpr std::size_t max_coordinate_bytes_k = 64ull << 30;
 
+/**
+ *  @brief What a conformer slot carries before `generate_conformers` has written it.
+ *
+ *  A value-initialized `conformer_status_t` is `success_k`, so a slot the pipeline never reached would
+ *  join the succeeded count and the status histogram would report a run that produced nothing as a run
+ *  that produced everything.
+ */
+static constexpr sfapi::conformer_status_t unwritten_status_k = sfapi::conformer_status_t::invalid_smiles_k;
+
 #pragma region Command Line
 
 /** Everything this driver takes from the command line. */
@@ -119,7 +128,7 @@ int main(int argc, char **argv) {
 
     std::vector<__half> coords(total_conformers * max_atoms * 3);
     std::vector<float> energies(total_conformers);
-    std::vector<sfapi::conformer_status_t> status(total_conformers);
+    std::vector<sfapi::conformer_status_t> status(total_conformers, unwritten_status_k);
 
     sfapi::context_t gpu_context;
     sfapi::config_t config;
