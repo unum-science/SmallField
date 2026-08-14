@@ -25,6 +25,7 @@
 #include "smallfield/cuda/etkdg_pipeline.cuh"
 #include "smallfield/cuda/metric_embedding_prepass.cuh"
 #include "smallfield/cuda/preprocess_kernel.cuh"
+#include "smallfield/cuda/stereo_validation.cuh"
 #include "smallfield/cuda_error.hpp"
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
@@ -50,6 +51,7 @@ using smallfield::cuda::mmff94_apply_typing_patch_kernel;
 using smallfield::cuda::mmff_polish_warp_kernel;
 using smallfield::cuda::stamp_refused_molecules_kernel;
 using smallfield::cuda::upload_csd_torsion_table_to_device;
+using smallfield::cuda::validate_polished_stereo_kernel;
 using smallfield::cuda::warp_size_k;
 using smallfield::mmff94::mmff94_build_csr_kernel;
 using smallfield::mmff94::mmff94_compact_terms_kernel;
@@ -72,6 +74,7 @@ using smallfield::types::carve;
 using smallfield::types::device_allocator_t;
 using smallfield::types::device_bytes_t;
 using smallfield::types::download_from;
+using smallfield::types::energy_is_physical;
 using smallfield::types::etk_torsion_descriptor_t;
 using smallfield::types::etkdg_molecule_metadata_t;
 using smallfield::types::max_atoms_per_molecule_k;
@@ -737,26 +740,39 @@ struct molecule_readback_t {
 };
 
 /**
- *  @brief Widen the byte a kernel wrote into the public per-conformer status.
+ *  @brief Widen the byte a kernel wrote into the public per-conformer status, and check the energy
+ *  behind a success.
  *
  *  Three values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`,
  *  and `stamp_refused_molecules_kernel` overwrites both with `bounds_infeasible_k` wherever the metric
  *  prepass found bounds no coordinates satisfy. Anything else is a slot no kernel reached, and it reports
  *  as unconverged rather than as a success the coordinates would not back.
+ *
+ *  A success is only a success while its energy is a number a consumer can rank by, so the two facts are
+ *  decided together here rather than left for six consumers to re-derive from the status byte alone.
  */
-static conformer_status_t conformer_status_of_(std::uint8_t raw) noexcept {
+static conformer_status_t conformer_status_of_(std::uint8_t raw, float energy) noexcept {
     auto const status = static_cast<conformer_status_t>(raw);
     switch (status) {
     case conformer_status_t::success_k:
+        return energy_is_physical(energy) ? status : conformer_status_t::nonphysical_energy_k;
     case conformer_status_t::stereo_failure_k:
     case conformer_status_t::bounds_infeasible_k: return status;
     default: return conformer_status_t::mmff_unconverged_k;
     }
 }
 
-/** Report the launch error the preceding `<<<>>>` left on the device, if any. */
+/**
+ *  @brief Report the launch error the preceding `<<<>>>` left on the device, if any.
+ *
+ *  `cudaGetLastError` rather than `cudaPeekAtLastError`, because peeking leaves the sticky slot set:
+ *  this runs eleven times per wave, so one refused kernel was re-reported by every later call under
+ *  the name of a kernel that had not failed, and `cuda_error_count` counted one failure eleven times.
+ *  It also picked up an error left by an earlier `cudaMemcpyAsync` on the same host thread and blamed
+ *  it on whichever launch came next.
+ */
 static void check_launch_(cuda_error_sink_t const &sink, char const *label) noexcept {
-    [[maybe_unused]] bool const launched = sink.check(cudaPeekAtLastError(), label);
+    [[maybe_unused]] bool const launched = sink.check(cudaGetLastError(), label);
 }
 
 /**
@@ -1004,6 +1020,17 @@ static void enqueue_binned_kernels_(wave_slice_view_t const &device_view,
     // outright. A molecule refused there was still minimised from a zeroed embedding above, so what it holds
     // is a conformer nothing asked for — the status is what stops it being read as one.
     if (molecule_count != 0) {
+        // Before the stamp and before the half-precision narrowing: the polish kernel above rewrote
+        // every coordinate after the pipeline kernel's own chirality gate, so this is the only place a
+        // center it inverted can still be seen. One warp per slot, over the whole batch at once — every
+        // bin writes coordinates at the same stride, so no per-bin offset walk is needed here.
+        std::uint32_t const validate_grid = std::min<std::uint32_t>(
+            molecule_count * conformer_count, static_cast<std::uint32_t>(8 * multiprocessor_count));
+        validate_polished_stereo_kernel<<<validate_grid, warp_size_k, 0, stream>>>(
+            regions.coordinates_fp32.data(), device_view.chiral_centers.data(), device_view.descriptors.data(),
+            device_metadata, regions.status.data(), molecule_count, conformer_count, gpu_max_atoms);
+        check_launch_(sink, "validate_polished_stereo_kernel launch");
+
         constexpr std::uint32_t stamp_block_k = 256;
         stamp_refused_molecules_kernel<<<divide_rounding_up(molecule_count, stamp_block_k), stamp_block_k, 0, stream>>>(
             regions.molecule_verdicts.data(), regions.status.data(), molecule_count, conformer_count);
@@ -1079,9 +1106,15 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
     sf_assert_(device_outcome != reserve_outcome_t::grown_k);
     sf_assert_(host_outcome != reserve_outcome_t::grown_k);
     if (device_outcome == reserve_outcome_t::failed_k || host_outcome == reserve_outcome_t::failed_k) {
+        // Through the sink rather than the logger, because `cuda_error_count` is what the batch CLI
+        // reads to park a shard and to set its exit code. Logging alone left this device's molecules
+        // carrying the `invalid_smiles_k` pre-fill, so an out-of-memory device shipped as "these
+        // SMILES failed to parse" and the process still returned zero.
         if (sink.log != nullptr)
             sink.log->error("launch_gpu_pipeline: pool allocation failed on device {} ({} device, {} host bytes)",
                             device_id, device_bytes, host_bytes);
+        [[maybe_unused]] bool const reserved = sink.check(cudaErrorMemoryAllocation,
+                                                          "launch_gpu_pipeline pool reserve");
         return {};
     }
 
@@ -1189,8 +1222,11 @@ static void finalize_gpu_pipeline(gpu_pipeline_handle_t &handle) {
         for (std::uint32_t conformer = 0; conformer < conformer_count; ++conformer) {
             std::size_t const source_slot = static_cast<std::size_t>(sorted_index) * conformer_count + conformer;
             std::size_t const destination_slot = static_cast<std::size_t>(caller_index) * conformer_count + conformer;
-            handle.outputs.energies[destination_slot] = handle.staged.energies[source_slot];
-            handle.outputs.status[destination_slot] = conformer_status_of_(handle.staged.status[source_slot]);
+            // The demoted slot keeps the energy it was demoted for: the status says not to read it, and
+            // the value is the only evidence of what the minimizer did.
+            float const energy = handle.staged.energies[source_slot];
+            handle.outputs.energies[destination_slot] = energy;
+            handle.outputs.status[destination_slot] = conformer_status_of_(handle.staged.status[source_slot], energy);
             // Both sides are structure-of-arrays but at different strides, so each axis is copied into
             // its own section. `conformer_slot_layout_t` is the contract shared with the RDKit fallback
             // producer and the Parquet writer.

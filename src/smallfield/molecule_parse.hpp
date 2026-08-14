@@ -99,7 +99,8 @@ inline bool names_multiple_fragments_(std::string_view smiles) noexcept {
  *  Order is the contract: parse, drop counterions, add hydrogens, gate on atom count, then
  *  optionally measure. Dropping fragments has to precede `AddHs` so the hydrogen count belongs to
  *  the parent, and precede the atom-count gate so a bulky counterion stops pushing an otherwise
- *  ordinary molecule past the cap.
+ *  ordinary molecule past the cap. The gate is two-sided: a molecule of no atoms is refused as
+ *  `invalid_smiles_k`, so `success_k` and a non-zero `num_atoms` always travel together.
  *
  *  @param[in] smiles Input string; not required to be null-terminated.
  *  @param[in] options Per-call-site knobs.
@@ -151,6 +152,14 @@ inline parse_result_t parse_smiles(std::string_view smiles, parse_options_t cons
     }
 
     result.num_atoms = static_cast<std::uint32_t>(result.molecule->getNumAtoms());
+    // An empty or whitespace-only string parses into a valid `RWMol` of no atoms, which is how a null
+    // cell in an input shard arrives here. It is not a molecule: there is no geometry to embed and no
+    // atom to type, and admitting it lets a row nothing was generated for count as a success. The
+    // status stays `invalid_smiles_k`, the reason `GLOSSARY.md` names for an empty molecule.
+    if (result.num_atoms == 0) {
+        result.molecule.reset();
+        return result;
+    }
     if (options.max_atoms != 0 && result.num_atoms > options.max_atoms) {
         result.molecule.reset();
         result.status = types::conformer_status_t::too_many_atoms_k;

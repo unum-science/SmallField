@@ -108,6 +108,13 @@ __Effort:__ Low.
 __Risk:__ Low — behaviour-preserving by construction, since the skipped molecules already end at the same status.
 __Gate:__ Per-status counts in the output shard unchanged, with only wall time moving.
 
+__Closed 2026-08-13.__
+Implemented: `fill_retry_indices_into_` now dispatches through `fallback_dispatch_cause`, which consults a per-status disposition policy.
+The rule is right and the throughput argument for it was wrong by three orders of magnitude.
+At `100K PubChem, K=3, 1× H100 + 16 cores`, 2026-08-13, the measured saving is __under 1 CPU-second out of 1 942__, or 0.04 %, because embedding is 93 % of the fallback's cost while parse and typing together are 0.02 %.
+The 85 % tail is real; it is simply not made of the work this item skips.
+See `DEFECTS.md` for the per-stage breakdown.
+
 ### Depth-3 Ring Buffer and Async Finalize
 
 __Mechanism:__ Promote the 2-slot `batch_pool_t` ring in `generate_conformers` to 3 slots, issue wave N's D2H and reorder on a separate stream so wave N+1's `launch_wave` overlaps wave N's finalize, and pre-allocate the third slot's pinned buffer in the `context_t` constructor so no `cudaHostAlloc` fires mid-run.

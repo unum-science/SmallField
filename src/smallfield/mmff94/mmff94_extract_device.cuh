@@ -284,6 +284,10 @@ static __launch_bounds__(warp_size_k, 4) __global__ void mmff94_extract_terms_ke
             for (std::uint16_t k_neighbor_slot = kstart; k_neighbor_slot < kend; ++k_neighbor_slot) {
                 std::uint32_t const atom_l = descriptor.neighbor_atom[k_neighbor_slot];
                 if (atom_l == atom_j) continue;
+                // A three-membered ring closes i onto l, so the dihedral is identically zero and the
+                // term is a constant with no gradient. RDKit's `addTorsions` excludes it for the same
+                // reason; emitting it moves no atom and offsets every energy comparison.
+                if (atom_l == atom_i) continue;
                 auto const [torsion_type_primary, torsion_type_secondary] = native_get_mmff_torsion_type(
                     descriptor, atom_type_span, bond_types, atom_i, atom_j, atom_k, atom_l);
                 [[maybe_unused]] auto const [canonical_torsion_type, torsion_entry] = lookup_torsion(

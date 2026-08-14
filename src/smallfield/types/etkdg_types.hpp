@@ -111,43 +111,31 @@ struct etkdg_molecule_metadata_t {
 static_assert(sizeof(etkdg_molecule_metadata_t) == 108);
 
 /*
- *  The volume window a chiral center must stay inside, in cubic angstrom, as magnitudes — the
- *  handedness is `chiral_center_descriptor_t::target_sign` and lives in exactly one place.
+ *  The floor a chiral center's volume must reach, in cubic angstrom, as a magnitude — the handedness
+ *  is `chiral_center_descriptor_t::target_sign` and lives in exactly one place.
  *
- *  Both floors are RDKit's, and each is taken from the place where it transfers into our convention.
- *  Ours is the triple product over the center and its three lowest-indexed neighbors; RDKit's
- *  `DistGeom::ChiralSet` bound is over the four @b neighbors taken from the fourth of them.
+ *  Both are RDKit's `DistGeom::ChiralSet` bounds over RDKit's own expression, which we evaluate
+ *  unchanged: the triple product over the four neighbors, taken from the fourth of them. RDKit
+ *  substitutes the center itself as the fourth point when there is no fourth bond, so a
+ *  three-coordinate center reduces to the triple product over the center and its three neighbors.
  *
- *  For a three-coordinate center the two are the same expression, because RDKit inserts the center
- *  itself as its fourth point — so its lower bound of 2 transfers unchanged, and we are exactly as
- *  strict as `checkChiralCenters` and no stricter.
+ *  One floor serves both the restoring force in `evaluate_distance_geometry_energy` and the
+ *  `chiral_volume_slack_k` gate in `count_invalid_chiral_centers_`, matching `constructForceField`
+ *  and `checkChiralCenters` respectively.
  *
- *  For a four-coordinate center they do not. The two agree up to a factor of four only when the
- *  center sits at the centroid of its neighbors:
- *
- *  @verbatim
- *  n_0 + n_1 + n_2 + n_3 = 0  (center at the origin)
- *  det[n_0 - n_3, n_1 - n_3, n_2 - n_3] = det[n_0, n_1, n_2] * det[[2,1,1],[1,2,1],[1,1,2]]
- *                                       = det[n_0, n_1, n_2] * 4
- *  @endverbatim
- *
- *  Real centers do not: over 2338 stereocenters of a PubChem sample the measured factor averages
- *  5.4, and it varies with the center, so RDKit's 5 does not convert to a fixed number here. What
- *  does transfer is its other floor, `MIN_TETRAHEDRAL_CHIRAL_VOL` in `Embedder.cpp`, which
- *  `_volumeTest` applies to this very triple product over @b unit vectors. Read as a magnitude in
- *  cubic angstrom it is strictly the weaker test, since every bond a stereocenter carries is longer
- *  than one angstrom, which is what makes it safe as a dead band rather than a quality gate: across
- *  3223 correctly embedded stereocenters the smallest realized volume was 0.49, against a rejection
- *  threshold of 0.4.
+ *  @b Not `MIN_TETRAHEDRAL_CHIRAL_VOL`, which is 0.5 over unit vectors in `Embedder.cpp`. RDKit
+ *  applies that only to `tetrahedralCenters` — untagged degree-4 carbon and nitrogen, whose
+ *  `ChiralSet` carries bounds of (0, 0) and which never enter a force field at all. It is a
+ *  planarity check on atoms with no stereochemistry to preserve, not a target for atoms that have it.
  *
  *  RDKit's `volUpperBound` has no counterpart here. It sits at 100 cubic angstrom, which a center
  *  would need bonds over three angstroms long to reach, so the upper branch of its penalty is a
  *  branch nothing takes, and carrying it cost a register on `sm_100` for no force ever applied.
  */
 
-/** Floor on |V| for a center with four bonded neighbors. */
-inline constexpr float min_four_coordinate_volume_k = 0.5f;
-/** Floor on |V| for a center whose fourth substituent is a lone pair. */
+/** Floor on |V| for a center with four bonded neighbors; RDKit's `volLowerBound`. */
+inline constexpr float min_four_coordinate_volume_k = 5.0f;
+/** Floor on |V| for a center whose fourth substituent is a lone pair; RDKit's github #5883 case. */
 inline constexpr float min_three_coordinate_volume_k = 2.0f;
 
 /**
@@ -158,7 +146,8 @@ inline constexpr float min_three_coordinate_volume_k = 2.0f;
  *  The ordering is index-based, not CIP-based: `target_sign` is derived from the tetrahedral tag
  *  and the parity of this permutation relative to the bond order the tag is defined against, so
  *  any deterministic order works as long as the same one is used at derivation and validation.
- *  A three-coordinate center stores its three bonded neighbors and leaves the fourth slot unused.
+ *  A three-coordinate center stores its three bonded neighbors and the center itself as the fourth,
+ *  which is what RDKit substitutes when there is no fourth bond.
  *
  *  The sign and the floor are two halves of one statement and neither is derivable from the other:
  *  the sign says which way the center is handed, the floor says how far from flat it has to stay.
@@ -167,8 +156,8 @@ inline constexpr float min_three_coordinate_volume_k = 2.0f;
  *  reads no violation at all.
  *
  *  @verbatim
- *  Validation: V = dot(r_b - r_a, cross(r_c - r_a, r_d - r_a))
- *  where a = center and b, c, d = neighbor_atoms[0..2].
+ *  Validation: V = dot(r_0 - r_3, cross(r_1 - r_3, r_2 - r_3))
+ *  where r_i = neighbor_atoms[i], so the fourth neighbor is the pivot and the center is not read.
  *  sign(V) must equal target_sign, and |V| must reach minimum_volume.
  *  @endverbatim
  */

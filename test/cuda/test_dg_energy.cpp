@@ -324,8 +324,8 @@ static constexpr float bound_clearance_angstrom_k = 1.0f;
 static constexpr float random_start_span_k = 5.0f;
 static constexpr std::int32_t max_iterations_k = 400;
 static constexpr float gradient_threshold_k = 1e-4f;
-/** Weight on the fourth-dimension crush penalty wherever a section exercises it. */
-static constexpr float fourth_dimension_weight_k = 0.5f;
+/** Weight on the fourth-dimension crush penalty wherever a section exercises it, matching the pipeline's. */
+static constexpr float fourth_dimension_weight_k = 10.0f;
 /** The finite-difference sweep costs two launches per component, so it walks only the first few molecules. */
 static constexpr std::size_t max_gradient_molecules_k = 3;
 /** The chirality sweep costs the same per center, so it too walks only the first few chiral molecules. */
@@ -347,7 +347,12 @@ static bool gradients_agree_(double finite_difference, double analytical) {
 static constexpr float chiral_weight_k = 100.0f;
 /** Fraction of its out-of-plane height a flattened center keeps, small enough to be flat, not zero. */
 static constexpr float near_flat_retention_k = 0.02f;
-/** Fraction kept for the finite-difference sweep: well inside the penalty's active branch, and smooth. */
+/**
+ *  Fraction kept for the finite-difference sweep. The penalty is active while `|V| < minimum_volume`,
+ *  so this has to be small enough that a realized volume times it still lands under that floor —
+ *  otherwise `excess_volume` is zero, the sweep compares zero against zero, and the assertion passes
+ *  without exercising anything. `chirality_penalty_is_active` is the check that this still holds.
+ */
 static constexpr float penalized_retention_k = 0.3f;
 
 /** Relative agreement demanded between the minimiser's own report and a fresh evaluation of it. */
@@ -581,20 +586,24 @@ static sftest::dg_probe_t check_gradient_(sftest::diagnostic_reporter_t &reporte
 }
 
 /**
- *  @brief Slide every chiral center toward the plane of its three stored neighbors.
+ *  @brief Slide every chiral center's pivot toward the plane of the other three stored neighbors.
  *
  *  At @p retained zero the signed volume is exactly zero, the geometry a sign test cannot classify at
  *  all; at a small positive fraction the sign is still the one the descriptor asks for and only the
  *  magnitude has collapsed, which is the case a sign test passes and a volume window rejects.
  *
+ *  The atom moved is `neighbor_atoms[3]`, because that is the point the volume is measured from. For
+ *  a three-coordinate center it is the center itself, so that case flattens exactly as it always did.
+ *
  *  @param[inout] coordinates Four-axis embedding, modified in place.
- *  @param[in] centers Chiral centers whose center atoms are moved.
+ *  @param[in] centers Chiral centers whose pivot atoms are moved.
  *  @param[in] retained Fraction of the out-of-plane height each center keeps.
  */
 static void flatten_chiral_centers_(sft::embedding_soa_t coordinates,
                                     custd::span<sft::chiral_center_descriptor_t const> centers, float retained) {
     for (auto const &center : centers) {
         std::uint32_t const origin = center.neighbor_atoms[0];
+        std::uint32_t const pivot = center.neighbor_atoms[3];
         float first_edge[3] = {}, second_edge[3] = {}, normal[3] = {};
         for (std::uint32_t axis = 0; axis < 3; ++axis) {
             first_edge[axis] = coordinates(center.neighbor_atoms[1], axis) - coordinates(origin, axis);
@@ -608,9 +617,9 @@ static void flatten_chiral_centers_(sft::embedding_soa_t coordinates,
 
         float height = 0.0f;
         for (std::uint32_t axis = 0; axis < 3; ++axis)
-            height += (coordinates(center.center_atom, axis) - coordinates(origin, axis)) * normal[axis] / length;
+            height += (coordinates(pivot, axis) - coordinates(origin, axis)) * normal[axis] / length;
         for (std::uint32_t axis = 0; axis < 3; ++axis)
-            coordinates(center.center_atom, axis) -= (1.0f - retained) * height * normal[axis] / length;
+            coordinates(pivot, axis) -= (1.0f - retained) * height * normal[axis] / length;
     }
 }
 
@@ -694,9 +703,16 @@ static sftest::dg_probe_t check_chirality_(sftest::diagnostic_reporter_t &report
     float energy_at_center = 0.0f;
     probe = gpu_dg_energy(problem, coordinates.data_handle(), gradient.data_handle(), &energy_at_center);
     if (probe != sftest::dg_probe_t::completed_k) return probe;
+
+    // The sweep below only means something while the penalty is in its active branch. Outside it
+    // `excess_volume` is zero, so the analytical gradient and the finite difference are both zero and
+    // every comparison passes having exercised nothing. These are chiral-only weights, so a positive
+    // energy is exactly the statement that the flattened centers are still being penalised.
+    reporter.mismatch("dg_chirality", "smiles={} retained={}", subject.smiles, penalized_retention_k)
+        .field("chirality_penalty_is_active", true, energy_at_center > 0.0f, sftest::exactly_equal);
     for (auto const &center : centers)
         for (std::uint8_t const atom :
-             {center.center_atom, center.neighbor_atoms[0], center.neighbor_atoms[1], center.neighbor_atoms[2]})
+             {center.neighbor_atoms[0], center.neighbor_atoms[1], center.neighbor_atoms[2], center.neighbor_atoms[3]})
             for (std::uint32_t axis = 0; axis < 3; ++axis) {
                 float const original = coordinates(atom, axis);
 

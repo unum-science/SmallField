@@ -523,6 +523,11 @@ static void rdkit_direct_extract_(RDKit::ROMol &molecule, sft::molecule_descript
                  ++k_neighbor_slot) {
                 std::uint32_t atom_l = descriptor.neighbor_atom[k_neighbor_slot];
                 if (atom_l == atom_j) continue;
+                // `MMFF::Tools::addTorsions` skips `idx4 == idx1` — "make sure this isn't a
+                // three-membered ring" — so the force field RDKit minimises with carries no such
+                // term. Without this the baseline is a transliteration of the enumeration it is
+                // meant to check, and shares every omission with it.
+                if (atom_l == atom_i) continue;
                 unsigned torsion_type;
                 ForceFields::MMFF::MMFFTor torsion_params;
                 if (!props.getMMFFTorsionParams(molecule, atom_i, atom_j, atom_k, atom_l, torsion_type, torsion_params))

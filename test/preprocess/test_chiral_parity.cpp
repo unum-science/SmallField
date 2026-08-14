@@ -219,7 +219,9 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
     auto const &conformer = embedded.getConformer();
 
     for (auto const &center : centers) {
-        auto const &origin = conformer.getAtomPos(center.center_atom);
+        // The pivot is `neighbor_atoms[3]`, matching `count_invalid_chiral_centers_`; for a
+        // three-coordinate center it is the center itself.
+        auto const &origin = conformer.getAtomPos(center.neighbor_atoms[3]);
         double edges[3][3] = {};
         for (std::uint32_t slot = 0; slot < 3; ++slot) {
             auto const &position = conformer.getAtomPos(center.neighbor_atoms[slot]);
@@ -232,8 +234,9 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
                                  edges[1][0] * edges[2][1] - edges[1][1] * edges[2][0]};
         double const volume = edges[0][0] * cross[0] + edges[0][1] * cross[1] + edges[0][2] * cross[2];
 
-        // A near-planar arrangement carries no handedness to compare against.
-        if (std::fabs(volume) < 0.5) continue;
+        // A near-planar arrangement carries no handedness to compare against. The center's own floor
+        // is the threshold, because below it the pipeline itself declines to read a handedness.
+        if (std::fabs(volume) < static_cast<double>(center.minimum_volume)) continue;
 
         if (descriptor.degree[center.center_atom] < 4) ++tally.geometry_three_coordinate;
         int const realized_sign = (volume > 0.0) ? 1 : -1;

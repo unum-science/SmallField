@@ -367,8 +367,12 @@ struct cross_validation_tally_t {
     std::uint32_t molecules_rejected = 0;
     std::uint32_t conformers_attempted = 0;
     std::uint32_t conformers_succeeded = 0;
-    std::uint32_t energies_finite = 0;
-    std::uint32_t energies_reasonable = 0;
+    /** Successful slots whose own energy is not a number a consumer can rank by. Gated at zero:
+     *  `finalize_gpu_pipeline` demotes such a slot, so one surviving as `success_k` is a defect. */
+    std::uint32_t energies_nonphysical = 0;
+    /** RDKit's energy at our coordinates, which is the reference rather than our own output. */
+    std::uint32_t reference_energies_finite = 0;
+    std::uint32_t reference_energies_reasonable = 0;
     std::uint32_t energies_diverged = 0;
     std::uint32_t conformers_clashing = 0;
     double worst_energy_delta = 0.0;
@@ -381,12 +385,14 @@ struct cross_validation_tally_t {
 /**
  *  @brief Generate conformers for @p corpus and read every successful one back through RDKit.
  *
- *  One quantity is compared and two are narrated. The post-preprocess atom count must equal RDKit's
+ *  Two quantities are gated and two are narrated. The post-preprocess atom count must equal RDKit's
  *  own count with hydrogens added, which is what makes the gather address this molecule's atoms
- *  rather than a neighbouring slot's padding. RDKit's MMFF94 energy at our own coordinates is then
- *  printed beside ours — the two implementations agree to about 0.01 kcal/mol — and the returned
- *  geometry is measured for atom pairs closer than any bond, which is what a divergent energy
- *  usually turns out to be. Both are counted and reported rather than gated.
+ *  rather than a neighbouring slot's padding; and no slot the pipeline calls a success may carry an
+ *  energy that is not a finite number, which is what the status byte promises. RDKit's
+ *  MMFF94 energy at our own coordinates is then printed beside ours — the two implementations agree
+ *  to about 0.01 kcal/mol — and the returned geometry is measured for atom pairs closer than any
+ *  bond, which is what a divergent energy usually turns out to be. Those two are counted and
+ *  reported rather than gated.
  *
  *  @param[in] corpus Molecules to generate for, built-ins plus whatever corpus was named.
  *  @param[inout] checks Reporter that owns the atom-count comparison section.
@@ -469,11 +475,16 @@ static void check_generation_against_rdkit(custd::span<std::string_view const> c
                 tally.closest_molecule = molecule;
             }
 
+            // Our own energy, through the predicate the producer decided this slot's status with. A
+            // non-finite one is invisible to the divergence count below — `fabs(NaN) > tolerance` is
+            // false — so it needs its own tally or it is not counted at all.
+            if (!types::energy_is_physical(outputs.energies[slot])) ++tally.energies_nonphysical;
+
             set_coords_interleaved(*rdkit_molecule, interleaved.data());
             double const rdkit_energy = rdkit_mmff94_energy(*rdkit_molecule);
             if (std::isfinite(rdkit_energy)) {
-                ++tally.energies_finite;
-                if (rdkit_energy < 500.0) ++tally.energies_reasonable;
+                ++tally.reference_energies_finite;
+                if (rdkit_energy < 500.0) ++tally.reference_energies_reasonable;
             }
 
             double const delta = static_cast<double>(outputs.energies[slot]) - rdkit_energy;
@@ -502,9 +513,13 @@ static void print_cross_validation_summary(cross_validation_tally_t const &tally
     fmt::println("    conformers attempted:  {}", fmt::group_digits(tally.conformers_attempted));
     fmt::println("    conformers succeeded:  {} ({:.3f}%)", fmt::group_digits(tally.conformers_succeeded),
                  success_rate);
-    fmt::println("    finite MMFF94 energy:  {} ({:.3f}% of successes)", fmt::group_digits(tally.energies_finite),
-                 tally.conformers_succeeded > 0 ? 100.0 * tally.energies_finite / tally.conformers_succeeded : 0.0);
-    fmt::println("    reasonable energy:     {} (< 500 kcal/mol)", fmt::group_digits(tally.energies_reasonable));
+    fmt::println("    nonphysical energy:    {} of our own successful slots", //
+                 fmt::group_digits(tally.energies_nonphysical));
+    fmt::println(
+        "    finite RDKit energy:   {} ({:.3f}% of successes)", fmt::group_digits(tally.reference_energies_finite),
+        tally.conformers_succeeded > 0 ? 100.0 * tally.reference_energies_finite / tally.conformers_succeeded : 0.0);
+    fmt::println("    reasonable RDKit:      {} (< 500 kcal/mol)",
+                 fmt::group_digits(tally.reference_energies_reasonable));
     fmt::println("    energy divergence:     {} conformers beyond {:.3g} kcal/mol, " //
                  "worst {:+.3g} at molecule={} conformer={}",
                  fmt::group_digits(tally.energies_diverged), energy_agreement_kcal_k, tally.worst_energy_delta,
@@ -562,6 +577,9 @@ int main(int argc, char **argv) {
                                    checks.comparison_count());
     if (tally.conformers_succeeded == 0)
         return sftest::report_fail(test_name_k, "no conformer succeeded over {} attempts", tally.conformers_attempted);
+    if (tally.energies_nonphysical > 0)
+        return sftest::report_fail(test_name_k, "{} successful slots carry a nonphysical energy",
+                                   tally.energies_nonphysical);
     if (success_rate < 50.0)
         return sftest::report_fail(test_name_k, "success rate {:.3f}% is below the 50% floor", success_rate);
     return sftest::report_pass(test_name_k);

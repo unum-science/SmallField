@@ -18,6 +18,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from rich.table import Table
 
+from smallfield.chemistry import parent_with_hydrogens
 from smallfield.log import Logger, log as _default_log, thousands
 
 log = Logger()
@@ -66,6 +67,8 @@ class CrossValidation:
     compared: int = 0
     nan_coordinates: int = 0
     rdkit_failures: int = 0
+    #: Rows whose reference molecule and stored slot describe different atom counts.
+    atom_count_mismatch: int = 0
     energy_deltas: np.ndarray = field(default_factory=lambda: np.array([]))
     #: True when RDKit is not importable, which is a skip rather than a verdict.
     skipped: bool = False
@@ -169,18 +172,19 @@ def cross_validate_with_rdkit(first_shard: str, sample_indices: np.ndarray) -> C
             result.rdkit_failures += 1
             continue
 
-        molecule = Chem.MolFromSmiles(smiles)
+        molecule = parent_with_hydrogens(smiles)
         if molecule is None:
             result.rdkit_failures += 1
             continue
-        molecule = Chem.AddHs(molecule)
         num_atoms = molecule.GetNumAtoms()
 
         coordinates = np.asarray(stored_coordinates, dtype=np.float16).astype(np.float32)
         # The parse must reproduce the atom order the writer stored, and a length mismatch is exactly
-        # where it did not.
+        # where it did not. Counted apart from an RDKit refusal: parsing the whole SMILES rather than
+        # the parent lands every multi-fragment row here, which on PubChem is 8.8 % of a shard, and
+        # a validator that drops a tenth of its sample must not read like one that compared it.
         if coordinates.size != num_atoms * 3:
-            result.rdkit_failures += 1
+            result.atom_count_mismatch += 1
             continue
         coordinates = coordinates.reshape(num_atoms, 3)
         if np.any(np.isnan(coordinates)):
@@ -250,6 +254,7 @@ def render_cross_validation_table(result: CrossValidation) -> None:
     # `compared` is printed whatever it is, so a validator that compares nothing cannot look like a pass.
     table.add_row("compared", f"{result.compared} / {result.num_samples}")
     table.add_row("NaN coordinates", str(result.nan_coordinates))
+    table.add_row("atom-count mismatch", str(result.atom_count_mismatch))
     table.add_row("RDKit failures", str(result.rdkit_failures))
     if result.energy_deltas.size:
         deltas = result.energy_deltas

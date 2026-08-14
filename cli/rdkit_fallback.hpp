@@ -79,6 +79,9 @@ enum class fallback_disposition_t : std::uint8_t {
     // `EmbedMultipleConfs` smooths its own bounds by a different route and may not agree the matrix
     // is infeasible. Whether it ever does is what the per-status recovery tally measures.
     case types::conformer_status_t::bounds_infeasible_k: return fallback_disposition_t::retry_k;
+    // RDKit reaches the geometry by an entirely different route — its own embedding and its own
+    // minimizer — so the energy that came back non-finite is not one it re-derives.
+    case types::conformer_status_t::nonphysical_energy_k: return fallback_disposition_t::retry_k;
     }
     // A status byte outside the enum keeps its second chance rather than being dropped.
     return fallback_disposition_t::retry_k;

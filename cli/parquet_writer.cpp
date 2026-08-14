@@ -430,6 +430,31 @@ class row_columns_t {
         detail_ = arrow_status.message();
     }
 
+    /**
+     *  @brief Visit every leading scalar column once, in schema order, with its name and nullability.
+     *
+     *  The one list `reserve` and `finish_into` both walk, so a column cannot reach one phase and miss
+     *  the other - a column reserved and appended but never finished writes a shard silently short of
+     *  it, and nothing compared the two lists. `column_table_t::append` already binds a field to its
+     *  array for the same reason; this closes the level above it.
+     *
+     *  `conformer_energy_` is deliberately absent: its schema position trails the two list columns, so
+     *  `finish_energy_into` places it after them. It is the one column whose phases genuinely differ.
+     */
+    template <typename visitor_>
+    void for_each_leading_column_(visitor_ &&visit) {
+        visit("input_shard", column_nullability_t::required_k, input_shard_);
+        visit("input_row", column_nullability_t::required_k, input_row_);
+        visit("smiles", column_nullability_t::required_k, smiles_);
+        visit("conformer_index", column_nullability_t::required_k, conformer_index_);
+        visit("status", column_nullability_t::required_k, status_);
+        visit("n_heavy_atoms", column_nullability_t::nullable_k, num_heavy_atoms_);
+        visit("n_atoms", column_nullability_t::nullable_k, num_atoms_);
+        visit("n_bonds", column_nullability_t::nullable_k, num_bonds_);
+        visit("molecular_weight", column_nullability_t::nullable_k, molecular_weight_);
+        visit("n_conformers", column_nullability_t::nullable_k, num_conformers_);
+    }
+
   public:
     /** Whatever Arrow said about the refusal, empty when nothing refused. */
     [[nodiscard]] std::string const &detail() const noexcept { return detail_; }
@@ -437,20 +462,10 @@ class row_columns_t {
     /** Size every column for @p num_rows, so the fixed-width appends below cannot fail on capacity. */
     [[nodiscard]] shard_write_report_t reserve(std::size_t num_rows) {
         std::int64_t const rows = static_cast<std::int64_t>(num_rows);
-        auto reserve_ = [&](std::string_view column, auto &builder) {
+        for_each_leading_column_([&](std::string_view column, column_nullability_t, auto &builder) {
             record_(shard_write_t::column_reserve_failed_k, column, builder.Reserve(rows));
-        };
-        reserve_("input_shard", input_shard_);
-        reserve_("input_row", input_row_);
-        reserve_("smiles", smiles_);
-        reserve_("conformer_index", conformer_index_);
-        reserve_("status", status_);
-        reserve_("n_heavy_atoms", num_heavy_atoms_);
-        reserve_("n_atoms", num_atoms_);
-        reserve_("n_bonds", num_bonds_);
-        reserve_("molecular_weight", molecular_weight_);
-        reserve_("n_conformers", num_conformers_);
-        reserve_("conformer_energy", conformer_energy_);
+        });
+        record_(shard_write_t::column_reserve_failed_k, "conformer_energy", conformer_energy_.Reserve(rows));
         return report_;
     }
 
@@ -506,21 +521,11 @@ class row_columns_t {
 
     /** Hand every finished column to @p table in schema order. */
     [[nodiscard]] shard_write_report_t finish_into(column_table_t &table) {
-        auto finish_ = [&](std::string_view column, column_nullability_t nullability, auto &builder) {
+        for_each_leading_column_([&](std::string_view column, column_nullability_t nullability, auto &builder) {
             std::shared_ptr<arrow::Array> array;
             record_(shard_write_t::column_finish_failed_k, column, builder.Finish(&array));
             if (array) table.append(std::string {column}, nullability, std::move(array));
-        };
-        finish_("input_shard", column_nullability_t::required_k, input_shard_);
-        finish_("input_row", column_nullability_t::required_k, input_row_);
-        finish_("smiles", column_nullability_t::required_k, smiles_);
-        finish_("conformer_index", column_nullability_t::required_k, conformer_index_);
-        finish_("status", column_nullability_t::required_k, status_);
-        finish_("n_heavy_atoms", column_nullability_t::nullable_k, num_heavy_atoms_);
-        finish_("n_atoms", column_nullability_t::nullable_k, num_atoms_);
-        finish_("n_bonds", column_nullability_t::nullable_k, num_bonds_);
-        finish_("molecular_weight", column_nullability_t::nullable_k, molecular_weight_);
-        finish_("n_conformers", column_nullability_t::nullable_k, num_conformers_);
+        });
         return report_;
     }
 

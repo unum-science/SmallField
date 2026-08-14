@@ -137,10 +137,13 @@ struct logger_t {
     template <typename... args_types_>
     void write_(std::FILE *stream, fmt::text_style style, fmt::format_string<args_types_...> fmt_string,
                 args_types_ &&...args) const {
-        // `fmt::println(stream, style, fmt, args...)` with an empty style emits no ANSI escapes; no need to
-        // branch. The prefix goes out unstyled so the color spans only the payload.
-        fmt::print(stream, "{} ", timestamp_prefix());
-        fmt::println(stream, style, fmt_string, std::forward<args_types_>(args)...);
+        // One write, not two. The four `pipeline-roles` and the library share one stream, and stdio locks
+        // each call rather than the pair - so a prefix and its payload emitted separately can be split by
+        // another role's line, which breaks the `^`-anchored greps the diagnostic grammar exists for.
+        // Styling the payload alone keeps the prefix unstyled; an empty style emits no ANSI escapes, so
+        // there is nothing to branch on.
+        fmt::print(stream, "{} {}\n", timestamp_prefix(),
+                   fmt::styled(fmt::format(fmt_string, std::forward<args_types_>(args)...), style));
         // `fflush` here so redirected-to-file log tails are live and long-running jobs expose progress
         // mid-shard. Cost is one syscall per line; with hundreds of lines over a multi-hour run this is
         // negligible.

@@ -689,7 +689,9 @@ static std::uint64_t compute_shape_descriptors_(cli_config_t const &config, thre
         buffer.shape_described[molecule_index] = sfcli::shape_described_t::described_k;
         std::uint32_t const num_atoms = stored_atoms;
 
-        std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
+        // Left uninitialized: `gather_slot_into_interleaved` writes all `3 * num_atoms` components below, and
+        // nothing past them is ever read.
+        std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved;
         for (std::uint32_t conformer = 0; conformer < num_conformers; ++conformer) {
             std::size_t const flat = slot_layout.flat_slot(molecule_index, conformer);
             if (buffer.status[flat] != sfapi::conformer_status_t::success_k) continue;
@@ -704,9 +706,9 @@ static std::uint64_t compute_shape_descriptors_(cli_config_t const &config, thre
                                                      buffer.coordinates.data() + slot_base);
             }
 
-            std::array<double, sfcli::usrcat_components_k> usrcat {};
-            sfpost::usrcat_descriptor(coords_view, context, usrcat);
-            std::copy(usrcat.begin(), usrcat.end(), buffer.usrcat.data() + flat * sfcli::usrcat_components_k);
+            sfpost::usrcat_descriptor(
+                coords_view, context,
+                {buffer.usrcat.data() + flat * sfcli::usrcat_components_k, sfcli::usrcat_components_k});
         }
     }
     return undescribed;

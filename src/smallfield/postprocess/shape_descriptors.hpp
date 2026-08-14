@@ -23,10 +23,10 @@
  *  @code{.cpp}
  *  namespace sfpost = smallfield::postprocess;
  *  sfpost::molecule_shape_context_t context;  // hoisted above the molecule loop, one per worker
- *  std::array<double, sfpost::usrcat_components_k> fingerprint;
  *  if (sfpost::build_shape_context_into(smiles, num_atoms, smallfield::keep_largest_fragment_k, context) ==
  *      sfpost::shape_typing_t::typed_k)
- *      sfpost::usrcat_descriptor(coordinates, context, fingerprint);
+ *      sfpost::usrcat_descriptor(coordinates, context,
+ *                                {rows.data() + slot * sfpost::usrcat_components_k, sfpost::usrcat_components_k});
  *  @endcode
  */
 
@@ -69,7 +69,8 @@ inline constexpr std::size_t credo_subset_count_k = 4;
 /** Numbers USRCAT carries: the all-atom block, then one block per CREDO subset. */
 inline constexpr std::size_t usrcat_components_k = usr_components_k * (credo_subset_count_k + 1);
 
-/** Connected components a context can label, set by the width of `component_label`. */
+/** Connected components a context describes; past it `separate_fragments` would string more bounding spheres
+ *  along +x than one shape means anything for, so the molecule is refused instead. */
 inline constexpr std::uint32_t max_components_k = 255;
 
 #pragma endregion Extents
@@ -90,8 +91,9 @@ inline constexpr std::uint32_t max_components_k = 255;
 struct molecule_shape_context_t {
     /** Hydrophobic, aromatic, acceptor, donor. */
     std::array<std::vector<std::uint32_t>, credo_subset_count_k> credo_subsets;
-    /** Per-atom connected-component id, so `num_components` never exceeds `max_components_k`. */
-    std::vector<std::uint8_t> component_label;
+    /** Per-atom connected-component id, in the width `MolOps::getMolFrags` writes, so that call labels the atoms
+     *  in place and nothing narrows its output afterwards. */
+    std::vector<int> component_label;
     std::uint32_t num_components = 0;
 
     /** Atoms the context describes. Read off the per-atom labeling rather than stored beside it, so an
@@ -112,7 +114,7 @@ enum class shape_typing_t : std::uint8_t {
     typed_k,
     /** The SMILES did not parse under the library's contract, or typing threw on it. */
     unparsed_k,
-    /** More fragments than `max_components_k`, where a label would alias another component. */
+    /** More fragments than `max_components_k`, which is more than one shape describes. */
     too_many_fragments_k,
     /** The reparse produced a different atom count, so the stored coordinate order cannot be trusted. */
     atom_count_divergence_k,
@@ -123,7 +125,7 @@ inline char const *describe_shape_typing(shape_typing_t typing) {
     switch (typing) {
     case shape_typing_t::typed_k: return "typed";
     case shape_typing_t::unparsed_k: return "does not parse, or threw while being typed";
-    case shape_typing_t::too_many_fragments_k: return "falls into more fragments than a component label can name";
+    case shape_typing_t::too_many_fragments_k: return "falls into more fragments than one shape describes";
     case shape_typing_t::atom_count_divergence_k: return "reparses to a different atom count";
     }
     return "was refused";
@@ -401,19 +403,15 @@ inline void clear_shape_context_(molecule_shape_context_t &out) {
                     out.credo_subsets[subset_index].push_back(static_cast<std::uint32_t>(pair.second));
         }
 
-        // Label connected components — disconnected fragments and salt counterions. Past
-        // `max_components_k` a label does not fit its byte and would alias another component, so the
-        // molecule is refused rather than mislabelled.
-        std::vector<int> mapping;
-        std::uint32_t const num_components = RDKit::MolOps::getMolFrags(*molecule, mapping);
+        // Label connected components — disconnected fragments and salt counterions. `getMolFrags` resizes the
+        // destination to the atom count and writes every entry, so a hoisted context is labeled in place and
+        // keeps the capacity it grew to. Past `max_components_k` the molecule is refused rather than described.
+        std::uint32_t const num_components = RDKit::MolOps::getMolFrags(*molecule, out.component_label);
         if (num_components > max_components_k) {
             clear_shape_context_(out);
             return shape_typing_t::too_many_fragments_k;
         }
         out.num_components = num_components;
-        out.component_label.resize(mapping.size());
-        for (std::size_t atom_index = 0; atom_index < mapping.size(); ++atom_index)
-            out.component_label[atom_index] = static_cast<std::uint8_t>(mapping[atom_index]);
     }
     catch (...) {
         clear_shape_context_(out);
@@ -427,12 +425,14 @@ inline void clear_shape_context_(molecule_shape_context_t &out) {
  *
  *  @param[in] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
  *  @param[in] num_atoms Atom count; the span carries three floats per atom.
- *  @param[out] out `usr_components_k` doubles, reference-point major (ctd, cst, fct, ftf).
+ *  @param[out] out Exactly `usr_components_k` doubles of the caller's own destination, reference-point major
+ *      (ctd, cst, fct, ftf). Every one is written, so nothing stages through a temporary.
  */
 inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uint32_t num_atoms,
-                           std::array<double, usr_components_k> &out) {
+                           custd::span<double> out) {
+    sf_assert_(out.size() == usr_components_k);
     [[maybe_unused]] std::array<point3_t, usr_reference_point_count_k> const points = usr_block_into_(
-        conformer_over_(coords_interleaved, num_atoms), custd::span<double> {out.data(), out.size()});
+        conformer_over_(coords_interleaved, num_atoms), out);
 }
 
 /**
@@ -444,18 +444,19 @@ inline void usr_descriptor(custd::span<float const> coords_interleaved, std::uin
  *
  *  @param[in] coords_interleaved Tight (num_atoms, 3) row-major xyz for one conformer.
  *  @param[in] context Context from `build_shape_context_into` for this molecule.
- *  @param[out] out `usrcat_components_k` doubles, one `usr_components_k` block per subset.
+ *  @param[out] out Exactly `usrcat_components_k` doubles of the caller's own destination, one
+ *      `usr_components_k` block per subset. Every one is written, so nothing stages through a temporary.
  */
 inline void usrcat_descriptor(custd::span<float const> coords_interleaved, molecule_shape_context_t const &context,
-                              std::array<double, usrcat_components_k> &out) {
+                              custd::span<double> out) {
+    sf_assert_(out.size() == usrcat_components_k);
     conformer_reader_t const coords = conformer_over_(coords_interleaved, context.num_atoms());
-    custd::span<double> const row {out.data(), out.size()};
     std::array<point3_t, usr_reference_point_count_k> const points = usr_block_into_(coords,
-                                                                                     row.subspan(0, usr_components_k));
+                                                                                     out.subspan(0, usr_components_k));
 
     for (std::size_t subset_index = 0; subset_index < credo_subset_count_k; ++subset_index)
         moments_for_subset_(coords, points, context.credo_subsets[subset_index],
-                            row.subspan((subset_index + 1) * usr_components_k, usr_components_k));
+                            out.subspan((subset_index + 1) * usr_components_k, usr_components_k));
 }
 
 #pragma endregion Public API

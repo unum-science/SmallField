@@ -127,6 +127,7 @@ The Parquet writer persists the raw byte.
 |     7 | `too_many_bonds`     | More bonds than the flat descriptor's `max_bonds_k`, which only a molecule under the atom cap carrying an unusual number of ring closures reaches. |
 |     8 | `too_many_rings`     | More SSSR rings than `atom_ring_bitmap` has bits, or more ring-membership entries than `ring_atoms` holds, so a genuinely in-ring atom would carry no ring label. |
 |     9 | `bounds_infeasible`  | Triangle smoothing drove some atom pair's lower bound above its upper, so no coordinates satisfy the molecule's bounds matrix. |
+|    10 | `nonphysical_energy` | The slot's MMFF94 energy is not finite, so it can neither rank the molecule's conformers nor be published. The slot keeps the value it was refused for; the writer nulls the column. |
 
 ## Fallback Disposition
 

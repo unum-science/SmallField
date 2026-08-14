@@ -257,6 +257,9 @@ static std::uint32_t recover_molecule_(admitted_molecule_t &admitted, std::uint6
         float energy_kcal_per_mol = 0.0f;
         if (!minimize_conformer_(molecule, *admitted.mmff_properties, conformer_id, energy_kcal_per_mol, tally))
             continue;
+        // A slot is a success only if its energy is one. The slot keeps whatever the GPU left it with,
+        // which is the honest answer: this producer has nothing to publish for it.
+        if (!types::energy_is_physical(energy_kcal_per_mol)) continue;
 
         {
             scoped_stage_span_t const timed {tally, fallback_stage_t::store_k};

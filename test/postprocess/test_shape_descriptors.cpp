@@ -21,7 +21,7 @@
 
 #include <cmath>   // `std::fabs`, `std::sqrt`
 #include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint32_t`, `std::uint8_t`
+#include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
 #include <algorithm>   // `std::max`
 #include <array>       // `std::array`
@@ -271,8 +271,8 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string_view smiles
  */
 
 /** Sum of pairwise distances within one component — invariant under a rigid translation. */
-static double intra_component_distance_sum_(std::vector<float> const &coords, std::vector<std::uint8_t> const &label,
-                                            std::uint8_t component, std::vector<std::uint32_t> &component_atoms) {
+static double intra_component_distance_sum_(std::vector<float> const &coords, std::vector<int> const &label,
+                                            int component, std::vector<std::uint32_t> &component_atoms) {
     component_atoms.clear();
     for (std::uint32_t atom_index = 0; atom_index < label.size(); ++atom_index)
         if (label[atom_index] == component) component_atoms.push_back(atom_index);
@@ -289,8 +289,8 @@ static double intra_component_distance_sum_(std::vector<float> const &coords, st
     return total;
 }
 
-static std::array<double, 3> component_centroid_(std::vector<float> const &coords,
-                                                 std::vector<std::uint8_t> const &label, std::uint8_t component) {
+static std::array<double, 3> component_centroid_(std::vector<float> const &coords, std::vector<int> const &label,
+                                                 int component) {
     std::array<double, 3> centroid {0.0, 0.0, 0.0};
     std::uint32_t count = 0;
     for (std::uint32_t atom_index = 0; atom_index < label.size(); ++atom_index) {
@@ -310,8 +310,8 @@ static std::array<double, 3> component_centroid_(std::vector<float> const &coord
 }
 
 /** Bounding-sphere radius of one component about its own centroid. */
-static double component_radius_(std::vector<float> const &coords, std::vector<std::uint8_t> const &label,
-                                std::uint8_t component, std::array<double, 3> const &centroid) {
+static double component_radius_(std::vector<float> const &coords, std::vector<int> const &label, int component,
+                                std::array<double, 3> const &centroid) {
     double radius = 0.0;
     for (std::uint32_t atom_index = 0; atom_index < label.size(); ++atom_index) {
         if (label[atom_index] != component) continue;
@@ -353,7 +353,7 @@ static void check_separation_(std::string_view smiles, shape_reporters_t &report
     std::uint32_t const num_components = context.num_components;
     scratch.components_before.assign(num_components, component_before_t {});
     for (std::uint32_t component = 0; component < num_components; ++component) {
-        std::uint8_t const label = static_cast<std::uint8_t>(component);
+        int const label = static_cast<int>(component);
         component_before_t &before = scratch.components_before[component];
         before.intra_distance_sum = intra_component_distance_sum_(scratch.coordinates, context.component_label, label,
                                                                   scratch.component_atoms);
@@ -372,7 +372,7 @@ static void check_separation_(std::string_view smiles, shape_reporters_t &report
     std::array<double, 3> previous_centroid {0.0, 0.0, 0.0};
     double previous_radius = 0.0;
     for (std::uint32_t component = 0; component < num_components; ++component) {
-        std::uint8_t const label = static_cast<std::uint8_t>(component);
+        int const label = static_cast<int>(component);
         double const intra_sum_after = intra_component_distance_sum_(scratch.coordinates, context.component_label,
                                                                      label, scratch.component_atoms);
         std::array<double, 3> const centroid_after = component_centroid_(scratch.coordinates, context.component_label,

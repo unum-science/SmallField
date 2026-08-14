@@ -253,8 +253,10 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
  *  against the SM register file, and below the largest bins, the 32-blocks-per-SM slot limit.
  *
  *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`, over the shipped
- *    architecture set: sm_80=64, sm_89=69, sm_90=69, sm_100=112, sm_120=119 regs/thread. Hopper and
- *    earlier spill nothing (STACK=0, LOCAL=0); both Blackwell targets carry a 64-byte frame.
+ *    architecture set: sm_80=64, sm_89=69, sm_90=69, sm_100=124, sm_120=128 regs/thread. Hopper and
+ *    earlier spill nothing (STACK=0, LOCAL=0); both Blackwell targets carry an 8-byte frame. Blackwell
+ *    trades registers against that frame rather than holding both: the twelve extra registers there
+ *    bought the frame down from 64 bytes, which is the direction to keep it in.
  *    On sm_90 that is 65536 / (69 × 32) = 29 blocks/SM = 29 warps, against a hard ceiling of
  *    32 warps — a 32-thread block can never fill more than 32 of the SM's 64 warp slots, so
  *    50 % is the most this shape can reach at any register count, and the last 1.10× of it is
@@ -436,14 +438,21 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
             }
             else { final_energy = crush_result.energy; }
 
-            // Final validation: Run final validation.
-            if (count_invalid_chiral_centers_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane) == 0) {
-                // ETK-refined 3D positions are the final output of this kernel.
-                // The sibling mmff_polish_warp_kernel picks them up from
-                // conformer_coordinates_out and runs MMFF94 polish in-place.
-                verdict = conformer_status_t::success_k;
-                break;
-            }
+            // Final validation. The torsion functor carries only 1-2 and 1-3 distances, a set exactly
+            // invariant under reflection at a stereocenter, so the refinement above is free to invert
+            // a center the crush had correct — which is what this catches. Re-entering the distance
+            // geometry functor in three dimensions repairs most of them and was measured, but it
+            // spends eight more bytes of stack on both Blackwell targets for a correctness gain of two
+            // centers in twenty-five hundred, so `validate_polished_chirality_kernel` carries this
+            // instead: it refuses on the geometry that ships rather than on a prediction about it.
+            if (count_invalid_chiral_centers_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane) != 0)
+                continue;
+
+            // ETK-refined 3D positions are the final output of this kernel.
+            // The sibling mmff_polish_warp_kernel picks them up from
+            // conformer_coordinates_out and runs MMFF94 polish in-place.
+            verdict = conformer_status_t::success_k;
+            break;
         }
 
         // Write the conformer output.
@@ -571,6 +580,16 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
                     conformer_coordinates_out[coord_offset + dimension * output_atoms_stride + atom];
         __syncwarp(full_mask_k);
 
+        // The MMFF energy of the geometry as staged, before anything moves — the number that decides
+        // below whether the polish is worth keeping. It is parked in the output slot rather than a
+        // register: holding it across the FIRE call and the rescue costs `sm_90` five registers, which
+        // is the difference between 32 resident blocks and 29, and the slot is written here anyway.
+        {
+            float const staged_energy = mmff_functor(positions, shared_float + 2 * dimensions_3d, dimensions_3d, lane);
+            if (lane == 0) conformer_energies_out[slot] = staged_energy;
+        }
+        __syncwarp(full_mask_k);
+
         fire_result_t mmff_result = run_fire_stage_(scratch, refinement_policy.mmff_initial_iterations,
                                                     refinement_policy.mmff_continuation_iterations,
                                                     refinement_policy.mmff_gradient_threshold, lane, mmff_functor);
@@ -581,13 +600,23 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
         if (run_heavy_rescue) { mmff_result = run_fire_stage_(scratch, 160, 160, 2.5e-5f, lane, mmff_functor); }
         float const mmff_energy = mmff_result.energy;
 
-        // Write polished positions + updated energy back. Status is left
-        // untouched: MMFF non-convergence does not mark the conformer failed.
-        for (std::uint32_t dimension = 0; dimension < 3; ++dimension)
-            for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k)
-                conformer_coordinates_out[coord_offset + dimension * output_atoms_stride + atom] =
-                    positions[dimension * num_atoms + atom];
-        if (lane == 0) conformer_energies_out[slot] = mmff_energy;
+        // Write polished positions + updated energy back, but only if the polish improved on what it
+        // was handed. FIRE takes every step it computes: when its power criterion goes non-positive
+        // the velocities zero and the timestep halves, and the step is still taken. So a stage can
+        // finish above where it started, and shipping that would be a regression nothing would see.
+        //
+        // The geometry to fall back on needs no buffer. `conformer_coordinates_out` is the array this
+        // kernel staged from and has not touched since, so declining the write-back leaves exactly the
+        // ETK-refined coordinates in place — the best-seen geometry is already stored, for free.
+        //
+        // Status is left untouched either way: MMFF non-convergence does not mark the conformer failed.
+        if (mmff_energy < conformer_energies_out[slot]) {
+            for (std::uint32_t dimension = 0; dimension < 3; ++dimension)
+                for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k)
+                    conformer_coordinates_out[coord_offset + dimension * output_atoms_stride + atom] =
+                        positions[dimension * num_atoms + atom];
+            if (lane == 0) conformer_energies_out[slot] = mmff_energy;
+        }
         __syncwarp(full_mask_k);
     }
 }

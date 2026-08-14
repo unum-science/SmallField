@@ -41,7 +41,7 @@ using smallfield::types::chiral_center_descriptor_t;
  *
  *  @param[in] positions SoA coordinate array.
  *  @param[in] num_atoms Number of atoms (stride between dimensions).
- *  @param[in] atom_a Center atom index.
+ *  @param[in] atom_a Pivot atom index — the point the three edges are measured from.
  *  @param[in] atom_b First neighbor atom index.
  *  @param[in] atom_c Second neighbor atom index.
  *  @param[in] atom_d Third neighbor atom index.
@@ -88,7 +88,7 @@ __device__ __forceinline__ std::uint32_t count_invalid_chiral_centers_(float con
     std::uint32_t lane_invalid = 0;
     for (std::uint32_t center_index = lane; center_index < num_chiral_centers; center_index += warp_size_k) {
         auto const &center = chiral_centers[center_index];
-        float const volume = compute_signed_tetrahedral_volume_(positions, num_atoms, center.center_atom,
+        float const volume = compute_signed_tetrahedral_volume_(positions, num_atoms, center.neighbor_atoms[3],
                                                                 center.neighbor_atoms[0], center.neighbor_atoms[1],
                                                                 center.neighbor_atoms[2]);
         bool const wrong_handed = (signbit(volume) != 0) != (center.target_sign < 0);
@@ -227,20 +227,24 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
         }
 
         // chiral volume contributions for this atom; volume and gradient share
-        // the same edge_b/c/d and the cross(edge_c, edge_d) intermediate.
+        // the same three edges and the cross(second, third) intermediate.
         for (std::uint32_t center_index = 0; center_index < num_chiral_centers; ++center_index) {
             auto const &center = chiral_centers[center_index];
             std::uint8_t const chiral_center_atom = center.center_atom;
-            std::uint8_t const chiral_neighbor_a = center.neighbor_atoms[0];
-            std::uint8_t const chiral_neighbor_b = center.neighbor_atoms[1];
-            std::uint8_t const chiral_neighbor_c = center.neighbor_atoms[2];
+            std::uint8_t const chiral_neighbor_first = center.neighbor_atoms[0];
+            std::uint8_t const chiral_neighbor_second = center.neighbor_atoms[1];
+            std::uint8_t const chiral_neighbor_third = center.neighbor_atoms[2];
+            std::uint8_t const chiral_pivot_atom = center.neighbor_atoms[3];
 
-            float3 const center_position = load_position_(positions, num_atoms, chiral_center_atom);
-            float3 const edge_b = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_a), center_position);
-            float3 const edge_c = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_b), center_position);
-            float3 const edge_d = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_c), center_position);
-            float3 const cross_cd = cross_float3_(edge_c, edge_d);
-            float const volume = dot_float3_(edge_b, cross_cd);
+            float3 const pivot_position = load_position_(positions, num_atoms, chiral_pivot_atom);
+            float3 const edge_first = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_first),
+                                                  pivot_position);
+            float3 const edge_second = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_second),
+                                                   pivot_position);
+            float3 const edge_third = sub_float3_(load_position_(positions, num_atoms, chiral_neighbor_third),
+                                                  pivot_position);
+            float3 const cross_second_third = cross_float3_(edge_second, edge_third);
+            float const volume = dot_float3_(edge_first, cross_second_third);
 
             // Signing the floor puts both failure modes on one axis: a wrongly handed volume and a
             // correctly handed but nearly flat one both land on the far side of it, and the
@@ -254,9 +258,9 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
             // only one thread per chiral center counts the energy
             if (atom == chiral_center_atom) total_energy += chiral_volume_weight * excess_volume * excess_volume;
 
-            // V = edge_b · (edge_c × edge_d), so the chain rule gives each neighbour gradient as
-            // a cross product of the other two edges, and the centre takes the negated sum.
-            // cross(edge_c, edge_d) is already in hand as cross_cd.
+            // V = edge_first · (edge_second × edge_third), so the chain rule gives each of the three
+            // gradients as a cross product of the other two edges, and the pivot takes the negated
+            // sum. cross(edge_second, edge_third) is already in hand.
             float const scale = 2.0f * chiral_volume_weight * excess_volume;
             auto add_scaled_to_grad_a_ = [&](float3 const &delta) {
                 grad_a[0] += scale * delta.x;
@@ -264,13 +268,14 @@ __device__ __forceinline__ float evaluate_distance_geometry_energy(
                 grad_a[2] += scale * delta.z;
             };
 
-            if (atom == chiral_neighbor_a) { add_scaled_to_grad_a_(cross_cd); }
-            else if (atom == chiral_neighbor_b) { add_scaled_to_grad_a_(cross_float3_(edge_d, edge_b)); }
-            else if (atom == chiral_neighbor_c) { add_scaled_to_grad_a_(cross_float3_(edge_b, edge_c)); }
-            else if (atom == chiral_center_atom) {
-                float3 const dvdc = cross_float3_(edge_d, edge_b);
-                float3 const dvdd = cross_float3_(edge_b, edge_c);
-                add_scaled_to_grad_a_(scale_float3_(add_float3_(add_float3_(cross_cd, dvdc), dvdd), -1.0f));
+            if (atom == chiral_neighbor_first) { add_scaled_to_grad_a_(cross_second_third); }
+            else if (atom == chiral_neighbor_second) { add_scaled_to_grad_a_(cross_float3_(edge_third, edge_first)); }
+            else if (atom == chiral_neighbor_third) { add_scaled_to_grad_a_(cross_float3_(edge_first, edge_second)); }
+            else if (atom == chiral_pivot_atom) {
+                float3 const gradient_second = cross_float3_(edge_third, edge_first);
+                float3 const gradient_third = cross_float3_(edge_first, edge_second);
+                add_scaled_to_grad_a_(scale_float3_(
+                    add_float3_(add_float3_(cross_second_third, gradient_second), gradient_third), -1.0f));
             }
         }
 

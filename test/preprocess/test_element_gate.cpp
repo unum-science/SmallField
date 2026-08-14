@@ -115,7 +115,8 @@ static bool gate_can_answer_(sft::conformer_status_t status) noexcept {
     case sft::conformer_status_t::stereo_failure_k:
     case sft::conformer_status_t::mmff_unconverged_k:
     case sft::conformer_status_t::preprocess_timeout_k:
-    case sft::conformer_status_t::bounds_infeasible_k: return false;
+    case sft::conformer_status_t::bounds_infeasible_k:
+    case sft::conformer_status_t::nonphysical_energy_k: return false;
     }
     // A status byte no enumerator claims is nothing the gate answers with, so it borrows no verdict.
     return false;

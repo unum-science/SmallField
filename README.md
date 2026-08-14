@@ -115,6 +115,10 @@ Then the embedding itself, one warp per molecule, all data resident in shared me
 | 8    | ETK torsion refine         | FIRE, 3D, 6-term Fourier + distance constraints                    |
 | 9    | Final validation           | Repeat stereo check                                                |
 | 10   | MMFF94 polish              | FIRE, 3D, full force field: van der Waals + electrostatic + bonded |
+| 11   | Shipped-geometry validation | Chiral volumes and declared E/Z re-read from the polished coordinates |
+
+Stage 11 exists because stage 10 rewrites every coordinate after stage 9 has already stamped its verdict, and carries no stereochemistry term of its own — so a centre or bond the polish inverts would otherwise leave no trace.
+It reads single precision before the half-precision narrowing, and demotes to `stereo_failure`, which the CPU fallback already knows how to recover.
 
 ## Architecture
 

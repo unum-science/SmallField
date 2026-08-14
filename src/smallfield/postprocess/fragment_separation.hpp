@@ -58,8 +58,9 @@ inline void separate_fragments(custd::span<float> coords_interleaved, molecule_s
 
     // Centroid of each component.
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
-        sf_assert_(context.component_label[atom_index] < context.num_components);
-        component_placement_t &placement = placements[context.component_label[atom_index]];
+        std::uint32_t const label = static_cast<std::uint32_t>(context.component_label[atom_index]);
+        sf_assert_(label < context.num_components);
+        component_placement_t &placement = placements[label];
         point3_t const point = read_point_(coords, atom_index);
         placement.centroid.x += point.x;
         placement.centroid.y += point.y;
@@ -75,7 +76,8 @@ inline void separate_fragments(custd::span<float> coords_interleaved, molecule_s
 
     // Bounding-sphere radius of each component about its centroid.
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
-        component_placement_t &placement = placements[context.component_label[atom_index]];
+        std::uint32_t const label = static_cast<std::uint32_t>(context.component_label[atom_index]);
+        component_placement_t &placement = placements[label];
         double const distance = point_distance_(read_point_(coords, atom_index), placement.centroid);
         if (distance > placement.radius) placement.radius = distance;
     }
@@ -89,7 +91,8 @@ inline void separate_fragments(custd::span<float> coords_interleaved, molecule_s
     }
 
     for (std::uint32_t atom_index = 0; atom_index < num_atoms; ++atom_index) {
-        point3_t const &translation = placements[context.component_label[atom_index]].translation;
+        std::uint32_t const label = static_cast<std::uint32_t>(context.component_label[atom_index]);
+        point3_t const &translation = placements[label].translation;
         coords(atom_index, 0) += static_cast<float>(translation.x);
         coords(atom_index, 1) += static_cast<float>(translation.y);
         coords(atom_index, 2) += static_cast<float>(translation.z);

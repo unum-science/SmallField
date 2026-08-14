@@ -215,6 +215,10 @@ inline mmff94_extract_outcome_t extract_mmff94_params_native(molecule_descriptor
             for (std::uint16_t neighbor_slot_k = kstart; neighbor_slot_k < kend; ++neighbor_slot_k) {
                 std::uint32_t const atom_l = descriptor.neighbor_atom[neighbor_slot_k];
                 if (atom_l == atom_j) continue;
+                // A three-membered ring closes i onto l, so the dihedral is identically zero and the
+                // term is a constant with no gradient. RDKit's `addTorsions` excludes it for the same
+                // reason; emitting it moves no atom and offsets every energy comparison.
+                if (atom_l == atom_i) continue;
                 auto const [torsion_type, torsion_type_secondary] = native_get_mmff_torsion_type(
                     descriptor, atom_types, bond_types, atom_i, atom_j, atom_k, atom_l);
                 auto const lookup = lookup_torsion(tables, torsion_type, torsion_type_secondary, atom_types[atom_i],

@@ -726,7 +726,9 @@ sfcli::shape_described_t augment_molecule_(input_shard_t const &shard, custd::sp
                                            sfpost::molecule_shape_context_t const &context,
                                            sfpost::shape_typing_t typing, sfapi::conformer_slot_layout_t const &layout,
                                            shard_buffers_t &buffers, shard_stats_t &stats) {
-    std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved {};
+    // Left uninitialized: a row that fills fewer than `3 * num_atoms` components is skipped below, so nothing
+    // past what `read_row_coordinates_into_` wrote is ever read.
+    std::array<float, sfapi::max_atoms_per_molecule_k * 3u> interleaved;
     sfcli::shape_described_t described = sfcli::shape_described_t::described_k;
     std::size_t const num_slots = std::min<std::size_t>(rows.size(), layout.num_conformers);
     for (std::size_t conformer_slot = 0; conformer_slot < num_slots; ++conformer_slot) {
@@ -764,9 +766,9 @@ sfcli::shape_described_t augment_molecule_(input_shard_t const &shard, custd::sp
             described = sfcli::shape_described_t::undescribed_k;
             continue;
         }
-        std::array<double, sfcli::usrcat_components_k> usrcat_row {};
-        sfpost::usrcat_descriptor(coordinates, context, usrcat_row);
-        std::copy(usrcat_row.begin(), usrcat_row.end(), buffers.usrcat.data() + flat * sfcli::usrcat_components_k);
+        sfpost::usrcat_descriptor(
+            coordinates, context,
+            {buffers.usrcat.data() + flat * sfcli::usrcat_components_k, sfcli::usrcat_components_k});
     }
     return described;
 }

@@ -8,9 +8,11 @@
 
 #pragma once
 
+#include <cmath>   // `std::sqrt`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
 #include <cstdlib> // `std::getenv`
 
+#include <algorithm>    // `std::min`
 #include <charconv>     // `std::from_chars`
 #include <fstream>      // `std::ifstream`
 #include <limits>       // `std::numeric_limits`
@@ -44,13 +46,28 @@ using smallfield::types::mmff94_bond_t;
 using smallfield::types::unreachable_hops_k;
 
 /**
- *  @brief Create a molecule from SMILES with explicit hydrogens added.
+ *  @brief Create a molecule from SMILES with explicit hydrogens added, keeping every fragment.
+ *
+ *  The parser parameters are `smallfield::parse_smiles`'s, because a reference molecule that disagrees with
+ *  the production parse cannot receive the pipeline's coordinates. `removeHs` matters most: left at its
+ *  default it strips an explicit hydrogen that `addHs` then re-appends at the end, so `[H]OC(=O)C` comes
+ *  back with its hydrogen last where production keeps it first. The two orders carry an identical atom
+ *  count, so it is a permutation no count check can see.
+ *
+ *  The salt policy is the one thing deliberately not matched. `parse_smiles` keeps only the largest
+ *  fragment, while the bond-hop suites need a counterion to reach the unreachable-hop sentinel that a single
+ *  connected component never produces. A caller comparing against pipeline output therefore checks its own
+ *  atom count against `num_atoms_out` and skips the molecule when the two disagree.
  *
  *  @param[in] smiles SMILES string to parse.
  *  @return Owning pointer to the molecule, or nullptr on parse failure.
  */
 inline std::unique_ptr<RDKit::RWMol> mol_from_smiles(std::string const &smiles) {
-    std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
+    RDKit::SmilesParserParams parameters;
+    parameters.sanitize = true;
+    parameters.removeHs = false;
+    parameters.strictCXSMILES = false;
+    std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles, parameters));
     if (!molecule) {
         fmt::println(stderr, "NOTE mol_from_smiles smiles={} parsed=0", smiles);
         return nullptr;
@@ -128,6 +145,32 @@ inline void set_coords_interleaved(RDKit::RWMol &molecule, float const *coords, 
                                                          static_cast<double>(coords[atom_index * 3 + 1]),
                                                          static_cast<double>(coords[atom_index * 3 + 2])));
     }
+}
+
+/**
+ *  @brief Distance between the two closest atoms of a conformer, in angstroms.
+ *
+ *  The geometry half of a cross-validation, and the half that needs no force field. The shortest bond
+ *  MMFF94 parameterises is around 0.95 angstrom, so a conformer holding a pair under half that cannot be
+ *  the geometry its own energy was evaluated at, whichever engine evaluated it — which is what lets this
+ *  catch a coordinate readback addressing the wrong atoms, where an energy comparison reports only a large
+ *  number of unclear origin. Each caller names the threshold it holds a conformer to.
+ *
+ *  @param[in] geometry Coordinates of one molecule; fewer than two atoms has no pair and answers infinity.
+ *  @return The smallest interatomic distance in angstroms.
+ */
+inline double closest_atom_pair(conformer_aos_t geometry) noexcept {
+    double closest = std::numeric_limits<double>::infinity();
+    for (std::uint32_t atom = 0; atom < geometry.extent(0); ++atom)
+        for (std::uint32_t neighbor = atom + 1; neighbor < geometry.extent(0); ++neighbor) {
+            double squared = 0.0;
+            for (std::uint32_t axis = 0; axis < geometry.extent(1); ++axis) {
+                double const difference = geometry(atom, axis) - geometry(neighbor, axis);
+                squared += difference * difference;
+            }
+            closest = std::min(closest, std::sqrt(squared));
+        }
+    return closest;
 }
 
 /**

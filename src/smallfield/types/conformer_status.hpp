@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <cmath>   // `std::isfinite`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`
 
@@ -57,12 +58,19 @@ enum class conformer_status_t : std::uint8_t {
      *  crossed pair. Distinct from `stereo_failure_k`: an impossible matrix embedded anyway fails
      *  downstream under a name that describes the symptom rather than the cause. */
     bounds_infeasible_k = 9,
+    /** The slot's MMFF94 energy is not a finite number, so the geometry behind it is not one either.
+     *  Energies order the conformers of a molecule, and a `NaN` compares false against everything —
+     *  which breaks the strict-weak ordering `std::stable_sort` requires — while an infinity sorts
+     *  first and would be published as the molecule's best conformer. The demoted slot keeps the
+     *  value it was refused for: consumers gate on the status, and the number is the only evidence
+     *  of what diverged. */
+    nonphysical_energy_k = 10,
 };
 
 /** One past the highest `conformer_status_t`, so a per-status array is indexed by the enumerator
  *  itself. The enum is append-only, so its newest value is always its widest. */
 inline constexpr std::size_t conformer_status_count_k =
-    static_cast<std::size_t>(conformer_status_t::bounds_infeasible_k) + 1u;
+    static_cast<std::size_t>(conformer_status_t::nonphysical_energy_k) + 1u;
 
 /** What a status byte no enumerator claims prints as, which a shard from a newer producer can carry. */
 inline constexpr std::string_view unnamed_status_k = "unnamed_status";
@@ -85,6 +93,7 @@ inline constexpr std::string_view conformer_status_name(conformer_status_t statu
     case conformer_status_t::too_many_bonds_k: return "too_many_bonds";
     case conformer_status_t::too_many_rings_k: return "too_many_rings";
     case conformer_status_t::bounds_infeasible_k: return "bounds_infeasible";
+    case conformer_status_t::nonphysical_energy_k: return "nonphysical_energy";
     }
     return unnamed_status_k;
 }
@@ -93,5 +102,16 @@ static_assert(conformer_status_name(static_cast<conformer_status_t>(conformer_st
                       unnamed_status_k &&
                   conformer_status_name(static_cast<conformer_status_t>(conformer_status_count_k)) == unnamed_status_k,
               "every enumerator carries a name, and nothing past the last one does");
+
+/**
+ *  @brief Whether an MMFF94 energy is one a conformer can be ranked and published by.
+ *
+ *  The predicate both producers of a `success_k` slot share, so the GPU pipeline and the
+ *  `fallback-role` cannot disagree about what a publishable energy is. Finiteness only, and
+ *  deliberately no magnitude bound: at this pipeline's dispatch geometry a bound is a throughput
+ *  decision rather than a policy detail, and the signal separating a diverged minimization from a
+ *  genuinely low energy is a paired delta against RDKit that production does not have.
+ */
+inline constexpr auto energy_is_physical = [](float energy) noexcept { return std::isfinite(energy); };
 
 } // namespace smallfield::types

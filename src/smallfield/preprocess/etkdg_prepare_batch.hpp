@@ -214,14 +214,18 @@ inline void extract_chiral_centers(RDKit::ROMol const &molecule, molecule_descri
             ordered[slot] = moving;
         }
 
+        // The fourth point is RDKit's: the fourth bonded neighbor, or the center itself when there
+        // is none, which is what makes the three-coordinate case reduce to the center-based triple
+        // product its floor of 2 was measured against.
+        if (count < 4) ordered[3] = static_cast<std::uint8_t>(atom);
         for (std::uint32_t slot = 0; slot < 4; ++slot) chiral_center.neighbor_atoms[slot] = ordered[slot];
 
         int const tag_sign = (descriptor.chiral_tag[atom] == 1) ? 1 : -1;
         int const order_parity = (swaps % 2 == 0) ? 1 : -1;
         chiral_center.target_sign = static_cast<std::int8_t>(-tag_sign * order_parity);
 
-        // Which floor applies is decided by whether RDKit's own bound transfers into our volume
-        // convention, and it does exactly when the center has no fourth bonded neighbor.
+        // RDKit lowers the bound for a three-coordinate center because inserting the center as the
+        // fourth point yields a smaller volume for the same handedness.
         chiral_center.minimum_volume = count >= 4 ? min_four_coordinate_volume_k : min_three_coordinate_volume_k;
 
         chiral_centers.push_back(chiral_center);
@@ -657,6 +661,10 @@ inline smallfield::types::conformer_status_t extract_mmff94_params_via_rdkit(RDK
             for (std::uint16_t atom_k_entry = kstart; atom_k_entry < kend; ++atom_k_entry) {
                 std::uint32_t const atom_l = descriptor.neighbor_atom[atom_k_entry];
                 if (atom_l == atom_j) continue;
+                // A three-membered ring closes i onto l, so the dihedral is identically zero and the
+                // term is a constant with no gradient. RDKit's `addTorsions` excludes it for the same
+                // reason; emitting it moves no atom and offsets every energy comparison.
+                if (atom_l == atom_i) continue;
                 unsigned int torsion_type;
                 ForceFields::MMFF::MMFFTor torsion_params;
                 if (!mmff_props.getMMFFTorsionParams(mutable_molecule, atom_i, atom_j, atom_k, atom_l, torsion_type,
@@ -719,7 +727,8 @@ inline smallfield::types::conformer_status_t extract_mmff94_params_via_rdkit(RDK
  *  keep their capacity from the previous call, so `push_back` stays on the hot path without heap
  *  allocation after the first few molecules. Sets `result.num_atoms = 0` on failure and returns the
  *  rejection reason; on success returns `conformer_status_t::success_k`. Callers that don't need the
- *  per-molecule reason code can still test `result.num_atoms == 0` as the in-band drop signal.
+ *  per-molecule reason code can still test `result.num_atoms == 0` as the in-band drop signal, and
+ *  the two agree in both directions because `parse_smiles` refuses a molecule of no atoms.
  */
 inline smallfield::types::conformer_status_t prepare_molecule_into(std::string_view smiles,
                                                                    etkdg_prepared_molecule_t &result) {
@@ -858,7 +867,8 @@ inline smallfield::types::conformer_status_t extract_mmff94_typing_via_rdkit_(RD
  *  device from the descriptor this function fills.
  *
  *  Sets `result.num_atoms` to zero on rejection and returns the reason; on success returns
- *  `conformer_status_t::success_k`.
+ *  `conformer_status_t::success_k` over a molecule that has atoms, since `parse_smiles` refuses one
+ *  that does not.
  *
  *  @param[in] smiles Input string; not required to be null-terminated.
  *  @param[in] salt_policy Whether a multi-fragment input keeps its largest fragment.
@@ -1122,7 +1132,10 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
             auto const status = prepare_molecule_topology_into(smiles_list[molecule], salt_policy, output_atom_capacity,
                                                                contribution.scratch);
             auto const &prepared = contribution.scratch;
-            if (prepared.num_atoms == 0) {
+            // The refusal itself, rather than the zeroed atom count that accompanies it: a rejection
+            // list is a list of reasons, and taking the reason from the returned status is what makes
+            // it impossible to file a molecule under a status that did not refuse it.
+            if (status != conformer_status_t::success_k) {
                 contribution.rejected_input_indices.push_back({static_cast<std::uint32_t>(molecule), status});
                 continue;
             }

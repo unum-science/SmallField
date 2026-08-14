@@ -86,3 +86,16 @@ def test_atom_stride_is_published_rather_than_restated():
 def test_invalid_smiles_raises_value_error():
     with pytest.raises(ValueError, match="Invalid SMILES"):
         sfa.generate_conformers("not_a_smiles")
+
+
+def test_empty_smiles_is_invalid_rather_than_a_successful_no_atom_molecule():
+    """RDKit parses an empty string into a valid molecule of no atoms, and a null Parquet cell arrives
+    as exactly that. Every slot must carry INVALID_SMILES, since a SUCCESS there is a molecule counted
+    against the shipped success rate that no conformer was ever produced for.
+    """
+    gpu_context = sfa.Context([])
+    batch = gpu_context.generate_conformers(["", "   ", "CCO"], num_conformers=2, random_seed=42)
+
+    assert all(int(code) == int(sfa.ConformerStatus.INVALID_SMILES) for code in batch.status[:4])
+    assert int(batch.num_atoms[0]) == 0 and int(batch.num_atoms[1]) == 0
+    assert any(int(code) == int(sfa.ConformerStatus.SUCCESS) for code in batch.status[4:])
