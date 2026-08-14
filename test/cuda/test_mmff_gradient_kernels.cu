@@ -44,6 +44,63 @@ __global__ void mmff_energy_eval_kernel(
     if (lane == 0) *out_energy = energy;
 }
 
+/**
+ *  @brief Floats the three minimizer arrays occupy before the folded van der Waals table starts.
+ *
+ *  `mmff94_atom_vdw_folded_t` is sixteen bytes and eight-byte aligned, and `9 * num_atoms` floats is a
+ *  multiple of eight bytes only for an even atom count -- the polish kernel carves at the bin's atom cap,
+ *  which is even, while this harness carves at the molecule's own count and would otherwise hand the pair
+ *  sweep a misaligned load on every odd molecule.
+ */
+constexpr std::uint32_t minimizer_array_floats_(std::uint32_t num_atoms) { return (9u * num_atoms + 3u) & ~3u; }
+
+/**
+ *  One warp relaxing one molecule, staged as `mmff_polish_warp_kernel` stages it: the three minimizer
+ *  arrays first in the dynamic block, the folded van der Waals table behind them.
+ */
+__global__ void mmff_minimize_kernel(float *positions_inout, sft::mmff94_atom_vdw_params_t const *atom_vdw,
+                                     float const *atom_charge, std::uint8_t const *bond_distance,
+                                     sft::mmff94_bond_t const *bond_params, sft::mmff94_angle_t const *angle_params,
+                                     sft::mmff94_torsion_t const *torsion_params, sft::mmff94_oop_t const *oop_params,
+                                     sft::mmff94_stretchbend_t const *stretchbend_params,
+                                     sft::mmff94_atom_interaction_t const *interactions,
+                                     sft::mmff94_atom_offsets_t const *atom_offsets, std::uint32_t num_atoms,
+                                     std::int32_t max_iterations, float gradient_threshold,
+                                     smallfield::tests::mmff_minimize_result_t *out_result) {
+
+    std::uint32_t const lane = threadIdx.x;
+    std::uint32_t const num_elements = 3 * num_atoms;
+
+    extern __shared__ float shared_float[];
+    auto *shared_atom_vdw = reinterpret_cast<sft::mmff94_atom_vdw_folded_t *>(shared_float +
+                                                                              minimizer_array_floats_(num_atoms));
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += sfc::warp_size_k)
+        shared_atom_vdw[atom] = sfc::fold_atom_vdw_params_(atom_vdw[atom]);
+    for (std::uint32_t element = lane; element < num_elements; element += sfc::warp_size_k)
+        shared_float[element] = positions_inout[element];
+    __syncwarp(sfc::full_mask_k);
+
+    sfc::mmff94_energy_functor_t functor {shared_atom_vdw, atom_charge,    bond_distance, bond_params,
+                                          angle_params,    torsion_params, oop_params,    stretchbend_params,
+                                          interactions,    atom_offsets,   num_atoms};
+
+    sfc::fire_scratch<3> const scratch {.positions = sfc::fire_positions<3> {shared_float, num_atoms},
+                                        .velocities = sfc::fire_velocities<3> {shared_float + num_elements, num_atoms},
+                                        .gradient = sfc::fire_gradient<3> {shared_float + 2 * num_elements, num_atoms}};
+
+    sfc::fire_result_t const result = sfc::barzilai_borwein_minimize_(scratch, max_iterations, gradient_threshold, lane,
+                                                                      functor);
+
+    for (std::uint32_t element = lane; element < num_elements; element += sfc::warp_size_k)
+        positions_inout[element] = shared_float[element];
+    if (lane == 0)
+        *out_result = {.energy = result.energy,
+                       .rms_gradient = result.rms_gradient,
+                       .final_step = result.final_timestep,
+                       .iterations = result.iterations,
+                       .status = result.status};
+}
+
 } // namespace
 
 namespace smallfield::tests {
@@ -57,6 +114,7 @@ struct gradient_arena_t {
     device_array<float> positions;
     device_array<float> gradient;
     device_array<float> energy;
+    device_array<mmff_minimize_result_t> minimize_result;
     device_array<sft::mmff94_atom_vdw_params_t> atom_vdw;
     device_array<float> atom_charge;
     device_array<std::uint8_t> bond_distance;
@@ -82,6 +140,7 @@ struct gradient_arena_t {
         reserve_(positions, num_elements);
         reserve_(gradient, num_elements);
         reserve_(energy, 1);
+        reserve_(minimize_result, 1);
         reserve_term_(atom_vdw, terms.atom_vdw.size());
         reserve_term_(atom_charge, terms.atom_charge.size());
         reserve_term_(bond_distance, std::size_t {num_atoms} * num_atoms);
@@ -144,6 +203,37 @@ mmff_energy_probe_t gpu_mmff_energy(custd::span<float const> host_positions, std
     custd::span<float const> const device_energy = arena.energy.view();
     bool const copied = sft::download_from(host_gradient, device_gradient, nullptr) &&
                         sft::download_from(custd::span<float> {out_energy, 1}, device_energy, nullptr);
+    cudaError_t const drained = cudaStreamSynchronize(nullptr);
+    if (!copied) return mmff_energy_probe_t::transfer_failed_k;
+    if (drained != cudaSuccess) return mmff_energy_probe_t::launch_failed_k;
+    return mmff_energy_probe_t::completed_k;
+}
+
+mmff_energy_probe_t gpu_mmff_minimize(custd::span<float> host_positions, std::uint32_t num_atoms,
+                                      mmff_energy_terms_t const &terms, std::int32_t max_iterations,
+                                      float gradient_threshold, mmff_minimize_result_t &out_result) {
+
+    gradient_arena_t arena;
+    if (!arena.resize_for(num_atoms, terms)) return mmff_energy_probe_t::allocation_failed_k;
+    if (!arena.upload(custd::span<float const> {host_positions.data(), host_positions.size()}, terms))
+        return mmff_energy_probe_t::transfer_failed_k;
+
+    // The three minimizer arrays, then the folded per-atom table behind them, which is the carve
+    // `mmff_minimize_kernel` performs.
+    std::uint32_t const shared_bytes = minimizer_array_floats_(num_atoms) * static_cast<std::uint32_t>(sizeof(float)) +
+                                       num_atoms * static_cast<std::uint32_t>(sizeof(sft::mmff94_atom_vdw_folded_t));
+    mmff_minimize_kernel<<<1, sfc::warp_size_k, shared_bytes>>>(
+        arena.positions.data(), arena.atom_vdw.data(), arena.atom_charge.data(), arena.bond_distance.data(),
+        arena.bonds.data(), arena.angles.data(), arena.torsions.data(), arena.oops.data(), arena.stretchbends.data(),
+        arena.interactions.data(), arena.atom_offsets.data(), num_atoms, max_iterations, gradient_threshold,
+        arena.minimize_result.data());
+    if (cudaGetLastError() != cudaSuccess) return mmff_energy_probe_t::launch_failed_k;
+
+    custd::span<float const> const device_positions = arena.positions.view();
+    custd::span<mmff_minimize_result_t const> const device_result = arena.minimize_result.view();
+    bool const copied = sft::download_from(host_positions, device_positions, nullptr) &&
+                        sft::download_from(custd::span<mmff_minimize_result_t> {&out_result, 1}, device_result,
+                                           nullptr);
     cudaError_t const drained = cudaStreamSynchronize(nullptr);
     if (!copied) return mmff_energy_probe_t::transfer_failed_k;
     if (drained != cudaSuccess) return mmff_energy_probe_t::launch_failed_k;

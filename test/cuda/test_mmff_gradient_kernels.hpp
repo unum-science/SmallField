@@ -9,6 +9,7 @@
 
 #include <string_view> // `std::string_view`
 
+#include "smallfield/cuda/fire_warp.cuh"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/types/views.hpp"
 
@@ -77,5 +78,42 @@ struct mmff_energy_terms_t {
 [[nodiscard]] mmff_energy_probe_t gpu_mmff_energy(custd::span<float const> host_positions, std::uint32_t num_atoms,
                                                   mmff_energy_terms_t const &terms, custd::span<float> host_gradient,
                                                   float *out_energy);
+
+/**
+ *  @brief What one `gpu_mmff_minimize` call measured, at the geometry it hands back.
+ *
+ *  `smallfield::cuda::fire_result_t` sits inside that header's `__CUDACC__` guard, so a host driver
+ *  reading the outcome needs a spelling of the same five fields it can name from a `.cpp`.
+ */
+struct mmff_minimize_result_t {
+    float energy = 0.0f;
+    /** Root mean square of the gradient over all `3 * num_atoms` components, in kcal per mol per angstrom. */
+    float rms_gradient = 0.0f;
+    /** Length of the last Barzilai-Borwein step, in Å² per kcal per mol. */
+    float final_step = 0.0f;
+    std::int32_t iterations = 0;
+    smallfield::cuda::fire_status_t status = smallfield::cuda::fire_status_t::exhausted_k;
+};
+
+/**
+ *  @brief Relax one molecule on the device with `barzilai_borwein_minimize_`, the production minimizer.
+ *
+ *  The budget and the threshold are parameters rather than `mmff_polish_iteration_cap_k` and
+ *  `mmff_polish_gradient_threshold_k`, so a caller can sweep either without moving a production constant.
+ *  Everything else matches `mmff_polish_warp_kernel`: one warp, the same folded van der Waals staging, the
+ *  same three shared arrays, and the same functor.
+ *
+ *  @param[inout] host_positions Coordinates as `(axis, atom)`, `3 * num_atoms` entries; overwritten with the
+ *      relaxed geometry the returned energy and gradient norm were measured at.
+ *  @param[in] num_atoms Atom count.
+ *  @param[in] terms Every parameter array the energy functor reads.
+ *  @param[in] max_iterations Iteration budget; the last evaluation is measured, not stepped from.
+ *  @param[in] gradient_threshold Convergence when the RMS gradient falls below it.
+ *  @param[out] out_result Receives the outcome; untouched on a refusal.
+ *  @return Whether the round trip completed, and which step refused it.
+ */
+[[nodiscard]] mmff_energy_probe_t gpu_mmff_minimize(custd::span<float> host_positions, std::uint32_t num_atoms,
+                                                    mmff_energy_terms_t const &terms, std::int32_t max_iterations,
+                                                    float gradient_threshold, mmff_minimize_result_t &out_result);
 
 } // namespace smallfield::tests

@@ -27,6 +27,16 @@ define_smallfield_target(
     LINK smallfield_lib
 )
 
+# Separates an algorithmic stall in the Barzilai-Borwein polish from an unreachable threshold and from too small a
+# budget.  It drives `gpu_mmff_minimize`, the single-molecule wrapper the MMFF gradient test already owns, so the
+# minimizer under measurement is the production one and the sweep passes its budget and threshold as arguments rather
+# than moving a constant in `src/`.
+define_smallfield_target(
+    bench_mmff_convergence
+    SOURCES bench_mmff_convergence.cpp ${PROJECT_SOURCE_DIR}/test/cuda/test_mmff_gradient_kernels.cu
+    LINK smallfield_lib
+)
+
 # Kernel replay of one captured atom-limited bin, and the one target here that does not go through
 # `define_smallfield_target`.  Every NVIDIA profiler dies at the first CUDA call inside a binary carrying the
 # conda-forge stack, so this one links neither `smallfield_lib` nor jemalloc -- linking the CUDA runtime alone is the
