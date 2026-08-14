@@ -166,6 +166,26 @@ inline constexpr std::uint32_t pinned_prep_depth_k = 2;
  *  Reuse across multiple `generate_conformers` calls to avoid re-initialization.
  */
 struct context_t {
+    /**
+     *  @brief Owned per-context logger. Tune verbosity via `context.logger.verbose_level = 1;`
+     *  before calling `generate_conformers`. Library diagnostics — wave timing table, per-device breakdown —
+     *  route through `logger.trace` / `logger.trace2`; CUDA errors through `logger.error`.
+     *
+     *  First of the members, with the error counter, because destruction runs in reverse declaration
+     *  order and every release below could report through them. Nothing on the teardown path does today
+     *  — each release binds its status `[[maybe_unused]]` — but that is a convention, and giving one of
+     *  them a sink is an ordinary change that would otherwise write through a destroyed logger.
+     */
+    smallfield::logger_t logger;
+
+    /**
+     *  @brief Per-context CUDA error accumulator, incremented by `cuda_error_sink_t::check` every time a
+     *  CUDA API call returns a non-success status. Production callers read this after each
+     *  `generate_conformers` call and exit non-zero if it is positive, catching silent failures that would
+     *  otherwise hide behind per-wave zero-filled outputs. Reset via `context.cuda_error_count.store(0)`.
+     */
+    std::atomic<std::uint64_t> cuda_error_count {0};
+
     std::vector<int> device_ids;
     /**
      *  @brief One owned CUDA stream per device. All per-wave work on a given device (H2D, kernels,
@@ -195,21 +215,6 @@ struct context_t {
      *  sizer clamps to this so a runtime wave can never exceed the construction-time
      *  reservation and trigger a grow from inside the per-device launch fan-out. */
     std::uint32_t per_device_reserved_molecules = 0;
-
-    /**
-     *  @brief Owned per-context logger. Tune verbosity via `context.logger.verbose_level = 1;`
-     *  before calling `generate_conformers`. Library diagnostics — wave timing table, per-device breakdown —
-     *  route through `logger.trace` / `logger.trace2`; CUDA errors through `logger.error`.
-     */
-    smallfield::logger_t logger;
-
-    /**
-     *  @brief Per-context CUDA error accumulator, incremented by `cuda_error_sink_t::check` every time a
-     *  CUDA API call returns a non-success status. Production callers read this after each
-     *  `generate_conformers` call and exit non-zero if it is positive, catching silent failures that would
-     *  otherwise hide behind per-wave zero-filled outputs. Reset via `context.cuda_error_count.store(0)`.
-     */
-    std::atomic<std::uint64_t> cuda_error_count {0};
 
     /**
      *  @brief Construct for the given GPUs.
