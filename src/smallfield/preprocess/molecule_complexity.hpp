@@ -5,10 +5,10 @@
  *  Atom count alone is a weak proxy for kernel wall time. Within one `embedding-wave` the dominant GPU costs are:
  *
  *    1. Bounds-matrix smoothing and the nonbonded pair scan: O(num_atoms²).
- *    2. FIRE minimisation over MMFF and ETK torsions: linear in torsion count per iteration, and the iteration
- *       count itself scales with torsion count via `select_refinement_policy_`.
- *    3. A heavy-rescue branch in `mmff_polish_warp_kernel` that runs a second FIRE stage, doubling the iterations,
- *       when `is_heavy_refinement_case` holds.
+ *    2. Minimisation over the ETK torsions: linear in torsion count per iteration, with the iteration count
+ *       itself scaling with torsion count via `select_refinement_policy_`.
+ *    3. The MMFF94 polish, which spends one flat cap per conformer rather than a per-molecule budget, so it
+ *       enters the estimate through its per-iteration cost alone.
  *
  *  Nothing here touches CUDA, so `src/smallfield/cuda/etkdg_pipeline.cuh` includes it and the balance estimate
  *  reads the same definition the kernels dispatch on rather than a restatement that has to be kept in step.
@@ -31,7 +31,7 @@ inline constexpr std::uint32_t total_mmff_terms(smallfield::types::etkdg_molecul
            metadata.num_mmff_oops + metadata.num_mmff_stretchbends;
 }
 
-/** True iff the molecule takes the widened FIRE budget and the `mmff_polish_warp_kernel` heavy-rescue branch. */
+/** True iff the molecule takes the widened FIRE budget for the ETK torsion stage. */
 inline constexpr bool is_heavy_refinement_case(smallfield::types::etkdg_molecule_metadata_t const &metadata) noexcept {
     std::uint32_t const torsion_complexity = metadata.num_etk_torsions + metadata.num_mmff_torsions;
     return metadata.num_atoms >= 96u || total_mmff_terms(metadata) >= 900u || torsion_complexity >= 64u;

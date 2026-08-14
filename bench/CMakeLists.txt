@@ -11,6 +11,14 @@ define_smallfield_target(
     LINK smallfield_lib
 )
 
+# Scores `build_bounds_matrix` by driving RDKit's own embedder through `params.boundsMat`, against two controls that
+# take the same measurement through the untouched channel.  Host-only -- it reaches no kernel and needs no GPU.
+define_smallfield_target(
+    bench_bounds_embedding
+    SOURCES bench_bounds_embedding.cpp
+    LINK smallfield_lib
+)
+
 # MMFF kernel scaling benchmark, measuring the GPU kernel trio in isolation.  Mixed build: the .cpp drives RDKit and
 # OpenMP CPU timing, the .cu launches the kernels with cudaEvent timing.
 define_smallfield_target(

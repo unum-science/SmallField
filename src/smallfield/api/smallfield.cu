@@ -30,7 +30,7 @@
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
 #include "smallfield/nvtx.hpp"
-#include "smallfield/parameters/mmff94_tables_device.cuh"
+#include "smallfield/parameters/mmff94_tables_device.hpp"
 #include "smallfield/parameters/mmff94_tables_rdkit.hpp"
 #include "smallfield/preprocess/etkdg_prepare_batch.hpp"
 #include "smallfield/utilities.hpp"
@@ -62,6 +62,7 @@ using smallfield::parameters::extract_mmff94_tables_from_rdkit;
 using smallfield::parameters::mmff94_tables_device_t;
 using smallfield::parameters::mmff94_tables_host_t;
 using smallfield::parameters::upload_mmff94_tables_to_device;
+using smallfield::preprocess::batch_prep_scratch_t;
 using smallfield::preprocess::carve_wave_slice;
 using smallfield::preprocess::prepare_per_device_batches_into;
 using smallfield::preprocess::rejected_mol_t;
@@ -1382,7 +1383,7 @@ context_t::context_t(custd::span<int const> devices) {
             this->logger.error("context_t: pool reservation failed on device {} ({} device, {} host bytes)", device_id,
                                worst_case_device_bytes, worst_case_host_bytes);
     }
-    // The pinned batch slots are deliberately left unreserved. `prepare_molecule_batch_into`
+    // The pinned batch slots are deliberately left unreserved. `prepare_per_device_batches_into`
     // sizes each one from the wave's own uploaded prefix, and preprocess partitions atom-count
     // descending, so the first wave carries the largest molecules and every slot reaches its peak
     // capacity on that wave; later waves find the buffer already large enough. Reserving here
@@ -1500,6 +1501,9 @@ struct wave_dispatcher_t {
     cuda_error_sink_t sink {};
     /** Grow-only across waves; `prepare` refills it from each slice. */
     std::vector<rejected_mol_t> rejected {};
+    /** Preprocess's per-worker and partition buffers. One dispatcher owns one, which is what lets two
+     *  `context_t` objects prepare waves on two threads; grow-only across this run's waves. */
+    batch_prep_scratch_t prep_scratch {};
 
     [[nodiscard]] std::uint32_t device_count() const noexcept {
         return static_cast<std::uint32_t>(context.device_ids.size());
@@ -1525,7 +1529,7 @@ struct wave_dispatcher_t {
         scoped_span_ms_t const timed {clock, record.prepare};
         custd::span<wave_slice_pool_t> const slot = context.wave_slot(wave_index);
         prepare_per_device_batches_into(sorted_smiles.subspan(range.begin, range.size()), device_count(),
-                                        host_max_atoms, slot, &rejected);
+                                        host_max_atoms, slot, prep_scratch, &rejected);
 
         wave_outputs_t const wave_outputs = outputs_for(range);
 

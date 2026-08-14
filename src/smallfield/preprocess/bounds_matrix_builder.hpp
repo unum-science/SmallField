@@ -59,6 +59,10 @@ using smallfield::types::upper_distance_bound_at;
  *  Ported from RDKit's `Type14` in `Code/GraphMol/DistGeomHelpers/BoundsMatrixBuilder.cpp`. The three
  *  bonds of a path are `first — second`, `second — third` and `third — fourth`, and the ring membership
  *  of those three is the whole classification.
+ *
+ *  This is srETKDGv3, so `useMacrocycle14config` is off and a large ring is classified by size alone
+ *  like any other. Upstream's two extra macrocycle cases are deliberately absent; the divergence harness
+ *  calls `setTopolBounds` with defaults, which is the same preset.
  */
 enum class path_14_kind_t : std::uint8_t {
     /** The middle bond is not a ring bond and neither end bond is either. */
@@ -71,10 +75,6 @@ enum class path_14_kind_t : std::uint8_t {
     two_in_different_rings_k,
     /** The middle bond is a ring bond and neither end bond shares a ring with it. */
     shares_ring_bond_k,
-    /** `two_in_same_ring_k` where the middle bond belongs to a macrocycle. */
-    macrocycle_two_in_same_ring_k,
-    /** `all_in_ring_k` where that ring is a macrocycle. */
-    macrocycle_all_in_ring_k,
 };
 
 /** What a path's case asks of its central torsion. */
@@ -87,15 +87,6 @@ enum class torsion_preference_t : std::uint8_t {
     flexible_k,
     /** Torsion pi/2, which only a disulfide asks for. */
     right_angle_k,
-    /** The path declines to say, so the pair takes no interval from it. */
-    none_k,
-};
-
-/** The torsion a path's case asks for, and the slack that case adds on top. */
-struct torsion_target_t {
-    torsion_preference_t preference = torsion_preference_t::flexible_k;
-    /** Extra reach in Å on top of the computed distance; only a macrocyclic trans amide asks for it. */
-    float extra_reach = 0.0f;
 };
 
 /** The E/Z relationship a central bond fixes between a path's two end atoms. */
@@ -132,9 +123,6 @@ struct path_14_case_t {
     exocyclic_preference_t exocyclic = exocyclic_preference_t::unbiased_k;
 };
 
-/** Smallest ring RDKit's `useMacrocycle14config` treats as a macrocycle, in atoms. ETKDGv3 leaves it on. */
-inline constexpr std::uint32_t macrocycle_ring_size_k = 9;
-
 /** Largest ring whose sp2 pair still pins its 1-4 path cis; past it there is room for trans. */
 inline constexpr std::uint32_t largest_pinned_ring_size_k = 8;
 
@@ -143,9 +131,6 @@ inline constexpr float one_four_tolerance_k = 0.06f;
 
 /** Interval width below which a flexible 1-4 pair is widened instead. RDKit's `DIST12_DELTA`. */
 inline constexpr float degenerate_interval_k = 0.01f;
-
-/** Extra reach a macrocyclic trans amide takes, the most that survives triangle smoothing. */
-inline constexpr float macrocycle_amide_reach_k = 0.1f;
 
 /** Lower bound in Å for a pair that can close an intramolecular hydrogen bond. */
 inline constexpr float hydrogen_bond_length_k = 1.8f;
@@ -258,15 +243,6 @@ inline std::uint32_t larger_sp2_ring_atoms_(molecule_descriptor_t const &descrip
     return static_cast<std::uint32_t>(is_larger_sp2_ring_atom(first)) +
            static_cast<std::uint32_t>(is_larger_sp2_ring_atom(center)) +
            static_cast<std::uint32_t>(is_larger_sp2_ring_atom(second));
-}
-
-/** Whether any SSSR ring named in @p ring_mask is a macrocycle. */
-inline bool ring_mask_holds_macrocycle_(molecule_descriptor_t const &descriptor, std::uint32_t ring_mask) {
-    for (std::uint32_t ring = 0; ring < descriptor.num_rings; ++ring) {
-        if ((ring_mask & (1u << ring)) == 0) continue;
-        if (descriptor.ring_offset[ring + 1] - descriptor.ring_offset[ring] >= macrocycle_ring_size_k) return true;
-    }
-    return false;
 }
 
 /** Ideal length in Å of @p bond, read from the element pair and the bond type. */
@@ -438,65 +414,6 @@ inline bool is_amide_or_ester_15_(molecule_descriptor_t const &descriptor, path_
     return is_carbonyl_(descriptor, path.third);
 }
 
-/**
- *  @brief `is_amide_or_ester_14_` widened for a macrocycle, where the nitrogen may carry no hydrogen.
- *
- *  A methylated amide inside a large ring is still an amide, and the hydrogen count that the open-chain
- *  predicate leans on is the one thing a ring closure can take away.
- */
-inline bool is_macrocyclic_amide_or_ester_14_(molecule_descriptor_t const &descriptor, path_14_t const &path) {
-    std::uint8_t const element_second = descriptor.element[path.second];
-    std::uint8_t const element_fourth = descriptor.element[path.fourth];
-    return descriptor.element[path.first] != 1 && descriptor.element[path.third] == 6 &&
-           bond_kind_(descriptor, path.bond_third_fourth) == bond_kind_t::double_k &&
-           (element_fourth == 8 || element_fourth == 7) &&
-           bond_kind_(descriptor, path.bond_first_second) == bond_kind_t::single_k &&
-           (element_second == 8 || element_second == 7);
-}
-
-/** The only neighbour of @p atom that is neither @p excluded_first nor @p excluded_second. */
-inline std::optional<std::uint32_t> other_neighbor_entry_(molecule_descriptor_t const &descriptor, std::uint32_t atom,
-                                                          std::uint32_t excluded_first, std::uint32_t excluded_second) {
-    std::uint32_t const first_entry = descriptor.neighbor_offset[atom];
-    std::uint32_t const last_entry = descriptor.neighbor_offset[atom + 1];
-    for (std::uint32_t entry = first_entry; entry < last_entry; ++entry) {
-        std::uint32_t const neighbor = descriptor.neighbor_atom[entry];
-        if (neighbor == excluded_first || neighbor == excluded_second) continue;
-        return entry;
-    }
-    return std::nullopt;
-}
-
-/**
- *  @brief Whether an amide or ester spans the path with every one of its four substituents in the ring.
- *
- *  Where `is_macrocyclic_amide_or_ester_14_` reads the path's own four atoms, this one also inspects
- *  what hangs off the two central atoms: a carbon or a hydrogen on the nitrogen, and the carbonyl
- *  oxygen on the carbon. Both central atoms are three-coordinate, so each has exactly one such
- *  neighbour.
- */
-inline bool is_macrocyclic_ring_amide_or_ester_14_(molecule_descriptor_t const &descriptor, path_14_t const &path) {
-    std::uint8_t const element_second = descriptor.element[path.second];
-    if (descriptor.element[path.third] != 6) return false;
-    if (element_second != 7 && element_second != 8) return false;
-    if (descriptor.degree[path.second] != 3 || descriptor.degree[path.third] != 3) return false;
-
-    std::optional<std::uint32_t> const substituent = other_neighbor_entry_(descriptor, path.second, path.first,
-                                                                           path.third);
-    if (substituent) {
-        std::uint8_t const element = descriptor.element[descriptor.neighbor_atom[*substituent]];
-        if (element != 6 && element != 1) return false;
-        if (bond_kind_(descriptor, descriptor.neighbor_bond[*substituent]) != bond_kind_t::single_k) return false;
-    }
-    std::optional<std::uint32_t> const carbonyl = other_neighbor_entry_(descriptor, path.third, path.second,
-                                                                        path.fourth);
-    if (carbonyl) {
-        if (descriptor.element[descriptor.neighbor_atom[*carbonyl]] != 8) return false;
-        if (bond_kind_(descriptor, descriptor.neighbor_bond[*carbonyl]) != bond_kind_t::double_k) return false;
-    }
-    return true;
-}
-
 /** Whether an end of the path is the N-H hydrogen of a secondary amide. */
 inline bool ends_on_secondary_amide_hydrogen_(molecule_descriptor_t const &descriptor, path_14_t const &path) {
     auto const hydrogen_on_nitrogen = [&](std::uint32_t hydrogen, std::uint32_t nitrogen) {
@@ -536,28 +453,28 @@ inline torsion_preference_t stereo_preference_(molecule_descriptor_t const &desc
 }
 
 /** The open-chain case: a cumulated double bond, a disulfide, an amide or ester, or free rotation. */
-inline torsion_target_t chain_preference_(molecule_descriptor_t const &descriptor, path_14_t const &path) {
+inline torsion_preference_t chain_preference_(molecule_descriptor_t const &descriptor, path_14_t const &path) {
     switch (bond_kind_(descriptor, path.bond_second_third)) {
     case bond_kind_t::double_k:
         // An allene's two double bonds share a plane and eclipse the ends.
         if (bond_kind_(descriptor, path.bond_first_second) == bond_kind_t::double_k ||
             bond_kind_(descriptor, path.bond_third_fourth) == bond_kind_t::double_k)
-            return {.preference = torsion_preference_t::cis_k};
-        return {.preference = stereo_preference_(descriptor, path)};
+            return torsion_preference_t::cis_k;
+        return stereo_preference_(descriptor, path);
     case bond_kind_t::single_k:
         // Two lone pairs per sulfur hold a disulfide near a right angle.
-        if (central_pair_is_disulfide_(descriptor, path)) return {.preference = torsion_preference_t::right_angle_k};
+        if (central_pair_is_disulfide_(descriptor, path)) return torsion_preference_t::right_angle_k;
         if (holds_in_either_direction_(descriptor, path, is_amide_or_ester_14_))
-            return {.preference = ends_on_secondary_amide_hydrogen_(descriptor, path) ? torsion_preference_t::trans_k
-                                                                                      : torsion_preference_t::cis_k};
+            return ends_on_secondary_amide_hydrogen_(descriptor, path) ? torsion_preference_t::trans_k
+                                                                       : torsion_preference_t::cis_k;
         // One atom further out the sense inverts: the amide's own N-H is now syn to the far end.
         if (holds_in_either_direction_(descriptor, path, is_amide_or_ester_15_))
-            return {.preference = ends_on_secondary_amide_hydrogen_(descriptor, path) ? torsion_preference_t::cis_k
-                                                                                      : torsion_preference_t::trans_k};
-        return {.preference = torsion_preference_t::flexible_k};
-    case bond_kind_t::other_k: return {.preference = torsion_preference_t::flexible_k};
+            return ends_on_secondary_amide_hydrogen_(descriptor, path) ? torsion_preference_t::cis_k
+                                                                       : torsion_preference_t::trans_k;
+        return torsion_preference_t::flexible_k;
+    case bond_kind_t::other_k: return torsion_preference_t::flexible_k;
     }
-    return {.preference = torsion_preference_t::flexible_k};
+    return torsion_preference_t::flexible_k;
 }
 
 /**
@@ -566,67 +483,30 @@ inline torsion_target_t chain_preference_(molecule_descriptor_t const &descripto
  *  @p ring_size is 0 when the three bonds share no ring, which is how `two_in_different_rings_k` and
  *  `shares_ring_bond_k` reach the same answer as a small ring: a flat centre pair eclipses its ends.
  */
-inline torsion_target_t in_ring_preference_(molecule_descriptor_t const &descriptor, path_14_t const &path,
-                                            std::uint32_t ring_size) {
+inline torsion_preference_t in_ring_preference_(molecule_descriptor_t const &descriptor, path_14_t const &path,
+                                                std::uint32_t ring_size) {
     path_stereo_t const stereo = path_stereo_(descriptor, path);
     // A ring past eight atoms has room for a trans arrangement, so its flat centre pins nothing.
     bool const closure_pins_cis = ring_size <= largest_pinned_ring_size_k && central_pair_is_flat_(descriptor, path) &&
                                   stereo != path_stereo_t::trans_k;
-    if (closure_pins_cis || stereo == path_stereo_t::cis_k) return {.preference = torsion_preference_t::cis_k};
-    if (stereo == path_stereo_t::trans_k) return {.preference = torsion_preference_t::trans_k};
-    return {.preference = torsion_preference_t::flexible_k};
+    if (closure_pins_cis || stereo == path_stereo_t::cis_k) return torsion_preference_t::cis_k;
+    if (stereo == path_stereo_t::trans_k) return torsion_preference_t::trans_k;
+    return torsion_preference_t::flexible_k;
 }
 
 /** The case where the path leaves the ring at one end, so a flat ring pushes that end anti. */
-inline torsion_target_t two_in_same_ring_preference_(molecule_descriptor_t const &descriptor, path_14_t const &path,
-                                                     exocyclic_preference_t exocyclic) {
+inline torsion_preference_t two_in_same_ring_preference_(molecule_descriptor_t const &descriptor, path_14_t const &path,
+                                                         exocyclic_preference_t exocyclic) {
     path_stereo_t const stereo = path_stereo_(descriptor, path);
     bool const ring_pushes_trans = exocyclic == exocyclic_preference_t::prefers_trans_k &&
                                    central_pair_is_flat_(descriptor, path) && stereo != path_stereo_t::cis_k;
-    if (ring_pushes_trans || stereo == path_stereo_t::trans_k) return {.preference = torsion_preference_t::trans_k};
-    if (stereo == path_stereo_t::cis_k) return {.preference = torsion_preference_t::cis_k};
-    return {.preference = torsion_preference_t::flexible_k};
-}
-
-/** `two_in_same_ring_preference_` for a macrocycle, where an amide across the ring reads cis. */
-inline torsion_target_t macrocycle_two_in_same_ring_preference_(molecule_descriptor_t const &descriptor,
-                                                                path_14_t const &path) {
-    if (holds_in_either_direction_(descriptor, path, is_macrocyclic_amide_or_ester_14_))
-        return {.preference = torsion_preference_t::cis_k};
-    return {.preference = stereo_preference_(descriptor, path)};
-}
-
-/** `chain_preference_` for a path whose three bonds all lie in one macrocycle. */
-inline torsion_target_t macrocycle_all_in_ring_preference_(molecule_descriptor_t const &descriptor,
-                                                           path_14_t const &path) {
-    switch (bond_kind_(descriptor, path.bond_second_third)) {
-    case bond_kind_t::double_k:
-        if (bond_kind_(descriptor, path.bond_first_second) == bond_kind_t::double_k ||
-            bond_kind_(descriptor, path.bond_third_fourth) == bond_kind_t::double_k)
-            return {.preference = torsion_preference_t::cis_k};
-        return {.preference = stereo_preference_(descriptor, path)};
-    case bond_kind_t::single_k:
-        if (central_pair_is_disulfide_(descriptor, path)) return {.preference = torsion_preference_t::right_angle_k};
-        if (holds_in_either_direction_(descriptor, path, is_macrocyclic_ring_amide_or_ester_14_))
-            return {.preference = torsion_preference_t::trans_k, .extra_reach = macrocycle_amide_reach_k};
-        if (holds_in_either_direction_(descriptor, path, is_amide_or_ester_15_)) {
-            // The secondary amide's own hydrogen is placed by the shorter path across the same amide,
-            // so bounding it from here as well would fight that answer.
-            bool const own_amide_hydrogen = descriptor.element[path.second] == 7 &&
-                                            descriptor.degree[path.second] == 3 &&
-                                            descriptor.element[path.first] == 1 &&
-                                            descriptor.num_hydrogens[path.second] == 1;
-            if (own_amide_hydrogen) return {.preference = torsion_preference_t::none_k};
-            return {.preference = torsion_preference_t::trans_k};
-        }
-        return {.preference = torsion_preference_t::flexible_k};
-    case bond_kind_t::other_k: return {.preference = torsion_preference_t::flexible_k};
-    }
-    return {.preference = torsion_preference_t::flexible_k};
+    if (ring_pushes_trans || stereo == path_stereo_t::trans_k) return torsion_preference_t::trans_k;
+    if (stereo == path_stereo_t::cis_k) return torsion_preference_t::cis_k;
+    return torsion_preference_t::flexible_k;
 }
 
 /**
- *  @brief Which of the seven cases @p path is in, read from the ring membership of its three bonds.
+ *  @brief Which of the five cases @p path is in, read from the ring membership of its three bonds.
  *
  *  @param[in] descriptor Molecule graph.
  *  @param[in] bond_ring_bitmap One word per bond, bit `ring` set when the bond belongs to that SSSR ring.
@@ -640,18 +520,11 @@ inline path_14_case_t classify_path_14_(molecule_descriptor_t const &descriptor,
     std::uint32_t const rings_last = bond_ring_bitmap[path.bond_third_fourth];
 
     std::uint32_t const ring_size_all = smallest_ring_size_(descriptor, rings_first & rings_central & rings_last);
-    if (ring_size_all != 0)
-        return {.kind = ring_size_all >= macrocycle_ring_size_k ? path_14_kind_t::macrocycle_all_in_ring_k
-                                                                : path_14_kind_t::all_in_ring_k,
-                .ring_size = ring_size_all};
+    if (ring_size_all != 0) return {.kind = path_14_kind_t::all_in_ring_k, .ring_size = ring_size_all};
 
     std::uint32_t const ring_size_front = smallest_ring_size_(descriptor, rings_first & rings_central);
     std::uint32_t const ring_size_back = smallest_ring_size_(descriptor, rings_central & rings_last);
     if (ring_size_front != 0 || ring_size_back != 0) {
-        // The middle bond belonging to a macrocycle is what makes the path a macrocycle case, whichever
-        // of its two neighbours is the one sharing a ring with it.
-        if (ring_mask_holds_macrocycle_(descriptor, rings_central))
-            return {.kind = path_14_kind_t::macrocycle_two_in_same_ring_k};
         bool const flat_ring = (ring_size_front != 0 && ring_size_front <= largest_pinned_ring_size_k) ||
                                (ring_size_back != 0 && ring_size_back <= largest_pinned_ring_size_k);
         return {.kind = path_14_kind_t::two_in_same_ring_k,
@@ -665,19 +538,16 @@ inline path_14_case_t classify_path_14_(molecule_descriptor_t const &descriptor,
 }
 
 /** The torsion @p path's case asks for. */
-inline torsion_target_t path_14_target_(molecule_descriptor_t const &descriptor, path_14_t const &path,
-                                        path_14_case_t const &path_case) {
+inline torsion_preference_t path_14_target_(molecule_descriptor_t const &descriptor, path_14_t const &path,
+                                            path_14_case_t const &path_case) {
     switch (path_case.kind) {
     case path_14_kind_t::in_chain_k: return chain_preference_(descriptor, path);
     case path_14_kind_t::all_in_ring_k: return in_ring_preference_(descriptor, path, path_case.ring_size);
     case path_14_kind_t::two_in_same_ring_k: return two_in_same_ring_preference_(descriptor, path, path_case.exocyclic);
     case path_14_kind_t::two_in_different_rings_k: return in_ring_preference_(descriptor, path, 0);
     case path_14_kind_t::shares_ring_bond_k: return in_ring_preference_(descriptor, path, 0);
-    case path_14_kind_t::macrocycle_two_in_same_ring_k:
-        return macrocycle_two_in_same_ring_preference_(descriptor, path);
-    case path_14_kind_t::macrocycle_all_in_ring_k: return macrocycle_all_in_ring_preference_(descriptor, path);
     }
-    return {.preference = torsion_preference_t::flexible_k};
+    return torsion_preference_t::flexible_k;
 }
 
 #pragma endregion Torsion Targets
@@ -686,7 +556,7 @@ inline torsion_target_t path_14_target_(molecule_descriptor_t const &descriptor,
 
 /** The distance interval @p target claims for @p path, in Å. */
 inline bound_interval_t path_14_interval_(molecule_descriptor_t const &descriptor, path_14_t const &path,
-                                          torsion_target_t const &target) {
+                                          torsion_preference_t target) {
     float const length_12 = bond_length_angstrom_(descriptor, path.bond_first_second);
     float const length_23 = bond_length_angstrom_(descriptor, path.bond_second_third);
     float const length_34 = bond_length_angstrom_(descriptor, path.bond_third_fourth);
@@ -696,7 +566,7 @@ inline bound_interval_t path_14_interval_(molecule_descriptor_t const &descripto
         return one_four_distance_(length_12, length_23, length_34, angle_123, angle_234, cos_torsion);
     };
 
-    if (target.preference == torsion_preference_t::flexible_k) {
+    if (target == torsion_preference_t::flexible_k) {
         float lower = distance_at(1.0f);
         float upper = distance_at(-1.0f);
         // A strained centre can invert the two, and a degenerate interval is no constraint at all.
@@ -708,10 +578,10 @@ inline bound_interval_t path_14_interval_(molecule_descriptor_t const &descripto
         return {.lower = lower, .upper = upper};
     }
 
-    float const cos_torsion = target.preference == torsion_preference_t::cis_k     ? 1.0f
-                              : target.preference == torsion_preference_t::trans_k ? -1.0f
-                                                                                   : 0.0f;
-    float const distance = distance_at(cos_torsion) + target.extra_reach;
+    float const cos_torsion = target == torsion_preference_t::cis_k     ? 1.0f
+                              : target == torsion_preference_t::trans_k ? -1.0f
+                                                                        : 0.0f;
+    float const distance = distance_at(cos_torsion);
     return {.lower = distance - one_four_tolerance_k, .upper = distance + one_four_tolerance_k};
 }
 
@@ -719,7 +589,7 @@ inline bound_interval_t path_14_interval_(molecule_descriptor_t const &descripto
  *  @brief Collapse the intervals several 1-4 paths claim for one atom pair into a single interval.
  *
  *  A pair reachable by more than one three-bond path — a stereo double bond on each of two routes, a
- *  fused ring system, an amide inside a macrocycle — is claimed once per path, and a bounds matrix
+ *  fused ring system, a bridged bicycle — is claimed once per path, and a bounds matrix
  *  holds one interval per pair. Taking the union of the maximal intersections keeps every claim that
  *  can be satisfied together and widens to cover the rest, so a pair whose paths disagree outright
  *  ends up loose rather than contradictory. Ported from RDKit's `merge`,
@@ -898,9 +768,8 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_
                                           .bond_second_third = descriptor.neighbor_bond[third_entry],
                                           .bond_third_fourth = *closing};
                     path_14_case_t const path_case = classify_path_14_(descriptor, ring_bitmap_span, path);
-                    torsion_target_t const target = path_14_target_(descriptor, path, path_case);
-                    if (target.preference == torsion_preference_t::none_k) continue;
-                    claims[num_claims++] = path_14_interval_(descriptor, path, target);
+                    claims[num_claims++] = path_14_interval_(descriptor, path,
+                                                             path_14_target_(descriptor, path, path_case));
                 }
             }
 
