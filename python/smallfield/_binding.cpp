@@ -218,6 +218,18 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
             "generate_conformers",
             [](sfapi::context_t &gpu_context, std::vector<std::string> const &smiles_list, std::uint32_t num_conformers,
                std::uint32_t max_atoms_per_molecule, std::uint32_t max_stereo_attempts, std::uint64_t random_seed) {
+                // Both CLI binaries refuse these three at the command line; this entry had no equivalent
+                // floor. Zero atoms is the one that corrupts rather than merely misbehaving: the
+                // preprocess step reads a zero capacity as "no cap, use the library maximum" while
+                // `conformer_slot_layout_t` reads it as a zero stride, so a molecule is admitted at its
+                // real atom count and finalize writes it into a slot the caller allocated empty.
+                if (num_conformers == 0 || num_conformers > sfapi::max_conformer_count_k)
+                    throw std::invalid_argument("num_conformers must be between 1 and " +
+                                                std::to_string(sfapi::max_conformer_count_k));
+                if (max_atoms_per_molecule == 0 || max_atoms_per_molecule > sfapi::max_atoms_per_molecule_k)
+                    throw std::invalid_argument("max_atoms_per_molecule must be between 1 and " +
+                                                std::to_string(sfapi::max_atoms_per_molecule_k));
+
                 sfapi::config_t config;
                 config.num_conformers = num_conformers;
                 config.max_stereo_attempts = max_stereo_attempts;

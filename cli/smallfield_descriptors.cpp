@@ -564,10 +564,24 @@ enum class augment_t {
     write_failed_k,
 };
 
-/** The contiguous `input_row` span a shard covers, from which `input_row = first_row + molecule_index`. */
+/** The contiguous `input_row` range a shard covers, from which `input_row = first_row + molecule_index`. */
 struct molecule_span_t {
     std::uint64_t first_row = 0;
-    std::uint64_t num_molecules = 0;
+    std::uint64_t last_row = 0;
+
+    /**
+     *  @brief Whether the range names more molecules than @p num_rows rows can each claim one of.
+     *
+     *  Every molecule of a contiguous shard owns at least one row, so a wider range already carries a
+     *  hole. Written as a comparison of the two ends rather than of `num_molecules`, because the count
+     *  is what overflows on a range spanning the whole of `std::uint64_t`.
+     */
+    [[nodiscard]] bool spans_more_molecules_than(std::uint64_t num_rows) const noexcept {
+        return last_row - first_row >= num_rows;
+    }
+
+    /** Molecules the range addresses, which only a range `spans_more_molecules_than` has passed can hold. */
+    [[nodiscard]] std::uint64_t num_molecules() const noexcept { return last_row - first_row + 1; }
 };
 
 /**
@@ -584,7 +598,7 @@ molecule_span_t molecule_span_of_(input_shard_t const &shard) {
         first_row = std::min(first_row, value);
         last_row = std::max(last_row, value);
     }
-    return {.first_row = first_row, .num_molecules = last_row - first_row + 1};
+    return {.first_row = first_row, .last_row = last_row};
 }
 
 /**
@@ -782,7 +796,7 @@ sfcli::shape_described_t augment_molecule_(input_shard_t const &shard, custd::sp
 sfcli::writer_inputs_t shard_writer_inputs_(input_shard_t const &shard, cli_config_t const &config,
                                             molecule_span_t const &span, sfapi::conformer_slot_layout_t const &layout,
                                             shard_buffers_t const &buffers) {
-    std::uint64_t const num_molecules = span.num_molecules;
+    std::uint64_t const num_molecules = span.num_molecules();
     std::size_t const num_slots = static_cast<std::size_t>(num_molecules) * layout.num_conformers;
     return {
         .provenance = {.input_shard_stem = std::string {shard.input_shard->GetView(0)},
@@ -822,16 +836,28 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
     }
 
     molecule_span_t const span = molecule_span_of_(shard);
-    molecule_grouping_t const grouping = group_rows_by_molecule_(shard, span.first_row, span.num_molecules, buffers);
+
+    // The histogram below is sized by this range and indexed by it, so a range no set of rows could have
+    // produced has to be refused before the sizing rather than after it. The same hole the check further
+    // down names, seen one pass earlier and without an allocation it cannot survive.
+    if (span.spans_more_molecules_than(static_cast<std::uint64_t>(shard.num_rows))) {
+        logger.error("shard {} is gapped over input_row {}..{}, skipping — that range names more molecules " //
+                     "than its {} rows can each claim one of",                                               //
+                     input_path.string(), fmt::group_digits(span.first_row), fmt::group_digits(span.last_row),
+                     fmt::group_digits(static_cast<std::uint64_t>(shard.num_rows)));
+        return augment_t::gapped_input_k;
+    }
+
+    std::uint64_t const num_molecules = span.num_molecules();
+    molecule_grouping_t const grouping = group_rows_by_molecule_(shard, span.first_row, num_molecules, buffers);
 
     // A molecule with no rows would be written out as an all-null row carrying an `input_row` the input
     // shard never held, so a hole is refused rather than filled.
     if (grouping.unclaimed_molecules > 0) {
         logger.error("shard {} is gapped over input_row {}..{}, skipping — {} of {} molecules own no row, " //
                      "the first at input_row {}",                                                           //
-                     input_path.string(), fmt::group_digits(span.first_row),
-                     fmt::group_digits(span.first_row + span.num_molecules - 1),
-                     fmt::group_digits(grouping.unclaimed_molecules), fmt::group_digits(span.num_molecules),
+                     input_path.string(), fmt::group_digits(span.first_row), fmt::group_digits(span.last_row),
+                     fmt::group_digits(grouping.unclaimed_molecules), fmt::group_digits(num_molecules),
                      fmt::group_digits(grouping.first_unclaimed_row));
         return augment_t::gapped_input_k;
     }
@@ -840,7 +866,7 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
     // `num_conformers` provenance value. Reembed molecules can only add rows.
     sfapi::conformer_slot_layout_t const layout {
         config.max_atoms, std::max(grouping.widest_conformers, reembed.widest_molecule_conformers)};
-    buffers.reset_for(span.num_molecules, layout);
+    buffers.reset_for(num_molecules, layout);
 
     // `private` hands each thread its own key buffer and its own typing context, both of which keep their
     // capacity across the molecules that thread walks; declaring either inside the body would allocate and
@@ -850,7 +876,7 @@ augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config,
 
 #pragma omp parallel for schedule(dynamic, 256) \
     num_threads(config.threads) private(reembed_key, context) if (config.threads > 1)
-    for (std::uint64_t molecule_index = 0; molecule_index < span.num_molecules; ++molecule_index) {
+    for (std::uint64_t molecule_index = 0; molecule_index < num_molecules; ++molecule_index) {
         custd::span<std::int64_t const> const rows = buffers.rows_of(molecule_index);
         std::int64_t const first_row = rows.front();
 

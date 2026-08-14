@@ -5,6 +5,7 @@
  */
 
 #include <cstddef> // `std::size_t`
+#include <cstdint> // `std::int32_t`
 #include <cstring> // `std::memset`, `std::memcpy`
 
 #include <algorithm>   // `std::min`, `std::stable_sort`
@@ -47,6 +48,8 @@ char const *describe_shard_write(shard_write_t status) {
     case shard_write_t::written_k: return "written";
     case shard_write_t::missing_per_molecule_arrays_k: return "was handed nothing a row could describe";
     case shard_write_t::input_span_too_short_k: return "was handed a short input span";
+    case shard_write_t::coordinate_offsets_overflowed_k:
+        return "packs more coordinate halves than a 32-bit list offset addresses";
     case shard_write_t::buffer_allocation_failed_k: return "could not allocate a column buffer";
     case shard_write_t::column_reserve_failed_k: return "could not reserve a column for every row";
     case shard_write_t::column_append_failed_k: return "could not append to a column";
@@ -62,6 +65,9 @@ std::string describe_shard_write(shard_write_report_t const &report) {
     char const *const reason = describe_shard_write(report.status);
     if (report.status == shard_write_t::input_span_too_short_k)
         return fmt::format("{}: {} holds {} of the {} elements required", reason, report.column,
+                           fmt::group_digits(report.held), fmt::group_digits(report.required));
+    if (report.status == shard_write_t::coordinate_offsets_overflowed_k)
+        return fmt::format("{}: {} packs {} halves against the {} one addresses", reason, report.column,
                            fmt::group_digits(report.held), fmt::group_digits(report.required));
     if (!report.column.empty()) return fmt::format("{}: {}", reason, report.column);
     return std::string {reason};
@@ -277,6 +283,16 @@ static shard_write_report_t pack_coordinates_as_list(writer_inputs_t const &inpu
     for (output_row_t const &row : rows)
         if (row.outcome == row_outcome_t::conformer_success_k)
             total_halves += static_cast<std::size_t>(atoms_of_(row)) * 3u;
+
+    // Arrow's `List` carries 32-bit offsets, so a shard packing more halves than one addresses cannot be
+    // written at all. Refused here rather than discovered by the running offset below, which would
+    // overflow its own `std::int32_t` and then gather into the values buffer at a negative index.
+    constexpr std::size_t addressable_halves_k = static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
+    if (total_halves > addressable_halves_k)
+        return {.status = shard_write_t::coordinate_offsets_overflowed_k,
+                .column = "conformer_coords",
+                .held = total_halves,
+                .required = addressable_halves_k};
 
     shard_write_report_t const allocation_failed {.status = shard_write_t::buffer_allocation_failed_k,
                                                   .column = "conformer_coords"};
