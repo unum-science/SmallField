@@ -744,10 +744,11 @@ struct molecule_readback_t {
  *  @brief Widen the byte a kernel wrote into the public per-conformer status, and check the energy
  *  behind a success.
  *
- *  Three values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`,
- *  and `stamp_refused_molecules_kernel` overwrites both with `bounds_infeasible_k` wherever the metric
- *  prepass found bounds no coordinates satisfy. Anything else is a slot no kernel reached, and it reports
- *  as unconverged rather than as a success the coordinates would not back.
+ *  Four values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`, and
+ *  `stamp_refused_molecules_kernel` overwrites both with the molecule's verdict — `bounds_infeasible_k`
+ *  where the metric prepass found bounds no coordinates satisfy, `batch_overflow_k` where that prepass
+ *  refused the whole batch over scratch it could not fit. Anything else is a slot no kernel reached, and
+ *  it reports as unconverged rather than as a success the coordinates would not back.
  *
  *  A success is only a success while its energy is a number a consumer can rank by, so the two facts are
  *  decided together here rather than left for six consumers to re-derive from the status byte alone.
@@ -758,7 +759,8 @@ static conformer_status_t conformer_status_of_(std::uint8_t raw, float energy) n
     case conformer_status_t::success_k:
         return energy_is_physical(energy) ? status : conformer_status_t::nonphysical_energy_k;
     case conformer_status_t::stereo_failure_k:
-    case conformer_status_t::bounds_infeasible_k: return status;
+    case conformer_status_t::bounds_infeasible_k:
+    case conformer_status_t::batch_overflow_k: return status;
     default: return conformer_status_t::mmff_unconverged_k;
     }
 }
@@ -1116,6 +1118,14 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
                             device_id, device_bytes, host_bytes);
         [[maybe_unused]] bool const reserved = sink.check(cudaErrorMemoryAllocation,
                                                           "launch_gpu_pipeline pool reserve");
+        // The handle finalizes to nothing, so this is the only place these rows are ever written. The
+        // pre-fill would otherwise name the molecules, and nothing about them is what refused: the same
+        // input at a smaller wave fits. `prepare` has already translated the pool's indices into caller
+        // rows, so the walk lands directly.
+        for (std::uint32_t const caller_index : host_view.input_indices)
+            for (std::uint32_t conformer = 0; conformer < config.num_conformers; ++conformer)
+                outputs.status[static_cast<std::size_t>(caller_index) * config.num_conformers + conformer] =
+                    conformer_status_t::batch_overflow_k;
         return {};
     }
 
@@ -1159,10 +1169,22 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
                                sink);
 
     events.open(wave_phase_t::metric_k, stream);
-    [[maybe_unused]] bool const embedded = build_metric_initial_coordinates_on_gpu(
+    bool const embedded = build_metric_initial_coordinates_on_gpu(
         device_view.bounds_matrices.data(), device_view.molecule_metadata.data(), host_metadata, gpu_max_atoms,
         regions.metric_embedding.data(), regions.molecule_verdicts.data(), context.metric_scratch[device_index], sink,
         stream);
+
+    // The prepass refuses a bin its scratch cannot hold, and it refuses before writing that bin's
+    // embedding. The kernels below run either way, so without this they would relax the zeroed embedding
+    // into a geometry that met no bounds and report it as a conformer. One verdict per molecule rather
+    // than a bail-out, because the download and the timings behind it are already enqueued and the stamp
+    // is the channel every other refusal already travels.
+    if (!embedded && !regions.molecule_verdicts.empty()) {
+        [[maybe_unused]] bool const refused = sink.check(
+            cudaMemsetAsync(regions.molecule_verdicts.data(), static_cast<int>(conformer_status_t::batch_overflow_k),
+                            regions.molecule_verdicts.size_bytes(), stream),
+            "memset device molecule verdicts (batch overflow)");
+    }
 
     events.open(wave_phase_t::kernels_k, stream);
     enqueue_binned_kernels_(device_view, host_metadata, regions, context.launch_configs[device_index], config,
@@ -1445,15 +1467,19 @@ static void sort_input_by_smiles_length_(custd::span<std::string_view const> smi
 /**
  *  @brief Molecules per wave, and with it how many waves the run takes.
  *
- *  A non-zero `config.wave_size` is taken as given. An auto-sized wave may additionally never exceed
- *  what the constructor reserved, because going past it fires a grow from inside the per-device
- *  fan-out that discards a pool the wave is mid-way through filling. The two sizings disagree without
- *  that ceiling: the constructor assumes `max_conformer_count_k` while this uses the caller's K, which
- *  at K=3 halves the per-molecule estimate.
+ *  A caller's explicit `wave_size` is bounded by @p wave_size_ceiling exactly as the auto-sized one is,
+ *  which is what keeps preprocess's `batch_overflow_k` tail empty: past that bound a molecule's rows
+ *  would be packed at a wrapped 32-bit region offset, so the tail is refused rather than aliased.
+ *
+ *  An auto-sized wave may additionally never exceed what the constructor reserved, because going past it
+ *  fires a grow from inside the per-device fan-out that discards a pool the wave is mid-way through
+ *  filling. The two sizings disagree without that ceiling: the constructor assumes `max_conformer_count_k`
+ *  while this uses the caller's K, which at K=3 halves the per-molecule estimate.
  */
 static std::uint32_t choose_wave_size_(context_t const &context, config_t const &config,
-                                       std::uint32_t max_atoms_per_molecule, cuda_error_sink_t const &sink) {
-    if (config.wave_size != 0) return config.wave_size;
+                                       std::uint32_t max_atoms_per_molecule, std::uint32_t wave_size_ceiling,
+                                       cuda_error_sink_t const &sink) {
+    if (config.wave_size != 0) return std::min(config.wave_size, wave_size_ceiling);
     std::uint64_t const auto_wave = compute_wave_size_(context.device_ids, max_atoms_per_molecule,
                                                        config.num_conformers, sink);
     std::uint64_t const reserved_ceiling = static_cast<std::uint64_t>(context.per_device_reserved_molecules) *
@@ -1468,13 +1494,18 @@ static std::uint32_t choose_wave_size_(context_t const &context, config_t const 
  *  An input that fits within half again the target rides in a single wave, which is what the
  *  un-pipelined dispatch amounted to: with one wave there is nothing to overlap with, so the ring
  *  never turns and the loop below degenerates to prepare, launch, finalize.
+ *
+ *  @p wave_size_ceiling bounds that shortcut as well as the target. `choose_wave_size_` already holds
+ *  its answer under what a 32-bit per-molecule region offset addresses, and half again a bounded target
+ *  is not bounded — the shortcut is the one path that can hand preprocess a slice it has to refuse.
  */
-static std::vector<wave_range_t> split_into_waves_(std::uint32_t num_input, std::uint32_t wave_size_target) {
+static std::vector<wave_range_t> split_into_waves_(std::uint32_t num_input, std::uint32_t wave_size_target,
+                                                   std::uint32_t wave_size_ceiling) {
     std::vector<wave_range_t> waves;
     if (num_input == 0) return waves;
-    std::uint32_t const stride = num_input <= wave_size_target * 3u / 2u
-                                     ? num_input
-                                     : std::max<std::uint32_t>(wave_size_target, 1u);
+    std::uint32_t const single_wave_limit = std::min(wave_size_target * 3u / 2u, wave_size_ceiling);
+    std::uint32_t const stride = num_input <= single_wave_limit ? num_input
+                                                                : std::max<std::uint32_t>(wave_size_target, 1u);
     waves.reserve(divide_rounding_up(num_input, stride));
     for (std::uint32_t begin = 0; begin < num_input; begin += stride)
         waves.push_back({.begin = begin, .end = std::min(begin + stride, num_input)});
@@ -1640,8 +1671,14 @@ conformer_status_t context_t::generate_conformers(
     sort_input_by_smiles_length_(smiles, sort_perm, sorted_smiles);
 
     std::uint32_t const num_input = static_cast<std::uint32_t>(smiles.size());
-    std::uint32_t const wave_size_target = choose_wave_size_(*this, config, max_atoms_per_molecule, sink);
-    std::vector<wave_range_t> const waves = split_into_waves_(num_input, wave_size_target);
+    // Molecules one batch can address at this atom cap, which bounds the wave both times it is decided:
+    // once when the size is chosen and once when the input is cut, because the single-wave shortcut takes
+    // half again the chosen size.
+    std::uint32_t const addressable_molecules = smallfield::preprocess::max_molecules_for_atom_capacity(
+        max_atoms_per_molecule);
+    std::uint32_t const wave_size_target = choose_wave_size_(*this, config, max_atoms_per_molecule,
+                                                             addressable_molecules, sink);
+    std::vector<wave_range_t> const waves = split_into_waves_(num_input, wave_size_target, addressable_molecules);
     this->logger.trace("generate_conformers: n={} K={} wave={} waves={}", num_input, config.num_conformers,
                        wave_size_target, waves.size());
     if (waves.empty()) return conformer_status_t::mmff_unconverged_k;

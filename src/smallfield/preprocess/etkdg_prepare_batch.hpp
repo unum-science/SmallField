@@ -1181,11 +1181,11 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
  *  @brief Merge every worker's refusals, plus the tail the batch could not address, into @p out.
  *
  *  Each entry carries the slice-local input index and the `conformer_status_t` reason. The tail past
- *  @p admitted_count is refused with `too_many_atoms_k`, which the `fallback-role` treats as terminal
- *  because it re-derives that same refusal from the same atom cap — so a molecule in the tail is
- *  dropped rather than retried. Nothing in the tail is oversized, so that is only the right verdict
- *  while the tail stays empty: a caller sizes its slice to `max_molecules_for_atom_capacity` and a
- *  non-empty tail is that caller's sizing bug rather than a property of the molecules in it.
+ *  @p admitted_count is refused with `batch_overflow_k`, because nothing in it is oversized: the slice
+ *  outgrew what a 32-bit per-molecule region offset addresses, which is a property of the caller's
+ *  sizing rather than of the molecules. Naming it `too_many_atoms_k` would report a sizing bug as a
+ *  corpus fact, and the two call for opposite responses: the tail clears by cutting the slice, not by
+ *  cutting the atom cap.
  */
 inline void collect_rejections_into_(std::vector<batch_prep_thread_contribution_t> const &contribs,
                                      std::size_t admitted_count, std::size_t input_count,
@@ -1194,7 +1194,7 @@ inline void collect_rejections_into_(std::vector<batch_prep_thread_contribution_
     for (auto const &contribution : contribs)
         out.insert(out.end(), contribution.rejected_input_indices.begin(), contribution.rejected_input_indices.end());
     for (std::size_t molecule = admitted_count; molecule < input_count; ++molecule)
-        out.push_back({static_cast<std::uint32_t>(molecule), conformer_status_t::too_many_atoms_k});
+        out.push_back({static_cast<std::uint32_t>(molecule), conformer_status_t::batch_overflow_k});
 }
 
 /**
@@ -1474,7 +1474,7 @@ struct batch_prep_scratch_t {
  *
  *  @param[in] smiles_list Slice of input SMILES to prepare, at most
  *             `max_molecules_for_atom_capacity(output_atom_capacity)` of which are admitted; the tail
- *             past that is refused with `too_many_atoms_k`, which no `fallback-role` retries.
+ *             past that is refused with `batch_overflow_k`, which no `fallback-role` retries.
  *  @param[in] device_count Devices to partition across; 1 fills a single pool.
  *  @param[in] output_atom_capacity Atoms the caller's per-molecule coordinate slot holds. Every
  *             admitted molecule fits it, so a slice's `observed_max_atoms` — the stride the launch

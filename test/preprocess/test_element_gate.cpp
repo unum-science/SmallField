@@ -111,12 +111,15 @@ static bool gate_can_answer_(sft::conformer_status_t status) noexcept {
     case sft::conformer_status_t::too_many_rings_k:
     case sft::conformer_status_t::unsupported_element_k: return true;
     // Verdicts of stages downstream of the gate — the metric prepass, the warp pipeline and the MMFF
-    // polish — plus the reserved value nothing produces.
+    // polish — plus the reserved value nothing produces. `batch_overflow_k` sits here too and is the one
+    // that names no property of the molecule at all: it is what the wave sizer and the device pools
+    // refuse, so the gate could not answer with it even in principle.
     case sft::conformer_status_t::stereo_failure_k:
     case sft::conformer_status_t::mmff_unconverged_k:
     case sft::conformer_status_t::preprocess_timeout_k:
     case sft::conformer_status_t::bounds_infeasible_k:
-    case sft::conformer_status_t::nonphysical_energy_k: return false;
+    case sft::conformer_status_t::nonphysical_energy_k:
+    case sft::conformer_status_t::batch_overflow_k: return false;
     }
     // A status byte no enumerator claims is nothing the gate answers with, so it borrows no verdict.
     return false;

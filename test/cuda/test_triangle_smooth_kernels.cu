@@ -84,15 +84,26 @@ smoothing_t gpu_triangle_smooth(packed_matrix<float> bounds) {
             triangle_smooth_kernel<<<1, warp_size_k, cell_count * sizeof(float), stream>>>(
                 device_bounds.data(), num_atoms, device_verdict.data());
 
-            [[maybe_unused]] bool const read_back =
-                types::download_from(custd::span<float> {bounds.data_handle(), cell_count},
-                                     custd::span<float const> {device_bounds.data(), cell_count}, stream) &&
-                types::download_from(custd::span<smoothing_t> {&verdict, 1},
-                                     custd::span<smoothing_t const> {device_verdict.data(), 1}, stream);
+            // A refused enqueue reports here and nowhere else: the drain below sees an empty stream and
+            // returns success, and the download then hands back the matrix exactly as it was uploaded
+            // under the `consistent_k` the caller pre-set. This suite reads that as a smoothing that
+            // found nothing to tighten and compares it against RDKit, so the enqueue status is what
+            // separates a measured divergence from a shared-memory request the device would not take.
+            cudaError_t const enqueued = cudaGetLastError();
+            if (enqueued != cudaSuccess)
+                std::fprintf(stderr, "triangle_smooth_kernel: refused at %u atoms: %s\n", num_atoms,
+                             cudaGetErrorString(enqueued));
+            else {
+                [[maybe_unused]] bool const read_back =
+                    types::download_from(custd::span<float> {bounds.data_handle(), cell_count},
+                                         custd::span<float const> {device_bounds.data(), cell_count}, stream) &&
+                    types::download_from(custd::span<smoothing_t> {&verdict, 1},
+                                         custd::span<smoothing_t const> {device_verdict.data(), 1}, stream);
 
-            cudaError_t const smoothed = cudaStreamSynchronize(stream);
-            if (smoothed != cudaSuccess)
-                std::fprintf(stderr, "triangle_smooth_kernel: %s\n", cudaGetErrorString(smoothed));
+                cudaError_t const smoothed = cudaStreamSynchronize(stream);
+                if (smoothed != cudaSuccess)
+                    std::fprintf(stderr, "triangle_smooth_kernel: %s\n", cudaGetErrorString(smoothed));
+            }
         }
     }
 

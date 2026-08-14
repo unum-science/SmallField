@@ -31,8 +31,10 @@ namespace smallfield::cli {
 enum class fallback_disposition_t : std::uint8_t {
     /** RDKit embeds by a different route and may fill the slot. */
     retry_k,
-    /** `admit_molecule_` re-derives this refusal from the same caps and the same parser, so
-     *  dispatching it buys one `SmilesToMol` and the verdict the slot already carries. */
+    /** Nothing worth spending an embedding on: either `admit_molecule_` re-derives the refusal from the
+     *  same caps and the same parser, so the dispatch buys one `SmilesToMol` and the verdict the slot
+     *  already carries, or the refusal is the producer's own and the fallback would be laundering it
+     *  rather than answering it. */
     terminal_k,
 };
 
@@ -56,6 +58,14 @@ enum class fallback_disposition_t : std::uint8_t {
     case types::conformer_status_t::too_many_atoms_k: return fallback_disposition_t::terminal_k;
     // `MMFFMolProperties::isValid` is the same typing check on the same molecule.
     case types::conformer_status_t::unsupported_element_k: return fallback_disposition_t::terminal_k;
+    // The one verdict here that is not re-derived and is still terminal. RDKit would embed these — the
+    // molecule was never the problem — but the population is unbounded where every other retried status
+    // is per-molecule and rare: one mis-sized wave refuses an entire device's batch, so at 20,088 µs of
+    // CPU per molecule against 250 µs on GPU a single sizing failure would turn into hours of fallback
+    // and read as a hang rather than as the loud, cheap, re-runnable error it is. The producer already
+    // says so through `cuda_error_count`, which parks the shard and sets the exit code; the shard is
+    // re-run at a wave that fits, not laundered one molecule at a time.
+    case types::conformer_status_t::batch_overflow_k: return fallback_disposition_t::terminal_k;
 
     /* Retry: nothing in `admit_molecule_` reproduces these. */
     // ETKDG perceives and enforces chirality by its own route, so a chiral volume the device driver

@@ -165,7 +165,13 @@ trio_launch_t launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t 
     };
 
     // Warm the driver, so the one-shot setup of a first launch is not charged to the steady-state cost.
+    // The drain clears the sticky slot, so a refusal here has to be read before it, or the timed pass
+    // below reports a zero-length launch as a measured cost.
     launch_type_and_charge_();
+    if (cudaError_t const warm_error = cudaGetLastError(); warm_error != cudaSuccess) {
+        fmt::println(stderr, "kernel error: {}", cudaGetErrorString(warm_error));
+        return trio_launch_t::kernel_failed_k;
+    }
     cudaDeviceSynchronize();
 
     cudaEventRecord(events.start);

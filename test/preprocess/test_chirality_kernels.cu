@@ -82,11 +82,17 @@ chirality_verdict_t gpu_validate_chirality(conformer_soa_reader_t host_coords,
                 arena.coordinates.data(), num_atoms, arena.centers.data(),
                 static_cast<std::uint32_t>(host_chirals.size()), arena.verdict.data());
 
+            // A refused enqueue reports here and nowhere else. The drain below returns success over an
+            // empty stream, and the download then reads whatever the allocation happened to hold — so
+            // without this the suite would score an unwritten byte as a chirality verdict, and a zero
+            // there reads as `violated_k`, which is the answer these tests exist to detect.
+            cudaError_t const enqueued = cudaGetLastError();
+
             bool satisfied = false;
             custd::span<bool const> const device_verdict = arena.verdict.view();
             bool const read_back = sft::download_from(custd::span<bool> {&satisfied, 1}, device_verdict, stream);
             cudaError_t const drained = cudaStreamSynchronize(stream);
-            if (read_back && drained == cudaSuccess)
+            if (enqueued == cudaSuccess && read_back && drained == cudaSuccess)
                 verdict = satisfied ? chirality_verdict_t::satisfied_k : chirality_verdict_t::violated_k;
         }
     }

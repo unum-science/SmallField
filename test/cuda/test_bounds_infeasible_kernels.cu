@@ -152,8 +152,14 @@ conformer_status_t gpu_pipeline_status_of_bounds(sft::packed_matrix<float> bound
                 arena.metadata.data(), arena.input_indices.data(), arena.coordinates.data(), arena.energies.data(),
                 arena.status.data(), 1u, 1u, 4u, num_atoms, num_atoms, num_atoms, 0x5eedull);
 
+            // The pipeline kernel asks for shared memory proportional to the atom count, so it is the
+            // launch in this file a device can refuse. Read before the stamp is enqueued, because the
+            // sticky slot holds one error and the caller has to be told which kernel it belongs to.
+            cudaError_t const pipeline_enqueued = cudaGetLastError();
+
             sfc::stamp_refused_molecules_kernel<<<1, 1, 0, stream>>>(arena.verdicts.data(), arena.status.data(), 1u,
                                                                      1u);
+            cudaError_t const stamp_enqueued = cudaGetLastError();
 
             std::uint8_t status_byte = unreached;
             [[maybe_unused]] bool const read_back =
@@ -163,7 +169,16 @@ conformer_status_t gpu_pipeline_status_of_bounds(sft::packed_matrix<float> bound
                                    custd::span<std::uint8_t const> {arena.status.view()}, stream);
 
             cudaError_t const finished = cudaStreamSynchronize(stream);
-            if (finished != cudaSuccess)
+            // A refused enqueue leaves the status slot at `unreached`, which is `mmff_unconverged_k` —
+            // the same byte a molecule the kernels reached and failed to converge carries. The drain
+            // returns success either way, so without these two the suite would read a launch the device
+            // declined as a verdict the pipeline reached.
+            if (pipeline_enqueued != cudaSuccess)
+                std::fprintf(stderr, "etkdg_pipeline_warp_kernel: refused at %u atoms: %s\n", num_atoms,
+                             cudaGetErrorString(pipeline_enqueued));
+            else if (stamp_enqueued != cudaSuccess)
+                std::fprintf(stderr, "stamp_refused_molecules_kernel: %s\n", cudaGetErrorString(stamp_enqueued));
+            else if (finished != cudaSuccess)
                 std::fprintf(stderr, "gpu_pipeline_status_of_bounds: %s\n", cudaGetErrorString(finished));
             else verdict = static_cast<conformer_status_t>(status_byte);
         }
