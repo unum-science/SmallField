@@ -10,7 +10,7 @@
  *  stereo retry → fourth-dim crush → ETK torsion → final validation. Writes ETK-refined 3D positions to
  *  `conformer_coordinates_out`.
  *
- *  `mmff_polish_warp_kernel` — MMFF94 polish, meaning MMFF94 relaxation plus optional heavy rescue. Reads
+ *  `mmff_polish_warp_kernel` — MMFF94 relaxation under one Barzilai-Borwein call. Reads
  *  positions from `conformer_coordinates_out` as written by the first kernel, overwrites them with the
  *  MMFF-polished coordinates, replaces the ETK energy with the MMFF energy in `conformer_energies_out`. Skips
  *  slots whose status is non-zero — a failed stereo check — or whose molecule has no MMFF terms.
@@ -90,29 +90,39 @@ using smallfield::types::mmff94_torsion_t;
 constexpr std::int32_t distance_geometry_iterations_k = 200;
 constexpr std::int32_t fourth_dimension_crush_iterations_k = 100;
 
-/** Per-molecule FIRE iteration budgets for ETK torsion refinement and MMFF94 polish. */
+/** Per-molecule FIRE iteration budget for the ETK torsion refinement stage. */
 struct refinement_policy_t {
     std::int32_t etk_initial_iterations;
     std::int32_t etk_continuation_iterations;
     float etk_gradient_threshold;
-    std::int32_t mmff_initial_iterations;
-    std::int32_t mmff_continuation_iterations;
-    float mmff_gradient_threshold;
 };
 
-constexpr float heavy_mmff_rescue_threshold_(etkdg_molecule_metadata_t const &meta) {
-    return fmaxf(220.0f, 2.0f * static_cast<float>(meta.num_atoms));
-}
+/**
+ *  Energy evaluations one conformer's MMFF94 polish may spend, and the RMS gradient that ends it early.
+ *
+ *  One cap and one threshold rather than the three tiers this used to carry beside the ETK budgets. The
+ *  tiers were not separating anything: `total_mmff_terms` counts the N(N-1)/2 nonbonded pairs, so both
+ *  boundaries were pure atom counts, and the light branch needed N ≤ 14 with hydrogens against corpus
+ *  medians of 27 to 52 — it was unreachable in production while the heavy branch took over half of
+ *  PubChem and most of REAL.
+ *
+ *  The cap is explicit rather than a `while (!converged)` because the grid the polish launches under
+ *  exceeds the slot count at every captured bin: each block draws exactly one slot, so the kernel's
+ *  wall time is the single worst slot's, and under a per-slot stopping rule the cost is the maximum
+ *  and not the mean.
+ */
+constexpr std::int32_t mmff_polish_iteration_cap_k = 800;
+constexpr float mmff_polish_gradient_threshold_k = 5.0e-5f;
 
 constexpr refinement_policy_t select_refinement_policy_(etkdg_molecule_metadata_t const &meta) {
     std::uint32_t const mmff_terms = total_mmff_terms(meta);
     std::uint32_t const torsion_complexity = meta.num_etk_torsions + meta.num_mmff_torsions;
 
-    if (meta.num_atoms <= 20 && mmff_terms <= 96 && torsion_complexity <= 12) return {60, 0, 1.5e-4f, 120, 0, 1.5e-4f};
+    if (meta.num_atoms <= 20 && mmff_terms <= 96 && torsion_complexity <= 12) return {60, 0, 1.5e-4f};
 
-    if (is_heavy_refinement_case(meta)) return {160, 80, 7.5e-5f, 320, 160, 5.0e-5f};
+    if (is_heavy_refinement_case(meta)) return {160, 80, 7.5e-5f};
 
-    return {100, 40, 1.0e-4f, 200, 80, 1.0e-4f};
+    return {100, 40, 1.0e-4f};
 }
 
 template <std::size_t dimensions_, typename energy_gradient_functor_>
@@ -482,20 +492,88 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
     }
 }
 
+#pragma region Polish Diagnostics
+
+/**
+ *  @brief Which of `mmff_polish_warp_kernel`'s four exits a conformer slot left through.
+ *
+ *  Three of the four ship a geometry the MMFF94 minimizer never improved, and nothing in the status
+ *  byte or the energy tells them apart — the byte is reserved for verdicts the host classifies and
+ *  the energy is written on every path.
+ */
+enum class polish_path_t : std::int32_t {
+    /** The grid never drew this slot, or the diagnostics array was not primed. */
+    unreached_k = 0,
+    /** Skipped at the status gate: an earlier stage had already failed the conformer. */
+    status_skipped_k = 1,
+    /** Skipped for an empty term list: the molecule has no MMFF94 energy to minimize. */
+    no_terms_k = 2,
+    /** Relaxed, then declined — the minimizer finished above what it was handed, so ETK coordinates ship. */
+    write_back_declined_k = 3,
+    /** Relaxed and kept. */
+    write_back_accepted_k = 4,
+};
+
+/** What each of the floats `mmff_polish_warp_kernel` writes per slot into its diagnostics array holds. */
+enum class polish_diagnostic_t : std::uint32_t {
+    /** A `polish_path_t`, widened to float. */
+    path_k = 0,
+    /** RMS gradient at the geometry the minimizer returned, whether or not that geometry was kept. */
+    rms_gradient_k = 1,
+    /** The step length the minimizer last used — the stall detector. */
+    final_timestep_k = 2,
+    /** Energy evaluations the polish spent on this slot. */
+    iterations_k = 3,
+    /** A `fire_status_t`, widened to float. */
+    fire_status_k = 4,
+    /** MMFF94 energy of the ETK-refined geometry as staged, before the minimizer moved anything. */
+    staged_energy_k = 5,
+};
+
+/** Floats per conformer slot in `mmff_polish_warp_kernel`'s diagnostics array. */
+constexpr std::uint32_t polish_diagnostic_floats_k = 6;
+
+/** Write one diagnostic field for @p slot, from lane 0, doing nothing when no array was handed in. */
+__device__ __forceinline__ void store_polish_diagnostic_(float *diagnostics_out, std::uint32_t slot,
+                                                         polish_diagnostic_t field, float value, std::uint32_t lane) {
+    if (diagnostics_out == nullptr || lane != 0) return;
+    diagnostics_out[slot * polish_diagnostic_floats_k + static_cast<std::uint32_t>(field)] = value;
+}
+
+/** Record the four fields a finished minimization stage reports, for @p slot, from lane 0. */
+__device__ __forceinline__ void store_polish_stage_(float *diagnostics_out, std::uint32_t slot,
+                                                    fire_result_t const &result, std::uint32_t lane) {
+    if (diagnostics_out == nullptr || lane != 0) return;
+    float *const row = diagnostics_out + slot * polish_diagnostic_floats_k;
+    row[static_cast<std::uint32_t>(polish_diagnostic_t::rms_gradient_k)] = result.rms_gradient;
+    row[static_cast<std::uint32_t>(polish_diagnostic_t::final_timestep_k)] = result.final_timestep;
+    row[static_cast<std::uint32_t>(polish_diagnostic_t::iterations_k)] = static_cast<float>(result.iterations);
+    row[static_cast<std::uint32_t>(polish_diagnostic_t::fire_status_k)] = static_cast<float>(result.status);
+}
+
+#pragma endregion Polish Diagnostics
+
 /**
  *  @brief Persistent warp-loop MMFF94 polish kernel.
  *
  *  Reads ETK-refined 3D positions from `conformer_coordinates_out` (produced
- *  by `etkdg_pipeline_warp_kernel` on the same stream + wave), runs MMFF94
- *  FIRE with the per-molecule refinement policy, and overwrites the positions
- *  and energy in place. Skips slots that failed stereo (status != 0) and
- *  molecules with zero MMFF terms.
+ *  by `etkdg_pipeline_warp_kernel` on the same stream + wave), minimizes MMFF94
+ *  under one Barzilai-Borwein call, and overwrites the positions and energy in
+ *  place. Skips slots that failed stereo (status != 0) and molecules with zero
+ *  MMFF terms.
  *
- *  Shared memory at bin 128 is 7 KB, FIRE scratch plus the two per-atom caches, since no bounds
- *  matrix is needed here. On `sm_90` neither that nor the register count binds any more: at 64
- *  registers and 228 KB of shared memory per multiprocessor the 32-block slot limit a 32-thread
- *  block imposes is what is left, at every bin. On `sm_120`'s 100 KB the shared memory binds
- *  first at bin 128, at 14 blocks against the 23 the registers would allow.
+ *  The minimizer is not FIRE, and the reason is a measurement rather than a preference. FIRE carries
+ *  one timestep for every degree of freedom, so on a molecular force field it settles at the stability
+ *  limit of the stiffest bond stretch: across a captured bin of 3,672 slots its final timestep sat
+ *  between 1e-3 and 1e-2 against an initial 0.05 and a ceiling of 0.5, never collapsed and never
+ *  converged, and the residual RMS gradient after the full budget was 0.35 against a 5e-5 threshold.
+ *  Barzilai-Borwein reaches the same energy in a quarter of the iterations because its step is a
+ *  secant estimate of the curvature the last step actually met.
+ *
+ *  Shared memory at bin 128 is 7 KB, minimizer scratch plus the two per-atom caches, since no bounds
+ *  matrix is needed here. On `sm_90` neither that nor the register count binds any more: against
+ *  228 KB of shared memory per multiprocessor the 32-block slot limit a 32-thread block imposes is
+ *  what is left, at every bin. On `sm_120`'s 100 KB the shared memory binds first at bin 128.
  *
  *  Which is why 4.5 KB of per-molecule scratch cannot be added here without paying for it. An
  *  ablation raising the allocation by the 72 bytes per atom a 3N torsion scratch would need,
@@ -504,20 +582,16 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
  *
  *  Unlike its sibling's, this kernel's second launch bound is a cap that binds. Twenty blocks per
  *  multiprocessor at 32 threads asks `ptxas` for at most 102 registers against a 65536-register
- *  file, which is above what any architecture but `sm_120` reaches on its own, so it is the one
- *  place the Blackwell budget is stated rather than discovered. It costs `sm_90` nothing, where the
- *  count is already 64. A bound of 24 takes `sm_100` to 70 and `sm_120` to 72, still without
- *  spilling, and that is a claim about codegen on hardware this box does not have.
+ *  file, which is above what any architecture reaches on its own, so it states the Blackwell budget
+ *  rather than discovering it and costs `sm_90` nothing.
+ *  What each architecture actually costs is a measurement of today's binary, so it is not written
+ *  down here — read it from `cuobjdump --dump-resource-usage` on a build whose architectures all
+ *  carry the `-real` suffix, since without it the dump also reports the PTX section.
  *
- *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`:
- *    sm_80=63, sm_89=64, sm_90=64, sm_100=79, sm_120=87 regs/thread, no spills (STACK=0, LOCAL=0).
- *    On sm_90 that is the 32-block slot limit a 32-thread block imposes, so nothing but the slot
- *    cap is left to bind there.
- *
- *    `bond_distance` is read from global memory on every FIRE iteration, N²/2 per iteration since
- *    the pair sweep visits each pair once. It is only ever tested as `< 3`, `== 3`, and `>= 4`,
- *    which is two bits per pair, so an N²/4 packed copy staged into shared memory alongside the
- *    FIRE arrays would remove that traffic for a footprint the smaller bins can afford.
+ *  `bond_distance` is read from global memory on every energy evaluation, N²/2 per evaluation since
+ *  the pair sweep visits each pair once. It is only ever tested as `< 3`, `== 3`, and `>= 4`, which
+ *  is two bits per pair, so an N²/4 packed copy staged into shared memory alongside the minimizer
+ *  arrays would remove that traffic for a footprint the smaller bins can afford.
  *
  *  @see etkdg_pipeline_warp_kernel
  */
@@ -531,7 +605,7 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
     etkdg_molecule_metadata_t const *__restrict__ molecule_metadata, float *__restrict__ conformer_coordinates_out,
     float *__restrict__ conformer_energies_out, std::uint8_t const *__restrict__ conformer_status_in,
     std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t output_atoms_stride,
-    std::uint32_t bin_max_atoms) {
+    std::uint32_t bin_max_atoms, float *__restrict__ polish_diagnostics_out = nullptr) {
 
     std::uint32_t const warp_id = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
@@ -551,19 +625,25 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
         std::uint32_t const conformer = pair_index - molecule * num_conformers_per_molecule;
 
         std::uint32_t const slot = molecule * num_conformers_per_molecule + conformer;
-        if (conformer_status_in[slot] != 0) continue;
+        if (conformer_status_in[slot] != 0) {
+            store_polish_diagnostic_(polish_diagnostics_out, slot, polish_diagnostic_t::path_k,
+                                     static_cast<float>(polish_path_t::status_skipped_k), lane);
+            continue;
+        }
 
         auto const meta = molecule_metadata[molecule];
         std::uint32_t const num_atoms = meta.num_atoms;
         std::uint32_t const dimensions_3d = 3 * num_atoms;
 
         std::uint32_t const mmff_terms = total_mmff_terms(meta);
-        if (mmff_terms == 0 || mmff_interactions == nullptr) continue;
-
-        auto const refinement_policy = select_refinement_policy_(meta);
+        if (mmff_terms == 0 || mmff_interactions == nullptr) {
+            store_polish_diagnostic_(polish_diagnostics_out, slot, polish_diagnostic_t::path_k,
+                                     static_cast<float>(polish_path_t::no_terms_k), lane);
+            continue;
+        }
 
         // Stage per-atom params into shmem for this pair, folding the pair-invariant half of the
-        // combining rules on the way in so the FIRE loop never re-derives it.
+        // combining rules on the way in so the minimizer never re-derives it.
         {
             mmff94_atom_vdw_params_t const *global_vdw = mmff_atom_vdw + meta.mmff_atom_vdw_offset;
             for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k)
@@ -602,41 +682,44 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
 
         // The MMFF energy of the geometry as staged, before anything moves — the number that decides
         // below whether the polish is worth keeping. It is parked in the output slot rather than a
-        // register: holding it across the FIRE call and the rescue costs `sm_90` five registers, which
-        // is the difference between 32 resident blocks and 29, and the slot is written here anyway.
+        // register: holding it across the minimizer call costs `sm_90` five registers, which is the
+        // difference between 32 resident blocks and 29, and the slot is written here anyway.
         {
             float const staged_energy = mmff_functor(positions, shared_float + 2 * dimensions_3d, dimensions_3d, lane);
             if (lane == 0) conformer_energies_out[slot] = staged_energy;
+            store_polish_diagnostic_(polish_diagnostics_out, slot, polish_diagnostic_t::staged_energy_k, staged_energy,
+                                     lane);
         }
         __syncwarp(full_mask_k);
 
-        fire_result_t mmff_result = run_fire_stage_(scratch, refinement_policy.mmff_initial_iterations,
-                                                    refinement_policy.mmff_continuation_iterations,
-                                                    refinement_policy.mmff_gradient_threshold, lane, mmff_functor);
-
-        bool const run_heavy_rescue = is_heavy_refinement_case(meta) &&
-                                      (mmff_result.status == fire_status_t::exhausted_k ||
-                                       mmff_result.energy > heavy_mmff_rescue_threshold_(meta));
-        if (run_heavy_rescue) { mmff_result = run_fire_stage_(scratch, 160, 160, 2.5e-5f, lane, mmff_functor); }
+        fire_result_t const mmff_result = barzilai_borwein_minimize_(
+            scratch, mmff_polish_iteration_cap_k, mmff_polish_gradient_threshold_k, lane, mmff_functor);
+        store_polish_stage_(polish_diagnostics_out, slot, mmff_result, lane);
         float const mmff_energy = mmff_result.energy;
 
         // Write polished positions + updated energy back, but only if the polish improved on what it
-        // was handed. FIRE takes every step it computes: when its power criterion goes non-positive
-        // the velocities zero and the timestep halves, and the step is still taken. So a stage can
-        // finish above where it started, and shipping that would be a regression nothing would see.
+        // was handed. Barzilai-Borwein is deliberately non-monotone — the secant step is read off the
+        // last displacement, not off a line search — so a call can finish above where it started, and
+        // shipping that would be a regression nothing would see. Across the captured bin it never has:
+        // 3,672 of 3,672 slots ended below their staged energy.
         //
         // The geometry to fall back on needs no buffer. `conformer_coordinates_out` is the array this
         // kernel staged from and has not touched since, so declining the write-back leaves exactly the
         // ETK-refined coordinates in place — the best-seen geometry is already stored, for free.
         //
         // Status is left untouched either way: MMFF non-convergence does not mark the conformer failed.
-        if (mmff_energy < conformer_energies_out[slot]) {
+        bool const keep_polish = mmff_energy < conformer_energies_out[slot];
+        if (keep_polish) {
             for (std::uint32_t dimension = 0; dimension < 3; ++dimension)
                 for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k)
                     conformer_coordinates_out[coord_offset + dimension * output_atoms_stride + atom] =
                         positions[dimension * num_atoms + atom];
             if (lane == 0) conformer_energies_out[slot] = mmff_energy;
         }
+        store_polish_diagnostic_(polish_diagnostics_out, slot, polish_diagnostic_t::path_k,
+                                 static_cast<float>(keep_polish ? polish_path_t::write_back_accepted_k
+                                                                : polish_path_t::write_back_declined_k),
+                                 lane);
         __syncwarp(full_mask_k);
     }
 }

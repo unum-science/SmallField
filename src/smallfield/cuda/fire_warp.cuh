@@ -92,6 +92,12 @@ struct fire_result_t {
      *  distance-geometry stages carry their own, so the four are calibrated apart rather than shared.
      */
     float rms_gradient;
+    /**
+     *  The step length the driver last used, in the units its own update takes it in. Reported because
+     *  a stage that has stalled and a stage that is still descending are indistinguishable from the
+     *  iteration count alone, and the distinction decides whether more budget would buy anything.
+     */
+    float final_timestep;
     std::int32_t iterations;
     fire_status_t status;
 };
@@ -136,6 +142,11 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
     // FIRE parameters (Bitzek et al., PRL 2006)
     constexpr float initial_timestep_k = 0.05f;
     constexpr float max_timestep_k = 0.5f;
+    // Below this the step is shorter than single precision can resolve against a coordinate of a few
+    // angstrom, so the geometry stops moving while the budget keeps draining. Nothing in the captured
+    // corpus reaches it — the measured floor of the distribution is 1e-3 — so this is a guard rail
+    // rather than a lever, and it is here because an unbounded halving has no other end.
+    constexpr float min_timestep_k = 1e-5f;
     constexpr float timestep_increase_factor_k = 1.1f;
     constexpr float timestep_decrease_factor_k = 0.5f;
     constexpr float initial_alpha_k = 0.1f;
@@ -181,6 +192,7 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
         if (rms_gradient < gradient_threshold)
             return {.energy = energy,
                     .rms_gradient = rms_gradient,
+                    .final_timestep = timestep,
                     .iterations = iteration,
                     .status = fire_status_t::converged_k};
 
@@ -189,8 +201,12 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
         // belonging to two different geometries.
         if (iteration + 1 == max_iterations) break;
 
-        float const power = -gradient_dot_velocity; // P = F·v = -∇E·v
-        if (power > 0.0f) {
+        // P = F·v = -∇E·v. The comparison admits equality because entry zeroes the velocities, so the
+        // first iteration of every stage has `power == -0.0f` and a strict test would send it down the
+        // decelerating branch before a single step had been taken — halving the initial timestep to
+        // 0.025 on every stage and every restart, for every molecule, unconditionally.
+        float const power = -gradient_dot_velocity;
+        if (power >= 0.0f) {
             float const inverse_force_norm = rsqrtf(fmaxf(gradient_dot_gradient, 1e-20f));
             float const velocity_norm = sqrtf(fmaxf(velocity_dot_velocity, 1e-20f));
             float const velocity_over_force_ratio = velocity_norm * inverse_force_norm;
@@ -201,17 +217,23 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
                                       alpha * velocity_over_force_ratio * gradient[element];
             }
 
+            steps_since_reset++;
             if (steps_since_reset > min_steps_before_acceleration_k) {
                 timestep = fminf(timestep * timestep_increase_factor_k, max_timestep_k);
                 alpha *= alpha_decay_factor_k;
             }
-            steps_since_reset++;
         }
         else {
-            // decelerating: reset velocity, shrink step
-            for (std::uint32_t element = lane; element < num_elements; element += warp_size_k)
+            // Decelerating: the momentum has carried the geometry past the point where the force still
+            // agreed with it, so undo half of the last step before dropping the velocity. Zeroing alone
+            // leaves the overshoot in the positions and lets the next stretch of downhill steps spend
+            // itself walking back — this is FIRE 2.0's correction, Guénolé et al. 2020, and it is the
+            // half of the two the halving alone never performs.
+            for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
+                positions[element] -= 0.5f * timestep * velocities[element];
                 velocities[element] = 0.0f;
-            timestep *= timestep_decrease_factor_k;
+            }
+            timestep = fmaxf(timestep * timestep_decrease_factor_k, min_timestep_k);
             alpha = initial_alpha_k;
             steps_since_reset = 0;
         }
@@ -247,6 +269,124 @@ __device__ __forceinline__ fire_result_t fire_minimize_(fire_scratch<dimensions_
 
     return {.energy = energy,
             .rms_gradient = rms_gradient,
+            .final_timestep = timestep,
+            .iterations = max_iterations,
+            .status = fire_status_t::exhausted_k};
+}
+
+/**
+ *  @brief Barzilai-Borwein gradient descent, warp-level, same three arrays and same functor.
+ *
+ *  FIRE carries one timestep for every degree of freedom, so a molecular force field holds it at the
+ *  stability limit of its stiffest bond stretch and the soft torsions relax at that rate. The
+ *  measured consequence is a residual RMS gradient three decades above any threshold after the whole
+ *  budget. Barzilai-Borwein reads a curvature out of the last step instead of tuning a timestep by
+ *  heuristic: with @f$ s = x_k - x_{k-1} @f$ and @f$ y = g_k - g_{k-1} @f$ the step is
+ *  @f$ \langle s,y \rangle / \langle y,y \rangle @f$, a secant estimate of the inverse curvature
+ *  along the direction the minimizer is actually travelling.
+ *
+ *  It costs nothing extra to compute. The previous gradient lives in the array FIRE used for
+ *  velocities, so @f$ s @f$ is @f$ -\text{step} \cdot g_{k-1} @f$ and both inner products fall out of
+ *  the same three reductions FIRE already performs — and the position update is one sweep rather than
+ *  the two a trust region on a Verlet step needs, because a step of @f$ -\alpha g @f$ has RMS length
+ *  @f$ \alpha \cdot \mathrm{rms}(g) @f$ analytically.
+ *
+ *  The method is not monotone: a Barzilai-Borwein step may raise the energy on the way to a far
+ *  better point, which is where its speed comes from. The caller owns that — `mmff_polish_warp_kernel`
+ *  keeps the geometry it staged and declines the write-back when the result is worse.
+ *
+ *  @param[inout] scratch Positions, the previous gradient in the velocity slot, and the gradient.
+ *  @param[in] max_iterations Maximum energy evaluations; the last one is measured, not stepped from.
+ *  @param[in] gradient_threshold Convergence when rms(gradient) < threshold.
+ *  @param[in] lane Warp lane index (threadIdx.x % 32).
+ *  @param[in] compute_energy_gradient The energy/gradient functor.
+ *  @return Warp-uniform `fire_result_t`, its `final_timestep` the last step length in Å per unit force.
+ */
+template <std::size_t dimensions_, typename energy_gradient_functor_>
+__device__ __forceinline__ fire_result_t
+barzilai_borwein_minimize_(fire_scratch<dimensions_> scratch, std::int32_t max_iterations, float gradient_threshold,
+                           std::uint32_t lane, energy_gradient_functor_ &&compute_energy_gradient) {
+
+    float *const positions = scratch.positions.data_handle();
+    float *const previous_gradient = scratch.velocities.data_handle();
+    float *const gradient = scratch.gradient.data_handle();
+    std::uint32_t const num_elements = scratch.positions.extent(0) * static_cast<std::uint32_t>(dimensions_);
+
+    /** RMS displacement the opening step is allowed, before any curvature has been observed. */
+    constexpr float opening_root_mean_square_step_k = 0.01f;
+    /** Widest and narrowest inverse curvature the secant estimate may report, in Å² per kcal/mol. */
+    constexpr float min_step_k = 1e-6f;
+    constexpr float max_step_k = 1.0f;
+
+    // Zero rather than uninitialized: the opening iteration reduces against this array before anything
+    // has been written to it, and `applied_step` is what tells it there is no history to read.
+    for (std::uint32_t element = lane; element < num_elements; element += warp_size_k)
+        previous_gradient[element] = 0.0f;
+    __syncwarp(full_mask_k);
+
+    float applied_step = 0.0f;
+    float energy = 0.0f;
+    float rms_gradient = 0.0f;
+
+    for (std::int32_t iteration = 0; iteration < max_iterations; ++iteration) {
+        energy = compute_energy_gradient(positions, gradient, num_elements, lane);
+        __syncwarp(full_mask_k);
+
+        float gradient_dot_gradient = 0.0f;
+        float gradient_dot_previous = 0.0f;
+        float previous_dot_previous = 0.0f;
+        for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
+            float const gradient_value = gradient[element];
+            float const previous_value = previous_gradient[element];
+            gradient_dot_gradient = fmaf(gradient_value, gradient_value, gradient_dot_gradient);
+            gradient_dot_previous = fmaf(gradient_value, previous_value, gradient_dot_previous);
+            previous_dot_previous = fmaf(previous_value, previous_value, previous_dot_previous);
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gradient_dot_gradient += __shfl_xor_sync(full_mask_k, gradient_dot_gradient, offset);
+            gradient_dot_previous += __shfl_xor_sync(full_mask_k, gradient_dot_previous, offset);
+            previous_dot_previous += __shfl_xor_sync(full_mask_k, previous_dot_previous, offset);
+        }
+
+        rms_gradient = sqrtf(gradient_dot_gradient / static_cast<float>(num_elements));
+        if (rms_gradient < gradient_threshold)
+            return {.energy = energy,
+                    .rms_gradient = rms_gradient,
+                    .final_timestep = applied_step,
+                    .iterations = iteration,
+                    .status = fire_status_t::converged_k};
+
+        // The last budgeted evaluation has happened, so a step now would move the structure past the
+        // only state this call has measured.
+        if (iteration + 1 == max_iterations) break;
+
+        // s = -applied_step · g_{k-1}, so both secant inner products are combinations of the three
+        // reductions above and neither needs a sweep of its own.
+        float const step_dot_difference = applied_step * (previous_dot_previous - gradient_dot_previous);
+        float const difference_dot_difference = gradient_dot_gradient - 2.0f * gradient_dot_previous +
+                                                previous_dot_previous;
+        bool const secant_is_convex = step_dot_difference > 0.0f && difference_dot_difference > 0.0f;
+
+        // Without history, or along a direction the secant reports as non-convex, fall back to the
+        // trust region alone — a fixed RMS displacement, which is the one step length that needs no
+        // curvature to be safe.
+        float step = secant_is_convex ? step_dot_difference / difference_dot_difference
+                                      : opening_root_mean_square_step_k / rms_gradient;
+        step = fminf(fmaxf(step, min_step_k), max_step_k);
+        step = fminf(step, max_root_mean_square_step_k / rms_gradient);
+
+        for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
+            float const gradient_value = gradient[element];
+            previous_gradient[element] = gradient_value;
+            positions[element] -= step * gradient_value;
+        }
+        applied_step = step;
+        __syncwarp(full_mask_k);
+    }
+
+    return {.energy = energy,
+            .rms_gradient = rms_gradient,
+            .final_timestep = applied_step,
             .iterations = max_iterations,
             .status = fire_status_t::exhausted_k};
 }

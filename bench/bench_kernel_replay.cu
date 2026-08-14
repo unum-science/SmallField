@@ -26,8 +26,9 @@
 #include <cstdlib> // `std::strtoull`
 #include <cstring> // `std::strcmp`, `std::strncmp`
 
-#include <string> // `std::string`
-#include <vector> // `std::vector`
+#include <algorithm> // `std::sort`
+#include <string>    // `std::string`
+#include <vector>    // `std::vector`
 
 #include <cuda_runtime.h>
 
@@ -190,6 +191,7 @@ struct replay_device_t {
     float *coordinates = nullptr;
     float *energies = nullptr;
     std::uint8_t *status = nullptr;
+    float *diagnostics = nullptr;
 
     ~replay_device_t() {
         cudaFree(batch);
@@ -197,6 +199,7 @@ struct replay_device_t {
         cudaFree(coordinates);
         cudaFree(energies);
         cudaFree(status);
+        cudaFree(diagnostics);
     }
 };
 
@@ -273,7 +276,7 @@ static void launch_mmff_(capture_manifest_t const &manifest, replay_device_t con
         reinterpret_cast<sft::mmff94_atom_offsets_t const *>(pool_at(manifest.offset_mmff_atom_offsets)),
         reinterpret_cast<sft::etkdg_molecule_metadata_t const *>(pool_at(manifest.offset_molecule_metadata)),
         device.coordinates, device.energies, device.status, bin_size, conformer_count, gpu_max_atoms,
-        static_cast<std::uint32_t>(manifest.bin_max_atoms));
+        static_cast<std::uint32_t>(manifest.bin_max_atoms), device.diagnostics);
 }
 
 /**
@@ -292,6 +295,8 @@ static bool upload_(capture_manifest_t const &manifest, std::vector<char> const 
     allocated &= cudaMalloc(&device.coordinates, coordinate_count * sizeof(float)) == cudaSuccess;
     allocated &= cudaMalloc(&device.energies, slot_count * sizeof(float)) == cudaSuccess;
     allocated &= cudaMalloc(&device.status, slot_count) == cudaSuccess;
+    allocated &= cudaMalloc(&device.diagnostics, slot_count * sfc::polish_diagnostic_floats_k * sizeof(float)) ==
+                 cudaSuccess;
     if (!allocated) {
         std::printf("FAIL allocation bytes=%llu\n", static_cast<unsigned long long>(manifest.batch_bytes));
         return false;
@@ -301,10 +306,129 @@ static bool upload_(capture_manifest_t const &manifest, std::vector<char> const 
     cudaMemset(device.coordinates, 0, coordinate_count * sizeof(float));
     cudaMemset(device.energies, 0, slot_count * sizeof(float));
     cudaMemset(device.status, unwritten_status_k, slot_count);
+    cudaMemset(device.diagnostics, 0, slot_count * sfc::polish_diagnostic_floats_k * sizeof(float));
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
 #pragma endregion Device Replay
+
+#pragma region Polish Histogram
+
+/** What one conformer slot's row of `polish_diagnostic_floats_k` floats says, unpacked. */
+struct polish_row_t {
+    sfc::polish_path_t path = sfc::polish_path_t::unreached_k;
+    float rms_gradient = 0.0f;
+    float final_timestep = 0.0f;
+    float iterations = 0.0f;
+    sfc::fire_status_t status = sfc::fire_status_t::converged_k;
+    float staged_energy = 0.0f;
+};
+
+static polish_row_t polish_row_(std::vector<float> const &diagnostics, std::uint64_t slot) {
+    float const *const row = diagnostics.data() + slot * sfc::polish_diagnostic_floats_k;
+    auto const field = [row](sfc::polish_diagnostic_t which) { return row[static_cast<std::uint32_t>(which)]; };
+    return {.path = static_cast<sfc::polish_path_t>(static_cast<int>(field(sfc::polish_diagnostic_t::path_k))),
+            .rms_gradient = field(sfc::polish_diagnostic_t::rms_gradient_k),
+            .final_timestep = field(sfc::polish_diagnostic_t::final_timestep_k),
+            .iterations = field(sfc::polish_diagnostic_t::iterations_k),
+            .status = static_cast<sfc::fire_status_t>(static_cast<int>(field(sfc::polish_diagnostic_t::fire_status_k))),
+            .staged_energy = field(sfc::polish_diagnostic_t::staged_energy_k)};
+}
+
+/** One decade per bucket, shared by the timestep and the RMS gradient — both are read as decades. */
+static constexpr std::size_t decade_bucket_count_k = 7;
+static constexpr float decade_edges_k[decade_bucket_count_k] = {1e-6f, 1e-5f, 1e-4f, 1e-3f, 1e-2f, 1e-1f, 1e30f};
+static constexpr char const *decade_labels_k[decade_bucket_count_k] = {"lt_1e-6", "1e-6", "1e-5",   "1e-4",
+                                                                       "1e-3",    "1e-2", "ge_1e-1"};
+
+/** Index of the decade @p value falls in, saturating into the last bucket. */
+static std::size_t decade_bucket_(float value) {
+    for (std::size_t bucket = 0; bucket + 1 < decade_bucket_count_k; ++bucket)
+        if (value < decade_edges_k[bucket]) return bucket;
+    return decade_bucket_count_k - 1;
+}
+
+/** Print the median, the upper decile and the worst of @p samples, sorting them in place. */
+static void print_quantiles_(char const *name, std::vector<float> &samples) {
+    if (samples.empty()) return;
+    std::sort(samples.begin(), samples.end());
+    auto const quantile = [&samples](double fraction) {
+        double const last = static_cast<double>(samples.size() - 1);
+        return static_cast<double>(samples[static_cast<std::size_t>(fraction * last)]);
+    };
+    std::printf(" %s_p50=%.4g %s_p90=%.4g %s_max=%.4g", name, quantile(0.50), name, quantile(0.90), name,
+                static_cast<double>(samples.back()));
+}
+
+/**
+ *  @brief Print how the polish kernel's conformer slots divided across its four exits.
+ *
+ *  The four exits are what the mean energy cannot separate: three of them ship a geometry MMFF94
+ *  never improved, and the energy array is written on every one of them.
+ */
+static void report_polish_diagnostics_(std::vector<float> const &diagnostics, std::vector<float> const &energies,
+                                       std::uint64_t slot_count) {
+    std::uint64_t path_counts[5] = {0, 0, 0, 0, 0};
+    std::uint64_t timestep_counts[decade_bucket_count_k] = {};
+    std::uint64_t rms_counts[decade_bucket_count_k] = {};
+    std::uint64_t converged = 0, exhausted = 0;
+    double iteration_sum = 0.0, drop_sum = 0.0, rms_sum = 0.0;
+    float worst_iterations = 0.0f;
+    std::uint64_t relaxed = 0;
+    std::vector<float> final_energies, final_gradients;
+
+    for (std::uint64_t slot = 0; slot < slot_count; ++slot) {
+        polish_row_t const row = polish_row_(diagnostics, slot);
+        ++path_counts[static_cast<int>(row.path)];
+        if (row.path != sfc::polish_path_t::write_back_declined_k &&
+            row.path != sfc::polish_path_t::write_back_accepted_k)
+            continue;
+
+        ++relaxed;
+        if (row.status == sfc::fire_status_t::converged_k) ++converged;
+        else ++exhausted;
+        iteration_sum += static_cast<double>(row.iterations);
+        if (row.iterations > worst_iterations) worst_iterations = row.iterations;
+        rms_sum += static_cast<double>(row.rms_gradient);
+        drop_sum += static_cast<double>(row.staged_energy) - static_cast<double>(energies[slot]);
+        ++timestep_counts[decade_bucket_(row.final_timestep)];
+        ++rms_counts[decade_bucket_(row.rms_gradient)];
+        final_energies.push_back(energies[slot]);
+        final_gradients.push_back(row.rms_gradient);
+    }
+
+    std::printf("PATH unreached=%llu status_skipped=%llu no_terms=%llu declined=%llu accepted=%llu\n",
+                static_cast<unsigned long long>(path_counts[0]), static_cast<unsigned long long>(path_counts[1]),
+                static_cast<unsigned long long>(path_counts[2]), static_cast<unsigned long long>(path_counts[3]),
+                static_cast<unsigned long long>(path_counts[4]));
+
+    double const relaxed_denominator = relaxed == 0 ? 1.0 : static_cast<double>(relaxed);
+    std::printf("STAGE relaxed=%llu converged=%llu exhausted=%llu\n", static_cast<unsigned long long>(relaxed),
+                static_cast<unsigned long long>(converged), static_cast<unsigned long long>(exhausted));
+    std::printf("SPEND iters_mean=%.1f iters_max=%.0f rms_mean=%.3g drop_mean=%.4g\n",
+                iteration_sum / relaxed_denominator, static_cast<double>(worst_iterations),
+                rms_sum / relaxed_denominator, drop_sum / relaxed_denominator);
+
+    std::printf("TIMESTEP");
+    for (std::size_t bucket = 0; bucket < decade_bucket_count_k; ++bucket)
+        std::printf(" %s=%llu", decade_labels_k[bucket], static_cast<unsigned long long>(timestep_counts[bucket]));
+    std::printf("\n");
+
+    std::printf("GRADIENT");
+    for (std::size_t bucket = 0; bucket < decade_bucket_count_k; ++bucket)
+        std::printf(" %s=%llu", decade_labels_k[bucket], static_cast<unsigned long long>(rms_counts[bucket]));
+    std::printf("\n");
+
+    // A mean over conformer energies is dominated by whichever slot kept a van der Waals clash, whose
+    // r^-12 term runs to millions, so the quantiles are what a comparison between two minimizers can
+    // actually be read off.
+    std::printf("QUANTILE");
+    print_quantiles_("energy", final_energies);
+    print_quantiles_("rms", final_gradients);
+    std::printf("\n");
+}
+
+#pragma endregion Polish Histogram
 
 #pragma region Command Line
 
@@ -397,6 +521,7 @@ int main(int argc, char **argv) {
 
     for (std::uint32_t repeat = 0; repeat < arguments.repeats; ++repeat) {
         cudaMemset(device.status, unwritten_status_k, slot_count);
+        cudaMemset(device.diagnostics, 0, slot_count * sfc::polish_diagnostic_floats_k * sizeof(float));
         cudaEventRecord(before);
         launch_etkdg_(manifest, device);
         cudaEventRecord(between);
@@ -434,7 +559,11 @@ int main(int argc, char **argv) {
         }
     std::printf("OUTPUT slots=%llu succeeded=%llu mean_energy=%.4g\n", static_cast<unsigned long long>(slot_count),
                 static_cast<unsigned long long>(succeeded),
-                succeeded == 0 ? 0.0 : energy_sum / static_cast<double>(succeeded));
+                static_cast<double>(succeeded == 0 ? 0.0 : energy_sum / static_cast<double>(succeeded)));
+
+    std::vector<float> diagnostics(slot_count * sfc::polish_diagnostic_floats_k);
+    cudaMemcpy(diagnostics.data(), device.diagnostics, diagnostics.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    report_polish_diagnostics_(diagnostics, energies, slot_count);
 
     std::printf("PASS repeats=%u\n", arguments.repeats);
     return 0;
