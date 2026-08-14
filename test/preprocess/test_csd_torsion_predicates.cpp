@@ -371,7 +371,7 @@ using sftest::recursive_case_t;
 int main(int argc, char **argv) {
     fmt::println("{}: native CSD predicates and patterns vs RDKit SubstructMatch", test_name_k);
 
-    auto const selection = sftest::select_corpus(argc, argv, 200);
+    auto const selection = sftest::select_corpus(argc, argv, 200, sftest::adversarial_corpus_path());
     if (selection.knob == sftest::corpus_knob_t::refused_k) {
         fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", argv[0]);
         return 2;

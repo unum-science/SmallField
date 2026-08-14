@@ -227,27 +227,28 @@ struct mmff94_covrad_entry_t {
 };
 static_assert(sizeof(mmff94_covrad_entry_t) == 12);
 
-/**
- *  @brief The `MMFFVdWCollection` scalars that belong to the collection rather than to one atom type.
- *
- *  Both the host container and the device view hold one of these, so the extraction, the view and the
- *  upload each move all five in a single assignment and a sixth scalar arrives in one place.
- */
-struct mmff94_vdw_constants_t {
-    /** MMFF `power`, the exponent `alpha_i` is raised to in the R* combination rule. */
-    float vdw_power = 0.25f;
-    /** MMFF `B`, the amplitude of that rule's asymmetry correction. */
-    float vdw_b = 0.2f;
-    /** MMFF `Beta`, how fast the correction decays with the asymmetry. */
-    float vdw_beta = 12.0f;
-    /** MMFF `DARAD`, the R* scale a donor-acceptor pair takes. */
-    float vdw_darad = 0.8f;
-    /** MMFF `DAEPS`, the well-depth scale a donor-acceptor pair takes. */
-    float vdw_daeps = 0.5f;
-};
-static_assert(sizeof(mmff94_vdw_constants_t) == 20);
-
 #pragma endregion Table Entry Structs
+
+#pragma region VdW Collection Scalars
+
+/*  The `MMFFVdWCollection` scalars that belong to the collection rather than to one atom type. They are
+ *  the same on every molecule, so the nonbonded kernel compiles them in rather than reading them from the
+ *  uploaded view; `test/parameters/test_mmff94_tables.cpp` compares each against RDKit's live collection,
+ *  which is what holds a compiled-in constant to the parameter file it was read from.
+ *
+ *  MMFF `power`, the exponent `alpha_i` is raised to, has no consumer: `r_star` arrives already combined
+ *  from `MMFFVdW::R_star`, so nothing here ever raises `alpha_i` to anything. */
+
+/** MMFF `B`, the amplitude of the R* combination rule's asymmetry correction. */
+constexpr float mmff94_vdw_asymmetry_amplitude_k = 0.2f;
+/** MMFF `Beta`, how fast that correction decays with the asymmetry. */
+constexpr float mmff94_vdw_asymmetry_decay_k = 12.0f;
+/** MMFF `DARAD`, the R* scale a donor-acceptor pair takes. */
+constexpr float mmff94_vdw_donor_acceptor_radius_scale_k = 0.8f;
+/** MMFF `DAEPS`, the well-depth scale a donor-acceptor pair takes. */
+constexpr float mmff94_vdw_donor_acceptor_well_depth_scale_k = 0.5f;
+
+#pragma endregion VdW Collection Scalars
 
 #pragma region Table View
 
@@ -273,14 +274,12 @@ struct mmff94_tables_view_t {
     custd::span<mmff94_hl_entry_t const> hl;
     custd::span<mmff94_covrad_entry_t const> covrad;
 
-    mmff94_vdw_constants_t vdw_constants;
-
     std::uint8_t max_atom_type = 0;
 };
 
 /*  The upload in `mmff94_tables_device.hpp` writes these fields and every MMFF kernel takes the struct
  *  by value, so a change in the layout silently redirects every parameter lookup on the device. */
-static_assert(sizeof(mmff94_tables_view_t) == 248);
+static_assert(sizeof(mmff94_tables_view_t) == 232);
 
 #pragma endregion Table View
 
@@ -319,9 +318,6 @@ struct mmff94_tables_host_t {
     /** Sorted by atomic_num. */
     std::vector<mmff94_covrad_entry_t> covrad;
 
-    /** VdW collection scalar constants, from `MMFFVdWCollection` members. */
-    mmff94_vdw_constants_t vdw_constants;
-
     /** Highest atom type seen, for `MMFFDef` indexing. */
     std::uint8_t max_atom_type = 0;
 
@@ -343,7 +339,6 @@ struct mmff94_tables_host_t {
         result.bndk = bndk;
         result.hl = hl;
         result.covrad = covrad;
-        result.vdw_constants = vdw_constants;
         result.max_atom_type = max_atom_type;
         return result;
     }

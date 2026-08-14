@@ -35,6 +35,31 @@ SUCCESS_STATUS = 0
 #: RDKit scoring its own geometry has no mechanism to fail, so anything above zero is a harness bug.
 CONTROL_INVERSION_LIMIT = 0.5
 
+#: Inversion share, in percent, the subject may show before the run fails. These are regression
+#: ratchets set at twice the worst rate current code is recorded at, not targets: tetrahedral stereo
+#: sits at 6.1 % and 5.5 % on the two standing corpora, so 12 % catches a regression toward the 20 %
+#: and 23.3 % those corpora scored before the chiral-volume target landed, and toward the 22.9 % the
+#: shipped corpus still carries. Override per corpus rather than loosening these, because the two
+#: differ in stereo density and one ceiling for both would be the looser of the two.
+SHARD_CHIRAL_INVERSION_LIMIT = 12.0
+
+#: E/Z rests on a smaller draw — 1 of 584 declared bonds, 0.171 %, with the post-polish check in
+#: place — and `BENCH.md` cautions that the sample wants a larger one. Set at 1 %, about six bonds of
+#: that draw, so counting noise cannot fail a run while a regression toward the 6.441 % of the
+#: pre-check configuration or the 52.08 % of the shipped corpus still does.
+SHARD_EZ_INVERSION_LIMIT = 1.0
+
+#: Share of scored rows, in percent, that may fail the bond-length window. Measured at 0.140 % over
+#: 1,432 rows of the shipped PubChem corpus. This ceiling is what makes the two above meaningful: an
+#: unusable row leaves the inversion ratio entirely, so without it a geometry that degrades until
+#: nothing is scorable reports a perfect rate.
+GEOMETRY_UNUSABLE_LIMIT = 1.0
+
+#: Declared centers or bonds the subject's score must rest on before it is a measurement rather than
+#: an accident. `StereoScore.percent` divides by `max(declared, 1)`, so zero declared renders as a
+#: clean `0.000 %` — the same shape a validator that compared nothing has, and the same failure.
+MINIMUM_DECLARED = 100
+
 #: Bond-length window, in angstrom, every bond must land inside before a geometry is trusted.
 #: A wrong atom-order guess fails this instantly, which is what it exists for.
 BOND_LENGTH_WINDOW = (0.8, 2.2)
@@ -78,6 +103,10 @@ class FidelityReport:
     atom_count_mismatch: int = 0
     #: Rows whose geometry failed the bond-length window, so no verdict was taken.
     geometry_unusable: int = 0
+    #: Rows that reached the scorer at all, which is what `geometry_unusable` is a share of. An
+    #: unusable row leaves both sides of the inversion ratio, so without this denominator a geometry
+    #: that degrades until nothing is scorable reports a perfect score.
+    rows_scored: int = 0
     unparsable: int = 0
     #: True when RDKit is not importable, which is a skip rather than a verdict.
     skipped: bool = False
@@ -99,6 +128,24 @@ def parse_args() -> argparse.Namespace:
         help="Cap on shards scanned (0 = all). One shard samples one neighbourhood of a corpus.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed for the control embedding.")
+    parser.add_argument(
+        "--max-chiral-inversion",
+        type=float,
+        default=SHARD_CHIRAL_INVERSION_LIMIT,
+        help="Percent of declared tetrahedral centers the shard may invert before the run fails.",
+    )
+    parser.add_argument(
+        "--max-ez-inversion",
+        type=float,
+        default=SHARD_EZ_INVERSION_LIMIT,
+        help="Percent of declared E/Z bonds the shard may invert before the run fails.",
+    )
+    parser.add_argument(
+        "--max-unusable",
+        type=float,
+        default=GEOMETRY_UNUSABLE_LIMIT,
+        help="Percent of scored rows that may fail the bond-length window before the run fails.",
+    )
     return parser.parse_args()
 
 
@@ -261,6 +308,7 @@ def measure_shard(path: str, num_samples: int, seed: int, report: FidelityReport
             report.atom_count_mismatch += 1
             continue
         coordinates = flat[: 3 * atom_count].reshape(atom_count, 3)
+        report.rows_scored += 1
 
         # Control first, and every time. A subject number taken without one is not a measurement.
         reference = control_coordinates(molecule, seed)
@@ -305,10 +353,12 @@ def render_report(report: FidelityReport, corpus: str, shards: int) -> None:
 
     # Printed whatever they are, so a harness that scored almost nothing cannot look like a pass.
     log.info(
-        "skipped: {} unparsable, {} atom-count mismatch, {} geometry unusable",
+        "skipped: {} unparsable, {} atom-count mismatch, {} geometry unusable of {} scored ({:.3f} %)",
         thousands(report.unparsable),
         thousands(report.atom_count_mismatch),
         thousands(report.geometry_unusable),
+        thousands(report.rows_scored),
+        100.0 * report.geometry_unusable / max(report.rows_scored, 1),
     )
 
 
@@ -329,6 +379,47 @@ def control_is_sound(report: FidelityReport) -> bool:
             )
             return False
     return True
+
+
+def shard_is_within_budget(report: FidelityReport, max_chiral: float, max_ez: float, max_unusable: float) -> bool:
+    """The subject's own verdict, which `control_is_sound` deliberately does not take.
+
+    Every refusal names the measured percentage beside the ceiling it was measured against, at the
+    precision the ceiling is written at, so a failing run is reproducible from its own log.
+    """
+    if report.skipped:
+        return True
+
+    within_budget = True
+    for label, score, ceiling in (
+        ("tetrahedral", report.shard_chiral, max_chiral),
+        ("E/Z", report.shard_ez, max_ez),
+    ):
+        if score.declared < MINIMUM_DECLARED:
+            log.error(
+                "{} shard rests on {} declared, under {} — the run measured too little to answer",
+                label,
+                thousands(score.declared),
+                thousands(MINIMUM_DECLARED),
+            )
+            within_budget = False
+        elif score.percent > ceiling:
+            log.error("{} shard at {:.3f} % exceeds {:.3f} %", label, score.percent, ceiling)
+            within_budget = False
+
+    if report.rows_scored == 0:
+        log.error("no row reached the scorer — the run proved nothing")
+        return False
+    unusable = 100.0 * report.geometry_unusable / report.rows_scored
+    if unusable > max_unusable:
+        log.error(
+            "{:.3f} % of scored rows were geometrically unusable, over {:.3f} % — an unusable row "
+            "leaves the inversion ratio entirely, so this is what stops a worse geometry scoring better",
+            unusable,
+            max_unusable,
+        )
+        within_budget = False
+    return within_budget
 
 
 def main() -> int:
@@ -356,7 +447,11 @@ def main() -> int:
         measure_shard(path, args.num_samples, args.seed, report)
 
     render_report(report, os.path.basename(os.path.normpath(args.input)), len(shards))
-    return 0 if control_is_sound(report) else 1
+    # Both verdicts are taken rather than short-circuited: a broken instrument and an out-of-budget
+    # shard are different failures, and a run carrying both should say so once for each.
+    sound = control_is_sound(report)
+    within_budget = shard_is_within_budget(report, args.max_chiral_inversion, args.max_ez_inversion, args.max_unusable)
+    return 0 if sound and within_budget else 1
 
 
 if __name__ == "__main__":

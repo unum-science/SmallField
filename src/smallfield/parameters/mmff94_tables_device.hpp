@@ -26,6 +26,7 @@ namespace smallfield::parameters {
 using smallfield::types::buffer;
 using smallfield::types::device_allocator_t;
 using smallfield::types::reserve_outcome_t;
+using smallfield::types::table_residency_t;
 using smallfield::types::upload_into;
 
 #pragma region Device Storage
@@ -69,57 +70,89 @@ struct mmff94_tables_device_t {
 #pragma region Upload
 
 /**
- *  @brief Reserve device storage for one table, enqueue its upload, and hand back the device-side span.
+ *  @brief Reserve device storage for one table, enqueue its upload, and point @p staged at the result.
  *
  *  Rebinding the buffer to @p stream is what ties the allocation and its eventual free to one device, so
  *  it happens before the reservation rather than at declaration. An empty host table allocates nothing and
- *  yields an empty span, which every `lookup_*` cascade already reads as "no entry".
+ *  leaves @p staged empty, which every `lookup_*` cascade already reads as "no entry" — and is `resident_k`,
+ *  because a table that has no rows is a different fact from a table whose rows never arrived.
+ *
+ *  @param[in] source Host table to copy; may legitimately be empty.
+ *  @param[out] destination Device buffer to fill; any prior contents and their allocation are dropped.
+ *  @param[out] staged Span over @p destination, empty unless rows landed.
+ *  @param[in] stream Orders the allocation and the copy, and names the device they land on.
+ *  @param[in] sink Routes a refused allocation or copy to the logger and the error counter.
  */
 template <typename element_>
-custd::span<element_ const> upload_table_(std::vector<element_> const &source,
-                                          buffer<element_, device_allocator_t> &destination, cudaStream_t stream,
-                                          cuda_error_sink_t const &sink) noexcept {
-    if (source.empty()) return {};
-
+[[nodiscard]] table_residency_t upload_table_(std::vector<element_> const &source,
+                                              buffer<element_, device_allocator_t> &destination,
+                                              custd::span<element_ const> &staged, cudaStream_t stream,
+                                              cuda_error_sink_t const &sink) noexcept {
     destination = buffer<element_, device_allocator_t> {device_allocator_t {.stream = stream}};
+    staged = {};
+    if (source.empty()) return table_residency_t::resident_k;
+
     if (destination.try_reserve(source.size()) == reserve_outcome_t::failed_k) {
-        sink.check(cudaErrorMemoryAllocation, "upload_table_");
-        return {};
+        [[maybe_unused]] bool const reported = sink.check(cudaErrorMemoryAllocation, "upload_table_");
+        return table_residency_t::refused_k;
     }
 
     custd::span<element_ const> const host_view {source.data(), source.size()};
-    if (!upload_into(destination.view(), host_view, stream, sink)) return {};
-    return {destination.data(), source.size()};
+    if (!upload_into(destination.view(), host_view, stream, sink)) return table_residency_t::refused_k;
+    staged = {destination.data(), source.size()};
+    return table_residency_t::resident_k;
 }
 
 /**
  *  @brief Upload every MMFF94 parameter table onto the device along @p stream.
  *
- *  Fills `device.view` with spans into `device`'s own buffers, so @p device must outlive any launch that
- *  reads that view and @p stream must outlive @p device.
+ *  The spans are built into a staging view and published to `device.view` only once every table has landed,
+ *  so a caller that finds the view empty knows no kernel may read it — a partially uploaded set would
+ *  otherwise present as a complete force field whose missing lookups fall through to the empirical rules.
+ *  @p device must outlive any launch that reads the view, and @p stream must outlive @p device.
  *
  *  The copies are only enqueued, and @p host is pageable, so its vectors must survive until the caller's
  *  next synchronization on @p stream — which is also when a device-side lookup first becomes valid.
+ *
+ *  @param[in] host Tables extracted from RDKit.
+ *  @param[out] device Device buffers and the view over them; empty on refusal.
+ *  @param[in] stream Orders the allocations and the copies, and outlives the buffers they produce.
+ *  @param[in] sink Routes a refused allocation or copy to the logger and the error counter.
+ *  @return Whether the whole set is resident. A refused device must not be given molecules.
  */
-inline void upload_mmff94_tables_to_device(mmff94_tables_host_t const &host, mmff94_tables_device_t &device,
-                                           cudaStream_t stream, cuda_error_sink_t const &sink = {}) {
-    device.view.vdw = upload_table_(host.vdw, device.vdw, stream, sink);
-    device.view.bond = upload_table_(host.bond, device.bond, stream, sink);
-    device.view.angle = upload_table_(host.angle, device.angle, stream, sink);
-    device.view.torsion = upload_table_(host.torsion, device.torsion, stream, sink);
-    device.view.oop = upload_table_(host.oop, device.oop, stream, sink);
-    device.view.stbn = upload_table_(host.stbn, device.stbn, stream, sink);
-    device.view.dfsb = upload_table_(host.dfsb, device.dfsb, stream, sink);
-    device.view.def = upload_table_(host.def, device.def, stream, sink);
-    device.view.prop = upload_table_(host.prop, device.prop, stream, sink);
-    device.view.pbci = upload_table_(host.pbci, device.pbci, stream, sink);
-    device.view.chg = upload_table_(host.chg, device.chg, stream, sink);
-    device.view.bndk = upload_table_(host.bndk, device.bndk, stream, sink);
-    device.view.hl = upload_table_(host.hl, device.hl, stream, sink);
-    device.view.covrad = upload_table_(host.covrad, device.covrad, stream, sink);
+[[nodiscard]] inline table_residency_t upload_mmff94_tables_to_device(mmff94_tables_host_t const &host,
+                                                                      mmff94_tables_device_t &device,
+                                                                      cudaStream_t stream,
+                                                                      cuda_error_sink_t const &sink = {}) {
+    device.view = {};
+    mmff94_tables_view_t staging {};
 
-    device.view.vdw_constants = host.vdw_constants;
-    device.view.max_atom_type = host.max_atom_type;
+    // One refusal is the whole force field's refusal, so the walk stops at the first one and the staging
+    // view never reaches `device.view`.
+    table_residency_t residency = table_residency_t::resident_k;
+    auto stage = [&](auto const &source, auto &destination, auto &staged) {
+        if (residency == table_residency_t::resident_k)
+            residency = upload_table_(source, destination, staged, stream, sink);
+    };
+    stage(host.vdw, device.vdw, staging.vdw);
+    stage(host.bond, device.bond, staging.bond);
+    stage(host.angle, device.angle, staging.angle);
+    stage(host.torsion, device.torsion, staging.torsion);
+    stage(host.oop, device.oop, staging.oop);
+    stage(host.stbn, device.stbn, staging.stbn);
+    stage(host.dfsb, device.dfsb, staging.dfsb);
+    stage(host.def, device.def, staging.def);
+    stage(host.prop, device.prop, staging.prop);
+    stage(host.pbci, device.pbci, staging.pbci);
+    stage(host.chg, device.chg, staging.chg);
+    stage(host.bndk, device.bndk, staging.bndk);
+    stage(host.hl, device.hl, staging.hl);
+    stage(host.covrad, device.covrad, staging.covrad);
+    if (residency == table_residency_t::refused_k) return residency;
+
+    staging.max_atom_type = host.max_atom_type;
+    device.view = staging;
+    return table_residency_t::resident_k;
 }
 
 #pragma endregion Upload

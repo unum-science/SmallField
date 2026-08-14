@@ -23,6 +23,40 @@ abstract: >-
   approximating the physics. Output is reproducible bitwise under a fixed seed,
   and the library deliberately answers one question — given a SMILES string,
   produce K geometries consistent with it.
+references:
+  - type: article
+    title: "Better Informed Distance Geometry: Using What We Know To Improve Conformation Generation"
+    authors:
+      - given-names: Sereina
+        family-names: Riniker
+      - given-names: Gregory A.
+        family-names: Landrum
+    journal: "Journal of Chemical Information and Modeling"
+    volume: 55
+    issue: 12
+    start: 2562
+    end: 2574
+    year: 2015
+    doi: "10.1021/acs.jcim.5b00654"
+  - type: article
+    title: >-
+      Merck molecular force field. I. Basis, form, scope, parameterization, and
+      performance of MMFF94
+    authors:
+      - given-names: Thomas A.
+        family-names: Halgren
+    journal: "Journal of Computational Chemistry"
+    volume: 17
+    issue: 5-6
+    start: 490
+    end: 519
+    year: 1996
+    doi: "10.1002/(SICI)1096-987X(199604)17:5/6<490::AID-JCC1>3.0.CO;2-P"
+  - type: software
+    title: "RDKit: Open-source cheminformatics"
+    repository-code: "https://github.com/rdkit/rdkit"
+    url: "https://www.rdkit.org"
+    license: BSD-3-Clause
 keywords:
   - cheminformatics
   - conformer generation

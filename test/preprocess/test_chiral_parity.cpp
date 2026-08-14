@@ -390,7 +390,7 @@ int main(int argc, char **argv) {
     sf_verify_(reporters.cip.passed(), "every curated stereocenter must match the CIP oracle");
     sf_verify_(reporters.geometry.passed(), "every curated stereocenter must match its embedded geometry");
 
-    auto const selection = sftest::select_corpus(argc, argv, 20000);
+    auto const selection = sftest::select_corpus(argc, argv, 20000, sftest::adversarial_corpus_path());
     if (selection.knob == sftest::corpus_knob_t::refused_k) {
         fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", argv[0]);
         return 2;

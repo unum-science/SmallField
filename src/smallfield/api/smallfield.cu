@@ -44,11 +44,17 @@ using smallfield::cuda::convert_coords_fp32_to_fp16_kernel;
 using smallfield::cuda::csd_torsion_match_kernel;
 using smallfield::cuda::csd_torsion_table_device_t;
 using smallfield::cuda::csd_torsion_table_host_t;
+using smallfield::cuda::decode_polish_row;
 using smallfield::cuda::etk_build_csr_kernel;
 using smallfield::cuda::etkdg_pipeline_warp_kernel;
+using smallfield::cuda::fire_status_t;
 using smallfield::cuda::launch_bond_distance_bfs;
 using smallfield::cuda::mmff94_apply_typing_patch_kernel;
 using smallfield::cuda::mmff_polish_warp_kernel;
+using smallfield::cuda::polish_diagnostic_floats_k;
+using smallfield::cuda::polish_path_count_k;
+using smallfield::cuda::polish_path_t;
+using smallfield::cuda::polish_row_t;
 using smallfield::cuda::stamp_refused_molecules_kernel;
 using smallfield::cuda::upload_csd_torsion_table_to_device;
 using smallfield::cuda::validate_polished_stereo_kernel;
@@ -96,6 +102,7 @@ using smallfield::types::pinned_bytes_t;
 using smallfield::types::pool_alignment_k;
 using smallfield::types::pool_cursor;
 using smallfield::types::reserve_outcome_t;
+using smallfield::types::table_residency_t;
 using smallfield::types::upload_into;
 
 using smallfield::cuda_error_sink_t;
@@ -566,13 +573,17 @@ struct device_wave_regions_t {
     custd::span<float> metric_embedding {};
     /** What the prepass decided about each molecule's bounds, which only the stamp reads. */
     custd::span<conformer_status_t> molecule_verdicts {};
+    /** `polish_diagnostic_floats_k` floats per slot, empty under `polish_telemetry_t::disabled_k`. */
+    custd::span<float> polish_diagnostics {};
 };
 
-/** Pinned host regions the wave's three device-to-host copies land in. */
+/** Pinned host regions the wave's device-to-host copies land in. */
 struct host_wave_regions_t {
     custd::span<__half> coordinates {};
     custd::span<float> energies {};
     custd::span<std::uint8_t> status {};
+    /** Mirror of the device diagnostics region, and empty on exactly the same configuration. */
+    custd::span<float> polish_diagnostics {};
 };
 
 /**
@@ -591,6 +602,8 @@ struct wave_pool_shape_t {
     std::size_t coordinate_count = 0;
     /** Floats the four-dimensional metric embedding spans, one molecule at a time. */
     std::size_t embedding_count = 0;
+    /** Floats the polish diagnostics span, and zero is how `disabled_k` carves nothing. */
+    std::size_t polish_diagnostic_count = 0;
     /** Molecules this device carries. */
     std::uint32_t molecule_count = 0;
 };
@@ -602,14 +615,19 @@ struct wave_pool_shape_t {
  *  @param[in] molecule_count Molecules this device carries.
  *  @param[in] conformer_count Conformers requested per molecule.
  *  @param[in] max_atoms Coordinate stride, which is this wave's own largest atom count.
+ *  @param[in] telemetry Whether the polish diagnostics get a region; `disabled_k` sizes it at zero.
  */
 static wave_pool_shape_t compute_wave_pool_shape_(std::size_t batch_bytes, std::uint32_t molecule_count,
-                                                  std::uint32_t conformer_count, std::uint32_t max_atoms) noexcept {
+                                                  std::uint32_t conformer_count, std::uint32_t max_atoms,
+                                                  polish_telemetry_t telemetry) noexcept {
     std::size_t const conformer_slots = static_cast<std::size_t>(molecule_count) * conformer_count;
     return {.batch_bytes = batch_bytes,
             .conformer_slots = conformer_slots,
             .coordinate_count = conformer_slots * max_atoms * types::conformer_dimensions_k,
             .embedding_count = static_cast<std::size_t>(molecule_count) * max_atoms * types::embedding_dimensions_k,
+            .polish_diagnostic_count = telemetry == polish_telemetry_t::summarized_k
+                                           ? conformer_slots * polish_diagnostic_floats_k
+                                           : 0,
             .molecule_count = molecule_count};
 }
 
@@ -624,7 +642,66 @@ static device_wave_regions_t carve_device_wave_(wave_pool_shape_t const &shape,
     regions.status = carve<std::uint8_t>(cursor, shape.conformer_slots);
     regions.metric_embedding = carve<float>(cursor, shape.embedding_count);
     regions.molecule_verdicts = carve<conformer_status_t>(cursor, shape.molecule_count);
+    regions.polish_diagnostics = carve<float>(cursor, shape.polish_diagnostic_count);
     return regions;
+}
+
+/**
+ *  @brief Prime the device regions a wave inherits from the wave before it.
+ *
+ *  Every wave re-carves the same pool from offset zero, so all eight regions alias the previous wave's
+ *  bytes. The five below are the ones a reader can reach before a kernel has written them; the walk
+ *  follows the carve's own order so a region added there is missing here in the same place. Defence in
+ *  depth rather than a live-bug fix: the pipeline kernel is a grid-stride loop that writes every slot,
+ *  and a launch that fails parks the whole shard.
+ */
+static void prime_wave_regions_(device_wave_regions_t const &regions, cudaStream_t stream,
+                                cuda_error_sink_t const &sink) noexcept {
+
+    // `write_conformer_output_` fills only the first `num_atoms` slots of each axis, so the padding up
+    // to the stride would reach `convert_coords_fp32_to_fp16_kernel` uninitialised — compute-sanitizer
+    // counts about 16K such reads on the 50-conformer corpus, and reading them risks propagating a NaN.
+    if (!regions.coordinates_fp32.empty()) {
+        [[maybe_unused]] bool const zeroed = sink.check(
+            cudaMemsetAsync(regions.coordinates_fp32.data(), 0, regions.coordinates_fp32.size_bytes(), stream),
+            "memset device coordinates_fp32 (zero)");
+    }
+
+    // All-ones bytes are a `NaN` in every float, which `energy_is_physical` refuses. An energy nothing
+    // wrote must not be rankable, and a zeroed one would sort ahead of every real conformer.
+    if (!regions.energies.empty()) {
+        [[maybe_unused]] bool const poisoned = sink.check(
+            cudaMemsetAsync(regions.energies.data(), 0xFF, regions.energies.size_bytes(), stream),
+            "memset device energies (not a number)");
+    }
+
+    // A slot no kernel reached reads as `slot_unwritten_k` rather than as the previous wave's verdict,
+    // and above all rather than as `success_k`, which byte zero would spell.
+    if (!regions.status.empty()) {
+        [[maybe_unused]] bool const primed = sink.check(
+            cudaMemsetAsync(regions.status.data(), static_cast<int>(conformer_status_t::slot_unwritten_k),
+                            regions.status.size_bytes(), stream),
+            "memset device status (slot unwritten)");
+    }
+
+    // The prepass writes a verdict only for the molecules it refuses, so the rest have to arrive saying
+    // nothing — and here `success_k` is that nothing, because the stamp reads this region to decide
+    // which molecules to overwrite and a refusal left behind would land on whoever now holds the slot.
+    if (!regions.molecule_verdicts.empty()) {
+        [[maybe_unused]] bool const cleared = sink.check(
+            cudaMemsetAsync(regions.molecule_verdicts.data(), static_cast<int>(conformer_status_t::success_k),
+                            regions.molecule_verdicts.size_bytes(), stream),
+            "memset device molecule verdicts (no refusal)");
+    }
+
+    // `polish_path_t::unreached_k` is numbered zero so a zeroed row spells it, which is the whole reason
+    // the tally can tell a slot the polish grid never drew from one it skipped. Empty whenever the
+    // telemetry is off, so this costs a branch and nothing else.
+    if (!regions.polish_diagnostics.empty()) {
+        [[maybe_unused]] bool const unreached = sink.check(
+            cudaMemsetAsync(regions.polish_diagnostics.data(), 0, regions.polish_diagnostics.size_bytes(), stream),
+            "memset device polish diagnostics (unreached)");
+    }
 }
 
 /** Carve the pinned host side of one wave out of @p cursor, or size it when the cursor holds no pool. */
@@ -633,6 +710,7 @@ static host_wave_regions_t carve_host_wave_(wave_pool_shape_t const &shape, pool
     staged.coordinates = carve<__half>(cursor, shape.coordinate_count);
     staged.energies = carve<float>(cursor, shape.conformer_slots);
     staged.status = carve<std::uint8_t>(cursor, shape.conformer_slots);
+    staged.polish_diagnostics = carve<float>(cursor, shape.polish_diagnostic_count);
     return staged;
 }
 
@@ -649,6 +727,68 @@ static std::size_t host_wave_bytes_(wave_pool_shape_t const &shape) noexcept {
     [[maybe_unused]] host_wave_regions_t const unallocated = carve_host_wave_(shape, cursor);
     return align_up_(cursor.bytes, pool_alignment_k);
 }
+
+#pragma region Polish Telemetry
+
+/**
+ *  @brief What one wave's staged polish rows add up to, across every device that ran it.
+ *
+ *  What the conformer output cannot answer: three of the polish kernel's five exits ship a geometry
+ *  MMFF94 never improved, and the status byte and the energy are written on all five.
+ */
+struct polish_tally_t {
+    /** Rows read, which is one per conformer slot the wave carried. */
+    std::uint64_t slots = 0;
+    /** Slots by the exit they left through, indexed by `polish_path_t`. */
+    std::array<std::uint64_t, polish_path_count_k> by_path {};
+    /** Relaxed slots whose minimizer met the gradient threshold. */
+    std::uint64_t converged = 0;
+    /** Relaxed slots that spent the whole iteration budget instead. */
+    std::uint64_t exhausted = 0;
+
+    [[nodiscard]] std::uint64_t count_of(polish_path_t path) const noexcept {
+        return by_path[static_cast<std::size_t>(path)];
+    }
+};
+
+/** Fold one device's staged rows into @p tally; an empty span is the telemetry being off. */
+static void tally_polish_rows_(custd::span<float const> staged, polish_tally_t &tally) noexcept {
+    std::size_t const slots = staged.size() / polish_diagnostic_floats_k;
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        polish_row_t const row = decode_polish_row(staged, slot);
+        std::size_t const path = static_cast<std::size_t>(row.path);
+        // A download that never landed leaves the pinned staging holding bytes no kernel wrote, so the
+        // decoded path is bounded here rather than trusted to index the histogram.
+        if (path >= polish_path_count_k) continue;
+        ++tally.slots;
+        ++tally.by_path[path];
+        if (row.path != polish_path_t::write_back_declined_k && row.path != polish_path_t::write_back_accepted_k)
+            continue;
+        if (row.status == fire_status_t::converged_k) ++tally.converged;
+        else ++tally.exhausted;
+    }
+}
+
+/** One line per wave, at `info` because this telemetry is opt-in and exists to be read. */
+static void log_polish_tally_(logger_t const &logger, std::uint32_t wave_index, polish_tally_t const &tally) {
+    auto const percent_of = [](std::uint64_t part, std::uint64_t whole) {
+        return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole);
+    };
+    std::uint64_t const relaxed = tally.converged + tally.exhausted;
+    std::uint64_t const declined = tally.count_of(polish_path_t::write_back_declined_k);
+    logger.info("POLISH wave={} slots={} unreached={} status_skipped={} no_terms={} " // pinned split
+                "declined={} accepted={} relaxed={} converged={} exhausted={} "       //
+                "declined_percent={:.3f} exhausted_percent={:.3f}",                   //
+                wave_index, fmt::group_digits(tally.slots),
+                fmt::group_digits(tally.count_of(polish_path_t::unreached_k)),
+                fmt::group_digits(tally.count_of(polish_path_t::status_skipped_k)),
+                fmt::group_digits(tally.count_of(polish_path_t::no_terms_k)), fmt::group_digits(declined),
+                fmt::group_digits(tally.count_of(polish_path_t::write_back_accepted_k)), fmt::group_digits(relaxed),
+                fmt::group_digits(tally.converged), fmt::group_digits(tally.exhausted), percent_of(declined, relaxed),
+                percent_of(tally.exhausted, relaxed));
+}
+
+#pragma endregion Polish Telemetry
 
 /**
  *  @brief Grow the per-device metric scratch for the given group size and atom count; no-op on shrink.
@@ -747,8 +887,9 @@ struct molecule_readback_t {
  *  Four values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`, and
  *  `stamp_refused_molecules_kernel` overwrites both with the molecule's verdict — `bounds_infeasible_k`
  *  where the metric prepass found bounds no coordinates satisfy, `batch_overflow_k` where that prepass
- *  refused the whole batch over scratch it could not fit. Anything else is a slot no kernel reached, and
- *  it reports as unconverged rather than as a success the coordinates would not back.
+ *  refused the whole batch over scratch it could not fit. Anything else is a slot no kernel reached — the
+ *  priming walk's `slot_unwritten_k`, or a byte from a producer this build does not know — and it reports
+ *  as unwritten rather than as a success the coordinates would not back.
  *
  *  A success is only a success while its energy is a number a consumer can rank by, so the two facts are
  *  decided together here rather than left for six consumers to re-derive from the status byte alone.
@@ -761,7 +902,7 @@ static conformer_status_t conformer_status_of_(std::uint8_t raw, float energy) n
     case conformer_status_t::stereo_failure_k:
     case conformer_status_t::bounds_infeasible_k:
     case conformer_status_t::batch_overflow_k: return status;
-    default: return conformer_status_t::mmff_unconverged_k;
+    default: return conformer_status_t::slot_unwritten_k;
     }
 }
 
@@ -1005,13 +1146,18 @@ static void enqueue_binned_kernels_(wave_slice_view_t const &device_view,
             config.max_stereo_attempts, bin_max_atoms, gpu_max_atoms, gpu_max_atoms, config.random_seed);
         check_launch_(sink, "etkdg_pipeline_warp_kernel launch");
 
+        // Null when the telemetry is off, which is the guard the kernel's own stores already test.
+        float *const bin_diagnostics = regions.polish_diagnostics.empty()
+                                           ? nullptr
+                                           : regions.polish_diagnostics.data() + slot_base * polish_diagnostic_floats_k;
         mmff_polish_warp_kernel<<<grid_size_mmff, warp_size_k, shared_bytes_mmff, stream>>>(
             device_view.mmff_atom_vdw.data(), device_view.mmff_atom_charge.data(), device_view.bond_distance.data(),
             device_view.mmff_bonds.data(), device_view.mmff_angles.data(), device_view.mmff_torsions.data(),
             device_view.mmff_oops.data(), device_view.mmff_stretchbends.data(), device_view.mmff_interactions.data(),
             device_view.mmff_atom_offsets.data(), device_metadata + bin_start,
             regions.coordinates_fp32.data() + coordinate_base, regions.energies.data() + slot_base,
-            regions.status.data() + slot_base, bin_size, conformer_count, gpu_max_atoms, bin_max_atoms);
+            regions.status.data() + slot_base, bin_size, conformer_count, gpu_max_atoms, bin_max_atoms,
+            bin_diagnostics);
         check_launch_(sink, "mmff_polish_warp_kernel launch");
         if (capture == capture_outcome_t::captured_k) report_captured_bin_timing(stream);
 
@@ -1041,7 +1187,7 @@ static void enqueue_binned_kernels_(wave_slice_view_t const &device_view,
     }
 }
 
-/** Enqueue the half-precision conversion and the three device-to-host copies this wave reads back. */
+/** Enqueue the half-precision conversion and the device-to-host copies this wave reads back. */
 static void enqueue_download_(device_wave_regions_t const &regions, host_wave_regions_t const &staged,
                               cudaStream_t stream, cuda_error_sink_t const &sink) {
     if (!regions.coordinates_fp32.empty()) {
@@ -1058,6 +1204,10 @@ static void enqueue_download_(device_wave_regions_t const &regions, host_wave_re
         staged.energies, custd::span<float const> {regions.energies}, stream, sink);
     [[maybe_unused]] bool const copied_status = download_from(
         staged.status, custd::span<std::uint8_t const> {regions.status}, stream, sink);
+    if (!regions.polish_diagnostics.empty()) {
+        [[maybe_unused]] bool const copied_diagnostics = download_from(
+            staged.polish_diagnostics, custd::span<float const> {regions.polish_diagnostics}, stream, sink);
+    }
 }
 
 /**
@@ -1095,9 +1245,9 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
     // The GPU coordinate buffer and the pinned staging are sized to this wave's actual largest atom
     // count rather than the caller's cap; finalize zero-pads to the caller's stride per slot.
     std::uint32_t const gpu_max_atoms = std::max<std::uint32_t>(batch.observed_max_atoms, 1u);
-    wave_pool_shape_t const shape = compute_wave_pool_shape_(wave_slice_bytes(batch.shape),
-                                                             static_cast<std::uint32_t>(host_metadata.size()),
-                                                             config.num_conformers, gpu_max_atoms);
+    wave_pool_shape_t const shape = compute_wave_pool_shape_(
+        wave_slice_bytes(batch.shape), static_cast<std::uint32_t>(host_metadata.size()), config.num_conformers,
+        gpu_max_atoms, config.polish_telemetry);
     std::size_t const device_bytes = device_wave_bytes_(shape);
     std::size_t const host_bytes = host_wave_bytes_(shape);
 
@@ -1142,25 +1292,9 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
     // ends are the same walk's prefix, so neither side can name a length the other does not.
     [[maybe_unused]] bool const uploaded = upload_into(device_view.uploaded, host_view.uploaded, stream, sink);
 
-    // `write_conformer_output_` fills only the first `num_atoms` slots of each axis, so the padding up
-    // to the stride would reach `convert_coords_fp32_to_fp16_kernel` uninitialised — compute-sanitizer
-    // counts about 16K such reads on the 50-conformer corpus, and reading them risks propagating a NaN.
-    // The memset is bandwidth-trivial against the FIRE relaxation that follows.
-    if (!regions.coordinates_fp32.empty()) {
-        [[maybe_unused]] bool const zeroed = sink.check(
-            cudaMemsetAsync(regions.coordinates_fp32.data(), 0, regions.coordinates_fp32.size_bytes(), stream),
-            "memset device_coords_fp32 zero");
-    }
-
-    // The prepass writes a verdict only for the molecules it refuses, so the rest have to arrive saying
-    // nothing. The pool is reused wave after wave, and without this a previous wave's refusal would be
-    // stamped onto whichever molecule now occupies that slot.
-    if (!regions.molecule_verdicts.empty()) {
-        [[maybe_unused]] bool const primed = sink.check(
-            cudaMemsetAsync(regions.molecule_verdicts.data(), static_cast<int>(conformer_status_t::success_k),
-                            regions.molecule_verdicts.size_bytes(), stream),
-            "memset device molecule verdicts");
-    }
+    // The pool is re-carved from offset zero every wave, so one walk primes what the wave inherits
+    // before anything reads it. Bandwidth-trivial against the FIRE relaxation that follows.
+    prime_wave_regions_(regions, stream, sink);
 
     // Everything from here to the metric prepass reads the uploaded descriptors and writes the regions
     // past the uploaded prefix, so the host ships the molecular graph and the GPU derives the force
@@ -1349,16 +1483,42 @@ context_t::context_t(custd::span<int const> devices) {
 
         auto scratch_owner = std::make_unique<launch_scratch_t>(stream);
         launch_scratch_t &scratch = *scratch_owner;
-        upload_mmff94_tables_to_device(mmff_tables_host, scratch.mmff_tables, stream, sink);
-        upload_csd_torsion_table_to_device(csd_torsion_host, scratch.csd_torsion_table, stream, sink);
+        // A device without its parameter tables would still run every kernel: the lookups would all miss and
+        // extraction would fall through to the empirical rules, producing a complete and plausible force
+        // field that is not MMFF94. So a refusal drops the device rather than degrading it.
+        if (upload_mmff94_tables_to_device(mmff_tables_host, scratch.mmff_tables, stream, sink) ==
+            table_residency_t::refused_k) {
+            this->logger.error("context_t: MMFF94 parameter tables were refused on device {}; it is not used",
+                               device_id);
+            continue;
+        }
+        if (upload_csd_torsion_table_to_device(csd_torsion_host, scratch.csd_torsion_table, stream, sink) ==
+            table_residency_t::refused_k) {
+            this->logger.error("context_t: the CSD torsion table was refused on device {}; it is not used", device_id);
+            continue;
+        }
         scratch.events.create(sink);
-        [[maybe_unused]] bool const shared_raised = sink.check(
-            cudaFuncSetAttribute(smallfield::cuda::embed_4d_power_iter_kernel,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(max_embed_shared_bytes)),
-            "cudaFuncSetAttribute(embed_4d_power_iter_kernel)");
-        if (scratch.mmff_staging.try_reserve(mmff_staging_bytes_k) == reserve_outcome_t::failed_k)
-            this->logger.error("context_t: MMFF staging allocation ({} bytes) failed on device {}",
+        // On sm_89 and sm_120 the request is above what the architecture grants and is refused rather than
+        // clamped, so every later embed launch on this device would fail instead.
+        if (!sink.check(cudaFuncSetAttribute(smallfield::cuda::embed_4d_power_iter_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             static_cast<int>(max_embed_shared_bytes)),
+                        "cudaFuncSetAttribute(embed_4d_power_iter_kernel)")) {
+            this->logger.error("context_t: device {} grants under {} bytes of dynamic shared memory, " // pinned split
+                               "so the metric prepass cannot run there; it is not used",
+                               device_id, max_embed_shared_bytes);
+            continue;
+        }
+        // The launch path expects this reservation to be already sufficient, so a refusal here is a device
+        // that cannot run a wave. It goes through the sink rather than the logger alone, because
+        // `cuda_error_count` is what tells a caller the context is not trustworthy.
+        if (scratch.mmff_staging.try_reserve(mmff_staging_bytes_k) == reserve_outcome_t::failed_k) {
+            [[maybe_unused]] bool const reported = sink.check(cudaErrorMemoryAllocation,
+                                                              "mmff_staging.try_reserve(context_t)");
+            this->logger.error("context_t: MMFF staging allocation ({} bytes) failed on device {}; it is not used",
                                mmff_staging_bytes_k, device_id);
+            continue;
+        }
 
         device_launch_config_t launch_config {};
         populate_device_launch_config_(device_id, launch_config, sink);
@@ -1373,7 +1533,13 @@ context_t::context_t(custd::span<int const> devices) {
         metric_scratch.push_back(std::move(scratch_for_metric));
     }
 
-    if (device_ids.size() != requested_count)
+    // No survivor means every later stage has nothing to run on, and `generate_conformers` would return a
+    // batch that reads exactly like unparseable input. `cuda_error_count` already carries each refusal, so
+    // this line names the aggregate rather than adding a second encoding of it.
+    if (device_ids.empty())
+        this->logger.error("context_t: none of the {} requested devices came up; this context runs nothing",
+                           requested_count);
+    else if (device_ids.size() != requested_count)
         this->logger.error("context_t: {} of {} devices came up; the rest are not used", device_ids.size(),
                            requested_count);
     std::size_t const device_count = device_ids.size();
@@ -1386,9 +1552,12 @@ context_t::context_t(custd::span<int const> devices) {
                                                                   max_conformer_count_k, sink);
     per_device_reserved_molecules = reserve_molecules_per_device(worst_case_wave_size,
                                                                  static_cast<std::uint32_t>(device_count));
+    // Sized with the telemetry on, because the reservation must cover whatever a later call configures
+    // and the diagnostics region is six floats a slot against the coordinates' 576.
     wave_pool_shape_t const worst_case_shape = compute_wave_pool_shape_(
         estimate_per_molecule_batch_bytes(max_atoms_per_molecule_k) * per_device_reserved_molecules,
-        per_device_reserved_molecules, max_conformer_count_k, max_atoms_per_molecule_k);
+        per_device_reserved_molecules, max_conformer_count_k, max_atoms_per_molecule_k,
+        polish_telemetry_t::summarized_k);
     std::size_t const worst_case_device_bytes = device_wave_bytes_(worst_case_shape);
     std::size_t const worst_case_host_bytes = host_wave_bytes_(worst_case_shape);
 
@@ -1632,11 +1801,16 @@ struct wave_dispatcher_t {
     void finalize(std::vector<gpu_pipeline_handle_t> &handles, wave_record_t &record) {
         scoped_span_ms_t const timed {clock, record.finalize};
         record.per_device_gpu.assign(device_count(), gpu_phase_ms_t {});
+        polish_tally_t polish {};
         for (std::uint32_t device_index = 0; device_index < handles.size(); ++device_index) {
             if (!handles[device_index].has_work()) continue;
             finalize_gpu_pipeline(handles[device_index]);
             record.per_device_gpu[device_index] = handles[device_index].timings;
+            // After that device's drain, so the rows are the ones this wave's polish just wrote.
+            tally_polish_rows_(handles[device_index].staged.polish_diagnostics, polish);
         }
+        if (config.polish_telemetry == polish_telemetry_t::summarized_k)
+            log_polish_tally_(context.logger, record.wave_index, polish);
     }
 };
 

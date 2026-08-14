@@ -39,8 +39,8 @@ std::string_view extract_probe_reason(extract_probe_t outcome) noexcept;
 /**
  *  @brief Host mirror of the packed, variable-length MMFF term arrays the compaction pass emits.
  *
- *  Each vector is sized from the batch totals the scan kernel reports, so the aggregate size is
- *  the real device footprint of a wave rather than the fixed-stride staging footprint.
+ *  Each vector is sized from the batch totals the harness sums out of the per-molecule counts, so the
+ *  aggregate size is the real device footprint of a wave rather than the fixed-stride staging footprint.
  */
 struct mmff94_packed_host_result_t {
     std::vector<smallfield::types::mmff94_bond_t> bonds;
@@ -72,7 +72,7 @@ struct mmff94_packed_host_result_t {
  *  @param[out] out_stbns Receives the fixed-stride stretch-bend staging.
  *  @param[out] out_interactions Receives the fixed-stride nonbonded staging.
  *  @param[out] out_atom_offsets Receives one CSR offset record per atom of the batch.
- *  @param[out] packed_out Receives the compacted arrays, resized to the totals the scan reported.
+ *  @param[out] packed_out Receives the compacted arrays, resized to the totals the counts sum to.
  *  @return Whether the round trip completed, and which step refused it.
  */
 [[nodiscard]] extract_probe_t launch_mmff94_gpu_extract_pipeline(

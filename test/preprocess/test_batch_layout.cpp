@@ -12,6 +12,9 @@
  *  Nothing here allocates the batch it describes: the walk over an unallocated cursor hands out empty
  *  spans and totals bytes, so a 17 GB slice costs the test a few microseconds. One walk over a
  *  one-molecule allocation follows, which is what ties those byte totals to the spans they pay for.
+ *
+ *  A slice sized past what a host can page lock is the other half of the same arithmetic, so the pack
+ *  pass is driven at one and checked to refuse its device's molecules by name rather than silently.
  */
 
 #include <cstddef> // `std::byte`, `std::size_t`
@@ -244,10 +247,79 @@ static void check_drug_like_wrap_(diagnostic_reporter_t &reporter) {
         .field("wrap_under_wave_clamp", wave_size_clamp_k, first_wrapping_count_k, below);
 }
 
+/**
+ *  @brief Check that a device whose pinned staging cannot be reserved refuses its batch out loud.
+ *
+ *  The pack pass sizes each device's pinned pool from the molecules assigned to it, and the one thing
+ *  it cannot do is hand the launch a pool it never allocated: the pool then carries no molecules, the
+ *  launch skips the device, and every molecule of it keeps whatever the caller pre-filled. So the
+ *  refusal is filed per molecule under `batch_overflow_k` — the status whose producer this is, and a
+ *  terminal one, so the shard parks and is re-run at a wave that fits.
+ *
+ *  Driven by fabricating molecules whose bounds matrices alone span more bytes than any host can page
+ *  lock, which is what a mis-sized wave looks like from inside the pack pass. Nothing is allocated to
+ *  reach it: the reservation is refused before a single byte is packed, so the check needs neither a
+ *  GPU nor a corpus.
+ *
+ *  @param[inout] reporter Sink for the per-field diagnostics and the section's comparison count.
+ */
+static void check_pinned_refusal_(diagnostic_reporter_t &reporter) {
+    // Four molecules of 400000 atoms ask for 2.5 TB of bounds matrix, and `per_mol_sizes_t::bounds`
+    // is 64-bit, so the total states that size rather than wrapping down to a reservable one.
+    constexpr std::uint32_t refused_molecule_count_k = 4;
+    constexpr std::uint32_t unpinnable_atom_count_k = 400'000;
+
+    std::vector<sfp::batch_prep_thread_contribution_t> contribs(1);
+    auto &contribution = contribs.front();
+    for (std::uint32_t molecule = 0; molecule < refused_molecule_count_k; ++molecule) {
+        sfp::batch_prep_per_mol_record_t record {};
+        record.original_index = molecule;
+        record.metadata.num_atoms = unpinnable_atom_count_k;
+        contribution.mols.push_back(record);
+        // A zeroed descriptor claims no bonds and no neighbours, so every device-filled region is
+        // empty and the bounds matrix is the whole of what the reservation is asked for.
+        contribution.descriptors.push_back(smallfield::types::molecule_descriptor_t {});
+    }
+
+    sfp::distribute_scratch_t distribution;
+    sfp::wave_slice_pool_t pool;
+    // A stride survives a reset that forgets it, so it is set here rather than left at its default.
+    pool.observed_max_atoms = unpinnable_atom_count_k;
+    sfp::pack_contribs_into_device_pools_(contribs, 1u, {&pool, 1}, distribution);
+
+    std::vector<sfp::rejected_mol_t> rejections;
+    sfp::collect_rejections_into_(contribs, distribution, refused_molecule_count_k, refused_molecule_count_k,
+                                  rejections);
+
+    // Exactly once each, so neither a dropped molecule nor a doubled one reads as a filed refusal.
+    std::vector<std::uint32_t> filings(refused_molecule_count_k, 0u);
+    std::uint64_t wrong_reason = 0;
+    std::uint64_t out_of_range = 0;
+    for (sfp::rejected_mol_t const &entry : rejections) {
+        if (entry.reason != smallfield::types::conformer_status_t::batch_overflow_k) ++wrong_reason;
+        if (entry.slice_local_index >= refused_molecule_count_k) {
+            ++out_of_range;
+            continue;
+        }
+        filings[entry.slice_local_index] += 1u;
+    }
+    std::uint64_t filed_once = 0;
+    for (std::uint32_t const count : filings) filed_once += count == 1u ? 1u : 0u;
+
+    reporter.mismatch("pinned_refusal", "molecules={} atoms={}", refused_molecule_count_k, unpinnable_atom_count_k)
+        .field("rejections", refused_molecule_count_k, static_cast<std::uint64_t>(rejections.size()), exactly_equal)
+        .field("filed_exactly_once", refused_molecule_count_k, filed_once, exactly_equal)
+        .field("out_of_range_indices", std::uint64_t {0}, out_of_range, exactly_equal)
+        .field("wrong_reason", std::uint64_t {0}, wrong_reason, exactly_equal)
+        .field("observed_max_atoms", std::uint64_t {0}, static_cast<std::uint64_t>(pool.observed_max_atoms),
+               exactly_equal)
+        .field("num_molecules", std::uint64_t {0}, static_cast<std::uint64_t>(pool.num_molecules()), exactly_equal);
+}
+
 } // namespace smallfield::tests
 
 int main() {
-    fmt::println("{}: batch region totals and offset widths past the 32-bit ceiling", test_name_k);
+    fmt::println("{}: batch totals past the 32-bit ceiling, and the refusal an unpinnable slice files", test_name_k);
 
     sftest::diagnostic_reporter_t reporter {"expected", "computed"};
 
@@ -273,6 +345,9 @@ int main() {
 
     sftest::check_carve_(reporter);
     reporter.summarize("carve");
+
+    sftest::check_pinned_refusal_(reporter);
+    reporter.summarize("pinned_refusal");
 
     if (!reporter.passed())
         return sftest::report_fail(test_name_k, "{} of {} comparisons disagreed", reporter.mismatch_count(),

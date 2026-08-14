@@ -9,9 +9,9 @@
  *  heights all vanish is dropped, an out-of-plane centre with no table entry is dropped — so the
  *  numbers here are upper bounds that hold molecule by molecule.
  *
- *  Sizing this way is what lets the pipeline skip `mmff94_scan_counts_kernel`: the scan's totals
- *  are exact but live in device memory, and reading them back to size the packed arrays would put
- *  a synchronize in the middle of an otherwise asynchronous chain. The price is the slack between
+ *  Sizing this way is what keeps the packed arrays off a device readback: the counts the kernels
+ *  report are exact but live in device memory, and reading them back to size the packed arrays would
+ *  put a synchronize in the middle of an otherwise asynchronous chain. The price is the slack between
  *  bound and actual, which leaves gaps in the packed arrays that no consumer reads. Measured over
  *  a 5000-SMILES stratified PubChem sample the device-only regions reserve 34.5 KB per molecule
  *  against the 17.2 KB the packed arrays actually hold, and over a 5000-SMILES Enamine REAL sample

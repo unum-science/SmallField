@@ -168,7 +168,7 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
 
     // Every enumerator is named, so a caller reading `batch.status` never meets a bare integer. The
     // assertion is what keeps that true: appending a status without naming it below stops the build here.
-    static_assert(sfapi::conformer_status_count_k == 12u, "a conformer_status_t was added - name it below");
+    static_assert(sfapi::conformer_status_count_k == 13u, "a conformer_status_t was added - name it below");
     py::enum_<sfapi::conformer_status_t>(smallfield_module, "ConformerStatus")
         .value("SUCCESS", sfapi::conformer_status_t::success_k)
         .value("STEREO_FAILURE", sfapi::conformer_status_t::stereo_failure_k)
@@ -181,7 +181,8 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
         .value("TOO_MANY_RINGS", sfapi::conformer_status_t::too_many_rings_k)
         .value("BOUNDS_INFEASIBLE", sfapi::conformer_status_t::bounds_infeasible_k)
         .value("NONPHYSICAL_ENERGY", sfapi::conformer_status_t::nonphysical_energy_k)
-        .value("BATCH_OVERFLOW", sfapi::conformer_status_t::batch_overflow_k);
+        .value("BATCH_OVERFLOW", sfapi::conformer_status_t::batch_overflow_k)
+        .value("SLOT_UNWRITTEN", sfapi::conformer_status_t::slot_unwritten_k);
 
     py::class_<conformer_batch_t>(smallfield_module, "ConformerBatch",
                                   "Named outputs of one `Context.generate_conformers` call.")
@@ -200,7 +201,17 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
                                  "GPU context owning CUDA streams and per-device scratch. Construction " // split
                                  "initializes every device, so reuse one across calls.")
         .def(py::init([](std::vector<int> const &device_ids) {
-                 return std::make_unique<sfapi::context_t>(custd::span<int const>(device_ids));
+                 auto gpu_context = std::make_unique<sfapi::context_t>(custd::span<int const>(device_ids));
+                 // Read absolutely rather than as a delta: a device that refused its parameter tables, its
+                 // shared-memory opt-in or its staging is dropped during construction, and the context then
+                 // yields batches that read exactly like unparseable input. The per-call check below stays a
+                 // delta so it does not re-raise what this already reported.
+                 std::uint64_t const errors = gpu_context->cuda_error_count.load();
+                 if (errors != 0)
+                     throw std::runtime_error(std::to_string(errors) +
+                                              " CUDA errors constructing Context; " // pinned split
+                                              "the context logger names each one");
+                 return gpu_context;
              }),
              py::arg("device_ids") = std::vector<int> {}, py::call_guard<py::gil_scoped_release>())
         .def(

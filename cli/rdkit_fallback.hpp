@@ -62,18 +62,22 @@ enum class fallback_disposition_t : std::uint8_t {
     // molecule was never the problem — but the population is unbounded where every other retried status
     // is per-molecule and rare: one mis-sized wave refuses an entire device's batch, so at 20,088 µs of
     // CPU per molecule against 250 µs on GPU a single sizing failure would turn into hours of fallback
-    // and read as a hang rather than as the loud, cheap, re-runnable error it is. The producer already
-    // says so through `cuda_error_count`, which parks the shard and sets the exit code; the shard is
-    // re-run at a wave that fits, not laundered one molecule at a time.
+    // and read as a hang rather than as the loud, cheap, re-runnable error it is. Two producers reach
+    // this: a device-side pool failure, which `cuda_error_count` already reports, and a host-side
+    // pinned reservation, which raises no CUDA error at all — so the exit code gates on this status's
+    // own terminal tally rather than on the counter. The shard is re-run at a wave that fits, not
+    // laundered one molecule at a time.
     case types::conformer_status_t::batch_overflow_k: return fallback_disposition_t::terminal_k;
 
     /* Retry: nothing in `admit_molecule_` reproduces these. */
     // ETKDG perceives and enforces chirality by its own route, so a chiral volume the device driver
     // could not satisfy is not a verdict RDKit shares.
     case types::conformer_status_t::stereo_failure_k: return fallback_disposition_t::retry_k;
-    // A different MMFF minimizer from the device FIRE driver, and the status the kernels also leave
-    // on a slot they never reached.
+    // A different MMFF minimizer from the device FIRE driver may still converge where it did not.
     case types::conformer_status_t::mmff_unconverged_k: return fallback_disposition_t::retry_k;
+    // No kernel reached the slot, so there is no device verdict to re-derive and the molecule itself was
+    // never refused: the fallback is the only thing that has said anything about it.
+    case types::conformer_status_t::slot_unwritten_k: return fallback_disposition_t::retry_k;
     // Two producers and only one is fully re-derived: `parse_smiles` refusing the string, which the
     // fallback repeats, and `prepare_molecule_topology_into` catching an exception out of descriptor,
     // bounds, chirality or MMFF typing construction. Only the last of those four does the fallback
@@ -161,21 +165,50 @@ constexpr std::size_t fallback_duration_bin_count_k = 16;
 
 /** Counter arrays here are indexed by the enumerator itself, so they take their extent from the enum. */
 using types::conformer_status_count_k;
+using types::unnamed_status_k;
+
+/**
+ *  @brief Molecules counted per `conformer_status_t`, with one bucket for a byte no enumerator claims.
+ *
+ *  `conformer_status_t` is append-only because every value is persisted into a shipped shard, and a
+ *  shard outlives the binaries that read it — so a status this reader has no name for is expected
+ *  rather than exceptional. `of` routes such a byte into `unnamed`, where a non-zero count says the
+ *  reader is older than the shard, instead of writing past the end of `named`.
+ */
+struct status_tally_t {
+    /** Counts indexed by the enumerator itself. */
+    std::array<std::uint64_t, conformer_status_count_k> named {};
+    /** Counts for every status byte outside the enum this binary was built against. */
+    std::uint64_t unnamed = 0;
+
+    /** The counter @p status belongs in, which is `unnamed` for a byte no enumerator claims. */
+    [[nodiscard]] std::uint64_t &of(types::conformer_status_t status) noexcept {
+        std::size_t const index = static_cast<std::size_t>(status);
+        return index < conformer_status_count_k ? named[index] : unnamed;
+    }
+
+    /** Molecules across every status, named or not. */
+    [[nodiscard]] std::uint64_t total() const noexcept {
+        std::uint64_t summed = unnamed;
+        for (std::uint64_t const count : named) summed += count;
+        return summed;
+    }
+};
 
 /**
  *  @brief Per-status account of what one `coprocessed-batch` of refusals cost and bought.
  *
- *  Every array is indexed by the `conformer_status_t` that decided the molecule's fate, and every
+ *  Every tally is keyed by the `conformer_status_t` that decided the molecule's fate, and every
  *  entry counts @b molecules rather than conformer slots. `skipped` is filled where the dispatch list
  *  is built, `attempted` and `recovered` by `rdkit_fallback` itself.
  */
 struct fallback_report_t {
     /** Molecules a terminal status kept out of the fallback. */
-    std::array<std::uint64_t, conformer_status_count_k> skipped {};
+    status_tally_t skipped {};
     /** Molecules dispatched, by the status that dispatched them. */
-    std::array<std::uint64_t, conformer_status_count_k> attempted {};
+    status_tally_t attempted {};
     /** Of `attempted`, those RDKit filled at least one slot for. */
-    std::array<std::uint64_t, conformer_status_count_k> recovered {};
+    status_tally_t recovered {};
     /** Host nanoseconds the dispatched molecules cost, by stage, summed over every worker thread. */
     fallback_stage_nanoseconds_t nanoseconds {};
     /** Dispatched molecules by the millisecond bin their whole attempt fell in, which is the shape a
@@ -185,14 +218,6 @@ struct fallback_report_t {
     std::uint64_t slowest_nanoseconds = 0;
     std::uint32_t slowest_molecule_index = 0;
 };
-
-/** Molecules across every status of one of a report's arrays. */
-[[nodiscard]] inline std::uint64_t total_of(
-    std::array<std::uint64_t, conformer_status_count_k> const &counts) noexcept {
-    std::uint64_t total = 0;
-    for (std::uint64_t const count : counts) total += count;
-    return total;
-}
 
 #pragma endregion Reporting
 

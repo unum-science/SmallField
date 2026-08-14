@@ -805,17 +805,14 @@ inline smallfield::types::conformer_status_t prepare_molecule_into(std::string_v
     result.metadata.chiral_offset = 0;
     result.metadata.torsion_offset = 0;
     result.metadata.constraint_offset = 0;
-    result.metadata.mmff_atom_vdw_offset = 0;
-    result.metadata.mmff_atom_charge_offset = 0;
+    result.metadata.atom_base_offset = 0;
     result.metadata.bond_distance_offset = 0;
     result.metadata.mmff_bond_offset = 0;
     result.metadata.mmff_angle_offset = 0;
     result.metadata.mmff_torsion_offset = 0;
     result.metadata.mmff_oop_offset = 0;
     result.metadata.mmff_stretchbend_offset = 0;
-    result.metadata.mmff_atom_csr_offset = 0;
     result.metadata.etk_interaction_offset = 0;
-    result.metadata.etk_atom_csr_offset = 0;
     return conformer_status_t::success_k;
 }
 
@@ -1178,26 +1175,6 @@ static inline void prepare_per_thread_contribs_(custd::span<std::string_view con
 }
 
 /**
- *  @brief Merge every worker's refusals, plus the tail the batch could not address, into @p out.
- *
- *  Each entry carries the slice-local input index and the `conformer_status_t` reason. The tail past
- *  @p admitted_count is refused with `batch_overflow_k`, because nothing in it is oversized: the slice
- *  outgrew what a 32-bit per-molecule region offset addresses, which is a property of the caller's
- *  sizing rather than of the molecules. Naming it `too_many_atoms_k` would report a sizing bug as a
- *  corpus fact, and the two call for opposite responses: the tail clears by cutting the slice, not by
- *  cutting the atom cap.
- */
-inline void collect_rejections_into_(std::vector<batch_prep_thread_contribution_t> const &contribs,
-                                     std::size_t admitted_count, std::size_t input_count,
-                                     std::vector<rejected_mol_t> &out) {
-    out.clear();
-    for (auto const &contribution : contribs)
-        out.insert(out.end(), contribution.rejected_input_indices.begin(), contribution.rejected_input_indices.end());
-    for (std::size_t molecule = admitted_count; molecule < input_count; ++molecule)
-        out.push_back({static_cast<std::uint32_t>(molecule), conformer_status_t::batch_overflow_k});
-}
-
-/**
  *  @brief Grow-only scratch for `pack_contribs_into_device_pools_`.
  *
  *  Holds the sort permutation, the CSR-packed per-device assignment list, the per-device CSR
@@ -1229,7 +1206,35 @@ struct distribute_scratch_t {
     /** Length: device_count + 1. */
     std::array<std::uint32_t, max_devices_k + 1u> per_device_offsets {};
     std::array<std::vector<device_capacities_t>, max_devices_k> capacities_per_mol {};
+    /** Every molecule a device refused because its pinned staging could not be reserved, by original
+     *  caller index. One slot per device, so the pack fan-out files without a lock, and cleared for
+     *  every device rather than only the refusing ones so a previous wave's refusals cannot replay. */
+    std::array<std::vector<rejected_mol_t>, max_devices_k> rejections_per_device {};
 };
+
+/**
+ *  @brief Merge every refusal the wave produced into @p out: each worker's parse-time rejections, the
+ *  devices that refused their whole batch, and the tail the batch could not address.
+ *
+ *  Each entry carries the slice-local input index and the `conformer_status_t` reason. The tail past
+ *  @p admitted_count is refused with `batch_overflow_k`, because nothing in it is oversized: the slice
+ *  outgrew what a 32-bit per-molecule region offset addresses, which is a property of the caller's
+ *  sizing rather than of the molecules. Naming it `too_many_atoms_k` would report a sizing bug as a
+ *  corpus fact, and the two call for opposite responses: the tail clears by cutting the slice, not by
+ *  cutting the atom cap. A device whose pinned staging could not be reserved refuses under the same
+ *  status for the same reason, and `pack_contribs_into_device_pools_` stages those on @p scratch.
+ */
+inline void collect_rejections_into_(std::vector<batch_prep_thread_contribution_t> const &contribs,
+                                     distribute_scratch_t const &scratch, std::size_t admitted_count,
+                                     std::size_t input_count, std::vector<rejected_mol_t> &out) {
+    out.clear();
+    for (auto const &contribution : contribs)
+        out.insert(out.end(), contribution.rejected_input_indices.begin(), contribution.rejected_input_indices.end());
+    for (auto const &rejections : scratch.rejections_per_device)
+        out.insert(out.end(), rejections.begin(), rejections.end());
+    for (std::size_t molecule = admitted_count; molecule < input_count; ++molecule)
+        out.push_back({static_cast<std::uint32_t>(molecule), conformer_status_t::batch_overflow_k});
+}
 
 /**
  *  @brief Decide which device every admitted molecule lands on, touching none of its bytes.
@@ -1331,6 +1336,9 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
                                              std::uint32_t device_count, custd::span<wave_slice_pool_t> per_device_out,
                                              distribute_scratch_t &scratch) {
 
+    // Every slot rather than the first `device_count`, so a wave driving fewer devices than the last
+    // one cannot inherit a refusal filed against a device it never touched.
+    for (auto &rejections : scratch.rejections_per_device) rejections.clear();
     for (std::uint32_t device_index = 0; device_index < device_count; ++device_index) {
         per_device_out[device_index].observed_max_atoms = 0;
         per_device_out[device_index].shape = wave_slice_shape_t {};
@@ -1377,6 +1385,20 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
         // they carry no constructor reservation and size themselves from the first wave, which is
         // the largest, so `grown_k` fires once per pool and never again.
         if (uploaded_bytes > 0 && out.host.try_reserve(uploaded_bytes) == reserve_outcome_t::failed_k) {
+            // Nothing lands in this pool, so the device refuses its whole batch under the status whose
+            // producer this is. Filing it is what stops the slice from keeping the caller's pre-fill
+            // and reading as a corpus of malformed SMILES; `batch_overflow_k` is terminal, so the shard
+            // parks and is re-run at a wave that fits rather than laundered one molecule at a time.
+            auto &rejections = scratch.rejections_per_device[device_index];
+            rejections.reserve(device_mol_count);
+            for (std::uint32_t position = 0; position < device_mol_count; ++position) {
+                auto const &source = scratch.molecule_sources[mol_list[position]];
+                auto const &contribution = contribs[source.thread_rank];
+                rejections.push_back(
+                    {contribution.mols[source.index_in_thread].original_index, conformer_status_t::batch_overflow_k});
+            }
+            // The stride goes with the shape: a pool holding nothing advertises neither.
+            out.observed_max_atoms = 0;
             out.shape = wave_slice_shape_t {};
             continue;
         }
@@ -1425,10 +1447,7 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
             destination_meta.chiral_offset = running.chirals;
             destination_meta.constraint_offset = running.distance_constraints;
             destination_meta.torsion_offset = position * out.shape.torsion_stride;
-            destination_meta.mmff_atom_vdw_offset = running.atoms;
-            destination_meta.mmff_atom_charge_offset = running.atoms;
-            destination_meta.mmff_atom_csr_offset = running.atoms;
-            destination_meta.etk_atom_csr_offset = running.atoms;
+            destination_meta.atom_base_offset = running.atoms;
             destination_meta.bond_distance_offset = as_region_offset_(running.bond_distance);
             destination_meta.etk_interaction_offset = running.etk_interactions;
             destination_meta.mmff_bond_offset = running.mmff_bonds;
@@ -1481,7 +1500,8 @@ struct batch_prep_scratch_t {
  *             path derives its coordinate buffers from — can never outgrow the caller's own.
  *  @param[out] per_device_out One pinned pool per device.
  *  @param[inout] scratch Grow-only caller-owned scratch; see `batch_prep_scratch_t`.
- *  @param[out] rejected_input_indices_out Optional sink for the slice-local rejection records.
+ *  @param[out] rejected_input_indices_out Optional sink for the slice-local rejection records, which
+ *              carry the whole batch of any device whose pinned staging could not be reserved.
  *  @param[in] salt_policy Whether a multi-fragment input keeps its largest fragment.
  */
 inline void prepare_per_device_batches_into(
@@ -1500,7 +1520,7 @@ inline void prepare_per_device_batches_into(
                                  scratch.contributions);
     pack_contribs_into_device_pools_(scratch.contributions, device_count, per_device_out, scratch.distribution);
     if (rejected_input_indices_out != nullptr)
-        collect_rejections_into_(scratch.contributions, admitted_count, smiles_list.size(),
+        collect_rejections_into_(scratch.contributions, scratch.distribution, admitted_count, smiles_list.size(),
                                  *rejected_input_indices_out);
 }
 

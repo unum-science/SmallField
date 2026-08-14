@@ -73,11 +73,16 @@ enum class conformer_status_t : std::uint8_t {
      *  oversized, so the same input at a smaller wave succeeds, and a histogram that spelled it as an
      *  atom-count refusal would report a sizing bug as a property of the corpus. */
     batch_overflow_k = 11,
+    /** No kernel wrote this slot: it carries what the wave's priming walk left there. Distinct from
+     *  `mmff_unconverged_k`, which is a minimiser that ran and did not converge — a geometry exists and
+     *  is simply not at a stationary point, where here there is no geometry at all. The two call for
+     *  opposite responses, so they cannot share a name. */
+    slot_unwritten_k = 12,
 };
 
 /** One past the highest `conformer_status_t`, so a per-status array is indexed by the enumerator
  *  itself. The enum is append-only, so its newest value is always its widest. */
-inline constexpr std::size_t conformer_status_count_k = static_cast<std::size_t>(conformer_status_t::batch_overflow_k) +
+inline constexpr std::size_t conformer_status_count_k = static_cast<std::size_t>(conformer_status_t::slot_unwritten_k) +
                                                         1u;
 
 /** What a status byte no enumerator claims prints as, which a shard from a newer producer can carry. */
@@ -103,6 +108,7 @@ inline constexpr std::string_view conformer_status_name(conformer_status_t statu
     case conformer_status_t::bounds_infeasible_k: return "bounds_infeasible";
     case conformer_status_t::nonphysical_energy_k: return "nonphysical_energy";
     case conformer_status_t::batch_overflow_k: return "batch_overflow";
+    case conformer_status_t::slot_unwritten_k: return "slot_unwritten";
     }
     return unnamed_status_k;
 }

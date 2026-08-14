@@ -16,8 +16,6 @@
 #include <array>   // `std::array`
 #include <utility> // `std::pair`
 
-#include "smallfield/types/etkdg_types.hpp"
-#include "smallfield/types/mmff94_bounds.hpp"
 #include "smallfield/types/views.hpp"
 #include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/mmff94/mmff94_typer.hpp"

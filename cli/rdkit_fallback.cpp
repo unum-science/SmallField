@@ -356,12 +356,13 @@ void rdkit_fallback(rdkit_fallback_inputs_t const &inputs, rdkit_fallback_output
         std::uint32_t const recovered = attempt_molecule_(inputs, outputs, molecule_index, status, tally);
         fold_molecule_cost_into_(tally, molecule_index, report);
 
-        std::size_t const cause_index = static_cast<std::size_t>(cause);
+        std::uint64_t &attempted_tally = report.attempted.of(cause);
 #pragma omp atomic
-        ++report.attempted[cause_index];
+        ++attempted_tally;
         if (recovered == 0) continue;
+        std::uint64_t &recovered_tally = report.recovered.of(cause);
 #pragma omp atomic
-        ++report.recovered[cause_index];
+        ++recovered_tally;
     }
 }
 

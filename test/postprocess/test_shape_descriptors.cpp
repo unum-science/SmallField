@@ -85,6 +85,13 @@ static constexpr std::array<std::string_view, sfpost::usr_components_k> usr_slot
     "ftf_mean", "ftf_standard_deviation", "ftf_skewness",
 };
 
+/** Moments each reference point contributes, and which of them is the skewness, per the order above. */
+static constexpr std::size_t moments_per_reference_point_k = 3;
+static constexpr std::size_t skewness_slot_k = 2;
+static_assert(usr_slot_names_k[skewness_slot_k] == "ctd_skewness" &&
+                  usr_slot_names_k[moments_per_reference_point_k + skewness_slot_k] == "cst_skewness",
+              "the skewness stride must track the slot table it indexes");
+
 /** USRCAT's blocks, the plain USR one and then the CREDO subsets, in the order `usrcat_descriptor` writes them. */
 static constexpr std::array<std::string_view, sfpost::credo_subset_count_k + 1> usrcat_block_names_k {
     "all", "hydrophobic", "aromatic", "acceptor", "donor",
@@ -251,13 +258,35 @@ static void compare_descriptors_(RDKit::RWMol &molecule, std::string_view smiles
                                                       usrcat_block_names_k[block]);
         // Block 0 is the plain USR over every atom; the four CREDO subsets follow it, and RDKit hands back the
         // atom ids it typed, so a typing divergence names itself here instead of surfacing as twelve moments.
+        std::size_t const subset_atoms = block == 0 ? scratch.context.num_atoms()
+                                                    : scratch.rdkit_usrcat_atoms[block - 1].size();
         if (block > 0)
             usrcat_group.field("subset_size", scratch.rdkit_usrcat_atoms[block - 1].size(),
                                scratch.context.credo_subsets[block - 1].size(), exactly_equal);
+
+        // Skewness is the third central moment standardized by the cube of the deviation, and on fewer than
+        // three points its exact value is identically zero — the deviations cancel term for term. Both sides
+        // are then dividing one roundoff residual by another and taking a cube root of the quotient, which
+        // maps a `1e-21` numerator onto a `1e-3` answer. Neither number is wrong about the geometry and
+        // neither is stable, so the pair is cited rather than gated; the mean and the deviation beside it are
+        // well-conditioned on the same subset and stay gated. Ours is the value nearer the exact zero.
+        auto degenerate_group = reporters.usrcat.divergence("usrcat_degenerate_skewness",
+                                                            "smiles={} subset={} atoms={}", smiles,
+                                                            usrcat_block_names_k[block], subset_atoms);
         std::size_t const base = block * usr_slot_names_k.size();
-        for (std::size_t slot = 0; slot < usr_slot_names_k.size(); ++slot)
-            usrcat_group.field(usr_slot_names_k[slot], scratch.rdkit_usrcat[base + slot],
-                               scratch.native_usrcat[base + slot], within_tolerance);
+        for (std::size_t slot = 0; slot < usr_slot_names_k.size(); ++slot) {
+            bool const is_skewness = slot % moments_per_reference_point_k == skewness_slot_k;
+            // Cited only where the two actually disagree. A degenerate subset whose skewness both sides
+            // put at zero is an agreement, and routing it to the divergence group would trade a real
+            // comparison for a cited non-difference — the count would grow while the evidence shrank.
+            if (is_skewness && subset_atoms < 3 &&
+                !within_tolerance(scratch.rdkit_usrcat[base + slot], scratch.native_usrcat[base + slot]))
+                degenerate_group.field(usr_slot_names_k[slot], scratch.rdkit_usrcat[base + slot],
+                                       scratch.native_usrcat[base + slot]);
+            else
+                usrcat_group.field(usr_slot_names_k[slot], scratch.rdkit_usrcat[base + slot],
+                                   scratch.native_usrcat[base + slot], within_tolerance);
+        }
     }
 }
 
@@ -504,7 +533,8 @@ static void check_corpus_line_(std::string_view smiles, shape_reporters_t &repor
 int main(int argc, char **argv) {
     fmt::println("{}: native USR / USRCAT against RDKit, then rigid fragment separation", test_name_k);
 
-    auto const selection = sftest::select_corpus(argc, argv, default_max_molecules_k);
+    auto const selection = sftest::select_corpus(argc, argv, default_max_molecules_k,
+                                                 sftest::adversarial_corpus_path());
     if (selection.knob == sftest::corpus_knob_t::refused_k) {
         fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", argv[0]);
         return 2;

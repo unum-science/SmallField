@@ -48,6 +48,7 @@
 #include "smallfield/cuda/etk_kernel.cuh"
 #include "smallfield/types/conformer_status.hpp"
 #include "smallfield/types/etkdg_types.hpp"
+#include "smallfield/types/views.hpp"
 #include "smallfield/cuda/fire_warp.cuh"
 #include "smallfield/cuda/mmff94_energy_kernel.cuh"
 #include "smallfield/preprocess/molecule_complexity.hpp"
@@ -281,13 +282,13 @@ __device__ __forceinline__ void write_conformer_output_(float *coordinates_out, 
  *  against the SM register file, and below the largest bins, the 32-blocks-per-SM slot limit.
  *
  *  @b Register-pressure-audit — nvcc 12.8, `cuobjdump --dump-resource-usage`, over the shipped
- *    architecture set: sm_80=64, sm_89=69, sm_90=69, sm_100=124, sm_120=128 regs/thread. Hopper and
+ *    architecture set: sm_80=64, sm_89=67, sm_90=66, sm_100=124, sm_120=128 regs/thread. Hopper and
  *    earlier spill nothing (STACK=0, LOCAL=0); both Blackwell targets carry an 8-byte frame. Blackwell
  *    trades registers against that frame rather than holding both: the twelve extra registers there
  *    bought the frame down from 64 bytes, which is the direction to keep it in.
- *    On sm_90 that is 65536 / (69 × 32) = 29 blocks/SM = 29 warps, against a hard ceiling of
+ *    On sm_90 that is 65536 / (66 × 32) = 31 blocks/SM = 31 warps, against a hard ceiling of
  *    32 warps — a 32-thread block can never fill more than 32 of the SM's 64 warp slots, so
- *    50 % is the most this shape can reach at any register count, and the last 1.10× of it is
+ *    50 % is the most this shape can reach at any register count, and the last 1.03× of it is
  *    all that a lower register count could buy.
  *
  *  Reading a verdict here rather than writing one is what that budget cannot afford. A molecule whose
@@ -459,7 +460,7 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
             // Torsion refinement: Run ETK torsion refinement in 3D with 100 FIRE iterations.
             if (meta.num_etk_torsions > 0) {
                 etk_torsion_energy_functor_t etk_functor {mol_torsions, mol_constraints, etk_interactions,
-                                                          etk_atom_offsets + meta.etk_atom_csr_offset, num_atoms};
+                                                          etk_atom_offsets + meta.atom_base_offset, num_atoms};
 
                 fire_result_t const etk_result = run_fire_stage_(
                     scratch_3d, refinement_policy.etk_initial_iterations, refinement_policy.etk_continuation_iterations,
@@ -514,6 +515,9 @@ enum class polish_path_t : std::int32_t {
     write_back_accepted_k = 4,
 };
 
+/** Exits `polish_path_t` names, so a histogram over it declares its own width once. */
+constexpr std::size_t polish_path_count_k = 5;
+
 /** What each of the floats `mmff_polish_warp_kernel` writes per slot into its diagnostics array holds. */
 enum class polish_diagnostic_t : std::uint32_t {
     /** A `polish_path_t`, widened to float. */
@@ -532,6 +536,33 @@ enum class polish_diagnostic_t : std::uint32_t {
 
 /** Floats per conformer slot in `mmff_polish_warp_kernel`'s diagnostics array. */
 constexpr std::uint32_t polish_diagnostic_floats_k = 6;
+
+/** One conformer slot's row of `polish_diagnostic_floats_k` floats, unpacked. */
+struct polish_row_t {
+    polish_path_t path = polish_path_t::unreached_k;
+    float rms_gradient = 0.0f;
+    float final_timestep = 0.0f;
+    float iterations = 0.0f;
+    fire_status_t status = fire_status_t::converged_k;
+    float staged_energy = 0.0f;
+};
+
+/**
+ *  @brief Read slot @p slot out of a staged diagnostics array, host-side.
+ *
+ *  Lives beside the enums it indexes so no reader re-derives the row layout; @p diagnostics must span
+ *  `polish_diagnostic_floats_k` floats per slot, which is what the kernel's own writes assume.
+ */
+inline polish_row_t decode_polish_row(custd::span<float const> diagnostics, std::size_t slot) noexcept {
+    float const *const row = diagnostics.data() + slot * polish_diagnostic_floats_k;
+    auto const field = [row](polish_diagnostic_t which) { return row[static_cast<std::uint32_t>(which)]; };
+    return {.path = static_cast<polish_path_t>(static_cast<int>(field(polish_diagnostic_t::path_k))),
+            .rms_gradient = field(polish_diagnostic_t::rms_gradient_k),
+            .final_timestep = field(polish_diagnostic_t::final_timestep_k),
+            .iterations = field(polish_diagnostic_t::iterations_k),
+            .status = static_cast<fire_status_t>(static_cast<int>(field(polish_diagnostic_t::fire_status_k))),
+            .staged_energy = field(polish_diagnostic_t::staged_energy_k)};
+}
 
 /** Write one diagnostic field for @p slot, from lane 0, doing nothing when no array was handed in. */
 __device__ __forceinline__ void store_polish_diagnostic_(float *diagnostics_out, std::uint32_t slot,
@@ -593,6 +624,10 @@ __device__ __forceinline__ void store_polish_stage_(float *diagnostics_out, std:
  *  is two bits per pair, so an N²/4 packed copy staged into shared memory alongside the minimizer
  *  arrays would remove that traffic for a footprint the smaller bins can afford.
  *
+ *  `polish_diagnostics_out` spans `polish_diagnostic_floats_k` floats per conformer slot, and every one
+ *  of the five exits writes its `polish_path_t` there. A null array is how a launch declines the
+ *  telemetry, and it carries no default so each launch states which it wants.
+ *
  *  @see etkdg_pipeline_warp_kernel
  */
 __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
@@ -605,7 +640,7 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
     etkdg_molecule_metadata_t const *__restrict__ molecule_metadata, float *__restrict__ conformer_coordinates_out,
     float *__restrict__ conformer_energies_out, std::uint8_t const *__restrict__ conformer_status_in,
     std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t output_atoms_stride,
-    std::uint32_t bin_max_atoms, float *__restrict__ polish_diagnostics_out = nullptr) {
+    std::uint32_t bin_max_atoms, float *__restrict__ polish_diagnostics_out) {
 
     std::uint32_t const warp_id = blockIdx.x;
     std::uint32_t const lane = threadIdx.x;
@@ -645,10 +680,10 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
         // Stage per-atom params into shmem for this pair, folding the pair-invariant half of the
         // combining rules on the way in so the minimizer never re-derives it.
         {
-            mmff94_atom_vdw_params_t const *global_vdw = mmff_atom_vdw + meta.mmff_atom_vdw_offset;
+            mmff94_atom_vdw_params_t const *global_vdw = mmff_atom_vdw + meta.atom_base_offset;
             for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k)
                 shared_atom_vdw[atom] = fold_atom_vdw_params_(global_vdw[atom]);
-            float const *global_charge = mmff_atom_charge + meta.mmff_atom_charge_offset;
+            float const *global_charge = mmff_atom_charge + meta.atom_base_offset;
             for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k)
                 shared_atom_charge[atom] = global_charge[atom];
         }
@@ -663,7 +698,7 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
                                               mmff_oop_terms + meta.mmff_oop_offset,
                                               mmff_stretchbend_terms + meta.mmff_stretchbend_offset,
                                               mmff_interactions,
-                                              mmff_atom_offsets + meta.mmff_atom_csr_offset,
+                                              mmff_atom_offsets + meta.atom_base_offset,
                                               num_atoms};
 
         float *positions = shared_float;

@@ -457,6 +457,31 @@ static void compare_torsion_against_rdkit_(sf::parameters::mmff94_tables_view_t 
 }
 
 /**
+ *  @brief Check the collection-wide VdW scalars, which reach the device as compiled-in constants.
+ *
+ *  No table carries these, so no probe key can reach them: the nonbonded kernel compiles `B`, `Beta`,
+ *  `DARAD` and `DAEPS` in as `mmff94_vdw_*_k`, and this is the only place a parameter file that changed
+ *  one of them would be noticed. `power` has no consumer at all — `r_star` arrives already combined from
+ *  the tabulated `R_star` column — so it is compared against the value that assumption rests on.
+ */
+static void compare_vdw_constants_against_rdkit_(diagnostic_reporter_t &reporter) {
+    /** MMFF `power`. Nothing raises `alpha_i` to it, and a change here is a reason to re-read the rule. */
+    constexpr float unconsumed_vdw_power_k = 0.25f;
+    auto const *collection = RDKit::MMFF::DefaultParameters::getMMFFVdW();
+    reporter.mismatch("vdw_constants", "collection=MMFFVdW")
+        .field("power", collection->power, unconsumed_vdw_power_k, equal_within(rdkit_narrowing_tolerance_k))
+        .field("asymmetry_amplitude", collection->B, sf::parameters::mmff94_vdw_asymmetry_amplitude_k,
+               equal_within(rdkit_narrowing_tolerance_k))
+        .field("asymmetry_decay", collection->Beta, sf::parameters::mmff94_vdw_asymmetry_decay_k,
+               equal_within(rdkit_narrowing_tolerance_k))
+        .field("donor_acceptor_radius_scale", collection->DARAD,
+               sf::parameters::mmff94_vdw_donor_acceptor_radius_scale_k, equal_within(rdkit_narrowing_tolerance_k))
+        .field("donor_acceptor_well_depth_scale", collection->DAEPS,
+               sf::parameters::mmff94_vdw_donor_acceptor_well_depth_scale_k, equal_within(rdkit_narrowing_tolerance_k));
+    reporter.summarize("vdw_constants");
+}
+
+/**
  *  @brief Put every key to RDKit's live lookups and to ours.
  *
  *  @param[in] host_tables Extracted tables, viewed for the lookups under test.
@@ -469,6 +494,7 @@ static void compare_against_rdkit_(sf::parameters::mmff94_tables_host_t const &h
     // Both suites close a section per table under the same subject names, so each says which one it is.
     fmt::println("NOTE suite=host reference=rdkit observed=ours");
     auto const tables = host_tables.view();
+    compare_vdw_constants_against_rdkit_(reporter);
     compare_vdw_against_rdkit_(tables, keys.vdw_keys, reporter, coverage.van_der_waals);
     compare_bond_against_rdkit_(tables, keys.bond_keys, reporter, coverage.bond);
     compare_angle_against_rdkit_(tables, keys.angle_keys, reporter, coverage.angle);
@@ -695,8 +721,11 @@ static void compare_against_device_(sf::parameters::mmff94_tables_host_t const &
     // scope and the stream is destroyed only once nothing is left to free against it.
     {
         sf::parameters::mmff94_tables_device_t device_storage;
-        sf::parameters::upload_mmff94_tables_to_device(host_tables, device_storage, stream);
-        if (cudaStreamSynchronize(stream) != cudaSuccess || device_storage.view.vdw.empty()) {
+        // The residency is the verdict, not the span length: an upload that silently refused would leave
+        // every table empty and turn the four sections below into a comparison of nothing against nothing.
+        sf::types::table_residency_t const residency = sf::parameters::upload_mmff94_tables_to_device(
+            host_tables, device_storage, stream);
+        if (cudaStreamSynchronize(stream) != cudaSuccess || residency == sf::types::table_residency_t::refused_k) {
             // One skipped section rather than four: no upload means no device suite at all, and closing it
             // empty is what carries the skip to the gate in `main`.
             close_skipped_section_("device_upload", "device_upload_failed", reporter);
@@ -721,11 +750,10 @@ static void compare_against_device_(sf::parameters::mmff94_tables_host_t const &
 /** One line per extracted table, so a table that came back empty is visible before anything reads it. */
 static void report_table_sizes_(sf::parameters::mmff94_tables_host_t const &host_tables) {
     fmt::println("NOTE mmff94_tables vdw={} bond={} angle={} torsion={} oop={} stbn={} dfsb={} " //
-                 "definitions={} pbci={} chg={} herschbach_laurie={} max_atom_type={} vdw_power={}",
+                 "definitions={} pbci={} chg={} herschbach_laurie={} max_atom_type={}",
                  host_tables.vdw.size(), host_tables.bond.size(), host_tables.angle.size(), host_tables.torsion.size(),
                  host_tables.oop.size(), host_tables.stbn.size(), host_tables.dfsb.size(), host_tables.def.size(),
-                 host_tables.pbci.size(), host_tables.chg.size(), host_tables.hl.size(), host_tables.max_atom_type,
-                 host_tables.vdw_constants.vdw_power);
+                 host_tables.pbci.size(), host_tables.chg.size(), host_tables.hl.size(), host_tables.max_atom_type);
 }
 
 /** One line naming how many keys each table will be probed with, before either suite runs. */

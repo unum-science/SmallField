@@ -140,8 +140,9 @@ trio_launch_t launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t 
                                                   custd::span<std::uint32_t const> atom_offsets,
                                                   std::uint32_t total_atom_count, kernel_trio_timings_t &timings) {
     sfparam::mmff94_tables_device_t tables_device;
-    sfparam::upload_mmff94_tables_to_device(tables_host, tables_device, nullptr);
-    if (tables_device.view.vdw.empty()) return trio_launch_t::table_upload_failed_k;
+    if (sfparam::upload_mmff94_tables_to_device(tables_host, tables_device, nullptr) ==
+        sft::table_residency_t::refused_k)
+        return trio_launch_t::table_upload_failed_k;
 
     std::uint32_t const num_molecules = static_cast<std::uint32_t>(descriptors.size());
     print_gpu_memory_usage_("before alloc");

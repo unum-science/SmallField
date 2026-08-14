@@ -314,27 +314,6 @@ static bool upload_(capture_manifest_t const &manifest, std::vector<char> const 
 
 #pragma region Polish Histogram
 
-/** What one conformer slot's row of `polish_diagnostic_floats_k` floats says, unpacked. */
-struct polish_row_t {
-    sfc::polish_path_t path = sfc::polish_path_t::unreached_k;
-    float rms_gradient = 0.0f;
-    float final_timestep = 0.0f;
-    float iterations = 0.0f;
-    sfc::fire_status_t status = sfc::fire_status_t::converged_k;
-    float staged_energy = 0.0f;
-};
-
-static polish_row_t polish_row_(std::vector<float> const &diagnostics, std::uint64_t slot) {
-    float const *const row = diagnostics.data() + slot * sfc::polish_diagnostic_floats_k;
-    auto const field = [row](sfc::polish_diagnostic_t which) { return row[static_cast<std::uint32_t>(which)]; };
-    return {.path = static_cast<sfc::polish_path_t>(static_cast<int>(field(sfc::polish_diagnostic_t::path_k))),
-            .rms_gradient = field(sfc::polish_diagnostic_t::rms_gradient_k),
-            .final_timestep = field(sfc::polish_diagnostic_t::final_timestep_k),
-            .iterations = field(sfc::polish_diagnostic_t::iterations_k),
-            .status = static_cast<sfc::fire_status_t>(static_cast<int>(field(sfc::polish_diagnostic_t::fire_status_k))),
-            .staged_energy = field(sfc::polish_diagnostic_t::staged_energy_k)};
-}
-
 /** One decade per bucket, shared by the timestep and the RMS gradient — both are read as decades. */
 static constexpr std::size_t decade_bucket_count_k = 7;
 static constexpr float decade_edges_k[decade_bucket_count_k] = {1e-6f, 1e-5f, 1e-4f, 1e-3f, 1e-2f, 1e-1f, 1e30f};
@@ -368,7 +347,7 @@ static void print_quantiles_(char const *name, std::vector<float> &samples) {
  */
 static void report_polish_diagnostics_(std::vector<float> const &diagnostics, std::vector<float> const &energies,
                                        std::uint64_t slot_count) {
-    std::uint64_t path_counts[5] = {0, 0, 0, 0, 0};
+    std::uint64_t path_counts[sfc::polish_path_count_k] = {};
     std::uint64_t timestep_counts[decade_bucket_count_k] = {};
     std::uint64_t rms_counts[decade_bucket_count_k] = {};
     std::uint64_t converged = 0, exhausted = 0;
@@ -377,8 +356,9 @@ static void report_polish_diagnostics_(std::vector<float> const &diagnostics, st
     std::uint64_t relaxed = 0;
     std::vector<float> final_energies, final_gradients;
 
+    custd::span<float const> const rows {diagnostics.data(), diagnostics.size()};
     for (std::uint64_t slot = 0; slot < slot_count; ++slot) {
-        polish_row_t const row = polish_row_(diagnostics, slot);
+        sfc::polish_row_t const row = sfc::decode_polish_row(rows, slot);
         ++path_counts[static_cast<int>(row.path)];
         if (row.path != sfc::polish_path_t::write_back_declined_k &&
             row.path != sfc::polish_path_t::write_back_accepted_k)

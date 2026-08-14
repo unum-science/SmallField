@@ -2,7 +2,7 @@
 
 ![SmallField conformer generation library](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/SmallField.jpg?raw=true)
 
-__SmallField__ generates 3D conformers from _"Simplified Molecular-Input Line-Entry System"_ SMILES strings using _"Experimental-Torsion Basic-Knowledge Distance Geometry"_ [ETKDG](https://doi.org/10.1021/acs.jcim.5b00654), followed by _"Merck Molecular Force Field"_ [MMFF94](https://doi.org/10.1006/jcat.1996.0027) optimization, entirely on the GPU.
+__SmallField__ generates 3D conformers from _"Simplified Molecular-Input Line-Entry System"_ SMILES strings using _"Experimental-Torsion Basic-Knowledge Distance Geometry"_ [ETKDG](https://doi.org/10.1021/acs.jcim.5b00654), followed by _"Merck Molecular Force Field"_ [MMFF94](https://doi.org/10.1002/%28SICI%291096-987X%28199604%2917%3A5/6%3C490%3A%3AAID-JCC1%3E3.0.CO%3B2-P) optimization, entirely on the GPU.
 One CUDA warp processes one molecule and runs all pipeline stages in shared memory with no global-memory atomics.
 CPU preprocessing uses [RDKit](https://github.com/rdkit/rdkit) for SMILES parsing, bounds matrices, _"Cambridge Structural Database"_ CSD torsion lookup, and MMFF94 parameter extraction.
 
@@ -103,18 +103,18 @@ Nothing in that chain returns to the CPU; the host uploads a descriptor, a bound
 
 Then the embedding itself, one warp per molecule, all data resident in shared memory:
 
-| #    | Stage                      | Method                                                             |
-| :--- | :------------------------- | :----------------------------------------------------------------- |
-| 1    | Bounds upload              | fp32 host → device, unquantized on the wire                        |
-| 2    | Triangle smoothing         | Floyd-Warshall on float bounds, fused into the prepass             |
-| 3    | Native metric init         | SmallField classical MDS embedding + mirrored retries              |
-| 4    | Bounds quantization        | int8 into shared memory, per-molecule linear scale                 |
-| 5    | Distance-geometry minimize | FIRE optimizer, 4D, atom-centric                                   |
-| 6    | Stereo check               | Chiral volume sign validation                                      |
-| 7    | 4th-dim crush              | FIRE with w&#8324; penalty                                         |
-| 8    | ETK torsion refine         | FIRE, 3D, 6-term Fourier + distance constraints                    |
-| 9    | Final validation           | Repeat stereo check                                                |
-| 10   | MMFF94 polish              | FIRE, 3D, full force field: van der Waals + electrostatic + bonded |
+| #    | Stage                       | Method                                                                |
+| :--- | :-------------------------- | :-------------------------------------------------------------------- |
+| 1    | Bounds upload               | fp32 host → device, unquantized on the wire                           |
+| 2    | Triangle smoothing          | Floyd-Warshall on float bounds, fused into the prepass                |
+| 3    | Native metric init          | SmallField classical MDS embedding + mirrored retries                 |
+| 4    | Bounds quantization         | int8 into shared memory, per-molecule linear scale                    |
+| 5    | Distance-geometry minimize  | FIRE optimizer, 4D, atom-centric                                      |
+| 6    | Stereo check                | Chiral volume sign validation                                         |
+| 7    | 4th-dim crush               | FIRE with w&#8324; penalty                                            |
+| 8    | ETK torsion refine          | FIRE, 3D, 6-term Fourier + distance constraints                       |
+| 9    | Final validation            | Repeat stereo check                                                   |
+| 10   | MMFF94 polish               | FIRE, 3D, full force field: van der Waals + electrostatic + bonded    |
 | 11   | Shipped-geometry validation | Chiral volumes and declared E/Z re-read from the polished coordinates |
 
 Stage 11 exists because stage 10 rewrites every coordinate after stage 9 has already stamped its verdict, and carries no stereochemistry term of its own — so a centre or bond the polish inverts would otherwise leave no trace.
@@ -288,15 +288,17 @@ Apache Arrow + Parquet are optional and only needed for the batch CLI binary.
 
 ## Acknowledgements
 
+The methods are not ours.
+[ETKDG](https://doi.org/10.1021/acs.jcim.5b00654) is Riniker and Landrum's, and [MMFF94](https://doi.org/10.1002/%28SICI%291096-987X%28199604%2917%3A5/6%3C490%3A%3AAID-JCC1%3E3.0.CO%3B2-P) is Halgren's.
+SmallField changes neither; it moves them onto the GPU.
+
 [RDKit](https://github.com/rdkit/rdkit) did the bulk of this work, over two decades, before any of it was fast.
-The chemistry SmallField runs is theirs — the distance geometry, the torsion preferences, the force field and the parameter sets behind them — and every correctness claim here is a claim about agreeing with them.
-A reimplementation is only ever as good as what it reimplements, and the fixes that landed in their 2026.03 series are cited in the commits that borrowed them.
+Every correctness claim here is a claim about agreeing with them, and a reimplementation is only ever as good as what it reimplements.
 
 [Nebius](https://nebius.com) provided the compute this was built and measured on.
-Nothing in the benchmarks would exist without hardware to run them against.
 
-[NVIDIA](https://github.com/NVIDIA/nvMolKit) deserves acknowledgement well beyond the GPUs.
-Their sustained work on accelerating science is what makes a project like this reasonable to attempt at all, and nvMolKit is pushing the same problem forward from a different direction.
+[NVIDIA](https://www.nvidia.com) deserves acknowledgement well beyond the GPUs: their sustained work on accelerating science is what makes a project like this reasonable to attempt at all.
+[nvMolKit](https://github.com/NVIDIA-Digital-Bio/nvMolKit) is their own GPU conformer generator, and the closest comparable work — it is the baseline in the table above.
 
 ## License
 

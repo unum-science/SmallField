@@ -111,7 +111,7 @@ static __global__ __launch_bounds__(32, 8) void etk_build_csr_kernel(
 
     etk_torsion_descriptor_t const *mol_torsions = torsions + (std::size_t)molecule_index * torsion_stride;
     distance_constraint_t const *mol_constraints = constraints + meta.constraint_offset;
-    etk_atom_offsets_t *mol_atom_offsets = atom_offsets + meta.etk_atom_csr_offset;
+    etk_atom_offsets_t *mol_atom_offsets = atom_offsets + meta.atom_base_offset;
     etk_atom_interaction_t *mol_interactions = interactions + meta.etk_interaction_offset;
 
     for (std::uint32_t atom = 0; atom < num_atoms; ++atom) mol_atom_offsets[atom] = {0u, 0u};

@@ -68,23 +68,19 @@ static constexpr float corpus_distortion_k = 0.20f;
  *  project's own parse of the SMILES while the coordinates come from RDKit's. Atom indexing is fingerprinted
  *  before a molecule is compared at all, so what remains is chemistry the two parses perceive differently.
  *
- *  Measured over the first 300 SMILES of `data/usearch-molecules/example`, 476 of 600 scorings reaching a
- *  comparison and 66,284 comparisons per term: bond, out-of-plane and nonbonded are exact, angle differs at
- *  332 ppm and stretch-bend at 302 ppm — gradient components only, no energy — so this budget is six times
- *  the worst of them and still an order of magnitude below a term that has actually regressed.
+ *  Measured 2026-08-14 over the first 300 SMILES of `data/usearch-molecules/example`, 526 of 600 scorings
+ *  reaching a comparison and 73,282 comparisons per term: bond and nonbonded are exact, out-of-plane and
+ *  torsion differ at 123 ppm, stretch-bend at 396 ppm and angle at 423 ppm — gradient components only, no
+ *  energy — so this budget is roughly five times the worst of them and still an order of magnitude below a
+ *  term that has actually regressed.
+ *
+ *  One budget covers every term. Torsion carried its own at 80,000 ppm, admitting a 47,644 ppm divergence
+ *  in which 149 disagreements were energies rather than gradient components; on the same corpus it now
+ *  measures 123 ppm, level with out-of-plane. The divergence was fixed and the exception outlived it,
+ *  which is what a per-term budget does when nobody re-measures. Triage a rise against
+ *  `test_mmff_cpu_port` and the SMILES parser rather than reintroducing one.
  */
 static constexpr double max_corpus_term_mismatch_ppm_k = 2000.0;
-
-/**
- *  @brief The same ceiling for torsion, which carries the one divergence this comparison cannot attribute here.
- *
- *  On the sample above torsion differs at 47,644 ppm, and 149 of those are energies rather than gradient
- *  components, spread over 84 molecules: an isolated-torsion energy that differs by kcal/mol at identical
- *  coordinates is a difference in the terms, not in the kernel that sums them. The MMFF torsion type is the
- *  term most sensitive to ring and aromaticity perception, which is where the two parses part company.
- *  Triage a rise against `test_mmff_cpu_port` and the SMILES parser rather than loosening this.
- */
-static constexpr double max_corpus_torsion_mismatch_ppm_k = 80000.0;
 
 namespace smallfield::tests {
 
@@ -616,11 +612,6 @@ static void fill_corpus_cases_into_(custd::span<std::string const> corpus, std::
 
 #pragma region Verdicts
 
-/** The ceiling one term's corpus disagreement must stay under, in parts per million. */
-static double corpus_budget_ppm_(term_kind_t kind) {
-    return kind == term_kind_t::torsion_k ? max_corpus_torsion_mismatch_ppm_k : max_corpus_term_mismatch_ppm_k;
-}
-
 /**
  *  @brief Close the curated sections and answer with the exit code they decided.
  *
@@ -675,7 +666,7 @@ static int report_corpus_(term_reporters_t &reporters, intake_tally_t const &tal
         // A term that compared nothing reports as wholly differing: a vacuous section must not read clean.
         double const differing_ppm = compared == 0 ? 1.0e6
                                                    : 1.0e6 * static_cast<double>(reporter.mismatch_count()) / compared;
-        double const budget = corpus_budget_ppm_(kind);
+        double const budget = max_corpus_term_mismatch_ppm_k;
         diagnostic_verb_t const verb = differing_ppm > budget ? diagnostic_verb_t::fail_k : diagnostic_verb_t::note_k;
         std::FILE *const stream = diagnostic_stream(verb);
         if (stream == stderr) std::fflush(stdout);
@@ -698,7 +689,8 @@ static int report_corpus_(term_reporters_t &reporters, intake_tally_t const &tal
 int main(int argc, char **argv) {
     fmt::println("{}: MMFF94 per-term energy and gradient against RDKit, one term at a time", test_name_k);
 
-    auto const selection = sftest::select_corpus(argc, argv, default_max_molecules_k);
+    auto const selection = sftest::select_corpus(argc, argv, default_max_molecules_k,
+                                                 sftest::adversarial_corpus_path());
     if (selection.knob == sftest::corpus_knob_t::refused_k) {
         std::fflush(stdout);
         fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", test_name_k);

@@ -104,8 +104,7 @@ typer_probe_t launch_mmff94_gpu_typer_batch(sfparam::mmff94_tables_view_t tables
 void *create_mmff94_device_tables_view(sfparam::mmff94_tables_host_t const &host,
                                        sfparam::mmff94_tables_view_t &out_view) {
     auto *device_tables = new sfparam::mmff94_tables_device_t;
-    sfparam::upload_mmff94_tables_to_device(host, *device_tables, nullptr);
-    if (device_tables->view.vdw.empty()) {
+    if (sfparam::upload_mmff94_tables_to_device(host, *device_tables, nullptr) == sft::table_residency_t::refused_k) {
         delete device_tables;
         return nullptr;
     }

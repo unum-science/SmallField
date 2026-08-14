@@ -5,8 +5,9 @@
 # host wrapper the .cu defines, which is ordinary host linkage -- no relocatable device code is involved, which is why
 # `define_smallfield_target` leaves it off.
 #
-# EXTRA_SOURCES carries a table a test owns but does not want in its own translation unit: rows of plain data belong in
-# a host-only .cpp for the same reason `csd_torsion_table.cpp` is one.
+# EXTRA_SOURCES carries a source a test owns but does not want in its own translation unit: a table of plain data
+# belongs in a host-only .cpp for the same reason `csd_torsion_table.cpp` is one, and a sidecar another test already
+# defines is named here rather than copied.
 #
 # GPU marks a test that drives the device, and sets the `RESOURCE_LOCK` CTest holds while it runs, so `ctest -j` never
 # starts two of them at once.  Several of these size a device allocation against the whole card, so run together they
@@ -32,8 +33,11 @@ function (define_smallfield_test subfolder base_name)
         LINK ${ARG_LINK}
     )
     add_test(NAME test_${base_name} COMMAND test_${base_name})
+    # The lock and the label are one fact: a test that must not run beside another device test is exactly a test a
+    # GPU-less runner cannot run at all.  Written together so `ctest --label-exclude gpu` and the serialization can
+    # never disagree about which half a binary is in.
     if (ARG_MIXED OR ARG_GPU)
-        set_tests_properties(test_${base_name} PROPERTIES RESOURCE_LOCK smallfield_gpu)
+        set_tests_properties(test_${base_name} PROPERTIES RESOURCE_LOCK smallfield_gpu LABELS gpu)
     endif ()
 endfunction ()
 
@@ -82,14 +86,15 @@ define_smallfield_test(mmff94 mmff_cpu_port)
 define_smallfield_test(mmff94 mmff_typer)
 
 # Per-term parity reuses the single-molecule energy entry point that the gradient test's kernel wrapper already exposes,
-# so it takes that sidecar rather than one of its own.
-define_smallfield_target(
-    test_mmff_term_parity
-    SOURCES mmff94/test_mmff_term_parity.cpp cuda/test_mmff_gradient_kernels.cu
-    LINK smallfield_lib
-)
-add_test(NAME test_mmff_term_parity COMMAND test_mmff_term_parity)
-set_tests_properties(test_mmff_term_parity PROPERTIES RESOURCE_LOCK smallfield_gpu)
+# so it takes that sidecar rather than one of its own.  Registered through the function like everything else, or it is
+# the one test that silently misses whatever the function grows next.
+define_smallfield_test(mmff94 mmff_term_parity GPU EXTRA_SOURCES cuda/test_mmff_gradient_kernels.cu)
+
+# The fallback policy is a `constexpr` switch and a span walk, so the test asserts it without ever reaching a device.
+# `smallfield_lib` would only add the `rdkit_fallback` definition it never calls; `smallfield_rdkit` and `CUDA::cudart`
+# are here for their include directories alone, carrying the RDKit headers `molecule_descriptor_t` is declared against
+# and the libcu++ headers behind `smallfield/types/views.hpp`.
+define_smallfield_test(cli fallback_policy LINK smallfield_rdkit fmt::fmt CUDA::cudart)
 
 define_smallfield_test(api conformer_slot_layout)
 define_smallfield_test(api pipeline GPU)

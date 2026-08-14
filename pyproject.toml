@@ -51,9 +51,14 @@ dev = ["pytest", "pytest-benchmark", "rdkit", "pybind11", "black", "ruff"]
 version = { file = "VERSION" }
 
 # `python/` on the path so `import smallfield` resolves from a clone without an install step, which
-# is what lets the CPU test job run before anything is built.
+# is what lets the CPU test job run before anything is built; `bench/` so the stereo harness's own
+# verdict is testable without a shard folder or a device.
+#
+# `test/api` is the GPU tier: everything there binds the compiled `_smallfield` extension at import,
+# so a hosted runner cannot collect it. The directory is the marker rather than a `pytest.mark`,
+# because a marker still imports the module during collection and a skip is not a verdict.
 [tool.pytest.ini_options]
-pythonpath = ["python"]
+pythonpath = ["python", "bench"]
 testpaths = ["test"]
 
 [tool.black]

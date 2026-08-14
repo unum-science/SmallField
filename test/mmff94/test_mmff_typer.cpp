@@ -236,7 +236,7 @@ static std::size_t test_kekulized_bond_types_(std::string const &smiles, sfparam
 int main(int argc, char **argv) {
     fmt::println("{}: native MMFF atom-typer + BCI charge gate vs RDKit", test_name_k);
 
-    auto const corpus = sftest::select_corpus(argc, argv, 5000);
+    auto const corpus = sftest::select_corpus(argc, argv, 5000, sftest::adversarial_corpus_path());
     if (corpus.knob == sftest::corpus_knob_t::refused_k) {
         std::fflush(stdout);
         fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", test_name_k);

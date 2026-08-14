@@ -2,10 +2,10 @@
  *  @file src/smallfield/mmff94/mmff94_extract_device.cuh
  *  @brief `mmff94_extract_terms_kernel` runs the native MMFF term extractor on the GPU.
  *
- *  Four kernels in sequence. The extractor and `mmff94_build_csr_kernel` write per-molecule slots of
+ *  Three kernels in sequence. The extractor and `mmff94_build_csr_kernel` write per-molecule slots of
  *  fixed stride, sized by the `max_mmff_*_per_mol_k` constants, and report their actual counts;
- *  `mmff94_scan_counts_kernel` prefix-sums those counts and `mmff94_compact_terms_kernel` packs the
- *  staging into the variable-length layout `wave_slice_pool_t` and `mmff_polish_warp_kernel` consume.
+ *  `mmff94_compact_terms_kernel` packs the staging into the variable-length layout `wave_slice_pool_t`
+ *  and `mmff_polish_warp_kernel` consume, at the per-molecule base offsets its caller supplies.
  */
 
 #pragma once
@@ -77,16 +77,9 @@ struct mmff94_per_mol_counts_t {
     std::uint8_t padding;
 };
 
-/** Batch-global base offset of one molecule inside each packed term array. The conformer pipeline
- *  fills these on the host from per-molecule capacity bounds and skips `mmff94_scan_counts_kernel`
- *  entirely, so the sizing never crosses the bus. */
+/** Batch-global base offset of one molecule inside each packed term array. The caller fills these on
+ *  the host by prefix-summing per-molecule capacity bounds, so the sizing never crosses the bus. */
 using smallfield::types::mmff94_packed_offsets_t;
-
-/** Number of independently scanned components in `mmff94_packed_offsets_t`. */
-inline constexpr std::uint32_t mmff94_packed_components_k = 6;
-
-/** Thread count of the single-block scan that turns per-molecule counts into packed offsets. */
-inline constexpr std::uint32_t mmff94_scan_block_k = 512;
 
 /** Angle scratch, written by the angle pass and read by the stretch-bend pass. Held in shared memory,
  *  one array per block rather than one per thread. */
@@ -562,68 +555,6 @@ static __launch_bounds__(warp_size_k, 8) __global__ void mmff94_build_csr_kernel
     }
 }
 
-/**
- *  @brief Exclusive prefix sum of the per-molecule term counts, plus the batch totals in @p totals.
- *
- *  A single block of `mmff94_scan_block_k` threads sweeps the molecule axis one tile at a time,
- *  carrying the running sums in registers, so no temporary block-sum array is needed.
- */
-static __launch_bounds__(mmff94_scan_block_k, 1) __global__
-    void mmff94_scan_counts_kernel(mmff94_per_mol_counts_t const *__restrict__ per_mol_counts,
-                                   std::uint32_t num_molecules, mmff94_packed_offsets_t *__restrict__ per_mol_offsets,
-                                   mmff94_packed_offsets_t *__restrict__ totals) {
-
-    __shared__ std::uint32_t partial_sums[mmff94_packed_components_k][mmff94_scan_block_k];
-    std::uint32_t const slot = threadIdx.x;
-    std::uint32_t carry[mmff94_packed_components_k] = {0, 0, 0, 0, 0, 0};
-
-    for (std::uint32_t tile_base = 0; tile_base < num_molecules; tile_base += mmff94_scan_block_k) {
-        std::uint32_t const molecule = tile_base + slot;
-        std::uint32_t own_counts[mmff94_packed_components_k] = {0, 0, 0, 0, 0, 0};
-        if (molecule < num_molecules) {
-            auto const counts = per_mol_counts[molecule];
-            own_counts[0] = counts.bonds;
-            own_counts[1] = counts.angles;
-            own_counts[2] = counts.torsions;
-            own_counts[3] = counts.oops;
-            own_counts[4] = counts.stretchbends;
-            own_counts[5] = counts.interactions;
-        }
-        for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
-            partial_sums[component][slot] = own_counts[component];
-        __syncthreads();
-
-        for (std::uint32_t stride = 1; stride < mmff94_scan_block_k; stride <<= 1) {
-            std::uint32_t addend[mmff94_packed_components_k];
-            for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
-                addend[component] = slot >= stride ? partial_sums[component][slot - stride] : 0u;
-            __syncthreads();
-            for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
-                partial_sums[component][slot] += addend[component];
-            __syncthreads();
-        }
-
-        if (molecule < num_molecules)
-            per_mol_offsets[molecule] = {.bonds = carry[0] + partial_sums[0][slot] - own_counts[0],
-                                         .angles = carry[1] + partial_sums[1][slot] - own_counts[1],
-                                         .torsions = carry[2] + partial_sums[2][slot] - own_counts[2],
-                                         .oops = carry[3] + partial_sums[3][slot] - own_counts[3],
-                                         .stretchbends = carry[4] + partial_sums[4][slot] - own_counts[4],
-                                         .interactions = carry[5] + partial_sums[5][slot] - own_counts[5]};
-        for (std::uint32_t component = 0; component < mmff94_packed_components_k; ++component)
-            carry[component] += partial_sums[component][mmff94_scan_block_k - 1];
-        __syncthreads();
-    }
-
-    if (slot == 0)
-        *totals = {.bonds = carry[0],
-                   .angles = carry[1],
-                   .torsions = carry[2],
-                   .oops = carry[3],
-                   .stretchbends = carry[4],
-                   .interactions = carry[5]};
-}
-
 /** Lane-strided copy of @p count elements from the staging slot into the packed array. */
 template <typename element_>
 __device__ inline void copy_packed_terms_(element_ const *__restrict__ source, element_ *__restrict__ destination,
@@ -635,7 +566,7 @@ __device__ inline void copy_packed_terms_(element_ const *__restrict__ source, e
 /**
  *  @brief Compact the fixed-stride staging arrays into the packed layout `wave_slice_pool_t` uses.
  *
- *  One warp per molecule. Every term type is copied to the batch-global base the scan assigned, the
+ *  One warp per molecule. Every term type is copied to the batch-global base @p per_mol_offsets names, the
  *  per-atom CSR starts are rebased from molecule-relative to batch-global, and the molecule's metadata
  *  entry gains the offsets and counts `mmff_polish_warp_kernel` and `bond_distance_kernel` read. A
  *  molecule the typer routed to the CPU fallback carries zero counts, so it contributes an empty slice
@@ -707,9 +638,7 @@ static __launch_bounds__(warp_size_k, 8) __global__ void mmff94_compact_terms_ke
     entry.mmff_torsion_offset = bases.torsions;
     entry.mmff_oop_offset = bases.oops;
     entry.mmff_stretchbend_offset = bases.stretchbends;
-    entry.mmff_atom_csr_offset = atom_base;
-    entry.mmff_atom_vdw_offset = atom_base;
-    entry.mmff_atom_charge_offset = atom_base;
+    entry.atom_base_offset = atom_base;
 }
 #endif // __CUDACC__
 

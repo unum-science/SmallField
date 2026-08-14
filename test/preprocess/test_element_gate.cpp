@@ -119,7 +119,10 @@ static bool gate_can_answer_(sft::conformer_status_t status) noexcept {
     case sft::conformer_status_t::preprocess_timeout_k:
     case sft::conformer_status_t::bounds_infeasible_k:
     case sft::conformer_status_t::nonphysical_energy_k:
-    case sft::conformer_status_t::batch_overflow_k: return false;
+    case sft::conformer_status_t::batch_overflow_k:
+    // `slot_unwritten_k` names the absence of a device verdict, and the gate runs on the host before any
+    // slot exists to be left unwritten.
+    case sft::conformer_status_t::slot_unwritten_k: return false;
     }
     // A status byte no enumerator claims is nothing the gate answers with, so it borrows no verdict.
     return false;
@@ -206,7 +209,7 @@ int main(int argc, char **argv) {
     fmt::println("{}: MMFF94 element gate over curated rejections, then a corpus for the gate's invariants",
                  test_name_k);
 
-    auto const selection = sftest::select_corpus(argc, argv, 10000);
+    auto const selection = sftest::select_corpus(argc, argv, 10000, sftest::adversarial_corpus_path());
     if (selection.knob == sftest::corpus_knob_t::refused_k) {
         fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", argv[0]);
         return 2;

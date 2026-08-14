@@ -64,6 +64,7 @@ using smallfield::types::hybridization_sp2_k;
 using smallfield::types::max_bonds_k;
 using smallfield::types::molecule_descriptor_t;
 using smallfield::types::reserve_outcome_t;
+using smallfield::types::table_residency_t;
 using smallfield::types::upload_into;
 
 /**
@@ -203,17 +204,22 @@ struct csd_torsion_table_device_t {
  *  @param[in] source Host array to copy.
  *  @param[in] stream Orders the allocation and the copy, and names the device they land on.
  *  @param[in] sink Routes a refused allocation or copy to the logger and the error counter.
- *  @return Whether the array is resident. On failure the stream carries the reason.
+ *  @return Whether the array is resident. An empty source is resident. On failure the stream carries the reason.
  */
 template <typename element_>
-[[nodiscard]] bool upload_table_array_(buffer<element_, device_allocator_t> &destination,
-                                       std::vector<element_> const &source, cudaStream_t stream,
-                                       cuda_error_sink_t const &sink) {
+[[nodiscard]] table_residency_t upload_table_array_(buffer<element_, device_allocator_t> &destination,
+                                                    std::vector<element_> const &source, cudaStream_t stream,
+                                                    cuda_error_sink_t const &sink) {
     destination = buffer<element_, device_allocator_t>(device_allocator_t {.stream = stream});
-    if (source.empty()) return true;
-    if (destination.try_reserve(source.size()) == reserve_outcome_t::failed_k)
-        return sink.check(cudaErrorMemoryAllocation, "upload_csd_torsion_table_to_device");
-    return upload_into<element_>(destination.view(), {source.data(), source.size()}, stream, sink);
+    if (source.empty()) return table_residency_t::resident_k;
+    if (destination.try_reserve(source.size()) == reserve_outcome_t::failed_k) {
+        [[maybe_unused]] bool const reported = sink.check(cudaErrorMemoryAllocation,
+                                                          "upload_csd_torsion_table_to_device");
+        return table_residency_t::refused_k;
+    }
+    if (!upload_into<element_>(destination.view(), {source.data(), source.size()}, stream, sink))
+        return table_residency_t::refused_k;
+    return table_residency_t::resident_k;
 }
 
 /** Raise the per-thread device stack to `csd_torsion_stack_bytes_k` when it sits lower. */
@@ -234,20 +240,27 @@ inline void ensure_csd_torsion_device_stack() {
  *  @param[out] device Device buffers and view; the caller keeps them alive for every kernel that reads them.
  *  @param[in] stream Orders the allocations and the copies, and outlives the buffers they produce.
  *  @param[in] sink Routes a refused allocation or copy to the logger and the error counter.
+ *  @return Whether the whole table is resident. A refused device must not be given molecules.
  */
-inline void upload_csd_torsion_table_to_device(csd_torsion_table_host_t const &host, csd_torsion_table_device_t &device,
-                                               cudaStream_t stream, cuda_error_sink_t const &sink = {}) {
+[[nodiscard]] inline table_residency_t upload_csd_torsion_table_to_device(csd_torsion_table_host_t const &host,
+                                                                          csd_torsion_table_device_t &device,
+                                                                          cudaStream_t stream,
+                                                                          cuda_error_sink_t const &sink = {}) {
     ensure_csd_torsion_device_stack();
     device.view = {};
-    if (!upload_table_array_(device.patterns, host.patterns, stream, sink)) return;
-    if (!upload_table_array_(device.nodes, host.nodes, stream, sink)) return;
-    if (!upload_table_array_(device.closures, host.closures, stream, sink)) return;
+    if (upload_table_array_(device.patterns, host.patterns, stream, sink) == table_residency_t::refused_k)
+        return table_residency_t::refused_k;
+    if (upload_table_array_(device.nodes, host.nodes, stream, sink) == table_residency_t::refused_k)
+        return table_residency_t::refused_k;
+    if (upload_table_array_(device.closures, host.closures, stream, sink) == table_residency_t::refused_k)
+        return table_residency_t::refused_k;
 
     custd::span<csd_device_pattern_t const> const patterns = device.patterns.view();
     device.view.patterns = patterns.data();
     device.view.nodes = device.nodes.data();
     device.view.closures = device.closures.data();
     device.view.num_patterns = static_cast<std::uint32_t>(patterns.size());
+    return table_residency_t::resident_k;
 }
 
 /** Assemble the matcher's read handle on one device pattern. */

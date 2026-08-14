@@ -13,10 +13,15 @@
 
 #if defined(__CUDACC__)
 
+#include "smallfield/parameters/mmff94_tables.hpp"
 #include "smallfield/types/etkdg_types.hpp"
 #include "smallfield/cuda/warp_primitives.cuh"
 
 namespace smallfield::cuda {
+using smallfield::parameters::mmff94_vdw_asymmetry_amplitude_k;
+using smallfield::parameters::mmff94_vdw_asymmetry_decay_k;
+using smallfield::parameters::mmff94_vdw_donor_acceptor_radius_scale_k;
+using smallfield::parameters::mmff94_vdw_donor_acceptor_well_depth_scale_k;
 using smallfield::types::atom_role_first_k;
 using smallfield::types::atom_role_fourth_k;
 using smallfield::types::atom_role_second_k;
@@ -91,7 +96,9 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(float const *positi
     float const vdw_radius_j = p_other.r_star;
     float const gamma = (vdw_radius_i - vdw_radius_j) * (1.0f / (vdw_radius_i + vdw_radius_j));
     bool const has_donor = (p_atom.donor_acceptor == 2) || (p_other.donor_acceptor == 2);
-    float const factor = has_donor ? 0.0f : 0.2f * (1.0f - expf(-12.0f * gamma * gamma));
+    float const factor = has_donor ? 0.0f
+                                   : mmff94_vdw_asymmetry_amplitude_k *
+                                         (1.0f - expf(-mmff94_vdw_asymmetry_decay_k * gamma * gamma));
     float vdw_radius_combined = 0.5f * (vdw_radius_i + vdw_radius_j) * (1.0f + factor);
 
     float const vdw_radius_squared = vdw_radius_combined * vdw_radius_combined;
@@ -103,8 +110,8 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(float const *positi
     bool const is_donor_acceptor_pair = (p_atom.donor_acceptor == 2 && p_other.donor_acceptor == 1) ||
                                         (p_atom.donor_acceptor == 1 && p_other.donor_acceptor == 2);
     if (is_donor_acceptor_pair) {
-        vdw_radius_combined *= 0.8f;
-        vdw_epsilon *= 0.5f;
+        vdw_radius_combined *= mmff94_vdw_donor_acceptor_radius_scale_k;
+        vdw_epsilon *= mmff94_vdw_donor_acceptor_well_depth_scale_k;
     }
 
     // Pair geometry.

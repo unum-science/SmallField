@@ -10,6 +10,7 @@
 
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::remove_cvref_t`
+#include <vector>      // `std::vector`
 
 #include <cuda_runtime.h>
 
@@ -68,7 +69,6 @@ struct extract_arena_t {
     device_array<sft::mmff94_atom_interaction_t> interactions;
     device_array<sft::mmff94_atom_offsets_t> atom_offsets_lookup;
     device_array<sfmmff::mmff94_packed_offsets_t> packed_offsets;
-    device_array<sfmmff::mmff94_packed_offsets_t> packed_totals;
     device_array<sft::mmff94_bond_t> packed_bonds;
     device_array<sft::mmff94_angle_t> packed_angles;
     device_array<sft::mmff94_torsion_t> packed_torsions;
@@ -103,16 +103,15 @@ struct extract_arena_t {
         reserve_(interactions, std::size_t {num_molecules} * sft::max_mmff_interactions_per_mol_k);
         reserve_(atom_offsets_lookup, total_atoms);
         reserve_(packed_offsets, num_molecules);
-        reserve_(packed_totals, 1);
         reserve_(metadata, num_molecules);
         return reserved;
     }
 
     /**
-     *  @brief Reserve the compacted arrays once the scan has reported what the batch actually holds.
+     *  @brief Reserve the compacted arrays once the downloaded counts say what the batch actually holds.
      *
-     *  Separate from `resize_for` because these extents are a device-computed result rather than a
-     *  property of the batch: nothing on the host knows them until the scan kernel's totals come back.
+     *  Separate from `resize_for` because these extents are what the extractor found rather than a
+     *  property of the batch: nothing on the host knows them until the per-molecule counts come back.
      *  One slot past each total keeps a batch whose every count is zero from asking for an empty array.
      */
     [[nodiscard]] bool resize_packed_for(sfmmff::mmff94_packed_offsets_t const &totals) noexcept {
@@ -139,8 +138,9 @@ extract_probe_t launch_mmff94_gpu_extract_pipeline(
     custd::span<sft::mmff94_atom_interaction_t> out_interactions,
     custd::span<sft::mmff94_atom_offsets_t> out_atom_offsets, mmff94_packed_host_result_t &packed_out) {
     sfparam::mmff94_tables_device_t device_tables;
-    sfparam::upload_mmff94_tables_to_device(tables_host, device_tables, nullptr);
-    if (device_tables.view.vdw.empty()) return extract_probe_t::table_upload_failed_k;
+    if (sfparam::upload_mmff94_tables_to_device(tables_host, device_tables, nullptr) ==
+        sft::table_residency_t::refused_k)
+        return extract_probe_t::table_upload_failed_k;
 
     // The CSR offset array carries one record per atom, so it is what states the batch's atom total.
     std::uint32_t const num_mols = static_cast<std::uint32_t>(descriptors.size());
@@ -174,20 +174,31 @@ extract_probe_t launch_mmff94_gpu_extract_pipeline(
     bool copied = sft::download_from(out_interactions, device_interactions, nullptr);
     copied &= sft::download_from(out_atom_offsets, device_atom_offsets, nullptr);
 
-    // Compaction: scan the per-molecule counts, read the totals back to size the
-    // packed arrays, then compact the fixed-stride staging into them.
-    // A single block scans the whole batch, so the grid is one whatever the molecule count is.
-    sfmmff::mmff94_scan_counts_kernel<<<1, sfmmff::mmff94_scan_block_k, 0, nullptr>>>(
-        arena.counts_per_molecule.data(), num_mols, arena.packed_offsets.data(), arena.packed_totals.data());
-    if (!launch_completed_()) return extract_probe_t::launch_failed_k;
-
-    sfmmff::mmff94_packed_offsets_t packed_totals {};
-    custd::span<sfmmff::mmff94_packed_offsets_t const> const device_totals = arena.packed_totals.view();
-    copied &= sft::download_from(custd::span<sfmmff::mmff94_packed_offsets_t> {&packed_totals, 1}, device_totals,
-                                 nullptr);
-    // The totals size every allocation below, so the host waits for them rather than reading a copy in flight.
+    // Compaction: bring the per-molecule counts home and lay the batch out here, so the offsets the
+    // compaction is judged against are the harness's own arithmetic rather than a second device pass.
+    custd::span<sfmmff::mmff94_per_mol_counts_t const> const device_counts = arena.counts_per_molecule.view();
+    copied &= sft::download_from(out_counts, device_counts, nullptr);
+    // The counts size every allocation below, so the host waits for them rather than reading a copy in flight.
     if (cudaStreamSynchronize(nullptr) != cudaSuccess) return extract_probe_t::launch_failed_k;
     if (!copied) return extract_probe_t::transfer_failed_k;
+
+    // Exclusive scan: molecule `m` is based at the sum of the counts of molecules `0 .. m - 1`, so the
+    // first molecule sits at zero and the running sum after the last one is the batch total.
+    std::vector<sfmmff::mmff94_packed_offsets_t> per_mol_offsets(num_mols);
+    sfmmff::mmff94_packed_offsets_t packed_totals {};
+    for (std::uint32_t molecule = 0; molecule < num_mols; ++molecule) {
+        auto const &counts = out_counts[molecule];
+        per_mol_offsets[molecule] = packed_totals;
+        packed_totals.bonds += counts.bonds;
+        packed_totals.angles += counts.angles;
+        packed_totals.torsions += counts.torsions;
+        packed_totals.oops += counts.oops;
+        packed_totals.stretchbends += counts.stretchbends;
+        packed_totals.interactions += counts.interactions;
+    }
+    if (!sft::upload_into(arena.packed_offsets.view(),
+                          custd::span<sfmmff::mmff94_packed_offsets_t const> {per_mol_offsets}, nullptr))
+        return extract_probe_t::transfer_failed_k;
 
     packed_out.bonds.resize(packed_totals.bonds);
     packed_out.angles.resize(packed_totals.angles);
@@ -231,9 +242,7 @@ extract_probe_t launch_mmff94_gpu_extract_pipeline(
                                  nullptr);
 
     custd::span<std::uint8_t const> const device_status = arena.typing_status.view();
-    custd::span<sfmmff::mmff94_per_mol_counts_t const> const device_counts = arena.counts_per_molecule.view();
     copied &= sft::download_from(out_status, device_status, nullptr);
-    copied &= sft::download_from(out_counts, device_counts, nullptr);
     // Full per-molecule strides, so the caller can inspect any slot.
     copied &= sft::download_from(out_bonds, custd::span<sft::mmff94_bond_t const> {arena.bonds.view()}, nullptr);
     copied &= sft::download_from(out_angles, custd::span<sft::mmff94_angle_t const> {arena.angles.view()}, nullptr);

@@ -452,7 +452,7 @@ static std::size_t compare_packed_layout_(diagnostic_reporter_t &reporter, extra
         .field("num_mmff_oops", std::uint32_t {gpu_counts.oops}, meta.num_mmff_oops, exactly_equal)
         .field("num_mmff_stretchbends", std::uint32_t {gpu_counts.stretchbends}, meta.num_mmff_stretchbends,
                exactly_equal)
-        .field("mmff_atom_csr_offset", atom_offset_base, meta.mmff_atom_csr_offset, exactly_equal);
+        .field("atom_base_offset", atom_offset_base, meta.atom_base_offset, exactly_equal);
     // The offsets below index the packed arrays, so reading them is only safe once they agree.
     if (layout.reported_field_count() != 0) return layout.reported_field_count();
 

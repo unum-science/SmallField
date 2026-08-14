@@ -78,10 +78,11 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t num_mmff_torsions;
     std::uint32_t num_mmff_oops;
     std::uint32_t num_mmff_stretchbends;
-    /** Offset into batched per-atom VdW params (= atom offset). */
-    std::uint32_t mmff_atom_vdw_offset;
-    /** Offset into batched per-atom charge (= atom offset). */
-    std::uint32_t mmff_atom_charge_offset;
+    /**
+     *  First atom of this molecule in every batched per-atom array: MMFF VdW params, MMFF partial
+     *  charges, the MMFF interaction CSR and the ETK interaction CSR all share one concatenation order.
+     */
+    std::uint32_t atom_base_offset;
     /** Offset into batched per-molecule N×N bond_distance. */
     std::uint32_t bond_distance_offset;
     std::uint32_t mmff_bond_offset;
@@ -89,11 +90,8 @@ struct etkdg_molecule_metadata_t {
     std::uint32_t mmff_torsion_offset;
     std::uint32_t mmff_oop_offset;
     std::uint32_t mmff_stretchbend_offset;
-    std::uint32_t mmff_atom_csr_offset;
     /** Offset into batched ETK interaction list. */
     std::uint32_t etk_interaction_offset;
-    /** Offset into batched ETK atom offsets. */
-    std::uint32_t etk_atom_csr_offset;
     /**
      *  @brief Heavy, non-hydrogen, atom count.
      *
@@ -108,7 +106,7 @@ struct etkdg_molecule_metadata_t {
     /** Exact molecular weight in Daltons. */
     float molecular_weight;
 };
-static_assert(sizeof(etkdg_molecule_metadata_t) == 108);
+static_assert(sizeof(etkdg_molecule_metadata_t) == 96);
 
 /*
  *  The floor a chiral center's volume must reach, in cubic angstrom, as a magnitude — the handedness

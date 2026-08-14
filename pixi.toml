@@ -29,3 +29,12 @@ rich = ">=15"
 pip = ">=26.1.1, <27"
 usearch = ">=2.25.2, <3"
 stringzilla = ">=4.6.0, <5"
+
+# The suite splits by what the machine has, not by what a test asserts. The `gpu` label comes from the same line in
+# `test/CMakeLists.txt` that sets the CTest resource lock, so one place decides which half a binary is in. The host
+# half is what a runner with no device can prove; the GPU half is invoked by hand and its results land in `BENCH.md`.
+[tasks]
+test-host = "ctest --test-dir build --output-on-failure --label-exclude gpu"
+test-gpu = "ctest --test-dir build --output-on-failure --label-regex gpu"
+test-python-host = "pytest --ignore=test/api"
+test-python-gpu = "pytest test/api"

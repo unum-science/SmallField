@@ -104,6 +104,8 @@ struct cli_config_t {
     int gpu_runner_threads = 0;
     restart_policy_t restart_policy = restart_policy_t::resume_k;
     std::uint64_t random_seed = 42;
+    /** Costs a device region, a device-to-host copy and a host pass, all per conformer slot. */
+    sfapi::polish_telemetry_t polish_telemetry = sfapi::polish_telemetry_t::disabled_k;
     int verbose_level = 0;
 };
 
@@ -123,6 +125,8 @@ static void print_usage_() {
   --rdkit-fallback-threads N  OpenMP threads for fallback-role (default: num_procs - 4)
   --gpu-runner-threads N      OpenMP threads for gpu-runner-role preprocess (default: num_procs - 4)
   --restart                   overwrite already-complete output shards
+  --polish-telemetry          one POLISH line per wave, paid for with a per-conformer
+                              device region and its readback; disabled by default
   --seed N                    RNG seed for both GPU and RDKit fallback
   --verbose[=LEVEL]           library diagnostics: 1 = wave table, 2 = +per-device
 )");
@@ -180,6 +184,13 @@ static cli_parse_t parse_cli_(int argc, char **argv, cli_config_t &config) {
     });
     parser.add_argument("--resume").flag().append().action([&config](std::string const &) {
         config.restart_policy = restart_policy_t::resume_k;
+    });
+    // The same last-one-wins shape, over the library's own two-state telemetry switch.
+    parser.add_argument("--polish-telemetry").flag().append().action([&config](std::string const &) {
+        config.polish_telemetry = sfapi::polish_telemetry_t::summarized_k;
+    });
+    parser.add_argument("--no-polish-telemetry").flag().append().action([&config](std::string const &) {
+        config.polish_telemetry = sfapi::polish_telemetry_t::disabled_k;
     });
     // Under `nargs(0, 1)` a bare `--verbose` consumes nothing and the action never fires, which is how it is
     // told apart from `--verbose=LEVEL` below.
@@ -467,6 +478,11 @@ struct progress_counters_t {
     std::atomic<std::uint64_t> input_files_failed {0};
     /** Molecules that shipped coordinates but no USRCAT, because their shape context could not be rebuilt. */
     std::atomic<std::uint64_t> molecules_undescribed {0};
+    /** Molecules a wave refused for its own sizing rather than for anything about them, summed across
+     *  batches. One producer is device-side and already raises `cuda_error_count`; the other is a
+     *  host-side pinned reservation, which raises nothing at all — so without this the run would report
+     *  a whole device's batch as refused and still exit 0. */
+    std::atomic<std::uint64_t> molecules_batch_overflowed {0};
     std::uint64_t total_input_files = 0;
     std::chrono::steady_clock::time_point start_time;
 };
@@ -561,7 +577,7 @@ static void fill_retry_indices_into_(custd::span<sfapi::conformer_status_t const
         // Nothing here the fallback can fill; name the refusal that ships, where there is one.
         for (sfapi::conformer_status_t const slot_status : slots)
             if (slot_status != sfapi::conformer_status_t::success_k) {
-                ++report.skipped[static_cast<std::size_t>(slot_status)];
+                ++report.skipped.of(slot_status);
                 break;
             }
     }
@@ -581,6 +597,7 @@ static void generate_batch_(sfapi::context_t &gpu_context, cli_config_t const &c
     sfapi::config_t generation_config;
     generation_config.num_conformers = config.num_conformers;
     generation_config.random_seed = config.random_seed;
+    generation_config.polish_telemetry = config.polish_telemetry;
 
     // The aggregate status is discarded because a batch-level `mmff_unconverged_k` may still carry a
     // majority of successful conformers; the per-conformer codes in `buffer.status` drive every stage below.
@@ -841,15 +858,23 @@ using sfapi::conformer_status_name;
 static void log_fallback_breakdown_(coprocessed_batch_result_t const &result, logger_t const &logger) {
     for (std::size_t index = 0; index < sfcli::conformer_status_count_k; ++index) {
         auto const status = static_cast<sfapi::conformer_status_t>(index);
-        std::uint64_t const attempted = result.fallback_report.attempted[index];
-        std::uint64_t const skipped = result.fallback_report.skipped[index];
+        std::uint64_t const attempted = result.fallback_report.attempted.named[index];
+        std::uint64_t const skipped = result.fallback_report.skipped.named[index];
         if (attempted > 0)
             logger.info("  fallback cause={} attempted={} recovered={} {:.3f}%", conformer_status_name(status),
-                        fmt::group_digits(attempted), fmt::group_digits(result.fallback_report.recovered[index]),
-                        percent_of_(result.fallback_report.recovered[index], attempted));
+                        fmt::group_digits(attempted), fmt::group_digits(result.fallback_report.recovered.named[index]),
+                        percent_of_(result.fallback_report.recovered.named[index], attempted));
         if (skipped > 0)
             logger.info("  fallback cause={} terminal={}", conformer_status_name(status), fmt::group_digits(skipped));
     }
+    // A status byte this binary has no enumerator for, which is what a shard from a newer producer carries.
+    std::uint64_t const unnamed_attempted = result.fallback_report.attempted.unnamed;
+    std::uint64_t const unnamed_skipped = result.fallback_report.skipped.unnamed;
+    if (unnamed_attempted > 0 || unnamed_skipped > 0)
+        logger.info("  fallback cause={} attempted={} recovered={} {:.3f}% terminal={}", sfcli::unnamed_status_k,
+                    fmt::group_digits(unnamed_attempted), fmt::group_digits(result.fallback_report.recovered.unnamed),
+                    percent_of_(result.fallback_report.recovered.unnamed, unnamed_attempted),
+                    fmt::group_digits(unnamed_skipped));
 }
 
 /**
@@ -896,9 +921,9 @@ static void log_batch_progress_(coprocessed_batch_result_t const &result, logger
     auto const finish_wall = std::chrono::system_clock::now() +
                              std::chrono::milliseconds(static_cast<std::int64_t>(remaining_seconds * 1000.0));
 
-    std::uint64_t const attempted = sfcli::total_of(result.fallback_report.attempted);
-    std::uint64_t const recovered = sfcli::total_of(result.fallback_report.recovered);
-    std::uint64_t const skipped = sfcli::total_of(result.fallback_report.skipped);
+    std::uint64_t const attempted = result.fallback_report.attempted.total();
+    std::uint64_t const recovered = result.fallback_report.recovered.total();
+    std::uint64_t const skipped = result.fallback_report.skipped.total();
     std::string fallback_fragment;
     if (attempted > 0 || skipped > 0)
         fallback_fragment = fmt::format("  fallback attempted={} recovered={} {:.3f}% terminal={}",
@@ -937,6 +962,8 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
         pool.release(result.buffer_slot);
         counters.batches_completed.fetch_add(1);
         counters.molecules_undescribed.fetch_add(result.molecules_undescribed);
+        counters.molecules_batch_overflowed.fetch_add(
+            result.fallback_report.skipped.of(sfapi::conformer_status_t::batch_overflow_k));
         log_batch_progress_(result, logger, counters);
         log_fallback_breakdown_(result, logger);
         log_fallback_cost_(result, logger);
@@ -1110,6 +1137,15 @@ int main(int argc, char **argv) {
     std::uint64_t const cuda_errors = gpu_context.cuda_error_count.load();
     if (cuda_errors > 0) {
         logger.error("{} CUDA errors reported by the library — output is unreliable", fmt::group_digits(cuda_errors));
+        return 1;
+    }
+    // A wave that could not size itself refuses molecules the corpus never had a problem with, and the
+    // host-side producer of that refusal raises no CUDA error — so this is the only thing between a
+    // silently short shard and a rerun at a wave that fits.
+    std::uint64_t const batch_overflowed = counters.molecules_batch_overflowed.load();
+    if (batch_overflowed > 0) {
+        logger.error("{} molecules refused for wave sizing, not chemistry; rerun at a smaller --batch-size",
+                     fmt::group_digits(batch_overflowed));
         return 1;
     }
     return files_failed > 0 ? 1 : 0;

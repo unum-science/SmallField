@@ -53,6 +53,20 @@ using preprocess::wave_slice_pool_t;
 using types::device_indices_t;
 
 /**
+ *  @brief Whether the MMFF94 polish reports what it did with each conformer slot.
+ *
+ *  The kernel writes the same six floats per slot either way; what this selects is whether a region is
+ *  carved for them, staged back, and reduced into the per-wave tally the pipeline logs. Off by default
+ *  because the download and the reduce are per-slot work no production output reads.
+ */
+enum class polish_telemetry_t : std::uint8_t {
+    /** No region is carved, so the kernel is handed no array and writes none. */
+    disabled_k,
+    /** One row per conformer slot is staged and folded into one log line per wave. */
+    summarized_k,
+};
+
+/**
  *  @brief Pipeline configuration.
  */
 struct config_t {
@@ -61,6 +75,7 @@ struct config_t {
     /** Target `embedding-wave` size for pipelined dispatch; 0 = VRAM-aware auto. */
     std::uint32_t wave_size = 0;
     std::uint64_t random_seed = 42;
+    polish_telemetry_t polish_telemetry = polish_telemetry_t::disabled_k;
 };
 
 /** Upper bound on devices a single `context_t` can manage. */

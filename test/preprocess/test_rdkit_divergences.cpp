@@ -81,23 +81,6 @@ static constexpr std::string_view test_name_k = "test_rdkit_divergences";
  */
 static constexpr std::size_t default_max_molecules_k = 10000;
 
-/**
- *  @brief The corpus walked when no path is named: `adversarial.smi` beside this source file.
- *
- *  A gate is only as strong as what it is asked. The built-ins plus the registry are twelve molecules, a
- *  corpus so narrow that a whole class of disagreement could stay invisible and still report zero -- so
- *  the default is the in-tree adversarial set instead, which the sweep below walks in seconds.
- *
- *  Derived from `__FILE__` because the corpus and the test are one artifact: a path spelled anywhere else
- *  is a second place to keep them together, and CMake compiles this file by its absolute path.
- */
-static std::string default_corpus_path_() {
-    std::string_view const source_path = __FILE__;
-    std::size_t const directory_end = source_path.find_last_of('/');
-    if (directory_end == std::string_view::npos) return "adversarial.smi";
-    return std::string(source_path.substr(0, directory_end + 1)) + "adversarial.smi";
-}
-
 namespace smallfield::tests {
 
 #pragma region Measurement
@@ -818,7 +801,8 @@ static void narrate_sixfold_reach_() {
 int main(int argc, char **argv) {
     fmt::println("{}: recorded RDKit divergences, re-measured and asserted", test_name_k);
 
-    auto const selection = sftest::select_corpus(argc, argv, default_max_molecules_k);
+    auto const selection = sftest::select_corpus(argc, argv, default_max_molecules_k,
+                                                 sftest::adversarial_corpus_path());
     if (selection.knob == sftest::corpus_knob_t::refused_k) {
         fmt::println(stderr, "usage: {} [corpus.smi] [max_molecules]", argv[0]);
         return 2;
@@ -853,8 +837,7 @@ int main(int argc, char **argv) {
     // completeness pass would not have found on its own.
     std::vector<std::string> corpus = sftest::standard_test_smiles();
     for (auto const &row : rows) corpus.emplace_back(row.smiles);
-    std::string const corpus_path = selection.knob == sftest::corpus_knob_t::named_k ? selection.path
-                                                                                     : default_corpus_path_();
+    std::string const &corpus_path = selection.path;
     std::vector<std::string> loaded;
     auto const outcome = sftest::load_smiles_into(corpus_path, selection.max_molecules, loaded);
     if (outcome != sftest::smiles_load_t::loaded_k)

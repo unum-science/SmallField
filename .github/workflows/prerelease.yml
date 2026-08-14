@@ -70,7 +70,7 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
 
       - name: Report the architectures being built
-        run: grep -E '^CMAKE_CUDA_ARCHITECTURES' build/CMakeCache.txt
+        run: grep -E '^SMALLFIELD_CUDA_ARCH' build/CMakeCache.txt
 
       - name: Build
         run: cmake --build build --parallel
@@ -88,8 +88,16 @@ jobs:
       - name: Confirm sm_120 reached the binary
         run: cuobjdump --list-elf build/test/test_pipeline | grep -q sm_120
 
-      # Deliberately no test job. Every test here links the CUDA library and opens a device, and the
-      # Python suite additionally needs the compiled `_smallfield` extension, so a hosted runner
-      # cannot run any of it. Test results come from the hardware runs recorded in BENCH.md.
-      # What CI can prove is that the sources compile for hardware this project has never touched,
-      # which is the failure a developer building `--preset dev` will never see.
+      # Ten of the twenty-five test binaries never open a device: they link `CUDA::cudart` for the
+      # libcu++ headers behind `smallfield/types/views.hpp` and never call into it, and nothing here
+      # links `CUDA::cuda_driver`, so they load and run on a GPU-less runner. The other fifteen carry
+      # `LABELS gpu`, written beside the resource lock that already marked them, and their results
+      # come from the hardware runs recorded in BENCH.md.
+      - name: Run the host-only C++ suite
+        run: pixi run test-host
+
+      # `pyproject.toml` puts `python/` on the path, so `smallfield.log` and `smallfield.chemistry`
+      # import from a clone with nothing built. `test/api` is the tier that binds the compiled
+      # `_smallfield` extension, and it is excluded for the same reason the device binaries are.
+      - name: Run the host-only Python suite
+        run: pixi run test-python-host

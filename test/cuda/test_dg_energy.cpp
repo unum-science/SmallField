@@ -328,6 +328,19 @@ static constexpr float gradient_threshold_k = 1e-4f;
 static constexpr float fourth_dimension_weight_k = 10.0f;
 /** The finite-difference sweep costs two launches per component, so it walks only the first few molecules. */
 static constexpr std::size_t max_gradient_molecules_k = 3;
+
+/**
+ *  @brief How far each coordinate of a well-posed start is displaced, in angstrom.
+ *
+ *  Large enough that the minimizer has real work to do and cannot pass by standing still, small
+ *  enough that the basin RDKit's own embedding sits in is the one it relaxes back into. The random
+ *  `random_start_span_k` cloud is a different question: from there only descent is demanded, because
+ *  requiring convergence out of noise would ratchet the suite on noise.
+ */
+static constexpr float perturbation_span_angstrom_k = 0.2f;
+
+/** Molecules the convergence section walks, which pays a full minimization each. */
+static constexpr std::size_t max_convergence_molecules_k = 3;
 /** The chirality sweep costs the same per center, so it too walks only the first few chiral molecules. */
 static constexpr std::size_t max_chiral_molecules_k = 4;
 /** One pathological molecule must not bury the log; suppressed lines are still counted. */
@@ -370,6 +383,7 @@ static std::string_view fire_status_name_(smallfield::cuda::fire_status_t status
 
 static bool increased_(double before, double after) { return after > before; }
 static bool decreased_(double before, double after) { return after < before; }
+static bool at_most_(double ceiling, double observed) { return observed <= ceiling; }
 static bool both_finite_(double reference, double observed) {
     return std::isfinite(reference) && std::isfinite(observed);
 }
@@ -413,6 +427,7 @@ struct dg_reporters_t {
     sftest::diagnostic_reporter_t gradient {"finite_difference", "analytical"};
     sftest::diagnostic_reporter_t chirality {"expected", "observed"};
     sftest::diagnostic_reporter_t minimize {"before", "after"};
+    sftest::diagnostic_reporter_t convergence {"threshold", "achieved"};
     sftest::diagnostic_reporter_t quantization {"exact_bounds", "int8_bounds"};
 
     void limit_printed_lines(std::size_t maximum) noexcept {
@@ -420,11 +435,12 @@ struct dg_reporters_t {
         gradient.limit_printed_lines(maximum);
         chirality.limit_printed_lines(maximum);
         minimize.limit_printed_lines(maximum);
+        convergence.limit_printed_lines(maximum);
         quantization.limit_printed_lines(maximum);
     }
 
     bool passed() const noexcept {
-        return energy.passed() && gradient.passed() && chirality.passed() && minimize.passed();
+        return energy.passed() && gradient.passed() && chirality.passed() && minimize.passed() && convergence.passed();
     }
 };
 
@@ -805,6 +821,59 @@ static sftest::dg_probe_t check_minimization_(sftest::diagnostic_reporter_t &rep
     return sftest::dg_probe_t::completed_k;
 }
 
+/**
+ *  @brief Relax from a well-posed start and require the minimizer to report that it converged.
+ *
+ *  `check_minimization_` starts from a uniform random cloud and demands only that energy, violation
+ *  and fourth-dimension magnitude fall — which one downhill step satisfies, so it cannot distinguish
+ *  a minimizer that finishes from one that stops early. This section removes that excuse: the start
+ *  is RDKit's own embedding displaced by `perturbation_span_angstrom_k` per coordinate, which is
+ *  a basin the distance bounds were built from, so `exhausted_k` inside `max_iterations_k` means
+ *  the iteration budget is short rather than the problem hard.
+ *
+ *  Both the status and the gradient are gated. `fire_minimize_` returns `converged_k` exactly when
+ *  the RMS gradient fell under the threshold it was handed, so asserting the pair keeps that
+ *  equivalence a checked fact instead of an assumed one.
+ *
+ *  @return Whether every launch ran, so a refusal reaches the gate instead of being compared.
+ */
+static sftest::dg_probe_t check_convergence_(sftest::diagnostic_reporter_t &reporter, molecule_case_t const &subject,
+                                             RDKit::RWMol &molecule, dg_weights_t weights,
+                                             molecule_scratch_t &scratch) {
+    auto const bounds = subject.bounds;
+    auto const &smiles = subject.smiles;
+    std::uint32_t const num_atoms = bounds.extent(0);
+    auto const coordinates = reset_embedding_(scratch.embedding, num_atoms);
+    auto const interleaved = reset_interleaved_(scratch.interleaved, num_atoms);
+
+    sftest::read_conformer_into(molecule, interleaved);
+    sft::transpose_into(interleaved, coordinates);
+    fill_fourth_dimension_(coordinates);
+
+    // A fixed generator, so a failure here is reproducible rather than a run the next one cannot repeat.
+    std::mt19937 generator(4242);
+    std::uniform_real_distribution<float> displacement(-perturbation_span_angstrom_k, perturbation_span_angstrom_k);
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom)
+        for (std::uint32_t dimension = 0; dimension < 3; ++dimension)
+            coordinates(atom, dimension) += displacement(generator);
+
+    auto const problem = problem_for_(bounds, subject.chiral_centers, weights);
+    sftest::dg_minimize_report_t report;
+    sftest::dg_probe_t const probe = gpu_dg_minimize(problem, coordinates.data_handle(), max_iterations_k,
+                                                     gradient_threshold_k, &report);
+    if (probe != sftest::dg_probe_t::completed_k) return probe;
+
+    // The status rides in the key, where it is readable and greppable, and the field gates on the one
+    // question: `append_delta` needs operands it can subtract, so a name cannot be the compared value.
+    reporter
+        .mismatch("dg_convergence", "smiles={} atoms={} status={} iterations={}", smiles, num_atoms,
+                  fire_status_name_(report.status), report.iterations)
+        .field("converged", true, report.status == smallfield::cuda::fire_status_t::converged_k, sftest::exactly_equal)
+        .field("rms_gradient", static_cast<double>(gradient_threshold_k), static_cast<double>(report.rms_gradient),
+               at_most_);
+    return sftest::dg_probe_t::completed_k;
+}
+
 #pragma endregion Molecule Checks
 
 /**
@@ -852,6 +921,7 @@ int main(int argc, char **argv) {
     sft::molecule_descriptor_t descriptor;
     std::unique_ptr<RDKit::RWMol> molecule;
     std::size_t ready_molecules = 0, skipped_molecules = 0, gradient_molecules = 0, chiral_molecules = 0;
+    std::size_t convergence_molecules = 0;
     std::size_t refused_sections = 0;
 
     // A launch the driver declines leaves the kernel's outputs as the allocation found them, so a section
@@ -910,6 +980,13 @@ int main(int argc, char **argv) {
             ++chiral_molecules;
         }
 
+        // Before the random-start section, which overwrites the conformer this one reads.
+        if (convergence_molecules < max_convergence_molecules_k) {
+            record_("dg_convergence", smiles,
+                    check_convergence_(reporters.convergence, subject, *molecule, minimize_weights, scratch));
+            ++convergence_molecules;
+        }
+
         // Last per molecule: it overwrites the conformer the other sections read.
         record_("dg_minimize", smiles,
                 check_minimization_(reporters.minimize, subject, *molecule, minimize_weights, scratch));
@@ -925,13 +1002,16 @@ int main(int argc, char **argv) {
     reporters.gradient.summarize("dg_gradient");
     reporters.chirality.summarize("dg_chirality");
     reporters.minimize.summarize("dg_minimize");
+    reporters.convergence.summarize("dg_convergence");
 
     if (refused_sections != 0)
         return sftest::report_fail(test_name_k, "the device refused {} sections before either operand existed",
                                    refused_sections);
     if (!reporters.passed())
-        return sftest::report_fail(test_name_k, "{} energy, {} gradient, {} chirality, and {} minimization mismatches",
-                                   reporters.energy.mismatch_count(), reporters.gradient.mismatch_count(),
-                                   reporters.chirality.mismatch_count(), reporters.minimize.mismatch_count());
+        return sftest::report_fail(
+            test_name_k, "{} energy, {} gradient, {} chirality, {} minimization, and {} convergence mismatches",
+            reporters.energy.mismatch_count(), reporters.gradient.mismatch_count(),
+            reporters.chirality.mismatch_count(), reporters.minimize.mismatch_count(),
+            reporters.convergence.mismatch_count());
     return sftest::report_pass(test_name_k);
 }

@@ -268,18 +268,45 @@ struct corpus_selection_t {
 };
 
 /**
+ *  @brief Path of `test/preprocess/adversarial.smi`, the in-tree fixture of macrocycles, cages, charged
+ *         and hypervalent species.
+ *
+ *  This is a fixture, not a dataset: it is tracked in the repository, it travels with the source that
+ *  reads it, and it is small enough that every test walks all of it in seconds. The `./data/<name>`
+ *  rule governs corpora that live outside the tree and differ per machine; this one cannot differ,
+ *  because it is derived from `__FILE__` and therefore names the same checkout that compiled the test.
+ *
+ *  Handing it to `select_corpus` as a fallback does not resurrect the built-in-default failure mode.
+ *  A fallback that is taken still reports `named_k`, so the caller still runs it through
+ *  `load_smiles_into` and still fails on `missing_file_k`: deleting the fixture turns the suite red
+ *  rather than turning it into an empty run that passes because it compared nothing.
+ */
+inline std::string adversarial_corpus_path() {
+    std::string_view const helpers_path = __FILE__;
+    std::size_t const directory_end = helpers_path.find_last_of('/');
+    if (directory_end == std::string_view::npos) return "preprocess/adversarial.smi";
+    return std::string(helpers_path.substr(0, directory_end + 1)) + "preprocess/adversarial.smi";
+}
+
+/**
  *  @brief Resolve the corpus knobs every corpus-driven test shares.
  *
- *  The path comes from `argv[1]`, falling back to `SMALLFIELD_TEST_CORPUS`; the cap comes from
- *  `argv[2]`, falling back to `SMALLFIELD_TEST_MAX_MOLS`, and finally to @p default_max_molecules.
- *  No corpus path is ever a literal in a test, so a binary that names one names it here.
+ *  The path comes from `argv[1]`, falling back to `SMALLFIELD_TEST_CORPUS`, and finally to
+ *  @p fallback_path; the cap comes from `argv[2]`, falling back to `SMALLFIELD_TEST_MAX_MOLS`, and
+ *  finally to @p default_max_molecules. No corpus path is ever a literal in a test, so a binary that
+ *  names one names it here.
+ *
+ *  A @p fallback_path that is taken reports `named_k` exactly as an explicit one does, so it is walked
+ *  and its absence is reported rather than silently yielding zero molecules.
  *
  *  @param[in] argc Argument count as `main` received it.
  *  @param[in] argv Argument vector as `main` received it.
  *  @param[in] default_max_molecules Cap applied when neither cap knob is set.
+ *  @param[in] fallback_path Corpus walked when neither knob names one; empty leaves the knob `unset_k`.
  *  @return The resolved corpus, or `refused_k` when a cap argument is not a number.
  */
-inline corpus_selection_t select_corpus(int argc, char const *const *argv, std::size_t default_max_molecules) {
+inline corpus_selection_t select_corpus(int argc, char const *const *argv, std::size_t default_max_molecules,
+                                        std::string_view fallback_path = {}) {
     corpus_selection_t selection;
     selection.max_molecules = default_max_molecules;
 
@@ -287,6 +314,7 @@ inline corpus_selection_t select_corpus(int argc, char const *const *argv, std::
     if (argc > 1 && argv[1][0] != '\0') selection.path = argv[1];
     else if (path_from_environment != nullptr && path_from_environment[0] != '\0')
         selection.path = path_from_environment;
+    else selection.path = fallback_path;
     if (!selection.path.empty()) selection.knob = corpus_knob_t::named_k;
 
     char const *const cap_from_environment = std::getenv("SMALLFIELD_TEST_MAX_MOLS");

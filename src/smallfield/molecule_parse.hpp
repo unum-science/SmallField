@@ -51,6 +51,20 @@ enum metadata_policy_t : std::uint8_t {
     compute_metadata_k = 1,
 };
 
+/**
+ *  @brief Whether the parse pays for RDKit's stereochemistry perception.
+ *
+ *  `SmilesToMol` runs `MolOps::assignStereochemistry` with `cleanIt`, `force` and `flagPossible` all set
+ *  whenever it is asked to sanitize — a full CIP ranking and potential-stereo perception over the whole
+ *  graph, and a pass `MolOps::sanitizeMol` itself does not contain. `skip_k` therefore sanitizes by hand
+ *  and skips only that: the aromatic model, the valences and the hydrogen counts are the same molecule.
+ *  Only a caller that reads chiral tags or bond stereo needs `perceive_k`.
+ */
+enum class stereo_policy_t : std::uint8_t {
+    perceive_k,
+    skip_k,
+};
+
 /** Knobs the four call sites genuinely disagree on. */
 struct parse_options_t {
     /** Reject past this many atoms, counting hydrogens; zero disables the check.
@@ -60,6 +74,10 @@ struct parse_options_t {
     std::uint32_t max_atoms = types::max_atoms_per_molecule_k;
     salt_policy_t salt_policy = keep_largest_fragment_k;
     metadata_policy_t metadata_policy = skip_metadata_k;
+    /** Defaults to perceiving, because a caller that silently loses stereochemistry is the worse failure.
+     *  The postprocess path opts out: its consumers are four SMARTS naming no stereochemistry, a
+     *  connected-component labeling, and an atom count. */
+    stereo_policy_t stereo_policy = stereo_policy_t::perceive_k;
 };
 
 /** A parsed molecule, or the reason there isn't one. */
@@ -114,12 +132,20 @@ inline parse_result_t parse_smiles(std::string_view smiles, parse_options_t cons
         // kept scoped to this call. removeHs=false because addHs follows.
         std::string const smiles_string {smiles};
         RDKit::SmilesParserParams parameters;
-        parameters.sanitize = true;
+        parameters.sanitize = options.stereo_policy == stereo_policy_t::perceive_k;
         parameters.removeHs = false;
         parameters.strictCXSMILES = false;
         result.molecule.reset(RDKit::SmilesToMol(smiles_string, parameters));
+        // The sanitize `SmilesToMol` skipped, minus the stereochemistry perception it would have run
+        // after it. It belongs in this `try` because a sanitization throw is what the `catch` is for,
+        // and it is the same `MolSanitizeException` on the same molecules either way.
+        if (result.molecule && options.stereo_policy == stereo_policy_t::skip_k)
+            RDKit::MolOps::sanitizeMol(*result.molecule);
     }
     catch (...) {
+        // A sanitization throw arrives after the molecule was built, and a molecule this function is
+        // returning `invalid_smiles_k` for must not travel with it.
+        result.molecule.reset();
         return result;
     }
     if (!result.molecule) return result;

@@ -77,6 +77,21 @@ enum class reserve_outcome_t : std::uint8_t {
 };
 
 /**
+ *  @brief Whether a table an uploader was asked to stage is readable by a kernel.
+ *
+ *  A length cannot carry this: a legitimately empty table uploads nothing and yields an empty span, which
+ *  every lookup already reads as "no entry", while a refused reservation or copy yields the same empty span
+ *  and means the caller holds no parameters at all. The two call for opposite responses, so the uploader
+ *  answers with a state and the caller drops the device on `refused_k`.
+ */
+enum class table_residency_t : std::uint8_t {
+    /** Every table landed. An empty span among them is an empty table, not a lost one. */
+    resident_k,
+    /** A reservation or a copy was refused. Nothing may read the view. The stream carries the reason. */
+    refused_k,
+};
+
+/**
  *  @brief Acquires and releases raw bytes, returning the pointer and leaving the reason to the stream.
  *
  *  `allocate` is not `const`: a stream-ordered allocator may record the pool it drew from.

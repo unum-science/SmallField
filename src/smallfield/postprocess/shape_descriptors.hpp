@@ -359,8 +359,9 @@ inline void clear_shape_context_(molecule_shape_context_t &out) {
 /**
  *  @brief Parses @p smiles and types it for USRCAT into @p out, once per molecule.
  *
- *  Uses the same parse contract as the rest of the library — sanitize on, keep explicit hydrogens, tolerant
- *  CXSMILES — then `MolOps::addHs` so the atom order matches the coordinates the conformer generator stores. The
+ *  Uses the same parse contract as the rest of the library — sanitized, explicit hydrogens kept, tolerant
+ *  CXSMILES, and stereochemistry left unperceived because nothing here reads it — then `MolOps::addHs` so the
+ *  atom order matches the coordinates the conformer generator stores. The
  *  four CREDO subsets are matched with RDKit's own default USRCAT SMARTS, and connected components are labeled
  *  with `MolOps::getMolFrags`.
  *
@@ -384,6 +385,11 @@ inline void clear_shape_context_(molecule_shape_context_t &out) {
         smallfield::parse_options_t parse_options;
         parse_options.max_atoms = 0;
         parse_options.salt_policy = salt_policy;
+        // Nothing below reads a chiral tag or a bond stereo: the four SMARTS name elements, charges,
+        // hydrogen counts, valences, aromaticity and hybridization, and the labeling and the atom count
+        // are pure connectivity. Perceiving stereochemistry here is a CIP ranking of every molecule that
+        // no consumer can observe.
+        parse_options.stereo_policy = smallfield::stereo_policy_t::skip_k;
         smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
         if (!parsed.molecule) return shape_typing_t::unparsed_k;
         // Checked before the four substructure searches, which a molecule nobody can describe need not pay for.
