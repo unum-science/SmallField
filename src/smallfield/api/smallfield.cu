@@ -539,11 +539,17 @@ struct launch_scratch_t {
     /**
      *  @brief Bind this device's stream, which every device allocation here is ordered against.
      *
-     *  @param[in] stream Outlives this scratch: `~context_t` resets the scratch before destroying the
-     *                    stream, which is what `cudaFreeAsync` requires.
+     *  @param[in] stream Outlives this scratch, which is what `cudaFreeAsync` requires: `context_t`
+     *                    declares the owning `device_stream_t` ahead of every scratch built on it.
      */
     explicit launch_scratch_t(cudaStream_t stream) noexcept
         : device_pool(device_allocator_t {stream}), mmff_staging(device_allocator_t {stream}) {}
+
+    launch_scratch_t(launch_scratch_t const &) = delete;
+    launch_scratch_t &operator=(launch_scratch_t const &) = delete;
+    /** The events are the one resource here whose handles are borrowed by a wave rather than owned by
+     *  it, so their release is this owner's and the buffers' is their own. */
+    ~launch_scratch_t() noexcept { events.destroy(); }
 
     device_bytes_t device_pool;
     pinned_bytes_t host_staging;
@@ -1231,7 +1237,7 @@ static gpu_pipeline_handle_t launch_gpu_pipeline(context_t &context, std::size_t
                                                  std::uint32_t host_max_atoms, wave_outputs_t const &outputs,
                                                  cuda_error_sink_t sink) {
     int const device_id = context.device_ids[device_index];
-    cudaStream_t const stream = context.streams[device_index];
+    cudaStream_t const stream = context.streams[device_index].handle();
     launch_scratch_t &launch_buffers = *context.launch_scratch[device_index];
     [[maybe_unused]] bool const bound = sink.check(cudaSetDevice(device_id), "cudaSetDevice(launch_gpu_pipeline)");
 
@@ -1478,8 +1484,11 @@ context_t::context_t(custd::span<int const> devices) {
 
     for (int const device_id : requested_device_ids) {
         if (!sink.check(cudaSetDevice(device_id), "cudaSetDevice(context_t)")) continue;
-        cudaStream_t stream = nullptr;
-        if (!sink.check(cudaStreamCreate(&stream), "cudaStreamCreate")) continue;
+        // Declared ahead of everything allocated against it, so a device that refuses below releases its
+        // scratch first and its stream after, in the same order the context's members do.
+        device_stream_t stream_owner;
+        if (!stream_owner.create(sink)) continue;
+        cudaStream_t const stream = stream_owner.handle();
 
         auto scratch_owner = std::make_unique<launch_scratch_t>(stream);
         launch_scratch_t &scratch = *scratch_owner;
@@ -1527,7 +1536,7 @@ context_t::context_t(custd::span<int const> devices) {
         scratch_for_metric.group_indices = device_indices_t {device_allocator_t {stream}};
 
         device_ids.push_back(device_id);
-        streams.push_back(stream);
+        streams.push_back(std::move(stream_owner));
         launch_scratch.push_back(std::move(scratch_owner));
         launch_configs.push_back(launch_config);
         metric_scratch.push_back(std::move(scratch_for_metric));
@@ -1582,17 +1591,13 @@ context_t::context_t(custd::span<int const> devices) {
     // molecule than a corpus like GDB13 actually stages.
 }
 
-context_t::~context_t() {
-    // Every entry is whole: the constructor appends a device only once its stream and scratch exist, so
-    // there is no half-built slot to test for here. The scratch is released before its stream, because
-    // `cudaFreeAsync` against a destroyed stream is undefined.
-    for (std::size_t device_index = 0; device_index < device_ids.size(); ++device_index) {
-        cudaSetDevice(device_ids[device_index]);
-        launch_scratch[device_index]->events.destroy();
-        launch_scratch[device_index].reset();
-        cudaStreamDestroy(streams[device_index]);
-    }
-}
+/**
+ *  Teardown is entirely the members', which is what keeps every `cudaFreeAsync` ahead of the destruction
+ *  of the stream it names: `streams` is declared before every buffer built on it, so reverse declaration
+ *  order releases the buffers first. Defined here rather than in the header because `launch_scratch_t`
+ *  is complete only in this translation unit.
+ */
+context_t::~context_t() = default;
 
 #pragma endregion Context
 

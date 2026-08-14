@@ -148,6 +148,58 @@ struct device_allocator_t {
 
 #pragma endregion Policies
 
+#pragma region Stream
+
+/**
+ *  @brief Owning CUDA stream, so the ordering `device_allocator_t` depends on is a lifetime rather than
+ *  a sequence of statements.
+ *
+ *  A raw `cudaStream_t` member destroyed by hand puts the deallocations of every buffer built on it at
+ *  the mercy of statement order in some destructor's body, and a member freed after that body runs is
+ *  then a `cudaFreeAsync` against a destroyed stream. Owning the handle moves the question to member
+ *  declaration order, which the compiler settles: declare the stream before the buffers ordered against
+ *  it and it is destroyed after them.
+ */
+class device_stream_t {
+    cudaStream_t handle_ = nullptr;
+
+  public:
+    device_stream_t() = default;
+    device_stream_t(device_stream_t const &) = delete;
+    device_stream_t &operator=(device_stream_t const &) = delete;
+    device_stream_t(device_stream_t &&other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+    device_stream_t &operator=(device_stream_t &&other) noexcept {
+        if (this != &other) {
+            release_();
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
+    ~device_stream_t() noexcept { release_(); }
+
+    /**
+     *  @brief Create the stream on the current device, replacing whatever this held.
+     *
+     *  @param[in] sink Routes a refused creation to the logger and the error counter.
+     *  @return Whether the stream exists afterward; a refusal leaves this empty.
+     */
+    [[nodiscard]] bool create(cuda_error_sink_t const &sink = {}) noexcept {
+        release_();
+        return sink.check(cudaStreamCreate(&handle_), "cudaStreamCreate");
+    }
+
+    /** The borrowed handle every stream-ordered call takes, null until `create` succeeds. */
+    [[nodiscard]] cudaStream_t handle() const noexcept { return handle_; }
+
+  private:
+    void release_() noexcept {
+        if (handle_ == nullptr) return;
+        [[maybe_unused]] cudaError_t const status = cudaStreamDestroy(std::exchange(handle_, nullptr));
+    }
+};
+
+#pragma endregion Stream
+
 #pragma region Buffer
 
 /**

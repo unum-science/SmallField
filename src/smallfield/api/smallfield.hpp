@@ -51,6 +51,7 @@ using types::conformer_status_t;
 
 using preprocess::wave_slice_pool_t;
 using types::device_indices_t;
+using types::device_stream_t;
 
 /**
  *  @brief Whether the MMFF94 polish reports what it did with each conformer slot.
@@ -166,9 +167,15 @@ inline constexpr std::uint32_t pinned_prep_depth_k = 2;
  */
 struct context_t {
     std::vector<int> device_ids;
-    /** One CUDA stream per device. All per-wave work on a given
-     *  device (H2D, kernels, D2H) runs stream-ordered on its own stream. */
-    std::vector<cudaStream_t> streams;
+    /**
+     *  @brief One owned CUDA stream per device. All per-wave work on a given device (H2D, kernels,
+     *  D2H) runs stream-ordered on its own stream.
+     *
+     *  Declared ahead of every member allocated against these streams, so destruction — which runs in
+     *  reverse declaration order — releases those buffers first and a `cudaFreeAsync` can never reach
+     *  a stream that is already gone.
+     */
+    std::vector<device_stream_t> streams;
     /** One per device. */
     std::vector<metric_scratch_t> metric_scratch;
     /** One per device. */
@@ -210,6 +217,8 @@ struct context_t {
      *  @param[in] devices GPU device IDs. Empty span = all available GPUs.
      */
     explicit context_t(custd::span<int const> devices = {});
+    /** Defaulted, and defined where `launch_scratch_t` is complete rather than here. Teardown is the
+     *  members' own, in reverse declaration order, so no statement can put a free after its stream. */
     ~context_t();
 
     context_t(context_t const &) = delete;
