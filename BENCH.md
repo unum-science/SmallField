@@ -265,6 +265,27 @@ __365 dispatches per 20,000 is not new breakage.__
 It is 1.8 % of molecules that were already shipping with a centre MMFF polish had inverted after the last gate, now visible for the first time.
 Whether that cost matters depends on the box, the same way the repair's gain does.
 
+### The Distance-Geometry Budget Is Not Free, And Still Worth Raising
+
+Doubling the two four-dimensional stages — distance geometry 100 → 200 iterations, fourth-dimension crush 50 → 100 — on the same 20,000-molecule PubChem shard.
+
+| Measurement                                   |   before |    after |    delta |
+| :-------------------------------------------- | -------: | -------: | -------: |
+| `stereo_failure`, `bench_conformer_backends`   |  1.830 % |  1.240 % | __−32 %__ |
+| GPU arm, same harness                          | 3,649 ms | 4,225 ms | __+15.8 %__ |
+| fallback dispatches, full CLI at K=3           |      599 |      401 | __−33 %__ |
+| `gpu-runner` wall, full CLI                    |    5.6 s |    7.2 s |  +29 % |
+| __end-to-end wall, full CLI__                  | __108.2 s__ | __106.3 s__ | __−1.8 %__ |
+
+__The stage is not the rounding error it is often called.__
+The ETKDG kernel's 3.8 % of wall is measured on REAL at K=3 with the CPU fallback folded in; against a GPU-only arm the same two stages are roughly 16 %.
+Quoting the first number to justify spending in the second is the same category error as quoting a PubChem throughput figure for the pipeline.
+
+__It is still the right trade here, for a different reason than cheapness.__
+The geometry these two stages hand forward is what the reflection-blind torsion stage works from and what the stereo gates then judge, so better input means fewer conformers arrive in a state worth refusing — and a refusal costs the CPU embedder 240 ms against microseconds on the GPU.
+On this shape the fallback is 92 % of wall and the trade is clearly positive.
+On a GPU-bound REAL run, with a 0.347 % refusal rate and far less to recover, it would most likely be a net loss.
+
 __E/Z is untouched at 6-8 % and none of this reaches it.__
 `count_invalid_chiral_centers_` counts tetrahedral centres only, so `stereo_failure_k` stays structurally unreachable for a double bond.
 One hypothesis was tested and refused: `molecule_descriptor.hpp` maps RDKit's CIP spelling and its reference-atom spelling onto one flag, which would build the wrong isomer wherever the recorded stereo atoms are not the CIP-preferred pair — measured over 4,493 declared bonds, __0 disagree__, because RDKit sets those atoms to the CIP pair on the SMILES path.

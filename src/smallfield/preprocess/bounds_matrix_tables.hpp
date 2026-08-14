@@ -137,6 +137,26 @@ inline constexpr float tetrahedral_angle_radians_k = 1.91063324f;
 /** Right angle, 90°. The sp3d axial and sp3d2 ideal. */
 inline constexpr float right_angle_radians_k = 1.57079633f;
 
+/** Full turn, 360°. The angle budget a trigonal centre divides among its neighbour pairs. */
+inline constexpr float full_turn_radians_k = 6.28318531f;
+
+/**
+ *  Half-widths of the 1-2 and 1-3 distance windows, in angstrom. `DIST12_DELTA` and `DIST13_TOL`
+ *  upstream. Absolute rather than a fraction of the distance: what they express is how far a real
+ *  bond or angle sits from its rest value, which does not scale with the bond it belongs to.
+ */
+inline constexpr float bond_tolerance_angstrom_k = 0.01f;
+inline constexpr float angle_tolerance_angstrom_k = 0.04f;
+
+/**
+ *  116° and 112°, what an sp3 centre gives a substituent reaching out of a three- or four-membered
+ *  ring. Upstream states these as literals rather than deriving them, `BoundsMatrixBuilder.cpp:638`:
+ *  the ring compresses its own internal angle far below tetrahedral and the exocyclic pair opens to
+ *  compensate, but not by the full amount a budget would predict.
+ */
+inline constexpr float sp3_in_three_ring_angle_radians_k = 2.02458193f;
+inline constexpr float sp3_in_four_ring_angle_radians_k = 1.95476876f;
+
 /** 104°, the angle an sp3 centre takes inside a five-membered ring. */
 inline constexpr float cyclopentane_angle_radians_k = 1.81514242f;
 

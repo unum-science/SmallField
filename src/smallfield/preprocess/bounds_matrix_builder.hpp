@@ -200,6 +200,82 @@ inline std::uint32_t smallest_ring_size_(molecule_descriptor_t const &descriptor
     return smallest;
 }
 
+/**
+ *  @brief The angle a ring atom has left for a pair that reaches outside the ring.
+ *
+ *  RDKit assigns ring angles first and then divides what remains of the center's budget among the
+ *  pairs that did not get one, `BoundsMatrixBuilder.cpp:629-641`. At an sp2 center the budget is a
+ *  full turn, so a three-ring taking 60° leaves 150° for each of the two exocyclic pairs — not the
+ *  120° the hybridization alone would say. An sp3 center is not a budget at all upstream, just two
+ *  literals for the two strained ring sizes.
+ *
+ *  The remainder is recomputed here rather than accumulated in a per-atom table: at degree three the
+ *  leftover is uniquely determined, so this is exact where it matters, and a bond-by-bond matrix at
+ *  `max_bonds_k` would put half a megabyte on a frame that already carries the hop matrix.
+ *
+ *  @param[in] descriptor Molecule supplying adjacency, ring membership and hybridization.
+ *  @param[in] center Ring atom the angle is measured at.
+ *  @param[in] center_ring_size Smallest ring the center belongs to.
+ *  @return Angle in radians.
+ */
+inline float exocyclic_angle_radians_(molecule_descriptor_t const &descriptor, std::uint32_t center,
+                                      std::uint32_t center_ring_size) {
+    std::uint8_t const hybridization = descriptor.hybridization[center];
+    if (hybridization == hybridization_sp3_k) {
+        if (center_ring_size == 3) return sp3_in_three_ring_angle_radians_k;
+        if (center_ring_size == 4) return sp3_in_four_ring_angle_radians_k;
+        return tetrahedral_angle_radians_k;
+    }
+    if (hybridization != hybridization_sp2_k) return ideal_angle_radians(hybridization);
+
+    // Every neighbour pair sharing a ring with the center has already been answered by the closure;
+    // the rest divide the turn that is left.
+    std::uint16_t const neighbor_first = descriptor.neighbor_offset[center];
+    std::uint16_t const neighbor_last = descriptor.neighbor_offset[center + 1];
+    float spent = 0.0f;
+    std::uint32_t ring_pairs = 0, total_pairs = 0;
+    for (std::uint16_t left = neighbor_first; left < neighbor_last; ++left)
+        for (std::uint16_t right = left + 1; right < neighbor_last; ++right) {
+            ++total_pairs;
+            std::uint32_t const pair_shared = descriptor.atom_ring_bitmap[descriptor.neighbor_atom[left]] &
+                                              descriptor.atom_ring_bitmap[center] &
+                                              descriptor.atom_ring_bitmap[descriptor.neighbor_atom[right]];
+            std::uint32_t const pair_ring_size = smallest_ring_size_(descriptor, pair_shared);
+            if (pair_ring_size == 0) continue;
+            ++ring_pairs;
+            spent += ring_interior_angle_radians(hybridization, pair_ring_size);
+        }
+
+    std::uint32_t const open_pairs = total_pairs - ring_pairs;
+    if (open_pairs == 0 || spent >= full_turn_radians_k) return ideal_angle_radians(hybridization);
+    return (full_turn_radians_k - spent) / static_cast<float>(open_pairs);
+}
+
+/**
+ *  @brief How many of a 1-3 triple's atoms are heavy sp2 ring atoms, each doubling the window.
+ *
+ *  `isLargerSP2Atom` upstream: past the first two rows of the periodic table, sp2, and in a ring.
+ *  A thiophene or furan 1-3 spans atoms whose geometry the polygon interior angle describes poorly,
+ *  and doubling per such atom is upstream declining to assert a window it cannot justify — dropping
+ *  it while adopting `DIST13_TOL` would manufacture infeasibility exactly where RDKit loosens.
+ *
+ *  @param[in] descriptor Molecule supplying element, hybridization and ring membership.
+ *  @param[in] first First atom of the 1-3 triple.
+ *  @param[in] center Shared neighbour.
+ *  @param[in] second Third atom of the triple.
+ *  @return Count in [0, 3]; the caller shifts the tolerance left by it.
+ */
+inline std::uint32_t larger_sp2_ring_atoms_(molecule_descriptor_t const &descriptor, std::uint32_t first,
+                                            std::uint32_t center, std::uint32_t second) {
+    auto is_larger_sp2_ring_atom = [&](std::uint32_t atom) {
+        return descriptor.element[atom] > 13 && descriptor.hybridization[atom] == hybridization_sp2_k &&
+               descriptor.atom_ring_bitmap[atom] != 0;
+    };
+    return static_cast<std::uint32_t>(is_larger_sp2_ring_atom(first)) +
+           static_cast<std::uint32_t>(is_larger_sp2_ring_atom(center)) +
+           static_cast<std::uint32_t>(is_larger_sp2_ring_atom(second));
+}
+
 /** Whether any SSSR ring named in @p ring_mask is a macrocycle. */
 inline bool ring_mask_holds_macrocycle_(molecule_descriptor_t const &descriptor, std::uint32_t ring_mask) {
     for (std::uint32_t ring = 0; ring < descriptor.num_rings; ++ring) {
@@ -230,7 +306,16 @@ inline float interior_angle_radians_(molecule_descriptor_t const &descriptor, st
                                      std::uint32_t second) {
     std::uint32_t const shared = descriptor.atom_ring_bitmap[first] & descriptor.atom_ring_bitmap[center] &
                                  descriptor.atom_ring_bitmap[second];
-    return ring_interior_angle_radians(descriptor.hybridization[center], smallest_ring_size_(descriptor, shared));
+    std::uint32_t const shared_ring_size = smallest_ring_size_(descriptor, shared);
+    if (shared_ring_size != 0) return ring_interior_angle_radians(descriptor.hybridization[center], shared_ring_size);
+
+    // The pair is not in a ring, but the center may still be: an exocyclic substituent on a ring
+    // atom. The ring closure has already spent part of the center's angle budget, and what is left
+    // belongs to the pairs that reach outside — so the free-atom answer is wrong by however much the
+    // ring took. At an sp2 center in a three-ring it is wrong by thirty degrees.
+    std::uint32_t const center_ring_size = smallest_ring_size_(descriptor, descriptor.atom_ring_bitmap[center]);
+    if (center_ring_size == 0) return ideal_angle_radians(descriptor.hybridization[center]);
+    return exocyclic_angle_radians_(descriptor, center, center_ring_size);
 }
 
 /** How the 1-4 classification reads @p bond's order. */
@@ -272,6 +357,20 @@ inline float one_four_distance_(float length_12, float length_23, float length_3
 #pragma endregion Graph Queries
 
 #pragma region Chemical Predicates
+
+/*
+ *  The nitrogen these predicates accept carries exactly one hydrogen, which is a secondary amide.
+ *  That is not a statement about resonance -- a tertiary amide is every bit as flat -- but about what
+ *  a bounds matrix can hold. Each 1-4 pair owns one interval, and `merge_intervals_` reconciles only
+ *  the claims made on the same pair, so a preference is expressible here only when the two ends can be
+ *  told apart. A secondary amide's nitrogen offers a hydrogen and a carbon, `ends_on_secondary_amide_hydrogen_`
+ *  sends one anti and the other syn, and the two pairs agree. A tertiary nitrogen offers two carbons
+ *  that no rule below separates, so both would be pinned syn to the same carbonyl oxygen -- two cells
+ *  no arrangement satisfies, and nothing in the builder positioned to notice.
+ *
+ *  What holds a tertiary amide flat is the CSD torsion table, whose `NX3H0` rows carry a doubled
+ *  periodicity and so name both planar minima instead of choosing one.
+ */
 
 /**
  *  @brief The E/Z relationship @p path's central bond fixes between its two end atoms.
@@ -706,14 +805,19 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_
             lower_distance_bound_at(bounds, row_atom, column_atom) = 0.0f;
         }
 
-    // set12 — exact ideal bond lengths ± 2% tolerance per bond from the descriptor.
-    constexpr float bond_tolerance_k = 0.02f;
+    // set12 — exact ideal bond lengths inside an absolute band, `DIST12_DELTA` upstream.
+    //
+    // A fraction of the bond is the wrong shape for this: it makes a long bond's window wide and a
+    // short one's narrow, when the uncertainty being expressed is how far a real bond sits from its
+    // rest length and has nothing to do with the length. RDKit only reaches a percentage on the
+    // branch where UFF cannot type an atom, so ± 2 % was a tighter copy of its give-up path — three
+    // times the band for C-C, three and a half for C-S.
     for (std::uint32_t bond = 0; bond < descriptor.num_bonds; ++bond) {
         std::uint32_t const atom_i = descriptor.bond_atom_i[bond];
         std::uint32_t const atom_j = descriptor.bond_atom_j[bond];
         float const ideal = bond_length_angstrom_(descriptor, bond);
-        upper_distance_bound_at(bounds, atom_i, atom_j) = ideal * (1.0f + bond_tolerance_k);
-        lower_distance_bound_at(bounds, atom_i, atom_j) = ideal * (1.0f - bond_tolerance_k);
+        upper_distance_bound_at(bounds, atom_i, atom_j) = ideal + bond_tolerance_angstrom_k;
+        lower_distance_bound_at(bounds, atom_i, atom_j) = ideal - bond_tolerance_angstrom_k;
     }
 
     // set13 — one 1-3 bound per pair of neighbors around every center atom.
@@ -740,8 +844,14 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_
                 float const cos_theta = std::cos(theta);
                 float const d_ij = std::sqrt(
                     std::max(0.0f, d_ci * d_ci + d_cj * d_cj - 2.0f * d_ci * d_cj * cos_theta));
-                // ± 3% tolerance — 1-3 distances tend to have slightly more slack.
-                float const lower = d_ij * 0.97f, upper = d_ij * 1.03f;
+                // An absolute band, `DIST13_TOL` upstream, doubled once per heavy sp2 ring atom in the
+                // triple. That widening is not slack for its own sake: a thiophene or furan 1-3 spans
+                // atoms whose ring geometry the polygon angle above describes badly, and upstream
+                // loosens exactly there rather than manufacturing an infeasible window.
+                float const tolerance = angle_tolerance_angstrom_k *
+                                        static_cast<float>(1u << larger_sp2_ring_atoms_(descriptor, first_neighbor,
+                                                                                        center, second_neighbor));
+                float const lower = d_ij - tolerance, upper = d_ij + tolerance;
                 float &current_lower = lower_distance_bound_at(bounds, first_neighbor, second_neighbor);
                 float &current_upper = upper_distance_bound_at(bounds, first_neighbor, second_neighbor);
                 // A pair sharing two centers is claimed once per center, and the two claims differ when

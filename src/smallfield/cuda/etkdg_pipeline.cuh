@@ -3,7 +3,8 @@
  *  @brief Persistent warp-loop CUDA kernels for the ETKDG conformer generation pipeline.
  *
  *  The pipeline lives in two sibling kernels that share the `warp_per_molecule` pattern, split to keep register
- *  pressure per kernel under the launch-bounds cap; on Hopper, `sm_90`, they land at 69 and 72 regs/thread.
+ *  pressure per kernel under the launch-bounds cap. What each costs is a measurement of today's binary rather
+ *  than a rule, so it is not restated here — read it from `cuobjdump --dump-resource-usage`.
  *
  *  `etkdg_pipeline_warp_kernel` — bounds quantization through final validation: bounds quantize → DG FIRE →
  *  stereo retry → fourth-dim crush → ETK torsion → final validation. Writes ETK-refined 3D positions to
@@ -71,6 +72,23 @@ using smallfield::types::mmff94_bond_t;
 using smallfield::types::mmff94_oop_t;
 using smallfield::types::mmff94_stretchbend_t;
 using smallfield::types::mmff94_torsion_t;
+
+/**
+ *  FIRE iterations the two four-dimensional stages get. Flat rather than per-molecule: what they are
+ *  worth is a better starting geometry for the reflection-blind torsion stage, and that is not a
+ *  function of molecule size the way the polish budget next door is.
+ *
+ *  These are not free, and the tempting argument that they are does not survive measurement — the
+ *  ETKDG kernel's often-quoted small share of wall is measured with the CPU fallback folded in, and
+ *  does not transfer to a GPU-only arm. Doubling both costs about 16 % of that arm.
+ *
+ *  They earn it anyway wherever the fallback is on the critical path, because the geometry these two
+ *  hand forward is what the later stereo gates judge, and a refusal costs the CPU embedder hundreds
+ *  of milliseconds against microseconds here. Where the GPU is the critical path and the refusal rate
+ *  is already low, the arithmetic reverses — which is why these are named rather than inlined.
+ */
+constexpr std::int32_t distance_geometry_iterations_k = 200;
+constexpr std::int32_t fourth_dimension_crush_iterations_k = 100;
 
 /** Per-molecule FIRE iteration budgets for ETK torsion refinement and MMFF94 polish. */
 struct refinement_policy_t {
@@ -416,7 +434,8 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
                                                            .chiral_volume_weight = 100.0f,
                                                            .fourth_dimension_penalty_weight = 0.0f};
 
-            [[maybe_unused]] fire_result_t const dg_result = fire_minimize_(scratch_4d, 100, 1e-4f, lane, dg_functor);
+            [[maybe_unused]] fire_result_t const dg_result = fire_minimize_(scratch_4d, distance_geometry_iterations_k,
+                                                                            1e-4f, lane, dg_functor);
 
             // Stereochemistry validation: Check stereochemistry.
             if (count_invalid_chiral_centers_(positions, num_atoms, mol_chirals, meta.num_chiral_centers, lane) != 0)
@@ -424,7 +443,8 @@ __global__ __launch_bounds__(32, 4) void etkdg_pipeline_warp_kernel(
 
             // Fourth-dimension crush: Crush the fourth dimension with 50 FIRE iterations.
             dg_functor.fourth_dimension_penalty_weight = 10.0f;
-            fire_result_t const crush_result = fire_minimize_(scratch_4d, 50, 1e-4f, lane, dg_functor);
+            fire_result_t const crush_result = fire_minimize_(scratch_4d, fourth_dimension_crush_iterations_k, 1e-4f,
+                                                              lane, dg_functor);
 
             // Torsion refinement: Run ETK torsion refinement in 3D with 100 FIRE iterations.
             if (meta.num_etk_torsions > 0) {
