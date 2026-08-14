@@ -1705,18 +1705,19 @@ conformer_status_t context_t::generate_conformers(
                                   .clock = clock,
                                   .sink = sink};
 
-    // Wave N is prepared while wave N-1 is still on the GPUs, so the ring holds one slot per wave in
-    // flight and `pinned_prep_slot_of` is the only place the modulus is written.
-    std::array<std::vector<gpu_pipeline_handle_t>, pinned_prep_depth_k> in_flight {};
+    // One wave is GPU-resident at a time: N-1 is finalized before N is launched, so a single handle
+    // vector spans exactly the window it describes. The pinned ring is deeper than this for a different
+    // reason — wave N-1's host-to-device copy is still reading its slot while `prepare` fills wave N's —
+    // and sizing the handles by that depth implied a second resident wave this loop has never issued.
+    std::vector<gpu_pipeline_handle_t> in_flight;
     dispatcher.prepare(waves[0], 0, records[0]);
-    dispatcher.launch(waves[0], 0, records[0], in_flight[pinned_prep_slot_of(0)]);
+    dispatcher.launch(waves[0], 0, records[0], in_flight);
     for (std::uint32_t wave = 1; wave < waves.size(); ++wave) {
         dispatcher.prepare(waves[wave], wave, records[wave]);
-        dispatcher.finalize(in_flight[pinned_prep_slot_of(wave - 1)], records[wave - 1]);
-        dispatcher.launch(waves[wave], wave, records[wave], in_flight[pinned_prep_slot_of(wave)]);
+        dispatcher.finalize(in_flight, records[wave - 1]);
+        dispatcher.launch(waves[wave], wave, records[wave], in_flight);
     }
-    std::uint32_t const last_wave = static_cast<std::uint32_t>(waves.size() - 1);
-    dispatcher.finalize(in_flight[pinned_prep_slot_of(last_wave)], records[last_wave]);
+    dispatcher.finalize(in_flight, records.back());
 
     print_wave_timeline_(this->logger, records, clock.elapsed_ms());
 

@@ -214,6 +214,11 @@ inline conformer_status_t descriptor_capacity_status_(RDKit::ROMol const &molecu
     if (molecule.getNumAtoms() > max_atoms_per_molecule_k) return conformer_status_t::too_many_atoms_k;
     if (molecule.getNumBonds() > max_bonds_k) return conformer_status_t::too_many_bonds_k;
 
+    // Ring perception is the caller's to run, not this function's, so an uninitialized `RingInfo` leaves
+    // both ring extents unmeasured and answers `success_k` — a verdict that reads as "every extent fits"
+    // when two of them were never checked. `fill_rings_` then writes zero rings, and MMFF typing and the
+    // CSD torsion match read the molecule as acyclic, which is the outcome the two refusals below exist
+    // to prevent. Safe only because every caller sanitizes first.
     RDKit::RingInfo const *const ring_info = molecule.getRingInfo();
     if (ring_info == nullptr || !ring_info->isInitialized()) return conformer_status_t::success_k;
     auto const &atom_rings = ring_info->atomRings();

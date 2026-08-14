@@ -496,105 +496,13 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
 }
 
 /**
- *  @brief MMFF94 energy and gradient evaluation.
+ *  @brief MMFF94 energy and gradient over per-atom interaction lists, in the shape `fire_minimize_` calls.
  *
  *  Bonded terms iterate the pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) first, then
  *  nonbonded pairs are enumerated on the fly from the `bond_distance` matrix, once per pair, with
  *  their parameters combined in registers. The order is what keeps the bonded write a plain store.
  *
  *  @see fire_minimize_
- */
-__device__ __forceinline__ float evaluate_mmff94_energy(
-    mmff94_atom_vdw_folded_t const *__restrict__ atom_vdw_params, float const *__restrict__ atom_charge,
-    std::uint8_t const *__restrict__ bond_distance, mmff94_bond_t const *__restrict__ bond_params,
-    mmff94_angle_t const *__restrict__ angle_params, mmff94_torsion_t const *__restrict__ torsion_params,
-    mmff94_oop_t const *__restrict__ oop_params, mmff94_stretchbend_t const *__restrict__ stretchbend_params,
-    mmff94_atom_interaction_t const *__restrict__ interactions, mmff94_atom_offsets_t const *__restrict__ atom_offsets,
-    std::uint32_t num_atoms, float const *positions, float *gradient, std::uint32_t num_elements, std::uint32_t lane) {
-
-    for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) gradient[element] = 0.0f;
-    __syncwarp(full_mask_k);
-
-    float total_energy = 0.0f;
-
-    // Bonded terms walk the per-atom CSR, one lane per atom, so each writes only the three words its
-    // own atom owns and reads none another lane owns. Running them before the pair sweep is what
-    // keeps that write a plain store: the pair sweep below is the only pass that reaches a partner.
-    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
-        float3 gradient_acc {0.0f, 0.0f, 0.0f};
-        auto const &offsets = atom_offsets[atom];
-
-        for (std::uint32_t index = offsets.bond_offset; index < offsets.bond_offset + offsets.bond_count; ++index)
-            mmff_bond_contribution_(positions, num_atoms, atom, bond_params[interactions[index].term_index],
-                                    interactions[index].role, &total_energy, &gradient_acc);
-
-        for (std::uint32_t index = offsets.angle_offset; index < offsets.angle_offset + offsets.angle_count; ++index)
-            mmff_angle_contribution_(positions, num_atoms, atom, angle_params[interactions[index].term_index],
-                                     interactions[index].role, &total_energy, &gradient_acc);
-
-        for (std::uint32_t index = offsets.torsion_offset; index < offsets.torsion_offset + offsets.torsion_count;
-             ++index)
-            mmff_torsion_contribution_(positions, num_atoms, atom, torsion_params[interactions[index].term_index],
-                                       interactions[index].role, &total_energy, &gradient_acc);
-
-        for (std::uint32_t index = offsets.oop_offset; index < offsets.oop_offset + offsets.oop_count; ++index)
-            mmff_oop_contribution_(positions, num_atoms, atom, oop_params[interactions[index].term_index],
-                                   interactions[index].role, &total_energy, &gradient_acc);
-
-        for (std::uint32_t index = offsets.stretchbend_offset;
-             index < offsets.stretchbend_offset + offsets.stretchbend_count; ++index)
-            mmff_stretchbend_contribution_(positions, num_atoms, atom,
-                                           stretchbend_params[interactions[index].term_index], interactions[index].role,
-                                           &total_energy, &gradient_acc);
-
-        store_gradient_(gradient, num_atoms, atom, gradient_acc);
-    }
-    __syncwarp(full_mask_k);
-
-    // Nonbonded pairs, enumerated from bond_distance, which a warp BFS over the undirected bond
-    // graph fills (cuda/bond_distance_kernel.cuh) — so it is symmetric and one endpoint's read
-    // answers for both. Walking `other = (atom + offset) mod num_atoms` over the first half of the
-    // ring visits every pair exactly once with all 32 lanes productive, where an `other > atom`
-    // test would leave half the warp's issue slots idle on a warp-uniform predicate.
-    //
-    // The partner's share of the force is the exact negation of this atom's, so one evaluation
-    // delivers both. At a fixed offset the 32 lanes address 32 distinct atoms, whatever the atom
-    // count, so writing the partner's share into the shared gradient needs no atomic.
-    std::uint32_t const half_shell = num_atoms / 2;
-    // An even atom count makes the last offset its own mirror, since atom and atom + N/2 reach each
-    // other from both ends, so only the lower half of the ring speaks for that offset.
-    bool const middle_offset_is_mirrored = (num_atoms % 2u) == 0u;
-
-    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
-        mmff94_atom_vdw_folded_t const p_atom = atom_vdw_params[atom];
-        float const q_atom = atom_charge[atom];
-        float3 own_force {0.0f, 0.0f, 0.0f};
-
-        for (std::uint32_t offset = 1; offset <= half_shell; ++offset) {
-            if (middle_offset_is_mirrored && offset == half_shell && atom >= half_shell) continue;
-            std::uint32_t const wrapped = atom + offset;
-            std::uint32_t const other = wrapped < num_atoms ? wrapped : wrapped - num_atoms;
-            std::uint8_t const bond_hops = bond_distance[atom * num_atoms + other];
-            if (bond_hops < 3 || bond_hops == 255) continue; // bonded, geminal, or unreachable
-            float3 pair_force {0.0f, 0.0f, 0.0f};
-            mmff_nonbonded_contribution_(
-                positions, num_atoms, atom, other, p_atom, atom_vdw_params[other], q_atom * atom_charge[other],
-                bond_hops == 3 ? pair_separation_t::one_four_k : pair_separation_t::beyond_one_four_k, &total_energy,
-                &pair_force);
-            own_force = add_float3_(own_force, pair_force);
-            accumulate_gradient_into_(gradient, num_atoms, other, scale_float3_(pair_force, -1.0f));
-        }
-        accumulate_gradient_into_(gradient, num_atoms, atom, own_force);
-    }
-
-    return warp_reduce_sum_f32_(total_energy);
-}
-
-/**
- *  @brief MMFF94 energy and gradient functor using per-atom interaction lists.
- *
- *  Thin wrapper around `evaluate_mmff94_energy` that provides the `operator()` interface expected
- *  by `fire_minimize_`.
  */
 struct mmff94_energy_functor_t {
     mmff94_atom_vdw_folded_t const *__restrict__ atom_vdw_params;
@@ -611,9 +519,84 @@ struct mmff94_energy_functor_t {
 
     __device__ __forceinline__ float operator()(float const *positions, float *gradient, std::uint32_t num_elements,
                                                 std::uint32_t lane) const {
-        return evaluate_mmff94_energy(atom_vdw_params, atom_charge, bond_distance, bond_params, angle_params,
-                                      torsion_params, oop_params, stretchbend_params, interactions, atom_offsets,
-                                      num_atoms, positions, gradient, num_elements, lane);
+
+        for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) gradient[element] = 0.0f;
+        __syncwarp(full_mask_k);
+
+        float total_energy = 0.0f;
+
+        // Bonded terms walk the per-atom CSR, one lane per atom, so each writes only the three words its
+        // own atom owns and reads none another lane owns. Running them before the pair sweep is what
+        // keeps that write a plain store: the pair sweep below is the only pass that reaches a partner.
+        for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
+            float3 gradient_acc {0.0f, 0.0f, 0.0f};
+            auto const &offsets = atom_offsets[atom];
+
+            for (std::uint32_t index = offsets.bond_offset; index < offsets.bond_offset + offsets.bond_count; ++index)
+                mmff_bond_contribution_(positions, num_atoms, atom, bond_params[interactions[index].term_index],
+                                        interactions[index].role, &total_energy, &gradient_acc);
+
+            for (std::uint32_t index = offsets.angle_offset; index < offsets.angle_offset + offsets.angle_count;
+                 ++index)
+                mmff_angle_contribution_(positions, num_atoms, atom, angle_params[interactions[index].term_index],
+                                         interactions[index].role, &total_energy, &gradient_acc);
+
+            for (std::uint32_t index = offsets.torsion_offset; index < offsets.torsion_offset + offsets.torsion_count;
+                 ++index)
+                mmff_torsion_contribution_(positions, num_atoms, atom, torsion_params[interactions[index].term_index],
+                                           interactions[index].role, &total_energy, &gradient_acc);
+
+            for (std::uint32_t index = offsets.oop_offset; index < offsets.oop_offset + offsets.oop_count; ++index)
+                mmff_oop_contribution_(positions, num_atoms, atom, oop_params[interactions[index].term_index],
+                                       interactions[index].role, &total_energy, &gradient_acc);
+
+            for (std::uint32_t index = offsets.stretchbend_offset;
+                 index < offsets.stretchbend_offset + offsets.stretchbend_count; ++index)
+                mmff_stretchbend_contribution_(positions, num_atoms, atom,
+                                               stretchbend_params[interactions[index].term_index],
+                                               interactions[index].role, &total_energy, &gradient_acc);
+
+            store_gradient_(gradient, num_atoms, atom, gradient_acc);
+        }
+        __syncwarp(full_mask_k);
+
+        // Nonbonded pairs, enumerated from bond_distance, which a warp BFS over the undirected bond
+        // graph fills (cuda/bond_distance_kernel.cuh) — so it is symmetric and one endpoint's read
+        // answers for both. Walking `other = (atom + offset) mod num_atoms` over the first half of the
+        // ring visits every pair exactly once with all 32 lanes productive, where an `other > atom`
+        // test would leave half the warp's issue slots idle on a warp-uniform predicate.
+        //
+        // The partner's share of the force is the exact negation of this atom's, so one evaluation
+        // delivers both. At a fixed offset the 32 lanes address 32 distinct atoms, whatever the atom
+        // count, so writing the partner's share into the shared gradient needs no atomic.
+        std::uint32_t const half_shell = num_atoms / 2;
+        // An even atom count makes the last offset its own mirror, since atom and atom + N/2 reach each
+        // other from both ends, so only the lower half of the ring speaks for that offset.
+        bool const middle_offset_is_mirrored = (num_atoms % 2u) == 0u;
+
+        for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
+            mmff94_atom_vdw_folded_t const p_atom = atom_vdw_params[atom];
+            float const q_atom = atom_charge[atom];
+            float3 own_force {0.0f, 0.0f, 0.0f};
+
+            for (std::uint32_t offset = 1; offset <= half_shell; ++offset) {
+                if (middle_offset_is_mirrored && offset == half_shell && atom >= half_shell) continue;
+                std::uint32_t const wrapped = atom + offset;
+                std::uint32_t const other = wrapped < num_atoms ? wrapped : wrapped - num_atoms;
+                std::uint8_t const bond_hops = bond_distance[atom * num_atoms + other];
+                if (bond_hops < 3 || bond_hops == 255) continue; // bonded, geminal, or unreachable
+                float3 pair_force {0.0f, 0.0f, 0.0f};
+                mmff_nonbonded_contribution_(
+                    positions, num_atoms, atom, other, p_atom, atom_vdw_params[other], q_atom * atom_charge[other],
+                    bond_hops == 3 ? pair_separation_t::one_four_k : pair_separation_t::beyond_one_four_k,
+                    &total_energy, &pair_force);
+                own_force = add_float3_(own_force, pair_force);
+                accumulate_gradient_into_(gradient, num_atoms, other, scale_float3_(pair_force, -1.0f));
+            }
+            accumulate_gradient_into_(gradient, num_atoms, atom, own_force);
+        }
+
+        return warp_reduce_sum_f32_(total_energy);
     }
 };
 

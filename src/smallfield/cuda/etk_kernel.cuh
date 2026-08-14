@@ -133,92 +133,18 @@ __device__ __forceinline__ float compute_torsion_contribution_(float const *posi
 }
 
 /**
- *  @brief Atom-centric ETK torsion energy and gradient evaluation.
+ *  @brief Atom-centric ETK torsion energy and gradient, in the shape `fire_minimize_` calls.
  *
- *  Each thread owns atoms, iterates all torsions checking participation.
- *  No atomicAdd.
+ *  Each lane owns atoms and walks its own interaction list, so no `atomicAdd` is needed. The terms and
+ *  the molecule are members and the geometry arrives per call, which is the split that lets one functor
+ *  serve every iteration of a stage.
  *
- *  @param[in] torsion_terms Array of torsion descriptors.
- *  @param[in] distance_constraints Array of distance constraint descriptors.
- *  @param[in] interactions Per-atom interaction list entries.
- *  @param[in] atom_offsets Per-atom offsets into the interaction list.
- *  @param[in] num_atoms Number of atoms in the molecule.
  *  @param[in] positions SoA coordinate array [x0..xN, y0..yN, z0..zN].
- *  @param[out] gradient Output gradient array (same layout as positions).
+ *  @param[out] gradient Output gradient array, same layout as positions.
  *  @param[in] num_elements Total number of coordinate elements.
- *  @param[in] lane Warp lane index (0-31).
- *  @return Total energy (same value in all lanes after warp reduction).
+ *  @param[in] lane Warp lane index, 0-31.
+ *  @return Total energy, the same value in all lanes after the warp reduction.
  *  @see fire_minimize_
- */
-__device__ __forceinline__ float evaluate_etk_torsion_energy(
-    etk_torsion_descriptor_t const *__restrict__ torsion_terms,
-    distance_constraint_t const *__restrict__ distance_constraints,
-    etk_atom_interaction_t const *__restrict__ interactions, etk_atom_offsets_t const *__restrict__ atom_offsets,
-    std::uint32_t num_atoms, float const *positions, float *gradient, std::uint32_t num_elements, std::uint32_t lane) {
-
-    for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) gradient[element] = 0.0f;
-    __syncwarp(full_mask_k);
-
-    float total_energy = 0.0f;
-
-    for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
-        float3 gradient_acc {0.0f, 0.0f, 0.0f};
-
-        std::uint32_t const interaction_offset = atom_offsets[atom].interaction_offset;
-        std::uint32_t const interaction_count = atom_offsets[atom].interaction_count;
-
-        for (std::uint32_t index = interaction_offset; index < interaction_offset + interaction_count; ++index) {
-            auto const &entry = interactions[index];
-
-            if (entry.interaction_type == etk_torsion_k) {
-                // torsion term
-                float torsion_energy = compute_torsion_contribution_(
-                    positions, num_atoms, torsion_terms[entry.term_index], entry.role, &gradient_acc);
-                if (entry.role == atom_role_first_k) total_energy += torsion_energy;
-            }
-            else {
-                // distance constraint
-                auto const &constraint = distance_constraints[entry.term_index];
-                std::uint32_t const atom_i = constraint.atom_index_i;
-                std::uint32_t const atom_j = constraint.atom_index_j;
-
-                float3 const delta = sub_float3_(load_position_(positions, num_atoms, atom_j),
-                                                 load_position_(positions, num_atoms, atom_i));
-                float const distance_squared = dot_float3_(delta, delta);
-                float const inverse_distance = rsqrtf(fmaxf(distance_squared, 1e-10f));
-                float const distance = distance_squared * inverse_distance;
-
-                float const upper_bound = constraint.upper_bound_angstrom;
-                float const lower_bound = constraint.lower_bound_angstrom;
-                float const weight = constraint.penalty_weight;
-                float const direction = (entry.role == atom_role_first_k) ? -1.0f : 1.0f;
-
-                if (distance > upper_bound) {
-                    if (entry.role == atom_role_first_k)
-                        total_energy += weight * (distance - upper_bound) * (distance - upper_bound);
-                    float const scale = 2.0f * weight * (distance - upper_bound) * inverse_distance;
-                    accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
-                }
-                else if (distance < lower_bound) {
-                    if (entry.role == atom_role_first_k)
-                        total_energy += weight * (lower_bound - distance) * (lower_bound - distance);
-                    float const scale = -2.0f * weight * (lower_bound - distance) * inverse_distance;
-                    accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
-                }
-            }
-        }
-
-        store_gradient_(gradient, num_atoms, atom, gradient_acc);
-    }
-
-    return warp_reduce_sum_f32_(total_energy);
-}
-
-/**
- *  @brief Atom-centric ETK torsion energy and gradient functor.
- *
- *  Thin wrapper around `evaluate_etk_torsion_energy` that provides the `operator()` interface
- *  expected by `fire_minimize_`.
  */
 struct etk_torsion_energy_functor_t {
     etk_torsion_descriptor_t const *__restrict__ torsion_terms;
@@ -229,8 +155,63 @@ struct etk_torsion_energy_functor_t {
 
     __device__ __forceinline__ float operator()(float const *positions, float *gradient, std::uint32_t num_elements,
                                                 std::uint32_t lane) const {
-        return evaluate_etk_torsion_energy(torsion_terms, distance_constraints, interactions, atom_offsets, num_atoms,
-                                           positions, gradient, num_elements, lane);
+
+        for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) gradient[element] = 0.0f;
+        __syncwarp(full_mask_k);
+
+        float total_energy = 0.0f;
+
+        for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
+            float3 gradient_acc {0.0f, 0.0f, 0.0f};
+
+            std::uint32_t const interaction_offset = atom_offsets[atom].interaction_offset;
+            std::uint32_t const interaction_count = atom_offsets[atom].interaction_count;
+
+            for (std::uint32_t index = interaction_offset; index < interaction_offset + interaction_count; ++index) {
+                auto const &entry = interactions[index];
+
+                if (entry.interaction_type == etk_torsion_k) {
+                    // torsion term
+                    float torsion_energy = compute_torsion_contribution_(
+                        positions, num_atoms, torsion_terms[entry.term_index], entry.role, &gradient_acc);
+                    if (entry.role == atom_role_first_k) total_energy += torsion_energy;
+                }
+                else {
+                    // distance constraint
+                    auto const &constraint = distance_constraints[entry.term_index];
+                    std::uint32_t const atom_i = constraint.atom_index_i;
+                    std::uint32_t const atom_j = constraint.atom_index_j;
+
+                    float3 const delta = sub_float3_(load_position_(positions, num_atoms, atom_j),
+                                                     load_position_(positions, num_atoms, atom_i));
+                    float const distance_squared = dot_float3_(delta, delta);
+                    float const inverse_distance = rsqrtf(fmaxf(distance_squared, 1e-10f));
+                    float const distance = distance_squared * inverse_distance;
+
+                    float const upper_bound = constraint.upper_bound_angstrom;
+                    float const lower_bound = constraint.lower_bound_angstrom;
+                    float const weight = constraint.penalty_weight;
+                    float const direction = (entry.role == atom_role_first_k) ? -1.0f : 1.0f;
+
+                    if (distance > upper_bound) {
+                        if (entry.role == atom_role_first_k)
+                            total_energy += weight * (distance - upper_bound) * (distance - upper_bound);
+                        float const scale = 2.0f * weight * (distance - upper_bound) * inverse_distance;
+                        accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
+                    }
+                    else if (distance < lower_bound) {
+                        if (entry.role == atom_role_first_k)
+                            total_energy += weight * (lower_bound - distance) * (lower_bound - distance);
+                        float const scale = -2.0f * weight * (lower_bound - distance) * inverse_distance;
+                        accumulate_gradient_(&gradient_acc, scale_float3_(delta, direction * scale));
+                    }
+                }
+            }
+
+            store_gradient_(gradient, num_atoms, atom, gradient_acc);
+        }
+
+        return warp_reduce_sum_f32_(total_energy);
     }
 };
 
