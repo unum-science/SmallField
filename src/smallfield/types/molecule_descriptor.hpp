@@ -97,6 +97,10 @@ enum bond_flag_t : std::uint8_t {
      *  Kekulé order, which is how an in-ring triple bond reaches the descriptor as order 3 and aromatic. */
     bond_flag_aromatic_k = 1u << 0,
     bond_flag_in_ring_k = 1u << 1,
+    /** `Bond::getIsConjugated()`. Read by the bounds builder's UFF typing, which puts an sp2 C, N, O or S
+     *  on the resonant parameter row when the atom is aromatic @b or carries one of these — an enone's
+     *  carbonyl oxygen is `O_R` and not `O_2`, a difference of 0.046 Å in the valence radius. */
+    bond_flag_conjugated_k = 1u << 2,
     /** E / trans. */
     bond_flag_stereo_e_k = 1u << 3,
     /** Z / cis. */
@@ -306,6 +310,7 @@ inline void fill_bonds_(RDKit::ROMol const &molecule, molecule_descriptor_t &des
         std::uint8_t flags = 0;
         if (bond->getIsAromatic()) flags |= bond_flag_aromatic_k;
         if (order == RDKit::Bond::AROMATIC) flags |= bond_flag_order_aromatic_k;
+        if (bond->getIsConjugated()) flags |= bond_flag_conjugated_k;
         RDKit::Bond::BondStereo const stereo = bond->getStereo();
         if (stereo == RDKit::Bond::STEREOE || stereo == RDKit::Bond::STEREOTRANS) flags |= bond_flag_stereo_e_k;
         if (stereo == RDKit::Bond::STEREOZ || stereo == RDKit::Bond::STEREOCIS) flags |= bond_flag_stereo_z_k;

@@ -35,9 +35,10 @@
 
 namespace smallfield::preprocess {
 
+using smallfield::types::atom_flag_aromatic_k;
 using smallfield::types::atom_flag_hbond_acceptor_k;
 using smallfield::types::atom_flag_hbond_donor_h_k;
-using smallfield::types::bond_flag_aromatic_k;
+using smallfield::types::bond_flag_conjugated_k;
 using smallfield::types::bond_flag_order_aromatic_k;
 using smallfield::types::bond_flag_stereo_e_k;
 using smallfield::types::bond_flag_stereo_z_k;
@@ -245,15 +246,59 @@ inline std::uint32_t larger_sp2_ring_atoms_(molecule_descriptor_t const &descrip
            static_cast<std::uint32_t>(is_larger_sp2_ring_atom(second));
 }
 
-/** Ideal length in Å of @p bond, read from the element pair and the bond type. */
-inline float bond_length_angstrom_(molecule_descriptor_t const &descriptor, std::uint32_t bond) {
-    covalent_bond_t const covalent = (descriptor.bond_flags[bond] & bond_flag_aromatic_k) != 0
-                                         ? covalent_bond_t::aromatic_k
-                                     : descriptor.bond_order[bond] == 2 ? covalent_bond_t::double_k
-                                     : descriptor.bond_order[bond] == 3 ? covalent_bond_t::triple_k
-                                                                        : covalent_bond_t::single_k;
-    return ideal_bond_length_angstrom(descriptor.element[descriptor.bond_atom_i[bond]],
-                                      descriptor.element[descriptor.bond_atom_j[bond]], covalent);
+/**
+ *  @brief Whether @p atom sits on its element's resonant UFF row.
+ *
+ *  Aromaticity is the half a reader expects; the conjugated bond is the half that decides an enone's
+ *  carbonyl oxygen, an ester's, an amide's and a diene's central carbons, none of which are aromatic.
+ *  Reading only the first would put 25,349 of 231,978 bonds on the wrong row.
+ */
+inline resonance_t atom_resonance_(molecule_descriptor_t const &descriptor, std::uint32_t atom) {
+    if ((descriptor.atom_flags[atom] & atom_flag_aromatic_k) != 0) return resonance_t::resonant_k;
+    std::uint32_t const first_entry = descriptor.neighbor_offset[atom];
+    std::uint32_t const last_entry = descriptor.neighbor_offset[atom + 1];
+    for (std::uint32_t entry = first_entry; entry < last_entry; ++entry)
+        if ((descriptor.bond_flags[descriptor.neighbor_bond[entry]] & bond_flag_conjugated_k) != 0)
+            return resonance_t::resonant_k;
+    return resonance_t::isolated_k;
+}
+
+/** The UFF row @p atom reads, or `untyped_k` where upstream has none either. */
+inline uff_type_t uff_type_at_(molecule_descriptor_t const &descriptor, std::uint32_t atom) {
+    return uff_type_of(descriptor.element[atom], descriptor.hybridization[atom], atom_resonance_(descriptor, atom),
+                       descriptor.degree[atom], descriptor.formal_charge[atom]);
+}
+
+/**
+ *  @brief Bond order as UFF reads it, where an aromatic bond is 1.5 rather than a whole number.
+ *
+ *  Keyed on `bond_flag_order_aromatic_k` and not on `bond_flag_aromatic_k`, because the two are different
+ *  questions: upstream's `getBondTypeAsDouble` answers 1.5 only for a bond with no Kekulé order at all,
+ *  and an in-ring bond that kept one is a plain double or triple to this arithmetic.
+ */
+inline float uff_bond_order_(molecule_descriptor_t const &descriptor, std::uint32_t bond) {
+    if ((descriptor.bond_flags[bond] & bond_flag_order_aromatic_k) != 0) return 1.5f;
+    return static_cast<float>(descriptor.bond_order[bond]);
+}
+
+/**
+ *  @brief Rest length in Å of every bond, written once so three sweeps read it instead of recomputing it.
+ *
+ *  @param[in] descriptor Molecule graph.
+ *  @param[in] atom_types One UFF row per atom.
+ *  @param[out] rest_lengths One length per bond; sized to `descriptor.num_bonds` by the caller.
+ */
+inline void fill_bond_rest_lengths_(molecule_descriptor_t const &descriptor, custd::span<uff_type_t const> atom_types,
+                                    custd::span<float> rest_lengths) {
+    for (std::uint32_t bond = 0; bond < descriptor.num_bonds; ++bond) {
+        std::uint32_t const atom_i = descriptor.bond_atom_i[bond];
+        std::uint32_t const atom_j = descriptor.bond_atom_j[bond];
+        uff_type_t const type_i = atom_types[atom_i], type_j = atom_types[atom_j];
+        rest_lengths[bond] = type_i == uff_type_t::untyped_k || type_j == uff_type_t::untyped_k
+                                 ? untypable_bond_rest_length_angstrom(descriptor.element[atom_i],
+                                                                       descriptor.element[atom_j])
+                                 : uff_bond_rest_length_angstrom(type_i, type_j, uff_bond_order_(descriptor, bond));
+    }
 }
 
 /**
@@ -555,11 +600,12 @@ inline torsion_preference_t path_14_target_(molecule_descriptor_t const &descrip
 #pragma region Interval Merge
 
 /** The distance interval @p target claims for @p path, in Å. */
-inline bound_interval_t path_14_interval_(molecule_descriptor_t const &descriptor, path_14_t const &path,
+inline bound_interval_t path_14_interval_(molecule_descriptor_t const &descriptor,
+                                          custd::span<float const> bond_rest_lengths, path_14_t const &path,
                                           torsion_preference_t target) {
-    float const length_12 = bond_length_angstrom_(descriptor, path.bond_first_second);
-    float const length_23 = bond_length_angstrom_(descriptor, path.bond_second_third);
-    float const length_34 = bond_length_angstrom_(descriptor, path.bond_third_fourth);
+    float const length_12 = bond_rest_lengths[path.bond_first_second];
+    float const length_23 = bond_rest_lengths[path.bond_second_third];
+    float const length_34 = bond_rest_lengths[path.bond_third_fourth];
     float const angle_123 = interior_angle_radians_(descriptor, path.first, path.second, path.third);
     float const angle_234 = interior_angle_radians_(descriptor, path.second, path.third, path.fourth);
     auto const distance_at = [&](float cos_torsion) {
@@ -649,6 +695,17 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_
     hop_matrix_t const bond_hops {bond_hop_storage, num_atoms, num_atoms};
     fill_bond_distances(descriptor, bond_hops);
 
+    // Every bond's rest length is asked for once by the 1-2 sweep, twice per 1-3 pair and three times per
+    // 1-4 path, so it is written once here. The UFF row each atom reads outlives it because the 1-2
+    // window depends on whether both ends were typed at all, which is not recoverable from the length.
+    uff_type_t atom_uff_types[max_atoms_per_molecule_k];
+    for (std::uint32_t atom = 0; atom < num_atoms; ++atom) atom_uff_types[atom] = uff_type_at_(descriptor, atom);
+    custd::span<uff_type_t const> const uff_types {atom_uff_types, num_atoms};
+    float bond_rest_storage[max_bonds_k];
+    custd::span<float> const bond_rest_lengths {bond_rest_storage, descriptor.num_bonds};
+    fill_bond_rest_lengths_(descriptor, uff_types, bond_rest_lengths);
+    custd::span<float const> const rest_lengths {bond_rest_storage, descriptor.num_bonds};
+
     // Initial upper bound for every pair: large (effectively unconstrained).
     constexpr float upper_initial_k = 1000.0f;
     for (std::uint32_t row_atom = 0; row_atom < num_atoms; ++row_atom)
@@ -657,19 +714,21 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_
             lower_distance_bound_at(bounds, row_atom, column_atom) = 0.0f;
         }
 
-    // set12 — exact ideal bond lengths inside an absolute band, `DIST12_DELTA` upstream.
+    // set12 — the UFF rest length inside an absolute band, `DIST12_DELTA` upstream.
     //
-    // A fraction of the bond is the wrong shape for this: it makes a long bond's window wide and a
-    // short one's narrow, when the uncertainty being expressed is how far a real bond sits from its
-    // rest length and has nothing to do with the length. RDKit only reaches a percentage on the
-    // branch where UFF cannot type an atom, so ± 2 % was a tighter copy of its give-up path — three
-    // times the band for C-C, three and a half for C-S.
+    // A fraction of the bond is the wrong shape for a typed bond: it makes a long bond's window wide and
+    // a short one's narrow, when what the window expresses is how far a real bond sits from its rest
+    // length and does not scale with the length. Upstream reaches a percentage only where UFF cannot type
+    // an end, and that branch is kept here rather than approximated, because it is the one place a
+    // percentage is what upstream means — a metal-ligand bound it declines to assert.
     for (std::uint32_t bond = 0; bond < descriptor.num_bonds; ++bond) {
         std::uint32_t const atom_i = descriptor.bond_atom_i[bond];
         std::uint32_t const atom_j = descriptor.bond_atom_j[bond];
-        float const ideal = bond_length_angstrom_(descriptor, bond);
-        upper_distance_bound_at(bounds, atom_i, atom_j) = ideal + bond_tolerance_angstrom_k;
-        lower_distance_bound_at(bounds, atom_i, atom_j) = ideal - bond_tolerance_angstrom_k;
+        float const rest = rest_lengths[bond];
+        bool const untypable = uff_types[atom_i] == uff_type_t::untyped_k || uff_types[atom_j] == uff_type_t::untyped_k;
+        float const half_width = untypable ? rest * untypable_bond_window_k : bond_tolerance_angstrom_k;
+        upper_distance_bound_at(bounds, atom_i, atom_j) = rest + half_width;
+        lower_distance_bound_at(bounds, atom_i, atom_j) = rest - half_width;
     }
 
     // set13 — one 1-3 bound per pair of neighbors around every center atom.
@@ -686,10 +745,10 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_
         std::uint32_t const nend = descriptor.neighbor_offset[center + 1];
         for (std::uint32_t first_entry = nbegin; first_entry < nend; ++first_entry) {
             std::uint32_t const first_neighbor = descriptor.neighbor_atom[first_entry];
-            float const d_ci = bond_length_angstrom_(descriptor, descriptor.neighbor_bond[first_entry]);
+            float const d_ci = rest_lengths[descriptor.neighbor_bond[first_entry]];
             for (std::uint32_t second_entry = first_entry + 1; second_entry < nend; ++second_entry) {
                 std::uint32_t const second_neighbor = descriptor.neighbor_atom[second_entry];
-                float const d_cj = bond_length_angstrom_(descriptor, descriptor.neighbor_bond[second_entry]);
+                float const d_cj = rest_lengths[descriptor.neighbor_bond[second_entry]];
                 if (bond_hops(first_neighbor, second_neighbor) != 2) continue;
 
                 float const theta = interior_angle_radians_(descriptor, first_neighbor, center, second_neighbor);
@@ -768,7 +827,7 @@ inline void build_bounds_matrix(molecule_descriptor_t const &descriptor, packed_
                                           .bond_second_third = descriptor.neighbor_bond[third_entry],
                                           .bond_third_fourth = *closing};
                     path_14_case_t const path_case = classify_path_14_(descriptor, ring_bitmap_span, path);
-                    claims[num_claims++] = path_14_interval_(descriptor, path,
+                    claims[num_claims++] = path_14_interval_(descriptor, rest_lengths, path,
                                                              path_14_target_(descriptor, path, path_case));
                 }
             }
