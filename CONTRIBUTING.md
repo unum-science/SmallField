@@ -740,7 +740,7 @@ nvcc preprocesses to a synthetic flat file before the host compiler runs, so no 
 Measured on the C++ half alone it was 111 s against 109 s, and nvcc `--threads` measured slower than none, 380 s against 366 s, because `-j` already saturates the machine.
 A linker swap is equally pointless: the host link is 0.64 s, and the bytes come from `ptxas`, which no host linker replaces.
 
-__Never add `#include <fmt/…>` to a header under `cuda/`, to any `*_device.cuh`, or to `mmff94_tables_device.cuh`, and never use `{fmt}` inside a `__device__`, `__global__` or `__host__ __device__` body.__
+__Never add `#include <fmt/…>` to a header under `cuda/` or to any `*_device.cuh`, and never use `{fmt}` inside a `__device__`, `__global__` or `__host__ __device__` body.__
 
 The boundary is not the file extension, and getting that wrong costs work in both directions.
 `{fmt}` is already compiled by nvcc here — `smallfield.cu` is forced to `LANGUAGE CUDA` and reaches `fmt/chrono.h` transitively, with consteval-checked `logger.*` calls that build.

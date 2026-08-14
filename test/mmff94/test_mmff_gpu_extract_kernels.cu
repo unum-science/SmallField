@@ -16,7 +16,7 @@
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"
-#include "smallfield/parameters/mmff94_tables_device.cuh"
+#include "smallfield/parameters/mmff94_tables_device.hpp"
 #include "smallfield/types/storage.hpp"
 
 #include "test/mmff94/test_mmff_gpu_extract_kernels.hpp"

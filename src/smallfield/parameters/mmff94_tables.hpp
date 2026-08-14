@@ -278,7 +278,7 @@ struct mmff94_tables_view_t {
     std::uint8_t max_atom_type = 0;
 };
 
-/*  The upload in `mmff94_tables_device.cuh` writes these fields and every MMFF kernel takes the struct
+/*  The upload in `mmff94_tables_device.hpp` writes these fields and every MMFF kernel takes the struct
  *  by value, so a change in the layout silently redirects every parameter lookup on the device. */
 static_assert(sizeof(mmff94_tables_view_t) == 248);
 

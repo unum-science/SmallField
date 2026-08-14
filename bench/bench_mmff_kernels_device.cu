@@ -15,7 +15,7 @@
 
 #include "smallfield/mmff94/mmff94_extract_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"
-#include "smallfield/parameters/mmff94_tables_device.cuh"
+#include "smallfield/parameters/mmff94_tables_device.hpp"
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
 #include "smallfield/types/storage.hpp"
 
@@ -37,7 +37,15 @@ char const *describe_trio_launch(trio_launch_t status) {
     return "was refused";
 }
 
-/** Grow-only device storage over the benchmark's stream, which is the one the kernels and events ride. */
+/**
+ *  @brief Grow-only device storage on the default stream, which is the one everything below rides.
+ *
+ *  `device_allocator_t` defaults its stream to `nullptr` and every launch, upload and event here passes
+ *  the same, so the allocations, the copies and the kernels are ordered against each other by
+ *  construction. A benchmark that owns the device pays nothing for the legacy default stream's habit of
+ *  serializing against every other one, and taking a stream of its own would be a handle to keep in
+ *  agreement across five call sites in exchange for that nothing.
+ */
 template <typename value_type_>
 using device_array = types::buffer<value_type_, types::device_allocator_t>;
 
@@ -143,8 +151,8 @@ trio_launch_t launch_mmff94_kernel_trio_benchmark(sfparam::mmff94_tables_host_t 
         return trio_launch_t::allocation_failed_k;
     }
 
-    // The allocations above are stream-ordered against the stream the kernels and events below ride, so the
-    // uploads see them without a synchronize of their own.
+    // The allocations above are stream-ordered against the default stream, which is the one the uploads,
+    // the kernels and the events below all name, so they see each other without a synchronize.
     if (!types::upload_into(batch.descriptors.view(), descriptors, nullptr)) return trio_launch_t::allocation_failed_k;
     if (!types::upload_into(batch.atom_offsets.view(), atom_offsets, nullptr))
         return trio_launch_t::allocation_failed_k;

@@ -14,6 +14,7 @@
 
 #include <algorithm>    // `std::min`
 #include <charconv>     // `std::from_chars`
+#include <exception>    // `std::exception`
 #include <fstream>      // `std::ifstream`
 #include <limits>       // `std::numeric_limits`
 #include <memory>       // `std::unique_ptr`
@@ -59,6 +60,10 @@ using smallfield::types::unreachable_hops_k;
  *  connected component never produces. A caller comparing against pipeline output therefore checks its own
  *  atom count against `num_atoms_out` and skips the molecule when the two disagree.
  *
+ *  A refusal answers `nullptr` whichever way RDKit spells it. Sanitization reports an aromatic ring it
+ *  cannot kekulize by throwing rather than by returning, and a corpus assembled to be adversarial holds
+ *  such rows on purpose, so a caller sweeping one would otherwise die on the first of them.
+ *
  *  @param[in] smiles SMILES string to parse.
  *  @return Owning pointer to the molecule, or nullptr on parse failure.
  */
@@ -67,12 +72,19 @@ inline std::unique_ptr<RDKit::RWMol> mol_from_smiles(std::string const &smiles) 
     parameters.sanitize = true;
     parameters.removeHs = false;
     parameters.strictCXSMILES = false;
-    std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles, parameters));
+    std::unique_ptr<RDKit::RWMol> molecule;
+    try {
+        molecule.reset(RDKit::SmilesToMol(smiles, parameters));
+        if (molecule) RDKit::MolOps::addHs(*molecule);
+    }
+    catch (std::exception const &refusal) {
+        fmt::println(stderr, "NOTE mol_from_smiles smiles={} parsed=0 reason={}", smiles, refusal.what());
+        return nullptr;
+    }
     if (!molecule) {
         fmt::println(stderr, "NOTE mol_from_smiles smiles={} parsed=0", smiles);
         return nullptr;
     }
-    RDKit::MolOps::addHs(*molecule);
     return molecule;
 }
 

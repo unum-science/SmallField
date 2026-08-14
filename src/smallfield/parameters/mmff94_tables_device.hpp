@@ -1,5 +1,5 @@
 /**
- *  @file src/smallfield/parameters/mmff94_tables_device.cuh
+ *  @file src/smallfield/parameters/mmff94_tables_device.hpp
  *  @brief Upload MMFF94 tables from host to device.
  *
  *  Mirrors `mmff94_tables_host_t` on the device: one grow-only device buffer per table, and an

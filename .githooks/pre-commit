@@ -782,9 +782,9 @@ while IFS= read -r -d '' file; do
             ;;
         esac
         # The device-header set is a list of function bodies {fmt} may not enter, named by the files
-        # that carry them: everything under cuda/, every *_device.cuh, and the MMFF table header.
+        # that carry them: everything under cuda/, and every *_device.cuh.
         case "$file" in
-        src/smallfield/cuda/* | *_device.cuh | *mmff94_tables_device.cuh)
+        src/smallfield/cuda/* | *_device.cuh)
             check_device_header_fmt
             ;;
         esac

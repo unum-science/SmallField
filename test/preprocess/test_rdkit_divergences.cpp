@@ -18,6 +18,9 @@
  *   - @b We-still-say-it: SmallField reproduces `our_values` within `our_tolerance`.
  *   - @b Still-apart: the two remain more than `divergence_threshold` apart. Convergence retires a row
  *     rather than relaxing it.
+ *   - @b Reaching-alike: on every pair of the corpus the two sides agree about whether the pair is
+ *     constrained at all, which is the assertion that has to come first -- two numbers can only be
+ *     compared where both sides produced one.
  *   - @b Complete: a rescan of the corpus finds no disagreement of a recorded kind that no row explains.
  *
  *  When `fixed_in` names a release at or below the installed one, the fourth assertion inverts: the two
@@ -30,8 +33,9 @@
  *  table stopped being readable. Its row carries the defect once, and the rescan says so rather than
  *  pretending to have covered it.
  *
- *  Corpus: the built-in standards plus every molecule the registry names, so the registry is always
- *  rescanned against itself; `argv[1]` or `SMALLFIELD_TEST_CORPUS` widens it.
+ *  Corpus: the built-in standards, every molecule the registry names -- so the registry is always
+ *  rescanned against itself -- and `adversarial.smi` beside this file, which is what makes the rescan a
+ *  gate rather than a formality. `argv[1]` or `SMALLFIELD_TEST_CORPUS` replaces that last part.
  */
 
 #include <cmath>   // `std::fabs`, `std::cos`, `std::sin`
@@ -68,8 +72,31 @@ namespace sftest = smallfield::tests;
 
 static constexpr std::string_view test_name_k = "test_rdkit_divergences";
 
-/** Molecules taken from a named corpus when no cap is given; the registry's own are always walked. */
-static constexpr std::size_t default_max_molecules_k = 50;
+/**
+ *  @brief Molecules taken from a corpus when no cap is given; the registry's own are always walked.
+ *
+ *  It sits above the built-in corpus so the default run walks all of it, and high enough that naming a
+ *  larger corpus without also naming `SMALLFIELD_TEST_MAX_MOLS` gets that corpus rather than a truncation
+ *  of it reading like a sweep.
+ */
+static constexpr std::size_t default_max_molecules_k = 10000;
+
+/**
+ *  @brief The corpus walked when no path is named: `adversarial.smi` beside this source file.
+ *
+ *  A gate is only as strong as what it is asked. The built-ins plus the registry are twelve molecules, a
+ *  corpus so narrow that a whole class of disagreement could stay invisible and still report zero -- so
+ *  the default is the in-tree adversarial set instead, which the sweep below walks in seconds.
+ *
+ *  Derived from `__FILE__` because the corpus and the test are one artifact: a path spelled anywhere else
+ *  is a second place to keep them together, and CMake compiles this file by its absolute path.
+ */
+static std::string default_corpus_path_() {
+    std::string_view const source_path = __FILE__;
+    std::size_t const directory_end = source_path.find_last_of('/');
+    if (directory_end == std::string_view::npos) return "adversarial.smi";
+    return std::string(source_path.substr(0, directory_end + 1)) + "adversarial.smi";
+}
 
 namespace smallfield::tests {
 
@@ -362,30 +389,32 @@ struct divergence_reporters_t {
     diagnostic_reporter_t drift {"recorded", "measured"};
     /** The two sides against each other, which is the assertion the row exists to make. */
     diagnostic_reporter_t disagreement {"rdkit", "ours"};
+    /** Whether the two sides constrain the same pairs at all, before any of their numbers are compared. */
+    diagnostic_reporter_t reach {"expected", "observed"};
     /** Whether a corpus disagreement is one some row already explains. */
     diagnostic_reporter_t completeness {"expected", "observed"};
 
     /** True when every section held; a caller gates its verdict on this rather than on one reporter. */
     bool passed() const noexcept {
-        return shape.passed() && drift.passed() && disagreement.passed() && completeness.passed();
+        return shape.passed() && drift.passed() && disagreement.passed() && reach.passed() && completeness.passed();
     }
 
     /** Divergences asserted across every section, for the verdict line. */
     std::size_t divergence_count() const noexcept {
         return shape.divergence_count() + drift.divergence_count() + disagreement.divergence_count() +
-               completeness.divergence_count();
+               reach.divergence_count() + completeness.divergence_count();
     }
 
     /** Mismatches across every section, for the verdict line. */
     std::size_t mismatch_count() const noexcept {
         return shape.mismatch_count() + drift.mismatch_count() + disagreement.mismatch_count() +
-               completeness.mismatch_count();
+               reach.mismatch_count() + completeness.mismatch_count();
     }
 
     /** Comparisons across every section, so the verdict states what the mismatch count is out of. */
     std::size_t comparison_count() const noexcept {
         return shape.comparison_count() + drift.comparison_count() + disagreement.comparison_count() +
-               completeness.comparison_count();
+               reach.comparison_count() + completeness.comparison_count();
     }
 };
 
@@ -409,6 +438,11 @@ struct registry_tally_t {
  *
  *  Such a row passes or fails on which way the last bit rounded, and a flapping assertion teaches the
  *  next reader to delete it rather than to read it.
+ *
+ *  A row recording a pair only one side constrains needs no exemption from this, because it records the
+ *  same two bounds every other row records -- one of them the `unconstrained_upper_k` sentinel, which both
+ *  sides spell identically and neither side rounds. All three numbers stay distances in angstroms, which
+ *  is the only currency in which their comparison means anything.
  *
  *  @param[in] rows Whole registry.
  *  @param[inout] reporter Shape reporter the refusals are printed through.
@@ -525,6 +559,70 @@ static void check_row_(rdkit_divergence_row_t const &row, std::uint32_t installe
 static constexpr float determined_spread_k = 0.6f;
 
 /**
+ *  @brief The upper bound a side writes when it declines to constrain a pair at all.
+ *
+ *  Both builders start every pair at the same literal -- ours at `bounds_matrix_builder.hpp`'s
+ *  `upper_initial_k`, RDKit's at `MAX_UPPER` -- so "never written" is one comparison and means the same
+ *  thing on both sides. No real 1-2, 1-3 or 1-4 distance approaches it.
+ */
+static constexpr float unconstrained_upper_k = 1000.0f;
+
+/**
+ *  @brief How far apart two sides' interval widths may sit before one is constraining what the other is not.
+ *
+ *  The reaches below are the readable name for this, but they cannot be the assertion: they are a cliff at
+ *  `determined_spread_k`, and a PubChem sweep puts a real population of 1-4 windows within 0.03 angstrom of
+ *  that line, so comparing the two labels would report a divergence on nothing but which side of the cliff
+ *  each landed. The width itself has no cliff, and its distribution has an empty band to put this in:
+ *  over 19,555 PubChem molecules and 5,180,376 pairs the differences run continuously up to 0.70, then
+ *  nothing until 1.24 and a long tail past it. One angstrom sits in the middle of that, and it is the scale
+ *  the band is made of -- a side leaving a full cis-to-trans inversion more freedom than the other is
+ *  describing different chemistry, not the same chemistry more loosely. A smaller corpus shows a wider
+ *  empty band and would justify a tighter constant, which is why this one is set from the larger sweep.
+ *  The widest difference actually called agreement is printed at the end of every run.
+ */
+static constexpr float spread_agreement_k = 1.0f;
+
+/** Whether two sides constrain a pair to comparably wide intervals, whatever the two intervals sit at. */
+inline constexpr auto spreads_agree = [](float rdkit_spread, float our_spread) {
+    return !(std::fabs(our_spread - rdkit_spread) > spread_agreement_k);
+};
+
+/**
+ *  @brief How much of a pair one side actually claims, which is what decides whether its number is
+ *         comparable to the other side's at all.
+ *
+ *  Reported rather than asserted -- see `spread_agreement_k`. A pinned 1-4 carries a window of about 0.12
+ *  angstrom where a freely rotating one spans the full cis-to-trans inversion at 1.0 and up, and
+ *  `determined_spread_k` separates them well enough to decide comparability, which is all it decides.
+ */
+enum class constraint_reach_t : std::uint8_t {
+    /** The upper bound is still the sentinel, so this side put no constraint on the pair whatsoever. */
+    declined_k,
+    /** Constrained, but to a range rather than a distance -- modelling slack, not a claim about geometry. */
+    bracketed_k,
+    /** Constrained inside `determined_spread_k`, which is the only state in which two bounds compare. */
+    pinned_k,
+};
+
+/** The literal a reach prints as, which is what a diagnostic line carries instead of a raw byte. */
+static std::string_view constraint_reach_name(constraint_reach_t reach) noexcept {
+    switch (reach) {
+    case constraint_reach_t::declined_k: return "declined";
+    case constraint_reach_t::bracketed_k: return "bracketed";
+    case constraint_reach_t::pinned_k: return "pinned";
+    }
+    return "unrecorded";
+}
+
+/** Sort one side's `{lower, upper}` into the three reaches; the upper alone separates the first two. */
+static constraint_reach_t constraint_reach_of_(float const (&values)[2]) noexcept {
+    if (values[1] >= unconstrained_upper_k) return constraint_reach_t::declined_k;
+    return values[1] - values[0] > determined_spread_k ? constraint_reach_t::bracketed_k
+                                                       : constraint_reach_t::pinned_k;
+}
+
+/**
  *  @brief How far two pinned bounds must differ before the rescan calls it a candidate divergence.
  *
  *  This is the rescan's sensitivity floor, chosen to clear the residual the two builders' ideal-geometry
@@ -571,25 +669,41 @@ static void print_candidate_row_(std::string const &smiles, divergence_kind_t ki
 struct completeness_tally_t {
     std::size_t molecules = 0;
     std::size_t skipped = 0;
+    /** Every 1-2, 1-3 and 1-4 pair the corpus holds, whatever either side chose to do with it. */
     std::size_t pairs = 0;
+    /** Pairs both sides pinned, which are the only ones whose two numbers are compared against each other. */
+    std::size_t pinned_pairs = 0;
+    /** Pairs the two sides reach differently -- one asserts a geometry the other declines to. */
+    std::size_t one_sided = 0;
     std::size_t unlisted = 0;
+    /** How many of the unlisted are one-sided rather than a disagreement between two pinned numbers. */
+    std::size_t unlisted_one_sided = 0;
     /** Widest deviation the rescan let through, which is what says whether its floor is still right. */
     float widest_within_floor = 0.0f;
+    /** The same headroom for the reach section: widest interval-width difference it called agreement. */
+    float widest_spread_within_floor = 0.0f;
 };
 
 /**
  *  @brief Rescan one molecule for pairwise bounds disagreements no registry row explains.
  *
+ *  Every pair is looked at twice and both looks are counted. The first asks whether the two sides reach
+ *  the pair the same way, which is the question a comparison of their numbers presupposes; the second
+ *  compares the numbers, and can only run where both sides pinned the pair. A pair excluded from the
+ *  second is therefore still carried by the first, which is what stops an entire class of disagreement --
+ *  every pair where we assert a geometry RDKit declines to, or decline one it asserts -- from being
+ *  counted in nothing at all.
+ *
  *  @param[in] smiles Molecule to rescan.
  *  @param[in] rows Registry to check candidates against.
  *  @param[in] installed_release_code `YYYYMM` of the linked RDKit, for the printed candidate row.
  *  @param[inout] scratch Bounds and descriptor buffers reused across the corpus.
- *  @param[inout] reporter Reporter the unlisted candidates are printed through.
+ *  @param[inout] reporters Reporters the reach mismatches and the unlisted candidates are printed through.
  *  @param[inout] tally Counters advanced by every molecule and every pair.
  */
 static void rescan_molecule_(std::string const &smiles, custd::span<rdkit_divergence_row_t const> rows,
                              std::uint32_t installed_release_code, divergence_scratch_t &scratch,
-                             diagnostic_reporter_t &reporter, completeness_tally_t &tally) {
+                             divergence_reporters_t &reporters, completeness_tally_t &tally) {
     std::unique_ptr<RDKit::RWMol> molecule = mol_from_smiles(smiles);
     if (!molecule || molecule->getNumAtoms() > sft::max_atoms_per_molecule_k) {
         ++tally.skipped;
@@ -611,23 +725,56 @@ static void rescan_molecule_(std::string const &smiles, custd::span<rdkit_diverg
             divergence_measurement_t measurement;
             read_bounds_pair_(scratch.rdkit_bounds, num_atoms, first_atom, second_atom, measurement.rdkit_values);
             read_bounds_pair_(scratch.our_bounds, num_atoms, first_atom, second_atom, measurement.our_values);
-            if (measurement.rdkit_values[1] - measurement.rdkit_values[0] > determined_spread_k) continue;
-            if (measurement.our_values[1] - measurement.our_values[0] > determined_spread_k) continue;
-
             ++tally.pairs;
+
+            divergence_kind_t const kind = bounds_kinds_by_separation_k[hops - 1];
+            std::string_view const subject = divergence_kind_traits(kind).name;
+            bool const listed = covered_by_registry_(rows, smiles, kind, first_atom, second_atom);
+
+            // How far each side reached comes before what it said, because two numbers only compare where
+            // both sides produced one. The widths are the operands, so the predicate compares what the
+            // line prints and no cliff decides it; the two reach names ride the key columns, which is
+            // what makes a line readable without reconstructing the widths in one's head.
+            constraint_reach_t const rdkit_reach = constraint_reach_of_(measurement.rdkit_values);
+            constraint_reach_t const our_reach = constraint_reach_of_(measurement.our_values);
+            float const rdkit_spread = measurement.rdkit_values[1] - measurement.rdkit_values[0];
+            float const our_spread = measurement.our_values[1] - measurement.our_values[0];
+            bool const reaches_alike = spreads_agree(rdkit_spread, our_spread);
+            if (!reaches_alike) ++tally.one_sided;
+            reporters.reach
+                .mismatch(subject, "smiles={} pair={},{} rdkit_reach={} our_reach={}", smiles, first_atom, second_atom,
+                          constraint_reach_name(rdkit_reach), constraint_reach_name(our_reach))
+                .field("interval_spread", rdkit_spread, our_spread, [listed](float reference, float observed) {
+                    return spreads_agree(reference, observed) || listed;
+                });
+            float const spread_gap = std::fabs(our_spread - rdkit_spread);
+            if (reaches_alike && spread_gap > tally.widest_spread_within_floor)
+                tally.widest_spread_within_floor = spread_gap;
+            if (!reaches_alike && !listed) {
+                ++tally.unlisted;
+                ++tally.unlisted_one_sided;
+                fmt::println("Unlisted {} one-sided pair on {} between atoms {} and {}: rdkit {}, ours {}; "
+                             "the row it would take:",
+                             subject, smiles, first_atom, second_atom, constraint_reach_name(rdkit_reach),
+                             constraint_reach_name(our_reach));
+                print_candidate_row_(smiles, kind, first_atom, second_atom, measurement, installed_release_code);
+            }
+            // A pair either side left as a range carries modelling slack rather than a claim, so its two
+            // numbers are not comparable and the section below never sees it. The section above did.
+            if (rdkit_reach != constraint_reach_t::pinned_k || our_reach != constraint_reach_t::pinned_k) continue;
+
+            ++tally.pinned_pairs;
             float widest = 0.0f;
             for (std::size_t slot = 0; slot < 2; ++slot) {
                 float const deviation = std::fabs(measurement.our_values[slot] - measurement.rdkit_values[slot]);
                 if (deviation > widest) widest = deviation;
             }
-            divergence_kind_t const kind = bounds_kinds_by_separation_k[hops - 1];
-            std::string_view const subject = divergence_kind_traits(kind).name;
 
-            // Every determined pair is a comparison, whether or not it disagrees: a rescan that
+            // Every pinned pair is a comparison, whether or not it disagrees: a rescan that
             // silently looked at nothing and a rescan that found nothing must not read alike.
-            bool const explained = widest <= scan_threshold_k ||
-                                   covered_by_registry_(rows, smiles, kind, first_atom, second_atom);
-            reporter.mismatch(subject, "smiles={} pair={},{} widest={:.3g}", smiles, first_atom, second_atom, widest)
+            bool const explained = widest <= scan_threshold_k || listed;
+            reporters.completeness
+                .mismatch(subject, "smiles={} pair={},{} widest={:.3g}", smiles, first_atom, second_atom, widest)
                 .field("explained", true, explained, exactly_equal);
             if (explained) {
                 if (widest <= scan_threshold_k && widest > tally.widest_within_floor)
@@ -685,6 +832,7 @@ int main(int argc, char **argv) {
     auto const rows = sftest::rdkit_divergence_rows();
     sftest::divergence_reporters_t reporters;
     reporters.completeness.limit_printed_lines(60); // one pathological molecule must not bury the rest
+    reporters.reach.limit_printed_lines(60);
 
     std::size_t const refused = sftest::refuse_flapping_rows_(rows, reporters.shape);
     reporters.shape.summarize("row_shape");
@@ -705,25 +853,28 @@ int main(int argc, char **argv) {
     // completeness pass would not have found on its own.
     std::vector<std::string> corpus = sftest::standard_test_smiles();
     for (auto const &row : rows) corpus.emplace_back(row.smiles);
-    if (selection.knob == sftest::corpus_knob_t::named_k) {
-        std::vector<std::string> loaded;
-        auto const outcome = sftest::load_smiles_into(selection.path, selection.max_molecules, loaded);
-        if (outcome != sftest::smiles_load_t::loaded_k)
-            return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), selection.path);
-        fmt::println("Corpus: {} ({} molecules) plus the built-ins and the registry's own", selection.path,
-                     fmt::group_digits(loaded.size()));
-        for (auto &smiles : loaded) corpus.push_back(std::move(smiles));
-    }
-    else fmt::println("Corpus: built-ins and the registry's own; name one in SMALLFIELD_TEST_CORPUS to widen it");
+    std::string const corpus_path = selection.knob == sftest::corpus_knob_t::named_k ? selection.path
+                                                                                     : default_corpus_path_();
+    std::vector<std::string> loaded;
+    auto const outcome = sftest::load_smiles_into(corpus_path, selection.max_molecules, loaded);
+    if (outcome != sftest::smiles_load_t::loaded_k)
+        return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), corpus_path);
+    fmt::println("Corpus: {} ({} molecules, capped at {}) plus the built-ins and the registry's own", corpus_path,
+                 fmt::group_digits(loaded.size()), fmt::group_digits(selection.max_molecules));
+    for (auto &smiles : loaded) corpus.push_back(std::move(smiles));
 
     sftest::completeness_tally_t completeness;
     for (auto const &smiles : corpus)
-        sftest::rescan_molecule_(smiles, rows, installed_release_code, scratch, reporters.completeness, completeness);
+        sftest::rescan_molecule_(smiles, rows, installed_release_code, scratch, reporters, completeness);
+    reporters.reach.summarize("constraint_reach");
     reporters.completeness.summarize("completeness");
-    fmt::println("Completeness: {} molecules ({} skipped), {} determined pairs, " //
-                 "{} unlisted, widest below the rescan floor {:.3g}",
+    fmt::println("Completeness: {} molecules ({} skipped), {} pairs of which {} pinned on both sides, " //
+                 "{} one-sided, {} unlisted ({} of them one-sided), widest below the rescan floor {:.3g} " //
+                 "and below the reach floor {:.3g}",
                  fmt::group_digits(completeness.molecules), completeness.skipped, fmt::group_digits(completeness.pairs),
-                 completeness.unlisted, completeness.widest_within_floor);
+                 fmt::group_digits(completeness.pinned_pairs), fmt::group_digits(completeness.one_sided),
+                 completeness.unlisted, completeness.unlisted_one_sided, completeness.widest_within_floor,
+                 completeness.widest_spread_within_floor);
 
     if (!reporters.passed())
         return sftest::report_fail(test_name_k, "{} mismatches over {} comparisons, {} divergences asserted",

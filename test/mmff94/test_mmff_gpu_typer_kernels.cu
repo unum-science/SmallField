@@ -15,7 +15,7 @@
 
 #include "smallfield/mmff94/mmff94_typer_device.cuh"
 #include "smallfield/parameters/mmff94_tables.hpp"
-#include "smallfield/parameters/mmff94_tables_device.cuh"
+#include "smallfield/parameters/mmff94_tables_device.hpp"
 #include "smallfield/types/molecule_descriptor.hpp"
 #include "smallfield/types/storage.hpp"
 

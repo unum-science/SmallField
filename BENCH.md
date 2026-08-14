@@ -219,6 +219,22 @@ Forty-eight bonds is what 400 drug-like molecules yield, because most carry no E
 The direction is unambiguous and every multi-bond failure mode reaches zero, but do not treat 7.50 % as a precise rate — it rests on three bonds.
 The chiral figures above rest on 345 and 202 centres and are firm; this one wants a larger draw before it carries weight.
 
+__Three E/Z Rates Are Quoted In This Project, And They Are Three Different Measurements.__
+They do not average and they do not convert into one another, so each is carried with the configuration and the sample it was taken on.
+
+| Rate | Configuration Scored | Sample | Recorded In |
+| :--- | :------------------- | :----- | :---------- |
+| __52.08 %__ | The shipped 3D corpus, produced before any post-polish stereo check existed | 25 of 48 declared bonds over 400 PubChem molecules | the table above |
+| __6.441 %__ | Current code with the chiral-volume target and no post-polish E/Z check | declared bonds of the 5,000 molecules scored out of one 20,000-molecule PubChem shard at K=3 | _Closing The Tetrahedral Residual_ |
+| __0.171 %__ | Current code as it ships, post-polish E/Z check included | 1 of 584 declared bonds, same 5,000 molecules | _Closing The Tetrahedral Residual_ |
+
+The first two differ by producing code and by sample, not by method — both score declared bonds against `AssignCIPLabels` on the geometry.
+The 52.08 % row is a property of stored data and cannot move without regenerating the corpus; the other two move with the pipeline.
+
+`DEFECTS.md` carries a fourth figure, 279 of 4,921 bonds and 5.67 % on PubChem with 17 of 360 and 4.72 % on REAL, over a 20,000-molecule run at K=3 scoring every declared bond of every slot returned `success_k`.
+That measurement was taken without the post-polish E/Z check and therefore describes the 6.441 % configuration, which its agreement in magnitude confirms.
+What it needs is the configuration named beside the number and a pointer to the 0.171 % row, since as written it reads as a description of what ships.
+
 __Run the control first and run it every time.__
 It scores RDKit's own ETKDGv3 geometry of the same molecules through the identical code path, and it must come back at zero.
 A non-zero control means the instrument is broken rather than the pipeline, which is the failure mode that produced — and then hid — the withdrawn energy table above.
@@ -286,8 +302,11 @@ The geometry these two stages hand forward is what the reflection-blind torsion 
 On this shape the fallback is 92 % of wall and the trade is clearly positive.
 On a GPU-bound REAL run, with a 0.347 % refusal rate and far less to recover, it would most likely be a net loss.
 
-__E/Z is untouched at 6-8 % and none of this reaches it.__
-`count_invalid_chiral_centers_` counts tetrahedral centres only, so `stereo_failure_k` stays structurally unreachable for a double bond.
+__E/Z is not what this budget buys, and no E/Z figure was taken across the doubling.__
+Nothing in this table is evidence either way about it.
+The two rates that bracket the quantity are 6.441 % without the post-polish check and 0.171 % with it, both from _Closing The Tetrahedral Residual_ and both from a different experiment on a different sample.
+A double bond reaches `stereo_failure_k` only through that check: `count_invalid_chiral_centers_` counts tetrahedral centres, and no chiral descriptor is ever emitted for a bond.
+
 One hypothesis was tested and refused: `molecule_descriptor.hpp` maps RDKit's CIP spelling and its reference-atom spelling onto one flag, which would build the wrong isomer wherever the recorded stereo atoms are not the CIP-preferred pair — measured over 4,493 declared bonds, __0 disagree__, because RDKit sets those atoms to the CIP pair on the SMILES path.
 The conflation is latent, not live.
 
