@@ -8,7 +8,7 @@
  *  pageable memory, which silently degrades to a synchronous transfer.
  *
  *  Flow:
- *    1. `prepare_molecule_batch_into` accumulates a `wave_slice_shape_t` from the per-molecule sizes,
+ *    1. `prepare_per_device_batches_into` accumulates a `wave_slice_shape_t` from the per-molecule sizes,
  *       walks it once over an empty cursor to learn what the slice spans, resizes one pinned host
  *       buffer, and walks it again to memcpy per-molecule arrays into the subspans it hands back.
  *    2. `launch_gpu_pipeline` issues a single `cudaMemcpyAsync` of `wave_slice_view::uploaded` into a
@@ -20,8 +20,6 @@
 
 #include <cstddef> // `std::byte`, `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint8_t`
-
-#include <vector> // `std::vector`
 
 #include <cuda_runtime.h>
 
@@ -361,7 +359,7 @@ inline std::size_t uploaded_wave_slice_bytes(wave_slice_shape_t const &shape) no
 /**
  *  @brief Per-wave-slice pool: one pinned host allocation, and the shape that carves it.
  *
- *  `prepare_molecule_batch_into` fills the pool on the CPU. The launch path uses a device-side mirror
+ *  `prepare_per_device_batches_into` fills the pool on the CPU. The launch path uses a device-side mirror
  *  inside `launch_scratch_t`, walked from the same `wave_slice_shape_t`, and issues one
  *  `cudaMemcpyAsync` of the host buffer's uploaded prefix to that mirror.
  */
@@ -372,11 +370,6 @@ struct wave_slice_pool_t {
      *  `smallfield::types::max_atoms_per_molecule_k` is the cap; conflating the two sizes a kernel stride
      *  from one wave and a caller's buffer from the other. */
     std::uint32_t observed_max_atoms = 0;
-    /** Slice-local indices for every molecule rejected by the `preprocess-step`, tagged with the rejection
-     *  reason. Populated by `prepare_molecule_batch_into`; consumed by the caller to stamp
-     *  `conformer_status_t` per molecule and route rejected mols to the `fallback-role`. Grow-only across
-     *  calls. */
-    std::vector<rejected_mol_t> rejected_input_indices;
 
     /** Molecules the slice carries, which is the extent of every per-molecule region it holds. */
     [[nodiscard]] std::uint32_t num_molecules() const noexcept { return shape.totals.valid; }

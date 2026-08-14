@@ -85,7 +85,6 @@ enum atom_flag_t : std::uint8_t {
     atom_flag_hbond_donor_h_k = 1u << 2,
     /** N or O with a lone pair. */
     atom_flag_hbond_acceptor_k = 1u << 3,
-    atom_flag_has_chirality_k = 1u << 4,
     /** `Atom::getIsAromatic()` under MMFF94's own perception rather than RDKit's, which is a strictly
      *  different question — see `fill_mmff_perception`. The MMFF typer reads this one and ETKDG reads
      *  `atom_flag_aromatic_k`; nothing reads both. */
@@ -98,7 +97,6 @@ enum bond_flag_t : std::uint8_t {
      *  Kekulé order, which is how an in-ring triple bond reaches the descriptor as order 3 and aromatic. */
     bond_flag_aromatic_k = 1u << 0,
     bond_flag_in_ring_k = 1u << 1,
-    bond_flag_conjugated_k = 1u << 2,
     /** E / trans. */
     bond_flag_stereo_e_k = 1u << 3,
     /** Z / cis. */
@@ -161,12 +159,8 @@ struct alignas(8) molecule_descriptor_t {
      *  carry `bond_flag_in_ring_k`. Zero for an acyclic atom and for a ring atom whose every
      *  bond leaves the ring, which cannot happen, so zero reads as "not in a ring". */
     std::uint8_t ring_bond_degree[max_atoms_per_molecule_k];
-    /** CIP priority rank; 0 is lowest. */
-    std::uint8_t cip_rank[max_atoms_per_molecule_k];
     /** 0=none, 1=CW, 2=CCW. */
     std::uint8_t chiral_tag[max_atoms_per_molecule_k];
-    /** Isotope mass number; 0 is natural or unspecified. */
-    std::uint8_t isotope[max_atoms_per_molecule_k];
 
     std::uint8_t bond_atom_i[max_bonds_k];
     std::uint8_t bond_atom_j[max_bonds_k];
@@ -248,9 +242,7 @@ inline void fill_atoms_(RDKit::ROMol const &molecule, molecule_descriptor_t &des
         descriptor.total_valence[atom_index] = static_cast<std::uint8_t>(
             atom->getValence(RDKit::Atom::ValenceType::EXPLICIT) + atom->getNumImplicitHs());
         descriptor.formal_charge[atom_index] = static_cast<std::int8_t>(atom->getFormalCharge());
-        descriptor.isotope[atom_index] = static_cast<std::uint8_t>(std::min<unsigned>(atom->getIsotope(), 255));
         descriptor.smallest_ring[atom_index] = 0;
-        descriptor.cip_rank[atom_index] = 0;
 
         std::uint8_t flags = 0;
         if (atom->getIsAromatic()) flags |= atom_flag_aromatic_k | atom_flag_mmff_aromatic_k;
@@ -274,7 +266,6 @@ inline void fill_atoms_(RDKit::ROMol const &molecule, molecule_descriptor_t &des
                                         : chiral == RDKit::Atom::CHI_TETRAHEDRAL_CCW ? std::uint8_t {2}
                                                                                      : std::uint8_t {0};
         descriptor.chiral_tag[atom_index] = chiral_tag;
-        if (chiral_tag != 0) flags |= atom_flag_has_chirality_k;
         descriptor.atom_flags[atom_index] = flags;
     }
 }
@@ -315,7 +306,6 @@ inline void fill_bonds_(RDKit::ROMol const &molecule, molecule_descriptor_t &des
         std::uint8_t flags = 0;
         if (bond->getIsAromatic()) flags |= bond_flag_aromatic_k;
         if (order == RDKit::Bond::AROMATIC) flags |= bond_flag_order_aromatic_k;
-        if (bond->getIsConjugated()) flags |= bond_flag_conjugated_k;
         RDKit::Bond::BondStereo const stereo = bond->getStereo();
         if (stereo == RDKit::Bond::STEREOE || stereo == RDKit::Bond::STEREOTRANS) flags |= bond_flag_stereo_e_k;
         if (stereo == RDKit::Bond::STEREOZ || stereo == RDKit::Bond::STEREOCIS) flags |= bond_flag_stereo_z_k;

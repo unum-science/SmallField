@@ -85,7 +85,9 @@ static void test_device_matches_host_(std::vector<std::string> const &smiles_lis
     // Counterions are kept deliberately: a disconnected fragment is the only way to reach the
     // unreachable-hop sentinel, and the production path strips them.
     sfp::wave_slice_pool_t batch {};
-    sfp::prepare_molecule_batch_into(views, sft::max_atoms_per_molecule_k, batch, smallfield::keep_all_fragments_k);
+    sfp::batch_prep_scratch_t scratch;
+    sfp::prepare_per_device_batches_into(views, 1u, sft::max_atoms_per_molecule_k, {&batch, 1}, scratch, nullptr,
+                                         smallfield::keep_all_fragments_k);
     sf_verify_(batch.num_molecules() > 0, "no molecule survived preprocessing");
 
     sfp::wave_slice_view_t const view = batch.host_view();

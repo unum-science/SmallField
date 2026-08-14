@@ -3,7 +3,7 @@
  *  @brief Test the end-to-end ETKDG pipeline using the SmallField library API.
  *
  *  Tests: SMILES → context_t::generate_conformers → RDKit cross-validation, plus the wave-sizing
- *  arithmetic and the per-wave timing bookkeeping that surround it.
+ *  arithmetic, the per-wave timing bookkeeping, and the reentrancy that lets two contexts run at once.
  */
 
 #include <cmath>   // `std::isfinite`, `std::fabs`, `std::sqrt`
@@ -16,6 +16,7 @@
 #include <limits>      // `std::numeric_limits`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
+#include <thread>      // `std::thread`
 #include <vector>      // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`
@@ -324,6 +325,107 @@ static void check_empty_wave_timings(diagnostic_reporter_t &reporter) {
 
 #pragma endregion Wave Timeline Capture
 
+#pragma region Concurrent Contexts
+
+/**
+ *  @brief Bytes that differ between two runs of one slice, over every array `generate_conformers` fills.
+ *
+ *  Raw storage rather than numbers: a half-precision coordinate that came out of a corrupted batch is
+ *  still a finite number, and an approximate comparison is exactly what would let one through.
+ *
+ *  @param[in] first One run's outputs.
+ *  @param[in] second The other run's outputs, sized for the same slice and layout.
+ *  @return Differing bytes summed over the four arrays.
+ */
+static std::size_t differing_bytes_(conformer_outputs_t const &first, conformer_outputs_t const &second) noexcept {
+    auto const count_over = [](void const *left, void const *right, std::size_t bytes) {
+        auto const *left_bytes = static_cast<std::uint8_t const *>(left);
+        auto const *right_bytes = static_cast<std::uint8_t const *>(right);
+        std::size_t differing = 0;
+        for (std::size_t offset = 0; offset < bytes; ++offset) differing += left_bytes[offset] != right_bytes[offset];
+        return differing;
+    };
+    return count_over(first.coordinates.data(), second.coordinates.data(), first.coordinates.size() * sizeof(__half)) +
+           count_over(first.energies.data(), second.energies.data(), first.energies.size() * sizeof(float)) +
+           count_over(first.status.data(), second.status.data(), first.status.size() * sizeof(conformer_status_t)) +
+           count_over(first.num_atoms.data(), second.num_atoms.data(), first.num_atoms.size());
+}
+
+/**
+ *  @brief Two contexts generating on two threads must answer what the same two slices answer alone.
+ *
+ *  This check could not be written while `prepare_per_device_batches_into` kept its per-worker
+ *  contributions and its partition buffers in file-scope statics: the two threads shared one set of
+ *  buffers, each cleared what the other was mid-way through filling, and each packed some share of the
+ *  other's molecules into its own pinned pools. Nothing warned — the corruption reads as ordinary
+ *  geometry. The scratch is caller-owned now, and byte equality against the serial baseline is the
+ *  whole measurable effect of that change.
+ *
+ *  Both baselines run on their own fresh context, so the only difference between the two phases is
+ *  that the second pair overlaps in time.
+ */
+static void check_concurrent_contexts(diagnostic_reporter_t &reporter) {
+    constexpr std::uint32_t num_conformers_k = 2;
+    api::conformer_slot_layout_t const layout {128u, num_conformers_k};
+
+    api::config_t config;
+    config.num_conformers = num_conformers_k;
+    config.random_seed = 11;
+
+    std::vector<std::string> const storage = standard_test_smiles();
+    std::vector<std::string_view> const corpus(storage.begin(), storage.end());
+    std::size_t const split = corpus.size() / 2;
+    sf_verify_(split > 0, "the built-in corpus must split into two non-empty slices");
+    custd::span<std::string_view const> const first_slice {corpus.data(), split};
+    custd::span<std::string_view const> const second_slice {corpus.data() + split, corpus.size() - split};
+
+    int const device_id = 0;
+    auto const generate = [&layout, &config](custd::span<std::string_view const> slice, api::context_t &context,
+                                             conformer_outputs_t &outputs) {
+        outputs.reset_for(static_cast<std::uint32_t>(slice.size()), layout);
+        [[maybe_unused]] conformer_status_t const batch_status = context.generate_conformers(
+            slice, config, layout.max_atoms, outputs.coordinates, outputs.energies, outputs.status, outputs.num_atoms);
+    };
+
+    conformer_outputs_t first_alone, second_alone, first_together, second_together;
+    {
+        api::context_t context(custd::span<int const>(&device_id, 1));
+        generate(first_slice, context, first_alone);
+    }
+    {
+        api::context_t context(custd::span<int const>(&device_id, 1));
+        generate(second_slice, context, second_alone);
+    }
+
+    // Both contexts are built on this thread and only driven from the two below, so the wave sizer
+    // sees the same VRAM census it would see either way and neither construction races the other.
+    {
+        api::context_t first_context(custd::span<int const>(&device_id, 1));
+        api::context_t second_context(custd::span<int const>(&device_id, 1));
+        std::thread first_thread {[&] { generate(first_slice, first_context, first_together); }};
+        std::thread second_thread {[&] { generate(second_slice, second_context, second_together); }};
+        first_thread.join();
+        second_thread.join();
+    }
+
+    // A baseline of nothing but refusals would match a corrupted run byte for byte.
+    std::size_t succeeded = 0;
+    for (conformer_status_t const status : first_alone.status) succeeded += status == conformer_status_t::success_k;
+    for (conformer_status_t const status : second_alone.status) succeeded += status == conformer_status_t::success_k;
+    sf_verify_(succeeded > 0, "the serial baseline produced no conformer, so byte equality is vacuous");
+
+    reporter.mismatch("reentrancy", "slice=first molecules={}", first_slice.size())
+        .field("differing_bytes", std::size_t {0}, differing_bytes_(first_alone, first_together), exactly_equal);
+    reporter.mismatch("reentrancy", "slice=second molecules={}", second_slice.size())
+        .field("differing_bytes", std::size_t {0}, differing_bytes_(second_alone, second_together), exactly_equal);
+    reporter.summarize("reentrancy");
+
+    fmt::println("  two contexts on two threads: {} + {} molecules, {} successful slots in the serial baseline",
+                 first_slice.size(), second_slice.size(), succeeded);
+}
+
+#pragma endregion Concurrent Contexts
+
 #pragma region RDKit Cross Validation
 
 /** Beyond this the two MMFF94 implementations are counted as diverging; nothing gates on the count. */
@@ -534,7 +636,7 @@ static void print_cross_validation_summary(cross_validation_tally_t const &tally
 } // namespace smallfield::tests
 
 int main(int argc, char **argv) {
-    fmt::println("{}: wave sizing, empty-wave timings, and end-to-end ETKDG generation via the library API",
+    fmt::println("{}: wave sizing, empty-wave timings, two-context reentrancy, and end-to-end ETKDG generation",
                  test_name_k);
 
     auto const selection = sftest::select_corpus(argc, argv, default_max_molecules_k);
@@ -549,6 +651,7 @@ int main(int argc, char **argv) {
     sftest::check_wave_budget_arithmetic(checks);
     sftest::check_per_device_reservation(checks);
     sftest::check_empty_wave_timings(checks);
+    sftest::check_concurrent_contexts(checks);
 
     std::vector<std::string> corpus_storage = sftest::standard_test_smiles();
     if (selection.knob == sftest::corpus_knob_t::named_k) {

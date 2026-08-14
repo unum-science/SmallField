@@ -21,21 +21,16 @@
 
 #pragma once
 
-#if defined(__CUDACC__) || defined(__CUDA_RUNTIME_H__) || defined(__CUDA_RUNTIME_API_H__)
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#else
-/** Forward-declares for non-CUDA translation units. */
-struct __half;
-using cudaStream_t = void *;
-#endif
+#include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
 #include <array>       // `std::array`
 #include <atomic>      // `std::atomic`
-#include <cstdint>     // `std::uint32_t`, `std::uint64_t`
 #include <memory>      // `std::unique_ptr`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
+
+#include <cuda_fp16.h>    // `__half`
+#include <cuda_runtime.h> // `cudaStream_t`
 
 #include "smallfield/api/conformer_layout.hpp"
 #include "smallfield/log.hpp"
@@ -129,10 +124,15 @@ struct launch_scratch_t;
 /**
  *  @brief Waves in flight at once, and with it the slot count of every per-wave ring.
  *
- *  Two, and that is a property of the code rather than a tuning knob. There is one
- *  `launch_scratch_t::device_pool` per device, so two waves resident on one device would carve their
- *  outputs from the same bytes, and `prepare_per_device_batches_into` holds per-call state a second
- *  concurrent preparation would share.
+ *  Two, and that is a property of the code rather than a tuning knob. Four buffers are one per device
+ *  and re-carved from offset zero on every launch — `launch_scratch_t::device_pool`, `::host_staging`
+ *  and `::mmff_staging`, plus this context's `metric_scratch` — so a second resident wave would write
+ *  its regions over the first wave's. Raising the depth means one set per slot, and the wave is sized
+ *  to 75 % of free VRAM, so a second set halves the wave rather than deepening the pipeline.
+ *
+ *  Depth 2 is also already all the dispatch loop can use: it finalizes wave N−1 before launching wave
+ *  N, so a third slot would never be live. Preparation is not the constraint — that state is
+ *  caller-owned on `preprocess::batch_prep_scratch_t` and the entry is reentrant.
  *
  *  Named for the pinned prep ring rather than for "the pipeline", because `cli/smallfield_batch.cpp`
  *  carries a depth of its own for the four-role handoff and the two are unrelated numbers.

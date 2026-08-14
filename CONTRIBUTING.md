@@ -144,7 +144,8 @@ Third-party groups keep their own required order — RDKit's headers are not sel
 ## State and Memory
 
 __Per-worker state is an explicit rank into caller-owned scratch, never `thread_local`.__
-Hidden global state is not a style preference here: the file-scope scratch in `etkdg_prepare_batch.hpp` is precisely why `prepare_molecule_batch_into` cannot be called concurrently, which blocks the deeper pipeline ring.
+Hidden global state is not a style preference here: `prepare_per_device_batches_into` held its per-worker contributions and its partition buffers in file-scope statics, and that alone made two `context_t` objects on two threads corrupt each other silently.
+The buffers did not change — they moved onto a caller-owned `batch_prep_scratch_t`, which is what the reentrancy test in `test/api/test_pipeline.cpp` measures.
 
 __Fill a caller-owned output rather than returning a container.__
 Write `fill_x_into(input, std::vector<T> &out)` with `out.clear()`, not `std::vector<T> compute_x(input)`, and declare the scratch above the loop that consumes it so a growth phase happens once.

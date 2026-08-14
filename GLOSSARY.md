@@ -162,6 +162,6 @@ Glossary terms are vocabulary; the table below points at where each one is groun
 | `embedding-wave`    | `wave_record_t` in `src/smallfield/api/smallfield.cu`                                                                                         |
 | `atom-limited-bin`  | `atom_limited_bin_caps_k[]` in `src/smallfield/api/smallfield.hpp`                                                                            |
 | pipeline roles      | `cli/smallfield_batch.cpp` — architectural comment blocks, no per-role struct                                                                 |
-| `preprocess-step`   | `prepare_molecule_batch_into` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`                                                          |
+| `preprocess-step`   | `prepare_per_device_batches_into` in `src/smallfield/preprocess/etkdg_prepare_batch.hpp`                                                      |
 | `embedding-step`    | `launch_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                                                                   |
 | `finalize-step`     | `finalize_gpu_pipeline` in `src/smallfield/api/smallfield.cu`                                                                                 |

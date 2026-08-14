@@ -141,13 +141,13 @@ The `reader-role` already pulls the next batch from disk in parallel; this exten
 __Evidence:__ 10M USearch, K=1, 8× Blackwell, 2026-04-19 — `libRDKitSmilesParse` at 4.87 % of CPU self-time.
 Unlike the other host items this one did not shrink: the RDKit front-end is all that stays on the host now, so parse is the largest remaining host cost rather than a smaller share of a smaller loop.
 __Gain:__ 4–7 % host prep, upper end if combined with the barrier fix above.
-__Effort:__ Medium — requires decoupling the parse from `prepare_molecule_batch_into`.
+__Effort:__ Medium — requires decoupling the parse from `prepare_per_device_batches_into`.
 __Risk:__ Low to medium — RDKit's SMILES parser is thread-safe for independent molecules.
 __Gate:__ Confirm the embedding step is long enough to hide a parse at the wave sizes auto-sizing now picks, roughly 263 K molecules on an 80 GB card.
 
 ### Allocator Pressure Reduction
 
-__Mechanism:__ Audit `prepare_molecule_batch_into` for temp-alloc sites, promote short-lived `std::vector` to per-thread scratch with grow-only capacity, and pre-size the known-bounded containers.
+__Mechanism:__ Audit `prepare_per_device_batches_into` for temp-alloc sites, promote short-lived `std::vector` to per-thread scratch with grow-only capacity, and pre-size the known-bounded containers.
 __Evidence:__ jemalloc 4.10 % plus libc malloc 2.82 % at 10M USearch, K=1, 8× Blackwell, 2026-04-19; _stale_, because `extract_mmff94_params_via_rdkit` is off the production batch path, which is where most of this allocation sat.
 That function still exists and is still called by `prepare_molecule_into`, the non-pipelined path the tests use, so a profile taken through that entry point will still show it.
 __Gain:__ 3–5 % host prep.

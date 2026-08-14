@@ -107,14 +107,6 @@ enum class exocyclic_preference_t : std::uint8_t { unbiased_k, prefers_trans_k }
 /** Bond order as the 1-4 classification reads it; an aromatic bond is neither single nor double. */
 enum class bond_kind_t : std::uint8_t { single_k, double_k, other_k };
 
-/** How a 1-4 path across an amide or an ester is bounded. */
-enum class amide_geometry_t : std::uint8_t {
-    /** A secondary amide's N-H is placed anti to the carbonyl oxygen and every other such path syn. */
-    trans_locked_k,
-    /** The path roams from cis to trans and the force field planarizes it afterwards. */
-    freely_rotating_k,
-};
-
 /** Interval bounds a single 1-4 path claims for its end-to-end distance, in Å. */
 struct bound_interval_t {
     float lower = 0.0f;
@@ -139,14 +131,6 @@ struct path_14_case_t {
     std::uint32_t ring_size = 0;
     exocyclic_preference_t exocyclic = exocyclic_preference_t::unbiased_k;
 };
-
-/**
- *  @brief RDKit's `forceTransAmides`, at the setting every RDKit comparison in this tree runs.
- *
- *  ETKDGv3 leaves it on, and `test/`, `bench/` and `cli/` all embed with `RDKit::DGeomHelpers::ETKDGv3`,
- *  so the amide branches below are reached rather than configured away.
- */
-inline constexpr amide_geometry_t amide_geometry_k = amide_geometry_t::trans_locked_k;
 
 /** Smallest ring RDKit's `useMacrocycle14config` treats as a macrocycle, in atoms. ETKDGv3 leaves it on. */
 inline constexpr std::uint32_t macrocycle_ring_size_k = 9;
@@ -563,8 +547,6 @@ inline torsion_target_t chain_preference_(molecule_descriptor_t const &descripto
     case bond_kind_t::single_k:
         // Two lone pairs per sulfur hold a disulfide near a right angle.
         if (central_pair_is_disulfide_(descriptor, path)) return {.preference = torsion_preference_t::right_angle_k};
-        if (amide_geometry_k == amide_geometry_t::freely_rotating_k)
-            return {.preference = torsion_preference_t::flexible_k};
         if (holds_in_either_direction_(descriptor, path, is_amide_or_ester_14_))
             return {.preference = ends_on_secondary_amide_hydrogen_(descriptor, path) ? torsion_preference_t::trans_k
                                                                                       : torsion_preference_t::cis_k};

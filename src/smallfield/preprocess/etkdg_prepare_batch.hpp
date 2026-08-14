@@ -1029,7 +1029,7 @@ struct staged_typing_patch_t {
 
 /**
  *  @brief Per-OpenMP-thread contribution buffer for the three-stage `preprocess-step` of
- *  `prepare_molecule_batch_into`.
+ *  `prepare_per_device_batches_into`.
  *
  *  One instance per thread. Each region accumulator holds the concatenation of the host-produced
  *  region for every molecule that thread processed, in append order, at the element type that region
@@ -1048,8 +1048,8 @@ struct alignas(64) batch_prep_thread_contribution_t {
     std::vector<float> patch_atom_charges;
     std::vector<staged_typing_patch_t> typing_patches;
     std::vector<batch_prep_per_mol_record_t> mols;
-    /** Slice-local input indices for every molecule this thread's slice rejected, each
-     *  tagged with the reason. Aggregated upstream into `wave_slice_pool_t::rejected_input_indices`. */
+    /** Slice-local input indices for every molecule this thread's slice rejected, each tagged with the
+     *  reason. Merged across threads by `collect_rejections_into_` into the caller's own sink. */
     std::vector<rejected_mol_t> rejected_input_indices;
     std::uint32_t max_atoms_seen = 0;
     std::uint32_t max_bonds_seen = 0;
@@ -1449,14 +1449,28 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
 }
 
 /**
+ *  @brief Everything `prepare_per_device_batches_into` reuses between calls, owned by whoever calls it.
+ *
+ *  The workers' append buffers and the partition's CSR buffers, both grow-only, so a wave allocates
+ *  only where a previous wave was narrower. One instance per concurrent preparation and no more: this
+ *  is the whole of the entry's mutable state, so two callers holding one each cannot collide, and a
+ *  caller driving one wave at a time keeps a single instance across every wave of a run — one, not one
+ *  per pinned-prep ring slot, since the ring's depth bounds resident pools and nothing else.
+ */
+struct batch_prep_scratch_t {
+    /** One entry per OpenMP worker, resized to `omp_get_max_threads()` on first use. */
+    std::vector<batch_prep_thread_contribution_t> contributions;
+    distribute_scratch_t distribution;
+};
+
+/**
  *  @brief Preprocess + distribute entry: produce `device_count` per-device pinned batch pools with
  *  a complexity-descending stripe partition. Each device's pool holds only its assigned mols in
  *  complexity-ascending order — atom-count-ascending on average — for kernel bin dispatch.
  *
  *  The workers' contributions are packed straight into the per-device pools, so a molecule's bytes
- *  are written once. Two file-scope `static` scratch instances hold the per-worker contributions
- *  and the partition buffers so neither allocation fires on the hot path; that is also what makes
- *  this entry non-reentrant, and the reason a caller must not drive it from two threads.
+ *  are written once. Every buffer that survives the call lives on @p scratch, so the entry is
+ *  reentrant: two `context_t` objects on two threads prepare independent waves.
  *
  *  @param[in] smiles_list Slice of input SMILES to prepare, at most
  *             `max_molecules_for_atom_capacity(output_atom_capacity)` of which are admitted; the tail
@@ -1466,15 +1480,15 @@ inline void pack_contribs_into_device_pools_(std::vector<batch_prep_thread_contr
  *             admitted molecule fits it, so a slice's `observed_max_atoms` — the stride the launch
  *             path derives its coordinate buffers from — can never outgrow the caller's own.
  *  @param[out] per_device_out One pinned pool per device.
+ *  @param[inout] scratch Grow-only caller-owned scratch; see `batch_prep_scratch_t`.
  *  @param[out] rejected_input_indices_out Optional sink for the slice-local rejection records.
  *  @param[in] salt_policy Whether a multi-fragment input keeps its largest fragment.
  */
 inline void prepare_per_device_batches_into(
     custd::span<std::string_view const> smiles_list, std::uint32_t device_count, std::uint32_t output_atom_capacity,
-    custd::span<wave_slice_pool_t> per_device_out, std::vector<rejected_mol_t> *rejected_input_indices_out = nullptr,
+    custd::span<wave_slice_pool_t> per_device_out, batch_prep_scratch_t &scratch,
+    std::vector<rejected_mol_t> *rejected_input_indices_out = nullptr,
     smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
-    static std::vector<batch_prep_thread_contribution_t> contribs;
-    static distribute_scratch_t scratch;
 
     // Past this many, a molecule's own region offsets stop fitting the 32-bit fields that carry
     // them, so the tail is refused here rather than packed at a wrapped offset that aliases an
@@ -1482,29 +1496,12 @@ inline void prepare_per_device_batches_into(
     // caller that did not.
     std::size_t const admitted_count = std::min<std::size_t>(smiles_list.size(),
                                                              max_molecules_for_atom_capacity(output_atom_capacity));
-    prepare_per_thread_contribs_(smiles_list.first(admitted_count), salt_policy, output_atom_capacity, contribs);
-    pack_contribs_into_device_pools_(contribs, device_count, per_device_out, scratch);
+    prepare_per_thread_contribs_(smiles_list.first(admitted_count), salt_policy, output_atom_capacity,
+                                 scratch.contributions);
+    pack_contribs_into_device_pools_(scratch.contributions, device_count, per_device_out, scratch.distribution);
     if (rejected_input_indices_out != nullptr)
-        collect_rejections_into_(contribs, admitted_count, smiles_list.size(), *rejected_input_indices_out);
-}
-
-/**
- *  @brief In-place `preprocess-step` driver for a single pool: the one-device partition.
- *
- *  Recycling the pinned buffer across `embedding-waves` is the lever that kills pinned-memory
- *  allocator contention at 8-GPU scale — `cudaHostAlloc`/`cudaFreeHost` serialize on a driver lock.
- *
- *  @param[in] smiles_list Slice of input SMILES to prepare.
- *  @param[in] output_atom_capacity Atoms the caller's per-molecule coordinate slot holds; a wider
- *             molecule is refused rather than raising the whole wave's slot stride past it.
- *  @param[out] batch Pinned pool, refilled in place.
- *  @param[in] salt_policy Whether a multi-fragment input keeps its largest fragment.
- */
-inline void prepare_molecule_batch_into(custd::span<std::string_view const> smiles_list,
-                                        std::uint32_t output_atom_capacity, wave_slice_pool_t &batch,
-                                        smallfield::salt_policy_t salt_policy = smallfield::keep_largest_fragment_k) {
-    prepare_per_device_batches_into(smiles_list, 1u, output_atom_capacity, {&batch, 1}, &batch.rejected_input_indices,
-                                    salt_policy);
+        collect_rejections_into_(scratch.contributions, admitted_count, smiles_list.size(),
+                                 *rejected_input_indices_out);
 }
 
 #pragma endregion Batch Layout
