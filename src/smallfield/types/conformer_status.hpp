@@ -78,12 +78,22 @@ enum class conformer_status_t : std::uint8_t {
      *  is simply not at a stationary point, where here there is no geometry at all. The two call for
      *  opposite responses, so they cannot share a name. */
     slot_unwritten_k = 12,
+    /** The MMFF polish moved a declared tetrahedral center onto the wrong handedness, caught by the
+     *  post-polish validation. Distinct from `stereo_failure_k`, which the pipeline kernel writes when
+     *  the embedding could not satisfy the chiral constraint in the first place: that one is a molecule
+     *  the distance geometry found hard, this one is a geometry the force field walked out of a basin
+     *  it was already in. Splitting them is what tells a corpus-scale run which stage is inverting. */
+    polish_inverted_center_k = 13,
+    /** The same, for a declared E/Z double bond. Separate from the center above because the two have
+     *  different causes and different fixes, and the shipped corpus was wrong in both at once at rates
+     *  nobody could tell apart. */
+    polish_inverted_bond_k = 14,
 };
 
 /** One past the highest `conformer_status_t`, so a per-status array is indexed by the enumerator
  *  itself. The enum is append-only, so its newest value is always its widest. */
-inline constexpr std::size_t conformer_status_count_k = static_cast<std::size_t>(conformer_status_t::slot_unwritten_k) +
-                                                        1u;
+inline constexpr std::size_t conformer_status_count_k =
+    static_cast<std::size_t>(conformer_status_t::polish_inverted_bond_k) + 1u;
 
 /** What a status byte no enumerator claims prints as, which a shard from a newer producer can carry. */
 inline constexpr std::string_view unnamed_status_k = "unnamed_status";
@@ -109,6 +119,8 @@ inline constexpr std::string_view conformer_status_name(conformer_status_t statu
     case conformer_status_t::nonphysical_energy_k: return "nonphysical_energy";
     case conformer_status_t::batch_overflow_k: return "batch_overflow";
     case conformer_status_t::slot_unwritten_k: return "slot_unwritten";
+    case conformer_status_t::polish_inverted_center_k: return "polish_inverted_center";
+    case conformer_status_t::polish_inverted_bond_k: return "polish_inverted_bond";
     }
     return unnamed_status_k;
 }

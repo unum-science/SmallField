@@ -141,6 +141,11 @@ find_package(OpenMP REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
 # jemalloc for allocation-heavy host paths -- RDKit SMILES parsing and MMFF parameter lookups.
+# `JEMALLOC_LIB` is a cached `find_library` result and outlives the option that produced it, so consumers
+# must link the plain variable below rather than the cache entry: turning the option off in an existing
+# build tree leaves the cache populated, and every binary would keep `libjemalloc.so.2` in `DT_NEEDED`.
+# That is not cosmetic -- compute-sanitizer refuses to start against a jemalloc-linked binary, so the
+# option silently failed to do the one thing anyone turns it off for.
 if (SMALLFIELD_USE_JEMALLOC)
     find_library(JEMALLOC_LIB NAMES jemalloc)
     if (JEMALLOC_LIB)
@@ -148,6 +153,10 @@ if (SMALLFIELD_USE_JEMALLOC)
     else ()
         message(STATUS "jemalloc not found -- consider installing it for better allocation performance")
     endif ()
+    set(SMALLFIELD_JEMALLOC_LINK "${JEMALLOC_LIB}")
+else ()
+    set(SMALLFIELD_JEMALLOC_LINK "")
+    message(STATUS "jemalloc disabled -- required for compute-sanitizer, ncu and nsys")
 endif ()
 
 # `argparse` -- the command-line grammar shared by `smallfield_batch` and `smallfield_descriptors`, and nothing else.
@@ -240,7 +249,7 @@ function (define_smallfield_target target_name)
     add_executable(${target_name} ${ARG_SOURCES})
     target_link_libraries(
         ${target_name} PRIVATE smallfield_settings OpenMP::OpenMP_CXX ${ARG_LINK}
-                               $<$<BOOL:${JEMALLOC_LIB}>:${JEMALLOC_LIB}>
+                               $<$<BOOL:${SMALLFIELD_JEMALLOC_LINK}>:${SMALLFIELD_JEMALLOC_LINK}>
     )
     target_compile_definitions(${target_name} PRIVATE ${ARG_DEFINES})
     set_target_properties(

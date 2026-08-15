@@ -363,14 +363,20 @@ barzilai_borwein_minimize_(fire_scratch<dimensions_> scratch, std::int32_t max_i
         // s = -applied_step · g_{k-1}, so both secant inner products are combinations of the three
         // reductions above and neither needs a sweep of its own.
         float const step_dot_difference = applied_step * (previous_dot_previous - gradient_dot_previous);
-        float const difference_dot_difference = gradient_dot_gradient - 2.0f * gradient_dot_previous +
-                                                previous_dot_previous;
-        bool const secant_is_convex = step_dot_difference > 0.0f && difference_dot_difference > 0.0f;
+        float const step_dot_step = applied_step * applied_step * previous_dot_previous;
+        bool const secant_is_convex = step_dot_difference > 0.0f && step_dot_step > 0.0f;
 
+        // `<s,s>/<s,y>` rather than `<s,y>/<y,y>`. Both are Barzilai-Borwein and both fall out of the
+        // three reductions above, but they sit at opposite ends of the spectrum: the second lies near
+        // `1/lambda_max` and the first near `1/lambda_min`. MMFF spans bond stretches around
+        // 2000 kcal/mol/A^2 against torsions near unity, so tracking the stiffest mode sizes every step
+        // for bonds and leaves the soft torsional directions barely moving — which is what the measured
+        // step of ~5e-4 was, three decades below any clamp, with none of them binding.
+        //
         // Without history, or along a direction the secant reports as non-convex, fall back to the
         // trust region alone — a fixed RMS displacement, which is the one step length that needs no
         // curvature to be safe.
-        float step = secant_is_convex ? step_dot_difference / difference_dot_difference
+        float step = secant_is_convex ? step_dot_step / step_dot_difference
                                       : opening_root_mean_square_step_k / rms_gradient;
         step = fminf(fmaxf(step, min_step_k), max_step_k);
         step = fminf(step, max_root_mean_square_step_k / rms_gradient);

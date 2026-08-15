@@ -106,9 +106,11 @@ __device__ __forceinline__ std::uint32_t count_invalid_bond_stereo_(float const 
  *  post-polish geometry, in single precision and before the half-precision narrowing.
  *
  *  Only slots already holding `success_k` are read, and only those are demoted, so a more specific
- *  refusal keeps its own cause. The verdict is `stereo_failure_k` rather than a new enumerator because
- *  it names the same defect, and `fallback_disposition` already routes that status to the CPU retry
- *  which recovers it.
+ *  refusal keeps its own cause. The verdict names which kind of stereochemistry moved —
+ *  `polish_inverted_center_k` or `polish_inverted_bond_k` — rather than the `stereo_failure_k` the
+ *  pipeline kernel writes when the embedding could not satisfy a constraint to begin with. Both route
+ *  to the CPU retry, which recovers them; the split is what separates a stage that cannot reach a
+ *  geometry from a stage that walks out of one it had.
  *
  *  Launched between the last polish and `stamp_refused_molecules_kernel`, so the stamp stays the last
  *  word and a molecule the metric prepass refused outright is not relabelled by this.
@@ -129,15 +131,23 @@ __global__ __launch_bounds__(32, 8) void validate_polished_stereo_kernel(
         // the slot's padded stride is what it wants rather than the molecule's own atom count.
         float const *const positions = conformer_coordinates + static_cast<std::size_t>(slot) * output_atoms_stride *
                                                                    types::conformer_dimensions_k;
-        std::uint32_t invalid = 0;
+        std::uint32_t invalid_centers = 0;
         if (meta.num_chiral_centers != 0)
-            invalid = count_invalid_chiral_centers_(positions, output_atoms_stride, chiral_centers + meta.chiral_offset,
-                                                    meta.num_chiral_centers, lane);
+            invalid_centers = count_invalid_chiral_centers_(
+                positions, output_atoms_stride, chiral_centers + meta.chiral_offset, meta.num_chiral_centers, lane);
         // No metadata field counts declared double bonds, so the bond walk is the membership test —
         // it reads one flag byte per bond and leaves immediately on the ones carrying no E/Z.
-        invalid += count_invalid_bond_stereo_(positions, output_atoms_stride, descriptors[molecule], lane);
-        if (invalid != 0 && lane == 0)
-            conformer_status[slot] = static_cast<std::uint8_t>(conformer_status_t::stereo_failure_k);
+        std::uint32_t const invalid_bonds = count_invalid_bond_stereo_(positions, output_atoms_stride,
+                                                                       descriptors[molecule], lane);
+        // The two counts were summed here and the distinction died in the sum. They answer different
+        // questions — an inverted tetrahedral center and an inverted double bond have different causes
+        // and different fixes — and the shipped corpus was wrong in both at once, at rates nobody could
+        // separate. Naming them costs one branch on a value both counters already carry, and the split
+        // then rides the parquet `status` column and every histogram built on it.
+        if (lane == 0 && (invalid_centers != 0 || invalid_bonds != 0))
+            conformer_status[slot] = static_cast<std::uint8_t>(invalid_centers != 0
+                                                                   ? conformer_status_t::polish_inverted_center_k
+                                                                   : conformer_status_t::polish_inverted_bond_k);
     }
 }
 

@@ -40,7 +40,7 @@ static constexpr std::string_view test_name_k = "test_fallback_policy";
  *  status appended to that append-only enum land here as well as at the `-Wswitch` in the header: without
  *  it, a new status would inherit a verdict this file never states. */
 
-static_assert(sft::conformer_status_count_k == 13,
+static_assert(sft::conformer_status_count_k == 15,
               "every `conformer_status_t` carries one pinned verdict below, so a new one is pinned here too");
 
 /* A filled slot is not offered to the fallback, which leaves filled slots alone. */
@@ -99,6 +99,14 @@ static_assert(sfcli::fallback_disposition(sft::conformer_status_t::batch_overflo
 static_assert(sfcli::fallback_disposition(sft::conformer_status_t::slot_unwritten_k) ==
                   sfcli::fallback_disposition_t::retry_k,
               "no kernel reached the slot, so there is no device verdict for the fallback to re-derive");
+
+static_assert(sfcli::fallback_disposition(sft::conformer_status_t::polish_inverted_center_k) ==
+                  sfcli::fallback_disposition_t::retry_k,
+              "RDKit enforces chirality by its own route, so a centre our polish inverted is not its verdict");
+
+static_assert(sfcli::fallback_disposition(sft::conformer_status_t::polish_inverted_bond_k) ==
+                  sfcli::fallback_disposition_t::retry_k,
+              "the same for a double bond, which RDKit perceives from its own embedding");
 
 static_assert(sfcli::fallback_disposition(static_cast<sft::conformer_status_t>(sft::conformer_status_count_k)) ==
                   sfcli::fallback_disposition_t::retry_k,

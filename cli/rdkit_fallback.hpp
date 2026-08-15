@@ -78,6 +78,11 @@ enum class fallback_disposition_t : std::uint8_t {
     // No kernel reached the slot, so there is no device verdict to re-derive and the molecule itself was
     // never refused: the fallback is the only thing that has said anything about it.
     case types::conformer_status_t::slot_unwritten_k: return fallback_disposition_t::retry_k;
+    // Both are a post-polish stereo refusal, which is what `stereo_failure_k` already routes here for:
+    // RDKit's ETKDG perceives and enforces chirality by its own route, so a centre or a bond our force
+    // field walked out of its basin is not a verdict it shares.
+    case types::conformer_status_t::polish_inverted_center_k: return fallback_disposition_t::retry_k;
+    case types::conformer_status_t::polish_inverted_bond_k: return fallback_disposition_t::retry_k;
     // Two producers and only one is fully re-derived: `parse_smiles` refusing the string, which the
     // fallback repeats, and `prepare_molecule_topology_into` catching an exception out of descriptor,
     // bounds, chirality or MMFF typing construction. Only the last of those four does the fallback

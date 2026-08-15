@@ -150,7 +150,13 @@ struct gradient_arena_t {
         reserve_term_(oops, terms.oops.size());
         reserve_term_(stretchbends, terms.stretchbends.size());
         reserve_term_(interactions, terms.interactions.size());
-        reserve_term_(atom_offsets, terms.atom_offsets.size());
+        // Indexed per atom, not per term, so the one-slot floor above is the wrong shape for it: a
+        // molecule whose MMFF setup failed arrives with the offsets cleared and `num_atoms` intact, and
+        // every atom above zero then reads past a single element. The fault is sticky, so every later
+        // allocation fails and the run ends having compared almost nothing — which is how this passed
+        // without a sanitizer. Production never reaches it, because the polish kernel skips a molecule
+        // with no terms; this harness has no such guard and must size by what it indexes by.
+        reserve_(atom_offsets, std::max<std::size_t>(terms.atom_offsets.size(), num_atoms));
         return reserved;
     }
 

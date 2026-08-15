@@ -581,26 +581,47 @@ struct mmff94_energy_functor_t {
         // other from both ends, so only the lower half of the ring speaks for that offset.
         bool const middle_offset_is_mirrored = (num_atoms % 2u) == 0u;
 
-        for (std::uint32_t atom = lane; atom < num_atoms; atom += warp_size_k) {
-            mmff94_atom_vdw_folded_t const p_atom = atom_vdw_params[atom];
-            float const q_atom = atom_charge[atom];
+        // The partner write below lands in a slot another lane owns, so the "32 distinct atoms" argument
+        // above holds only while every lane is on the same `offset`. Nothing enforced that: the outer
+        // bound is not a multiple of the warp, and both tests inside were `continue`s, so lanes reached
+        // different offsets and two of them could target one atom — lane 2 at offset 5 and lane 0 at
+        // offset 7 both address atom 7. Independent thread scheduling promises no reconvergence, and
+        // `compute-sanitizer --tool racecheck` reported the collision on every production entry point.
+        //
+        // Both trip counts are warp-uniform now and the tests are predicates, so all 32 lanes reach the
+        // barrier that separates one offset's partner writes from the next offset's reads.
+        for (std::uint32_t base = 0; base < num_atoms; base += warp_size_k) {
+            std::uint32_t const atom = base + lane;
+            bool const owns_atom = atom < num_atoms;
+            mmff94_atom_vdw_folded_t const p_atom = owns_atom ? atom_vdw_params[atom] : mmff94_atom_vdw_folded_t {};
+            float const q_atom = owns_atom ? atom_charge[atom] : 0.0f;
             float3 own_force {0.0f, 0.0f, 0.0f};
 
             for (std::uint32_t offset = 1; offset <= half_shell; ++offset) {
-                if (middle_offset_is_mirrored && offset == half_shell && atom >= half_shell) continue;
+                bool const mirrored_out = middle_offset_is_mirrored && offset == half_shell && atom >= half_shell;
                 std::uint32_t const wrapped = atom + offset;
                 std::uint32_t const other = wrapped < num_atoms ? wrapped : wrapped - num_atoms;
-                std::uint8_t const bond_hops = bond_distance[atom * num_atoms + other];
-                if (bond_hops < 3 || bond_hops == 255) continue; // bonded, geminal, or unreachable
+                bool const addressable = owns_atom && !mirrored_out;
+                std::uint8_t const bond_hops = addressable ? bond_distance[atom * num_atoms + other] : 0u;
+                // Bonded, geminal and unreachable pairs contribute nothing, and neither does a lane
+                // holding no atom — all three arrive here as a zero force rather than as a skipped lane.
+                bool const contributes = addressable && bond_hops >= 3 && bond_hops != 255;
                 float3 pair_force {0.0f, 0.0f, 0.0f};
-                mmff_nonbonded_contribution_(
-                    positions, num_atoms, atom, other, p_atom, atom_vdw_params[other], q_atom * atom_charge[other],
-                    bond_hops == 3 ? pair_separation_t::one_four_k : pair_separation_t::beyond_one_four_k,
-                    &total_energy, &pair_force);
+                if (contributes)
+                    mmff_nonbonded_contribution_(
+                        positions, num_atoms, atom, other, p_atom, atom_vdw_params[other], q_atom * atom_charge[other],
+                        bond_hops == 3 ? pair_separation_t::one_four_k : pair_separation_t::beyond_one_four_k,
+                        &total_energy, &pair_force);
                 own_force = add_float3_(own_force, pair_force);
-                accumulate_gradient_into_(gradient, num_atoms, other, scale_float3_(pair_force, -1.0f));
+                if (contributes)
+                    accumulate_gradient_into_(gradient, num_atoms, other, scale_float3_(pair_force, -1.0f));
+                __syncwarp(full_mask_k);
             }
-            accumulate_gradient_into_(gradient, num_atoms, atom, own_force);
+            if (owns_atom) accumulate_gradient_into_(gradient, num_atoms, atom, own_force);
+            // This write is to the lane's own atom, but the next outer iteration's partner writes are
+            // not, and one of them can target exactly this slot. The inner barrier does not cover the
+            // gap between the two loops, so it is closed here.
+            __syncwarp(full_mask_k);
         }
 
         return warp_reduce_sum_f32_(total_energy);

@@ -168,7 +168,7 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
 
     // Every enumerator is named, so a caller reading `batch.status` never meets a bare integer. The
     // assertion is what keeps that true: appending a status without naming it below stops the build here.
-    static_assert(sfapi::conformer_status_count_k == 13u, "a conformer_status_t was added - name it below");
+    static_assert(sfapi::conformer_status_count_k == 15u, "a conformer_status_t was added - name it below");
     py::enum_<sfapi::conformer_status_t>(smallfield_module, "ConformerStatus")
         .value("SUCCESS", sfapi::conformer_status_t::success_k)
         .value("STEREO_FAILURE", sfapi::conformer_status_t::stereo_failure_k)
@@ -182,7 +182,9 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
         .value("BOUNDS_INFEASIBLE", sfapi::conformer_status_t::bounds_infeasible_k)
         .value("NONPHYSICAL_ENERGY", sfapi::conformer_status_t::nonphysical_energy_k)
         .value("BATCH_OVERFLOW", sfapi::conformer_status_t::batch_overflow_k)
-        .value("SLOT_UNWRITTEN", sfapi::conformer_status_t::slot_unwritten_k);
+        .value("SLOT_UNWRITTEN", sfapi::conformer_status_t::slot_unwritten_k)
+        .value("POLISH_INVERTED_CENTER", sfapi::conformer_status_t::polish_inverted_center_k)
+        .value("POLISH_INVERTED_BOND", sfapi::conformer_status_t::polish_inverted_bond_k);
 
     py::class_<conformer_batch_t>(smallfield_module, "ConformerBatch",
                                   "Named outputs of one `Context.generate_conformers` call.")
