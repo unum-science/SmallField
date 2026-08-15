@@ -333,18 +333,26 @@ barzilai_borwein_minimize_(fire_scratch<dimensions_> scratch, std::int32_t max_i
         __syncwarp(full_mask_k);
 
         float gradient_dot_gradient = 0.0f;
-        float gradient_dot_previous = 0.0f;
+        // The secant needs `<p, g - p>`, and forming it as `<p,p> - <g,p>` from two separately reduced
+        // sums is where the step used to lose its meaning: near a stationary point `g` approaches `p`,
+        // so the two sums approach each other while each still carries the rounding of its own
+        // magnitude. Once the true gap falls under about 1e-7 of them the difference is noise, and
+        // since the step is `applied_step * <p,p> / <p, g - p>` a noisy denominator returns an
+        // arbitrarily large step or flips the convexity test outright. Differencing per element
+        // instead costs the rounding of one element rather than of the whole sum.
+        float previous_dot_difference = 0.0f;
         float previous_dot_previous = 0.0f;
         for (std::uint32_t element = lane; element < num_elements; element += warp_size_k) {
             float const gradient_value = gradient[element];
             float const previous_value = previous_gradient[element];
+            float const difference_value = gradient_value - previous_value;
             gradient_dot_gradient = fmaf(gradient_value, gradient_value, gradient_dot_gradient);
-            gradient_dot_previous = fmaf(gradient_value, previous_value, gradient_dot_previous);
+            previous_dot_difference = fmaf(previous_value, difference_value, previous_dot_difference);
             previous_dot_previous = fmaf(previous_value, previous_value, previous_dot_previous);
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
             gradient_dot_gradient += __shfl_xor_sync(full_mask_k, gradient_dot_gradient, offset);
-            gradient_dot_previous += __shfl_xor_sync(full_mask_k, gradient_dot_previous, offset);
+            previous_dot_difference += __shfl_xor_sync(full_mask_k, previous_dot_difference, offset);
             previous_dot_previous += __shfl_xor_sync(full_mask_k, previous_dot_previous, offset);
         }
 
@@ -360,23 +368,33 @@ barzilai_borwein_minimize_(fire_scratch<dimensions_> scratch, std::int32_t max_i
         // only state this call has measured.
         if (iteration + 1 == max_iterations) break;
 
-        // s = -applied_step · g_{k-1}, so both secant inner products are combinations of the three
-        // reductions above and neither needs a sweep of its own.
-        float const step_dot_difference = applied_step * (previous_dot_previous - gradient_dot_previous);
+        // `s = -applied_step * p`, so `<s, y> = -applied_step * <p, g - p>` and `<s, s>` is a sum of
+        // squares that carries no cancellation — which is why only the first needed the elementwise
+        // treatment above, and why `<y, y>` is reconstructed here rather than reduced separately.
+        float const step_dot_difference = -applied_step * previous_dot_difference;
         float const step_dot_step = applied_step * applied_step * previous_dot_previous;
         bool const secant_is_convex = step_dot_difference > 0.0f && step_dot_step > 0.0f;
 
-        // `<s,s>/<s,y>` rather than `<s,y>/<y,y>`. Both are Barzilai-Borwein and both fall out of the
-        // three reductions above, but they sit at opposite ends of the spectrum: the second lies near
-        // `1/lambda_max` and the first near `1/lambda_min`. MMFF spans bond stretches around
-        // 2000 kcal/mol/A^2 against torsions near unity, so tracking the stiffest mode sizes every step
-        // for bonds and leaves the soft torsional directions barely moving — which is what the measured
-        // step of ~5e-4 was, three decades below any clamp, with none of them binding.
+        // `<s,y>/<y,y>`, the short Barzilai-Borwein step, which lies near `1/lambda_max`. Its sibling
+        // `<s,s>/<s,y>` lies near `1/lambda_min` and looks like the better choice on paper: MMFF spans
+        // bond stretches around 2000 kcal/mol/A^2 against torsions near unity, so tracking the stiffest
+        // mode sizes every step for bonds and leaves the soft torsional directions barely moving.
+        //
+        // Measured, on 36 drug-like molecules from RDKit embeddings at the 800-evaluation cap, the long
+        // step is worse on every axis that describes a geometry: median RMS gradient 0.49 against 0.049,
+        // worst case 8.8e4 against 0.58 — it diverges outright on a subset — and a median energy gap to
+        // RDKit's basin of 3.0 kcal/mol against 1.5, with 97 % of molecules landing within 10 kcal/mol
+        // here against 69 %. Unguarded, the long step needs a line search that this kernel has no
+        // registers for; the short step is stable without one. It also flatters the convergence counter
+        // on small well-conditioned molecules while degrading the geometry, so judge a change here by
+        // the energy gap and never by the converged share.
         //
         // Without history, or along a direction the secant reports as non-convex, fall back to the
         // trust region alone — a fixed RMS displacement, which is the one step length that needs no
         // curvature to be safe.
-        float step = secant_is_convex ? step_dot_step / step_dot_difference
+        float const difference_dot_difference = gradient_dot_gradient - previous_dot_previous -
+                                                2.0f * previous_dot_difference;
+        float step = secant_is_convex ? step_dot_difference / difference_dot_difference
                                       : opening_root_mean_square_step_k / rms_gradient;
         step = fminf(fmaxf(step, min_step_k), max_step_k);
         step = fminf(step, max_root_mean_square_step_k / rms_gradient);
