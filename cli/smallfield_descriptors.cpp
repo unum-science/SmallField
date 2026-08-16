@@ -32,6 +32,7 @@
 #include <arrow/array.h>
 #include <arrow/io/file.h>
 #include <arrow/table.h>
+#include <arrow/util/key_value_metadata.h>
 #include <parquet/arrow/reader.h>
 
 #include "smallfield/api/conformer_layout.hpp"
@@ -558,7 +559,6 @@ molecule_grouping_t group_rows_by_molecule_(input_shard_t const &shard, std::uin
 /** How one shard's augmentation ended, so each refusal stays distinguishable from the others. */
 enum class augment_t {
     written_k,
-    empty_input_k,
     /** A molecule inside the shard's `input_row` span owns no row, so the shard is not what the schema promises. */
     gapped_input_k,
     write_failed_k,
@@ -830,9 +830,35 @@ sfcli::writer_inputs_t shard_writer_inputs_(input_shard_t const &shard, cli_conf
 augment_t augment_shard_(input_shard_t const &shard, cli_config_t const &config, reembed_store_t const &reembed,
                          shard_buffers_t &buffers, fs::path const &input_path, fs::path const &output_path,
                          logger_t const &logger, shard_stats_t &stats) {
+    // The producer emits a zero-row shard for an input file that carried no rows, and the only completeness
+    // signal downstream is the sentinel — so this shard owes a zero-row output of its own or it is offered
+    // again on every pass, forever. It is written here rather than through the walk below because neither
+    // `molecule_span_of_`, which reads row zero, nor `num_molecules`, which counts the ends inclusively,
+    // means anything over no rows.
     if (shard.num_rows == 0) {
-        logger.warn("empty shard, skipping: {}", input_path.string());
-        return augment_t::empty_input_k;
+        logger.info("{} holds no rows — sealing a zero-row output shard", input_path.string());
+        // K is the shard's own property and no row of an empty one carries it, so the metadata the producer
+        // recorded is carried across rather than replaced by a number this run made up — a consumer sizing a
+        // slot stride from the corpus's first shard would otherwise read the wrong one off an empty shard.
+        std::uint32_t num_conformers = std::max(reembed.widest_molecule_conformers, 1u);
+        if (auto const metadata = shard.table->schema()->metadata(); metadata) {
+            std::string const declared = metadata->Get("num_conformers").ValueOr("");
+            std::uint32_t parsed = 0;
+            auto const [unused_end, parse_error] = std::from_chars(declared.data(), declared.data() + declared.size(),
+                                                                   parsed);
+            if (parse_error == std::errc {} && parsed > 0) num_conformers = parsed;
+        }
+        sfapi::conformer_slot_layout_t const layout {config.max_atoms, num_conformers};
+        sfcli::writer_inputs_t const empty_inputs {
+            .provenance = {.input_shard_stem = input_path.stem().string(),
+                           .dataset = config.dataset,
+                           .base_row_index = 0},
+            .molecules = {},
+            .conformers = {.layout = layout, .status = {}, .energies = {}, .coordinates = {}, .usrcat = {}},
+        };
+        sfcli::shard_write_report_t const empty_report = sfcli::write_shard(output_path, empty_inputs, &logger);
+        return empty_report.status == sfcli::shard_write_t::written_k ? augment_t::written_k
+                                                                      : augment_t::write_failed_k;
     }
 
     molecule_span_t const span = molecule_span_of_(shard);
@@ -949,12 +975,16 @@ void process_shard_(fs::path const &input_path, cli_config_t const &config, reem
     switch (augment_shard_(shard, config, reembed, buffers, input_path, output_path, logger, stats)) {
     case augment_t::written_k: break;
     // Every refusal already logged itself, in `augment_shard_` or in `write_shard`.
-    case augment_t::empty_input_k:
     case augment_t::gapped_input_k:
     case augment_t::write_failed_k: ++tally.failed; return;
     }
 
-    sfcli::write_encoded_sentinel(output_path, &logger);
+    // A shard written and not sealed is offered again by every later run, so an unsealed one is a failure
+    // however durable its parquet is; `write_encoded_sentinel` already named which half of the write stopped.
+    if (sfcli::write_encoded_sentinel(output_path, &logger) != sfcli::sentinel_write_t::sealed_k) {
+        ++tally.failed;
+        return;
+    }
 
     double const shard_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - shard_start).count();
     double const rows = static_cast<double>(shard.num_rows);

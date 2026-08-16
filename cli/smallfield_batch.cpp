@@ -477,6 +477,10 @@ struct progress_counters_t {
     std::atomic<std::uint64_t> batches_completed {0};
     /** Pending input-files that reached no output shard, on either end of the pipeline; drives the exit code. */
     std::atomic<std::uint64_t> input_files_failed {0};
+    /** Input-files moved out of the offered set after a CUDA fault, each encoded by nothing. Counted apart
+     *  from a failure because a rerun does retry a failure and cannot retry one of these: the shard is gone
+     *  from where the corpus is globbed, and only an operator putting it back brings it up again. */
+    std::atomic<std::uint64_t> input_files_parked {0};
     /** Input-files that carried no rows at all, each sealed with a zero-row output shard. Counted apart from
      *  the molecules a populated shard loses to preprocessing, which the fallback breakdown already names:
      *  an empty shard and a shard nothing survived both finish, and only one of them is a corpus defect. */
@@ -550,22 +554,20 @@ enum class gpu_runner_outcome_t {
 };
 
 /**
- *  @brief Move every input shard that fed this batch into a sibling `_skip` folder.
+ *  @brief Move every input shard that fed this batch out of the set a later run is offered.
  *
  *  A CUDA error poisons the driver context on every device, so parking is what makes the wrapper's next
  *  invocation skip these shards rather than fault on them again. Every shard of the batch is parked, not
- *  just the offending one; on Enamine and PubChem a batch holds one shard anyway.
+ *  just the offending one; on Enamine and PubChem a batch holds one shard anyway. A shard that could not be
+ *  moved is still offered, so it counts as a failure and the run says so rather than reporting it parked.
  */
-static void park_batch_shards_(coprocessed_batch_accumulator_t const &accumulator, logger_t const &logger) {
-    fs::path const input_dir = accumulator.input_file_pairs.front()->input_path.parent_path();
-    fs::path const skip_dir = input_dir.parent_path() / (input_dir.filename().string() + "_skip");
-    std::error_code error_code;
-    fs::create_directories(skip_dir, error_code);
+static void park_batch_shards_(coprocessed_batch_accumulator_t const &accumulator, logger_t const &logger,
+                               progress_counters_t &counters) {
     for (auto const *pair : accumulator.input_file_pairs) {
-        fs::path const destination = skip_dir / pair->input_path.filename();
-        fs::rename(pair->input_path, destination, error_code);
-        logger.error("CUDA error — parked shard {} -> {} ({})", pair->input_path.string(), destination.string(),
-                     error_code ? error_code.message() : "ok");
+        switch (sfcli::park_input_shard(pair->input_path, &logger)) {
+        case sfcli::park_outcome_t::parked_k: counters.input_files_parked.fetch_add(1); break;
+        case sfcli::park_outcome_t::rename_failed_k: counters.input_files_failed.fetch_add(1); break;
+        }
     }
 }
 
@@ -630,7 +632,7 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
                                              thread_budget_t const &budget, logger_t const &logger,
                                              handoff<coprocessed_batch_accumulator_t> &input_queue,
                                              handoff<coprocessed_batch_result_t> &output_queue, buffer_pool_t &pool,
-                                             pipeline_timings_t &timings) {
+                                             progress_counters_t &counters, pipeline_timings_t &timings) {
     omp_set_num_threads(budget.gpu_runner);
     gpu_runner_outcome_t outcome = gpu_runner_outcome_t::completed_k;
 
@@ -659,7 +661,7 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
         // Park this batch's shards and stop feeding the GPU, so `main` returns non-zero and the wrapper
         // relaunches with a fresh CUDA context.
         if (gpu_context.cuda_error_count.load() > 0) {
-            park_batch_shards_(accumulator, logger);
+            park_batch_shards_(accumulator, logger, counters);
             logger.error("aborting invocation after {} CUDA errors; wrapper will relaunch",
                          fmt::group_digits(gpu_context.cuda_error_count.load()));
             stop_requested_.store(true, std::memory_order_relaxed);
@@ -869,7 +871,12 @@ static void write_batch_shards_(cli_config_t const &config, thread_budget_t cons
         }
         // `write_shard` closed the shard before it returned, so the sentinel this iteration writes can only
         // seal a file that is already durable — the one ordering the corpus's completeness signal depends on.
-        sfcli::write_encoded_sentinel(output_path, &logger);
+        // A durable shard nothing sealed is the same infinite re-offer a shard nothing wrote is, because the
+        // sentinel is the whole completeness signal, so the two are counted alike.
+        if (sfcli::write_encoded_sentinel(output_path, &logger) != sfcli::sentinel_write_t::sealed_k) {
+            counters.input_files_failed.fetch_add(1);
+            continue;
+        }
 
         counters.molecules_completed.fetch_add(accumulator.molecules_of(file_index));
         counters.input_files_completed.fetch_add(1);
@@ -1045,7 +1052,7 @@ static gpu_runner_outcome_t run_pipeline_(sfapi::context_t &gpu_context, cli_con
 #pragma omp section
         {
             outcome = gpu_runner_loop_(gpu_context, config, budget, logger, reader_to_gpu, gpu_to_fallback, pool,
-                                       timings);
+                                       counters, timings);
         }
 #pragma omp section
         { fallback_loop_(config, budget, pool, gpu_to_fallback, fallback_to_writer, timings); }
@@ -1167,6 +1174,11 @@ int main(int argc, char **argv) {
     if (files_empty > 0)
         logger.info("{} of {} input-files carried no rows — each sealed a zero-row output shard",
                     fmt::group_digits(files_empty), fmt::group_digits(counters.total_input_files));
+    std::uint64_t const files_parked = counters.input_files_parked.load();
+    if (files_parked > 0)
+        logger.error("{} of {} input-files were parked after a CUDA fault — each is out of the " //
+                     "offered set and encoded by nothing, so putting one back is an operator's decision",
+                     fmt::group_digits(files_parked), fmt::group_digits(counters.total_input_files));
     std::uint64_t const files_failed = counters.input_files_failed.load();
     if (files_failed > 0)
         logger.error("{} of {} input-files produced no output shard — none of them was sealed, so a rerun retries them",

@@ -6,7 +6,8 @@
  *  canonical naming the Python reference reimplementation also keys on. An output counts as complete only
  *  once its `<output>.encoded` sentinel exists, and the writer emits that sentinel after the parquet closes,
  *  so a kill mid-write never flags completion. A file already ending in `.3D.parquet` is an output and never
- *  an input, which is what lets `--output` default to `--input`.
+ *  an input, which is what lets `--output` default to `--input`. Sealing and parking both live here because
+ *  they are the only two ways an input shard leaves the set a later run is offered.
  */
 
 #pragma once
@@ -42,12 +43,25 @@ enum class restart_policy_t {
 inline constexpr std::string_view encoded_sentinel_suffix_k = ".encoded";
 
 /**
+ *  @brief Whether an output shard reached the only state downstream reads as complete.
+ *
+ *  Anything but `sealed_k` leaves the input unsealed, so every later run offers it again — which makes the
+ *  outcome the caller's failure counter and not a diagnostic it may drop.
+ */
+enum class sentinel_write_t {
+    sealed_k,
+    open_failed_k,
+    truncated_k,
+};
+
+/**
  *  @brief Seal @p output_path by writing the sentinel a `--resume` run keys on, at `<output_path>.encoded`.
  *
  *  Removed again if the write was short, because a truncated sentinel would make the next run skip an
  *  unfinished shard as though it were done. A null @p log falls back to a default one.
  */
-inline void write_encoded_sentinel(std::filesystem::path const &output_path, logger_t const *log = nullptr) {
+[[nodiscard]] inline sentinel_write_t write_encoded_sentinel(std::filesystem::path const &output_path,
+                                                             logger_t const *log = nullptr) {
     constexpr std::string_view body_k = "v1\n";
     logger_t const fallback;
     logger_t const &logger = log != nullptr ? *log : fallback;
@@ -57,14 +71,55 @@ inline void write_encoded_sentinel(std::filesystem::path const &output_path, log
     FILE *sentinel_file = std::fopen(sentinel.string().c_str(), "wb");
     if (sentinel_file == nullptr) {
         logger.error("sentinel write failed: {}", sentinel.string());
-        return;
+        return sentinel_write_t::open_failed_k;
     }
     std::size_t const written = std::fwrite(body_k.data(), 1, body_k.size(), sentinel_file);
     std::fclose(sentinel_file);
-    if (written == body_k.size()) return;
+    if (written == body_k.size()) return sentinel_write_t::sealed_k;
     std::error_code remove_error;
     std::filesystem::remove(sentinel, remove_error);
     logger.error("sentinel write truncated, removed: {}", sentinel.string());
+    return sentinel_write_t::truncated_k;
+}
+
+/** Whether a shard that poisoned the driver context left the set a later run is offered. */
+enum class park_outcome_t {
+    parked_k,
+    rename_failed_k,
+};
+
+/**
+ *  @brief Move the shard @p input_path names into a sibling `_skip` folder, so no later run is offered it.
+ *
+ *  `--input` is routinely a staging directory of symlinks into a corpus the runner globs separately, and
+ *  renaming a symlink parks nothing: the shard stays where the runner finds it and faults the driver again on
+ *  every pass. So the file the link resolves to is what moves, into a `_skip` sibling of @b its own directory,
+ *  and the link left dangling behind it is dropped. A null @p log falls back to a default one.
+ */
+[[nodiscard]] inline park_outcome_t park_input_shard(std::filesystem::path const &input_path,
+                                                     logger_t const *log = nullptr) {
+    namespace fs = std::filesystem;
+    logger_t const fallback;
+    logger_t const &logger = log != nullptr ? *log : fallback;
+
+    std::error_code error_code;
+    fs::path const resolved = fs::weakly_canonical(input_path, error_code);
+    fs::path const shard = error_code ? input_path : resolved;
+    fs::path const shard_dir = shard.parent_path();
+    fs::path const skip_dir = shard_dir.parent_path() / (shard_dir.filename().string() + "_skip");
+    fs::create_directories(skip_dir, error_code);
+    fs::path const destination = skip_dir / shard.filename();
+
+    fs::rename(shard, destination, error_code);
+    if (error_code) {
+        logger.error("parking {} -> {} failed: {}", shard.string(), destination.string(), error_code.message());
+        return park_outcome_t::rename_failed_k;
+    }
+    logger.error("parked shard {} -> {}", shard.string(), destination.string());
+    // The staging link the run was handed now names nothing, and it only exists because this run was pointed
+    // at a view of the corpus rather than at the corpus.
+    if (fs::is_symlink(input_path, error_code)) fs::remove(input_path, error_code);
+    return park_outcome_t::parked_k;
 }
 
 /**

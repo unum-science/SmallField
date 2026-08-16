@@ -101,6 +101,11 @@ define_smallfield_test(cli fallback_policy LINK smallfield_rdkit fmt::fmt CUDA::
 # `find_package` imports its targets into the directory that calls it, so a name arriving from another subdirectory
 # would not resolve.  Host-only: `write_shard` reaches no device, and the coordinates it is handed are three halves
 # written by hand.
+#
+# Sealing and parking are the two ways an input shard leaves the set a later run is offered, so they are pinned against a
+# real temporary tree rather than a fake.  `cli/shard_inventory.hpp` carries both inline, so the test needs no source of
+# its own beyond the CLI headers -- and it is registered here, beside the writer test, because the header ships behaviour
+# only to the two binaries this option builds.
 if (SMALLFIELD_BUILD_CLI)
     find_package(Arrow CONFIG REQUIRED)
     find_package(Parquet CONFIG REQUIRED)
@@ -108,6 +113,7 @@ if (SMALLFIELD_BUILD_CLI)
         cli empty_shard
         LINK smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared
     )
+    define_smallfield_test(cli shard_sealing LINK smallfield_rdkit fmt::fmt CUDA::cudart)
 endif ()
 
 define_smallfield_test(api conformer_slot_layout)
