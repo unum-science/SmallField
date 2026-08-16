@@ -813,9 +813,16 @@ static sfcli::writer_inputs_t shard_writer_inputs_(cli_config_t const &config,
     };
 }
 
-/** Emit one output shard per input file the batch consumed, sealing each with its `.encoded` sentinel. */
-static void write_batch_shards_(cli_config_t const &config, coprocessed_batch_accumulator_t const &accumulator,
-                                output_buffers_t &buffer, logger_t const &logger, progress_counters_t &counters) {
+/**
+ *  @brief Emit one output shard per input file the batch consumed, sealing each with its `.encoded` sentinel.
+ *
+ *  `parquet::arrow::WriteTable` carries no threading of its own, so the role's budget is spent across the
+ *  batch's files rather than inside one: each file owns a disjoint slice of the batch's buffers, reads them
+ *  and writes its own path, and the counters it raises are atomic.
+ */
+static void write_batch_shards_(cli_config_t const &config, thread_budget_t const &budget,
+                                coprocessed_batch_accumulator_t const &accumulator, output_buffers_t &buffer,
+                                logger_t const &logger, progress_counters_t &counters) {
     // No deduplication: every surviving molecule emits all K slots, and a failed one emits zero, which the
     // writer turns into a single all-null row so every input row keeps at least one output row.
     for (std::uint64_t molecule_index = 0; molecule_index < accumulator.num_molecules(); ++molecule_index)
@@ -823,7 +830,12 @@ static void write_batch_shards_(cli_config_t const &config, coprocessed_batch_ac
                                                                  ? static_cast<std::uint8_t>(config.num_conformers)
                                                                  : 0u;
 
-    for (std::size_t file_index = 0; file_index < accumulator.input_file_pairs.size(); ++file_index) {
+    std::size_t const num_files = accumulator.input_file_pairs.size();
+    int const workers = static_cast<int>(
+        std::min<std::size_t>(num_files, static_cast<std::size_t>(std::max(budget.writer, 1))));
+
+#pragma omp parallel for schedule(dynamic, 1) num_threads(workers) if (workers > 1)
+    for (std::size_t file_index = 0; file_index < num_files; ++file_index) {
         auto const &output_path = accumulator.input_file_pairs[file_index]->output_path;
         // `write_shard` already logged the column or the file that stopped it, so nothing is said here.
         sfcli::shard_write_report_t const report = sfcli::write_shard(
@@ -834,6 +846,8 @@ static void write_batch_shards_(cli_config_t const &config, coprocessed_batch_ac
             counters.input_files_failed.fetch_add(1);
             continue;
         }
+        // `write_shard` closed the shard before it returned, so the sentinel this iteration writes can only
+        // seal a file that is already durable — the one ordering the corpus's completeness signal depends on.
         sfcli::write_encoded_sentinel(output_path, &logger);
 
         counters.molecules_completed.fetch_add(accumulator.molecules_of(file_index));
@@ -958,7 +972,7 @@ static void writer_loop_(cli_config_t const &config, thread_budget_t const &budg
         std::uint64_t const batch_molecules = result.accumulator.num_molecules();
         scoped_role_span_t const timed {timings.writer, batch_molecules};
 
-        write_batch_shards_(config, result.accumulator, pool.at(result.buffer_slot), logger, counters);
+        write_batch_shards_(config, budget, result.accumulator, pool.at(result.buffer_slot), logger, counters);
         pool.release(result.buffer_slot);
         counters.batches_completed.fetch_add(1);
         counters.molecules_undescribed.fetch_add(result.molecules_undescribed);

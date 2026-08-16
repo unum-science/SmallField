@@ -576,6 +576,11 @@ static std::shared_ptr<arrow::KeyValueMetadata> build_provenance_(writer_inputs_
     return provenance;
 }
 
+/* Leaf paths of the two fp16 list columns, spelled the way Parquet addresses a column rather than the way
+ * the schema names it: a path that names no leaf is accepted and silently configures nothing. */
+constexpr char const *coordinate_leaf_path_k = "conformer_coords.list.element";
+constexpr char const *usrcat_leaf_path_k = "usrcat.list.element";
+
 /** Write @p table to @p path as one ZSTD-compressed Parquet file, closed before this returns. */
 static shard_write_report_t write_parquet_(fs::path const &path, arrow::Table const &table, logger_t const &logger) {
     auto outfile_result = arrow::io::FileOutputStream::Open(path.string());
@@ -584,8 +589,18 @@ static shard_write_report_t write_parquet_(fs::path const &path, arrow::Table co
                        outfile_result.status().message());
     auto outfile = outfile_result.ValueOrDie();
 
-    auto writer_props =
-        parquet::WriterProperties::Builder().compression(parquet::Compression::ZSTD)->compression_level(3)->build();
+    // Half-precision coordinates and descriptors are near-random, so their dictionary overflows and falls
+    // back to PLAIN having already paid the hashing, and their min/max statistics cost a comparator pass
+    // per page that no reader of these shards consults. Both stay on for the small scalar columns, where
+    // the dictionary is what makes `input_shard` and `status` cheap.
+    auto writer_props = parquet::WriterProperties::Builder()
+                            .compression(parquet::Compression::ZSTD)
+                            ->compression_level(3)
+                            ->disable_dictionary(coordinate_leaf_path_k)
+                            ->disable_statistics(coordinate_leaf_path_k)
+                            ->disable_dictionary(usrcat_leaf_path_k)
+                            ->disable_statistics(usrcat_leaf_path_k)
+                            ->build();
     auto arrow_props = parquet::ArrowWriterProperties::Builder().store_schema()->build();
     auto write_status = parquet::arrow::WriteTable(table, arrow::default_memory_pool(), outfile, 65536, writer_props,
                                                    arrow_props);
