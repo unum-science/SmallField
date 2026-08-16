@@ -234,7 +234,16 @@ static std::uint32_t recover_molecule_(admitted_molecule_t &admitted, std::uint6
     RDKit::RWMol &molecule = *admitted.molecule;
     RDKit::DGeomHelpers::EmbedParameters embed_params = RDKit::DGeomHelpers::ETKDGv3;
     embed_params.randomSeed = static_cast<int>(random_seed);
-    embed_params.maxIterations = 200;
+    // The knee, measured on 40,000 REAL molecules with 1,345 dispatched. Distance-geometry embedding is
+    // 65 % of this role's CPU and 81 % of it for the stereo refusals, and the bill is concentrated in
+    // molecules that never recover at all: three of 666 returned zero conformers and burned 16 % of the
+    // whole embed budget, the worst of them 16.2 seconds. A ceiling gives up on exactly those an order
+    // of magnitude sooner. At 25 the residual population's embed falls 279 ms to 99 ms, total 393 ms to
+    // 153 ms, and the paired best MMFF94 energy is unchanged to three decimals on every molecule that
+    // recovered — one slot of 1,284 is lost and no molecule is. At 10 the knee is past: 4.3 % of slots
+    // go. `bench_conformer_backends` has run its RDKit arm at 10 all along, so the shipped path and the
+    // benchmark disagreed about this number and the 200 was never measured.
+    embed_params.maxIterations = 25;
 
     std::vector<int> conformer_ids;
     {
