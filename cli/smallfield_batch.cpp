@@ -61,9 +61,10 @@ using smallfield::logger_t;
 
 namespace smallfield::cli {
 
-/* Set by SIGINT/SIGTERM. The reader-role stops feeding new shards at the next shard boundary, so
- * in-flight batches drain and write and the run still exits zero; a runner wrapper pairs this with
- * a pause sentinel to hold off relaunch and free the GPU on demand.
+/* Set by SIGINT/SIGTERM, and by the gpu-runner-role's own CUDA fault. The reader-role stops feeding new
+ * shards and the gpu-runner-role drops the ones already staged behind it, so what drains is the work
+ * conformers were generated for and nothing else, and the run still exits zero; a runner wrapper pairs
+ * this with a pause sentinel to hold off relaunch and free the GPU on demand.
  *
  * `handle_stop_signal_` keeps C language linkage for `std::signal`, which an ordinary `static`
  * function cannot combine with, so the unnamed namespace supplies the internal linkage here. */
@@ -623,9 +624,13 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
     for (;;) {
         auto accumulator = input_queue.receive();
         if (accumulator.item == pipeline_item_t::end_of_stream_k) break;
-        // Once the driver context is poisoned nothing further is launched, but the loop keeps draining so
-        // the reader-role never blocks on a full ring and the whole pipeline can shut down in order.
-        if (outcome == gpu_runner_outcome_t::cuda_fault_k) continue;
+        // A stopped run launches nothing further, but the loop keeps draining so the reader-role never
+        // blocks on a full ring and the whole pipeline can shut down in order. Both producers of a stop
+        // land here: a poisoned driver context, and the operator's SIGINT or SIGTERM. A batch dropped
+        // here has only been read — no conformer was generated for it and no shard of it was sealed, so
+        // `--resume` picks its input-files up again — and dropping it is what bounds a stop to the work
+        // already past this role rather than to the whole ring staged behind it.
+        if (stop_requested_.load(std::memory_order_relaxed)) continue;
         SF_NVTX_RANGE_COLORED("gpu_runner: preprocess+launch", 0x2E86C1);
         std::uint64_t const batch_molecules = accumulator.num_molecules();
         scoped_role_span_t const timed {timings.gpu_runner, batch_molecules};
