@@ -9,6 +9,11 @@
  *  accumulation order only. Every one of the 12 USR and 60 USRCAT elements is compared at 1e-4, rather than
  *  their worst deviation alone, so a single divergent moment names itself.
  *
+ *  The four CREDO subsets are checked separately and index for index against `SubstructMatch` over the same
+ *  SMARTS, because the descriptor comparison above would hide a subset that differs by an atom the moments
+ *  happen not to move. That check needs no conformer, so it covers every corpus line rather than only the
+ *  ones that embed.
+ *
  *  `separate_fragments` documents a rigid translation that strings the component centroids along +x with their
  *  bounding spheres clear, so the checks are exactly those three claims: intra-component distances unchanged,
  *  each centroid on the axis, and consecutive centroids at least the sum of their two radii apart. A gap that
@@ -38,6 +43,7 @@
 #include <GraphMol/GraphMol.h>
 #include <GraphMol/MolOps.h>
 #include <GraphMol/SmilesParse/SmilesParse.h>
+#include <GraphMol/Substruct/SubstructMatch.h>
 
 #include "smallfield/postprocess/fragment_separation.hpp"
 #include "smallfield/postprocess/shape_descriptors.hpp"
@@ -163,22 +169,25 @@ static prepare_outcome_t prepare_molecule_(std::string_view smiles, std::unique_
 struct shape_reporters_t {
     diagnostic_reporter_t usr {"rdkit", "ours"};
     diagnostic_reporter_t usrcat {"rdkit", "ours"};
+    diagnostic_reporter_t credo {"substruct", "per_atom"};
     diagnostic_reporter_t separation {"before", "after"};
 
     void limit_printed_lines(std::size_t maximum) {
         usr.limit_printed_lines(maximum);
         usrcat.limit_printed_lines(maximum);
+        credo.limit_printed_lines(maximum);
         separation.limit_printed_lines(maximum);
     }
 
-    bool passed() const { return usr.passed() && usrcat.passed() && separation.passed(); }
+    bool passed() const { return usr.passed() && usrcat.passed() && credo.passed() && separation.passed(); }
 
     std::size_t mismatch_count() const {
-        return usr.mismatch_count() + usrcat.mismatch_count() + separation.mismatch_count();
+        return usr.mismatch_count() + usrcat.mismatch_count() + credo.mismatch_count() + separation.mismatch_count();
     }
 
     std::size_t comparison_count() const {
-        return usr.comparison_count() + usrcat.comparison_count() + separation.comparison_count();
+        return usr.comparison_count() + usrcat.comparison_count() + credo.comparison_count() +
+               separation.comparison_count();
     }
 };
 
@@ -200,6 +209,9 @@ struct shape_scratch_t {
     std::vector<std::vector<unsigned int>> rdkit_usrcat_atoms;
     std::vector<std::uint32_t> component_atoms;
     std::vector<component_before_t> components_before;
+    /** The CREDO subsets as `SubstructMatch` collects them, against which the typing is checked. */
+    std::array<std::vector<std::uint32_t>, sfpost::credo_subset_count_k> substruct_subsets;
+    std::vector<RDKit::MatchVectType> substruct_matches;
 };
 
 /** Where every corpus line went, so a section that compared little says why. */
@@ -216,6 +228,82 @@ struct shape_tally_t {
 };
 
 #pragma endregion Reporting
+
+#pragma region Credo Typing
+
+/**
+ *  @brief RDKit's default USRCAT SMARTS, compiled as whole-molecule queries.
+ *
+ *  The oracle for the typing in `build_shape_context_into`, which tests one atom at a time and fills the
+ *  recursive `$()` environments itself. `SubstructMatch` is the mechanism that filling replaced, so an
+ *  environment left unfilled, filled twice, or filled against the wrong molecule shows up here as a subset
+ *  that differs.
+ */
+static std::array<RDKit::ROMol, sfpost::credo_subset_count_k> const &substruct_matchers_() {
+    static char const *const patterns[sfpost::credo_subset_count_k] = {
+        "[#6+0!$(*~[#7,#8,F]),SH0+0v2,s+0,S^3,Cl+0,Br+0,I+0]",             //  hydrophobic
+        "[a]",                                                             //  aromatic
+        "[$([O,S;H1;v2]-[!$(*=[O,N,P,S])]),$([O,S;H0;v2]),$([O,S;-]),"     //  acceptor
+        "$([N&v3;H1,H2]-[!$(*=[O,N,P,S])]),$([N;v3;H0]),$([n,o,s;+0]),F]", //
+        "[N!H0v3,N!H0+v4,OH+0,SH+0,nH+0]",                                 //  donor
+    };
+    static auto const parse_one = [](char const *smarts) {
+        std::unique_ptr<RDKit::ROMol const> const parsed {RDKit::SmartsToMol(smarts)};
+        return RDKit::ROMol(*parsed);
+    };
+    static std::array<RDKit::ROMol, sfpost::credo_subset_count_k> const compiled {
+        parse_one(patterns[0]), parse_one(patterns[1]), parse_one(patterns[2]), parse_one(patterns[3])};
+    return compiled;
+}
+
+/**
+ *  @brief Compare the four CREDO subsets against the `SubstructMatch` oracle, index for index.
+ *
+ *  Needs no conformer, so it runs over every corpus line rather than only the ones that embed. A line the
+ *  parse or the typing refuses is left uncompared: the production path ships no descriptor for it either.
+ *
+ *  @param[in] smiles Molecule to type.
+ *  @param[in] salt_policy Counterion handling, applied to both sides so they type the same molecule.
+ *  @param[inout] reporters Reporters counting and printing the comparisons.
+ *  @param[inout] scratch Buffers reused across molecules; left holding this molecule's typing context.
+ */
+static void check_credo_typing_(std::string_view smiles, smallfield::salt_policy_t salt_policy,
+                                shape_reporters_t &reporters, shape_scratch_t &scratch) {
+    smallfield::parse_options_t parse_options;
+    parse_options.max_atoms = 0;
+    parse_options.salt_policy = salt_policy;
+    parse_options.stereo_policy = smallfield::stereo_policy_t::skip_k;
+    smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
+    if (!parsed.molecule) return;
+
+    for (std::vector<std::uint32_t> &subset : scratch.substruct_subsets) subset.clear();
+    std::array<RDKit::ROMol, sfpost::credo_subset_count_k> const &matchers = substruct_matchers_();
+    for (std::size_t subset_index = 0; subset_index < sfpost::credo_subset_count_k; ++subset_index) {
+        RDKit::SubstructMatch(*parsed.molecule, matchers[subset_index], scratch.substruct_matches);
+        for (RDKit::MatchVectType const &match : scratch.substruct_matches)
+            for (std::pair<int, int> const &pair : match)
+                scratch.substruct_subsets[subset_index].push_back(static_cast<std::uint32_t>(pair.second));
+    }
+
+    if (sfpost::build_shape_context_into(smiles, parsed.num_atoms, salt_policy, scratch.context) !=
+        sfpost::shape_typing_t::typed_k)
+        return;
+
+    for (std::size_t subset_index = 0; subset_index < sfpost::credo_subset_count_k; ++subset_index) {
+        std::vector<std::uint32_t> const &reference = scratch.substruct_subsets[subset_index];
+        std::vector<std::uint32_t> const &observed = scratch.context.credo_subsets[subset_index];
+        // The atoms carry their own index as their value, so a differing position names itself and the field
+        // name does not have to be built per element.
+        comparison_group_t group = reporters.credo.mismatch("credo_typing", "smiles={} subset={}", smiles,
+                                                            usrcat_block_names_k[subset_index + 1]);
+        group.field("size", static_cast<std::uint32_t>(reference.size()), static_cast<std::uint32_t>(observed.size()),
+                    exactly_equal);
+        for (std::size_t position = 0; position < std::min(reference.size(), observed.size()); ++position)
+            group.field("atom", reference[position], observed[position], exactly_equal);
+    }
+}
+
+#pragma endregion Credo Typing
 
 #pragma region Descriptors
 
@@ -548,6 +636,10 @@ int main(int argc, char **argv) {
     reporters.usr.summarize("usr_builtin");
     reporters.usrcat.summarize("usrcat_builtin");
 
+    for (std::string_view const smiles : sftest::builtin_smiles_k)
+        sftest::check_credo_typing_(smiles, smallfield::keep_largest_fragment_k, reporters, scratch);
+    reporters.credo.summarize("credo_builtin");
+
     if (selection.knob == sftest::corpus_knob_t::named_k) {
         // Naming a corpus is a request to validate against it, so a path that does not open is a failure
         // rather than an empty run: the sections would otherwise close with nothing compared.
@@ -556,6 +648,11 @@ int main(int argc, char **argv) {
         if (outcome != sftest::smiles_load_t::loaded_k)
             return sftest::report_fail(test_name_k, "{} {}", sftest::smiles_load_reason(outcome), selection.path);
         fmt::println("{}: corpus {}, {} SMILES", test_name_k, selection.path, fmt::group_digits(corpus.size()));
+
+        // Typing needs no conformer, so it covers every line rather than only the ones that embed.
+        for (auto const &smiles : corpus)
+            sftest::check_credo_typing_(smiles, smallfield::keep_all_fragments_k, reporters, scratch);
+        reporters.credo.summarize("credo_corpus");
 
         sftest::shape_tally_t tally;
         for (auto const &smiles : corpus) sftest::check_corpus_line_(smiles, reporters, scratch, tally);
