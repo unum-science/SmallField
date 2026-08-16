@@ -1178,7 +1178,7 @@ static void enqueue_binned_kernels_(wave_slice_view_t const &device_view,
             device_view.mmff_atom_vdw.data(), device_view.mmff_atom_charge.data(), device_view.bond_distance.data(),
             device_view.mmff_bonds.data(), device_view.mmff_angles.data(), device_view.mmff_torsions.data(),
             device_view.mmff_oops.data(), device_view.mmff_stretchbends.data(), device_view.mmff_interactions.data(),
-            device_view.mmff_atom_offsets.data(), device_metadata + bin_start,
+            device_view.mmff_atom_offsets.data(), device_view.chiral_centers.data(), device_metadata + bin_start,
             regions.coordinates_fp32.data() + coordinate_base, regions.energies.data() + slot_base,
             regions.status.data() + slot_base, bin_size, conformer_count, gpu_max_atoms, bin_max_atoms,
             bin_diagnostics);

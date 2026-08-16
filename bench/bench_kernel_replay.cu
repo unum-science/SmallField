@@ -274,6 +274,7 @@ static void launch_mmff_(capture_manifest_t const &manifest, replay_device_t con
         reinterpret_cast<sft::mmff94_stretchbend_t const *>(pool_at(manifest.offset_mmff_stretchbends)),
         reinterpret_cast<sft::mmff94_atom_interaction_t const *>(pool_at(manifest.offset_mmff_interactions)),
         reinterpret_cast<sft::mmff94_atom_offsets_t const *>(pool_at(manifest.offset_mmff_atom_offsets)),
+        reinterpret_cast<sft::chiral_center_descriptor_t const *>(pool_at(manifest.offset_chiral_centers)),
         reinterpret_cast<sft::etkdg_molecule_metadata_t const *>(pool_at(manifest.offset_molecule_metadata)),
         device.coordinates, device.energies, device.status, bin_size, conformer_count, gpu_max_atoms,
         static_cast<std::uint32_t>(manifest.bin_max_atoms), device.diagnostics);

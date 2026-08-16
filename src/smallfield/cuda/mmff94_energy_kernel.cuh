@@ -27,6 +27,7 @@ using smallfield::types::atom_role_fourth_k;
 using smallfield::types::atom_role_second_k;
 using smallfield::types::atom_role_t;
 using smallfield::types::atom_role_third_k;
+using smallfield::types::chiral_center_descriptor_t;
 using smallfield::types::mmff94_angle_t;
 using smallfield::types::mmff94_atom_interaction_t;
 using smallfield::types::mmff94_atom_offsets_t;
@@ -51,6 +52,17 @@ constexpr float mmff_torsion_prefactor_k = 0.5f;
 constexpr float mmff_stretch_bend_prefactor_k = 2.51210f;
 constexpr float mmff_degrees_to_radians_k = 3.14159265f / 180.0f;
 constexpr float mmff_radians_to_degrees_k = 180.0f / 3.14159265f;
+
+/**
+ *  Stiffness of the chiral restraint, in kcal/mol per cubic angstrom squared.
+ *
+ *  It sets the height of the barrier between a stereoisomer and its mirror, since the path between
+ *  them passes through a flat center where the penalty is `w * v_min^2` — 2,500 kcal/mol at a
+ *  four-coordinate center's 5 cubic angstrom floor. That is far above the deepest descent the polish
+ *  measures, so no relaxation buys its way through. It costs nothing anywhere the restraint is not
+ *  violated, which is why the number can be this large without distorting geometry.
+ */
+constexpr float mmff_chiral_volume_weight_k = 100.0f;
 
 /** Whether a nonbonded pair is exactly three bonds apart, which scales electrostatics. */
 enum class pair_separation_t : bool { beyond_one_four_k = false, one_four_k = true };
@@ -113,6 +125,7 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(float const *positi
         vdw_radius_combined *= mmff94_vdw_donor_acceptor_radius_scale_k;
         vdw_epsilon *= mmff94_vdw_donor_acceptor_well_depth_scale_k;
     }
+    float const inverse_vdw_radius = 1.0f / vdw_radius_combined;
 
     // Pair geometry.
     float3 const delta = sub_float3_(load_position_(positions, num_atoms, other),
@@ -122,28 +135,34 @@ __device__ __forceinline__ void mmff_nonbonded_contribution_(float const *positi
     float const distance = distance_squared * inverse_distance;
 
     // VdW buffered 14-7 energy and gradient.
-    float const density_ratio = distance * (1.0f / (vdw_radius_combined)); // ρ = r / R*
-    float const density_ratio_pow7 = density_ratio * density_ratio * density_ratio * density_ratio * density_ratio *
-                                     density_ratio * density_ratio;
+    float const density_ratio = distance * inverse_vdw_radius; // ρ = r / R*
+    // `ρ⁶` is the same left-associated product `ρ⁷` already walks through, and the gradient's `ρ⁷ / ρ`
+    // is exactly it — so the quotient never becomes a division.
+    float const density_ratio_pow6 = density_ratio * density_ratio * density_ratio * density_ratio * density_ratio *
+                                     density_ratio;
+    float const density_ratio_pow7 = density_ratio_pow6 * density_ratio;
     float const repulsion_denominator = density_ratio + mmff_vdw_delta_k; // ρ + δ
-    float const repulsion_base = (1.0f + mmff_vdw_delta_k) * (1.0f / (repulsion_denominator));
+    float const inverse_repulsion_denominator = 1.0f / repulsion_denominator;
+    float const repulsion_base = (1.0f + mmff_vdw_delta_k) * inverse_repulsion_denominator;
     float const repulsion_pow7 = repulsion_base * repulsion_base * repulsion_base * repulsion_base * repulsion_base *
                                  repulsion_base * repulsion_base;
-    float const attractive_term = (1.0f + mmff_vdw_gamma_k) * (1.0f / (density_ratio_pow7 + mmff_vdw_gamma_k)) - 2.0f;
+    // `1 / (ρ⁷ + γ)` appears once in the energy and squared in the gradient, so one reciprocal serves both.
+    float const inverse_attractive_denominator = 1.0f / (density_ratio_pow7 + mmff_vdw_gamma_k);
+    float const attractive_term = (1.0f + mmff_vdw_gamma_k) * inverse_attractive_denominator - 2.0f;
     float const energy_vdw = vdw_epsilon * repulsion_pow7 * attractive_term;
-    float const d_repulsion = -7.0f * repulsion_pow7 * (1.0f / (repulsion_denominator));
-    float const d_attractive =
-        -7.0f * (1.0f + mmff_vdw_gamma_k) * density_ratio_pow7 *
-        (1.0f / (density_ratio * (density_ratio_pow7 + mmff_vdw_gamma_k) * (density_ratio_pow7 + mmff_vdw_gamma_k)));
+    float const d_repulsion = -7.0f * repulsion_pow7 * inverse_repulsion_denominator;
+    float const d_attractive = -7.0f * (1.0f + mmff_vdw_gamma_k) * density_ratio_pow6 * inverse_attractive_denominator *
+                               inverse_attractive_denominator;
     float const energy_gradient_vdw = vdw_epsilon * (d_repulsion * attractive_term + repulsion_pow7 * d_attractive) *
-                                      (1.0f / (vdw_radius_combined));
+                                      inverse_vdw_radius;
 
-    // Electrostatic energy and gradient.
+    // Electrostatic energy and gradient; the buffered reciprocal serves the gradient squared.
     float const scale = separation == pair_separation_t::one_four_k ? mmff_1_4_scale_k : 1.0f;
-    float const buffered_distance = distance + mmff_electrostatic_buffer_k;
-    float const energy_electrostatic = mmff_coulomb_k * charge_product * (1.0f / (buffered_distance)) * scale;
-    float const energy_gradient_electrostatic = -mmff_coulomb_k * charge_product *
-                                                (1.0f / (buffered_distance * buffered_distance)) * scale;
+    float const inverse_buffered_distance = 1.0f / (distance + mmff_electrostatic_buffer_k);
+    float const scaled_charge_product = mmff_coulomb_k * charge_product * scale;
+    float const energy_electrostatic = scaled_charge_product * inverse_buffered_distance;
+    float const energy_gradient_electrostatic = -scaled_charge_product * inverse_buffered_distance *
+                                                inverse_buffered_distance;
 
     *energy += energy_vdw + energy_electrostatic;
 
@@ -503,6 +522,78 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
 }
 
 /**
+ *  @brief One declared chiral center's restraint contribution to @p atom, added to the MMFF94 terms.
+ *
+ *  Published MMFF94 has no chiral term, so its energy is blind to which of two mirror images it is
+ *  scoring and the minimizer is free to descend into the reflected one. The restraint is what makes
+ *  the declared handedness cost something, and it is the same expression the distance-geometry stage
+ *  already minimizes — `distance_geometry_energy_functor_t`'s chiral term over the same descriptors —
+ *  so a center is held to one convention from embedding through polish.
+ *
+ *  @verbatim
+ *  V         = (r_0 - r_3) . [(r_1 - r_3) x (r_2 - r_3)],  r_i = neighbor_atoms[i]
+ *  E_chiral  = w * (V - s * v_min)^2  where V has not reached the signed floor, else 0
+ *  @endverbatim
+ *
+ *  Signing the floor puts both failures on one axis: an inverted center and a correctly handed but
+ *  nearly flat one both land past it, and the distance to it is already the derivative. The floor is
+ *  `minimum_volume` unslacked while `count_invalid_chiral_centers_` calls a center flat below
+ *  `chiral_volume_slack_k` of it, so the restraint pushes to the far side of the verdict rather than
+ *  to its boundary. It is flat-bottomed, so a center that is already handed correctly and far enough
+ *  from planar contributes no energy and no force, and the geometry MMFF94 would have reached is
+ *  unchanged.
+ *
+ *  @param[in] positions SoA coordinate array.
+ *  @param[in] num_atoms Number of atoms, the stride between dimensions.
+ *  @param[in] atom The atom whose energy share and gradient this call accumulates.
+ *  @param[in] center The declared center.
+ *  @param[inout] energy Running energy, credited once per center by its central atom.
+ *  @param[inout] gradient Running gradient of @p atom.
+ */
+__device__ __forceinline__ void mmff_chiral_contribution_(float const *positions, std::uint32_t num_atoms,
+                                                          std::uint32_t atom, chiral_center_descriptor_t const &center,
+                                                          float *energy, float3 *gradient) {
+    std::uint8_t const neighbor_first = center.neighbor_atoms[0];
+    std::uint8_t const neighbor_second = center.neighbor_atoms[1];
+    std::uint8_t const neighbor_third = center.neighbor_atoms[2];
+    std::uint8_t const pivot = center.neighbor_atoms[3];
+
+    // Every lane walks every center, so the four that carry a force and the one that carries the
+    // energy are found by comparison; the rest of the molecule leaves before loading a position.
+    bool const scores = atom == center.center_atom;
+    bool const forced = atom == neighbor_first || atom == neighbor_second || atom == neighbor_third || atom == pivot;
+    if (!scores && !forced) return;
+
+    float3 const pivot_position = load_position_(positions, num_atoms, pivot);
+    float3 const edge_first = sub_float3_(load_position_(positions, num_atoms, neighbor_first), pivot_position);
+    float3 const edge_second = sub_float3_(load_position_(positions, num_atoms, neighbor_second), pivot_position);
+    float3 const edge_third = sub_float3_(load_position_(positions, num_atoms, neighbor_third), pivot_position);
+    float3 const cross_second_third = cross_float3_(edge_second, edge_third);
+    float const volume = dot_float3_(edge_first, cross_second_third);
+
+    float const signed_floor = center.target_sign < 0 ? -center.minimum_volume : center.minimum_volume;
+    float const shortfall = volume - signed_floor;
+    if (signbit(signed_floor) == signbit(shortfall)) return;
+
+    if (scores) *energy += mmff_chiral_volume_weight_k * shortfall * shortfall;
+    if (!forced) return;
+
+    // V = edge_first . (edge_second x edge_third), so the chain rule hands each edge the cross product
+    // of the other two, and the pivot takes the negated sum. cross(second, third) is already in hand.
+    float const scale = 2.0f * mmff_chiral_volume_weight_k * shortfall;
+    float3 delta = cross_second_third;
+    if (atom == neighbor_second) { delta = cross_float3_(edge_third, edge_first); }
+    else if (atom == neighbor_third) { delta = cross_float3_(edge_first, edge_second); }
+    else if (atom != neighbor_first) {
+        // The pivot. Summing the three in place keeps the other two crosses off the live set together.
+        delta = scale_float3_(delta, -1.0f);
+        delta = sub_float3_(delta, cross_float3_(edge_third, edge_first));
+        delta = sub_float3_(delta, cross_float3_(edge_first, edge_second));
+    }
+    *gradient = add_float3_(*gradient, scale_float3_(delta, scale));
+}
+
+/**
  *  @brief MMFF94 energy and gradient over per-atom interaction lists, in the shape `fire_minimize_` calls.
  *
  *  Bonded terms iterate the pre-built per-atom CSR (`interactions[]` / `atom_offsets[]`) first, then
@@ -522,7 +613,10 @@ struct mmff94_energy_functor_t {
     mmff94_stretchbend_t const *__restrict__ stretchbend_params;
     mmff94_atom_interaction_t const *__restrict__ interactions;
     mmff94_atom_offsets_t const *__restrict__ atom_offsets;
+    /** Declared centers of this molecule; may be null exactly when `num_chiral_centers` is zero. */
+    chiral_center_descriptor_t const *__restrict__ chiral_centers;
     std::uint32_t num_atoms;
+    std::uint32_t num_chiral_centers;
 
     __device__ __forceinline__ float operator()(float const *positions, float *gradient, std::uint32_t num_elements,
                                                 std::uint32_t lane) const {
@@ -562,6 +656,14 @@ struct mmff94_energy_functor_t {
                 mmff_stretchbend_contribution_(positions, num_atoms, atom,
                                                stretchbend_params[interactions[index].term_index],
                                                interactions[index].role, &total_energy, &gradient_acc);
+
+            // The restraint rides this sweep rather than a pass of its own: the atom's gradient is
+            // already accumulating in a register and the store below is still a plain one into the
+            // slot this lane owns, so the four atoms a center moves need no barrier and no atomic
+            // between them. A separate sweep was measured and costs `sm_100` one more register.
+            for (std::uint32_t center = 0; center < num_chiral_centers; ++center)
+                mmff_chiral_contribution_(positions, num_atoms, atom, chiral_centers[center], &total_energy,
+                                          &gradient_acc);
 
             store_gradient_(gradient, num_atoms, atom, gradient_acc);
         }

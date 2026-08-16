@@ -36,9 +36,21 @@ __global__ void mmff_energy_eval_kernel(
         shared_atom_vdw[atom] = sfc::fold_atom_vdw_params_(atom_vdw[atom]);
     __syncwarp(sfc::full_mask_k);
 
-    sfc::mmff94_energy_functor_t functor {shared_atom_vdw, atom_charge,    bond_distance, bond_params,
-                                          angle_params,    torsion_params, oop_params,    stretchbend_params,
-                                          interactions,    atom_offsets,   num_atoms};
+    // No chiral centers: the reference this harness compares against is RDKit's MMFF94, which carries
+    // no chiral term, so the restraint must be absent on both sides for the gradients to agree.
+    sfc::mmff94_energy_functor_t const functor {.atom_vdw_params = shared_atom_vdw,
+                                                .atom_charge = atom_charge,
+                                                .bond_distance = bond_distance,
+                                                .bond_params = bond_params,
+                                                .angle_params = angle_params,
+                                                .torsion_params = torsion_params,
+                                                .oop_params = oop_params,
+                                                .stretchbend_params = stretchbend_params,
+                                                .interactions = interactions,
+                                                .atom_offsets = atom_offsets,
+                                                .chiral_centers = nullptr,
+                                                .num_atoms = num_atoms,
+                                                .num_chiral_centers = 0};
 
     float const energy = functor(positions, gradient, 3 * num_atoms, lane);
     if (lane == 0) *out_energy = energy;
@@ -80,9 +92,21 @@ __global__ void mmff_minimize_kernel(float *positions_inout, sft::mmff94_atom_vd
         shared_float[element] = positions_inout[element];
     __syncwarp(sfc::full_mask_k);
 
-    sfc::mmff94_energy_functor_t functor {shared_atom_vdw, atom_charge,    bond_distance, bond_params,
-                                          angle_params,    torsion_params, oop_params,    stretchbend_params,
-                                          interactions,    atom_offsets,   num_atoms};
+    // No chiral centers: the reference this harness compares against is RDKit's MMFF94, which carries
+    // no chiral term, so the restraint must be absent on both sides for the gradients to agree.
+    sfc::mmff94_energy_functor_t const functor {.atom_vdw_params = shared_atom_vdw,
+                                                .atom_charge = atom_charge,
+                                                .bond_distance = bond_distance,
+                                                .bond_params = bond_params,
+                                                .angle_params = angle_params,
+                                                .torsion_params = torsion_params,
+                                                .oop_params = oop_params,
+                                                .stretchbend_params = stretchbend_params,
+                                                .interactions = interactions,
+                                                .atom_offsets = atom_offsets,
+                                                .chiral_centers = nullptr,
+                                                .num_atoms = num_atoms,
+                                                .num_chiral_centers = 0};
 
     sfc::fire_scratch<3> const scratch {.positions = sfc::fire_positions<3> {shared_float, num_atoms},
                                         .velocities = sfc::fire_velocities<3> {shared_float + num_elements, num_atoms},

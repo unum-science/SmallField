@@ -281,6 +281,36 @@ __365 dispatches per 20,000 is not new breakage.__
 It is 1.8 % of molecules that were already shipping with a centre MMFF polish had inverted after the last gate, now visible for the first time.
 Whether that cost matters depends on the box, the same way the repair's gain does.
 
+### A Centre Carries Two Signed Volumes, And They Are Not The Same Number
+
+The same 19,952-molecule PubChem shard through `smallfield_batch` at K=3, scored over 10,000 molecules by `bench/validate_stereo.py`.
+`1× H100`, 8 physical cores, 2026-08-16.
+The control reads 0.000 % on every row.
+
+| Configuration                            | Declared Centres | Centres Inverted | Fallback Molecules | Energy p90 | Energy Max |
+| :--------------------------------------- | ---------------: | ---------------: | -----------------: | ---------: | ---------: |
+| post-polish check only — __was shipped__  |            4,607 |      __0.065 %__ |                362 |  __130.6__ |  __6,462__ |
+| + MMFF chiral restraint                   |            4,924 |      __0.772 %__ |            __153__ |      132.9 |      6,463 |
+| __+ centre-based read__ — __shipped__     |            4,766 |      __0.021 %__ |                257 |  __131.2__ |      6,463 |
+
+__The restraint alone makes the shipped stereochemistry worse, and not because it fails.__
+Its 38 offenders hold a signed volume of 4.86 to 6.33 cubic angstrom, median 4.93, against the restraint's floor of 5 — parked exactly where it stops pushing — and 17 of 17 that a control embedding could resolve carry the __correct__ sign.
+So the geometry satisfies the constraint and RDKit still reads it inverted, because the two are reading different expressions.
+
+`DistGeom::ChiralSet` takes the triple product over the four neighbours from the __fourth__, which is what the embedding and the restraint hold.
+RDKit's `assignChiralTypesFrom3D` takes it over the first three from the __centre atom__ and never reads the fourth at all.
+The two agree for any centre whose atom lies on the same side of its first three neighbours' plane as the fourth, which is every ordinary tetrahedron.
+The restraint moves the four neighbours and applies no force to the centre, so it reaches the geometries where they do not: 44 of 4,917 declared centres come out split, and RDKit reads 37 of them inverted.
+
+Half-precision narrowing was the first suspect and is not the cause.
+At those magnitudes the fp16 coordinate quantum is about 4e-3 Å, worth under 0.05 cubic angstrom of volume, and the offenders sit five cubic angstrom from a sign change.
+
+__The fix is in the reader, not the floor.__
+`validate_polished_stereo_kernel` now takes both volumes, so a slot ships only when the stage that produced the geometry and the stage that will perceive it agree on what it is.
+It costs 34 more fallback dispatches per 10,000 molecules and leaves the restraint's throughput gain intact — 257 dispatches against the 362 the post-polish check alone pays.
+`mmff_polish_warp_kernel` is untouched — 63 registers and no stack on `sm_90`, 71 and 8 bytes on `sm_100`, both where the restraint left them.
+`validate_polished_stereo_kernel` lands at 47 registers and no stack on `sm_90`, and moves 40/0 → 48/8 on `sm_100`, against the 256 per thread its `__launch_bounds__(32, 8)` allows.
+
 ### The Distance-Geometry Budget Is Not Free, And Still Worth Raising
 
 Doubling the two four-dimensional stages — distance geometry 100 → 200 iterations, fourth-dimension crush 50 → 100 — on the same 20,000-molecule PubChem shard.

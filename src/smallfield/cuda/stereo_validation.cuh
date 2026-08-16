@@ -39,10 +39,64 @@ using smallfield::types::molecule_descriptor_t;
 constexpr float bond_stereo_planarity_floor_k = 0.5f;
 
 /**
+ *  @brief Count the declared centers a re-perception of the shipped geometry will read the other way.
+ *
+ *  A tetrahedral center carries two signed volumes over the same three neighbors, and the pipeline
+ *  and its consumer read different ones. `count_invalid_chiral_centers_` takes the triple product
+ *  from the @b fourth neighbor, which is RDKit's `DistGeom::ChiralSet` expression and the quantity
+ *  both the embedding and the MMFF polish restrain. RDKit's `assignChiralTypesFrom3D` takes it from
+ *  the @b center atom and never reads the fourth neighbor at all. The two agree for any center whose
+ *  atom lies on the same side of its first three neighbors' plane as the fourth, which is every
+ *  ordinary tetrahedron, and disagree once it does not.
+ *
+ *  That gap is reachable, because the restraint moves the four neighbors and applies no force to the
+ *  center: over 10,000 scored molecules of one PubChem shard it holds 4,917 declared centers at the
+ *  restrained volume and leaves 44 of them split, of which RDKit reads 37 inverted. So the restrained
+ *  volume is not sufficient on its own, and this is the stage that has to say so — the embedding gate
+ *  is asking a question about its own constraint, while this one is predicting what the consumer will
+ *  perceive.
+ *
+ *  Both are taken. The restrained volume still has to be handed correctly and clear the flatness
+ *  floor, and the center-based volume has to agree with it. A three-coordinate center stores itself
+ *  as its own fourth neighbor, so the two expressions coincide there and the second test is free.
+ *
+ *  Centers are spread across the warp, so the count is warp-reduced and every lane returns it.
+ *
+ *  @param[in] positions SoA coordinate array.
+ *  @param[in] stride Distance between coordinate planes, which need not be the atom count.
+ *  @param[in] chiral_centers Declared centers of this molecule.
+ *  @param[in] num_chiral_centers How many there are.
+ *  @param[in] lane Warp lane index (0-31).
+ *  @return How many centers will not read back as declared; zero means the geometry ships as asked.
+ */
+__device__ __forceinline__ std::uint32_t count_unreadable_chiral_centers_(
+    float const *positions, std::uint32_t stride, chiral_center_descriptor_t const *chiral_centers,
+    std::uint32_t num_chiral_centers, std::uint32_t lane) {
+    std::uint32_t lane_invalid = 0;
+    for (std::uint32_t center_index = lane; center_index < num_chiral_centers; center_index += warp_size_k) {
+        auto const &center = chiral_centers[center_index];
+        float const restrained = compute_signed_tetrahedral_volume_(positions, stride, center.neighbor_atoms[3],
+                                                                    center.neighbor_atoms[0], center.neighbor_atoms[1],
+                                                                    center.neighbor_atoms[2]);
+        float const perceived = compute_signed_tetrahedral_volume_(positions, stride, center.center_atom,
+                                                                   center.neighbor_atoms[0], center.neighbor_atoms[1],
+                                                                   center.neighbor_atoms[2]);
+        bool const target_negative = center.target_sign < 0;
+        bool const wrong_handed = (signbit(restrained) != 0) != target_negative;
+        bool const wrong_perceived = (signbit(perceived) != 0) != target_negative;
+        bool const too_flat = fabsf(restrained) < chiral_volume_slack_k * center.minimum_volume;
+        lane_invalid += (wrong_handed || wrong_perceived || too_flat) ? 1u : 0u;
+    }
+    for (std::uint32_t offset = warp_size_k / 2; offset > 0; offset >>= 1)
+        lane_invalid += __shfl_xor_sync(full_mask_k, lane_invalid, offset);
+    return lane_invalid;
+}
+
+/**
  *  @brief Count the declared double bonds whose geometry contradicts their flag.
  *
- *  `count_invalid_chiral_centers_` is blind to these: it walks tetrahedral centers, and no chiral
- *  descriptor is ever emitted for a double bond, so `stereo_failure_k` was unreachable for one.
+ *  The center walk above is blind to these: it walks tetrahedral centers, and no chiral descriptor is
+ *  ever emitted for a double bond, so `stereo_failure_k` was unreachable for one.
  *
  *  The flag states the relationship of the two @b recorded reference substituents, one per end, so the
  *  test is the sign of `cos phi` over (reference, end, end, reference) — positive is cis, which is what
@@ -102,8 +156,10 @@ __device__ __forceinline__ std::uint32_t count_invalid_bond_stereo_(float const 
 /**
  *  @brief Re-read each conformer's stereochemistry out of the coordinates that will actually ship.
  *
- *  One warp per slot, re-running the same predicates the pipeline kernel gates on against the
- *  post-polish geometry, in single precision and before the half-precision narrowing.
+ *  One warp per slot against the post-polish geometry, in single precision and before the
+ *  half-precision narrowing. The predicates are not the pipeline kernel's: this stage asks what a
+ *  re-perception of the shipped coordinates will say, which for a tetrahedral center is a different
+ *  signed volume than the one the embedding constrains.
  *
  *  Only slots already holding `success_k` are read, and only those are demoted, so a more specific
  *  refusal keeps its own cause. The verdict names which kind of stereochemistry moved —
@@ -127,13 +183,13 @@ __global__ __launch_bounds__(32, 8) void validate_polished_stereo_kernel(
         std::uint32_t const molecule = slot / num_conformers_per_molecule;
         auto const &meta = molecule_metadata[molecule];
 
-        // `count_invalid_chiral_centers_` reads its second argument only as the dimension stride, so
-        // the slot's padded stride is what it wants rather than the molecule's own atom count.
+        // The counter reads its second argument only as the dimension stride, so the slot's padded
+        // stride is what it wants rather than the molecule's own atom count.
         float const *const positions = conformer_coordinates + static_cast<std::size_t>(slot) * output_atoms_stride *
                                                                    types::conformer_dimensions_k;
         std::uint32_t invalid_centers = 0;
         if (meta.num_chiral_centers != 0)
-            invalid_centers = count_invalid_chiral_centers_(
+            invalid_centers = count_unreadable_chiral_centers_(
                 positions, output_atoms_stride, chiral_centers + meta.chiral_offset, meta.num_chiral_centers, lane);
         // No metadata field counts declared double bonds, so the bond walk is the membership test —
         // it reads one flag byte per bond and leaves immediately on the ones carrying no E/Z.

@@ -602,6 +602,15 @@ __device__ __forceinline__ void store_polish_stage_(float *diagnostics_out, std:
  *  place. Skips slots that failed stereo (status != 0) and molecules with zero
  *  MMFF terms.
  *
+ *  `chiral_centers` is what keeps the declared stereochemistry. Published MMFF94 has no chiral term,
+ *  so nothing in its energy distinguishes a declared center from its mirror, and the minimizer descends
+ *  into the reflected basin — a real MMFF basin, often the lower one — on 32 % of slots at five or more
+ *  declared centers. `mmff94_energy_functor_t` therefore carries a flat-bottomed signed-volume restraint
+ *  over the same descriptors, so the wrong handedness is a hill the minimizer feels rather than a verdict
+ *  read off the geometry afterwards. Refusing the write-back instead was measured and is not equivalent:
+ *  it ships the raw distance-geometry embedding, which takes conformer energy p90 from 85.4 to
+ *  1,349 kcal/mol.
+ *
  *  The minimizer is not FIRE, and the reason is a measurement rather than a preference. FIRE carries
  *  one timestep for every degree of freedom, so on a molecular force field it settles at the stability
  *  limit of the stiffest bond stretch: across a captured bin of 3,672 slots its final timestep sat
@@ -646,6 +655,7 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
     mmff94_oop_t const *__restrict__ mmff_oop_terms, mmff94_stretchbend_t const *__restrict__ mmff_stretchbend_terms,
     mmff94_atom_interaction_t const *__restrict__ mmff_interactions,
     mmff94_atom_offsets_t const *__restrict__ mmff_atom_offsets,
+    chiral_center_descriptor_t const *__restrict__ chiral_centers,
     etkdg_molecule_metadata_t const *__restrict__ molecule_metadata, float *__restrict__ conformer_coordinates_out,
     float *__restrict__ conformer_energies_out, std::uint8_t const *__restrict__ conformer_status_in,
     std::uint32_t total_molecules, std::uint32_t num_conformers_per_molecule, std::uint32_t output_atoms_stride,
@@ -698,17 +708,20 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
         }
         __syncwarp(full_mask_k);
 
-        mmff94_energy_functor_t mmff_functor {shared_atom_vdw,
-                                              shared_atom_charge,
-                                              bond_distance + meta.bond_distance_offset,
-                                              mmff_bond_terms + meta.mmff_bond_offset,
-                                              mmff_angle_terms + meta.mmff_angle_offset,
-                                              mmff_torsion_terms + meta.mmff_torsion_offset,
-                                              mmff_oop_terms + meta.mmff_oop_offset,
-                                              mmff_stretchbend_terms + meta.mmff_stretchbend_offset,
-                                              mmff_interactions,
-                                              mmff_atom_offsets + meta.atom_base_offset,
-                                              num_atoms};
+        mmff94_energy_functor_t const mmff_functor {
+            .atom_vdw_params = shared_atom_vdw,
+            .atom_charge = shared_atom_charge,
+            .bond_distance = bond_distance + meta.bond_distance_offset,
+            .bond_params = mmff_bond_terms + meta.mmff_bond_offset,
+            .angle_params = mmff_angle_terms + meta.mmff_angle_offset,
+            .torsion_params = mmff_torsion_terms + meta.mmff_torsion_offset,
+            .oop_params = mmff_oop_terms + meta.mmff_oop_offset,
+            .stretchbend_params = mmff_stretchbend_terms + meta.mmff_stretchbend_offset,
+            .interactions = mmff_interactions,
+            .atom_offsets = mmff_atom_offsets + meta.atom_base_offset,
+            .chiral_centers = chiral_centers + meta.chiral_offset,
+            .num_atoms = num_atoms,
+            .num_chiral_centers = meta.num_chiral_centers};
 
         float *positions = shared_float;
         fire_scratch<3> const scratch {.positions = fire_positions<3> {positions, num_atoms},
@@ -746,6 +759,11 @@ __global__ __launch_bounds__(32, 20) void mmff_polish_warp_kernel(
         // last displacement, not off a line search — so a call can finish above where it started, and
         // shipping that would be a regression nothing would see. Across the captured bin it never has:
         // 3,672 of 3,672 slots ended below their staged energy.
+        //
+        // Handedness is not tested here, because the restraint above already carries it: a center that
+        // came out inverted costs energy, so the comparison this line makes is between two geometries
+        // scored on the same terms. `validate_polished_stereo_kernel` re-reads the geometry afterwards
+        // and is what reports a center the restraint failed to hold.
         //
         // The geometry to fall back on needs no buffer. `conformer_coordinates_out` is the array this
         // kernel staged from and has not touched since, so declining the write-back leaves exactly the
