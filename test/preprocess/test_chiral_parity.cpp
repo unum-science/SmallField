@@ -1,9 +1,18 @@
 /**
  *  @file test/preprocess/test_chiral_parity.cpp
- *  @brief Police the tag-and-parity derivation of the chiral volume sign with two exact oracles.
+ *  @brief Police the tag-and-parity derivation of the chiral volume sign with three exact oracles.
  *
  *  `extract_chiral_centers` derives the target signed-volume sign from the atom's tetrahedral tag and the parity
- *  of the stored neighbor order. Two independent oracles police that derivation, and both demand exact agreement:
+ *  of the stored neighbor order. Three independent oracles police that derivation, and all three demand exact
+ *  agreement:
+ *
+ *  The chiral-set oracle rebuilds the answer from the order the bonds appear on the atom, which is the order
+ *  RDKit's `Atom::getPerturbationOrder` reads and the order `EmbeddingOps::findChiralSets` hands to
+ *  `DistGeom::ChiralSet` - counterclockwise asks for a positive volume, clockwise for a negative one. It is the
+ *  only oracle that speaks at every center: the derivation's load-bearing claim is that the CSR adjacency, filled
+ *  in bond-index order, reproduces that bond order, and a center with tied CIP ranks or no R/S label at all - a
+ *  bicyclo bridgehead, an adamantane cage - is exactly where the two could diverge unobserved. The census counts
+ *  the divergences it finds, so the claim in the production docblock is measured rather than asserted.
  *
  *  The CIP oracle rebuilds the answer straight from RDKit - `assignAtomCIPRanks` for the neighbor ordering, the
  *  `_CIPCode` property for the R/S label - and transports that sign onto the neighbor order the production code
@@ -72,6 +81,8 @@ struct oracle_tally_t {
     std::uint64_t unlabeled = 0;
     std::uint64_t geometry_three_coordinate = 0;
     std::uint64_t embed_failures = 0;
+    /** Centers whose CSR neighbor order is not the order the bonds appear on the atom. */
+    std::uint64_t csr_order_divergences = 0;
 };
 
 /**
@@ -84,10 +95,12 @@ struct oracle_tally_t {
 struct oracle_reporters_t {
     diagnostic_reporter_t cip {"cip", "derived"};
     diagnostic_reporter_t geometry {"embedded", "derived"};
+    diagnostic_reporter_t chiral_sets {"chiral_sets", "derived"};
 
     void limit_printed_lines(std::size_t maximum) noexcept {
         cip.limit_printed_lines(maximum);
         geometry.limit_printed_lines(maximum);
+        chiral_sets.limit_printed_lines(maximum);
     }
 };
 
@@ -128,6 +141,65 @@ static bool any_rank_tie_(RDKit::UINT_VECT const &cip_ranks, custd::span<std::ui
         for (std::size_t right = left + 1; right < order.size(); ++right)
             if (cip_ranks[order[left]] == cip_ranks[order[right]]) return true;
     return false;
+}
+
+/**
+ *  @brief Compare the extracted signs against the chiral set RDKit's own embedder would build.
+ *
+ *  RDKit defines the tetrahedral tag against the order the bonds appear on the atom, and
+ *  `findChiralSets` hands that order straight to `DistGeom::ChiralSet`: counterclockwise asks for a
+ *  positive volume over it, clockwise for a negative one, with the center substituted as the fourth
+ *  point when there is no fourth bond. Transporting that sign onto the emitted neighbor order is the
+ *  whole derivation, stated in RDKit's vocabulary instead of ours.
+ *
+ *  It declines nothing - no rank tie, no missing R/S label, no coordination number - which is what
+ *  makes it the oracle for a bridgehead or a cage, where the other two are silent.
+ *
+ *  @param[in] molecule Molecule already carrying assigned stereochemistry.
+ *  @param[in] descriptor Flat descriptor the centers were extracted from.
+ *  @param[in] centers Extracted chiral center descriptors.
+ *  @param[in] label Printed alongside any mismatch so the offender is identifiable.
+ *  @param[inout] reporters Sink that counts and prints the chiral-set oracle's comparisons.
+ *  @param[inout] tally Counters advanced by this molecule.
+ */
+static void check_against_chiral_sets_(RDKit::ROMol const &molecule, sft::molecule_descriptor_t const &descriptor,
+                                       std::vector<sft::chiral_center_descriptor_t> const &centers,
+                                       std::string const &label, oracle_reporters_t &reporters, oracle_tally_t &tally) {
+    for (auto const &center : centers) {
+        std::uint32_t const atom = center.center_atom;
+        auto const *rdkit_atom = molecule.getAtomWithIdx(atom);
+
+        std::uint8_t bond_order[4] = {0, 0, 0, 0};
+        std::uint32_t count = 0;
+        for (RDKit::Bond const *const bond : molecule.atomBonds(rdkit_atom)) {
+            if (count == 4) break;
+            bond_order[count++] = static_cast<std::uint8_t>(bond->getOtherAtomIdx(atom));
+        }
+
+        // The claim the production derivation rests on: the CSR adjacency, filled in bond-index order,
+        // is the bond order the tag is defined against. Counted rather than asserted, so a corpus that
+        // breaks it names how often before the sign comparison below reports what it cost.
+        std::uint32_t csr_count = 0;
+        std::uint16_t const neighbor_first = descriptor.neighbor_offset[atom];
+        std::uint16_t const neighbor_last = descriptor.neighbor_offset[atom + 1];
+        for (std::uint16_t entry = neighbor_first; entry < neighbor_last && csr_count < count; ++entry, ++csr_count)
+            if (descriptor.neighbor_atom[entry] != bond_order[csr_count]) ++tally.csr_order_divergences;
+
+        // RDKit substitutes the center itself as the fourth point when there is no fourth bond, which is
+        // what `extract_chiral_centers` stores in the same slot.
+        if (count < 4) bond_order[3] = static_cast<std::uint8_t>(atom);
+
+        auto const tag = rdkit_atom->getChiralTag();
+        int const reference_sign = (tag == RDKit::Atom::CHI_TETRAHEDRAL_CCW) ? 1 : -1;
+        int const parity = permutation_parity_({bond_order, 4}, {center.neighbor_atoms, 4});
+        sf_verify_(parity != 0, "emitted neighbors must be a permutation of the bond-ordered neighbors");
+        int const expected_sign = reference_sign * parity;
+
+        reporters.chiral_sets
+            .mismatch("chiral_parity", "oracle=chiral_sets molecule={} atom={} tag={}", label, atom,
+                      tag == RDKit::Atom::CHI_TETRAHEDRAL_CCW ? "ccw" : "cw")
+            .field("target_sign", expected_sign, static_cast<int>(center.target_sign), exactly_equal);
+    }
 }
 
 /**
@@ -249,10 +321,10 @@ static void check_against_geometry_(RDKit::ROMol const &molecule, sft::molecule_
 
 /** Which oracles a molecule's extracted centers are put to. */
 enum class chiral_oracles_t {
-    /** The CIP oracle alone, for a corpus too large to embed. */
-    cip_only_k,
-    /** Both oracles, which is what the curated set is small enough to afford. */
-    cip_and_geometry_k,
+    /** The two graph oracles alone, for a corpus too large to embed. */
+    graph_only_k,
+    /** All three, which is what the curated set is small enough to afford. */
+    graph_and_geometry_k,
 };
 
 /**
@@ -278,8 +350,9 @@ static void check_molecule_(RDKit::RWMol &molecule, std::string const &label, ch
 
     // The extraction has already run `assignStereochemistry`, so the CIP labels and ranks
     // below describe exactly the molecule the descriptors were derived from.
+    check_against_chiral_sets_(molecule, descriptor, centers, label, reporters, tally);
     check_against_cip_(molecule, descriptor, centers, label, reporters, tally);
-    if (oracles == chiral_oracles_t::cip_and_geometry_k)
+    if (oracles == chiral_oracles_t::graph_and_geometry_k)
         check_against_geometry_(molecule, descriptor, centers, label, reporters, tally);
 }
 
@@ -314,6 +387,18 @@ static std::vector<std::string> stereo_test_smiles_() {
         "C[S@@](=O)CC",                                                        // three-coordinate sulfoxide
         "C[P@](CC)c1ccccc1",                                                   // three-coordinate phosphine
         "COc1ccc2[nH]c([S@](=O)Cc3ncc(C)c(OC)c3C)nc2c1",                       // esomeprazole
+        "C[S@](=O)[C@@H]1CC[C@H](C)CC1",                                       // sulfoxide beside a tied ring pair
+        // Bridged and caged skeletons, where the ring-closure bonds land furthest from anything an
+        // index-sorted order would produce, and where the CIP oracle mostly falls silent: a bicyclo
+        // bridgehead carries no R/S label and a symmetric bridge ties its neighbors' ranks.
+        "C1[C@@H]2CC[C@H](C1)C2",                  // norbornane, unlabeled bridgeheads
+        "O[C@H]1C[C@@H]2CC[C@H]1C2",               // norbornanol
+        "O[C@@H]1C[C@H]2CC[C@@H]1CC2",             // bicyclo[2.2.2]octanol
+        "C[C@]12C[C@@H]3C[C@H](C1)C[C@H](C3)C2",   // methyladamantane cage
+        "COC(=O)[C@H]1[C@@H]2CC[C@H](C2)[C@@H]1O", // bridged bicyclic ester
+        "OC[C@H]1O[C@@H]2OC[C@H]1O2",              // dioxabicyclic sugar cage
+        "O=C(O)[C@H]1C[C@@H]2CC[C@H]1O2",          // oxabicyclic acid
+        "CC(=O)O[C@H]1C[C@@H]2CC[C@@H](C1)N2C",    // tropane ester, bridging nitrogen
     };
 }
 
@@ -350,7 +435,7 @@ static void check_stereoisomers_(std::string const &smiles, oracle_reporters_t &
             variant.getAtomWithIdx(tagged_atoms[position])
                 ->setChiralTag(clockwise ? RDKit::Atom::CHI_TETRAHEDRAL_CW : RDKit::Atom::CHI_TETRAHEDRAL_CCW);
         }
-        check_molecule_(variant, smiles, chiral_oracles_t::cip_and_geometry_k, reporters, tally);
+        check_molecule_(variant, smiles, chiral_oracles_t::graph_and_geometry_k, reporters, tally);
     }
 }
 
@@ -366,6 +451,8 @@ static void report_(std::string_view heading, oracle_tally_t const &tally) {
                  fmt::group_digits(tally.centers), fmt::group_digits(tally.three_coordinate));
     fmt::println("    CIP oracle: {} skipped on rank ties, {} unlabeled", fmt::group_digits(tally.rank_ties),
                  fmt::group_digits(tally.unlabeled));
+    fmt::println("    chiral-set oracle: {} centers where the CSR order is not RDKit's bond order",
+                 fmt::group_digits(tally.csr_order_divergences));
     fmt::println("    geometry oracle: {} three-coordinate centers reached, {} embeddings failed",
                  fmt::group_digits(tally.geometry_three_coordinate), fmt::group_digits(tally.embed_failures));
 }
@@ -380,13 +467,20 @@ int main(int argc, char **argv) {
     fmt::println("{}: curated stereo set with exhaustive tag enumeration", test_name_k);
     for (auto const &smiles : sftest::stereo_test_smiles_()) sftest::check_stereoisomers_(smiles, reporters, curated);
     sftest::report_("curated", curated);
+    reporters.chiral_sets.summarize("curated_chiral_sets");
     reporters.cip.summarize("curated_cip");
     reporters.geometry.summarize("curated_geometry");
     sf_verify_(reporters.cip.comparison_count() >= 400, "curated set must reach several hundred CIP comparisons");
     sf_verify_(curated.three_coordinate > 0, "curated set must exercise three-coordinate centers");
     sf_verify_(curated.rank_ties > 0, "curated set must exercise a pseudo-asymmetric center");
+    // The chiral-set oracle exists for the centers the CIP one declines, so a curated set that
+    // declines none would leave it policing only ground the other already covers.
+    sf_verify_(curated.unlabeled > 0, "curated set must exercise centers carrying no R/S label");
+    sf_verify_(reporters.chiral_sets.comparison_count() > reporters.cip.comparison_count(),
+               "the chiral-set oracle must speak at centers the CIP oracle declines");
     sf_verify_(reporters.geometry.comparison_count() >= 50, "curated set must reach the geometric oracle");
     sf_verify_(curated.geometry_three_coordinate > 0, "geometric oracle must reach a three-coordinate center");
+    sf_verify_(reporters.chiral_sets.passed(), "every curated stereocenter must match RDKit's own chiral set");
     sf_verify_(reporters.cip.passed(), "every curated stereocenter must match the CIP oracle");
     sf_verify_(reporters.geometry.passed(), "every curated stereocenter must match its embedded geometry");
 
@@ -414,7 +508,7 @@ int main(int argc, char **argv) {
                 std::unique_ptr<RDKit::RWMol> molecule(RDKit::SmilesToMol(smiles));
                 if (!molecule) continue;
                 RDKit::MolOps::addHs(*molecule);
-                sftest::check_molecule_(*molecule, smiles, sftest::chiral_oracles_t::cip_only_k, reporters,
+                sftest::check_molecule_(*molecule, smiles, sftest::chiral_oracles_t::graph_only_k, reporters,
                                         corpus_tally);
             }
             catch (...) {
@@ -424,9 +518,13 @@ int main(int argc, char **argv) {
         sftest::report_("corpus", corpus_tally);
         // The same reasoning one level down: every molecule may have been skipped, and a section of zero
         // comparisons is indistinguishable from a section of zero mismatches.
+        if (reporters.chiral_sets.summarize("corpus_chiral_sets").compared == 0)
+            return sftest::report_fail(test_name_k, "corpus {} produced no chiral-set comparisons over {} SMILES",
+                                       selection.path, corpus.size());
         if (reporters.cip.summarize("corpus_cip").compared == 0)
             return sftest::report_fail(test_name_k, "corpus {} produced no CIP comparisons over {} SMILES",
                                        selection.path, corpus.size());
+        sf_verify_(reporters.chiral_sets.passed(), "every corpus stereocenter must match RDKit's own chiral set");
         sf_verify_(reporters.cip.passed(), "every corpus stereocenter must match the CIP oracle");
     }
 
