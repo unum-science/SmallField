@@ -43,7 +43,6 @@
 
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
-#include <mutex>       // `std::mutex`, `std::unique_lock`
 #include <ranges>      // `std::views::iota`
 #include <string_view> // `std::string_view`
 #include <vector>      // `std::vector`
@@ -88,6 +87,93 @@ inline constexpr std::uint32_t max_components_k = 255;
 
 #pragma endregion Extents
 
+#pragma region Credo Matchers
+
+/** How a recursive `$()` environment's set of satisfying atoms is filled for a target molecule. */
+enum class recursive_fill_t : std::uint8_t {
+    /** The environment is one atom, so every atom is tested against it directly. */
+    atom_query_k,
+    /** The environment is one bond, so each atom is tested as its root and its own bonds walked from there. */
+    bond_query_k,
+    /** The environment is wider, so `SubstructMatch` walks it and the environments nested inside it. */
+    subgraph_query_k,
+};
+
+/** A recursive `$()` environment and how it is filled. Borrowed from the query tree that owns it, which has no
+ *  index to name a node by. */
+struct recursive_query_t {
+    RDKit::RecursiveStructureQuery *query = nullptr;
+    recursive_fill_t fill = recursive_fill_t::subgraph_query_k;
+};
+
+/**
+ *  @brief Collects the recursive `$()` nodes of one query tree, each node after the ones it depends on.
+ *
+ *  An environment narrow enough to walk here is descended into, because filling it needs its own nested
+ *  environments filled first. A wider one is not: `SubstructMatch` fills what is inside it as it walks it.
+ *  An environment with no query molecule is skipped, as `SubstructMatch` skips it, leaving its set empty.
+ */
+inline void gather_recursive_queries_(RDKit::Atom::QUERYATOM_QUERY *query, std::vector<recursive_query_t> &out) {
+    if (!query) return;
+    if (query->getDescription() != "RecursiveStructure") {
+        for (auto child = query->beginChildren(); child != query->endChildren(); ++child)
+            gather_recursive_queries_(child->get(), out);
+        return;
+    }
+    auto *const recursive = static_cast<RDKit::RecursiveStructureQuery *>(query);
+    RDKit::ROMol const *const environment = recursive->getQueryMol();
+    if (!environment) return;
+    recursive_fill_t const fill = environment->getNumAtoms() == 1 && environment->getNumBonds() == 0
+                                      ? recursive_fill_t::atom_query_k
+                                  : environment->getNumAtoms() == 2 && environment->getNumBonds() == 1
+                                      ? recursive_fill_t::bond_query_k
+                                      : recursive_fill_t::subgraph_query_k;
+    if (fill != recursive_fill_t::subgraph_query_k)
+        for (RDKit::Atom const *const atom : environment->atoms()) gather_recursive_queries_(atom->getQuery(), out);
+    out.push_back({recursive, fill});
+}
+
+/**
+ *  @brief RDKit's default USRCAT pharmacophore SMARTS, in the order `GetUSRCAT` types them.
+ *
+ *  Every pattern is a single-atom query — the `-` and `~` bonds in the first and third appear only inside `$()`
+ *  environments, which are themselves rooted at one atom.
+ */
+inline constexpr std::array<std::string_view, credo_subset_count_k> credo_patterns_k {
+    "[#6+0!$(*~[#7,#8,F]),SH0+0v2,s+0,S^3,Cl+0,Br+0,I+0]",             //  hydrophobic
+    "[a]",                                                             //  aromatic
+    "[$([O,S;H1;v2]-[!$(*=[O,N,P,S])]),$([O,S;H0;v2]),$([O,S;-]),"     //  acceptor
+    "$([N&v3;H1,H2]-[!$(*=[O,N,P,S])]),$([N;v3;H0]),$([n,o,s;+0]),F]", //
+    "[N!H0v3,N!H0+v4,OH+0,SH+0,nH+0]",                                 //  donor
+};
+
+/**
+ *  @brief One CREDO pharmacophore SMARTS, compiled to the single query atom it names.
+ *
+ *  A recursive `$()` environment answers for a target atom out of a set of atom indices it holds itself, and
+ *  that set is filled per target molecule rather than at compile time. `SubstructMatch` fills it on the way in;
+ *  `prime_recursive_queries_` does it here instead, which is what lets an atom be tested directly.
+ *
+ *  Priming writes into the compiled pattern, so a matcher describes one target molecule at a time and belongs to
+ *  exactly one worker. Copying is deleted rather than defined: the gathered pointers name nodes of `pattern`, so
+ *  a copy would leave them addressing the source's query tree.
+ */
+struct credo_matcher_t {
+    RDKit::ROMol pattern;
+    std::vector<recursive_query_t> recursive_queries;
+
+    explicit credo_matcher_t(std::string_view smarts)
+        : pattern(*std::unique_ptr<RDKit::ROMol const>(RDKit::SmartsToMol(std::string {smarts}))) {
+        sf_assert_(pattern.getNumAtoms() == 1);
+        gather_recursive_queries_(pattern.getAtomWithIdx(0)->getQuery(), recursive_queries);
+    }
+
+    credo_matcher_t(credo_matcher_t const &) = delete;
+    credo_matcher_t &operator=(credo_matcher_t const &) = delete;
+};
+
+#pragma endregion Credo Matchers
+
 #pragma region Shape Context
 
 /**
@@ -99,6 +185,12 @@ inline constexpr std::uint32_t max_components_k = 255;
  *
  *  `build_shape_context_into` is the only producer and its `shape_typing_t` verdict the only success signal, so
  *  the context carries no flag of its own. A refusal leaves every field empty, capacity aside.
+ *
+ *  The context also owns the four compiled matchers, because typing primes their recursive `$()` environments
+ *  against the molecule in hand. One context per worker is therefore what makes the typing loops parallel; a
+ *  context shared across threads would have each worker's priming overwrite the others'. Compiling the four
+ *  SMARTS is the whole cost of constructing one, so a context belongs above a molecule loop rather than inside
+ *  it — which is where both production loops already declare theirs.
  */
 struct molecule_shape_context_t {
     /** Hydrophobic, aromatic, acceptor, donor. */
@@ -107,6 +199,14 @@ struct molecule_shape_context_t {
      *  in place and nothing narrows its output afterwards. */
     std::vector<int> component_label;
     std::uint32_t num_components = 0;
+    /** The four patterns of `credo_patterns_k`, compiled, and primed against whichever molecule was typed last. */
+    std::array<credo_matcher_t, credo_subset_count_k> credo_matchers;
+
+    // Each element is initialized from a prvalue and so is built in place: `credo_matcher_t`'s gathered pointers
+    // name nodes of its own `pattern`, and a copy or a move would leave them naming another object's tree.
+    molecule_shape_context_t()
+        : credo_matchers {credo_matcher_t {credo_patterns_k[0]}, credo_matcher_t {credo_patterns_k[1]},
+                          credo_matcher_t {credo_patterns_k[2]}, credo_matcher_t {credo_patterns_k[3]}} {}
 
     /** Atoms the context describes. Read off the per-atom labeling rather than stored beside it, so an
      *  atom count that disagrees with the labels it indexes is not representable. */
@@ -327,105 +427,12 @@ inline std::array<point3_t, usr_reference_point_count_k> usr_block_into_(conform
     return points;
 }
 
-/** How a recursive `$()` environment's set of satisfying atoms is filled for a target molecule. */
-enum class recursive_fill_t : std::uint8_t {
-    /** The environment is one atom, so every atom is tested against it directly. */
-    atom_query_k,
-    /** The environment is one bond, so each atom is tested as its root and its own bonds walked from there. */
-    bond_query_k,
-    /** The environment is wider, so `SubstructMatch` walks it and the environments nested inside it. */
-    subgraph_query_k,
-};
-
-/** A recursive `$()` environment and how it is filled. Borrowed from the query tree that owns it, which has no
- *  index to name a node by. */
-struct recursive_query_t {
-    RDKit::RecursiveStructureQuery *query = nullptr;
-    recursive_fill_t fill = recursive_fill_t::subgraph_query_k;
-};
-
-/**
- *  @brief Collects the recursive `$()` nodes of one query tree, each node after the ones it depends on.
- *
- *  An environment narrow enough to walk here is descended into, because filling it needs its own nested
- *  environments filled first. A wider one is not: `SubstructMatch` fills what is inside it as it walks it.
- *  An environment with no query molecule is skipped, as `SubstructMatch` skips it, leaving its set empty.
- */
-inline void gather_recursive_queries_(RDKit::Atom::QUERYATOM_QUERY *query, std::vector<recursive_query_t> &out) {
-    if (!query) return;
-    if (query->getDescription() != "RecursiveStructure") {
-        for (auto child = query->beginChildren(); child != query->endChildren(); ++child)
-            gather_recursive_queries_(child->get(), out);
-        return;
-    }
-    auto *const recursive = static_cast<RDKit::RecursiveStructureQuery *>(query);
-    RDKit::ROMol const *const environment = recursive->getQueryMol();
-    if (!environment) return;
-    recursive_fill_t const fill = environment->getNumAtoms() == 1 && environment->getNumBonds() == 0
-                                      ? recursive_fill_t::atom_query_k
-                                  : environment->getNumAtoms() == 2 && environment->getNumBonds() == 1
-                                      ? recursive_fill_t::bond_query_k
-                                      : recursive_fill_t::subgraph_query_k;
-    if (fill != recursive_fill_t::subgraph_query_k)
-        for (RDKit::Atom const *const atom : environment->atoms()) gather_recursive_queries_(atom->getQuery(), out);
-    out.push_back({recursive, fill});
-}
-
-/**
- *  @brief One CREDO pharmacophore SMARTS, compiled to the single query atom it names.
- *
- *  A recursive `$()` environment answers for a target atom out of a set of atom indices it holds itself, and
- *  that set is filled per target molecule rather than at compile time. `SubstructMatch` fills it on the way in;
- *  `prime_recursive_queries_` does it here instead, which is what lets an atom be tested directly.
- */
-struct credo_matcher_t {
-    RDKit::ROMol pattern;
-    std::vector<recursive_query_t> recursive_queries;
-
-    explicit credo_matcher_t(char const *smarts)
-        : pattern(*std::unique_ptr<RDKit::ROMol const>(RDKit::SmartsToMol(smarts))) {
-        sf_assert_(pattern.getNumAtoms() == 1);
-        gather_recursive_queries_(pattern.getAtomWithIdx(0)->getQuery(), recursive_queries);
-    }
-};
-
-/**
- *  @brief The four CREDO pharmacophore matchers, compiled once.
- *
- *  Order matches RDKit's USRCAT default typing: hydrophobic, aromatic, acceptor, donor. Every pattern is a
- *  single-atom query — the `-` and `~` bonds in the first and third appear only inside `$()` environments,
- *  which are themselves rooted at one atom.
- */
-inline std::array<credo_matcher_t, credo_subset_count_k> const &credo_matchers_() {
-    static char const *const patterns[credo_subset_count_k] = {
-        "[#6+0!$(*~[#7,#8,F]),SH0+0v2,s+0,S^3,Cl+0,Br+0,I+0]",             //  hydrophobic
-        "[a]",                                                             //  aromatic
-        "[$([O,S;H1;v2]-[!$(*=[O,N,P,S])]),$([O,S;H0;v2]),$([O,S;-]),"     //  acceptor
-        "$([N&v3;H1,H2]-[!$(*=[O,N,P,S])]),$([N;v3;H0]),$([n,o,s;+0]),F]", //
-        "[N!H0v3,N!H0+v4,OH+0,SH+0,nH+0]",                                 //  donor
-    };
-    // Each element is initialized from a prvalue and so is built in place: a copy would leave the gathered
-    // pointers naming the tree of the temporary they were gathered from.
-    static std::array<credo_matcher_t, credo_subset_count_k> const compiled {
-        credo_matcher_t {patterns[0]}, credo_matcher_t {patterns[1]}, credo_matcher_t {patterns[2]},
-        credo_matcher_t {patterns[3]}};
-    return compiled;
-}
-
-/** Serializes the priming below. The matchers are one shared object and priming writes into them, so two
- *  workers typing at once would otherwise interleave one molecule's matched atoms with another's. */
-inline std::mutex &credo_priming_mutex_() {
-    static std::mutex mutex;
-    return mutex;
-}
-
 /**
  *  @brief Fills @p matcher's recursive `$()` sets with the atoms of @p molecule that satisfy them.
  *
  *  Every environment is matched against the whole molecule and the atom each match is rooted at is inserted,
  *  which is what `SubstructMatch` does on the way into a match; the widest case is handed straight back to it,
- *  capped where RDKit caps it. The caller holds `credo_priming_mutex_` from here until it has finished reading
- *  the sets back.
+ *  capped where RDKit caps it.
  */
 inline void prime_recursive_queries_(RDKit::ROMol const &molecule, credo_matcher_t const &matcher,
                                      std::vector<RDKit::MatchVectType> &matches) {
@@ -522,19 +529,13 @@ inline void clear_shape_context_(molecule_shape_context_t &out) {
 
         // Type the four CREDO subsets exactly as RDKit's `getAtomIdsForFeatures` does. A single-atom query
         // matches one atom at a time and in index order, so ascending atom order is the order RDKit collects.
-        std::array<credo_matcher_t, credo_subset_count_k> const &matchers = credo_matchers_();
+        // The matchers belong to `out`, so priming touches nothing another worker reads.
         // `SubstructMatch` move-assigns a vector it built itself, so the buffer behind the priming searches is
         // RDKit's and the hoist keeps the object rather than its capacity.
         std::vector<RDKit::MatchVectType> matches;
         for (std::size_t subset_index = 0; subset_index < credo_subset_count_k; ++subset_index) {
-            credo_matcher_t const &matcher = matchers[subset_index];
-            // A pattern carrying no `$()` environment reads nothing shared, so it takes no lock at all; the
-            // other two hold theirs until the atom loop has finished reading the sets just primed.
-            std::unique_lock<std::mutex> guard {credo_priming_mutex_(), std::defer_lock};
-            if (!matcher.recursive_queries.empty()) {
-                guard.lock();
-                prime_recursive_queries_(*molecule, matcher, matches);
-            }
+            credo_matcher_t const &matcher = out.credo_matchers[subset_index];
+            if (!matcher.recursive_queries.empty()) prime_recursive_queries_(*molecule, matcher, matches);
             RDKit::Atom const *const query_atom = matcher.pattern.getAtomWithIdx(0);
             std::vector<std::uint32_t> &subset = out.credo_subsets[subset_index];
             for (RDKit::Atom const *const atom : molecule->atoms())

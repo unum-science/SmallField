@@ -36,6 +36,7 @@
 #include <vector>      // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`, `fmt::group_digits`
+#include <omp.h>        // `omp_get_max_threads`
 
 #include <GraphMol/Descriptors/USRDescriptor.h>
 #include <GraphMol/DistGeomHelpers/Embedder.h>
@@ -256,6 +257,45 @@ static std::array<RDKit::ROMol, sfpost::credo_subset_count_k> const &substruct_m
     return compiled;
 }
 
+/** The four CREDO subsets of one molecule, in the order `build_shape_context_into` fills them. */
+using credo_subsets_t = std::array<std::vector<std::uint32_t>, sfpost::credo_subset_count_k>;
+
+/** Fill `scratch.substruct_subsets` with the oracle's answer for @p molecule. */
+static void fill_substruct_subsets_(RDKit::ROMol const &molecule, shape_scratch_t &scratch) {
+    for (std::vector<std::uint32_t> &subset : scratch.substruct_subsets) subset.clear();
+    std::array<RDKit::ROMol, sfpost::credo_subset_count_k> const &matchers = substruct_matchers_();
+    for (std::size_t subset_index = 0; subset_index < sfpost::credo_subset_count_k; ++subset_index) {
+        RDKit::SubstructMatch(molecule, matchers[subset_index], scratch.substruct_matches);
+        for (RDKit::MatchVectType const &match : scratch.substruct_matches)
+            for (std::pair<int, int> const &pair : match)
+                scratch.substruct_subsets[subset_index].push_back(static_cast<std::uint32_t>(pair.second));
+    }
+}
+
+/**
+ *  @brief Compare one molecule's four typed subsets against `scratch.substruct_subsets`, index for index.
+ *
+ *  @param[in] smiles The molecule's SMILES, carried into every diagnostic key.
+ *  @param[in] observed The subsets the per-atom typing produced, single-threaded or concurrent.
+ *  @param[inout] reporters Reporters counting and printing the comparisons.
+ *  @param[in] scratch Holds the oracle's answer for the same molecule.
+ */
+static void compare_credo_subsets_(std::string_view smiles, credo_subsets_t const &observed_subsets,
+                                   shape_reporters_t &reporters, shape_scratch_t const &scratch) {
+    for (std::size_t subset_index = 0; subset_index < sfpost::credo_subset_count_k; ++subset_index) {
+        std::vector<std::uint32_t> const &reference = scratch.substruct_subsets[subset_index];
+        std::vector<std::uint32_t> const &observed = observed_subsets[subset_index];
+        // The atoms carry their own index as their value, so a differing position names itself and the field
+        // name does not have to be built per element.
+        comparison_group_t group = reporters.credo.mismatch("credo_typing", "smiles={} subset={}", smiles,
+                                                            usrcat_block_names_k[subset_index + 1]);
+        group.field("size", static_cast<std::uint32_t>(reference.size()), static_cast<std::uint32_t>(observed.size()),
+                    exactly_equal);
+        for (std::size_t position = 0; position < std::min(reference.size(), observed.size()); ++position)
+            group.field("atom", reference[position], observed[position], exactly_equal);
+    }
+}
+
 /**
  *  @brief Compare the four CREDO subsets against the `SubstructMatch` oracle, index for index.
  *
@@ -276,31 +316,79 @@ static void check_credo_typing_(std::string_view smiles, smallfield::salt_policy
     smallfield::parse_result_t parsed = smallfield::parse_smiles(smiles, parse_options);
     if (!parsed.molecule) return;
 
-    for (std::vector<std::uint32_t> &subset : scratch.substruct_subsets) subset.clear();
-    std::array<RDKit::ROMol, sfpost::credo_subset_count_k> const &matchers = substruct_matchers_();
-    for (std::size_t subset_index = 0; subset_index < sfpost::credo_subset_count_k; ++subset_index) {
-        RDKit::SubstructMatch(*parsed.molecule, matchers[subset_index], scratch.substruct_matches);
-        for (RDKit::MatchVectType const &match : scratch.substruct_matches)
-            for (std::pair<int, int> const &pair : match)
-                scratch.substruct_subsets[subset_index].push_back(static_cast<std::uint32_t>(pair.second));
-    }
+    fill_substruct_subsets_(*parsed.molecule, scratch);
 
     if (sfpost::build_shape_context_into(smiles, parsed.num_atoms, salt_policy, scratch.context) !=
         sfpost::shape_typing_t::typed_k)
         return;
 
-    for (std::size_t subset_index = 0; subset_index < sfpost::credo_subset_count_k; ++subset_index) {
-        std::vector<std::uint32_t> const &reference = scratch.substruct_subsets[subset_index];
-        std::vector<std::uint32_t> const &observed = scratch.context.credo_subsets[subset_index];
-        // The atoms carry their own index as their value, so a differing position names itself and the field
-        // name does not have to be built per element.
-        comparison_group_t group = reporters.credo.mismatch("credo_typing", "smiles={} subset={}", smiles,
-                                                            usrcat_block_names_k[subset_index + 1]);
-        group.field("size", static_cast<std::uint32_t>(reference.size()), static_cast<std::uint32_t>(observed.size()),
-                    exactly_equal);
-        for (std::size_t position = 0; position < std::min(reference.size(), observed.size()); ++position)
-            group.field("atom", reference[position], observed[position], exactly_equal);
+    compare_credo_subsets_(smiles, scratch.context.credo_subsets, reporters, scratch);
+}
+
+/** One molecule's typing as a worker among many produced it, kept until the main thread can judge it. */
+struct concurrent_typing_t {
+    sfpost::shape_typing_t typing = sfpost::shape_typing_t::unparsed_k;
+    credo_subsets_t subsets;
+};
+
+/**
+ *  @brief Type the whole corpus again from several workers at once, then judge every answer against the oracle.
+ *
+ *  Each worker owns its `molecule_shape_context_t`, and that context owns the four compiled matchers whose
+ *  recursive `$()` sets priming writes into. A typing that is right on one thread and wrong on many is exactly
+ *  what per-worker matchers can get wrong, so this runs the same comparison `check_credo_typing_` runs and
+ *  gates on it.
+ *
+ *  The concurrent pass only writes its own slot of @p typings; the oracle is then run single-threaded over the
+ *  same lines, so nothing here depends on `SubstructMatch` being reentrant and a divergence is attributable to
+ *  the code under test alone.
+ *
+ *  @param[in] corpus SMILES to type.
+ *  @param[in] salt_policy Counterion handling, applied to both sides so they type the same molecule.
+ *  @param[in] threads Workers the parallel pass runs on.
+ *  @param[inout] reporters Reporters counting and printing the comparisons.
+ *  @param[inout] scratch Buffers reused across the serial comparison pass.
+ *  @param[inout] typings One slot per corpus line, grown once and reused.
+ *  @return Molecules the concurrent pass typed, and whose subsets were therefore compared.
+ */
+static std::uint64_t check_credo_typing_concurrently_(std::vector<std::string> const &corpus,
+                                                      smallfield::salt_policy_t salt_policy, int threads,
+                                                      shape_reporters_t &reporters, shape_scratch_t &scratch,
+                                                      std::vector<concurrent_typing_t> &typings) {
+    typings.assign(corpus.size(), concurrent_typing_t {});
+
+    // `private` hands each worker its own context, exactly as both production loops do.
+    sfpost::molecule_shape_context_t context;
+    // A small chunk on purpose: the in-tree fixture is a hundred lines, and a chunk that let two workers cover
+    // it would leave the concurrency this section exists to exercise unexercised.
+#pragma omp parallel for schedule(dynamic, 4) num_threads(threads) private(context)
+    for (std::size_t molecule = 0; molecule < corpus.size(); ++molecule) {
+        smallfield::parse_options_t parse_options;
+        parse_options.max_atoms = 0;
+        parse_options.salt_policy = salt_policy;
+        parse_options.stereo_policy = smallfield::stereo_policy_t::skip_k;
+        smallfield::parse_result_t parsed = smallfield::parse_smiles(corpus[molecule], parse_options);
+        if (!parsed.molecule) continue; // the serial pass leaves an unparsed line uncompared too
+        concurrent_typing_t &typing = typings[molecule];
+        typing.typing = sfpost::build_shape_context_into(corpus[molecule], parsed.num_atoms, salt_policy, context);
+        if (typing.typing != sfpost::shape_typing_t::typed_k) continue;
+        typing.subsets = context.credo_subsets;
     }
+
+    std::uint64_t compared = 0;
+    for (std::size_t molecule = 0; molecule < corpus.size(); ++molecule) {
+        if (typings[molecule].typing != sfpost::shape_typing_t::typed_k) continue;
+        smallfield::parse_options_t parse_options;
+        parse_options.max_atoms = 0;
+        parse_options.salt_policy = salt_policy;
+        parse_options.stereo_policy = smallfield::stereo_policy_t::skip_k;
+        smallfield::parse_result_t parsed = smallfield::parse_smiles(corpus[molecule], parse_options);
+        if (!parsed.molecule) continue;
+        fill_substruct_subsets_(*parsed.molecule, scratch);
+        compare_credo_subsets_(corpus[molecule], typings[molecule].subsets, reporters, scratch);
+        ++compared;
+    }
+    return compared;
 }
 
 #pragma endregion Credo Typing
@@ -653,6 +741,15 @@ int main(int argc, char **argv) {
         for (auto const &smiles : corpus)
             sftest::check_credo_typing_(smiles, smallfield::keep_all_fragments_k, reporters, scratch);
         reporters.credo.summarize("credo_corpus");
+
+        // The same corpus and the same oracle, typed from every core the machine offers. Each worker owns its
+        // matchers, so a priming that reached another worker's sets would surface here and nowhere else.
+        int const threads = omp_get_max_threads();
+        std::vector<sftest::concurrent_typing_t> typings;
+        std::uint64_t const typed_concurrently = sftest::check_credo_typing_concurrently_(
+            corpus, smallfield::keep_all_fragments_k, threads, reporters, scratch, typings);
+        fmt::println("  NOTE credo_concurrent threads={} molecules={}", threads, fmt::group_digits(typed_concurrently));
+        reporters.credo.summarize("credo_concurrent");
 
         sftest::shape_tally_t tally;
         for (auto const &smiles : corpus) sftest::check_corpus_line_(smiles, reporters, scratch, tally);
