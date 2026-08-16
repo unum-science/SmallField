@@ -147,8 +147,8 @@ enum class shard_write_t {
     written_k,
     missing_per_molecule_arrays_k,
     input_span_too_short_k,
-    /** More packed coordinate halves than an Arrow `List` 32-bit offset addresses. */
-    coordinate_offsets_overflowed_k,
+    /** More packed fp16 halves in one list column than an Arrow `List` 32-bit offset addresses. */
+    list_offsets_overflowed_k,
     buffer_allocation_failed_k,
     column_reserve_failed_k,
     column_append_failed_k,
@@ -166,7 +166,7 @@ struct shard_write_report_t {
     shard_write_t status = shard_write_t::written_k;
     /** The schema column or input span the refusal is about, empty where it names none. */
     std::string_view column {};
-    /** The size contract `input_span_too_short_k` or `coordinate_offsets_overflowed_k` broke; both stay
+    /** The size contract `input_span_too_short_k` or `list_offsets_overflowed_k` broke; both stay
      *  zero under every other refusal. The first names what a span held against what its axis required,
      *  the second what the shard packs against what an offset addresses. */
     std::size_t held = 0;

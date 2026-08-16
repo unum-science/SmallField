@@ -18,7 +18,6 @@
 
 #include <arrow/array/array_nested.h>
 #include <arrow/array/builder_binary.h>
-#include <arrow/array/builder_nested.h>
 #include <arrow/array/builder_primitive.h>
 #include <arrow/array/data.h>
 #include <arrow/array/util.h>
@@ -48,8 +47,7 @@ char const *describe_shard_write(shard_write_t status) {
     case shard_write_t::written_k: return "written";
     case shard_write_t::missing_per_molecule_arrays_k: return "was handed nothing a row could describe";
     case shard_write_t::input_span_too_short_k: return "was handed a short input span";
-    case shard_write_t::coordinate_offsets_overflowed_k:
-        return "packs more coordinate halves than a 32-bit list offset addresses";
+    case shard_write_t::list_offsets_overflowed_k: return "packs more halves than a 32-bit list offset addresses";
     case shard_write_t::buffer_allocation_failed_k: return "could not allocate a column buffer";
     case shard_write_t::column_reserve_failed_k: return "could not reserve a column for every row";
     case shard_write_t::column_append_failed_k: return "could not append to a column";
@@ -66,7 +64,7 @@ std::string describe_shard_write(shard_write_report_t const &report) {
     if (report.status == shard_write_t::input_span_too_short_k)
         return fmt::format("{}: {} holds {} of the {} elements required", reason, report.column,
                            fmt::group_digits(report.held), fmt::group_digits(report.required));
-    if (report.status == shard_write_t::coordinate_offsets_overflowed_k)
+    if (report.status == shard_write_t::list_offsets_overflowed_k)
         return fmt::format("{}: {} packs {} halves against the {} one addresses", reason, report.column,
                            fmt::group_digits(report.held), fmt::group_digits(report.required));
     if (!report.column.empty()) return fmt::format("{}: {}", reason, report.column);
@@ -257,6 +255,76 @@ static void fill_output_rows_into(writer_inputs_t const &inputs, std::vector<out
 #pragma region List Columns
 
 /**
+ *  @brief The three buffers one nullable `List<float16>` column is packed into.
+ *
+ *  The bitmap arrives cleared, so a row stays null until `mark_valid` claims it, and `offsets` holds one
+ *  entry past the last row because a list's final extent is the difference of two of them.
+ */
+struct fp16_list_buffers_t {
+    std::shared_ptr<arrow::Buffer> validity;
+    std::shared_ptr<arrow::Buffer> offsets;
+    std::shared_ptr<arrow::Buffer> values;
+
+    [[nodiscard]] std::int32_t *offset_slots() const noexcept {
+        return reinterpret_cast<std::int32_t *>(offsets->mutable_data());
+    }
+    [[nodiscard]] std::uint16_t *halves() const noexcept {
+        return reinterpret_cast<std::uint16_t *>(values->mutable_data());
+    }
+    /** Arrow's validity bitmap: bit @p row is set when the row carries data and clear when it is null. */
+    void mark_valid(std::size_t row) const noexcept {
+        validity->mutable_data()[row >> 3] |= static_cast<std::uint8_t>(1u << (row & 7u));
+    }
+};
+
+/**
+ *  @brief Allocate @p out for @p num_rows rows over @p total_halves values, every row starting null.
+ *
+ *  Arrow's `List` carries 32-bit offsets, so a column packing more halves than one addresses is refused here
+ *  rather than discovered by the running offset each packer keeps, which would overflow its own
+ *  `std::int32_t` and then gather into the values buffer at a negative index.
+ *
+ *  @param[out] out Untouched on refusal.
+ */
+static shard_write_report_t allocate_fp16_list_(std::string_view column, std::size_t num_rows, std::size_t total_halves,
+                                                fp16_list_buffers_t &out) {
+    constexpr std::size_t addressable_halves_k = static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
+    if (total_halves > addressable_halves_k)
+        return {.status = shard_write_t::list_offsets_overflowed_k,
+                .column = column,
+                .held = total_halves,
+                .required = addressable_halves_k};
+
+    shard_write_report_t const allocation_failed {.status = shard_write_t::buffer_allocation_failed_k,
+                                                  .column = column};
+    std::size_t const bitmap_bytes = (num_rows + 7) / 8;
+    auto validity_result = arrow::AllocateBuffer(static_cast<std::int64_t>(bitmap_bytes));
+    if (!validity_result.ok()) return allocation_failed;
+    auto offsets_result = arrow::AllocateBuffer(static_cast<std::int64_t>((num_rows + 1) * sizeof(std::int32_t)));
+    if (!offsets_result.ok()) return allocation_failed;
+    auto values_result = arrow::AllocateBuffer(static_cast<std::int64_t>(total_halves * sizeof(std::uint16_t)));
+    if (!values_result.ok()) return allocation_failed;
+
+    out.validity = std::move(validity_result).ValueOrDie();
+    out.offsets = std::move(offsets_result).ValueOrDie();
+    out.values = std::move(values_result).ValueOrDie();
+    std::memset(out.validity->mutable_data(), 0, bitmap_bytes);
+    return {.status = shard_write_t::written_k};
+}
+
+/** Wrap the filled @p buffers as one `List<float16>` of @p num_rows rows over @p total_halves values. */
+static std::shared_ptr<arrow::Array> finish_fp16_list_(fp16_list_buffers_t &buffers, std::size_t num_rows,
+                                                       std::size_t total_halves, std::int64_t null_count) {
+    auto leaf_data = arrow::ArrayData::Make(arrow::float16(), static_cast<std::int64_t>(total_halves),
+                                            {nullptr, std::move(buffers.values)}, /*null_count=*/0);
+    auto leaf_array = arrow::MakeArray(std::move(leaf_data));
+    auto list_data = arrow::ArrayData::Make(arrow::list(arrow::float16()), static_cast<std::int64_t>(num_rows),
+                                            {std::move(buffers.validity), std::move(buffers.offsets)},
+                                            {leaf_array->data()}, null_count);
+    return arrow::MakeArray(std::move(list_data));
+}
+
+/**
  *  @brief Pack fp16 coordinates from the strided slot pool into a tight Arrow `List<float16>`, one element
  *  per output row.
  *
@@ -284,36 +352,12 @@ static shard_write_report_t pack_coordinates_as_list(writer_inputs_t const &inpu
         if (row.outcome == row_outcome_t::conformer_success_k)
             total_halves += static_cast<std::size_t>(atoms_of_(row)) * 3u;
 
-    // Arrow's `List` carries 32-bit offsets, so a shard packing more halves than one addresses cannot be
-    // written at all. Refused here rather than discovered by the running offset below, which would
-    // overflow its own `std::int32_t` and then gather into the values buffer at a negative index.
-    constexpr std::size_t addressable_halves_k = static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
-    if (total_halves > addressable_halves_k)
-        return {.status = shard_write_t::coordinate_offsets_overflowed_k,
-                .column = "conformer_coords",
-                .held = total_halves,
-                .required = addressable_halves_k};
-
-    shard_write_report_t const allocation_failed {.status = shard_write_t::buffer_allocation_failed_k,
-                                                  .column = "conformer_coords"};
-    auto offsets_buffer_result = arrow::AllocateBuffer(
-        static_cast<std::int64_t>((num_rows + 1) * sizeof(std::int32_t)));
-    if (!offsets_buffer_result.ok()) return allocation_failed;
-    auto offsets_buffer = std::move(offsets_buffer_result).ValueOrDie();
-    std::int32_t *offsets = reinterpret_cast<std::int32_t *>(offsets_buffer->mutable_data());
-
-    auto values_buffer_result = arrow::AllocateBuffer(static_cast<std::int64_t>(total_halves * sizeof(std::uint16_t)));
-    if (!values_buffer_result.ok()) return allocation_failed;
-    auto values_buffer = std::move(values_buffer_result).ValueOrDie();
-    std::uint16_t *values = reinterpret_cast<std::uint16_t *>(values_buffer->mutable_data());
-
-    // Arrow's validity bitmap: bit `row` is set when the row carries data and clear when it is null.
-    std::size_t const bitmap_bytes = (num_rows + 7) / 8;
-    auto validity_buffer_result = arrow::AllocateBuffer(static_cast<std::int64_t>(bitmap_bytes));
-    if (!validity_buffer_result.ok()) return allocation_failed;
-    auto validity_buffer = std::move(validity_buffer_result).ValueOrDie();
-    std::memset(validity_buffer->mutable_data(), 0, bitmap_bytes);
-    std::uint8_t *validity = validity_buffer->mutable_data();
+    fp16_list_buffers_t buffers;
+    if (shard_write_report_t const report = allocate_fp16_list_("conformer_coords", num_rows, total_halves, buffers);
+        report.status != shard_write_t::written_k)
+        return report;
+    std::int32_t *offsets = buffers.offset_slots();
+    std::uint16_t *values = buffers.halves();
 
     std::int32_t running = 0;
     std::int64_t null_count = 0;
@@ -332,18 +376,11 @@ static shard_write_report_t pack_coordinates_as_list(writer_inputs_t const &inpu
             api::gather_slot_into_interleaved(source, layout, atom_count, values + running);
             running += static_cast<std::int32_t>(atom_count * 3u);
         }
-        validity[row_index >> 3] |= static_cast<std::uint8_t>(1u << (row_index & 7u));
+        buffers.mark_valid(row_index);
     }
     offsets[num_rows] = running;
 
-    auto leaf_data = arrow::ArrayData::Make(arrow::float16(), static_cast<std::int64_t>(total_halves),
-                                            {nullptr, std::move(values_buffer)}, /*null_count=*/0);
-    auto leaf_array = arrow::MakeArray(std::move(leaf_data));
-
-    auto list_data = arrow::ArrayData::Make(arrow::list(arrow::float16()), static_cast<std::int64_t>(num_rows),
-                                            {std::move(validity_buffer), std::move(offsets_buffer)},
-                                            {leaf_array->data()}, null_count);
-    array = arrow::MakeArray(std::move(list_data));
+    array = finish_fp16_list_(buffers, num_rows, total_halves, null_count);
     return {.status = shard_write_t::written_k};
 }
 
@@ -367,31 +404,42 @@ static shape_described_t row_shape_described_(writer_inputs_t const &inputs, out
 static shard_write_report_t pack_usrcat_as_fp16_list(writer_inputs_t const &inputs,
                                                      custd::span<output_row_t const> rows,
                                                      std::shared_ptr<arrow::Array> &array) {
-    auto value_builder = std::make_shared<arrow::HalfFloatBuilder>();
-    arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-    custd::span<double const> const values = inputs.conformers.usrcat;
-    shard_write_report_t const append_failed {.status = shard_write_t::column_append_failed_k, .column = "usrcat"};
+    custd::span<double const> const descriptors = inputs.conformers.usrcat;
+    std::size_t const num_rows = rows.size();
 
-    for (output_row_t const &row : rows) {
+    std::size_t described_rows = 0;
+    for (output_row_t const &row : rows)
+        if (row_shape_described_(inputs, row) == shape_described_t::described_k) ++described_rows;
+    std::size_t const total_halves = described_rows * usrcat_components_k;
+
+    fp16_list_buffers_t buffers;
+    if (shard_write_report_t const report = allocate_fp16_list_("usrcat", num_rows, total_halves, buffers);
+        report.status != shard_write_t::written_k)
+        return report;
+    std::int32_t *offsets = buffers.offset_slots();
+    std::uint16_t *values = buffers.halves();
+
+    std::int32_t running = 0;
+    std::int64_t null_count = 0;
+    for (std::size_t row_index = 0; row_index < num_rows; ++row_index) {
+        output_row_t const &row = rows[row_index];
+        offsets[row_index] = running;
         if (row_shape_described_(inputs, row) == shape_described_t::undescribed_k) {
-            if (!list_builder.AppendNull().ok()) return append_failed;
+            ++null_count;
             continue;
         }
         std::size_t const base = inputs.conformers.layout.flat_slot(row.molecule_index, row.conformer_slot) *
                                  usrcat_components_k;
-        if (!list_builder.Append().ok()) return append_failed;
         for (std::uint32_t component = 0; component < usrcat_components_k; ++component) {
-            __half const half_value = __float2half(static_cast<float>(values[base + component]));
-            std::uint16_t bits;
-            std::memcpy(&bits, &half_value, sizeof(bits));
-            if (!value_builder->Append(bits).ok()) return append_failed;
+            __half const half_value = __float2half(static_cast<float>(descriptors[base + component]));
+            std::memcpy(values + running + component, &half_value, sizeof(std::uint16_t));
         }
+        running += static_cast<std::int32_t>(usrcat_components_k);
+        buffers.mark_valid(row_index);
     }
+    offsets[num_rows] = running;
 
-    std::shared_ptr<arrow::Array> finished;
-    if (!list_builder.Finish(&finished).ok())
-        return {.status = shard_write_t::column_finish_failed_k, .column = "usrcat"};
-    array = std::move(finished);
+    array = finish_fp16_list_(buffers, num_rows, total_halves, null_count);
     return {.status = shard_write_t::written_k};
 }
 
