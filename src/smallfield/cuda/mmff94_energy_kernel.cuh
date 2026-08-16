@@ -64,6 +64,23 @@ constexpr float mmff_radians_to_degrees_k = 180.0f / 3.14159265f;
  */
 constexpr float mmff_chiral_volume_weight_k = 100.0f;
 
+/**
+ *  Fraction of a center's `minimum_volume` the center-based volume is held to.
+ *
+ *  The two volumes a center carries are not the same size, so `minimum_volume` cannot serve both.
+ *  Over 7,649 declared centers of one Enamine REAL shard the center-based magnitude has a median of
+ *  2.57 cubic angstrom against the pivot-based 8.38, because the center sits inside the tetrahedron
+ *  its neighbors span rather than at one of its corners; the unscaled floor would sit above the 37th
+ *  percentile of that distribution and bend a third of the corpus to reach it.
+ *
+ *  At 0.3 the floor is 1.5 cubic angstrom on a four-coordinate center, which is the measured 0.5th
+ *  percentile — the bottom is flat for 99.5 % of the centers that already ship, and 1.5 is thirty
+ *  times the volume the half-precision coordinate quantum is worth for the rest. A three-coordinate
+ *  center is its own fourth neighbor, so its two volumes are one expression and this floor sits below
+ *  the one already holding it, contributing nothing.
+ */
+constexpr float mmff_center_volume_fraction_k = 0.3f;
+
 /** Whether a nonbonded pair is exactly three bonds apart, which scales electrostatics. */
 enum class pair_separation_t : bool { beyond_one_four_k = false, one_four_k = true };
 
@@ -526,22 +543,37 @@ __device__ __forceinline__ void mmff_stretchbend_contribution_(float const *posi
  *
  *  Published MMFF94 has no chiral term, so its energy is blind to which of two mirror images it is
  *  scoring and the minimizer is free to descend into the reflected one. The restraint is what makes
- *  the declared handedness cost something, and it is the same expression the distance-geometry stage
- *  already minimizes — `distance_geometry_energy_functor_t`'s chiral term over the same descriptors —
- *  so a center is held to one convention from embedding through polish.
+ *  the declared handedness cost something.
+ *
+ *  A center carries two signed volumes over the same three neighbors, distinguished by the point the
+ *  three edges are measured from, and two different stages read them. The pivot-based one is
+ *  `DistGeom::ChiralSet`'s and is what the embedding and `count_invalid_chiral_centers_` hold; the
+ *  center-based one is what RDKit's `assignChiralTypesFrom3D` will read back off the shipped
+ *  coordinates, and is therefore the one that decides what the corpus is perceived to contain.
+ *  Both are restrained, because holding only one is what the two stages disagreeing costs: the
+ *  pivot-based term applies no force to the center atom at all, so a minimizer under it alone walks
+ *  the center through its neighbors' plane and inverts the perceived handedness while satisfying
+ *  every constraint it was given.
  *
  *  @verbatim
- *  V         = (r_0 - r_3) . [(r_1 - r_3) x (r_2 - r_3)],  r_i = neighbor_atoms[i]
- *  E_chiral  = w * (V - s * v_min)^2  where V has not reached the signed floor, else 0
+ *  N         = (r_1 - r_0) x (r_2 - r_0),  r_i = neighbor_atoms[i], c = center_atom
+ *  V_pivot   = (r_0 - r_3) . N
+ *  V_center  = (r_0 - c)   . N
+ *  E_chiral  = w * (V_pivot - s * v_min)^2 + w * (V_center - s * f * v_min)^2
  *  @endverbatim
  *
+ *  The signed volume over a fixed base triangle is affine in its apex, so the two share one normal
+ *  and each term's gradient with respect to its own apex is that normal negated — which is how the
+ *  center atom acquires a force at all. Each of the three neighbors takes both terms' cross products.
+ *
  *  Signing the floor puts both failures on one axis: an inverted center and a correctly handed but
- *  nearly flat one both land past it, and the distance to it is already the derivative. The floor is
- *  `minimum_volume` unslacked while `count_invalid_chiral_centers_` calls a center flat below
+ *  nearly flat one both land past it, and the distance to it is already the derivative. The pivot
+ *  floor is `minimum_volume` unslacked while `count_invalid_chiral_centers_` calls a center flat below
  *  `chiral_volume_slack_k` of it, so the restraint pushes to the far side of the verdict rather than
- *  to its boundary. It is flat-bottomed, so a center that is already handed correctly and far enough
- *  from planar contributes no energy and no force, and the geometry MMFF94 would have reached is
- *  unchanged.
+ *  to its boundary; the center floor is `mmff_center_volume_fraction_k` of it, which is a measurement
+ *  rather than a conversion. Both are flat-bottomed, so a center already handed correctly and far
+ *  enough from planar contributes no energy and no force, and the geometry MMFF94 would have reached
+ *  is unchanged.
  *
  *  @param[in] positions SoA coordinate array.
  *  @param[in] num_atoms Number of atoms, the stride between dimensions.
@@ -558,39 +590,58 @@ __device__ __forceinline__ void mmff_chiral_contribution_(float const *positions
     std::uint8_t const neighbor_third = center.neighbor_atoms[2];
     std::uint8_t const pivot = center.neighbor_atoms[3];
 
-    // Every lane walks every center, so the four that carry a force and the one that carries the
-    // energy are found by comparison; the rest of the molecule leaves before loading a position.
+    // Every lane walks every center, so the five atoms that carry a force are found by comparison;
+    // the rest of the molecule leaves before loading a position.
     bool const scores = atom == center.center_atom;
-    bool const forced = atom == neighbor_first || atom == neighbor_second || atom == neighbor_third || atom == pivot;
-    if (!scores && !forced) return;
+    bool const on_pivot = atom == pivot;
+    if (!scores && !on_pivot && atom != neighbor_first && atom != neighbor_second && atom != neighbor_third) return;
 
+    float3 const position_first = load_position_(positions, num_atoms, neighbor_first);
+    float3 const position_second = load_position_(positions, num_atoms, neighbor_second);
+    float3 const position_third = load_position_(positions, num_atoms, neighbor_third);
     float3 const pivot_position = load_position_(positions, num_atoms, pivot);
-    float3 const edge_first = sub_float3_(load_position_(positions, num_atoms, neighbor_first), pivot_position);
-    float3 const edge_second = sub_float3_(load_position_(positions, num_atoms, neighbor_second), pivot_position);
-    float3 const edge_third = sub_float3_(load_position_(positions, num_atoms, neighbor_third), pivot_position);
-    float3 const cross_second_third = cross_float3_(edge_second, edge_third);
-    float const volume = dot_float3_(edge_first, cross_second_third);
+    float3 const center_position = load_position_(positions, num_atoms, center.center_atom);
+    float3 const normal = cross_float3_(sub_float3_(position_second, position_first),
+                                        sub_float3_(position_third, position_first));
 
-    float const signed_floor = center.target_sign < 0 ? -center.minimum_volume : center.minimum_volume;
-    float const shortfall = volume - signed_floor;
-    if (signbit(signed_floor) == signbit(shortfall)) return;
+    // A shortfall is zero wherever the flat bottom reaches, and is the term's derivative elsewhere.
+    float const pivot_floor = center.target_sign < 0 ? -center.minimum_volume : center.minimum_volume;
+    float const center_floor = mmff_center_volume_fraction_k * pivot_floor;
+    float const pivot_gap = dot_float3_(sub_float3_(position_first, pivot_position), normal) - pivot_floor;
+    float const center_gap = dot_float3_(sub_float3_(position_first, center_position), normal) - center_floor;
+    float const pivot_shortfall = signbit(pivot_floor) == signbit(pivot_gap) ? 0.0f : pivot_gap;
+    float const center_shortfall = signbit(center_floor) == signbit(center_gap) ? 0.0f : center_gap;
+    if (pivot_shortfall == 0.0f && center_shortfall == 0.0f) return;
 
-    if (scores) *energy += mmff_chiral_volume_weight_k * shortfall * shortfall;
-    if (!forced) return;
+    if (scores)
+        *energy += mmff_chiral_volume_weight_k *
+                   (pivot_shortfall * pivot_shortfall + center_shortfall * center_shortfall);
 
-    // V = edge_first . (edge_second x edge_third), so the chain rule hands each edge the cross product
-    // of the other two, and the pivot takes the negated sum. cross(second, third) is already in hand.
-    float const scale = 2.0f * mmff_chiral_volume_weight_k * shortfall;
-    float3 delta = cross_second_third;
-    if (atom == neighbor_second) { delta = cross_float3_(edge_third, edge_first); }
-    else if (atom == neighbor_third) { delta = cross_float3_(edge_first, edge_second); }
-    else if (atom != neighbor_first) {
-        // The pivot. Summing the three in place keeps the other two crosses off the live set together.
-        delta = scale_float3_(delta, -1.0f);
-        delta = sub_float3_(delta, cross_float3_(edge_third, edge_first));
-        delta = sub_float3_(delta, cross_float3_(edge_first, edge_second));
+    float const pivot_scale = 2.0f * mmff_chiral_volume_weight_k * pivot_shortfall;
+    float const center_scale = 2.0f * mmff_chiral_volume_weight_k * center_shortfall;
+
+    // An apex takes the normal negated. A three-coordinate center is stored as its own pivot, so it is
+    // the apex of both terms at once and collects both; its two volumes are then one expression, and
+    // the smaller of the two floors can never be the binding one.
+    float3 delta {0.0f, 0.0f, 0.0f};
+    if (on_pivot) delta = scale_float3_(normal, -pivot_scale);
+    if (scores) delta = add_float3_(delta, scale_float3_(normal, -center_scale));
+    if (!scores && !on_pivot) {
+        // A neighbor takes the cross product of the other two edges as measured from the apex, once
+        // per term, and the two apexes give different edges.
+        auto neighbor_delta_ = [&](float3 apex, float scale) -> float3 {
+            float3 const edge_first = sub_float3_(position_first, apex);
+            float3 const edge_second = sub_float3_(position_second, apex);
+            float3 const edge_third = sub_float3_(position_third, apex);
+            float3 cross_pair = cross_float3_(edge_second, edge_third);
+            if (atom == neighbor_second) { cross_pair = cross_float3_(edge_third, edge_first); }
+            else if (atom == neighbor_third) { cross_pair = cross_float3_(edge_first, edge_second); }
+            return scale_float3_(cross_pair, scale);
+        };
+        delta = add_float3_(neighbor_delta_(pivot_position, pivot_scale),
+                            neighbor_delta_(center_position, center_scale));
     }
-    *gradient = add_float3_(*gradient, scale_float3_(delta, scale));
+    *gradient = add_float3_(*gradient, delta);
 }
 
 /**

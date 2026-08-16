@@ -311,6 +311,59 @@ It costs 34 more fallback dispatches per 10,000 molecules and leaves the restrai
 `mmff_polish_warp_kernel` is untouched — 63 registers and no stack on `sm_90`, 71 and 8 bytes on `sm_100`, both where the restraint left them.
 `validate_polished_stereo_kernel` lands at 47 registers and no stack on `sm_90`, and moves 40/0 → 48/8 on `sm_100`, against the 256 per thread its `__launch_bounds__(32, 8)` allows.
 
+### Restraining Only One Of The Two Volumes Costs REAL 1.586 % Of Its Molecules
+
+The section above fixed PubChem's stereochemistry by teaching the reader about the second volume.
+It did not fix the reason there is a second reading to disagree with, and on Enamine REAL — the corpus about to be encoded — that is 1.553 % of a full 1,000,000-molecule shard dispatched to the CPU embedder as `polish_inverted_center`, against 1.535 % before the restraint landed.
+The refusal is correct and it is nearly the whole fallback bill: 15,527 of 19,868 dispatches, and 410 s of a 555 s shard.
+
+__A centre's two volumes share one plane normal, which is what makes holding both cheap.__
+The signed volume of a tetrahedron over a fixed base triangle is affine in its apex, so with `N = (r_1 - r_0) × (r_2 - r_0)` the pivot-based volume is `(r_0 - r_3) · N` and the centre-based one is `(r_0 - c) · N`.
+One cross product serves both, each term's derivative with respect to its own apex is `-N`, and that second `-N` is the force on the centre atom the old expression could not produce.
+
+__The two floors cannot be one number.__
+Over 7,649 declared centres of 8,000 shipped GPU rows of a REAL slice, `|V|` reads:
+
+| Expression   | p0.5 | p1 | p5 | p50 | p90 |
+| :----------- | ---: | ---: | ---: | ---: | ---: |
+| pivot-based  | 6.07 | 6.11 | 6.34 | __8.38__ | 8.71 |
+| centre-based | 1.53 | 2.08 | 2.25 | __2.57__ | 2.91 |
+
+`minimum_volume` is 5 for a four-coordinate centre, so transplanted whole it would sit above the 37th percentile of the centre-based distribution and bend a third of the corpus.
+At `mmff_center_volume_fraction_k = 0.3` the floor is 1.5, which is that distribution's own 0.5th percentile: the flat bottom is inactive for 99.5 % of centres that already ship, and 1.5 cubic angstrom is thirty times what the half-precision coordinate quantum is worth.
+A three-coordinate centre is stored as its own fourth neighbour, so the two expressions are one there and the smaller floor can never be the binding one — confirmed at `collect_chiral_centers`, and all 7,649 centres of this slice are four-coordinate, so the case is covered by fixture rather than by corpus.
+
+__The result, on a 100,000-molecule stride sample of REAL shard 0 at K=3, `1× H100`, Release `sm_90`, 2026-08-16.__
+The baseline column reproduces the full-shard rate to within 0.03 points.
+
+| Measurement                                | pivot volume only | __both volumes__ |
+| :----------------------------------------- | ----------------: | ---------------: |
+| `polish_inverted_center`, share of molecules | __1.586 %__ | __0.000 %__ |
+| `stereo_failure`                             | 416 | 453 |
+| `polish_inverted_bond`                       | 7 | 9 |
+| fallback molecules, all causes               | 2,009 | __462__ |
+| `rdkit-fallback` wall                        | 41.7 s | __6.7 s__ |
+| `gpu-runner-role` wall                       | 16.1 s | 15.0 s |
+| __end to end__                               | __1,653 mol/s__ | __3,919 mol/s__ |
+| conformer energy p90                         | 100.9 | 103.3 |
+| conformer energy max                         | 1,518 | 2,420 |
+
+The `stereo_failure` and `polish_inverted_bond` rises are bookkeeping, not regression: a cause is tallied once per molecule, so a molecule refused for both reasons was counted under the centre cause and is now counted under the other one.
+
+__Geometry is almost untouched, and the tail that moves is the tail that was being refused.__
+Paired by input row over 299,921 slots both configurations ship, 81.3 % are bit-identical — the flat bottom never binds — and of the 18.7 % that move the median is +0.04 and the p90 +1.99 kcal/mol.
+The p99 of +538 is the slots that were previously RDKit's geometry rather than ours, which is the cost of shipping them instead of refusing them.
+
+__Fidelity is held, not traded.__
+On the REAL slice itself `bench/validate_stereo.py` reads 0.000 % of declared centres inverted both before and after — 8,810 declared centres against 8,586 — on a control of 0.000 %.
+The baseline reached that number by refusing 1.586 % of molecules to the CPU; this reaches it by not needing to.
+On the same 20,000-molecule PubChem slice the rate goes 0.021 % → __0.000 %__ over 4,610 declared centres, control 0.000 %, and `polish_inverted_center` goes 114 → 0.
+E/Z reads 0.163 % there against a control of 0.202 %, both two bonds of a ~1,200 draw and both inside the noise this file already cautions about at that sample size; REAL declares 72 bonds over 10,000 molecules and answers nothing about E/Z at all.
+
+`mmff_polish_warp_kernel` does not move on any architecture — 63 registers and no stack on `sm_90`, 71 and 8 bytes on `sm_100`, 79 and 8 bytes on `sm_120`, each byte-identical to the same build with the second term removed.
+The pivot path lost the three cross products it used to sum and gained a shared normal, which is what pays for the second term's two.
+`compute-sanitizer --tool racecheck` reports 0 hazards over `test_pipeline`.
+
 ### The Distance-Geometry Budget Is Not Free, And Still Worth Raising
 
 Doubling the two four-dimensional stages — distance geometry 100 → 200 iterations, fourth-dimension crush 50 → 100 — on the same 20,000-molecule PubChem shard.

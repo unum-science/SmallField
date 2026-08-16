@@ -611,6 +611,11 @@ __device__ __forceinline__ void store_polish_stage_(float *diagnostics_out, std:
  *  it ships the raw distance-geometry embedding, which takes conformer energy p90 from 85.4 to
  *  1,349 kcal/mol.
  *
+ *  The restraint holds both of the two signed volumes a center carries, not only the embedding's, because
+ *  `validate_polished_stereo_kernel` downstream reads both and the two are reachable apart. Held to the
+ *  embedding's alone it refused 1.586 % of an Enamine REAL slice to the CPU fallback; holding both takes
+ *  that to zero, which is 2.4x the end-to-end throughput on that slice.
+ *
  *  The minimizer is not FIRE, and the reason is a measurement rather than a preference. FIRE carries
  *  one timestep for every degree of freedom, so on a molecular force field it settles at the stability
  *  limit of the stiffest bond stretch: across a captured bin of 3,672 slots its final timestep sat

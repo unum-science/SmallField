@@ -125,6 +125,27 @@ __global__ void mmff_minimize_kernel(float *positions_inout, sft::mmff94_atom_vd
                        .status = result.status};
 }
 
+/**
+ *  The chiral restraint on its own, walked exactly as `mmff94_energy_functor_t` walks it: one lane per
+ *  atom, every declared center per atom, and the energy credited once by each center's central atom.
+ */
+__global__ void chiral_restraint_eval_kernel(float const *positions, std::uint32_t num_atoms,
+                                             sft::chiral_center_descriptor_t const *centers, std::uint32_t num_centers,
+                                             float *gradient, float *out_energy) {
+
+    std::uint32_t const lane = threadIdx.x;
+    float energy = 0.0f;
+    for (std::uint32_t atom = lane; atom < num_atoms; atom += sfc::warp_size_k) {
+        float3 accumulated {0.0f, 0.0f, 0.0f};
+        for (std::uint32_t center = 0; center < num_centers; ++center)
+            sfc::mmff_chiral_contribution_(positions, num_atoms, atom, centers[center], &energy, &accumulated);
+        sfc::store_gradient_(gradient, num_atoms, atom, accumulated);
+    }
+    for (std::uint32_t offset = sfc::warp_size_k / 2; offset > 0; offset >>= 1)
+        energy += __shfl_xor_sync(sfc::full_mask_k, energy, offset);
+    if (lane == 0) *out_energy = energy;
+}
+
 } // namespace
 
 namespace smallfield::tests {
@@ -264,6 +285,54 @@ mmff_energy_probe_t gpu_mmff_minimize(custd::span<float> host_positions, std::ui
     bool const copied = sft::download_from(host_positions, device_positions, nullptr) &&
                         sft::download_from(custd::span<mmff_minimize_result_t> {&out_result, 1}, device_result,
                                            nullptr);
+    cudaError_t const drained = cudaStreamSynchronize(nullptr);
+    if (!copied) return mmff_energy_probe_t::transfer_failed_k;
+    if (drained != cudaSuccess) return mmff_energy_probe_t::launch_failed_k;
+    return mmff_energy_probe_t::completed_k;
+}
+
+/** Every device array one restraint evaluation stages, released in stream order however the call leaves. */
+struct chiral_restraint_arena_t {
+    device_array<float> positions;
+    device_array<float> gradient;
+    device_array<float> energy;
+    device_array<sft::chiral_center_descriptor_t> centers;
+
+    /** Reserve one molecule's coordinates, gradient and centers; false when the device refused any. */
+    [[nodiscard]] bool resize_for(std::size_t num_components, std::size_t num_centers) noexcept {
+        bool reserved = true;
+        auto reserve_ = [&](auto &array, std::size_t count) {
+            reserved &= array.try_reserve(count) != sft::reserve_outcome_t::failed_k;
+        };
+        reserve_(positions, num_components);
+        reserve_(gradient, num_components);
+        reserve_(energy, 1);
+        // A molecule with no declared center is a legal fixture and stages nothing, but the kernel is
+        // handed the pointer either way, so the array keeps one slot rather than a null.
+        reserve_(centers, num_centers == 0 ? 1 : num_centers);
+        return reserved;
+    }
+};
+
+mmff_energy_probe_t gpu_chiral_restraint(custd::span<float const> host_positions, std::uint32_t num_atoms,
+                                         custd::span<sft::chiral_center_descriptor_t const> host_centers,
+                                         custd::span<float> host_gradient, float *out_energy) {
+
+    chiral_restraint_arena_t arena;
+    if (!arena.resize_for(host_positions.size(), host_centers.size())) return mmff_energy_probe_t::allocation_failed_k;
+    if (!sft::upload_into(arena.positions.view(), host_positions, nullptr) ||
+        !sft::upload_into(arena.centers.view(), host_centers, nullptr))
+        return mmff_energy_probe_t::transfer_failed_k;
+
+    chiral_restraint_eval_kernel<<<1, sfc::warp_size_k>>>(arena.positions.data(), num_atoms, arena.centers.data(),
+                                                          static_cast<std::uint32_t>(host_centers.size()),
+                                                          arena.gradient.data(), arena.energy.data());
+    if (cudaGetLastError() != cudaSuccess) return mmff_energy_probe_t::launch_failed_k;
+
+    custd::span<float const> const device_gradient = arena.gradient.view();
+    custd::span<float const> const device_energy = arena.energy.view();
+    bool const copied = sft::download_from(host_gradient, device_gradient, nullptr) &&
+                        sft::download_from(custd::span<float> {out_energy, 1}, device_energy, nullptr);
     cudaError_t const drained = cudaStreamSynchronize(nullptr);
     if (!copied) return mmff_energy_probe_t::transfer_failed_k;
     if (drained != cudaSuccess) return mmff_energy_probe_t::launch_failed_k;

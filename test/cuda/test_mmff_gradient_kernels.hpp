@@ -116,4 +116,24 @@ struct mmff_minimize_result_t {
                                                     mmff_energy_terms_t const &terms, std::int32_t max_iterations,
                                                     float gradient_threshold, mmff_minimize_result_t &out_result);
 
+/**
+ *  @brief Evaluate the chiral restraint alone on the device, as `mmff94_energy_functor_t` walks it.
+ *
+ *  One warp, one lane per atom, every declared center walked per atom — the production sweep with every
+ *  published MMFF94 term removed, so a central difference of the returned energy measures the restraint's
+ *  own derivative and nothing else. Published MMFF94 carries no chiral term to compare against, so a
+ *  finite difference is the only reference this restraint has.
+ *
+ *  @param[in] host_positions Coordinates as `(axis, atom)`, `3 * num_atoms` entries.
+ *  @param[in] num_atoms Atom count.
+ *  @param[in] host_centers Declared centers, in the layout the polish kernel hands the functor.
+ *  @param[out] host_gradient Receives the gradient, same extent and layout as @p host_positions.
+ *  @param[out] out_energy Receives the restraint's total energy.
+ *  @return Whether the round trip completed, and which step refused it.
+ */
+[[nodiscard]] mmff_energy_probe_t gpu_chiral_restraint(
+    custd::span<float const> host_positions, std::uint32_t num_atoms,
+    custd::span<smallfield::types::chiral_center_descriptor_t const> host_centers, custd::span<float> host_gradient,
+    float *out_energy);
+
 } // namespace smallfield::tests

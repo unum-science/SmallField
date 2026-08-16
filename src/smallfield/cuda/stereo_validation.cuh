@@ -44,20 +44,17 @@ constexpr float bond_stereo_planarity_floor_k = 0.5f;
  *  A tetrahedral center carries two signed volumes over the same three neighbors, and the pipeline
  *  and its consumer read different ones. `count_invalid_chiral_centers_` takes the triple product
  *  from the @b fourth neighbor, which is RDKit's `DistGeom::ChiralSet` expression and the quantity
- *  both the embedding and the MMFF polish restrain. RDKit's `assignChiralTypesFrom3D` takes it from
- *  the @b center atom and never reads the fourth neighbor at all. The two agree for any center whose
- *  atom lies on the same side of its first three neighbors' plane as the fourth, which is every
- *  ordinary tetrahedron, and disagree once it does not.
+ *  the embedding restrains. RDKit's `assignChiralTypesFrom3D` takes it from the @b center atom and
+ *  never reads the fourth neighbor at all. The two agree for any center whose atom lies on the same
+ *  side of its first three neighbors' plane as the fourth, which is every ordinary tetrahedron, and
+ *  disagree once it does not.
  *
- *  That gap is reachable, because the restraint moves the four neighbors and applies no force to the
- *  center: over 10,000 scored molecules of one PubChem shard it holds 4,917 declared centers at the
- *  restrained volume and leaves 44 of them split, of which RDKit reads 37 inverted. So the restrained
- *  volume is not sufficient on its own, and this is the stage that has to say so — the embedding gate
- *  is asking a question about its own constraint, while this one is predicting what the consumer will
- *  perceive.
- *
- *  Both are taken. The restrained volume still has to be handed correctly and clear the flatness
- *  floor, and the center-based volume has to agree with it. A three-coordinate center stores itself
+ *  Both are taken here, because only one of them is the embedding's. The pivot-based volume has to be
+ *  handed correctly and clear the flatness floor, which is the question the embedding gate asked; the
+ *  center-based one has to agree with it, which is the question the consumer will ask. The MMFF polish
+ *  restrains both, so this stage is the audit of that rather than the stage that discovers the gap:
+ *  over a 100,000-molecule Enamine REAL slice at K=3 it refuses no center at all, against 1.586 % of
+ *  molecules when only the pivot-based volume was restrained. A three-coordinate center stores itself
  *  as its own fourth neighbor, so the two expressions coincide there and the second test is free.
  *
  *  Centers are spread across the warp, so the count is warp-reduced and every lane returns it.

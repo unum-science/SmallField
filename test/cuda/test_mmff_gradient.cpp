@@ -240,6 +240,213 @@ static bool axis_sum_vanishes_(float magnitude_sum, float axis_sum) noexcept {
 
 #pragma endregion Tolerances
 
+#pragma region Chiral Restraint
+
+/**
+ *  @brief How far one coordinate moves either way for the restraint's own central difference.
+ *
+ *  Five times the stage's step, because the restraint is the one term whose energy is not a chemical
+ *  quantity: at a weight of 100 an inverted center carries some 2e4 kcal per mol, which a `float`
+ *  resolves to about 2e-3, and the stage's 1e-3 step would divide that by 2e-3 and leave the quotient a
+ *  resolution of one. The truncation a central difference pays grows as the square of the step and stays
+ *  well under the band either way.
+ */
+static constexpr float chiral_difference_step_k = 5.0e-3f;
+
+/**
+ *  @brief The band the restraint's derivative is trusted to against a central difference of its energy.
+ *
+ *  The absolute floor is set from the energy scale rather than from the derivative's, for the reason
+ *  above: a component whose true derivative is zero still reads back as the cancellation noise of two
+ *  2e4 totals, which no floor below that noise can accept. The relative band is ten times tighter than
+ *  the stage's, because a restraint gradient that is wrong is wrong by a whole term rather than by
+ *  rounding — a missing force on the center atom is a hundred percent error, not a percent.
+ */
+static constexpr gradient_tolerance_t chiral_restraint_tolerance_k {.absolute = 2.0f, .relative = 1.0e-3f};
+
+/** Bond length every tetrahedral fixture places its neighbors at, in angstroms. */
+static constexpr float fixture_bond_length_k = 1.5f;
+
+/** What the restraint must make of one fixture; the three cases are the ones the two floors admit. */
+enum class restraint_expectation_t : std::uint8_t {
+    /** Both volumes clear their floors, so the restraint owes no energy and no force to anyone. */
+    flat_bottom_k,
+    /** Both volumes sit past their floors on the wrong side, so all five atoms are pushed. */
+    both_terms_k,
+    /** The pivot volume is satisfied and the center-based one is not, so only the center term pushes. */
+    center_term_only_k,
+};
+
+/** One geometry the restraint is scored on, with the descriptor the polish kernel would be handed. */
+struct chiral_fixture_t {
+    std::string_view name;
+    /** Axis-major coordinates, `3 * num_atoms` components; atom zero is the center. */
+    std::vector<float> positions;
+    std::uint32_t num_atoms = 0;
+    sft::chiral_center_descriptor_t center {};
+    restraint_expectation_t expectation = restraint_expectation_t::flat_bottom_k;
+};
+
+/**
+ *  @brief The four fixtures, built around one ideal tetrahedron.
+ *
+ *  At a 1.5 angstrom bond the pivot-based volume is 10.4 cubic angstrom against its floor of 5, and the
+ *  center-based one is 2.60 against its floor of 1.5 — which is the whole reason the second floor is not
+ *  the first: the same geometry that clears one by a factor of two clears the other by less.
+ *
+ *  `center_through_plane` is the geometry this restraint exists for. Its four neighbors are untouched, so
+ *  the pivot-based volume is still 10.4 and its term is flat; the center alone has crossed its neighbors'
+ *  plane, which is exactly what a restraint applying no force to the center atom cannot see and what
+ *  `assignChiralTypesFrom3D` reads as the opposite handedness.
+ */
+static std::vector<chiral_fixture_t> chiral_fixtures_() {
+    float const offset = fixture_bond_length_k / 1.7320508f;
+    // Four ideal tetrahedral directions, as (atom, axis) rows behind atom zero, the center.
+    float const directions[4][3] = {{offset, offset, offset},
+                                    {offset, -offset, -offset},
+                                    {-offset, offset, -offset},
+                                    {-offset, -offset, offset}};
+
+    auto build_ = [&](std::string_view name, std::uint32_t num_atoms, std::int8_t target_sign, float minimum_volume,
+                      std::uint8_t pivot, float center_offset,
+                      restraint_expectation_t expectation) -> chiral_fixture_t {
+        chiral_fixture_t fixture {.name = name,
+                                  .positions = std::vector<float>(std::size_t {3} * num_atoms, 0.0f),
+                                  .num_atoms = num_atoms,
+                                  .center = {.center_atom = 0,
+                                             .neighbor_atoms = {1, 2, 3, pivot},
+                                             .target_sign = target_sign,
+                                             .padding = {0, 0},
+                                             .minimum_volume = minimum_volume,
+                                             .padding_float = 0.0f},
+                                  .expectation = expectation};
+        sft::conformer_soa_t const coordinates {fixture.positions.data(), num_atoms};
+        for (std::uint32_t neighbor = 1; neighbor < num_atoms; ++neighbor)
+            for (std::uint32_t axis = 0; axis < 3; ++axis) coordinates(neighbor, axis) = directions[neighbor - 1][axis];
+        // The plane normal of the first three neighbors is (1, 1, -1) normalized; walking the center
+        // along it by more than 0.5 angstrom carries the center-based volume through zero.
+        float const normal[3] = {0.5773503f, 0.5773503f, -0.5773503f};
+        for (std::uint32_t axis = 0; axis < 3; ++axis) coordinates(0, axis) = center_offset * normal[axis];
+        return fixture;
+    };
+
+    std::vector<chiral_fixture_t> fixtures;
+    fixtures.push_back(build_("four_coordinate_satisfied", 5, 1, sft::min_four_coordinate_volume_k, 4, 0.0f,
+                              restraint_expectation_t::flat_bottom_k));
+    fixtures.push_back(build_("four_coordinate_inverted", 5, -1, sft::min_four_coordinate_volume_k, 4, 0.0f,
+                              restraint_expectation_t::both_terms_k));
+    fixtures.push_back(build_("center_through_plane", 5, 1, sft::min_four_coordinate_volume_k, 4, 0.8f,
+                              restraint_expectation_t::center_term_only_k));
+    // A three-coordinate center is stored as its own fourth neighbor, so both expressions read the same
+    // volume and the second floor, at a fraction of the first, can never bind on its own.
+    fixtures.push_back(build_("three_coordinate_inverted", 4, -1, sft::min_three_coordinate_volume_k, 0, 0.0f,
+                              restraint_expectation_t::both_terms_k));
+    return fixtures;
+}
+
+/** Central difference of the restraint's energy with respect to one coordinate of @p positions. */
+[[nodiscard]] static mmff_energy_probe_t chiral_difference_component_(chiral_fixture_t const &fixture,
+                                                                      std::uint32_t atom, std::uint32_t axis,
+                                                                      std::vector<float> &positions,
+                                                                      std::vector<float> &probe_gradient,
+                                                                      float &derivative) {
+
+    custd::span<sft::chiral_center_descriptor_t const> const centers {&fixture.center, 1};
+    sft::conformer_soa_t const coordinates {positions.data(), fixture.num_atoms};
+    float const original = coordinates(atom, axis);
+    float energy_plus = 0.0f, energy_minus = 0.0f;
+
+    coordinates(atom, axis) = original + chiral_difference_step_k;
+    mmff_energy_probe_t probe = sftest::gpu_chiral_restraint(positions, fixture.num_atoms, centers, probe_gradient,
+                                                             &energy_plus);
+    coordinates(atom, axis) = original - chiral_difference_step_k;
+    if (probe == mmff_energy_probe_t::completed_k)
+        probe = sftest::gpu_chiral_restraint(positions, fixture.num_atoms, centers, probe_gradient, &energy_minus);
+
+    coordinates(atom, axis) = original;
+    if (probe != mmff_energy_probe_t::completed_k) return probe;
+    derivative = (energy_plus - energy_minus) / (2.0f * chiral_difference_step_k);
+    return mmff_energy_probe_t::completed_k;
+}
+
+/** Sum of squares of one atom's three gradient components, which names whether it was pushed at all. */
+static float gradient_magnitude_(gradient_soa_t gradient, std::uint32_t atom) noexcept {
+    float total = 0.0f;
+    for (std::uint32_t axis = 0; axis < 3; ++axis) total += gradient(atom, axis) * gradient(atom, axis);
+    return total;
+}
+
+/**
+ *  @brief Gate the chiral restraint's own energy and derivative, which no MMFF94 reference can see.
+ *
+ *  Published MMFF94 carries no chiral term, so the corpus sweep below runs with the restraint switched
+ *  off and nothing there touches it. Its only reference is a central difference of its own energy, and
+ *  its only structural claim is which atoms each of its two terms pushes.
+ *
+ *  @param[inout] terms Receives one comparison per structural claim of every fixture.
+ *  @param[inout] derivatives Receives one comparison per gradient component of every fixture.
+ *  @param[out] worst_error Receives the largest error any component showed, so the band stays auditable.
+ *  @return Whether every fixture's device round trip completed.
+ */
+[[nodiscard]] static mmff_energy_probe_t check_chiral_restraint_(diagnostic_reporter_t &terms,
+                                                                 diagnostic_reporter_t &derivatives,
+                                                                 float &worst_error) {
+    std::vector<float> analytical, probe_gradient;
+    for (chiral_fixture_t &fixture : chiral_fixtures_()) {
+        std::size_t const num_components = std::size_t {3} * fixture.num_atoms;
+        analytical.assign(num_components, 0.0f);
+        probe_gradient.assign(num_components, 0.0f);
+        custd::span<sft::chiral_center_descriptor_t const> const centers {&fixture.center, 1};
+
+        float energy = 0.0f;
+        mmff_energy_probe_t probe = sftest::gpu_chiral_restraint(fixture.positions, fixture.num_atoms, centers,
+                                                                 analytical, &energy);
+        if (probe != mmff_energy_probe_t::completed_k) return probe;
+
+        gradient_soa_t const gradient {analytical.data(), fixture.num_atoms};
+        std::uint32_t const pivot = fixture.center.neighbor_atoms[3];
+        float const center_push = gradient_magnitude_(gradient, 0);
+        float const pivot_push = gradient_magnitude_(gradient, pivot);
+
+        // One line per structural claim, so a fixture that violates one names which.
+        auto claim = terms.mismatch("restraint", "fixture={}", fixture.name);
+        switch (fixture.expectation) {
+        case restraint_expectation_t::flat_bottom_k:
+            claim.field("energy", 0.0f, energy, exactly_equal);
+            claim.field("center_push", 0.0f, center_push, exactly_equal);
+            claim.field("pivot_push", 0.0f, pivot_push, exactly_equal);
+            break;
+        case restraint_expectation_t::both_terms_k:
+            claim.field("energy_positive", true, energy > 0.0f, exactly_equal);
+            claim.field("center_pushed", true, center_push > 0.0f, exactly_equal);
+            claim.field("pivot_pushed", true, pivot_push > 0.0f, exactly_equal);
+            break;
+        case restraint_expectation_t::center_term_only_k:
+            claim.field("energy_positive", true, energy > 0.0f, exactly_equal);
+            claim.field("center_pushed", true, center_push > 0.0f, exactly_equal);
+            claim.field("pivot_push", 0.0f, pivot_push, exactly_equal);
+            break;
+        }
+
+        for (std::uint32_t atom = 0; atom < fixture.num_atoms; ++atom)
+            for (std::uint32_t axis = 0; axis < 3; ++axis) {
+                float difference = 0.0f;
+                probe = chiral_difference_component_(fixture, atom, axis, fixture.positions, probe_gradient,
+                                                     difference);
+                if (probe != mmff_energy_probe_t::completed_k) return probe;
+                worst_error = std::max(worst_error, std::fabs(gradient(atom, axis) - difference));
+                derivatives.mismatch("restraint_gradient", "fixture={} atom={}", fixture.name, atom)
+                    .field(gradient_field_name_(axis), difference, gradient(atom, axis),
+                           [](float reference, float observed) {
+                               return chiral_restraint_tolerance_k.agree(reference, observed);
+                           });
+            }
+    }
+    return mmff_energy_probe_t::completed_k;
+}
+
+#pragma endregion Chiral Restraint
+
 #pragma region Sections
 
 /** How one molecule's turn through the sweep ended. */
@@ -297,6 +504,10 @@ struct gradient_reporters_t {
     diagnostic_reporter_t translation_invariance {"invariant", "device"};
     /** Full-stage analytical gradient against a central difference, over sampled components. */
     diagnostic_reporter_t stage_gradient {"finite_difference", "analytical"};
+    /** Which atoms each of the chiral restraint's two terms pushes, and what it charges for them. */
+    diagnostic_reporter_t chiral_terms {"expected", "observed"};
+    /** The chiral restraint's analytical derivative against a central difference of its own energy. */
+    diagnostic_reporter_t chiral_restraint {"finite_difference", "analytical"};
 
     /** Cap what each section prints, so one pathological molecule cannot bury the log. */
     void limit_printed_lines(std::size_t maximum) noexcept {
@@ -304,26 +515,31 @@ struct gradient_reporters_t {
         stage_energy.limit_printed_lines(maximum);
         translation_invariance.limit_printed_lines(maximum);
         stage_gradient.limit_printed_lines(maximum);
+        chiral_terms.limit_printed_lines(maximum);
+        chiral_restraint.limit_printed_lines(maximum);
     }
 
     std::size_t comparison_count() const noexcept {
         return oop_gradient.comparison_count() + stage_energy.comparison_count() +
-               translation_invariance.comparison_count() + stage_gradient.comparison_count();
+               translation_invariance.comparison_count() + stage_gradient.comparison_count() +
+               chiral_terms.comparison_count() + chiral_restraint.comparison_count();
     }
 
     std::size_t mismatch_count() const noexcept {
         return oop_gradient.mismatch_count() + stage_energy.mismatch_count() + translation_invariance.mismatch_count() +
-               stage_gradient.mismatch_count();
+               stage_gradient.mismatch_count() + chiral_terms.mismatch_count() + chiral_restraint.mismatch_count();
     }
 
-    /** Close all four sections; true when each compared something and every field agreed. */
+    /** Close all six sections; true when each compared something and every field agreed. */
     bool summarize_sections() {
         oop_gradient.summarize("oop_gradient");
         stage_energy.summarize("stage_energy");
         translation_invariance.summarize("translation_invariance");
         stage_gradient.summarize("stage_gradient");
+        chiral_terms.summarize("chiral_terms");
+        chiral_restraint.summarize("chiral_restraint");
         return oop_gradient.passed() && stage_energy.passed() && translation_invariance.passed() &&
-               stage_gradient.passed();
+               stage_gradient.passed() && chiral_terms.passed() && chiral_restraint.passed();
     }
 };
 
@@ -598,6 +814,18 @@ int main(int argc, char **argv) {
 
     sftest::gradient_reporters_t reporters;
     reporters.limit_printed_lines(sftest::max_printed_lines_k);
+
+    // The restraint is scored on its own fixtures before the corpus, because the sweep below switches it
+    // off: RDKit's MMFF94 carries no chiral term, so no molecule there can say anything about it.
+    float worst_restraint_error = 0.0f;
+    sftest::mmff_energy_probe_t const restraint_probe = sftest::check_chiral_restraint_(
+        reporters.chiral_terms, reporters.chiral_restraint, worst_restraint_error);
+    if (restraint_probe != sftest::mmff_energy_probe_t::completed_k)
+        return sftest::report_fail(test_name_k, "the device refused a chiral restraint fixture as {}",
+                                   sftest::mmff_energy_probe_reason(restraint_probe));
+    fmt::println("worst chiral restraint gradient error {} against an absolute floor of {:.3g}", worst_restraint_error,
+                 sftest::chiral_restraint_tolerance_k.absolute);
+
     sftest::gradient_tally_t tally;
     sftest::sweep_corpus_(corpus, reporters, tally);
 
