@@ -890,26 +890,44 @@ struct molecule_readback_t {
  *  @brief Widen the byte a kernel wrote into the public per-conformer status, and check the energy
  *  behind a success.
  *
- *  Four values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`, and
- *  `stamp_refused_molecules_kernel` overwrites both with the molecule's verdict — `bounds_infeasible_k`
- *  where the metric prepass found bounds no coordinates satisfy, `batch_overflow_k` where that prepass
- *  refused the whole batch over scratch it could not fit. Anything else is a slot no kernel reached — the
- *  priming walk's `slot_unwritten_k`, or a byte from a producer this build does not know — and it reports
- *  as unwritten rather than as a success the coordinates would not back.
+ *  Six values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`,
+ *  `validate_polished_stereo_kernel` demotes a success to `polish_inverted_center_k` or
+ *  `polish_inverted_bond_k`, and `stamp_refused_molecules_kernel` overwrites whatever is there with the
+ *  molecule's verdict — `bounds_infeasible_k` where the metric prepass found bounds no coordinates
+ *  satisfy, `batch_overflow_k` where that prepass refused the whole batch over scratch it could not fit.
+ *  The priming walk's own `slot_unwritten_k` survives wherever no kernel reached the slot.
+ *
+ *  Exhaustive over `conformer_status_t` and carrying no `default:`, so a status appended to that
+ *  append-only enum is a `-Wswitch` warning here rather than a device verdict silently laundered into
+ *  `slot_unwritten_k` — which is what the arm this replaces did to both polish demotions.
  *
  *  A success is only a success while its energy is a number a consumer can rank by, so the two facts are
  *  decided together here rather than left for six consumers to re-derive from the status byte alone.
  */
 static conformer_status_t conformer_status_of_(std::uint8_t raw, float energy) noexcept {
+    // A byte past the last enumerator comes from a producer this build does not know.
+    if (raw >= conformer_status_count_k) return conformer_status_t::slot_unwritten_k;
     auto const status = static_cast<conformer_status_t>(raw);
     switch (status) {
     case conformer_status_t::success_k:
         return energy_is_physical(energy) ? status : conformer_status_t::nonphysical_energy_k;
     case conformer_status_t::stereo_failure_k:
     case conformer_status_t::bounds_infeasible_k:
-    case conformer_status_t::batch_overflow_k: return status;
-    default: return conformer_status_t::slot_unwritten_k;
+    case conformer_status_t::batch_overflow_k:
+    case conformer_status_t::polish_inverted_center_k:
+    case conformer_status_t::polish_inverted_bond_k:
+    case conformer_status_t::slot_unwritten_k: return status;
+    /* No kernel writes these, so a slot carrying one was never reached by the wave that primed it. */
+    case conformer_status_t::mmff_unconverged_k:
+    case conformer_status_t::invalid_smiles_k:
+    case conformer_status_t::too_many_atoms_k:
+    case conformer_status_t::preprocess_timeout_k:
+    case conformer_status_t::unsupported_element_k:
+    case conformer_status_t::too_many_bonds_k:
+    case conformer_status_t::too_many_rings_k:
+    case conformer_status_t::nonphysical_energy_k: return conformer_status_t::slot_unwritten_k;
     }
+    return conformer_status_t::slot_unwritten_k;
 }
 
 /**
