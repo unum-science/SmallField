@@ -96,6 +96,20 @@ define_smallfield_test(mmff94 mmff_term_parity GPU EXTRA_SOURCES cuda/test_mmff_
 # and the libcu++ headers behind `smallfield/types/views.hpp`.
 define_smallfield_test(cli fallback_policy LINK smallfield_rdkit fmt::fmt CUDA::cudart)
 
+# The zero-row shard goes through the shipped writer rather than a copy of it, so it takes the object library both CLI
+# binaries link -- which exists only when the CLI is built.  Arrow is found here as well as in `cli/` because
+# `find_package` imports its targets into the directory that calls it, so a name arriving from another subdirectory
+# would not resolve.  Host-only: `write_shard` reaches no device, and the coordinates it is handed are three halves
+# written by hand.
+if (SMALLFIELD_BUILD_CLI)
+    find_package(Arrow CONFIG REQUIRED)
+    find_package(Parquet CONFIG REQUIRED)
+    define_smallfield_test(
+        cli empty_shard
+        LINK smallfield_parquet_writer Arrow::arrow_shared Parquet::parquet_shared
+    )
+endif ()
+
 define_smallfield_test(api conformer_slot_layout)
 define_smallfield_test(api pipeline GPU)
 define_smallfield_test(api seed_determinism GPU)

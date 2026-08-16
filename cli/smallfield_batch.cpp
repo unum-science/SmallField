@@ -477,6 +477,10 @@ struct progress_counters_t {
     std::atomic<std::uint64_t> batches_completed {0};
     /** Pending input-files that reached no output shard, on either end of the pipeline; drives the exit code. */
     std::atomic<std::uint64_t> input_files_failed {0};
+    /** Input-files that carried no rows at all, each sealed with a zero-row output shard. Counted apart from
+     *  the molecules a populated shard loses to preprocessing, which the fallback breakdown already names:
+     *  an empty shard and a shard nothing survived both finish, and only one of them is a corpus defect. */
+    std::atomic<std::uint64_t> input_files_empty {0};
     /** Molecules that shipped coordinates but no USRCAT, because their shape context could not be rebuilt. */
     std::atomic<std::uint64_t> molecules_undescribed {0};
     /** Molecules a wave refused for its own sizing rather than for anything about them, summed across
@@ -516,6 +520,12 @@ static void reader_loop_(custd::span<shard_pair_t const *const> pending, cli_con
             molecules_read = data.smiles.size();
         }
         accumulator.add_input_file(std::move(data), pair);
+        // A shard fetched into its final name can be truncated to nothing, so a zero-row read is a corpus
+        // fact rather than a refusal: it travels the pipeline like any other and seals a zero-row output.
+        if (molecules_read == 0) {
+            logger.info("{} holds no rows — sealing a zero-row output shard", pair->input_path.string());
+            counters.input_files_empty.fetch_add(1);
+        }
 
         if (accumulator.num_molecules() >= batch_target) {
             output_queue.send(std::move(accumulator));
@@ -523,7 +533,10 @@ static void reader_loop_(custd::span<shard_pair_t const *const> pending, cli_con
         }
     }
 
-    if (accumulator.num_molecules() > 0) { output_queue.send(std::move(accumulator)); }
+    // What the tail batch carries is input-files, not molecules: a batch of nothing but empty shards holds no
+    // molecule and still owes an output shard and a sentinel for each of them. Testing the molecule count here
+    // is what dropped those shards silently, and an unsealed shard is offered again by every later run.
+    if (!accumulator.input_file_pairs.empty()) { output_queue.send(std::move(accumulator)); }
 
     coprocessed_batch_accumulator_t sentinel;
     sentinel.item = pipeline_item_t::end_of_stream_k;
@@ -638,7 +651,10 @@ static gpu_runner_outcome_t gpu_runner_loop_(sfapi::context_t &gpu_context, cli_
         auto const batch_start = std::chrono::steady_clock::now();
         std::size_t const buffer_slot = pool.acquire();
         output_buffers_t &buffer = pool.at(buffer_slot);
-        generate_batch_(gpu_context, config, accumulator, buffer);
+        // A batch of nothing but zero-row input shards has no wave to launch, and `generate_conformers` reports
+        // a wave of no molecules as a CUDA fault — which would park shards that are merely empty. It skips the
+        // device and travels on, so each of its input-files is still written and sealed downstream.
+        if (batch_molecules > 0) generate_batch_(gpu_context, config, accumulator, buffer);
 
         // Park this batch's shards and stop feeding the GPU, so `main` returns non-zero and the wrapper
         // relaunches with a fresh CUDA context.
@@ -1147,6 +1163,10 @@ int main(int argc, char **argv) {
                 fmt::group_digits(static_cast<std::uint64_t>(static_cast<double>(done) / std::max(total, 0.001))),
                 fmt::group_digits(undescribed), sfcli::percent_of_(undescribed, done));
     sfcli::log_pipeline_timings_(timings, counters, total, logger);
+    std::uint64_t const files_empty = counters.input_files_empty.load();
+    if (files_empty > 0)
+        logger.info("{} of {} input-files carried no rows — each sealed a zero-row output shard",
+                    fmt::group_digits(files_empty), fmt::group_digits(counters.total_input_files));
     std::uint64_t const files_failed = counters.input_files_failed.load();
     if (files_failed > 0)
         logger.error("{} of {} input-files produced no output shard — none of them was sealed, so a rerun retries them",

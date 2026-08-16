@@ -104,6 +104,20 @@ def find_shards(input_dir: str, shard_limit: int = 0) -> List[str]:
     return shards
 
 
+def first_shard_with_successes(shards: Sequence[str]) -> str | None:
+    """Return the first shard carrying a successful conformer, or ``None`` when no shard does.
+
+    Not simply ``shards[0]``: an input shard with no rows produces a valid zero-row output shard, and a
+    corpus whose first name sorts to one of those would otherwise sample nothing and fail the run for it.
+    A corpus where no shard succeeded still samples nothing, which stays a failure.
+    """
+    for path in shards:
+        status = pq.read_table(path, columns=["status"]).column("status").to_numpy()
+        if np.any(status == SUCCESS_STATUS):
+            return path
+    return None
+
+
 def missing_columns(first_shard: str) -> List[str]:
     """Return the subset of ``REQUIRED_COLUMNS`` absent from ``first_shard``'s schema."""
     column_names = pq.read_schema(first_shard).names
@@ -290,8 +304,13 @@ def main() -> int:
 
     render_aggregate_table(aggregate_shard_stats(shards))
 
+    sample_shard = first_shard_with_successes(shards)
+    if sample_shard is None:
+        log.error("no successful conformer in {} shards — nothing to cross-validate", thousands(len(shards)))
+        return 1
+
     log.info("RDKit cross-validation on up to {} random successful conformers", thousands(args.num_samples))
-    result = cross_validate_with_rdkit(shards[0], sample_successful_indices(shards[0], args.num_samples))
+    result = cross_validate_with_rdkit(sample_shard, sample_successful_indices(sample_shard, args.num_samples))
     render_cross_validation_table(result)
     return 0 if cross_validation_passed(result) else 1
 

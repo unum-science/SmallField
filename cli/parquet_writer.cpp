@@ -118,7 +118,13 @@ static std::size_t optional_required_(std::size_t held, std::size_t required) { 
 static shard_write_report_t check_input_extents_(writer_inputs_t const &inputs) {
     molecule_columns_t const &molecules = inputs.molecules;
     conformer_slot_columns_t const &conformers = inputs.conformers;
-    if (molecules.num_atoms.empty() || molecules.num_conformers.empty() || conformers.layout.num_conformers == 0)
+    // `molecule_columns_t::count()` reads `num_atoms`'s own extent, so an empty `num_atoms` beside a populated
+    // sibling is an axis the caller dropped rather than one an input shard of no rows genuinely has. The two
+    // must stay apart: the first would publish an empty shard for molecules that exist, while the second is a
+    // zero-row shard under the full schema, which is how an empty input shard reaches a terminal state.
+    bool const no_molecules = molecules.num_atoms.empty() && molecules.num_conformers.empty() &&
+                              molecules.smiles.empty();
+    if (conformers.layout.num_conformers == 0 || (molecules.num_atoms.empty() && !no_molecules))
         return {.status = shard_write_t::missing_per_molecule_arrays_k};
 
     std::uint64_t const num_molecules = molecules.count();

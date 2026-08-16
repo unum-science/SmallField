@@ -75,7 +75,8 @@ enum class shape_described_t : std::uint8_t {
  *  @brief The molecule axis: one element per molecule, in one order, across every non-empty column.
  *
  *  `num_heavy_atoms`, `num_bonds`, `molecular_weight` and `shape_described` are optional: an empty span opts
- *  the column out, and any other length must cover every molecule.
+ *  the column out, and any other length must cover every molecule. An axis empty in `smiles`, `num_atoms` and
+ *  `num_conformers` alike is a shard of no molecules, written with zero rows rather than refused.
  */
 struct molecule_columns_t {
     custd::span<std::string_view const> smiles;
@@ -140,8 +141,9 @@ struct writer_inputs_t {
 /**
  *  @brief Why a shard was written, or which class of refusal stopped it.
  *
- *  `missing_per_molecule_arrays_k` is the one whose name does not carry it: `num_atoms` or `num_conformers`
- *  is empty, or the layout holds no slots, so nothing describes a row.
+ *  `missing_per_molecule_arrays_k` is the one whose name does not carry it: the layout holds no slots, or
+ *  `num_atoms` is empty while a sibling molecule column is not, so the molecule axis is missing rather than
+ *  empty. A shard whose molecule axis is empty throughout is written out with zero rows.
  */
 enum class shard_write_t {
     written_k,
