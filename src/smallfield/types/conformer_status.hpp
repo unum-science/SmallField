@@ -72,12 +72,18 @@ enum class conformer_status_t : std::uint8_t {
     /** The same, for a declared E/Z double bond. Separate from the center above because a corpus can be
      *  wrong in both at once at rates a single count cannot tell apart. */
     polish_inverted_bond_k = 14,
+    /** The polished geometry puts two atoms closer than any chemistry places them, so the coordinates are
+     *  not a molecule whatever the energy behind them reads. Measured on the shipped geometry rather than
+     *  inferred from the energy: a clash drives the buffered 14-7 term to an enormous but finite value that
+     *  `energy_is_physical` accepts, and refusing it by magnitude needs a reference this stage does not have,
+     *  while a separation does not. The demoted slot keeps its coordinates, the evidence of what collapsed. */
+    nonphysical_geometry_k = 15,
 };
 
 /** One past the highest `conformer_status_t`, so a per-status array is indexed by the enumerator
  *  itself. The enum is append-only, so its newest value is always its widest. */
 inline constexpr std::size_t conformer_status_count_k =
-    static_cast<std::size_t>(conformer_status_t::polish_inverted_bond_k) + 1u;
+    static_cast<std::size_t>(conformer_status_t::nonphysical_geometry_k) + 1u;
 
 /** What a status byte no enumerator claims prints as, which a shard from a newer producer can carry. */
 inline constexpr std::string_view unnamed_status_k = "unnamed_status";
@@ -101,6 +107,7 @@ inline constexpr std::string_view conformer_status_name(conformer_status_t statu
     case conformer_status_t::slot_unwritten_k: return "slot_unwritten";
     case conformer_status_t::polish_inverted_center_k: return "polish_inverted_center";
     case conformer_status_t::polish_inverted_bond_k: return "polish_inverted_bond";
+    case conformer_status_t::nonphysical_geometry_k: return "nonphysical_geometry";
     }
     return unnamed_status_k;
 }

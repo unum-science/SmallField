@@ -85,6 +85,10 @@ static_assert(sfcli::fallback_disposition(sft::conformer_status_t::nonphysical_e
                   sfcli::fallback_disposition_t::retry_k,
               "RDKit reaches the geometry by its own embedding and its own minimizer");
 
+static_assert(sfcli::fallback_disposition(sft::conformer_status_t::nonphysical_geometry_k) ==
+                  sfcli::fallback_disposition_t::retry_k,
+              "a pair our polish collapsed onto one point is not where RDKit has to put them");
+
 /*  The one terminal verdict not re-derived: RDKit would embed these, but a mis-sized wave refuses a whole
  *  device's batch, and that population at 20 ms of CPU each reads as a hang, not a re-runnable sizing error. */
 static_assert(sfcli::fallback_disposition(sft::conformer_status_t::batch_overflow_k) ==

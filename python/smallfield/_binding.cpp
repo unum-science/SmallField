@@ -162,7 +162,8 @@ PYBIND11_MODULE(_smallfield, smallfield_module) {
         .value("BATCH_OVERFLOW", sfapi::conformer_status_t::batch_overflow_k)
         .value("SLOT_UNWRITTEN", sfapi::conformer_status_t::slot_unwritten_k)
         .value("POLISH_INVERTED_CENTER", sfapi::conformer_status_t::polish_inverted_center_k)
-        .value("POLISH_INVERTED_BOND", sfapi::conformer_status_t::polish_inverted_bond_k);
+        .value("POLISH_INVERTED_BOND", sfapi::conformer_status_t::polish_inverted_bond_k)
+        .value("NONPHYSICAL_GEOMETRY", sfapi::conformer_status_t::nonphysical_geometry_k);
 
     py::class_<conformer_batch_t>(smallfield_module, "ConformerBatch",
                                   "Named outputs of one `Context.generate_conformers` call.")

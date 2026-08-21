@@ -108,8 +108,9 @@ static bool gate_can_answer_(sft::conformer_status_t status) noexcept {
     case sft::conformer_status_t::batch_overflow_k:
     // `slot_unwritten_k` names a missing device verdict; the host gate runs before any slot exists.
     case sft::conformer_status_t::slot_unwritten_k:
-    // Both are post-polish verdicts on a geometry, and the host gate runs before any geometry exists.
+    // All three are post-polish verdicts on a geometry, and the host gate runs before any geometry exists.
     case sft::conformer_status_t::polish_inverted_center_k:
+    case sft::conformer_status_t::nonphysical_geometry_k:
     case sft::conformer_status_t::polish_inverted_bond_k: return false;
     }
     // A status byte no enumerator claims is nothing the gate answers with, so it borrows no verdict.

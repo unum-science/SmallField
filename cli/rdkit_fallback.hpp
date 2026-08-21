@@ -82,6 +82,9 @@ enum class fallback_disposition_t : std::uint8_t {
     case types::conformer_status_t::bounds_infeasible_k: return fallback_disposition_t::retry_k;
     // RDKit reaches geometry by its own embedding and minimizer, so a non-finite energy is not one it re-derives.
     case types::conformer_status_t::nonphysical_energy_k: return fallback_disposition_t::retry_k;
+    // The same embedding and minimizer decide where the atoms land, so a pair our polish collapsed onto one
+    // point is not a place RDKit has to put them either.
+    case types::conformer_status_t::nonphysical_geometry_k: return fallback_disposition_t::retry_k;
     }
     // A status byte outside the enum keeps its second chance rather than being dropped.
     return fallback_disposition_t::retry_k;

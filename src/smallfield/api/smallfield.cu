@@ -822,11 +822,12 @@ struct molecule_readback_t {
  *  @brief Widen the byte a kernel wrote into the public per-conformer status, and check the energy behind
  *  a success — decided together here rather than re-derived by six consumers from the status byte alone.
  *
- *  Six values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`,
- *  `validate_polished_stereo_kernel` demotes a success to `polish_inverted_center_k` or
- *  `polish_inverted_bond_k`, and `stamp_refused_molecules_kernel` overwrites whatever is there with the
- *  molecule's verdict — `bounds_infeasible_k` where the metric prepass found bounds no coordinates satisfy,
- *  `batch_overflow_k` where it refused the whole batch over scratch it could not fit. The priming walk's own
+ *  Seven values reach this buffer: `write_conformer_output_` writes `success_k` or `stereo_failure_k`,
+ *  `validate_polished_stereo_kernel` demotes a success to `nonphysical_geometry_k`,
+ *  `polish_inverted_center_k` or `polish_inverted_bond_k`, and `stamp_refused_molecules_kernel` overwrites
+ *  whatever is there with the molecule's verdict — `bounds_infeasible_k` where the metric prepass found
+ *  bounds no coordinates satisfy, `batch_overflow_k` where it refused the whole batch over scratch it could
+ *  not fit. The priming walk's own
  *  `slot_unwritten_k` survives wherever no kernel reached the slot. Exhaustive over `conformer_status_t` and
  *  carrying no `default:`, so a status appended to that append-only enum is a `-Wswitch` warning here rather
  *  than a device verdict silently laundered into `slot_unwritten_k`.
@@ -843,6 +844,7 @@ static conformer_status_t conformer_status_of_(std::uint8_t raw, float energy) n
     case conformer_status_t::batch_overflow_k:
     case conformer_status_t::polish_inverted_center_k:
     case conformer_status_t::polish_inverted_bond_k:
+    case conformer_status_t::nonphysical_geometry_k:
     case conformer_status_t::slot_unwritten_k: return status;
     // No kernel writes these, so a slot carrying one was never reached by the wave that primed it.
     case conformer_status_t::mmff_unconverged_k:
